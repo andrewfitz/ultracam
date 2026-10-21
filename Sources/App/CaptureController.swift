@@ -43,7 +43,7 @@ struct CaptureUpdate: @unchecked Sendable {
   var videoBitrateMbps: Double = 0
   var videoDrops: UInt64 = 0
   var cameraOutputActive = false
-  var cameraMessage = "Virtual camera not connected"
+  var cameraMessage = "Ultracam camera not connected"
   var stopped = false
 }
 
@@ -158,7 +158,7 @@ final class CaptureController: @unchecked Sendable {
   private var cameraOutage = false
   private var reconnectRequested = false
   private var reconnectAfter: Double = 0
-  private var cameraMessage = "Virtual camera not connected"
+  private var cameraMessage = "Ultracam camera not connected"
   private var message = "Stopped"
   private var frameRateGate = FrameRateGate()
   private var watchdog: DispatchSourceTimer?
@@ -549,7 +549,7 @@ final class CaptureController: @unchecked Sendable {
     cameraOutage = false
     reconnectRequested = false
     reconnectAfter = 0
-    cameraMessage = "Virtual camera not connected"
+    cameraMessage = "Ultracam camera not connected"
     activeConfiguration = nil
     activeInputType = nil
     deliveryStager = CameraFrameStager()
@@ -637,7 +637,7 @@ final class CaptureController: @unchecked Sendable {
     do {
       try services.connect(next, inputType)
       cameraConnected = true
-      cameraMessage = "Virtual camera connected — choose Ultracam in your meeting app"
+      cameraMessage = "Ultracam camera connected. Choose it in your meeting app."
     } catch {
       cameraMessage = "Camera output unavailable — \(error.localizedDescription)"
       if wasConnected { beginCameraRecovery() }

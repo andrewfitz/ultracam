@@ -158,7 +158,7 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     guard let identity = requestIdentity.token(for: ObjectIdentifier(request)) else { return }
     Task { @MainActor in
       guard self.requestIdentity.matches(identity) else { return }
-      self.status = "Approve Ultracam in System Settings → General → Login Items & Extensions → Camera Extensions."
+      self.status = "Approve Ultracam in System Settings › General › Login Items & Extensions › Camera Extensions."
     }
   }
 

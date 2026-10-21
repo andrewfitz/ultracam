@@ -110,7 +110,7 @@ struct UICameraPictureView: View {
       UIPicturePlaceholder(symbol: "video", title: "Starting…", compact: compact,
         detail: "Waiting for the first frame from \(camera.inputName).", showsProgress: true)
     case .noSignal:
-      UIPicturePlaceholder(symbol: "video.slash", title: "No HDMI signal", compact: compact,
+      UIPicturePlaceholder(symbol: "video.slash", title: "No signal", compact: compact,
         detail: "Check the camera's HDMI output: 2160p 29.97 or 59.94, 10-bit 4:2:2, RAW off, display LUT off.")
     case .unsupported(let mode):
       UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "Unsupported format", compact: compact,
@@ -326,7 +326,9 @@ struct UICameraPictureView: View {
   }
 
   @ViewBuilder private var pictureMenu: some View {
-    Button("Freeze") { context.send(.freeze(cameraID: camera.id)) }
+    // A checkmark item, like View › Freeze; the menu is built on open, so it reads the current state.
+    Toggle("Freeze", isOn: Binding(get: { UIMonitorBridge.presenter(for: camera.id)?.isFrozen == true },
+      set: { _ in context.send(.freeze(cameraID: camera.id)) }))
     Button(isClean ? "Show Overlays" : "Clean View") { context.send(.toggleClean(cameraID: camera.id)) }
     Button("Reset Monitor Tools") { context.send(.resetMonitorTools(cameraID: camera.id)) }
     UICopySettingsMenu(camera: camera, context: context, title: "Copy Settings To")
@@ -726,6 +728,10 @@ struct UIChannelStripView: View {
       Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
     case .failed:
       HStack(spacing: 6) {
+        // Out of space: the next take needs another folder (or room on this drive).
+        if camera.diskFull {
+          Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }
+        }
         Button("Show in Finder", systemImage: "folder") {
           if let url = snapshot?.recording.savedURL { context.send(.revealInFinder(url)) } else { context.send(.revealRecordings) }
         }
@@ -736,7 +742,12 @@ struct UIChannelStripView: View {
       EmptyView()
     case .finishing:
       Text("Saving…").font(.uiRow).foregroundStyle(.secondary)
-    case .ready, .waiting:
+    case .waiting:
+      // The strip says a folder is also needed; offer it now rather than after the signal arrives.
+      if let recording = snapshot?.recording, recording.folderPath == nil {
+        Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
+      }
+    case .ready:
       EmptyView()
     }
   }
@@ -923,7 +934,7 @@ struct UIChannelStripView: View {
       collapsedLabel(camera.statusBadge, symbol: camera.statusTone == .warning ? "exclamationmark.triangle.fill" : nil, color: .orange)
     case .noFolder: collapsedLabel("No folder", symbol: "exclamationmark.triangle.fill", color: .orange)
     case .failed:
-      collapsedLabel("Recording failed", symbol: "exclamationmark.triangle.fill", color: .orange)
+      collapsedLabel(camera.recordTitle, symbol: "exclamationmark.triangle.fill", color: .orange)
         .accessibilityElement(children: .combine)
     case .ready: collapsedLabel("Ready")
     }

@@ -202,7 +202,7 @@ struct UISessionSidebarViewContent: View {
         }
       }
       .accessibilityElement(children: .combine)
-      .help("A camera starts when a meeting app opens its virtual camera and stops when the last app closes. Set it per camera in the inspector.")
+      .help("A camera starts when a meeting app opens its Ultracam camera and stops when the last app closes. Set it per camera in the inspector.")
       VStack(alignment: .leading, spacing: 1) {
         Text("Backup recording")
         Text("Coming later").font(.subheadline)
@@ -238,7 +238,7 @@ struct UIDriveRow: View {
   let drive: UIDrive
   var body: some View {
     let used = drive.totalBytes > 0 ? 1 - Double(drive.availableBytes) / Double(drive.totalBytes) : 0
-    let low = (drive.secondsLeft ?? .infinity) < 30 * 60
+    let low = (drive.secondsLeft ?? .infinity) < 30 * 60 || UIPresentationBuilder.isFull(drive)
     VStack(alignment: .leading, spacing: 4) {
       HStack {
         Image(systemName: low ? "exclamationmark.triangle.fill" : "externaldrive").foregroundStyle(low ? Color.orange : .secondary)
@@ -298,7 +298,8 @@ struct UIShotTimerView: View {
             Rectangle().fill(Color.primary.opacity(0.5)).frame(width: 1.5, height: 12)
               .offset(x: width * min(1, mark / maximum) - 0.75)
           }
-          Rectangle().fill(Color.red).frame(width: 1.5, height: 12).offset(x: width - 1.5)
+          // The maximum is a full-strength primary tick, as in Settings › Switcher; red means on air or recording.
+          Rectangle().fill(Color.primary).frame(width: 1.5, height: 12).offset(x: width - 1.5)
         }
       }
       .frame(height: 6)

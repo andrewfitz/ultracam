@@ -310,6 +310,8 @@ struct UIStatusPopover: View {
       ForEach(context.session.drives) { UIDriveRow(drive: $0) }
       HStack {
         Button("Show in Finder") { context.send(.revealRecordings) }
+          .disabled(!context.presentation.canRevealRecordings)
+          .help(context.presentation.canRevealRecordings ? "Open the recording folder in Finder." : "Choose a recording folder first.")
         Spacer()
         if !takes.isEmpty {
           Button("Stop All Recordings") { context.send(.stopAllRecordings) }
@@ -330,7 +332,7 @@ struct UIStatusPopover: View {
           UIAudioMeter(audio: camera.audio)
         }
       }
-      Text("48 kHz stereo from each input. Not sent through the virtual camera.")
+      Text("48 kHz stereo from each input. Not sent through the Ultracam cameras.")
         .font(.subheadline).foregroundStyle(.secondary)
     }
   }

@@ -271,10 +271,6 @@ struct UICommands: Commands {
     }
   }
 
-  private func strategy(_ title: String) -> SwitcherStrategy {
-    [SwitcherStrategy.manual, .fixedInterval, .naturalTalkingHead, .dynamicAnalysis].first { UIStrategy.title($0) == title } ?? .manual
-  }
-
   private func allCollapsed(_ session: UISessionSnapshot) -> Bool {
     let ids = Set(session.cameras.map(\.id))
     return !ids.isEmpty && ids.isSubset(of: session.collapsed)

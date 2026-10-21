@@ -138,8 +138,8 @@
 
 | # | Item | Status | Evidence | Fix suggestion | Sev |
 |---|---|---|---|---|---|
-| 70 | System colors and materials; every screen renders in light and dark; picture overlays stay dark glass in light | OK | `UIStyle.swift`; ui-verify `*-light.png` / `*-dark.png` | – | – |
-| 71 | Liquid Glass with availability fallback and Reduce Transparency | OK | `UIStyle.swift` `UIGlassBackground` | – | – |
+| 70 | System colors and materials; every screen renders in light and dark; picture overlays stay dark capsules in light | OK | `UIStyle.swift`; ui-verify `*-light.png` / `*-dark.png` | – | – |
+| 71 | Reduce Transparency and Increase Contrast: system materials (sidebar, inspector, `.bar`, popovers) adapt on their own; overlays on video are dark capsules (black at 72%), no custom glass | OK | `UIStyle.swift` header, `uiPictureOverlay`, `uiPictureControls`; the unused `UIGlassBackground`/`uiGlass` was removed | – | – |
 | 72 | Native containers: NavigationSplitView, `.inspector`, Form `.grouped`, Settings scene, Window scenes, NSMenu, `confirmationDialog`, popovers | OK | code | – | – |
 
 ### Deferred by design (D6/D8, user-approved)

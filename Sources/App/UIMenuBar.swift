@@ -213,6 +213,8 @@ final class UIMenuCommandBox: NSObject {
     }
     if let drive = session.drives.first, let left = drive.secondsLeft {
       parts.append("\(drive.name) \(UIFormat.duration(left)) left")
+    } else if let drive = session.drives.first, UIPresentationBuilder.isFull(drive) {
+      parts.append("\(drive.name) full")
     }
     return parts.joined(separator: " · ")
   }
@@ -377,7 +379,7 @@ final class UIMenuCommandBox: NSObject {
     case .recording, .updating: status.append("REC \(UIFormat.shortElapsed(session.cameras.first { $0.id == camera.id }?.recording.elapsed ?? 0))")
     case .recordingNoSignal: status.append("Recording, no signal")
     case .paused: status.append("Paused")
-    case .failed: status.append("Recording failed")
+    case .failed: status.append(camera.recordTitle)
     case .noFolder: status.append("No folder")
     // "Stopped", "Couldn't start" or "Input missing", as on the camera's own badge.
     case .stopped, .waiting: status.append(camera.statusBadge)

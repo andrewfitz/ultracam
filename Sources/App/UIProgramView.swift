@@ -211,7 +211,8 @@ struct UIProgramCutBar: View {
             .frame(width: width * min(1, (current ?? 0) / maximum), height: 8)
           marker(at: shot.minimum / maximum, width: width, label: "min \(Int(shot.minimum)) s")
           marker(at: shot.softMaximum / maximum, width: width, label: "soft max \(Int(shot.softMaximum)) s")
-          marker(at: 1, width: width, label: "max \(Int(shot.maximum)) s", color: .red)
+          // Primary, not red, as in Settings › Switcher: red means on air or recording.
+          marker(at: 1, width: width, label: "max \(Int(shot.maximum)) s", color: .primary)
         }
         .frame(maxHeight: .infinity, alignment: .top)
       }

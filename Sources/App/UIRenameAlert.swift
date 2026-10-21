@@ -31,7 +31,7 @@ private struct UIRenameAlert: ViewModifier {
         Button("Cancel", role: .cancel) { context.send(.endRename) }
       } message: {
         // The camera extension keeps the device name it published until it restarts.
-        Text("Meeting apps list the new name after the camera extension restarts, for example after restarting your Mac.")
+        Text("Meeting apps list the new name after Ultracam's camera restarts, for example after restarting your Mac.")
       }
       .onChange(of: context.session.renamingCameraID, initial: true) { _, id in
         nameDraft = id.flatMap { context.camera($0)?.name } ?? ""

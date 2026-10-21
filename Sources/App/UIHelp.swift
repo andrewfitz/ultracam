@@ -27,7 +27,7 @@ struct UIHelpView: View {
     ("⌃⌥F", "Freeze the selected picture"),
     ("⌃⌥C", "Clean view for the selected picture"),
     ("⌘O", "Load a LUT for the selected camera"),
-    ("⌘0", "Main window"),
+    ("⌘0", "Show Main Window"),
     ("⌘,", "Settings"),
   ]
 

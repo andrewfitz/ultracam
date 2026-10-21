@@ -294,6 +294,8 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var accessibilityLabel: String
   var lutError: String?
   var automaticStartFailed: Bool
+  /// The failed take ran out of disk space: the strip offers another folder.
+  var diskFull = false
 }
 
 enum UIRecordControl: Sendable, Equatable {
@@ -528,7 +530,14 @@ enum UIPresentationBuilder {
     case .noFolder: recordTitle = "No folder"; recordDetail = "Choose where \(camera.name) records"; recordTone = .warning
     case .failed:
       // Orange, not red: red means recording or on air (D8), and a failed take is neither.
-      recordTitle = "Recording failed"; recordDetail = rec.error ?? "The recording ended with an error."; recordTone = .warning
+      recordTone = .warning
+      if diskFull(camera, in: session) {
+        // Say what to do, not the writer's error text; Details still has that.
+        recordTitle = "Disk full"
+        recordDetail = "Free space on \(drive(for: camera, in: session)?.name ?? "the drive") or choose another folder"
+      } else {
+        recordTitle = "Recording failed"; recordDetail = rec.error ?? "The recording ended with an error."
+      }
     case .stopped: recordTitle = "Not recording"; recordDetail = "Start the camera to record"
     case .waiting:
       // Name what is actually missing; the badge and picture already say which signal problem it is.
@@ -591,7 +600,9 @@ enum UIPresentationBuilder {
       dropsLine: isRecording ? (rec.droppedFrames > 0 ? "\(rec.droppedFrames) dropped" : "0 dropped") : nil,
       dropsWarning: rec.droppedFrames > 0,
       folderLine: rec.folderPath.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "No recording folder",
-      timeLeftLine: rec.secondsLeft.map { "\(UIFormat.duration($0)) left" },
+      // A drive with nothing free has no time left to show; say so instead of hiding the line.
+      timeLeftLine: rec.secondsLeft.map { "\(UIFormat.duration($0)) left" }
+        ?? (drive(for: camera, in: session).map(isFull) == true ? "No space left" : nil),
       outputLine: outputLine,
       outputInUse: session.outputMode == .program ? (session.onAirID == camera.id && session.programInUse) : camera.inUse,
       showsCut: session.outputMode == .program && session.onAirID != camera.id,
@@ -604,7 +615,8 @@ enum UIPresentationBuilder {
       timecode: camera.timecode ?? "—", audio: camera.audio,
       activeTools: UIMonitorTool.allCases.filter { camera.activeTools.contains($0) },
       accessibilityLabel: labelParts.joined(separator: ", "),
-      lutError: camera.lutError, automaticStartFailed: camera.automaticStartFailed)
+      lutError: camera.lutError, automaticStartFailed: camera.automaticStartFailed,
+      diskFull: diskFull(camera, in: session))
   }
 
   static func stopMessage(camera: UICameraSnapshot, recording: Bool, onAir: Bool) -> String {
@@ -725,9 +737,15 @@ enum UIPresentationBuilder {
   static func warning(_ session: UISessionSnapshot, includingPlainNoSignal: Bool = true) -> String? {
     for camera in session.cameras {
       if camera.recording.status == .recording, case .noSignal = camera.signal { return "\(camera.name): recording, no signal" }
-      if camera.recording.failed || camera.recording.error != nil { return "\(camera.name): recording failed" }
+      if camera.recording.failed || camera.recording.error != nil {
+        return diskFull(camera, in: session) ? "\(camera.name): disk full" : "\(camera.name): recording failed"
+      }
     }
     if let failed = session.cameras.first(where: \.automaticStartFailed) { return "\(failed.name): couldn't start" }
+    // What the meeting sees comes before what might go wrong later.
+    if let program = programWarning(session) { return program }
+    // A drive with nothing free has no time left at all, so the check below never sees it.
+    if let full = session.drives.first(where: isFull) { return "\(full.name): no space left" }
     if let low = session.drives.first(where: { ($0.secondsLeft ?? .infinity) < 30 * 60 }), let left = low.secondsLeft {
       return "\(low.name): \(UIFormat.duration(left)) left"
     }
@@ -742,6 +760,72 @@ enum UIPresentationBuilder {
     if let lut = session.cameras.first(where: { $0.lutError != nil }) { return "\(lut.name): LUT unavailable" }
     if session.outputMode == .program && session.programFormatMismatch { return "Program cameras use different formats" }
     return nil
+  }
+
+  /// Program mode: the camera on Program has lost its picture, or no camera has one.
+  /// Not behind `includingPlainNoSignal`: the picture on screen may not be the one on air.
+  static func programWarning(_ session: UISessionSnapshot) -> String? {
+    guard session.outputMode == .program else { return nil }
+    func hasPicture(_ camera: UICameraSnapshot) -> Bool {
+      if case .live = camera.signal { return camera.running }
+      return false
+    }
+    // Capture without a first frame yet, or an automatic camera about to start for the
+    // meeting that just connected (a failed one already said "couldn't start").
+    func starting(_ camera: UICameraSnapshot) -> Bool {
+      if camera.running { return camera.signal == .none || camera.signal == .connecting }
+      return camera.automaticStart && !camera.automaticStartFailed && camera.deviceAvailable
+    }
+    let onAir = session.cameras.first { $0.id == session.onAirID }
+    if !session.cameras.contains(where: hasPicture) {
+      // Only worth saying while a meeting shows Program, and not while a camera is still starting.
+      guard session.programInUse, !session.cameras.contains(where: starting) else { return nil }
+      // One camera: name its problem below rather than "no camera".
+      if session.cameras.count != 1 || onAir == nil { return "No camera has a picture" }
+    }
+    guard let onAir, !hasPicture(onAir), !starting(onAir) else { return nil }
+    let problem: String
+    if !onAir.running {
+      problem = onAir.deviceAvailable ? "stopped" : (onAir.inputName == nil ? "no input" : "input missing")
+    } else {
+      switch onAir.signal {
+      case .noSignal: problem = "no signal"
+      case .unsupported: problem = "unsupported format"
+      case .deviceMissing: problem = "input disconnected"
+      case .none, .connecting, .live: return nil
+      }
+    }
+    return "\(onAir.name) \(session.programInUse ? "on air" : "in Program"): \(problem)"
+  }
+
+  /// The drive a camera records to: the volume its /Volumes folder names, or the
+  /// only drive when the folder is elsewhere (every folder is then on that drive).
+  static func drive(for camera: UICameraSnapshot, in session: UISessionSnapshot) -> UIDrive? {
+    guard let path = camera.recording.folderPath else { return nil }
+    let parts = (path as NSString).pathComponents
+    if parts.count >= 3, parts[1] == "Volumes" { return session.drives.first { $0.name == parts[2] } }
+    return session.drives.count == 1 ? session.drives[0] : nil
+  }
+
+  /// Nothing free on a drive whose size is known (an unreadable drive reports zero for both).
+  static func isFull(_ drive: UIDrive) -> Bool { drive.totalBytes > 0 && drive.availableBytes <= 0 }
+
+  /// How the recording layer and AVFoundation word an out-of-space failure: the
+  /// output manager's reservation ("… bytes of free space; only … are available"),
+  /// AVError.diskFull (-11807), NSFileWriteOutOfSpaceError (640) and ENOSPC (28).
+  static let diskFullPhrases = ["no space left", "disk is full", "disk full", "drive is full", "volume is full",
+    "out of space", "enough space", "enough available space", "enough free space", "bytes of free space",
+    "error -11807", "nscocoaerrordomain error 640", "nsposixerrordomain error 28."]
+  /// Free space below this after a failed take means the drive filled, whatever the error says.
+  static let nearlyFullBytes: Int64 = 256 * 1_048_576
+
+  /// A failed take that ended because its drive filled.
+  static func diskFull(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> Bool {
+    let rec = camera.recording
+    guard rec.failed || rec.error != nil else { return false }
+    if let error = rec.error?.lowercased(), diskFullPhrases.contains(where: error.contains) { return true }
+    guard let drive = drive(for: camera, in: session), drive.totalBytes > 0 else { return false }
+    return drive.availableBytes < nearlyFullBytes
   }
 
   static func menuBarIcon(_ session: UISessionSnapshot) -> UIMenuBarIcon {

@@ -1,7 +1,10 @@
 import SwiftUI
 
 // Shared visual language for the new interface. System colors and materials
-// only, so light, dark, Increase Contrast and Reduce Transparency all work.
+// only, so light, dark and Increase Contrast work, and the system materials
+// (sidebar, inspector, bars, popovers) go opaque with Reduce Transparency.
+// Overlays on video are dark capsules (black at 72%), not glass or blur, so
+// they need no Reduce Transparency fallback.
 
 extension UITone {
   var color: Color {
@@ -49,33 +52,7 @@ extension Font {
   static let uiPlaceholderTitle = Font.title3.weight(.semibold)
 }
 
-/// Glass on macOS 26 and later. Before that, the fallback fill or a regular
-/// material; with Reduce Transparency on, the fallback fill or an opaque
-/// window background.
-struct UIGlassBackground<S: Shape>: ViewModifier {
-  var shape: S
-  var tint: Color? = nil
-  var fallback: Color? = nil
-  @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-
-  func body(content: Content) -> some View {
-    if reduceTransparency {
-      content.background(fallback ?? Color(nsColor: .windowBackgroundColor), in: shape)
-    } else if #available(macOS 26.0, *) {
-      content.glassEffect(tint.map { Glass.regular.tint($0) } ?? .regular, in: shape)
-    } else if let fallback {
-      content.background(fallback, in: shape)
-    } else {
-      content.background(.regularMaterial, in: shape)
-    }
-  }
-}
-
 extension View {
-  func uiGlass<S: Shape>(in shape: S, tint: Color? = nil, fallback: Color? = nil) -> some View {
-    modifier(UIGlassBackground(shape: shape, tint: tint, fallback: fallback))
-  }
-
   /// Dark backing for text drawn over video, so it stays readable over bright pictures (≥ 4.5:1).
   /// A caller's own `.font` wins; the default is the overlay style.
   func uiPictureOverlay() -> some View {

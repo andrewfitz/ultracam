@@ -38,9 +38,14 @@ enum UIRecordingLibrary {
     for case let folder? in folders {
       let name = volumeName(for: folder)
       guard seen[name] == nil else { continue }
-      let values = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
-      let available = values?.volumeAvailableCapacityForImportantUsage ?? 0
-      let total = Int64(values?.volumeTotalCapacity ?? 0)
+      let values = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
+        .volumeAvailableCapacityKey, .volumeTotalCapacityKey])
+      // Some volumes (network, non-APFS) don't report the "important usage" figure; a missing
+      // value must not read as a full drive.
+      let reported = values?.volumeAvailableCapacityForImportantUsage ?? values?.volumeAvailableCapacity.map(Int64.init)
+      let available = reported ?? 0
+      // An unreadable free figure leaves the size unknown too, so the drive isn't shown as full.
+      let total = reported == nil ? 0 : Int64(values?.volumeTotalCapacity ?? 0)
       let rate = recordingRates.filter { volumeName(for: $0.0) == name }.map(\.1).reduce(0, +)
       let megabits = rate > 0 ? rate : fallbackMegabits
       let seconds = available > 0 ? Double(available) * 8 / (megabits * 1_000_000) : nil

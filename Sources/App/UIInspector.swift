@@ -70,8 +70,10 @@ struct UIInspectorViewContent: View {
         get: { context.inputs.first { $0.name == snapshot.inputName }?.id ?? "" },
         set: { context.send(.setInput(cameraID: camera.id, deviceID: $0)) })) {
         if snapshot.inputName == nil { Text("No input").tag("") }
-        ForEach(context.inputs) { Text($0.name).tag($0.id) }
+        ForEach(context.inputs) { Text($0.name).lineLimit(1).truncationMode(.middle).tag($0.id) }
       }
+      // One row: a long device name truncates instead of widening the inspector.
+      .lineLimit(1)
       .disabled(snapshot.running)
       .help(snapshot.running ? "Stop the camera to change its input." : "Choose the Blackmagic capture device.")
       LabeledContent("Signal") {
@@ -235,7 +237,7 @@ struct UIInspectorViewContent: View {
     case .none: return snapshot.deviceAvailable ? "Camera stopped" : "Input missing"
     case .connecting: return "Starting…"
     case .live(let format): return "\(format) · 4:2:2"
-    case .noSignal: return "No HDMI signal"
+    case .noSignal: return "No signal"
     case .unsupported(let mode): return mode
     case .deviceMissing: return "Input disconnected"
     }

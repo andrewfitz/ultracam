@@ -65,7 +65,13 @@ private struct UIDiagnosticsRow: View {
   }
   var body: some View {
     LabeledContent(title) {
-      Text(value).monospacedDigit().foregroundStyle(warning ? Color.orange : .primary).textSelection(.enabled)
+      // The tone goes on the symbol; small orange text is hard to read in light mode.
+      HStack(spacing: 4) {
+        if warning {
+          Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).accessibilityLabel("Warning")
+        }
+        Text(value).monospacedDigit().textSelection(.enabled)
+      }
     }
   }
 }
@@ -222,7 +228,7 @@ private struct UIDiagnosticsProgramTab: View {
     let switcher = model.switcherSettings
     Form {
       Section("Output") {
-        UIDiagnosticsRow("Virtual camera", "Ultracam · Program")
+        UIDiagnosticsRow("Camera", "Ultracam · Program")
         UIDiagnosticsRow("Clients", model.programInUse ? "In use" : "Not in use")
         UIDiagnosticsRow("Camera formats", model.programFormatMismatch ? "Differ — each cut updates the output" : "Match",
           warning: model.programFormatMismatch)

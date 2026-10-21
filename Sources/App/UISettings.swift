@@ -329,7 +329,7 @@ struct UISettingsCameraPane: View {
         }
         .pickerStyle(.segmented)
         .disabled(!model.canEditFeedTopology)
-        .help(model.canEditFeedTopology ? "Separate cameras publishes one virtual camera per camera. Program publishes one switched camera."
+        .help(model.canEditFeedTopology ? "Separate cameras publishes an Ultracam camera for each camera. Program publishes one switched camera, Ultracam · Program."
           : "Change while all cameras are stopped and nothing is recording.")
       } header: { Text("Output") } footer: {
         UISettingsFootnote(model.canEditFeedTopology ? "After changing the output mode, choose the new camera in your meeting app."

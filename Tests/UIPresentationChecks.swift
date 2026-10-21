@@ -695,4 +695,180 @@ import XCTest
     withDefault.defaultFolderPath = "/Volumes/8TB/Takes"
     XCTAssertTrue(UIPresentationBuilder.session(withDefault).canRevealRecordings)
   }
+
+  // MARK: Disk full (r3 P0-5)
+
+  private let roomy = UIDrive(name: "8TB", availableBytes: 595_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 6720)
+
+  func testDiskFullFromTheErrorText() {
+    let errors = [
+      "Recording writer failed: The operation couldn’t be completed. No space left on device",
+      "Recording requires 134217728 bytes of free space; only 1024 are available.",
+      "Recording writer failed: The file “Camera 1.mov” couldn’t be saved because there isn’t enough space.",
+      "Recording writer failed: The operation could not be completed. (AVFoundationErrorDomain error -11807.)",
+      "Recording writer failed: Disk Full",
+    ]
+    for error in errors {
+      var failed = camera(1)
+      failed.recording.error = error
+      var session = separate([failed])
+      session.drives = [roomy]
+      let presentation = presented(session)
+      XCTAssertEqual(presentation.stripState, .failed, error)
+      XCTAssertEqual(presentation.recordTitle, "Disk full", error)
+      XCTAssertEqual(presentation.recordDetail, "Free space on 8TB or choose another folder", error)
+      XCTAssertEqual(presentation.recordTone, .warning, "Orange like any failed take; red is only for recording and on air (D8)")
+      XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: disk full", error)
+      XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .attention)
+      XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments.last?.text, "Camera 1: disk full")
+    }
+  }
+
+  func testDiskFullFromTheDriveAfterAFailedTake() {
+    var failed = camera(1)
+    failed.recording.failed = true
+    failed.recording.error = "Recording writer failed: AVAssetWriter finish failed."
+    var session = separate([failed])
+    session.drives = [UIDrive(name: "8TB", availableBytes: 40_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 0.4)]
+    XCTAssertEqual(presented(session).recordTitle, "Disk full")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: disk full")
+    // The same error with room left on the drive is an ordinary failure.
+    session.drives = [roomy]
+    XCTAssertEqual(presented(session).recordTitle, "Recording failed")
+    XCTAssertEqual(presented(session).recordDetail, "Recording writer failed: AVAssetWriter finish failed.")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording failed")
+    // A drive that can't be read (zero size) says nothing about space.
+    session.drives = [UIDrive(name: "8TB", availableBytes: 0, totalBytes: 0, secondsLeft: nil)]
+    XCTAssertEqual(presented(session).recordTitle, "Recording failed")
+  }
+
+  func testDiskFullNamesTheTakesDrive() {
+    var failed = camera(1, folder: "/Volumes/Archive/Takes")
+    failed.recording.error = "No space left on device"
+    var session = separate([failed, camera(2)])
+    session.drives = [roomy, UIDrive(name: "Archive", availableBytes: 0, totalBytes: 4_000_000_000_000, secondsLeft: nil)]
+    XCTAssertEqual(presented(session).recordDetail, "Free space on Archive or choose another folder")
+    // A folder on the startup disk: the only drive is that disk.
+    var home = camera(1, folder: "/Users/andrew/Movies")
+    home.recording.error = "No space left on device"
+    var startup = separate([home])
+    startup.drives = [UIDrive(name: "Macintosh HD", availableBytes: 0, totalBytes: 1_000_000_000_000, secondsLeft: nil)]
+    XCTAssertEqual(presented(startup).recordDetail, "Free space on Macintosh HD or choose another folder")
+    // Unknown drive: generic wording, still a next step.
+    startup.drives = []
+    XCTAssertEqual(presented(startup).recordDetail, "Free space on the drive or choose another folder")
+    for text in [presented(session).recordTitle, presented(session).recordDetail] { assertNoAppNames(text) }
+  }
+
+  func testOtherFailuresStayRecordingFailed() {
+    for error in ["The drive was disconnected.", "Free space could not be determined for the recording volume.",
+      "Recording writer failed: VideoToolbox callback failed (OSStatus -12909)."] {
+      var failed = camera(1)
+      failed.recording.error = error
+      var session = separate([failed])
+      session.drives = [roomy]
+      XCTAssertEqual(presented(session).recordTitle, "Recording failed", error)
+      XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording failed", error)
+    }
+  }
+
+  func testFullDriveWarnsAndShowsNoSpaceLeft() {
+    // At zero free bytes the drive reports no time left at all; the < 30 min warning never saw it.
+    var session = separate([camera(1, recording: .recording)])
+    session.drives = [UIDrive(name: "8TB", availableBytes: 0, totalBytes: 8_000_000_000_000, secondsLeft: nil)]
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB: no space left")
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .attention)
+    XCTAssertEqual(presented(session).timeLeftLine, "No space left")
+    // Low but not empty keeps the existing time-left warning.
+    session.drives = [UIDrive(name: "8TB", availableBytes: 9_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 100)]
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB: 1 min left")
+    XCTAssertNil(presented(session).timeLeftLine, "The camera's own secondsLeft drives this line")
+    session.drives = [roomy]
+    XCTAssertNil(UIPresentationBuilder.warning(session))
+  }
+
+  // MARK: Program sources (r3 P1-9)
+
+  func testOnAirCameraLosingItsPicture() {
+    var session = program([camera(1), camera(2)])
+    session.cameras[0].signal = .noSignal
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: no signal")
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .attention)
+    session.cameras[0].signal = .unsupported("1080i")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: unsupported format")
+    session.cameras[0].signal = .deviceMissing
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: input disconnected")
+    session.cameras[0] = camera(1, running: false)
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: stopped")
+    session.cameras[0].deviceAvailable = false
+    session.cameras[0].inputName = "UltraStudio 4K Mini"
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: input missing")
+    // Without a viewer it's the Program camera, not on air.
+    session.programInUse = false
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 in Program: input missing")
+    // Still starting is not a problem yet.
+    session.cameras[0] = camera(1, signal: .connecting)
+    XCTAssertNil(UIPresentationBuilder.warning(session))
+    // Nor is an automatic camera about to start for the meeting that just connected, alone or not.
+    session.programInUse = true
+    session.cameras[0] = camera(1, running: false)
+    session.cameras[0].automaticStart = true
+    XCTAssertNil(UIPresentationBuilder.warning(session))
+    var joining = program([session.cameras[0]])
+    XCTAssertNil(UIPresentationBuilder.warning(joining))
+    joining.cameras.append(camera(2, running: false))
+    XCTAssertNil(UIPresentationBuilder.warning(joining), "No camera has a picture yet, but one is starting")
+    // Once it has failed, the failure says so.
+    joining.cameras[0].automaticStartFailed = true
+    XCTAssertEqual(UIPresentationBuilder.warning(joining), "Camera 1: couldn't start")
+    // A camera that's not on air keeps its plain warning.
+    session = program([camera(1), camera(2, signal: .noSignal)])
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 2: no signal")
+  }
+
+  func testOnAirWarningIsShownEvenWithOneCamera() {
+    // The status bar leaves a plain no-signal to the one picture, but not what the meeting sees.
+    let one = program([camera(1, signal: .noSignal)])
+    XCTAssertEqual(UIPresentationBuilder.session(one).statusSegments.last?.text, "Camera 1 on air: no signal")
+    XCTAssertEqual(UIPresentationBuilder.warning(one), "Camera 1 on air: no signal")
+    // Idle Program with nobody watching and nothing running is not a problem.
+    XCTAssertNil(UIPresentationBuilder.warning(program([camera(1, running: false)], inUse: false)))
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(program([camera(1, running: false)], inUse: false)), .stopped)
+  }
+
+  func testNoCameraHasAPicture() {
+    var session = program([camera(1, signal: .noSignal), camera(2, running: false)])
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "No camera has a picture")
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .attention)
+    session.onAirID = nil
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "No camera has a picture")
+    // Nobody watching: each camera's own problem instead.
+    session.programInUse = false
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: no signal")
+    // A camera still starting gets its chance.
+    session.programInUse = true
+    session.cameras[1] = camera(2, signal: .connecting)
+    XCTAssertNotEqual(UIPresentationBuilder.warning(session), "No camera has a picture")
+    // Separate mode has no Program to warn about.
+    XCTAssertEqual(UIPresentationBuilder.warning(separate([camera(1, signal: .noSignal), camera(2, running: false)])),
+      "Camera 1: no signal")
+    for text in ["No camera has a picture", "Camera 1 on air: no signal"] { assertNoAppNames(text) }
+  }
+
+  func testProgramWarningPrecedence() {
+    // A take losing its picture still comes first; it's the one thing that can't be redone.
+    var session = program([camera(1, signal: .noSignal, recording: .recording), camera(2)])
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording, no signal")
+    session.cameras[0].recording.status = .idle
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: no signal")
+    // On air beats a low drive and another camera's plain no-signal.
+    session.cameras.append(camera(3, signal: .noSignal))
+    session.drives = [UIDrive(name: "8TB", availableBytes: 1, totalBytes: 2, secondsLeft: 12 * 60)]
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: no signal")
+    // An automatic start that failed names the fix (Retry) first.
+    session.cameras[0] = camera(1, running: false)
+    session.cameras[0].automaticStart = true
+    session.cameras[0].automaticStartFailed = true
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: couldn't start")
+  }
 }
