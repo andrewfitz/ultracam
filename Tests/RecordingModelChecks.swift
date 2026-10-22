@@ -77,7 +77,7 @@ import XCTest
 
   func testDefaultsExposeRequiredRecordingChoices() {
     XCTAssertEqual(RecordingCodec.allCases, [.proRes42210Bit, .hevcMain10_422])
-    XCTAssertEqual(RecordingCodec.proRes42210Bit.title, "ProRes 422 10-bit")
+    XCTAssertEqual(RecordingCodec.proRes42210Bit.title, "ProRes 422 HQ")
     XCTAssertEqual(RecordingCodec.hevcMain10_422.title, "HEVC Main10 4:2:2")
     XCTAssertEqual(RecordingTimecodeMode.allCases, [.source, .recordStart, .wallClock])
     XCTAssertEqual(RecordingTimecodeMode.wallClock.title, "PC time")
@@ -190,6 +190,27 @@ import XCTest
     }
     XCTAssertNil(model.recoveringID)
     XCTAssertNotNil(model.recoveryMessage, "Invalid synthetic media should report an error from the recovery attempt")
+  }
+
+  func testSuccessfulRecoveryScanClearsAnEarlierScanError() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("ultracam-scan-error-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let model = RecordingModel()
+    model.outputFolder = root
+    let failureDeadline = Date(timeIntervalSinceNow: 3)
+    while model.recoveryMessage == nil && Date() < failureDeadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertNotNil(model.recoveryMessage)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    model.refreshRecovery()
+    let successDeadline = Date(timeIntervalSinceNow: 3)
+    while model.recoveryMessage != nil && Date() < successDeadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertNil(model.recoveryMessage)
+    XCTAssertTrue(model.interruptedRecordings.isEmpty)
   }
 
   func testPerFeedControlsRemainIndependent() {

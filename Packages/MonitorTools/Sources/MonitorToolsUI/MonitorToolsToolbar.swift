@@ -72,13 +72,7 @@ public struct MonitorToolsToolbar: View {
             Text("Unsupported saved mode").tag(MonitorFalseColorMode.arri).disabled(true)
           }
         }
-        Text(
-          supportsSourceAnalysis
-            ? configuration.falseColor.mode == .elZone
-              ? "Analysis: Source stops · 18% gray = 0 before offset"
-              : "Analysis: Source IRE · Sony S-Log3"
-            : "Analysis unavailable: Program Output has no paired source Log"
-        ).font(.caption)
+        Text(falseColorAnalysisLabel).font(.caption)
         Picker(
           "Camera / Log",
           selection: sourceProfileSelection
@@ -157,6 +151,18 @@ public struct MonitorToolsToolbar: View {
         Toggle("Graticule", isOn: $configuration.scopes.graticule)
       }
     }.controlSize(.small)
+  }
+  var falseColorAnalysisLabel: String {
+    guard configuration.falseColor.mode != .off else { return "Analysis: Off" }
+    guard supportsSourceAnalysis else {
+      return "Analysis unavailable: Program Output has no paired source Log"
+    }
+    switch configuration.falseColor.mode {
+    case .off: return "Analysis: Off"
+    case .elZone: return "Analysis: Source stops · 18% gray = 0 before offset"
+    case .sonySLog3: return "Analysis: Source IRE · Sony S-Log3"
+    case .arri: return "Analysis: Unsupported saved mode"
+    }
   }
   private var isSonySource: Bool {
     SonySLog3FalseColor.supports(sourceProfileID: configuration.sourceProfileID)

@@ -117,6 +117,7 @@ struct SourceRecordingConfiguration {
   /// at the first encoded frame. An explicit `timecodeStartDate` is kept when
   /// this is false, which is the default.
   let timecodeSamplesComputerClockAtFirstFrame: Bool
+  let checkAvailableSpace: (() throws -> Void)?
 
   init(feedID: SourceRecordingFeedID, outputURL: URL, width: Int, height: Int,
     videoCodec: CMVideoCodecType = kCMVideoCodecType_HEVC,
@@ -128,7 +129,8 @@ struct SourceRecordingConfiguration {
     timecodeDropFrame: Bool? = nil,
     timecodeStartDate: Date = Date(),
     timecodeSourceStartTime: CMTime = .zero,
-    timecodeSamplesComputerClockAtFirstFrame: Bool = false) throws {
+    timecodeSamplesComputerClockAtFirstFrame: Bool = false,
+    checkAvailableSpace: (() throws -> Void)? = nil) throws {
     guard !feedID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       throw SourceRecordingError.invalidConfiguration("A feed ID is required.")
     }
@@ -169,6 +171,7 @@ struct SourceRecordingConfiguration {
     self.timecodeStartDate = timecodeStartDate
     self.timecodeSourceStartTime = timecodeSourceStartTime
     self.timecodeSamplesComputerClockAtFirstFrame = timecodeSamplesComputerClockAtFirstFrame
+    self.checkAvailableSpace = checkAvailableSpace
   }
 }
 
@@ -190,6 +193,7 @@ struct SourceRecordingTelemetry: Equatable, Sendable {
   fileprivate(set) var encoderErrors: UInt64 = 0
   fileprivate(set) var droppedVideo: UInt64 = 0
   fileprivate(set) var droppedAudio: UInt64 = 0
+  fileprivate(set) var droppedTimecode: UInt64 = 0
   fileprivate(set) var queueSamples = 0
   fileprivate(set) var queueCapacity = 0
   fileprivate(set) var encodedVideoBytes: UInt64 = 0
@@ -228,6 +232,8 @@ enum SourceRecordingError: Error, Equatable, LocalizedError, Sendable {
 /// source sample timing and must not mutate or replace the source buffers.
 struct SourceRecordingWriterTelemetry: Equatable, Sendable {
   var failed = false
+  var droppedAudio: UInt64 = 0
+  var droppedTimecode: UInt64 = 0
   var encodedVideoBytes: UInt64 = 0
   var encoderLatencyMS: Double?
   var maxEncoderLatencyMS: Double?
@@ -272,6 +278,14 @@ final class SourceRecorderCore: @unchecked Sendable {
 
   private let queue: DispatchQueue
   private let stateLock = NSLock()
+  /// Counts an admission that has not yet reached `queue.async`. `stop` waits
+  /// for it so finish cannot run in that gap, and the lock is not held across
+  /// the async submit.
+  private let admission = DispatchGroup()
+  private let stopCompletion = DispatchGroup()
+  private let queueKey = DispatchSpecificKey<Bool>()
+  private var stopStarted = false
+  private var stopResult: Result<Void, SourceRecordingError>?
   private let configuration: SourceRecordingConfiguration
   private let writer: SourceRecordingWriter
   private var telemetryValue = SourceRecordingTelemetry()
@@ -282,6 +296,7 @@ final class SourceRecorderCore: @unchecked Sendable {
     self.writer = try writerFactory()
     self.queue = DispatchQueue(label: "org.ultracam.recording.\(configuration.feedID.rawValue)",
       qos: .userInitiated)
+    self.queue.setSpecific(key: queueKey, value: true)
   }
 
   convenience init(configuration: SourceRecordingConfiguration) throws {
@@ -290,15 +305,20 @@ final class SourceRecorderCore: @unchecked Sendable {
     })
   }
 
-  var state: SourceRecordingState { stateLock.withLock { telemetryValue.state } }
+  var state: SourceRecordingState { telemetry.state }
   var telemetry: SourceRecordingTelemetry {
     let writerSnapshot = writer.telemetry
     return stateLock.withLock {
+      if writerSnapshot.failed {
+        telemetryValue.state = .failed
+        if telemetryValue.lastError == nil { telemetryValue.lastError = writerSnapshot.lastError }
+      }
       var snapshot = telemetryValue
       snapshot.encodedVideo = writerSnapshot.encodedVideo
       snapshot.droppedEncodedVideo = writerSnapshot.droppedEncodedVideo
       snapshot.encoderErrors = writerSnapshot.encoderErrors
-      if writerSnapshot.failed { snapshot.state = .failed }
+      snapshot.droppedAudio &+= writerSnapshot.droppedAudio
+      snapshot.droppedTimecode = writerSnapshot.droppedTimecode
       snapshot.encodedVideoBytes = writerSnapshot.encodedVideoBytes
       snapshot.encoderLatencyMS = writerSnapshot.encoderLatencyMS
       snapshot.maxEncoderLatencyMS = writerSnapshot.maxEncoderLatencyMS
@@ -362,32 +382,35 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   /// Drains already admitted samples before finalizing the writer. New callback
-  /// samples are rejected once stopping begins. This method must not be called
-  /// from the recorder's private queue or from a writer callback.
+  /// samples are rejected once stopping begins. Calls on the recorder queue
+  /// (including writer callbacks on that queue) return without waiting, since
+  /// waiting there would deadlock the caller performing finalization.
   func stop() throws {
-    let failedBeforeStop = stateLock.withLock { telemetryValue.state == .failed }
+    guard DispatchQueue.getSpecific(key: queueKey) != true else { return }
+    let failedBeforeStop = state == .failed
     let shouldStop = stateLock.withLock { () -> Bool in
-      switch telemetryValue.state {
-      case .recording, .paused, .failed:
-        telemetryValue.state = .stopping
-        return true
-      case .idle:
-        return false
-      case .finished:
-        return false
-      case .stopping:
-        return false
-      }
+      guard !stopStarted, telemetryValue.state != .idle else { return false }
+      stopStarted = true
+      stopCompletion.enter()
+      telemetryValue.state = .stopping
+      return true
     }
     guard shouldStop else {
-      let current = stateLock.withLock { telemetryValue.state }
-      if current == .idle || current == .finished { return }
+      stopCompletion.wait()
+      try stateLock.withLock { try stopResult?.get() }
       return
     }
-    try queue.sync {
+    admission.wait()
+    let result: Result<Void, SourceRecordingError> = queue.sync {
       do {
         try writer.finish()
-        stateLock.withLock { telemetryValue.state = failedBeforeStop ? .failed : .finished }
+        let writerFailed = writer.telemetry.failed
+        stateLock.withLock {
+          // A sample that failed while this stop was draining must stay failed.
+          telemetryValue.state = failedBeforeStop || writerFailed || telemetryValue.state == .failed
+            ? .failed : .finished
+        }
+        return .success(())
       } catch {
         let failure = Self.recordingError(error)
         stateLock.withLock {
@@ -395,9 +418,12 @@ final class SourceRecorderCore: @unchecked Sendable {
           telemetryValue.writerErrors &+= 1
           telemetryValue.lastError = failure.localizedDescription
         }
-        throw failure
+        return .failure(failure)
       }
     }
+    stateLock.withLock { stopResult = result }
+    stopCompletion.leave()
+    try result.get()
   }
 
   private func enqueue(_ sample: CMSampleBuffer, kind: SampleKind) -> Bool {
@@ -405,6 +431,8 @@ final class SourceRecorderCore: @unchecked Sendable {
       recordDrop(.invalidSample, video: kind == .video)
       return false
     }
+    _ = telemetry // Observe asynchronous writer failures before admitting media.
+    let queuedSample = QueuedSample(value: sample)
     let admitted = stateLock.withLock { () -> Bool in
       guard telemetryValue.state == .recording else {
         switch telemetryValue.state {
@@ -420,6 +448,7 @@ final class SourceRecorderCore: @unchecked Sendable {
         return false
       }
       pending += 1
+      admission.enter()
       switch kind {
       case .video: telemetryValue.enqueuedVideo &+= 1
       case .audio: telemetryValue.enqueuedAudio &+= 1
@@ -427,15 +456,23 @@ final class SourceRecorderCore: @unchecked Sendable {
       return true
     }
     guard admitted else { return false }
-    let queuedSample = QueuedSample(value: sample)
+    defer { admission.leave() }
     queue.async { [weak self] in
       guard let self else { return }
       defer { self.stateLock.withLock { self.pending -= 1 } }
-      guard self.stateLock.withLock({ self.telemetryValue.state != .failed }) else {
-        self.recordDrop(.appendFailure, video: kind == .video)
+      _ = self.telemetry
+      let shouldAppend = self.stateLock.withLock { () -> Bool in
+        switch self.telemetryValue.state {
+        case .recording, .paused, .stopping: return true
+        case .idle, .finished, .failed: return false
+        }
+      }
+      guard shouldAppend else {
+        self.recordDrop(.notRecording, video: kind == .video)
         return
       }
       do {
+        try self.configuration.checkAvailableSpace?()
         switch kind {
         case .video:
           try self.writer.appendVideo(queuedSample.value)

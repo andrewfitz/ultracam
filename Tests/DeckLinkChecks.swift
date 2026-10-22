@@ -8,7 +8,14 @@ final class DeckLinkChecks: XCTestCase {
   }
   func testNativeSDKCallbacksAndLifecycle() {
     var error: NSError?
-    XCTAssertTrue(UltracamRunSyntheticChecks(&error), error?.localizedDescription ?? "Native SDK checks failed")
+    XCTAssertTrue(UltracamRunOwnershipSyntheticChecks(&error),
+      error?.localizedDescription ?? "Native lifecycle checks failed")
+  }
+
+  func testInputOwnershipAndReentrantControlQueue() {
+    var error: NSError?
+    XCTAssertTrue(UltracamRunOwnershipSyntheticChecks(&error),
+      error?.localizedDescription ?? "Native ownership checks failed")
   }
 
   func testRawEmbeddedAudioBridge() {
@@ -71,6 +78,7 @@ final class DeckLinkChecks: XCTestCase {
     ("automatic HDMI detection and live transitions", testAutomaticInputDetectionAndTransitions),
     ("missing automatic device fails cleanly", testMissingAutoDeviceFailsCleanly),
     ("native SDK callbacks, frame ownership, lifecycle and HDMI restore", testNativeSDKCallbacksAndLifecycle),
+    ("input ownership and reentrant control queue", testInputOwnershipAndReentrantControlQueue),
     ("raw embedded audio bridge", testRawEmbeddedAudioBridge),
     ("native stop before start is idempotent", testStopBeforeStartIsIdempotent),
     ("native missing-device startup cleans up", testMissingDeviceFailsCleanlyAndCanStop),

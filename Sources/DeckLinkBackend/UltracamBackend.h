@@ -96,6 +96,7 @@ typedef void (^UltracamRawAudioHandler)(NSData *_Nullable samples, CMTime audioP
 #if defined(ULTRACAM_BACKEND_TESTING)
 // Synthetic SDK callbacks only; never opens hardware or saves video.
 FOUNDATION_EXPORT BOOL UltracamRunSyntheticChecks(NSError *_Nullable *_Nullable error);
+FOUNDATION_EXPORT BOOL UltracamRunOwnershipSyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunAutoSyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunRawAudioSyntheticChecks(NSError *_Nullable *_Nullable error);
 #endif

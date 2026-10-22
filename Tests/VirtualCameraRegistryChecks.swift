@@ -110,6 +110,32 @@ import XCTest
     XCTAssertEqual(store.load(), current)
   }
 
+  func testMissingAppGroupDoesNotPublishIntoStandardDefaults() throws {
+    let marker = Data("standard-domain-must-stay-empty".utf8)
+    UserDefaults.standard.set(marker, forKey: VirtualCameraRegistryStore.key)
+    defer { UserDefaults.standard.removeObject(forKey: VirtualCameraRegistryStore.key) }
+    let store = VirtualCameraRegistryStore(appGroupIdentifier: "")
+    let snapshot = VirtualCameraRegistrySnapshot(generation: 1, appGroupIdentifier: "",
+      devices: [.feed(feedID: "feed-1")])
+    XCTAssertThrowsError(try store.save(snapshot))
+    XCTAssertEqual(UserDefaults.standard.data(forKey: VirtualCameraRegistryStore.key), marker)
+    XCTAssertNil(store.load())
+  }
+
+  func testStoreRejectsGenerationThatWouldFreezeLaterPublishes() throws {
+    let suiteName = "org.ultracam.tests.registry.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let appGroup = "group.org.ultracam.registry.\(UUID().uuidString)"
+    let store = VirtualCameraRegistryStore(appGroupIdentifier: appGroup, defaults: defaults)
+    let frozen = VirtualCameraRegistrySnapshot(generation: UInt64.max, appGroupIdentifier: appGroup,
+      devices: [.feed(feedID: "feed-1")])
+    XCTAssertThrowsError(try store.save(frozen)) { error in
+      XCTAssertEqual(error as? VirtualCameraRegistryError, .invalidGeneration)
+    }
+    XCTAssertNil(store.load())
+  }
+
   func testStoreRejectsZeroGenerationWithoutWriting() throws {
     let suiteName = "org.ultracam.tests.registry.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

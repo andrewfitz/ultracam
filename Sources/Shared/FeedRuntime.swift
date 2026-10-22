@@ -44,7 +44,9 @@ final class ProgramOutputRoute {
     // leases would let a removed feed leak into the next Program segment and
     // would retain pixel buffers until the consumer happened to dequeue them.
     fanOut.drain()
+    let previous = switcher
     switcher = SwitcherCoordinator(settings: settings, feedIDs: feedIDs)
+    switcher.carryProgramTimeline(from: previous)
   }
 
   /// Updates switch policy on the same coordinator that ingests Program
@@ -583,7 +585,14 @@ final class FeedCoordinator {
     normalized.selectedFeedID = requested
     programOutput.updateSettings(normalized)
     if outputMode == .program, programOutput.selectedFeedID != requested {
-      _ = programOutput.requestCut(to: requested)
+      let result = programOutput.requestCut(to: requested)
+      // A missing source is not a selection. Queued cuts stay pending and the
+      // saved id remains the request until the target frame lands.
+      if case .rejectedMissingSource = result {
+        var rolled = normalized
+        rolled.selectedFeedID = programOutput.selectedFeedID ?? requested
+        programOutput.updateSettings(rolled)
+      }
     }
     syncSwitcherMirror()
     publishVirtualCameraRegistry()

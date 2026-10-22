@@ -45,6 +45,7 @@ final class AutoSwitcherBridge: @unchecked Sendable {
 
   private let queue = DispatchQueue(label: "org.ultracam.auto-switcher",
     qos: .userInteractive)
+  private let queueKey = DispatchSpecificKey<UInt8>()
   private var handle: OpaquePointer?
   private var nextAudioID: UInt64 = 1
   private var silenceStartedAt: CMTime?
@@ -58,6 +59,7 @@ final class AutoSwitcherBridge: @unchecked Sendable {
   var onTranscriptCue: TranscriptCueHandler?
 
   init?(settings: NaturalTalkingHeadSettings, anchor: FeedID, emphasis: FeedID) {
+    queue.setSpecific(key: queueKey, value: 1)
     let config: [String: Any] = [
       "anchor_camera_id": anchor.rawValue,
       "emphasis_camera_id": emphasis.rawValue,
@@ -88,13 +90,17 @@ final class AutoSwitcherBridge: @unchecked Sendable {
   deinit { stop() }
 
   func stop() {
-    queue.sync {
-      if let handle { auto_switcher_destroy(handle) }
-      handle = nil
-      silenceStartedAt = nil
-      speaking = false
-      lastCueSeconds = nil
+    let release = {
+      if let handle = self.handle { auto_switcher_destroy(handle) }
+      self.handle = nil
+      self.silenceStartedAt = nil
+      self.speaking = false
+      self.lastCueSeconds = nil
     }
+    // deinit can run on this queue when the last release happens inside a
+    // queued callback. queue.sync from that queue deadlocks.
+    if DispatchQueue.getSpecific(key: queueKey) != nil { release() }
+    else { queue.sync(execute: release) }
   }
 
   /// Tells the director a configured camera can or cannot be cut to. The

@@ -69,6 +69,137 @@ final class MonitorMetalTests: XCTestCase {
       })
     wait(for: [done], timeout: 10)
   }
+  func testDeviceInitializationRetriesOnNextFrameAndKeepsSuccessfulContext() throws {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+    var attempts = 0
+    let runtime = MonitorRuntime(sharedDevice: {
+      attempts += 1
+      return attempts == 1 ? nil : device
+    })
+    let input = try buffer()
+    var config = MonitorConfiguration()
+    config.toolsEnabled = true
+    config.zebra.enabled = true
+    let first = stamp()
+    runtime.configure(target: first.target, generation: 1, configurationRevision: 1, configuration: config)
+    for sequence in 1...3 {
+      var next = first
+      next.sequence = UInt64(sequence)
+      let done = expectation(description: "initialization attempt frame \(sequence)")
+      let bundle = MonitorFrameBundle(
+        stamp: next, source: input,
+        sourceSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "rec709"))
+      // The previous frame's completion can arrive before its job slot is released,
+      // and a busy runtime rejects the offer without calling back. Offer again until admitted.
+      let deadline = Date().addingTimeInterval(5)
+      var accepted = false
+      repeat {
+        accepted = runtime.offer(bundle) { result in
+          let display = try? result.get()
+          XCTAssertNotNil(display?.clean)
+          if sequence == 1 {
+            XCTAssertNil(display?.decorated)
+          } else {
+            XCTAssertNotNil(display?.decorated, "\(display?.availability ?? [])")
+          }
+          done.fulfill()
+        }
+        if !accepted { usleep(2_000) }
+      } while !accepted && Date() < deadline
+      XCTAssertTrue(accepted)
+      wait(for: [done], timeout: 15)
+      XCTAssertEqual(attempts, min(sequence, 2))
+    }
+  }
+
+  func testShaderCompileFailureRetriesOnceOnEachLaterOffer() throws {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+    var attempts = 0
+    let runtime = MonitorRuntime(sharedDevice: {
+      attempts += 1
+      return device
+    }, shaderSource: "invalid shader")
+    let input = try buffer()
+    var config = MonitorConfiguration()
+    config.toolsEnabled = true
+    config.zebra.enabled = true
+    let first = stamp()
+    runtime.configure(target: first.target, generation: 1, configurationRevision: 1, configuration: config)
+    for sequence in 1...2 {
+      var next = first
+      next.sequence = UInt64(sequence)
+      let done = expectation(description: "shader compile fallback")
+      XCTAssertTrue(runtime.offer(MonitorFrameBundle(stamp: next, source: input)) { result in
+        XCTAssertNotNil(try? result.get().clean)
+        XCTAssertNil((try? result.get())?.decorated)
+        done.fulfill()
+      })
+      wait(for: [done], timeout: 15)
+      XCTAssertEqual(attempts, sequence, "Exactly one initialization attempt per admitted frame")
+    }
+  }
+
+  func testStaleGPUPreparationReleasesCompositeWithoutAnotherOffer() throws {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+    let entered = expectation(description: "GPU completed before publication")
+    let gate = DispatchSemaphore(value: 0)
+    defer { gate.signal() }
+    let runtime = MonitorRuntime(sharedDevice: { device }, gpuTiming: { _, _ in
+      entered.fulfill()
+      _ = gate.wait(timeout: .now() + 5)
+    })
+    let input = try buffer()
+    let first = stamp()
+    var config = MonitorConfiguration()
+    config.toolsEnabled = true
+    config.zebra.enabled = true
+    runtime.configure(target: first.target, generation: 1, configurationRevision: 1, configuration: config)
+    let obsolete = expectation(description: "obsolete composite delivery")
+    obsolete.isInverted = true
+    XCTAssertTrue(runtime.offer(MonitorFrameBundle(stamp: first, source: input,
+      sourceSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "rec709")
+    )) { _ in obsolete.fulfill() })
+    wait(for: [entered], timeout: 15)
+    runtime.configure(target: first.target, generation: 2, configurationRevision: 1, configuration: config)
+    gate.signal()
+    let drained = expectation(for: NSPredicate { _, _ in
+      runtime.ledger.snapshot.retainedBytes == 0 && runtime.ledger.snapshot.analysisJobs == 0
+    }, evaluatedWith: nil)
+    wait(for: [drained, obsolete], timeout: 3)
+    XCTAssertEqual(runtime.resourceStatistics.compositePoolCapacityBytes, 0)
+  }
+
+  func testPostAdmissionAllocationFailureRecordsPressure() throws {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+    // Working and clean storage fit, but the composite's 1 MiB reservation does not.
+    let ledger = MonitorAdmissionLedger(maximumBytes: 1_300_000, cleanReserveBytes: 1_000_000)
+    let runtime = MonitorRuntime(ledger: ledger, sharedDevice: { device })
+    let input = try buffer()
+    var config = MonitorConfiguration()
+    config.toolsEnabled = true
+    config.zebra.enabled = true
+    let first = stamp()
+    runtime.configure(target: first.target, generation: 1, configurationRevision: 1, configuration: config)
+    for sequence in 1...8 {
+      var next = first
+      next.sequence = UInt64(sequence)
+      let done = expectation(description: "post-admission allocation failure")
+      XCTAssertTrue(runtime.offer(MonitorFrameBundle(
+        stamp: next, source: input,
+        sourceSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "rec709")
+      )) { result in
+        let display = try? result.get()
+        XCTAssertNotNil(display?.clean)
+        XCTAssertNil(display?.decorated)
+        XCTAssertTrue(display?.availability.contains { $0.contains("allocationFailed") } ?? false)
+        done.fulfill()
+      })
+      wait(for: [done], timeout: 15)
+      Thread.sleep(forTimeInterval: 0.26)
+    }
+    XCTAssertNotEqual(runtime.diagnostics(for: first.target).effectiveQuality.tier, .nominal)
+  }
+
   func testActualGPUZebraAndSpatialScope() throws {
     guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
     let b = try buffer()
@@ -278,6 +409,12 @@ final class MonitorMetalTests: XCTestCase {
     gate.signal()
     wait(for: [callback], timeout: 0.3)
     XCTAssertEqual(runtime.ledger.snapshot.analysisJobs, 0)
+    let drained = expectation(for: NSPredicate { _, _ in
+      runtime.ledger.snapshot.retainedBytes == 0
+    }, evaluatedWith: nil)
+    wait(for: [drained], timeout: 3)
+    XCTAssertEqual(runtime.resourceStatistics.compositeAllocations, 0,
+      "Obsolete initialization must not prepare a composite after reconfiguration")
   }
 
   func testScopeRGBOrderAndExtendedRangeAxesOnGPU() throws {

@@ -70,6 +70,10 @@ struct ProgramOutput<SourceID: Hashable> {
     scheduler = ProgramCutScheduler(selectedSource: selectedSource,
       programTimescale: scheduler.mapper.programTimescale)
   }
+
+  mutating func carryTimeline(from previous: ProgramOutput<SourceID>) {
+    scheduler.carryTimeline(from: previous.scheduler)
+  }
 }
 
 /// Compatibility spelling for call sites that use the coordinator name.
@@ -136,7 +140,27 @@ struct SwitcherCoordinator {
   mutating func setFeedHealth(_ feedID: FeedID, healthy: Bool) {
     guard feedIDs.contains(feedID) else { return }
     feedHealth[feedID] = healthy
+    let wasPendingTarget = programOutput.pendingCut == feedID
     programOutput.setSourceHealth(feedID, healthy: healthy)
+    // Health can drop the pending cut inside the scheduler. The automatic
+    // latch has to drop with it, or later ticks stay idle forever.
+    if wasPendingTarget, !healthy {
+      automaticRequestPending = false
+      if pendingDirectorDecision?.targetCameraID == feedID.rawValue {
+        pendingDirectorDecision = nil
+      }
+    }
+  }
+
+  /// Copies the Program clock and remaining source health onto a coordinator
+  /// rebuilt for a feed add, remove, or disable. The new mapper would otherwise
+  /// start presentation time at zero on the same sink.
+  mutating func carryProgramTimeline(from previous: SwitcherCoordinator) {
+    programOutput.carryTimeline(from: previous.programOutput)
+    for (id, healthy) in previous.feedHealth where feedIDs.contains(id) {
+      feedHealth[id] = healthy
+      programOutput.setSourceHealth(id, healthy: healthy)
+    }
   }
 
   mutating func setSourceHealth(_ feedID: FeedID, healthy: Bool) {

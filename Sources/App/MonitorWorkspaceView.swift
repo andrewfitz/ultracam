@@ -211,7 +211,7 @@ private struct MonitorBoundTile: View {
   }
   private func register() {
     coordinator.registerSurface(
-      id: surfaceID, target: target, isVisible: previewEnabled && !presenter.isFrozen,
+      id: surfaceID, target: target, isVisible: previewEnabled,
       scopeVisible: configuration.wrappedValue.toolsEnabled
         && configuration.wrappedValue.scopes.enabled && scopesVisible && !presenter.isFrozen
         && previewEnabled,

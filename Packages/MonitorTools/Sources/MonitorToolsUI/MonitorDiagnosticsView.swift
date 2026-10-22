@@ -32,7 +32,7 @@ public struct MonitorDiagnosticsView: View {
         Text(
           "Shared monitor budget: \(bytes(snapshot.retainedBytes)) retained, \(bytes(snapshot.retiredBytes)) retiring"
         )
-        Text("GPU deadline: \(deadline)")
+        Text("Picture age deadline (250 ms): \(deadline)")
         Text("This surface: \(surfaceScopeTiming)")
         if !presentationEstimate.isEmpty {
           Text(presentationEstimate + " (estimate; existing native baseline excluded)")
@@ -44,11 +44,11 @@ public struct MonitorDiagnosticsView: View {
   private func bytes(_ value: Int) -> String {
     String(format: "%.1f MiB", Double(value) / 1_048_576)
   }
-  private var deadline: String {
+  var deadline: String {
     switch snapshot.softDeadlineStatus {
     case .unavailable: return "unavailable"
     case .withinDeadline: return "within limit"
-    case .exceeded: return "exceeded; clean monitoring fallback"
+    case .exceeded: return "exceeded; last delivered picture is older than limit"
     }
   }
   private var availability: String {

@@ -11,7 +11,7 @@ enum RecordingCodec: String, CaseIterable, Codable, Equatable, Sendable {
 
   var title: String {
     switch self {
-    case .proRes42210Bit: return "ProRes 422 10-bit"
+    case .proRes42210Bit: return "ProRes 422 HQ"
     case .hevcMain10_422: return "HEVC Main10 4:2:2"
     }
   }
@@ -252,7 +252,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
         videoCodec: configuration.codec == .proRes42210Bit
           ? kCMVideoCodecType_AppleProRes422HQ : kCMVideoCodecType_HEVC,
         timecodePolicy: Self.timecodePolicy(for: configuration.timecodeMode),
-        timecodeSamplesComputerClockAtFirstFrame: configuration.timecodeMode == .wallClock)
+        timecodeSamplesComputerClockAtFirstFrame: configuration.timecodeMode == .wallClock,
+        checkAvailableSpace: { try output.checkExternalWriterCapacity() })
       let recorder = try recorderFactory(sourceConfiguration)
       let adapter = SourceRecordingCallbackAdapter(feedID: sourceConfiguration.feedID, recorder: recorder)
       try adapter.start()
@@ -402,18 +403,6 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     }
   }
 
-  /// Callers must not fabricate an audio sample when a backend has no raw PCM
-  /// callback; this explicit error keeps unsupported capture visible.
-  func appendRawAudio(feedID: FeedID, sample: CMSampleBuffer) throws {
-    guard rawAudioCallbackAvailable else { throw RecordingUIError.rawAudioUnavailable }
-    guard let session = sessionLock.withLock({ sessions[feedID] }) else {
-      throw SourceRecordingError.invalidState(.idle, operation: "append audio")
-    }
-    guard session.adapter.appendEmbeddedAudio(sample: sample) else {
-      throw SourceRecordingError.unsupportedSample("The raw audio sample was rejected.")
-    }
-  }
-
   private static func safeComponent(_ value: String) -> String {
     let words = value.split(whereSeparator: { character in
       !(character.isLetter || character.isNumber || character == "-" || character == "_")
@@ -466,7 +455,10 @@ final class RecordingModel {
   }
   private(set) var interruptedRecordings: [InterruptedRecording] = []
   private(set) var recoveringID: URL?
-  private(set) var recoveryMessage: String?
+  private(set) var recoveryMessage: String? { didSet { recoveryMessageIsScanError = false } }
+  /// The current message is an earlier scan's failure. Only that kind clears on a
+  /// successful scan; folder warnings and recovery results stay until replaced.
+  private var recoveryMessageIsScanError = false
   private(set) var recoveredURL: URL?
   private let folderStore: RecordingFolderStore?
   private var recoveryScanGeneration = 0
@@ -495,7 +487,7 @@ final class RecordingModel {
     refreshRecovery()
   }
 
-  func refreshRecovery() {
+  func refreshRecovery(clearMessage: Bool = true) {
     recoveryScanGeneration += 1
     let generation = recoveryScanGeneration
     var seenPaths = Set<String>()
@@ -515,6 +507,9 @@ final class RecordingModel {
       guard let self, self.recoveryScanGeneration == generation else { return }
       var takesByID: [URL: InterruptedRecording] = [:]
       self.interruptedRecordingRoots = [:]
+      if clearMessage, self.recoveryMessageIsScanError {
+        self.recoveryMessage = nil
+      }
       for (root, result) in results {
         switch result {
         case let .success(takes):
@@ -524,6 +519,7 @@ final class RecordingModel {
           }
         case let .failure(error):
           self.recoveryMessage = "Could not check interrupted recordings in \(root.path): \(error.localizedDescription)"
+          self.recoveryMessageIsScanError = true
         }
       }
       self.interruptedRecordings = takesByID.values.sorted { $0.id.path < $1.id.path }
@@ -547,7 +543,7 @@ final class RecordingModel {
         self.recoveryMessage = "Recovered \(url.lastPathComponent). The interrupted original has been kept."
       case let .failure(error): self.recoveryMessage = error.localizedDescription
       }
-      self.refreshRecovery()
+      self.refreshRecovery(clearMessage: false)
     }
   }
 
@@ -662,14 +658,16 @@ final class RecordingModel {
     guard let index = index(of: feedID),
       feeds[index].status == .recording || feeds[index].status == .paused else { return }
     let output = (driver as? RecordingSessionDriverArtifacts)?.recordingOutputURL(feedID: feedID)
+    let folder = outputFolder(for: feedID)
     feeds[index].status = .finishing
     feeds[index].error = nil
     driver.stopRecording(feedID: feedID) { [weak self] result in
       guard let self, let index = self.index(of: feedID) else { return }
       self.feeds[index].status = .idle
+      let saved = Self.existingFile(output, scope: folder)
       if case let .failure(error) = result { self.feeds[index].error = error.localizedDescription }
-      else { self.feeds[index].savedURL = Self.existingFile(output) }
-      self.onRecordingFinished?(feedID, Self.existingFile(output))
+      else { self.feeds[index].savedURL = saved }
+      self.onRecordingFinished?(feedID, saved)
       self.refreshRecovery()
       self.notifyFinished()
       Task { [weak self] in await self?.refreshStatistics() }
@@ -698,8 +696,14 @@ final class RecordingModel {
     }
   }
 
-  private static func existingFile(_ url: URL?) -> URL? {
-    url.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+  private static func existingFile(_ url: URL?, scope: URL? = nil) -> URL? {
+    guard let url else { return nil }
+    // The take's security-scoped folder is released when the session ends.
+    // Start it again for this existence check, or a bookmark-restored folder
+    // reports the finished movie as missing.
+    let accessed = scope?.startAccessingSecurityScopedResource() ?? false
+    defer { if accessed { scope?.stopAccessingSecurityScopedResource() } }
+    return FileManager.default.fileExists(atPath: url.path) ? url : nil
   }
 
   func recordAll() {

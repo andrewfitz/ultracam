@@ -1,4 +1,5 @@
 import CoreVideo
+import Foundation
 import Metal
 
 // Capture-queue ownership. Production processing uses explicit 32-bit float
@@ -35,6 +36,9 @@ final class LUTProcessor {
   private let commandQueue: MTLCommandQueue
   private let states: [String: MTLComputePipelineState]
   private var textureCache: CVMetalTextureCache!
+  private var textureCacheUses = 0
+  // Often enough to release cache-retained pool buffers, not every frame.
+  private static let textureCacheFlushInterval = 32
   private var pool: CVPixelBufferPool?
   private var poolConfiguration: PipelineConfiguration?
   private var cube: CubeLUT?
@@ -254,7 +258,10 @@ final class LUTProcessor {
     var output: CVPixelBuffer?
     let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool,
       [kCVPixelBufferPoolAllocationThresholdKey: VideoContract.outputBufferLimit] as CFDictionary, &output)
-    if status == kCVReturnWouldExceedAllocationThreshold { throw VideoError.outputBackPressure }
+    if status == kCVReturnWouldExceedAllocationThreshold {
+      flushTextureCache(force: true)
+      throw VideoError.outputBackPressure
+    }
     guard status == kCVReturnSuccess, let output else { throw VideoError.message("Output buffers are busy (\(status)).") }
     let (yWrapper, y) = try plane(output, index: 0, format: configuration.convertTo420 ? .r8Unorm : .r16Unorm)
     let (uvWrapper, uv) = try plane(output, index: 1, format: configuration.convertTo420 ? .rg8Unorm : .rg16Unorm)
@@ -331,11 +338,19 @@ final class LUTProcessor {
     }
     let timingObserver = commandTimingObserver
     let commitBegin = timingObserver == nil ? 0 : ProcessInfo.processInfo.systemUptime
+    let completed = DispatchSemaphore(value: 0)
+    let retainedWrappers = wrappers
+    command.addCompletedHandler { _ in
+      withExtendedLifetime(retainedWrappers) {}
+      completed.signal()
+    }
     command.commit()
     let commitReturn = timingObserver == nil ? 0 : ProcessInfo.processInfo.systemUptime
-    command.waitUntilCompleted()
+    // Stop is queued on this same capture queue. An unbounded wait would keep
+    // a wedged command buffer from ever running it.
+    let waitResult = completed.wait(timeout: .now() + 2)
     let waitReturn = timingObserver == nil ? 0 : ProcessInfo.processInfo.systemUptime
-    if command.status == .completed {
+    if waitResult == .success, command.status == .completed {
       AppGPUActivity.shared.record(start: command.gpuStartTime, end: command.gpuEndTime)
     }
     if let timingObserver {
@@ -344,7 +359,12 @@ final class LUTProcessor {
         meterReturn: ProcessInfo.processInfo.systemUptime))
     }
     withExtendedLifetime(wrappers) {}
-    guard command.status == .completed else { throw VideoError.message(command.error?.localizedDescription ?? "GPU processing failed.") }
+    guard waitResult == .success, command.status == .completed else {
+      throw VideoError.message(waitResult == .timedOut
+        ? "GPU processing timed out."
+        : (command.error?.localizedDescription ?? "GPU processing failed."))
+    }
+    flushTextureCache(force: false)
     // Pool buffers can carry attachments from their previous use. Start from a
     // clean attachment set, then carry the source's geometry/timing metadata
     // into the new image. Color labels are overridden below after the exact
@@ -381,5 +401,14 @@ final class LUTProcessor {
       CVBufferSetAttachment(output, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
     }
     return output
+  }
+
+  private func flushTextureCache(force: Bool) {
+    if !force {
+      textureCacheUses &+= 1
+      guard textureCacheUses >= Self.textureCacheFlushInterval else { return }
+    }
+    textureCacheUses = 0
+    CVMetalTextureCacheFlush(textureCache, 0)
   }
 }

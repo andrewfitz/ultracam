@@ -7,6 +7,12 @@ private struct FixedRecordingOutputDiskSpace: RecordingOutputDiskSpaceProviding 
   func availableBytes(at directory: URL) throws -> UInt64 { bytes }
 }
 
+private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpaceProviding, @unchecked Sendable {
+  var bytes: UInt64
+  init(bytes: UInt64) { self.bytes = bytes }
+  func availableBytes(at directory: URL) throws -> UInt64 { bytes }
+}
+
 @objcMembers final class RecordingOutputChecks: XCTestCase {
   private func makeRoot() throws -> URL {
     let root = FileManager.default.temporaryDirectory
@@ -26,7 +32,7 @@ private struct FixedRecordingOutputDiskSpace: RecordingOutputDiskSpaceProviding 
     XCTAssertEqual(session.paths.feedDirectory.lastPathComponent, "camera-a")
     XCTAssertEqual(session.paths.finalFile.pathExtension, "mov")
     XCTAssertNotNil(session.paths.finalFile.lastPathComponent.range(
-      of: #"^camera-a_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{3}(?:-\d+)?\.mov$"#, options: .regularExpression))
+      of: #"^camera-a_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{3}_AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE(?:-\d+)?\.mov$"#, options: .regularExpression))
     XCTAssertTrue(FileManager.default.fileExists(atPath: session.temporaryURL.path))
     XCTAssertFalse(FileManager.default.fileExists(atPath: session.finalURL.path))
 
@@ -285,6 +291,71 @@ private struct FixedRecordingOutputDiskSpace: RecordingOutputDiskSpaceProviding 
     XCTAssertThrowsError(try take.start())
     try take.cancel()
     XCTAssertEqual(try Data(contentsOf: take.temporaryURL), original)
+  }
+
+  func testExternalWriterRechecksFloorWithoutCountingWrittenReservationTwice() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let disk = ChangingRecordingOutputDiskSpace(bytes: 1_000)
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk)
+    for expectedBytes: UInt64 in [0, 80] {
+      disk.bytes = 1_000
+      let session = try manager.beginExternalWriterSession(feedID: "Wide", expectedBytes: expectedBytes)
+      let media = Data(repeating: 7, count: 80)
+      try media.write(to: session.temporaryURL)
+      disk.bytes = 110
+      XCTAssertNoThrow(try session.checkExternalWriterCapacity())
+      XCTAssertEqual(session.bytesWritten, 80)
+      disk.bytes = 99
+      XCTAssertThrowsError(try session.checkExternalWriterCapacity()) { error in
+        XCTAssertEqual(error as? RecordingOutputError, .insufficientDiskSpace(required: 100, available: 99))
+      }
+      XCTAssertEqual(try Data(contentsOf: session.temporaryURL), media)
+      session.preserveForRecovery()
+    }
+  }
+
+  func testExternalWriterAppendErrorNamesFileOwner() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let session = try manager.beginExternalWriterSession(feedID: "Wide")
+    XCTAssertThrowsError(try session.append(Data([1]))) { error in
+      XCTAssertEqual(error.localizedDescription, "Recording output I/O failed: Cannot append data while the external writer owns the output file.")
+    }
+    XCTAssertEqual(session.state, .recording)
+    try session.cancel()
+  }
+
+  func testSessionIDSeparatesUncreatedPathsAcrossManagers() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firstManager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let secondManager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let firstID = UUID()
+    let secondID = UUID()
+    let first = try firstManager.makeSession(feedID: "Wide", sessionID: firstID)
+    let second = try secondManager.makeSession(feedID: "Wide", sessionID: secondID)
+    XCTAssertTrue(first.finalURL.lastPathComponent.contains(firstID.uuidString))
+    XCTAssertTrue(second.finalURL.lastPathComponent.contains(secondID.uuidString))
+    XCTAssertNotEqual(first.temporaryURL, second.temporaryURL)
+  }
+
+  func testRecoveryScanReclaimsInterruptedExportAndKeepsOriginal() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let session = try manager.beginExternalWriterSession(feedID: "Wide")
+    let original = Data([1, 2, 3])
+    try original.write(to: session.temporaryURL)
+    let staging = session.temporaryURL.appendingPathExtension("export.ultracam-recovery")
+    try Data([4, 5]).write(to: staging)
+    XCTAssertTrue(try RecordingRecovery.scan(root: root).isEmpty)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: staging.path), "A live export owns the journal lock")
+    session.preserveForRecovery()
+    XCTAssertEqual(try RecordingRecovery.scan(root: root).count, 1)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path))
+    XCTAssertEqual(try Data(contentsOf: session.temporaryURL), original)
   }
 
   static let allTests = [

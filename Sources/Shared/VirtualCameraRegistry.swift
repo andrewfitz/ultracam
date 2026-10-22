@@ -127,6 +127,7 @@ enum VirtualCameraRegistryError: Error, Equatable, LocalizedError, Sendable {
   case staleGeneration(current: UInt64, candidate: UInt64)
   case noValidSnapshot
   case writeVerificationFailed
+  case unavailableContainer
 
   var errorDescription: String? {
     switch self {
@@ -143,6 +144,7 @@ enum VirtualCameraRegistryError: Error, Equatable, LocalizedError, Sendable {
       return "Virtual-camera registry generation \(candidate) is not newer than \(current)."
     case .noValidSnapshot: return "No valid virtual-camera registry snapshot is available."
     case .writeVerificationFailed: return "Virtual-camera registry write could not be verified."
+    case .unavailableContainer: return "Virtual-camera registry app-group container is unavailable."
     }
   }
 }
@@ -249,7 +251,7 @@ struct VirtualCameraRegistrySnapshot: Codable, Equatable, Sendable {
     // legacy fallback. It must never cross the publication/reconciliation
     // boundary, because it would allow a reset snapshot to bypass the
     // monotonic rollback fence.
-    guard candidate.generation > 0 else {
+    guard candidate.generation > 0, candidate.generation < UInt64.max else {
       throw VirtualCameraRegistryError.invalidGeneration
     }
     guard candidate.appGroupIdentifier == appGroupIdentifier else {
@@ -269,7 +271,7 @@ final class VirtualCameraRegistryStore {
   static let key = "ultracam.virtual-camera-registry.v1"
   static let backupKey = "ultracam.virtual-camera-registry.v1.backup"
 
-  private let defaults: UserDefaults
+  private let defaults: UserDefaults?
   private let appGroupIdentifier: String
 
   /// The suite this store publishes to.  Keeping this available lets a host
@@ -280,12 +282,15 @@ final class VirtualCameraRegistryStore {
   init(appGroupIdentifier: String = VirtualCameraRegistrySnapshot.defaultAppGroupIdentifier,
     defaults: UserDefaults? = nil) {
     self.appGroupIdentifier = appGroupIdentifier
-    self.defaults = defaults ?? UserDefaults(suiteName: appGroupIdentifier) ?? .standard
+    // A missing suite must not fall back to UserDefaults.standard. That domain
+    // is per-process and can publish a different camera set than the app group.
+    self.defaults = defaults ?? UserDefaults(suiteName: appGroupIdentifier)
   }
 
   /// Returns the newest valid slot and repairs a corrupt or stale primary
   /// slot from it. A nil result means both slots failed validation.
   func load() -> VirtualCameraRegistrySnapshot? {
+    guard let defaults else { return nil }
     let primary = decode(data: defaults.data(forKey: Self.key))
     let backup = decode(data: defaults.data(forKey: Self.backupKey))
     guard let selected = [primary, backup].compactMap({ $0 }).max(by: { $0.generation < $1.generation }) else {
@@ -300,7 +305,11 @@ final class VirtualCameraRegistryStore {
   /// Publishes a complete newer snapshot. The current primary bytes are
   /// copied to backup before replacement, so a torn write can roll back.
   func save(_ snapshot: VirtualCameraRegistrySnapshot) throws {
+    guard let defaults else { throw VirtualCameraRegistryError.unavailableContainer }
     try snapshot.validate()
+    guard snapshot.generation < UInt64.max else {
+      throw VirtualCameraRegistryError.invalidGeneration
+    }
     guard snapshot.appGroupIdentifier == appGroupIdentifier else {
       throw VirtualCameraRegistryError.appGroupMismatch(expected: appGroupIdentifier,
         actual: snapshot.appGroupIdentifier)

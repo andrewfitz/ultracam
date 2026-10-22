@@ -56,6 +56,7 @@ private final class AnalysisInputLease: @unchecked Sendable {
   init(_ frame: MonitorFrameBundle) { self.frame = frame }
 }
 private enum PreparedAnalysis {
+  case discarded
   case gpu(MTLCommandBuffer)
   case delivery(Result<MonitorDisplayResult, Error>, MonitorResourceLease?)
 }
@@ -445,6 +446,16 @@ public final class MonitorRuntime: @unchecked Sendable {
       withExtendedLifetime(retired) {}
     }
   }
+  /// True once the frame's target was removed or restarted with a new generation.
+  /// Only then is in-flight work dropped and cached composite storage released.
+  /// A configuration revision change or a busy lock is not a reason: rebuilding
+  /// the pool on the next frame made the picture stutter and the scope go blank.
+  private func generationRetired(_ stamp: MonitorFrameStamp) -> Bool {
+    guard lock.try() else { return false }
+    defer { lock.unlock() }
+    guard let s = sessions[stamp.target] else { return true }
+    return stamp.generation != s.0
+  }
   private func current(_ stamp: MonitorFrameStamp) -> MonitorConfiguration? {
     guard lock.try() else { return nil }
     defer { lock.unlock() }
@@ -629,7 +640,16 @@ public final class MonitorRuntime: @unchecked Sendable {
       // producer borrow before committing GPU work or releasing the admission slot.
       input.frame = nil
       switch prepared {
-      case .gpu(let command): command.commit()
+      case .discarded:
+        cleanMemory.release()
+        job.release()
+      case .gpu(let command):
+        guard !self.generationRetired(stamp) else {
+          job.release()
+          self.compositePool.trim()
+          return
+        }
+        command.commit()
       case .delivery(let result, let failedReservation):
         job.release()
         self.deliver(
@@ -644,6 +664,7 @@ public final class MonitorRuntime: @unchecked Sendable {
     working: WorkingSet, job: AnalysisJob, quality: MonitorEffectiveQuality,
     completion: @escaping @Sendable (Result<MonitorDisplayResult, Error>) -> Void
   ) -> PreparedAnalysis {
+    guard !generationRetired(frame.stamp) else { return .discarded }
     let picture = config.pictureStage == .source ? frame.source : (frame.output ?? frame.source)
     let scopeInput = config.scopeStage == .source ? frame.source : (frame.output ?? frame.source)
     let pictureSignal = Self.signal(frame, configuration: config, stage: config.pictureStage)
@@ -665,11 +686,16 @@ public final class MonitorRuntime: @unchecked Sendable {
       let scale = min(1, Double(quality.pictureHeightLimit) / Double(height))
       let effectiveWidth = max(1, Int(Double(width) * scale))
       let effectiveHeight = max(1, Int(Double(height) * scale))
-      if context == nil && !initializationFailed {
+      // One worker attempt per admitted frame; failures retry only on a later offer.
+      if context == nil {
         do {
           guard let device = deviceProvider() else { throw MonitorPreviewError.shadersUnavailable }
           context = try MetalContext(device: device, source: shaderSource)
-        } catch { initializationFailed = true }
+          initializationFailed = false
+        } catch {
+          initializationFailed = true
+          recordPreparationPressure(error, target: frame.stamp.target)
+        }
       }
       guard let context else {
         return .delivery(
@@ -679,6 +705,7 @@ public final class MonitorRuntime: @unchecked Sendable {
               availability: ["Analysis unavailable: shader/device initialization failed"],
               pictureSignal: pictureSignal)), nil)
       }
+      guard !generationRetired(frame.stamp) else { return .discarded }
       do {
         return .gpu(
           try submit(
@@ -688,6 +715,7 @@ public final class MonitorRuntime: @unchecked Sendable {
             job: job,
             quality: quality, completion: completion))
       } catch {
+        recordPreparationPressure(error, target: frame.stamp.target)
         return .delivery(
           .success(
             MonitorDisplayResult(
@@ -695,9 +723,17 @@ public final class MonitorRuntime: @unchecked Sendable {
               availability: ["Analysis unavailable: \(error)"], pictureSignal: pictureSignal)), nil)
       }
     } catch {
+      recordPreparationPressure(error, target: frame.stamp.target)
       // Error-only callbacks have no owned pixel buffer, so retain their reservation
       // explicitly until the consumer returns, just like the clean-copy service.
       return .delivery(.failure(error), cleanMemory)
+    }
+  }
+  private func recordPreparationPressure(_ error: Error, target: MonitorTargetID) {
+    switch error {
+    case MonitorPreviewError.allocationFailed, is MonitorCompositePool.AllocationError:
+      telemetry.record(target, pressure: true)
+    default: break
     }
   }
   private func deliver(
@@ -707,7 +743,13 @@ public final class MonitorRuntime: @unchecked Sendable {
   ) {
     delivery.async { [weak self] in
       defer { failedReservation?.release() }
-      guard self?.current(stamp) != nil else { return }
+      guard let self else { return }
+      guard self.current(stamp) != nil else {
+        if self.generationRetired(stamp) {
+          self.worker.async { [compositePool = self.compositePool] in compositePool.trim() }
+        }
+        return
+      }
       completion(result)
     }
   }
@@ -1217,7 +1259,14 @@ public final class MonitorRuntime: @unchecked Sendable {
       if command.gpuEndTime > command.gpuStartTime {
         self?.gpuTiming(command.gpuStartTime, command.gpuEndTime)
       }
-      guard let self, self.current(stamp) != nil, !deadlineExceeded else { return }
+      guard let self else { return }
+      guard self.current(stamp) != nil else {
+        if self.generationRetired(stamp) {
+          self.worker.async { [compositePool = self.compositePool] in compositePool.trim() }
+        }
+        return
+      }
+      guard !deadlineExceeded else { return }
       guard command.status == .completed else {
         self.deliver(
           .success(

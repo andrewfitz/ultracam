@@ -3,7 +3,8 @@ use auto_switcher::director::DirectorState;
 use auto_switcher::model::{
     AudioCue, CueKind, CutReason, StreamEvent, SwitcherConfig, TranscriptCue,
 };
-use auto_switcher::Director;
+use auto_switcher::{Director, SwitcherOutput, TimelineRecorder};
+use uuid::Uuid;
 
 fn config() -> SwitcherConfig {
     SwitcherConfig {
@@ -373,4 +374,279 @@ fn clock_reset_accepts_generation_zero_cues_after_advancing_session() {
         session_generation: 0,
     });
     assert!(director.tick(0.5).is_none());
+}
+
+fn record_with_director(
+    director: &mut Director,
+    recorder: &mut TimelineRecorder,
+    event: StreamEvent,
+) -> Vec<SwitcherOutput> {
+    let outputs = director.process_event(event.clone());
+    recorder.record_event(event, outputs.clone());
+    outputs
+}
+
+#[test]
+fn recorder_matches_accepted_and_rejected_manual_overrides() {
+    for (camera, requested, applied) in [
+        ("B", 12.0, Some(12.0)),
+        ("B", 10.0, Some(10.0)),
+        ("B", 9.5, Some(10.0)),
+        ("B", 8.0, Some(10.0)), // Exactly two seconds behind is accepted.
+        ("A", 9.5, Some(10.0)), // Same-camera acceptance still clears pending.
+        ("B", 7.99, None),
+        ("A", 7.99, None),
+        ("B", 0.0, None),
+        ("unknown", 10.0, None),
+        ("B", -1.0, None),
+        ("B", f64::NAN, None),
+        ("B", f64::INFINITY, None),
+    ] {
+        let cfg = config();
+        let mut director = Director::new(cfg.clone()).unwrap();
+        let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+        record_with_director(
+            &mut director,
+            &mut recorder,
+            StreamEvent::Tick { time: 10.0 },
+        );
+        let pending = director.pending().expect("forced cut").clone();
+        assert_eq!(recorder.timeline.cuts.len(), 1);
+
+        let outputs = record_with_director(
+            &mut director,
+            &mut recorder,
+            StreamEvent::ManualOverride {
+                camera_id: camera.into(),
+                time: requested,
+            },
+        );
+        if let Some(time) = applied {
+            assert!(matches!(outputs.as_slice(), [SwitcherOutput::Status {
+                time: applied_at, current_camera_id, pending_decision_id: None, ..
+            }] if *applied_at == time && current_camera_id == camera));
+            assert_eq!(director.current_camera_id(), camera);
+            assert!(director.pending().is_none());
+            assert_eq!(recorder.timeline.cuts[0].status, "cancelled");
+            assert_eq!(recorder.timeline.cuts.len(), 2);
+            let cut = &recorder.timeline.cuts[1];
+            assert_eq!(cut.from_camera_id.as_deref(), Some("A"));
+            assert_eq!(cut.target_camera_id, camera);
+            assert_eq!(cut.status, "applied");
+            assert_eq!(cut.requested_cut_time, Some(time));
+            assert_eq!(cut.applied_source_time, Some(time));
+            assert_eq!(cut.applied_program_time, Some(time));
+            let ticks = Some(auto_switcher::timeline::to_ticks(time, 60_000));
+            assert_eq!(cut.requested_cut_time_ticks, ticks);
+            assert_eq!(cut.applied_source_time_ticks, ticks);
+            assert_eq!(cut.applied_program_time_ticks, ticks);
+        } else {
+            assert!(
+                outputs.is_empty(),
+                "rejected override: {camera} at {requested}"
+            );
+            assert_eq!(director.current_camera_id(), "A");
+            assert_eq!(director.pending().unwrap().decision_id, pending.decision_id);
+            assert_eq!(recorder.timeline.cuts.len(), 1);
+            assert_eq!(recorder.timeline.cuts[0].status, "proposed");
+        }
+
+        record_with_director(
+            &mut director,
+            &mut recorder,
+            StreamEvent::Acknowledge {
+                decision_id: pending.decision_id,
+                applied_at: Some(10.0),
+            },
+        );
+        assert_eq!(
+            recorder.timeline.cuts[0].status,
+            if applied.is_some() {
+                "cancelled"
+            } else {
+                "applied"
+            },
+            "a late acknowledgement must not resurrect a cancelled cut"
+        );
+        let current = director.current_camera_id().to_string();
+        record_with_director(
+            &mut director,
+            &mut recorder,
+            StreamEvent::Tick { time: 20.0 },
+        );
+        assert_eq!(
+            recorder
+                .timeline
+                .cuts
+                .last()
+                .unwrap()
+                .from_camera_id
+                .as_deref(),
+            Some(current.as_str()),
+            "recorder and director must retain the same current camera"
+        );
+    }
+}
+
+#[test]
+fn recorder_drops_pending_cuts_when_director_resets_or_expires_them() {
+    for cause in ["reset", "deadline", "clock", "health"] {
+        let cfg = config();
+        let mut director = Director::new(cfg.clone()).unwrap();
+        let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+        record_with_director(
+            &mut director,
+            &mut recorder,
+            StreamEvent::Tick { time: 10.0 },
+        );
+        let pending = director.pending().unwrap().clone();
+        if cause == "health" {
+            record_with_director(
+                &mut director,
+                &mut recorder,
+                StreamEvent::Video {
+                    observation: auto_switcher::VideoObservation {
+                        time: 10.0,
+                        camera_id: "B".into(),
+                        healthy: false,
+                        motion: 0.0,
+                        scene_change: 0.0,
+                        session_generation: 0,
+                    },
+                },
+            );
+        }
+        let event = match cause {
+            "reset" => StreamEvent::Reset { generation: None },
+            "deadline" => StreamEvent::Tick {
+                time: pending.expires_at + 0.1,
+            },
+            "clock" => StreamEvent::Tick { time: 9.0 },
+            "health" => StreamEvent::Tick { time: 10.0 },
+            _ => unreachable!(),
+        };
+        record_with_director(&mut director, &mut recorder, event);
+        let status = if cause == "reset" {
+            "cancelled"
+        } else {
+            "expired"
+        };
+        assert_eq!(recorder.timeline.cuts[0].status, status, "{cause}");
+        assert_ne!(
+            director.pending().map(|cut| cut.decision_id),
+            Some(pending.decision_id)
+        );
+        record_with_director(
+            &mut director,
+            &mut recorder,
+            StreamEvent::Acknowledge {
+                decision_id: pending.decision_id,
+                applied_at: Some(10.0),
+            },
+        );
+        assert_eq!(recorder.timeline.cuts[0].status, status, "{cause}");
+        assert_eq!(director.current_camera_id(), "A", "{cause}");
+    }
+}
+
+#[test]
+fn offline_sorts_untimed_events_after_timed_events_and_preserves_time_zero() {
+    let unknown_decision = Uuid::new_v4();
+    let untimed = vec![
+        StreamEvent::Reset {
+            generation: Some(7),
+        },
+        StreamEvent::Acknowledge {
+            decision_id: unknown_decision,
+            applied_at: None,
+        },
+        StreamEvent::Reject {
+            decision_id: unknown_decision,
+        },
+        StreamEvent::Reset { generation: None },
+    ];
+    let mut events = untimed.clone();
+    events.extend([
+        StreamEvent::Tick { time: 1.0 },
+        StreamEvent::ManualOverride {
+            camera_id: "B".into(),
+            time: 0.0,
+        },
+    ]);
+    let timeline =
+        auto_switcher::offline::analyze_events(events, SwitcherConfig::default()).unwrap();
+    let first = &timeline.events[0];
+    assert!(matches!(
+        first.event,
+        StreamEvent::ManualOverride { time: 0.0, .. }
+    ));
+    assert_eq!(first.media_time, Some(0.0));
+    assert_eq!(first.media_time_ticks, Some(0));
+    assert_eq!(timeline.cuts.len(), 1);
+    assert_eq!(timeline.cuts[0].session_generation, 1);
+    assert_eq!(timeline.cuts[0].applied_source_time, Some(0.0));
+    assert_eq!(timeline.cuts[0].applied_program_time_ticks, Some(0));
+    assert_eq!(timeline.cuts[0].status, "applied");
+    let first_untimed = timeline
+        .events
+        .iter()
+        .position(|event| event.media_time.is_none())
+        .unwrap();
+    assert!(timeline.events[..first_untimed]
+        .iter()
+        .all(|event| event.media_time.is_some()));
+    assert_eq!(
+        timeline.events[first_untimed..]
+            .iter()
+            .map(|event| event.event.clone())
+            .collect::<Vec<_>>(),
+        untimed,
+        "untimed events retain their input order"
+    );
+    assert!(timeline.events[first_untimed..]
+        .iter()
+        .all(|event| event.media_time_ticks.is_none()));
+    assert_eq!(
+        timeline.config.session_generation, 8,
+        "both resets must execute"
+    );
+}
+
+#[test]
+fn reset_at_clock_zero_still_resets_the_director_and_recorder() {
+    let cfg = SwitcherConfig::default();
+    let mut director = Director::new(cfg.clone()).unwrap();
+    let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+    record_with_director(
+        &mut director,
+        &mut recorder,
+        StreamEvent::ManualOverride {
+            camera_id: "B".into(),
+            time: 0.0,
+        },
+    );
+    assert_eq!(director.current_camera_id(), "B");
+    record_with_director(
+        &mut director,
+        &mut recorder,
+        StreamEvent::Reset { generation: None },
+    );
+    assert_eq!(director.current_camera_id(), "A");
+    assert_eq!(director.session_generation(), 2);
+    assert_eq!(recorder.timeline.config.session_generation, 2);
+    let reset = recorder.timeline.events.last().unwrap();
+    assert!(matches!(reset.event, StreamEvent::Reset { .. }));
+    assert_eq!(reset.media_time, None);
+    record_with_director(
+        &mut director,
+        &mut recorder,
+        StreamEvent::ManualOverride {
+            camera_id: "B".into(),
+            time: 0.0,
+        },
+    );
+    let cut = recorder.timeline.cuts.last().unwrap();
+    assert_eq!(cut.from_camera_id.as_deref(), Some("A"));
+    assert_eq!(cut.applied_source_time, Some(0.0));
+    assert_eq!(cut.session_generation, 2);
 }

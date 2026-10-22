@@ -447,4 +447,47 @@ private final class PreviewTestCounters: @unchecked Sendable {
     XCTAssertEqual(renderer.diagnosticsSnapshot().failed, 1, "A current-generation failure must still be reported")
     XCTAssertNotNil(renderer.diagnosticsSnapshot().lastError)
   }
+
+  func testSuccessfulEnqueueClearsLastErrorFromAnEarlierFailure() throws {
+    let renderer = VideoPreviewRenderer(renderWhenUnattached: true)
+    let window = attach(renderer)
+    defer { renderer.flush(); window.close() }
+    let image = try source(width: 640, height: 360,
+      format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, shareable: true)
+    var formatDescription: CMVideoFormatDescription?
+    XCTAssertEqual(CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+      imageBuffer: image, formatDescriptionOut: &formatDescription), noErr)
+    let format = try XCTUnwrap(formatDescription)
+    var block: CMBlockBuffer?
+    XCTAssertEqual(CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+      memoryBlock: nil, blockLength: 1, blockAllocator: kCFAllocatorDefault,
+      customBlockSource: nil, offsetToData: 0, dataLength: 1, flags: 0,
+      blockBufferOut: &block), noErr)
+    var timing = CMSampleTimingInfo(duration: VideoContract.fastDuration,
+      presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+    var size = 1
+    var malformed: CMSampleBuffer?
+    XCTAssertEqual(CMSampleBufferCreateReady(allocator: kCFAllocatorDefault,
+      dataBuffer: block, formatDescription: format, sampleCount: 1,
+      sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+      sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &malformed), noErr)
+    renderer.enqueue(try XCTUnwrap(malformed))
+    let failureDeadline = Date(timeIntervalSinceNow: 2)
+    while renderer.diagnosticsSnapshot().failed < 1 && Date() < failureDeadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertNotNil(renderer.diagnosticsSnapshot().lastError)
+    let failed = renderer.diagnosticsSnapshot().failed
+    renderer.enqueue(try VideoContract.sample(image, at: CMTime(value: 1001, timescale: 60_000),
+      duration: VideoContract.fastDuration))
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while renderer.diagnosticsSnapshot().enqueued < 1 && Date() < deadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    let diagnostics = renderer.diagnosticsSnapshot()
+    XCTAssertGreaterThanOrEqual(diagnostics.enqueued, 1)
+    XCTAssertEqual(diagnostics.failed, failed, "A later success must not erase the failure count")
+    XCTAssertNil(diagnostics.lastError, "A later successful enqueue must clear lastError")
+  }
+
 }

@@ -107,7 +107,7 @@ final class AppModel {
   var gamut = "S-Gamut3.Cine / S-Log3" { didSet { if gamut != oldValue { saveSettings() } } }
   var pipelineEnabled = true {
     didSet {
-      guard pipelineEnabled != oldValue else { return }
+      guard pipelineEnabled != oldValue, !restoringSettings else { return }
       saveSettings()
       if running { reconfigure() }
     }
@@ -178,8 +178,7 @@ final class AppModel {
   private var lutBookmark: Data?
   private var rememberedLUTEnabled = false
   // LUT parsing and GPU uploads are asynchronous. Invalidate an operation
-  // whenever the selected feed or a newer load changes, so an old completion
-  // cannot overwrite the current feed's settings.
+  // whenever a newer load starts, so an old completion cannot overwrite it.
   private var lutLoadGeneration: UInt64 = 0
   private let demandMonitor = CameraDemandMonitor()
   private var automaticPolicy = AutomaticFeedPolicy()
@@ -350,8 +349,9 @@ final class AppModel {
     do {
       devices = try UltracamBackend.devices().map { InputDevice(id: $0.identifier, name: $0.name) }
     } catch { devices = []; update.message = error.localizedDescription }
-    if !devices.isEmpty, !devices.contains(where: { $0.id == selectedDevice }) {
-      selectedDevice = devices.first!.id
+    if !running, !capture.hasActiveFeed, let first = devices.first,
+      !devices.contains(where: { $0.id == selectedDevice }) {
+      selectedDevice = first.id
     }
     if feedDescriptors.contains(where: \.automaticFeed), !restoringSettings {
       demandMonitor.refresh()
@@ -359,18 +359,18 @@ final class AppModel {
     }
   }
 
-  func chooseLUT() {
-    guard !loading else { return }
+  func chooseLUT(feedID: FeedID? = nil) {
+    let feedID = feedID ?? selectedFeedID
+    guard descriptor(for: feedID) != nil else { return }
     let panel = NSOpenPanel()
-    panel.title = "Choose an FX3 log-to-Rec.709 LUT"
+    panel.title = "Choose a LUT"
     panel.allowedContentTypes = [UTType(filenameExtension: "cube") ?? .plainText]
     panel.allowsMultipleSelection = false
     guard panel.runModal() == .OK, let url = panel.url else { return }
-    lutError = nil
+    if feedID == selectedFeedID { lutError = nil }
     loading = true
     lutLoadGeneration &+= 1
     let loadGeneration = lutLoadGeneration
-    let feedID = selectedFeedID
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.load(url: url)
@@ -390,7 +390,7 @@ final class AppModel {
       do {
         let loaded = try await lutLoader.restore(bookmark: bookmark)
         guard let self else { return }
-        self.uploadLUT(loaded, enable: self.rememberedLUTEnabled, restoring: true,
+        self.uploadLUT(loaded, enable: self.descriptor(for: feedID)?.applyLUT == true, restoring: true,
           generation: loadGeneration, feedID: feedID)
       } catch { self?.lutLoadFailed(error, restoring: true, generation: loadGeneration, feedID: feedID) }
     }
@@ -398,15 +398,26 @@ final class AppModel {
 
   private func uploadLUT(_ loaded: LoadedLUT, enable: Bool, restoring: Bool = false,
                          generation: UInt64, feedID: FeedID) {
-    guard generation == lutLoadGeneration, feedID == selectedFeedID else { return }
-    capture.load(loaded.cube) { [weak self] result in
+    let controller = feedCoordinator.capture(for: feedID)
+    let controllerGeneration = controller.generationToken
+    guard generation == lutLoadGeneration else { return }
+    controller.load(loaded.cube, expectedGeneration: controllerGeneration) { [weak self] result in
       MainActor.assumeIsolated {
         guard let self else { return }
-        guard generation == self.lutLoadGeneration, feedID == self.selectedFeedID else { return }
+        guard generation == self.lutLoadGeneration else { return }
         switch result {
         case .success:
-          self.lutError = nil
           self.loading = false
+          let enable = restoring ? self.descriptor(for: feedID)?.applyLUT == true : enable
+          guard feedID == self.selectedFeedID else {
+            self.updateCamera(feedID) { descriptor in
+              descriptor.lutBookmark = loaded.bookmark
+              descriptor.applyLUT = enable
+            }
+            self.reconcileAutomaticFeed()
+            return
+          }
+          self.lutError = nil
           self.lutLoaded = true
           self.lutBookmark = loaded.bookmark
           self.rememberedLUTEnabled = enable
@@ -424,12 +435,19 @@ final class AppModel {
   }
 
   private func lutLoadFailed(_ error: Error, restoring: Bool, generation: UInt64, feedID: FeedID) {
-    guard generation == lutLoadGeneration, feedID == selectedFeedID else { return }
+    guard generation == lutLoadGeneration else { return }
     loading = false
+    let message = "\(restoring ? "Saved LUT could not be restored" : "LUT was not changed"): \(error.localizedDescription)"
+    guard feedID == selectedFeedID else {
+      var cameraUpdate = cameraUpdates[feedID] ?? CaptureUpdate(message: message)
+      cameraUpdate.message = message
+      cameraUpdates[feedID] = cameraUpdate
+      reconcileAutomaticFeed()
+      return
+    }
     // Keep the last saved bookmark and an already-loaded LUT. A missing moved
     // file is recoverable by choosing it again; it does not erase preferences.
     if restoring { lutTitle = "Saved LUT unavailable" }
-    let message = "\(restoring ? "Saved LUT could not be restored" : "LUT was not changed"): \(error.localizedDescription)"
     lutError = message
     update.message = message
     reconcileAutomaticFeed()
@@ -440,8 +458,6 @@ final class AppModel {
   /// previous feed are committed before the new descriptor is applied.
   @discardableResult
   func selectFeed(_ id: FeedID) -> Bool {
-    // A LUT still loading for the previous camera doesn't block selection:
-    // applySelectedDescriptor invalidates that load and clears the flag.
     guard feedCoordinator.descriptors.contains(where: { $0.id == id }) else { return false }
     saveSettings()
     guard feedCoordinator.select(id) else { return false }
@@ -563,10 +579,6 @@ final class AppModel {
   }
 
   private func applySelectedDescriptor(_ descriptor: FeedDescriptor) {
-    lutLoadGeneration &+= 1
-    // An in-flight load for the previous feed no longer owns this flag.
-    // Leaving it true disables Start until that discarded load finishes.
-    loading = false
     restoringSettings = true
     selectedDevice = descriptor.selectedDevice
     configuration = descriptor.configuration
@@ -923,7 +935,12 @@ final class AppModel {
     Task { [weak self, lutLoader] in
       let loaded: LoadedLUT
       do { loaded = try await lutLoader.restore(bookmark: bookmark) }
-      catch { return }
+      catch {
+        await MainActor.run { [weak self] in
+          self?.headlessLUTRestoreFailed(error, feedID: feedID, bookmark: bookmark, generation: generation)
+        }
+        return
+      }
       await MainActor.run { [weak self] in
         guard let self, self.feedCoordinator.isFeedRunning(feedID),
           controller.generationToken == generation,
@@ -931,18 +948,39 @@ final class AppModel {
           descriptor.lutBookmark == bookmark, descriptor.applyLUT else { return }
         controller.load(loaded.cube, expectedGeneration: generation) { [weak self] result in
           MainActor.assumeIsolated {
-            guard let self, case .success = result,
-              self.feedCoordinator.isFeedRunning(feedID),
+            guard let self else { return }
+            if case .failure(let error) = result {
+              self.headlessLUTRestoreFailed(error, feedID: feedID, bookmark: bookmark, generation: generation)
+              return
+            }
+            guard self.feedCoordinator.isFeedRunning(feedID),
               controller.generationToken == generation,
               let descriptor = self.feedCoordinator.descriptors.first(where: { $0.id == feedID }),
               descriptor.lutBookmark == bookmark, descriptor.applyLUT else { return }
             var configuration = descriptor.configuration
+            if let detected = self.detectedInputCadence[feedID] { configuration.inputFast = detected }
             configuration.applyLUT = true
             self.feedCoordinator.reconfigureCapture(feedID: feedID,
               configuration: configuration, pipelineEnabled: descriptor.pipelineEnabled)
           }
         }
       }
+    }
+  }
+
+  private func headlessLUTRestoreFailed(_ error: Error, feedID: FeedID, bookmark: Data, generation: UInt64) {
+    guard feedCoordinator.isFeedRunning(feedID),
+      feedCoordinator.capture(for: feedID).generationToken == generation,
+      let descriptor = descriptor(for: feedID),
+      descriptor.lutBookmark == bookmark, descriptor.applyLUT else { return }
+    updateCamera(feedID) { $0.applyLUT = false }
+    let message = "Saved LUT could not be restored: \(error.localizedDescription)"
+    var cameraUpdate = cameraUpdates[feedID] ?? CaptureUpdate(message: message)
+    cameraUpdate.message = message
+    cameraUpdates[feedID] = cameraUpdate
+    if feedID == selectedFeedID {
+      lutError = message
+      update.message = message
     }
   }
 
@@ -978,22 +1016,26 @@ final class AppModel {
   }
 
   var automaticFeedStatus: String {
-    if let cameraDemandError { return cameraDemandError }
-    if !automaticCaptureRequested { return "Waiting for a camera app or visible preview. Capture and video processing are off." }
-    if loading { return "Restoring your LUT…" }
     if running {
+      if !demandStartedFeeds.contains(selectedFeedID) { return "Camera is running. It stays up until Stop." }
       return cameraRequested
         ? "Camera in use. Hide preview without interrupting camera output."
         : "Preview is live. Hide it to stop capture until a camera app needs it."
     }
+    if let cameraDemandError { return cameraDemandError }
+    if !automaticCaptureRequested { return "Waiting for a camera app or visible preview. Capture and video processing are off." }
+    if loading { return "Restoring your LUT…" }
     if !devices.contains(where: { $0.id == selectedDevice }) { return "Connect the UltraStudio and refresh inputs." }
     return "Camera stopped. Retry to resume preview or camera output."
   }
 
-  func retryAutomaticFeed() {
-    manuallyStoppedFeeds.remove(selectedFeedID)
-    automaticPolicy.retry()
-    feedPolicies[selectedFeedID]?.retry()
+  func retryAutomaticFeed(feedID: FeedID? = nil) {
+    let id = feedID ?? selectedFeedID
+    manuallyStoppedFeeds.remove(id)
+    var policy = feedPolicies[id] ?? AutomaticFeedPolicy()
+    policy.retry()
+    feedPolicies[id] = policy
+    if id == selectedFeedID { automaticPolicy = policy }
     programTransportRequired = false
     programTransportConfiguration = nil
     // `start()` is idempotent while the monitor is healthy, and retries the
@@ -1081,11 +1123,11 @@ final class AppModel {
       pipelineEnabled: producer?.pipelineEnabled ?? pipelineEnabled,
       detectedInputFast: producerID.flatMap { detectedInputCadence[$0] })
     guard required != programTransportRequired || (required && contract != programTransportConfiguration) else { return }
-    programTransportRequired = required
-    programTransportConfiguration = required ? contract : nil
     do {
       try feedCoordinator.setProgramOutputDemand(required, configuration: contract,
         passthroughFormat: kCVPixelFormatType_422YpCbCr10)
+      programTransportRequired = required
+      programTransportConfiguration = required ? contract : nil
     } catch {
       update.message = "Program camera unavailable: \(error.localizedDescription)"
     }
@@ -1182,6 +1224,7 @@ final class AppModel {
     mutate(&descriptor)
     guard descriptor != before else { return }
     if id == selectedFeedID {
+      if descriptor.applyLUT != before.applyLUT { rememberedLUTEnabled = descriptor.applyLUT }
       if descriptor.configuration.downscale != configuration.downscale ||
         descriptor.configuration.convertTo420 != configuration.convertTo420 ||
         descriptor.configuration.reduceFrameRate != configuration.reduceFrameRate ||
@@ -1190,7 +1233,10 @@ final class AppModel {
         next.downscale = descriptor.configuration.downscale
         next.convertTo420 = descriptor.configuration.convertTo420
         next.reduceFrameRate = descriptor.configuration.reduceFrameRate
-        if descriptor.applyLUT != before.applyLUT { next.applyLUT = descriptor.applyLUT && lutLoaded }
+        if descriptor.applyLUT != before.applyLUT {
+          if !descriptor.applyLUT { next.applyLUT = false }
+          else if lutLoaded { next.applyLUT = true }
+        }
         configuration = next
       }
       if descriptor.pipelineEnabled != pipelineEnabled { pipelineEnabled = descriptor.pipelineEnabled }
@@ -1198,6 +1244,7 @@ final class AppModel {
       if descriptor.previewEnabled != previewEnabled { previewEnabled = descriptor.previewEnabled }
       if descriptor.automaticFeed != automaticFeedEnabled { automaticFeedEnabled = descriptor.automaticFeed }
       if descriptor.selectedDevice != selectedDevice, !running { selectedDevice = descriptor.selectedDevice }
+      if descriptor.applyLUT != before.applyLUT { saveSettings() }
       return
     }
     if feedCoordinator.isFeedRunning(id) && descriptor.selectedDevice != before.selectedDevice {
@@ -1214,6 +1261,7 @@ final class AppModel {
     if feedCoordinator.isFeedRunning(id),
       descriptor.configuration != before.configuration || descriptor.pipelineEnabled != before.pipelineEnabled {
       var configuration = descriptor.configuration
+      if let detected = detectedInputCadence[id] { configuration.inputFast = detected }
       // A headless camera's LUT is applied only once its file is loaded.
       configuration.applyLUT = false
       cameraUpdates[id]?.pipelineEnabledApplied = nil

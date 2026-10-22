@@ -87,6 +87,34 @@ import XCTest
     XCTAssertFalse(scheduler.hasPendingCut)
   }
 
+  func testPendingCutResumesOnAirSourceAfterTimeout() {
+    var now: TimeInterval = 10
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setClock { now }
+    scheduler.pendingCutTimeout = 2
+    guard case .queued = scheduler.requestCut(to: "B") else {
+      return XCTFail("A valid target should queue")
+    }
+    if case .skipped(.staleQueuedFrame) = scheduler.ingest(frame("A", 0)) {} else {
+      XCTFail("The on-air source stays held until the timeout")
+    }
+    now = 12
+    guard case .accepted = scheduler.ingest(frame("A", 1_001)) else {
+      return XCTFail("The on-air source resumes when the pending target never qualifies")
+    }
+    XCTAssertFalse(scheduler.hasPendingCut)
+    XCTAssertEqual(scheduler.selectedSource, "A")
+  }
+
+  func testCarriedTimelineDoesNotRestartAtZero() {
+    var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
+    let first = mapped(mapper.map(frame("A", 0)))!
+    var rebuilt = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
+    rebuilt.carryTimeline(from: mapper)
+    let next = mapped(rebuilt.map(frame("A", 0)))!
+    XCTAssertGreaterThan(CMTimeCompare(next.programTime, first.programTime), 0)
+  }
+
   func testRapidCutsCoalesceToLatestTarget() {
     var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
     guard case .queued = scheduler.requestCut(to: "B") else {

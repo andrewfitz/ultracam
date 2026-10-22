@@ -59,9 +59,10 @@ struct HDMILease {
   ComRef<IDeckLinkConfiguration> configuration;
   int64_t previous = bmdVideoConnectionHDMI;
   bool changed = false;
+  bool started = false;
   ~HDMILease() {
     int64_t current = 0;
-    if (changed && configuration && configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &current) == S_OK && current == bmdVideoConnectionHDMI)
+    if (started && changed && configuration && configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &current) == S_OK && current == bmdVideoConnectionHDMI)
       configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, previous);
   }
   HRESULT select(IDeckLink *device) {
@@ -470,22 +471,28 @@ static void stopInput(IDeckLinkInput *input, CaptureCallback *callback) {
 
 static HRESULT startInput(IDeckLinkInput *input, CaptureCallback *callback,
   BMDDisplayMode mode, BMDVideoInputFlags flags, bool rawAudio = false) {
-  HRESULT status = input->SetCallback(callback);
-  if (status == S_OK) status = input->EnableVideoInput(mode, bmdFormat10BitYUV, flags);
+  // Claim video before installing callbacks so a competing EnableVideoInput
+  // failure cannot replace or detach the active owner's callback.
+  HRESULT status = input->EnableVideoInput(mode, bmdFormat10BitYUV, flags);
+  bool videoEnabled = status == S_OK;
+  if (status == S_OK) status = input->SetCallback(callback);
+  bool callbackSet = status == S_OK;
   if (status == S_OK) {
-    // Embedded audio is optional on a few older Desktop Video devices.  Keep
-    // video capture usable when audio is unavailable, but retain the enabled
-    // bit so teardown can always disable a successfully opened audio stream.
+    // Embedded audio is optional unless raw audio was requested.
     HRESULT audioStatus = input->EnableAudioInput(bmdAudioSampleRate48kHz,
       rawAudio ? bmdAudioSampleType32bitInteger : bmdAudioSampleType16bitInteger, 2);
     if (audioStatus == S_OK) callback->audioEnabled = true;
-    else if (rawAudio) {
-      stopInput(input, callback);
-      return audioStatus;
-    }
+    else if (rawAudio) status = audioStatus;
   }
   if (status == S_OK) status = input->StartStreams();
-  if (status != S_OK) stopInput(input, callback);
+  if (status != S_OK) {
+    callback->accepting = false;
+    // This instance never started streams. Undo only its successful setup;
+    // StopStreams belongs exclusively to teardown of a successful start.
+    if (callbackSet) input->SetCallback(nullptr);
+    if (callback->audioEnabled.exchange(false)) input->DisableAudioInput();
+    if (videoEnabled) input->DisableVideoInput();
+  }
   return status;
 }
 
@@ -713,6 +720,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
       @"UltraStudio is in use by another app. Close the other capture app, then restart." :
       [NSString stringWithFormat:@"UltraStudio could not start the 4K 10-bit input (0x%08x). Check Desktop Video and HDMI settings.", (unsigned)status], status);
   }
+  connection->started = true;
   _input = input.take(); _callback = callback; _connection = std::move(connection);
   return YES;
 #else
@@ -723,6 +731,12 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 #if ULTRACAM_HAS_SDK
 - (void)configureAutoCallback:(CaptureCallback *)callback
   frameHandler:(void (^)(CVPixelBufferRef, CMTime, CMTime, BOOL))frameHandler {
+  // Frames stay enabled until a format notification says otherwise. Desktop Video
+  // only notifies when the signal differs from the opened mode, so an input that
+  // already matches it never gets a notification and would otherwise never be delivered.
+  // A mismatched signal arrives flagged without an input source, or fails the
+  // 3840 × 2160 10-bit check in VideoInputFrameArrived.
+  callback->framesEnabled = true;
   _autoMode = std::make_shared<AutoModeMailbox>();
   auto mailbox = _autoMode;
   callback->autoFrameHandler = [frameHandler copy];
@@ -784,14 +798,201 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 - (void)stopOnQueue {
 #if ULTRACAM_HAS_SDK
   if (_autoMode) { _autoMode->cancel(); _autoMode.reset(); }
-  stopInput(_input, _callback);
-  if (_input) { _input->Release(); _input = nullptr; }
+  if (_input) {
+    stopInput(_input, _callback);
+    // Restore while this successful session still holds its input, never after release.
+    _connection.reset();
+    _input->Release(); _input = nullptr;
+  } else {
+    if (_connection) _connection->started = false;
+    _connection.reset();
+  }
   if (_callback) { _callback->Release(); _callback = nullptr; }
-  _connection.reset();
 #endif
 }
 
 #if defined(ULTRACAM_BACKEND_TESTING) && ULTRACAM_HAS_SDK && BLACKMAGIC_DECKLINK_API_VERSION < 0x0e030000
+- (BOOL)runOwnershipChecks:(NSError **)error {
+  // Keep the legacy callback/media coverage here; its included lifecycle fixture
+  // requires StopStreams on failed starts and cannot exercise owned startup.
+  {
+    __block CVPixelBufferRef retained = nullptr;
+    __block int frames = 0, events = 0;
+    __block int mediaCallbacks = 0;
+    __block BOOL mediaTimecodeMatches = NO;
+    __block BOOL mediaTimecodeAbsent = NO;
+    __block CMTime mediaPacketTime = kCMTimeInvalid;
+    __block NSUInteger mediaFrames = 0, mediaChannels = 0, mediaBytes = 0;
+    __block float mediaLeftPeak = 0, mediaRightPeak = 0, mediaLeftRMS = 0, mediaRightRMS = 0;
+    __block BOOL mediaPresent = NO;
+    __block NSString *lastMessage = nil;
+    __block CMTime timestamp = kCMTimeInvalid;
+    auto framesBlock = ^(CVPixelBufferRef buffer, CMTime pts, BOOL valid) {
+      if (valid) { ++frames; timestamp = pts; retained = CVPixelBufferRetain(buffer); }
+    };
+    auto eventsBlock = ^(NSString *message) { ++events; lastMessage = message; };
+    auto mediaBlock = ^(NSString *timecode, CMTime packetTime, NSUInteger sampleFrames,
+      NSUInteger channels, float leftPeak, float rightPeak, float leftRMS, float rightRMS,
+      NSUInteger bytes, BOOL present) {
+      ++mediaCallbacks; mediaTimecodeMatches = [timecode isEqualToString:@"01:02:03:04"]; mediaTimecodeAbsent = timecode == nil; mediaPacketTime = packetTime;
+      mediaFrames = sampleFrames; mediaChannels = channels; mediaBytes = bytes;
+      mediaLeftPeak = leftPeak; mediaRightPeak = rightPeak; mediaLeftRMS = leftRMS;
+      mediaRightRMS = rightRMS; mediaPresent = present;
+    };
+    auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock);
+    bool destroyed = false;
+    auto frame = new FakeFrame(&destroyed);
+    auto timecode = new FakeTimecode(); frame->timecode = timecode;
+    auto audio = new FakeAudioPacket({INT16_MIN, 16384, 8192, -16384});
+    callback->VideoInputFrameArrived(frame, audio);
+    if (frames != 1 || !retained || CMTimeCompare(timestamp, CMTimeMake(123123, 60000)) != 0 ||
+      CVPixelBufferGetPixelFormatType(retained) != kCVPixelFormatType_422YpCbCr10 || frame->references != 2 ||
+      mediaCallbacks != 1 || !mediaTimecodeMatches ||
+      CMTimeCompare(mediaPacketTime, CMTimeMake(960, 48000)) != 0 || mediaFrames != 2 ||
+      mediaChannels != 2 || mediaBytes != 8 || !mediaPresent || mediaLeftPeak != 1.0f ||
+      mediaRightPeak != 0.5f || std::abs(mediaLeftRMS - 0.728868f) > 0.0001f ||
+      std::abs(mediaRightRMS - 0.5f) > 0.0001f)
+      return fail(error, @"Native frame/media format, timing, metadata or reference test failed.");
+    audio->Release(); frame->timecode = nullptr; timecode->Release();
+    frame->Release();
+    if (destroyed) return fail(error, @"Native frame was freed while Swift retained its pixel buffer.");
+    callback->accepting = false;
+    CVPixelBufferRelease(retained); retained = nullptr;
+    if (!destroyed) return fail(error, @"Native frame leaked after final pixel buffer release.");
+    callback->Release();
+
+    // Lost signal is reported once per transition; stop rejects late frames.
+    destroyed = false; frame = new FakeFrame(&destroyed); frame->noSignal = true;
+    callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
+    callback->VideoInputFrameArrived(frame, nullptr); callback->VideoInputFrameArrived(frame, nullptr);
+    if (events != 1 || frames != 1) return fail(error, @"No-signal event deduplication failed.");
+    callback->accepting = false; frame->noSignal = false;
+    callback->VideoInputFrameArrived(frame, nullptr);
+    if (frames != 1) return fail(error, @"Stopped callback delivered a late frame.");
+    frame->Release(); callback->Release();
+
+    // A media callback without a valid packet must not fabricate channel
+    // metadata. The callback still runs so consumers can clear stale meters.
+    mediaCallbacks = 0; mediaChannels = 99; mediaPresent = YES; mediaTimecodeAbsent = NO;
+    destroyed = false; frame = new FakeFrame(&destroyed);
+    auto emptyTimecode = new FakeTimecode(); emptyTimecode->value = CFSTR(""); frame->timecode = emptyTimecode;
+    callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock);
+    callback->VideoInputFrameArrived(frame, nullptr);
+    if (mediaCallbacks != 1 || !mediaTimecodeAbsent || mediaChannels != 0 || mediaPresent || mediaFrames != 0 || mediaBytes != 0)
+      return fail(error, @"Missing embedded audio fabricated packet metadata.");
+    frame->timecode = nullptr; emptyTimecode->Release();
+    callback->accepting = false; if (retained) { CVPixelBufferRelease(retained); retained = nullptr; }
+    frame->Release(); callback->Release();
+    for (int scenario = 0; scenario != 5; ++scenario) {
+      destroyed = false; frame = new FakeFrame(&destroyed);
+      if (scenario == 0) frame->width = 1920;
+      if (scenario == 1) frame->invalidTime = true;
+      if (scenario == 2) frame->badBytes = true;
+      if (scenario == 3) frame->frameDuration = 1000;
+      if (scenario == 4) frame->negativeTime = true;
+      events = 0;
+      callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
+      callback->VideoInputFrameArrived(frame, nullptr); callback->VideoInputFrameArrived(frame, nullptr);
+      if (events != 1 || callback->accepting || frames != 2 || ![lastMessage hasPrefix:@"Capture error: "])
+        return fail(error, @"Invalid native frame did not stop with one permanent capture error.");
+      if (retained) { CVPixelBufferRelease(retained); retained = nullptr; }
+      frame->Release(); callback->Release();
+      if (!destroyed) return fail(error, @"Rejected native frame leaked.");
+    }
+  }
+  // Fake SDK objects only. Exercise the same control queue and teardown as the API.
+  __block bool nested = false;
+  [self onControlQueue:^{
+    [self onControlQueue:^{ nested = true; }];
+    [self stop];
+  }];
+  if (!nested) return fail(error, @"Reentrant control-queue execution did not run inline.");
+
+  for (int scenario = 0; scenario != 5; ++scenario) {
+    FakeInput input;
+    if (scenario == 1) input.enableResult = E_ACCESSDENIED;
+    if (scenario == 2) input.callbackResult = E_FAIL;
+    if (scenario == 3) input.startResult = E_FAIL;
+    ComRef<CaptureCallback> callback;
+    callback.value = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+    HRESULT status = startInput(&input, callback.value, bmdMode4K2160p5994,
+      bmdVideoInputFlagDefault, scenario == 4);
+    if ((scenario == 0) != (status == S_OK))
+      return fail(error, @"Owned startup did not preserve failure status.");
+    if (scenario == 0) {
+      stopInput(&input, callback.value);
+      if (input.calls != std::vector<std::string>{"enable", "callback", "start", "stop", "clear", "disable"})
+        return fail(error, @"Successful input teardown changed its synchronous stop order.");
+    }
+    auto stops = std::count(input.calls.begin(), input.calls.end(), "stop");
+    if (stops != (scenario == 0 ? 1 : 0) || input.callback ||
+        callback->accepting || callback->references != 1)
+      return fail(error, @"A failed start stopped streams or retained a callback.");
+    if (scenario == 1 && input.calls != std::vector<std::string>{"enable"})
+      return fail(error, @"Competing startup changed an input it did not acquire.");
+  }
+
+  FakeInput shared;
+  ComRef<CaptureCallback> owner, competitor;
+  owner.value = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+  competitor.value = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+  if (startInput(&shared, owner.value, bmdMode4K2160p5994, bmdVideoInputFlagDefault) != S_OK)
+    return fail(error, @"Synthetic owner failed to start.");
+  shared.calls.clear();
+  shared.enableResult = E_ACCESSDENIED;
+  if (startInput(&shared, competitor.value, bmdMode4K2160p5994, bmdVideoInputFlagDefault) == S_OK ||
+      shared.callback != owner.value || shared.calls != std::vector<std::string>{"enable"})
+    return fail(error, @"Failed competing start disturbed the active owner's input.");
+  stopInput(&shared, owner.value);
+
+  for (int scenario = 0; scenario != 5; ++scenario) {
+    FakeInput input;
+    FakeConfiguration configuration;
+    configuration.connection = scenario == 3 ? bmdVideoConnectionOpticalSDI : bmdVideoConnectionHDMI;
+    FakeInput *inputPointer = &input;
+    FakeConfiguration *configurationPointer = &configuration;
+    [self onControlQueue:^{
+      auto lease = std::make_unique<HDMILease>();
+      lease->configuration.value = configurationPointer; configurationPointer->AddRef();
+      lease->previous = bmdVideoConnectionSDI;
+      lease->changed = scenario != 4;
+      lease->started = scenario != 1;
+      self->_connection = std::move(lease);
+      // Scenarios 1 and 2 represent never-started and already-released inputs.
+      if (scenario != 1 && scenario != 2) {
+        self->_input = inputPointer; inputPointer->AddRef();
+        self->_callback = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+      }
+      [self stop];
+      [self stop];
+    }];
+    if (configuration.writes != (scenario == 0 ? 1 : 0) || configuration.references != 1 ||
+        input.references != 1 || configuration.persistentWrites)
+      return fail(error, @"Connector restore escaped successful input ownership.");
+    if (scenario == 0 && configuration.connection != bmdVideoConnectionSDI)
+      return fail(error, @"Owned HDMI connection was not restored before input release.");
+    if ((scenario == 1 || scenario == 2) && !input.calls.empty())
+      return fail(error, @"Never-started or released input was stopped.");
+  }
+
+  // Preserve the legacy fixture's post-start callback checks as well.
+  __block int events = 0;
+  ComRef<CaptureCallback> callback;
+  callback.value = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, ^(NSString *) { ++events; });
+  FakeMode mode;
+  callback->VideoInputFormatChanged(bmdVideoInputDisplayModeChanged, &mode, bmdDetectedVideoInputYCbCr422);
+  if (events || !callback->accepting) return fail(error, @"Matching mode stopped capture.");
+  mode.mode = bmdMode4K2160p2997;
+  callback->VideoInputFormatChanged(bmdVideoInputDisplayModeChanged, &mode, bmdDetectedVideoInputYCbCr422);
+  callback->VideoInputFormatChanged(bmdVideoInputDisplayModeChanged, &mode, bmdDetectedVideoInputYCbCr422);
+  if (events != 1 || callback->accepting) return fail(error, @"Changed mode was not rejected once.");
+  ComRef<CaptureCallback> noHandlers;
+  noHandlers.value = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+  if (!noHandlers->frameHandler || !noHandlers->eventHandler)
+    return fail(error, @"Callback did not install safe no-op handlers.");
+  return YES;
+}
+
 - (BOOL)runAutoChecks:(NSError **)error {
   // Uses the production queue, callback adapter and reconfiguration method.
   // No real device is enumerated or opened by this fixture.
@@ -965,6 +1166,15 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 @end
 
 #if defined(ULTRACAM_BACKEND_TESTING)
+BOOL UltracamRunOwnershipSyntheticChecks(NSError **error) {
+#if ULTRACAM_HAS_SDK && BLACKMAGIC_DECKLINK_API_VERSION < 0x0e030000
+  UltracamBackend *backend = [UltracamBackend new];
+  return [backend runOwnershipChecks:error];
+#else
+  return fail(error, @"Ownership SDK mocks require the pinned SDK12 interfaces.");
+#endif
+}
+
 BOOL UltracamRunAutoSyntheticChecks(NSError **error) {
 #if ULTRACAM_HAS_SDK && BLACKMAGIC_DECKLINK_API_VERSION < 0x0e030000
   UltracamBackend *backend = [UltracamBackend new];

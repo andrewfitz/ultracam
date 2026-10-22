@@ -209,6 +209,12 @@ struct UISessionBridge {
 
   private func feedID(_ raw: String) -> FeedID { FeedID(rawValue: raw) }
 
+  /// Selecting reloads the camera's LUT and processing, so a tap on the camera
+  /// that's already selected (its picture, its tools, Show Inspector) must not select it again.
+  private func select(_ id: FeedID) {
+    if id != model.selectedFeedID { _ = model.selectFeed(id) }
+  }
+
   private func cameraID(number: Int) -> FeedID? {
     let descriptors = model.feedDescriptors
     return descriptors.indices.contains(number - 1) ? descriptors[number - 1].id : nil
@@ -251,8 +257,8 @@ struct UISessionBridge {
   func perform(_ action: UIAction) {
     let recording = model.recordingModel
     switch action {
-    case .select(let id): _ = model.selectFeed(feedID(id))
-    case .selectNumber(let number): if let id = cameraID(number: number) { _ = model.selectFeed(id) }
+    case .select(let id): select(feedID(id))
+    case .selectNumber(let number): if let id = cameraID(number: number) { select(id) }
     case .setLayout(let layout): interface.layout = layout; interface.expandedFrom = nil
     case .toggleCollapsed(let id):
       if interface.collapsed.contains(id) { interface.collapsed.remove(id) } else { interface.collapsed.insert(id) }
@@ -262,12 +268,12 @@ struct UISessionBridge {
     case .toggleInspector: interface.inspectorOpen.toggle()
     case .setInspectorOpen(let open): if interface.inspectorOpen != open { interface.inspectorOpen = open }
     case .setSidebarVisible(let visible): if interface.sidebarVisible != visible { interface.sidebarVisible = visible }
-    case .showInspector(let id): _ = model.selectFeed(feedID(id)); interface.inspectorOpen = true
+    case .showInspector(let id): select(feedID(id)); interface.inspectorOpen = true
     case .makeRoomForPictures:
       guard interface.sidebarVisible && interface.inspectorOpen else { break }
       if interface.lastOpenedColumn == .sidebar { interface.inspectorOpen = false } else { interface.sidebarVisible = false }
     case .expandPicture(let id):
-      _ = model.selectFeed(feedID(id))
+      select(feedID(id))
       if interface.layout != .single { interface.expandedFrom = interface.layout }
       interface.layout = .single
     case .restoreLayout:
@@ -293,14 +299,13 @@ struct UISessionBridge {
         }
       }
     case .chooseLUT(let id):
-      if model.selectedFeedID.rawValue != id { _ = model.selectFeed(feedID(id)) }
-      model.chooseLUT()
+      model.chooseLUT(feedID: feedID(id))
     case .setGamut(let id, let gamut): model.updateCamera(feedID(id)) { $0.gamut = gamut }
     case .setInput(let id, let device): model.updateCamera(feedID(id)) { $0.selectedDevice = device }
     case .refreshInputs: model.refresh()
     case .setPreviewEnabled(let id, let on): model.updateCamera(feedID(id)) { $0.previewEnabled = on }
     case .setAutomaticStart(let id, let on): model.updateCamera(feedID(id)) { $0.automaticFeed = on }
-    case .retryAutomaticStart: model.retryAutomaticFeed()
+    case .retryAutomaticStart(let id): model.retryAutomaticFeed(feedID: feedID(id))
     case .retryPreview: model.resetPreview()
     case .addCamera:
       if let id = model.addFeed(), interface.defaultCollapsed { interface.collapsed.insert(id.rawValue) }

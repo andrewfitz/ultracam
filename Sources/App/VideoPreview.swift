@@ -434,6 +434,7 @@ final class VideoPreviewRenderer: @unchecked Sendable {
         guard visible && token == generation else { return }
         videoRenderer.enqueue(preview)
         diagnostics.enqueued &+= 1
+        diagnostics.lastError = nil
 #if CAPTURE_LIFECYCLE_TESTS
         if enqueuedTimes.count == 64 {
           enqueuedTimes.removeFirst()

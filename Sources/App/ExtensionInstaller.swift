@@ -144,8 +144,18 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     services.submit(request)
   }
 
-  private func finish(_ identity: UUID, message: String) {
-    guard requestIdentity.matches(identity) else { return }
+  /// True when this callback belongs to the request that is still in flight.
+  /// A missing token still matches the active request object. A token that no
+  /// longer matches does not finish a newer request.
+  /// Takes the request's identifier: the request object itself is not Sendable.
+  private func isCurrentRequest(_ request: ObjectIdentifier) -> Bool {
+    if activeRequest.map({ ObjectIdentifier($0) == request }) == true { return true }
+    guard let token = requestIdentity.token(for: request) else { return false }
+    return requestIdentity.matches(token)
+  }
+
+  private func finish(_ request: ObjectIdentifier, message: String) {
+    guard isCurrentRequest(request) else { return }
     requestIdentity.clear()
     activeRequest?.delegate = nil
     activeRequest = nil
@@ -153,6 +163,10 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     pending = false
     status = message
   }
+
+  /// Drops the identity token while leaving the in-flight request pending.
+  /// Tests use this to cover a callback whose token was already lost.
+  func testingForgetRequestToken() { requestIdentity.clear() }
 
   nonisolated func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
     guard let identity = requestIdentity.token(for: ObjectIdentifier(request)) else { return }
@@ -163,21 +177,23 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   }
 
   nonisolated func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {
-    guard let identity = requestIdentity.token(for: ObjectIdentifier(request)) else { return }
     let completed = result == .completed
+    let request = ObjectIdentifier(request)
     Task { @MainActor in
-      guard self.requestIdentity.matches(identity) else { return }
+      guard self.isCurrentRequest(request) else { return }
       let removed = self.activeChange == .remove
-      self.finish(identity, message: completed ? (removed ? "Camera extension removed." :
+      self.finish(request, message: completed ? (removed ? "Camera extension removed." :
         "Camera extension request completed. Refresh inputs, then choose Ultracam in your meeting app.") :
         "Camera extension change requires a restart.")
     }
   }
 
   nonisolated func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
-    guard let identity = requestIdentity.token(for: ObjectIdentifier(request)) else { return }
     let description = error.localizedDescription
-    Task { @MainActor in self.finish(identity, message: "Camera extension change failed: \(description). Capture and preview still work.") }
+    let request = ObjectIdentifier(request)
+    Task { @MainActor in
+      self.finish(request, message: "Camera extension change failed: \(description). Capture and preview still work.")
+    }
   }
 
   nonisolated func request(_ request: OSSystemExtensionRequest,

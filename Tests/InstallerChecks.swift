@@ -186,6 +186,21 @@ import XCTest
     XCTAssertTrue(installer.status.contains("restart"))
   }
 
+  func testFinishClearsPendingWhenTheRequestTokenWasLost() throws {
+    let harness = InstallerHarness()
+    let installer = ExtensionInstaller(services: harness.services())
+    installer.install()
+    let request = try XCTUnwrap(harness.submitted.first)
+    installer.testingForgetRequestToken()
+    XCTAssertTrue(installer.pending)
+    installer.request(request, didFinishWithResult: .completed)
+    callbacks()
+    XCTAssertFalse(installer.pending)
+    XCTAssertTrue(installer.status.contains("meeting app"))
+    installer.install()
+    XCTAssertTrue(installer.pending)
+  }
+
   func testQueuedApprovalCannotOverwriteCompletion() throws {
     let harness = InstallerHarness()
     let installer = ExtensionInstaller(services: harness.services())

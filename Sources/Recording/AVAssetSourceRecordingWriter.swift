@@ -11,6 +11,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter {
   typealias EncodeFrame = (VTCompressionSession, CVImageBuffer, CMTime, CMTime) -> OSStatus
   private let configuration: SourceRecordingConfiguration
   private let encodeFrame: EncodeFrame
+  private let inputReady: (AVAssetWriterInput) -> Bool
+  private let appendSample: (CMSampleBuffer, AVAssetWriterInput) -> Bool
   private let lock = NSRecursiveLock()
   private var pendingFrameStarts: [Int64: UInt64] = [:]
   private static func frameKey(_ pts: CMTime) -> Int64 {
@@ -46,9 +48,12 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter {
       return VTCompressionSessionEncodeFrame(session, imageBuffer: image,
         presentationTimeStamp: pts, duration: duration, frameProperties: nil,
         sourceFrameRefcon: nil, infoFlagsOut: &flags)
-    }) throws {
+    }, inputReady: @escaping (AVAssetWriterInput) -> Bool = AVAssetSourceRecordingWriter.inputIsReady,
+    appendSample: @escaping (CMSampleBuffer, AVAssetWriterInput) -> Bool = AVAssetSourceRecordingWriter.append) throws {
     self.configuration = configuration
     self.encodeFrame = encodeFrame
+    self.inputReady = inputReady
+    self.appendSample = appendSample
   }
 
   /// Returns the generated track description for modes that do not depend on
@@ -161,27 +166,22 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter {
     try lock.withLock {
       try ensureCanAppend()
       if let lastAudioPTS, CMTimeCompare(pts, lastAudioPTS) < 0 {
-        throw SourceRecordingError.unsupportedSample("Audio timestamps moved backwards.")
+        throw SourceRecordingError.writerNotReady("The late audio sample was rejected because its timestamp moved backwards.")
       }
-      // Video establishes the pass-through format hint and therefore must be
-      // admitted before audio starts the file. Keep a bounded early packet
-      // queue while VideoToolbox produces its first compressed sample.
-      guard let audioInput else {
-        guard pendingAudio.count < Self.pendingAudioCapacity else {
-          throw SourceRecordingError.writerNotReady("Video has not established the pass-through format hint.")
-        }
-        pendingAudio.append(sample)
-        lastAudioPTS = pts
-        return
+      // Keep early and later audio in one ordered queue. A temporarily blocked
+      // input must never let newer audio overtake the early packets.
+      guard pendingAudio.count < Self.pendingAudioCapacity else {
+        throw SourceRecordingError.writerNotReady("The pending audio queue is full.")
       }
-      try ensureSession(at: pts)
-      guard Self.inputIsReady(audioInput) else {
-        throw SourceRecordingError.writerNotReady("Audio writer input is not ready.")
+      pendingAudio.append(sample)
+      pendingAudio.sort {
+        CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0),
+          CMSampleBufferGetPresentationTimeStamp($1)) < 0
       }
-      guard Self.append(sample, to: audioInput) else {
-        throw Self.writerError(writer, fallback: "Audio sample append failed.")
+      if audioInput != nil {
+        try ensureSession(at: CMSampleBufferGetPresentationTimeStamp(pendingAudio[0]))
+        try appendPendingAudio()
       }
-      lastAudioPTS = pts
     }
   }
 
@@ -441,7 +441,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter {
     }
   }
 
-  fileprivate func appendEncodedVideo(_ sample: CMSampleBuffer) {
+  func appendEncodedVideo(_ sample: CMSampleBuffer) {
     lock.withLock {
       do {
         guard !finished else {
@@ -475,27 +475,19 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter {
           return CMTimeCompare(audioPTS, pts) < 0 ? audioPTS : pts
         } ?? pts
         try ensureSession(at: sessionTime)
-        guard Self.inputIsReady(videoInput) else {
+        guard inputReady(videoInput) else {
           telemetryValue.droppedEncodedVideo &+= 1
           telemetryValue.encoderErrors &+= 1
           telemetryValue.lastError = SourceRecordingError.writerNotReady("Video writer input is not ready.").localizedDescription
           return
         }
-        guard Self.append(sample, to: videoInput) else {
+        guard appendSample(sample, videoInput) else {
           throw Self.writerError(writer, fallback: "Video sample append failed.")
         }
         telemetryValue.encodedVideo &+= 1
         telemetryValue.encodedVideoBytes &+= UInt64(CMSampleBufferGetTotalSampleSize(sample))
         try appendTimecode(for: pts)
-        if let audioInput {
-          while let pendingAudio = self.pendingAudio.first {
-            guard Self.inputIsReady(audioInput) else { break }
-            guard Self.append(pendingAudio, to: audioInput) else {
-              throw Self.writerError(writer, fallback: "Pending audio sample append failed.")
-            }
-            self.pendingAudio.removeFirst()
-          }
-        }
+        try appendPendingAudio()
       } catch {
         telemetryValue.droppedEncodedVideo &+= 1
         telemetryValue.encoderErrors &+= 1
@@ -521,31 +513,45 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter {
     let deadline = Date().addingTimeInterval(2)
     while true {
       let idle = try lock.withLock { () -> Bool in
-        guard let audioInput, !pendingAudio.isEmpty else { return true }
-        while !pendingAudio.isEmpty {
-          guard Self.inputIsReady(audioInput) else { return false }
-          guard Self.append(pendingAudio[0], to: audioInput) else {
-            throw Self.writerError(writer, fallback: "Pending audio sample append failed.")
-          }
-          pendingAudio.removeFirst()
-        }
-        return true
+        try appendPendingAudio()
+        return pendingAudio.isEmpty || audioInput == nil
       }
       if idle || Date() >= deadline { return }
       Thread.sleep(forTimeInterval: 0.005)
     }
   }
 
+  /// Called under `lock`; all audio paths share this FIFO and written PTS.
+  private func appendPendingAudio() throws {
+    guard let audioInput else { return }
+    while let sample = pendingAudio.first {
+      let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+      if let lastAudioPTS, CMTimeCompare(pts, lastAudioPTS) < 0 {
+        pendingAudio.removeFirst()
+        telemetryValue.droppedAudio &+= 1
+        continue
+      }
+      guard inputReady(audioInput) else { return }
+      guard appendSample(sample, audioInput) else {
+        throw Self.writerError(writer, fallback: "Pending audio sample append failed.")
+      }
+      lastAudioPTS = pts
+      pendingAudio.removeFirst()
+    }
+  }
+
   private func appendTimecode(for sourcePTS: CMTime) throws {
     guard let timecodeInput, let timecodeTrack, let timecodeSession else { return }
-    guard Self.inputIsReady(timecodeInput) else {
-      throw SourceRecordingError.writerNotReady("Timecode writer input is not ready.")
+    guard inputReady(timecodeInput) else {
+      telemetryValue.droppedTimecode &+= 1
+      telemetryValue.lastError = SourceRecordingError.writerNotReady("Timecode writer input is not ready.").localizedDescription
+      return
     }
     guard let value = timecodeSession.timecode(for: sourcePTS) else {
       throw SourceRecordingError.unsupportedSample("The source timestamp cannot be mapped to timecode.")
     }
     let sample = try timecodeTrack.sample(for: value, at: sourcePTS)
-    guard Self.append(sample, to: timecodeInput) else {
+    guard appendSample(sample, timecodeInput) else {
       throw Self.writerError(writer, fallback: "Timecode sample append failed.")
     }
   }

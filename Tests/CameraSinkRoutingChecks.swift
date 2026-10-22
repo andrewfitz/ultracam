@@ -42,6 +42,23 @@ import XCTest
     XCTAssertNil(CameraDemandMonitor.sourceStream([(7, "Ultracam · Feed 1 Input")], named: "Ultracam · Camera 1"))
   }
 
+  @MainActor func testSourceNamedInputIsNotChosenAsTheSink() {
+    let streams: [(id: UInt32, name: String, direction: UInt32?)] = [
+      (1, "Input Cam", nil),
+      (2, "Input Cam Input", nil),
+    ]
+    let paired = CameraStreamNames.pair(streams, sinkName: "Renamed Input", sourceName: "Renamed")
+    XCTAssertEqual(paired?.sink, 2)
+    XCTAssertEqual(paired?.source, 1)
+    XCTAssertEqual(CameraDemandMonitor.sourceStream([(1, "Input Cam"), (2, "Input Cam Input")], named: "Renamed"), 1)
+    let directed = CameraStreamNames.pair([
+      (4, "Whatever Input", 0),
+      (3, "Not the sink", 1),
+    ], sinkName: "missing", sourceName: "missing")
+    XCTAssertEqual(directed?.sink, 3)
+    XCTAssertEqual(directed?.source, 4)
+  }
+
   func testLegacyRoutePreservesOriginalSingleCameraIdentity() {
     let legacy = CameraSinkRoute(feedID: nil)
     let defaultID = CameraSinkRoute(feedID: FeedID(rawValue: "default"))

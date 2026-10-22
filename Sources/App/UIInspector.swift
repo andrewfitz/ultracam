@@ -218,7 +218,7 @@ struct UIInspectorViewContent: View {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
           }
           Spacer()
-          Button("Retry") { context.send(.retryAutomaticStart) }
+          Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }
             .help("Try starting the camera again.")
         }
       }

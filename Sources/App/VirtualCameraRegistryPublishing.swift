@@ -37,8 +37,11 @@ extension VirtualCameraRegistrySnapshot {
     } else {
       currentGeneration = 0
     }
+    // UInt64.max cannot be advanced. Saving it is rejected, which keeps a
+    // client from freezing every later publish by exhausting the counter.
+    let generation = currentGeneration == UInt64.max ? currentGeneration : currentGeneration + 1
     return VirtualCameraRegistrySnapshot(
-      generation: currentGeneration == UInt64.max ? UInt64.max : currentGeneration + 1,
+      generation: generation,
       appGroupIdentifier: appGroupIdentifier,
       devices: devices)
   }

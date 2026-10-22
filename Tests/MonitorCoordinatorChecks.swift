@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import MonitorToolsCore
+import MonitorToolsMetal
 import XCTest
 
 @MainActor @objcMembers final class MonitorCoordinatorChecks: XCTestCase {
@@ -14,6 +15,74 @@ import XCTest
         FeedDescriptor(id: FeedID(rawValue: "beta"), name: "Tight"),
       ], programAvailable: false)
     return value
+  }
+
+  func testFreezingTheOnlySurfacePreservesDemandUntilHideOrClose() throws {
+    let value = coordinator()
+    var policy = AutomaticFeedPolicy()
+    var demand: Set<MonitorTargetID> = []
+    value.onDemandChange = {
+      demand = $0
+      policy.previewDemand($0.contains(self.alpha))
+    }
+    let id = UUID()
+    let presenter = value.surface(id: id, target: alpha)
+    value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
+    XCTAssertEqual(policy.action(ready: true, running: false), .start)
+    var pixelBuffer: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA,
+      nil, &pixelBuffer), kCVReturnSuccess)
+    let copied = expectation(description: "synthetic owned freeze picture")
+    let service = CleanPreviewService()
+    let stamp = MonitorFrameStamp(target: alpha, generation: 1, sequence: 1,
+      sourcePTS: 0, hostTime: ProcessInfo.processInfo.systemUptime, configurationRevision: 1)
+    XCTAssertTrue(service.offer(MonitorFrameBundle(stamp: stamp, source: try XCTUnwrap(pixelBuffer))) {
+      result in
+      if let clean = try? result.get() {
+        presenter.accept(MonitorDisplayResult(clean: clean, configuration: MonitorConfiguration()))
+      } else { XCTFail("Synthetic clean copy failed") }
+      copied.fulfill()
+    })
+    wait(for: [copied], timeout: 3)
+    presenter.setClean(false)
+    presenter.toggleFreeze()
+    XCTAssertTrue(presenter.isFrozen)
+    value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
+    XCTAssertEqual(demand, [alpha])
+    XCTAssertNil(policy.action(ready: true, running: true))
+    XCTAssertFalse(value.captureSink(for: alpha).needsOutput, "Freeze holds display without pixel work")
+    value.setPreviewEnabled(false, for: alpha)
+    XCTAssertTrue(demand.isEmpty)
+    XCTAssertEqual(policy.action(ready: true, running: true), .stop)
+    value.setPreviewEnabled(true, for: alpha)
+    XCTAssertEqual(demand, [alpha])
+    value.unregisterSurface(id: id)
+    XCTAssertTrue(demand.isEmpty)
+  }
+
+  func testPausedDiagnosticsAndLayoutCapsFollowCurrentState() {
+    var saved = MonitorWorkspaceState()
+    saved.layout = .fourUp
+    let restored = MonitorCoordinator(workspace: saved)
+    XCTAssertEqual(restored.diagnostics(for: alpha).requestedPictureHz, 30)
+    restored.workspace.layout = .sideBySide
+    XCTAssertEqual(restored.diagnostics(for: alpha).requestedPictureHz, 60)
+    let value = coordinator()
+    let id = UUID()
+    let presenter = value.surface(id: id, target: alpha)
+    value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
+    for layout in MonitorWorkspaceLayout.allCases {
+      value.workspace.layout = layout
+      XCTAssertEqual(value.diagnostics(for: alpha).requestedPictureHz, layout == .fourUp ? 30 : 60)
+    }
+    value.workspace.layout = .single
+    XCTAssertEqual(value.diagnostics(for: alpha).requestedPictureHz, 60)
+    presenter.onVisibilityChange?(true, false)
+    XCTAssertEqual(value.diagnostics(for: alpha).availability, .paused)
+    presenter.onVisibilityChange?(true, true)
+    XCTAssertNotEqual(value.diagnostics(for: alpha).availability, .paused)
+    value.setPreviewEnabled(false, for: alpha)
+    XCTAssertEqual(value.diagnostics(for: alpha).availability, .paused)
   }
 
   func testWindowVisibilityFreezeAndPreviewHideHaveIndependentDemand() {
@@ -32,7 +101,7 @@ import XCTest
     first.onVisibilityChange?(true, true)
     XCTAssertTrue(value.captureSink(for: alpha).needsOutput)
     value.registerSurface(id: a, target: alpha, isVisible: false, scopeVisible: false)
-    XCTAssertEqual(demand, [beta], "Freezing one surface leaves the other feed live")
+    XCTAssertEqual(demand, [beta], "Hiding one surface leaves the other feed live")
     value.setPreviewEnabled(false, for: beta)
     XCTAssertEqual(demand, [])
     XCTAssertFalse(value.captureSink(for: beta).needsOutput)
@@ -86,7 +155,7 @@ import XCTest
     XCTAssertEqual(demand, [beta])
     value.setPreviewEnabled(true, for: alpha)
     value.registerSurface(id: a, target: alpha, isVisible: false, scopeVisible: false)
-    XCTAssertEqual(demand, [beta], "A frozen surface cannot stop another live feed")
+    XCTAssertEqual(demand, [beta], "A hidden surface cannot stop another live feed")
     XCTAssertTrue(value.captureSink(for: beta).needsOutput)
   }
 
@@ -146,7 +215,7 @@ import XCTest
     XCTAssertTrue(value.captureSink(for: alpha).needsOutput)
     value.registerSurface(id: b, target: alpha, isVisible: false, scopeVisible: false)
     XCTAssertTrue(value.captureSink(for: alpha).needsOutput,
-      "Freezing the other surface must leave this live scope consumer active")
+      "Hiding the other surface must leave this live scope consumer active")
     value.registerSurface(id: a, target: alpha, isVisible: false, scopeVisible: true)
     XCTAssertFalse(value.captureSink(for: alpha).needsOutput)
     XCTAssertEqual(demand, [])

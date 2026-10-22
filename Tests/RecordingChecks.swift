@@ -236,6 +236,76 @@ private func assertEnqueued(_ result: Result<Void, RecordingError>,
     XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("recording-stress-segment-000000.part").path))
   }
 
+  func testFailurePreservesTheActivePartWithWrittenMedia() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("ultracam-preserved-part-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = AtomicRecordingSegmentWriter(directory: directory, sessionID: "kept")
+    let disk = FixedDiskSpace(1_000)
+    let session = try LongRunRecordingSession(configuration: LongRunRecordingConfiguration(
+      minimumFreeBytes: 100, outputDirectory: directory), diskSpace: disk, writer: writer)
+    try session.start()
+    assertEnqueued(session.enqueue(RecordingPacket(mediaKind: .video, presentationTime: .zero,
+      duration: CMTime(value: 1, timescale: 30), payload: Data([1, 2, 3]))))
+    try session.drain()
+    let part = directory.appendingPathComponent("recording-kept-segment-000000.part")
+    let original = try Data(contentsOf: part)
+    XCTAssertGreaterThan(original.count, 3)
+    disk.bytes = 99
+    assertEnqueued(session.enqueue(RecordingPacket(mediaKind: .video,
+      presentationTime: CMTime(value: 1, timescale: 30), duration: CMTime(value: 1, timescale: 30))))
+    XCTAssertThrowsError(try session.drain())
+    XCTAssertEqual(session.currentState, .failed)
+    XCTAssertEqual(try Data(contentsOf: part), original)
+  }
+
+  func testLateAudioBeforeRolloverIsDroppedWithoutFailingSegment() throws {
+    let writer = MemorySegmentWriter()
+    let session = try LongRunRecordingSession(configuration: LongRunRecordingConfiguration(
+      maximumSegmentDuration: CMTime(value: 1, timescale: 1),
+      maximumAVDrift: CMTime(value: 2, timescale: 1), minimumFreeBytes: 0,
+      outputDirectory: URL(fileURLWithPath: "/tmp/ultracam-recording-test")),
+      diskSpace: FixedDiskSpace(Int64.max), writer: writer)
+    try session.start()
+    for (kind, time): (RecordingMediaKind, Int64) in [(.video, 0), (.audio, 0),
+      (.video, 10), (.audio, 5), (.audio, 10)] {
+      assertEnqueued(session.enqueue(RecordingPacket(mediaKind: kind,
+        presentationTime: CMTime(value: time, timescale: 10), duration: CMTime(value: 1, timescale: 10))))
+      try session.drain()
+    }
+    let summary = try session.finish()
+    XCTAssertEqual(summary.packetCount, 4)
+    XCTAssertEqual(summary.finalState, .finalized)
+    XCTAssertEqual(writer.segments.count, 2)
+    XCTAssertEqual(writer.segments[0].packets.count, 2)
+    XCTAssertEqual(writer.segments[1].packets.count, 2)
+    XCTAssertTrue(writer.segments[1].packets.allSatisfy { CMTimeCompare($0.presentationTime, writer.segments[1].start) >= 0 })
+  }
+
+  func testResumeKeepsVideoAfterTheLastWrittenVideoDespiteTrailingAudio() throws {
+    let writer = MemorySegmentWriter()
+    let session = try LongRunRecordingSession(configuration: LongRunRecordingConfiguration(
+      maximumAVDrift: CMTime(value: 10, timescale: 1), minimumFreeBytes: 0,
+      outputDirectory: URL(fileURLWithPath: "/tmp/ultracam-recording-test")),
+      diskSpace: FixedDiskSpace(Int64.max), writer: writer)
+    try session.start()
+    for (kind, time): (RecordingMediaKind, Int64) in [(.video, 0), (.video, 10), (.audio, 5)] {
+      assertEnqueued(session.enqueue(RecordingPacket(mediaKind: kind,
+        presentationTime: CMTime(value: time, timescale: 10), duration: CMTime(value: 1, timescale: 10))))
+      try session.drain()
+    }
+    try session.pause()
+    try session.resume()
+    assertEnqueued(session.enqueue(RecordingPacket(mediaKind: .video,
+      presentationTime: CMTime(value: 100, timescale: 1), duration: CMTime(value: 1, timescale: 10))))
+    try session.drain()
+    let video = writer.segments.flatMap(\.packets).filter { $0.packet.mediaKind == .video }
+    XCTAssertEqual(video.count, 3)
+    XCTAssertEqual(video.last?.presentationTime, CMTime(value: 11, timescale: 10))
+    XCTAssertGreaterThan(CMTimeCompare(video[2].presentationTime, video[1].presentationTime), 0)
+    XCTAssertEqual(try session.finish().finalState, .finalized)
+  }
+
   static let allTests = [
     ("large packet monotonicity", testNormalizerRemainsMonotonicAcrossLargePacketCount),
     ("29.97 audio rounding", testNormalizerAcceptsAlternating2997AudioPackets),

@@ -73,12 +73,23 @@ private struct UIAppSurfacePicture: View {
   private var scopesShown: Bool {
     previewEnabled && displayConfiguration.toolsEnabled && displayConfiguration.scopes.enabled
   }
-  /// Matches the original tile: only the selected camera, showing its
-  /// processed output with no tools and no freeze, uses the native renderer.
+  /// The selected camera's processed output uses the native renderer, which shows
+  /// every frame, whenever no tool changes the picture's pixels. Guides draw on top
+  /// and scopes are computed beside it; only zebra, false color, focus peaking, a
+  /// source picture or a freeze need the monitor's composited picture.
   private var usesNativePreview: Bool {
     !isProgram && target.rawValue == model.selectedFeedID.rawValue
       && configuration.pictureStage == .processedOutput
-      && !configuration.toolsEnabled && !presenter.isFrozen && !presenter.isFreezePending
+      && !Self.altersPicture(configuration) && !presenter.isFrozen && !presenter.isFreezePending
+  }
+
+  private static func altersPicture(_ configuration: MonitorConfiguration) -> Bool {
+    configuration.toolsEnabled
+      && (configuration.zebra.enabled || configuration.falseColor.mode != .off || configuration.focus.enabled)
+  }
+
+  private var guidesShown: Bool {
+    displayConfiguration.toolsEnabled && displayConfiguration.guides.enabled && !presenter.isClean
   }
 
   var body: some View {
@@ -89,10 +100,16 @@ private struct UIAppSurfacePicture: View {
       } else if usesNativePreview {
         VideoPreview(renderer: compact ? model.miniPreviewRenderer : model.previewRenderer)
           .overlay { MonitorSurfaceVisibility(presenter: presenter).allowsHitTesting(false) }
+        if guidesShown {
+          // The processed output is always 16:9.
+          MonitorGuideOverlay(settings: displayConfiguration.guides)
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .allowsHitTesting(false)
+        }
       } else {
         ZStack {
           MonitorNativePicture(presenter: presenter)
-          if displayConfiguration.toolsEnabled && displayConfiguration.guides.enabled && !presenter.isClean {
+          if guidesShown {
             MonitorGuideOverlay(settings: displayConfiguration.guides)
               .aspectRatio(presenter.pictureAspectRatio, contentMode: .fit)
           }
@@ -154,7 +171,7 @@ private struct UIAppSurfacePicture: View {
   private func register() {
     if !isProgram && !compact { UIMonitorBridge.setUsesNativePreview(usesNativePreview, cameraID: target.rawValue) }
     coordinator.registerSurface(
-      id: surfaceID, target: target, isVisible: previewEnabled && !presenter.isFrozen,
+      id: surfaceID, target: target, isVisible: previewEnabled,
       scopeVisible: configuration.toolsEnabled && configuration.scopes.enabled && !presenter.isFrozen
         && previewEnabled && !compact,
       usesNativePreview: usesNativePreview,

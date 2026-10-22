@@ -312,6 +312,31 @@ struct CameraSinkRoute: Equatable, Sendable {
   }
 }
 
+/// Pairs a virtual camera's source and input streams without treating a
+/// display name that merely contains "input" as the sink.
+enum CameraStreamNames {
+  static func pair(_ streams: [(id: UInt32, name: String, direction: UInt32?)],
+    sinkName: String, sourceName: String) -> (sink: UInt32, source: UInt32)? {
+    let sinkByDirection = streams.first { $0.direction == 1 }?.id
+    let sourceByDirection = streams.first { $0.direction == 0 && $0.id != sinkByDirection }?.id
+    if let sinkByDirection, let sourceByDirection { return (sinkByDirection, sourceByDirection) }
+    if let sink = streams.first(where: { $0.name == sinkName })?.id,
+      let source = streams.first(where: { $0.name == sourceName && $0.id != sink })?.id {
+      return (sink, source)
+    }
+    guard streams.count == 2 else { return nil }
+    let first = streams[0]
+    let second = streams[1]
+    if first.name == second.name + " Input" { return (first.id, second.id) }
+    if second.name == first.name + " Input" { return (second.id, first.id) }
+    if let source = streams.first(where: { $0.name == sourceName }) {
+      guard let sink = streams.first(where: { $0.id != source.id }) else { return nil }
+      return (sink.id, source.id)
+    }
+    return nil
+  }
+}
+
 final class CameraSink {
   private var deviceID: CMIODeviceID = 0
   private var streamID: CMIOStreamID = 0
@@ -356,19 +381,15 @@ final class CameraSink {
       let streams = try ids(id, selector: kCMIODevicePropertyStreams)
       let format = try VideoContract.formatDescription(width: configuration.width, height: configuration.height,
         pixelFormat: configuration.untouched ? passthroughFormat : configuration.pixelFormat)
-      let namedStreams = try streams.map { ($0, try string($0, selector: kCMIOObjectPropertyName)) }
-      // The UID selects the feed. Stream display names may be customized in
-      // the registry, so use the deterministic names first and then infer the
-      // two-stream source/input pair within that already selected device.
-      let sinkStream = namedStreams.first(where: { $0.1 == route.sinkStreamName })?.0
-        ?? namedStreams.first(where: { name in
-          let value = name.1.localizedCaseInsensitiveContains("input") ||
-            name.1.localizedCaseInsensitiveContains("sink")
-          return value
-        })?.0
-      let sourceStream = namedStreams.first(where: { $0.1 == route.sourceStreamName })?.0
-        ?? namedStreams.first(where: { $0.0 != sinkStream })?.0
-      guard let sinkStream, let sourceStream, sourceStream != sinkStream else {
+      let namedStreams = try streams.map { stream -> (id: UInt32, name: String, direction: UInt32?) in
+        (stream, try string(stream, selector: kCMIOObjectPropertyName), direction(stream))
+      }
+      // The UID selects the feed. Match the published names, then the
+      // source/input pair. A display name that contains "input" is still the
+      // source; the input stream is the one named "<source> Input" or the
+      // stream whose direction is into the device.
+      guard let paired = CameraStreamNames.pair(namedStreams, sinkName: route.sinkStreamName,
+        sourceName: route.sourceStreamName) else {
         throw VideoError.message("The virtual camera for \(route.feedID ?? "legacy") does not publish its source and input streams.")
       }
       // AVFoundation clients such as Zoom claim device control before starting
@@ -377,7 +398,7 @@ final class CameraSink {
       // itself; don't require stealing another client's device-control lease.
       do {
         if !controlledByAnotherProcess(id) {
-          for stream in [sinkStream, sourceStream] {
+          for stream in [paired.sink, paired.source] {
             var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyFormatDescription),
               mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
             var description = Unmanaged.passUnretained(format).toOpaque()
@@ -394,14 +415,14 @@ final class CameraSink {
         guard controlledByAnotherProcess(id) else { throw error }
       }
       var unmanaged: Unmanaged<CMSimpleQueue>?
-      try check(CMIOStreamCopyBufferQueue(sinkStream, cameraSinkQueueAltered, nil, &unmanaged), "Open camera queue")
+      try check(CMIOStreamCopyBufferQueue(paired.sink, cameraSinkQueueAltered, nil, &unmanaged), "Open camera queue")
       guard let unmanaged else { throw VideoError.message("Camera queue is unavailable.") }
       queue = CameraBufferQueue(unmanaged.takeRetainedValue())
       negotiatedFormat = format
       negotiatedDuration = configuration.duration
       deviceID = id
-      streamID = sinkStream
-      do { try check(CMIODeviceStartStream(id, sinkStream), "Start virtual camera input") }
+      streamID = paired.sink
+      do { try check(CMIODeviceStartStream(id, paired.sink), "Start virtual camera input") }
       catch { disconnect(); throw error }
       return
     }
@@ -488,6 +509,15 @@ final class CameraSink {
       try check(CMIOObjectGetPropertyData(object, &address, 0, nil, size, &size, bytes.baseAddress!), "Read camera list")
     }
     return values
+  }
+
+  private func direction(_ object: CMIOObjectID) -> UInt32? {
+    var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyDirection),
+      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard CMIOObjectGetPropertyData(object, &address, 0, nil, size, &size, &value) == noErr else { return nil }
+    return value
   }
 
   private func string(_ object: CMIOObjectID, selector: Int) throws -> String {

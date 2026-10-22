@@ -79,6 +79,12 @@ final class CaptureController: @unchecked Sendable {
   private var accepting = false
   private var activeFeedID: FeedID?
   private var recordingCallbacks: [FeedID: SourceRecordingCallbackAdapter.Callbacks] = [:]
+  // Bumped under `lock` on every setRecordingCallbacks. stop()'s queued
+  // cleanup captures the value it observed and must not delete a newer map.
+  private var recordingCallbackGeneration: UInt64 = 0
+  // FeedCapturePool sets this only after it has released the device. A start
+  // on that discarded object must not open a second backend.
+  private var retiredFromPool = false
   // Keep admission counters per generation. A driver callback may pass the
   // lock just before Stop advances the generation and enqueue stale work just
   // after the next Start begins; one global counter would underflow when that
@@ -87,6 +93,9 @@ final class CaptureController: @unchecked Sendable {
   private var mediaInFlight: [UInt64: UInt64] = [:]
   private var callbackDrops: UInt64 = 0
   private var mediaDropSamples: UInt64 = 0
+  /// Admission drops already included in `mediaDropSamples`. The next packet's
+  /// timestamp gap covers those same samples, so they must not be added again.
+  private var accountedAdmissionAudioDrops: UInt64 = 0
   private var sourceDrops: UInt64 = 0
   private var sourceDuration = VideoContract.fastDuration
   private var lastSourcePTS: CMTime?
@@ -199,6 +208,7 @@ final class CaptureController: @unchecked Sendable {
   }
 
   func setCameraOutputEnabled(_ enabled: Bool) {
+    let token = lock.withLock { generation }
     syncOnQueue {
       cameraOutputEnabled = enabled
       if enabled {
@@ -208,6 +218,8 @@ final class CaptureController: @unchecked Sendable {
       }
       services.disconnect()
       cameraConnected = false
+      cameraMessage = "Ultracam camera not connected"
+      publishCurrent(token: token)
     }
   }
 
@@ -252,7 +264,8 @@ final class CaptureController: @unchecked Sendable {
 
   private func start(feedID: FeedID?, deviceID: String, configuration: PipelineConfiguration,
     pipelineEnabled: Bool, previewEnabled: Bool) {
-    let token = lock.withLock {
+    let token = lock.withLock { () -> UInt64? in
+      if retiredFromPool { return nil }
       generation &+= 1
       accepting = false
       // Any callbacks admitted for the previous generation are stale once a
@@ -264,6 +277,7 @@ final class CaptureController: @unchecked Sendable {
       activeFeedID = feedID
       return generation
     }
+    guard let token else { return }
     queue.async { [self] in
       guard self.isCurrent(token) else { return }
       self.stopNotified = false
@@ -299,6 +313,7 @@ final class CaptureController: @unchecked Sendable {
         self.audioSamples = 0
         self.audioBytes = 0
         self.audioDrops = 0
+        self.accountedAdmissionAudioDrops = 0
         self.audioPeakLeft = 0
         self.audioPeakRight = 0
         self.audioRMSLeft = 0
@@ -351,6 +366,7 @@ final class CaptureController: @unchecked Sendable {
           self.callbackDrops = 0
           self.sourceDrops = 0
           self.mediaDropSamples = 0
+          self.accountedAdmissionAudioDrops = 0
           self.lastSourcePTS = nil
           self.sourceDuration = configuration.inputFast ? VideoContract.fastDuration : VideoContract.slowDuration
           self.lastReceived = ProcessInfo.processInfo.systemUptime
@@ -489,28 +505,66 @@ final class CaptureController: @unchecked Sendable {
   }
 
   func stop() {
-    let stopped = lock.withLock { () -> (UInt64, UInt64, MonitorCaptureSink?) in
+    let request = makeStopRequest()
+    request.sink?.invalidate(rejectingCaptureGeneration: request.stoppedGeneration)
+    // Admission is dropped under the lock above. Cleanup stays queued so a
+    // capture worker blocked in preview or GPU work cannot deadlock stop().
+    queue.async { self.performStop(request) }
+  }
+
+  private struct StopRequest {
+    var token: UInt64
+    var stoppedGeneration: UInt64
+    var callbackGeneration: UInt64
+    var sink: MonitorCaptureSink?
+  }
+
+  private func makeStopRequest() -> StopRequest {
+    lock.withLock {
       let stoppedGeneration = generation
       generation &+= 1
       accepting = false
       inFlight.removeAll(keepingCapacity: true)
       mediaInFlight.removeAll(keepingCapacity: true)
       activeFeedID = nil
-      return (generation, stoppedGeneration, monitorLifecycleSink)
+      return StopRequest(token: generation, stoppedGeneration: stoppedGeneration,
+        callbackGeneration: recordingCallbackGeneration, sink: monitorLifecycleSink)
     }
-    let token = stopped.0
-    stopped.2?.invalidate(rejectingCaptureGeneration: stopped.1)
-    queue.async {
-      guard self.isCurrent(token) else { return }
-      guard !self.stopNotified else { return }
-      self.stopNotified = true
-      self.stopResources()
-      self.detected = nil
-      self.inputLabel = "No signal"
-      self.outputLabel = ""
-      self.applied = nil
-      self.message = "Stopped"
-      self.publishCurrent(token: token, stopped: true)
+  }
+
+  private func performStop(_ request: StopRequest) {
+    guard isCurrent(request.token) else { return }
+    guard !stopNotified else { return }
+    stopNotified = true
+    stopResources(callbackGeneration: request.callbackGeneration)
+    detected = nil
+    inputLabel = "No signal"
+    outputLabel = ""
+    applied = nil
+    message = "Stopped"
+    publishCurrent(token: request.token, stopped: true)
+  }
+
+  /// Finishes `stopResources` before returning when called off the capture
+  /// queue. Nil means a newer start won; the caller must keep this controller.
+  /// `fileprivate` so `FeedCapturePool.remove` in this file can call it.
+  fileprivate func stopReleasingResources() -> UInt64? {
+    let request = makeStopRequest()
+    request.sink?.invalidate(rejectingCaptureGeneration: request.stoppedGeneration)
+    syncOnQueue { self.performStop(request) }
+    return lock.withLock {
+      generation == request.token && !accepting ? request.token : nil
+    }
+  }
+
+  /// Shares `lock` with `start` so removal and a racing start cannot both own
+  /// the device. Already-retired generations stay retired.
+  /// `fileprivate` so `FeedCapturePool.remove` in this file can call it.
+  fileprivate func retireIfStillStopped(_ token: UInt64) -> Bool {
+    lock.withLock {
+      guard generation == token, !accepting else { return false }
+      retiredFromPool = true
+      return true
     }
   }
 
@@ -523,6 +577,7 @@ final class CaptureController: @unchecked Sendable {
   func setRecordingCallbacks(feedID: FeedID,
     callbacks: SourceRecordingCallbackAdapter.Callbacks?) {
     lock.withLock {
+      recordingCallbackGeneration &+= 1
       if let callbacks { recordingCallbacks[feedID] = callbacks }
       else { recordingCallbacks.removeValue(forKey: feedID) }
     }
@@ -536,7 +591,8 @@ final class CaptureController: @unchecked Sendable {
     lock.withLock { accepting && activeFeedID != nil }
   }
 
-  private func stopResources(preserveRecordingCallbacks: Bool = false) {
+  private func stopResources(preserveRecordingCallbacks: Bool = false,
+    callbackGeneration: UInt64? = nil) {
     watchdog?.cancel()
     watchdog = nil
     if let activity = realtimeActivity { ProcessInfo.processInfo.endActivity(activity) }
@@ -556,7 +612,13 @@ final class CaptureController: @unchecked Sendable {
     processor?.releaseIdleResources()
     preparedConfiguration = nil
     if !preserveRecordingCallbacks {
-      lock.withLock { recordingCallbacks.removeAll(keepingCapacity: true) }
+      lock.withLock {
+        // Callbacks installed after this stop began belong to the next take.
+        // The following start preserves the map, so wiping them here leaves
+        // that take with no picture or audio.
+        if let callbackGeneration, recordingCallbackGeneration != callbackGeneration { return }
+        recordingCallbacks.removeAll(keepingCapacity: true)
+      }
     }
   }
 
@@ -640,6 +702,9 @@ final class CaptureController: @unchecked Sendable {
       cameraMessage = "Ultracam camera connected. Choose it in your meeting app."
     } catch {
       cameraMessage = "Camera output unavailable — \(error.localizedDescription)"
+      // Only a lost connection retries. Each attempt blocks the capture queue
+      // for up to seconds, so a camera that never connected (extension not
+      // running) would stall capture three more times before giving up.
       if wasConnected { beginCameraRecovery() }
     }
     activeConfiguration = next
@@ -802,7 +867,12 @@ final class CaptureController: @unchecked Sendable {
         if elapsed > 0 {
           let expected = Int((elapsed * EmbeddedAudioFormat.sampleRate).rounded())
           if expected > Int(lastAudioSampleFrames) {
-            audioDrops &+= UInt64(expected - Int(lastAudioSampleFrames))
+            let missing = UInt64(expected - Int(lastAudioSampleFrames))
+            let admission = lock.withLock { mediaDropSamples }
+            let fresh = admission > accountedAdmissionAudioDrops ? admission - accountedAdmissionAudioDrops : 0
+            let overlap = min(missing, fresh)
+            accountedAdmissionAudioDrops += overlap
+            audioDrops &+= missing - overlap
           }
         }
       }
@@ -1142,13 +1212,26 @@ final class FeedCapturePool: @unchecked Sendable {
   /// routed into a replacement backend for the same feed ID.
   @discardableResult
   func remove(_ feedID: FeedID) -> Bool {
-    lock.withLock {
-      guard let controller = controllers[feedID] else { return true }
-      guard !controller.hasActiveFeed else { return false }
-      controller.stop()
-      controllers.removeValue(forKey: feedID)
+    lock.lock()
+    guard let controller = controllers[feedID] else {
+      lock.unlock()
       return true
     }
+    if controller.hasActiveFeed {
+      lock.unlock()
+      return false
+    }
+    lock.unlock()
+    // Release the device before dropping the controller. Do not hold this
+    // lock across the capture queue: stop syncs when invoked off that queue.
+    // A start that wins the generation race keeps the live controller.
+    guard let token = controller.stopReleasingResources() else { return false }
+    lock.lock()
+    defer { lock.unlock() }
+    guard controllers[feedID] === controller else { return true }
+    guard controller.retireIfStillStopped(token) else { return false }
+    controllers.removeValue(forKey: feedID)
+    return true
   }
 
   func stop(_ feedID: FeedID) {

@@ -236,7 +236,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
     let nonce = pathNonce
     pathNonce &+= 1
     let take = String(format: "%03llu", nonce + 1)
-    let stemBase = "\(feedID)_\(Self.fileTimestamp())_\(take)"
+    let stemBase = "\(feedID)_\(Self.fileTimestamp())_\(take)_\(sessionID.uuidString)"
     var stem = stemBase
     var suffix = 2
     while fileManager.fileExists(atPath: feedDirectory.appendingPathComponent(".\(stem).partial").path)
@@ -426,10 +426,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     guard let handle else {
       if externalWriterOwnsFile {
-        // The external writer appends directly to the temporary URL. Byte
-        // accounting is unavailable here, but finalization still verifies
-        // that it produced a file before renaming it.
-        throw RecordingOutputError.invalidState(stateValue, operation: "append data")
+        throw RecordingOutputError.ioFailure("Cannot append data while the external writer owns the output file.")
       }
       stateValue = .failed
       releaseReservationLocked()
@@ -456,6 +453,28 @@ public final class RecordingOutputSession: @unchecked Sendable {
       releaseReservationLocked()
       throw RecordingOutputError.ioFailure(error.localizedDescription)
     }
+  }
+
+  /// Called on the recorder queue before more media reaches the external
+  /// writer. Written bytes consume the initial reservation; counting them
+  /// again as reserved space would reject a take that still has room.
+  public func checkExternalWriterCapacity() throws {
+    lock.lock(); defer { lock.unlock() }
+    // Samples admitted just before a pause still reach the writer after the
+    // session is paused. Space is rechecked once recording resumes.
+    if externalWriterOwnsFile, stateValue == .paused { return }
+    guard externalWriterOwnsFile, stateValue == .recording else {
+      throw RecordingOutputError.invalidState(stateValue, operation: "check external writer space")
+    }
+    if manager.fileManagerRef.fileExists(atPath: paths.temporaryFile.path) {
+      let attributes = try manager.fileManagerRef.attributesOfItem(atPath: paths.temporaryFile.path)
+      let written = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+      let consumed = min(reservedBytes, written > bytesWrittenValue ? written - bytesWrittenValue : 0)
+      manager.release(reserved: consumed)
+      reservedBytes -= consumed
+      bytesWrittenValue = written
+    }
+    try manager.reserveAdditional(0)
   }
 
   public func finish() throws -> URL {

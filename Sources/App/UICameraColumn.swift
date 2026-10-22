@@ -128,7 +128,7 @@ struct UICameraPictureView: View {
     case .stopped where camera.automaticStartFailed:
       UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "Couldn't start \(camera.name)", compact: compact,
         detail: startFailureDetail) {
-        Button("Retry", systemImage: "arrow.clockwise") { context.send(.retryAutomaticStart) }
+        Button("Retry", systemImage: "arrow.clockwise") { context.send(.retryAutomaticStart(cameraID: camera.id)) }
       }
     case .stopped:
       UIPicturePlaceholder(symbol: "video", title: "Camera stopped", compact: compact, detail: "Start the camera to see its HDMI input.") {
@@ -505,7 +505,7 @@ struct UIChannelStripView: View {
         Text("Couldn't start \(camera.name)").font(.uiRowEmphasis)
         Text(snapshot?.automaticStatus ?? "").font(.uiRow).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
         Spacer(minLength: 4)
-        Button("Retry") { context.send(.retryAutomaticStart) }.controlSize(.small)
+        Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }.controlSize(.small)
           .help("Try starting the camera again.")
       }
       .accessibilityElement(children: .contain)
@@ -573,7 +573,7 @@ struct UIChannelStripView: View {
       .accessibilityLabel("Stop \(camera.name)")
     } else if camera.automaticStartFailed {
       // One problem, one action: the same Retry the picture offers.
-      Button { context.send(.retryAutomaticStart) } label: {
+      Button { context.send(.retryAutomaticStart(cameraID: camera.id)) } label: {
         if compact { Image(systemName: "arrow.clockwise") } else { Label("Retry", systemImage: "arrow.clockwise") }
       }
       .controlSize(.small)
@@ -873,7 +873,7 @@ struct UIChannelStripView: View {
       tallyBadge
       collapsedState
       if camera.automaticStartFailed {
-        Button("Retry") { context.send(.retryAutomaticStart) }.controlSize(.small)
+        Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }.controlSize(.small)
           .help("Couldn't start \(camera.name). Try starting the camera again.")
       }
       if camera.lutError != nil {

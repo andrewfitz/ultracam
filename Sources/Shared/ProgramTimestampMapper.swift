@@ -151,6 +151,14 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
       programTime: mappedTime, programDuration: mappedDuration))
   }
 
+  /// Keeps the Program clock across a scheduler rebuild. Source origins are
+  /// not copied: the next frame establishes those against this Program time.
+  public mutating func carryTimeline(from other: ProgramTimestampMapper<SourceID>) {
+    guard programTimescale == other.programTimescale else { return }
+    lastProgramTime = other.lastProgramTime
+    lastProgramDuration = other.lastProgramDuration
+  }
+
   private func nextProgramTime() -> CMTime {
     guard let lastProgramTime else { return .zero }
     guard let lastProgramDuration else { return lastProgramTime }
@@ -187,8 +195,17 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
   public private(set) var pendingCut: SourceID?
   public private(set) var pendingCutTime: CMTime? = nil
   public private(set) var mapper: ProgramTimestampMapper<SourceID>
+  /// How long the on-air source stays held while a pending target produces
+  /// no valid frame. The skip itself stays in place until this elapses.
+  public var pendingCutTimeout: TimeInterval = 2
 
   private var availability: [SourceID: Bool] = [:]
+  private var pendingCutRequestedAt: TimeInterval?
+  private var clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+
+  public mutating func setClock(_ clock: @escaping () -> TimeInterval) {
+    self.clock = clock
+  }
 
   public init(selectedSource: SourceID? = nil, programTimescale: Int32 = 60_000) {
     self.selectedSource = selectedSource
@@ -203,8 +220,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
   public mutating func setSource(_ sourceID: SourceID, available: Bool) {
     availability[sourceID] = available
     if !available, pendingCut == sourceID {
-      pendingCut = nil
-      pendingCutTime = nil
+      clearPendingCut()
     }
   }
 
@@ -219,8 +235,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     if sourceID == selectedSource {
       // A rapid A → B → A request resolves to the already selected source;
       // discard the pending B cut instead of emitting a duplicate A cut.
-      pendingCut = nil
-      pendingCutTime = nil
+      clearPendingCut()
       return .ignoredSameSource
     }
     if let pendingCut {
@@ -242,18 +257,38 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
         // director and Program route out of sync.
         return .coalesced(previous: pendingCut, replacement: sourceID)
       }
+      notePendingTarget(sourceID)
       self.pendingCut = sourceID
       self.pendingCutTime = noEarlierThan
       return .coalesced(previous: pendingCut, replacement: sourceID)
     }
+    notePendingTarget(sourceID)
     pendingCut = sourceID
     pendingCutTime = noEarlierThan
     return .queued
   }
 
   public mutating func cancelPendingCut() {
+    clearPendingCut()
+  }
+
+  public mutating func carryTimeline(from other: ProgramCutScheduler<SourceID>) {
+    mapper.carryTimeline(from: other.mapper)
+  }
+
+  private mutating func notePendingTarget(_ sourceID: SourceID) {
+    if pendingCut != sourceID { pendingCutRequestedAt = clock() }
+  }
+
+  private mutating func clearPendingCut() {
     pendingCut = nil
     pendingCutTime = nil
+    pendingCutRequestedAt = nil
+  }
+
+  private func pendingCutHasExpired() -> Bool {
+    guard let pendingCutRequestedAt else { return false }
+    return clock() - pendingCutRequestedAt >= pendingCutTimeout
   }
 
   private static func validCutTime(_ time: CMTime) -> CMTime? {
@@ -273,8 +308,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
   public mutating func ingest(_ frame: ProgramSourceFrame<SourceID>)
     -> ProgramFrameDecision<SourceID> {
     if let pendingCut, !isSourceAvailable(pendingCut) {
-      self.pendingCut = nil
-      self.pendingCutTime = nil
+      clearPendingCut()
     }
     guard isSourceAvailable(frame.sourceID) else { return .skipped(.missingSource) }
 
@@ -304,17 +338,20 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
         case let .success(mapped):
           mapper = candidateMapper
           selectedSource = pendingCut
-          self.pendingCut = nil
-          self.pendingCutTime = nil
+          clearPendingCut()
           return .cutApplied(mapped, flushStaleFrames: true)
         case let .failure(error):
           return .skipped(.invalidTimestamp(error))
         }
       }
       if frame.sourceID == selectedSource {
-        return .skipped(.staleQueuedFrame)
+        // Hold A until B qualifies. If B never does, resume A instead of
+        // leaving the meeting on the last Program frame forever.
+        guard pendingCutHasExpired() else { return .skipped(.staleQueuedFrame) }
+        clearPendingCut()
+      } else {
+        return .skipped(.nonSelectedSource)
       }
-      return .skipped(.nonSelectedSource)
     }
 
     guard frame.sourceID == selectedSource else { return .skipped(.nonSelectedSource) }

@@ -218,6 +218,82 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertEqual(recorder.telemetry.totalDrops, 0)
   }
 
+  private func encodedVideoSample(at time: CMTime) throws -> CMSampleBuffer {
+    var format: CMVideoFormatDescription?
+    XCTAssertEqual(CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+      codecType: kCMVideoCodecType_JPEG, width: 16, height: 16, extensions: nil,
+      formatDescriptionOut: &format), noErr)
+    var block: CMBlockBuffer?
+    XCTAssertEqual(CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+      memoryBlock: nil, blockLength: 4, blockAllocator: kCFAllocatorDefault,
+      customBlockSource: nil, offsetToData: 0, dataLength: 4, flags: 0,
+      blockBufferOut: &block), noErr)
+    var timing = CMSampleTimingInfo(duration: RecordingFrameRate.fps2997.frameDuration,
+      presentationTimeStamp: time, decodeTimeStamp: .invalid)
+    var size = 4
+    var sample: CMSampleBuffer?
+    XCTAssertEqual(CMSampleBufferCreateReady(allocator: kCFAllocatorDefault,
+      dataBuffer: try XCTUnwrap(block), formatDescription: try XCTUnwrap(format), sampleCount: 1,
+      sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 1,
+      sampleSizeArray: &size, sampleBufferOut: &sample), noErr)
+    return try XCTUnwrap(sample)
+  }
+
+  func testEarlyAudioDrainsBeforeLaterAudioAfterInputBackpressure() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-audio-order-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let config = try configuration(feed: "audio-order", url: root.appendingPathComponent("take.mov"))
+    var audioReady = false
+    var audioPTS: [CMTime] = []
+    let writer = try AVAssetSourceRecordingWriter(configuration: config,
+      inputReady: { $0.mediaType != .audio || audioReady }, appendSample: { sample, input in
+        if input.mediaType == .audio { audioPTS.append(CMSampleBufferGetPresentationTimeStamp(sample)) }
+        return true
+      })
+    try writer.start()
+    // Embedded audio is 48 kHz. These stamps are 0.1s, 0s, then 0.2s.
+    let early = CMTime(value: 4_800, timescale: 48_000)
+    let first = CMTime(value: 0, timescale: 48_000)
+    let later = CMTime(value: 9_600, timescale: 48_000)
+    try writer.appendAudio(audioSample(at: early))
+    try writer.appendAudio(audioSample(at: first))
+    writer.appendEncodedVideo(try encodedVideoSample(at: .zero))
+    XCTAssertEqual(writer.telemetry.encodedVideo, 1)
+    XCTAssertTrue(audioPTS.isEmpty)
+    audioReady = true
+    try writer.appendAudio(audioSample(at: later))
+    XCTAssertEqual(audioPTS, [first, early, later])
+    XCTAssertThrowsError(try writer.appendAudio(audioSample(at: first))) { error in
+      guard case .writerNotReady = error as? SourceRecordingError else {
+        return XCTFail("Late audio must be a recoverable rejection")
+      }
+    }
+    XCTAssertFalse(writer.telemetry.failed)
+    XCTAssertEqual(writer.telemetry.encodedVideo, 1, "Audio ordering must keep the appended picture")
+    XCTAssertEqual(writer.telemetry.droppedEncodedVideo, 0)
+  }
+
+  func testTimecodeBackpressureDoesNotCountAnAppendedPictureAsDropped() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-timecode-drop-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("timecode-drop"),
+      outputURL: root.appendingPathComponent("take.mov"), width: 16, height: 16, timecodePolicy: .recordStart)
+    var pictures = 0
+    let writer = try AVAssetSourceRecordingWriter(configuration: config,
+      inputReady: { $0.mediaType != .timecode }, appendSample: { _, input in
+        if input.mediaType == .video { pictures += 1 }
+        return true
+      })
+    try writer.start()
+    writer.appendEncodedVideo(try encodedVideoSample(at: .zero))
+    XCTAssertEqual(pictures, 1)
+    XCTAssertEqual(writer.telemetry.encodedVideo, 1)
+    XCTAssertEqual(writer.telemetry.droppedEncodedVideo, 0)
+    XCTAssertEqual(writer.telemetry.encoderErrors, 0)
+    XCTAssertEqual(writer.telemetry.droppedTimecode, 1)
+    XCTAssertFalse(writer.telemetry.failed)
+  }
+
   static let allTests = [
     ("two feeds pause and finalize", testTwoFeedsRecordSimultaneouslyAndFinalizeAfterPauseResume),
     ("audio/video PTS alignment", testAudioAndVideoPTSStayAlignedAtBothCaptureRates),

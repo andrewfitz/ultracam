@@ -17,6 +17,19 @@ import XCTest
     func finish() throws { finished = true }
   }
 
+  /// Records the first shader-device attempt. Later retries return immediately.
+  private final class FirstInitialization: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = false
+    func claim() -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      if started { return false }
+      started = true
+      return true
+    }
+  }
+
   private final class Harness: @unchecked Sendable {
     let lock = NSLock()
     var callback: ((CVPixelBuffer, CMTime, CMTime, Bool) -> Void)?
@@ -125,9 +138,14 @@ import XCTest
     let target = MonitorTargetID("capture-tap-integration")
     let initializing = expectation(description: "Monitor initialization held on utility worker")
     let initializationGate = DispatchSemaphore(value: 0)
+    // Shader setup retries on every later frame while the device is missing.
+    // Only the first attempt may block the worker and fulfill the expectation.
+    let firstInitialization = FirstInitialization()
     let runtime = MonitorRuntime(sharedDevice: {
-      initializing.fulfill()
-      _ = initializationGate.wait(timeout: .now() + 5)
+      if firstInitialization.claim() {
+        initializing.fulfill()
+        _ = initializationGate.wait(timeout: .now() + 5)
+      }
       return nil  // deterministic shader/device failure must preserve clean fallback
     })
     let sink = MonitorCaptureSink(target: target, runtime: runtime)
@@ -642,6 +660,240 @@ import XCTest
         "COMBINED_CAPTURE monitor=\(enabled) source=v210-4K2997 camera=1080p420 LUT=nonlinear frames=\(frameCount) cameraCount=\(samples.count-1) recordingCount=\(writer.samples.count-1) callbackMS=\(distribution(callbackMS)) cameraLatencyMS=\(distribution(latencyMS)) monitorUpdates=\(monitorSequences.count) monitorAgeSeconds=\(distribution(monitorAges))"
       )
     }
+  }
+
+
+  func testCallbacksArmedAfterStopReturnsSurviveTheNextStart() throws {
+    let image = try syntheticRamp()
+    let entered = expectation(description: "capture queue blocked in start")
+    let release = DispatchSemaphore(value: 0)
+    final class Box: @unchecked Sendable {
+      let lock = NSLock()
+      var starts = 0
+      var hits = 0
+      var handler: ((CVPixelBuffer, CMTime, Bool) -> Void)?
+    }
+    let box = Box()
+    let services = CaptureServices(
+      start: { _, _, frames, _ in
+        let index = box.lock.withLock { () -> Int in
+          box.starts += 1
+          box.handler = frames
+          return box.starts
+        }
+        if index == 1 {
+          entered.fulfill()
+          _ = release.wait(timeout: .now() + 3)
+        }
+      },
+      stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true })
+    let controller = CaptureController(services: services, previewRenderer: nil)
+    defer { controller.onUpdate = nil; controller.stop(); release.signal() }
+    let feed = FeedID(rawValue: "callback-after-stop")
+    let configuration = PipelineConfiguration(downscale: false, convertTo420: false)
+    controller.start(feedID: feed, deviceID: "synthetic", configuration: configuration,
+      pipelineEnabled: false, previewEnabled: false)
+    wait(for: [entered], timeout: 3)
+    let stopBegan = Date()
+    controller.stop()
+    XCTAssertLessThan(Date().timeIntervalSince(stopBegan), 0.3,
+      "stop() must invalidate admission without waiting out a blocked capture worker")
+    let callbacks = SourceRecordingCallbackAdapter.Callbacks(
+      video: { _, _, _, _ in box.lock.withLock { box.hits += 1 }; return true },
+      audio: { _ in true },
+      rawAudio: { _, _, _, _, _ in true })
+    controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks)
+    let stopped = expectation(description: "queued stop finished")
+    controller.onUpdate = { if $0.stopped { stopped.fulfill() } }
+    release.signal()
+    wait(for: [stopped], timeout: 3)
+    let restarted = expectation(description: "restarted")
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { restarted.fulfill() } }
+    controller.start(feedID: feed, deviceID: "synthetic", configuration: configuration,
+      pipelineEnabled: false, previewEnabled: false)
+    wait(for: [restarted], timeout: 3)
+    let duration = VideoContract.fastDuration
+    box.lock.withLock { box.handler }?(image, .zero, true)
+    let deadline = Date().addingTimeInterval(2)
+    while box.lock.withLock({ box.hits }) == 0 && Date() < deadline {
+      Thread.sleep(forTimeInterval: 0.01)
+    }
+    XCTAssertEqual(box.lock.withLock { box.hits }, 1,
+      "Callbacks installed after stop() returns must still receive the next take")
+  }
+
+  func testRemoveReleasesTheDeviceBeforeDroppingTheController() {
+    let feed = FeedID(rawValue: "pool-release")
+    final class Counters: @unchecked Sendable {
+      let lock = NSLock()
+      var created = 0
+      var stops = 0
+    }
+    let counters = Counters()
+    let pool = FeedCapturePool { _ in
+      counters.lock.withLock { counters.created += 1 }
+      return CaptureController(services: CaptureServices(
+        start: { _, _, _, _ in }, stop: { counters.lock.withLock { counters.stops += 1 } },
+        connect: { _, _ in }, disconnect: {}, send: { _ in true }))
+    }
+    let first = pool.controller(for: feed)
+    XCTAssertEqual(counters.lock.withLock { counters.created }, 1)
+    XCTAssertTrue(pool.remove(feed))
+    XCTAssertGreaterThanOrEqual(counters.lock.withLock { counters.stops }, 1,
+      "remove must finish stopResources before it returns")
+    XCTAssertNil(pool.existingController(for: feed))
+    let second = pool.controller(for: feed)
+    XCTAssertFalse(first === second)
+    XCTAssertEqual(counters.lock.withLock { counters.created }, 2)
+    first.start(deviceID: "synthetic", configuration: PipelineConfiguration())
+    let ignored = expectation(description: "discarded start had time to run")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { ignored.fulfill() }
+    wait(for: [ignored], timeout: 2)
+    XCTAssertTrue(pool.existingController(for: feed) === second,
+      "Starting a removed controller must not replace the pool's new backend")
+    second.stop()
+  }
+
+  func testRemoveKeepsTheControllerWhenANewerStartWins() {
+    let feed = FeedID(rawValue: "pool-live-start")
+    let entered = expectation(description: "remove is inside stopResources")
+    let release = DispatchSemaphore(value: 0)
+    final class Flag: @unchecked Sendable {
+      let lock = NSLock()
+      var stops = 0
+      var starts = 0
+    }
+    let flag = Flag()
+    let pool = FeedCapturePool { _ in
+      CaptureController(services: CaptureServices(
+        start: { _, _, _, _ in flag.lock.withLock { flag.starts += 1 } },
+        stop: {
+          let block = flag.lock.withLock { () -> Bool in
+            flag.stops += 1
+            return flag.stops == 1
+          }
+          if block {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 3)
+          }
+        },
+        connect: { _, _ in }, disconnect: {}, send: { _ in true }))
+    }
+    let controller = pool.controller(for: feed)
+    defer { release.signal(); controller.stop() }
+    let removed = expectation(description: "remove returned")
+    final class ResultBox: @unchecked Sendable { var value = true }
+    let result = ResultBox()
+    DispatchQueue.global().async {
+      result.value = pool.remove(feed)
+      removed.fulfill()
+    }
+    wait(for: [entered], timeout: 3)
+    controller.start(deviceID: "synthetic",
+      configuration: PipelineConfiguration(downscale: false, convertTo420: false),
+      pipelineEnabled: false, previewEnabled: false)
+    release.signal()
+    wait(for: [removed], timeout: 3)
+    XCTAssertFalse(result.value, "A start that wins during remove must keep the live controller")
+    XCTAssertTrue(pool.existingController(for: feed) === controller)
+    let deadline = Date().addingTimeInterval(2)
+    while flag.lock.withLock({ flag.starts }) == 0 && Date() < deadline {
+      Thread.sleep(forTimeInterval: 0.01)
+    }
+    XCTAssertEqual(flag.lock.withLock { flag.starts }, 1)
+  }
+
+  func testInitialCameraConnectFailureDoesNotRetry() throws {
+    let image = try syntheticRamp()
+    final class Harness: @unchecked Sendable {
+      let lock = NSLock()
+      var connects = 0
+      var handler: ((CVPixelBuffer, CMTime, CMTime, Bool) -> Void)?
+    }
+    let harness = Harness()
+    var services = CaptureServices(
+      start: { _, _, _, _ in }, stop: {},
+      connect: { _, _ in
+        try harness.lock.withLock {
+          harness.connects += 1
+          throw VideoError.message("Synthetic virtual camera unavailable")
+        }
+      },
+      disconnect: {}, send: { _ in true })
+    services.startAutomatic = { _, frames, _ in harness.lock.withLock { harness.handler = frames } }
+    services.cameraRetryInterval = 0
+    let controller = CaptureController(services: services, previewRenderer: nil)
+    defer { controller.onUpdate = nil; controller.stop() }
+    let started = expectation(description: "automatic capture ready")
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
+    controller.start(deviceID: "synthetic",
+      configuration: PipelineConfiguration(downscale: false, convertTo420: false),
+      pipelineEnabled: false, previewEnabled: false)
+    wait(for: [started], timeout: 3)
+    let duration = VideoContract.fastDuration
+    for frame in 0..<6 {
+      harness.lock.withLock { harness.handler }?(
+        image, CMTimeMultiply(duration, multiplier: Int32(frame)), duration, true)
+    }
+    let deadline = Date().addingTimeInterval(3)
+    while harness.lock.withLock({ harness.connects }) < 1 && Date() < deadline {
+      Thread.sleep(forTimeInterval: 0.01)
+    }
+    Thread.sleep(forTimeInterval: 0.15)
+    // Each attempt blocks the capture queue; a camera that never connected
+    // (extension not running) must not stall capture with retries.
+    XCTAssertEqual(harness.lock.withLock { harness.connects }, 1,
+      "Only a lost connection retries")
+  }
+
+  func testDisablingCameraOutputPublishesNotConnected() {
+    let started = expectation(description: "capture ready")
+    let services = CaptureServices(
+      start: { _, _, _, _ in }, stop: {},
+      connect: { _, _ in }, disconnect: {}, send: { _ in true })
+    let controller = CaptureController(services: services, previewRenderer: nil)
+    defer { controller.onUpdate = nil; controller.stop() }
+    var sawConnected = false
+    controller.onUpdate = { update in
+      if update.cameraOutputActive && update.cameraMessage.contains("Ultracam camera connected") {
+        sawConnected = true
+      }
+      if update.message.hasPrefix("Waiting") { started.fulfill() }
+    }
+    controller.start(deviceID: "synthetic",
+      configuration: PipelineConfiguration(downscale: false, convertTo420: false),
+      pipelineEnabled: false, previewEnabled: false)
+    wait(for: [started], timeout: 3)
+    XCTAssertTrue(sawConnected)
+    let disconnected = expectation(description: "status says not connected")
+    controller.onUpdate = { update in
+      if !update.cameraOutputActive && update.cameraMessage == "Ultracam camera not connected" {
+        disconnected.fulfill()
+      }
+    }
+    controller.setCameraOutputEnabled(false)
+    wait(for: [disconnected], timeout: 3)
+  }
+
+  func testNeedsOutputTreatsABusyLockAsWanted() {
+    let runtime = MonitorRuntime(sharedDevice: { nil })
+    let sink = MonitorCaptureSink(target: MonitorTargetID("needs-output-lock"), runtime: runtime)
+    var monitor = MonitorConfiguration()
+    monitor.pictureStage = .processedOutput
+    let presenter = MonitorSurfacePresenter()
+    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
+    XCTAssertTrue(sink.needsOutput)
+    let entered = expectation(description: "sink lock held")
+    let release = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      sink.withLockHeldForTesting {
+        entered.fulfill()
+        _ = release.wait(timeout: .now() + 3)
+      }
+    }
+    wait(for: [entered], timeout: 2)
+    XCTAssertTrue(sink.needsOutput, "A failed try-lock must not look like an absent monitor consumer")
+    release.signal()
   }
 
 }

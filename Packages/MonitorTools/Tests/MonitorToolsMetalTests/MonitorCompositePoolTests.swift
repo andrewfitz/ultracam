@@ -109,19 +109,21 @@ final class MonitorCompositePoolTests: XCTestCase {
     XCTAssertEqual(pool.statsSnapshot().poolFailures, 1)
   }
 
-  // Catches an uncharged provisional allocation even when a reusable surface exists.
-  func testReuseAlsoRequiresProvisionalBudgetWithoutLosingCacheCharge() throws {
+  // Catches rejecting already charged storage when there is no headroom for growth.
+  func testIdleSameKeyReusesWithoutProvisionalBudget() throws {
     let ledger = MonitorAdmissionLedger(maximumBytes: 32_768, cleanReserveBytes: 0)
     let pool = MonitorCompositePool(ledger: ledger)
     try autoreleasepool {
       _ = try pool.allocate(width: 64, height: 32, reservation: reservation)
     }
+    let reused = try pool.allocate(width: 64, height: 32, reservation: reservation)
     XCTAssertThrowsError(try pool.allocate(width: 64, height: 32, reservation: reservation)) {
       XCTAssertEqual($0 as? MonitorCompositePool.AllocationError, .budgetExceeded)
     }
     XCTAssertEqual(ledger.snapshot.retainedBytes, 32_768)
     XCTAssertEqual(pool.statsSnapshot().allocations, 1)
-    XCTAssertEqual(pool.statsSnapshot().reuses, 0)
+    XCTAssertEqual(pool.statsSnapshot().reuses, 1)
+    withExtendedLifetime(reused) {}
     pool.trim()
     XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
   }

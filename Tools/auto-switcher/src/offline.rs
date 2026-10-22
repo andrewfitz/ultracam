@@ -95,11 +95,15 @@ pub fn analyze_events(events: Vec<StreamEvent>, config: SwitcherConfig) -> Resul
     let mut director = Director::new(config.clone()).map_err(anyhow::Error::msg)?;
     let mut timeline = TimelineRecorder::new(config, "offline", Uuid::new_v4());
     let mut ordered = events;
+    // Missing timestamps sort last; a real timestamp of zero remains timed.
     ordered.sort_by(|a, b| {
-        timeline_time(a)
-            .unwrap_or(0.0)
-            .total_cmp(&timeline_time(b).unwrap_or(0.0))
-            .then_with(|| event_rank(a).cmp(&event_rank(b)))
+        match (timeline_time(a), timeline_time(b)) {
+            (Some(a), Some(b)) => a.total_cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| event_rank(a).cmp(&event_rank(b)))
     });
 
     for event in ordered {

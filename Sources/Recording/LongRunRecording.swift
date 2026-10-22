@@ -9,9 +9,9 @@ public enum RecordingMediaKind: UInt8, Sendable {
 
 /// A packet presented to the recording session.
 ///
-/// The recorder never silently discards a packet. A packet that cannot be
-/// admitted, timed, or written returns a typed error and permanently fails the
-/// session until the caller starts a new one.
+/// Invalid packets fail the session. Late audio from a previous segment and
+/// video that maps before the last written frame are dropped to preserve the
+/// media already written.
 public struct RecordingPacket: Sendable, Equatable {
   public let mediaKind: RecordingMediaKind
   public let presentationTime: CMTime
@@ -371,6 +371,7 @@ public final class LongRunRecordingSession: @unchecked Sendable {
   private var segmentIndex = 0
   private var segmentStart: CMTime?
   private var latestOutputEnd: CMTime?
+  private var latestVideoPTS: CMTime?
   private var segmentHasPackets = false
   private var segments: [RecordingSegmentInfo] = []
   private var packetCount = 0
@@ -550,19 +551,30 @@ public final class LongRunRecordingSession: @unchecked Sendable {
   }
 
   private func process(_ packet: RecordingPacket) throws {
+    if packet.mediaKind == .audio,
+      packet.presentationTime.isNumeric, packet.presentationTime.epoch == 0,
+      let resumeSourceOrigin, let resumeOutputOrigin, let segmentStart {
+      let mappedTime = CMTimeAdd(resumeOutputOrigin,
+        CMTimeSubtract(packet.presentationTime, resumeSourceOrigin))
+      if CMTimeCompare(mappedTime, segmentStart) < 0 { return }
+    }
     var normalizer = packet.mediaKind == .video ? videoNormalizer : audioNormalizer
     let result = normalizer.normalize(packet)
-    switch packet.mediaKind {
-    case .video: videoNormalizer = normalizer
-    case .audio: audioNormalizer = normalizer
-    }
     let normalized: NormalizedRecordingPacket
     switch result {
     case let .success(packet): normalized = packet
     case let .failure(error): throw RecordingError.timestamp(error)
     }
 
-    let timelinePacket = try mapToOutputTimeline(normalized)
+    guard let timelinePacket = try mapToOutputTimeline(normalized) else { return }
+    if packet.mediaKind == .audio, let segmentStart,
+      CMTimeCompare(timelinePacket.presentationTime, segmentStart) < 0 { return }
+    if packet.mediaKind == .video, let latestVideoPTS,
+      CMTimeCompare(timelinePacket.presentationTime, latestVideoPTS) < 0 { return }
+    switch packet.mediaKind {
+    case .video: videoNormalizer = normalizer
+    case .audio: audioNormalizer = normalizer
+    }
     do {
       try drift.observe(timelinePacket)
     } catch let error as RecordingDriftError {
@@ -584,10 +596,13 @@ public final class LongRunRecordingSession: @unchecked Sendable {
     try writer.append(timelinePacket)
     segmentHasPackets = true
     packetCount += 1
-    latestOutputEnd = timelinePacket.endTime
+    if packet.mediaKind == .video { latestVideoPTS = timelinePacket.presentationTime }
+    if latestOutputEnd == nil || CMTimeCompare(timelinePacket.endTime, latestOutputEnd!) > 0 {
+      latestOutputEnd = timelinePacket.endTime
+    }
   }
 
-  private func mapToOutputTimeline(_ packet: NormalizedRecordingPacket) throws -> NormalizedRecordingPacket {
+  private func mapToOutputTimeline(_ packet: NormalizedRecordingPacket) throws -> NormalizedRecordingPacket? {
     guard let resumeSourceOrigin else {
       // Every recording starts at zero even when the capture device's source
       // clock began before admission. A resumed segment intentionally starts
@@ -608,6 +623,7 @@ public final class LongRunRecordingSession: @unchecked Sendable {
     // A lead inside the drift limit starts at the segment origin. A larger gap
     // is still a broken timeline.
     if CMTimeCompare(mappedTime, outputOrigin) < 0 {
+      if packet.packet.mediaKind == .audio || latestVideoPTS != nil { return nil }
       let lead = CMTimeSubtract(outputOrigin, mappedTime)
       guard CMTimeCompare(lead, configuration.maximumAVDrift) <= 0 else {
         throw RecordingError.timestamp(.timestampRegressed)
@@ -782,7 +798,7 @@ public final class AtomicRecordingSegmentWriter: RecordingSegmentWriter {
     handle?.synchronizeFile()
     handle?.closeFile()
     handle = nil
-    if let temporaryURL { try? FileManager.default.removeItem(at: temporaryURL) }
+    // Preserve the open segment for inspection/recovery after failure.
     temporaryURL = nil
     finalURL = nil
     segmentIndex = nil

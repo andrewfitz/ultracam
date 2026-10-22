@@ -136,7 +136,7 @@ impl TimelineRecorder {
         for output in &outputs {
             self.record_output(output.clone());
         }
-        self.apply_event_state(&event);
+        self.apply_event_state(&event, &outputs);
         self.timeline.events.push(TimelineEvent {
             sequence: self.next_sequence,
             media_time,
@@ -167,6 +167,10 @@ impl TimelineRecorder {
 
     pub fn finish(&mut self, ended_at_unix_ms: Option<i64>) {
         self.timeline.ended_at_unix_ms = ended_at_unix_ms;
+        self.cancel_pending();
+    }
+
+    fn cancel_pending(&mut self) {
         for index in self.pending.values() {
             if let Some(cut) = self.timeline.cuts.get_mut(*index) {
                 cut.status = "cancelled".to_string();
@@ -214,7 +218,7 @@ impl TimelineRecorder {
         self.timeline.cuts.push(cut);
     }
 
-    fn apply_event_state(&mut self, event: &StreamEvent) {
+    fn apply_event_state(&mut self, event: &StreamEvent, outputs: &[SwitcherOutput]) {
         match event {
             StreamEvent::Acknowledge {
                 decision_id,
@@ -252,33 +256,39 @@ impl TimelineRecorder {
                     }
                 }
             }
-            StreamEvent::ManualOverride { camera_id, time } => {
-                let valid_camera = camera_id == &self.timeline.config.anchor_camera_id
-                    || camera_id == &self.timeline.config.emphasis_camera_id;
-                if !valid_camera || !time.is_finite() || *time < 0.0 {
-                    self.timeline.statuses.push(SwitcherOutput::Error {
-                        message: "invalid manual override omitted from timeline".to_string(),
-                    });
+            StreamEvent::ManualOverride { camera_id, .. } => {
+                // Only the director can accept an override and resolve a
+                // lagging timestamp. Its status carries that applied time.
+                let Some(time) = outputs.iter().find_map(|output| match output {
+                    SwitcherOutput::Status {
+                        time,
+                        current_camera_id,
+                        pending_decision_id: None,
+                        ..
+                    } if current_camera_id == camera_id => Some(*time),
+                    _ => None,
+                }) else {
                     return;
-                }
+                };
+                self.cancel_pending();
                 self.timeline.cuts.push(CutRecord {
                     decision_id: None,
                     session_generation: self.timeline.config.session_generation.max(1),
                     from_camera_id: Some(self.current_camera_id.clone()),
                     target_camera_id: camera_id.clone(),
-                    requested_cut_time: Some(*time),
+                    requested_cut_time: Some(time),
                     requested_cut_time_ticks: Some(to_ticks(
-                        *time,
+                        time,
                         self.timeline.timebase.timescale,
                     )),
-                    applied_source_time: Some(*time),
+                    applied_source_time: Some(time),
                     applied_source_time_ticks: Some(to_ticks(
-                        *time,
+                        time,
                         self.timeline.timebase.timescale,
                     )),
-                    applied_program_time: Some(*time),
+                    applied_program_time: Some(time),
                     applied_program_time_ticks: Some(to_ticks(
-                        *time,
+                        time,
                         self.timeline.timebase.timescale,
                     )),
                     expires_at: None,
@@ -296,12 +306,7 @@ impl TimelineRecorder {
                     .max(1);
                 self.timeline.config.session_generation =
                     requested.max(self.timeline.config.session_generation);
-                for index in self.pending.values() {
-                    if let Some(cut) = self.timeline.cuts.get_mut(*index) {
-                        cut.status = "cancelled".to_string();
-                    }
-                }
-                self.pending.clear();
+                self.cancel_pending();
             }
             _ => {}
         }

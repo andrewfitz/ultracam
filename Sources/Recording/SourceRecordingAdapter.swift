@@ -133,7 +133,9 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
       },
       audio: { [weak self] sample in self?.appendEmbeddedAudio(sample: sample) ?? false },
       rawAudio: { [weak self] sourcePCM32, sampleFrameCount, presentationTime, channelCount, bytesPerSample in
-        guard bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample else { return false }
+        guard bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample else {
+          return self?.reject(video: false) ?? false
+        }
         return self?.appendEmbeddedAudio(sourcePCM32: sourcePCM32, sampleFrameCount: sampleFrameCount,
           presentationTime: presentationTime, channelCount: channelCount) ?? false
       })

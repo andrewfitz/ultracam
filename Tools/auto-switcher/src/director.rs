@@ -149,8 +149,10 @@ impl Director {
                 Vec::new()
             }
             StreamEvent::ManualOverride { camera_id, time } => {
-                self.manual_override(camera_id, time);
-                Vec::new()
+                match self.apply_manual_override(camera_id, time) {
+                    Some(applied_at) => vec![self.status(applied_at)],
+                    None => Vec::new(),
+                }
             }
             StreamEvent::Reset { generation } => {
                 self.reset(generation);
@@ -434,12 +436,16 @@ impl Director {
     }
 
     pub fn manual_override(&mut self, camera_id: String, time: MediaTime) {
+        self.apply_manual_override(camera_id, time);
+    }
+
+    fn apply_manual_override(&mut self, camera_id: String, time: MediaTime) -> Option<MediaTime> {
         if !time.is_finite()
             || time < 0.0
             || (camera_id != self.config.anchor_camera_id
                 && camera_id != self.config.emphasis_camera_id)
         {
-            return;
+            return None;
         }
         let time = if let Some(last) = self.last_media_time {
             if time < last {
@@ -447,7 +453,7 @@ impl Director {
                 // recent override forward keeps the operator cut; a large gap
                 // is a different timeline and is ignored.
                 if last - time > 2.0 {
-                    return;
+                    return None;
                 }
                 last
             } else {
@@ -463,6 +469,7 @@ impl Director {
         self.last_cut_at = Some(time);
         self.last_media_time = Some(time);
         self.state = self.state_for_current();
+        Some(time)
     }
 
     pub fn reset(&mut self, generation: Option<u64>) {

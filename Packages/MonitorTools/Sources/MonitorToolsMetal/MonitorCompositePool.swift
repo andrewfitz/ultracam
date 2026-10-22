@@ -68,13 +68,15 @@ final class MonitorCompositePool: @unchecked Sendable {
         }
       }
 
-      // Reserve before asking Core Video: it may allocate a new backing store even
-      // when a previously returned buffer is eligible for reuse.
-      guard let provisional = ledger.tryAcquire(
+      // Without fresh headroom, allow only reuse of an already charged backing.
+      // Core Video's threshold prevents growth while all cached buffers are held.
+      let provisional = ledger.tryAcquire(
         target: cacheTarget, generation: 0, kind: .presentation, bytes: reservation)
-      else { throw AllocationError.budgetExceeded }
+      guard provisional != nil || !(cached?.surfaceLeases.isEmpty ?? true) else {
+        throw AllocationError.budgetExceeded
+      }
       var retainedByCache = false
-      defer { if !retainedByCache { provisional.release() } }
+      defer { if !retainedByCache { provisional?.release() } }
 
       let entry: Entry
       if let cached {
@@ -104,13 +106,16 @@ final class MonitorCompositePool: @unchecked Sendable {
       let otherSurfaces = entries.reduce(0) {
         $0 + ($1 === entry ? 0 : $1.surfaceLeases.count)
       }
-      let threshold = maximumBuffers - otherSurfaces
+      let threshold = provisional == nil ? entry.surfaceLeases.count : maximumBuffers - otherSurfaces
       var buffer: CVPixelBuffer?
       let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
         nil, entry.pool, [kCVPixelBufferPoolAllocationThresholdKey: threshold] as CFDictionary,
         &buffer)
       guard status == kCVReturnSuccess, let buffer else {
         if entry.surfaceLeases.isEmpty { removeEntryLocked(entry) }
+        if provisional == nil && status == kCVReturnWouldExceedAllocationThreshold {
+          throw AllocationError.budgetExceeded
+        }
         throw AllocationError.allocationFailed(status)
       }
       let actual = CVPixelBufferGetDataSize(buffer)
@@ -126,6 +131,7 @@ final class MonitorCompositePool: @unchecked Sendable {
       }
       let identifier = IOSurfaceGetID(surface)
       if entry.surfaceLeases[identifier] == nil {
+        guard let provisional else { throw AllocationError.budgetExceeded }
         entry.surfaceLeases[identifier] = provisional
         retainedByCache = true
         stats.poolCapacityBytes += reservation

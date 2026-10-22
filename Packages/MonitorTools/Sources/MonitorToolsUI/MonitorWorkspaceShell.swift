@@ -142,6 +142,13 @@ public struct MonitorTileChrome<Picture: View, Scopes: View>: View {
     self.scopes = scopes()
   }
   private var isProgram: Bool { target?.rawValue == "program" }
+  var pictureCaption: String {
+    let displayed = legendConfiguration ?? configuration
+    if !isProgram && displayed.toolsEnabled && displayed.falseColor.mode != .off {
+      return "False color: Source analysis · selected picture signal: \(displayed.pictureStage == .source ? "Source" : "Processed Output")"
+    }
+    return "Picture: \(isProgram ? "Program Output" : displayed.pictureStage == .source ? "Source" : "Processed Output")"
+  }
   public var body: some View {
     VStack(alignment: .leading, spacing: 6) {
       HStack {
@@ -161,11 +168,9 @@ public struct MonitorTileChrome<Picture: View, Scopes: View>: View {
           Text("Processed Output").tag(MonitorStage.processedOutput)
         }.controlSize(.mini)
       }
-      Text(
-        "Picture: \(isProgram ? "Program Output" : (legendConfiguration ?? configuration).pictureStage == .source ? "Source" : "Processed Output")"
-      ).font(.caption2)
-      if let frozen = legendConfiguration {
-        Text("Frozen picture · \(frozen.pictureStage == .source ? "Source" : "Processed Output")")
+      Text(pictureCaption).font(.caption2)
+      if legendConfiguration != nil {
+        Text("Frozen · " + pictureCaption)
           .font(.caption)
       }
       MonitorToolsToolbar(

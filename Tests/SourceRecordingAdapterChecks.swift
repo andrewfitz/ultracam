@@ -4,6 +4,26 @@ import CoreVideo
 import Foundation
 import XCTest
 
+private final class FailAfterFirstVideoWriter: SourceRecordingWriter, @unchecked Sendable {
+  private let lock = NSLock()
+  private let videoSignal = DispatchSemaphore(value: 0)
+  private var videos = 0
+  func start() throws {}
+  func appendVideo(_ sample: CMSampleBuffer) throws {
+    let count = lock.withLock { () -> Int in
+      videos += 1
+      return videos
+    }
+    videoSignal.signal()
+    if count > 1 { throw SourceRecordingError.writerFailure("second sample rejected") }
+  }
+  func appendAudio(_ sample: CMSampleBuffer) throws {}
+  func finish() throws {}
+  func waitForVideo(timeout: TimeInterval = 1) -> Bool {
+    videoSignal.wait(timeout: .now() + timeout) == .success
+  }
+}
+
 private final class AdapterRecordingWriter: SourceRecordingWriter, @unchecked Sendable {
   private let lock = NSLock()
   private let videoSignal = DispatchSemaphore(value: 0)
@@ -37,6 +57,40 @@ private final class AdapterRecordingWriter: SourceRecordingWriter, @unchecked Se
 
   var videoSnapshot: [CMSampleBuffer] { lock.withLock { videos } }
   var audioSnapshot: [CMSampleBuffer] { lock.withLock { audios } }
+}
+
+private final class BlockingStopWriter: SourceRecordingWriter, @unchecked Sendable {
+  let entered = DispatchSemaphore(value: 0)
+  let release = DispatchSemaphore(value: 0)
+  let failure: SourceRecordingError?
+  var onFinish: (() throws -> Void)?
+  private(set) var finishCount = 0
+  init(failure: SourceRecordingError?) { self.failure = failure }
+  func start() throws {}
+  func appendVideo(_ sample: CMSampleBuffer) throws {}
+  func appendAudio(_ sample: CMSampleBuffer) throws {}
+  func finish() throws {
+    finishCount += 1
+    try onFinish?()
+    entered.signal()
+    guard release.wait(timeout: .now() + 3) == .success else {
+      throw SourceRecordingError.writerFailure("Timed out waiting for test release.")
+    }
+    if let failure { throw failure }
+  }
+}
+
+private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecked Sendable {
+  private let lock = NSLock()
+  private var failed = false
+  var telemetry: SourceRecordingWriterTelemetry {
+    lock.withLock { SourceRecordingWriterTelemetry(failed: failed, lastError: failed ? "callback failed" : nil) }
+  }
+  func fail() { lock.withLock { failed = true } }
+  func start() throws {}
+  func appendVideo(_ sample: CMSampleBuffer) throws {}
+  func appendAudio(_ sample: CMSampleBuffer) throws {}
+  func finish() throws {}
 }
 
 @objcMembers final class SourceRecordingAdapterChecks: XCTestCase {
@@ -76,6 +130,31 @@ private final class AdapterRecordingWriter: SourceRecordingWriter, @unchecked Se
     try adapter.stop()
     XCTAssertEqual(adapter.state, .finished)
     XCTAssertTrue(writer.finished)
+  }
+
+  func testAppendFailureWhileStoppingStaysFailed() throws {
+    let writer = FailAfterFirstVideoWriter()
+    let feedID = SourceRecordingFeedID("camera-fail")
+    let config = try SourceRecordingConfiguration(feedID: feedID,
+      outputURL: URL(fileURLWithPath: "/tmp/camera-fail.mov"), width: 96, height: 64,
+      queueCapacity: 4)
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    let adapter = SourceRecordingCallbackAdapter(feedID: feedID, recorder: recorder)
+    try adapter.start()
+    var source: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 96, 64, kCVPixelFormatType_422YpCbCr10, nil, &source), kCVReturnSuccess)
+    let image = try XCTUnwrap(source)
+    let duration = CMTime(value: 1_001, timescale: 60_000)
+    XCTAssertTrue(adapter.appendRawVideo(pixelBuffer: image,
+      presentationTime: CMTime(value: 0, timescale: 60_000), duration: duration))
+    XCTAssertTrue(adapter.appendRawVideo(pixelBuffer: image,
+      presentationTime: CMTime(value: 1_001, timescale: 60_000), duration: duration))
+    XCTAssertTrue(writer.waitForVideo())
+    XCTAssertNoThrow(try adapter.stop())
+    XCTAssertEqual(adapter.state, .failed)
+    XCTAssertFalse(adapter.appendRawVideo(pixelBuffer: image,
+      presentationTime: CMTime(value: 2_002, timescale: 60_000), duration: duration))
+    XCTAssertEqual(adapter.state, .failed)
   }
 
   func testEmbeddedAudioCallbackForwardsSampleBufferAndPayload() throws {
@@ -145,6 +224,76 @@ private final class AdapterRecordingWriter: SourceRecordingWriter, @unchecked Se
     try second.stop()
     XCTAssertEqual(first.state, .finished)
     XCTAssertEqual(second.state, .finished)
+  }
+
+  func testConcurrentStopWaitsAndRepeatsFinishOutcome() throws {
+    for failure: SourceRecordingError? in [nil, .writerFailure("finish failed")] {
+      let writer = BlockingStopWriter(failure: failure)
+      let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("stop"),
+        outputURL: URL(fileURLWithPath: "/tmp/stop.mov"), width: 32, height: 32)
+      let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+      writer.onFinish = { [weak recorder] in try recorder?.stop() }
+      try recorder.start()
+      let first = expectation(description: "First stop finished")
+      let second = expectation(description: "Second stop finished")
+      let secondEntered = DispatchSemaphore(value: 0)
+      let secondReturned = DispatchSemaphore(value: 0)
+      let stop = {
+        do {
+          try recorder.stop()
+          XCTAssertNil(failure)
+        } catch { XCTAssertEqual(error as? SourceRecordingError, failure) }
+      }
+      DispatchQueue.global().async { stop(); first.fulfill() }
+      XCTAssertEqual(writer.entered.wait(timeout: .now() + 1), .success)
+      DispatchQueue.global().async {
+        secondEntered.signal()
+        stop()
+        secondReturned.signal()
+        second.fulfill()
+      }
+      XCTAssertEqual(secondEntered.wait(timeout: .now() + 1), .success)
+      XCTAssertEqual(secondReturned.wait(timeout: .now() + 0.05), .timedOut)
+      writer.release.signal()
+      wait(for: [first, second], timeout: 3)
+      stop()
+      XCTAssertEqual(writer.finishCount, 1)
+      XCTAssertEqual(recorder.state, failure == nil ? .finished : .failed)
+    }
+  }
+
+  func testWriterFailureClosesAdmissionAndMatchesTelemetry() throws {
+    for readTelemetryFirst in [true, false] {
+      let writer = AsynchronouslyFailedWriter()
+      let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("failure"),
+        outputURL: URL(fileURLWithPath: "/tmp/failure.mov"), width: 32, height: 32)
+      let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+      let adapter = SourceRecordingCallbackAdapter(feedID: config.feedID, recorder: recorder)
+      try adapter.start()
+      writer.fail()
+      if readTelemetryFirst { XCTAssertEqual(recorder.telemetry.state, .failed) }
+      XCTAssertFalse(adapter.callbacks.video(try image(width: 32, height: 32), .zero,
+        CMTime(value: 1, timescale: 30), true))
+      XCTAssertEqual(recorder.state, .failed)
+      XCTAssertEqual(recorder.telemetry.state, recorder.state)
+      XCTAssertEqual(recorder.telemetry.enqueuedVideo, 0)
+      try recorder.stop()
+      XCTAssertEqual(recorder.state, .failed)
+    }
+  }
+
+  func testRawAudioRejectsUnsupportedSampleWidthAndCountsDrop() throws {
+    let writer = AdapterRecordingWriter()
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("raw-audio"),
+      outputURL: URL(fileURLWithPath: "/tmp/raw-audio.mov"), width: 32, height: 32)
+    let adapter = try SourceRecordingCallbackAdapter(configuration: config, writerFactory: { writer })
+    try adapter.start()
+    XCTAssertFalse(adapter.callbacks.rawAudio(Data(repeating: 0, count: 32), 1, .zero, 16, 2))
+    XCTAssertEqual(adapter.telemetry.droppedInvalidSample, 1)
+    XCTAssertEqual(adapter.telemetry.droppedAudio, 1)
+    XCTAssertEqual(adapter.telemetry.droppedVideo, 0)
+    XCTAssertEqual(adapter.telemetry.enqueuedAudio, 0)
+    try adapter.stop()
   }
 
   private func image(width: Int, height: Int) throws -> CVPixelBuffer {

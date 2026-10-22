@@ -36,7 +36,7 @@ enum UIAction: Sendable, Equatable {
   case refreshInputs
   case setPreviewEnabled(cameraID: String, Bool)
   case setAutomaticStart(cameraID: String, Bool)
-  case retryAutomaticStart
+  case retryAutomaticStart(cameraID: String)
   case retryPreview
   case addCamera
   case removeCamera(cameraID: String)

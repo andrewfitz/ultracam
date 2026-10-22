@@ -118,6 +118,10 @@ enum RecordingRecovery {
       for url in files where url.pathExtension == "ultracam-recovery" {
         guard let journal = try? RecordingRecoveryJournal(opening: url) else { continue }
         let source = folder.appendingPathComponent(journal.entry.temporaryName)
+        // The journal lock also covers export. Only reclaim its staging file
+        // after a crashed exporter has released that lock.
+        let staging = source.appendingPathExtension("export.ultracam-recovery")
+        if fm.fileExists(atPath: staging.path) { try fm.removeItem(at: staging) }
         let final = folder.appendingPathComponent(journal.entry.finalName)
         if let recovered = journal.entry.recoveredName,
           fm.fileExists(atPath: folder.appendingPathComponent(recovered).path) { continue }
@@ -160,7 +164,7 @@ enum RecordingRecovery {
       throw RecordingOutputError.ioFailure("This interrupted movie cannot be recovered. The original has been kept.")
     }
     let fm = FileManager.default
-    let staging = folder.appendingPathComponent(".Ultracam recovery-\(UUID().uuidString).mov")
+    let staging = take.temporaryURL.appendingPathExtension("export.ultracam-recovery")
     defer { try? fm.removeItem(at: staging) }
     try await exporter.export(to: staging, as: .mov)
     let recoveredAsset = AVURLAsset(url: staging)

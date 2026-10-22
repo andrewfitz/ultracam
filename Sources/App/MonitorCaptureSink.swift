@@ -103,13 +103,23 @@ final class MonitorCaptureSink: @unchecked Sendable {
   }
 
   var needsOutput: Bool {
-    guard lock.try() else { return false }
+    // try() failing means the lock is busy, not that the consumer left.
+    // Treating that as "no destination" drops the frame.
+    guard lock.try() else { return true }
     defer { lock.unlock() }
     return !consumers.isEmpty
       && (configuration.pictureStage == .processedOutput
         || (configuration.toolsEnabled && configuration.scopes.enabled
           && configuration.scopeStage == .processedOutput))
   }
+
+#if CAPTURE_LIFECYCLE_TESTS
+  func withLockHeldForTesting(_ body: () -> Void) {
+    lock.lock()
+    body()
+    lock.unlock()
+  }
+#endif
 
   /// The early source offer is used only when every requested signal is Source.
   /// Otherwise the atomic Output offer supplies both buffers from the same frame.

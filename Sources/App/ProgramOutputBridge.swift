@@ -211,7 +211,9 @@ final class ProgramOutputBridge: @unchecked Sendable {
     configuration.convertTo420 = metadata.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     configuration.inputFast = metadata.duration == VideoContract.fastDuration
     configuration.reduceFrameRate = false
-    let passthrough = demandPassthroughFormat ?? kCVPixelFormatType_422YpCbCr10
+    // The rejected frame's own format is the contract. Reusing the previous
+    // packed v210 passthrough makes CameraSink reject every later bi-planar frame.
+    let passthrough = OSType(metadata.pixelFormat)
     do {
       try connectSink(configuration, passthrough)
       connected = true

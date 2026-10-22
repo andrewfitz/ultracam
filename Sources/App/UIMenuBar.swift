@@ -280,8 +280,10 @@ final class UIMenuCommandBox: NSObject {
       items.append(banner)
     }
     // A failed automatic start gets one explicit Retry (there is no background retry loop).
-    if session.cameras.contains(where: \.automaticStartFailed) {
-      items.append(row("Retry Camera Start", action(.retryAutomaticStart), symbol: "arrow.clockwise", target: target))
+    let failedCameras = session.cameras.filter(\.automaticStartFailed)
+    for camera in failedCameras {
+      let title = failedCameras.count > 1 ? "Retry \(camera.name)" : "Retry Camera Start"
+      items.append(row(title, action(.retryAutomaticStart(cameraID: camera.id)), symbol: "arrow.clockwise", target: target))
     }
     if waiting && !showLivePreview {
       items.append(row("Show Live Preview", [.showLivePreview], symbol: "eye", target: target))

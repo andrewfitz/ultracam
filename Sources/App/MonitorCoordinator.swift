@@ -62,6 +62,10 @@ import MonitorToolsUI
     var snapshot = diagnosticSnapshots[target] ?? MonitorDiagnostics()
     snapshot.requestedPictureHz = workspace.layout == .fourUp ? 30 : 60
     snapshot.requestedScopeHz = configuration(for: target).scopes.refreshHz
+    let registered = surfaces.values.filter { $0.target == target }
+    if !registered.isEmpty && (!isPreviewEnabled(for: target) || registered.allSatisfy({
+      !$0.visible || !($0.presented ?? true) || !($0.drawable ?? true) || $0.presenter.isFrozen
+    })) { snapshot.availability = .paused }
     return snapshot
   }
 
@@ -194,10 +198,10 @@ import MonitorToolsUI
     value.scopeVisible = scopeVisible
     value.usesNativePreview = usesNativePreview
     surfaces[id] = value
+    // A native picture still gets its scopes from the monitor.
     presenter.setPresentationDemand(
       picture: !usesNativePreview && isPreviewEnabled(for: target),
-      scopes: !usesNativePreview && isPreviewEnabled(for: target)
-        && (presentationScopeVisible ?? scopeVisible))
+      scopes: isPreviewEnabled(for: target) && (presentationScopeVisible ?? scopeVisible))
     _ = captureSink(for: target)
     refreshSink(target)
     refreshDemand()
@@ -214,14 +218,18 @@ import MonitorToolsUI
   private func refreshSink(_ target: MonitorTargetID) {
     let available = targets.contains { $0.id == target && $0.isAvailable }
     let live = surfaces.values.filter {
-      $0.target == target && $0.visible && !$0.usesNativePreview && available
+      $0.target == target && $0.visible && !$0.presenter.isFrozen
+        && (!$0.usesNativePreview || $0.scopeVisible) && available
         && $0.presenter.isPresentationAdmitted
         && isPreviewEnabled(for: target) && ($0.presented ?? true) && ($0.drawable ?? true)
     }
+    // Native pictures need only their scopes, at the scope rate.
+    let scopesOnly = !live.isEmpty && live.allSatisfy(\.usesNativePreview)
     sinks[target]?.configure(
       configuration(for: target), consumers: live.map(\.presenter),
       scopeVisible: live.contains(where: \.scopeVisible),
-      preferredHz: workspace.layout == .fourUp ? 30 : 60)
+      preferredHz: scopesOnly ? Double(configuration(for: target).scopes.refreshHz)
+        : workspace.layout == .fourUp ? 30 : 60)
   }
 
   private func refreshDemand() {

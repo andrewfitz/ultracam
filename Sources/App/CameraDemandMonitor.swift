@@ -177,9 +177,8 @@ final class CameraDemandMonitor {
   /// published, so after a camera is renamed the expected name is missing; the
   /// device UID already selected the camera, so take the stream that isn't its input.
   static func sourceStream(_ streams: [(id: UInt32, name: String)], named name: String) -> UInt32? {
-    streams.first { $0.name == name }?.id ?? streams.first { stream in
-      !stream.name.localizedCaseInsensitiveContains("input") && !stream.name.localizedCaseInsensitiveContains("sink")
-    }?.id
+    if let exact = streams.first(where: { $0.name == name })?.id { return exact }
+    return CameraStreamNames.pair(streams.map { ($0.id, $0.name, nil) }, sinkName: name + " Input", sourceName: name)?.source
   }
 
   private func readDemand(routeID: String) {

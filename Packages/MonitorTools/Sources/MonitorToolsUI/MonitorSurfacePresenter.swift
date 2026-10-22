@@ -47,16 +47,18 @@ public final class MonitorSurfacePresenter: ObservableObject, @unchecked Sendabl
   @MainActor private weak var scopeView: MonitorScopeNSView?
   @MainActor public var onVisibilityChange: ((Bool, Bool) -> Void)?
   @MainActor private var visibility = (presented: false, drawable: false)
+  @MainActor private var visibilityReported = false
   @MainActor func reportVisibility(presented: Bool, drawable: Bool) {
-    guard visibility.presented != presented || visibility.drawable != drawable else { return }
+    let first = !visibilityReported
+    guard first || visibility.presented != presented || visibility.drawable != drawable
+    else { return }
+    visibilityReported = true
     visibility = (presented, drawable)
-    if !drawable {
-      lock.lock()
-      if frozen == nil { latest = nil }
-      lock.unlock()
-    }
     refreshPresentationAdmission()
-    onVisibilityChange?(presented, drawable)
+    // A first "not presented" report arrives before the view reaches its window.
+    // Passing it on drops monitor demand, which stops and restarts automatic capture.
+    if !(first && !presented && !drawable) { onVisibilityChange?(presented, drawable) }
+    present(forceStatus: true)
   }
   public var currentStamp: MonitorFrameStamp? {
     lock.lock()
@@ -204,8 +206,10 @@ public final class MonitorSurfacePresenter: ObservableObject, @unchecked Sendabl
     lock.lock()
     latest = nil
     unavailableReason = reason
+    pendingFreeze = false
     let hasFrozen = frozen != nil
     lock.unlock()
+    isFreezePending = false
     if !hasFrozen {
       pictureView?.clear()
       scopeView?.result = nil
@@ -314,6 +318,7 @@ public final class MonitorSurfacePresenter: ObservableObject, @unchecked Sendabl
     lock.unlock()
     isFrozen = frozen
     isFreezePending = pendingFreeze
+    let occluded = !frozen && visibilityReported && !visibility.drawable
     if pendingFreeze {
       status = "Waiting to freeze next picture"
       detail = status
@@ -323,8 +328,12 @@ public final class MonitorSurfacePresenter: ObservableObject, @unchecked Sendabl
       pictureView?.clear()
       scopeView?.result = nil
       scopeTiming = "No scope signal"
-      status = unavailableReason
-      detail = unavailableReason
+      if occluded {
+        status = visibility.presented ? "Occluded" : "Paused / hidden"
+      } else {
+        status = unavailableReason
+      }
+      detail = status
       return
     }
     guard isPresentationAdmitted else {
@@ -337,6 +346,15 @@ public final class MonitorSurfacePresenter: ObservableObject, @unchecked Sendabl
     }
     if presentationLedger == nil || scopeAllowance != nil { scopeView?.result = result.scope }
     let now = ProcessInfo.processInfo.systemUptime
+    if occluded {
+      if forceStatus || now - lastStatusUpdate >= 0.5 {
+        lastStatusUpdate = now
+        configuration = result.configuration
+      }
+      status = visibility.presented ? "Occluded" : "Paused / hidden"
+      detail = status
+      return
+    }
     if forceStatus || now - lastStatusUpdate >= 0.5 {
       lastStatusUpdate = now
       configuration = result.configuration
@@ -346,10 +364,8 @@ public final class MonitorSurfacePresenter: ObservableObject, @unchecked Sendabl
       if displaySize.height > 0 { pictureAspectRatio = displaySize.width / displaySize.height }
       let age = max(0, now - result.clean.stamp.hostTime)
       status = frozen ? "Frozen" : age > 0.25 ? "Stale" : "Live"
-      if !frozen && age > 0.25 {
-        pictureView?.clear()
-        scopeView?.result = nil
-      }
+      // Keep the last picture up. Clearing here erased the clean fallback
+      // on the same tick that labeled it Stale.
       detail =
         "Picture PTS \(String(format: "%.3f", result.clean.stamp.sourcePTS)) · \(String(format: "%.1f", age)) s old"
       if let scope = result.scope {
@@ -455,11 +471,14 @@ private final class MonitorWindowObservations: @unchecked Sendable {
       removingDisplayedImage: true, completionHandler: { [retiring] in _ = retiring })
     heldFrame = nil
   }
+  func flushIfFailed(_ status: AVQueuedSampleBufferRenderingStatus) {
+    guard status == .failed else { return }
+    displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true)
+    heldFrame = nil
+  }
   func display(_ frame: MonitorOwnedFrame) {
+    flushIfFailed(displayLayer.sampleBufferRenderer.status)
     guard heldFrame !== frame else { return }
-    if displayLayer.sampleBufferRenderer.status == .failed {
-      displayLayer.sampleBufferRenderer.flush()
-    }
     guard displayLayer.sampleBufferRenderer.isReadyForMoreMediaData else { return }
     var description: CMVideoFormatDescription?
     guard

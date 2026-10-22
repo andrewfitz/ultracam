@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CoreVideo
 import MetalKit
 import MonitorToolsCore
@@ -9,6 +10,66 @@ import XCTest
 @testable import MonitorToolsUI
 
 final class MonitorToolsUITests: XCTestCase {
+  @MainActor func testFailedLayerClearsIdentityWithoutUnfreezingSuccessfulHold() throws {
+    let presenter = MonitorSurfacePresenter()
+    let picture = try XCTUnwrap(presenter.makeView() as? MonitorPictureNSView)
+    let result = try fixture(sequence: 1, configuration: MonitorConfiguration(), requiresIOSurface: false)
+    presenter.accept(result)
+    presenter.setClean(false)
+    presenter.toggleFreeze()
+    XCTAssertTrue(presenter.isFrozen)
+    XCTAssertTrue(picture.heldFrame === result.clean)
+    picture.flushIfFailed(.rendering)
+    XCTAssertTrue(picture.heldFrame === result.clean, "A successful frozen display stays held")
+    picture.flushIfFailed(.failed)
+    XCTAssertNil(picture.heldFrame, "Failure invalidates the identity even for the same frozen frame")
+    XCTAssertTrue(presenter.isFrozen)
+    XCTAssertEqual(presenter.currentStamp, result.clean.stamp)
+  }
+
+  @MainActor func testOcclusionAndHiddenStatusPreserveSuccessfulFreeze() async throws {
+    let presenter = MonitorSurfacePresenter()
+    presenter.accept(try fixture(sequence: 1, configuration: MonitorConfiguration(), requiresIOSurface: false))
+    await Task.yield()
+    presenter.setClean(false)
+    presenter.reportVisibility(presented: true, drawable: false)
+    XCTAssertEqual(presenter.status, "Occluded")
+    presenter.reportVisibility(presented: false, drawable: false)
+    XCTAssertEqual(presenter.status, "Paused / hidden")
+    presenter.reportVisibility(presented: true, drawable: true)
+    presenter.accept(try fixture(sequence: 2, configuration: MonitorConfiguration(), requiresIOSurface: false))
+    await Task.yield()
+    presenter.setClean(false)
+    presenter.toggleFreeze()
+    let frozen = presenter.currentStamp
+    presenter.reportVisibility(presented: true, drawable: false)
+    XCTAssertTrue(presenter.isFrozen)
+    XCTAssertEqual(presenter.status, "Frozen")
+    XCTAssertEqual(presenter.currentStamp, frozen)
+  }
+
+  @MainActor func testFalseColorOffAndSourceMatteCaptions() {
+    var configuration = MonitorConfiguration()
+    configuration.toolsEnabled = true
+    configuration.pictureStage = .processedOutput
+    let toolbar = MonitorToolsToolbar(configuration: .constant(configuration))
+    XCTAssertEqual(toolbar.falseColorAnalysisLabel, "Analysis: Off")
+    let plain = MonitorTileChrome(
+      target: .constant(MonitorTargetID("feed")), configuration: .constant(configuration),
+      choices: [], status: "Live", picture: { EmptyView() }, scopes: { EmptyView() })
+    XCTAssertEqual(plain.pictureCaption, "Picture: Processed Output")
+    configuration.falseColor.mode = .sonySLog3
+    let matte = MonitorTileChrome(
+      target: .constant(MonitorTargetID("feed")), configuration: .constant(configuration),
+      choices: [], status: "Frozen", legendConfiguration: configuration,
+      picture: { EmptyView() }, scopes: { EmptyView() })
+    XCTAssertTrue(matte.pictureCaption.hasPrefix("False color: Source analysis"))
+    var diagnostic = MonitorDiagnostics()
+    diagnostic.softDeadlineStatus = .exceeded
+    let view = MonitorDiagnosticsView(snapshot: diagnostic, surfaceScopeTiming: "", presentationEstimate: "")
+    XCTAssertEqual(view.deadline, "exceeded; last delivered picture is older than limit")
+  }
+
   @MainActor func testExplicitSonyModeSelectionQualifiesAnExistingSonyDeclaration() {
     for source in ["sony-slog3-sgamut3cine", "sony-slog3-sgamut3"] {
       var selected = MonitorConfiguration()
@@ -722,12 +783,12 @@ final class MonitorToolsUITests: XCTestCase {
   private func fixture(
     sequence: UInt64, configuration: MonitorConfiguration, transfer: String = "Synthetic signal",
     generation: UInt64 = 1, revision: UInt64? = nil, processing: UInt64 = 0,
-    target: String = "synthetic"
+    target: String = "synthetic", requiresIOSurface: Bool = true
   ) throws -> MonitorDisplayResult {
     var buffer: CVPixelBuffer?
     let result = CVPixelBufferCreate(
       kCFAllocatorDefault, 16, 9, kCVPixelFormatType_32BGRA,
-      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
+      requiresIOSurface ? [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary : nil, &buffer)
     XCTAssertEqual(result, kCVReturnSuccess)
     let pixelBuffer = try XCTUnwrap(buffer)
     CVPixelBufferLockBaseAddress(pixelBuffer, [])
