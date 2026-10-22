@@ -1,37 +1,41 @@
 import Foundation
-import MonitorToolsCore
+import MonitorKitCore
 import XCTest
 
 @objcMembers final class MonitorLifecycleChecks: XCTestCase {
   func testLegacySnapshotsDefaultMonitoringOff() throws {
     let data = Data(#"{"feeds":[{"id":"default","name":"Legacy"}]}"#.utf8)
     let snapshot = try JSONDecoder().decode(AppSettingsSnapshot.self, from: data)
-    XCTAssertFalse(snapshot.feeds[0].monitorConfiguration.toolsEnabled)
-    XCTAssertFalse(snapshot.programMonitorConfiguration.toolsEnabled)
-    XCTAssertEqual(snapshot.monitorWorkspace.layout, .single)
+    XCTAssertFalse(snapshot.feeds[0].monitor.toolsEnabled)
+    XCTAssertFalse(snapshot.programMonitor.toolsEnabled)
+    XCTAssertEqual(snapshot.feeds[0].monitor, MonitorFeedPreferences())
+    XCTAssertNil(snapshot.feeds[0].legacyMonitorConfiguration)
+    XCTAssertNil(snapshot.legacyProgramMonitorConfiguration)
+    XCTAssertEqual(snapshot.monitorWorkspacePreferences.layout, .single)
   }
 
   func testIndependentFeedProgramAndWorkspaceRoundTrip() throws {
-    var first = MonitorConfiguration()
-    first.toolsEnabled = true
-    first.zebra.enabled = true
-    first.zebra.thresholdIRE = 89
-    var second = MonitorConfiguration()
+    var first = MonitorFeedPreferences(toolsEnabled: true)
+    first.state.zebras[0].enabled = true
+    first.state.zebras[0].level = 89
+    var second = MonitorFeedPreferences()
     second.scopes.enabled = true
-    var program = MonitorConfiguration()
-    program.pictureStage = .source
-    var workspace = MonitorWorkspaceState()
+    var program = MonitorFeedPreferences()
+    program.state.pictureStage = .source
+    var workspace = MonitorWorkspacePreferences()
     workspace.layout = .sideBySide
-    workspace.tileBindings = [MonitorTargetID("a"), MonitorTargetID("b"), nil, nil]
+    workspace.tileBindings = ["a", "b", nil, nil]
     let snapshot = AppSettingsSnapshot(
       feeds: [
-        FeedDescriptor(id: FeedID(rawValue: "a"), monitorConfiguration: first),
-        FeedDescriptor(id: FeedID(rawValue: "b"), monitorConfiguration: second),
-      ], programMonitorConfiguration: program, monitorWorkspace: workspace)
-    XCTAssertEqual(
-      try JSONDecoder().decode(
-        AppSettingsSnapshot.self,
-        from: JSONEncoder().encode(snapshot)), snapshot)
+        FeedDescriptor(id: FeedID(rawValue: "a"), monitor: first),
+        FeedDescriptor(id: FeedID(rawValue: "b"), monitor: second),
+      ], programMonitor: program, monitorWorkspace: workspace)
+    let decoded = try JSONDecoder().decode(AppSettingsSnapshot.self, from: JSONEncoder().encode(snapshot))
+    XCTAssertEqual(decoded, snapshot)
+    XCTAssertEqual(decoded.feeds[0].monitor.state.zebras[0].level, 89)
+    XCTAssertTrue(decoded.feeds[1].monitor.scopes.enabled)
+    XCTAssertEqual(decoded.programMonitor.state.pictureStage, .source)
+    XCTAssertEqual(decoded.monitorWorkspacePreferences.tileBindings, ["a", "b", nil, nil])
   }
 
   func testClosingOneMonitorPreservesRecordingAndOtherFeedDemand() {

@@ -1,7 +1,6 @@
 import CoreMedia
 import CoreVideo
 import Foundation
-import MonitorToolsCore
 
 /// The result of routing one processed frame through the Program output.
 /// The scheduler decision remains available to diagnostics while the route
@@ -771,8 +770,10 @@ final class FeedCoordinator {
   var switcherCoordinator: SwitcherCoordinator { programOutput.switcher }
   private(set) var virtualCameraRegistrySnapshot: VirtualCameraRegistrySnapshot
   private let registryStore: VirtualCameraRegistryStore?
-  var programMonitorConfiguration: MonitorConfiguration
-  var monitorWorkspace: MonitorWorkspaceState
+  var programMonitor: MonitorFeedPreferences
+  /// Program's MonitorTools blob from an earlier build, passed through untouched.
+  private let legacyProgramMonitorConfiguration: PreservedJSON?
+  var monitorWorkspace: MonitorWorkspacePreferences
   private var sessions: [FeedID: FeedSession] = [:]
   let capturePool: FeedCapturePool
   let programOutput: ProgramOutputRoute
@@ -790,8 +791,9 @@ final class FeedCoordinator {
        capturePool: FeedCapturePool = FeedCapturePool(),
        registryStore: VirtualCameraRegistryStore? = nil) {
     let safe = snapshot.validated() ?? AppSettingsSnapshot()
-    programMonitorConfiguration = safe.programMonitorConfiguration
-    monitorWorkspace = safe.monitorWorkspace
+    programMonitor = safe.programMonitor
+    legacyProgramMonitorConfiguration = safe.legacyProgramMonitorConfiguration
+    monitorWorkspace = safe.monitorWorkspacePreferences
     descriptors = safe.feeds
     // A persisted selection can point at a disabled descriptor. Keep the
     // collection and the live Program route on the same usable source so a
@@ -1260,7 +1262,9 @@ final class FeedCoordinator {
     AppSettingsSnapshot(feeds: descriptors, selectedFeedID: selectedFeedID,
       outputMode: outputMode, switcher: switcher,
       virtualCameraRegistryVersion: virtualCameraRegistryVersion,
-      programMonitorConfiguration: programMonitorConfiguration, monitorWorkspace: monitorWorkspace)
+      programMonitor: programMonitor,
+      legacyProgramMonitorConfiguration: legacyProgramMonitorConfiguration,
+      monitorWorkspace: monitorWorkspace)
   }
 
   @discardableResult

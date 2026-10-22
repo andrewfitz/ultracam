@@ -11,14 +11,15 @@ import MonitorToolsUI
       guard workspace != oldValue else { return }
       if !workspace.isConfigured { workspace.isConfigured = true }
       for target in sinks.keys { refreshSink(target) }
-      onWorkspaceChange?(workspace)
+      onWorkspaceChange?(MonitorWorkspacePreferences(workspace))
     }
   }
   @Published private(set) var targets: [MonitorTargetOption] = []
   @Published private var configurations: [MonitorTargetID: MonitorConfiguration]
   @Published private var previewEnabled: [MonitorTargetID: Bool] = [:]
-  var onConfigurationChange: ((MonitorTargetID, MonitorConfiguration) -> Void)?
-  var onWorkspaceChange: ((MonitorWorkspaceState) -> Void)?
+  /// A target's tools changed; merge them into its `MonitorFeedPreferences`.
+  var onConfigurationChange: ((MonitorTargetID, LegacyMonitorConfiguration) -> Void)?
+  var onWorkspaceChange: ((MonitorWorkspacePreferences) -> Void)?
   var onDemandChange: ((Set<MonitorTargetID>) -> Void)?
   var onPreviewEnabledChange: ((MonitorTargetID, Bool) -> Void)?
   @Published private var diagnosticSnapshots: [MonitorTargetID: MonitorDiagnostics] = [:]
@@ -54,6 +55,17 @@ import MonitorToolsUI
       guard let self else { return timer.invalidate() }
       MainActor.assumeIsolated { self.refreshDiagnostics() }
     }
+  }
+
+  /// Restores the persisted preferences of every feed, Program and the workspace.
+  convenience init(
+    feeds: [FeedDescriptor], program: MonitorFeedPreferences, workspace: MonitorWorkspacePreferences
+  ) {
+    var configurations = Dictionary(uniqueKeysWithValues: feeds.map {
+      (MonitorTargetID($0.id.rawValue), MonitorConfiguration($0.monitor.legacyConfiguration))
+    })
+    configurations[MonitorTargetID("program")] = MonitorConfiguration(program.legacyConfiguration)
+    self.init(configurations: configurations, workspace: MonitorWorkspaceState(workspace))
   }
 
   /// Once a second: source rate from the sink, presented rate and GPU time
@@ -111,7 +123,7 @@ import MonitorToolsUI
     guard configurations[target] != value else { return }
     configurations[target] = value
     refreshSink(target)
-    onConfigurationChange?(target, value)
+    onConfigurationChange?(target, LegacyMonitorConfiguration(value))
   }
 
   func copySettings(from source: MonitorTargetID, to destination: MonitorTargetID) {
@@ -160,11 +172,11 @@ import MonitorToolsUI
       let target = MonitorTargetID(feed.id.rawValue)
       previewEnabled[target] = feed.previewEnabled
       if let oldDevice = assignedDevices[target], oldDevice != feed.selectedDevice {
-        configurations[target] = feed.monitorConfiguration
+        configurations[target] = MonitorConfiguration(feed.monitor.legacyConfiguration)
         sinks[target]?.invalidate()
         refreshSink(target)
       } else if configurations[target] == nil {
-        configurations[target] = feed.monitorConfiguration
+        configurations[target] = MonitorConfiguration(feed.monitor.legacyConfiguration)
       }
       assignedDevices[target] = feed.selectedDevice
       refreshSink(target)
@@ -282,5 +294,130 @@ import MonitorToolsUI
         surface.presenter.setUnavailable("Feed stopped")
       }
     }
+  }
+}
+
+// The settings boundary while surfaces still render with MonitorTools: the
+// app persists `MonitorFeedPreferences` (MonitorKit) and converts through
+// `LegacyMonitorConfiguration`, its app-owned copy of `MonitorConfiguration`.
+// No file imports both packages.
+
+extension MonitorConfiguration {
+  init(_ legacy: LegacyMonitorConfiguration) {
+    self.init()
+    schemaVersion = legacy.schemaVersion
+    toolsEnabled = legacy.toolsEnabled
+    guides.enabled = legacy.guides.enabled
+    guides.thirds = legacy.guides.thirds
+    guides.centerCross = legacy.guides.centerCross
+    guides.safeArea = legacy.guides.safeArea
+    guides.opacity = legacy.guides.opacity
+    guides.contrast = legacy.guides.contrast
+    zebra.enabled = legacy.zebra.enabled
+    zebra.thresholdIRE = legacy.zebra.thresholdIRE
+    zebra.widthIRE = legacy.zebra.widthIRE
+    zebra.mode = legacy.zebra.mode == .band ? .band : .aboveThreshold
+    zebra.opacity = legacy.zebra.opacity
+    falseColor.mode = MonitorFalseColorMode(rawValue: legacy.falseColor.mode.rawValue) ?? .off
+    falseColor.profileID = legacy.falseColor.profileID
+    falseColor.specificationVersion = legacy.falseColor.specificationVersion
+    falseColor.exposureIndex = legacy.falseColor.exposureIndex
+    falseColor.referenceOffsetStops = legacy.falseColor.referenceOffsetStops
+    focus.enabled = legacy.focus.enabled
+    focus.color = MonitorPeakingColor(rawValue: legacy.focus.color.rawValue) ?? .red
+    focus.sensitivity = legacy.focus.sensitivity
+    focus.noiseRejection = legacy.focus.noiseRejection
+    focus.opacity = legacy.focus.opacity
+    scopes.enabled = legacy.scopes.enabled
+    scopes.mode = legacy.scopes.mode == .lumaWaveform ? .lumaWaveform : .rgbParade
+    scopes.gain = legacy.scopes.gain
+    scopes.graticule = legacy.scopes.graticule
+    scopes.refreshHz = legacy.scopes.refreshHz
+    pictureStage = legacy.pictureStage == .source ? .source : .processedOutput
+    scopeStage = legacy.scopeStage == .source ? .source : .processedOutput
+    sourceProfileID = legacy.sourceProfileID
+    sourceCodeRange = legacy.sourceCodeRange.map { $0 == .full ? .full : .legal }
+    sourceLogMapping = legacy.sourceLogMapping == .fullRescaledToLegal10Bit
+      ? .fullRescaledToLegal10Bit : .native10Bit
+  }
+}
+
+extension LegacyMonitorConfiguration {
+  init(_ configuration: MonitorConfiguration) {
+    self.init()
+    schemaVersion = configuration.schemaVersion
+    toolsEnabled = configuration.toolsEnabled
+    guides.enabled = configuration.guides.enabled
+    guides.thirds = configuration.guides.thirds
+    guides.centerCross = configuration.guides.centerCross
+    guides.safeArea = configuration.guides.safeArea
+    guides.opacity = configuration.guides.opacity
+    guides.contrast = configuration.guides.contrast
+    zebra.enabled = configuration.zebra.enabled
+    zebra.thresholdIRE = configuration.zebra.thresholdIRE
+    zebra.widthIRE = configuration.zebra.widthIRE
+    zebra.mode = configuration.zebra.mode == .band ? .band : .aboveThreshold
+    zebra.opacity = configuration.zebra.opacity
+    falseColor.mode = FalseColorMode(rawValue: configuration.falseColor.mode.rawValue) ?? .off
+    falseColor.profileID = configuration.falseColor.profileID
+    falseColor.specificationVersion = configuration.falseColor.specificationVersion
+    falseColor.exposureIndex = configuration.falseColor.exposureIndex
+    falseColor.referenceOffsetStops = configuration.falseColor.referenceOffsetStops
+    focus.enabled = configuration.focus.enabled
+    focus.color = PeakingColor(rawValue: configuration.focus.color.rawValue) ?? .red
+    focus.sensitivity = configuration.focus.sensitivity
+    focus.noiseRejection = configuration.focus.noiseRejection
+    focus.opacity = configuration.focus.opacity
+    scopes.enabled = configuration.scopes.enabled
+    scopes.mode = configuration.scopes.mode == .lumaWaveform ? .lumaWaveform : .rgbParade
+    scopes.gain = configuration.scopes.gain
+    scopes.graticule = configuration.scopes.graticule
+    scopes.refreshHz = configuration.scopes.refreshHz
+    pictureStage = configuration.pictureStage == .source ? .source : .processedOutput
+    scopeStage = configuration.scopeStage == .source ? .source : .processedOutput
+    sourceProfileID = configuration.sourceProfileID
+    sourceCodeRange = configuration.sourceCodeRange.map { $0 == .full ? .full : .legal }
+    sourceLogMapping = configuration.sourceLogMapping == .fullRescaledToLegal10Bit
+      ? .fullRescaledToLegal10Bit : .native10Bit
+  }
+}
+
+extension MonitorWorkspaceState {
+  init(_ preferences: MonitorWorkspacePreferences) {
+    self.init()
+    schemaVersion = preferences.schemaVersion
+    isConfigured = preferences.isConfigured
+    layout = MonitorWorkspaceLayout(rawValue: preferences.layout.rawValue) ?? .single
+    tileBindings = preferences.tileBindings.map { $0.map(MonitorTargetID.init(rawValue:)) }
+    splitRatio = preferences.splitRatio
+  }
+}
+
+extension MonitorWorkspacePreferences {
+  init(_ state: MonitorWorkspaceState) {
+    self.init()
+    schemaVersion = state.schemaVersion
+    isConfigured = state.isConfigured
+    layout = Layout(rawValue: state.layout.rawValue) ?? .single
+    tileBindings = state.tileBindings.map { $0?.rawValue }
+    splitRatio = state.splitRatio
+  }
+}
+
+extension AppSettingsSnapshot {
+  /// The workspace as MonitorTools' type, for callers not yet moved to
+  /// `monitorWorkspacePreferences`. Removed with MonitorTools.
+  var monitorWorkspace: MonitorWorkspaceState {
+    get { MonitorWorkspaceState(monitorWorkspacePreferences) }
+    set { monitorWorkspacePreferences = MonitorWorkspacePreferences(newValue) }
+  }
+
+  /// `init(...)` with MonitorTools' workspace type. Removed with MonitorTools.
+  init(feeds: [FeedDescriptor] = [FeedDescriptor()], selectedFeedID: FeedID? = nil,
+    outputMode: FeedOutputMode = .separateCameras, switcher: SwitcherSettings = SwitcherSettings(),
+    virtualCameraRegistryVersion: Int = 1, monitorWorkspace: MonitorWorkspaceState) {
+    self.init(feeds: feeds, selectedFeedID: selectedFeedID, outputMode: outputMode, switcher: switcher,
+      virtualCameraRegistryVersion: virtualCameraRegistryVersion,
+      monitorWorkspace: MonitorWorkspacePreferences(monitorWorkspace))
   }
 }

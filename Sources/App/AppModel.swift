@@ -258,11 +258,8 @@ final class AppModel {
     self.virtualCameraRegistryStore = registryStore ?? VirtualCameraRegistryStore()
     let snapshot = store.loadSnapshot()
     persistedSnapshot = snapshot
-    var monitorConfigurations = Dictionary(uniqueKeysWithValues: snapshot.feeds.map {
-      (MonitorTargetID($0.id.rawValue), $0.monitorConfiguration)
-    })
-    monitorConfigurations[MonitorTargetID("program")] = snapshot.programMonitorConfiguration
-    monitorCoordinator = MonitorCoordinator(configurations: monitorConfigurations, workspace: snapshot.monitorWorkspace)
+    monitorCoordinator = MonitorCoordinator(feeds: snapshot.feeds, program: snapshot.programMonitor,
+      workspace: snapshot.monitorWorkspacePreferences)
 
     let renderer = VideoPreviewRenderer()
     let miniRenderer = VideoPreviewRenderer()
@@ -292,10 +289,11 @@ final class AppModel {
     self.lutLoader = lutLoader
     monitorCoordinator.onConfigurationChange = { [weak self] target, configuration in
       guard let self else { return }
-      if target == MonitorTargetID("program") {
-        self.feedCoordinator.programMonitorConfiguration = configuration
+      // Merged, so MonitorKit settings the configuration cannot carry survive.
+      if target.rawValue == "program" {
+        self.feedCoordinator.programMonitor.merge(configuration)
       } else if var descriptor = self.feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
-        descriptor.monitorConfiguration = configuration
+        descriptor.monitor.merge(configuration)
         self.feedCoordinator.update(descriptor)
       }
       self.saveSettings()
@@ -757,23 +755,16 @@ final class AppModel {
   func saveSettings() {
     guard !restoringSettings, !settingsResetPending else { return }
     let oldName = feedCoordinator.selectedDescriptor.name
-    var monitorConfiguration = feedCoordinator.selectedDescriptor.monitorConfiguration
-    if feedCoordinator.selectedDescriptor.selectedDevice != selectedDevice {
-      monitorConfiguration.sourceProfileID = nil
-      monitorConfiguration.sourceCodeRange = nil
-      monitorConfiguration.sourceLogMapping = .native10Bit
-      monitorConfiguration.falseColor.profileID = nil
-      monitorConfiguration.falseColor.specificationVersion = nil
-      monitorConfiguration.falseColor.exposureIndex = 800
-      monitorConfiguration.falseColor.referenceOffsetStops = 0
-    }
+    var monitor = feedCoordinator.selectedDescriptor.monitor
+    if feedCoordinator.selectedDescriptor.selectedDevice != selectedDevice { monitor.forgetCameraCalibration() }
     let descriptor = FeedDescriptor(id: selectedFeedID, name: oldName, selectedDevice: selectedDevice,
       applyLUT: lutLoaded ? configuration.applyLUT : rememberedLUTEnabled,
       downscale: configuration.downscale, convertTo420: configuration.convertTo420,
       reduceFrameRate: configuration.reduceFrameRate, gamut: gamut,
       pipelineEnabled: pipelineEnabled, previewEnabled: previewEnabled, lutBookmark: lutBookmark,
       automaticFeed: automaticFeedEnabled, enabled: feedCoordinator.selectedDescriptor.enabled,
-      monitorConfiguration: monitorConfiguration)
+      monitor: monitor,
+      legacyMonitorConfiguration: feedCoordinator.selectedDescriptor.legacyMonitorConfiguration)
     feedCoordinator.update(descriptor)
     persistedSnapshot = feedCoordinator.snapshot
     settingsStore.saveSnapshot(persistedSnapshot)

@@ -232,14 +232,20 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   var lutBookmark: Data?
   var automaticFeed = false
   var enabled = true
-  var monitorConfiguration = MonitorConfiguration()
+  /// Monitor tools for this feed's surfaces (key `monitor`).
+  var monitor = MonitorFeedPreferences()
+  /// The MonitorTools configuration an earlier build saved (key
+  /// `monitorConfiguration`), written back untouched so a downgrade still finds
+  /// its tools. Only migrated from, never decoded as a `MonitorState`.
+  var legacyMonitorConfiguration: PreservedJSON?
 
   init(id: FeedID = .primary, name: String = "Camera 1", selectedDevice: String = "",
     applyLUT: Bool = false, downscale: Bool = true, convertTo420: Bool = true,
     reduceFrameRate: Bool = false, gamut: String = "S-Gamut3.Cine / S-Log3",
     pipelineEnabled: Bool = true, previewEnabled: Bool = true, lutBookmark: Data? = nil,
     automaticFeed: Bool = false, enabled: Bool = true,
-    monitorConfiguration: MonitorConfiguration = MonitorConfiguration()) {
+    monitor: MonitorFeedPreferences = MonitorFeedPreferences(),
+    legacyMonitorConfiguration: PreservedJSON? = nil) {
     self.id = id
     self.name = name
     self.selectedDevice = selectedDevice
@@ -253,7 +259,8 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     self.lutBookmark = lutBookmark
     self.automaticFeed = automaticFeed
     self.enabled = enabled
-    self.monitorConfiguration = monitorConfiguration
+    self.monitor = monitor
+    self.legacyMonitorConfiguration = legacyMonitorConfiguration
   }
 
   init(legacy settings: AppSettings, id: FeedID = .primary, name: String = "Camera 1") {
@@ -290,7 +297,8 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   private enum CodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, pipelineEnabled, previewEnabled, lutBookmark,
-      automaticFeed, enabled, monitorConfiguration
+      automaticFeed, enabled, monitor
+    case legacyMonitorConfiguration = "monitorConfiguration"
   }
 
   init(from decoder: Decoder) throws {
@@ -312,7 +320,10 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     lutBookmark = try values.decodeIfPresent(Data.self, forKey: .lutBookmark)
     automaticFeed = try values.decodeIfPresent(Bool.self, forKey: .automaticFeed) ?? false
     enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
-    monitorConfiguration = try values.decodeIfPresent(MonitorConfiguration.self, forKey: .monitorConfiguration) ?? MonitorConfiguration()
+    // New keys only: `version` stays 1, since `validated()` rejects any other
+    // and a rejected snapshot loses every feed.
+    monitor = values.monitorPreferences(.monitor, legacy: .legacyMonitorConfiguration)
+    legacyMonitorConfiguration = values.preservedJSON(.legacyMonitorConfiguration)
   }
 }
 
@@ -324,22 +335,29 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
   var selectedFeedID: FeedID
   var outputMode: FeedOutputMode = .separateCameras
   var switcher = SwitcherSettings()
-  var programMonitorConfiguration = MonitorConfiguration()
-  var monitorWorkspace = MonitorWorkspaceState()
+  /// Monitor tools for Program's surfaces (key `programMonitor`).
+  var programMonitor = MonitorFeedPreferences()
+  /// Program's MonitorTools configuration from an earlier build (key
+  /// `programMonitorConfiguration`), kept untouched like the feeds'.
+  var legacyProgramMonitorConfiguration: PreservedJSON?
+  /// Key `monitorWorkspace`, the same JSON as before.
+  var monitorWorkspacePreferences = MonitorWorkspacePreferences()
   var virtualCameraRegistryVersion = 1
 
   init(feeds: [FeedDescriptor] = [FeedDescriptor()], selectedFeedID: FeedID? = nil,
     outputMode: FeedOutputMode = .separateCameras, switcher: SwitcherSettings = SwitcherSettings(),
     virtualCameraRegistryVersion: Int = 1,
-    programMonitorConfiguration: MonitorConfiguration = MonitorConfiguration(),
-    monitorWorkspace: MonitorWorkspaceState = MonitorWorkspaceState()) {
+    programMonitor: MonitorFeedPreferences = MonitorFeedPreferences(),
+    legacyProgramMonitorConfiguration: PreservedJSON? = nil,
+    monitorWorkspace: MonitorWorkspacePreferences = MonitorWorkspacePreferences()) {
     self.feeds = feeds
     self.selectedFeedID = selectedFeedID ?? feeds.first?.id ?? .primary
     self.outputMode = outputMode
     self.switcher = switcher
     self.virtualCameraRegistryVersion = virtualCameraRegistryVersion
-    self.programMonitorConfiguration = programMonitorConfiguration
-    self.monitorWorkspace = monitorWorkspace
+    self.programMonitor = programMonitor
+    self.legacyProgramMonitorConfiguration = legacyProgramMonitorConfiguration
+    self.monitorWorkspacePreferences = monitorWorkspace
   }
 
   var selectedFeed: FeedDescriptor? {
@@ -363,7 +381,9 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
   }
 
   private enum CodingKeys: String, CodingKey {
-    case version, feeds, selectedFeedID, outputMode, switcher, virtualCameraRegistryVersion, programMonitorConfiguration, monitorWorkspace
+    case version, feeds, selectedFeedID, outputMode, switcher, virtualCameraRegistryVersion, programMonitor
+    case legacyProgramMonitorConfiguration = "programMonitorConfiguration"
+    case monitorWorkspacePreferences = "monitorWorkspace"
   }
 
   init(from decoder: Decoder) throws {
@@ -375,8 +395,10 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
     outputMode = try values.decodeIfPresent(FeedOutputMode.self, forKey: .outputMode) ?? .separateCameras
     switcher = try values.decodeIfPresent(SwitcherSettings.self, forKey: .switcher) ?? SwitcherSettings()
     virtualCameraRegistryVersion = try values.decodeIfPresent(Int.self, forKey: .virtualCameraRegistryVersion) ?? 1
-    programMonitorConfiguration = try values.decodeIfPresent(MonitorConfiguration.self, forKey: .programMonitorConfiguration) ?? MonitorConfiguration()
-    monitorWorkspace = try values.decodeIfPresent(MonitorWorkspaceState.self, forKey: .monitorWorkspace) ?? MonitorWorkspaceState()
+    programMonitor = values.monitorPreferences(.programMonitor, legacy: .legacyProgramMonitorConfiguration)
+    legacyProgramMonitorConfiguration = values.preservedJSON(.legacyProgramMonitorConfiguration)
+    monitorWorkspacePreferences = try values.decodeIfPresent(MonitorWorkspacePreferences.self,
+      forKey: .monitorWorkspacePreferences) ?? MonitorWorkspacePreferences()
   }
 }
 
