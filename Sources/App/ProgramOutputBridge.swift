@@ -417,16 +417,18 @@ extension ProgramOutputBridge {
 }
 
 /// Feeds the Program monitor from the Program route's publishing thread.
-/// `MonitorCaptureSink` is lock-based and non-blocking, so the monitor gets
-/// every Program frame in order without a main-actor hop. Generation changes
-/// at each cut so the monitor restarts its per-source state.
+/// The sink is lock-based and non-blocking, so the monitor gets every Program
+/// frame in order without a main-actor hop. Program's frame is its only
+/// picture (no output twin): it is already processed, so its sink has no
+/// burn-in LUT and no source correspondence. Generation changes at each cut
+/// so the monitor restarts its per-source state.
 final class ProgramMonitorTap: @unchecked Sendable {
-  private let sink: MonitorCaptureSink
+  private let sink: any MonitorFrameSink
   private let lock = NSLock()
   private var generation: UInt64 = 1
   private var sequence: UInt64 = 0
 
-  init(sink: MonitorCaptureSink) { self.sink = sink }
+  init(sink: any MonitorFrameSink) { self.sink = sink }
 
   /// Starts a new monitor generation, e.g. when Program becomes available
   /// again after the monitor invalidated the Program sink.
@@ -443,9 +445,6 @@ final class ProgramMonitorTap: @unchecked Sendable {
     let generation = self.generation
     let sequence = self.sequence
     lock.unlock()
-    sink.offer(source: frame.payload, output: frame.payload, pts: sourcePTS,
-      captureGeneration: generation, sequence: sequence,
-      processingRevision: frame.metadata.processingRevision,
-      sourceOnly: false, correspondence: nil)
+    sink.offer(frame.payload, pts: sourcePTS, captureGeneration: generation, sequence: sequence)
   }
 }

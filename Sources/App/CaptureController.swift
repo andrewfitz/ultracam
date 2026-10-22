@@ -146,11 +146,9 @@ final class CaptureController: @unchecked Sendable {
   private let services: CaptureServices
   private let previewRenderers: [VideoPreviewRenderer]
   private var legacyPreviewOwner = true
-  private var monitorSink: MonitorCaptureSink?
-  private var monitorLifecycleSink: MonitorCaptureSink?
+  private var monitorSink: (any MonitorFrameSink)?
+  private var monitorLifecycleSink: (any MonitorFrameSink)?
   private var monitorSequence: UInt64 = 0
-  private var monitorProcessingRevision: UInt64 = 0
-  private var monitorPipelineConfiguration: PipelineConfiguration?
   private var ownedPreviewRenderers: [VideoPreviewRenderer] { legacyPreviewOwner ? previewRenderers : [] }
   // Capture queue: bumped by every preview flush and frozen into each frame,
   // so frames still on the GPU at a flush can't reach the preview after it.
@@ -313,7 +311,6 @@ final class CaptureController: @unchecked Sendable {
         }
         try self.makeProcessor().load(lut)
         self.lock.withLock { self.loadedLUT = lut }
-        self.monitorProcessingRevision &+= 1
         if self.pipelineEnabled && self.configuration.applyLUT { self.flushOwnedPreviews() }
         DispatchQueue.main.async { completion(.success(())) }
       } catch { DispatchQueue.main.async { completion(.failure(error)) } }
@@ -417,9 +414,10 @@ final class CaptureController: @unchecked Sendable {
         let hasPreview = previewEnabled &&
           (self.ownedPreviewRenderers.contains { $0.isVisible } || self.services.preview != nil)
         // Every consumer that makes the first frame do GPU work, including a
-        // headless Program source and the monitor's processed view.
+        // headless Program source. The monitor is not one: it shows the source
+        // (and the burn-in LUT in its own shader), so it never forces processing.
         let hasProgram = self.lock.withLock { self.processedFrameHandler != nil }
-        if self.cameraConnected || hasPreview || hasProgram || self.monitorSink?.needsOutput == true {
+        if self.cameraConnected || hasPreview || hasProgram {
           if !warm.untouched { _ = try self.makeProcessor() }
           try self.ensurePrepared(warm, wait: true)
         }
@@ -564,7 +562,6 @@ final class CaptureController: @unchecked Sendable {
       self.configuration = configuration
       self.pipelineEnabled = pipelineEnabled
       self.publishBurnIn()
-      self.monitorProcessingRevision &+= 1
       if !self.cameraConnected { self.reconnectRequested = true }
       self.applied = nil
       self.outputLabel = ""
@@ -590,7 +587,9 @@ final class CaptureController: @unchecked Sendable {
     queue.async { self.legacyPreviewOwner = enabled }
   }
 
-  func setMonitorSink(_ sink: MonitorCaptureSink?) {
+  /// The monitor's endpoint for this camera: every frame's source buffer, in
+  /// capture order, from the delivery queue.
+  func setMonitorSink(_ sink: (any MonitorFrameSink)?) {
     lock.withLock { monitorLifecycleSink = sink }
     queue.async { self.monitorSink = sink }
   }
@@ -607,7 +606,7 @@ final class CaptureController: @unchecked Sendable {
     var token: UInt64
     var stoppedGeneration: UInt64
     var callbackGeneration: UInt64
-    var sink: MonitorCaptureSink?
+    var sink: (any MonitorFrameSink)?
   }
 
   private func makeStopRequest() -> StopRequest {
@@ -1002,7 +1001,6 @@ final class CaptureController: @unchecked Sendable {
       type: CVPixelBufferGetPixelFormatType(input), duration: frame.duration)
     let metadataChanged = detected != actual
     if detected != actual {
-      monitorProcessingRevision &+= 1
       if detected != nil { flushPreviewsIfEnabled() }
       if detected?.duration != actual.duration { firstSourceTime = nil; frameRateGate = FrameRateGate() }
       detected = actual
@@ -1021,26 +1019,21 @@ final class CaptureController: @unchecked Sendable {
       try VideoBufferLayout.validate(input)
       let effective = effectiveConfiguration(inputFast: actual.duration == VideoContract.fastDuration)
       establish(effective, inputType: actual.type)
-      if monitorPipelineConfiguration != effective {
-        monitorPipelineConfiguration = effective
-        monitorProcessingRevision &+= 1
-      }
       let entryTime = ProcessInfo.processInfo.systemUptime
       let entryQueueAge = max(0, entryTime - frame.receivedAt)
       if entryQueueAge > 2 * actual.duration.seconds { lateFrames &+= 1 }
       // Every monitor offer is made on the delivery queue, in capture order:
-      // with the frame's output when the monitor wants it, source-only
-      // otherwise (and for frames that skip the GPU, ordered behind the
-      // frames still on it).
+      // the source frame only, when the GPU work completes (and for frames
+      // that skip the GPU, ordered behind the frames still on it). The
+      // monitor never keeps processing alive on its own.
       let sink = monitorSink
-      let hasMonitorOutput = sink?.needsOutput == true
       let hasVisiblePreview = previewEnabled && ownedPreviewRenderers.contains { $0.isVisible }
       let hasPreview = hasVisiblePreview || (previewEnabled && services.preview != nil)
       // One lock for the handler and the preview source ID.
       let (processedHandler, feedID) = lock.withLock { (processedFrameHandler, activeFeedID?.rawValue) }
       // No downstream demand: keep metadata/detection alive without allocating,
       // submitting GPU work or staging raw buffers that nobody can consume.
-      guard cameraConnected || cameraConnecting || hasPreview || processedHandler != nil || hasMonitorOutput else {
+      guard cameraConnected || cameraConnecting || hasPreview || processedHandler != nil else {
         if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token) }
         if preparedConfiguration != nil {
           processor?.releaseIdleResources()
@@ -1057,7 +1050,7 @@ final class CaptureController: @unchecked Sendable {
       // Temporal selection happens before any GPU work or buffer allocation;
       // complete bypass keeps the source duration and so every frame.
       guard frameRateGate.shouldDeliver(frame.pts, duration: effective.duration) else {
-        if let sink, !hasMonitorOutput { offerSourceOnlyInOrder(sink, frame: frame, token: token) }
+        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token) }
         return
       }
       // Created on first demand; a complete bypass still uses it for the owned GPU copy.
@@ -1068,12 +1061,10 @@ final class CaptureController: @unchecked Sendable {
       let item = DeliveryItem(token: token, sequence: frame.sequence, source: sink == nil ? nil : input,
         pts: frame.pts, hostTime: hostTime(for: frame.pts, duration: effective.duration, image: input),
         duration: effective.duration, receivedAt: frame.receivedAt, encodeStart: entryTime,
-        sourceWidth: actual.width, sourceHeight: actual.height,
         pipelineEnabled: pipelineEnabled, applyLUT: effective.applyLUT,
         renderers: hasVisiblePreview ? ownedPreviewRenderers : [], preview: previewEnabled ? services.preview : nil,
         sourceID: hasVisiblePreview ? feedID : nil, previewEpoch: previewEpoch,
-        cameraAttempt: cameraAttempt, monitorSink: sink, monitorWantsOutput: hasMonitorOutput,
-        processingRevision: monitorProcessingRevision, processedHandler: processedHandler)
+        cameraAttempt: cameraAttempt, monitorSink: sink, processedHandler: processedHandler)
       let completion: LUTProcessor.Completion = { [self] completed in
         // GPU completion queue: the frame is finished. Hand it to delivery in
         // commit order (the processor releases completions in order).
@@ -1104,12 +1095,10 @@ final class CaptureController: @unchecked Sendable {
   /// A monitor offer for a frame that skips the GPU (no other consumer, or
   /// removed by the frame-rate gate). Ordered behind every frame already on
   /// the GPU, whose offers are made when they complete.
-  private func offerSourceOnlyInOrder(_ sink: MonitorCaptureSink, frame: CapturedFrame, token: UInt64) {
-    let revision = monitorProcessingRevision
+  private func offerSourceOnlyInOrder(_ sink: any MonitorFrameSink, frame: CapturedFrame, token: UInt64) {
     let offer: @Sendable () -> Void = { [deliveryQueue] in
       deliveryQueue.async {
-        sink.offer(source: frame.image, output: nil, pts: frame.pts, captureGeneration: token,
-          sequence: frame.sequence, processingRevision: revision, sourceOnly: true, correspondence: .identity)
+        sink.offer(frame.image, pts: frame.pts, captureGeneration: token, sequence: frame.sequence)
       }
     }
     if let processor { processor.afterCommittedFrames(offer) } else { offer() }
@@ -1131,17 +1120,7 @@ final class CaptureController: @unchecked Sendable {
     let outputWidth = CVPixelBufferGetWidth(rendered), outputHeight = CVPixelBufferGetHeight(rendered)
     let outputType = CVPixelBufferGetPixelFormatType(rendered)
     if let sink = item.monitorSink, let source = item.source {
-      if item.monitorWantsOutput {
-        sink.offer(source: source, output: rendered, pts: item.pts, captureGeneration: item.token,
-          sequence: item.sequence, processingRevision: item.processingRevision, sourceOnly: false,
-          correspondence: MonitorCorrespondence(
-            scaleX: Double(outputWidth) / Double(item.sourceWidth),
-            scaleY: Double(outputHeight) / Double(item.sourceHeight), offsetX: 0, offsetY: 0))
-      } else {
-        sink.offer(source: source, output: nil, pts: item.pts, captureGeneration: item.token,
-          sequence: item.sequence, processingRevision: item.processingRevision, sourceOnly: true,
-          correspondence: .identity)
-      }
+      sink.offer(source, pts: item.pts, captureGeneration: item.token, sequence: item.sequence)
     }
     let processingMS = (timing.completed - item.encodeStart) * 1000
     services.didProcess(processingMS, (item.encodeStart - item.receivedAt) * 1000)
@@ -1160,8 +1139,7 @@ final class CaptureController: @unchecked Sendable {
     if let handler = item.processedHandler {
       let metadata = ProcessedFrameMetadata(
         presentationTime: item.pts, duration: item.duration,
-        width: outputWidth, height: outputHeight,
-        pixelFormat: UInt32(outputType), processingRevision: item.processingRevision)
+        width: outputWidth, height: outputHeight, pixelFormat: UInt32(outputType))
       handler(ProcessedFrame(payload: rendered, metadata: metadata), item.token)
     }
     let report = DeliveryReport(item: item, outcome: outcome,
@@ -1346,8 +1324,6 @@ private struct DeliveryItem: @unchecked Sendable {
   let duration: CMTime
   let receivedAt: Double
   let encodeStart: Double
-  let sourceWidth: Int
-  let sourceHeight: Int
   let pipelineEnabled: Bool
   let applyLUT: Bool
   let renderers: [VideoPreviewRenderer]
@@ -1355,10 +1331,7 @@ private struct DeliveryItem: @unchecked Sendable {
   let sourceID: String?
   let previewEpoch: UInt64
   let cameraAttempt: UInt64
-  let monitorSink: MonitorCaptureSink?
-  /// The monitor's offer carries the output; otherwise it is source-only.
-  let monitorWantsOutput: Bool
-  let processingRevision: UInt64
+  let monitorSink: (any MonitorFrameSink)?
   let processedHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
 }
 
@@ -1715,5 +1688,40 @@ struct CaptureServices: @unchecked Sendable {
       }, capturePixelFormat: kCVPixelFormatType_422YpCbCr10)
     services.deviceDroppedFrames = { backend.deviceDroppedFrames }
     return services
+  }
+}
+
+/// A monitor target's frame endpoint: a camera's source frames from its capture
+/// delivery queue, in capture order (frames that skip the GPU are ordered behind
+/// the ones still on it), or Program's from the Program route's publishing
+/// thread. Only the source is offered; the monitor computes its Output stage
+/// (source plus burn-in LUT) in its own shader. Never blocks, never waits for
+/// the GPU, never copies pixels. `MonitorFeedHost` is the MonitorKit endpoint.
+protocol MonitorFrameSink: AnyObject, Sendable {
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64)
+  /// The capture stopped: rejects `rejected` (and every older generation) and
+  /// drops the stopped generation's state.
+  func invalidate(rejectingCaptureGeneration rejected: UInt64?)
+}
+
+// MARK: - MonitorTools bridge (W4 step 5, until the surfaces move to MonitorKit)
+
+/// Feeds the MonitorTools surfaces from the source-only offer. Their sink drops
+/// a source-only offer for an Output-stage target and takes only a paired offer
+/// there (`guard sourceOnly != requiresOutput`), so each frame is offered both
+/// ways and the sink keeps exactly one: source-only for a Source-stage target,
+/// the source as its own output for an Output-stage one. Until the MonitorKit
+/// surfaces land, MonitorTools' Output stage therefore shows the source without
+/// the burn-in LUT. Program keeps no correspondence, so focus and log false
+/// colour stay off there. Delete with `MonitorCaptureSink`.
+extension MonitorCaptureSink: MonitorFrameSink {
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64) {
+    let correspondence: MonitorCorrespondence? = target.rawValue == "program" ? nil : .identity
+    offer(
+      source: image, output: nil, pts: pts, captureGeneration: captureGeneration, sequence: sequence,
+      processingRevision: 0, sourceOnly: true, correspondence: correspondence)
+    offer(
+      source: image, output: image, pts: pts, captureGeneration: captureGeneration, sequence: sequence,
+      processingRevision: 0, sourceOnly: false, correspondence: correspondence)
   }
 }
