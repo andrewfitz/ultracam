@@ -62,7 +62,23 @@ def validate(app):
         raise ValueError("Host MonitorToolsMetal shader resource bundle is missing.")
     if any("MonitorTools" in path.name for path in extension.rglob("*")):
         raise ValueError("Monitor Tools must not be packaged into the camera extension.")
-    print("Camera metadata and host-only Monitor Tools resources validated.")
+    # MonitorKit's runtime shaders: SwiftPM `.copy("Shaders")` resources, host only.
+    for name, shaders in (
+        ("MonitorKit_MonitorKit.bundle", ("MKLUT.msl", "MKDecode.msl", "MKMonitor.msl")),
+        ("MonitorKit_MonitorKitScopes.bundle", ("MKScopes.msl",)),
+    ):
+        bundle = app / "Contents/Resources" / name
+        if not bundle.is_dir():
+            raise ValueError(f"Host MonitorKit resource bundle {name} is missing.")
+        for shader in shaders:
+            if not any(path.is_file() and path.parent.name == "Shaders" for path in bundle.rglob(shader)):
+                raise ValueError(f"{name} is missing Shaders/{shader}.")
+    if any("MonitorKit" in path.name for path in extension.rglob("*")):
+        raise ValueError("MonitorKit must not be packaged into the camera extension.")
+    # Static linking leaves no file behind, so also check the extension's code for MonitorKit symbols.
+    if any(b"MonitorKit" in path.read_bytes() for path in (extension / "Contents/MacOS").iterdir() if path.is_file()):
+        raise ValueError("MonitorKit must not be linked into the camera extension.")
+    print("Camera metadata and host-only Monitor Tools and MonitorKit resources validated.")
 
 
 if __name__ == "__main__":

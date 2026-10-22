@@ -25,6 +25,10 @@ xcrun swift test --package-path "$monitor_package" --scratch-path "$monitor_scra
   --configuration release --arch arm64 > "$logs_root/monitor-package-tests-$run_id.log" 2>&1 || {
   cat "$logs_root/monitor-package-tests-$run_id.log"; exit 1;
 }
+source "$task_root/scripts/monitor-kit-package.sh"
+monitor_kit_package_build >> "$package_log" 2>&1 || { cat "$package_log"; exit 1; }
+monitor_kit_test_log="$logs_root/monitor-kit-package-tests-$run_id.log"
+monitor_kit_package_test "$monitor_kit_test_log" || { cat "$monitor_kit_test_log"; exit 1; }
 bash "$task_root/scripts/fetch-decklink-sdk.sh"
 rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
 rustc_path="$(rustup which --toolchain stable rustc)"
@@ -50,7 +54,7 @@ xcrun clang++ -std=c++17 -I "$sdk_dir" -c "$sdk_dir/DeckLinkAPIDispatch.cpp" \
   cat "$compile_log"; exit 1
 }
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
-  "${monitor_link_args[@]}" \
+  "${monitor_link_args[@]}" "${monitor_kit_link_args[@]}" \
   -D CAPTURE_LIFECYCLE_TESTS -Xcc -DULTRACAM_BACKEND_TESTING \
   -import-objc-header "$task_root/Sources/DeckLinkBackend/BridgingHeader.h" \
   -F "$frameworks" -Xlinker -rpath -Xlinker "$frameworks" \
@@ -83,4 +87,9 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-pat
   cat "$test_log"
   exit 1
 }
+# MonitorKit's XCTest bundles, one "Executed" summary each after the run.
+monitor_kit_tests="$(awk "/Test Suite 'All tests' (passed|failed)/ { getline; print }" "$monitor_kit_test_log" \
+  | awk '{ tests += $2 } END { print tests + 0 }')"
+echo "MonitorKit package: $monitor_kit_tests tests run, all passed ($monitor_kit_test_log)"
+/usr/bin/grep -E '^FLAKY \(passed on retry\)' "$monitor_kit_test_log" || true
 tail -5 "$test_log"

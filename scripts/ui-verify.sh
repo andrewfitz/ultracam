@@ -18,8 +18,9 @@ run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 build_root="$external_root/agent-work/build/ultracam/ui-verify"
 # Skip when nothing the verifier compiles has changed since its last passing run.
 # FORCE=1 runs it anyway.
-inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify Packages/MonitorTools/Sources ThirdParty scripts/ui-verify.sh \
-  -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' \) \
+inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify Packages/MonitorTools/Sources Packages/MonitorKit/Sources Packages/MonitorKit/Package.swift \
+  ThirdParty scripts/ui-verify.sh scripts/monitor-tools-package.sh scripts/monitor-kit-package.sh \
+  -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.msl' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' \) \
   -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-strict${STRICT:-1}"
 if [[ "${FORCE:-0}" != 1 && -f "$build_root/last-pass" && "$(cat "$build_root/last-pass")" == "$inputs_hash" ]]; then
   echo "UI verify: unchanged since the last passing run ($build_root/latest). FORCE=1 to rerun."
@@ -31,7 +32,12 @@ export TMPDIR="$test_root/tmp"
 export MACOSX_DEPLOYMENT_TARGET=26.0
 export ULTRACAM_SHADER="$task_root/Sources/App/LUTShaders.metal"
 source "$task_root/scripts/monitor-tools-package.sh"
+source "$task_root/scripts/monitor-kit-package.sh"
 monitor_package_build > "$test_root/package-build.log" 2>&1 || {
+  cat "$test_root/package-build.log"
+  exit 1
+}
+monitor_kit_package_build >> "$test_root/package-build.log" 2>&1 || {
   cat "$test_root/package-build.log"
   exit 1
 }
@@ -56,7 +62,7 @@ done < <(find "$task_root/Sources/App" -maxdepth 1 -name '*.swift' | sort)
 # Unoptimized: the checks don't need optimized code, and -O doubles the compile.
 xcrun swiftc -Onone -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D UI_VERIFY \
   -target arm64-apple-macos26.0 \
-  -module-cache-path "$test_root/modules" "${monitor_link_args[@]}" \
+  -module-cache-path "$test_root/modules" "${monitor_link_args[@]}" "${monitor_kit_link_args[@]}" \
   -Xcc -DULTRACAM_BACKEND_TESTING \
   -import-objc-header "$task_root/Sources/DeckLinkBackend/BridgingHeader.h" \
   "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/Recording/*.swift \

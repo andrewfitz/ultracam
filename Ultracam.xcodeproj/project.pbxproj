@@ -590,6 +590,35 @@
 			"package" = "68991DF5F26724E6F8DD1CDD";
 			"productName" = "MonitorToolsUI";
 		};
+		"44E3513B813BBDD856A537C9" = {
+			"isa" = "XCLocalSwiftPackageReference";
+			"relativePath" = "Packages/MonitorKit";
+		};
+		"4B7B9AA96148BAAC64DC43EF" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "44E3513B813BBDD856A537C9";
+			"productName" = "MonitorKitCore";
+		};
+		"2635499CF1CBE57C1F1036E1" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "44E3513B813BBDD856A537C9";
+			"productName" = "MonitorKit";
+		};
+		"63289977FF4D4E3A41BF663D" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "44E3513B813BBDD856A537C9";
+			"productName" = "MonitorKitScopes";
+		};
+		"F7A9C90EA0674C296854DA81" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "44E3513B813BBDD856A537C9";
+			"productName" = "MonitorKitAudio";
+		};
+		"6E1349A90BE765DAAE0B8D8C" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "44E3513B813BBDD856A537C9";
+			"productName" = "MonitorKitUI";
+		};
 		"469D0F9103C7890C2B120EA8" = {
 			"isa" = "PBXBuildFile";
 			"fileRef" = "8725D62A8CE1EF20CBDB40C3";
@@ -991,10 +1020,30 @@
 			"isa" = "PBXBuildFile";
 			"productRef" = "E90079008E38C9DDBDD619B3";
 		};
+		"331CB70A1C8DDFB7A6B128C0" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "4B7B9AA96148BAAC64DC43EF";
+		};
+		"FA75867FE6078B8EA824747E" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "2635499CF1CBE57C1F1036E1";
+		};
+		"5F14C791B036FB588AB74F56" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "63289977FF4D4E3A41BF663D";
+		};
+		"F087B0CC204701B459A52CFD" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "F7A9C90EA0674C296854DA81";
+		};
+		"7BF4A1B12A540894604194C2" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "6E1349A90BE765DAAE0B8D8C";
+		};
 		"7A4C2DC8FCA657188648E999" = {
 			"isa" = "PBXFrameworksBuildPhase";
 			"buildActionMask" = 2147483647;
-			"files" = ("515DF69A3EAB539155043520", "A98759A86A9E6EDE733C94CD", "FAD16F192E169DAEF565AC10");
+			"files" = ("515DF69A3EAB539155043520", "A98759A86A9E6EDE733C94CD", "FAD16F192E169DAEF565AC10", "331CB70A1C8DDFB7A6B128C0", "FA75867FE6078B8EA824747E", "5F14C791B036FB588AB74F56", "F087B0CC204701B459A52CFD", "7BF4A1B12A540894604194C2");
 			"runOnlyForDeploymentPostprocessing" = 0;
 		};
 		"5CBABBD58BD110CEF998B5FC" = {
@@ -1074,7 +1123,7 @@
 			"buildPhases" = ("AFF87A50730392B6633ACECE", "7A4C2DC8FCA657188648E999", "F9187E824FE171A6F0EFAE28", "0020CE5E1A000179BFD76884", "D96E4898459569162B4403ED");
 			"buildRules" = ();
 			"dependencies" = ("C8A866A35DAC7743BBB7ED1D");
-			"packageProductDependencies" = ("ACC2AF385EB7A9D1373A2611", "97021AC3F2FDC5E352ABB5C7", "E90079008E38C9DDBDD619B3");
+			"packageProductDependencies" = ("ACC2AF385EB7A9D1373A2611", "97021AC3F2FDC5E352ABB5C7", "E90079008E38C9DDBDD619B3", "4B7B9AA96148BAAC64DC43EF", "2635499CF1CBE57C1F1036E1", "63289977FF4D4E3A41BF663D", "F7A9C90EA0674C296854DA81", "6E1349A90BE765DAAE0B8D8C");
 			"name" = "Ultracam";
 			"productName" = "Ultracam";
 			"productReference" = "681C948D238C526E9E3424E0";
@@ -1124,7 +1173,7 @@
 			"projectDirPath" = "";
 			"projectRoot" = "";
 			"targets" = ("C1E9827DB735CA9BAA54A540", "165D8D32214BB888FB58C89E");
-			"packageReferences" = ("68991DF5F26724E6F8DD1CDD");
+			"packageReferences" = ("68991DF5F26724E6F8DD1CDD", "44E3513B813BBDD856A537C9");
 		};
 	};
 	"rootObject" = "244210E48437B6556980A702";
