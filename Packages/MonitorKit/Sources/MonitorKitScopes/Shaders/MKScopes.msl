@@ -574,7 +574,7 @@ struct mk_ScopeDraw {
   float4 viewport;   // x, y, width, height in target pixels
   float4 plot;       // x, y, width, height in viewport pixels
   uint4 shape;       // x: kind, y: mode, z: channels
-  uint4 flags;       // x: has data, y: sRGB target, z: trace (0 phosphor, 1 white, 2 colorized), w: reduced axes (bit 0 x, bit 1 y)
+  uint4 flags;       // x: has data, y: sRGB target, z: trace (0 phosphor, 1 white, 2 colorized, 3 legacy: no bloom), w: reduced axes (bit 0 x, bit 1 y)
   float4 intensity;  // x: brightness
   float4 background; // x: opacity, y: graticule opacity
   float4 chroma;     // x: kr, y: kb, z: chroma per plot half side
@@ -722,8 +722,9 @@ inline float4 mk_sampleTrace(texture2d<float, access::sample> trace, float2 f, u
 }
 
 inline float3 mk_traceColor(float3 base, float i, uint style) {
-  // Dense areas bloom towards white, like a phosphor trace.
-  return i * mix(base, float3(1), style == 0 ? i * i * .6f : i * i * .3f);
+  // Dense areas bloom towards white, like a phosphor trace; style 3 (the
+  // legacy palette) is the colour scaled by intensity, as MonitorTools drew it.
+  return i * mix(base, float3(1), style == 3 ? 0.0f : (style == 0 ? i * i * .6f : i * i * .3f));
 }
 
 inline float mk_shapeDistance(mk_ScopeShape s, float2 p) {

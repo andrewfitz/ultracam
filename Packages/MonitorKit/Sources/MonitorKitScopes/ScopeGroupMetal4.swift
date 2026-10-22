@@ -149,6 +149,19 @@ extension ScopeGroup {
     finishFused(f, members: members, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT)
   }
 
+  /// Makes the group's and every member's Metal 4 argument tables now, at
+  /// start-up, instead of in the first Metal 4 accumulation. Encodes nothing;
+  /// calling it again does nothing. Pair it with `prepare(layouts:)`, which
+  /// builds the fused pipelines.
+  public func prepareMetal4() throws {
+    _ = try argumentTable()
+    var i = 0
+    while i < accumulators.count {
+      try accumulators[i].prepareMetal4()
+      i += 1
+    }
+  }
+
   private func argumentTable() throws -> any MTL4ArgumentTable {
     if let t = metal4Table { return t }
     let t = try engine.makeArgumentTable(textures: 5, buffers: 15, label: "MonitorKit scope group")

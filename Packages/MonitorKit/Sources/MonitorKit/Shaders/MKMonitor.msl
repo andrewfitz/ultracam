@@ -52,6 +52,16 @@ using namespace metal;
 #ifndef MK_ROLLOFF
 #define MK_ROLLOFF (p.colorFlags.x != 0) // highlight roll-off before the target encode
 #endif
+// The stage the picture shows: 0 source, 1 output (burn-in LUT), 2 monitor (both
+// LUTs). The engine fixes it per pipeline; compiled on its own it follows the uniforms.
+#ifndef MK_PICTURE_STAGE
+#define MK_PICTURE_STAGE (uint(p.falseColor.z))
+#endif
+// The display assist's log curve (luts.z codes: 1 S-Log3, 2 LogC3, 3 LogC4). The
+// engine fixes it per pipeline; compiled on its own it follows the uniforms.
+#ifndef MK_LOG_CURVE
+#define MK_LOG_CURVE (p.luts.z)
+#endif
 
 // ---------------------------------------------------------------- transfers
 
@@ -219,7 +229,7 @@ struct mk_PassParams {
   float4 zebra1;
   uint4  zebra;              // x: set 0 stage, y: set 1 stage, z: bit 0 set 0 on, bit 1 set 1 on, w: stripe period px
   uint4  modes;              // x: false colour measure (0 off), y: stage, z: band count, w: integral 10-bit restore
-  float4 falseColor;         // x: offset stops, y: ARRI tables are full range
+  float4 falseColor;         // x: offset stops, y: ARRI tables are full range, z: picture stage (0 source, 1 output, 2 monitor)
   float4 gamutWeights;       // scene-linear luminance weights of the source gamut
   float4 focus;              // x: opacity, y: style (0 edges, 1 peak), z: on
   float4 focusColor;
@@ -247,6 +257,7 @@ struct mk_PassParams {
   float4 clipColors[16];     // 0-7 over, 8-15 under, by flagged channel bits (0: luma alone)
   float4 whiteGain;          // white-point trim: xyz linear-light gains in the picture primaries, w: picture transfer (0 off)
   float4 whiteSignalGain;    // the same gains on the signal of a power-law picture (BT.1886, gamma 2.2, linear)
+  float4 reciprocals;        // correctly rounded: x: 1 / luma span (levels.y), y: 1 / chroma span (levels.w), z: 1 / kg (matrix.y), w: 1 / zebra stripe period; 0: computed here
 };
 
 // Mirrors MonitorKit.GuideParameters: guide strokes in viewport pixels, drawn
@@ -412,24 +423,33 @@ float3 mk_pairCodes(uint2 xy, thread const mk_Inputs& in) {
   return float3(c.x, c.yz - f.levels.z);
 }
 
-float4 mk_decodeCodes(float3 c, constant mk_FrameParams& f) {
+// mk_decode of codes (mk_tapCodes' form). The quotients by the frame's spans use
+// their reciprocals (`inverse`: x luma span, y chroma span, z kg): the same values
+// as MKDecode's divisions at a fraction of the cost. Float RGB keeps its values.
+float4 mk_decodeCodes(float3 c, constant mk_FrameParams& f, float3 inverse) {
   if (MK_LAYOUT(f) == MK_RGB) {
     float3 rgb = c;
-    if (f.codeScale.w == 0 && !f.options.y) rgb = (rgb * f.codeScale.z - f.levels.x) / f.levels.y;
+    if (f.codeScale.w == 0 && !f.options.y) rgb = mk_quotient(rgb * f.codeScale.z - f.levels.x, f.levels.y, inverse.x);
     return float4(rgb, mk_luma(rgb, f.matrix.xyz));
   }
-  float y = (c.x - f.levels.x) / f.levels.y;
-  return float4(mk_ycbcrToRGB(y, c.yz / f.levels.w, f.matrix), y);
+  float y = mk_quotient(c.x - f.levels.x, f.levels.y, inverse.x);
+  return float4(mk_ycbcrToRGB(y, mk_quotient(c.yz, f.levels.w, inverse.y), f.matrix, inverse.z), y);
+}
+
+// The mean of `count` filter taps' codes: an exact quotient by the count (its
+// reciprocal is the axis's), except float RGB, whose values may be non-finite.
+inline float3 mk_mean(float3 sum, float count, float inverse, constant mk_FrameParams& f) {
+  return MK_LAYOUT(f) == MK_RGB && f.codeScale.w != 0 ? sum / count : mk_quotient(sum, count, inverse);
 }
 
 // One axis of the filter: `count` taps from `first`, `step` apart.
-struct mk_Axis { float first, step; uint count; bool cubic; float4 w; };
+struct mk_Axis { float first, step; uint count; bool cubic; float4 w; float inverse; };
 
 // Nearest for an exact 1:1 or when asked; Catmull-Rom (Keys 1981, a = -1/2) when
 // magnified, the sharp interpolating bicubic; otherwise a box of bounded
 // stratified taps, exact for integral minification.
 mk_Axis mk_axis(float centre, float footprint, bool nearest, uint maxTaps) {
-  mk_Axis a = {centre, 0, 1, false, float4(1, 0, 0, 0)};
+  mk_Axis a = {centre, 0, 1, false, float4(1, 0, 0, 0), 1};
   if (nearest || footprint == 1) return a;
   if (MK_INTERPOLATES && footprint < 1) {
     float p = centre - .5f, base = floor(p), t = p - base, t2 = t * t, t3 = t2 * t;
@@ -441,7 +461,8 @@ mk_Axis mk_axis(float centre, float footprint, bool nearest, uint maxTaps) {
     return a;
   }
   a.count = uint(clamp(ceil(footprint - .001f), 1.0f, float(maxTaps)));
-  a.step = footprint / float(a.count);
+  a.inverse = 1.0f / float(a.count);
+  a.step = mk_quotient(footprint, float(a.count), a.inverse);
   a.first = centre - footprint * .5f + a.step * .5f;
   return a;
 }
@@ -478,7 +499,7 @@ float3 mk_row(uint y, thread const mk_Axis& ax, bool pairs, thread const mk_Inpu
     } else {
       for (uint i = 0; i < ax.count; i += 2) sum += mk_pairCodes(uint2(x0 + i, y), in);
     }
-    return sum * 2 / float(ax.count);
+    return mk_mean(sum * 2, float(ax.count), ax.inverse, f);
   }
   // A single tap (an axis at 1:1 under an anisotropic footprint) reads only what it needs.
   if (v210 && ax.count > 1) {
@@ -489,7 +510,7 @@ float3 mk_row(uint y, thread const mk_Axis& ax, bool pairs, thread const mk_Inpu
     for (uint i = 0; i < ax.count; i++)
       sum += mk_tapCodes(uint2(mk_clampPixel(float2(ax.first + float(i) * ax.step, 0), f).x, y), in);
   }
-  return sum / float(ax.count);
+  return mk_mean(sum, float(ax.count), ax.inverse, f);
 }
 
 // Source R'G'B' and transport Y' over the picture footprint of display pixel `d`
@@ -499,11 +520,10 @@ float4 mk_filtered(float2 d, float4 map, bool nearest, uint maxTaps, thread cons
   constant mk_FrameParams& f = in.frame;
   float2 centre = d * map.xy + map.zw, footprint = abs(map.xy);
   mk_Axis ax = mk_axis(centre.x, footprint.x, nearest, maxTaps), ay = mk_axis(centre.y, footprint.y, nearest, maxTaps);
-  if (ax.count == 1 && ay.count == 1) {
-    uint2 xy = mk_clampPixel(centre, f);
-    if (MK_LAYOUT(f) == MK_V210 && !f.options.x) return mk_codesToRGB(mk_v210PixelCodes(in.packed, xy, f), f);
-    return mk_decode(in.packed, in.luma, in.chroma, xy, f);
-  }
+  // The frame's reciprocals from the uniforms (MonitorPass sets them), else here.
+  float3 inverse = in.pass.reciprocals.x != 0 ? in.pass.reciprocals.xyz
+                                               : float3(1.0f / f.levels.y, 1.0f / f.levels.w, 1.0f / f.matrix.y);
+  if (ax.count == 1 && ay.count == 1) return mk_decodeCodes(mk_tapCodes(mk_clampPixel(centre, f), in), f, inverse);
   bool packed422 = MK_LAYOUT(f) == MK_V210 || MK_LAYOUT(f) == MK_UYVY8 || MK_LAYOUT(f) == MK_YUYV8;
   uint x0 = mk_clampPixel(float2(ax.first, 0), f).x;
   bool pairs = packed422 && !f.options.x && !ax.cubic && ax.step == 1 && (ax.count & 1) == 0 && ax.first >= 0
@@ -517,9 +537,9 @@ float4 mk_filtered(float2 d, float4 map, bool nearest, uint maxTaps, thread cons
     float3 sum = 0;
 #pragma clang loop unroll(disable)
     for (uint j = 0; j < ay.count; j++) sum += mk_row(mk_clampPixel(float2(0, ay.first + float(j) * ay.step), f).y, ax, pairs, in);
-    codes = sum / float(ay.count);
+    codes = mk_mean(sum, float(ay.count), ay.inverse, f);
   }
-  return mk_decodeCodes(codes, f);
+  return mk_decodeCodes(codes, f, inverse);
 }
 
 // Source, output (after the burn-in LUT) and monitor (after the monitor LUT) values.
@@ -593,7 +613,7 @@ float3 mk_displayTransform(float3 c, thread const mk_Inputs& in) {
     // MonitorKit display assist v1: scene light, Rec.709, the BT.709 OETF with a
     // shoulder. One log2 and one exp2 per channel serve both branches: the OETF's
     // x^0.45 and the shoulder's (x / xk)^-q.
-    float3 x = mk_rows(p.transformMatrix, mk_logDecodeFast(mk_logSignalFast(c, p.luts.z, in.frame), p.luts.z));
+    float3 x = mk_rows(p.transformMatrix, mk_logDecodeFast(mk_logSignalFast(c, MK_LOG_CURVE, in.frame), MK_LOG_CURVE));
     bool3 over = x > p.assist.x;
     float3 lx = fast::log2(max(x, .018f));
     float3 t = fast::exp2(select(.45f * lx, -p.assist.z * (lx - p.assist.w), over));
@@ -890,7 +910,8 @@ float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float
 
   if (navigator) {
     // The whole picture, dimmed (never above graphics white), with the visible region outlined.
-    c = clamp(mk_present(mk_adjust(mk_displayTransform(s.monitor, in), p), p), 0.0f, p.overlayWhite.rgb) * .85f;
+    c = clamp(mk_present(mk_adjust(mk_displayTransform(mk_stage(s, MK_PICTURE_STAGE), in), p), p), 0.0f,
+              p.overlayWhite.rgb) * .85f;
     float4 n = p.navigatorRect, r = p.navigatorVisible;
     if (any(d < n.xy + 1) || any(d >= n.zw - 1)) c = p.navigatorColors[0].rgb;
     bool box = all(d >= r.xy - 1) && all(d < r.zw + 1);
@@ -898,13 +919,13 @@ float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float
   } else {
     if (logFalseColor) c = mk_logFalseColor(sample, in);
     else if (stageFalseColor) c = mk_stageFalseColor(s, in);
-    else c = mk_present(mk_adjust(mk_displayTransform(s.monitor, in), p), p);
+    else c = mk_present(mk_adjust(mk_displayTransform(mk_stage(s, MK_PICTURE_STAGE), in), p), p);
     // Overlays mix in target values with colours encoded for the target.
     {
       int2 px = int2(corner);
       if (MK_ZEBRAS && p.zebra.z != 0) {
         int period = int(p.zebra.w), stripe = period / 2;
-        float inverse = 1.0f / float(period);
+        float inverse = p.reciprocals.w != 0 ? p.reciprocals.w : 1.0f / float(period);
         if (p.zebra.z & 1) {
           float ire = mk_stageLuma(s, p.zebra.x, p) * 100;
           if (ire >= p.zebra0.x && ire < p.zebra0.y && mk_modulo(px.x + px.y, period, inverse) < stripe)
@@ -1011,11 +1032,13 @@ kernel void mk_copyFloat(texture2d<float, access::read> source [[texture(0)]],
 // ---------------------------------------------------------------- analysis
 
 // Left-sited v210 R'G'B' of pixel xy for the analysis: mk_decode's values, with
-// the picture pass's select-picked lanes. An odd pixel's next chroma sample is
-// pixel x + 1's co-sited one, which the next SIMD lane decodes, so only a row's
-// last lane reads it itself (a row of lanes is one SIMD-group, and every lane
-// calls this). Together a fifth cheaper than mk_decodeRGB here.
-float3 mk_focusV210RGB(texture2d<uint, access::read> packed, uint2 xy, bool lastLane, constant mk_FrameParams& f) {
+// the picture pass's select-picked lanes and exact quotients by the reciprocals
+// in `inverse` (x luma span, y chroma span, z kg). An odd pixel's next chroma
+// sample is pixel x + 1's co-sited one, which the next SIMD lane decodes, so only
+// a row's last lane reads it itself (a row of lanes is one SIMD-group, and every
+// lane calls this).
+float3 mk_focusV210RGB(texture2d<uint, access::read> packed, uint2 xy, bool lastLane, constant mk_FrameParams& f,
+                       float3 inverse) {
   uint4 g = packed.read(uint2(xy.x / 6, xy.y));
   uint n = xy.x % 6;
   float2 c = mk_v210ChromaLane(g, n / 2);
@@ -1025,19 +1048,31 @@ float3 mk_focusV210RGB(texture2d<uint, access::read> packed, uint2 xy, bool last
     else if (mk_v210LastPair(xy.x, f)) after = c;
     c = mix(c, after, .5f);
   }
-  float y = (mk_v210LumaLane(g, n) - f.levels.x) / f.levels.y;
-  return mk_ycbcrToRGB(y, (c - f.levels.z) / f.levels.w, f.matrix);
+  float y = mk_quotient(mk_v210LumaLane(g, n) - f.levels.x, f.levels.y, inverse.x);
+  return mk_ycbcrToRGB(y, mk_quotient(c - f.levels.z, f.levels.w, inverse.y), f.matrix, inverse.z);
 }
 
 // Y' an edge is measured on: the transport luma, or with MK_LUTS the Rec.709 luma
 // after the LUTs its bits select (1 burn-in, 2 monitor; a disabled LUT passes through).
+// mk_decodeLuma's and mk_decodeRGB's values, with exact quotients (RGB as MKDecode).
 float mk_focusLuma(texture2d<uint, access::read> packed, texture2d<float, access::read> luma,
                    texture2d<float, access::read> chroma, texture3d<float, access::sample> burnLUT,
                    texture3d<float, access::sample> monitorLUT, uint2 xy, bool lastLane, constant mk_FrameParams& f,
-                   constant mk_LUTParams& burn, constant mk_LUTParams& monitor) {
-  if (MK_LUTS == 0) return mk_decodeLuma(packed, luma, chroma, xy, f);
-  float3 c = MK_LAYOUT(f) == MK_V210 && !f.options.x ? mk_focusV210RGB(packed, xy, lastLane, f)
-                                                     : mk_decodeRGB(packed, luma, chroma, xy, f);
+                   constant mk_LUTParams& burn, constant mk_LUTParams& monitor, float3 inverse) {
+  if (MK_LUTS == 0) {
+    if (MK_LAYOUT(f) == MK_RGB) return mk_decode(packed, luma, chroma, xy, f).w;
+    return mk_quotient(mk_lumaCode(packed, luma, xy, f) - f.levels.x, f.levels.y, inverse.x);
+  }
+  float3 c;
+  if (MK_LAYOUT(f) == MK_V210 && !f.options.x) {
+    c = mk_focusV210RGB(packed, xy, lastLane, f, inverse);
+  } else if (MK_LAYOUT(f) == MK_RGB) {
+    c = mk_decodeRGB(packed, luma, chroma, xy, f);
+  } else {
+    float y = mk_quotient(mk_lumaCode(packed, luma, xy, f) - f.levels.x, f.levels.y, inverse.x);
+    c = mk_ycbcrToRGB(y, mk_quotient(mk_chromaCode(packed, chroma, xy, f) - f.levels.z, f.levels.w, inverse.y),
+                      f.matrix, inverse.z);
+  }
   if (MK_LUTS & 1) c = mk_applyLUT(c, burnLUT, burn);
   if (MK_LUTS & 2) c = mk_applyLUT(c, monitorLUT, monitor);
   return mk_luma709(c);
@@ -1045,25 +1080,33 @@ float mk_focusLuma(texture2d<uint, access::read> packed, texture2d<float, access
 
 // Edge confidence from a pixel's eight neighbours' lumas: Sobel-like 3-10-3
 // gradients, kept only where a directional median exceeds the noise level.
+// The ramp is clamp(excess / span, 0, 1), span = max(.0001, threshold / 2): a
+// quotient is taken only strictly inside it, exactly, from `inverseSpan` = 1 / span
+// (at or past the ends, and for non-finite lumas, the clamp decides alone).
 inline float mk_focusConfidence(float tl, float tc, float tr, float ml, float mr, float bl, float bc, float br,
-                                float2 thresholds) {
+                                float2 thresholds, float inverseSpan) {
   float3 dx = float3(tr - tl, mr - ml, br - bl), dy = float3(bl - tl, bc - tc, br - tr);
   float gx = dot(dx, float3(3, 10, 3)) / 16, gy = dot(dy, float3(3, 10, 3)) / 16;
   float support = max(abs(max(min(dx.x, dx.y), min(max(dx.x, dx.y), dx.z))), abs(max(min(dy.x, dy.y), min(max(dy.x, dy.y), dy.z))));
-  float threshold = thresholds.x, noise = thresholds.y;
-  return support > noise ? clamp((max(abs(gx), abs(gy)) - threshold) / max(.0001f, threshold * .5f), 0.0f, 1.0f) : 0;
+  float threshold = thresholds.x, noise = thresholds.y, span = max(.0001f, threshold * .5f);
+  float excess = max(abs(gx), abs(gy)) - threshold;
+  float ramp = excess >= span ? 1.0f : (excess > 0 ? mk_quotient(excess, span, inverseSpan) : 0.0f);
+  return support > noise ? ramp : 0;
 }
 
 // Rows of the mask per thread (MonitorFeed.focusRows).
-constant uint MK_FOCUS_ROWS = 8;
+constant uint MK_FOCUS_ROWS = 16;
 
 // Source-resolution edge confidence, shared by every surface of a feed. A thread
-// takes one column of MK_FOCUS_ROWS pixels: it decodes those rows and the one
-// above and below once, and gets its left and right neighbours' from the
-// adjacent SIMD lanes. Each row of the threadgroup is one SIMD-group whose two
-// outer lanes only supply halo, so no threadgroup memory or barrier is needed and
-// each pixel is decoded about 1.3 times (the 16 × 16 tile this replaces took
-// twice as long at 4K). Positions clamp to the picture, so tail groups are correct.
+// takes one column of MK_FOCUS_ROWS pixels and walks down it, decoding each row
+// once (the rows above and below the run included) and keeping three rows of
+// lumas; its left and right neighbours' come from the adjacent SIMD lanes. Each
+// row of the threadgroup is one SIMD-group whose two outer lanes only supply halo,
+// so no threadgroup memory or barrier is needed and each pixel is decoded about
+// 1.2 times (18/16 down, 32/30 across; the 8-row form decoded 1.33, the 16 × 16
+// tile before it took twice as long). The quotients by the frame's spans and the
+// threshold use reciprocals computed once per thread. Positions clamp to the
+// picture, so tail groups are correct.
 kernel void mk_focusMask(texture2d<uint, access::read> packed [[texture(0)]],
                          texture2d<float, access::read> luma [[texture(1)]],
                          texture2d<float, access::read> chroma [[texture(2)]],
@@ -1081,20 +1124,28 @@ kernel void mk_focusMask(texture2d<uint, access::read> packed [[texture(0)]],
   int x = int(group.x * (groupSize.x - 2) + local.x) - 1;
   uint y0 = (group.y * groupSize.y + local.y) * MK_FOCUS_ROWS;
   uint cx = uint(clamp(x, 0, int(w) - 1));
-  float l[MK_FOCUS_ROWS + 2], left[MK_FOCUS_ROWS + 2], right[MK_FOCUS_ROWS + 2];
-  for (uint j = 0; j < MK_FOCUS_ROWS + 2; j++) {
+  bool lastLane = local.x == groupSize.x - 1, writes = local.x != 0 && !lastLane && x < int(w);
+  float3 inverse = float3(1.0f / f.levels.y, 1.0f / f.levels.w, 1.0f / f.matrix.y);
+  float inverseSpan = 1.0f / max(.0001f, thresholds.x * .5f);
+  // Rows y0 - 1 … y0 + MK_FOCUS_ROWS, stopping after the picture's last row (one
+  // past it, clamped, closes the last mask row). Uniform per SIMD-group, so every
+  // lane shuffles, halo and out-of-picture ones included.
+  uint rows = uint(clamp(int(h) + 2 - int(y0), 0, int(MK_FOCUS_ROWS) + 2));
+  float above = 0, aboveLeft = 0, aboveRight = 0, centre = 0, left = 0, right = 0;
+  for (uint j = 0; j < rows; j++) {
     uint2 p = uint2(cx, uint(clamp(int(y0 + j) - 1, 0, int(h) - 1)));
-    l[j] = mk_focusLuma(packed, luma, chroma, burnLUT, monitorLUT, p, local.x == groupSize.x - 1, f, burn, monitor);
-  }
-  // Every lane shuffles, halo and out-of-picture ones included.
-  for (uint j = 0; j < MK_FOCUS_ROWS + 2; j++) {
-    left[j] = simd_shuffle_up(l[j], 1);
-    right[j] = simd_shuffle_down(l[j], 1);
-  }
-  if (local.x == 0 || local.x == groupSize.x - 1 || x >= int(w)) return;
-  for (uint j = 0; j < MK_FOCUS_ROWS && y0 + j < h; j++) {
-    float c = mk_focusConfidence(left[j], l[j], right[j], left[j + 1], right[j + 1], left[j + 2], l[j + 2], right[j + 2],
-                                 thresholds);
-    mask.write(float4(c), uint2(x, y0 + j));
+    float below = mk_focusLuma(packed, luma, chroma, burnLUT, monitorLUT, p, lastLane, f, burn, monitor, inverse);
+    float belowLeft = simd_shuffle_up(below, 1), belowRight = simd_shuffle_down(below, 1);
+    if (j >= 2 && writes) {
+      float c = mk_focusConfidence(aboveLeft, above, aboveRight, left, right, belowLeft, below, belowRight, thresholds,
+                                   inverseSpan);
+      mask.write(float4(c), uint2(x, y0 + j - 2));
+    }
+    above = centre;
+    aboveLeft = left;
+    aboveRight = right;
+    centre = below;
+    left = belowLeft;
+    right = belowRight;
   }
 }

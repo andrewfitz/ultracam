@@ -62,6 +62,7 @@ final class ABITests: XCTestCase {
       ("transformMatrix", o(\.transformMatrix)), ("overlayWhite", o(\.overlayWhite)),
       ("zebraColors", o(\.zebraColors)), ("navigatorColors", o(\.navigatorColors)), ("clipLevels", o(\.clipLevels)),
       ("clipColors", o(\.clipColors)), ("whiteGain", o(\.whiteGain)), ("whiteSignalGain", o(\.whiteSignalGain)),
+      ("reciprocals", o(\.reciprocals)),
     ])
     let members = try XCTUnwrap(try fragmentBuffers()[3]?.bufferStructType?.members)
     let arrays = [

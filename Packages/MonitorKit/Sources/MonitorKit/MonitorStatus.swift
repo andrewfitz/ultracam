@@ -26,9 +26,16 @@ public struct MonitorViewport: Equatable, Sendable {
 public enum MonitorTool: String, Sendable, CaseIterable, Codable {
   case falseColor, zebra1, zebra2, focusPeaking, guides, burnInLUT, monitorLUT, magnification,
     desqueeze, flip, displayAdjustments, displayTransform, clipIndicators
+  /// The picture itself, in one list at most: unavailable
+  /// (`unsupportedGeometry`) when its pixel aspect ratio is unusable and it is shown
+  /// with square pixels; otherwise active when there is something to say (a
+  /// picture stage other than the default monitor stage, a code-value view).
+  /// `MonitorStatus.pictureStage` and `isCodeValueView` hold either way.
+  case picture
 }
 
-/// Why a tool that is switched on is not drawn. The picture is always drawn.
+/// Why a tool that is switched on is not drawn, or (`unsupportedGeometry`, on
+/// `.picture`) not drawn as declared. The picture itself is always drawn.
 public enum MonitorUnavailableReason: Equatable, Sendable, CustomStringConvertible {
   /// The surface is in clean mode.
   case cleanFeed
@@ -54,6 +61,14 @@ public enum MonitorUnavailableReason: Equatable, Sendable, CustomStringConvertib
   /// monitor stage: LUT output is Rec.709 display R'G'B' (the burn-in or monitor LUT
   /// already maps the picture for display).
   case lutOnMonitorStage
+  /// The tool classifies or measures the camera's own signal (log false colour,
+  /// focus peaking), and the frame is a processed picture
+  /// (`MonitorFrame.isProcessed`: a programme mix, a scaled or graded render).
+  case requiresCameraSignal
+  /// The frame's geometry cannot be shown as declared: its pixel aspect ratio is
+  /// not finite or outside `MonitorFrameGeometry.pixelAspectRatioRange`. The
+  /// picture is shown with square pixels.
+  case unsupportedGeometry
 
   public var description: String {
     switch self {
@@ -68,6 +83,8 @@ public enum MonitorUnavailableReason: Equatable, Sendable, CustomStringConvertib
     case .requiresHDRSource: return "Needs a PQ or HLG signal."
     case .requiresHDROutput: return "Needs an HDR output."
     case .lutOnMonitorStage: return "Not available while a LUT is applied; the LUT output is Rec.709."
+    case .requiresCameraSignal: return "Needs a camera's own signal; this picture is processed."
+    case .unsupportedGeometry: return "Unsupported picture geometry; shown with square pixels."
     }
   }
 }
@@ -86,8 +103,24 @@ public struct MonitorStatus: Equatable, Sendable {
     public var reason: MonitorUnavailableReason
   }
 
+  /// What is drawn, with its label. `.burnInLUT` and `.monitorLUT` are listed only
+  /// when something this surface draws passes through that LUT, their labels ending
+  /// " · tools only" when the picture's own stage does not (a source picture
+  /// whose zebras measure the output, an output picture with monitor-stage false colour).
   public internal(set) var active: [Entry] = []
   public internal(set) var unavailable: [Unavailable] = []
+  /// The stage the picture shows (`MonitorState.pictureStage`).
+  public internal(set) var pictureStage: SignalStage = .monitor
+  /// The picture shows a signal's code values as they are: a declared log source
+  /// (or an unlabelled one) on a picture stage no LUT touched, with no display
+  /// transform and no false colour replacing it. Nothing maps it for viewing, and its brightness is not an exposure
+  /// reading. The `.picture` entry's label says so; `codeValueViewNote` is the
+  /// longer text.
+  public internal(set) var isCodeValueView = false
+
+  /// Explains a code-value view (`isCodeValueView`).
+  public static let codeValueViewNote =
+    "Code-value view: the signal's code values are shown as they are, with no LUT, viewing transform or exposure calibration."
 
   public init() {}
 

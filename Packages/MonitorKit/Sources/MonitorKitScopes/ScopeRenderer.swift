@@ -305,8 +305,10 @@ public final class ScopeRenderer {
     parameters.plot = SIMD4<Float>(plotPixels)
     let d = s.display
     parameters.shape = SIMD4(s.kind.shaderCode, s.shaderMode, UInt32(accumulator.layout.channels), 0)
+    // 3: the legacy palette's traces, scaled by intensity without blooming.
     let trace: UInt32 =
-      d.trace == .white ? 1 : (d.trace == .colorized && s.kind == .vectorscope ? 2 : 0)
+      d.palette == .ultracamLegacy && s.kind != .vectorscope
+      ? 3 : d.trace == .white ? 1 : (d.trace == .colorized && s.kind == .vectorscope ? 2 : 0)
     parameters.flags.x = hasTrace ? 1 : 0
     parameters.flags.y = target.colorPixelFormat.isSRGB ? 1 : 0
     parameters.flags.z = trace
@@ -613,7 +615,26 @@ public final class ScopeRenderer {
     shapes.size.z = Float(count)
   }
 
+  /// The Y'CbCr parade's Cb and Cr panels.
+  static let chromaBlue = SIMD4<Float>(0.35, 0.6, 1, 1), chromaRed = SIMD4<Float>(1, 0.4, 0.35, 1)
+  /// `ScopeTracePalette.ultracamLegacy` R, G, B.
+  static let legacyChannels = (SIMD4<Float>(1, 0.1, 0.1, 1), SIMD4<Float>(0.1, 1, 0.1, 1), SIMD4<Float>(0.1, 0.3, 1, 1))
+
   static func colors(settings s: ScopeSettings) -> (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) {
+    if s.display.palette == .ultracamLegacy && s.kind != .vectorscope {
+      // MonitorTools.metal.txt `scopeTexel`: white luma, (1, .1, .1), (.1, 1, .1), (.1, .3, 1).
+      let white = SIMD4<Float>(1, 1, 1, 1)
+      switch s.kind {
+      case .waveform:
+        switch s.waveformMode {
+        case .luma: return (white, white, white)
+        case .rgbOverlay, .rgbParade: return Self.legacyChannels
+        case .ycbcrParade: return (white, Self.chromaBlue, Self.chromaRed)
+        }
+      case .histogram: return s.histogramMode == .luma ? (white, white, white) : Self.legacyChannels
+      case .vectorscope: break
+      }
+    }
     let single: SIMD4<Float> = s.display.trace == .white ? SIMD4(0.92, 0.92, 0.92, 1) : SIMD4(0.45, 1, 0.55, 1)
     let red = SIMD4<Float>(1, 0.18, 0.15, 1), green = SIMD4<Float>(0.2, 1, 0.25, 1)
     let blue = SIMD4<Float>(0.25, 0.45, 1, 1)
@@ -622,7 +643,7 @@ public final class ScopeRenderer {
       switch s.waveformMode {
       case .luma: return (single, single, single)
       case .rgbOverlay, .rgbParade: return (red, green, blue)
-      case .ycbcrParade: return (single, SIMD4(0.35, 0.6, 1, 1), SIMD4(1, 0.4, 0.35, 1))
+      case .ycbcrParade: return (single, Self.chromaBlue, Self.chromaRed)
       }
     case .histogram:
       let neutral = SIMD4<Float>(0.85, 0.85, 0.85, 1)

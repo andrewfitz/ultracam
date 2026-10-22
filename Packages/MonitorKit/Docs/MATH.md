@@ -13,7 +13,7 @@ Status:
 
 Code locations name files and symbols. The shader files are changing, so MSL locations name functions, not line numbers.
 
-Research date: 2026-10-22 (W1); W2 additions (output colour, display transforms, white-point trim, scope HDR colours, audio rate rules) the same day.
+Research date: 2026-10-22 (W1); W2 additions (output colour, display transforms, white-point trim, scope HDR colours, audio rate rules) the same day. W3 addition: picture geometry (clean aperture, pixel aspect ratio, display aspect), section 12.
 
 ## Sources
 
@@ -51,6 +51,7 @@ Research date: 2026-10-22 (W1); W2 additions (output colour, display transforms,
 | WIKI-VU | Wikipedia, *VU meter*, revision 1374995076 (2026-09-15), raw wikitext. Secondary | [en.wikipedia.org](https://en.wikipedia.org/w/index.php?title=VU_meter&oldid=1374995076) | `c03c8433…b75c94` |
 | R68 | EBU R 68-2000: alignment level −18 dBFS. Cited through WIKI-PPM's table | — | — |
 | RP155 | SMPTE RP 155: reference level −20 dBFS. Paywalled. Cited through WIKI-PPM's table | — | — |
+| ISOBMFF | ISO/IEC 14496-12 (ISO base media file format), `clap` (CleanApertureBox) and `pasp` (PixelAspectRatioBox), as used by QuickTime and CoreVideo (`kCVImageBufferCleanApertureKey`, `kCVImageBufferPixelAspectRatioKey`). Paywalled; the box semantics are reproduced in Apple's QuickTime File Format Specification ("Clean aperture", "Pixel aspect ratio") | [Apple QTFF](https://developer.apple.com/documentation/quicktime-file-format) | — |
 | OCIO | OpenColorIO `SonyCameras.cpp` / `ArriCameras.cpp` (ASF). Secondary; used to cross-check primaries only. | [GitHub](https://github.com/AcademySoftwareFoundation/OpenColorIO/tree/main/src/OpenColorIO/transforms/builtins) | `8be9c5db…cec74` |
 
 ## 1. Transport: Y'CbCr, quantization, chroma siting, native log codes
@@ -416,3 +417,16 @@ Each entry gives the location, the value found, the correct value and the source
 - `testShippedTruePeakTapsAreTheAnnex2Filter` and `testShippedScopeTransfersAreST2084AndBT2100` read `Filters.swift`, `ScopeGraticule.swift` and `ScopeSettings.swift` as text, because this target cannot import MonitorKitAudio or MonitorKitScopes. They compare the 48 taps exactly and match the PQ/HLG/bar expressions with whitespace removed. Symbol-level checks: `ScopeGraticuleTests.testPQAnchors`, `testHLGAnchors` and `testSkinToneLineDefaultsToTheNTSCIAxis` on the shipped `ScopeTransfer`/`ScopeDisplay`; the shipped true-peak filter is checked behaviourally against the Annex 2 taps by `ReferenceTests.testTruePeakMatchesAnnex2Reference` (`TruePeakFilter` is internal and the audio tests import the module without `@testable`, so they also run in release builds).
 - `ScopePictureAgreementTests.testPictureIREAndScopeClipCountsAgreeOnEveryLayoutAndStage` draws one frame of highlights straddling 940 through the picture pass (custom IRE false colour, which shares `mk_stageLuma` with the zebras) and through a scope, and checks that both count exactly the same pixels at or above 100 % at the source stage and after a burn-in LUT (the scope compares in percent with the picture's Float operations). `testClipReadoutsCountExactlyThePixelsTheClipIndicatorMarks` extends this to every channel and both sides against the clip indicator.
 - The classification-table GPU tests (`FalseColorTests`) and the decode tests (`DecodeTests`) compare the GPU with the Core references; this document's tests tie those references to the sources.
+
+## 12. Picture geometry (`MonitorLayout.swift`, `MonitorFrame.cleanAperture(of:)`)
+
+| Item | Value | Where | Source | Status |
+| --- | --- | --- | --- | --- |
+| Clean aperture centre | pcX = horizOff + (W − 1)/2, pcY = vertOff + (H − 1)/2 in pixel coordinates, x to the right and **y down**, W × H the encoded frame | `MonitorFrame.cleanAperture(of:)` | ISOBMFF `clap` | verified (`PictureStageApertureTests.testWrapReadsTheCleanApertureAttachment`) |
+| Clean aperture rectangle | left = (W − w)/2 + horizOff, **top = (H − h)/2 + vertOff**, size w × h (the `clap` width and height), clipped to the frame; nil when absent, not finite, or under a pixel on either axis once clipped | same; `MonitorFrameGeometry.shownRect` applies the same clip and fallback to a host-set `cleanAperture` | ISOBMFF `clap` (the aperture is centred on pc) | verified: the test writes CoreVideo's attachment (width 40, height 24, offsets +6, +5 in a 64 × 40 frame), reads `CVImageBufferGetCleanRect` (lower-left origin) and flips it, and gets x 18, y 13: a positive vertical offset moves the aperture **down**. A top of (H − h)/2 − vertOff is mirrored about the frame's centre. Clipping and the nonsense cases: same test and `LayoutTests.testUnusableAperturesShowTheWholeFrame` |
+| Pixel aspect ratio | PAR = hSpacing / vSpacing; 1 when absent or not positive and finite; shown as square pixels (status `.unsupportedGeometry`) outside 1/16…16 | `MonitorFrame.pixelAspectRatio(of:)`, `MonitorFrameGeometry.pixelAspectRatioRange`, `effectivePixelAspectRatio` | ISOBMFF `pasp`; the 1/16…16 bound is MonitorTools' (**convention**) | verified (`PictureStageApertureTests.testUnusablePixelAspectRatioShowsSquarePixels`) |
+| Display aspect ratio | DAR = w · PAR · d / h, with w × h the shown rectangle and d the anamorphic de-squeeze (1…4) | `MonitorFrameGeometry.displayAspectRatio(desqueeze:)` / `(for:)`, `MonitorLayout` | definition (a 1920 × 1080 aperture with square pixels and d = 2 is 3.556 : 1) | verified (`LayoutTests.testFrameGeometryDisplayAspect`, `testCleanApertureSetsTheAspectAndTheMap`) |
+| Display → picture map | the fitted (or zoomed) image rectangle maps onto the aperture in frame pixels, flipped as asked; magnification's centre is normalized inside the aperture | `AxisMap.display(_:toPicture:flip:)`, `MonitorLayout` | — | verified (`LayoutTests.testCleanApertureWithMagnificationAndPixelExact`; GPU: `PictureStageApertureTests.testAsymmetricApertureShowsExactlyItsPixels`, `PortedCleanApertureTests.testAsymmetricApertureShowsTheTopLeftOriginedCleanRect`) |
+| De-squeeze factors | 1, 1.3, 1.33, 1.5, 1.65, 1.66, 1.8, 2 (`ViewGeometry.standardDesqueezeFactors`); Sony's "1.6x" applies 1.65 | `ViewGeometry` | FX3 help guide (De-Squeeze Display, TP1001106329) and the Video Assist manual (1.33, 1.5, 1.66, 2) | verified by reading |
+
+Edge sampling: a magnified picture's bicubic taps at the aperture edge read the frame's real pixels just outside the aperture rather than clamping at the aperture, since the aperture is a window onto the continuous image (**convention**). Focus analysis and scopes cover the whole frame; the focus footprint follows the aperture (`PictureStageApertureTests.testFocusFootprintFollowsTheAperture`).

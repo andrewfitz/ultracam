@@ -88,14 +88,20 @@ public final class ScopeEngine: @unchecked Sendable {
   private let generalCompute: [Kernel: MTLComputePipelineState]
   private let computePipelines = Mutex<[ComputeKey: MTLComputePipelineState]>([:])
   private let renderPipelines = Mutex<[RenderKey: MTLRenderPipelineState]>([:])
-  /// Builds started and not finished; a failed one stays here, so it is never retried.
-  private let pendingCompute = Mutex<Set<ComputeKey>>([])
-  private let pendingRender = Mutex<Set<RenderKey>>([])
+  /// Builds started and not finished; a failed one stays here, so it is never
+  /// retried. Internal for tests.
+  let pendingCompute = Mutex<Set<ComputeKey>>([])
+  let pendingRender = Mutex<Set<RenderKey>>([])
   /// Builds that failed, asynchronous or on this thread; none is retried.
   /// Callers fall back to the general pipeline for good. Internal for tests.
   let failedCompute = Mutex<Set<ComputeKey>>([])
   let failedRender = Mutex<Set<RenderKey>>([])
   private let failures = Mutex<[String]>([])
+  /// Broadcast whenever an asynchronous build stores or fails, so warm-up on
+  /// another thread joins a build already running instead of compiling it again.
+  private let buildFinished = NSCondition()
+  /// Pipelines built on the calling thread (compute, render). Internal for tests.
+  let builtOnCallerThread = Mutex<(compute: Int, render: Int)>((0, 0))
 
   /// Binds MK_LAYOUT to function constant 0 when a pipeline defines it.
   static let specializationPrefix = """
@@ -222,37 +228,151 @@ public final class ScopeEngine: @unchecked Sendable {
     return try String(contentsOf: url, encoding: .utf8)
   }
 
-  /// Builds the general render pipeline for `pixelFormat` on this thread, ahead of the first draw.
+  /// The layer formats a monitor host draws scopes into: `bgr10a2Unorm` (SDR
+  /// and wide-gamut layers), `rgba16Float` (EDR layers for PQ and HLG) and
+  /// `bgra8Unorm` (8-bit drawables). The default of `prepare(pixelFormats:)`.
+  public static let drawablePixelFormats: [MTLPixelFormat] = [.bgr10a2Unorm, .rgba16Float, .bgra8Unorm]
+
+  /// Warm-up at start-up: makes the general render pipeline of every format
+  /// in `pixelFormats` ready before returning, so a layer switched to EDR draws
+  /// on its first frame. A built one costs a lookup; one an asynchronous engine
+  /// is already building (it starts every `drawablePixelFormats` format at
+  /// init) is waited for, not compiled again; any other is built on this
+  /// thread. The output colour (`ScopeRenderer.colorPipeline`) is a uniform, so
+  /// one pipeline per format covers SDR, PQ and HLG. Pipelines are shared by
+  /// the classic and Metal 4 paths; `prepareMetal4()` on each object makes its
+  /// argument table.
+  ///
+  /// On `.asynchronous` and `.off` engines no draw into these formats then
+  /// waits for the compiler. A `.synchronous` engine still builds each scope's
+  /// specialized pipeline on the thread of its first draw: warm it with
+  /// `prepare(settings:layouts:pixelFormats:)` for the kinds and modes it draws.
+  ///
+  /// A format that fails does not stop the others: every format is tried, then
+  /// the first error is thrown (`pipelineBuildFailures` lists each).
+  public func prepare(pixelFormats: [MTLPixelFormat] = ScopeEngine.drawablePixelFormats) throws {
+    var firstError: (any Error)?
+    var i = 0
+    while i < pixelFormats.count {
+      do { try prepare(pixelFormat: pixelFormats[i]) } catch { firstError = firstError ?? error }
+      i += 1
+    }
+    if let firstError { throw firstError }
+  }
+
+  /// `prepare(settings:layouts:pixelFormat:)` for every format in
+  /// `pixelFormats`. Every pipeline is tried even after one fails; the first
+  /// error is thrown at the end.
+  public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], pixelFormats: [MTLPixelFormat]) throws {
+    if pixelFormats.isEmpty { return try prepare(settings: settings, layouts: layouts, target: nil) }
+    var firstError: (any Error)?
+    var i = 0
+    while i < pixelFormats.count {
+      do { try prepare(settings: settings, layouts: layouts, pixelFormat: pixelFormats[i]) } catch {
+        firstError = firstError ?? error
+      }
+      i += 1
+    }
+    if let firstError { throw firstError }
+  }
+
+  /// Whether the general render pipeline for `target` is built, so a draw into
+  /// it renders now (an asynchronous engine draws nothing until it is).
+  public func isPrepared(target: MonitorRenderTargetFormat) -> Bool {
+    renderPipelines.withLock { $0[RenderKey(target: target, scope: nil)] != nil }
+  }
+
+  /// `isPrepared(target:)` for a single-attachment pass of `pixelFormat`.
+  public func isPrepared(pixelFormat: MTLPixelFormat) -> Bool {
+    isPrepared(target: MonitorRenderTargetFormat(colorPixelFormat: pixelFormat))
+  }
+
+  /// Makes the general render pipeline for `pixelFormat` ready ahead of the
+  /// first draw: built on this thread, or waited for when an asynchronous
+  /// build of it is already running.
   public func prepare(pixelFormat: MTLPixelFormat) throws {
     try prepare(target: MonitorRenderTargetFormat(colorPixelFormat: pixelFormat))
   }
 
-  /// Builds the general render pipeline for a host render pass with these
-  /// formats (depth, stencil, sample count, extra colour attachments) on this
-  /// thread, ahead of the first draw.
+  /// Makes the general render pipeline for a host render pass with these
+  /// formats (depth, stencil, sample count, extra colour attachments) ready
+  /// ahead of the first draw: built on this thread, or waited for when an
+  /// asynchronous build of it is already running.
   public func prepare(target: MonitorRenderTargetFormat) throws {
-    _ = try renderPipeline(RenderKey(target: target, scope: nil))
+    _ = try preparedRenderPipeline(RenderKey(target: target, scope: nil))
   }
 
-  /// Builds every pipeline `settings` needs for frames of `layouts` drawn into
-  /// `pixelFormat` on this thread, so the first frames use specialized ones.
+  /// Makes every pipeline `settings` needs for frames of `layouts` drawn into
+  /// `pixelFormat` ready (built on this thread, or waited for when already
+  /// building asynchronously), so the first frames use specialized ones.
   public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], pixelFormat: MTLPixelFormat?) throws {
     try prepare(
       settings: settings, layouts: layouts, target: pixelFormat.map { MonitorRenderTargetFormat(colorPixelFormat: $0) })
   }
 
-  /// `prepare(settings:layouts:pixelFormat:)` for a host render pass with these formats.
+  /// `prepare(settings:layouts:pixelFormat:)` for a host render pass with these
+  /// formats. Every pipeline is tried even after one fails; the first error is
+  /// thrown at the end.
   public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], target: MonitorRenderTargetFormat?) throws {
+    var firstError: (any Error)?
+    func attempt(_ build: () throws -> Void) {
+      do { try build() } catch { firstError = firstError ?? error }
+    }
+    if let target { attempt { _ = try preparedRenderPipeline(RenderKey(target: target, scope: nil)) } }
     for s in settings.map({ $0.normalized() }) {
       for layout in layouts {
-        _ = try computePipeline(ComputeKey(kernel: s.kind.kernel, layout: layout.scopeLayoutCode))
+        attempt { _ = try preparedComputePipeline(ComputeKey(kernel: s.kind.kernel, layout: layout.scopeLayoutCode)) }
       }
       if let target {
-        _ = try renderPipeline(RenderKey(target: target, scope: nil))
-        _ = try renderPipeline(
-          RenderKey(target: target, scope: DrawVariant(kind: s.kind.shaderCode, mode: s.shaderMode)))
+        attempt {
+          _ = try preparedRenderPipeline(
+            RenderKey(target: target, scope: DrawVariant(kind: s.kind.shaderCode, mode: s.shaderMode)))
+        }
       }
     }
+    if let firstError { throw firstError }
+  }
+
+  /// `computePipeline(_:)` for warm-up: first waits for an asynchronous build
+  /// of `key` that is already running, so it is not compiled twice. Never on a frame.
+  func preparedComputePipeline(_ key: ComputeKey) throws -> MTLComputePipelineState {
+    awaitBuild { pendingCompute.withLock { $0.contains(key) } && !isFinished(key) }
+    return try computePipeline(key)
+  }
+
+  /// `renderPipeline(_:)` for warm-up: first waits for an asynchronous build
+  /// of `key` that is already running, so it is not compiled twice. Never on a frame.
+  func preparedRenderPipeline(_ key: RenderKey) throws -> MTLRenderPipelineState {
+    awaitBuild { pendingRender.withLock { $0.contains(key) } && !isFinished(key) }
+    return try renderPipeline(key)
+  }
+
+  private func isFinished(_ key: ComputeKey) -> Bool {
+    computePipelines.withLock { $0[key] != nil } || failedCompute.withLock { $0.contains(key) }
+  }
+
+  private func isFinished(_ key: RenderKey) -> Bool {
+    renderPipelines.withLock { $0[key] != nil } || failedRender.withLock { $0.contains(key) }
+  }
+
+  /// Waits while `running` (an asynchronous build of the key started and has
+  /// neither stored nor failed). Metal calls every completion handler; after a
+  /// minute without one the caller builds the pipeline itself instead.
+  private func awaitBuild(while running: () -> Bool) {
+    let deadline = Date(timeIntervalSinceNow: 60)
+    buildFinished.lock()
+    defer { buildFinished.unlock() }
+    while running() {
+      if !buildFinished.wait(until: deadline) { return }
+    }
+  }
+
+  /// Wakes warm-up waiting for an asynchronous build. Called after the caches
+  /// and the pending and failed sets are updated, so no wake-up is lost.
+  private func signalBuildFinished() {
+    buildFinished.lock()
+    buildFinished.broadcast()
+    buildFinished.unlock()
   }
 
   /// Pipeline builds that failed (asynchronous and synchronous), oldest first.
@@ -326,6 +446,7 @@ public final class ScopeEngine: @unchecked Sendable {
     if failedCompute.withLock({ $0.contains(key) }) {
       throw MonitorKitError.gpu("The scope kernel \(key.kernel.rawValue) \(key) failed to build.")
     }
+    builtOnCallerThread.withLock { $0.compute += 1 }
     do {
       let function = try library.makeFunction(name: key.kernel.rawValue, constantValues: Self.constants(key))
       return store(try device.makeComputePipelineState(function: function), for: key)
@@ -342,15 +463,23 @@ public final class ScopeEngine: @unchecked Sendable {
       guard let function else { return failed(key, error) }
       device.makeComputePipelineState(function: function) { [self] state, error in
         guard let state else { return failed(key, error) }
-        store(state, for: key)
-        _ = pendingCompute.withLock { $0.remove(key) }
+        built(state, for: key)
       }
     }
   }
 
-  private func failed(_ key: ComputeKey, _ error: (any Error)?) {
+  /// An asynchronous build of `key` finished. Internal for tests.
+  func built(_ state: MTLComputePipelineState, for key: ComputeKey) {
+    store(state, for: key)
+    _ = pendingCompute.withLock { $0.remove(key) }
+    signalBuildFinished()
+  }
+
+  /// A build of `key` failed. Internal for tests.
+  func failed(_ key: ComputeKey, _ error: (any Error)?) {
     _ = failedCompute.withLock { $0.insert(key) }
     record("scope kernel \(key.kernel.rawValue) \(key): \(error.map { "\($0)" } ?? "unknown error")")
+    signalBuildFinished()
   }
 
   private func record(_ failure: String) { failures.withLock { $0.append(failure) } }
@@ -411,6 +540,7 @@ public final class ScopeEngine: @unchecked Sendable {
     if failedRender.withLock({ $0.contains(key) }) {
       throw MonitorKitError.gpu("Cannot draw scopes into \(key.target): the pipeline build failed.")
     }
+    builtOnCallerThread.withLock { $0.render += 1 }
     do {
       let fragment = try library.makeFunction(name: "mk_scopeFragment", constantValues: Self.constants(key))
       return store(try device.makeRenderPipelineState(descriptor: descriptor(key, fragment: fragment)), for: key)
@@ -426,15 +556,23 @@ public final class ScopeEngine: @unchecked Sendable {
       guard let function else { return failed(key, error) }
       device.makeRenderPipelineState(descriptor: descriptor(key, fragment: function)) { [self] state, error in
         guard let state else { return failed(key, error) }
-        store(state, for: key)
-        _ = pendingRender.withLock { $0.remove(key) }
+        built(state, for: key)
       }
     }
   }
 
-  private func failed(_ key: RenderKey, _ error: (any Error)?) {
+  /// An asynchronous build of `key` finished. Internal for tests.
+  func built(_ state: MTLRenderPipelineState, for key: RenderKey) {
+    store(state, for: key)
+    _ = pendingRender.withLock { $0.remove(key) }
+    signalBuildFinished()
+  }
+
+  /// A build of `key` failed. Internal for tests.
+  func failed(_ key: RenderKey, _ error: (any Error)?) {
     _ = failedRender.withLock { $0.insert(key) }
     record("scope render pipeline \(key): \(error.map { "\($0)" } ?? "unknown error")")
+    signalBuildFinished()
   }
 
   @discardableResult

@@ -60,6 +60,7 @@ final class MonitorStateTests: XCTestCase {
     s.clipIndicators.coloring = .uniform
     s.clipIndicators.overColor = ColorRGB(r: 1, g: 0, b: 1)
     s.clipIndicators.opacity = 0.5
+    s.pictureStage = .source
     return s
   }
 
@@ -70,6 +71,9 @@ final class MonitorStateTests: XCTestCase {
     XCTAssertEqual(try JSONDecoder().decode(MonitorState.self, from: try JSONEncoder().encode(MonitorState())), MonitorState())
     let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     XCTAssertEqual(json["schemaVersion"] as? Int, MonitorState.schemaVersion)
+    XCTAssertEqual(json["schemaVersion"] as? Int, 2)
+    XCTAssertEqual(json["kind"] as? String, "MonitorKit.MonitorState")
+    XCTAssertEqual(json["pictureStage"] as? String, "source")
   }
 
   func testOpenBandEdgesSurviveJSON() throws {
@@ -79,26 +83,112 @@ final class MonitorStateTests: XCTestCase {
     XCTAssertEqual(try JSONDecoder().decode(MonitorState.self, from: data).falseColor.customBands, SixBandFalseColor.bands)
   }
 
-  func testLenientDecodeNeverThrowsAndKeepsWhatIsValid() throws {
-    func decode(_ json: String) throws -> MonitorState {
-      try JSONDecoder().decode(MonitorState.self, from: Data(json.utf8))
+  /// The JSON header every genuine blob carries.
+  static let header = #""kind": "MonitorKit.MonitorState", "schemaVersion": 2"#
+
+  func testLenientInsideAGenuineBlob() throws {
+    func decode(_ fields: String) throws -> MonitorState {
+      let body = fields.isEmpty ? Self.header : Self.header + ", " + fields
+      return try JSONDecoder().decode(MonitorState.self, from: Data("{\(body)}".utf8))
     }
-    XCTAssertEqual(try decode("{}"), MonitorState())
-    XCTAssertEqual(try decode("[]"), MonitorState(), "a non-object decodes as defaults")
-    XCTAssertEqual(try decode(#"{"schemaVersion": 99, "clean": true}"#), MonitorState(), "unknown versions are ignored")
-    let partial = try decode(#"{"clean": "yes", "focus": {"enabled": true, "color": "magenta", "sensitivity": "high"}, "display": {"saturation": 1.5}}"#)
+    XCTAssertEqual(try decode(""), MonitorState(), "a header alone is the defaults")
+    let partial = try decode(
+      #""clean": "yes", "focus": {"enabled": true, "color": "magenta", "sensitivity": "high"}, "display": {"saturation": 1.5}, "pictureStage": "nonsense""#)
     XCTAssertFalse(partial.clean, "malformed values fall back")
     XCTAssertTrue(partial.focus.enabled)
     XCTAssertEqual(partial.focus.color, .red)
     XCTAssertEqual(partial.focus.sensitivity, 0.5)
     XCTAssertEqual(partial.display.saturation, 1.5)
+    XCTAssertEqual(partial.pictureStage, .monitor, "an unknown picture stage decodes as the default")
+    XCTAssertEqual(try decode(#""pictureStage": "output""#).pictureStage, .output)
     // Out-of-range values are normalized on decode.
-    let wild = try decode(#"{"zebras": [{"level": 500, "range": -3}], "geometry": {"desqueeze": 0.2, "magnification": {"zoom": 1000}}}"#)
+    let wild = try decode(#""zebras": [{"level": 500, "range": -3}], "geometry": {"desqueeze": 0.2, "magnification": {"zoom": 1000}}"#)
     XCTAssertEqual(wild.zebras.count, 2)
     XCTAssertEqual(wild.zebras[0].level, 120)
     XCTAssertEqual(wild.zebras[0].range, 0)
     XCTAssertEqual(wild.geometry.desqueeze, 1)
     XCTAssertEqual(wild.geometry.magnification.zoom, 64)
+    // A newer MonitorKit's schema decodes what this one knows (changes within a kind are additive).
+    let newer = try JSONDecoder().decode(
+      MonitorState.self,
+      from: Data(#"{"kind": "MonitorKit.MonitorState", "schemaVersion": 3, "clean": true, "futureField": 1}"#.utf8))
+    XCTAssertTrue(newer.clean)
+  }
+
+  /// R13: anything that is not a MonitorKit MonitorState throws instead of decoding partially.
+  func testForeignJSONFailsClosed() {
+    let foreign = [
+      "{}", "[]", "1", "null", #""MonitorKit.MonitorState""#,
+      #"{"schemaVersion": 1, "clean": true}"#,  // MonitorKit's own discriminator-less schema 1
+      #"{"schemaVersion": 2, "clean": true}"#,  // a version without the discriminator
+      #"{"kind": "MonitorKit.MonitorState", "clean": true}"#,  // no version
+      #"{"kind": "MonitorKit.MonitorState", "schemaVersion": 1, "clean": true}"#,
+      #"{"kind": "MonitorKit.MonitorState", "schemaVersion": "2"}"#,
+      #"{"kind": "MonitorKit.ScopeSettings", "schemaVersion": 2}"#,
+      #"{"kind": 7, "schemaVersion": 2}"#,
+    ]
+    for json in foreign {
+      XCTAssertThrowsError(try JSONDecoder().decode(MonitorState.self, from: Data(json.utf8)), json) { error in
+        guard case DecodingError.dataCorrupted = error else { return XCTFail("\(json): \(error)") }
+      }
+    }
+  }
+
+  /// A realistic blob of Ultracam's old `MonitorConfiguration` (Packages/MonitorTools,
+  /// `MonitorConfiguration.swift`, its synthesized keys and values) as AppSettingsStore
+  /// saved it: the user had switched the master tools switch off with guides,
+  /// peaking and false colour configured. Decoded as MonitorState it used to come
+  /// back partially, with those tools on (integration map §5.2); it must throw.
+  func testOldMonitorConfigurationBlobThrows() throws {
+    let old = #"""
+      {
+        "schemaVersion": 1,
+        "toolsEnabled": false,
+        "guides": {"enabled": true, "thirds": true, "centerCross": true, "safeArea": true, "opacity": 0.65, "contrast": 1},
+        "zebra": {"enabled": true, "thresholdIRE": 95, "widthIRE": 5, "mode": "aboveThreshold", "opacity": 0.65},
+        "falseColor": {"mode": "sonySLog3", "profileID": "sony-slog3-false-color-v1",
+                       "specificationVersion": "sony-monitor-control-pattern2-v1", "exposureIndex": 800,
+                       "referenceOffsetStops": 0},
+        "focus": {"enabled": true, "color": "red", "sensitivity": 0.5, "noiseRejection": 0.02, "opacity": 0.85},
+        "scopes": {"enabled": true, "mode": "rgbParade", "gain": 1, "graticule": true, "refreshHz": 15},
+        "pictureStage": "processedOutput",
+        "scopeStage": "processedOutput",
+        "sourceProfileID": "sony-slog3-sgamut3cine",
+        "sourceCodeRange": "legal",
+        "sourceLogMapping": "native10Bit"
+      }
+      """#
+    XCTAssertThrowsError(try JSONDecoder().decode(MonitorState.self, from: Data(old.utf8)))
+    // The same blob nested in a host's settings: the host's own lenient wrapper sees
+    // an error, not a partial state, and keeps its fallback.
+    struct Feed: Decodable {
+      var monitor: MonitorState?
+      enum CodingKeys: CodingKey { case monitor }
+      init(from decoder: Decoder) throws {
+        monitor = try? decoder.container(keyedBy: CodingKeys.self).decodeIfPresent(MonitorState.self, forKey: .monitor)
+      }
+    }
+    let feed = try JSONDecoder().decode(Feed.self, from: Data(#"{"monitor": \#(old)}"#.utf8))
+    XCTAssertNil(feed.monitor)
+    // And the defaults the host falls back to keep every tool off.
+    let d = MonitorState()
+    XCTAssertFalse(d.guides.enabled || d.focus.enabled || d.zebras[0].enabled || d.falseColor.mode != .off)
+  }
+
+  func testPictureStageRule() {
+    var s = MonitorState()
+    XCTAssertEqual(s.pictureStage, .monitor)
+    XCTAssertTrue(s.pictureHasLUT(burnInLUT: true, monitorLUT: false))
+    XCTAssertTrue(s.pictureHasLUT(burnInLUT: false, monitorLUT: true))
+    XCTAssertFalse(s.pictureHasLUT(burnInLUT: false, monitorLUT: false))
+    s.monitorLUT = false
+    XCTAssertFalse(s.pictureHasLUT(burnInLUT: false, monitorLUT: true), "the surface does not apply the monitor LUT")
+    s.monitorLUT = true
+    s.pictureStage = .output
+    XCTAssertTrue(s.pictureHasLUT(burnInLUT: true, monitorLUT: true))
+    XCTAssertFalse(s.pictureHasLUT(burnInLUT: false, monitorLUT: true), "the output stage has no monitor LUT")
+    s.pictureStage = .source
+    XCTAssertFalse(s.pictureHasLUT(burnInLUT: true, monitorLUT: true))
   }
 
   func testNormalizationClampsAndResetsNonFinite() {

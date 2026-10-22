@@ -42,6 +42,27 @@ public struct FrameParameters: Equatable, Sendable {
 /// Keep the frame (and so any `CVMetalTexture` it holds) alive until every
 /// command buffer that reads it has completed: the same rule as any texture
 /// from a `CVMetalTextureCache`.
+///
+/// Texture formats of a host-built frame (`init(layout:width:height:…)`), each
+/// plane at least the size given, read with `read()` (never sampled), usage
+/// `.shaderRead`, any storage mode. They are what `wrap(_:cache:)` and
+/// `MonitorTextureCache` make over CoreVideo's buffers, and what a Metal 4 host
+/// creates with `makeTexture(descriptor:iosurface:plane:)`:
+///
+/// | Layout | Plane | Format | Size |
+/// | --- | --- | --- | --- |
+/// | `.v210` (`'v210'`) | `packed` | `rgba32Uint` | ⌈w/6⌉ × h (one texel per 6-pixel group) |
+/// | `.uyvy8` (`'2vuy'`), `.yuyv8` (`'yuvs'`) | `packed` | `rgba8Uint` | ⌈w/2⌉ × h |
+/// | `.biplanar(_, bitDepth: 8)` (`'420v'`, `'422v'`, …) | `luma`, `chroma` | `r8Unorm`, `rg8Unorm` | w × h, chroma subsampled |
+/// | `.biplanar(_, bitDepth: 10 or 16)` (`'x420'`, `'x422'`, `'sv22'`, …) | `luma`, `chroma` | `r16Unorm`, `rg16Unorm` (high-aligned samples, not `r16Uint`) | as above |
+/// | `.bgra8` | `luma` | `bgra8Unorm` or `rgba8Unorm` | w × h |
+/// | `.rgb10a2` | `luma` | `bgr10a2Unorm` or `rgb10a2Unorm` | w × h |
+/// | `.rgb(bitDepth: 16, float: false)` | `luma` | `rgba16Unorm` | w × h |
+/// | `.rgba16Float`, `.rgba32Float` | `luma` | `rgba16Float`, `rgba32Float` | w × h |
+///
+/// Chroma planes are ⌈w/2⌉ wide for 4:2:0 and 4:2:2 and ⌈h/2⌉ high for 4:2:0.
+/// On Metal 4 the host makes the textures resident once, when it first wraps
+/// them (`addResidency(to:)`, or `MonitorTextureCache`, which does it for you).
 public struct MonitorFrame: @unchecked Sendable {
   /// Identifies the picture this frame holds, for analysis that must belong to
   /// it (the focus mask). Every new `MonitorFrame` gets a fresh value, so wrap
@@ -51,8 +72,31 @@ public struct MonitorFrame: @unchecked Sendable {
   public let layout: PixelLayout
   public let width: Int
   public let height: Int
-  public var pixelAspectRatio: Double
+  /// Horizontal over vertical pixel spacing, finite and positive (1 when the
+  /// frame's declared ratio is not). The declared value is kept: `geometry` reports
+  /// a broken one (not finite, zero or negative) as 0, which the pass reports as
+  /// `MonitorUnavailableReason.unsupportedGeometry` and shows with square pixels.
+  public var pixelAspectRatio: Double {
+    get { declaredPixelAspectRatio.isFinite && declaredPixelAspectRatio > 0 ? declaredPixelAspectRatio : 1 }
+    set { declaredPixelAspectRatio = newValue }
+  }
+  /// The ratio as declared (the tag, or what the host set), possibly unusable.
+  var declaredPixelAspectRatio: Double
   public var signal: SignalDescription
+  /// The part of the frame that is picture, in pixels from the top-left corner
+  /// (the clean aperture: ISO/IEC 14496-12 `clap`, CoreVideo's
+  /// `kCVImageBufferCleanApertureKey`); nil shows the whole frame. The layout, the
+  /// picture, the focus footprint, guides, the navigator and the display aspect
+  /// all follow it; analysis still covers the whole frame. `wrap` reads it from the
+  /// buffer. Set it to crop to any region of interest; one that is not finite or
+  /// under a pixel once clipped to the frame shows the whole frame.
+  public var cleanAperture: MonitorRect?
+  /// The picture was processed after the camera (a programme mix, a scaled or
+  /// graded render), so it is not the camera's own signal. Tools that classify or
+  /// measure the camera's signal itself, log false colour and focus peaking, are
+  /// then unavailable (`MonitorUnavailableReason.requiresCameraSignal`) and
+  /// `MonitorFeed.analyze` encodes nothing for it. False by default.
+  public var isProcessed = false
   /// v210: `rgba32Uint`, one texel per 6-pixel group. UYVY/YUYV: `rgba8Uint`, one texel per 2 pixels.
   public let packed: MTLTexture?
   /// Biplanar luma plane, or the RGB texture.
@@ -62,26 +106,40 @@ public struct MonitorFrame: @unchecked Sendable {
   /// Keep texture-cache wrappers alive with the frame (two at most, so no array).
   let retained0: AnyObject?
   let retained1: AnyObject?
-  /// Set on a frame `MonitorFeed.freeze` returned: its planes are the feed's.
+  /// Set on a frame `MonitorFeed.freeze` returned (its planes are the feed's), and
+  /// on a `MonitorTextureCache` frame (its first plane's cache entry).
   var frozenPlanes: FrozenPlanes?
+  /// A `MonitorTextureCache` frame's second plane's cache entry (biplanar chroma).
+  var secondPlanes: FrozenPlanes?
 
   private static let ids = Atomic<UInt64>(0)
   static func nextID() -> UInt64 { ids.add(1, ordering: .relaxed).newValue }
 
-  /// Wraps textures the host already has. Throws if they do not match `layout`.
+  /// Wraps textures the host already has (formats in the table above). Throws if
+  /// they do not match `layout`, or if `cleanAperture` (frame pixels, top-left
+  /// origin) is not a finite rect of at least a pixel inside the frame.
+  /// Allocation-free.
   public init(
     layout: PixelLayout, width: Int, height: Int, packed: MTLTexture? = nil,
     luma: MTLTexture? = nil, chroma: MTLTexture? = nil, signal: SignalDescription,
-    pixelAspectRatio: Double = 1
+    pixelAspectRatio: Double = 1, cleanAperture: MonitorRect? = nil
   ) throws {
+    if let a = cleanAperture {
+      // A hair of tolerance for apertures derived from rational CoreVideo values.
+      let e = 1e-6
+      guard a.x.isFinite, a.y.isFinite, a.width.isFinite, a.height.isFinite, a.width >= 1, a.height >= 1,
+        a.x >= -e, a.y >= -e, a.maxX <= Double(width) + e, a.maxY <= Double(height) + e
+      else { throw MonitorKitError.invalidFrame("clean aperture \(a) is not inside the \(width)×\(height) frame") }
+    }
     try self.init(
       layout: layout, width: width, height: height, packed: packed, luma: luma, chroma: chroma,
-      signal: signal, pixelAspectRatio: pixelAspectRatio, retained: (nil, nil))
+      signal: signal, pixelAspectRatio: pixelAspectRatio, retained: (nil, nil), cleanAperture: cleanAperture)
   }
 
   init(
     layout: PixelLayout, width: Int, height: Int, packed: MTLTexture?, luma: MTLTexture?,
-    chroma: MTLTexture?, signal: SignalDescription, pixelAspectRatio: Double, retained: (AnyObject?, AnyObject?)
+    chroma: MTLTexture?, signal: SignalDescription, pixelAspectRatio: Double, retained: (AnyObject?, AnyObject?),
+    cleanAperture: MonitorRect? = nil
   ) throws {
     guard layout.isValid else { throw MonitorKitError.invalidFrame("layout \(layout) is not valid") }
     guard width > 0, height > 0 else { throw MonitorKitError.invalidFrame("empty frame") }
@@ -125,25 +183,48 @@ public struct MonitorFrame: @unchecked Sendable {
     self.luma = luma
     self.chroma = chroma
     self.signal = signal
-    self.pixelAspectRatio =
-      pixelAspectRatio.isFinite && pixelAspectRatio > 0 ? pixelAspectRatio : 1
+    declaredPixelAspectRatio = pixelAspectRatio
+    self.cleanAperture = cleanAperture
     retained0 = retained.0
     retained1 = retained.1
     id = Self.nextID()
   }
 
+  /// The frame's shape without its pixels, for `MonitorLayout(frame:state:…)` and
+  /// the display aspect on any thread. A declared pixel aspect ratio that is not
+  /// finite and positive is 0 here (equality-stable, and outside
+  /// `MonitorFrameGeometry.pixelAspectRatioRange`, so it shows square pixels).
+  public var geometry: MonitorFrameGeometry {
+    MonitorFrameGeometry(
+      width: width, height: height, pixelAspectRatio: Self.stablePixelAspectRatio(declaredPixelAspectRatio),
+      cleanAperture: cleanAperture)
+  }
+
+  /// `ratio` when finite and positive, else 0: what `geometry` and the pass key
+  /// carry, so a NaN never makes two equal frames compare unequal.
+  static func stablePixelAspectRatio(_ ratio: Double) -> Double { ratio.isFinite && ratio > 0 ? ratio : 0 }
+
   /// The texture whose identity stands for this frame (the packed or luma/RGB texture).
   var primaryTexture: MTLTexture? { packed ?? luma }
 
-  /// Metal 4: a frame `MonitorFeed.freeze` returned whose planes the feed has
-  /// since let go (`unfreeze()` releasing them, or a freeze of another size) is
-  /// no longer in the residency set, though the frame keeps the textures alive.
-  /// This makes them resident again until the latest submission `residency`
-  /// observed completes; for any other frame it does nothing. MonitorKit's own
-  /// Metal 4 encodes (pictures, analysis, Freeze) call it after observing their
-  /// submission; other work that reads frames (e.g. scopes) calls it the same way.
+  /// Metal 4: a frame whose planes their owner has since let go is no longer in
+  /// the residency set, though the frame keeps the textures alive: a frame
+  /// `MonitorFeed.freeze` returned once the feed released its planes
+  /// (`unfreeze()`, or a freeze of another size), or a `MonitorTextureCache` frame
+  /// once the cache swept, flushed or removed its textures (e.g. a stalled camera's
+  /// last frame, still redrawn). This makes them resident again until the latest
+  /// submission `residency` observed completes; for any other frame it does
+  /// nothing. MonitorKit's own Metal 4 encodes (pictures, analysis, Freeze, scopes)
+  /// call it after observing their submission; other work that reads frames calls
+  /// it the same way. Allocation-free; it changes the residency set only for a
+  /// released frame.
   public func keepResidentIfReleased(in residency: MonitorResidency) {
-    guard let planes = frozenPlanes, planes.released.load(ordering: .acquiring) else { return }
+    // Sequentially consistent with the owner's store and `MonitorResidency`'s
+    // submission counter: either this sees the release, or the release's
+    // retirement covers the submission just observed.
+    let first = frozenPlanes?.released.load(ordering: .sequentiallyConsistent) ?? false
+    let second = secondPlanes?.released.load(ordering: .sequentiallyConsistent) ?? false
+    guard first || second else { return }
     if let packed {
       residency.add(packed)
       residency.retire(packed, resident: packed)
@@ -306,15 +387,49 @@ extension MonitorFrame {
     return (texture, wrapper)
   }
 
-  /// Horizontal over vertical spacing from the pixel aspect attachment, 1 when absent.
-  static func pixelAspectRatio(of pixelBuffer: CVPixelBuffer) -> Double {
-    guard let value = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil),
+  /// The clean aperture from `kCVImageBufferCleanApertureKey`, in pixels from the
+  /// top-left corner, clipped to the frame; nil when absent, not finite, or under a
+  /// pixel once clipped. CoreVideo stores the aperture's size and the offset of its
+  /// centre from the frame's centre, x to the right and y down (ISO/IEC 14496-12
+  /// `clap`: pcY = vertOff + (height − 1) / 2), so the top edge is
+  /// (height − apertureHeight) / 2 + verticalOffset, which is what
+  /// `CVImageBufferGetCleanRect` returns once its lower-left origin is flipped.
+  /// Reads CF values without bridging: allocation-free.
+  public static func cleanAperture(of pixelBuffer: CVPixelBuffer) -> MonitorRect? {
+    guard let value = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCleanApertureKey, nil),
       CFGetTypeID(value) == CFDictionaryGetTypeID()
-    else { return 1 }
+    else { return nil }
+    let dictionary = unsafeDowncast(value, to: CFDictionary.self)
+    let w = spacing(dictionary, kCVImageBufferCleanApertureWidthKey)
+    let h = spacing(dictionary, kCVImageBufferCleanApertureHeightKey)
+    let dx = spacing(dictionary, kCVImageBufferCleanApertureHorizontalOffsetKey)
+    let dy = spacing(dictionary, kCVImageBufferCleanApertureVerticalOffsetKey)
+    let fw = Double(CVPixelBufferGetWidth(pixelBuffer)), fh = Double(CVPixelBufferGetHeight(pixelBuffer))
+    guard w.isFinite, h.isFinite, dx.isFinite, dy.isFinite, w > 0, h > 0 else { return nil }
+    let rect = MonitorRect(x: (fw - w) / 2 + dx, y: (fh - h) / 2 + dy, width: w, height: h)
+      .intersection(MonitorRect(x: 0, y: 0, width: fw, height: fh))
+    return rect.width >= 1 && rect.height >= 1 ? rect : nil
+  }
+
+  /// The geometry of `pixelBuffer` (size, pixel aspect ratio, clean aperture) without
+  /// mapping any texture: for sizing a layer on the main thread. Allocation-free.
+  public static func geometry(of pixelBuffer: CVPixelBuffer) -> MonitorFrameGeometry {
+    MonitorFrameGeometry(
+      width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer),
+      pixelAspectRatio: pixelAspectRatio(of: pixelBuffer), cleanAperture: cleanAperture(of: pixelBuffer))
+  }
+
+  /// Horizontal over vertical spacing from the pixel aspect attachment: 1 when the
+  /// buffer has none, 0 when it has one that is broken (not a dictionary, a spacing
+  /// missing, zero, negative or not a number, or a ratio that is not finite), which
+  /// the pass reports as `MonitorUnavailableReason.unsupportedGeometry`.
+  static func pixelAspectRatio(of pixelBuffer: CVPixelBuffer) -> Double {
+    guard let value = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil) else { return 1 }
+    guard CFGetTypeID(value) == CFDictionaryGetTypeID() else { return 0 }
     let dictionary = unsafeDowncast(value, to: CFDictionary.self)
     let h = spacing(dictionary, kCVImageBufferPixelAspectRatioHorizontalSpacingKey)
     let v = spacing(dictionary, kCVImageBufferPixelAspectRatioVerticalSpacingKey)
-    return h > 0 && v > 0 && (h / v).isFinite ? h / v : 1
+    return h > 0 && v > 0 && (h / v).isFinite ? h / v : 0
   }
 
   private static func spacing(_ dictionary: CFDictionary, _ key: CFString) -> Double {
@@ -326,7 +441,8 @@ extension MonitorFrame {
   }
 
   /// Wraps an IOSurface-backed pixel buffer through the host's texture cache.
-  /// No pixels are copied. `signal` overrides what the attachments say.
+  /// No pixels are copied. `signal` overrides what the attachments say; the pixel
+  /// aspect ratio and the clean aperture come from the attachments.
   public static func wrap(
     _ pixelBuffer: CVPixelBuffer, cache: CVMetalTextureCache, signal: SignalDescription? = nil
   ) throws -> MonitorFrame {
@@ -361,13 +477,18 @@ extension MonitorFrame {
     return try MonitorFrame(
       layout: layout, width: width, height: height, packed: packed, luma: luma, chroma: chroma,
       signal: signal ?? Self.signal(of: pixelBuffer, range: range),
-      pixelAspectRatio: pixelAspectRatio(of: pixelBuffer), retained: wrappers)
+      pixelAspectRatio: pixelAspectRatio(of: pixelBuffer), retained: wrappers,
+      cleanAperture: cleanAperture(of: pixelBuffer))
   }
 }
 
-/// One set of a feed's Freeze planes, shared by the frames frozen into it. The
-/// feed marks it released when it lets the planes go, so a frame still held
-/// can be made resident again (`MonitorFrame.keepResidentIfReleased(in:)`).
+/// One set of a feed's Freeze planes, shared by the frames frozen into it, or one
+/// `MonitorTextureCache` entry, shared by the frames made over it. The owner marks
+/// it released when it lets the planes go, so a frame still held can be made
+/// resident again (`MonitorFrame.keepResidentIfReleased(in:)`).
 final class FrozenPlanes: Sendable {
   let released = Atomic<Bool>(false)
+
+  /// Marks the planes let go, before their retirement reads the submission counter.
+  func markReleased() { released.store(true, ordering: .sequentiallyConsistent) }
 }

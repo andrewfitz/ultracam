@@ -1,19 +1,21 @@
 # MonitorKit architecture contract
 
-The binding contract for everyone working on MonitorKit. Product scope is in [`docs/MONITOR_LIBRARY_PLAN.md`](../../../docs/MONITOR_LIBRARY_PLAN.md) and device research in [`docs/MONITOR_DEVICE_INVENTORY.md`](../../../docs/MONITOR_DEVICE_INVENTORY.md) (both in the Ultracam repo). The constants and formulas are in [`MATH.md`](MATH.md).
+The binding contract for everyone working on MonitorKit. User-facing documentation: [README](../README.md), [FEATURES](FEATURES.md), [API](API.md), [INTEGRATION](INTEGRATION.md). Product scope is in [`docs/MONITOR_LIBRARY_PLAN.md`](../../../docs/MONITOR_LIBRARY_PLAN.md) and device research in [`docs/MONITOR_DEVICE_INVENTORY.md`](../../../docs/MONITOR_DEVICE_INVENTORY.md) (both in the Ultracam repo). The constants and formulas are in [`MATH.md`](MATH.md).
 
 ## Platform
 
 - macOS 26+ / iOS 26+, Apple silicon. Swift 6 language mode, tools 6.2, warnings are errors.
 - Metal Shading Language 4.0 (4.1 on macOS/iOS 27), compiled at runtime from `.msl` text resources with `MonitorShaders.compileOptions` (safe math). `makeLibrary(source:)` uses the OS compiler, so no Metal toolchain is needed. `MonitorShaders.libraryDescriptor(parts:)` gives the same source to an `MTL4Compiler` (tested to produce identical output). All MSL symbols are prefixed `mk_`.
-- Two encode paths with bit-identical pixels: classic (`MTLCommandBuffer`) and Metal 4 (`MonitorSubmission` over an `MTL4CommandBuffer`). The Metal 4 path reuses the device-built pipeline states (valid in MTL4 encoders, no second compile).
+- Two encode paths with bit-identical pixels: classic (`MTLCommandBuffer`) and Metal 4 (`MonitorSubmission` over an `MTL4CommandBuffer`). One set of pipeline states serves both (device-built states are valid in MTL4 encoders; no second compile).
+- Pipeline builder: by default the device builds the library and pipelines. `MonitorEngine(…, compiler:)` takes the host's `MTL4Compiler` instead: the library (`libraryDescriptor(parts:)`), the picture render and compute pipelines (`MTL4RenderPipelineDescriptor`, `MTL4ComputePipelineDescriptor`), the focus kernels and Freeze's copy kernels are then built by it, so they land in the host's pipeline data set serializer and lookup archives. Its render pipelines carry no depth or stencil format and draw in any host pass. `ScopeEngine` always builds with the device.
 - No third-party dependencies.
 
 ## Zero-overhead contract (every rule is tested)
 
-1. **Host GPU objects.** The library never creates an `MTLDevice`, command queue, command buffer, command allocator, thread or dispatch queue. The one exception is the batteries-included view tier in `MonitorKitUI`: a convenience-mode `MonitorMetalView`, `MonitorView`, `ScopeView` or `ScopeStackView` creates a command queue only when none is given, and commits its own command buffers (see the UI tier below). `MonitorRenderer` itself creates nothing.
+1. **Host GPU objects.** The library never creates an `MTLDevice`, command queue, command buffer, command allocator, thread or dispatch queue. The one exception is the batteries-included view tier in `MonitorKitUI`: a convenience-mode `MonitorMetalView`, `MonitorView`, `ScopeView` or `ScopeStackView` creates a command queue only when none is given, and commits its own command buffers (see the UI tier below). `MonitorRenderer` itself creates nothing; when no `ScopeEngine` is given it builds the shared one on the existing global queue (`DispatchQueue.global(qos: .userInitiated)`), never on the display thread.
+   - Asynchronous compiles run on Metal's compiler threads. On an engine built with a `compiler`, asynchronous specialization awaits the Swift overlay's async-only `MTL4Compiler` API (`makeRenderPipelineState(descriptor:)`, `makeComputePipelineState(descriptor:)`) from `Task.detached(priority: .utility)`. That runs on Swift's cooperative pool; the library still creates no thread or queue of its own.
 2. **Encode, never commit.** Per-frame calls take an `MTLCommandBuffer` (classic) or a `MonitorSubmission` (Metal 4) and only encode into it. They never commit, wait or add handlers. On Metal 4 the library never begins or ends a command buffer either. A source-scan contract test checks both paths.
-3. **Borrowed inputs.** A `MonitorFrame` wraps textures the host already has, e.g. from a `CVMetalTextureCache` over an IOSurface `CVPixelBuffer`. The library never copies, stages or blits frame pixels. The only copy anywhere is Freeze, which the user asks for explicitly; it is a compute kernel (`mk_copyUint` / `mk_copyFloat`; BGRA8 and BGR10A2 planes are stored as RGBA8 / RGB10A2), never a blit.
+3. **Borrowed inputs.** A `MonitorFrame` wraps textures the host already has, e.g. from a `CVMetalTextureCache` over an IOSurface `CVPixelBuffer`, or from `MonitorTextureCache` (IOSurface-keyed textures made once, resident once, for Metal 4 hosts). The library never copies, stages or blits frame pixels. The only copy anywhere is Freeze, which the user asks for explicitly; it is a compute kernel (`mk_copyUint` / `mk_copyFloat`; BGRA8 and BGR10A2 planes are stored as RGBA8 / RGB10A2), never a blit.
 4. **Any output.** Draw into any render target: a drawable (including `framebufferOnly` drawables in `bgr10a2Unorm`, `rgba16Float` and `bgra8Unorm`, tested with real `CAMetalLayer` drawables), an offscreen texture, a viewport inside the host's render pass (depth, stencil, MSAA and further colour attachments described by `MonitorRenderTargetFormat`), or, on Metal 4, a compute write into a shader-writable target (`encodeCompute`).
 5. **No per-frame allocation.**
    - GPU: pipelines are built at init or on first use of a pixel format. Persistent textures and buffers are recreated only when size, format or settings change.
@@ -22,13 +24,14 @@ The binding contract for everyone working on MonitorKit. Product scope is in [`d
    - CPU: the encode path makes no heap allocation of its own (measured against the same Metal calls made inline). No arrays are built per frame; derived data is cached behind an `Equatable` key. Per-frame code uses `while` loops with direct subscripts (no `for`-in, `enumerated()`, `first`, `contains`), so the zero-allocation tests hold in debug builds.
 6. **No CPU readback on the frame path.** Scope data stays on the GPU. Small numeric results go into a shared buffer the host can read later (`ScopeStatisticsReader`).
 7. **Fusable.** `MKLUT.msl` and `MKDecode.msl` are self-contained. A host can prepend them to its own kernel and call `mk_applyLUT` / `mk_decodeRGB` in its own pass, compiling with `MonitorShaders.compileOptions` or `libraryDescriptor(parts:)`. `MonitorLUT` shaper rows are the texture width wide (at least 8), so a host must use the shipped `MKLUT.msl` (`mk_shaperEntry(lut, i, n, w)`), not an older copy.
+   - The two fusable parts are each guarded as a whole file (`MK_LUT_MSL_VERSION`, `MK_DECODE_MSL`), so a host source that includes one twice compiles it once. `MKMonitor.msl` and `MKScopes.msl` are not guarded (they are compiled once, by MonitorKit). `MKLUT.msl` is keyed by its layout version, `MonitorShaders.lutLayoutVersion` (2: the 80-byte `mk_LUTParams` = `LUTParameters`, with a 1D shaper). An older copy (plain `MK_LUT_MSL` guard, 48-byte parameters) in the same source fails to compile in either order (an `#error` before, a redefinition after), so one layout's bytes can never be bound to the other's struct. Bind `LUTParameters` by `MemoryLayout<LUTParameters>.size`, never a hand-written struct.
 
 ### Metal 4 rules
 
 - **One queue, one timeline.** All of an engine's Metal 4 work goes on one `MTL4CommandQueue`. Submission indices start at 1 (0 means none; `MonitorSubmission.init` and `MonitorResidency.observe` trap on 0). Every encode into one command buffer shares its index.
 - **Completion contract.** `completedIndex` is the highest *contiguous* completed submission: that one and every earlier one have completed or were abandoned. Feedback handlers can complete out of order, so a host keeps a done-set and advances a watermark (`Tests/MonitorKitTests/Metal4Support.swift`). Reporting a non-contiguous maximum would reuse ring slots and free resources still in flight. A host that limits frames in flight with a semaphore can use `MonitorSubmission(commandBuffer:index:framesInFlight:)` instead.
 - **Residency.** `MonitorEngine.residency` (a `MonitorResidency`) holds everything the library owns: placeholders, focus masks, Freeze planes, rings, argument tables' resources and the feeds' LUT textures (counted, so a LUT shared by two feeds stays until both release it). `ScopeEngine(…, residency:)` can take the same object, so the host attaches one set. The host attaches `residency.set` to its queue once. Host frames and targets stay the host's to make resident (`MonitorFrame.addResidency(to:)` when a texture is first wrapped, e.g. in an IOSurface-keyed cache, never per frame). Call `feed.updateResidency()` before other Metal 4 work reads a feed's LUTs outside MonitorKit.
-- **Argument tables.** Each object owns one table, made on its first Metal 4 encode (pass 7 textures / 5 buffers, feed 6 / 4, accumulator 5 / 6, group 5 / 15, renderer 2 / 3). Metal 4 snapshots bindings at each draw or dispatch, so reusing a table across encodes is safe. In a host encoder the library binds its own table; hosts rebind theirs afterwards.
+- **Argument tables.** Each object owns one table, made on its first Metal 4 encode (pass 7 textures / 5 buffers, feed 6 / 4, accumulator 5 / 6, group 5 / 15, renderer 2 / 3), or ahead of it for the scope objects (`ScopeAccumulator`, `ScopeGroup` and `ScopeRenderer.prepareMetal4()`). Metal 4 snapshots bindings at each draw or dispatch, so reusing a table across encodes is safe. In a host encoder the library binds its own table; hosts rebind theirs afterwards.
 - **Uniform sizes per encode** (`uniformLength`, 256-byte offsets): `MonitorPass` 5120 B (frame 80, two LUT blocks, `PassParameters` 1456 at offset 768, `GuideParameters` 2592 at 2304), `MonitorFeed` 1024, `ScopeAccumulator` 1280, `ScopeGroup` 2048 (fused pass; unfused members ask their own), `ScopeRenderer` 768 per `prepare` plus `graticuleUniformLength` 2304 only when the graticule changes. Use the constants, not hand-computed struct sizes.
 - **Barriers**, all encoded by the library, as narrow as correctness allows:
 
@@ -47,17 +50,21 @@ The binding contract for everyone working on MonitorKit. Product scope is in [`d
 
   The host orders its own writes to frames and targets. A host that reads a persistent, non-drawable target (samples or blits a multiview texture) ends its reading encoder with a producer barrier (after its stages, before fragment and dispatch) so the next frame's MonitorKit write does not overtake the read; `encode(clear: true)` adds no barrier of its own. A host reading scope bins in its own shaders adds a consumer barrier on `.dispatch` first. Drawables are covered by `waitForDrawable`.
 
+- **Warm-up.** `MonitorEngine.warmUp(targets:layouts:surfaces:)` builds, on the calling thread, every pipeline a first frame could need: for each target format (default `MonitorEngine.standardTargetFormats`: `bgr10a2Unorm`, `rgba16Float`, `bgra8Unorm`) and layout, the all-tools picture pipeline, the focus kernels and Freeze's copy kernels; for each `MonitorSurfaceConfiguration`, the pipeline specialized to that surface's tool set and colour path (peaking counted as drawn when `state.focus.enabled`; until a frame is analysed the surface draws with the all-tools pipeline). `ScopeEngine.prepare(pixelFormats:)` (default `ScopeEngine.drawablePixelFormats`) does the same for scope render pipelines; `isPrepared(pixelFormat:)` reports it. Call them off the frame path at start-up; a switch to an HLG layer then never waits for a compile.
+
 ### Thread safety
 
 - `MonitorEngine`, `MonitorLUT`, `MonitorResidency` and `ScopeEngine` are immutable after init (apart from locked caches) and safe to share. Specialized pipelines are cached behind a lock and built on Metal's compiler threads.
 - Feeds, passes, multiviews, accumulators, groups and renderers are confined: one thread at a time, no internal locks, and not `Sendable` (compile-time protection against sharing). Create and use them on the render thread, move them with `sending`, or keep them on a global actor whose executor is the render thread. A `ScopeRenderer` and the accumulators it draws stay on one thread (its Metal 4 `prepare` updates their residency). `ScopeStatisticsReader` is the `Sendable` reader for UI threads.
 - `MonitorSubmission` is a per-frame value and not `Sendable`. State types are values.
 - `MonitorKitUI`'s scene handles (`MonitorScene`, `MonitorSource`, `MonitorSurface`, `MonitorScopeOverlay`, `MonitorCompletionReporter`) are `Sendable` and lock-protected; `MonitorSource.submit` never waits for the GPU.
+- `MonitorTextureCache` is `Sendable` (one short lock per lookup; the idle sweep runs inside a lookup).
 
 ### Lifetimes
 
 - **Classic path.** Per-frame encodes may go into command buffers created without retained references. Hosts keep frames and `MonitorLUT`s alive until those buffers complete. A feed keeps a replaced or released focus mask in a ring of `MonitorFeed.retiredFrames` (3) slots, each aged by later `analyze` calls; scopes keep replaced bins (`ScopeAccumulator`, aged per accumulation) and replaced trace and graticule textures (`ScopeRenderer`, aged per `prepare`) the same way. Retired resources are not counted in `persistentMemoryBytes`; `MonitorFeed.retiredMemoryBytes` shows them, and `releaseRetired()` drops them once every command buffer that used the feed has completed (a feed nobody analyses any more never ages them). Hosts using unretained command buffers keep accumulators, groups and renderers alive until their last command buffer completes.
 - **Metal 4.** The library releases nothing early and needs no retain or retire hooks from the host. A replaced mask, Freeze plane, LUT texture, ring or bin buffer, and everything a feed, pass, accumulator, group or renderer owns when it is deallocated with work in flight, stays alive and resident until the submission that last used it completes (`MonitorResidency`, keyed by submission index). Keep the engines alive until their work completes. Resources retired after the host's last encode wait for the next `observe`; hosts can call `residency.release(through:)` from their completion handler. A LUT replaced with `feed.burnInLUT = nil` stays referenced until the feed's next Metal 4 encode or deinit (by design). `ScopeEngine` retires its placeholders from a shared residency set on deinit.
+- **Frame texture cache.** `MonitorTextureCache` adds each texture to its `MonitorResidency` once, when made, and retires it (released once the submissions that may read it complete) after `idleLifetime` seconds unused, on `flush(owner:)`, `removeAll()` or deinit. A texture retains its IOSurface, not the pixel buffer; the returned frame retains the pixel buffer, so hosts keep frames until their work completes, as with any frame.
 - **Frozen frames.** A `MonitorFrame` returned by `freeze` is valid while the host holds it. `unfreeze()` releases the planes by default (`unfreeze(keepingMemory: true)` keeps them for a host that toggles Freeze often). On Metal 4 the released planes leave residency once their last submission completes, and every MonitorKit Metal 4 encode that reads a held frozen frame (pictures, analysis, Freeze, scope accumulations and groups) calls `MonitorFrame.keepResidentIfReleased(in:)` to make it resident again for that submission. A re-freeze into the same planes needs no host ordering on Metal 4 (the library waits for earlier readers); on the classic path encode it after every command buffer that still reads the previous frozen frame.
 - **UI tier.** `MonitorRenderer` holds replaced frames and LUTs for `max(3, framesInFlight)` classic encodes, or until `completedIndex` passes them on Metal 4. An encode may span two command buffers (`encodePictures`, then `encodeScopes` committed after it on the same queue); completion (`noteCompleted(through:)` or `MonitorCompletionReporter`, thread-safe and monotonic) is reported only after the later one completes. A paused or hidden convenience view commits one empty marker command buffer with a single completion handler per pause, then releases idle frames and focus masks.
 
@@ -65,11 +72,11 @@ The binding contract for everyone working on MonitorKit. Product scope is in [`d
 
 | Target | Contents |
 | --- | --- |
-| `MonitorKitCore` | `MonitorState` and settings (zebras, false colour, focus, guides, geometry, display adjustments with white-point trim, `DisplayTransformSettings`, `ClipIndicatorSettings`), `SignalDescription` (with `primaries`), `PixelLayout`, `LogCurve`, `MonitorLayout` and `GuideRaster`, `CubeLUT` and the CPU LUT reference, false-colour tables (`FalseColorTable`, `usesFullRangeARRI(signal:layout:)`), `MonitorOutputColor` / `MonitorLayerColor` (`OutputColor.swift`), `ColorPrimaries` / `ColorMatrix` (`Colorimetry.swift`), the reference math (`ColorMath`, `DecodeReference`, `MonitorColorPipeline`, `DisplayAssist`, `HDRToSDR`, `ToneMapEETF`, `WhitePointTrim`, transfer functions, Sony, ARRI, EL Zone) |
-| `MonitorKit` | `MonitorFrame`, `MonitorShaders`, `MonitorLUT`, `MonitorEngine`, `MonitorFeed` (analysis, Freeze), `MonitorPass`, `MonitorMultiview`, `MonitorStatus`, the Metal 4 types (`Metal4.swift`: `MonitorSubmission`, `MonitorUniformAllocator`, `MonitorUniformRing`, `MonitorResidency`) and the Metal 4 encode paths (`MonitorFeedMetal4.swift`, `MonitorPassMetal4.swift`). Shaders: `MKLUT`, `MKDecode`, `MKMonitor` |
-| `MonitorKitScopes` | `ScopeSettings`, `ScopeEngine`, `ScopeAccumulator`, `ScopeGroup` (one fused pass for a stage's waveform, histogram and vectorscope), `ScopeRenderer` (HDR-aware via `colorPipeline`), `ScopeStatisticsReader`, graticules, `RetiredResources`, and the Metal 4 paths (`Scope*Metal4.swift`, `ScopeMetal4.swift`). Shader: `MKScopes` (compiled after `MKLUT` + `MKDecode`) |
+| `MonitorKitCore` | `MonitorState` (fail-closed JSON: `kind` + `schemaVersion` 2) and settings (`pictureStage`, zebras, false colour, focus, guides, geometry, display adjustments with white-point trim, `DisplayTransformSettings`, `ClipIndicatorSettings`), `SignalDescription` (with `primaries`), `PixelLayout`, `LogCurve`, `MonitorFrameGeometry`, `MonitorLayout` (with the clean `aperture`) and `GuideRaster`, `CubeLUT`, the CPU LUT reference and `LUTOutputEncoding`, false-colour tables (`FalseColorTable`, `usesFullRangeARRI(signal:layout:)`), `MonitorOutputColor` / `MonitorLayerColor` (`OutputColor.swift`), `ColorPrimaries` / `ColorMatrix` (`Colorimetry.swift`), the reference math (`ColorMath`, `DecodeReference`, `MonitorColorPipeline`, `DisplayAssist`, `HDRToSDR`, `ToneMapEETF`, `WhitePointTrim`, transfer functions, Sony, ARRI, EL Zone) |
+| `MonitorKit` | `MonitorFrame` (with `cleanAperture`, `isProcessed`, `geometry`), `MonitorShaders` (`lutLayoutVersion`), `MonitorLUT`, `MonitorEngine` (optional `MTL4Compiler`; `warmUp` and `MonitorSurfaceConfiguration` in `MonitorWarmUp.swift`), `MonitorFeed` (analysis, Freeze), `MonitorPass`, `MonitorMultiview`, `MonitorStatus`, `MonitorTextureCache`, the Metal 4 types (`Metal4.swift`: `MonitorSubmission`, `MonitorUniformAllocator`, `MonitorUniformRing`, `MonitorResidency`) and the Metal 4 encode paths (`MonitorFeedMetal4.swift`, `MonitorPassMetal4.swift`). Shaders: `MKLUT`, `MKDecode`, `MKMonitor` |
+| `MonitorKitScopes` | `ScopeSettings` (with `ScopeLevelRange`, `ScopeTracePalette` and the `ultracamLegacy` preset), `ScopeEngine`, `ScopeAccumulator`, `ScopeGroup` (one fused pass for a stage's waveform, histogram and vectorscope), `ScopeRenderer` (HDR-aware via `colorPipeline`), `ScopeStatisticsReader`, graticules, `RetiredResources`, and the Metal 4 paths (`Scope*Metal4.swift`, `ScopeMetal4.swift`). Shader: `MKScopes` (compiled after `MKLUT` + `MKDecode`) |
 | `MonitorKitAudio` | `AudioMeter`, `AudioMeterConfiguration`, `AudioMeterSnapshot`, `LoudnessMeter`, `LoudnessEngine`, `MeterScale` (marks and zones per meter type), reset generations. Pure Swift + Accelerate |
-| `MonitorKitUI` | Scene handles (`MonitorScene`, `MonitorSource`, `MonitorSurface`, `MonitorScopeOverlay`, `MonitorRegion`), `MonitorRenderer` (drawable-free, classic or Metal 4), `MonitorMetalView` (CAMetalLayer, `CAMetalDisplayLink`), layer colour (`MonitorLayerColor.apply(to:)`, exact ICC spaces), headroom, `MonitorMagnifier`, SwiftUI views (`MonitorView`, `MonitorSceneView`, `ScopeView`, `ScopeStackView`, `ClipReadout`, `MonitorStatusOverlay`), controls, `FalseColorLegend`, `AudioMeterView` |
+| `MonitorKitUI` | Scene handles (`MonitorScene`, `MonitorSource`, `MonitorSurface`, `MonitorScopeOverlay`, `MonitorRegion`), `MonitorRenderer` (drawable-free, classic or Metal 4), `MonitorMetalView` (CAMetalLayer, `CAMetalDisplayLink`), layer colour (`MonitorLayerColor.apply(to:)`, exact ICC spaces), headroom, `MonitorMagnifier`, SwiftUI views (`MonitorView`, `MonitorSceneView`, `ScopeView`, `ScopeStackView`, `ClipReadout`, `MonitorStatusOverlay`, `ScopeIREScaleView`, `MonitorTileToolbar`), controls, `FalseColorLegend` / `FalseColorLegendView` (list and captioned styles), `AudioMeterView` |
 
 ## Data flow per frame (Encode tier)
 
@@ -81,8 +88,10 @@ host frame (CVPixelBuffer) ──wrap──▶ MonitorFrame (borrowed textures)
                                          │
  for each surface: pass.encode(frame, feed, state, target, viewport, into:)   (or MonitorMultiview: all surfaces in one render pass)
        one fragment pass (or compute kernel), its pipeline specialized to the surface's tool set and colour path:
-                      decode (separable filter: nearest 1:1, Catmull-Rom magnified, box minified)
+                      decode (separable filter: nearest 1:1, Catmull-Rom magnified, box minified),
+                        inside the clean aperture
                       → burn-in LUT (output stage) → monitor LUT (monitor stage)
+                      → the picture stage the surface shows (source, output or monitor)
                       → false colour | display transform → display adjustments (incl. white-point trim)
                         → output conversion (linearize, 3×3 in linear light, optional roll-off, target encode)
                       → zebras → clip indicators → peaking → matte/guides (analytic strokes)
@@ -91,8 +100,11 @@ host frame (CVPixelBuffer) ──wrap──▶ MonitorFrame (borrowed textures)
 ```
 
 - Signal stages (one decode per pixel feeds all three): `source` (the camera signal, range-expanded, matrix-decoded, never clipped); `output` (after the feed's burn-in LUT: what the real output carries; a host that burns the LUT in its own kernel uses the same `MonitorLUT` and `mk_applyLUT`, so preview and output are identical); `monitor` (after the monitor-only LUT).
+- **Picture stage.** `MonitorState.pictureStage` (default `.monitor`) picks the stage the picture itself shows: `.output` shows what the output carries (burn-in LUT, no monitor LUT), `.source` the camera signal with no LUT, so a display transform can apply even while the feed burns a LUT in. Tools keep measuring their own stages. The choice is function constant 16 (`MK_PICTURE_STAGE`) in a specialized pipeline; the all-tools pipeline (constant value 3) reads it from `PassParameters.falseColor.z`. `MonitorStatus.pictureStage` reports it, and the `.picture` entry of `activeLabels` names a non-default stage and a code-value view ("Source · S-Log3 code values"): a log or unlabelled signal on a stage no LUT touched with no display transform (`MonitorStatus.isCodeValueView`, `codeValueViewNote`).
+- **Clean aperture.** `MonitorFrame.cleanAperture` (frame pixels, top-left origin; ISO/IEC 14496-12 `clap`, see MATH.md §12) crops what is shown: the layout, the picture, the focus footprint, guides, the navigator and the display aspect follow it, while analysis and scopes still cover the whole frame. A magnified picture's bicubic taps at the aperture edge read the frame's real pixels just outside it (it is the continuous image). `MonitorLayout.aperture` is the region shown and `pictureWidth`/`pictureHeight` its size; the layout's maps return frame pixels, and `pictureFraction`/`picturePoint` convert to the aperture fractions magnification uses. A pixel aspect ratio outside `MonitorFrameGeometry.pixelAspectRatioRange` (1/16…16) or not finite is drawn with square pixels and reported as `.unsupportedGeometry` on `.picture`.
+- **Processed frames.** `MonitorFrame.isProcessed` marks a picture that is not the camera's own signal (a programme mix, a scaled or graded render): log false colour and peaking then report `.requiresCameraSignal`, and `MonitorFeed.analyze` encodes nothing for it.
 - Tools measure their own `SignalStage`, never the transformed or output-encoded picture. Log false-colour modes always classify the source with the per-channel native-log decode. Zebras, the six-band and custom false colour, clip indicators, focus peaking and scopes each choose a stage.
-- **LUT convention.** LUT output is Rec.709 display R'G'B' on every stage. Any burn-in LUT, or a monitor LUT the surface shows, makes the picture Rec.709 SDR and every display transform unavailable (`.lutOnMonitorStage`), matching Sony's Gamma Display Assist, which is off while a LUT is applied. `MonitorFeed.monitorStageHasLUT(for:)` is the public rule; pass it to `MonitorOutputColor.layer(for:…)` and `MonitorEngine.prepare(…)`, and re-tag the layer when LUTs change. HDR-to-HDR LUTs are not modelled.
+- **LUT convention.** LUT output is Rec.709 display R'G'B' on every stage. A LUT on the picture's stage (the burn-in LUT unless `pictureStage` is `.source`; the monitor LUT too on `.monitor` when `state.monitorLUT`) makes the picture Rec.709 SDR and every display transform unavailable (`.lutOnMonitorStage`), matching Sony's Gamma Display Assist, which is off while a LUT is applied. `MonitorFeed.monitorStageHasLUT(for:)` (that is, `MonitorState.pictureHasLUT(burnInLUT:monitorLUT:)`) is the public rule; pass it to `MonitorOutputColor.layer(for:…)` and `MonitorEngine.prepare(…)`, and re-tag the layer when LUTs change. HDR-to-HDR LUTs are not modelled.
 - **One decode convention across modules** (tested end to end in `ScopePictureAgreementTests`): stage luma is the decoded transport Y' when no LUT touched the stage, else Rec.709 Y' of the LUT result (`mk_stageLuma` in the pass, the same rule in `MKScopes`). Boundaries are inclusive at the lower edge, so a 940 code is 100 IRE for zebras, false colour, clip indicators and scope clip counts alike. Scope statistics (Y' clip counts, luma min/max/average) always use this rule whatever `ScopeColorimetry` is; colorimetry drives only the drawn luma, the Y'CbCr parade and the vectorscope. Scope clip counts compare R', G', B' and Y' in percent with the same Float operations as the picture's clip indicator (`v·100 ≥ level`), so `ScopeStatistics.clippedHigh/Low` count exactly the pixels `ClipIndicatorSettings` marks.
 - Log signal: `LogCurve.signal` / `mk_logSignal`. S-Log3 is code-valued (a legal container carries code / 1023); LogC fills the container's range. A full container labelled `.fullRescaledToLegal` is unsqueezed from its own depth's legal range (`mk_unsqueezeLegal`). ARRI's full-range tables are chosen by `FalseColorTable.usesFullRangeARRI(signal:layout:)` (full or float container, or a rescaled transport), shared by the pass and `FalseColorLegend`.
 - Display-referred stops linearize with the source's own transfer (`DisplayTransfer.exposureLinear` / `mk_exposureLinear`).
@@ -110,19 +122,25 @@ public final class MonitorEngine: @unchecked Sendable {
   public let device: MTLDevice
   public let framesInFlight: Int                       // Metal 4 ring slots per object (default 3)
   public let residency: MonitorResidency               // attach `residency.set` to the MTL4 queue once
+  public let compiler: (any MTL4Compiler)?             // nil: the device builds the library and pipelines
   /// Compiles the library and compute pipelines (Freeze copy kernels start building
   /// at init on an asynchronous engine). Specialized per-tool-set picture pipelines
   /// build asynchronously by default; until one is ready a surface draws with the
   /// all-tools pipeline, which reads the output colour and transform from the
   /// uniforms (function constant 15): one per target format and layout, pixels
   /// identical to the specialized pipeline for native SDR and within 1e-5 otherwise.
-  public init(device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3) throws
+  public init(device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3,
+              compiler: (any MTL4Compiler)? = nil) throws
   /// Optional warm-up: the colour-independent all-tools render pipelines, three
   /// focus pipelines per layout (source, burn-in, both LUTs) and the Freeze copy kernels.
   public func prepare(pixelFormat: MTLPixelFormat, layouts: [PixelLayout]? = nil) throws
   public func prepare(target: MonitorRenderTargetFormat, layouts: [PixelLayout]? = nil) throws
   public func prepare(target:layouts:outputColor:signal:displayTransform:monitorStageHasLUT:) throws
   public func prepareCompute(pixelFormat:layouts:outputColor:signal:displayTransform:monitorStageHasLUT:) throws
+  /// Everything a first frame could need, on the calling thread, off the frame path. Returns pipelines built.
+  public static let standardTargetFormats: [MTLPixelFormat]   // bgr10a2Unorm, rgba16Float, bgra8Unorm
+  @discardableResult public func warmUp(targets: [MonitorRenderTargetFormat] = …, layouts: [PixelLayout]? = nil,
+                                        surfaces: [MonitorSurfaceConfiguration] = []) throws -> Int
   public func makeFeed() -> MonitorFeed
   public func makePass() -> MonitorPass
 }
@@ -135,7 +153,8 @@ public final class MonitorFeed {                       // one per video feed
   public func analyze(_ frame: MonitorFrame, focus: FocusSettings, into commandBuffer: MTLCommandBuffer) throws
   public func analyze(_ frame: MonitorFrame, focus: FocusSettings, into submission: MonitorSubmission) throws
   public func analyze(_ frame:, focus:, submission:, encoder: any MTL4ComputeCommandEncoder) throws
-  public func monitorStageHasLUT(for state: MonitorState) -> Bool
+  public func monitorStageHasLUT(for state: MonitorState) -> Bool   // follows state.pictureStage
+  public func hasFocusMask(for frame: MonitorFrame) -> Bool
   /// Freeze: one compute copy into planes owned by the feed (allocated once per size
   /// and format); the copy works wherever a live frame does.
   public func freeze(_ frame: MonitorFrame, into commandBuffer: MTLCommandBuffer) throws -> MonitorFrame
@@ -199,7 +218,33 @@ extension MonitorFrame {
 }
 ```
 
+```swift
+public struct MonitorFrame: @unchecked Sendable {
+  public init(layout:width:height:packed:luma:chroma:signal:pixelAspectRatio: = 1, cleanAperture: MonitorRect? = nil) throws
+  public static func wrap(_ pixelBuffer: CVPixelBuffer, cache: CVMetalTextureCache, signal: SignalDescription? = nil) throws -> MonitorFrame
+  public static func layout(for pixelFormat: OSType) -> (layout: PixelLayout, range: CodeRange)?
+  public static func signal(of: CVPixelBuffer, range: CodeRange) -> SignalDescription
+  public static func cleanAperture(of: CVPixelBuffer) -> MonitorRect?     // clap, y down, clipped
+  public static func geometry(of: CVPixelBuffer) -> MonitorFrameGeometry
+  public var id: UInt64; public var signal: SignalDescription; public var pixelAspectRatio: Double
+  public var cleanAperture: MonitorRect?; public var isProcessed: Bool; public var geometry: MonitorFrameGeometry { get }
+}
+
+public final class MonitorTextureCache: @unchecked Sendable {   // IOSurface-keyed, residency-aware (Metal 4 hosts)
+  public init(device:, residency:, idleLifetime: Double = 2, capacity: Int = 64)
+  public func frame(_ pixelBuffer: CVPixelBuffer, signal: SignalDescription? = nil, owner: UInt64 = 0, now: Double? = nil) throws -> MonitorFrame
+  public func makeTexture(iosurface:plane:format:width:height:owner:now:) throws -> MTLTexture
+  public func sweep(now:); public func flush(owner:); public func removeAll()
+}
+
+extension MonitorLayout { public init(frame: MonitorFrame, state: MonitorState, viewport: MonitorViewport) }
+public enum MonitorShaders { static let lutLayoutVersion = 2; static var compileOptions; source(_:); makeLibrary(…); libraryDescriptor(…) }
+public final class MonitorLUT { init(device:cube:interpolation: = .tetrahedral, outputEncoding: = .rec709) throws; texture; parameters }
+```
+
 `MonitorFrame.id` is fresh per wrapped frame (a host reusing one `MonitorFrame` value across pictures sets it). `MonitorFrame.signal(of:)` reads the colour-primaries attachment (709, 2020 and P3 D65; others stay nil; `SignalDescription` equality includes `primaries`, so compare `effectivePrimaries`). `FrameParameters.matrix.w` is the 4:2:0 vertical chroma offset; `PassParameters.luts.w` the source transfer code; `LUTParameters` carries the 1D shaper rows (`shaperLow`, `shaperScale`).
+
+**Function constants of `mk_picture`** (`MonitorEngine.specializationPrefix`): 0 layout (`MK_LAYOUT`), 1 LUTs read (bit 0 burn-in, bit 1 monitor), 2 zebras, 3 false colour tiers (bit 0 log modes, bit 1 stage modes), 4 interpolating filter, 5 navigator, 6 peaking, 7 guides, 8 display adjustments, 9 sRGB-encoded target, 10 display transform, 11 picture transfer, 12 target transfer, 13 roll-off, 14 clip indicators, 15 colour stages read from the uniforms (`PassParameters.color`, the all-tools stand-in), 16 picture stage (0 source, 1 output, 2 monitor, 3 read from `PassParameters.falseColor.z`). A specialized pipeline binds all of them; the all-tools pipeline turns every tier on and reads 10–13 and 16 from the uniforms, so one per target format and layout serves every colour setting and stage.
 
 ### Scopes
 
@@ -208,6 +253,10 @@ public final class ScopeEngine: @unchecked Sendable {
   public init(device:, specialization: = .asynchronous, framesInFlight: = 3, residency: MonitorResidency? = nil) throws
   public let residency: MonitorResidency               // pass MonitorEngine.residency to share one set
   public func prepare(pixelFormat:) / prepare(target: MonitorRenderTargetFormat) / prepare(settings:layouts:target:)
+  public static let drawablePixelFormats: [MTLPixelFormat]   // bgr10a2Unorm, rgba16Float, bgra8Unorm
+  public func prepare(pixelFormats: [MTLPixelFormat] = drawablePixelFormats) throws
+  public func prepare(settings:layouts:pixelFormats:) throws
+  public func isPrepared(target:) -> Bool; public func isPrepared(pixelFormat:) -> Bool
   public var pipelineBuildFailures: [String]           // recorded once, never retried; fall back to general pipelines
   public func makeAccumulator(settings:) throws -> ScopeAccumulator
   public func makeGroup(_ accumulators: [ScopeAccumulator]) throws -> ScopeGroup
@@ -225,11 +274,19 @@ public final class ScopeEngine: @unchecked Sendable {
 //   cull none, fill, bindings and an always-pass depth-stencil state with depth or stencil; render(target:) accepts MSAA.
 //   isReady (asynchronous engines draw nothing into a format until its pipeline is built);
 //   uniformLength 768, graticuleUniformLength 2304.
+// prepareMetal4() on accumulators, groups (and their members) and renderers makes the argument tables up front.
+// ScopeSettings: levelRange (ScopeLevelRange .standard -7…109 % | .minus10To110), display.palette
+//   (ScopeTracePalette .standard | .ultracamLegacy), ScopeSettings.ultracamLegacy(mode:stage:) (768 × 256, −10…110,
+//   legacy palette, opaque background). Codable, lenient, schemaVersion 1 (no `kind` yet).
 ```
 
 In `.asynchronous`, scopes never compile on the frame thread: the `bgra8Unorm`, `bgra8Unorm_srgb`, `rgba16Float`, `bgr10a2Unorm` and `rgba8Unorm` general render pipelines start building at init; any other format draws nothing until built (call `ScopeEngine.prepare(target:)` up front). In `.off`, the four all-tools fused kernels build at init on compiler threads and groups run unfused until they are ready. A `.synchronous` engine records a failed build and falls back the same way (a group to per-member accumulation); only a failed general render pipeline makes drawing throw.
 
-Status, not failure: a tool that cannot run on the given signal shows an explicit reason in `MonitorStatus` and is skipped. Examples: a log false-colour mode on a non-log source, stops on an unlabelled source (`requiresKnownTransfer`), peaking without an analysed mask, a display transform under a LUT (`lutOnMonitorStage`), an HDR transform on an SDR source (`requiresHDRSource`) or HDR passthrough into an SDR output (`requiresHDROutput`). The picture is still drawn.
+Status, not failure: a tool that cannot run on the given signal shows an explicit reason in `MonitorStatus` and is skipped. Examples: a log false-colour mode on a non-log source, stops on an unlabelled source (`requiresKnownTransfer`), peaking without an analysed mask, a display transform under a LUT (`lutOnMonitorStage`), an HDR transform on an SDR source (`requiresHDRSource`), HDR passthrough into an SDR output (`requiresHDROutput`), log false colour or peaking on a processed frame (`requiresCameraSignal`), or a pixel aspect ratio that cannot be shown (`unsupportedGeometry` on `MonitorTool.picture`). The picture is still drawn.
+
+### Persistence
+
+`MonitorState` is fail-closed: it writes `"kind": "MonitorKit.MonitorState"` (`MonitorState.codingKind`) and `schemaVersion` 2, and decoding throws `DecodingError.dataCorrupted` for anything without that `kind` or with a schema below 2 (another type's JSON, such as Ultracam's old `MonitorConfiguration`, which also said `schemaVersion` 1, and MonitorKit's own W1/W2 JSON). Inside a genuine blob every field decodes leniently and is normalized, and newer schemas decode field by field (changes within one `kind` are additive). Hosts catch the error and fall back to defaults or their legacy decoder; `MonitorState(decodingOrDefault:)`, `decodedOrDefault(from:)` and the `@LenientMonitorState` property wrapper do it for them, so a host's own synthesized `Codable` settings survive a foreign blob (a throwing field would fail the whole outer value). `ScopeSettings` (schema 1, no `kind` yet; it never throws), `MonitorOutputColor` and `SignalDescription` stay lenient: missing or malformed fields decode as defaults. The latter two are embedded values with no schema of their own.
 
 ## Target encoding and HDR
 

@@ -94,3 +94,23 @@ public enum LUTRouting: String, Codable, Sendable, CaseIterable {
   /// The real output feed and every preview of it.
   case burnIn
 }
+
+/// What a LUT's output values mean, declared per LUT. MonitorKit's convention is
+/// that every LUT outputs Rec.709 display R'G'B' (BT.709 primaries and matrix,
+/// the BT.1886 reference display, 0…1 nominal range), as camera viewing LUTs do,
+/// so a LUT stage is a Rec.709 SDR picture and its luma is weighted as Rec.709.
+/// It is the only encoding modelled; HDR or wide-gamut LUT outputs are not.
+public enum LUTOutputEncoding: String, Codable, Sendable, CaseIterable {
+  /// Rec.709 display R'G'B'. The default.
+  case rec709
+
+  /// The signal a LUT stage carries, e.g. to tag a host's processed output buffer
+  /// (CoreVideo's matrix, primaries and transfer attachments) so its colour matches
+  /// the monitor's. Its `range` is nominal (0…1 values); the code range is the
+  /// output container's (`MonitorFrame.layout(for:)`), so a host sets it from that.
+  public var signal: SignalDescription {
+    switch self {
+    case .rec709: return SignalDescription(range: .full, encoding: .display(.bt709), primaries: .rec709)
+    }
+  }
+}

@@ -12,8 +12,12 @@
 // - SwiftUI: `MonitorView`, `ScopeView`, `ScopeStackView` (several scopes of a
 //   source in one renderer), `ClipReadout`, `AudioMeterView`,
 //   `MonitorStatusOverlay` (host metadata: timecode, tally, format, LUT name,
-//   labels; `MonitorOverlayModel` for video-rate values), legends and the
-//   control views, all editing `MonitorState` through `normalized()`.
+//   labels; `MonitorOverlayModel` for video-rate values), legends (a list, or
+//   the captioned monitor-chrome legend), the scope IRE scale
+//   (`ScopeIREScaleView`), the tile toolbar (`MonitorTileToolbar`: tool
+//   toggles and settings, false colour, magnify; scopes and Freeze through the
+//   host's callbacks) and the control views, all editing `MonitorState`
+//   through `normalized()`.
 //
 // This tier is the one exception to the zero-overhead contract's "host GPU
 // objects" and "encode, never commit" rules: a view in convenience mode creates a

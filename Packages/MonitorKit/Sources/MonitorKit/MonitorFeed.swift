@@ -69,7 +69,7 @@ public final class MonitorFeed {
     // submission completes. Each is nil unless a Metal 4 encode used it.
     let residency = engine.residency
     // A frozen frame the host still holds is made resident again where it is drawn.
-    frozenPlanes?.released.store(true, ordering: .releasing)
+    frozenPlanes?.markReleased()
     retireResident(&resident.mask)
     retireResident(&resident.plane0)
     retireResident(&resident.plane1)
@@ -87,12 +87,13 @@ public final class MonitorFeed {
   /// once the frames in flight are done with it; turning peaking back on makes a
   /// new one. When the mask already holds this frame's analysis with these
   /// settings it encodes nothing either (a frozen frame, or a display refreshing
-  /// faster than the source).
+  /// faster than the source). A processed frame (`MonitorFrame.isProcessed`) is
+  /// treated like peaking off: peaking needs the camera's own signal.
   public func analyze(_ frame: MonitorFrame, focus: FocusSettings, into commandBuffer: MTLCommandBuffer)
     throws
   {
     ageRetired()
-    guard focus.enabled else { return releaseFocusMask() }
+    guard focus.enabled, !frame.isProcessed else { return releaseFocusMask() }
     let a = try prepareAnalysis(frame, focus: focus)
     if holds(frame, a) { return }
     guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -135,7 +136,7 @@ public final class MonitorFeed {
 
   /// `MK_FOCUS_ROWS`: mask rows per thread of `mk_focusMask` (a mismatch would
   /// leave rows unwritten, which the W1 mask comparison test catches).
-  static let focusRows = 8
+  static let focusRows = 16
   /// Rows of a focus threadgroup (fewer if the pipeline cannot take that many threads).
   static let focusGroupRows = 4
 
@@ -214,12 +215,13 @@ public final class MonitorFeed {
   /// Marks the mask stale, e.g. when the host stops analysing.
   public func invalidateFocusMask() { maskKey = nil }
 
-  /// Whether a surface showing this feed with `state` has a LUT on its monitor
-  /// stage (the burn-in LUT, or the monitor LUT when `state.monitorLUT`), which
-  /// makes its picture Rec.709 SDR: the `monitorStageHasLUT` argument of
-  /// `MonitorOutputColor.layer(for:…)` and `MonitorEngine.prepare(…)`.
+  /// Whether the picture a surface showing this feed with `state` draws came out
+  /// of a LUT (`state.pictureHasLUT`: the burn-in LUT unless the picture shows the
+  /// source, the monitor LUT too when it shows the monitor stage and
+  /// `state.monitorLUT`), which makes it Rec.709 SDR: the `monitorStageHasLUT`
+  /// argument of `MonitorOutputColor.layer(for:…)` and `MonitorEngine.prepare(…)`.
   public func monitorStageHasLUT(for state: MonitorState) -> Bool {
-    burnInLUT != nil || (state.monitorLUT && monitorLUT != nil)
+    state.pictureHasLUT(burnInLUT: burnInLUT != nil, monitorLUT: monitorLUT != nil)
   }
 
   /// Peaking is off: the mask goes (kept for `retiredFrames` more analyses on the
@@ -301,7 +303,8 @@ public final class MonitorFeed {
     var frozen = try MonitorFrame(
       layout: frame.layout, width: frame.width, height: frame.height, packed: packed ? f.planes.0 : nil,
       luma: packed ? nil : f.planes.0, chroma: f.planes.1, signal: frame.signal,
-      pixelAspectRatio: frame.pixelAspectRatio, retained: (nil, nil))
+      pixelAspectRatio: frame.declaredPixelAspectRatio, retained: (nil, nil), cleanAperture: frame.cleanAperture)
+    frozen.isProcessed = frame.isProcessed
     if frozenPlanes == nil { frozenPlanes = FrozenPlanes() }
     frozen.frozenPlanes = frozenPlanes
     frozenFrame = frozen
@@ -334,7 +337,7 @@ public final class MonitorFeed {
     guard existing !== texture else { return }
     if index == 0 { freezePlanes.0 = texture } else { freezePlanes.1 = texture }
     // Frames frozen into the old planes may outlive them here.
-    frozenPlanes?.released.store(true, ordering: .releasing)
+    frozenPlanes?.markReleased()
     frozenPlanes = nil
   }
 

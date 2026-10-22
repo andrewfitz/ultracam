@@ -138,6 +138,11 @@ extension ScopeRenderer {
     encoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 3)
   }
 
+  /// Makes this renderer's Metal 4 argument table now, at start-up, instead of
+  /// in its first Metal 4 `prepare`. Encodes nothing; calling it again does
+  /// nothing. Pipelines are the engine's: `ScopeEngine.prepare(pixelFormats:)`.
+  public func prepareMetal4() throws { _ = try argumentTable() }
+
   private func argumentTable() throws -> any MTL4ArgumentTable {
     if let t = metal4Table { return t }
     let t = try engine.makeArgumentTable(textures: 2, buffers: 3, label: "MonitorKit scope renderer")

@@ -242,4 +242,124 @@ extension GuideSettings {
     s.guides = self
     return s.normalized().guides
   }
+
+  // MARK: - Clean aperture (R10)
+
+  func aperture(_ crop: MonitorRect?, _ vw: Int, _ vh: Int, par: Double = 1, _ configure: (inout ViewGeometry) -> Void = { _ in })
+    -> MonitorLayout
+  {
+    var g = ViewGeometry()
+    configure(&g)
+    return MonitorLayout(
+      pictureWidth: 1920, pictureHeight: 1088, pixelAspectRatio: par, viewportWidth: vw, viewportHeight: vh, geometry: g,
+      cleanAperture: crop)
+  }
+
+  func testCleanApertureSetsTheAspectAndTheMap() {
+    // H.264's 1920×1088 coded frame with a 1920×1080 picture at the top.
+    let top = aperture(MonitorRect(x: 0, y: 0, width: 1920, height: 1080), 1920, 1080)
+    XCTAssertEqual(top.fitRect, MonitorRect(x: 0, y: 0, width: 1920, height: 1080), "1:1, no letterbox for the 8 coded rows")
+    XCTAssertEqual(top.displayToPicture, AxisMap(scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0))
+    XCTAssertEqual(top.pictureWidth, 1920)
+    XCTAssertEqual(top.pictureHeight, 1080)
+    XCTAssertEqual(top.aperture, MonitorRect(x: 0, y: 0, width: 1920, height: 1080))
+    // An asymmetric aperture: viewport edges land on its edges, not the frame's.
+    let crop = MonitorRect(x: 100, y: 40, width: 1600, height: 900)
+    let l = aperture(crop, 800, 450)
+    XCTAssertEqual(l.fitRect, MonitorRect(x: 0, y: 0, width: 800, height: 450))
+    let a = l.displayToPicture.apply(x: 0, y: 0), b = l.displayToPicture.apply(x: 800, y: 450)
+    XCTAssertEqual(a.x, 100)
+    XCTAssertEqual(a.y, 40)
+    XCTAssertEqual(b.x, 1700)
+    XCTAssertEqual(b.y, 940)
+    XCTAssertEqual(l.visiblePictureRect, crop)
+    XCTAssertEqual(l.footprintX, 2)
+    // Flipped, the crop's far edge comes first.
+    let flipped = aperture(crop, 800, 450) { $0.flip = .rotate180 }
+    let f0 = flipped.displayToPicture.apply(x: 0, y: 0), f1 = flipped.displayToPicture.apply(x: 800, y: 450)
+    XCTAssertEqual(f0.x, 1700)
+    XCTAssertEqual(f0.y, 940)
+    XCTAssertEqual(f1.x, 100)
+    XCTAssertEqual(f1.y, 40)
+    XCTAssertEqual(flipped.visiblePictureRect, crop)
+  }
+
+  func testCleanApertureWithMagnificationAndPixelExact() {
+    let crop = MonitorRect(x: 100, y: 40, width: 1600, height: 900)
+    // Zoomed 2× about the aperture's centre: the visible region is its middle half.
+    let zoomed = aperture(crop, 800, 450) { $0.magnification.zoom = 2 }
+    XCTAssertTrue(zoomed.isMagnified)
+    XCTAssertEqual(zoomed.visiblePictureRect, MonitorRect(x: 500, y: 265, width: 800, height: 450))
+    // The navigator shows the whole aperture.
+    let nav = try! XCTUnwrap(zoomed.navigatorRect)
+    let n0 = zoomed.navigatorToPicture.apply(x: nav.x, y: nav.y), n1 = zoomed.navigatorToPicture.apply(x: nav.maxX, y: nav.maxY)
+    XCTAssertEqual(n0.x, 100, accuracy: 1e-9)
+    XCTAssertEqual(n0.y, 40, accuracy: 1e-9)
+    XCTAssertEqual(n1.x, 1700, accuracy: 1e-9)
+    XCTAssertEqual(n1.y, 940, accuracy: 1e-9)
+    // Panned to the aperture's top-left corner: it stops at the aperture's edge.
+    let corner = aperture(crop, 800, 450) {
+      $0.magnification.zoom = 4
+      $0.magnification.centerX = 0
+      $0.magnification.centerY = 0
+    }
+    XCTAssertEqual(corner.visiblePictureRect.x, 100, accuracy: 1e-9)
+    XCTAssertEqual(corner.visiblePictureRect.y, 40, accuracy: 1e-9)
+    // Pixel exact: one aperture pixel per display pixel.
+    let exact = aperture(crop, 1600, 900) { $0.magnification.pixelExact = true }
+    XCTAssertEqual(exact.imageRect, MonitorRect(x: 0, y: 0, width: 1600, height: 900))
+    XCTAssertFalse(exact.isMagnified)
+    XCTAssertEqual(exact.displayToPicture, AxisMap(scaleX: 1, scaleY: 1, offsetX: 100, offsetY: 40))
+  }
+
+  func testUnusableAperturesShowTheWholeFrame() {
+    let whole = aperture(nil, 1920, 1088)
+    for bad in [
+      MonitorRect(x: .nan, y: 0, width: 100, height: 100), MonitorRect(x: 0, y: 0, width: .infinity, height: 100),
+      MonitorRect(x: 5000, y: 0, width: 100, height: 100), MonitorRect(x: 0, y: 0, width: 0.5, height: 100),
+    ] {
+      XCTAssertEqual(aperture(bad, 1920, 1088), whole, "\(bad)")
+    }
+    // Partly outside: clipped to the frame.
+    let clipped = aperture(MonitorRect(x: 1800, y: -20, width: 400, height: 220), 120, 200)
+    XCTAssertEqual(clipped.aperture, MonitorRect(x: 1800, y: 0, width: 120, height: 200))
+  }
+
+  func testFrameGeometryDisplayAspect() {
+    let g = MonitorFrameGeometry(width: 1920, height: 1088, cleanAperture: MonitorRect(x: 0, y: 0, width: 1920, height: 1080))
+    XCTAssertEqual(g.displayAspectRatio(), 16.0 / 9, accuracy: 1e-12)
+    XCTAssertEqual(g.displayAspectRatio(desqueeze: 2), 32.0 / 9, accuracy: 1e-12)
+    XCTAssertEqual(g.displayAspectRatio(desqueeze: 99), 64.0 / 9, accuracy: 1e-12, "de-squeeze clamps like the state")
+    // DV NTSC: 720×480 coded, a 704×480 clean aperture at 10:11 pixels is 4:3 (SMPTE RP 187).
+    let dv = MonitorFrameGeometry(
+      width: 720, height: 480, pixelAspectRatio: 10.0 / 11, cleanAperture: MonitorRect(x: 8, y: 0, width: 704, height: 480))
+    XCTAssertEqual(dv.displayAspectRatio(), 4.0 / 3, accuracy: 1e-12)
+    var state = MonitorState()
+    state.geometry.desqueeze = 1.33
+    XCTAssertEqual(dv.displayAspectRatio(for: state), 4.0 / 3 * 1.33, accuracy: 1e-12)
+    // An unusable pixel aspect ratio shows square pixels.
+    for par in [0.0, -1, .nan, .infinity, 0.01, 17] {
+      let broken = MonitorFrameGeometry(width: 1920, height: 1080, pixelAspectRatio: par)
+      XCTAssertFalse(broken.hasUsablePixelAspectRatio, "\(par)")
+      XCTAssertEqual(broken.displayAspectRatio(), 16.0 / 9, accuracy: 1e-12)
+    }
+    XCTAssertTrue(MonitorFrameGeometry(width: 1, height: 1, pixelAspectRatio: 16).hasUsablePixelAspectRatio)
+    XCTAssertTrue(MonitorFrameGeometry(width: 1, height: 1, pixelAspectRatio: 0.0625).hasUsablePixelAspectRatio)
+  }
+
+  /// The main-thread query equals the layout the pass builds from the normalized state.
+  func testLayoutQueryNormalizesTheGeometry() {
+    let g = MonitorFrameGeometry(
+      width: 1920, height: 1088, pixelAspectRatio: 1, cleanAperture: MonitorRect(x: 0, y: 4, width: 1920, height: 1080))
+    var state = MonitorState()
+    state.geometry.desqueeze = 9
+    state.geometry.magnification.zoom = .nan
+    state.geometry.magnification.centerX = 7
+    let query = MonitorLayout(frame: g, state: state, viewportWidth: 1280, viewportHeight: 720)
+    let direct = MonitorLayout(
+      pictureWidth: 1920, pictureHeight: 1088, pixelAspectRatio: 1, viewportWidth: 1280, viewportHeight: 720,
+      geometry: state.normalized().geometry, cleanAperture: g.cleanAperture)
+    XCTAssertEqual(query, direct)
+    XCTAssertEqual(query.fitRect.width / query.fitRect.height, g.displayAspectRatio(for: state.normalized()), accuracy: 0.01)
+  }
 }

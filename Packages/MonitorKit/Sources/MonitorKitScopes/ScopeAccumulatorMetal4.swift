@@ -99,6 +99,12 @@ extension ScopeAccumulator {
     finish(pass, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT)
   }
 
+  /// Makes this accumulator's Metal 4 argument table now, at start-up, instead
+  /// of in its first Metal 4 accumulation. Encodes nothing; calling it again
+  /// does nothing. (The uniform ring is still made by the first accumulation
+  /// that uses it; a host `MonitorUniformAllocator` needs none.)
+  public func prepareMetal4() throws { _ = try argumentTable() }
+
   // MARK: shared with ScopeGroup
 
   /// The argument table, made on first use.

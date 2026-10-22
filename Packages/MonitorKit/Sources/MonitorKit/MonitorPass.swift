@@ -87,6 +87,8 @@ public final class MonitorPass {
     var width: Int
     var height: Int
     var pixelAspectRatio: Double
+    var cleanAperture: MonitorRect?
+    var processed: Bool
     var signal: SignalDescription
     var viewport: MonitorViewport
     var target: MonitorRenderTargetFormat
@@ -100,7 +102,12 @@ public final class MonitorPass {
       a.maskValid == b.maskValid && a.burnInLUT === b.burnInLUT && a.monitorLUT === b.monitorLUT
         && a.width == b.width && a.height == b.height && a.target == b.target
         && a.viewport == b.viewport && a.layout == b.layout
-        && a.pixelAspectRatio == b.pixelAspectRatio && a.signal == b.signal && a.output == b.output && a.state == b.state
+        && a.pixelAspectRatio == b.pixelAspectRatio && a.cleanAperture == b.cleanAperture
+        && a.processed == b.processed && a.signal == b.signal && a.output == b.output && a.state == b.state
+    }
+
+    var geometry: MonitorFrameGeometry {
+      MonitorFrameGeometry(width: width, height: height, pixelAspectRatio: pixelAspectRatio, cleanAperture: cleanAperture)
     }
   }
 
@@ -126,6 +133,8 @@ public final class MonitorPass {
     var floatLayout: Bool
     /// Whether a LUT produces the stage display-referred modes measure.
     var stageHasLUT: Bool
+    /// The frame is a processed picture: log modes need the camera's signal.
+    var processed: Bool = false
   }
 
   /// Exactly what the status text reads, so uniforms (opacities, brightness, pan)
@@ -153,6 +162,13 @@ public final class MonitorPass {
     var transform: MonitorColorPipeline.Status
     /// The clip settings the label reads (colours and opacity reset).
     var clip: ClipIndicatorSettings
+    var processed: Bool
+    var pictureStage: SignalStage
+    var pictureHasLUT: Bool
+    var codeValues: SignalEncoding?
+    var geometryUsable: Bool
+    /// The LUTs something this surface draws passes through (`Variant.luts`).
+    var appliedLUTs: UInt32
   }
 
   init(engine: MonitorEngine) {
@@ -238,7 +254,11 @@ public final class MonitorPass {
     let output = outputColor.normalized()
     let maskValid =
       s.focus.enabled && feed.hasFocusMask(for: frame, stage: s.focus.stage, monitorLUTEnabled: s.monitorLUT)
-    let par = frame.pixelAspectRatio.isFinite && frame.pixelAspectRatio > 0 ? frame.pixelAspectRatio : 1
+    // The declared ratio, a broken one as 0 (equality-stable): the key's geometry
+    // reports it as unusable and lays the picture out with square pixels.
+    let par = MonitorFrame.stablePixelAspectRatio(frame.declaredPixelAspectRatio)
+    // The aperture as shown (finite, inside the frame), so a NaN cannot force a rebuild per frame.
+    let aperture = frame.cleanAperture == nil ? nil : Optional(frame.geometry.shownRect)
     let frameParameters = frame.parameters
     // Steady state: the state is bit for bit the last one, so `key.state` is its
     // normalized form already, and the rest compares field by field without
@@ -249,6 +269,7 @@ public final class MonitorPass {
       unchanged =
         k.maskValid == maskValid && k.burnInLUT === feed.burnInLUT && k.monitorLUT === feed.monitorLUT
         && k.width == frame.width && k.height == frame.height && k.pixelAspectRatio == par && k.layout == frame.layout
+        && k.cleanAperture == aperture && k.processed == frame.isProcessed
         && k.viewport == viewport && k.target == target && k.signal == frame.signal
         && k.output == output.withoutHeadroom
     }
@@ -256,7 +277,7 @@ public final class MonitorPass {
     if !unchanged {
       let next = Key(
         state: s, layout: frame.layout, width: frame.width, height: frame.height, pixelAspectRatio: par,
-        signal: frame.signal, viewport: viewport, target: target, burnInLUT: feed.burnInLUT,
+        cleanAperture: aperture, processed: frame.isProcessed, signal: frame.signal, viewport: viewport, target: target, burnInLUT: feed.burnInLUT,
         monitorLUT: feed.monitorLUT, maskValid: maskValid, output: output.withoutHeadroom)
       if key != next {
         rebuild(next, frameParameters: frameParameters, headroom: output.headroom)
@@ -269,9 +290,13 @@ public final class MonitorPass {
       applyHeadroom(output.headroom)
       uniformGeneration &+= 1
     }
-    if lastFrameParameters != frameParameters {
+    let frameChanged = lastFrameParameters != frameParameters
+    if frameChanged {
       lastFrameParameters = frameParameters
       uniformGeneration &+= 1
+    }
+    if rebuilt || frameChanged {
+      parameters.reciprocals = PassParameters.reciprocals(frameParameters, zebraPeriod: parameters.zebra.w)
     }
     if compute {
       try updateComputePipeline(layout: frame.layout.shaderKind)
@@ -415,9 +440,7 @@ public final class MonitorPass {
     rebuildCount += 1
     let s = k.state
     let vp = k.viewport
-    let layout = MonitorLayout(
-      pictureWidth: k.width, pictureHeight: k.height, pixelAspectRatio: k.pixelAspectRatio,
-      viewportWidth: vp.width, viewportHeight: vp.height, geometry: s.geometry)
+    let layout = MonitorLayout(frame: k.geometry, state: s, viewportWidth: vp.width, viewportHeight: vp.height)
 
     let showGuides = s.guides.enabled && !s.clean && !layout.isMagnified
     // Colour, opacity and contrast are uniforms: only geometry rebuilds the strokes.
@@ -441,16 +464,18 @@ public final class MonitorPass {
     let stageHasLUT =
       (s.falseColor.stage != .source && k.burnInLUT != nil) || (s.falseColor.stage == .monitor && monitorLUT)
     let fcKey = FalseColorKey(
-      settings: s.falseColor, clean: s.clean, signal: k.signal, floatLayout: k.layout.isFloat, stageHasLUT: stageHasLUT)
+      settings: s.falseColor, clean: s.clean, signal: k.signal, floatLayout: k.layout.isFloat, stageHasLUT: stageHasLUT,
+      processed: k.processed)
     if fcKey != falseColorKey {
       falseColor = Self.resolveFalseColor(
         s, signal: k.signal, full: FalseColorTable.usesFullRangeARRI(signal: k.signal, layout: k.layout),
-        stageHasLUT: stageHasLUT)
+        stageHasLUT: stageHasLUT, processed: k.processed)
       falseColorKey = fcKey
     }
+    // The picture's colour follows the stage it shows: a LUT on it makes it Rec.709.
+    let pictureHasLUT = s.pictureHasLUT(burnInLUT: k.burnInLUT != nil, monitorLUT: k.monitorLUT != nil)
     let inputs = ColorInputs(
-      output: k.output, signal: k.signal, transform: s.displayTransform,
-      monitorStageHasLUT: monitorLUT || k.burnInLUT != nil)
+      output: k.output, signal: k.signal, transform: s.displayTransform, monitorStageHasLUT: pictureHasLUT)
     if inputs != colorInputs {
       colorPipeline = MonitorColorPipeline(
         output: inputs.output, signal: inputs.signal, transform: inputs.transform,
@@ -463,6 +488,13 @@ public final class MonitorPass {
       frameParameters: frameParameters, color: colorPipeline)
     applyHeadroom(headroom)
     variant = Self.variant(parameters, state: s, layout: layout)
+    // The LUTs something drawn passes through: the pipeline's, and those of the
+    // stage peaking's mask was analysed on.
+    var appliedLUTs = variant.luts
+    if parameters.focus.z != 0 {
+      if s.focus.stage != .source && k.burnInLUT != nil { appliedLUTs |= 1 }
+      if s.focus.stage == .monitor && monitorLUT { appliedLUTs |= 2 }
+    }
 
     let m = s.geometry.magnification
     let nextStatusKey = StatusKey(
@@ -476,9 +508,14 @@ public final class MonitorPass {
       monochrome: s.display.monochrome, displayIdentity: s.display.isIdentity,
       burnInLUT: k.burnInLUT.map(ObjectIdentifier.init),
       monitorLUT: s.monitorLUT ? k.monitorLUT.map(ObjectIdentifier.init) : nil,
-      transform: colorPipeline.status, clip: Self.clipLabelSettings(s.clipIndicators))
+      transform: colorPipeline.status, clip: Self.clipLabelSettings(s.clipIndicators), processed: k.processed,
+      pictureStage: s.pictureStage, pictureHasLUT: pictureHasLUT,
+      codeValues: Self.codeValueEncoding(
+        k.signal, pictureHasLUT: pictureHasLUT, color: colorPipeline, falseColor: falseColor),
+      geometryUsable: k.geometry.hasUsablePixelAspectRatio, appliedLUTs: appliedLUTs)
     if nextStatusKey != statusKey {
-      status = Self.makeStatus(s, key: k, layout: layout, falseColor: falseColor, color: colorPipeline)
+      status = Self.makeStatus(
+        s, key: k, layout: layout, falseColor: falseColor, color: colorPipeline, appliedLUTs: appliedLUTs)
       statusKey = nextStatusKey
       statusRebuildCount += 1
     }
@@ -495,10 +532,11 @@ public final class MonitorPass {
     let navigator = p.navigatorRect.x < p.navigatorRect.z
     let zebraBits = p.zebra.z
     let zebra0 = zebraBits & 1 != 0, zebra1 = zebraBits & 2 != 0
-    // The highest stage anything reads: the picture shows the monitor stage
-    // unless false colour replaces it, and the navigator always does.
+    // The highest stage anything reads: the picture shows its stage unless false
+    // colour replaces it, and the navigator always does.
     var stage: UInt32 = 0
-    if measure == 0 || navigator { stage = 2 }
+    let pictureStage = stageCode(s.pictureStage)
+    if measure == 0 || navigator { stage = pictureStage }
     if stageFalseColor { stage = max(stage, p.modes.y) }
     if zebra0 { stage = max(stage, p.zebra.x) }
     if zebra1 { stage = max(stage, p.zebra.y) }
@@ -512,7 +550,8 @@ public final class MonitorPass {
     return MonitorEngine.Variant(
       luts: luts, zebras: zebraBits != 0, peaking: p.focus.z != 0, guides: p.guide.z != 0,
       falseColor: (logFalseColor ? 1 : 0) | (stageFalseColor ? 2 : 0),
-      interpolates: magnifiedMain || magnifiedNavigator, navigator: navigator, adjust: p.flags.y == 0, clip: clip)
+      interpolates: magnifiedMain || magnifiedNavigator, navigator: navigator, adjust: p.flags.y == 0, clip: clip,
+      pictureStage: pictureStage)
   }
 
   // MARK: - Output colour
@@ -524,8 +563,11 @@ public final class MonitorPass {
     let target = c.convertsToTarget ? c.target?.transfer.rawValue ?? 0 : 0
     let linear = MonitorColorPipeline.Transfer.linear
     let picture = target != 0 || c.picture.transfer == linear ? c.picture.transfer.rawValue : 1
+    // The display assist's curve is a constant too: its uniform branches cost a
+    // tenth of the assist (the curve is the source's, as `PassParameters.luts.z`).
+    let curve = c.transform == .logToRec709 ? c.log.map { logCurveCode($0.curve) } ?? 0 : 0
     return MonitorEngine.ColorKey(
-      transform: c.transform.rawValue, picture: picture, target: target, rolloff: c.rollsOff)
+      transform: c.transform.rawValue, picture: picture, target: target, rolloff: c.rollsOff, logCurve: curve)
   }
 
   /// The EETF's uniforms, or the identity (w = 1) when the target holds the source.
@@ -571,12 +613,14 @@ public final class MonitorPass {
   /// how the camera's codes reached us, not only the container flag. `stageHasLUT`:
   /// a LUT produces the measured stage, which is then Rec.709 display R'G'B'.
   static func resolveFalseColor(
-    _ s: MonitorState, signal: SignalDescription, full container: Bool, stageHasLUT: Bool = false
+    _ s: MonitorState, signal: SignalDescription, full container: Bool, stageHasLUT: Bool = false,
+    processed: Bool = false
   ) -> FalseColorResolution
   {
     let fc = s.falseColor
     guard fc.mode != .off else { return .off }
     if s.clean { return .unavailable(.cleanFeed) }
+    if processed && fc.mode.needsLogSource { return .unavailable(.requiresCameraSignal) }
     let log = signal.encoding.log
     let full = container || log?.transport == .fullRescaledToLegal
     var label: String
@@ -726,8 +770,12 @@ public final class MonitorPass {
       }
     }
 
+    // The stage the picture shows; a specialized pipeline fixes it (function constant 16).
+    p.falseColor.z = Float(stageCode(s.pictureStage))
+
     let f = s.focus
-    p.focus = SIMD4(Float(f.opacity), f.style == .peak ? 1 : 0, f.enabled && k.maskValid && !clean ? 1 : 0, 0)
+    p.focus = SIMD4(
+      Float(f.opacity), f.style == .peak ? 1 : 0, f.enabled && k.maskValid && !clean && !k.processed ? 1 : 0, 0)
     p.focusColor = overlay(f.color.rgb)
 
     let g = s.guides
@@ -793,6 +841,9 @@ public final class MonitorPass {
 
   // MARK: - Status
 
+  /// Suffix of a LUT entry that only tools pass through, not the picture.
+  static let toolsOnly = " · tools only"
+
   static func number(_ v: Double) -> String {
     v.rounded() == v ? String(Int(v)) : String(format: "%.3g", v)
   }
@@ -802,9 +853,46 @@ public final class MonitorPass {
     zoom < 10 ? (zoom * 10).rounded() / 10 : zoom.rounded()
   }
 
+  /// The signal encoding whose code values the picture shows as they are (a log or
+  /// unlabelled signal on a picture stage no LUT touched, with no display transform
+  /// running and no false colour replacing the picture), or nil.
+  static func codeValueEncoding(
+    _ signal: SignalDescription, pictureHasLUT: Bool, color: MonitorColorPipeline, falseColor: FalseColorResolution
+  ) -> SignalEncoding? {
+    if case .active = falseColor { return nil }
+    guard !pictureHasLUT, color.transform == .none else { return nil }
+    switch signal.encoding {
+    case .log, .unknown: return signal.encoding
+    case .display: return nil
+    }
+  }
+
+  /// The `.picture` entry: the stage when it is not the default monitor stage, and
+  /// a code-value view, e.g. "Source · S-Log3 code values".
+  static func pictureLabel(stage: SignalStage, codeValues: SignalEncoding?) -> String? {
+    let stageName: String? = stage == .source ? "Source" : (stage == .output ? "Output" : nil)
+    var values: String?
+    switch codeValues {
+    case .log(let log)?:
+      let curve = log.curve == .sLog3 ? "S-Log3" : (log.curve == .arriLogC3 ? "LogC3" : "LogC4")
+      values = "\(curve) code values"
+    case .unknown?: values = "Unlabelled code values"
+    case .display?, nil: values = nil
+    }
+    switch (stageName, values) {
+    case let (name?, v?): return "\(name) · \(v)"
+    case let (name?, nil): return name
+    case let (nil, v?): return v
+    case (nil, nil): return nil
+    }
+  }
+
+  /// `appliedLUTs`: bit 0 the burn-in LUT, bit 1 the monitor LUT, set when
+  /// something the surface draws (the picture, the navigator, false colour,
+  /// zebras, clip indicators, peaking's analysis stage) passes through it.
   static func makeStatus(
     _ s: MonitorState, key k: Key, layout: MonitorLayout, falseColor: FalseColorResolution,
-    color: MonitorColorPipeline = MonitorColorPipeline(output: .signalNative, signal: .rec709)
+    color: MonitorColorPipeline = MonitorColorPipeline(output: .signalNative, signal: .rec709), appliedLUTs: UInt32
   ) -> MonitorStatus {
     var status = MonitorStatus()
     func on(_ tool: MonitorTool, _ label: String, provisional: Bool = false) {
@@ -813,8 +901,26 @@ public final class MonitorPass {
     func off(_ tool: MonitorTool, _ reason: MonitorUnavailableReason) {
       status.unavailable.append(.init(tool: tool, reason: reason))
     }
-    if let lut = k.burnInLUT { on(.burnInLUT, "LUT · \(lut.cube.title)") }
-    if s.monitorLUT, let lut = k.monitorLUT { on(.monitorLUT, "Monitor LUT · \(lut.cube.title)") }
+    let pictureHasLUT = s.pictureHasLUT(burnInLUT: k.burnInLUT != nil, monitorLUT: k.monitorLUT != nil)
+    let codeValues = codeValueEncoding(k.signal, pictureHasLUT: pictureHasLUT, color: color, falseColor: falseColor)
+    status.pictureStage = s.pictureStage
+    status.isCodeValueView = codeValues != nil
+    // `.picture` is in one list only: unusable geometry wins over the stage label
+    // (`pictureStage` and `isCodeValueView` still say what the picture shows).
+    if !k.geometry.hasUsablePixelAspectRatio {
+      off(.picture, .unsupportedGeometry)
+    } else if let label = pictureLabel(stage: s.pictureStage, codeValues: codeValues) {
+      on(.picture, label)
+    }
+    // A LUT is listed only when something drawn passes through it; " · tools only"
+    // when the picture's own stage does not (e.g. a source picture whose zebras
+    // measure the output).
+    if let lut = k.burnInLUT, appliedLUTs & 1 != 0 {
+      on(.burnInLUT, "LUT · \(lut.cube.title)" + (s.pictureStage == .source ? Self.toolsOnly : ""))
+    }
+    if s.monitorLUT, let lut = k.monitorLUT, appliedLUTs & 2 != 0 {
+      on(.monitorLUT, "Monitor LUT · \(lut.cube.title)" + (s.pictureStage == .monitor ? "" : Self.toolsOnly))
+    }
     switch color.status {
     case .off: break
     case .active(let label): on(.displayTransform, label)
@@ -841,6 +947,7 @@ public final class MonitorPass {
     }
     if s.focus.enabled {
       if s.clean { off(.focusPeaking, .cleanFeed) }
+      else if k.processed { off(.focusPeaking, .requiresCameraSignal) }
       else if !k.maskValid { off(.focusPeaking, .focusNotAnalyzed) }
       else {
         let stage = s.focus.stage == .source ? "" : (s.focus.stage == .output ? " · output" : " · monitor")
@@ -879,5 +986,15 @@ public final class MonitorPass {
     case .off: if !s.display.isIdentity { on(.displayAdjustments, "Display adjusted") }
     }
     return status
+  }
+}
+
+extension MonitorLayout {
+  /// Where `frame`'s picture lands in `viewport` for `state`: the same layout
+  /// `MonitorPass` uses (and publishes as `layout`) when it draws them, before any
+  /// encode. Allocation-free, safe on any thread (e.g. the main thread sizing a
+  /// layer to `fitRect`, or to `frame.geometry.displayAspectRatio(for: state)`).
+  public init(frame: MonitorFrame, state: MonitorState, viewport: MonitorViewport) {
+    self.init(frame: frame.geometry, state: state, viewportWidth: viewport.width, viewportHeight: viewport.height)
   }
 }

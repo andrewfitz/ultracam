@@ -35,8 +35,13 @@ final class ScopeMetal4Tests: XCTestCase {
     histogramParade.histogramMode = .rgbParade
     var vector = ScopeSettings(kind: .vectorscope, stage: .monitor)
     vector.vectorscopeZoom = 2
+    // The legacy look: -10…110 IRE bins and colours (index 9 on, so the draw cases' indices hold).
+    var legacyHistogram = ScopeSettings(kind: .histogram, stage: .source)
+    legacyHistogram.levelRange = .minus10To110
+    legacyHistogram.display.palette = .ultracamLegacy
     return [luma, parade, ycbcr, overlay, histogram, histogramParade, ScopeSettings(kind: .histogram), vector,
-            ScopeSettings(kind: .vectorscope, stage: .source)]
+            ScopeSettings(kind: .vectorscope, stage: .source), ScopeSettings.ultracamLegacy(),
+            ScopeSettings.ultracamLegacy(mode: .luma, stage: .monitor), legacyHistogram]
   }
 
   static func frames(_ m: ScopeMTL4, width: Int = 320, height: Int = 180) throws -> [TestFrame] {
@@ -195,6 +200,9 @@ final class ScopeMetal4Tests: XCTestCase {
       DrawCase(name: "parade HLG", settings: s[1], format: .rgba32Float, output: hlg),
       DrawCase(name: "vectorscope extended linear P3", settings: colorized, format: .rgba16Float, output: linear),
       DrawCase(name: "waveform on a PQ-tagged native layer", settings: s[3], format: .rgba16Float, signal: pqSignal),
+      DrawCase(name: "legacy parade bgr10a2", settings: s[9], format: .bgr10a2Unorm),
+      DrawCase(name: "legacy luma bgra8", settings: s[10], format: .bgra8Unorm),
+      DrawCase(name: "legacy histogram HLG", settings: s[11], format: .rgba16Float, output: hlg),
     ]
   }
 

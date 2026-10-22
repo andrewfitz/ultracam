@@ -76,6 +76,12 @@ public final class MonitorEngine: @unchecked Sendable {
   /// MKLUT + MKDecode + MKMonitor, compiled once with `MK_LAYOUT` and the tool
   /// tiers bound to function constants: every entry point must be specialized.
   let library: MTLLibrary
+  /// The host's Metal 4 compiler, when the engine was built with one: the library
+  /// and every pipeline then come from it (`MTL4LibraryDescriptor`,
+  /// `MTL4RenderPipelineDescriptor`, `MTL4ComputePipelineDescriptor`, its
+  /// asynchronous compiler tasks for specialization), so they land in its
+  /// pipeline data set serializer and lookup archives. Nil: the device builds them.
+  public let compiler: (any MTL4Compiler)?
 
   private let vertexFunction: MTLFunction
   private let renderPipelines = Mutex<[PipelineKey: MTLRenderPipelineState]>([:])
@@ -103,9 +109,11 @@ public final class MonitorEngine: @unchecked Sendable {
     var navigator: Bool
     var adjust: Bool
     var clip: Bool = false
+    /// The stage the picture shows (0 source, 1 output, 2 monitor); 3 reads it from the uniforms.
+    var pictureStage: UInt32 = 2
     static let uber = Variant(
       luts: 3, zebras: true, peaking: true, guides: true, falseColor: 3, interpolates: true, navigator: true,
-      adjust: true, clip: true)
+      adjust: true, clip: true, pictureStage: 3)
   }
 
   /// How the surface's picture becomes target values (`MonitorColorPipeline` codes),
@@ -117,6 +125,9 @@ public final class MonitorEngine: @unchecked Sendable {
     var picture: UInt32 = 1
     var target: UInt32 = 0
     var rolloff = false
+    /// The log curve of the display assist (`transform` 1; `PassParameters.luts.z`
+    /// codes), 0 otherwise or to read it from the uniforms.
+    var logCurve: UInt32 = 0
     /// The colour stages follow the uniforms instead of these codes.
     var uniforms = false
     static let fromUniforms = ColorKey(uniforms: true)
@@ -146,7 +157,8 @@ public final class MonitorEngine: @unchecked Sendable {
 
   /// Binds MK_LAYOUT, the tool tiers, the target's sRGB encode and the output
   /// colour to function constants 0–15 (15: the colour stages read the uniforms,
-  /// for the all-tools stand-in).
+  /// for the all-tools stand-in), the picture stage to 16 (3: the uniforms) and the
+  /// display assist's log curve to 17 (0: the uniforms).
   static let specializationPrefix = """
     #include <metal_stdlib>
     using namespace metal;
@@ -166,6 +178,8 @@ public final class MonitorEngine: @unchecked Sendable {
     constant bool mk_rolloffConstant [[function_constant(13)]];
     constant bool mk_clipConstant [[function_constant(14)]];
     constant bool mk_colorUniformsConstant [[function_constant(15)]];
+    constant uint mk_pictureStageConstant [[function_constant(16)]];
+    constant uint mk_logCurveConstant [[function_constant(17)]];
     #define MK_LAYOUT(f) mk_layoutConstant
     #define MK_LUTS mk_lutsConstant
     #define MK_ZEBRAS mk_zebrasConstant
@@ -181,6 +195,8 @@ public final class MonitorEngine: @unchecked Sendable {
     #define MK_TARGET_TF (mk_colorUniformsConstant ? p.color.z : mk_targetTFConstant)
     #define MK_ROLLOFF (mk_colorUniformsConstant ? p.colorFlags.x != 0 : mk_rolloffConstant)
     #define MK_CLIP mk_clipConstant
+    #define MK_PICTURE_STAGE (mk_pictureStageConstant > 2u ? uint(p.falseColor.z) : mk_pictureStageConstant)
+    #define MK_LOG_CURVE (mk_colorUniformsConstant || mk_logCurveConstant == 0u ? p.luts.z : mk_logCurveConstant)
     """
 
   /// Bound in place of inputs a pass does not use, so every argument is valid.
@@ -188,17 +204,37 @@ public final class MonitorEngine: @unchecked Sendable {
   let emptyFloat: MTLTexture
   let emptyLUT: MTLTexture
 
-  /// Compiles the library. Pipelines are built on first use or by `prepare`.
-  /// `framesInFlight` sizes the Metal 4 uniform rings (default 3).
-  public init(device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3)
-    throws
-  {
+  /// Compiles the library. Pipelines are built on first use or by `prepare` /
+  /// `warmUp`. `framesInFlight` sizes the Metal 4 uniform rings (default 3).
+  /// With `compiler` (a Metal 4 host's `MTL4Compiler`, made from `device`) the
+  /// library and pipelines are built by it, with `MonitorShaders.compileOptions`;
+  /// the pixels are the same either way. Its pipelines draw in Metal 4 and classic
+  /// encoders alike; a Metal 4 render pipeline carries no depth or stencil format,
+  /// which suits any host pass.
+  public init(
+    device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3,
+    compiler: (any MTL4Compiler)? = nil
+  ) throws {
     self.device = device
     self.specialization = specialization
     self.framesInFlight = min(16, max(1, framesInFlight))
+    self.compiler = compiler
     residency = try MonitorResidency(device: device)
-    let library = try MonitorShaders.makeLibrary(
-      device: device, parts: [.lut, .decode, .monitor], prefix: Self.specializationPrefix)
+    let library: MTLLibrary
+    if let compiler {
+      do {
+        library = try compiler.makeLibrary(
+          descriptor: MonitorShaders.libraryDescriptor(
+            parts: [.lut, .decode, .monitor], prefix: Self.specializationPrefix, name: "MonitorKit"))
+      } catch let error as MonitorKitError {
+        throw error
+      } catch {
+        throw MonitorKitError.gpu("The MTL4Compiler cannot build the MonitorKit library: \(error)")
+      }
+    } else {
+      library = try MonitorShaders.makeLibrary(
+        device: device, parts: [.lut, .decode, .monitor], prefix: Self.specializationPrefix)
+    }
     self.library = library
     guard let vertex = library.makeFunction(name: "mk_fullscreen") else {
       throw MonitorKitError.gpu("MonitorKit shader function mk_fullscreen is missing.")
@@ -335,6 +371,10 @@ public final class MonitorEngine: @unchecked Sendable {
     values.setConstantValue(&rolloff, type: .bool, index: 13)
     values.setConstantValue(&clip, type: .bool, index: 14)
     values.setConstantValue(&uniforms, type: .bool, index: 15)
+    var pictureStage = variant.pictureStage
+    values.setConstantValue(&pictureStage, type: .uint, index: 16)
+    var logCurve = color.logCurve
+    values.setConstantValue(&logCurve, type: .uint, index: 17)
     return values
   }
 
@@ -354,16 +394,79 @@ public final class MonitorEngine: @unchecked Sendable {
     return d
   }
 
+  /// `descriptor(_:fragment:)` for the host's `MTL4Compiler`: the same functions,
+  /// attachments and constants (a Metal 4 render pipeline has no depth or stencil format).
+  func metal4Descriptor(_ key: PipelineKey, values: MTLFunctionConstantValues) -> MTL4RenderPipelineDescriptor {
+    let d = MTL4RenderPipelineDescriptor()
+    d.label = "MonitorKit picture"
+    let vertex = MTL4LibraryFunctionDescriptor()
+    vertex.name = "mk_fullscreen"
+    vertex.library = library
+    let fragment = MTL4LibraryFunctionDescriptor()
+    fragment.name = "mk_picture"
+    fragment.library = library
+    let specialized = MTL4SpecializedFunctionDescriptor()
+    specialized.functionDescriptor = fragment
+    specialized.constantValues = values
+    d.vertexFunctionDescriptor = vertex
+    d.fragmentFunctionDescriptor = specialized
+    d.colorAttachments[0].pixelFormat = key.target.colorPixelFormat
+    for (i, format) in key.target.additionalColorPixelFormats.prefix(7).enumerated() {
+      d.colorAttachments[i + 1].pixelFormat = format
+      d.colorAttachments[i + 1].writeMask = []
+    }
+    d.rasterSampleCount = key.target.sampleCount
+    return d
+  }
+
+  /// A compute function, specialized when `values` is given, for the host's `MTL4Compiler`.
+  func metal4ComputeDescriptor(_ name: String, _ values: MTLFunctionConstantValues?) -> MTL4ComputePipelineDescriptor {
+    let function = MTL4LibraryFunctionDescriptor()
+    function.name = name
+    function.library = library
+    let d = MTL4ComputePipelineDescriptor()
+    d.label = "MonitorKit \(name)"
+    if let values {
+      let specialized = MTL4SpecializedFunctionDescriptor()
+      specialized.functionDescriptor = function
+      specialized.constantValues = values
+      d.computeFunctionDescriptor = specialized
+    } else {
+      d.computeFunctionDescriptor = function
+    }
+    return d
+  }
+
+  /// A compute pipeline for `name` (specialized with `values`), by the compiler or the device.
+  func makeComputeState(_ name: String, _ values: MTLFunctionConstantValues?) throws -> MTLComputePipelineState {
+    if let compiler {
+      return try compiler.makeComputePipelineState(descriptor: metal4ComputeDescriptor(name, values))
+    }
+    let function: MTLFunction
+    if let values {
+      function = try library.makeFunction(name: name, constantValues: values)
+    } else {
+      guard let f = library.makeFunction(name: name) else {
+        throw MonitorKitError.gpu("MonitorKit shader function \(name) is missing.")
+      }
+      function = f
+    }
+    return try device.makeComputePipelineState(function: function)
+  }
+
   /// The picture pipeline for `key`, built on this thread if it is not cached.
   func renderPipeline(_ key: PipelineKey) throws -> MTLRenderPipelineState {
     if let cached = renderPipelines.withLock({ $0[key] }) { return cached }
     let state: MTLRenderPipelineState
     do {
-      let fragment = try library.makeFunction(
-        name: "mk_picture",
-        constantValues: Self.constants(
-          layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color))
-      state = try device.makeRenderPipelineState(descriptor: descriptor(key, fragment: fragment))
+      let values = Self.constants(
+        layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color)
+      if let compiler {
+        state = try compiler.makeRenderPipelineState(descriptor: metal4Descriptor(key, values: values))
+      } else {
+        let fragment = try library.makeFunction(name: "mk_picture", constantValues: values)
+        state = try device.makeRenderPipelineState(descriptor: descriptor(key, fragment: fragment))
+      }
     } catch {
       throw MonitorKitError.gpu("Cannot draw into pixel format \(key.target.colorPixelFormat.rawValue): \(error)")
     }
@@ -391,6 +494,20 @@ public final class MonitorEngine: @unchecked Sendable {
       guard pendingPipelines.withLock({ $0.insert(key).inserted }) else { return nil }
       let values = Self.constants(
         layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color)
+      if compiler != nil {
+        // The compiler's asynchronous build (Metal's compiler threads) awaited from
+        // a task; no thread or queue of the library's own.
+        Task.detached(priority: .utility) { [self] in
+          guard let compiler else { return }
+          let descriptor = metal4Descriptor(key, values: Self.constants(
+            layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color))
+          if let state = try? await compiler.makeRenderPipelineState(descriptor: descriptor) {
+            _ = store(state, for: key)
+          }
+          finish(key)
+        }
+        return nil
+      }
       library.makeFunction(name: "mk_picture", constantValues: values) { [self] function, _ in
         guard let function else { return finish(key) }
         device.makeRenderPipelineState(descriptor: descriptor(key, fragment: function)) { [self] state, _ in
@@ -414,10 +531,9 @@ public final class MonitorEngine: @unchecked Sendable {
     if let cached = computePipelines.withLock({ $0[key] }) { return cached }
     let state: MTLComputePipelineState
     do {
-      let function = try library.makeFunction(
-        name: "mk_pictureKernel",
-        constantValues: Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color))
-      state = try device.makeComputePipelineState(function: function)
+      state = try makeComputeState(
+        "mk_pictureKernel",
+        Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color))
     } catch {
       throw MonitorKitError.gpu("Cannot build the compute picture pipeline: \(error)")
     }
@@ -452,6 +568,18 @@ public final class MonitorEngine: @unchecked Sendable {
       let pendingKey = { var k = key; k.compute = true; return k }()
       guard pendingPipelines.withLock({ $0.insert(pendingKey).inserted }) else { return nil }
       let values = Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color)
+      if compiler != nil {
+        Task.detached(priority: .utility) { [self] in
+          guard let compiler else { return }
+          let d = metal4ComputeDescriptor(
+            "mk_pictureKernel",
+            Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color))
+          guard let state = try? await compiler.makeComputePipelineState(descriptor: d) else { return }
+          _ = storeCompute(state, for: key)
+          pendingPipelines.withLock { _ = $0.remove(pendingKey) }
+        }
+        return nil
+      }
       library.makeFunction(name: "mk_pictureKernel", constantValues: values) { [self] function, _ in
         guard let function else { return }
         device.makeComputePipelineState(function: function) { [self] state, _ in
@@ -469,9 +597,7 @@ public final class MonitorEngine: @unchecked Sendable {
     if let cached = focusPipelines.withLock({ $0[key] }) { return cached }
     var variant = Variant.uber
     variant.luts = key.luts
-    let function = try library.makeFunction(
-      name: "mk_focusMask", constantValues: Self.constants(layout: key.layout, variant: variant))
-    let state = try device.makeComputePipelineState(function: function)
+    let state = try makeComputeState("mk_focusMask", Self.constants(layout: key.layout, variant: variant))
     return focusPipelines.withLock { cache in
       if let raced = cache[key] { return raced }
       cache[key] = state
@@ -484,10 +610,7 @@ public final class MonitorEngine: @unchecked Sendable {
   /// `.synchronous` or `.off`), built by `prepare`, else here on first use.
   func copyPipeline(integer: Bool) throws -> MTLComputePipelineState {
     if let cached = cachedCopyPipeline(integer: integer) { return cached }
-    guard let function = library.makeFunction(name: Self.copyFunction(integer: integer)) else {
-      throw MonitorKitError.gpu("MonitorKit shader function \(Self.copyFunction(integer: integer)) is missing.")
-    }
-    return storeCopy(try device.makeComputePipelineState(function: function), integer: integer)
+    return storeCopy(try makeComputeState(Self.copyFunction(integer: integer), nil), integer: integer)
   }
 
   func cachedCopyPipeline(integer: Bool) -> MTLComputePipelineState? {
@@ -513,6 +636,14 @@ public final class MonitorEngine: @unchecked Sendable {
   /// they are needed finds them ready. Trivial kernels without constants.
   private func buildCopyPipelinesAsynchronously() {
     for integer in [true, false] {
+      if compiler != nil {
+        Task.detached(priority: .utility) { [self] in
+          guard let compiler else { return }
+          let d = metal4ComputeDescriptor(Self.copyFunction(integer: integer), nil)
+          if let state = try? await compiler.makeComputePipelineState(descriptor: d) { _ = storeCopy(state, integer: integer) }
+        }
+        continue
+      }
       guard let function = library.makeFunction(name: Self.copyFunction(integer: integer)) else { continue }
       device.makeComputePipelineState(function: function) { [self] state, _ in
         if let state { _ = storeCopy(state, integer: integer) }

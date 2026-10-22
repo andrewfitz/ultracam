@@ -1,25 +1,68 @@
 import Foundation
 import MonitorKitCore
 
+/// The span of the signal-level axis shared by the waveform (vertical) and the
+/// histogram (horizontal), in normalized signal (0 black, 1 nominal white).
+/// The bins are uniform over it, so it is part of the accumulation.
+public enum ScopeLevelRange: String, Codable, Sendable, CaseIterable {
+  /// -7% to 109%: every legal 10-bit code (4…1019) with the conventional SDR
+  /// graticule range. The default.
+  case standard
+  /// -10% to 110% (-10…110 IRE for SDR): the range of Ultracam's earlier
+  /// MonitorTools scopes, whose graticule marks -10, 0, 50, 100 and 110.
+  case minus10To110
+
+  /// The level at the bottom (waveform) or left (histogram) edge of the axis.
+  public var low: Double {
+    switch self {
+    case .standard: return -0.07
+    case .minus10To110: return -0.10
+    }
+  }
+
+  /// The level at the top (waveform) or right (histogram) edge of the axis.
+  public var high: Double {
+    switch self {
+    case .standard: return 1.09
+    case .minus10To110: return 1.10
+    }
+  }
+}
+
 /// The signal-level axis shared by the waveform (vertical) and the histogram
-/// (horizontal): normalized signal from -7% to 109%, which covers every legal
-/// 10-bit code (4…1019) with the conventional SDR graticule range.
+/// (horizontal). The statics without a `range` are the default range
+/// (`ScopeLevelRange.standard`): normalized signal from -7% to 109%, which
+/// covers every legal 10-bit code (4…1019) with the conventional SDR graticule range.
 public enum ScopeLevelAxis {
-  public static let low = -0.07
-  public static let high = 1.09
+  public static let low = ScopeLevelRange.standard.low
+  public static let high = ScopeLevelRange.standard.high
 
   /// 0 at the bottom of the axis, 1 at the top.
-  public static func fraction(ofLevel level: Double) -> Double { (level - low) / (high - low) }
-  public static func level(atFraction fraction: Double) -> Double { low + fraction * (high - low) }
+  public static func fraction(ofLevel level: Double) -> Double { fraction(ofLevel: level, range: .standard) }
+  public static func level(atFraction fraction: Double) -> Double { level(atFraction: fraction, range: .standard) }
 
   /// Where a pixel at exactly `level` is drawn on an axis of `bins` uniform
   /// bins: the centre of the bin it is counted in, with the kernels' Float
   /// arithmetic (`mk_levelBin`). Graticule ticks sit there, so legal white
   /// traces on the 100% line at any bin count instead of up to half a bin off.
   public static func drawnFraction(ofLevel level: Double, bins: Int) -> Double {
+    drawnFraction(ofLevel: level, bins: bins, range: .standard)
+  }
+
+  /// 0 at the bottom of an axis spanning `range`, 1 at the top.
+  public static func fraction(ofLevel level: Double, range: ScopeLevelRange) -> Double {
+    (level - range.low) / (range.high - range.low)
+  }
+  public static func level(atFraction fraction: Double, range: ScopeLevelRange) -> Double {
+    range.low + fraction * (range.high - range.low)
+  }
+
+  /// `drawnFraction(ofLevel:bins:)` on an axis spanning `range`: the same Float
+  /// operations as the kernels' bin (`mk_levelBin` with `mk_ScopeParams.level`).
+  public static func drawnFraction(ofLevel level: Double, bins: Int, range: ScopeLevelRange) -> Double {
     let n = max(1, bins)
-    let scale = Float(Double(n) / (high - low))
-    let bin = min(max(((Float(level) - Float(low)) * scale).rounded(.down), 0), Float(n - 1))
+    let scale = Float(Double(n) / (range.high - range.low))
+    let bin = min(max(((Float(level) - Float(range.low)) * scale).rounded(.down), 0), Float(n - 1))
     return (Double(bin) + 0.5) / Double(n)
   }
 }
@@ -92,15 +135,21 @@ public struct ScopeTick: Equatable, Sendable {
 }
 
 extension WaveformScale {
-  /// Graticule ticks for a frame of `range`, inside `ScopeLevelAxis`.
-  public func ticks(range: CodeRange) -> [ScopeTick] {
+  /// Graticule ticks for a frame of `range`, inside the default level axis
+  /// (`ScopeLevelRange.standard`).
+  public func ticks(range: CodeRange) -> [ScopeTick] { ticks(range: range, levelRange: .standard) }
+
+  /// Graticule ticks for a frame of `range` on an axis spanning `levelRange`.
+  /// Percent ticks run every 10% from -10 to 110 and keep those on the axis
+  /// (0…100 on the standard range, all thirteen on `.minus10To110`).
+  public func ticks(range: CodeRange, levelRange: ScopeLevelRange) -> [ScopeTick] {
     func number(_ v: Double) -> String {
       v == v.rounded() ? String(Int(v)) : String(format: v < 1 ? "%.1f" : "%g", v)
     }
     var ticks: [ScopeTick]
     switch self {
     case .percent:
-      ticks = stride(from: 0.0, through: 100, by: 10).map {
+      ticks = stride(from: -10.0, through: 110, by: 10).map {
         ScopeTick(value: $0, level: $0 / 100, label: number($0), isMajor: $0 == 0 || $0 == 50 || $0 == 100)
       }
     case .codeValues:
@@ -125,15 +174,18 @@ extension WaveformScale {
         ScopeTick(value: $0.0, level: ScopeTransfer.hlgSignal(nits: $0.0), label: number($0.0), isMajor: $0.1)
       }
     }
-    return Self.clamped(ticks)
+    return Self.clamped(ticks, levelRange)
   }
 
   /// Ticks for the Cb and Cr panels of the Y'CbCr parade, which plot chroma
   /// offset by one half. Code values label chroma codes (512 + 896·C legal,
   /// 512 + 1023·C full, 10-bit); every other scale labels them in percent,
   /// since luminance has no meaning for chroma.
-  public func chromaTicks(range: CodeRange) -> [ScopeTick] {
-    guard self == .codeValues else { return WaveformScale.percent.ticks(range: range) }
+  public func chromaTicks(range: CodeRange) -> [ScopeTick] { chromaTicks(range: range, levelRange: .standard) }
+
+  /// `chromaTicks(range:)` on an axis spanning `levelRange`.
+  public func chromaTicks(range: CodeRange, levelRange: ScopeLevelRange) -> [ScopeTick] {
+    guard self == .codeValues else { return WaveformScale.percent.ticks(range: range, levelRange: levelRange) }
     let legal = range == .legal
     let codes: [Double] =
       legal ? [64, 128, 256, 384, 512, 640, 768, 896, 960] : [0, 128, 256, 384, 512, 640, 768, 896, 1023]
@@ -142,17 +194,16 @@ extension WaveformScale {
     return Self.clamped(
       codes.map {
         ScopeTick(value: $0, level: ($0 - 512) / span + 0.5, label: String(Int($0)), isMajor: majors.contains($0))
-      })
+      }, levelRange)
   }
 
-  private static func clamped(_ ticks: [ScopeTick]) -> [ScopeTick] {
-    // Code 1019 sits 0.02% above the axis top; snap anything that close onto it.
+  private static func clamped(_ ticks: [ScopeTick], _ range: ScopeLevelRange) -> [ScopeTick] {
+    // Code 1019 sits 0.02% above the standard axis top; snap anything that close onto it.
     let tolerance = 0.001
     return ticks.compactMap { tick in
-      guard tick.level >= ScopeLevelAxis.low - tolerance, tick.level <= ScopeLevelAxis.high + tolerance
-      else { return nil }
+      guard tick.level >= range.low - tolerance, tick.level <= range.high + tolerance else { return nil }
       var t = tick
-      t.level = min(ScopeLevelAxis.high, max(ScopeLevelAxis.low, t.level))
+      t.level = min(range.high, max(range.low, t.level))
       return t
     }
   }
@@ -229,7 +280,7 @@ public struct ScopeLabel: Equatable, Sendable {
 /// Graticule geometry for one scope in one viewport. Lines are drawn on the
 /// GPU; labels are returned as data for the UI to draw. Level ticks sit where
 /// a pixel at exactly their level is drawn (`ScopeLevelAxis.drawnFraction`),
-/// within half a bin of `ScopeLevelAxis.fraction`.
+/// within half a bin of `ScopeLevelAxis.fraction`, on the settings' `levelRange`.
 public struct ScopeGraticule: Equatable, Sendable {
   public enum Element: Equatable, Sendable {
     /// Normalized viewport coordinates.
@@ -255,11 +306,14 @@ public struct ScopeGraticule: Equatable, Sendable {
     case .waveform:
       // The Y'CbCr parade's chroma panels have their own ticks.
       let ycbcr = s.waveformMode == .ycbcrParade
-      var panels = [(ticks: d.waveformScale.ticks(range: context.range), from: 0.0, to: ycbcr ? 1.0 / 3 : 1)]
-      if ycbcr { panels.append((d.waveformScale.chromaTicks(range: context.range), 1.0 / 3, 1)) }
+      let levels = s.levelRange
+      var panels = [
+        (ticks: d.waveformScale.ticks(range: context.range, levelRange: levels), from: 0.0, to: ycbcr ? 1.0 / 3 : 1)
+      ]
+      if ycbcr { panels.append((d.waveformScale.chromaTicks(range: context.range, levelRange: levels), 1.0 / 3, 1)) }
       for panel in panels {
         for tick in panel.ticks {
-          let y = 1 - ScopeLevelAxis.drawnFraction(ofLevel: tick.level, bins: s.waveformLevels)
+          let y = 1 - ScopeLevelAxis.drawnFraction(ofLevel: tick.level, bins: s.waveformLevels, range: levels)
           elements.append(.line(from: SIMD2(panel.from, y), to: SIMD2(panel.to, y), major: tick.isMajor))
           labels.append(
             ScopeLabel(
@@ -281,9 +335,9 @@ public struct ScopeGraticule: Equatable, Sendable {
         }
       }
     case .histogram:
-      let ticks = d.waveformScale.ticks(range: context.range)
+      let ticks = d.waveformScale.ticks(range: context.range, levelRange: s.levelRange)
       for tick in ticks {
-        let x = ScopeLevelAxis.drawnFraction(ofLevel: tick.level, bins: s.histogramBins)
+        let x = ScopeLevelAxis.drawnFraction(ofLevel: tick.level, bins: s.histogramBins, range: s.levelRange)
         elements.append(.line(from: SIMD2(x, 0), to: SIMD2(x, 1), major: tick.isMajor))
         labels.append(
           ScopeLabel(

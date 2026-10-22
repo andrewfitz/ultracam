@@ -18,6 +18,8 @@ public struct PassParameters: Sendable {
   public var zebra1 = SIMD4<Float>.zero
   public var zebra = SIMD4<UInt32>.zero
   public var modes = SIMD4<UInt32>.zero
+  /// x: offset stops, y: ARRI tables are full range, z: the picture stage (0 source,
+  /// 1 output, 2 monitor; `MK_PICTURE_STAGE` of a host compiling MKMonitor itself).
   public var falseColor = SIMD4<Float>.zero
   public var gamutWeights = SIMD4<Float>.zero
   public var focus = SIMD4<Float>.zero
@@ -66,8 +68,21 @@ public struct PassParameters: Sendable {
   /// The same gains on the signal of a power-law picture (BT.1886: g^(1/2.4),
   /// gamma 2.2: g^(1/2.2), linear: g), where a signal gain is exact.
   public var whiteSignalGain = SIMD4<Float>(1, 1, 1, 0)
+  /// Correctly rounded reciprocals the shader divides by exactly (`mk_quotient`):
+  /// x 1 / the frame's luma span (`FrameParameters.levels.y`), y 1 / its chroma
+  /// span (`levels.w`), z 1 / its kg (`matrix.y`), w 1 / the zebra stripe period.
+  /// `MonitorPass` sets them from the frame and the zebras. Zero (the default, as
+  /// in a host's own parameters) makes the shader compute them per pixel: the same
+  /// pixels, slower.
+  public var reciprocals = SIMD4<Float>.zero
 
   public init() {}
+
+  /// `reciprocals` for `frame`'s parameters and the stripe period `zebra.w`.
+  static func reciprocals(_ frame: FrameParameters, zebraPeriod: UInt32) -> SIMD4<Float> {
+    func inverse(_ v: Float) -> Float { v == 0 || !v.isFinite ? 0 : 1 / v }
+    return SIMD4(inverse(frame.levels.y), inverse(frame.levels.w), inverse(frame.matrix.y), inverse(Float(zebraPeriod)))
+  }
 }
 
 /// Mirrors `mk_Guides` in MKMonitor.msl: the guide strokes the picture pass

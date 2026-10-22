@@ -1,11 +1,21 @@
 // MonitorKit 3D LUT sampling. Self-contained: a host can prepend this file to
 // its own Metal source and call mk_applyLUT in its own kernel, so a burned-in
 // LUT adds no pass. Every symbol is prefixed mk_.
+//
+// The whole file is one guarded unit, keyed by its layout version
+// (MK_LUT_MSL_VERSION, MonitorShaders.lutLayoutVersion), so including it twice is
+// harmless. It deliberately does not define the older copies' MK_LUT_MSL guard:
+// an older copy (48-byte mk_LUTParams, no shaper) in the same source cannot
+// half-include. Before this file its guard is caught by the #error below; after
+// it, its mk_LUTParams is a redefinition. Either order fails to compile instead of
+// silently binding one layout's bytes to the other's struct.
+#if defined(MK_LUT_MSL) && !defined(MK_LUT_MSL_VERSION)
+#error "An older copy of MonitorKit's MKLUT.msl (48-byte mk_LUTParams) is in this source: delete it and use MonitorShaders.source([.lut])."
+#endif
+#ifndef MK_LUT_MSL_VERSION
+#define MK_LUT_MSL_VERSION 2
 #include <metal_stdlib>
 using namespace metal;
-
-#ifndef MK_LUT_MSL
-#define MK_LUT_MSL
 
 // Mirrors MonitorKit.LUTParameters.
 struct mk_LUTParams {
@@ -15,6 +25,7 @@ struct mk_LUTParams {
   float4 shaperLow;    // xyz: shaper input minimum; w: 1 when there is no 3D table
   float4 shaperScale;  // xyz: 1 / (shaper input maximum - minimum)
 };
+static_assert(sizeof(mk_LUTParams) == 80, "mk_LUTParams is MonitorKit.LUTParameters: five 16-byte rows");
 
 // Lattice is an rgba32Float texture3d; x is red, y green, z blue. Its first n
 // slices hold the lattice (in their n × n corner); a 1D shaper follows in rows

@@ -12,10 +12,11 @@ public struct ScopeBinLayout: Equatable, Sendable {
   /// Waveform columns per channel, histogram bins, or vectorscope Cb bins.
   public var columns: Int
   /// Waveform levels (bottom to top), vectorscope Cr bins (bottom to top), 1 for the histogram.
-  /// Levels follow `ScopeLevelAxis`: bin k holds [low + k / scale, low + (k + 1) / scale)
-  /// with scale = bins / (high − low). Vectorscope bin j is centred on chroma
-  /// (j − side / 2) · 2 · `VectorscopeGeometry.halfExtent` / (side · zoom) on
-  /// its axis, so zero chroma is the middle of bin side / 2.
+  /// Levels follow the settings' `levelRange` (`ScopeLevelAxis`): bin k holds
+  /// [low + k / scale, low + (k + 1) / scale) with scale = bins / (high − low).
+  /// Vectorscope bin j is centred on chroma (j − side / 2) · 2 ·
+  /// `VectorscopeGeometry.halfExtent` / (side · zoom) on its axis, so zero
+  /// chroma is the middle of bin side / 2.
   public var rows: Int
   public var channels: Int
   public var bytesPerBin: Int
@@ -516,8 +517,10 @@ public final class ScopeAccumulator {
     }
     p.luts = SIMD4(burn ? 1 : 0, monitor ? 1 : 0, generation, 0)
     let levels = s.kind == .waveform ? layout.rows : layout.columns
+    // The same Float values as `ScopeLevelAxis.drawnFraction(ofLevel:bins:range:)`.
+    let range = s.levelRange
     p.level = SIMD4(
-      Float(ScopeLevelAxis.low), Float(Double(levels) / (ScopeLevelAxis.high - ScopeLevelAxis.low)),
+      Float(range.low), Float(Double(levels) / (range.high - range.low)),
       Float(1 / Double(max(1, frame.width))), 0)
     // The transport luma is the stage's Y' when nothing re-graded the pixel and
     // the scope weighs with the frame's own matrix.

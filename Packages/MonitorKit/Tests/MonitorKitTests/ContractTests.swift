@@ -513,9 +513,18 @@ final class ContractTests: XCTestCase {
     XCTAssertTrue(labels.contains("Peaking"))
     XCTAssertTrue(labels.contains("Guides"))
     XCTAssertTrue(labels.contains { $0.hasPrefix("LUT · ") })
-    XCTAssertTrue(labels.contains { $0.hasPrefix("Monitor LUT · ") })
+    // Six-band false colour on the output stage replaces the picture, and no tool
+    // reads the monitor stage: nothing drawn passes the monitor LUT, so it is not listed.
+    XCTAssertFalse(labels.contains { $0.hasPrefix("Monitor LUT · ") })
     XCTAssertTrue(labels.contains("Display adjusted"))
     XCTAssertTrue(pass.status.unavailable.isEmpty, "\(pass.status.unavailable)")
+    let rebuilds = pass.statusRebuildCount
+    try gpu.run { cb in try pass.encode(frame: frame, feed: feed, state: state, target: target, into: cb) }
+    XCTAssertEqual(pass.statusRebuildCount, rebuilds, "the same inputs rebuild no status")
+    var monitorStage = state
+    monitorStage.falseColor.stage = .monitor
+    try gpu.run { cb in try pass.encode(frame: frame, feed: feed, state: monitorStage, target: target, into: cb) }
+    XCTAssertTrue(pass.status.activeLabels.contains { $0.hasPrefix("Monitor LUT · ") })
   }
 
   func testEngineIsSharedAcrossThreads() throws {

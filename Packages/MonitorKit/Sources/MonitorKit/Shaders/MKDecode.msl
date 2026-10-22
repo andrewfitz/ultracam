@@ -1,11 +1,11 @@
 // MonitorKit frame decoding: every layout read straight from the host's textures.
 // Self-contained after MKLUT.msl (or on its own): a host can prepend it and call
 // mk_decodeRGB in its own kernel.
-#include <metal_stdlib>
-using namespace metal;
-
+// The whole file is one guarded unit: including it twice is harmless.
 #ifndef MK_DECODE_MSL
 #define MK_DECODE_MSL
+#include <metal_stdlib>
+using namespace metal;
 
 // Mirrors MonitorKit.FrameParameters.
 struct mk_FrameParams {
@@ -15,6 +15,7 @@ struct mk_FrameParams {
   float4 levels;    // luma black, luma span, chroma centre, chroma span, in stored codes
   float4 codeScale; // x: luma texel to code, y: chroma texel to code, z: RGB maximum code, w: float RGB
 };
+static_assert(sizeof(mk_FrameParams) == 80, "mk_FrameParams is MonitorKit.FrameParameters: five 16-byte rows");
 
 constant uint MK_V210 = 0, MK_UYVY8 = 1, MK_YUYV8 = 2, MK_BIPLANAR = 3, MK_RGB = 4;
 
@@ -83,11 +84,39 @@ float2 mk_chromaCode(texture2d<uint, access::read> packed, texture2d<float, acce
   return mix(top, bottom, fy);
 }
 
+// a / b correctly rounded (IEEE 754 round to nearest, as the safe-math `/`), given
+// r = 1 / b correctly rounded: q = a·r is within 1.5 ulp of a / b; one fused
+// Newton step, q + (a - b·q)·r, makes it faithful, and a second one rounds it
+// correctly with an exact remainder (Markstein's theorem: P. Markstein, "Computation
+// of elementary functions on the IBM RISC System/6000 processor", IBM J. Res. Dev.
+// 34(1), 1990; J.-M. Muller et al., Handbook of Floating-Point Arithmetic, 2nd ed.,
+// 2018, §4.7). One multiply and four fused multiply-adds against the correctly
+// rounded division's long sequence; a shared divisor pays its reciprocal once.
+// For finite a and a quotient in the normal range (or zero, whose sign it keeps):
+// decoded integral codes and their filtered means, never float-texture values.
+inline float mk_quotient(float a, float b, float r) {
+  float q = a * r;
+  q = fma(fma(-q, b, a), r, q);
+  q = fma(fma(-q, b, a), r, q);
+  return q == 0 ? a * r : q;
+}
+inline float2 mk_quotient(float2 a, float b, float r) { return float2(mk_quotient(a.x, b, r), mk_quotient(a.y, b, r)); }
+inline float3 mk_quotient(float3 a, float b, float r) {
+  return float3(mk_quotient(a.x, b, r), mk_quotient(a.y, b, r), mk_quotient(a.z, b, r));
+}
+
 float3 mk_ycbcrToRGB(float y, float2 c, float4 m) {
   // Exact neutral: chroma at its centre reconstructs Y in every channel.
   if (c.x == 0 && c.y == 0) return float3(y);
   float r = y + 2 * (1 - m.x) * c.y, b = y + 2 * (1 - m.z) * c.x;
   return float3(r, (y - m.x * r - m.z * b) / m.y, b);
+}
+
+// mk_ycbcrToRGB with the green quotient from `inverseG` = 1 / m.y: the same values.
+float3 mk_ycbcrToRGB(float y, float2 c, float4 m, float inverseG) {
+  if (c.x == 0 && c.y == 0) return float3(y);
+  float r = y + 2 * (1 - m.x) * c.y, b = y + 2 * (1 - m.z) * c.x;
+  return float3(r, mk_quotient(y - m.x * r - m.z * b, m.y, inverseG), b);
 }
 
 // The chroma sample after lane l of group g: the next lane, or the first lane of

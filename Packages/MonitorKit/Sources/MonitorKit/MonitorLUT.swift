@@ -44,6 +44,9 @@ public final class MonitorLUT: @unchecked Sendable {
   /// GPUs that cannot filter 32-bit float textures.
   public let interpolation: LUTInterpolation
   public let parameters: LUTParameters
+  /// What the LUT's output means: Rec.709 display R'G'B' (MonitorKit's convention
+  /// for every LUT stage; `outputEncoding.signal` tags a host's output buffer).
+  public let outputEncoding: LUTOutputEncoding
 
   /// Lattice size of the placeholder 3D table of a 1D-only LUT, and the least
   /// width and height of a texture with a shaper: 64 entries a slice, so a
@@ -51,9 +54,14 @@ public final class MonitorLUT: @unchecked Sendable {
   /// the 2048-slice depth limit beside any lattice.
   static let shaperOnlyLattice = 8
 
-  public init(device: MTLDevice, cube: CubeLUT, interpolation: LUTInterpolation = .tetrahedral)
-    throws
-  {
+  /// Uploads `cube`. `interpolation` defaults to tetrahedral; `.trilinear` is
+  /// bit-compatible with Ultracam's original LUT shader (and with a host kernel
+  /// calling `mk_applyLUT` with these `parameters`). `outputEncoding` declares what
+  /// the LUT outputs; Rec.709, the default, is the only one modelled.
+  public init(
+    device: MTLDevice, cube: CubeLUT, interpolation: LUTInterpolation = .tetrahedral,
+    outputEncoding: LUTOutputEncoding = .rec709
+  ) throws {
     let n = cube.hasCube ? cube.dimension : Self.shaperOnlyLattice
     // Shaper rows are the texture's width: a small lattice sits in the corner of
     // wider slices. Without a shaper the texture is exactly the lattice.
@@ -125,6 +133,7 @@ public final class MonitorLUT: @unchecked Sendable {
     self.cube = cube
     self.texture = texture
     self.interpolation = effective
+    self.outputEncoding = outputEncoding
     let mode: UInt32 = effective == .tetrahedral ? 0 : (effective == .trilinear ? 1 : 2)
     parameters = LUTParameters(
       domainLow: SIMD4(cube.domainMin, 0), domainScale: SIMD4(scale, 0),

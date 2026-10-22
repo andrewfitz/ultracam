@@ -49,38 +49,122 @@ public struct AxisMap: Equatable, Sendable {
   public static func display(_ rect: MonitorRect, toPictureWidth w: Double, height h: Double, flip: FlipMode)
     -> AxisMap
   {
-    let sx = w / rect.width, sy = h / rect.height
+    display(rect, toPicture: MonitorRect(x: 0, y: 0, width: w, height: h), flip: flip)
+  }
+
+  /// Maps `rect` (display) onto the region `crop` of the picture (picture pixels),
+  /// flipped as requested: the display rect's edges land on the crop's edges.
+  public static func display(_ rect: MonitorRect, toPicture crop: MonitorRect, flip: FlipMode) -> AxisMap {
+    let sx = crop.width / rect.width, sy = crop.height / rect.height
     return AxisMap(
       scaleX: flip.flipsX ? -sx : sx, scaleY: flip.flipsY ? -sy : sy,
-      offsetX: flip.flipsX ? w + rect.x * sx : -rect.x * sx,
-      offsetY: flip.flipsY ? h + rect.y * sy : -rect.y * sy)
+      offsetX: flip.flipsX ? crop.maxX + rect.x * sx : crop.x - rect.x * sx,
+      offsetY: flip.flipsY ? crop.maxY + rect.y * sy : crop.y - rect.y * sy)
+  }
+}
+
+/// A frame's geometry without its pixels: what the picture's shape depends on.
+/// Cheap to build on any thread (e.g. the main thread sizing a layer before the
+/// render thread encodes); `MonitorLayout(frame:geometry:…)` and
+/// `displayAspectRatio` read it without allocating.
+public struct MonitorFrameGeometry: Equatable, Sendable {
+  /// Encoded size in pixels.
+  public var width: Int
+  public var height: Int
+  /// Horizontal over vertical pixel spacing (CoreVideo's pixel aspect ratio).
+  public var pixelAspectRatio: Double
+  /// The region of the frame that is picture (the clean aperture, SMPTE RP 187 /
+  /// ISO/IEC 14496-12 `clap`), in pixels with a top-left origin; nil is the whole frame.
+  public var cleanAperture: MonitorRect?
+
+  /// Pixel aspect ratios a picture can be shown with. Outside it (a broken tag)
+  /// the picture is shown with square pixels and the status says why
+  /// (`MonitorUnavailableReason.unsupportedGeometry`). MonitorTools' bound.
+  public static let pixelAspectRatioRange: ClosedRange<Double> = 0.0625...16
+
+  public init(width: Int, height: Int, pixelAspectRatio: Double = 1, cleanAperture: MonitorRect? = nil) {
+    self.width = width
+    self.height = height
+    self.pixelAspectRatio = pixelAspectRatio
+    self.cleanAperture = cleanAperture
+  }
+
+  /// Whether the pixel aspect ratio is finite and inside `pixelAspectRatioRange`.
+  public var hasUsablePixelAspectRatio: Bool {
+    pixelAspectRatio.isFinite && Self.pixelAspectRatioRange.contains(pixelAspectRatio)
+  }
+
+  /// The pixel aspect ratio the picture is shown with: the frame's, or 1 when unusable.
+  public var effectivePixelAspectRatio: Double { hasUsablePixelAspectRatio ? pixelAspectRatio : 1 }
+
+  /// The region shown, in frame pixels: the clean aperture clipped to the frame, or
+  /// the whole frame when there is none or it is unusable (not finite, or under a
+  /// pixel on either axis once clipped).
+  public var shownRect: MonitorRect {
+    let w = Double(max(1, width)), h = Double(max(1, height))
+    let frame = MonitorRect(x: 0, y: 0, width: w, height: h)
+    guard let a = cleanAperture, a.x.isFinite, a.y.isFinite, a.width.isFinite, a.height.isFinite else { return frame }
+    let clipped = a.intersection(frame)
+    return clipped.width >= 1 && clipped.height >= 1 ? clipped : frame
+  }
+
+  /// Width over height of the picture as displayed: the shown region with the pixel
+  /// aspect ratio and the anamorphic `desqueeze` (1…4) applied.
+  public func displayAspectRatio(desqueeze: Double = 1) -> Double {
+    let r = shownRect
+    let d = desqueeze.isFinite ? min(4, max(1, desqueeze)) : 1
+    return r.width * effectivePixelAspectRatio * d / r.height
+  }
+
+  /// `displayAspectRatio(desqueeze:)` with the state's de-squeeze.
+  public func displayAspectRatio(for state: MonitorState) -> Double {
+    displayAspectRatio(desqueeze: state.geometry.desqueeze)
   }
 }
 
 /// Where the picture lands in a viewport, and how display pixels map back to it.
+///
+/// Two picture spaces: the maps (`displayToPicture`, `navigatorToPicture`) and
+/// `visiblePictureRect` are in frame pixels (the encoded frame, top-left origin),
+/// so with a clean aperture the shown picture's left edge maps to `aperture.x`,
+/// not 0. `pictureWidth` × `pictureHeight` is the aperture's size, and the
+/// magnification centre is a fraction of the aperture: convert a mapped point with
+/// `pictureFraction(x:y:)`, not by dividing by `pictureWidth`.
 public struct MonitorLayout: Equatable, Sendable {
   public let viewportWidth: Double, viewportHeight: Double
+  /// The shown region's size in frame pixels: `aperture.width` × `aperture.height`.
   public let pictureWidth: Double, pictureHeight: Double
   /// The whole picture fitted to the viewport (pixel-aligned).
   public let fitRect: MonitorRect
   /// The picture as shown, zoomed and panned. May extend past the viewport.
   /// Equal to `fitRect` unless magnified or pixel-exact.
   public let imageRect: MonitorRect
-  /// Display pixel → picture pixel.
+  /// Display pixel → frame pixel (inside `aperture`).
   public let displayToPicture: AxisMap
-  /// The part of the picture currently on screen, in picture pixels.
+  /// The part of the picture currently on screen, in frame pixels (inside `aperture`).
   public let visiblePictureRect: MonitorRect
   /// Inset showing the whole picture while magnified.
   public let navigatorRect: MonitorRect?
+  /// Navigator display pixel → frame pixel (inside `aperture`).
   public let navigatorToPicture: AxisMap
   public let isMagnified: Bool
+  /// The region of the frame shown, in frame pixels: the clean aperture, or the
+  /// whole frame. `pictureWidth` and `pictureHeight` are its size; every map into
+  /// the picture lands inside it.
+  public let aperture: MonitorRect
 
+  /// `pictureWidth` × `pictureHeight` is the frame; `cleanAperture` (frame pixels,
+  /// top-left origin) the part of it shown, clipped to the frame (nil, or one
+  /// that is not finite or under a pixel once clipped, shows the whole frame). The
+  /// aspect, the fit, magnification (its centre is normalized in the aperture),
+  /// pixel-exact sizing, guides and the navigator all follow the aperture.
   public init(
     pictureWidth: Int, pictureHeight: Int, pixelAspectRatio: Double = 1,
-    viewportWidth: Int, viewportHeight: Int, geometry: ViewGeometry
+    viewportWidth: Int, viewportHeight: Int, geometry: ViewGeometry, cleanAperture: MonitorRect? = nil
   ) {
     let g = geometry
-    let pw = Double(max(1, pictureWidth)), ph = Double(max(1, pictureHeight))
+    let crop = MonitorFrameGeometry(width: pictureWidth, height: pictureHeight, cleanAperture: cleanAperture).shownRect
+    let pw = crop.width, ph = crop.height
     let vw = Double(max(1, viewportWidth)), vh = Double(max(1, viewportHeight))
     let par = pixelAspectRatio.isFinite && pixelAspectRatio > 0 ? pixelAspectRatio : 1
     let desqueeze = g.desqueeze.isFinite && g.desqueeze >= 1 ? g.desqueeze : 1
@@ -89,6 +173,7 @@ public struct MonitorLayout: Equatable, Sendable {
     self.viewportHeight = vh
     self.pictureWidth = pw
     self.pictureHeight = ph
+    aperture = crop
 
     let raw = MonitorRect(x: 0, y: 0, width: vw, height: vh).fitting(aspect: aspect)
     // Whole-pixel edges keep borders and guides crisp; the aspect error is under a pixel.
@@ -126,7 +211,7 @@ public struct MonitorLayout: Equatable, Sendable {
       }
     }
     imageRect = image
-    displayToPicture = AxisMap.display(image, toPictureWidth: pw, height: ph, flip: g.flip)
+    displayToPicture = AxisMap.display(image, toPicture: crop, flip: g.flip)
 
     let shown = image.intersection(MonitorRect(x: 0, y: 0, width: vw, height: vh))
     let a = displayToPicture.apply(x: shown.x, y: shown.y)
@@ -143,16 +228,47 @@ public struct MonitorLayout: Equatable, Sendable {
       }
       let rect = MonitorRect(x: vw - margin - w, y: vh - margin - h, width: w, height: h)
       navigatorRect = rect.isEmpty ? nil : rect
-      navigatorToPicture = AxisMap.display(rect, toPictureWidth: pw, height: ph, flip: g.flip)
+      navigatorToPicture = AxisMap.display(rect, toPicture: crop, flip: g.flip)
     } else {
       navigatorRect = nil
       navigatorToPicture = .identity
     }
   }
 
+  /// The layout of a frame with `geometry` in a viewport, as a `MonitorPass` lays it
+  /// out for `state` (its geometry normalized as the pass does; an unusable pixel
+  /// aspect ratio shows square pixels). Allocation-free, so a host can size or
+  /// hit-test a layer on the main thread before the frame is encoded.
+  public init(frame geometry: MonitorFrameGeometry, state: MonitorState, viewportWidth: Int, viewportHeight: Int) {
+    self.init(
+      pictureWidth: geometry.width, pictureHeight: geometry.height,
+      pixelAspectRatio: geometry.effectivePixelAspectRatio, viewportWidth: viewportWidth,
+      viewportHeight: viewportHeight, geometry: state.geometry.normalized(), cleanAperture: geometry.cleanAperture)
+  }
+
   /// Picture pixels covered by one display pixel, per axis.
   public var footprintX: Double { abs(displayToPicture.scaleX) }
   public var footprintY: Double { abs(displayToPicture.scaleY) }
+
+  /// A frame-pixel point (what `displayToPicture` and `navigatorToPicture` return)
+  /// as fractions of the aperture: 0 at its top-left edge, 1 at its bottom-right,
+  /// not clamped. In the coordinates of `Magnification.centerX`/`centerY`, so a
+  /// flipped picture maps back to its own pixels.
+  public func pictureFraction(x: Double, y: Double) -> (x: Double, y: Double) {
+    ((x - aperture.x) / aperture.width, (y - aperture.y) / aperture.height)
+  }
+
+  /// The frame-pixel point at fractions of the aperture: `pictureFraction`'s inverse.
+  public func picturePoint(fractionX: Double, fractionY: Double) -> (x: Double, y: Double) {
+    (aperture.x + fractionX * aperture.width, aperture.y + fractionY * aperture.height)
+  }
+
+  /// The aperture fraction under display point `(x, y)`: `pictureFraction` of
+  /// `displayToPicture`. E.g. a double-click's new magnification centre.
+  public func pictureFraction(displayX x: Double, displayY y: Double) -> (x: Double, y: Double) {
+    let p = displayToPicture.apply(x: x, y: y)
+    return pictureFraction(x: p.x, y: p.y)
+  }
 }
 
 /// Guide lines in viewport pixels, ready for the GPU rasteriser.

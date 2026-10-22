@@ -82,6 +82,19 @@ public enum ScopeIntensityCurve: String, Codable, Sendable, CaseIterable {
   case gamma
 }
 
+/// The colours of the waveform's and histogram's traces.
+public enum ScopeTracePalette: String, Codable, Sendable, CaseIterable {
+  /// MonitorKit's colours: `ScopeTraceStyle` picks the single trace, channels
+  /// are a light red, green and blue, and dense areas bloom towards white.
+  case standard
+  /// Ultracam's earlier MonitorTools scopes: a white single trace and
+  /// R (1, 0.1, 0.1), G (0.1, 1, 0.1), B (0.1, 0.3, 1) channels (BT.709 SDR
+  /// display R'G'B'), each scaled by the trace intensity without blooming.
+  /// The vectorscope keeps its standard look; the Y'CbCr parade's chroma
+  /// panels keep their standard colours, also without blooming.
+  case ultracamLegacy
+}
+
 public enum ScopeTraceStyle: String, Codable, Sendable, CaseIterable {
   /// Green-white like a P31 phosphor for single traces; channel colours otherwise.
   case phosphor
@@ -99,6 +112,8 @@ public struct ScopeDisplay: Codable, Equatable, Sendable {
   public var gain = 1.0
   public var intensity: ScopeIntensityCurve = .logarithmic
   public var trace: ScopeTraceStyle = .phosphor
+  /// Waveform and histogram colours; `.ultracamLegacy` overrides `trace` there.
+  public var palette: ScopeTracePalette = .standard
   /// Black behind the scope, 0…1. Below 1 the scope overlays the picture.
   public var backgroundOpacity = 0.85
   public var showsGraticule = true
@@ -114,7 +129,7 @@ public struct ScopeDisplay: Codable, Equatable, Sendable {
   public init() {}
 
   private enum CodingKeys: String, CodingKey {
-    case brightness, gain, intensity, trace, backgroundOpacity, showsGraticule, graticuleOpacity,
+    case brightness, gain, intensity, trace, palette, backgroundOpacity, showsGraticule, graticuleOpacity,
       waveformScale, histogramScale, vectorscopeTargets, showsSkinToneLine, skinToneAngle
   }
   public init(from decoder: Decoder) throws {
@@ -124,6 +139,7 @@ public struct ScopeDisplay: Codable, Equatable, Sendable {
     gain = c.scopeLenient(.gain, gain)
     intensity = c.scopeLenient(.intensity, intensity)
     trace = c.scopeLenient(.trace, trace)
+    palette = c.scopeLenient(.palette, palette)
     backgroundOpacity = c.scopeLenient(.backgroundOpacity, backgroundOpacity)
     showsGraticule = c.scopeLenient(.showsGraticule, showsGraticule)
     graticuleOpacity = c.scopeLenient(.graticuleOpacity, graticuleOpacity)
@@ -170,10 +186,13 @@ public struct ScopeSettings: Codable, Equatable, Sendable {
   public var colorimetry: ScopeColorimetry = .auto
   /// Waveform bins across the whole scope (split three ways in parade), 64…4096, even.
   public var waveformColumns = 1024
-  /// Waveform bins from -7% to 109%, 64…2048.
+  /// Waveform bins over `levelRange` (-7% to 109% by default), 64…2048.
   public var waveformLevels = 512
-  /// Histogram bins from -7% to 109%, 64…4096, even.
+  /// Histogram bins over `levelRange` (-7% to 109% by default), 64…4096, even.
   public var histogramBins = 512
+  /// The level span of the waveform's and histogram's bins and graticule.
+  /// Ignored by the vectorscope.
+  public var levelRange: ScopeLevelRange = .standard
   /// Vectorscope bins per side, 64…2048, even.
   public var vectorscopeSize = 512
   /// Pixels at or above this level, in percent, count as clipped high, per
@@ -243,7 +262,8 @@ public struct ScopeSettings: Codable, Equatable, Sendable {
       width: n.kind == .waveform
         ? n.waveformColumns : (n.kind == .histogram ? n.histogramBins : n.vectorscopeSize),
       height: n.kind == .waveform ? n.waveformLevels : (n.kind == .vectorscope ? n.vectorscopeZoom : 1),
-      clipHigh: n.clipHighPercent, clipLow: n.clipLowPercent)
+      clipHigh: n.clipHighPercent, clipLow: n.clipLowPercent,
+      levelRange: n.kind == .vectorscope ? .standard : n.levelRange)
   }
 
   public struct AccumulationKey: Hashable, Sendable {
@@ -255,11 +275,13 @@ public struct ScopeSettings: Codable, Equatable, Sendable {
     public let height: Int
     public let clipHigh: Double
     public let clipLow: Double
+    /// `levelRange` of a waveform or histogram; `.standard` for a vectorscope.
+    public let levelRange: ScopeLevelRange
   }
 
   private enum CodingKeys: String, CodingKey {
     case schemaVersion, kind, stage, waveformMode, histogramMode, vectorscopeZoom, colorimetry,
-      waveformColumns, waveformLevels, histogramBins, vectorscopeSize, clipHighPercent,
+      waveformColumns, waveformLevels, histogramBins, vectorscopeSize, levelRange, clipHighPercent,
       clipLowPercent, display
   }
   /// Unknown versions and malformed values decode as defaults; this never
@@ -279,6 +301,7 @@ public struct ScopeSettings: Codable, Equatable, Sendable {
     waveformLevels = c.scopeLenient(.waveformLevels, waveformLevels)
     histogramBins = c.scopeLenient(.histogramBins, histogramBins)
     vectorscopeSize = c.scopeLenient(.vectorscopeSize, vectorscopeSize)
+    levelRange = c.scopeLenient(.levelRange, levelRange)
     clipHighPercent = c.scopeLenient(.clipHighPercent, clipHighPercent)
     clipLowPercent = c.scopeLenient(.clipLowPercent, clipLowPercent)
     display = c.scopeLenient(.display, display)
@@ -297,9 +320,42 @@ public struct ScopeSettings: Codable, Equatable, Sendable {
     try c.encode(waveformLevels, forKey: .waveformLevels)
     try c.encode(histogramBins, forKey: .histogramBins)
     try c.encode(vectorscopeSize, forKey: .vectorscopeSize)
+    try c.encode(levelRange, forKey: .levelRange)
     try c.encode(clipHighPercent, forKey: .clipHighPercent)
     try c.encode(clipLowPercent, forKey: .clipLowPercent)
     try c.encode(display, forKey: .display)
+  }
+}
+
+extension ScopeSettings {
+  /// The size of the scope image of Ultracam's earlier MonitorTools monitor,
+  /// 768 × 256 pixels: draw `ultracamLegacy(…)` into a viewport this size for
+  /// one bin per pixel, as it had. Levels land within one row of the old image,
+  /// not on identical rows: MonitorKit bins uniformly, bin ⌊f · 256⌋ of the
+  /// axis fraction f = (v + 0.1) / 1.2, where MonitorTools took ⌊f · 255⌋
+  /// (`scopeBin`), up to one bin lower. So 50% is drawn on row 127 from the
+  /// top (MonitorTools: 128) and 100% white on row 21, the row of the old 100%
+  /// graticule line (MonitorTools drew its white on row 22). The old graticule
+  /// rows, -10/0/50/100/110% on 255/234/128/21/0, are 255/234/127/21/0 here.
+  public static let ultracamLegacyImageWidth = 768
+  public static let ultracamLegacyImageHeight = 256
+
+  /// The look of Ultracam's earlier MonitorTools waveform: `mode` (it had RGB
+  /// parade and luma) with 768 columns (256 per parade channel) × 256 levels
+  /// over -10…110 IRE (`ScopeLevelRange.minus10To110`), the old channel colours
+  /// (`ScopeTracePalette.ultracamLegacy`) and an opaque black background. The
+  /// trace density curve and the uniform level binning stay MonitorKit's
+  /// (`display.intensity`; levels within one row of the old image, see
+  /// `ultracamLegacyImageWidth`); everything not named here keeps its default.
+  public static func ultracamLegacy(mode: WaveformMode = .rgbParade, stage: SignalStage = .output) -> ScopeSettings {
+    var s = ScopeSettings(kind: .waveform, stage: stage)
+    s.waveformMode = mode
+    s.waveformColumns = ultracamLegacyImageWidth
+    s.waveformLevels = ultracamLegacyImageHeight
+    s.levelRange = .minus10To110
+    s.display.palette = .ultracamLegacy
+    s.display.backgroundOpacity = 1
+    return s
   }
 }
 

@@ -160,13 +160,14 @@ public final class ScopeGroup {
     return pipeline
   }
 
-  /// Builds the fused pipelines the current settings need for frames of
-  /// `layouts` on this thread, so the first frames are fused.
+  /// Makes the fused pipelines the current settings need for frames of
+  /// `layouts` ready (built on this thread, or waited for when the engine is
+  /// already building one asynchronously), so the first frames are fused.
   public func prepare(layouts: [PixelLayout]) throws {
     let members = fusable()
     guard members.count >= 2 else { return }
     for layout in layouts {
-      _ = try engine.computePipeline(
+      _ = try engine.preparedComputePipeline(
         ScopeEngine.ComputeKey(
           kernel: .fused, layout: engine.specialization == .off ? nil : layout.scopeLayoutCode, scopes: members.scopes))
     }

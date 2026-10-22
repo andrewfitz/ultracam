@@ -33,7 +33,7 @@ extension MonitorFeed {
   ) throws {
     engine.residency.observe(submission)
     ageRetired()
-    guard focus.enabled else { return releaseFocusMask() }
+    guard focus.enabled, !frame.isProcessed else { return releaseFocusMask() }
     let a = try prepareAnalysis(frame, focus: focus)
     if holds(frame, a) { return }
     let table = try metal4Table()

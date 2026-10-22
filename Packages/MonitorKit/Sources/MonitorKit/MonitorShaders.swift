@@ -15,6 +15,14 @@ public enum MonitorShaders {
     case monitor = "MKMonitor"
   }
 
+  /// `MK_LUT_MSL_VERSION`: the layout of `mk_LUTParams` (`LUTParameters`, 80 bytes)
+  /// and the LUT texture. Every part is guarded as a whole, so a part included
+  /// twice compiles once, and an older `MKLUT.msl` copy (plain `MK_LUT_MSL` guard,
+  /// 48-byte parameters) in the same source fails to compile in either order.
+  /// Bind `LUTParameters` (`MemoryLayout<LUTParameters>.size` bytes), never a
+  /// hand-written struct.
+  public static let lutLayoutVersion = 2
+
   /// Source text of `parts`, in order, as one compilation unit.
   public static func source(_ parts: [Part]) throws -> String {
     try parts.map { part in

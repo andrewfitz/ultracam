@@ -126,7 +126,10 @@ public final class MonitorResidency: @unchecked Sendable {
   /// every submission up to `after` (default: the latest one observed) has completed.
   public func retire(_ object: AnyObject?, resident allocation: (any MTLAllocation)?, after: UInt64? = nil) {
     guard object != nil || allocation != nil else { return }
-    let tag = after ?? latest.load(ordering: .acquiring)
+    // Sequentially consistent with `observe` and with a released flag stored before
+    // this call (`MonitorFrame.keepResidentIfReleased`): an encode that misses the
+    // flag has its submission covered by this tag.
+    let tag = after ?? latest.load(ordering: .sequentiallyConsistent)
     state.withLock { $0.retired.append(Retired(object: object, allocation: allocation, after: tag)) }
     pending.add(1, ordering: .relaxed)
     release(through: completed.load(ordering: .acquiring))
@@ -195,10 +198,10 @@ public final class MonitorResidency: @unchecked Sendable {
   /// Raises `atomic` to `value`; true when it moved.
   @discardableResult
   private static func raise(_ atomic: borrowing Atomic<UInt64>, to value: UInt64) -> Bool {
-    var current = atomic.load(ordering: .relaxed)
+    var current = atomic.load(ordering: .sequentiallyConsistent)
     while value > current {
       let (exchanged, original) = atomic.compareExchange(
-        expected: current, desired: value, ordering: .acquiringAndReleasing)
+        expected: current, desired: value, ordering: .sequentiallyConsistent)
       if exchanged { return true }
       current = original
     }

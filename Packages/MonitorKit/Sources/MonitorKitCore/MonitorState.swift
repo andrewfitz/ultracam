@@ -325,6 +325,20 @@ public struct ViewGeometry: Codable, Equatable, Sendable {
 
   public static let standardDesqueezeFactors: [Double] = [1, 1.3, 1.33, 1.5, 1.65, 1.66, 1.8, 2]
 
+  /// De-squeeze 1…4, zoom 1…64 and the centre 0…1, non-finite values reset (the
+  /// geometry part of `MonitorState.normalized()`). Allocation-free.
+  public func normalized() -> ViewGeometry {
+    func b(_ x: Double, _ r: ClosedRange<Double>, _ fallback: Double) -> Double {
+      x.isFinite ? min(r.upperBound, max(r.lowerBound, x)) : fallback
+    }
+    var v = self
+    v.desqueeze = b(desqueeze, 1...4, 1)
+    v.magnification.zoom = b(magnification.zoom, 1...64, 1)
+    v.magnification.centerX = b(magnification.centerX, 0...1, 0.5)
+    v.magnification.centerY = b(magnification.centerY, 0...1, 0.5)
+    return v
+  }
+
   private enum CodingKeys: String, CodingKey { case desqueeze, flip, magnification }
   public init(from decoder: Decoder) throws {
     self.init()
@@ -510,8 +524,29 @@ public struct ClipIndicatorSettings: Codable, Equatable, Sendable {
 
 /// Every tool setting for one monitor surface. A value type: changing it costs
 /// nothing on the GPU except when guides must be redrawn.
+///
+/// Persisted JSON is fail-closed: it carries a positive discriminator
+/// (`"kind": "MonitorKit.MonitorState"`) and `schemaVersion` 2, and decoding
+/// throws `DecodingError.dataCorrupted` for anything else (another type's JSON,
+/// such as Ultracam's old `MonitorConfiguration`, which also said `schemaVersion`
+/// 1; MonitorKit's own discriminator-less schema 1; a non-object). Inside a
+/// genuine MonitorKit blob decoding stays lenient: a missing or malformed field
+/// decodes as its default and out-of-range values are normalized, so one bad value
+/// cannot cost the other settings. A host catches the error and falls back to
+/// defaults (or its own legacy decoder).
+///
+/// Embedded in a host's synthesized `Codable` type, a throwing field would fail
+/// the whole outer value (`decodeIfPresent` rethrows when the key is present), so
+/// a foreign or old blob would cost the host's other settings. Declare such a
+/// field `@LenientMonitorState var state: MonitorState` (it decodes to defaults
+/// and encodes the state as it is), or decode with
+/// `MonitorState(decodingOrDefault:)` / `MonitorState.decodedOrDefault(from:)`.
 public struct MonitorState: Codable, Equatable, Sendable {
-  public static let schemaVersion = 1
+  /// The schema written. 2 since the discriminator; versions above it from a newer
+  /// MonitorKit decode field by field (schema changes within one `codingKind` are additive).
+  public static let schemaVersion = 2
+  /// The JSON discriminator, written as `"kind"` and required to decode.
+  public static let codingKind = "MonitorKit.MonitorState"
   /// Turns every overlay and analysis off in one switch. LUTs, display
   /// adjustments, de-squeeze, flip and magnification still apply.
   public var clean = false
@@ -527,21 +562,56 @@ public struct MonitorState: Codable, Equatable, Sendable {
   /// clean surface keeps it, as it keeps LUTs.
   public var displayTransform = DisplayTransformSettings()
   public var clipIndicators = ClipIndicatorSettings()
+  /// The stage the picture itself shows. `.monitor` (the default) is the picture
+  /// after both LUTs; `.output` shows what the output carries (the burn-in LUT,
+  /// not the monitor LUT); `.source` shows the camera signal with no LUT, so a
+  /// display transform can apply even while the feed burns a LUT in. Tools keep
+  /// measuring their own stages. Each choice is fixed in a specialized pipeline.
+  public var pictureStage: SignalStage = .monitor
   public static let maximumZebraSets = 2
 
   public init() {}
 
-  private enum CodingKeys: String, CodingKey {
-    case schemaVersion, clean, zebras, falseColor, focus, guides, geometry, display, monitorLUT, displayTransform,
-      clipIndicators
+  /// Whether the picture this state shows came out of a LUT: a burn-in LUT on the
+  /// output or monitor stage, or the monitor LUT (when `monitorLUT`) on the monitor
+  /// stage. LUT output is Rec.709 display R'G'B', so such a picture is Rec.709 SDR
+  /// and display transforms are unavailable.
+  public func pictureHasLUT(burnInLUT: Bool, monitorLUT hasMonitorLUT: Bool) -> Bool {
+    switch pictureStage {
+    case .source: return false
+    case .output: return burnInLUT
+    case .monitor: return burnInLUT || (monitorLUT && hasMonitorLUT)
+    }
   }
-  /// Unknown versions and malformed values decode as defaults; this never throws,
-  /// so a monitor preference cannot invalidate the host's other settings.
+
+  private enum CodingKeys: String, CodingKey {
+    case kind, schemaVersion, clean, zebras, falseColor, focus, guides, geometry, display, monitorLUT,
+      displayTransform, clipIndicators, pictureStage
+  }
+  /// Throws unless the JSON is a MonitorKit `MonitorState` (`kind` and a
+  /// `schemaVersion` of at least 2); every field inside decodes leniently.
   public init(from decoder: Decoder) throws {
     self.init()
-    guard let c = try? decoder.container(keyedBy: CodingKeys.self),
-      c.lenient(.schemaVersion, Self.schemaVersion) == Self.schemaVersion
-    else { return }
+    let c: KeyedDecodingContainer<CodingKeys>
+    do {
+      c = try decoder.container(keyedBy: CodingKeys.self)
+    } catch {
+      throw DecodingError.dataCorrupted(
+        .init(codingPath: decoder.codingPath, debugDescription: "Not a \(Self.codingKind) object", underlyingError: error))
+    }
+    guard (try? c.decodeIfPresent(String.self, forKey: .kind)) == Self.codingKind else {
+      throw DecodingError.dataCorrupted(
+        .init(
+          codingPath: decoder.codingPath + [CodingKeys.kind],
+          debugDescription: "Not a \(Self.codingKind): the \"kind\" discriminator is missing or different"))
+    }
+    guard let version = (try? c.decodeIfPresent(Int.self, forKey: .schemaVersion)) ?? nil, version >= Self.schemaVersion
+    else {
+      throw DecodingError.dataCorrupted(
+        .init(
+          codingPath: decoder.codingPath + [CodingKeys.schemaVersion],
+          debugDescription: "\(Self.codingKind) needs schemaVersion \(Self.schemaVersion) or later"))
+    }
     clean = c.lenient(.clean, clean)
     zebras = c.lenient(.zebras, zebras)
     falseColor = c.lenient(.falseColor, falseColor)
@@ -552,10 +622,12 @@ public struct MonitorState: Codable, Equatable, Sendable {
     monitorLUT = c.lenient(.monitorLUT, monitorLUT)
     displayTransform = c.lenient(.displayTransform, displayTransform)
     clipIndicators = c.lenient(.clipIndicators, clipIndicators)
+    pictureStage = c.lenient(.pictureStage, pictureStage)
     self = normalized()
   }
   public func encode(to encoder: Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(Self.codingKind, forKey: .kind)
     try c.encode(Self.schemaVersion, forKey: .schemaVersion)
     try c.encode(clean, forKey: .clean)
     try c.encode(zebras, forKey: .zebras)
@@ -567,6 +639,7 @@ public struct MonitorState: Codable, Equatable, Sendable {
     try c.encode(monitorLUT, forKey: .monitorLUT)
     try c.encode(displayTransform, forKey: .displayTransform)
     try c.encode(clipIndicators, forKey: .clipIndicators)
+    try c.encode(pictureStage, forKey: .pictureStage)
   }
 
   /// Every value clamped to its documented range; non-finite values reset.
@@ -643,10 +716,7 @@ public struct MonitorState: Codable, Equatable, Sendable {
     v.guides.contrast = b(guides.contrast, 0...1, 1)
     v.guides.lineWidth = b(guides.lineWidth, 0.5...8, 1)
     if !guides.color.isFinite { v.guides.color = ColorRGB(r: 1, g: 1, b: 1) }
-    v.geometry.desqueeze = b(geometry.desqueeze, 1...4, 1)
-    v.geometry.magnification.zoom = b(geometry.magnification.zoom, 1...64, 1)
-    v.geometry.magnification.centerX = b(geometry.magnification.centerX, 0...1, 0.5)
-    v.geometry.magnification.centerY = b(geometry.magnification.centerY, 0...1, 0.5)
+    v.geometry = geometry.normalized()
     v.display.brightness = b(display.brightness, -1...1, 0)
     v.display.contrast = b(display.contrast, 0...2, 1)
     v.display.saturation = b(display.saturation, 0...2, 1)
@@ -666,5 +736,56 @@ extension KeyedDecodingContainer {
   /// The decoded value, or `fallback` when the key is missing or malformed.
   func lenient<T: Decodable>(_ key: Key, _ fallback: T) -> T {
     ((try? decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback
+  }
+}
+
+extension MonitorState {
+  /// The state `decoder` holds, or the defaults when it is not a MonitorKit
+  /// `MonitorState` (another type's JSON, MonitorKit's discriminator-less schema 1,
+  /// a non-object): the fail-closed decode without the error, for hosts that
+  /// embed a state in their own `Decodable` types. Never throws.
+  public init(decodingOrDefault decoder: Decoder) {
+    self = (try? MonitorState(from: decoder)) ?? MonitorState()
+  }
+
+  /// `data` (JSON) as a state, or the defaults when it is not a MonitorKit `MonitorState`.
+  public static func decodedOrDefault(from data: Data) -> MonitorState {
+    (try? JSONDecoder().decode(MonitorState.self, from: data)) ?? MonitorState()
+  }
+}
+
+/// A `MonitorState` field that falls back to the defaults instead of throwing, so
+/// a host's synthesized `Codable` type survives a foreign or old monitor blob
+/// (integration map R13: fail closed to defaults, keep the other settings):
+///
+///     struct FeedPreferences: Codable {
+///       var name: String
+///       @LenientMonitorState var monitor: MonitorState
+///     }
+///
+/// Decoding: a missing key, `null`, or anything `MonitorState`'s fail-closed
+/// decoder rejects is `MonitorState()`; a genuine blob decodes as usual. Encoding
+/// writes the state itself under the key (no wrapper object), so the JSON is the
+/// same as a plain `MonitorState` field's.
+@propertyWrapper
+public struct LenientMonitorState: Codable, Equatable, Sendable {
+  public var wrappedValue: MonitorState
+
+  public init(wrappedValue: MonitorState = MonitorState()) { self.wrappedValue = wrappedValue }
+
+  public init(from decoder: Decoder) {
+    let isNull = (try? decoder.singleValueContainer().decodeNil()) ?? false
+    wrappedValue = isNull ? MonitorState() : MonitorState(decodingOrDefault: decoder)
+  }
+
+  public func encode(to encoder: Encoder) throws { try wrappedValue.encode(to: encoder) }
+}
+
+extension KeyedDecodingContainer {
+  /// A missing `@LenientMonitorState` key decodes to the defaults (synthesized
+  /// `Decodable` calls this for a wrapped field) instead of `keyNotFound`.
+  public func decode(_ type: LenientMonitorState.Type, forKey key: Key) throws -> LenientMonitorState {
+    guard contains(key) else { return LenientMonitorState() }
+    return (try? decodeIfPresent(type, forKey: key) ?? nil) ?? LenientMonitorState()
   }
 }

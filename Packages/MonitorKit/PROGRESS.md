@@ -53,3 +53,40 @@ Open items carried into W3/W4:
 - W4 must-check (a) is covered in MonitorKit (output-colour recommendation reads primaries independently of the transfer; `MonitorFrame.signal(of:)` reads the primaries attachment). (b) and (c) are app-side and still apply.
 
 Next: W3 (two audit rounds of the W2 work + fixes; README, FEATURES, API, INTEGRATION, LICENSE docs; final benchmarks), then W4.
+- W2 committed 2026-10-22 as a1b652a: 619 tests pass, 2 opt-in skipped, Metal validation clean. One scopes test failed once and passed on the rerun (likely a timing assertion); W3 hardens it.
+- W4 behaviour decisions (2026-10-22). They are reversible; the aim is to preserve what the user sees:
+  (1) false colour still suppresses zebra (app glue rule);
+  (2) peaking and log false colour stay off on Program;
+  (3) SUPERSEDED: tetrahedral only (see DECISION below);
+  (4) overlays use BT.2408 graphics white on HDR layers;
+  (5) the one forced change: the monitor's "Output" stage is now source + burn-in LUT computed in the shader, not the published processed buffer, so the menu item is renamed "Output (LUT)";
+  (6) the old MonitorConfiguration blob must never decode as MonitorState (fail closed via a discriminator), and the legacy key is migrated and kept.
+- W3+W4 · wf_811d7738-f78 · /Users/andrew/.claude/projects/-Users-andrew-Projects-ai-ultracam/79374030-ad52-4ad4-9919-97fe11a9d54e/workflows/scripts/monitorkit-w3-w4-wf_811d7738-f78.js · launched 2026-10-22 ~09:40. Stages:
+  1. Gaps: picture R6/R7/R9/R10/R12/R13/R14 and the LUT guard; scopes timing hardening and the legacy look; UI parity; ported MonitorTools tests.
+  2. Audits, including scopes Metal 4 round 2, then fixes.
+  3. Docs, in parallel with W4.
+  4. W4 steps s1–s7, each implement → audit (regression + correctness) → fix → gates → commit.
+  5. Library fixes found during W4.
+  6. A 3-lens audit of the whole W4 diff, fix, all gates plus a Metal validation run.
+  7. Final perf pass and final verification, which also updates PROGRESS.
+  ultracam-18 agreed (2026-10-22) not to touch the W4 files, generate_project.py or build.sh until W4 is reported done. Tell it when W4 finishes.
+- DECISION 2026-10-22 (user): the app uses tetrahedral LUT interpolation only, for burn-in and monitor LUTs. No trilinear option and no backwards compatibility with older takes. The W4 prompts in wf_811d7738-f78 were edited to say so (run restarted with resumeFromRunId). The library keeps tetrahedral as its default.
+- 2026-10-22 ~10:30, restructured for parallelism at the user's request (same run ID wf_811d7738-f78, resumed; gap results cached). Now concurrent:
+  - the library audits → fixes → perf pass;
+  - docs;
+  - W4 waves.
+  W4 waves:
+  1. s1 plumbing;
+  2. s2 LUT ∥ s3 settings (AppModel split by function);
+  3. s4 feed host, then s5 surfaces running alongside s4's audit and fix;
+  4. NEEDS sweep;
+  5. s6a LUT routing ∥ s6b tools UI ∥ s6c scopes UI ∥ s6d audio ∥ s7a ported UI tests;
+  6. NEEDS sweep;
+  7. s7 retire (alone).
+  Then library W4 fixes, a 4-lens whole-diff audit, fix, final verify. Heavy gates are serialized with `/usr/bin/lockf -k /tmp/ultracam-gates.lock`. Each unit is implement → audit → fix.
+- Heartbeat 2026-10-22 10:21: W3+W4 (wf_811d7738-f78) running: library audits, docs and W4 s1-plumbing in progress
+
+## Queued peer findings (ultracam-18, 2026-10-22) — fold in after W4 final-verify, before releasing the freeze
+1. AppModel refused-Start expiry: drop the camera's `refusedStarts` entry (or call expireResolvedStartRefusals()) whenever its selectedDevice changes — selectedDevice didSet for the selected camera, updateCamera/setInput for others. Today a stale "Couldn't start" can resurface on a later unplug.
+2. AppModel.startRefusal: `selectedDevice.isEmpty` should say "Choose an input for this camera." not "Connect the UltraStudio."
+3. ProgramOutputBridge ~404-416 host-time anchoring: re-anchor when mapped time is more than ~2 frame durations behind/ahead of now, not only past ±1 s (short on-air gaps leave a lasting latency offset). Low priority.
