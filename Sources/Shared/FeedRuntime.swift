@@ -56,6 +56,13 @@ protocol ProgramFrameNormalizing: AnyObject, Sendable {
   func canNormalize(_ metadata: ProcessedFrameMetadata, to contract: ProgramOutputFormat) -> Bool
   func normalize(_ source: CVPixelBuffer, to contract: ProgramOutputFormat,
                  completion: @escaping @Sendable (Result<CVPixelBuffer, Error>) -> Void) throws
+  /// Frees cached GPU resources once no conversion uses them; work still on
+  /// the GPU keeps its resources. Called when Program output goes idle.
+  func releaseIdleResources()
+}
+
+extension ProgramFrameNormalizing {
+  func releaseIdleResources() {}
 }
 
 /// Events the route reports to the main actor. Per-frame work never hops to
@@ -146,6 +153,10 @@ final class ProgramOutputRoute: @unchecked Sendable {
   /// Consecutive skipped frames of the on-air source before it is reported.
   /// One or two can race a source being retired; more is a broken stream.
   static let onAirSkipReportThreshold = 3
+  /// Consecutive frames sent to the camera after which the error latch
+  /// re-arms (~1 s at 59.94): the next failure is reported again. Shorter
+  /// would turn an intermittent fault into one main-actor event per frame.
+  static let healthyPublishesToRearm = 60
 
   private struct StageEntry {
     let sequence: UInt64
@@ -176,6 +187,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
   private var stage: [StageEntry] = []
   private var stats = ProgramRouteStatistics()
   private var errorReported = false
+  /// Frames sent since the last failure; re-arms `errorReported`.
+  private var healthyPublishes = 0
   /// Program time of the next contract-cadence slot.
   private var nextSlot: CMTime?
   private var onAirSkips = 0
@@ -226,9 +239,13 @@ final class ProgramOutputRoute: @unchecked Sendable {
   /// are not offered to the camera route at all.
   func setOutput(contract: ProgramOutputFormat?, active: Bool) {
     locked {
+      let changed = outputContract != contract || outputActive != active
       outputContract = contract
       outputActive = active
       if active { errorReported = false }
+      // No client, or a new contract: the converter's surfaces and output
+      // pool for the old one are done with once their GPU work completes.
+      if changed { normalizerProvider?()?.releaseIdleResources() }
     }
   }
 
@@ -256,20 +273,25 @@ final class ProgramOutputRoute: @unchecked Sendable {
     // Descriptor edits (name, LUT, format) arrive through the same coordinator
     // as topology edits. Do not reset the Program clock or drain a live queue
     // when the ordered feed identity set is unchanged.
-    locked {
-      if state.feedIDs == feedIDs { return }
-      let valid = Set(feedIDs)
-      let selected = state.selectedFeedID.flatMap { valid.contains($0) ? $0 : nil }
-      var settings = state.settings
-      settings.selectedFeedID = selected ?? feedIDs.first
-      // A topology change invalidates every queued source frame. Keeping those
-      // leases would let a removed feed leak into the next Program segment and
-      // would retain pixel buffers until the consumer happened to dequeue them.
-      flushOutputLocked()
-      let previous = state
-      state = SwitcherCoordinator(settings: settings, feedIDs: feedIDs)
-      state.carryProgramTimeline(from: previous)
-    }
+    lock.lock()
+    guard state.feedIDs != feedIDs else { lock.unlock(); return }
+    let valid = Set(feedIDs)
+    let selected = state.selectedFeedID.flatMap { valid.contains($0) ? $0 : nil }
+    var settings = state.settings
+    settings.selectedFeedID = selected ?? feedIDs.first
+    // A topology change invalidates every queued source frame. Keeping those
+    // leases would let a removed feed leak into the next Program segment and
+    // would retain pixel buffers until the consumer happened to dequeue them.
+    flushOutputLocked()
+    let previous = state
+    state = SwitcherCoordinator(settings: settings, feedIDs: feedIDs)
+    // Readiness and a pending cut carry over; a cut whose target was removed
+    // is reported, so its requester (the automatic director) is released.
+    state.carryProgramTimeline(from: previous)
+    let abandoned = state.takeAbandonedCut()
+    let handler = eventHandler
+    lock.unlock()
+    if let (feedID, reason) = abandoned { handler?(.cutAbandoned(feedID: feedID, reason: reason)) }
   }
 
   /// Updates switch policy on the same coordinator that ingests Program
@@ -432,7 +454,10 @@ final class ProgramOutputRoute: @unchecked Sendable {
     }
     guard let onAirError, feedID == state.selectedFeedID else { return }
     onAirSkips += 1
-    guard onAirSkips == Self.onAirSkipReportThreshold else { return }
+    // At and past the threshold: once the latch re-arms (a healthy stretch,
+    // or a new client) a stream that is still broken is reported again.
+    // Reset when the on-air source is accepted again.
+    guard onAirSkips >= Self.onAirSkipReportThreshold else { return }
     reportErrorLocked("Program is skipping the on-air camera's frames: \(onAirError).", events: &events)
   }
 
@@ -597,6 +622,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
         if summary.enqueued > 0 {
           stats.published &+= 1
           published = true
+          healthyPublishes += 1
+          if healthyPublishes >= Self.healthyPublishesToRearm { errorReported = false }
           let elapsed = (ProcessInfo.processInfo.systemUptime - head.acceptedAt) * 1_000
           stats.lastStageMilliseconds = elapsed
           stats.maxStageMilliseconds = max(stats.maxStageMilliseconds, elapsed)
@@ -607,7 +634,10 @@ final class ProgramOutputRoute: @unchecked Sendable {
     return (last, published)
   }
 
+  /// Reports the first failure after a healthy stretch. Every failure, shown
+  /// or not, restarts the stretch.
   private func reportErrorLocked(_ message: String, events: inout [ProgramRouteEvent]) {
+    healthyPublishes = 0
     guard !errorReported else { return }
     errorReported = true
     events.append(.outputError(message))

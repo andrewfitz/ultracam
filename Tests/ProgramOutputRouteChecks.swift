@@ -1,5 +1,6 @@
 import CoreMedia
 import CoreVideo
+import IOSurface
 import XCTest
 
 @MainActor @objcMembers final class ProgramOutputRouteChecks: XCTestCase {
@@ -752,13 +753,194 @@ import XCTest
     let events = EventLog()
     route.onEvent = { events.append($0) }
     let image = try frame(source, at: 0).payload
+    // Duplicate timestamps: an earlier one would be a stream clock restart.
     route.ingest(feedID: source, frame: processed(image, at: 5))
-    for _ in 0..<2 { route.ingest(feedID: source, frame: processed(image, at: 1)) }
+    for _ in 0..<2 { route.ingest(feedID: source, frame: processed(image, at: 5)) }
     XCTAssertEqual(route.statistics.skippedInvalidTimestamp, 2)
     XCTAssertTrue(events.errors.isEmpty, "One or two can race a source being retired")
-    route.ingest(feedID: source, frame: processed(image, at: 1))
+    route.ingest(feedID: source, frame: processed(image, at: 5))
     XCTAssertEqual(route.statistics.skippedInvalidTimestamp, 3)
     XCTAssertEqual(events.errors.count, 1, "The on-air camera's frames being skipped is a visible error")
+    // Still skipping when the latch re-arms (a new client): reported again,
+    // not only at exactly the third skip.
+    route.acknowledgeOutputError()
+    route.ingest(feedID: source, frame: processed(image, at: 5))
+    XCTAssertEqual(events.errors.count, 2, "A stream that is still broken is reported again")
+  }
+
+  func testOnAirStreamClockRestartKeepsProgramOnTheGrid() throws {
+    let a = feed("alpha"), b = feed("beta")
+    let (route, consumer, image) = try cadenceRoute(contractDuration: VideoContract.fastDuration)
+    let events = EventLog()
+    route.onEvent = { events.append($0) }
+    route.setSourceHealth(a, healthy: true)
+    route.setSourceHealth(b, healthy: true)
+    for index in 3_000..<3_005 { route.ingest(feedID: a, frame: processed(image, at: Int64(index))) }
+    // Auto mode: an HDMI mode change on the on-air camera restarts its
+    // streams, and stream time goes back near zero while it stays live.
+    for index in 0..<5 {
+      guard case .accepted = route.ingest(feedID: a, frame: processed(image, at: Int64(index))).decision else {
+        return XCTFail("Program must not go to standby black after the on-air clock restarts")
+      }
+    }
+    _ = route.requestCut(to: b)
+    route.ingest(feedID: b, frame: processed(image, at: 0))
+    let sent = drain(consumer)
+    XCTAssertEqual(sent.map(\.0), (0..<11).map { CMTime(value: Int64($0) * 1_001, timescale: 60_000) },
+      "Program time stays strictly increasing, one slot apart, across the restart and the next cut")
+    XCTAssertEqual(route.statistics.skippedInvalidTimestamp, 0)
+    XCTAssertTrue(events.errors.isEmpty)
+  }
+
+  func testErrorLatchRearmsAfterAHealthyStretch() throws {
+    let source = feed("alpha")
+    let route = ProgramOutputRoute(feedIDs: [source])
+    let consumer = try route.addConsumerRoute(capacity: 8)
+    let events = EventLog()
+    route.onEvent = { events.append($0) }
+    route.setOutput(contract: ProgramOutputFormat(width: 1920, height: 1080,
+      pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, duration: VideoContract.fastDuration), active: true)
+    let matching = try ioSurfaceFrame(1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    let other = try ioSurfaceFrame(64, 64, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+    route.setNormalizerProvider { nil }
+    var index: Int64 = 0
+    func ingest(_ image: CVPixelBuffer) {
+      route.ingest(feedID: source, frame: processed(image, at: index))
+      index += 1
+      _ = drain(consumer)
+    }
+    ingest(other)  // converter not built yet, early in the session
+    ingest(other)
+    XCTAssertEqual(events.errors.count, 1, "Repeats of one fault are latched")
+    for _ in 1..<ProgramOutputRoute.healthyPublishesToRearm { ingest(matching) }
+    ingest(other)
+    XCTAssertEqual(events.errors.count, 1, "A stretch shorter than the re-arm bound keeps the latch")
+    for _ in 0..<ProgramOutputRoute.healthyPublishesToRearm { ingest(matching) }
+    // Later, a different fault: the GPU stalls.
+    route.setNormalizerProvider { StalledNormalizer() }
+    ingest(other)
+    XCTAssertEqual(events.errors.count, 2, "The first failure after a healthy stretch is shown again")
+    XCTAssertEqual(route.statistics.normalizationFailures, 4)
+  }
+
+  func testFeedRebuildKeepsTheCutOnAirAndReportsADroppedCut() throws {
+    let a = feed("alpha"), b = feed("beta"), c = feed("gamma")
+    let route = ProgramOutputRoute(feedIDs: [a, b])
+    let events = EventLog()
+    route.onEvent = { events.append($0) }
+    let image = try frame(a, at: 0).payload
+    route.setSourceHealth(a, healthy: true)
+    route.setSourceHealth(b, healthy: true)
+    route.ingest(feedID: a, frame: processed(image, at: 0))
+    route.ingest(feedID: b, frame: processed(image, at: 0))
+    route.updateFeeds([a, b, c])  // a camera is added while A is on air
+    XCTAssertTrue(route.isOnAir, "The on-air camera is still on air after a rebuild")
+    guard case .queued = route.requestSelection(b, cutsAllowed: true) else {
+      return XCTFail("A request right after a rebuild is a cut, not an instant selection")
+    }
+    route.updateFeeds([a, b])  // another rebuild while the cut is pending
+    XCTAssertEqual(route.pendingFeedID, b, "A pending cut survives a rebuild")
+    guard case .cutApplied = route.ingest(feedID: b, frame: processed(image, at: 1)).decision else {
+      return XCTFail("The carried cut lands on the target's next frame")
+    }
+    XCTAssertEqual(route.selectedFeedID, b)
+
+    _ = route.requestCut(to: a)
+    route.updateFeeds([b])  // the pending target is removed
+    XCTAssertFalse(route.hasPendingCut)
+    let deadline = Date().addingTimeInterval(1)
+    while events.abandoned.isEmpty, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+    XCTAssertEqual(events.abandoned.map(\.0), [a], "A dropped cut is reported so its requester is released")
+    XCTAssertEqual(events.abandoned.first?.1, .targetUnavailable)
+  }
+
+  func testNormalizerReplacesThePoolBuffersStaleColorAndGeometryTags() throws {
+    let normalizer = try ProgramNormalizer()
+    let contract = ProgramOutputFormat(width: 1920, height: 1080,
+      pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, duration: VideoContract.fastDuration)
+    func convert(_ source: CVPixelBuffer) throws -> (IOSurfaceID, [String: Any]) {
+      let done = DispatchSemaphore(value: 0)
+      let box = EventLog()
+      try normalizer.normalize(source, to: contract) { result in
+        if case let .success(output) = result { box.setBuffer(output) }
+        done.signal()
+      }
+      XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+      let output = try XCTUnwrap(box.buffer)
+      let attachments = (CVBufferCopyAttachments(output, .shouldPropagate) as? [String: Any]) ?? [:]
+      return (IOSurfaceGetID(CVPixelBufferGetIOSurface(output)!.takeUnretainedValue()), attachments)
+    }
+    let hdr = try ioSurfaceFrame(3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+    let tags: [(CFString, CFTypeRef)] = [
+      (kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020),
+      (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ),
+      (kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020),
+      (kCVImageBufferMasteringDisplayColorVolumeKey, Data(count: 24) as CFData),
+      (kCVImageBufferContentLightLevelInfoKey, Data(count: 4) as CFData),
+      (kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Left),
+      (kCVImageBufferCleanApertureKey, [kCVImageBufferCleanApertureWidthKey: 3840,
+        kCVImageBufferCleanApertureHeightKey: 2160, kCVImageBufferCleanApertureHorizontalOffsetKey: 0,
+        kCVImageBufferCleanApertureVerticalOffsetKey: 0] as CFDictionary),
+    ]
+    for (key, value) in tags { CVBufferSetAttachment(hdr, key, value, .shouldPropagate) }
+    let untagged = try ioSurfaceFrame(3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+    // Enough HDR frames that every pool buffer has carried HDR tags.
+    var hdrSurfaces = Set<IOSurfaceID>()
+    for _ in 0..<8 {
+      let (surface, attachments) = try convert(hdr)
+      hdrSurfaces.insert(surface)
+      XCTAssertEqual(attachments[kCVImageBufferTransferFunctionKey as String] as? String,
+        kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String, "The source's own color tags are carried")
+      XCTAssertNil(attachments[kCVImageBufferCleanApertureKey as String],
+        "A 3840×2160 clean aperture does not describe a 1920×1080 image")
+      XCTAssertEqual(attachments[kCVImageBufferChromaLocationTopFieldKey as String] as? String,
+        kCVImageBufferChromaLocation_Center as String, "Resampled chroma is centered")
+    }
+    var reused = false
+    for _ in 0..<8 {
+      let (surface, attachments) = try convert(untagged)
+      reused = reused || hdrSurfaces.contains(surface)
+      for key in [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey,
+                  kCVImageBufferYCbCrMatrixKey, kCVImageBufferMasteringDisplayColorVolumeKey,
+                  kCVImageBufferContentLightLevelInfoKey, kCVImageBufferCleanApertureKey] {
+        XCTAssertNil(attachments[key as String], "Cut to an untagged camera: no stale \(key) on Program")
+      }
+    }
+    XCTAssertTrue(reused, "The check must run on recycled pool buffers")
+  }
+
+  func testIdleNormalizerReleasesItsSurfacesAndPool() throws {
+    let normalizer = try ProgramNormalizer(idleReleaseDelay: 0.05)
+    let contract = ProgramOutputFormat(width: 1920, height: 1080,
+      pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, duration: VideoContract.fastDuration)
+    let done = DispatchSemaphore(value: 0)
+    for _ in 0..<3 {
+      let source = try ioSurfaceFrame(640, 360, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+      try normalizer.normalize(source, to: contract) { _ in done.signal() }
+    }
+    for _ in 0..<3 { XCTAssertEqual(done.wait(timeout: .now() + 5), .success) }
+    XCTAssertGreaterThan(normalizer.currentStatistics.cachedSurfaces, 0)
+    let deadline = Date().addingTimeInterval(2)
+    while normalizer.currentStatistics.cachedSurfaces > 0, Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    XCTAssertEqual(normalizer.currentStatistics.cachedSurfaces, 0,
+      "An idle normalizer pins no capture or Program surfaces")
+    // It still converts afterwards (the pool is rebuilt on demand), and an
+    // explicit release on output change frees the completed surfaces.
+    let source = try ioSurfaceFrame(640, 360, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+    try normalizer.normalize(source, to: contract) { _ in done.signal() }
+    XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+    let slow = try ProgramNormalizer()
+    try slow.normalize(source, to: contract) { _ in done.signal() }
+    XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+    let drained = Date().addingTimeInterval(1)
+    while Date() < drained {
+      slow.releaseIdleResources()
+      if slow.currentStatistics.cachedSurfaces == 0 { break }
+      RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    XCTAssertEqual(slow.currentStatistics.cachedSurfaces, 0)
   }
 
   func testCutToCameraWithNoSignalExpiresAndAutomaticSwitchingContinues() throws {
@@ -819,6 +1001,11 @@ import XCTest
     ("cuts between cadences stay on the grid", testCutsBetweenCadencesStayOnTheContractGrid),
     ("normalizer not built or stalled never blocks", testNormalizerThatIsNotBuiltOrFailsIsACountedErrorThatNeverBlocks),
     ("on-air timestamp skips reported", testOnAirTimestampSkipsAreCountedAndReported),
+    ("on-air clock restart stays on the grid", testOnAirStreamClockRestartKeepsProgramOnTheGrid),
+    ("error latch re-arms after a healthy stretch", testErrorLatchRearmsAfterAHealthyStretch),
+    ("feed rebuild keeps cut state", testFeedRebuildKeepsTheCutOnAirAndReportsADroppedCut),
+    ("normalizer replaces stale tags", testNormalizerReplacesThePoolBuffersStaleColorAndGeometryTags),
+    ("idle normalizer releases surfaces", testIdleNormalizerReleasesItsSurfacesAndPool),
     ("no-signal cut expires, auto continues", testCutToCameraWithNoSignalExpiresAndAutomaticSwitchingContinues),
   ]
 }
@@ -879,6 +1066,10 @@ private final class EventLog: @unchecked Sendable {
   var errors: [String] {
     lock.lock(); defer { lock.unlock() }
     return events.compactMap { if case let .outputError(message) = $0 { return message }; return nil }
+  }
+  var abandoned: [(FeedID, ProgramCutAbandonReason)] {
+    lock.lock(); defer { lock.unlock() }
+    return events.compactMap { if case let .cutAbandoned(feedID, reason) = $0 { return (feedID, reason) }; return nil }
   }
   var mainThreadSends: Int { lock.lock(); defer { lock.unlock() }; return sends.filter(\.0).count }
   var times: [CMTime] { lock.lock(); defer { lock.unlock() }; return sends.map(\.1) }

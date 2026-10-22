@@ -99,8 +99,9 @@ struct ProgramOutput<SourceID: Hashable> {
     scheduler.startingCutTimeout = startingTimeout
   }
 
-  mutating func carryTimeline(from previous: ProgramOutput<SourceID>) {
-    scheduler.carryTimeline(from: previous.scheduler)
+  mutating func carryTimeline(from previous: ProgramOutput<SourceID>,
+                              keeping sources: Set<SourceID>? = nil) {
+    scheduler.carryTimeline(from: previous.scheduler, keeping: sources)
   }
 }
 
@@ -225,15 +226,25 @@ struct SwitcherCoordinator {
     reconcilePendingState()
   }
 
-  /// Copies the Program clock and remaining source health onto a coordinator
-  /// rebuilt for a feed add, remove, or disable. The new mapper would otherwise
-  /// start presentation time at zero on the same sink.
+  /// Copies the Program clock, remaining source health and readiness, and a
+  /// pending cut onto a coordinator rebuilt for a feed add, remove, or
+  /// disable. The new mapper would otherwise start presentation time at zero
+  /// on the same sink, the on-air source would read as starting (so a request
+  /// would select at once instead of cutting), and a pending cut would vanish
+  /// without the abandoned report its requester waits for.
   mutating func carryProgramTimeline(from previous: SwitcherCoordinator) {
-    programOutput.carryTimeline(from: previous.programOutput)
+    programOutput.carryTimeline(from: previous.programOutput, keeping: Set(feedIDs))
     for (id, healthy) in previous.feedHealth where feedIDs.contains(id) {
       feedHealth[id] = healthy
       programOutput.setSourceHealth(id, healthy: healthy)
     }
+    if let target = programOutput.pendingCut {
+      automaticRequestPending = previous.automaticRequestPending
+      if previous.pendingDirectorDecision?.targetCameraID == target.rawValue {
+        pendingDirectorDecision = previous.pendingDirectorDecision
+      }
+    }
+    reconcilePendingState()
   }
 
   mutating func setSourceHealth(_ feedID: FeedID, healthy: Bool) {
@@ -385,9 +396,10 @@ struct SwitcherCoordinator {
     guard let decision = director.evaluate(input) else { return nil }
     let target = FeedID(rawValue: decision.targetCameraID)
     guard feedIDs.contains(target), isFeedHealthy(target) else { return nil }
-    // Preserve the director's editorial boundary. Requesting a cut without
-    // the lower bound lets the first queued target frame win, which can land
-    // the switch before the safe transcript/audio boundary.
+    // Test-only path: `cutTime` is the director's clock, and the scheduler
+    // compares the bound with the target's own video PTS. It is a valid bound
+    // only when the two share one clock, as in these checks. The live director
+    // (AutoSwitcherBridge via AppModel) requests its cuts with no bound.
     let result = programOutput.requestCut(to: target, noEarlierThan: decision.cutTime)
     switch result {
     case .queued, .coalesced:

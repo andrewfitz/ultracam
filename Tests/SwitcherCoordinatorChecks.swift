@@ -158,6 +158,40 @@ import XCTest
     XCTAssertEqual(coordinator.settings.selectedFeedID, b)
   }
 
+  /// A feed add or remove rebuilds the coordinator. The on-air source, the
+  /// pending automatic cut and its latch carry over; a cut to a removed
+  /// camera is reported so its requester is released.
+  func testRebuildCarriesTheAutomaticCutAndReportsARemovedTarget() {
+    let a = feed("A")
+    let b = feed("B")
+    let settings = SwitcherSettings(selectedFeedID: a, automatic: true,
+      intervalSeconds: 2, strategy: .fixedInterval)
+    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b])
+    var now: TimeInterval = 100
+    coordinator.setPendingCutClock({ now }, timeout: 2)
+    _ = coordinator.ingest(frame(a, 0))
+    XCTAssertEqual(coordinator.evaluate(at: time(0)), .idle)
+    XCTAssertEqual(coordinator.evaluate(at: time(2)), .cutQueued(b))
+    var rebuilt = SwitcherCoordinator(settings: coordinator.settings, feedIDs: [a, b, feed("C")])
+    rebuilt.carryProgramTimeline(from: coordinator)
+    XCTAssertTrue(rebuilt.isOnAir)
+    XCTAssertEqual(rebuilt.pendingCut, b)
+    XCTAssertTrue(rebuilt.isAutomaticRequestPending)
+    XCTAssertNil(rebuilt.takeAbandonedCut())
+    now = 102
+    rebuilt.expirePendingCutIfNeeded()
+    XCTAssertEqual(rebuilt.takeAbandonedCut()?.1, .expired, "The carried cut keeps its clock and timeout")
+    XCTAssertFalse(rebuilt.isAutomaticRequestPending)
+
+    var removed = SwitcherCoordinator(settings: coordinator.settings, feedIDs: [a])
+    removed.carryProgramTimeline(from: coordinator)
+    XCTAssertFalse(removed.hasPendingCut)
+    XCTAssertFalse(removed.isAutomaticRequestPending)
+    guard let abandoned = removed.takeAbandonedCut() else { return XCTFail("A dropped cut is reported") }
+    XCTAssertEqual(abandoned.0, b)
+    XCTAssertEqual(abandoned.1, .targetUnavailable)
+  }
+
   static let allTests = [
     ("manual cut boundary and acknowledgement", testManualCutAppliesAtTargetFrameAndAcknowledgesSelection),
     ("fixed interval health", testFixedIntervalAdvancesInStableOrderAndSkipsUnhealthyFeed),
@@ -166,5 +200,6 @@ import XCTest
     ("expired automatic cut releases latch", testExpiredAutomaticCutReleasesTheFixedIntervalLatch),
     ("no-signal starting cut releases latch", testCutToStartedCameraWithNoSignalExpiresAndReleasesTheLatch),
     ("settings never move selection ahead", testSettingsNeverMoveTheSelectionAheadOfTheCut),
+    ("rebuild carries the automatic cut", testRebuildCarriesTheAutomaticCutAndReportsARemovedTarget),
   ]
 }

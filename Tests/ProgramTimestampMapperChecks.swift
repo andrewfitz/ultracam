@@ -197,6 +197,69 @@ import XCTest
       "It continues at the next Program boundary")
   }
 
+  func testOnAirClockRestartWhileLiveResumesAtTheNextBoundary() {
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setSource("A", available: true)
+    scheduler.setSource("B", available: true)
+    var last: ProgramMappedFrame<String>?
+    for pts in stride(from: Int64(50_050), to: 55_055, by: 1_001) {
+      guard case let .accepted(mapped) = scheduler.ingest(frame("A", pts, duration: 1_001)) else {
+        return XCTFail("on air")
+      }
+      last = mapped
+    }
+    guard let before = last else { return XCTFail("on air") }
+    _ = scheduler.requestCut(to: "B")
+    // An HDMI mode change restarts the streams: the source never leaves
+    // producing, and its stream time starts over near zero.
+    XCTAssertEqual(scheduler.readiness(of: "A"), .producing)
+    var times: [CMTime] = []
+    for pts in stride(from: Int64(0), to: 3_003, by: 1_001) {
+      guard case let .accepted(mapped) = scheduler.ingest(frame("A", pts, duration: 1_001)) else {
+        return XCTFail("A restarted stream clock on air must not be skipped as a regression")
+      }
+      times.append(mapped.programTime)
+    }
+    XCTAssertEqual(times, (1...3).map { CMTimeAdd(before.programTime, time(Int64($0) * 1_001)) },
+      "The first restarted frame takes the next Program boundary; the rest follow it")
+    XCTAssertEqual(scheduler.pendingCut, "B", "A pending cut to another camera survives the restart")
+    guard case .skipped(.invalidTimestamp(.sourceTimestampRegressed)) =
+      scheduler.ingest(frame("A", 2_002, duration: 1_001)) else {
+      return XCTFail("A duplicate timestamp is not a restart and stays a counted skip")
+    }
+    guard case let .cutApplied(cut, _) = scheduler.ingest(frame("B", 0, duration: 1_001)) else {
+      return XCTFail("The pending cut still lands")
+    }
+    XCTAssertEqual(cut.programTime, CMTimeAdd(times[2], time(1_001)))
+  }
+
+  func testRebuiltSchedulerKeepsOnAirReadinessAndThePendingCut() {
+    var now: TimeInterval = 0
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setClock { now }
+    scheduler.pendingCutTimeout = 2
+    scheduler.setSource("A", available: true)
+    scheduler.setSource("B", available: true)
+    _ = scheduler.ingest(frame("A", 0, duration: 1_001))
+    _ = scheduler.requestCut(to: "B")
+    var rebuilt = ProgramCutScheduler<String>(selectedSource: "A")
+    rebuilt.carryTimeline(from: scheduler, keeping: ["A", "B", "C"])
+    XCTAssertTrue(rebuilt.isOnAir, "The on-air source is still on air after a rebuild")
+    XCTAssertEqual(rebuilt.pendingCut, "B")
+    XCTAssertNil(rebuilt.takeAbandonedCut())
+    now = 1.9
+    XCTAssertFalse(rebuilt.expirePendingCutIfNeeded(), "The carried cut keeps its own expiry clock")
+    guard case let .cutApplied(cut, _) = rebuilt.ingest(frame("B", 0, duration: 1_001)) else {
+      return XCTFail("The carried cut lands")
+    }
+    XCTAssertEqual(cut.programTime, time(1_001))
+
+    var removed = ProgramCutScheduler<String>(selectedSource: "A")
+    removed.carryTimeline(from: scheduler, keeping: ["A"])
+    XCTAssertFalse(removed.hasPendingCut)
+    XCTAssertEqual(removed.takeAbandonedCut()?.0, "B", "A cut to a removed camera is reported")
+  }
+
   func testCutToStartingSourceThatFailsIsAbandonedVisibly() {
     var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
     scheduler.setSource("B", available: true)
@@ -326,6 +389,8 @@ import XCTest
     ("no-signal starting target expires", testCutToStartingSourceWithNoSignalExpiresAtTheStartingBound),
     ("first frame switches to live timeout", testStartingTargetThatSendsItsFirstFrameGetsTheLiveTimeout),
     ("restarted on-air source re-anchors", testRestartedOnAirSourceIsReanchoredNotRejected),
+    ("on-air clock restart while live", testOnAirClockRestartWhileLiveResumesAtTheNextBoundary),
+    ("rebuild keeps readiness and pending cut", testRebuiltSchedulerKeepsOnAirReadinessAndThePendingCut),
     ("rapid cuts coalesce", testRapidCutsCoalesceToLatestTarget),
     ("invalid target preserves selection", testInvalidPendingTargetDoesNotSwitchSelection),
     ("missing sources", testMissingSourcesAreRejectedAndPendingTargetIsDropped),

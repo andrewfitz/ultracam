@@ -31,6 +31,9 @@ import Metal
 /// and Program pools' buffers and make every reuse a new allocation. The cache
 /// entry retains only the IOSurface (so its ID cannot be reused while cached)
 /// and is evicted once the surface is idle and its last GPU use has completed.
+/// When conversions stop (no client, or every source already matches the
+/// contract), a delayed sweep releases every completed surface and the output
+/// pool, so an idle normalizer pins no capture or Program memory.
 final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   struct Statistics: Equatable, Sendable {
     var frames: UInt64 = 0
@@ -100,6 +103,9 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   static let idleSurfaceFrames: UInt64 = 120
   static let maxCachedSurfaces = 96
 
+  /// With no conversion for this long, completed surfaces and the pool go.
+  let idleReleaseDelay: TimeInterval
+
   private let lock = NSLock()
   private let statsLock = NSLock()
   private let device: MTLDevice
@@ -117,8 +123,10 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   private var pool: CVPixelBufferPool?
   private var poolFormat: ProgramOutputFormat?
   private var statistics = Statistics()
+  private var idleSweepScheduled = false
 
-  init() throws {
+  init(idleReleaseDelay: TimeInterval = 2) throws {
+    self.idleReleaseDelay = idleReleaseDelay
     guard let device = MTLCreateSystemDefaultDevice() else {
       throw VideoError.message("A Metal GPU is required for Program output.")
     }
@@ -227,10 +235,11 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
       recordStall(output: true)
       throw VideoError.outputBackPressure
     }
-    CVBufferPropagateAttachments(source, output)
-
     let width = CVPixelBufferGetWidth(source)
     let height = CVPixelBufferGetHeight(source)
+    let resized = width != contract.width || height != contract.height
+    Self.stampAttachments(output, from: source, resized: resized,
+      chromaResampled: resized || (sourceCode == .yuv420) != (destinationCode == .yuv420))
     let fullRange: UInt32 = sourceFormat == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? 1 : 0
     var residencyChanged = false
     let sourcePlanes: [MTLTexture]
@@ -320,11 +329,44 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
         self?.recordFrame(milliseconds: milliseconds)
         completion(.success(retained.output))
       }
+      // After `completion`, which takes the route lock: the route calls
+      // `normalize` under its lock, so this lock is never held across it.
+      self?.scheduleIdleSweep()
     }
     queue.commit([command], options: options)
     queue.signalEvent(event, value: sequence)
     slot.lastSequence = sequence
     self.sequence = sequence
+  }
+
+  /// Releases every cached surface whose GPU work has completed, and the
+  /// output pool (in-flight frames keep their own buffers). Surfaces still on
+  /// the GPU are released by the idle sweep once they complete.
+  func releaseIdleResources() {
+    lock.lock()
+    defer { lock.unlock() }
+    releaseCompletedLocked()
+    if !textures.isEmpty { scheduleIdleSweepLocked() }
+  }
+
+  /// Pool buffers keep the attachments of their previous frame, which may be
+  /// another camera's (HDR tags on an SDR picture). Start clean, then carry
+  /// this source's tags: the pass changes no matrix, primaries or transfer. A
+  /// resized image has no source clean aperture or display size, and resampled
+  /// chroma is centered (the pass samples chroma as center-sited).
+  private static func stampAttachments(_ output: CVPixelBuffer, from source: CVPixelBuffer,
+                                       resized: Bool, chromaResampled: Bool) {
+    CVBufferRemoveAllAttachments(output)
+    CVBufferPropagateAttachments(source, output)
+    if resized {
+      CVBufferRemoveAttachment(output, kCVImageBufferCleanApertureKey)
+      CVBufferRemoveAttachment(output, kCVImageBufferDisplayDimensionsKey)
+    }
+    if chromaResampled {
+      CVBufferSetAttachment(output, kCVImageBufferChromaLocationTopFieldKey,
+        kCVImageBufferChromaLocation_Center, .shouldPropagate)
+      CVBufferRemoveAttachment(output, kCVImageBufferChromaLocationBottomFieldKey)
+    }
   }
 
   // MARK: - Resources
@@ -391,14 +433,15 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     return texture
   }
 
-  /// Removes surfaces that have been idle long enough and whose last GPU use
-  /// has completed. Pools rotate a small fixed set, so steady state never evicts.
-  private func evictIdleTextures(sequence: UInt64) -> Bool {
+  /// Removes surfaces that have been idle long enough (or, with `all`, any
+  /// surface) whose last GPU use has completed. Pools rotate a small fixed
+  /// set, so steady state never evicts.
+  private func evictIdleTextures(sequence: UInt64, all: Bool = false) -> Bool {
     let completed = event.signaledValue
     var removed = false
     let overCap = textures.count > Self.maxCachedSurfaces
     for (key, entry) in textures where entry.lastUsed <= completed &&
-      (overCap || sequence &- entry.lastUsed > Self.idleSurfaceFrames) {
+      (all || overCap || sequence &- entry.lastUsed > Self.idleSurfaceFrames) {
       residency.removeAllocation(entry.texture)
       textures.removeValue(forKey: key)
       removed = true
@@ -408,6 +451,40 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     statistics.cachedSurfaces = count
     statsLock.unlock()
     return removed
+  }
+
+  /// Lock held.
+  private func releaseCompletedLocked() {
+    if evictIdleTextures(sequence: sequence, all: true) { residency.commit() }
+    pool = nil
+    poolFormat = nil
+  }
+
+  /// Runs after every completion; one sweep is pending at a time.
+  private func scheduleIdleSweep() {
+    lock.lock()
+    defer { lock.unlock() }
+    scheduleIdleSweepLocked()
+  }
+
+  private func scheduleIdleSweepLocked() {
+    guard !idleSweepScheduled else { return }
+    idleSweepScheduled = true
+    let mark = sequence
+    feedbackQueue.asyncAfter(deadline: .now() + idleReleaseDelay) { [weak self] in
+      self?.sweepIfIdle(since: mark)
+    }
+  }
+
+  /// Releases everything completed if nothing was encoded since `mark`. While
+  /// conversions continue, or work is still on the GPU, it looks again later.
+  private func sweepIfIdle(since mark: UInt64) {
+    lock.lock()
+    defer { lock.unlock() }
+    idleSweepScheduled = false
+    let idle = sequence == mark
+    if idle { releaseCompletedLocked() }
+    if !idle || !textures.isEmpty { scheduleIdleSweepLocked() }
   }
 
   private func recordFrame(milliseconds: Double) {

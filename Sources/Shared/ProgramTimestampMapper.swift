@@ -57,11 +57,12 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
   public private(set) var selectedSource: SourceID?
   public private(set) var lastProgramTime: CMTime?
   public private(set) var lastProgramDuration: CMTime?
+  /// The selected source's last accepted timestamp, on its own clock.
+  public private(set) var lastSourceTime: CMTime?
 
   private var activeClock: SourceClock?
   private var sourceOrigin: CMTime?
   private var programOrigin: CMTime?
-  private var lastSourceTime: CMTime?
 
   public init(programTimescale: Int32 = 60_000, selectedSource: SourceID? = nil) {
     precondition(programTimescale > 0, "Program timescale must be positive")
@@ -303,6 +304,10 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     mapper.cut(to: sourceID)
   }
 
+  /// `noEarlierThan` is on the target's own stream clock (its video PTS):
+  /// the cut lands on the first target frame at or after it. Another clock,
+  /// such as the director's audio time, never qualifies; pass nil instead, as
+  /// the live automatic director does.
   public mutating func requestCut(to sourceID: SourceID,
                                  noEarlierThan: CMTime? = nil) -> ProgramCutRequestResult<SourceID> {
     let noEarlierThan = noEarlierThan.flatMap(Self.validCutTime)
@@ -347,8 +352,29 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     clearPendingCut()
   }
 
-  public mutating func carryTimeline(from other: ProgramCutScheduler<SourceID>) {
+  /// Carries the Program clock, source readiness and a pending cut onto a
+  /// scheduler rebuilt for a feed add, remove or disable, so the on-air source
+  /// stays on air and a requested cut still lands (or is reported). A pending
+  /// cut whose target is gone, unavailable or now selected is abandoned.
+  public mutating func carryTimeline(from other: ProgramCutScheduler<SourceID>,
+                                     keeping sources: Set<SourceID>? = nil) {
     mapper.carryTimeline(from: other.mapper)
+    clock = other.clock
+    pendingCutTimeout = other.pendingCutTimeout
+    startingCutTimeout = other.startingCutTimeout
+    for (id, state) in other.readiness where sources?.contains(id) ?? true {
+      readiness[id] = state
+    }
+    guard let target = other.pendingCut else { return }
+    guard sources?.contains(target) ?? true, target != selectedSource,
+      isSourceAvailable(target) else {
+      abandoned = (target, .targetUnavailable)
+      return
+    }
+    pendingCut = target
+    pendingCutTime = other.pendingCutTime
+    pendingCutRequestedAt = other.pendingCutRequestedAt
+    pendingTargetStarting = other.pendingTargetStarting
   }
 
   /// Expires a pending cut whose live target has not qualified in time.
@@ -433,6 +459,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
           }
           return .skipped(.invalidTimestamp(.invalidSourceTimestamp))
         }
+        // Same clock by contract: `pendingCutTime` is a target stream time.
         if CMTimeCompare(frame.sourceTime, pendingCutTime) < 0 {
           return .skipped(.staleQueuedFrame)
         }
@@ -455,7 +482,24 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     // The on-air source keeps flowing while a cut is pending, so Program
     // never freezes waiting for a target that is still opening.
     guard frame.sourceID == selectedSource else { return .skipped(.nonSelectedSource) }
-    switch mapper.map(frame) {
+    let result = mapper.map(frame)
+    if case .failure(.sourceTimestampRegressed) = result, let last = mapper.lastSourceTime,
+      CMTimeCompare(frame.sourceTime, last) < 0 {
+      // The on-air source's stream clock started over while it stayed live:
+      // an HDMI mode change restarts the DeckLink streams, and stream time
+      // goes back near zero. Re-anchor on this frame at the next Program
+      // boundary, as a cut does, so Program stays strictly increasing. An
+      // equal timestamp is a duplicate frame, not a restart, and stays skipped.
+      var restarted = mapper
+      restarted.cut(to: frame.sourceID)
+      switch restarted.map(frame) {
+      case let .success(mapped):
+        mapper = restarted
+        return .accepted(mapped)
+      case let .failure(error): return .skipped(.invalidTimestamp(error))
+      }
+    }
+    switch result {
     case let .success(mapped): return .accepted(mapped)
     case let .failure(error): return .skipped(.invalidTimestamp(error))
     }
