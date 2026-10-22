@@ -117,7 +117,9 @@ final class PlanarBlock {
 }
 
 extension AudioMeter {
-  /// Feeds planar Float32 in blocks of `blockSize`, calling `each` after every block.
+  /// Feeds planar Float32 in blocks of `blockSize`, calling `each` after
+  /// every block, then flushes the last publish interval (as a host does
+  /// when its stream stops).
   func feed(_ signal: Signal, blockSize: Int = 512, each: ((AudioMeterSnapshot) -> Void)? = nil) {
     let block = PlanarBlock(channelCount: signal.channels.count, capacity: blockSize)
     var offset = 0
@@ -128,6 +130,7 @@ extension AudioMeter {
       offset += n
       if let each { each(snapshot()) }
     }
+    flush()
   }
 }
 
@@ -146,3 +149,8 @@ extension LoudnessMeter {
 }
 
 func dB(_ linear: Double) -> Double { 20 * log10(linear) }
+
+extension LoudnessSnapshot {
+  /// What a loudness reset leaves of these readings: momentary and short-term.
+  var startingOver: LoudnessSnapshot { LoudnessSnapshot(momentary: momentary, shortTerm: shortTerm) }
+}

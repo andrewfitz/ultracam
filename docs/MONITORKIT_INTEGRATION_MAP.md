@@ -1,700 +1,657 @@
 # MonitorKit integration map
 
-Date: 2026-10-21. This is a read-only survey. It changes no app code. It covers two replacements: the app's GPU LUT application, and the whole `Packages/MonitorTools` package. Both move to `Packages/MonitorKit`.
+Date: 2026-10-22. A read-only survey for two goals:
+- (a) design MonitorKit's Metal 4 encode path so it drops into the app's monitor seam with zero overhead;
+- (b) let W4 replace `Packages/MonitorTools` with `Packages/MonitorKit` without regressions.
+
+It replaces the 2026-10-21 version, which predates the app's Metal 4 rewrite (`2270aca`).
 
 Related: [Monitor library plan](MONITOR_LIBRARY_PLAN.md), [GPU pipeline plan](GPU_PIPELINE_PLAN.md), [MonitorKit architecture](../Packages/MonitorKit/Docs/ARCHITECTURE.md), [MonitorKit progress](../Packages/MonitorKit/PROGRESS.md).
 
-## 0. Baseline and status (read first)
+## 0. Baseline
 
-**Line numbers are against HEAD `7a09c71` unless marked "WT" (working tree).** They will drift.
-- `PROGRESS.md` gates W4 (this integration) on session "ultracam-18" committing its app work first: the GPU monitor in MonitorTools, the pipelined `LUTProcessor`, Program, Recording and SDK 16.
-- **That work started landing in the working tree while this map was being written (about 23:30).** It is uncommitted.
-- **Sources:** 14 files, +3358/−890.
-  - `LUTProcessor.swift` and `LUTShaders.metal` are rewritten on **Metal 4** with a fused LUT (§2.3a).
-  - `VideoContract.swift` drops `captureAdmissionLimit` and `previewPendingLimit` and adds `maxFramesInFlight = 3`, `outputPoolMinimum` and `cameraSinkQueueSize = 8`.
-  - The DeckLink backend and `Sources/Recording/*` also change.
-- **`Packages/MonitorTools`:** it deletes `MonitorAdaptivePolicy`, `MonitorCriticalPipelinePolicy`, `MonitorCompositePool`, `MonitorCriticalPipelineProducer`, `MonitorResourceCounters`, `OwnedMetalInput`, `OwnedPreview` (which holds `CleanPreviewService`) and `MonitorPresentationEstimate`, and rewrites `MonitorRuntime` and `MonitorTools.metal.txt`. It also deletes most of the package's Metal test files (§3.7).
-- **Untouched so far** (still HEAD): `CaptureController.swift`, `MonitorCaptureSink.swift`, `MonitorCoordinator.swift` and the UI files. They still reference deleted symbols such as `MonitorCriticalPipelineProducer` and `CleanPreviewService`, so the tree is mid-change and won't build until that session finishes.
-- After it commits, rerun the greps in §1 and update the line numbers. The symbol-level mapping should mostly still hold.
-- **Anchor for the "WT" line numbers** (taken 2026-10-21 23:33; `git diff --shortstat -- Sources/` = 14 files, +3828/−890):
-  - `shasum -a 256 Sources/App/LUTProcessor.swift` = `a30ecc27ea51ad4a92e13bc9165941b4ced07d2dc256175acde7be3621c7054c`
-  - `shasum -a 256 Sources/App/LUTShaders.metal` = `75d4ffc7536cfe9db69bd760bff309c10eae8e9ba0fc90461a8ab190e27241cc`
-  - If those differ, re-derive the WT references in §2.3a and §2.4.
-
-**Uncommitted at the time of writing (another session's work; do not overwrite):**
-- The deployment target was raised from 15.0 to 26.0 in `scripts/generate_project.py:84`, `Packages/MonitorTools/Package.swift:6` and 11 shell scripts (see §4.3).
-- `Ultracam.xcodeproj/project.pbxproj` was regenerated before the `generate_project.py` edit:
-  - It still says `MACOSX_DEPLOYMENT_TARGET = 15.0` at lines 516 and 535.
-  - It drops `GPURawFrameCopy.swift` and `SharedMetalBuffer.swift` and adds `UIRenameAlert.swift`.
-  - It now has machine-absolute `DECKLINK_SDK_DIR` and `LIBRARY_SEARCH_PATHS`.
-  - `scripts/build.sh:51` regenerates this file on every build, so `generate_project.py` is the only source of truth.
-- `docs/MONITOR_LIBRARY_PLAN.md`: adds the "Platform" section.
-- `Packages/MonitorKit/`: the whole package is untracked. The W1 workflow (`wf_548da617-dbb`) is building it now.
-
-**What MonitorKit has.** It is being built live by W1; files appeared between 23:15 and 23:33. Recheck with `wc -l Packages/MonitorKit/Sources/*/*.swift` and `grep -l "class MonitorEngine\|class MonitorFeed\|class MonitorPass" -r Packages/MonitorKit/Sources`.
-
-| As of 2026-10-21 23:33 | Exists (code present, audit pending) | Not yet |
-| --- | --- | --- |
-| `MonitorKitCore` | `CubeLUT`, `LUTInterpolation`, `LUTRouting`, the `CubeLUT.apply` CPU reference, `MonitorState` and its settings, `SignalDescription`/`PixelLayout`/`LogEncoding`, `MonitorLayout`/`GuideRaster`/`MonitorRect`, the false-color tables, reference math (+`DecodeReference.swift`) | — |
-| `MonitorKit` | `MonitorFrame` + `wrap`, `MonitorLUT` + `LUTParameters`, `MonitorShaders`, `MonitorEngine` (`MonitorEngine.swift:9-82`), `MonitorFeed` (`burnInLUT`, `monitorLUT`, `analyze`, `hasFocusMask`, `invalidateFocusMask`; `MonitorFeed.swift:8-88`), `MonitorPass` (`encode`/`prepare`/`draw` as in the contract; `MonitorPass.swift:80-171`), `MonitorStatus`, `MonitorViewport`, `MonitorTool`, `PassParameters`; the shaders `MKLUT`, `MKDecode` and `MKMonitor` | Freeze API |
-| `MonitorKitScopes` | `ScopeSettings` (`kind`, `stage`, `waveformMode`, …, `display`), `ScopeDisplay`, `ScopeGraticule`, `ScopeParameters`, `ScopeEngine` (just added), `MKScopes.msl` (518 lines) | Accumulator and renderer not confirmed |
-| `MonitorKitAudio` | config, snapshot, filters, planar stage | meters not confirmed |
-| `MonitorKitUI` | — (2-line stub) | `MonitorMetalView`, SwiftUI controls, legends |
-| Tests | Core: 49 tests. `MonitorKitTests` has support files, but its only test compiles the shaders | GPU pixel and contract tests |
-
-**What this means for sequencing:**
-- **The LUT swap (§2) is unblocked**, and mostly done in the working tree (§2.3a).
-- **The monitor swap (§3) can be prototyped** against `MonitorEngine`/`MonitorFeed`/`MonitorPass` now, but it is blocked for real use until W1's audit and the GPU pixel tests land.
-- **The UI swap waits on MonitorKitUI** (W2).
-- In §3, **(contract)** marks types that were contract-only when §3 was first drafted. Most now exist; treat them as "API may still change until the W1 audit".
+- **Line numbers are against HEAD `dbddd91`.** `dbddd91` changed only the S-Gamut3 weights in MonitorTools (`ColorAnalysis.swift`, `MonitorTools.metal.txt`, `ELZoneProfileTests.swift`). Every app file below is as committed in `2270aca`.
+  - While this map was written, another session began uncommitted edits to Program, recording and switcher files: `ProgramNormalizer.swift`, `RecordingModel.swift`, `Sources/Recording/*`, `FeedRuntime.swift`, `ProgramTimestampMapper.swift`, `SwitcherCoordinator.swift` and their tests.
+  - None of those edits touch a monitor symbol. Line numbers in `FeedRuntime.swift` may drift.
+- **MonitorKit** is at W1 (`e82659f`, 320 tests).
+  - It encodes into **classic** `MTLCommandBuffer`s with `set*Bytes` (`MonitorPass.swift:131-222`, `MonitorFeed.swift:55-107`).
+  - There is no `MTL4` symbol anywhere in the package yet.
+  - `MonitorKitUI` is a 40-byte stub.
+  - W2 (`wf_bf60cab5-302`) is building the HDR output, Freeze and the Metal 4 path now.
+- **The app's monitor is already all GPU, all Metal 4.**
+  - Every picture is a `CAMetalLayer` drawn by a `CAMetalDisplayLink`: camera tiles, Program, the workspace, detached windows and the menu bar preview. There is no `AVSampleBufferDisplayLayer` picture any more. `VideoPreview.swift` survives only as the `VideoPreviewRenderer` the `CaptureController` feeds.
+  - So W4 is a renderer swap behind an existing seam (§1), not a re-architecture.
 
 ---
 
-## 1. Every use of MonitorTools today, and its MonitorKit replacement
+## 1. The monitor seam today (Packages/MonitorTools)
 
-Imports: `rg -n "import MonitorTools" Sources Tests Tools`. The package has three products: `MonitorToolsCore`, `MonitorToolsMetal` and `MonitorToolsUI` (`Packages/MonitorTools/Package.swift:7-10`).
+### 1.1 Objects and threads
 
-### 1.1 App sources
+| Object | File:lines | Role |
+| --- | --- | --- |
+| `MonitorRuntime` (`@unchecked Sendable`, one per `MonitorCoordinator`) | `MonitorToolsMetal/MonitorRuntime.swift:11-245` | Lazily built GPU context. Owns the `MonitorRenderThread`, the GPU-timing hook (→ `AppGPUActivity`, `MonitorCoordinator.swift:48-50`), `attachDrawables`/`detachDrawables`, `flushTextures(for:)`, and the test-only `renderSnapshot` (offscreen, waits) |
+| `MonitorMetalContext` (internal, thread-safe) | `MonitorRuntime.swift:423-634` | Device. **One `MTL4CommandQueue`** (label "MonitorTools") for every surface. `MTL4Compiler` pipelines compiled with `mathMode = .safe` (`:461-479`): `sourceFocus`, `compose`, `scopeColumns`, `clearTarget`. One `MTLResidencySet` added to the queue (`:480-484`). A pool of `MonitorEncodeContext`s. A 1 s residency "graveyard" for retired allocations (`:525-549`). A 1 Hz maintenance timer (`:487-493`) |
+| `MonitorEncodeContext` (public, pooled) | `MonitorRuntime.swift:308-372` | One reusable submission: `MTL4CommandBuffer` + `MTL4CommandAllocator` + **one `MTL4ArgumentTable` (max 4 buffers, 8 textures; `:328-331`)** + a **4 KB shared uniforms buffer (16 slots × 256 B; `:319-320`)** + a `retained` list (capacity 32) + `retiredResidents` |
+| `MonitorSurfaceTextureCache` | `MonitorRuntime.swift:642-801` | IOSurface → `MTLTexture` via `device.makeTexture(descriptor:iosurface:plane:)`, keyed by IOSurface ID, plane, format and size. Textures are added to the residency set **once**, swept after 2 s idle, and flushed per target. Retains only the `IOSurfaceRef`, so capture pools still recycle |
+| `MonitorRenderThread` | `MonitorRuntime.swift:805-853` | One `Thread` ("MonitorTools.render", `.userInteractive`) with a run loop. **Every display link and every encode runs here.** `perform(_:)` hops onto it |
+| `MonitorToolsRenderer` (one per surface, plus one freeze copier per presenter) | `MonitorToolsMetal/MonitorToolsRenderer.swift:10-498` | Conforms to `MonitorPictureRenderer` and `MonitorScopeRenderer`. Owns the per-surface source-resolution focus mask. Caches the kernel parameters behind an `Equatable` key (`:262-287`) |
+| `MonitorSurfacePresenter` (`ObservableObject`, `@unchecked Sendable`) | `MonitorToolsUI/MonitorSurfacePresenter.swift:39-770` | Latest-frame slot (`accept`, any thread, short `NSLock`). Freeze state machine (`frozen`, `lingering`, `pendingFreeze`). Clean flag. Visibility. Statistics. `@Published` status strings for SwiftUI |
+| `MonitorPictureNSView` / `MonitorScopeNSView` / `MonitorSurfaceRenderLoop` | `MonitorSurfacePresenter.swift:840-1265` | The layers, and the per-surface `CAMetalDisplayLinkDelegate` on the render thread |
 
-| File:lines | MonitorTools symbols | What it does today | MonitorKit replacement |
+### 1.2 The renderer protocols (`MonitorRuntime.swift:404-420`)
+
+```swift
+public protocol MonitorPictureRenderer: AnyObject {
+  func encode(frame: MonitorGPUFrame, state: MonitorRenderState, target: MTLTexture,
+              viewport: MonitorViewport, into context: MonitorEncodeContext) throws
+  var status: [String] { get }
+  func invalidate()
+}
+public protocol MonitorScopeRenderer: AnyObject {
+  func wantsScopes(_ state: MonitorRenderState) -> Bool
+  func encodeScopes(frame: MonitorGPUFrame, state: MonitorRenderState, target: MTLTexture,
+                    into context: MonitorEncodeContext) throws
+}
+```
+
+`MonitorRenderState` is `{configuration: MonitorConfiguration, clean: Bool, aperture: MonitorRect?}` (`:389-399`). There is exactly one conformer, `MonitorToolsRenderer`. The seam was built so MonitorKit can slot in. It is internal to MonitorTools, though: the app never names these protocols. Only `MonitorSurfaceRenderLoop` calls them.
+
+### 1.3 One picture frame, step by step (render thread, per surface, per vsync)
+
+`MonitorSurfaceRenderLoop.metalDisplayLink(_:needsUpdate:)` (`MonitorSurfacePresenter.swift:1074-1137`):
+1. Asks `presenter.renderWork(after: versions, force: sizeChanged)` for work.
+   - It returns nil when neither the frame nor the state changed, so **an unchanged surface encodes nothing**. It still burns the vsync's drawable.
+2. `runtime.beginEncoding()` pops a pooled context.
+   - `allocator.reset()` then `commandBuffer.beginCommandBuffer(allocator:)` (`:340-344`).
+   - The pool grows only while the GPU is behind (`acquire`, `:565-585`). The new context's uniforms are added to the residency set.
+3. `runtime.gpuFrame(bundle)` maps the frame's planes through the IOSurface texture cache.
+   - That cache is already resident, so there is no per-frame residency commit.
+   - Formats: v210 = `rgba32Uint` at width/6. BGRA = `rgba8Uint`. 8-bit biplanar = `r8Uint`/`rg8Uint`. 10-bit biplanar = `r16Uint`/`rg16Uint`, high-aligned and shifted down by 6 in the shader (`MonitorFrame.swift:87-99`, `MonitorRuntime.swift:690-729`).
+4. `applyColor(signal)` sets the layer's pixel format, colour space and EDR when the shown signal's colour changes (§2), and re-attaches the layer's drawable residency set if the layer made a new one.
+5. `renderer.encode(…)` (`MonitorToolsRenderer.swift:43-100`), all on **one compute encoder**:
+   - Retains the frame's textures and pixel buffers, and the target, in the context (`frame.retainResources(in:)`, `MonitorFrame.swift:164-173`).
+   - If peaking is on, a *consumer* barrier comes first: `barrier(afterQueueStages: .dispatch, beforeStages: .dispatch)`, because the one mask is shared by this surface's in-flight frames. Then a `sourceFocus` dispatch at source resolution writes the r8 mask, then `barrier(afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device)`.
+   - Then `compose` (16×16 groups over the viewport) **writes the drawable texture directly** (`texture2d<float, access::write>`).
+   - Bindings: the one argument table is rebound between the two dispatches. Textures 0-5 are picture planes 0/1, source planes 0/1, the mask and the target. Addresses 0-1 are `context.uniform(KernelParameters)`, a 160-byte struct.
+   - This works because Metal 4 snapshots argument-table bindings at dispatch encode time; the app relies on that today.
+6. `runtime.commit(context, drawable:, completion:, kind:)` (`MonitorRuntime.swift:589-609`):
+   - `endCommandBuffer`, `queue.waitForDrawable`, then `queue.commit([cb], options:)` with a feedback handler (GPU times → `AppGPUActivity` and the presenter's statistics; the context returns to the pool).
+   - Then `queue.signalDrawable`, then `drawable.present()`.
+7. If scopes are wanted and a scope layer is in a window, the frame is parked as `scopePendingFrame`. The scope link draws it at the user's rate:
+   - Its own `CAMetalDisplayLink` on the scope layer, with `preferredFrameRateRange` = 10/15/30 Hz.
+   - Its own context and command buffer.
+   - **At most 2 scope commits in flight.** Beyond that the update is skipped and counted (`scopeSkippedBusy`). This is the one "skip when busy" left. It applies to scopes only; the picture never waits.
+
+### 1.4 Freeze (the only copy)
+
+- `MonitorToolsRenderer.encodeFreezeCopy` (`:122-170`):
+  - On the render thread, the *compute* encoder's `copy(sourceTexture:destinationTexture:)` copies the source planes, and the output planes when they are a different image, into new `.private`, `.shaderRead` textures.
+  - These are made resident at once (`metal.makeResident`).
+  - Then a producer barrier: `afterStages: .blit, beforeQueueStages: [.dispatch, .blit], visibilityOptions: .device`.
+- The presenter swaps the held producer buffer for the owned copy as soon as the copy is committed (`makeFreezeCopy`/`adoptOwnedFreeze`, `MonitorSurfacePresenter.swift:306-352`), so **a freeze never pins a capture buffer**.
+- Release: `MonitorRuntime.release(_:)` retires the copies through an empty commit; residency ends about 1 s later (the graveyard).
+- The freeze state machine:
+  - `requestFreezeOnNextFrame` / `cancelPendingFreeze` (cancel wins).
+  - `toggleFreeze`.
+  - A "lingering" hold keeps the frozen picture on screen after unfreeze until the next live frame, so there is no black flash.
+  - It keeps the configuration captured at freeze time.
+
+### 1.5 CAMetalLayer configuration
+
+| Layer | Settings (file:lines) |
+| --- | --- |
+| Picture (`MonitorPictureNSView`, `MonitorSurfacePresenter.swift:840-908`) | `framebufferOnly = false` (compute writes it). `maximumDrawableCount = 3`. `isOpaque = true`. Actions disabled. `device = runtime.layerDevice`. Initial colour `MonitorPictureColor.rec709.apply`. `contentsScale` = the window's backing scale. **The layer frame is the aspect-fit rectangle** of `pictureAspectRatio` (clean aperture × PAR, `:651-667`, `:866-887`); `drawableSize` = frame × scale. The display link runs on the render thread, `preferredFrameLatency = 2`, and is paused while the view is not drawable (occluded, minimized, hidden, closing; `MonitorVisibilityNSView`, `:781-834`) |
+| Scope (`MonitorScopeNSView`, `:912-960`) | `bgra8Unorm`. `colorspace = sRGB` (display graphics). `framebufferOnly = false`. 3 drawables. Fixed `drawableSize` 768×256 (`MonitorToolsRenderer.scopeWidth/Height`). `contentsGravity = .resize`. Not opaque |
+| Drawable residency | `layer.residencySet` is attached to the monitor queue (`runtime.attachDrawables`; held as pending until the context exists, `MonitorRuntime.swift:161-177`). It is re-attached when a pixel-format change makes a new set (`applyColor`, `:1141-1154`) and detached on `deinit` from the render thread |
+
+### 1.6 Where frames come from (the app's producers)
+
+- **Camera feeds.** `CaptureController` (`Sources/App/CaptureController.swift`):
+  - The capture queue validates and encodes each frame on `LUTProcessor`'s own `MTL4CommandQueue`, commits, and returns.
+  - The completion goes to the delivery queue in commit order (`:1042-1046`). `deliver` (`:1086-1110`) offers the **source capture buffer**, plus the **processed output buffer** when the monitor wants it, to `MonitorCaptureSink.offer`.
+  - When the monitor wants output (`needsOutput`, `MonitorCaptureSink.swift:118-127`: `pictureStage == .processedOutput`, which is the **default**, or output-stage scopes), processing is kept alive just for the monitor (`CaptureController.swift:386-388, 1001, 1008`).
+  - The output offer carries a `MonitorCorrespondence` scale (`:1102-1104`), so focus and log false colour can map back to source pixels.
+  - Frames that skip the GPU (no other consumer, or removed by the frame-rate gate) get a source-only offer **ordered behind the frames still on the GPU** with `LUTProcessor.afterCommittedFrames` (`CaptureController.swift:1069-1081`, `LUTProcessor.swift:726-737`).
+  - `monitorProcessingRevision` is bumped on a LUT load (`:294`), on reconfigure (`:532`), on a format change (`:970`) and on a pipeline change (`:989-991`). It goes into every stamp, so the presenter rejects frames from an older processing state.
+  - `setMonitorSink` (`:558-561`). Stop invalidates the sink and rejects that capture generation (`:563-590`).
+- **The sink.** `MonitorCaptureSink` (`Sources/App/MonitorCaptureSink.swift`, 353 lines, `@unchecked Sendable`) runs on the delivery queue:
+  - Stamps each frame with `MonitorFrameStamp` (target, generation, sequence, PTS, host time, configuration revision, processing revision).
+  - Interprets the signal: the YCbCr matrix, transfer and primaries tags, the range from the pixel format or a user override, and the declared log profile. The `Interpretation` cache keeps the steady state allocation-free (`:205-257`, `:319-352`).
+  - Reads the geometry: clean aperture and pixel aspect, cached per IOSurface (`:260-300`).
+  - Then, **under the sink lock**, calls `presenter.accept(bundle, configuration:)` for every live consumer (`:192`).
+  - `MonitorCoordinatorChecks.testSteadyOffersReadColorimetryWithoutAllocating` guards the allocation-free path.
+- **Program.** `ProgramMonitorTap` (`ProgramOutputBridge.swift:423-451`):
+  - Offers the processed Program frame as both source and output, with `correspondence: nil`.
+  - That disables focus and log false colour (`MonitorToolsRenderer.swift:370-384`). The sink also forces Program's stages to `.processedOutput` (`MonitorCaptureSink.swift:91-94`).
+  - The generation is bumped on every cut, so a cut never shows a frame from the previous source.
+- **The menu bar preview** is a compact monitor surface: no scopes and no chrome (`UIAppProviders.swift:9-18`).
+
+---
+
+## 2. The colour model today (`MonitorToolsUI/MonitorPictureColor.swift`)
+
+The picture pass writes **signal-native non-linear R′G′B′**: the YCbCr matrix undone, no transfer applied, clamped to [0,1] (`MonitorTools.metal.txt:199`). The layer is then *tagged* with the signal's colour space, and Core Animation colour-matches and tone-maps, as `AVSampleBufferDisplayLayer` did.
+
+| Shown signal (`MonitorPictureColor.init(signal:)`, `:26-42`) | Space | Layer pixel format | `colorspace` | `wantsExtendedDynamicRangeContent` | `edrMetadata` |
+| --- | --- | --- | --- | --- | --- |
+| A declared camera log profile (`profileID != nil`), or no signal | rec709 | `bgr10a2Unorm` | `CGColorSpace.itur_709` | false | nil |
+| Transfer tag `ITU_R_2100_HLG` | hlg | `rgba16Float` | `itur_2100_HLG` | true | `CAEDRMetadata.hlg` |
+| Transfer tag `SMPTE_ST_2084_PQ` | pq | `rgba16Float` | `itur_2100_PQ` | true | `CAEDRMetadata.hdr10(minLuminance: 0.005, maxLuminance: 1000, opticalOutputScale: 100)` |
+| Primaries tag `ITU_R_2020`, SDR transfer | rec2020 | `bgr10a2Unorm` | `itur_2020` | false | nil |
+| Anything else (709, sRGB, linear, unknown) | rec709 | `bgr10a2Unorm` | `itur_709` | false | nil |
+
+How it is applied:
+- In its own `CATransaction` with actions disabled, from the render thread, and only when the space changes (`apply(to:)`, `:64-84`).
+- The signal is taken from the **picture stage**.
+- After a burned-in LUT, `LUTProcessor.stampAttachments` tags the output Rec.709 matrix, primaries and transfer (`LUTProcessor.swift:911-924`). So an Output picture of a LUT'd camera is a Rec.709 layer, and a Source picture of an HLG camera is an EDR HLG layer.
+
+Overlay colours:
+- They are mixed **in the signal's code space**. A zebra stripe mixes toward 1.0, and false-colour and peaking colours are code values.
+- So on a PQ layer a zebra stripe is 10,000-nit code white, and on HLG it is peak. This is today's behaviour.
+
+Tests that pin this model:
+- `MonitorToolsUITests.testPictureLayerPresentationFollowsSignalColorimetry` (`:614`)
+- `testDrawnHLGFrameSwitchesThePictureLayerToEDR` (`:662`)
+- `MonitorMetalTests.testUnknownOrHDRTransferDoesNotGetRetaggedAsSDR` (`:223`)
+
+**What MonitorKit's output colour must match for W4:**
+1. The same five-way decision, from the *stage* signal:
+   - The stage signal is the source when no LUT touched it.
+   - After a LUT it is the LUT's output encoding, Rec.709 by default, which matches `stampAttachments`.
+2. A **signal-native write mode**: no transfer conversion, so a PQ code goes out as the same PQ code into an `itur_2100_PQ` `rgba16Float` layer.
+   - Converting to extended-linear sRGB would change the look relative to today and add ALU.
+3. The same `CAEDRMetadata`.
+4. **`SignalDescription` must carry primaries.** Today it has range, matrix, siting and encoding only (`MonitorKitCore/Signal.swift:218-250`), and `MonitorFrame.signal(of:range:)` ignores `kCVImageBufferColorPrimariesKey` (`MonitorFrame.swift:214-246`). Without primaries the rec2020 row cannot be derived.
+5. Log sources stay a code-value view by default. The planned analytic S-Log3→709 transform must be opt-in, or the default picture changes.
+6. Recommended (a deliberate change): draw overlay whites at BT.2408 graphics white in HDR modes, which is 203 cd/m², about 0.58 PQ or 0.75 HLG ([ITU-R BT.2408](https://www.itu.int/rec/R-REC-BT.2408)). The alternative is to keep today's code-1.0 overlays for parity.
+
+The current MonitorKit pass writes "display-encoded SDR" and, for `*_srgb` targets, linearizes (`ARCHITECTURE.md`, Target encoding). For a 709 source that is the same R′G′B′ the app writes today. HDR is W2.
+
+---
+
+## 3. App files that consume MonitorTools
+
+`rg -n "import MonitorTools" Sources Tests Tools`: 14 sources, 3 tests and 7 tools.
+
+| File | MonitorTools symbols (lines) | Role today | W4 action |
 | --- | --- | --- | --- |
-| `Sources/App/AppSettingsStore.swift:2, 235, 242, 256, 293, 315` | `MonitorConfiguration` | `FeedDescriptor.monitorConfiguration`: per-camera tool settings, decoded leniently | `MonitorState` (Core) under a **new key**, plus a legacy decoder (§3.5) |
-| `AppSettingsStore.swift:327-328, 334-335, 341-342, 366, 378-379` | `MonitorConfiguration`, `MonitorWorkspaceState` | `AppSettingsSnapshot.programMonitorConfiguration` and `.monitorWorkspace` | `programMonitorState: MonitorState`. The workspace becomes an **app-owned** type (§3.6) |
-| `Sources/Shared/FeedRuntime.swift:4, 266-267, 281-282, 721` | `MonitorConfiguration`, `MonitorWorkspaceState` | `FeedCoordinator` holds the Program monitor config and the workspace, and writes them back into the snapshot | Same fields, retyped to `MonitorState` and the app-owned workspace type |
-| `Sources/App/AppModel.swift:2, 152` | `MonitorTargetID` | `monitorDemand: Set<MonitorTargetID>` | App-owned `MonitorTargetID` (§3.6) |
-| `AppModel.swift:203-207` | `MonitorTargetID`, `MonitorConfiguration` | Builds `MonitorCoordinator` from the snapshot, with "program" as a target | Same, with `MonitorState` |
-| `AppModel.swift:235-262` | — | `onConfigurationChange` writes back into the descriptor. Also `onWorkspaceChange`, `onDemandChange` (into `reconcileAutomaticFeed`) and `onPreviewEnabledChange` | Same callbacks; retype the payload |
-| `AppModel.swift:886, 893, 1050, 1069, 1100, 1198, 1258` | `MonitorTargetID` | `setMonitorSink`, `sourceStateChanged`, Program and preview demand, `setPreviewEnabled` | `setMonitorSink` becomes `setFeedMonitor(FeedMonitor?)` (§3.3). The others keep their shape |
-| `Sources/App/CaptureController.swift:5, 106-110` | `MonitorCaptureSink` (app type) | Monitor sink, sequence and `monitorProcessingRevision` / `monitorPipelineConfiguration` | One `FeedMonitor?`. `processingRevision` goes away: output-stage pixels are computed in the monitor pass from the same `MonitorLUT` |
-| `CaptureController.swift:244, 473, 898, 918-921` | — | Bumps `monitorProcessingRevision` on LUT load, reconfigure and format change | Delete. A LUT change becomes `feedMonitor.setBurnInLUT(_:)` |
-| `CaptureController.swift:499-502, 516-528` | — | `setMonitorSink` and the stop-path lifecycle sink | `setFeedMonitor`. On stop: `feedMonitor.clear()` |
-| `CaptureController.swift:924-931` | — | `reportCriticalPipeline`, plus the **early source-only offer** | One `feedMonitor?.publish(source: input, pts:, sequence:)`. Delete critical-pipeline reporting (GPU plan §3 retire list) |
-| `CaptureController.swift:935, 938, 940-941, 973-975` | — | `needsOutput` keeps processing alive for monitor output; `reportCriticalPipeline` | Delete `hasMonitorOutput`. The monitor needs only the source |
-| `CaptureController.swift:980-986` | `MonitorCorrespondence` | The **paired source+output offer**, with a scale correspondence | Delete. No processed-output tap for camera monitors (§3.2) |
-| `Sources/App/MonitorCaptureSink.swift` (all 346 lines) | `MonitorRuntime`, `MonitorCriticalPipelineProducer`, `MonitorSurfacePresenter`, `MonitorConfiguration`, `MonitorFrameStamp`, `MonitorFrameBundle`, `MonitorDisplayResult`, `MonitorGeometry`, `MonitorRect`, `MonitorFrameSignal`, `MonitorCodeRange`, `MonitorYCbCrMatrix`, `MonitorCorrespondence` | Capture-side endpoint. Try-locks and drops at 123, 147, 182-185, 197-204, 215-218, 263 and 288. Clean-preview fallback at 237-248. `geometry()` at 295-326, `signal()` at 328-345 | **Replace the file** with `FeedMonitor` (§3.3). `signal()` becomes `MonitorFrame.signal(of:range:)` plus the feed's declared log encoding. `geometry()` becomes `MonitorFrame.wrap` (it reads the PAR). Clean aperture has no MonitorKit equivalent yet (API ask) |
-| `Sources/App/MonitorCoordinator.swift` (281) | `MonitorRuntime` (27, 51-58), `MonitorSurfacePresenter` (31, 174-189), `MonitorTargetOption` (19, 119-126), `MonitorDiagnostics` (26, 61-70), `MonitorWorkspaceState` (11-18), `MonitorConfiguration` (20, 72-99), `MonitorTargetID` | Main-actor control: configs per target, `copySettings` (84-99), preview enable (101-114), `updateTargets` (116-164), `captureSink` (166-172), surfaces (174-216), `refreshSink` with scope-Hz cap (218-233), demand (235-245), `offerProgram` (267-280) | **Rewrite in place** with the same public surface the UI uses: `configuration(for:)` becomes `state(for:)`, plus `copySettings`, `targets`, `workspace`, demand and preview enable. It owns `MonitorEngine` (contract) and the `FeedMonitor`s. Delete runtime admission, the scope-Hz cap (`preferredHz`) and presentation admission |
-| `Sources/App/MonitorWorkspaceView.swift` (317) | `MonitorTileChrome` (43, 283), `MonitorSurfaceVisibility` (55, 60), `MonitorPictureZoom` (59, 79), `MonitorNativePicture` (65), `MonitorGuideOverlay` (73), `MonitorDiagnosticsView` (157), `MonitorNativeScope` (170), `MonitorScopeGraticule` (171), `MonitorSurfacePresenter` (11) | Detached monitor windows only: `MonitorDetachedWindows` (224), `MonitorWindowOwner` (249), `DetachedMonitorContent` (264). The tile chrome brings MonitorToolsUI's toolbar and false-color legend (`MonitorWorkspaceShell.swift:176, 189`) | The `MonitorSurface` view (CAMetalLayer) or `MonitorKitUI.MonitorMetalView` (contract). Legends become MonitorKitUI legends (contract). Guides are drawn in-shader, so delete the SwiftUI overlay. Zoom becomes `MonitorState.geometry.magnification` (GPU) |
-| `Sources/App/UIAppProviders.swift` (181) | `MonitorConfiguration` (35-40, 70-71, 86-89), `MonitorTargetID`, `MonitorSurfacePresenter` (63), `MonitorSurfaceVisibility` (99, 102), `MonitorGuideOverlay` (105, 113), `MonitorNativePicture` (111), `MonitorNativeScope` (125), `MonitorScopeGraticule` (126) | All in-window pictures: the native `VideoPreview` for the selected camera when no tool alters pixels (80-84, 101), a monitor surface otherwise, scopes, the Program toolbar (139-146), registration (171-180) | Every picture becomes a `MonitorSurface`. `usesNativePreview` goes (step 9 in §6.3). Remove the guide overlays (in-shader now) and presentation admission (117-120) |
-| `Sources/App/UISupport.swift:4-5, 86-181` | `MonitorSurfacePresenter` (89-101), `MonitorConfiguration` (103-158), `SonySLog3FalseColor`/`ELZoneProfile` (142-149), `MonitorTargetID` | `UIMonitorBridge`: the presenter registry, `activeTools`, `sourceProfile(forGamut:)`, `toggled` (master-switch logic 126-133, 155-156), freeze/clean/detach (167-181) | Retarget to `MonitorState`: `.zebras[0].enabled`, `.falseColor.mode`, and so on. `SonySLog3FalseColor` and `ELZoneProfile` keep their names in MonitorKitCore (`Reference/`). The registry holds `MonitorSurface`s |
-| `Sources/App/UIMonitorTools.swift` (349) | `MonitorConfiguration`, `MonitorZebraMode`, `MonitorPeakingColor`, `MonitorScopeMode`, `MonitorStage`, `MonitorFalseColorMode`, `MonitorCodeRange`, `MonitorSourceLogMapping`, `SonySLog3FalseColor`, `ELZoneProfile` | `UIMonitorToolButtons` (6-87). `UIMonitorToolSettingsView` (130-349) binds every field (179-266); `falseColorMode` (292-313); `sourceProfile` (315-336) | Bind to `MonitorState` (field map in §3.5). Signal settings (250-257) move to a per-feed signal editor. Or adopt the MonitorKitUI SwiftUI controls (contract) |
-| `Sources/App/UIContext.swift:2, 20-21, 89-102` | `MonitorConfiguration` | `UIMonitorSettingsProviding` protocol; `UIFixtureMonitorSettings` | Retype to `MonitorState` |
-| `Sources/App/UISessionBridge.swift:2, 142-143, 371-378` | `MonitorTargetID`, `MonitorConfiguration` | `activeTools` in the snapshot; reset and copy actions | Retype |
-| `Sources/App/UIDiagnostics.swift:2, 101, 174-215` | `MonitorDiagnostics` | `UIDiagnosticsMonitorSection`: offered/picture/scope fps, quality tier, admitted/skipped counts, memory, GPU deadline | New rows: presented fps, late vsyncs, GPU ms per pass, `MonitorStatus` reasons (contract). Delete tier, stride, admission and deadline rows (no skip rules) |
-| `Sources/App/UICameraColumn.swift:1-2, 64, 262-285` | `MonitorPictureZoom`, `MonitorStage` | SwiftUI zoom of the picture; the "Picture: Output / Source" menu | Zoom becomes `geometry.magnification`. **Picture stage has no `MonitorState` field** (gap, §3.5) |
-| `Sources/App/UICommands.swift:227-242`, `UIMenuBar.swift`, `UILiveRoot.swift:11, 17, 43` | via `UIMonitorBridge` / `MonitorCoordinator` (app types) | Freeze, Clean View and the tool menu | Unchanged call sites once `UIMonitorBridge` is retargeted |
-| `Sources/App/UISettings.swift:632-650` | — | Monitor pane text: "Under heavy load, new monitor analysis pauses…" (648) | Rewrite the text: the GPU plan removes skip rules |
-
-### 1.2 Tests, Tools, scripts, project
-
-| File:lines | Use | Action |
-| --- | --- | --- |
-| `Tests/MonitorCoordinatorChecks.swift:3-4` (14 tests) | `MonitorConfiguration`, `MonitorTargetID`, `CleanPreviewService`, `MonitorDisplayResult`, `MonitorFrameBundle`, `MonitorFrameStamp`, `MonitorWorkspaceState` | §3.7 |
-| `Tests/MonitorLifecycleChecks.swift:2, 6-35` | Snapshot defaults and round-trip | Retarget to `MonitorState` keys and add a migration test (§3.7) |
-| `Tests/CaptureRecordingIsolationChecks.swift:4-6` | `MonitorRuntime`, `MonitorSurfacePresenter`, `MonitorCaptureSink` (132-240, 242-340, 342-433, 435-522, 524-670, 883-) | §3.7 |
-| `Tools/CameraSmoke/main.swift:8-9, 377-420` | `MonitorComparison` (`--monitor` mode) builds `MonitorRuntime` bundles | Rewrite over `MonitorFeed`/`MonitorPass` (contract), or drop `--monitor` |
-| `Tools/MonitorAppIntegration/main.swift:2, 19-39, 86` | `MonitorTargetID`, `MonitorWorkspaceState` | Retype to the app-owned types |
-| `Tools/UIVerify/main.swift:2` | `MonitorConfiguration` fixtures; Monitor settings pane (498) | Retype |
-| `Tools/MonitorToolsSmoke`, `Tools/MonitorToolsRecording` (+`PipelineAdmission.swift`, `QualificationMetrics.swift`), `Tools/MonitorToolsRecordingTests`, `Tools/MonitorToolsBenchmark` | Qualification harnesses for the old runtime: ledger, admission, clean preview | Retire with the package. MonitorKit's own GPU-timing and contract tests replace them |
-| `scripts/monitor-tools-package.sh:4, 14, 21-23, 28` | Builds the 3 products, sets `monitor_link_args`, copies `MonitorToolsMetal.bundle` | Rename or replace (§4.2) |
-| `scripts/test.sh:21-27, 53, 60` | Package build, `swift test` of MonitorTools, link args; compiles `MonitorCoordinator.swift` and `MonitorCaptureSink.swift` | Point at MonitorKit. Update the source list after §3 |
-| `scripts/ui-verify.sh:21-22` | Input hash walks `Packages/MonitorTools/Sources` (`*.swift *.metal *.txt …`) | Walk `Packages/MonitorKit/Sources` **and add `*.msl`**, or shader edits will not invalidate the cache |
-| `scripts/ui-typecheck.sh:16-21`, `monitor-app-integration.sh:19-25, 45`, `camera-smoke.sh:29-31` | `monitor_package_build` and link args | Follow §4.2 |
-| `scripts/camera-smoke.sh:36`, `scripts/monitor-tools-recording.sh:24` | Compile `Sources/Shared/CubeLUT.swift` by path | Remove the path once the file is deleted (§2.6) |
-| `scripts/monitor-tools-{smoke,recording,benchmark,admission-checks,stress}.sh`, `scripts/monitor-tools-fingerprint.py:14-20` | Old harnesses and receipt fingerprints | Retire |
-| `scripts/validate_bundle.py:59-64` | Requires `*MonitorToolsMetal.bundle` with `MonitorTools.metal.txt`; forbids "MonitorTools" in the extension | Require `*MonitorKit_MonitorKit.bundle` with `Shaders/MKLUT.msl`, `MKDecode.msl` and `MKMonitor.msl`, plus the `MonitorKitScopes` bundle once it has resources. Forbid "MonitorKit" in the extension |
-| `scripts/generate_project.py:87-89, 95, 114, 125` | `XCLocalSwiftPackageReference` and 3 product dependencies, app target only | §4.1 |
-| `Ultracam.xcodeproj/project.pbxproj:555-575, 954-962, 1047, 1097` | Generated output of the above | Regenerate; never hand-edit |
+| `Sources/App/MonitorCaptureSink.swift` (all) | `MonitorRuntime`, `MonitorSurfacePresenter`, `MonitorConfiguration`, `MonitorFrameStamp`, `MonitorFrameBundle`, `MonitorFrameSignal`, `MonitorGeometry`, `MonitorRect`, `MonitorCodeRange`, `MonitorYCbCrMatrix`, `MonitorCorrespondence` | Delivery-queue endpoint (§1.6) | **Rewrite as `MonitorFeedHost`** (§6.2). Keep the stamp, out-of-order, generation and allocation-free colorimetry logic. Signal → `SignalDescription`. Delete `needsOutput`, the output buffer and the correspondence |
+| `Sources/App/MonitorCoordinator.swift` (286) | `MonitorRuntime` (26, 48-56), `MonitorSurfacePresenter` (31, 205-215), `MonitorTargetOption` (17, 150-157), `MonitorDiagnostics` (24, 59-103), `MonitorWorkspaceState` (9-16), `MonitorConfiguration` (18, 105-132) | Main-actor control: configurations per target, `copySettings` (117-132, which keeps the destination's calibration), preview enable, `updateTargets`, `captureSink`, surface registry, `refreshSink` (242-253), demand (255-265), `sourceStateChanged` | **Retype in place.** Same public surface: `state(for:)` replaces `configuration(for:)`, and `targets`, `workspace`, demand and preview enable stay. Owns the GPU context, the `MonitorEngine` and the feed hosts |
+| `Sources/App/MonitorWorkspaceView.swift` (285) | `MonitorTileChrome` (29, 251), `MonitorSurfaceVisibility` (39), `MonitorNativePicture` (44), `MonitorGuideOverlay` (52), `MonitorPictureZoom` (58), `MonitorDiagnosticsView` (132), `MonitorNativeScope` (144), `MonitorScopeGraticule` (145) | Workspace tiles and detached monitor windows (`MonitorDetachedWindows` 192, `MonitorWindowOwner` 217) | Swap to the app-owned picture and scope views. Delete the guide overlay (MonitorKit draws guides in-shader). Zoom → `geometry.magnification`. The chrome, legend and toolbar come from MonitorKitUI or app ports |
+| `Sources/App/UIAppProviders.swift` (150) | `MonitorConfiguration` (34-39, 69-77), `MonitorTargetID`, `MonitorSurfacePresenter` (62), `MonitorSurfaceVisibility` (83), `MonitorNativePicture` (86), `MonitorGuideOverlay` (88), `MonitorNativeScope` (97), `MonitorScopeGraticule` (98) | Every in-window picture, Program's toolbar, registration (142-149) | Same structure on the new views. Remove the `MonitorGuideOverlay` and `MonitorScopeGraticule` overlays. Registration semantics are unchanged |
+| `Sources/App/UISupport.swift` (86-208) | `MonitorSurfacePresenter`, `MonitorConfiguration`, `SonySLog3FalseColor`, `ELZoneProfile`, `MonitorTargetID` | `UIMonitorBridge`: the presenter registry, `activeTools` (102-111), master-switch emulation in `toggled` (122-157), freeze, clean and detach (165-181) | Retarget to `MonitorState` plus app-side scope prefs (§5). The master switch (`toolsEnabled`) no longer exists, so `toggled` loses the master logic |
+| `Sources/App/UIMonitorTools.swift` (349) | `MonitorConfiguration`, `MonitorZebraMode`, `MonitorPeakingColor`, `MonitorScopeMode`, `MonitorStage`, `MonitorFalseColorMode`, `MonitorCodeRange`, `MonitorSourceLogMapping`, `SonySLog3FalseColor`, `ELZoneProfile` | Tool buttons (6-87); the settings popover binds every field (178-266) | Bind to `MonitorState`, the per-feed signal declaration and the scope prefs. Zebra width becomes a half-width. Offset stepper range is −6…6 |
+| `Sources/App/UICameraColumn.swift` | `MonitorPictureZoom` (64; zoom `@State` 45, picker 300-308), `MonitorStage` (262-285, the "Output (as published) / Source (camera signal)" menu) | Picture zoom and picture stage | Zoom → ephemeral `geometry.magnification`. **The picture stage has no MonitorKit field** (§7, item 1) |
+| `Sources/App/UIContext.swift` (19-21, 89-101) | `MonitorConfiguration` | `UIMonitorSettingsProviding`; fixtures | Retype |
+| `Sources/App/UISessionBridge.swift` (142-144, 371-382) | `MonitorTargetID`, `MonitorConfiguration` | `activeTools` in the snapshot; reset and copy actions | Retype |
+| `Sources/App/UIDiagnostics.swift` (101, 174, 223-260) | `MonitorDiagnostics`, `MonitorAvailability` | "Monitoring" section: source rate, presented fps, scope fps, offered/presented, superseded, scope skips, GPU ms, failures | Keep the rows. `MonitorDiagnostics` becomes app-owned. Optionally add `MonitorStatus` reasons |
+| `Sources/App/AppModel.swift` (2, 188-189, 231, 259-263, 291-328, 615, 637, 773, 1035, 1042, 1194, 1213, 1245, 1387, 1447) | `MonitorTargetID`, `MonitorConfiguration` (through the coordinator) | Builds the coordinator from the snapshot; callbacks write back into the descriptors; `setMonitorSink`; demand into `reconcileAutomaticFeed`; Program tap | Retype. The `setMonitorSink` call (1035) takes the feed host. The LUT load path also hands the `MonitorLUT` to the feed (§4.4) |
+| `Sources/App/AppSettingsStore.swift` (2, 235, 242, 256, 291-315, 327-328, 334-342, 366-379) | `MonitorConfiguration`, `MonitorWorkspaceState` | Persistence (§5) | New keys plus a legacy decoder (§5.3) |
+| `Sources/Shared/FeedRuntime.swift` (4, 207, 744-763, 1233) | `MonitorConfiguration`, `MonitorWorkspaceState` | `FeedCoordinator.programMonitorConfiguration` and `monitorWorkspace`; `onMonitorFrame` for Program | Retype to the app-owned types in `Sources/Shared/MonitorWorkspace.swift` (Shared, because `FeedRuntime` is in Shared; the camera extension does not compile `FeedRuntime`) |
+| `Sources/App/CaptureController.swift` (5, 145-149, 294, 386-388, 532, 558-590, 970, 989-1041, 1069-1110, 1323-1326) | `MonitorCaptureSink`, `MonitorCorrespondence` | §1.6 | §6.2 step 6 |
+| `Sources/App/ProgramOutputBridge.swift` (423-451) | `MonitorCaptureSink` (app type) | `ProgramMonitorTap` | Offer the source only (no output twin) |
+| `Sources/App/UISettings.swift` (635-656) | — | Monitor pane text. Line 648: "Under heavy load, new monitor analysis pauses…" | Rewrite: only the scope skip-when-busy remains, and MonitorKit's scopes run at the host rate |
+| `Tests/MonitorCoordinatorChecks.swift` (14 tests), `Tests/MonitorLifecycleChecks.swift` (2 monitor tests), `Tests/CaptureRecordingIsolationChecks.swift` (121, 285, 362, 720) | sink, presenter, runtime, configuration | §8 | Retarget or delete (§8.1) |
+| `Tools/MonitorAppIntegration/main.swift`, `Tools/UIVerify/main.swift` | `MonitorTargetID`, `MonitorWorkspaceState`, `MonitorConfiguration` | Real `AppModel` with `hardware: .offline` (`MonitorAppIntegration/main.swift:40-42`, `UIVerify/main.swift:394-396`) | Retype; keep `.offline` |
+| `Tools/CameraSmoke/main.swift:380-460` (`MonitorComparison`), `Tools/MonitorToolsSmoke`, `Tools/MonitorToolsRecording` (+`MonitorGPUWorkload.swift`), `Tools/MonitorToolsRecordingTests`, `Tools/MonitorToolsBenchmark` | `MonitorRuntime`, `MonitorToolsRenderer`, `renderSnapshot` | Qualification harnesses | Rewrite `--monitor` over MonitorKit or drop it. Retire the `MonitorTools*` tools; MonitorKit's own benchmarks replace them |
 
 ---
 
-## 2. The LUT path today, and the swap to `MonitorLUT` + `mk_applyLUT`
+## 4. The LUT path
 
-### 2.1 Data and persistence
+### 4.1 The parser (`Sources/Shared/CubeLUT.swift`, 138 lines)
 
-- **Parser:** `Sources/Shared/CubeLUT.swift`.
-  - Internal `struct CubeLUT`: `title`, `dimension` (2…65), `domainMin`/`domainMax`, and `rgba` (red fastest, alpha = 1, 4 floats per entry), plus `data`.
-  - `Packages/MonitorKit/Sources/MonitorKitCore/CubeLUT.swift` is the **same parser, made public**. `diff` shows only `public`, `Equatable` and doc comments differ, and the `ParseError` case is the same.
-- **File access** is in `AppSettingsStore.swift:458-520`:
-  - `LoadedLUT {cube, bookmark, fileName}` and `actor LUTFileLoader`.
-  - `load(url:)` (471-478) makes a **security-scoped bookmark** (`.withSecurityScope, .securityScopeAllowOnlyReadAccess`), or `.minimalBookmark` when `scopedBookmarks == false` (tests).
-  - `restore(bookmark:)` (480-492) resolves it with `.withSecurityScope, .withoutUI` and re-creates the bookmark if it is stale.
-  - `read` (494-520) checks for a regular file, a 32 MB bound on both stat and read, and UTF-8.
-  - The access window spans the read only.
-  - Entitlements: `Config/App.entitlements`, `files.user-selected.read-write` and `files.bookmarks.app-scope`.
-- **What is persisted:**
-  - `FeedDescriptor.lutBookmark: Data?` and `FeedDescriptor.applyLUT: Bool` (`AppSettingsStore.swift:225, 232`; decoded at 305 and 312). They live inside `AppSettingsSnapshot`, which is JSON under defaults key `ultracam.settings.v2` (389, written at 434-442).
-  - The legacy v1 `AppSettings` (`ultracam.settings.v1`, 198-216) carries the same two fields and is migrated at 411-427.
-  - LUT *contents* are never persisted (383-384).
-  - The installed app keeps this in its sandbox container. The Debug build uses `~/Library/Preferences/org.ultracam.app.plist`.
+- An internal `struct CubeLUT: Sendable`:
+  - `title`, `dimension` (2…65), `domainMin`/`domainMax`, `rgba` (red fastest, alpha 1), `data`.
+  - **3D only:** a 1D or shaper table throws "1D/shaper LUTs are unsupported" (`:110`). `Tests/main.swift:66` asserts that `LUT_1D_SIZE` throws.
+- `MonitorKitCore.CubeLUT` (`Packages/MonitorKit/Sources/MonitorKitCore/CubeLUT.swift`) is the same parser, made public and `Equatable`, plus:
+  - 1D and shaper + 3D tables (`shaper`, `shaperDomainMin/Max`, `shaperSize`)
+  - `hasCube`, where `dimension == 0` for a 1D-only table
+  - `LUT_3D_INPUT_RANGE`
+- **Name collision.** The app's module-internal `CubeLUT` shadows the imported one. Delete the app file in the same change that adds the import; never keep both.
+- File access: `LoadedLUT` and `actor LUTFileLoader` (`AppSettingsStore.swift:458-520`), with security-scoped bookmarks, a 32 MB bound and UTF-8 only. Unchanged by W4.
 
-### 2.2 Control flow: settings and UI → `PipelineConfiguration` → GPU
+### 4.2 `LUTProcessor.swift` and `LUTShaders.metal` now
 
-- **`PipelineConfiguration`** (`Sources/Shared/VideoContract.swift:122-141`):
-  - `applyLUT`, `downscale`, `convertTo420`, `reduceFrameRate`, `inputFast`.
-  - `untouched` = `!applyLUT && !downscale && !convertTo420` (137).
-  - The descriptor builds it at `AppSettingsStore.swift:268-271`.
-- **Selected camera (AppModel):**
-  - Init restores `configuration` with `applyLUT = false` until the GPU upload succeeds (`AppModel.swift:308-335`, especially 313), then `restoreLUT(bookmark:)` (335, 382-397).
-  - `chooseLUT(feedID:)` (362-380) runs `NSOpenPanel` for `.cube`, then `LUTFileLoader.load`.
-  - `uploadLUT` (399-432) calls `controller.load(cube)`. On success it sets `lutLoaded` and `lutBookmark`, `configuration.applyLUT = enable` (424) and `lutTitle`/`lutFileName`.
-  - `configuration.didSet` (99-105) saves and calls `reconfigure()` (670-674).
-  - `effectiveConfiguration` (664-668) masks `applyLUT && lutLoaded`.
-  - `forgetLUT` (1278-1296).
-  - Known bug (GPU plan line 107): `chooseLUT` for a non-selected camera drops the selected camera's in-flight restore (the `lutLoadGeneration` guard at 403 and 408).
-- **Other cameras (headless):**
-  - `restoreHeadlessLUT` (932-969) loads the cube into that feed's controller, then `feedCoordinator.reconfigureCapture(…applyLUT: true)` (`FeedRuntime.swift:529`). Failure handling is at 971-980.
-  - It is called on selection change (580-600), on start (702-712, 1088-1093, 1178-1183, 1265-1271) and from `updateCamera` (1215-1250).
-- **Capture queue:**
-  - `CaptureController.load(_:expectedGeneration:completion:)` (`CaptureController.swift:235-251`) creates the `LUTProcessor` lazily and calls `processor.load(cube)`.
-  - `effectiveConfiguration(inputFast:)` (653-658) turns everything off when processing is off.
-  - `ensurePrepared` (660-666) re-warms when `applyLUT` changes.
-  - `process()` (957-970) calls `LUTProcessor.process`.
-- **UI:**
-  - Effect chip 0, "LUT" (`UIPresentation.swift:444-445, 561-566`), is enabled only when `lutName != nil`. It sends `.setEffect(id, 0, on)` (`UISessionBridge.swift:289-299`), which writes `descriptor.applyLUT`.
-  - The snapshot fills `effects[0]`, `lutName`, `lutLoading` and `lutError` (`UISessionBridge.swift:124-130`).
-  - Inspector `lutSection` (`UIInspector.swift:147-178`): Load/Change… and the input gamut.
-  - ⌘O (`UICommands.swift:39-40`), the menu bar item (`UIMenuBar.swift:420`), and "LUT unavailable · Locate…" (`UICameraColumn.swift:499-520`, 611).
-  - "Forget Saved LUTs" (`UISettings.swift:663-732`).
-- **Program and contracts:**
-  - The LUT never changes the camera format. `FeedLifecycleDemandPolicy.programContract` (`AutomaticFeedPolicy.swift:8-14`) passes `applyLUT` through.
-  - `programFormatMismatch` clears it (`AppModel.swift:1316-1330`).
-  - `ProgramOutputBridge.reconnectLocked` builds a default `applyLUT = false` contract (`ProgramOutputBridge.swift:205-226`), and `sameContract` ignores it (229-235).
+- **Is `LUTShaders.metal` a verbatim copy of `MKLUT.msl`?** It is a verbatim copy of an **older** `MKLUT.msl` (lines 11-63, under the same `MK_LUT_MSL` guard). It differs from the current file (`diff`, comments ignored):
 
-### 2.3 `LUTProcessor` and the kernels at HEAD (superseded in the working tree, §2.3a)
-
-- `LUTProcessor.init` (`LUTProcessor.swift:68-95`):
-  - Creates its **own** `MTLDevice` and queue (69-73).
-  - Compiles `LUTShaders.metal` **from source at runtime** with `options: nil` (78-81). Overrides: `ULTRACAM_METALLIB` (75-76) and `ULTRACAM_SHADER` (78).
-  - Builds pipelines for six kernels (84-87).
-  - Allocates a 16-byte placeholder `cubeBuffer` (89-92).
-  - The shader ships as a copied resource, not compiled by Xcode (`generate_project.py:108-109`, "Copy GPU Shader Source").
-- `load(_ cube:)` (97-104): `makeBuffer(bytes: cube.data)`, an `rgba32Float` lattice in a flat `MTLBuffer`.
-- `process` (291-454):
-  - Throws "Load a LUT or turn off Apply LUT." when `applyLUT && cube == nil` (300). `EndToEndChecks.swift:104-122` tests this.
-  - `Parameters` (58-66, mirrored at `LUTShaders.metal:4-12`) **overloads LUT fields** (315-321):
-    - `geometry.w` = cube dimension
-    - `domainLow.xyz` = DOMAIN_MIN
-    - `domainLow.w` = **chroma offset** (read at `LUTShaders.metal:38` and `:66`)
-    - `domainScale.xyz` = 1/(max−min)
-    - `options.x` = applyLUT
-  - `encodeMatrix` switches to Rec.709 when the LUT is applied (320), and so do the output colour tags (438-452).
-  - Dispatch:
-    - `packedLUT` (v210 through the texture cache, 339-359): `texture(3)` = groups, `texture(2)` = full-res `rgba32Float`, `buffer(0)` = cube, `buffer(1)` = params.
-    - `planarLUT` (360-369): `texture(0)` = Y, `texture(1)` = UV, `texture(2)` = out, same buffers.
-    - Then `lanczosHorizontal`/`lanczosVertical` (371-384) and `encodeNV12`/`encode422` (385-388, `buffer(1)` only).
-- `LUTShaders.metal:14-25` `lookup()`: manual trilinear with 8 buffer reads; x, then y, then z; `mix`. It is called at 41 (planar) and 69 (packed) on `decode(...)` (27-31).
-
-### 2.3a Working tree (ultracam-18, uncommitted): the fused LUT is mostly done
-
-The in-progress rewrite already does most of §2.4, in app-owned form.
-
-**`LUTShaders.metal` (WT):**
-- Lines 1-60 hold a **verbatim copy of `MKLUT.msl`**, including the `MK_LUT_MSL` guard.
-- `Parameters` (WT :63-74) now has a dedicated `chroma` row (the chroma offset no longer lives in `domainLow.w`) and embeds `mk_LUTParams lut`.
-- `graded()` (WT :134-136) calls `mk_applyLUT(source.pixel(x, y, p), lut, p.lut)`.
-- Eight fused kernels, each with `lut [[texture(2)]]` and `Parameters [[buffer(0)]]`:
-  - `fullPackedNV12`, `fullPacked422`, `fullPlanarNV12`, `fullPlanar422`: decode + LUT + encode in one pass, no downscale (WT :177-196)
-  - `horizontalPacked`, `horizontalPlanar`: decode + LUT + horizontal Lanczos (WT :233-241)
-  - `verticalNV12`, `vertical422` (WT :258-269)
-
-**`LUTProcessor.swift` (WT):**
-- Still `MTLCreateSystemDefaultDevice()` per processor (:179).
-- Uses `MTL4CommandQueue` (:182-185) and `MTL4Compiler` + `MTL4LibraryDescriptor` with **no `options` set** (:187-199).
-- Uses argument tables (:215-231), residency sets (:236-246) and `MTL4CommitOptions` (:668-674).
-- Still `cube: CubeLUT?` plus an app-made `lutTexture` (:101-102). `makeLUTTexture` (:255-273) is a `type3D rgba32Float`, `.shared`, `.shaderRead` texture uploaded with `bytesPerRow n*16` and `bytesPerImage n*n*16`. That is **byte-for-byte the same texture `MonitorLUT` builds** (`MonitorLUT.swift:31-47`).
-- A 2³ identity placeholder is bound when off (:240-243).
-- `load` waits for in-flight frames before swapping (:275-284).
-- The LUT fields are filled by hand (:470-480). `lutShape.y = 1` is hard-coded trilinear, and `lutShape.z = applyLUT`.
-
-**Consequence:** the Metal 4 APIs need macOS 26, so the app now needs the 26.0 target on its own, independent of MonitorKit.
-
-### 2.4 The swap: same pass, `texture3d` + `mk_applyLUT`
-
-This is the fused tier: decode, resize, depth and frame rate stay in `LUTProcessor`; only the LUT math and resource change.
-
-**Against the working tree (§2.3a), the remaining delta to MonitorKit is small:**
-1. **Replace the verbatim copy with the library source.** Prepend `try MonitorShaders.source([.lut])` to `descriptor.source` (WT `LUTProcessor.swift:195`).
-   - The include guard makes prepending safe even before the copy is deleted from `LUTShaders.metal` (WT :1-60).
-   - Alternatively keep the copy and add a drift test that asserts it equals `MKLUT.msl`.
-   - `ULTRACAM_METALLIB` (WT :189-190) needs the same concatenation at metallib build time.
-2. **Make the texture a `MonitorLUT`.**
-   - `cube` + `lutTexture` + `makeLUTTexture` (WT :101-102, 255-284) become `lut: MonitorLUT?`. The residency calls take `lut.texture`.
-   - The placeholder (WT :240-243) becomes a `MonitorLUT` of an identity 2³ cube, or stays as is.
-   - The numerics do not change, because the texture is identical.
-   - Build the `MonitorLUT` with `interpolation: .trilinear` **once per file load** and share the instance with the monitor feed (§3.4).
-   - Keep a `load(_ cube: CubeLUT)` convenience for the tests that call `controller.load(CubeLUT)`.
-3. **Take the parameters from the `MonitorLUT`.** WT :478-480 (`lutDomainLow`, `lutDomainScale`, `lutShape`) becomes `lut.parameters` (`LUTParameters` has the same 3×16-byte layout as `mk_LUTParams`), with `shape.z = 0` when `applyLUT` is off, or `LUTParameters.disabled`. The interpolation mode then comes from `MonitorLUT.interpolation` instead of a hard-coded 1.
-4. **Align the compile options** with `MonitorShaders.makeLibrary` (`mathMode = .safe`, MSL 4.0 or 4.1, `MonitorShaders.swift:31-38`). Set them on `MTL4LibraryDescriptor.options` (unverified: check that `MTL4Compiler` honours `mathMode`) so the output and monitor passes compile the same `mk_applyLUT` the same way (§2.5). A public `MonitorShaders.compileOptions` would be a useful API ask.
-5. **Swap `CubeLUT`** (§2.6) and **share the device** (§3.2).
-
-**For reference, the original plan against HEAD** (still valid if the working-tree rewrite is abandoned):
-
-**`Sources/App/LUTShaders.metal`**
-1. Delete `lookup()` (14-25).
-2. `planarLUT` (33-35): add `texture3d<float, access::sample> lut [[texture(4)]]`. Replace `device const float4 *cube [[buffer(0)]]` with `constant mk_LUTParams &lutParams [[buffer(0)]]`. Line 41 becomes `mk_applyLUT(decode(luma, c, p), lut, lutParams)`.
-3. `packedLUT` (55-56, 69): the same change. `texture(4)` is free; `texture(0..3)` are taken.
-4. Keep `Parameters` as it is so the decode and encode kernels don't move. `domainLow.w` stays the chroma offset. Optionally rename it (for example `float4 chroma`) in both the Swift and MSL structs. Leave `geometry.w`, `domainLow.xyz`, `domainScale.xyz` and `options.x` at zero, or remove them in a follow-up.
-
-**`Sources/App/LUTProcessor.swift`**
-1. Add `import MonitorKit`, which re-exports `MonitorKitCore` (`MonitorKit.swift:1`).
-2. Library (74-82): `source = try MonitorShaders.source([.lut]) + "\n" + String(contentsOf: url)`.
-   - `MKLUT.msl` is self-contained and include-guarded (`MK_LUT_MSL`, :7-8); duplicating `#include <metal_stdlib>` is harmless.
-   - **Choose the compile options deliberately (§2.5):** keep `device.makeLibrary(source:options: nil)` for exact equality with today's output, or use `MonitorShaders.makeLibrary(device:parts:[.lut], extra:)` so the output and monitor passes share `mathMode = .safe` and MSL 4.0 (`MonitorShaders.swift:31-39`).
-   - `ULTRACAM_METALLIB` (75-76): an offline metallib must be built from `MKLUT.msl` + `LUTShaders.metal` concatenated.
-3. Replace `cube: CubeLUT?` and `cubeBuffer: MTLBuffer` (46-47, 89-92) with `lut: MonitorLUT?` and `placeholderLUT: MonitorLUT`. The placeholder is an identity 2³ cube built once in `init`.
-   - Metal needs a 3D texture bound even when disabled. `mk_applyLUT` returns early on `shape.z == 0` (`MKLUT.msl:21`), exactly as `lookup` does on `options.x == 0` (`LUTShaders.metal:15`).
-4. `load(_ cube: CubeLUT)` (97-104) becomes `load(_ lut: MonitorLUT)` (`precondition(lut.texture.device === device)`).
-   - Build the `MonitorLUT` **once per file load** with `interpolation: .trilinear`, and share the same instance with the monitor feed (§3.4).
-   - Keep a `load(_ cube: CubeLUT)` convenience that builds a trilinear `MonitorLUT`, for the tests at `EndToEndChecks.swift:528, 1364` and `CaptureRecordingIsolationChecks.swift:572`.
-5. `process` (300, 313-321):
-   - The guard becomes `lut != nil`.
-   - Drop the cube-derived `low`/`scale`/dimension.
-   - `var lutParams = configuration.applyLUT ? lut!.parameters : LUTParameters.disabled`. `LUTParameters` has public `var`s but no public memberwise init (`MonitorLUT.swift:5-13`); use `.disabled` or mutate a copy.
-6. Dispatch (354-359, 364-368): `encoder.setTexture((configuration.applyLUT ? lut! : placeholderLUT).texture, index: 4)`, then `encoder.setBytes(&lutParams, length: MemoryLayout<LUTParameters>.stride, index: 0)`.
-7. Unchanged: `encodeMatrix`, the output tags, `untouched`, prewarm (`prepare` 109-138) and the pools. `PipelineConfiguration.applyLUT` now means **burn-in on**.
-
-### 2.5 Trilinear bit-compatibility
-
-**Why the texel reads are identical:**
-- Old read: `cube[(z*n + y)*n + x]` on a flat buffer of `cube.data`.
-- New read: `lut.read(uint3(x, y, z))` on a `type3D rgba32Float` texture. It is uploaded from **the same red-fastest array** with `bytesPerRow = n*16` and `bytesPerImage = n*n*16` (`MonitorLUT.swift:31-47`).
-- Both return the stored float exactly.
-
-**Why the arithmetic is identical:**
-- Clamp, scale, floor, `min(lo+1, n-1)`, `t` and the `mix` order (x, then y, then z) in `MKLUT.msl:23-36` match `LUTShaders.metal:17-24` line for line.
-- The domain math also matches: `MonitorLUT` computes `scale = 1/(max−min)` in Swift exactly as `LUTProcessor.swift:313-314` does.
-
-**What can break equality:**
-1. **Interpolation default.** `MonitorLUT.init` defaults to `.tetrahedral` (`MonitorLUT.swift:28`). The compat path must pass `.trilinear` explicitly (mode 1). Never use `.hardware` (mode 2, the texture filter) on the output path.
-2. **Compile options.**
-   - Today the kernels compile with `options: nil`, which is the default, fast math.
-   - `MonitorShaders.makeLibrary` forces `.safe` and MSL 4.0. A monitor pass compiled that way can differ from a fast-math `LUTProcessor` by a few ULPs.
-   - Exact output-vs-pre-change equality requires keeping `options: nil`. Exact preview-vs-output equality requires the same options on both sides.
-   - **Decision needed.** Recommended: switch `LUTProcessor` to `MonitorShaders.makeLibrary(…)` (safe math) and accept the ULP-level change against old output, which the existing tolerances absorb. That gives exact LUT equality between preview and output.
-3. **Golden check.** In the working tree, ultracam-18 has already replaced `lookup()` (§2.3a); make sure its commit includes this check. The MonitorKit delta in §2.4 is numerically neutral (same texture, same `mk_applyLUT` text) unless the compile options change. Re-run the check if they do. Before deleting `lookup()`, add a temporary test:
-   - Keep the old buffer kernel in a test-only shader string.
-   - Run both kernels with the same compile options on a ramp, plus a random 17³ and 33³ cube with a non-unit domain.
-   - Assert **exact** equality of the `rgba32Float` intermediate. Read it back via a test hook, or compare 10-bit 4:2:2 output with `convertTo420 = false`.
-   - Then delete the old kernel.
-
-**Tests that assert LUT output.** All use tolerances, so they pass if the math is unchanged or ULP-close. They should also pass with tetrahedral, because the synthetic cubes are separable along the neutral axis, but verify that before switching any default.
-
-| Test (file:line) | LUT | Expectation |
+| | App copy (`LUTShaders.metal:11-63`) | Current `MKLUT.msl` |
 | --- | --- | --- |
-| `Tests/main.swift:39-86` `CubeTests` (5) | parser | Unchanged semantics against `MonitorKitCore.CubeLUT`. The file needs `import MonitorKit` or `import MonitorKitCore` |
-| `Tests/main.swift:89-103` `testTenBitPrecision` | identity 2³ | 4K 4:2:2 output keeps >800 levels; endpoints 64 and 940 ±2 |
-| `Tests/main.swift:104-118` `testLUTAndLanczosThenNV12` | 17³ x² | NV12 1080p, luma[960] = 16+219·0.25 ±3 |
-| `Tests/main.swift:128-142` `testIndependentSwitches` | identity | Every switch combination gives the right geometry and format |
-| `Tests/main.swift:144-162` `testNonlinearLUTPrecedesLanczos` | 17³ x² | LUT before scaling: 16+219·0.5 ±3 |
-| `Tests/main.swift:163-~192` `testPackedV210Precision` | identity | v210, every lane ±1 code |
-| `Tests/EndToEndChecks.swift:50-75` `testAllSwitchesAndBothRatesProduceUsableSamples` | 1−x | Constant neutral image: luma 180/71 (4:2:0) or 721/283 (4:2:2) ±1, with or without the LUT |
-| `EndToEndChecks.swift:104-122` | none | `applyLUT` with no LUT throws (keep the guard) |
-| `EndToEndChecks.swift:124-150` `testLUTConsumesTenBitPrecisionBeforeEightBitQuantization` | domain 0.35…0.55 | 80 distinct 8-bit levels, each ±1; output tagged Rec.709 |
-| `EndToEndChecks.swift:499, 528, 1364-1374` | 17³ x² via `controller.load` | Controller paths (needs the `load(_ cube:)` convenience) |
-| `Tests/GPUExtendedChecks.swift:128-155` | identity | Packed and planar agree ±1 for every lane and stride |
-| `GPUExtendedChecks.swift:157-171, 173-195` | identity / reordered + domain | Chroma location ±1; RGB ordering and domain clipping ±2 (luma and both chroma) |
-| `GPUExtendedChecks.swift:263-275, 277-289, 359-371` | identity | No LUT colour labels leak onto bypass; prewarm keeps 10-bit; precision kept when downscale is off |
-| `Tests/CaptureRecordingIsolationChecks.swift:466, 572-583` | 17³ x² | LUT on the capture and recording path |
+| `mk_LUTParams` | **3 rows, 48 B**: `domainLow`, `domainScale`, `shape` | **5 rows, 80 B**: adds `shaperLow` (w = 1 when 1D-only) and `shaperScale`; `shape.w` = shaper entries |
+| 1D shaper | none | `mk_shaper`, with the entries in extra texture slices after the lattice |
+| Trilinear (`shape.y == 1`) | 8 reads, mix x, then y, then z | **identical** |
+| Tetrahedral (`shape.y == 0`) | branchy six-case | branch-free; same weights and summation order |
+| Hardware (`shape.y == 2`) | normalized by `n` | normalized per axis by `(n, n, depth)` |
+| Include | none (`metal_stdlib` at the top of the app file) | `#include <metal_stdlib>` inside the file |
 
-### 2.6 `CubeLUT` file swap
+- **Interpolation in use: trilinear, hard-coded.** `lutShape = SIMD4(dimension, 1, applyLUT ? 1 : 0, 0)` (`LUTProcessor.swift:518`).
+- **Struct layout.** Swift `Parameters` (`LUTProcessor.swift:167-176`) has 8 rows (128 B): `geometry`, `decodeRange`, `decodeMatrix`, `encodeMatrix`, `chroma`, `lutDomainLow`, `lutDomainScale`, `lutShape`. It is mirrored by MSL `Parameters` (`LUTShaders.metal:67-74`), which **embeds `mk_LUTParams lut` last**. Each frame writes it into a 256 B slot of `parameterBuffer` (`parameterStride = 256`, `:89`), bound through the argument table address 0.
+- **The LUT texture.** `makeLUTTexture` (`:288-306`) builds a `type3D rgba32Float`, `.shared`, `.shaderRead` texture of n³, `replace`d with `bytesPerRow n*16` and `bytesPerImage n*n*16`. For a 3D-only cube that is byte-for-byte what `MonitorLUT` builds. A 2³ identity placeholder is bound when no LUT is loaded (`:273-277`).
+  - It is bound at `texture(2)` of the first table (`:571`) and is in `persistentResidency`.
+  - `load(_ cube:)` (`:308-317`) **blocks the capture queue for up to 2 s** (`waitUntilIdle`) before swapping, because in-flight frames reference the old texture.
+- **Compile options.**
+  - `MTL4LibraryDescriptor` with **no `options`** (`:228-233`), so the defaults apply, i.e. fast math.
+  - MonitorKit compiles with `mathMode = .safe` and MSL 4.0, or 4.1 on macOS 27 (`MonitorShaders.swift:30-42`). So burn-in and monitor `mk_applyLUT` can differ by a few ULPs.
+  - `ULTRACAM_METALLIB` (`:222-223`) loads a prebuilt metallib instead. That path would need the same concatenation.
+- **The device.** Each `LUTProcessor` calls `MTLCreateSystemDefaultDevice()` (`:205`); so does `MonitorRuntime` (`:36`). On this single-GPU Mac they return the same device. A `MonitorLUT` can be shared only within one device. Assert `===` in W4, or inject the device.
+- `CubeLUT` call sites:
+  - `AppSettingsStore` (`LoadedLUT`, `LUTFileLoader.read`)
+  - `CaptureController.load(_:expectedGeneration:completion:)` (`:286-298`)
+  - `LUTProcessor.load`
+  - `Tests/main.swift` (`CubeTests`, `testTenBitPrecision`, …), `EndToEndChecks`, `GPUExtendedChecks`, `CaptureRecordingIsolationChecks`
+  - by path in `scripts/camera-smoke.sh:36` and `scripts/monitor-tools-recording.sh:24`
 
-- Delete `Sources/Shared/CubeLUT.swift` and use `MonitorKitCore.CubeLUT`.
-- **Do not leave both.** A declaration in the module shadows the imported one, so the app would silently keep its own type and the `MonitorLUT(cube:)` call would not type-check.
-- Add the import to: `AppSettingsStore.swift` (`LoadedLUT`, `LUTFileLoader.read` at 518), `CaptureController.swift`, `LUTProcessor.swift`, `Tests/main.swift`, `EndToEndChecks.swift`, `GPUExtendedChecks.swift` and `CaptureRecordingIsolationChecks.swift`.
-- Remove the path from `scripts/camera-smoke.sh:36` and `scripts/monitor-tools-recording.sh:24`.
-- The camera extension never compiles `CubeLUT.swift` (`generate_project.py:31-35`), so it stays MonitorKit-free.
+### 4.3 The include-guard trap
+
+Prepending `MonitorShaders.source([.lut])` to `LUTShaders.metal`, the "one-line change" its comment promises, silently skips the app's guarded copy. MSL `Parameters.lut` becomes 80 B while Swift still writes 48 B.
+
+- **Today this is safe only by accident.** `shape.w` sits in the same row in both layouts, and Swift writes it as 0, so `mk_shaper` and `shaperLow.w` are never read. The bytes past Swift's 128 are whatever the 256 B slot holds.
+- **It breaks the moment the parser is swapped**:
+  - A shaper LUT parses with `shaperSize > 0`.
+  - `makeLUTTexture` uploads only n³, with no shaper slices.
+  - Swift never sets `shape.w`, so the shaper is ignored.
+  - The burned-in output is then wrong, with no error.
+- The parser swap, the `MonitorLUT` texture, `MKLUT.msl` and the Swift struct must land in **one change**. Until then, guard in the app: reject `!cube.hasCube || cube.shaperSize > 0` in `LUTFileLoader` or `CaptureController.load`.
+
+### 4.4 W4 LUT target (fused tier)
+
+- `LUTShaders.metal`: delete lines 4-63 and build the library from `MonitorShaders.source([.lut]) + LUTShaders.metal`.
+- Swift `Parameters`: replace `lutDomainLow`/`lutDomainScale`/`lutShape` with `lut: LUTParameters`, which has the same 5-row layout as `mk_LUTParams`. That makes 10 rows, 160 B, which fits the 256 B stride.
+- `cube`/`lutTexture`/`makeLUTTexture` → `lut: MonitorLUT?`, plus a placeholder `MonitorLUT` (identity 2³) or `LUTParameters.disabled`.
+  - Parameters: `lut.parameters`, with `shape.z = 0` when `applyLUT` is off.
+  - Interpolation: `MonitorLUT.interpolation` (default `.trilinear` in the app for bit-compatibility; tetrahedral is a product decision).
+- Compile with MonitorKit's options (library requirement R6) so burn-in and preview are the same code under the same math mode.
+- `load(_ lut: MonitorLUT)` needs no `waitUntilIdle`: `MonitorLUT` is immutable, so retain the old one in the in-flight frame records and swap at once. Keep a `load(_ cube: CubeLUT)` convenience for the tests.
+- **One `MonitorLUT` per file load**, built on the main actor from the `LoadedLUT` with the shared device, and given to both `CaptureController.load` (burn-in) and the feed host (`MonitorFeed.burnInLUT`). Its texture must be in **both** residency sets: `LUTProcessor.persistentResidency` and the monitor's.
+- Golden check: trilinear output must equal the pre-change kernel, either exactly (same options) or within the existing tolerances (`Tests/main.swift:89-192`, `EndToEndChecks.swift:50-150`, `GPUExtendedChecks.swift:128-371`, `CaptureRecordingIsolationChecks.swift` LUT cases). Also against `CubeLUT.apply` ≤ 1e-4.
 
 ---
 
-## 3. The per-feed monitor pipeline
+## 5. Settings model and persistence
 
-### 3.1 Today
+### 5.1 Where monitor and LUT settings live
 
-The frame path for one camera:
-1. `CaptureController.process` offers the source to `MonitorCaptureSink` (`:929`, try-lock, may drop).
-2. The sink checks generation, revision and the scope-Hz rate limit (`MonitorCaptureSink.swift:141-224`).
-3. `MonitorRuntime.offer` (a utility-QoS worker) runs ledger and admission, then fairness (3 slots), then tiers, then a composite into a pooled `CVPixelBuffer` (CPU memcpy, GPU plan §Monitor).
-4. On failure the sink falls back to `CleanPreviewService` (237-248).
-5. `publish` (262-282) calls `MonitorSurfacePresenter.accept` (`ifCurrent` recheck).
-6. Each surface has an `AVSampleBufferDisplayLayer` (`MonitorNativePicture`) and a scope NSView (`MonitorNativeScope`).
-7. SwiftUI overlays draw the guides (`MonitorGuideOverlay`) and the graticule (`MonitorScopeGraticule`).
+- Defaults key `ultracam.settings.v2` holds the JSON `AppSettingsSnapshot` (`currentVersion = 2`, `AppSettingsStore.swift:320-381`, store `:386-457`).
+  - `feeds: [FeedDescriptor]`. Each has `version = 1`, enforced by `validated()` (`:353-357`). Fields include `applyLUT`, `lutBookmark: Data?`, `gamut` (default `"S-Gamut3.Cine / S-Log3"`, used to default the source profile, `UISupport.swift:116-120`), `previewEnabled` and **`monitorConfiguration: MonitorConfiguration`** (`decodeIfPresent`, `:315`).
+  - `programMonitorConfiguration: MonitorConfiguration` (`:378`).
+  - `monitorWorkspace: MonitorWorkspaceState`: `schemaVersion 1`, `isConfigured`, `layout` (`single`/`sideBySide`/`fourUp`), `tileBindings: [MonitorTargetID?]` (padded to 4), `splitRatio` (0.2…0.8).
+- The legacy `ultracam.settings.v1` (`AppSettings`) has no monitor fields. It is migrated once.
+- LUT *contents* are never persisted; only bookmarks are. `resetAll` (`:395-404`) removes `ultracam.settings.*`, `ui.*` and the recording bookmarks.
+- The installed app's settings live in its sandbox container. The Debug build uses `~/Library/Preferences/org.ultracam.app.plist`. **Never run `defaults` against `org.ultracam.app`**: it resolves to the installed app's container. Back up the Debug plist by explicit path.
 
-Around that path:
-- **Paired output tap:** `:984`, with `MonitorCorrespondence` for focus and aperture alignment.
-- **Selected camera:** it does not use the monitor at all while no tool alters pixels. `VideoPreview` (an `AVSampleBufferDisplayLayer` on the processed sample, `VideoPreview.swift:11-50, 135-185, 435-449`) is used instead (`UIAppProviders.swift:80-84`).
-- **Program:** `MonitorCoordinator.offerProgram` (267-280) offers the processed Program frame as both source and output; stages are forced to output (`MonitorCaptureSink.swift:64-67`).
-- **Control:** `MonitorCoordinator` (main actor) handles per-target configs, the surface registry, demand (sent to `AppModel.monitorDemand`, which feeds automatic start and preview demand at `AppModel.swift:1049-1069`) and diagnostics snapshots.
-- **Toolbar:** the app's `UIMonitorToolButtons` in pictures. The detached tile uses MonitorToolsUI `MonitorToolsToolbar`.
-- **Legend:** `MonitorFalseColorLegend`, in detached tiles only (`MonitorWorkspaceShell.swift:189`).
-- **Diagnostics:** `UIDiagnosticsMonitorSection`.
+### 5.2 The migration trap (verified)
 
-### 3.2 New design
+- Both schemas say `schemaVersion: 1`.
+- `MonitorState.init(from:)` is lenient and never throws (`MonitorState.swift:395-409`).
+- **Decoding an old `MonitorConfiguration` blob as `MonitorState` does not yield defaults. It yields a partial, wrong state.** Verified by compiling MonitorKitCore with a probe, decoding a saved configuration that has `toolsEnabled: false`:
+  - `guides` decodes `enabled`, `thirds`, `centerCross`, `opacity` and `contrast`; `safeArea` is dropped.
+  - `focus` decodes `enabled`, `color`, `sensitivity`, `noiseRejection` and `opacity`.
+  - `falseColor.mode` decodes `off`/`sonySLog3`/`elZone`, while `"arri"` becomes `.off`. `referenceOffsetStops` decodes, then clamps to ±6.
+  - `zebra` (singular) is ignored, so the zebras stay off.
+  - **`toolsEnabled` is ignored.** Guides, peaking and false colour that the user had switched off with the master switch **come back on**.
+- **Rules:**
+  1. Never decode the old key as `MonitorState`.
+  2. Decode the old key with an app-private `LegacyMonitorConfiguration`, a verbatim copy of `MonitorConfiguration.swift:1-247` including `normalized()` and the nested settings types. It needs the profile IDs from `MonitorKitCore.Reference` (`SonySLog3FalseColor`, `ELZoneProfile`, `ARRIFalseColorProfile`, `SonyARRIStyleFalseColor`).
+  3. Write `MonitorState` under **new keys**, and prefer them when present.
+  4. **Do not bump `FeedDescriptor.version`.** `validated()` rejects `version != 1`, and a rejected snapshot falls back to the v1 path, losing all feeds.
+  5. Keep round-tripping the old `monitorConfiguration` blob unchanged as opaque data, so a downgrade still finds its tools. It is cheap and avoids a one-way migration.
+- Optional MonitorKit hardening (R13): a type discriminator or `schemaVersion` 2 before any host persists `MonitorState`, so a foreign v1 blob fails closed to defaults.
 
-These rules come from the plan's added requirements and `ARCHITECTURE.md`.
-- **One engine.**
-  - One `MonitorEngine(device:)` (contract) per GPU, owned by `MonitorCoordinator` and created with the **same `MTLDevice`** as `LUTProcessor`.
-  - A `MonitorLUT` texture can only be shared within one device.
-  - Today every `LUTProcessor` calls `MTLCreateSystemDefaultDevice()` (`LUTProcessor.swift:69`; WT :179) and makes its own queue (WT: an `MTL4CommandQueue`). Inject a shared GPU context, which is GPU plan step 2 "one shared device and queue". Coordinate with ultracam-18's pipelined `LUTProcessor`.
-  - Note that a Metal 4 queue plus residency sets on the processor side means the monitor's queue (classic `MTLCommandBuffer` in the `ARCHITECTURE.md` API) may differ. That is fine as long as it is the same device, but the `MonitorLUT` texture must be resident for both: on the processor side add it to the residency set (WT :243, :279-281).
-- **One `MonitorFeed` per camera** (contract), plus one for "program".
-  - `feed.burnInLUT` = the **same `MonitorLUT` instance** that the feed's `LUTProcessor` burns in, when `applyLUT` is on; otherwise nil.
-  - `feed.monitorLUT` = the camera's monitor-only LUT.
-  - **Program:** `burnInLUT = nil`. Its frames are already processed. Signal = `MonitorFrame.signal(of:range:)` (display Rec.709).
-- **Camera surfaces read the source capture frame only.**
-  - They wrap it with `MonitorFrame.wrap(_:cache:signal:)` (borrowed v210 `rgba32Uint` view, no copy) and the feed's declared signal (§3.5).
-  - The **output stage is computed in-shader** from the same `MonitorLUT` and `mk_applyLUT` (`MKMonitor.msl:68-74`).
-  - **Semantic change:** the monitor's "output" is source resolution + LUT, not the published 1080p/4:2:0 pixels.
-  - So `MonitorCaptureSink.needsOutput` (120-129), the paired offer (`CaptureController.swift:980-986`) and `MonitorCorrespondence` all go away.
-  - **Residual differences:**
-    - Decode is algebraically equal but uses different float ops: `LUTShaders.metal:27-31` vs `MKDecode.msl:76-81`.
-    - Lanczos and 8-bit encode are not shown.
-    - Bit-identical output-stage tools would need `LUTProcessor` to call `mk_decodeRGB`, which the plan keeps out of scope.
-- **One `MonitorPass` per surface** (contract). It draws into a `CAMetalLayer` drawable, or uses `MonitorKitUI.MonitorMetalView` (contract).
-- **Shared analysis.** Once per frame per feed, `feed.analyze(frame, focus:, into: cb)` runs if any visible surface of that feed shows peaking. Scopes accumulate once per frame per feed, at the user's rate.
-  - Each `MonitorMetalView` owning its own command buffer would make shared analysis need cross-view coordination.
-  - **Recommended:**
-    - Use one app-owned render loop per display: a `CAMetalDisplayLink` on the window's screen.
-    - It draws every visible surface on that screen in **one command buffer per vsync**: wrap the latest frame of each feed, analyse it once, then encode each surface's pass, present and commit.
-    - Use `MonitorMetalView` only where a surface stands alone, for example a detached window on another screen, if its API allows sharing a feed.
-- **Ingest.**
-  - `FeedMonitor.publish` stores the source `CVPixelBuffer` in a lock-protected **latest-frame slot** (`Synchronization.Mutex`, macOS 15+).
-  - The render loop reads the slot at vsync. This is display sampling, not a drop rule. Nothing runs on the capture queue except the store.
-  - The slot retains one capture buffer per feed, plus those in flight. Check the DeckLink SDK 16 input pool size (GPU plan §Root cause).
-- **Freeze.** "An explicit snapshot into owned textures" (plan line 176). The API is not specified yet. Until it is, freeze keeps the last `MonitorFrame`'s pixel buffer alive and re-draws it.
-- **Clean View.** It stays ephemeral (`UICleanViewState`, `UIAppProviders.swift:24-30`). The surface sets `state.clean = true` at encode time; it is not persisted.
-- **Retire:** `MonitorRuntime`, ledger, fairness, tiers, composite pool, `CleanPreviewService`, critical-pipeline producer, the scope-Hz cap, presentation admission, and the per-surface `AVSampleBufferDisplayLayer` (GPU plan §3 retire list).
+### 5.3 Field-by-field: `MonitorConfiguration` → MonitorKit
 
-### 3.3 New app types
+New per-feed keys, all `decodeIfPresent`:
+- `FeedDescriptor.monitor` holds `MonitorFeedPreferences` with:
+  - `state: MonitorState`
+  - `signal: MonitorSignalDeclaration?`
+  - `scopes: MonitorScopePreferences`
+  - `pictureStage`, until MonitorKit has it (R9)
+- `AppSettingsSnapshot.programMonitor`, the same type.
+- These types are app-owned, in `Sources/Shared/MonitorWorkspace.swift`.
 
-All are new files in `Sources/App` unless noted.
-
-| New | Replaces | Owns / does |
+| Old field (default) | New home | Conversion / note |
 | --- | --- | --- |
-| `FeedMonitor` (`@unchecked Sendable`, render-thread confined except `publish`) | `MonitorCaptureSink` | `MonitorFeed` (contract); a `CVMetalTextureCache` on the shared device; the latest-frame slot; the `SignalDescription`; pending burn-in and monitor `MonitorLUT`s; `analyzedSequence`. `publish(source:pts:sequence:)` (capture queue), `setBurnInLUT`, `setMonitorLUT`, `setSignal` (main), `clear()` |
-| `MonitorSurface` (`ObservableObject`, main actor for UI state) | `MonitorSurfacePresenter` | `MonitorPass` (contract); `CAMetalLayer`; `MonitorState` (from the coordinator) plus ephemeral clean, freeze and magnification; `status` (`MonitorStatus`, contract) for SwiftUI |
-| `MonitorRenderLoop` | `MonitorRuntime` worker + presenters | A `CAMetalDisplayLink` per screen. Per vsync: one command buffer, then wrap, analyse once per feed, scopes at their rate, `pass.encode` per surface, `present`, `commit`. GPU time goes into `AppGPUActivity` |
-| `MonitorCoordinator` (rewritten) | itself | `MonitorEngine`; feeds and surfaces keyed by `MonitorTargetID`; `state(for:)` / `setState(_:for:)`; `copySettings` (keep the calibration-preserving rule at 84-99, with signal settings now per feed); targets, workspace, demand, preview enable (unchanged semantics); Program publish from `offerProgram` |
-| `Sources/Shared/MonitorWorkspace.swift` | MonitorToolsCore `MonitorTargetID`, `MonitorWorkspaceLayout`, `MonitorWorkspaceState` (`MonitorConfiguration.swift:3-8, 248-294`), MonitorToolsUI `MonitorTargetOption` | The same declarations and Codable keys, so the saved `tileBindings` JSON stays compatible. It goes in `Shared` because `FeedRuntime.swift:266-267` needs it. The camera extension does not compile `FeedRuntime`, so it is unaffected |
+| `schemaVersion` (1) | `MonitorState.schemaVersion` (1) | The trap above |
+| `toolsEnabled` (false) | none (no master switch) | When false: `zebras[*].enabled = false`, `guides.enabled = false`, `focus.enabled = false`, `falseColor.mode = .off`, `scopes.enabled = false`; sub-values kept. **Not** `MonitorState.clean`: Clean View is ephemeral |
+| `guides.enabled` (false), `.thirds` (true), `.centerCross` (false), `.opacity` (0.65), `.contrast` (1) | `guides.` same names | Same ranges (0…1) |
+| `guides.safeArea` (false) | `guides.safeAreas` | `true` → `[90]`: the old overlay insets 5% per side (`MonitorToolsToolbar.swift:266-267`) |
+| — | `guides.frameGuides`, `squareGrid`, `diagonals`, `centerDot`, `color`, `lineWidth`, `followsFrameGuide` | MonitorKit defaults |
+| `zebra.enabled` (false) | `zebras[0].enabled` | `zebras[1]` stays off |
+| `zebra.thresholdIRE` (95; −20…120) | `zebras[0].level` | Same clamp. The UI slider is 0…109 |
+| `zebra.widthIRE` (5; 0…30, **full** width) | `zebras[0].range` (**half** width) | `range = widthIRE / 2`. Old band `[t−w/2, t+w/2)` (`MonitorTools.metal.txt:196`) equals new `[level−range, level+range)` |
+| `zebra.mode` `.aboveThreshold` / `.band` | `zebras[0].mode` `.lowerLimit` / `.band` | |
+| `zebra.opacity` (0.65) | `zebras[0].opacity` | |
+| (implicit) zebra measured the *picture* stage | `zebras[0].stage` | `pictureStage == .source ? .source : .output` |
+| `effectiveZebraEnabled`: false colour suppresses zebra | none | MonitorKit draws both. Keep the suppression in the app glue (`state` derived at encode), or accept the change |
+| `falseColor.mode` `.off` / `.sonySLog3` / `.elZone` | `falseColor.mode` same | |
+| `.arri` + `SonyARRIStyleFalseColor.profileID` | `.sonySLog3` | The old `normalized()` already rewrote these (`MonitorConfiguration.swift:203-209`), so saved data is already Sony. `.arriStyleSLog3` exists if wanted |
+| `.arri` + `logC3EI800`/`alexa35LogC4EI800`, EI 800, `sourceProfileID == profile` | `.arriLogC` + signal `.log(LogEncoding(profileID:))` | Otherwise `.off`, as old `normalized()` did |
+| `falseColor.profileID`, `.specificationVersion` | dropped | Derived from mode + signal |
+| `falseColor.exposureIndex` (800) | dropped | Only 800 was ever valid |
+| `falseColor.referenceOffsetStops` (0; −10…10) | `falseColor.referenceOffsetStops` (−6…6) | Values clamp. Change the UI stepper (`UIMonitorTools.swift:260`) |
+| — | `falseColor.stage` (.output), `customUnit`, `customBands` | Log modes always classify the source |
+| `focus.enabled`, `.color`, `.sensitivity` (0.5), `.noiseRejection` (0.02), `.opacity` (0.85) | `focus.` same | Same raw colour values. Same `edgeThreshold = 0.02 + (1−s)·0.3` (`MonitorState.swift:212` = `MonitorToolsRenderer.swift:478`) |
+| — | `focus.style` (.coloredEdges), `focus.stage` (.source) | Old peaking was always source luma |
+| `scopes.enabled` (false) | `MonitorScopePreferences.enabled` (app) | MonitorKit leaves scope scheduling to the host |
+| `scopes.refreshHz` (15; 10/15/30) | `MonitorScopePreferences.refreshHz` (app) | |
+| `scopes.mode` `.rgbParade` / `.lumaWaveform` | `ScopeSettings(kind: .waveform)` with `waveformMode = .rgbParade` / `.luma` | |
+| `scopes.gain` (1; 0.25…4) | `ScopeSettings.display.gain` (0.05…20) | Same number. The trace curve differs (old: `1−exp(−n·gain·30.72/population)`) |
+| `scopes.graticule` (true) | `ScopeSettings.display.showsGraticule` | The old IRE labels are SwiftUI (`MonitorScopeGraticule`) |
+| `scopeStage` (.processedOutput) | `ScopeSettings.stage` | `.processedOutput` → `.output` |
+| `pictureStage` (.processedOutput) | **no MonitorKit field** | App-side until R9. `.source` = "show without burn-in"; `.processedOutput` = output stage |
+| `sourceProfileID` (nil) | per-feed `MonitorSignalDeclaration.encoding` → `SignalDescription.encoding = .log(LogEncoding(profileID:transport:))` (`Signal.swift:168-178`) | nil → display transfer from tags. **Per feed, not per surface** |
+| `sourceCodeRange` (nil) | `MonitorSignalDeclaration.range` → `SignalDescription.range` | nil → from the pixel format (`MonitorFrame.layout(for:)`) |
+| `sourceLogMapping` `.native10Bit` / `.fullRescaledToLegal10Bit` | `LogEncoding.transport` `.native` / `.fullRescaledToLegal` | |
+| — | `clean` | **Ephemeral**: Clean View is per presenter today. Set at encode; strip before persisting |
+| — | `geometry.magnification` | **Ephemeral**: zoom is `@State` today. Strip before persisting |
+| — | `geometry.desqueeze`, `.flip`, `display.*`, `monitorLUT` (true) | MonitorKit defaults (new features) |
+| Program's `programMonitorConfiguration` | `programMonitor.state` | Old stages were forced to output. Program has no burn-in, so `.source == .output` |
+| `monitorWorkspace` | unchanged, app-owned type with the same Codable keys | `MonitorTargetID` stays a single-value `RawRepresentable` String, so the JSON is unchanged |
 
-Threading:
-- `MonitorFeed` and `MonitorPass` are "confined: one thread at a time" (`ARCHITECTURE.md`).
-- But they are declared `@unchecked Sendable` (`MonitorFeed.swift:8`, `MonitorPass.swift:10`), so **the compiler will not stop cross-queue use**. The confinement rule is the app's to enforce: keep them inside the render-loop owner and never touch them from the capture queue.
-- The WT `LUTProcessor` is now `@unchecked Sendable` with its own `feedbackQueue` (WT :30, :181). It is the first app object that could own the shared GPU context (device + queues) recommended in §3.2.
-- LUT changes flow main → slot → render thread. The render thread applies `feed.burnInLUT = …` at the start of its next frame.
+`copySettings` (`MonitorCoordinator.swift:117-132`): the source's tools are copied and the destination's calibration is kept. With signal declarations per feed, calibration is simply not part of `MonitorState`. Copy `state` and `scopes` only, and keep the destination's `signal`. `referenceOffsetStops` stays per destination, as today.
 
-### 3.4 LUT routing: burn-in vs monitor-only
+---
 
-**Model.** This keeps every existing test and `PipelineConfiguration` meaning.
-- `FeedDescriptor.lutBookmark` and `.applyLUT` stay as the **burn-in LUT**. It reaches `LUTProcessor` (real output: the virtual camera and Program) **and** every preview of that feed (`feed.burnInLUT`).
-- **New** `FeedDescriptor.monitorLUTBookmark: Data?` and `monitorLUTEnabled: Bool`: the **monitor-only LUT**. It never reaches `LUTProcessor`. It is stacked after burn-in in the shader (`MKMonitor.msl:73`).
-- `MonitorState.monitorLUT` (`MonitorState.swift:363`): per-surface "apply this feed's monitor LUT".
-- **New** `FeedDescriptor.lutInterpolation: LUTInterpolation`. The default is `.trilinear`, which keeps today's output. Offer tetrahedral as an option. Changing the default is a product decision.
-- Monitoring overlays never reach output in either mode. They exist only in the monitor pass, and `LUTProcessor` has no overlay code.
+## 6. The Metal 4 seam MonitorKit must fit
 
-**Ownership.**
-- On load or restore, `LUTFileLoader` returns a `CubeLUT`. The main actor builds **one** `MonitorLUT(device: shared, cube:, interpolation:)`. A 65³ texture is about 4.4 MB with one `replace`.
-- The same instance goes to `CaptureController.load(lut)` (burn-in) and `FeedMonitor.setBurnInLUT(lut)`, or to `setMonitorLUT(lut)` for the monitor-only slot.
-- The headless restore (`AppModel.swift:932-969`) must also load the monitor LUT when only `monitorLUTEnabled` is set. Today it bails unless `descriptor.applyLUT` (948, 959).
+### 6.1 What "zero overhead" means here
 
-**UI.**
-- Inspector `lutSection` (`UIInspector.swift:147-178`):
-  - Add "Apply to: Output and previews / Monitor only".
-  - Switching moves the file between the burn-in and monitor slots.
-  - Add an optional second row, "Monitor LUT", for stacking.
-- Effect chip 0 (`UIPresentation.swift:561-566`) stays "burn in". When the LUT is monitor-only, it is disabled with help text: "This LUT is monitor-only."
-- Per surface: a "Monitor LUT" toggle in `UIMonitorToolSettingsView`, and optionally a `UIMonitorTool` case.
-- Help text to update: `UIHelp.swift:49`, the recording footnotes (`UICameraColumn.swift:650, 777`, `UISettings.swift:192`, `UIHelp.swift:9`) and the input gamut help (`UIInspector.swift:176`).
+Per surface per vsync the app spends:
+- one pooled `MTL4CommandBuffer`, `allocator.reset`
+- **no** per-frame residency commits (the frames come from the resident IOSurface cache)
+- one compute encoder, a few hundred bytes of uniforms, one commit with a drawable
 
-### 3.5 Migration: `MonitorConfiguration` → `MonitorState`
+MonitorKit's Metal 4 path must add **nothing** to that:
+- no command buffer, queue, allocator, residency set or argument table created per frame
+- no residency commit per frame
+- no `waitUntil*`, no commit, no feedback handler
+- no heap allocation on the encode path (the existing contract tests)
 
-**Data-loss trap.**
-- Both schemas use `schemaVersion = 1`, and `MonitorState.init(from:)` **never throws** (`MonitorState.swift:373-387`).
-- Decoding old `monitorConfiguration` JSON as `MonitorState` silently yields all defaults.
-- So:
-  - Keep an app-private `LegacyMonitorConfiguration`, a verbatim copy of `MonitorConfiguration.swift:30-247` including `normalized()`.
-  - Decode it from the **old** key.
-  - Write the result to a **new** key: `FeedDescriptor.monitorState` and `AppSettingsSnapshot.programMonitorState`.
-  - Prefer the new key when present.
-- **Do not bump `FeedDescriptor.version`.** `validated()` rejects any feed whose `version != 1` (`AppSettingsStore.swift:356`). A rejected snapshot falls back to the v1 legacy path (421-427) and loses all feeds.
-- Add keys with `decodeIfPresent`, as the file already does.
+### 6.2 The exact shape MonitorKit should expose (library requirements R1-R8)
 
-Field by field:
+```swift
+/// One host submission. The app's MonitorEncodeContext conforms.
+public protocol MonitorMetal4Encoding: AnyObject {
+  var commandBuffer: MTL4CommandBuffer { get }
+  /// Transient constant memory, valid until this submission completes. 256-byte aligned.
+  func allocateUniforms(length: Int) -> (contents: UnsafeMutableRawPointer, address: MTLGPUAddress)
+  /// Keeps `object` alive until this submission completes (resource replacement only, never per frame).
+  func retainUntilCompleted(_ object: AnyObject)
+  /// Ends `allocation`'s residency once this submission (and earlier work on the queue) completes.
+  func retireAfterCompletion(_ allocation: MTLAllocation)
+}
+/// Device-wide residency the host owns. Thread-safe. The app's MonitorMetalContext conforms.
+public protocol MonitorResidencyHost: AnyObject, Sendable {
+  func makeResident(_ allocation: MTLAllocation)      // add + commit; called only on allocation
+}
+```
 
-| Old (`MonitorConfiguration`) | New | Note |
+Calls:
+- `MonitorEngine(device:, residency: MonitorResidencyHost)`. Placeholders, focus masks, scope bins, stats and trace textures, LUT textures and freeze copies are added through it once, when they are created.
+- `feed.analyze(frame, focus:, into: some MonitorMetal4Encoding)`
+- `pass.encode(frame:feed:state:target:viewport:clear:into:)`
+- `scopeGroup.accumulate(frame, feed:, into:)` and `scopeRenderer.render(…, into:)`
+- `freeze(frame, into:) -> MonitorFrame`
+
+Details:
+1. **Command buffers (R1).** Only the host's `MTL4CommandBuffer`. Encoders are created inside it, and only for the library's own passes:
+   - a compute encoder for focus, scopes and freeze
+   - an `MTL4RenderCommandEncoder` from an `MTL4RenderPassDescriptor` on `target` for the picture and the scope image
+   - optionally `prepare` + `draw(with: MTL4RenderCommandEncoder)` inside a host pass
+2. **Argument tables (R3).** MonitorKit owns them: one per `MonitorPass`, `MonitorFeed`, `ScopeAccumulator`/`ScopeGroup` and `ScopeRenderer`, created at init and sized to its shaders. The app's table (4 buffers, 8 textures) is too small:
+   - the pass binds 6 textures and 5 buffers (`MonitorPass.swift:208-221`)
+   - focus binds 6 and 4 (`MonitorFeed.swift:86-98`)
+   - `ScopeGroup` binds up to buffer 10 and `ScopeAccumulator` up to index 11 (`ScopeGroup.swift:234-248`, `ScopeAccumulator.swift:238-270`)
+
+   Reusing a table across frames and command buffers is safe, because Metal 4 captures the bindings at draw/dispatch encode time. `MonitorToolsRenderer.swift:68-98` already depends on that.
+3. **Uniforms (R2).** No `set*Bytes` in Metal 4: everything goes through `setAddress`. Per-surface frame sizes, measured from the W1 types:
+   - `FrameParameters` 80 B, burn-in and monitor `LUTParameters` 80 + 80 B, `PassParameters` **848 B**, `GuideParameters` **2,336 B**: ≈ 3.4 KB per picture.
+   - Focus: 80 + 8 + 80 + 80 B.
+
+   **The app's `MonitorEncodeContext.uniform` cannot hold these.** Its stride is 256 B, a precondition (`MonitorRuntime.swift:347-358`), and its capacity is 4 KB. W4 changes it to a variable-size bump allocator: about 32 KB per context, 256-B aligned, reset in `begin()`, resident as today. That is still zero allocation per frame.
+4. **Residency (R4).**
+   - The library's persistent allocations go into the host's set once (`MonitorResidencyHost.makeResident`). Retirement, on a size change or a freeze release, goes through `retireAfterCompletion`. The app maps that onto its existing graveyard (`MonitorRuntime.swift:525-549`).
+   - A `MonitorLUT` texture must be addable to several sets (the processor's and the monitor's). It already exposes `texture`.
+   - The host keeps the drawable residency: `layer.residencySet` on the queue (§1.5). MonitorKit is not involved.
+5. **Barriers (R5).** Metal 4 tracks no hazards, so the library encodes its own:
+   - **Focus mask, write after read** across frames and surfaces: at the start of `analyze`, `barrier(afterQueueStages: [.fragment, .dispatch], beforeStages: .dispatch)`.
+   - **Mask read after write**: in the picture's render encoder, `barrier(afterQueueStages: .dispatch, beforeStages: .fragment, visibilityOptions: .device)` before the draw. It is a *queue* barrier because `analyze` may sit in another surface's command buffer on the same queue.
+   - **Scope bins**: the same around clear → accumulate → resolve or render.
+   - **Freeze copy**: `afterStages: .blit, beforeQueueStages: [.dispatch, .fragment, .blit]`.
+   - These are only correct because **all monitor work shares one `MTL4CommandQueue`** (the app's design). Document that in the contract. The capture frames are written by `LUTProcessor`'s queue or by DMA *before* delivery hands them over, so the monitor needs no cross-queue event.
+6. **Pipelines (R6).** Build them with `MTL4Compiler` (`MTL4LibraryDescriptor` with MonitorKit's `MTLCompileOptions`; `MTL4RenderPipelineDescriptor`/`MTL4ComputePipelineDescriptor`), as both app paths do.
+   - Use the compiler's asynchronous tasks for specialization.
+   - Expose `MonitorShaders.compileOptions` publicly for `LUTProcessor`.
+   - Unverified: whether device-made `MTLRenderPipelineState`s are accepted by `MTL4RenderCommandEncoder`. Test it before relying on the classic pipelines.
+   - Warm at start-up for the three layer formats in use: `bgr10a2Unorm` and `rgba16Float` (picture), `bgra8Unorm` (scope). A switch to HLG must not stall on a compile.
+7. **Render, not compute, into the drawable.** MonitorKit draws a fullscreen triangle with a fragment shader. With every write a render-target write, the app can set **`framebufferOnly = true`** on both layers, which allows lossless framebuffer compression and drops `.shaderWrite` on drawables. One exception: an offscreen snapshot target in tests needs `.renderTarget` usage instead of today's `[.shaderRead, .shaderWrite]` (`MonitorRuntime.swift:199-205`).
+8. **Frames (R12).** `MonitorFrame.wrap(_:cache:)` maps through `CVMetalTextureCache` **per frame**. Under Metal 4 those textures would need a residency set per frame, as `LUTProcessor` does (`:684-689`). The app instead builds `MonitorFrame` with its public `init(layout:width:height:packed:luma:chroma:signal:pixelAspectRatio:)` from its **resident IOSurface cache**, created in MonitorKit's formats:
+   - v210: `rgba32Uint` at w/6
+   - 8-bit biplanar: `r8Unorm`/`rg8Unorm`
+   - 10/16-bit biplanar: `r16Unorm`/`rg16Unorm` (not the `r16Uint` the old cache makes)
+   - BGRA: `bgra8Unorm`
+
+   The init validates without allocating. Better still, MonitorKit could ship that IOSurface-keyed, residency-aware cache, a port of `MonitorSurfaceTextureCache`, because every Metal 4 host needs it.
+9. **Threads and isolation.**
+   - Every `MonitorFeed`, `MonitorPass`, `ScopeAccumulator`/`ScopeGroup` and `ScopeRenderer` lives on the app's render thread (`MonitorRenderThread`). That satisfies "confined".
+   - Main-actor changes hop with `renderThread.perform`: `burnInLUT`/`monitorLUT` swaps and the signal declaration.
+   - `MonitorEngine` and `MonitorLUT` are `@unchecked Sendable` and can be built anywhere.
+   - `ScopeStatisticsReader` serves the UI.
+10. **Once-per-frame analysis across surfaces.**
+    - The app wraps one `MonitorFrame` per arriving frame per feed. It caches it by the frame's stamp, so every surface of the feed sees the same `MonitorFrame.id`.
+    - Whichever surface first draws a new frame encodes `feed.analyze` in its own command buffer.
+    - Scopes accumulate once per feed per scope tick.
+    - Limitation: one focus stage per feed per frame (`MonitorFeed.swift:55-107`). Two surfaces of one feed peaking on different stages will show "mask unavailable" on one. Today each surface computes its own source-stage mask.
+11. **Retention.** The host keeps frames and LUTs alive, as today (`frame.retainResources(in:)` + `context.retain`). MonitorKit retains nothing per frame. `retainUntilCompleted` is for replaced persistent objects only.
+12. **Freeze (R11).**
+    - `freeze(frame, into:)` allocates owned `.private` textures with the same formats and sizes (only on request), registers them through `makeResident`, copies with the compute encoder's `copy`, and adds the producer barrier.
+    - It returns a `MonitorFrame` with a stable `id`, so it is analysed once.
+    - `release` goes through `retireAfterCompletion`.
+    - Only the source planes are copied, since the output stage is computed in-shader. That halves today's freeze memory when an output buffer existed: 4K v210 ≈ 22 MB.
+13. **Status.** The app keeps its status strings; `MonitorStatus` reasons map onto them.
+
+### 6.3 What stays app-owned glue (answer: delete `Packages/MonitorTools` entirely)
+
+**Yes, W4 should delete `Packages/MonitorTools` entirely.** MonitorKit covers its pixels, math and settings. The rest is app plumbing, which moves into these app files:
+
+| New app file | Ported from | Contents |
 | --- | --- | --- |
-| `toolsEnabled == false` | every tool `enabled = false` / `falseColor.mode = .off`; sub-values kept | Matches `UIMonitorBridge.toggled` (`UISupport.swift:126-133`). `clean` stays false |
-| `guides.enabled, thirds, centerCross, opacity, contrast` | `guides.` same names | |
-| `guides.safeArea: Bool` | `guides.safeAreas = safeArea ? [90] : []` | Old overlay inset is 5% per side (`MonitorToolsToolbar.swift:266-267`) |
-| `zebra.enabled` | `zebras[0].enabled` | Old rule: false color **suppressed** zebra (`effectiveZebraEnabled`, `MonitorConfiguration.swift:144-146`). `mk_picture` draws both (`MKMonitor.msl:292-311`). Keep mutual exclusion in the app UI, or accept the change (decision) |
-| `zebra.thresholdIRE` | `zebras[0].level` | Same clamp −20…120 |
-| `zebra.widthIRE` (full width) | `zebras[0].range = widthIRE / 2` (half width) | Old band: `±width*.5` (`MonitorTools.metal.txt:181`); new: `level ± range` |
-| `zebra.mode .aboveThreshold / .band` | `.lowerLimit / .band` | |
-| `zebra.opacity` | `zebras[0].opacity` | |
-| `pictureStage .source / .processedOutput` | `zebras[0].stage` = `.source / .output`; `falseColor.stage` likewise | **No picture-stage field.** `mk_picture` always shows `s.monitor` (`MKMonitor.msl:294`). The UICameraColumn Source/Output menu (262-285) either goes or needs `MonitorState.pictureStage: SignalStage` from the MonitorKit owner. Not invented here |
-| `falseColor.mode .off / .sonySLog3 / .elZone` | same cases | |
-| `falseColor.mode .arri` + profile `SonyARRIStyleFalseColor.profileID` | `.sonySLog3` | Old `normalized()` already migrates this (`MonitorConfiguration.swift:203-209`). `.arriStyleSLog3` exists if the product wants it back |
-| `falseColor.mode .arri` + `ARRIFalseColorProfile` (LogC3/LogC4) | `.arriLogC` + feed signal `.log(LogEncoding(profileID:))` | |
-| `falseColor.profileID`, `specificationVersion` | dropped | Derived from the mode |
-| `falseColor.exposureIndex` | dropped | Old code allowed only 800 for ARRI (239-241) |
-| `falseColor.referenceOffsetStops` (−10…10) | `referenceOffsetStops` clamped to **−6…6** | Also change the stepper range at `UIMonitorTools.swift:260` |
-| `focus.enabled, color, sensitivity, noiseRejection, opacity` | `focus.` same; `style = .coloredEdges` | Same raw colour values; same `edgeThreshold` formula (`MonitorState.swift:190` vs `MonitorRuntime.swift:1047`) |
-| `scopes.mode .rgbParade / .lumaWaveform`, `scopeStage` | `ScopeSettings(kind: .waveform, stage:)` with `waveformMode = .rgbParade / .luma` (`ScopeSettings.swift:144-170`) | `.processedOutput` becomes `.output` |
-| `scopes.gain`, `scopes.graticule` | `ScopeSettings.display.gain`, `.display.showsGraticule` (`ScopeSettings.swift:91-107`) | |
-| `scopes.enabled`, `scopes.refreshHz` | **no field**: the host picks the scope rate | Keep app-side, next to `monitorState` (for example `scopesEnabled` and `scopeRefreshHz`). `MonitorState` has no scope member; persist `ScopeSettings` beside it |
-| `sourceProfileID` | **per-feed** `SignalDescription.encoding = .log(LogEncoding(profileID:transport:))` (`Signal.swift:128-138`) | New `FeedDescriptor` field (for example `monitorSignal`). If nil, derive from `gamut` as `UIMonitorBridge.sourceProfile(forGamut:)` does (`UISupport.swift:116-120`) |
-| `sourceCodeRange` | `SignalDescription.range` override | nil = from the pixel format (`MonitorFrame.layout(for:)`) |
-| `sourceLogMapping .native10Bit / .fullRescaledToLegal10Bit` | `LogTransport.native / .fullRescaledToLegal` | |
-| — | new defaults: `zebras[1]` off, `geometry`, `display`, `monitorLUT = true`, `falseColor.customBands = []` | |
-| Program (`programMonitorConfiguration`) | `programMonitorState` | Old code forced output stages (`MonitorCaptureSink.swift:64-67`). The Program feed has no burn-in, so `.source == .output` |
+| `Sources/App/MonitorGPUContext.swift` | `MonitorRuntime` + `MonitorMetalContext` + `MonitorSurfaceTextureCache` + `MonitorRenderThread` + `MonitorEncodeContext` | Shared device, one `MTL4CommandQueue`, residency set + graveyard, IOSurface texture cache (MonitorKit formats), encode-context pool (bump uniform allocator, conforming to `MonitorMetal4Encoding`), render thread, drawable attach/detach, GPU timing → `AppGPUActivity`, `MonitorEngine`/`ScopeEngine` |
+| `Sources/App/MonitorFeedHost.swift` | `MonitorCaptureSink` | Per target: `MonitorFeed`, `MonitorSignalDeclaration` → `SignalDescription`, burn-in and monitor `MonitorLUT`, stamps and out-of-order rules, latest `MonitorFrame` cache, analysed frame id, consumer list |
+| `Sources/App/MonitorSurface.swift` | `MonitorSurfacePresenter`, `MonitorPictureNSView`, `MonitorScopeNSView`, `MonitorSurfaceRenderLoop`, `MonitorVisibilityNSView`, `MonitorNativePicture`/`Scope`/`SurfaceVisibility` | Slot, freeze state machine, clean, visibility and demand, statistics, layers, display links; calls `MonitorPass`/`ScopeRenderer` instead of `MonitorToolsRenderer` |
+| `Sources/App/MonitorPictureColor.swift` | `MonitorPictureColor` | Kept until MonitorKit's output-colour resolver (R8) replaces it |
+| `Sources/Shared/MonitorWorkspace.swift` | `MonitorTargetID`, `MonitorWorkspaceLayout`, `MonitorWorkspaceState`, `MonitorTargetOption`, `MonitorDiagnostics`, `MonitorAvailability`, `MonitorFrameStamp` | Same Codable keys. Plus `LegacyMonitorConfiguration`, `MonitorFeedPreferences`, `MonitorSignalDeclaration`, `MonitorScopePreferences` |
+| UI ports, until MonitorKitUI covers them | `MonitorWorkspaceShell`/`MonitorTileChrome` (split layout), `MonitorToolsToolbar` (detached tiles), `MonitorFalseColorLegend`, `MonitorDiagnosticsView`, `MonitorScopeGraticule` (IRE labels) | SwiftUI only |
 
-- Downgrade: an older build ignores the new keys and shows monitor tools off. Writing the old key as well needs a reverse map; it isn't worth it.
-- Test migration on the **Debug** build's preferences only (§5).
+MonitorKitUI's `MonitorMetalView` should not replace the app's surfaces unless it can use the host's queue, render thread and shared feeds. The app needs one queue for the barrier rules (§6.2, item 5) and one feed per camera.
 
-### 3.6 App-owned types stranded by deleting MonitorTools
+---
 
-None of these has a MonitorKit replacement:
-- `MonitorTargetID`
-- `MonitorWorkspaceLayout`
-- `MonitorWorkspaceState` (with `normalizedSplitRatio`)
-- `MonitorTargetOption`
-- `MonitorCorrespondence` (deleted, not moved)
-- `MonitorDiagnostics` (replaced by new diagnostics)
+## 7. Features the app has that MonitorKit lacks
 
-Move the first four as described in §3.3. Users: `AppModel`, `FeedRuntime`, `MonitorCoordinator`, `UISupport`, `UISessionBridge`, `UIDiagnostics`, `UIAppProviders`, `MonitorWorkspaceView`, `Tools/MonitorAppIntegration/main.swift:19-39, 86`, `Tests/MonitorCoordinatorChecks`, `Tests/MonitorLifecycleChecks`.
+1. **Picture stage per surface:** "Output (as published)" vs "Source (camera signal)" (`UICameraColumn.swift:262-285`). `mk_picture` always shows the monitor stage. Needs `MonitorState.pictureStage` or a per-surface "bypass burn-in" (R9).
+2. **"As published" pixels.** The app shows the real processed buffer: 1080p, Lanczos, 4:2:0 8-bit when configured. MonitorKit computes output as source resolution + LUT in-shader. That is a semantic change, and an intended one: no monitor-only processing, and no `needsOutput` keeping the GPU busy. Rename the menu item to "Output (LUT)" or similar. If exact published pixels are ever wanted, wrap the processed buffer as a separate `MonitorFrame` with no burn-in.
+3. **Clean aperture**: read from CV attachments and used for the shown region and the aspect (`MonitorCaptureSink.swift:277-300`, `MonitorToolsRenderer.swift:481-487`). MonitorKit has PAR only. Needs a crop rect in `MonitorFrame` (R10).
+4. **A display-aspect query before encode**, for layer sizing on the main thread (`pictureAspectRatio`). MonitorKit computes `MonitorLayout` inside `prepare`. Needs a public static (R10).
+5. **Signal-native HDR output and the layer tagging decision** (§2), plus **primaries in `SignalDescription`** (R8). W2.
+6. **Freeze**: pending-freeze-on-next-frame, cancel wins, a lingering hold on unfreeze, a GPU-owned copy that releases the capture buffer, and the configuration frozen with it. MonitorKit has no Freeze yet (R11). The state machine stays in the app.
+7. **Scope scheduling**: enable, 10/15/30 Hz, its own display link, ≤ 2 in flight. Host-side by design; keep it in the app.
+8. **Master tools switch** (`toolsEnabled`) and the "turning back on doesn't resurrect" rule (`UISupport.swift:122-157`). No MonitorKit field; the UI logic simplifies.
+9. **False colour suppresses zebra** (`effectiveZebraEnabled`). MonitorKit draws both. Glue rule, or accept.
+10. **Program rules**: focus and log false colour disabled on Program, with the UI text "needs a camera's source picture" (`UIMonitorTools.swift:150-151`). MonitorKit would allow peaking on Program frames. Glue rule (`state.focus.enabled = false` for "program"), or lift the restriction deliberately.
+11. **Qualification gates**: false colour refused unless the source profile, transfer string, geometry and correspondence all qualify, with explicit status strings (`MonitorToolsRenderer.swift:363-463`). MonitorKit has `MonitorStatus` reasons (`requiresKnownTransfer`, log mode on a non-log source). Map the strings; check that every old refusal has a MonitorKit reason.
+12. **Per-surface diagnostics**: accepted, presented and superseded counts, scope fps, scope skips (busy, no drawable), GPU ms per picture and per scope, failures, live/stale/frozen, PTS age. App glue; MonitorKit only needs nothing per frame.
+13. **Visibility-driven demand**: occlusion, minimize, hide and close pause the display link and drop the slot, then feed `AppModel.monitorDemand` and automatic start (`MonitorSurfacePresenter.swift:424-462`, `MonitorCoordinator.swift:255-276`). App glue.
+14. **Workspace**: single, side-by-side and 4-up layouts, tile bindings, split ratio, detached windows. App-owned.
+15. **Tile chrome, the toolbar for detached tiles, the false-colour legend (Sony, EL Zone, ARRI captions) and the scope IRE labels**. MonitorKitUI is empty; port them or build them in W2.
+16. **Out-of-order and generation rejection** (`acceptsInOrder`, `MonitorFrameStamp`; `MonitorSurfacePresenter.swift:220-233`). App glue.
+17. **Allocation-free colorimetry and geometry caching per IOSurface on the delivery thread** (`MonitorCaptureSink.swift:205-275`). Keep it in the feed host. `MonitorFrame.signal(of:range:)` is allocation-free but re-reads the attachments every frame.
+18. **Resident IOSurface texture cache with idle sweep and flush per target** (`MonitorRuntime.swift:642-801`). App glue, or a MonitorKit helper (R12).
+19. **Old scope look**: 768×256 image, −10…110 % range (`scopeBin`), parade colours. MonitorKit's waveform defaults to 1024×512 with other trace curves. A visual change only.
+20. **Old zebra look**: a single 45° stripe in target pixels, `(x+y) % 16 < 8`, mixed to white. MonitorKit's stripes differ per set. A visual change only.
 
-### 3.7 Old tests: delete or retarget
+---
 
-This follows the GPU plan's "Tests that encode the old behavior" (lines 93-97).
+## 8. Tests
 
-**App tests**
+### 8.1 App tests (`Tests/`, run by `scripts/test.sh` and `monitor-app-integration.sh`)
 
 | Test | Action |
 | --- | --- |
-| `MonitorCoordinatorChecks.testPausedDiagnosticsAndLayoutCapsFollowCurrentState` (63-102: 30/60 Hz caps, `requestedPictureHz`) | **Delete** (GPU plan: "MonitorCoordinatorChecks (30/60 Hz caps)") |
-| `…testFreezingTheOnlySurfacePreservesDemandUntilHideOrClose` (20), `testWindowVisibilityFreezeAndPreviewHideHaveIndependentDemand` (104), `testRebindingSurfaceReleasesOldSinkAndIgnoresOldTeardown` (127), `testNativeToolsAndHiddenPreviewTransitionsPreserveIndependentDemand` (143), `testUnavailableTargetCannotReactivateMonitorConsumers` (178), `testRemovedAndDisabledTargetsReleaseOutputConsumersImmediately` (189), `testLocalScopeVisibilityUnionsDemandWithoutChangingFeedSettings` (208) | **Retarget** to the rewritten coordinator. The demand semantics remain |
-| `…testExplicitlyEmptyWorkspaceIsNotRepopulatedByPreferenceUpdates` (240) | Keep (workspace logic unchanged); retype |
-| `…testCopySettingsPreservesDestinationCameraCalibration` (254), `testCopyFalseColorModeUsesItsProfileWhilePreservingDestinationCalibration` (280) | Retarget: calibration is now the per-feed signal; there is no exposure index |
-| `…testNativePreviewRejectsLateFramesAfterSourceRebinding` (311) | Keep while `VideoPreview` lives; delete with it (step 9 in §6.3) |
-| `…testProgramMonitoringPreservesProcessingRevisionAndSelectedPixels` (335) | Retarget: Program frames reach the program feed with `burnInLUT == nil`; drop `processingRevision` |
-| `MonitorLifecycleChecks.testLegacySnapshotsDefaultMonitoringOff` (6-12), `testIndependentFeedProgramAndWorkspaceRoundTrip` (14-35) | Retarget to `monitorState`. **Add** a legacy-JSON migration test covering every row of §3.5 |
-| `CaptureRecordingIsolationChecks.testProductionMonitorTapsPreserveRecordingAndRejectRetiredDemand` (132) | Retarget: `FeedMonitor.publish` never blocks capture or recording |
-| `…testCriticalOutputPressureKeepsCleanPreviewCameraAndRecordingAlive` (242), `testHiddenProducerInvalidationClearsItsLatestHealthEpoch` (342), `testNeedsOutputTreatsABusyLockAsWanted` (883) | **Delete** (mechanism gone) |
-| `…testActualDownscaleKeepsSourceFocusAlignedAcrossAsymmetricAperture` (435) | Delete as an app test. The monitor reads the source only; aperture handling belongs in a MonitorKit pixel test |
-| `…testPacedProcessedCameraAndRecordingWithMonitorGPUEnabled` (524) | Retarget to the render loop |
-| Capture tests asserting admission and pool drops | GPU plan step 4, not this integration |
+| `MonitorCoordinatorChecks`: `testFreezingTheOnlySurfacePreservesDemandUntilHideOrClose` (44), `testWindowVisibilityFreezeAndPreviewHideHaveIndependentDemand` (121), `testRebindingSurfaceReleasesOldSinkAndIgnoresOldTeardown` (144), `testNativeToolsAndHiddenPreviewTransitionsPreserveIndependentDemand` (160), `testUnavailableTargetCannotReactivateMonitorConsumers` (195), `testRemovedAndDisabledTargetsReleaseOutputConsumersImmediately` (206), `testLocalScopeVisibilityUnionsDemandWithoutChangingFeedSettings` (225), `testExplicitlyEmptyWorkspaceIsNotRepopulatedByPreferenceUpdates` (257) | Retarget to the rewritten coordinator. The demand semantics are unchanged |
+| `…testPausedDiagnosticsAndLayoutCapsFollowCurrentState` (80) | Retarget the diagnostics part; drop any caps |
+| `…testCopySettingsPreservesDestinationCameraCalibration` (271), `testCopyFalseColorModeUsesItsProfileWhilePreservingDestinationCalibration` (297) | Retarget: calibration = the per-feed signal declaration; there is no exposure index |
+| `…testNativePreviewRejectsLateFramesAfterSourceRebinding` (328) | Keep while `VideoPreviewRenderer` lives |
+| `…testProgramMonitoringPreservesProcessingRevisionAndSelectedPixels` (352) | Retarget: Program reaches its feed with `burnInLUT == nil` |
+| `…testSteadyOffersReadColorimetryWithoutAllocating` (384) | **Keep**, against `MonitorFeedHost` |
+| `MonitorLifecycleChecks.testLegacySnapshotsDefaultMonitoringOff` (6), `testIndependentFeedProgramAndWorkspaceRoundTrip` (14) | Retarget to the new keys. **Add:** a migration test per row of §5.3, a test that the old blob never decodes as `MonitorState`, a test that the legacy key round-trips untouched, and `FeedDescriptor.version` stays 1 |
+| `CaptureRecordingIsolationChecks.testProductionMonitorTapsPreserveRecordingAndRejectRetiredDemand` (121), `testPacedProcessedCameraAndRecordingWithMonitorGPUEnabled` (362) | Retarget to the feed host and surfaces |
+| `…testActualDownscaleKeepsSourceFocusAlignedAcrossAsymmetricAperture` (285), `testNeedsOutputTreatsABusyLockAsWanted` (720) | Delete: there is no output tap or correspondence. Aperture alignment becomes a MonitorKit pixel test (clean-aperture crop) |
+| `Tests/main.swift:66` (`LUT_1D_SIZE` throws) | Retarget: 1D/shaper now parses, so assert it burns in correctly, or assert the app guard (§4.3) |
+| `Tests/main.swift`, `EndToEndChecks`, `GPUExtendedChecks`, `CaptureRecordingIsolationChecks` LUT cases | Must pass unchanged with trilinear `MonitorLUT` (§4.4 golden) |
+| `Tools/MonitorAppIntegration` (`MonitorAppIntegrationChecks`) | Retype; keep `hardware: .offline` |
 
-**Package tests**
+### 8.2 `Packages/MonitorTools/Tests` (goes with the package)
 
-`Packages/MonitorTools/Tests` goes with the package.
-
-**Working tree (WT):** ultracam-18 has already deleted these files. They are still in git at `7a09c71`, so port them from there:
-- `MonitorAdaptivePolicyTests`, `MonitorCriticalPipelinePolicyTests`, `MonitorCompositePoolTests`, `RuntimeResourceReuseTests`, `OwnedMetalInputTests`, `TiledMonitorKernelTests`
-- **and the pixel-correctness files** `ELZoneMetalTests`, `SonyARRIStyleMetalTests`, `MonitorSamplingTests`, `SourcePictureGeometryTests`, `ProcessedFalseColorGeometryTests`, `SourceInterpretationGuardTests` and `MonitorMetalTests`.
-
-`MonitorQualityTests` is modified, not deleted. The GPU plan (line 96) says to **keep** the pixel tests with a retargeted harness. Confirm with that session that the pixel coverage was moved, not dropped.
-
-Port these to MonitorKit:
-- **Pixel correctness (retarget the harness to `MonitorPass`):**
-  - `MonitorQualityTests` (9), `ELZoneMetalTests` (2), `SonyARRIStyleMetalTests` (6), `ProcessedFalseColorGeometryTests` (1), `SourcePictureGeometryTests` (3), `MonitorSamplingTests` (2), `SourceInterpretationGuardTests` (2).
-  - The `MonitorMetalTests` cases at 203, 241, 300, 420, 469, 510, 541, 642, 677, 726, 797 and 877: zebra and scope, ARRI source-before-LUT, source focus, scope RGB order, centred zebra band, HDR not retagged, ARRI rescaled table, aperture sign, graticule toggle, malformed planar height, ARRI 10-bit boundaries, declared log code view.
-  - `MonitorCoreTests` settings and geometry cases (79-289), against `MonitorState`/`MonitorLayout`.
-  - `SonyFalseColorUITests` (legend), against MonitorKitUI.
-  - Core `ColorAnalysisTests`, `ELZoneProfileTests` and `SonyFalseColorTests` are **already ported** (`Packages/MonitorKit/Tests/MonitorKitCoreTests`).
-- **Delete:**
-  - `MonitorAdaptivePolicyTests`, `MonitorCriticalPipelinePolicyTests`, `MonitorCompositePoolTests`, `RuntimeResourceReuseTests`, `OwnedMetalInputTests`, `TiledMonitorKernelTests`.
-  - The `MonitorCoreTests` ledger, lease and revision cases (6-78, 238, 290-405).
-  - The `MonitorMetalTests` skip, budget, fairness, retry and deadline cases (28-200, 283, 345, 372, 389, 591, 756, 766, 925, 968, 1056-1801).
-  - `MonitorToolsUITests` presenter and admission cases.
-  - `Metal4SpikeTests.swift` (ultracam-18's spike; ask before deleting).
+- **Port as MonitorKit pixel and reference tests** (owner: MonitorKit):
+  - `MonitorQualityTests` (9): Sony Pattern 2 at every native code, colour signal IRE, minification box average, focus impulse rejection, Scharr against a CPU oracle, thin focus at 2:1, fractional minification, scope density stability.
+  - `ELZoneMetalTests` (2), `SonyARRIStyleMetalTests` (6), `ProcessedFalseColorGeometryTests` (1), `SourcePictureGeometryTests` (3), `MonitorSamplingTests` (2), `SourceInterpretationGuardTests` (2).
+  - The `MonitorMetalTests` cases: GPU zebra + scope (97), ARRI source before LUT (117), source focus despite flat output (145), scope RGB order and extended axes (176), centred zebra band (195), HDR not retagged as SDR (223), ARRI full rescaled table (243), asymmetric clean aperture (282), graticule toggle (315), malformed planar height (336), every ARRI 10-bit boundary (359), declared log code view with zebra and source focus (414).
+  - `MonitorCoreTests` geometry and migration cases (8-160, 179-217), against `MonitorLayout` and the app's legacy decoder.
+  - Core `ColorAnalysisTests`, `ELZoneProfileTests` and `SonyFalseColorTests` are already ported (`Packages/MonitorKit/Tests/MonitorKitCoreTests`).
+- **Move into app tests** for the ported glue: the `MonitorToolsUITests` presenter, freeze, visibility and colour cases (27). Freeze/hold (15, 32, 254, 297, 312, 347, 712, 802, 852), visibility/display link (326, 372, 750), layer colour (614, 662), out-of-order (828), scope locality (877), layouts (179, 200, 558), zoom (903). Plus `SonyFalseColorUITests` (5), against the ported legend and settings.
+- **Delete:** `MonitorMetalTests` 36, 51 and 75 (build retry and texture cache; re-home 75 if the cache is ported), `TiledMonitorKernelTests` (2), `MonitorCoreTests` revision/gate cases (167, 219) if the stamp logic changes.
 
 ---
 
-## 4. Build system
+## 9. Build, project and scripts
 
-### 4.1 Xcode project
+### 9.1 Project generation
 
-- **Today:** `generate_project.py:87-89` declares `XCLocalSwiftPackageReference(relativePath="Packages/MonitorTools")` and three `XCSwiftPackageProductDependency`s.
-  - They are linked into the **app target only**: the frameworks phase at :95 and `packageProductDependencies` at :114.
-  - The project's `packageReferences` is at :125.
-  - The camera extension has none (pbxproj :664 `()`). `validate_bundle.py:63` enforces that.
-- **Change:**
-  - `relativePath="Packages/MonitorKit"`.
-  - Products: `("MonitorKitCore", "MonitorKit", "MonitorKitScopes", "MonitorKitUI")`, plus `"MonitorKitAudio"` only if the meters are used.
-  - Then let `build.sh:51` regenerate the pbxproj.
-  - During the transition both package references can coexist: different module names, different MSL prefixes (`mk_` vs the old names), separate resource bundles. **No single Swift file may import both.** These names exist in both modules and would be ambiguous: `MonitorRect`, `ELZoneProfile`, `ELZonePublicReference`, `ELZoneReferenceStatus`, `SonySLog3FalseColor`, `SonyFalseColorCategory`, `SonyFalseColorZone`, `SonyARRIStyleFalseColor`, `ARRIFalseColorProfile`/`Zone`/`Category`, `NativeLogCodeMapping`.
-- **Resources:**
-  - Local package resources are copied by Xcode into `Ultracam.app/Contents/Resources/MonitorKit_MonitorKit.bundle`.
-  - Verified with a SwiftPM build: the bundle contains `Contents/Resources/Shaders/{MKDecode,MKLUT,MKMonitor}.msl`.
-  - `MonitorShaders.source` reads `Bundle.module`, subdirectory `Shaders` (`MonitorShaders.swift:20-21`).
-  - `LUTShaders.metal` stays a copied app resource (`generate_project.py:108-109`).
-- **App-side collision:** only `CubeLUT` (§2.6). A scan of every public MonitorKit type against app declarations found nothing else (`Segment` in `Tests/RecordingChecks.swift:12` is nested).
+- **`scripts/generate_project.py` is the only source of truth.** `scripts/build.sh` regenerates `Ultracam.xcodeproj` on every build; never hand-edit the pbxproj.
+  - Today: `XCLocalSwiftPackageReference(relativePath="Packages/MonitorTools")` and products `MonitorToolsCore`/`Metal`/`UI` (`:87-89`), linked into **the app target only** (`:95`, `:114`), with `packageReferences` at `:125`.
+  - W4: `Packages/MonitorKit` with `MonitorKitCore`, `MonitorKit`, `MonitorKitScopes` and `MonitorKitUI` (+ `MonitorKitAudio` only if the meters are used). Both references can coexist during the transition. **No single Swift file may import both packages**: `MonitorRect`, `ELZoneProfile`, `SonySLog3FalseColor`, `ARRIFalseColorProfile` and others exist in both.
+  - `LUTShaders.metal` stays a copied app resource ("Copy GPU Shader Source", `:109`).
+- **`scripts/validate_bundle.py:59-65`** (run by `build.sh`): today it requires `*MonitorToolsMetal.bundle` containing `MonitorTools.metal.txt` and forbids "MonitorTools" in the extension. W4 requires:
+  - `MonitorKit_MonitorKit.bundle` containing `Shaders/MKLUT.msl`, `MKDecode.msl` and `MKMonitor.msl` (`Package.swift` `.copy("Shaders")`)
+  - `MonitorKit_MonitorKitScopes.bundle` containing `Shaders/MKScopes.msl`
+  - no "MonitorKit" anywhere in the camera extension
+- **Camera extension version bump rule** (commits `0ccf83c`, `52d21ab`, `94d0ec5`):
+  - Bump `Config/Camera-Info.plist` `CFBundleVersion` (now 6) when anything the extension compiles or ships changes, along with the app's `CFBundleVersion` (now 18). Otherwise macOS keeps the installed extension.
+  - That covers `Sources/CameraExtension/*`, `Sources/Shared/VideoContract.swift`, `VideoBufferLayout.swift`, `VirtualCameraRegistry.swift` and `VirtualCameraRegistryTransport.swift` (`generate_project.py:31-35`), plus its plist, its entitlements and the deployment target.
+  - **W4 should touch none of these**, so no extension bump is needed. If it does, bump; installing needs the user.
+- Swift settings:
+  - The app is Swift 5 mode with complete concurrency checking and warnings as errors; MonitorKit is Swift 6 with `.treatAllWarnings(as: .error)`. Importing works.
+  - A new compiler warning in MonitorKit breaks the app build.
+  - `@_exported import MonitorKitCore` (`MonitorKit.swift`) brings Core names into every importing file.
 
-### 4.2 Script builds (`swiftc` direct link)
+### 9.2 Scripts (all need `/Volumes/8TB` mounted)
 
-- **Verified:** with this toolchain, `swift build --product MonitorKitCore` and `--product MonitorKit` emit `libMonitorKitCore.a` / `libMonitorKit.a` plus `MonitorKit_MonitorKit.bundle` at `--show-bin-path`, even though the products are automatic type.
-  - So `type: .static` is **not** required for the script pattern.
-  - The library plan (line 117) does say "All products are static libraries". The MonitorKit owner may still add it for clarity.
-- **Replace `scripts/monitor-tools-package.sh`** (or add `monitor-kit-package.sh` and switch callers one at a time):
-  - `monitor_package="$task_root/Packages/MonitorKit"`.
-  - The product loop (:14): `MonitorKitCore MonitorKit MonitorKitScopes MonitorKitUI`.
-  - Link args (:21-23): `-lMonitorKitUI -lMonitorKitScopes -lMonitorKit -lMonitorKitCore` (+ `-lMonitorKitAudio -framework Accelerate` if Audio is used) `-framework Metal -framework QuartzCore -framework CoreVideo -framework SwiftUI`.
-  - The bundle check (:28): `*MonitorKit_MonitorKit.bundle`.
-  - Use a shared scratch under `/Volumes/8TB/…/monitor-package-cache`, like today. Don't share the W1 workflow's scratch.
-- **Callers:** `test.sh:21-27` (also `swift test` of the package), `ui-typecheck.sh:16`, `ui-verify.sh:33`, `monitor-app-integration.sh:19`, `camera-smoke.sh:29`, `monitor-tools-recording.sh:21`, `monitor-tools-smoke.sh:13`.
-- **`LUTProcessor` now needs MonitorKit at runtime.** That affects `camera-smoke.sh:39` and `monitor-tools-recording.sh:25`; both already link the monitor package. It also affects `test.sh:58`, and `ULTRACAM_SHADER` (`test.sh:36`, `ui-verify.sh:32`, `monitor-app-integration.sh:18`) keeps pointing at `LUTShaders.metal`, which `LUTProcessor` now prepends `MKLUT.msl` to.
+| Script | What it does | Safe without asking? | W4 change |
+| --- | --- | --- | --- |
+| `scripts/ui-typecheck.sh` | `swiftc -typecheck` of the Shared, Recording and App sources against the package | **Yes** (fastest gate) | Switch the sourced helper |
+| `scripts/test.sh` | Builds the package and runs its `swift test` (`:21-27`), Rust, the DeckLink backend in testing mode, and the `lut-tests` binary (app subset + `Tests/*`). Synthetic only | **Yes** | Helper → MonitorKit (scratch path). Replace `MonitorCoordinator.swift`/`MonitorCaptureSink.swift` (`:60`) with the new glue files |
+| `scripts/ui-verify.sh` (`FORCE=1`) | Offscreen render of every screen; real `AppModel(…, hardware: .offline)` with a throwaway suite | **Yes** | **The input hash (`:21-23`) walks `Packages/MonitorTools/Sources` and no `*.msl`.** Walk `Packages/MonitorKit/Sources` and add `-name '*.msl'`, or shader edits won't invalidate the cache |
+| `scripts/monitor-app-integration.sh` | Real `AppModel` (`.offline`) + `MonitorCoordinatorChecks` + capturing registry; no CMIO | **Yes** | Helper + source list |
+| `scripts/monitor-tools-package.sh` (sourced) | Builds the 3 products into a shared scratch, sets `monitor_link_args`, copies the bundles | n/a | Add `monitor-kit-package.sh`: products `MonitorKitCore MonitorKit MonitorKitScopes MonitorKitUI`; `-lMonitorKitUI -lMonitorKitScopes -lMonitorKit -lMonitorKitCore` (+ `-lMonitorKitAudio -framework Accelerate`) `-framework Metal -framework QuartzCore -framework CoreVideo -framework SwiftUI`; bundle check for both `.bundle`s. Callers: `test.sh:21`, `ui-typecheck.sh:16`, `ui-verify.sh:33`, `monitor-app-integration.sh:19`, `camera-smoke.sh`, `monitor-tools-recording.sh`, `monitor-tools-smoke.sh` |
+| `scripts/camera-smoke.sh` (no args) | Build only | Yes | Drop the `CubeLUT.swift` path (`:36`), link MonitorKitCore. `--run`/`--full`/`--consumer`/`--monitor*` use the installed extension: **ask** |
+| `scripts/monitor-tools-{smoke,recording,benchmark,admission-checks,stress}.sh`, `monitor-tools-fingerprint.py` | Synthetic harnesses for the old runtime | Yes | Retire with the package (`monitor-tools-recording.sh:24` also compiles `CubeLUT.swift`) |
+| `scripts/build.sh --debug` | Regenerates the project and builds the Debug app into `agent-work`; runs `validate_bundle.py` | Yes, when nobody else has project edits in flight | — |
+| `scripts/app-self-test.sh` (`SKIP_BUILD=1`) | Launches a second, Debug app with `--ui-self-test`; never starts cameras | Yes **without `LIVE=1`**; it uses the Debug preferences, so back them up first | — |
+| `scripts/ui-tour.sh` | Drives the Debug build by its own PID; saves and restores its preferences | Yes **without `LIVE=1`** | — |
+| `swift test --package-path Packages/MonitorKit --scratch-path <own>` | MonitorKit's tests; GPU tests skip without Metal | Yes | — |
+| Anything with `LIVE=1`, installer actions, or quitting or killing the installed app | Real UltraStudio or extension | **No** | — |
 
-### 4.3 Deployment target 15.0 → 26.0: every place it is set
-
-| Place | Value now | Note |
-| --- | --- | --- |
-| `scripts/generate_project.py:84` (project-level `MACOSX_DEPLOYMENT_TARGET`) | 26.0 (uncommitted) | **Source of truth** for both targets |
-| `Ultracam.xcodeproj/project.pbxproj:516, 535` | 15.0 (stale) | Regenerated by `build.sh:51` |
-| `Config/App-Info.plist:10`, `Config/Camera-Info.plist:10` (`LSMinimumSystemVersion = $(MACOSX_DEPLOYMENT_TARGET)`) | follows | **The camera extension's minimum OS changes too.** The rebuilt extension needs a version bump so macOS replaces the installed one (see commits `0ccf83c`, `52d21ab`) |
-| `scripts/build.sh:38` (exported for the Rust `auto_switcher` static lib) | 26.0 (uncommitted) | The comment at :37 still says "macOS 15" |
-| `scripts/test.sh:15, 52` | 26.0 (uncommitted) | `:15` also governs `cargo` and `clang++` (`:32, :43, :48`) |
-| `scripts/ui-verify.sh:31, 58`; `ui-typecheck.sh:15, 21`; `camera-smoke.sh:27, 32`; `monitor-app-integration.sh:17, 45`; `monitor-tools-admission-checks.sh:8, 13`; `monitor-tools-benchmark.sh:11, 52`; `monitor-tools-recording.sh:14, 22`; `monitor-tools-smoke.sh:8, 15` | 26.0 (uncommitted) | |
-| `scripts/recording-recovery-smoke.sh:14` | `-target …macos26.0` only, no export | Add `export MACOSX_DEPLOYMENT_TARGET=26.0` for consistency |
-| `Packages/MonitorTools/Package.swift:6` | `.macOS("26.0")` (uncommitted) | Goes with the package |
-| `Packages/MonitorKit/Package.swift:8` | `.macOS(.v26), .iOS(.v26)` | Requires an app target ≥ 26 |
-
-**Availability checks and APIs:**
-- `Sources/App/UIToolbar.swift:35, 72`: `if #available(macOS 26.0, *) { ToolbarSpacer(…) }` is now always true; remove the conditional.
-  - Checked with `swiftc -typecheck -warnings-as-errors -target arm64-apple-macos26.0` on an equivalent snippet: no warning. This is cleanup, not a build break.
-- `MonitorShaders.swift:34`: `#available(macOS 27.0, …)` (MSL 4.1) stays meaningful.
-- There are no other `@available`/`#available` in `Sources/`.
-- **Deprecations:** raising the target makes APIs deprecated in macOS 15.x–26 warn. Both Swift (`SWIFT_TREAT_WARNINGS_AS_ERRORS`, `-warnings-as-errors`) and the ObjC++ backend (`test.sh:43` `-Werror`) turn warnings into errors.
-  - The scripts already target 26.0 in the working tree, but it is not known whether they have been run since.
-  - Run `ui-typecheck.sh` and `test.sh` (§5) before anything else.
-- **Newly usable APIs:** `Synchronization.Mutex` (15+), `CAMetalDisplayLink` (14+), and the Metal 4 / MSL 4.0 runtime compile used by MonitorKit.
-
-### 4.4 Swift 5 app vs Swift 6 package
-
-- App settings: Swift 5 mode, `SWIFT_STRICT_CONCURRENCY=complete`, warnings as errors (`generate_project.py:84`). The scripts use `-swift-version 5 -strict-concurrency=complete -warnings-as-errors`.
-- MonitorKit settings: tools 6.2, `swiftLanguageModes: [.v6]` and `.treatAllWarnings(as: .error)` (`Package.swift:4`).
-- **Importing Swift 6 modules from Swift 5 mode is supported.**
-- **Concurrency:** MonitorKit's `Sendable` and isolation annotations are enforced in the app under complete checking.
-  - `MonitorEngine` and `MonitorLUT` are `@unchecked Sendable`, and `MonitorFrame` is `@unchecked Sendable`, so they can cross queues.
-  - Feeds and passes are confined, which forces the ownership rule in §3.3.
-  - MonitorKitUI views and controls are main-actor; the app's SwiftUI code is too.
-- **Warnings as errors inside the package:** when Xcode builds the local package with the app, a new compiler warning in MonitorKit breaks the **app** build. Pin the toolchain, or ask the owner to gate the setting for CI only.
-- **`@_exported import MonitorKitCore`** (`MonitorKit.swift:1`): `import MonitorKit` brings every Core name into each importing file. That is fine once `Sources/Shared/CubeLUT.swift` is gone. Every file that uses a MonitorKit type needs its own import (Swift imports are per file).
+**`AppHardware`** (`AppModel.swift:23-50`): `AppModel.init` defaults to `hardware: .live`. **Any tool or test that builds an `AppModel` must pass `.offline`**, as `MonitorAppIntegration` and `UIVerify` do. Only `UIAppEnvironment.model` (the real app) uses `.live`.
 
 ---
 
-## 5. Test and verification commands: what is safe to run
+## 10. Ordered W4 plan
 
-Common rules:
-- Every script needs `/Volumes/8TB` mounted (each checks).
-- **Never** quit `/Applications/Ultracam.app`; it may be serving a meeting.
-- **Never** run anything with `LIVE=1`.
-- **Never** run `defaults` against `org.ultracam.app`. It resolves to the installed app's sandbox container.
-- The Debug build uses `~/Library/Preferences/org.ultracam.app.plist`. Back it up by explicit path (`defaults export "$HOME/Library/Preferences/org.ultracam.app" <backup>.plist`) before the first launch that runs the §3.5 migration.
-
-| Command | What it does | Safe without asking? |
-| --- | --- | --- |
-| `scripts/ui-typecheck.sh` | `swiftc -typecheck` of all Shared, Recording and App sources against the package | **Yes.** The fastest compile gate |
-| `scripts/test.sh` | Builds the package and `swift test` (`:24-27`), the Rust lib and the DeckLink backend in `ULTRACAM_BACKEND_TESTING` mode; links the app subset + `Tests/*` into `lut-tests` and runs it | **Yes.** Synthetic frames only. Defaults are throwaway suites or the test binary's own domain (`VirtualCameraRegistryChecks.swift:115` uses `.standard` of `lut-tests`, not the app's) |
-| `scripts/ui-verify.sh` (`FORCE=1`, `STRICT=0`) | Offscreen render of every screen; real `AppModel` through `UISessionBridge` with a throwaway suite (`Tools/UIVerify/main.swift:342-344`) | **Yes.** It caches on an input hash; fix that hash for MonitorKit (§1.2) |
-| `scripts/monitor-app-integration.sh` | Real `AppModel` + `MonitorCoordinatorChecks`, a capturing registry publisher, no CMIO (`Tools/MonitorAppIntegration/main.swift:6-11`) | **Yes** |
-| `xcrun swift test --package-path Packages/MonitorKit --scratch-path <external scratch>` | MonitorKit's own tests; GPU tests `XCTSkip` without Metal | **Yes.** Use a scratch path different from the W1 workflow's |
-| `scripts/recording-recovery-smoke.sh`, `monitor-tools-{smoke,recording,benchmark,admission-checks,stress}.sh` | Synthetic media and old harnesses | Yes, but the `monitor-tools-*` harnesses retire |
-| `scripts/camera-smoke.sh` (no arguments) | Build only (`:1-8`: "never installs or activates extensions") | **Yes** |
-| `scripts/camera-smoke.sh --run / --full / --consumer / --registry-check / --monitor / --monitor-full` | Uses the installed camera extension. `--consumer` may make the running host start physical capture | **No. Ask the user** |
-| `scripts/build.sh --debug` | Regenerates the project (`:51`) and builds the Debug app into `agent-work/ultracam/Ultracam.app`; no install | **Yes** for the live app. But it **rewrites `project.pbxproj`**, which another session has uncommitted edits in; coordinate first |
-| `scripts/build.sh --signed` | Repoints the `agent-work/ultracam/Ultracam.app` symlink at the sandboxed Release build | Only last; rebuild `--debug` before any tour or self-test (memory note) |
-| `scripts/app-self-test.sh` (`SKIP_BUILD=1`) | Launches a **second**, Debug Ultracam with `--ui-self-test`; never starts cameras; windows flash on screen | Yes, without `LIVE=1`. It uses the Debug preferences: back them up first |
-| `scripts/ui-tour.sh` | Drives the Debug build by its own PID; saves and restores its preferences; refuses a sandboxed build | Yes, without `LIVE=1` |
-| Anything with `LIVE=1`, an installer action, or quitting the installed app | Real UltraStudio or extension changes | **No** |
-
-Checkpoint gates in §6 use: **T** = `ui-typecheck.sh`, **U** = `test.sh`, **V** = `ui-verify.sh`, **I** = `monitor-app-integration.sh`, **K** = MonitorKit `swift test`, **B** = `build.sh --debug` + `validate_bundle.py` (run by `build.sh:71`), **S** = `app-self-test.sh` (non-live).
-
----
-
-## 6. Risks and the ordered plan
-
-### 6.1 Concurrent work
-
-| Who | Files | Rule |
-| --- | --- | --- |
-| Session **ultracam-18**: GPU monitor in MonitorTools, pipelined `LUTProcessor`, Program, Recording, SDK 16 (`PROGRESS.md` W4 gate) | **Actively changing now (§0):** `LUTProcessor.swift`, `LUTShaders.metal`, `VideoContract.swift`, the DeckLink backend, `Sources/Recording/*`, `ProgramTimestampMapper`, `SwitcherCoordinator`, `Packages/MonitorTools/**` (+ untracked `Metal4SpikeTests.swift`). Expected next: `CaptureController.swift`, `MonitorCaptureSink.swift`, `MonitorCoordinator.swift`, `VideoPreview.swift` (`previewPendingLimit` is gone) | **Do not start W4 until it commits.** Then re-baseline this map. Its fused Metal 4 LUT (§2.3a) leaves only the §2.4 delta. Its "GPU monitor in MonitorTools" overlaps §3 entirely: reuse its `CAMetalLayer`/display-link plumbing rather than rebuilding it |
-| W1 workflow (`wf_548da617-dbb`) | `Packages/MonitorKit/**` | App-side code imports only public symbols; raise API gaps (below) with its owner |
-| Grok (GPU plan line 118) | Monitor sink, coordinator, diagnostics, `FULL_AUDIT.md` (uncapped monitor rate) | Merge, don't overwrite |
-| Unknown owner | Uncommitted 26.0 script edits, the stale pbxproj with absolute `DECKLINK_SDK_DIR`/`LIBRARY_SEARCH_PATHS` | Confirm who commits them. Don't commit the machine-absolute pbxproj paths unintentionally |
-
-### 6.2 Technical risks
-
-1. **The MonitorTools pixel-correctness tests are deleted in the working tree.** These seven files are gone: `ELZoneMetalTests`, `SonyARRIStyleMetalTests`, `MonitorSamplingTests`, `SourcePictureGeometryTests`, `ProcessedFalseColorGeometryTests`, `SourceInterpretationGuardTests` and `MonitorMetalTests` (§3.7).
-   - The GPU plan (line 96) says to keep them with a retargeted harness.
-   - They survive only in git at `7a09c71`.
-   - MonitorKit has no GPU pixel tests yet.
-   - **Confirm with ultracam-18 before it commits, and port them into MonitorKit's GPU tests from `7a09c71`.** Otherwise the false color, EL Zone, ARRI boundary and geometry qualification has no coverage.
-2. **The MonitorKit monitor API is new and unaudited** (§0, dated). `MonitorKitUI` is still a stub.
-3. **API gaps to raise with the MonitorKit owner:**
-   - picture stage (§3.5)
-   - `ScopeSettings` persistence shape
-   - the freeze API
-   - clean-aperture handling (old `MonitorGeometry.cleanAperture`)
-   - whether `MonitorMetalView` can share a feed's analysis
-   - `MonitorFrame.wrap` allocating a `[AnyObject]` per call (`MonitorFrame.swift:237`) against contract rule 5. The host should cache `MonitorFrame`s per IOSurface ID, as GPU plan step 1 suggests.
-4. **Settings data loss:** the same `schemaVersion` with non-throwing decode, and the `FeedDescriptor.version` guard (§3.5). Shipping the Release build migrates the user's real container, with no downgrade path for monitor settings.
-5. **Preview ≠ output at the ULP level:** fast vs safe math (§2.5) and the decode algebra (§3.2). The resize and encode stages are not visible in previews.
-6. **Capture-buffer retention:** the latest-frame slot plus frames in flight hold DeckLink buffers (§3.2).
-7. **Behaviour changes** that need product sign-off:
-   - zebra and false color now show together
-   - the Source/Output picture menu
-   - the trilinear vs tetrahedral default
-   - preview "output" is source resolution
-8. **Camera extension rebuilt at 26.0:** a version bump is needed for macOS to replace it; the user must install it (GPU plan line 117).
-9. **`.treatAllWarnings(as: .error)`** in MonitorKit can break app builds on a toolchain change.
-10. **Retiring `VideoPreview`** touches demand logic (`AppModel.swift:1050-1068`, `previewRenderer.isPresented`), the menu bar mini preview (`AppModel.swift:212-221`, `UIAppProviders.swift:13, 101`), the Diagnostics "Preview" drops, and `PreviewChecks`. Keep it until the last step.
-
-### 6.3 Ordered plan with checkpoints
+Gates:
+- **T** = `ui-typecheck.sh`
+- **U** = `test.sh`
+- **V** = `ui-verify.sh FORCE=1`
+- **I** = `monitor-app-integration.sh`
+- **K** = MonitorKit `swift test`
+- **B** = `build.sh --debug` (+ `validate_bundle.py`)
+- **S** = `app-self-test.sh` (non-live)
 
 0. **Preconditions.**
-   - ultracam-18 has committed.
-   - MonitorKit's `MonitorLUT`, `MKLUT.msl` and `CubeLUT` are frozen (W1 audit passed).
-   - Rerun the §1 greps and update the line numbers here.
-   - Back up the Debug preferences.
-   - Gate: **T, U** green on the new baseline at 26.0, which shows any deprecation errors.
+   - W2 has landed and been audited: the Metal 4 path (R1-R7), HDR/output colour (R8), Freeze (R11), `pictureStage` (R9), clean aperture and the aspect query (R10).
+   - Re-run the greps in §3 and refresh the line numbers.
+   - Back up `~/Library/Preferences/org.ultracam.app.plist` by path.
+   - Gate: T, U, I, V green on the baseline.
 1. **Plumbing, no behaviour change.**
-   - Add the MonitorKit package reference next to MonitorTools (`generate_project.py:87-89, 95, 114, 125`) and the `monitor-kit-package.sh` link args (§4.2).
-   - Make `validate_bundle.py` accept the new bundle.
-   - Fix the `ui-verify.sh` hash (Packages/MonitorKit + `*.msl`).
-   - No file imports both packages.
-   - Gate: **T, U, V, B, K**.
-2. **Swap `CubeLUT`** (§2.6): delete `Sources/Shared/CubeLUT.swift`, add the imports, fix the two script source lists. Gate: **U** (CubeTests unchanged), **T**.
-3. **Fused LUT in `LUTProcessor`**, trilinear, with the compile-option decision made.
-   - Most of this is already in ultracam-18's working tree (§2.3a). The remaining delta is §2.4 items 1-4.
-   - Golden exact-equality test against the HEAD kernel, if that session didn't add one.
-   - Gate: **U** (every test in the §2.5 table), golden equal, and GPU time per frame not worse (`CommandTiming`, `LUTProcessor.swift:22-32`).
-4. **One GPU context and one `MonitorLUT` per load.**
-   - The device is shared by every `LUTProcessor` (align with ultracam-18's step 2).
-   - `CaptureController.load(lut)` plus the test convenience.
-   - AppModel builds the LUT once (§3.4).
-   - Gate: **U, T**, then a Debug build that loads, restores and forgets a LUT through bookmarks, on Debug preferences only.
-5. **Settings schema.**
-   - App-owned `MonitorWorkspace.swift` (§3.6).
-   - `LegacyMonitorConfiguration` plus the `monitorState` and `programMonitorState` keys.
-   - Per-feed signal, `monitorLUTBookmark`/`monitorLUTEnabled`/`lutInterpolation`, and `ScopeSettingsV1`.
-   - The coordinator still runs on MonitorTools internally: convert at the boundary.
-   - Gate: **U** (retargeted `MonitorLifecycleChecks` + the new migration test), **I, V**.
-6. **Monitor runtime swap (blocked on W1/W2).**
-   - Add `FeedMonitor`, `MonitorSurface`, `MonitorRenderLoop` and the rewritten `MonitorCoordinator` (§3.3).
-   - `CaptureController` publishes once (`:929`); delete `:935-941`, `:973-975` and `:980-986`.
-   - Delete `MonitorCaptureSink.swift`.
-   - Retarget `UIAppProviders`, `MonitorWorkspaceView`, `UISupport`, `UIMonitorTools`, `UIDiagnostics` and `UICameraColumn`.
-   - Program is published through the coordinator.
-   - Gate: **U** (§3.7 retargets), **I, V, S**, plus counters: copies per frame = 0, presented fps = display rate, late vsyncs, GPU ms per pass ≤ the MonitorKit budget (0.5 ms per 4K→1080p pass).
-7. **Routing UI** (§3.4): the inspector routing picker, the monitor-LUT slot, the per-surface toggle, help text. Gate: **V, S**, and a non-live `ui-tour.sh`.
-8. **Retire MonitorTools.**
-   - Remove the package reference.
-   - Delete `Packages/MonitorTools`, `Tools/MonitorTools*` and `scripts/monitor-tools-*.sh` + `monitor-tools-fingerprint.py`.
-   - Drop the old checks from `validate_bundle.py`.
-   - Rewrite the `UISettings.swift:648` text.
-   - Port the package tests listed in §3.7 into MonitorKit (owner: MonitorKit).
-   - Gate: **T, U, V, I, K, B, S**.
-9. **Follow-ups.**
-   - Retire `VideoPreview`/`AVSampleBufferDisplayLayer` (GPU plan §3).
-   - Optional tetrahedral default.
-   - Bump the camera extension version for shipping.
-   - **Hands-on check with the UltraStudio only with the user's explicit go-ahead** (it needs the installed app quit, or `LIVE=1`).
+   - `generate_project.py`: add the MonitorKit reference beside MonitorTools.
+   - Add `monitor-kit-package.sh`.
+   - `validate_bundle.py`: accept the new bundles.
+   - `ui-verify.sh`: fix the hash.
+   - `test.sh`: also run MonitorKit `swift test`.
+   - Gate: T U V B K.
+2. **LUT, atomic** (§4.3, §4.4): `Sources/Shared/CubeLUT.swift` (delete), `LUTShaders.metal` (drop the copy), `LUTProcessor.swift` (`MonitorLUT`, `LUTParameters`, compile options, no wait on load), `CaptureController.swift` (`load(MonitorLUT)` + cube convenience), `AppSettingsStore.swift` (import), `Tests/main.swift:66`, the two scripts' `CubeLUT.swift` paths.
+   - Golden trilinear equality.
+   - Risk: the include guard and struct size; `ULTRACAM_METALLIB` concatenation.
+   - Gate: U (every LUT test), T.
+3. **Shared device and one `MonitorLUT` per load**: `AppModel.swift` (`uploadLUT`, `restoreHeadlessLUT`) builds the LUT once and gives it to the controller and the feed host; `LUTProcessor` takes the device. Gate: U T, then a Debug build that loads, restores and forgets a LUT.
+4. **Settings schema** (§5): `Sources/Shared/MonitorWorkspace.swift` (app-owned workspace types + `LegacyMonitorConfiguration` + new preference types), `AppSettingsStore.swift` (new keys, legacy decode, legacy passthrough), `FeedRuntime.swift`, `AppModel.swift`.
+   - The coordinator still runs on MonitorTools; convert at its boundary.
+   - Gate: U (`MonitorLifecycleChecks` + new migration tests), I, V.
+5. **GPU context + feed host**: add `MonitorGPUContext.swift` (bump uniforms ≥ 32 KB per context; MonitorKit conformances) and `MonitorFeedHost.swift`.
+   - `CaptureController.swift`: delete `needsOutput` (386-388, 1001, 1008, 1025), the output offer and correspondence (1098-1110), `monitorWantsOutput` (`DeliveryItem` 1323-1326) and the `monitorProcessingRevision` stamps.
+     - Keep the in-order source offer, including `afterCommittedFrames` (1069-1081).
+     - The monitor no longer forces GPU processing.
+   - `ProgramOutputBridge.swift` `ProgramMonitorTap`: source only.
+   - Gate: U, I.
+6. **Surfaces**: add `MonitorSurface.swift` (render loop on `MonitorPass`/`ScopeRenderer`; layers `framebufferOnly = true`; pipelines warmed for `bgr10a2Unorm`/`rgba16Float`/`bgra8Unorm`), port `MonitorPictureColor` or use R8, rewrite `MonitorCoordinator.swift`, delete `MonitorCaptureSink.swift`.
+   - UI: `UIAppProviders.swift`, `MonitorWorkspaceView.swift`, `UICameraColumn.swift` (zoom → magnification; the stage menu), `UIMonitorTools.swift`, `UISupport.swift`, `UIContext.swift`, `UISessionBridge.swift`, `UIDiagnostics.swift`, `UISettings.swift:648`.
+   - Tests §8.1.
+   - Gate: U I V S, plus counters: 0 copies per frame, presented fps = the source rate on a 60 Hz display, 0 allocations per steady frame, GPU per 4K→1080p pass within the 0.5 ms budget, and the HLG/PQ layer switch as in §2.
+7. **Optional routing UI**: monitor-only LUT (`FeedDescriptor.monitorLUTBookmark`/`monitorLUTEnabled`/`lutInterpolation`), wired to `MonitorFeed.monitorLUT`. Gate: V S.
+8. **Retire MonitorTools**:
+   - Remove its reference from `generate_project.py`.
+   - Delete `Packages/MonitorTools`, `Tools/MonitorTools*`, `scripts/monitor-tools-*.sh` and `monitor-tools-fingerprint.py`.
+   - Drop the old checks in `validate_bundle.py`.
+   - Port the package tests (§8.2).
+   - Gate: T U V I K B S.
+9. **Hands-on with the UltraStudio** only with the user's explicit go-ahead: it needs `LIVE=1` or the installed app quit.
+
+**Top risks:**
+1. Settings data loss through the partial decode (§5.2).
+2. The LUT struct and include guard (§4.3).
+3. Uniform capacity and argument-table bind counts (§6.2) cause precondition crashes or silent mis-binding.
+4. Missing barriers or residency under Metal 4 show up as intermittent garbage, not errors. Test with the Metal validation layer (`MTL_DEBUG_LAYER=1`) in `test.sh` runs.
+5. Behaviour changes that need sign-off: the in-shader output vs "as published", zebra together with false colour, peaking on Program, overlay white level in HDR, the trilinear vs tetrahedral default.
+6. Preview vs output differ by ULPs until the compile options match (R6).
+7. One focus stage per feed.
+8. Warnings as errors in the package on a toolchain change.
+
+---
+
+## 11. Library requirements before W4 (beyond what exists)
+
+- **R1** A Metal 4 encode path for `MonitorFeed.analyze`, `MonitorPass.encode`/`prepare`/`draw`, `ScopeGroup`/`ScopeAccumulator.accumulate`, `ScopeRenderer.render` and Freeze. It takes the host's `MTL4CommandBuffer` through a confined host protocol (`MonitorMetal4Encoding`, §6.2) and never creates command buffers or queues, commits, waits or adds handlers.
+- **R2** Uniforms through a host transient allocator (`allocateUniforms(length:) -> (pointer, gpuAddress)`, 256 B aligned; ≈ 3.4 KB per picture, ≈ 250 B per focus pass, plus the scope sizes, documented). No `set*Bytes`.
+- **R3** Library-owned `MTL4ArgumentTable`s, one per pass, feed or scope object, created at init with documented bind counts. Reused across frames, relying on Metal 4's binding snapshot at encode time.
+- **R4** Residency through a host hook (`MonitorResidencyHost.makeResident` when an allocation is created; `retireAfterCompletion` when one is replaced). No residency commit per frame. All persistent allocations are enumerable (placeholders, masks, bins, stats, trace and graticule textures, freeze copies).
+- **R5** Correct Metal 4 barriers inside the library's encoders (§6.2, item 5). Documented requirement: all MonitorKit work for an engine goes on one `MTL4CommandQueue`.
+- **R6** `MTL4Compiler`-built pipelines with `mathMode = .safe` and MSL 4.0/4.1, asynchronous specialization through compiler tasks, and a public `MonitorShaders.compileOptions` so `LUTProcessor` compiles `mk_applyLUT` identically. Verify whether classic `MTLRenderPipelineState`s work with `MTL4RenderCommandEncoder`.
+- **R7** Render-target picture and scope passes into `bgr10a2Unorm`, `rgba16Float` and `bgra8Unorm` drawables with `framebufferOnly = true`; a warm-up API for those formats.
+- **R8** HDR/EDR output that matches §2:
+  - a signal-native write mode
+  - an output-colour resolver (pixel format, `CGColorSpace` name, `wantsExtendedDynamicRangeContent`, `CAEDRMetadata` kind) from the stage signal
+  - `SignalDescription.primaries`, read from `kCVImageBufferColorPrimariesKey` in `signal(of:range:)`
+  - a declared output encoding per `MonitorLUT`, default Rec.709
+  - the overlay white level in HDR, defined and documented
+- **R9** A picture-stage selection per surface (`MonitorState.pictureStage: SignalStage` or equivalent), so the app's Source/Output picture menu survives.
+- **R10** A clean-aperture or region-of-interest crop on `MonitorFrame`, and a public, allocation-free display-aspect query (`MonitorLayout` for frame + state) for sizing the layer on the main thread.
+- **R11** Freeze:
+  - Encoded into the host's buffer with the compute encoder's copy.
+  - Owned `.private` textures registered through R4 and released through `retireAfterCompletion`.
+  - A stable `MonitorFrame.id` for the frozen frame.
+  - Copies only the source planes.
+  - Documented memory.
+- **R12** Documented texture formats for host-built `MonitorFrame`s. Optionally an IOSurface-keyed, residency-aware texture cache helper (a port of `MonitorSurfaceTextureCache`), because `wrap(cache:)` per frame does not suit Metal 4 residency.
+- **R13** Optional: make foreign `schemaVersion: 1` JSON fail closed (a type discriminator or schema 2) before any host persists `MonitorState`.
+- **R14** `MonitorStatus` reasons covering every old refusal string (§7, item 11), and a "code-value view" label for declared log sources shown without a transform.
+- **R15** MonitorKitUI parity, or a decision that the app keeps its ports: the false-colour legends (Sony Pattern 2, EL Zone, ARRI), the scope scale labels (−10…110 IRE), the tile toolbar.

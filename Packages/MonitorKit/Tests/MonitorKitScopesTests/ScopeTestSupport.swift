@@ -9,7 +9,14 @@ import XCTest
 enum GPU {
   static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
   static let queue: MTLCommandQueue? = device?.makeCommandQueue()
-  static let engine: ScopeEngine? = device.flatMap { try? ScopeEngine(device: $0) }
+  /// Asynchronous, like a host's; the general render pipelines of the test
+  /// targets' formats are built up front, so the first draw is not skipped.
+  static let engine: ScopeEngine? = device.flatMap { device in
+    guard let engine = try? ScopeEngine(device: device) else { return nil }
+    for format in targetFormats { try? engine.prepare(pixelFormat: format) }
+    return engine
+  }
+  static let targetFormats: [MTLPixelFormat] = [.rgba8Unorm, .rgba8Unorm_srgb, .bgra8Unorm, .rgba32Float]
   /// Builds every specialized pipeline on first use, so tests exercise them deterministically.
   static let synchronousEngine: ScopeEngine? = device.flatMap { try? ScopeEngine(device: $0, specialization: .synchronous) }
   /// Never specializes: the general pipelines only.
@@ -100,8 +107,24 @@ struct TestFrame {
     }
     static let all: [Kind] = [
       .v210, .uyvy8, .yuyv8, .biplanar(.s420, 8), .biplanar(.s422, 8), .biplanar(.s420, 10), .biplanar(.s422, 10),
-      .biplanar(.s444, 10), .bgra8, .rgba16Float,
+      .biplanar(.s444, 10), .biplanar(.s420, 12), .biplanar(.s422, 16), .bgra8, .rgba16Float,
     ]
+    /// The Y'CbCr layouts, which also come full range.
+    static let ycbcr: [Kind] = all.filter { !$0.isRGB }
+    var isRGB: Bool {
+      switch self {
+      case .bgra8, .rgba16Float: return true
+      default: return false
+      }
+    }
+    var bitDepth: Int {
+      switch self {
+      case .v210: return 10
+      case .uyvy8, .yuyv8, .bgra8: return 8
+      case .biplanar(_, let d): return d
+      case .rgba16Float: return 16
+      }
+    }
   }
 
   /// Y'CbCr codes at `bitDepth` for each luma pixel; chroma is taken at the
@@ -349,9 +372,16 @@ struct TestFrame {
 func mkLuma(_ rgb: SIMD3<Float>, _ k: SIMD3<Float>) -> Float { rgb.y + k.x * (rgb.x - rgb.y) + k.z * (rgb.z - rgb.y) }
 
 extension ScopeKernelParameters {
-  /// The stage Y' the kernels measure for a pixel: the transport luma, or `mk_luma` of the stage RGB.
-  func stageLuma(_ rgb: SIMD3<Float>, transport: Float) -> Float {
+  /// The Y' a scope draws for a pixel: the transport luma, or `mk_luma` of the
+  /// stage RGB with the colorimetry's weights.
+  func scopeLuma(_ rgb: SIMD3<Float>, transport: Float) -> Float {
     weights.w != 0 ? transport : mkLuma(rgb, SIMD3(weights.x, weights.y, weights.z))
+  }
+
+  /// The stage Y' the statistics measure, as the picture's `mk_stageLuma`: the
+  /// transport luma where no LUT touched the stage, Rec.709 Y' of a LUT result.
+  func statisticsLuma(_ rgb: SIMD3<Float>, transport: Float) -> Float {
+    luts.x != 0 || luts.y != 0 ? mkLuma(rgb, SIMD3(0.2126, 0.7152, 0.0722)) : transport
   }
 }
 

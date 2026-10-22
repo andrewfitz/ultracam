@@ -53,12 +53,15 @@ public enum VectorscopeTargets: String, Codable, Sendable, CaseIterable {
   }
 }
 
-/// Y'CbCr weights for luma, the Y'CbCr parade and the vectorscope.
+/// Y'CbCr weights for the drawn luma (waveform and histogram), the Y'CbCr
+/// parade and the vectorscope. The statistics always measure the picture's stage luma.
 public enum ScopeColorimetry: String, Codable, Sendable, CaseIterable {
   /// The frame's transport matrix for the source, Rec.709 after a LUT. The
   /// same rule as the picture pass's IRE, so zebras and the waveform agree.
   case auto
   case bt601, bt709, bt2020
+  /// SMPTE 240M-1999 (legacy 1035i/1080i HD): Y' = 0.212 R' + 0.701 G' + 0.087 B'.
+  case smpte240m
 
   public func matrix(source: YCbCrMatrix, lutApplied: Bool) -> YCbCrMatrix {
     switch self {
@@ -66,6 +69,7 @@ public enum ScopeColorimetry: String, Codable, Sendable, CaseIterable {
     case .bt601: return .bt601
     case .bt709: return .bt709
     case .bt2020: return .bt2020
+    case .smpte240m: return .smpte240m
     }
   }
 }
@@ -172,9 +176,16 @@ public struct ScopeSettings: Codable, Equatable, Sendable {
   public var histogramBins = 512
   /// Vectorscope bins per side, 64…2048, even.
   public var vectorscopeSize = 512
-  /// Pixels at or above this level, in percent, count as clipped high.
+  /// Pixels at or above this level, in percent, count as clipped high, per
+  /// channel (R', G', B' and Y' of the stage), -20…120. The same test as the
+  /// picture's clip indicators (`ClipIndicatorSettings.high`), so with equal
+  /// levels and stage the clip percentages count exactly the pixels it marks.
+  /// Y' here (and in the luma statistics) is the picture's stage luma whatever
+  /// `colorimetry` is: the transport Y' where no LUT touched the stage, Rec.709
+  /// Y' of a LUT result.
   public var clipHighPercent = 100.0
-  /// Pixels at or below this level, in percent, count as clipped low.
+  /// Pixels at or below this level, in percent, count as clipped low, -20…120
+  /// (`ClipIndicatorSettings.low`).
   public var clipLowPercent = 0.0
   public var display = ScopeDisplay()
 
@@ -215,8 +226,9 @@ public struct ScopeSettings: Codable, Equatable, Sendable {
     v.waveformLevels = clampInt(waveformLevels, Self.waveformLevelRange)
     v.histogramBins = clampInt(histogramBins, Self.histogramBinRange) & ~1
     v.vectorscopeSize = clampInt(vectorscopeSize, Self.vectorscopeSizeRange) & ~1
-    v.clipHighPercent = scopeClamp(clipHighPercent, -7...109, 100)
-    v.clipLowPercent = scopeClamp(clipLowPercent, -7...109, 0)
+    // The picture's clip indicator range.
+    v.clipHighPercent = scopeClamp(clipHighPercent, -20...120, 100)
+    v.clipLowPercent = scopeClamp(clipLowPercent, -20...120, 0)
     v.display = display.normalized()
     return v
   }

@@ -58,6 +58,15 @@ public enum FalseColorTable {
     }
   }
 
+  /// Whether a frame classifies against ARRI's full-range LogC tables: the
+  /// container is full range or float (float RGB carries full 10-bit levels), or
+  /// the camera's full-range codes were squeezed into a legal container
+  /// (`.fullRescaledToLegal`). The range follows how the codes reached us, not
+  /// only the container flag. `MonitorPass` and legends share this rule.
+  public static func usesFullRangeARRI(signal: SignalDescription, layout: PixelLayout? = nil) -> Bool {
+    signal.range == .full || layout?.isFloat == true || signal.encoding.log?.transport == .fullRescaledToLegal
+  }
+
   /// The literal ARRI table for a LogC curve.
   public static func arriProfile(for curve: LogCurve) -> ARRIFalseColorProfile? {
     switch curve {

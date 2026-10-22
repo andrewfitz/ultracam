@@ -64,17 +64,41 @@ final class PeakTests: XCTestCase {
     return Signal(sampleRate: fs, channels: [x, x])
   }
 
+  static let allRates: [Double] = [32000, 44100, 48000, 88200, 96000, 176_400, 192_000, 352_800, 384_000, 768_000]
+
   // EBU Tech 3341 cases 15-19: expected -6.0 / +3.0 dBTP, +0.2 / -0.4 dB.
-  // The cases are 48 kHz signals (12, 8 and 6 kHz tones); other rates get
-  // the same frequencies, which Annex 2's oversampling to ~192 kHz keeps on
-  // the same interpolation grid in time. There the tones sample the Annex 2
-  // filter's passband ripple at other normalized frequencies, which reads up
-  // to +0.22 dB (at 48 kHz it already reads +0.19 dB at 4.8 kHz).
-  func testTruePeakTech3341Cases15To19() throws {
+  // Tech 3341 states the tones as fractions of the meter's own rate ("fs/4
+  // denotes 12 kHz for a sample-rate of 48 kHz, etc."), so every rate gets
+  // its own fs/4, fs/6 and fs/8, with the filter's error included.
+  func testTruePeakTech3341Cases15To19AtEveryRate() throws {
     let cases: [(divisor: Double, amplitude: Double, phase: Double)] = [
       (4, 0.5, 0), (4, 0.5, 45), (6, 0.5, 60), (8, 0.5, 67.5), (4, 1.41, 45),
     ]
-    for fs in Self.rates + [88200, 192_000] {
+    for fs in Self.allRates {
+      for c in cases {
+        let m = try meter(fs)
+        m.feed(taperedTone(fs: fs, frequency: fs / c.divisor, amplitude: c.amplitude, phase: c.phase))
+        let tp = Double(m.snapshot().maximumTruePeak)
+        let expected = dB(c.amplitude)
+        XCTAssertLessThanOrEqual(tp, expected + 0.2, "fs/\(c.divisor) \(c.phase) deg at \(fs)")
+        XCTAssertGreaterThanOrEqual(tp, expected - 0.4, "fs/\(c.divisor) \(c.phase) deg at \(fs)")
+        // At 45 degrees the samples of fs/4 sit 3 dB below its crests.
+        if c.divisor == 4 && c.phase == 45 {
+          XCTAssertEqual(Double(m.snapshot()[0].samplePeakHold), expected - 3.01, accuracy: 0.05, "\(fs)")
+        }
+      }
+    }
+  }
+
+  // The same tones at their 48 kHz frequencies (12, 8 and 6 kHz) at other
+  // rates: there they sample the Annex 2 filter's passband ripple at other
+  // normalized frequencies, which reads up to +0.22 dB (at 48 kHz it already
+  // reads +0.19 dB at 4.8 kHz).
+  func testTruePeakTech3341TonesAt48kFrequencies() throws {
+    let cases: [(divisor: Double, amplitude: Double, phase: Double)] = [
+      (4, 0.5, 0), (4, 0.5, 45), (6, 0.5, 60), (8, 0.5, 67.5), (4, 1.41, 45),
+    ]
+    for fs in Self.allRates where fs >= 48000 {
       for c in cases {
         let m = try meter(fs)
         m.feed(taperedTone(fs: fs, frequency: 48000 / c.divisor, amplitude: c.amplitude, phase: c.phase))
@@ -82,17 +106,34 @@ final class PeakTests: XCTestCase {
         let expected = dB(c.amplitude)
         XCTAssertLessThanOrEqual(tp, expected + (fs == 48000 ? 0.2 : 0.25), "fs/\(c.divisor) \(c.phase) deg at \(fs)")
         XCTAssertGreaterThanOrEqual(tp, expected - 0.4, "fs/\(c.divisor) \(c.phase) deg at \(fs)")
-        // At 48 kHz the samples of fs/4 at 45 degrees sit 3 dB below its crests.
-        if fs == 48000 && c.divisor == 4 && c.phase == 45 {
-          XCTAssertEqual(Double(m.snapshot()[0].samplePeakHold), expected - 3.01, accuracy: 0.05)
-          XCTAssertEqual(tp, expected, accuracy: 0.2)
-        }
       }
     }
   }
 
+  /// BS.1770-4 Annex 2: a dBTP reading needs an oversampled rate of at least
+  /// 192 kHz. Every rate from 48 kHz up gets there; below, 4x is the most
+  /// Annex 2 offers.
+  func testTruePeakOversampledRateIsAtLeast192kHz() throws {
+    for fs in Self.allRates {
+      let factor = Reference.oversampling(fs)
+      if fs >= 48000 {
+        XCTAssertGreaterThanOrEqual(Double(factor) * fs, 192_000, "\(fs)")
+      } else {
+        XCTAssertEqual(factor, 4, "\(fs)")
+      }
+      XCTAssertGreaterThanOrEqual(factor, 2, "\(fs)")
+      // The meter runs exactly this factor (the reference test pins its output to it).
+      let x = Signal.sine(frequency: fs / 4, dBFS: -6, seconds: 0.05, sampleRate: fs, phaseDegrees: 45)
+      let m = try meter(fs, channels: 1, meters: [.samplePeak, .truePeak])
+      m.feed(Signal(sampleRate: fs, channels: [x]))
+      XCTAssertEqual(Double(m.snapshot()[0].truePeakMax), dB(Reference.truePeak(x, sampleRate: fs)), accuracy: 1e-4, "\(fs)")
+    }
+  }
+
   // EBU Tech 3341 cases 20-23: fs/6 at 0.5 with one fs/4 period at 1.0,
-  // synthesized at 4 fs, low-passed and decimated at offsets 0-3. Expected 0.0 dBTP.
+  // synthesized at 4 fs, low-passed and decimated at offsets 0-3. Expected
+  // 0.0 dBTP. The samples depend only on fs-relative frequencies, so the
+  // same arrays are the cases at every rate.
   func testTruePeakTech3341Cases20To23() throws {
     let fs = 48000.0
     let up = 4 * fs
@@ -122,11 +163,13 @@ final class PeakTests: XCTestCase {
         x.append(Float(acc))
         i += 4
       }
-      let m = try meter(fs)
-      m.feed(Signal(sampleRate: fs, channels: [x, x]))
-      let tp = Double(m.snapshot().maximumTruePeak)
-      XCTAssertLessThanOrEqual(tp, 0.2, "offset \(offset)")
-      XCTAssertGreaterThanOrEqual(tp, -0.4, "offset \(offset)")
+      for rate in Self.allRates {
+        let m = try meter(rate)
+        m.feed(Signal(sampleRate: rate, channels: [x, x]))
+        let tp = Double(m.snapshot().maximumTruePeak)
+        XCTAssertLessThanOrEqual(tp, 0.2, "offset \(offset) at \(rate)")
+        XCTAssertGreaterThanOrEqual(tp, -0.4, "offset \(offset) at \(rate)")
+      }
     }
   }
 

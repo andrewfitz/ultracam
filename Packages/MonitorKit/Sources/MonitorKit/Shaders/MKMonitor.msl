@@ -34,6 +34,24 @@ using namespace metal;
 #ifndef MK_NAVIGATOR
 #define MK_NAVIGATOR true     // the magnification inset
 #endif
+#ifndef MK_CLIP
+#define MK_CLIP true          // clip indicators
+#endif
+// Output colour (MonitorKitCore.MonitorColorPipeline). The engine fixes each per
+// pipeline; compiled on its own they follow the uniforms, so a host that prepends
+// this file gets the same pixels.
+#ifndef MK_TRANSFORM
+#define MK_TRANSFORM (p.color.x)         // display transform: 0 none, 1 log to Rec.709, 2 PQ to SDR, 3 HLG to SDR
+#endif
+#ifndef MK_PICTURE_TF
+#define MK_PICTURE_TF (p.color.y)        // the picture's transfer: 1 BT.1886, 2 sRGB, 3 gamma 2.2, 4 linear, 5 PQ, 6 HLG
+#endif
+#ifndef MK_TARGET_TF
+#define MK_TARGET_TF (p.color.z)         // the target's transfer, same codes; 0 writes the picture unchanged
+#endif
+#ifndef MK_ROLLOFF
+#define MK_ROLLOFF (p.colorFlags.x != 0) // highlight roll-off before the target encode
+#endif
 
 // ---------------------------------------------------------------- transfers
 
@@ -67,10 +85,10 @@ float mk_logC3ReferenceCode(float y) {
 float mk_bt709Linear(float v) { return v < .081f ? v / 4.5f : pow((v + .099f) / 1.099f, 1 / .45f); }
 // IEC 61966-2-1 decode.
 float3 mk_srgbDecode(float3 v) { return select(pow((v + .055f) / 1.055f, 2.4f), v / 12.92f, v <= .04045f); }
-// SMPTE ST 2084 EOTF, in cd/m².
+// SMPTE ST 2084 EOTF, in cd/m², on its 0…1 domain (above it the denominator falls to 0).
 float mk_pqNits(float e) {
   const float m1 = 2610.0f / 16384, m2 = 2523.0f / 4096 * 128, c1 = 3424.0f / 4096, c2 = 2413.0f / 4096 * 32, c3 = 2392.0f / 4096 * 32;
-  float p = pow(max(e, 0.0f), 1 / m2);
+  float p = pow(saturate(e), 1 / m2);
   return 10000 * pow(max(p - c1, 0.0f) / (c2 - c3 * p), 1 / m1);
 }
 // ITU-R BT.2100 HLG inverse OETF.
@@ -96,6 +114,94 @@ float3 mk_logSignal(float3 expanded, uint curve, constant mk_FrameParams& f) {
 }
 
 inline float mk_luma709(float3 c) { return mk_luma(c, float3(.2126f, .7152f, .0722f)); }
+
+// ---------------------------------------------------------------- output colour transfers
+// Mirrors MonitorKitCore's TransferFunctions.swift. These run on every displayed
+// pixel of an encoding other than signal-native, so they use the hardware's fast
+// exp2/log2 (relative error about 1e-6, far under a 12-bit code; the GPU-vs-CPU
+// tests bound it) instead of the library's safe-mode pow. For the same reason a
+// quotient of run-time values uses fast::divide (2.5 ulp, against a correctly
+// rounded division's long sequence: a fifth of the PQ encode) and a constant
+// divisor is a multiplication by its reciprocal.
+
+inline float3 mk_powf(float3 x, float3 y) { return fast::pow(x, y); }
+inline float mk_powf(float x, float y) { return fast::pow(x, y); }
+inline float3 mk_div(float3 x, float3 y) { return fast::divide(x, y); }
+inline float mk_div(float x, float y) { return fast::divide(x, y); }
+// sign(v)·|v|^e: the SDR curves mirrored about zero (Report ITU-R BT.2408-8 §5.3).
+inline float3 mk_mirrorPow(float3 v, float e) { return sign(v) * mk_powf(abs(v), float3(e)); }
+// ITU-R BT.709 OETF; 0 below zero.
+float3 mk_bt709OETF(float3 l) {
+  return select(1.099f * mk_powf(max(l, .018f), float3(.45f)) - .099f, 4.5f * max(l, 0.0f), l < .018f);
+}
+// SMPTE ST 2084 (BT.2100 Table 4): the EOTF in cd/m² (signal clipped to its 0…1
+// domain, so super-whites stop at 10 000 cd/m² and nothing is NaN), and its inverse.
+constant float MK_PQ_M1 = 2610.0f / 16384, MK_PQ_M2 = 2523.0f / 4096 * 128, MK_PQ_C1 = 3424.0f / 4096,
+               MK_PQ_C2 = 2413.0f / 4096 * 32, MK_PQ_C3 = 2392.0f / 4096 * 32;
+float3 mk_pqNits3(float3 e) {
+  float3 q = mk_powf(saturate(e), float3(1 / MK_PQ_M2));
+  return 10000 * mk_powf(mk_div(max(q - MK_PQ_C1, 0.0f), MK_PQ_C2 - MK_PQ_C3 * q), float3(1 / MK_PQ_M1));
+}
+float mk_pqNits1(float e) {
+  float q = mk_powf(saturate(e), 1 / MK_PQ_M2);
+  return 10000 * mk_powf(mk_div(max(q - MK_PQ_C1, 0.0f), MK_PQ_C2 - MK_PQ_C3 * q), 1 / MK_PQ_M1);
+}
+float3 mk_pqSignal(float3 nits) {
+  float3 y = mk_powf(clamp(nits, 0.0f, 10000.0f) * (1.0f / 10000), float3(MK_PQ_M1));
+  return mk_powf(mk_div(MK_PQ_C1 + MK_PQ_C2 * y, 1 + MK_PQ_C3 * y), float3(MK_PQ_M2));
+}
+float mk_pqSignal1(float nits) {
+  float y = mk_powf(clamp(nits, 0.0f, 10000.0f) * (1.0f / 10000), MK_PQ_M1);
+  return mk_powf(mk_div(MK_PQ_C1 + MK_PQ_C2 * y, 1 + MK_PQ_C3 * y), MK_PQ_M2);
+}
+// ITU-R BT.2100 Table 5 HLG OETF (scene light clipped to 0…1, as the signal holds
+// no more) and its inverse.
+float3 mk_hlgOETF(float3 e) {
+  const float a = .17883277f, b = 1 - 4 * a, c = .5f - a * log(4 * a);
+  e = saturate(e);
+  return select(a * fast::log(max(12 * e - b, 1e-6f)) + c, sqrt(3 * e), e <= 1.0f / 12);
+}
+float3 mk_hlgInverseOETF3(float3 e) {
+  const float a = .17883277f, b = 1 - 4 * a, c = .5f - a * log(4 * a);
+  e = max(e, 0.0f);
+  return select((fast::exp((e - c) * (1 / a)) + b) * (1.0f / 12), e * e * (1.0f / 3), e <= .5f);
+}
+// BT.2100 HLG OOTF (black lift 0), F = peak·Ys^(γ-1)·E in cd/m², and its inverse
+// E = F / (peak·Ys^(γ-1)) with Ys = (Yd/peak)^(1/γ), as F·peak⁻¹·(Yd/peak)^((1-γ)/γ).
+float3 mk_hlgOOTF(float3 e, float peak, float gamma, float3 w) {
+  float ys = dot(w, e);
+  return ys > 0 ? e * (peak * mk_powf(ys, gamma - 1)) : float3(0);
+}
+float3 mk_hlgInverseOOTF(float3 f, float peak, float gamma, float3 w) {
+  float yd = dot(w, f);
+  if (yd <= 0) return float3(0);
+  float inverse = mk_div(1.0f, peak);
+  return f * (inverse * mk_powf(yd * inverse, mk_div(1 - gamma, gamma)));
+}
+// Report ITU-R BT.2408-8 Annex 5 EETF on PQ signal normalized to the source peak
+// (black levels 0): 1:1 below the knee, then the Hermite spline to maxLum.
+float mk_eetf(float e1, float4 t) {
+  if (t.w != 0 || e1 < t.z) return e1;
+  // A knee that rounds to 1 (a target a hair under the source peak) leaves no span
+  // to divide by: at and above it the curve is maxLum, as in Double.
+  if (t.z >= 1) return t.y;
+  float x = mk_div(min(e1, 1.0f) - t.z, 1 - t.z), x2 = x * x, x3 = x2 * x;
+  return (2 * x3 - 3 * x2 + 1) * t.z + (x3 - 2 * x2 + x) * (1 - t.z) + (-2 * x3 + 3 * x2) * t.y;
+}
+// The EETF's maxRGB application to cd/m²: it keeps the target colour volume.
+float3 mk_toneMap(float3 nits, float4 t) {
+  float m = max3(nits.r, nits.g, nits.b);
+  if (t.w != 0 || m <= 0) return nits;
+  return nits * mk_div(mk_pqNits1(mk_eetf(mk_div(mk_pqSignal1(m), t.x), t) * t.x), m);
+}
+// mk_toneMap of PQ-decoded `nits` given the PQ signal of their maxRGB. The EOTF is
+// monotonic, so that is the largest source code: no re-encode (two fewer pow).
+float3 mk_toneMapPQ(float3 nits, float maxSignal, float4 t) {
+  float m = max3(nits.r, nits.g, nits.b);
+  if (t.w != 0 || m <= 0) return nits;
+  return nits * mk_div(mk_pqNits1(mk_eetf(mk_div(maxSignal, t.x), t) * t.x), m);
+}
+inline float3 mk_rows(constant float4* m, float3 c) { return float3(dot(m[0].xyz, c), dot(m[1].xyz, c), dot(m[2].xyz, c)); }
 
 // ---------------------------------------------------------------- parameters
 
@@ -123,7 +229,24 @@ struct mk_PassParams {
   uint4  flags;              // x: nearest sampling, y: display adjustments are identity, z: sRGB target, w: clean
   uint4  luts;               // x: burn-in LUT on, y: monitor LUT on, z: source log curve (0 none, 1 S-Log3, 2 LogC3, 3 LogC4), w: source transfer (mk_exposureLinear)
   float4 bandEdges[16];      // x: lower inclusive, y: upper exclusive
-  float4 bandColors[16];
+  float4 bandColors[16];     // in target values
+  uint4  color;              // x: display transform, y: picture transfer, z: target transfer (0 none), w: overlay transfer (0 as authored; CPU only)
+  uint4  colorFlags;         // x: roll-off, y: clip indicators on, z: clip channels (bit 0 R, 1 G, 2 B, 3 Y'), w: clip stage
+  float4 colorLevels;        // x: graphics white cd/m², y: its inverse, z: HLG output peak cd/m², w: its system gamma
+  float4 hlgSource;          // x: HLG decode peak cd/m², y: its system gamma, z: 1 / scene light of 75% HLG
+  float4 toneMap;            // BT.2408 Annex 5 EETF: x: PQ signal of the source peak, y: maxLum, z: knee start, w: identity
+  float4 assist;             // display assist v1: x: knee scene light, y: knee signal, z: shoulder exponent, w: log2(x)
+  float4 pictureWeights;     // luminance weights of the picture primaries (HLG OOTF)
+  float4 targetWeights;      // luminance weights of the target (or overlay) primaries (HLG inverse OOTF)
+  float4 toTarget[3];        // rows: linear picture primaries to target primaries
+  float4 transformMatrix[3]; // rows: linear source gamut to Rec.709 for the display transforms
+  float4 overlayWhite;       // graphics white in target values
+  float4 zebraColors[2];     // stripe colours of sets 1 and 2, in target values
+  float4 navigatorColors[2]; // frame, visible box
+  float4 clipLevels;         // x: over at or above (percent; +inf off), y: under at or below (-inf off), z: opacity
+  float4 clipColors[16];     // 0-7 over, 8-15 under, by flagged channel bits (0: luma alone)
+  float4 whiteGain;          // white-point trim: xyz linear-light gains in the picture primaries, w: picture transfer (0 off)
+  float4 whiteSignalGain;    // the same gains on the signal of a power-law picture (BT.1886, gamma 2.2, linear)
 };
 
 // Mirrors MonitorKit.GuideParameters: guide strokes in viewport pixels, drawn
@@ -134,7 +257,16 @@ struct mk_Guides {
   float4 reach;              // x: search radius (widest half width + outline + 1), y: outline width
   float4 lines[128];         // verticals (x, y0, y1, half width) by x, then horizontals (y, x0, x1, half width) by y
   float4 others[16];         // pairs: (x0, y0, x1, y1), (half width, 0, 0, 0); a zero-length one is a round dot
+  uint cells[64];            // bit k of words 0-31: a vertical reaches x in [16k, 16k + 16); 32-63: horizontals, by y
 };
+
+// Whether an axis-aligned stroke may be within reach of position v along `axis`:
+// most pixels are far from every line and skip the search (positions beyond the
+// table always search).
+inline bool mk_guideCell(float v, uint axis, constant mk_Guides& g) {
+  uint k = uint(max(v, 0.0f)) / 16;
+  return k >= 1024 || ((g.cells[axis * 32 + k / 32] >> (k % 32)) & 1) != 0;
+}
 
 // False colour measures (modes.x).
 constant uint MK_FC_OFF = 0, MK_FC_SONY = 1, MK_FC_ARRI_STYLE = 2, MK_FC_ARRI_LOGC = 3, MK_FC_ELZONE = 4,
@@ -152,6 +284,97 @@ struct mk_Inputs {
   constant mk_PassParams& pass;
 };
 
+// ---------------------------------------------------------------- v210 in the picture pass
+// MKDecode's v210 reads with the lanes picked by selects of constant shifts: in
+// this pass they cost a fifth less than MKDecode's indexed form (whose focus
+// kernel is faster with it), and the same codes come out.
+
+inline float mk_v210LumaLane(uint4 g, uint n) {
+  uint w = n == 0 ? g.x : (n <= 2 ? g.y : (n == 3 ? g.z : g.w));
+  return float((w >> (n == 0 || n == 3 ? 10 : (n == 2 || n == 5 ? 20 : 0))) & 1023);
+}
+// Cb of lane l is word l at bit 10l; Cr is word 0, 2, 3 at bit 20, 0, 10.
+inline float2 mk_v210ChromaLane(uint4 g, uint l) {
+  uint cb = l == 0 ? g.x : (l == 1 ? g.y >> 10 : g.z >> 20);
+  uint cr = l == 0 ? g.x >> 20 : (l == 1 ? g.z : g.w >> 10);
+  return float2(cb & 1023, cr & 1023);
+}
+
+// Whether pixel x is in the last chroma pair of its row (no chroma sample after it).
+inline bool mk_v210LastPair(uint x, constant mk_FrameParams& f) { return x / 2 + 1 >= (f.shape.y + 1) / 2; }
+
+// mk_v210NextChroma with these lanes.
+inline float2 mk_v210NextLane(texture2d<uint, access::read> packed, uint4 g, uint l, uint2 xy,
+                              constant mk_FrameParams& f) {
+  if (mk_v210LastPair(xy.x, f)) return mk_v210ChromaLane(g, l);
+  return l < 2 ? mk_v210ChromaLane(g, l + 1) : mk_v210ChromaLane(packed.read(uint2(xy.x / 6 + 1, xy.y)), 0);
+}
+
+// mk_v210Codes: pixel xy of left-sited v210; an odd pixel of lane 2 reads the next group.
+float3 mk_v210PixelCodes(texture2d<uint, access::read> packed, uint2 xy, constant mk_FrameParams& f) {
+  uint4 g = packed.read(uint2(xy.x / 6, xy.y));
+  uint n = xy.x % 6;
+  float2 c = mk_v210ChromaLane(g, n / 2);
+  if (n & 1) c = mix(c, mk_v210NextLane(packed, g, n / 2, xy, f), .5f);
+  return float3(mk_v210LumaLane(g, n), c);
+}
+
+// mk_v210PairCodes: pixels x, x + 1 (x even) of a left-sited v210 row.
+float3 mk_v210PixelPairCodes(texture2d<uint, access::read> packed, uint2 xy, constant mk_FrameParams& f) {
+  uint4 g = packed.read(uint2(xy.x / 6, xy.y));
+  uint n = xy.x % 6;
+  float2 c = mix(mk_v210ChromaLane(g, n / 2), mk_v210NextLane(packed, g, n / 2, xy, f), .25f);
+  return float3((mk_v210LumaLane(g, n) + mk_v210LumaLane(g, n + 1)) * .5f, c);
+}
+
+// A row's taps move only right, so a filter row keeps the group under its tap and
+// the one after it, each read once per row instead of once or twice per tap.
+struct mk_V210Row {
+  uint4 group, next;
+  uint index, last, y;
+};
+
+mk_V210Row mk_v210Row(texture2d<uint, access::read> packed, uint x, uint y, constant mk_FrameParams& f) {
+  mk_V210Row r;
+  r.index = x / 6;
+  r.last = (f.shape.y - 1) / 6;
+  r.y = y;
+  r.group = packed.read(uint2(r.index, y));
+  r.next = packed.read(uint2(min(r.index + 1, r.last), y));
+  return r;
+}
+
+void mk_v210Advance(thread mk_V210Row& r, uint x, texture2d<uint, access::read> packed) {
+  while (x / 6 > r.index) {
+    r.index++;
+    r.group = r.next;
+    r.next = packed.read(uint2(min(r.index + 1, r.last), r.y));
+  }
+}
+
+// The chroma after pixel x's lane (lane l of r.group): the next lane, or the next group's first.
+inline float2 mk_v210RowAfter(thread const mk_V210Row& r, uint x, uint l, float2 c, constant mk_FrameParams& f) {
+  return mk_v210LastPair(x, f) ? c : (l < 2 ? mk_v210ChromaLane(r.group, l + 1) : mk_v210ChromaLane(r.next, 0));
+}
+
+// mk_v210PixelCodes of pixel x of the row, centred chroma (mk_tapCodes).
+float3 mk_v210RowCodes(thread mk_V210Row& r, uint x, texture2d<uint, access::read> packed, constant mk_FrameParams& f) {
+  mk_v210Advance(r, x, packed);
+  uint n = x % 6, l = n / 2;
+  float2 c = mk_v210ChromaLane(r.group, l);
+  if (n & 1) c = mix(c, mk_v210RowAfter(r, x, l, c, f), .5f);
+  return float3(mk_v210LumaLane(r.group, n), c - f.levels.z);
+}
+
+// mk_v210PixelPairCodes of pixels x, x + 1 of the row, centred chroma (mk_pairCodes).
+float3 mk_v210RowPairCodes(thread mk_V210Row& r, uint x, texture2d<uint, access::read> packed, constant mk_FrameParams& f) {
+  mk_v210Advance(r, x, packed);
+  uint n = x % 6, l = n / 2;
+  float2 c = mk_v210ChromaLane(r.group, l);
+  c = mix(c, mk_v210RowAfter(r, x, l, c, f), .25f);
+  return float3((mk_v210LumaLane(r.group, n) + mk_v210LumaLane(r.group, n + 1)) * .5f, c - f.levels.z);
+}
+
 // ---------------------------------------------------------------- sampling
 
 uint2 mk_clampPixel(float2 p, constant mk_FrameParams& f) {
@@ -166,7 +389,7 @@ float3 mk_tapCodes(uint2 xy, thread const mk_Inputs& in) {
   constant mk_FrameParams& f = in.frame;
   if (MK_LAYOUT(f) == MK_RGB) return in.luma.read(xy).rgb;
   float3 c = MK_LAYOUT(f) == MK_V210 && !f.options.x
-               ? mk_v210Codes(in.packed, xy, f)
+               ? mk_v210PixelCodes(in.packed, xy, f)
                : float3(mk_lumaCode(in.packed, in.luma, xy, f), mk_chromaCode(in.packed, in.chroma, xy, f));
   return float3(c.x, c.yz - f.levels.z);
 }
@@ -177,7 +400,7 @@ float3 mk_pairCodes(uint2 xy, thread const mk_Inputs& in) {
   constant mk_FrameParams& f = in.frame;
   float3 c;
   if (MK_LAYOUT(f) == MK_V210) {
-    c = mk_v210PairCodes(in.packed, xy, f);
+    c = mk_v210PixelPairCodes(in.packed, xy, f);
   } else {
     uint2 t = uint2(xy.x / 2, xy.y);
     uint4 a = in.packed.read(t);
@@ -232,20 +455,40 @@ inline float3 mk_cubic(float3 c0, float3 c1, float3 c2, float3 c3, float4 w) {
 // One row of the filter at picture row y, in codes.
 float3 mk_row(uint y, thread const mk_Axis& ax, bool pairs, thread const mk_Inputs& in) {
   constant mk_FrameParams& f = in.frame;
+  bool v210 = MK_LAYOUT(f) == MK_V210 && !f.options.x;
+  uint x0 = mk_clampPixel(float2(ax.first, 0), f).x;
+  float3 c[4];
   if (ax.cubic) {
-    float3 c[4];
-    for (uint i = 0; i < 4; i++) c[i] = mk_tapCodes(uint2(mk_clampPixel(float2(ax.first + float(i), 0), f).x, y), in);
+    if (v210) {
+      mk_V210Row r = mk_v210Row(in.packed, x0, y, f);
+      for (uint i = 0; i < 4; i++)
+        c[i] = mk_v210RowCodes(r, mk_clampPixel(float2(ax.first + float(i), 0), f).x, in.packed, f);
+    } else {
+      for (uint i = 0; i < 4; i++) c[i] = mk_tapCodes(uint2(mk_clampPixel(float2(ax.first + float(i), 0), f).x, y), in);
+    }
     return mk_cubic(c[0], c[1], c[2], c[3], ax.w);
   }
   float3 sum = 0;
   if (pairs) {
-    // Whole-pixel box on left-sited packed 4:2:2: pixel pairs share a texel.
-    uint x = mk_clampPixel(float2(ax.first, 0), f).x;
-    for (uint i = 0; i < ax.count; i += 2) sum += mk_pairCodes(uint2(x + i, y), in);
+    // Whole-pixel box on left-sited packed 4:2:2: pixel pairs share a texel. A
+    // single pair reads only what it needs; more share the row's groups.
+    if (v210 && ax.count > 2) {
+      mk_V210Row r = mk_v210Row(in.packed, x0, y, f);
+      for (uint i = 0; i < ax.count; i += 2) sum += mk_v210RowPairCodes(r, x0 + i, in.packed, f);
+    } else {
+      for (uint i = 0; i < ax.count; i += 2) sum += mk_pairCodes(uint2(x0 + i, y), in);
+    }
     return sum * 2 / float(ax.count);
   }
-  for (uint i = 0; i < ax.count; i++)
-    sum += mk_tapCodes(uint2(mk_clampPixel(float2(ax.first + float(i) * ax.step, 0), f).x, y), in);
+  // A single tap (an axis at 1:1 under an anisotropic footprint) reads only what it needs.
+  if (v210 && ax.count > 1) {
+    mk_V210Row r = mk_v210Row(in.packed, x0, y, f);
+    for (uint i = 0; i < ax.count; i++)
+      sum += mk_v210RowCodes(r, mk_clampPixel(float2(ax.first + float(i) * ax.step, 0), f).x, in.packed, f);
+  } else {
+    for (uint i = 0; i < ax.count; i++)
+      sum += mk_tapCodes(uint2(mk_clampPixel(float2(ax.first + float(i) * ax.step, 0), f).x, y), in);
+  }
   return sum / float(ax.count);
 }
 
@@ -256,7 +499,11 @@ float4 mk_filtered(float2 d, float4 map, bool nearest, uint maxTaps, thread cons
   constant mk_FrameParams& f = in.frame;
   float2 centre = d * map.xy + map.zw, footprint = abs(map.xy);
   mk_Axis ax = mk_axis(centre.x, footprint.x, nearest, maxTaps), ay = mk_axis(centre.y, footprint.y, nearest, maxTaps);
-  if (ax.count == 1 && ay.count == 1) return mk_decode(in.packed, in.luma, in.chroma, mk_clampPixel(centre, f), f);
+  if (ax.count == 1 && ay.count == 1) {
+    uint2 xy = mk_clampPixel(centre, f);
+    if (MK_LAYOUT(f) == MK_V210 && !f.options.x) return mk_codesToRGB(mk_v210PixelCodes(in.packed, xy, f), f);
+    return mk_decode(in.packed, in.luma, in.chroma, xy, f);
+  }
   bool packed422 = MK_LAYOUT(f) == MK_V210 || MK_LAYOUT(f) == MK_UYVY8 || MK_LAYOUT(f) == MK_YUYV8;
   uint x0 = mk_clampPixel(float2(ax.first, 0), f).x;
   bool pairs = packed422 && !f.options.x && !ax.cubic && ax.step == 1 && (ax.count & 1) == 0 && ax.first >= 0
@@ -304,13 +551,118 @@ float mk_stageLuma(thread const mk_Stages& s, uint stage, constant mk_PassParams
   return mk_luma709(stage == 2 && p.luts.y != 0 ? s.monitor : s.output);
 }
 
+// mk_logSignal for the display transform, which runs on every pixel: constant
+// divisors as reciprocals and fast::divide (false colour keeps the exact form).
+float3 mk_logSignalFast(float3 expanded, uint curve, constant mk_FrameParams& f) {
+  bool full = f.options.y != 0, rescaled = f.options.z != 0;
+  // mk_unsqueezeLegal: (code - 16s) / 219s with s = 2^(n-8).
+  float scale = (f.levels.y + 1) * (1.0f / 256);
+  float3 unsqueezed = (expanded * f.levels.y - 16 * scale) * mk_div(1.0f, 219 * scale);
+  if (curve == 1 && !full) return rescaled ? expanded : (expanded * 876 + 64) * (1.0f / 1023);
+  return full && rescaled ? unsqueezed : expanded;
+}
+
+// The camera log decodes (mk_logDecode) with fast exp2, for the display transform,
+// which runs on every pixel; false colour keeps the exact ones.
+float3 mk_logDecodeFast(float3 v, uint curve) {
+  if (curve == 2) {
+    // LogC3 EI 800: (10^((t - d)/c) - b)/a above the cut, linear below.
+    float3 high = (fast::exp2((v - .385537f) * (M_LOG2E_F * M_LN10_F / .247190f)) - .052272f) * (1 / 5.555556f);
+    return select((v - .092809f) * (1 / 5.367655f), high, v > 5.367655f * .010591f + .092809f);
+  }
+  if (curve == 3) {
+    const float a = (262144.0f - 16) / 117.45f, b = (1023.0f - 95) / 1023, c = 95.0f / 1023;
+    const float s = (7 * M_LN2_F * exp2(7 - 14 * c / b)) / (a * b), t = (exp2(14 * (-c / b) + 6) - 64) / a;
+    return select(v * s + t, (fast::exp2((v - c) * (14 / b) + 6) - 64) * (1 / a), v >= 0);
+  }
+  // S-Log3: 10^((code - 420)/261.5)·0.19 - 0.01 from code 171.2102946929, linear below.
+  float3 code = v * 1023;
+  float3 high = fast::exp2((code - 420) * (M_LOG2E_F * M_LN10_F / 261.5f)) * .19f - .01f;
+  return select((code - 95) * (.01125f / (171.2102946929f - 95)), high, code >= 171.2102946929f);
+}
+
+// ---------------------------------------------------------------- output colour
+// Mirrors MonitorKitCore.MonitorColorPipeline: display transform → adjustments →
+// decode the picture transfer to linear light (1 = graphics white) → primaries →
+// optional roll-off → target encode. Overlays are then mixed in target values.
+
+// The monitor stage (in the source's encoding) to the picture encoding.
+float3 mk_displayTransform(float3 c, thread const mk_Inputs& in) {
+  constant mk_PassParams& p = in.pass;
+  if (MK_TRANSFORM == 1) {
+    // MonitorKit display assist v1: scene light, Rec.709, the BT.709 OETF with a
+    // shoulder. One log2 and one exp2 per channel serve both branches: the OETF's
+    // x^0.45 and the shoulder's (x / xk)^-q.
+    float3 x = mk_rows(p.transformMatrix, mk_logDecodeFast(mk_logSignalFast(c, p.luts.z, in.frame), p.luts.z));
+    bool3 over = x > p.assist.x;
+    float3 lx = fast::log2(max(x, .018f));
+    float3 t = fast::exp2(select(.45f * lx, -p.assist.z * (lx - p.assist.w), over));
+    float3 oetf = select(1.099f * t - .099f, 4.5f * max(x, 0.0f), x < .018f);
+    return select(oetf, p.assist.y + (1 - p.assist.y) * (1 - t), over);
+  }
+  if (MK_TRANSFORM == 2) {
+    // PQ by display light: the EETF to graphics white, Rec.709, BT.1886.
+    float3 e = saturate(c);
+    float3 l = mk_rows(p.transformMatrix, mk_toneMapPQ(mk_pqNits3(e), max3(e.r, e.g, e.b), p.toneMap) * p.colorLevels.y);
+    return mk_powf(saturate(l), float3(1 / 2.4f));
+  }
+  if (MK_TRANSFORM == 3) {
+    // HLG by scene light: 75% HLG is 100% SDR, Rec.709, the BT.709 OETF.
+    return mk_bt709OETF(min(mk_rows(p.transformMatrix, mk_hlgInverseOETF3(c) * p.hlgSource.z), 1.0f));
+  }
+  return c;
+}
+
+// Linear display light, 1 = graphics white, from transfer `tf`.
+float3 mk_toLinear(float3 v, uint tf, constant mk_PassParams& p) {
+  if (tf == 2) {
+    float3 a = abs(v);
+    return sign(v) * select(mk_powf((a + .055f) * (1 / 1.055f), float3(2.4f)), a * (1 / 12.92f), a <= .04045f);
+  }
+  if (tf == 3) return mk_mirrorPow(v, 2.2f);
+  if (tf == 4) return v;
+  if (tf == 5) return mk_pqNits3(v) * p.colorLevels.y;
+  if (tf == 6) return mk_hlgOOTF(mk_hlgInverseOETF3(v), p.hlgSource.x, p.hlgSource.y, p.pictureWeights.rgb) * p.colorLevels.y;
+  return mk_mirrorPow(v, 2.4f);
+}
+
+// Linear display light, 1 = graphics white, encoded with `tf` and clipped to what it
+// holds. `w`: the luminance weights of its primaries (the HLG inverse OOTF).
+float3 mk_fromLinear(float3 l, uint tf, float3 w, constant mk_PassParams& p) {
+  if (tf == 2) {
+    l = saturate(l);
+    return select(1.055f * mk_powf(l, float3(1 / 2.4f)) - .055f, l * 12.92f, l <= .0031308f);
+  }
+  if (tf == 3) return mk_powf(saturate(l), float3(1 / 2.2f));
+  if (tf == 4) return clamp(l, -65504.0f, 65504.0f);
+  if (tf == 5) return mk_pqSignal(l * p.colorLevels.x);
+  if (tf == 6) {
+    float3 f = clamp(l * p.colorLevels.x, 0.0f, p.colorLevels.z);
+    return mk_hlgOETF(mk_hlgInverseOOTF(f, p.colorLevels.z, p.colorLevels.w, w));
+  }
+  return mk_powf(saturate(l), float3(1 / 2.4f));
+}
+
+// A picture value (after adjustments) to the target value.
+float3 mk_present(float3 v, constant mk_PassParams& p) {
+  if (MK_TARGET_TF == 0) return v;
+  float3 l = mk_rows(p.toTarget, mk_toLinear(v, MK_PICTURE_TF, p));
+  if (MK_ROLLOFF) l = mk_toneMap(l * p.colorLevels.x, p.toneMap) * p.colorLevels.y;
+  return mk_fromLinear(l, MK_TARGET_TF, p.targetWeights.rgb, p);
+}
+
 // ---------------------------------------------------------------- false colour
 
-// First band containing `value` (lower inclusive, upper exclusive), else `fallback`.
-float3 mk_bands(float value, float3 fallback, constant mk_PassParams& p) {
-  for (uint i = 0; i < p.modes.z; i++)
-    if (value >= p.bandEdges[i].x && value < p.bandEdges[i].y) return p.bandColors[i].rgb;
-  return fallback;
+// First band containing `value` (lower inclusive, upper exclusive), else `fallback`:
+// a grey in the monitor stage's encoding, so it goes through the display transform
+// and the output conversion like the picture. Both come out in target values.
+float3 mk_bands(float value, float3 fallback, thread const mk_Inputs& in) {
+  constant mk_PassParams& p = in.pass;
+  // Scanned from the last band without an early exit, so the tests do not wait on each other.
+  int band = -1;
+  for (int i = int(p.modes.z) - 1; i >= 0; i--)
+    if (value >= p.bandEdges[i].x && value < p.bandEdges[i].y) band = i;
+  return band >= 0 ? p.bandColors[band].rgb : mk_present(mk_displayTransform(fallback, in), p);
 }
 
 // Log modes classify the source pixel under the display pixel's centre, never a
@@ -320,10 +672,14 @@ float3 mk_logFalseColor(float4 centre, thread const mk_Inputs& in) {
   constant mk_FrameParams& f = in.frame;
   uint measure = p.modes.x;
   float3 native = mk_nativeLog(centre.rgb, f);
+  // Unbanded pixels are native-signal grey, or with the log transform on, the
+  // transform of the decoded grey, as the picture is shown.
+  bool transformed = MK_TRANSFORM != 0;
+  float3 decodedGrey = float3(saturate(mk_luma709(centre.rgb)));
   if (measure == MK_FC_SONY) {
     // Sony Pattern 2 on native signal luma, in native IRE: (code - 64) / 876.
     float signal = mk_nativeLog(centre.w, f);
-    return mk_bands((signal * 1023 - 64) / 876 * 100, float3(signal), p);
+    return mk_bands((signal * 1023 - 64) / 876 * 100, transformed ? float3(saturate(centre.w)) : float3(signal), in);
   }
   if (measure == MK_FC_ARRI_LOGC) {
     // The 10-bit transport code, classified in the table of the declared range.
@@ -335,13 +691,14 @@ float3 mk_logFalseColor(float4 centre, thread const mk_Inputs& in) {
     // float normalization, before any rescale, so table edges stay exact.
     if (p.modes.w != 0 && centre.r == centre.g && centre.g == centre.b) code = round(code);
     if (f.options.z) code = (f.options.y ? mk_unsqueezeLegal(float3(code), f).x : (code - 64) / 876) * 1023;
-    return mk_bands(code, float3(mk_luma709(p.falseColor.y != 0 ? native : centre.rgb)), p);
+    return mk_bands(code, transformed ? decodedGrey : float3(mk_luma709(p.falseColor.y != 0 ? native : centre.rgb)), in);
   }
   float y = dot(mk_logDecode(native, 1), p.gamutWeights.rgb);
-  if (measure == MK_FC_ARRI_STYLE) return mk_bands(mk_logC3ReferenceCode(y), float3(mk_luma709(native)), p);
+  float3 nativeGrey = transformed ? decodedGrey : float3(mk_luma709(native));
+  if (measure == MK_FC_ARRI_STYLE) return mk_bands(mk_logC3ReferenceCode(y), nativeGrey, in);
   // EL Zone: stops over 18% grey of source-gamut scene-linear Y, plus the user offset.
   if (y <= 0) return float3(0);
-  return mk_bands(log2(y) - log2(.18f) + p.falseColor.x, float3(mk_luma709(native)), p);
+  return mk_bands(log2(y) - log2(.18f) + p.falseColor.x, nativeGrey, in);
 }
 
 // Display-referred modes measure the stage of the filtered display pixel.
@@ -349,7 +706,7 @@ float3 mk_stageFalseColor(thread const mk_Stages& s, thread const mk_Inputs& in)
   constant mk_PassParams& p = in.pass;
   uint stage = p.modes.y;
   float3 fallback = float3(clamp(mk_luma709(mk_stage(s, stage)), 0.0f, 1.0f));
-  if (p.modes.x == MK_FC_STAGE_IRE) return mk_bands(mk_stageLuma(s, stage, p) * 100, fallback, p);
+  if (p.modes.x == MK_FC_STAGE_IRE) return mk_bands(mk_stageLuma(s, stage, p) * 100, fallback, in);
   // Stops over 18% grey. A LUT result is Rec.709 display R'G'B'; an untouched
   // source is linearized by its own curve: the log decode in source-gamut Y, else
   // its display transfer, each channel, weighted by its Y'CbCr matrix.
@@ -365,7 +722,7 @@ float3 mk_stageFalseColor(thread const mk_Stages& s, thread const mk_Inputs& in)
     linear = mk_luma(c, in.frame.matrix.xyz);
   }
   float stops = linear > 0 ? log2(linear) - log2(.18f) + p.falseColor.x : -INFINITY;
-  return mk_bands(stops, fallback, p);
+  return mk_bands(stops, fallback, in);
 }
 
 // ---------------------------------------------------------------- overlays
@@ -373,8 +730,16 @@ float3 mk_stageFalseColor(thread const mk_Stages& s, thread const mk_Inputs& in)
 // Max focus confidence over the picture footprint of the display pixel whose
 // corner is `corner` (an integer). Up to 8 × 8 texels the footprint is covered by
 // 2 × 2 gathers, overlapping at odd extents (max is idempotent): a 3 × 3 or 4 × 4
-// footprint costs four gathers instead of 9 or 16 reads. A footprint one texel
-// wide on an axis is read texel by texel; larger than 8 is subsampled 8 × 8.
+// footprint costs four gathers instead of 9 or 16 reads, a 2 × 2 one a single
+// gather. A footprint one texel wide on an axis is read texel by texel; larger
+// than 8 is subsampled 8 × 8.
+inline float mk_gatherMax(texture2d<float, access::sample> mask, float2 corner) {
+  // Pixel coordinates: a gather at texel corner p returns texels p - 1 … p.
+  constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::nearest);
+  float4 g = mask.gather(s, corner);
+  return max(max(g.x, g.y), max(g.z, g.w));
+}
+
 float mk_focusFootprint(texture2d<float, access::sample> mask, float2 corner, float4 map) {
   float2 a = corner * map.xy + map.zw, b = (corner + 1) * map.xy + map.zw;
   float2 low = min(a, b), high = max(a, b);
@@ -382,17 +747,17 @@ float mk_focusFootprint(texture2d<float, access::sample> mask, float2 corner, fl
   float2 size = float2(mask.get_width(), mask.get_height()), limit = size - 1;
   if (all(extent <= 1)) return mask.read(uint2(clamp(base, float2(0), limit))).r;
   if (all(extent <= 8) && all(extent >= 2)) {
-    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
+    // Offsets end flush with the footprint; up to 4 × 4 that is the first and the last pair.
+    float2 last = max(extent - 2, float2(0)), first = base + 1;
+    if (all(extent == 2)) return mk_gatherMax(mask, first);
+    if (all(extent <= 4)) {
+      return max(max(mk_gatherMax(mask, first), mk_gatherMax(mask, first + float2(last.x, 0))),
+                 max(mk_gatherMax(mask, first + float2(0, last.y)), mk_gatherMax(mask, first + last)));
+    }
     uint2 count = uint2(ceil(extent * .5f));
-    float2 last = max(extent - 2, float2(0));
     float confidence = 0;
     for (uint y = 0; y < count.y; y++)
-      for (uint x = 0; x < count.x; x++) {
-        // A gather at texel corner p returns texels p - 1 … p; offsets end flush with the footprint.
-        float2 offset = min(float2(x, y) * 2, last);
-        float4 g = mask.gather(s, (base + offset + 1) / size);
-        confidence = max(confidence, max(max(g.x, g.y), max(g.z, g.w)));
-      }
+      for (uint x = 0; x < count.x; x++) confidence = max(confidence, mk_gatherMax(mask, first + min(float2(x, y) * 2, last)));
     return confidence;
   }
   uint2 count = uint2(clamp(extent, float2(1), float2(8)));
@@ -433,7 +798,9 @@ float2 mk_axisStrokes(float2 p, uint begin, uint end, uint axis, constant mk_Gui
 
 float2 mk_guideCoverage(float2 p, constant mk_Guides& g) {
   uint nv = g.counts.x, nh = g.counts.y;
-  float2 cover = max(mk_axisStrokes(p, 0, nv, 0, g), mk_axisStrokes(p, nv, nv + nh, 1, g));
+  float2 cover = 0;
+  if (mk_guideCell(p.x, 0, g)) cover = mk_axisStrokes(p, 0, nv, 0, g);
+  if (mk_guideCell(p.y, 1, g)) cover = max(cover, mk_axisStrokes(p, nv, nv + nh, 1, g));
   float o = g.reach.y;
   for (uint i = 0; i < g.counts.z; i++) {
     float4 e = g.others[2 * i];
@@ -454,13 +821,37 @@ float2 mk_guideCoverage(float2 p, constant mk_Guides& g) {
   return cover;
 }
 
+// The white-point trim (MonitorColorPipeline.whiteTrimmed): gains in linear light,
+// back into the picture's transfer `tf`, unclipped. On a power-law picture that is
+// a gain on the signal itself.
+float3 mk_whiteTrim(float3 c, uint tf, constant mk_PassParams& p) {
+  if (tf == 1 || tf == 3 || tf == 4) return c * p.whiteSignalGain.rgb;
+  float3 l = mk_toLinear(c, tf, p) * p.whiteGain.rgb;
+  if (tf == 2) {
+    float3 a = abs(l);
+    return sign(l) * select(1.055f * mk_powf(a, float3(1 / 2.4f)) - .055f, a * 12.92f, a <= .0031308f);
+  }
+  return mk_fromLinear(l, tf, p.pictureWeights.rgb, p);
+}
+
 float3 mk_adjust(float3 c, constant mk_PassParams& p) {
   if (!MK_ADJUST || p.flags.y) return c;
   if (p.display.w == 1) c = float3(mk_luma709(c));
   else if (p.display.w == 2) c = float3(c.b);
   float y = mk_luma709(c);
   c = y + (c - y) * p.display.z;
-  return (c - .5f) * p.display.y + .5f + p.display.x;
+  c = (c - .5f) * p.display.y + .5f + p.display.x;
+  // Last, as a display's white balance acts on its drives after the picture controls.
+  uint tf = uint(p.whiteGain.w);
+  return tf != 0 ? mk_whiteTrim(c, tf, p) : c;
+}
+
+// v mod m in 0…m - 1 for |v| < 2^23, m > 0, from a float quotient (the
+// integer remainder by a run-time divisor is a long sequence on the GPU): its
+// rounding is under one, so one correction step makes it exact.
+inline int mk_modulo(int v, int m, float inverse) {
+  int r = v - int(floor(float(v) * inverse)) * m;
+  return r < 0 ? r + m : (r >= m ? r - m : r);
 }
 
 bool mk_inside(float2 d, float4 r) { return r.x < r.z && all(d >= r.xy) && all(d < r.zw); }
@@ -475,20 +866,13 @@ vertex mk_VertexOut mk_fullscreen(uint id [[vertex_id]]) {
   return out;
 }
 
-fragment float4 mk_picture(mk_VertexOut v [[stage_in]],
-                           texture2d<uint, access::read> packed [[texture(0)]],
-                           texture2d<float, access::read> luma [[texture(1)]],
-                           texture2d<float, access::read> chroma [[texture(2)]],
-                           texture3d<float, access::sample> burnLUT [[texture(3)]],
-                           texture3d<float, access::sample> monitorLUT [[texture(4)]],
-                           texture2d<float, access::sample> focusMask [[texture(5)]],
-                           constant mk_FrameParams& frame [[buffer(0)]],
-                           constant mk_LUTParams& burn [[buffer(1)]],
-                           constant mk_LUTParams& monitor [[buffer(2)]],
-                           constant mk_PassParams& p [[buffer(3)]],
-                           constant mk_Guides& guides [[buffer(4)]]) {
-  mk_Inputs in = {packed, luma, chroma, burnLUT, monitorLUT, frame, burn, monitor, p};
-  float2 d = v.position.xy - p.viewport.xy;  // viewport pixel centre (i + .5)
+// The picture at target pixel centre `position` (i + .5). The fragment and the
+// compute entry points share it, so both write the same values.
+inline __attribute__((always_inline))
+float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float, access::sample> focusMask,
+                    constant mk_Guides& guides) {
+  constant mk_PassParams& p = in.pass;
+  float2 d = position - p.viewport.xy;  // viewport pixel centre (i + .5)
   float2 corner = floor(d);
   float3 c = float3(0);
 
@@ -505,32 +889,50 @@ fragment float4 mk_picture(mk_VertexOut v [[stage_in]],
   mk_Stages s = mk_stages(sample, in);
 
   if (navigator) {
-    // The whole picture, dimmed, with the visible region outlined.
-    c = clamp(mk_adjust(s.monitor, p), 0.0f, 1.0f) * .85f;
+    // The whole picture, dimmed (never above graphics white), with the visible region outlined.
+    c = clamp(mk_present(mk_adjust(mk_displayTransform(s.monitor, in), p), p), 0.0f, p.overlayWhite.rgb) * .85f;
     float4 n = p.navigatorRect, r = p.navigatorVisible;
-    if (any(d < n.xy + 1) || any(d >= n.zw - 1)) c = float3(.85f);
+    if (any(d < n.xy + 1) || any(d >= n.zw - 1)) c = p.navigatorColors[0].rgb;
     bool box = all(d >= r.xy - 1) && all(d < r.zw + 1);
-    if (box && (any(d < r.xy + 1) || any(d >= r.zw - 1))) c = float3(1, .8f, 0);
+    if (box && (any(d < r.xy + 1) || any(d >= r.zw - 1))) c = p.navigatorColors[1].rgb;
   } else {
     if (logFalseColor) c = mk_logFalseColor(sample, in);
     else if (stageFalseColor) c = mk_stageFalseColor(s, in);
-    else c = mk_adjust(s.monitor, p);
+    else c = mk_present(mk_adjust(mk_displayTransform(s.monitor, in), p), p);
+    // Overlays mix in target values with colours encoded for the target.
     {
-      uint2 px = uint2(corner);
-      uint period = p.zebra.w, stripe = period / 2;
-      if (MK_ZEBRAS && (p.zebra.z & 1)) {
-        float ire = mk_stageLuma(s, p.zebra.x, p) * 100;
-        if (ire >= p.zebra0.x && ire < p.zebra0.y && (px.x + px.y) % period < stripe) c = mix(c, float3(p.zebra0.w), p.zebra0.z);
+      int2 px = int2(corner);
+      if (MK_ZEBRAS && p.zebra.z != 0) {
+        int period = int(p.zebra.w), stripe = period / 2;
+        float inverse = 1.0f / float(period);
+        if (p.zebra.z & 1) {
+          float ire = mk_stageLuma(s, p.zebra.x, p) * 100;
+          if (ire >= p.zebra0.x && ire < p.zebra0.y && mk_modulo(px.x + px.y, period, inverse) < stripe)
+            c = mix(c, p.zebraColors[0].rgb, p.zebra0.z);
+        }
+        if (p.zebra.z & 2) {
+          // The second set slants the other way, so both read at once.
+          float ire = mk_stageLuma(s, p.zebra.y, p) * 100;
+          if (ire >= p.zebra1.x && ire < p.zebra1.y && mk_modulo(px.x - px.y, period, inverse) < stripe)
+            c = mix(c, p.zebraColors[1].rgb, p.zebra1.z);
+        }
       }
-      if (MK_ZEBRAS && (p.zebra.z & 2)) {
-        // The second set slants the other way, so both read at once.
-        float ire = mk_stageLuma(s, p.zebra.y, p) * 100;
-        if (ire >= p.zebra1.x && ire < p.zebra1.y && (px.x + period - px.y % period) % period < stripe)
-          c = mix(c, float3(p.zebra1.w), p.zebra1.z);
+      if (MK_CLIP && p.colorFlags.y != 0) {
+        // Each enabled channel at or above the over level (or else at or below the
+        // under level) sets its bit; the bits pick the colour. Over wins.
+        uint stage = p.colorFlags.w, mask = p.colorFlags.z;
+        float3 v = mk_stage(s, stage) * 100;
+        float y = mk_stageLuma(s, stage, p) * 100;
+        uint3 bits = uint3(1, 2, 4) & uint3(mask);
+        uint3 o = select(uint3(0), bits, v >= p.clipLevels.x), u = select(uint3(0), bits, v <= p.clipLevels.y);
+        uint over = o.x | o.y | o.z, under = u.x | u.y | u.z;
+        bool luma = (mask & 8) != 0;
+        if (over != 0 || (luma && y >= p.clipLevels.x)) c = mix(c, p.clipColors[over].rgb, p.clipLevels.z);
+        else if (under != 0 || (luma && y <= p.clipLevels.y)) c = mix(c, p.clipColors[8 + under].rgb, p.clipLevels.z);
       }
       if (MK_PEAKING && p.focus.z != 0) {
         float k = p.focus.x * mk_focusFootprint(focusMask, corner, map);
-        c = p.focus.y == 0 ? mix(c, p.focusColor.rgb, k) : c + (1 - c) * k;
+        c = p.focus.y == 0 ? mix(c, p.focusColor.rgb, k) : c + (p.overlayWhite.rgb - c) * k;
       }
       if (MK_GUIDES && p.guide.z != 0) {
         if (mk_inside(d, p.guideRect) && !mk_inside(d, p.matte) && p.matte.x < p.matte.z) c *= 1 - p.guide.w;
@@ -542,28 +944,126 @@ fragment float4 mk_picture(mk_VertexOut v [[stage_in]],
       }
     }
   }
-  c = clamp(c, 0.0f, 1.0f);
+  // Extended linear keeps out-of-gamut and above-white values, as does a linear
+  // picture written as it is (its layer is extended linear); everything else is 0…1.
+  bool extended = MK_TARGET_TF == 4 || (MK_TARGET_TF == 0 && MK_PICTURE_TF == 4);
+  c = extended ? clamp(c, -65504.0f, 65504.0f) : clamp(c, 0.0f, 1.0f);
   if (MK_SRGB_TARGET) c = mk_srgbDecode(c);
   return float4(c, 1);
 }
 
-// ---------------------------------------------------------------- analysis
-
-// Y' an edge is measured on: the transport luma, or with MK_LUTS the Rec.709 luma
-// after the feed's LUTs (a disabled LUT passes through).
-float mk_focusLuma(texture2d<uint, access::read> packed, texture2d<float, access::read> luma,
-                   texture2d<float, access::read> chroma, texture3d<float, access::sample> burnLUT,
-                   texture3d<float, access::sample> monitorLUT, uint2 xy, constant mk_FrameParams& f,
-                   constant mk_LUTParams& burn, constant mk_LUTParams& monitor) {
-  if (MK_LUTS == 0) return mk_decodeLuma(packed, luma, chroma, xy, f);
-  float3 c = mk_applyLUT(mk_decodeRGB(packed, luma, chroma, xy, f), burnLUT, burn);
-  return mk_luma709(mk_applyLUT(c, monitorLUT, monitor));
+fragment float4 mk_picture(mk_VertexOut v [[stage_in]],
+                           texture2d<uint, access::read> packed [[texture(0)]],
+                           texture2d<float, access::read> luma [[texture(1)]],
+                           texture2d<float, access::read> chroma [[texture(2)]],
+                           texture3d<float, access::sample> burnLUT [[texture(3)]],
+                           texture3d<float, access::sample> monitorLUT [[texture(4)]],
+                           texture2d<float, access::sample> focusMask [[texture(5)]],
+                           constant mk_FrameParams& frame [[buffer(0)]],
+                           constant mk_LUTParams& burn [[buffer(1)]],
+                           constant mk_LUTParams& monitor [[buffer(2)]],
+                           constant mk_PassParams& p [[buffer(3)]],
+                           constant mk_Guides& guides [[buffer(4)]]) {
+  mk_Inputs in = {packed, luma, chroma, burnLUT, monitorLUT, frame, burn, monitor, p};
+  return mk_pictureAt(v.position.xy, in, focusMask, guides);
 }
 
-// Source-resolution edge confidence, shared by every surface of a feed.
-// Sobel-like 3-10-3 gradients on luma; an edge needs a directional median above
-// `noise` so isolated sensor noise is rejected. All threads join the clamped halo
-// load, so tail groups stay correct.
+// The same picture written by a compute kernel into the viewport of a
+// shader-writable target (never *_srgb: MK_SRGB_TARGET is off), one thread per
+// viewport pixel.
+kernel void mk_pictureKernel(texture2d<uint, access::read> packed [[texture(0)]],
+                             texture2d<float, access::read> luma [[texture(1)]],
+                             texture2d<float, access::read> chroma [[texture(2)]],
+                             texture3d<float, access::sample> burnLUT [[texture(3)]],
+                             texture3d<float, access::sample> monitorLUT [[texture(4)]],
+                             texture2d<float, access::sample> focusMask [[texture(5)]],
+                             texture2d<float, access::write> target [[texture(6)]],
+                             constant mk_FrameParams& frame [[buffer(0)]],
+                             constant mk_LUTParams& burn [[buffer(1)]],
+                             constant mk_LUTParams& monitor [[buffer(2)]],
+                             constant mk_PassParams& p [[buffer(3)]],
+                             constant mk_Guides& guides [[buffer(4)]],
+                             uint2 xy [[thread_position_in_grid]]) {
+  if (xy.x >= uint(p.viewport.z) || xy.y >= uint(p.viewport.w)) return;
+  mk_Inputs in = {packed, luma, chroma, burnLUT, monitorLUT, frame, burn, monitor, p};
+  uint2 pixel = xy + uint2(p.viewport.xy);
+  target.write(mk_pictureAt(float2(pixel) + .5f, in, focusMask, guides), pixel);
+}
+
+// ---------------------------------------------------------------- freeze
+
+// Freeze copies a frame's planes texel for texel into owned textures (a compute
+// pass: the library encodes no blits). Unorm and float values round-trip exactly.
+kernel void mk_copyUint(texture2d<uint, access::read> source [[texture(0)]],
+                        texture2d<uint, access::write> copy [[texture(1)]],
+                        uint2 xy [[thread_position_in_grid]]) {
+  if (xy.x >= copy.get_width() || xy.y >= copy.get_height()) return;
+  copy.write(source.read(xy), xy);
+}
+
+kernel void mk_copyFloat(texture2d<float, access::read> source [[texture(0)]],
+                         texture2d<float, access::write> copy [[texture(1)]],
+                         uint2 xy [[thread_position_in_grid]]) {
+  if (xy.x >= copy.get_width() || xy.y >= copy.get_height()) return;
+  copy.write(source.read(xy), xy);
+}
+
+// ---------------------------------------------------------------- analysis
+
+// Left-sited v210 R'G'B' of pixel xy for the analysis: mk_decode's values, with
+// the picture pass's select-picked lanes. An odd pixel's next chroma sample is
+// pixel x + 1's co-sited one, which the next SIMD lane decodes, so only a row's
+// last lane reads it itself (a row of lanes is one SIMD-group, and every lane
+// calls this). Together a fifth cheaper than mk_decodeRGB here.
+float3 mk_focusV210RGB(texture2d<uint, access::read> packed, uint2 xy, bool lastLane, constant mk_FrameParams& f) {
+  uint4 g = packed.read(uint2(xy.x / 6, xy.y));
+  uint n = xy.x % 6;
+  float2 c = mk_v210ChromaLane(g, n / 2);
+  float2 after = simd_shuffle_down(c, 1);
+  if (n & 1) {
+    if (lastLane) after = mk_v210NextLane(packed, g, n / 2, xy, f);
+    else if (mk_v210LastPair(xy.x, f)) after = c;
+    c = mix(c, after, .5f);
+  }
+  float y = (mk_v210LumaLane(g, n) - f.levels.x) / f.levels.y;
+  return mk_ycbcrToRGB(y, (c - f.levels.z) / f.levels.w, f.matrix);
+}
+
+// Y' an edge is measured on: the transport luma, or with MK_LUTS the Rec.709 luma
+// after the LUTs its bits select (1 burn-in, 2 monitor; a disabled LUT passes through).
+float mk_focusLuma(texture2d<uint, access::read> packed, texture2d<float, access::read> luma,
+                   texture2d<float, access::read> chroma, texture3d<float, access::sample> burnLUT,
+                   texture3d<float, access::sample> monitorLUT, uint2 xy, bool lastLane, constant mk_FrameParams& f,
+                   constant mk_LUTParams& burn, constant mk_LUTParams& monitor) {
+  if (MK_LUTS == 0) return mk_decodeLuma(packed, luma, chroma, xy, f);
+  float3 c = MK_LAYOUT(f) == MK_V210 && !f.options.x ? mk_focusV210RGB(packed, xy, lastLane, f)
+                                                     : mk_decodeRGB(packed, luma, chroma, xy, f);
+  if (MK_LUTS & 1) c = mk_applyLUT(c, burnLUT, burn);
+  if (MK_LUTS & 2) c = mk_applyLUT(c, monitorLUT, monitor);
+  return mk_luma709(c);
+}
+
+// Edge confidence from a pixel's eight neighbours' lumas: Sobel-like 3-10-3
+// gradients, kept only where a directional median exceeds the noise level.
+inline float mk_focusConfidence(float tl, float tc, float tr, float ml, float mr, float bl, float bc, float br,
+                                float2 thresholds) {
+  float3 dx = float3(tr - tl, mr - ml, br - bl), dy = float3(bl - tl, bc - tc, br - tr);
+  float gx = dot(dx, float3(3, 10, 3)) / 16, gy = dot(dy, float3(3, 10, 3)) / 16;
+  float support = max(abs(max(min(dx.x, dx.y), min(max(dx.x, dx.y), dx.z))), abs(max(min(dy.x, dy.y), min(max(dy.x, dy.y), dy.z))));
+  float threshold = thresholds.x, noise = thresholds.y;
+  return support > noise ? clamp((max(abs(gx), abs(gy)) - threshold) / max(.0001f, threshold * .5f), 0.0f, 1.0f) : 0;
+}
+
+// Rows of the mask per thread (MonitorFeed.focusRows).
+constant uint MK_FOCUS_ROWS = 8;
+
+// Source-resolution edge confidence, shared by every surface of a feed. A thread
+// takes one column of MK_FOCUS_ROWS pixels: it decodes those rows and the one
+// above and below once, and gets its left and right neighbours' from the
+// adjacent SIMD lanes. Each row of the threadgroup is one SIMD-group whose two
+// outer lanes only supply halo, so no threadgroup memory or barrier is needed and
+// each pixel is decoded about 1.3 times (the 16 × 16 tile this replaces took
+// twice as long at 4K). Positions clamp to the picture, so tail groups are correct.
 kernel void mk_focusMask(texture2d<uint, access::read> packed [[texture(0)]],
                          texture2d<float, access::read> luma [[texture(1)]],
                          texture2d<float, access::read> chroma [[texture(2)]],
@@ -574,39 +1074,27 @@ kernel void mk_focusMask(texture2d<uint, access::read> packed [[texture(0)]],
                          constant float2& thresholds [[buffer(1)]],
                          constant mk_LUTParams& burn [[buffer(2)]],
                          constant mk_LUTParams& monitor [[buffer(3)]],
-                         uint2 xy [[thread_position_in_grid]],
-                         uint2 localID [[thread_position_in_threadgroup]],
+                         uint2 group [[threadgroup_position_in_grid]],
+                         uint2 local [[thread_position_in_threadgroup]],
                          uint2 groupSize [[threads_per_threadgroup]]) {
-  threadgroup float tile[18 * 18];
   uint w = f.shape.y, h = f.shape.z;
-  float tl, tc, tr, ml, mr, bl, bc, br;
-#define MK_FOCUS_LUMA(p) mk_focusLuma(packed, luma, chroma, burnLUT, monitorLUT, (p), f, burn, monitor)
-  if (groupSize.x <= 16 && groupSize.y <= 16) {
-    uint pitch = groupSize.x + 2, tileCount = pitch * (groupSize.y + 2), threads = groupSize.x * groupSize.y;
-    uint lane = localID.y * groupSize.x + localID.x;
-    int2 origin = int2(xy) - int2(localID);
-    for (uint i = lane; i < tileCount; i += threads) {
-      int2 position = clamp(origin + int2(i % pitch, i / pitch) - 1, int2(0), int2(w - 1, h - 1));
-      tile[i] = MK_FOCUS_LUMA(uint2(position));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (xy.x >= w || xy.y >= h) return;
-    uint centre = (localID.y + 1) * pitch + localID.x + 1;
-    tl = tile[centre - pitch - 1]; tc = tile[centre - pitch]; tr = tile[centre - pitch + 1];
-    ml = tile[centre - 1]; mr = tile[centre + 1];
-    bl = tile[centre + pitch - 1]; bc = tile[centre + pitch]; br = tile[centre + pitch + 1];
-  } else {
-    if (xy.x >= w || xy.y >= h) return;
-    uint l = xy.x ? xy.x - 1 : 0, r = min(xy.x + 1, w - 1), u = xy.y ? xy.y - 1 : 0, dn = min(xy.y + 1, h - 1);
-    tl = MK_FOCUS_LUMA(uint2(l, u)); tc = MK_FOCUS_LUMA(uint2(xy.x, u)); tr = MK_FOCUS_LUMA(uint2(r, u));
-    ml = MK_FOCUS_LUMA(uint2(l, xy.y)); mr = MK_FOCUS_LUMA(uint2(r, xy.y));
-    bl = MK_FOCUS_LUMA(uint2(l, dn)); bc = MK_FOCUS_LUMA(uint2(xy.x, dn)); br = MK_FOCUS_LUMA(uint2(r, dn));
+  int x = int(group.x * (groupSize.x - 2) + local.x) - 1;
+  uint y0 = (group.y * groupSize.y + local.y) * MK_FOCUS_ROWS;
+  uint cx = uint(clamp(x, 0, int(w) - 1));
+  float l[MK_FOCUS_ROWS + 2], left[MK_FOCUS_ROWS + 2], right[MK_FOCUS_ROWS + 2];
+  for (uint j = 0; j < MK_FOCUS_ROWS + 2; j++) {
+    uint2 p = uint2(cx, uint(clamp(int(y0 + j) - 1, 0, int(h) - 1)));
+    l[j] = mk_focusLuma(packed, luma, chroma, burnLUT, monitorLUT, p, local.x == groupSize.x - 1, f, burn, monitor);
   }
-#undef MK_FOCUS_LUMA
-  float3 dx = float3(tr - tl, mr - ml, br - bl), dy = float3(bl - tl, bc - tc, br - tr);
-  float gx = dot(dx, float3(3, 10, 3)) / 16, gy = dot(dy, float3(3, 10, 3)) / 16;
-  float support = max(abs(max(min(dx.x, dx.y), min(max(dx.x, dx.y), dx.z))), abs(max(min(dy.x, dy.y), min(max(dy.x, dy.y), dy.z))));
-  float threshold = thresholds.x, noise = thresholds.y;
-  float confidence = support > noise ? clamp((max(abs(gx), abs(gy)) - threshold) / max(.0001f, threshold * .5f), 0.0f, 1.0f) : 0;
-  mask.write(float4(confidence), xy);
+  // Every lane shuffles, halo and out-of-picture ones included.
+  for (uint j = 0; j < MK_FOCUS_ROWS + 2; j++) {
+    left[j] = simd_shuffle_up(l[j], 1);
+    right[j] = simd_shuffle_down(l[j], 1);
+  }
+  if (local.x == 0 || local.x == groupSize.x - 1 || x >= int(w)) return;
+  for (uint j = 0; j < MK_FOCUS_ROWS && y0 + j < h; j++) {
+    float c = mk_focusConfidence(left[j], l[j], right[j], left[j + 1], right[j + 1], left[j + 2], l[j + 2], right[j + 2],
+                                 thresholds);
+    mask.write(float4(c), uint2(x, y0 + j));
+  }
 }

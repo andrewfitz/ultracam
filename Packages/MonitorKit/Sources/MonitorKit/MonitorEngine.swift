@@ -48,11 +48,14 @@ public struct MonitorRenderTargetFormat: Hashable, Sendable {
 /// How the engine builds pipelines specialized to a surface's tool set.
 public enum PipelineSpecialization: Sendable {
   /// Draw with the all-tools pipeline while the specialized one compiles on
-  /// Metal's compiler threads, then switch. Never stalls a frame (the default).
+  /// Metal's compiler threads, then switch. Never stalls a frame (the default):
+  /// the all-tools pipeline reads the output colour and display transform from
+  /// the uniforms, so one per target format and layout serves every colour
+  /// setting, and `prepare` builds it ahead of the first frame.
   case asynchronous
   /// Compile the specialized pipeline on first use, on the calling thread.
   case synchronous
-  /// Always use the all-tools pipeline.
+  /// Always use the all-tools pipeline (colour stages driven by the uniforms).
   case off
 }
 
@@ -63,6 +66,13 @@ public enum PipelineSpecialization: Sendable {
 public final class MonitorEngine: @unchecked Sendable {
   public let device: MTLDevice
   public let specialization: PipelineSpecialization
+  /// Uniform slots per pass and feed on the Metal 4 path: the submissions a host
+  /// keeps in flight. A host that has more grows the rings once, never per frame.
+  public let framesInFlight: Int
+  /// Every allocation the library owns or reads for the host on the Metal 4 path,
+  /// and their deferred release. Attach `residency.set` to the host's
+  /// `MTL4CommandQueue` once; all of an engine's Metal 4 work goes on that queue.
+  public let residency: MonitorResidency
   /// MKLUT + MKDecode + MKMonitor, compiled once with `MK_LAYOUT` and the tool
   /// tiers bound to function constants: every entry point must be specialized.
   let library: MTLLibrary
@@ -71,8 +81,11 @@ public final class MonitorEngine: @unchecked Sendable {
   private let renderPipelines = Mutex<[PipelineKey: MTLRenderPipelineState]>([:])
   private let pendingPipelines = Mutex<Set<PipelineKey>>([])
   private let focusPipelines = Mutex<[FocusKey: MTLComputePipelineState]>([:])
+  private let computePipelines = Mutex<[PipelineKey: MTLComputePipelineState]>([:])
+  private let copyPipelines = Mutex<(uint: MTLComputePipelineState?, float: MTLComputePipelineState?)>((nil, nil))
   private let createdResources = Atomic<Int>(0)
   private let builtPipelines = Atomic<Int>(0)
+  private let callerBuiltPipelines = Atomic<Int>(0)
   /// Depth and stencil always pass and are never written, so the picture draws
   /// the same inside any host pass.
   let depthStencil: MTLDepthStencilState
@@ -89,23 +102,51 @@ public final class MonitorEngine: @unchecked Sendable {
     var interpolates: Bool
     var navigator: Bool
     var adjust: Bool
+    var clip: Bool = false
     static let uber = Variant(
       luts: 3, zebras: true, peaking: true, guides: true, falseColor: 3, interpolates: true, navigator: true,
-      adjust: true)
+      adjust: true, clip: true)
+  }
+
+  /// How the surface's picture becomes target values (`MonitorColorPipeline` codes),
+  /// fixed in a specialized pipeline. The all-tools stand-in uses `uniforms`: the
+  /// same code reads the codes from `PassParameters.color`, so it draws the same
+  /// pixels and a colour change never needs a new stand-in.
+  struct ColorKey: Hashable {
+    var transform: UInt32 = 0
+    var picture: UInt32 = 1
+    var target: UInt32 = 0
+    var rolloff = false
+    /// The colour stages follow the uniforms instead of these codes.
+    var uniforms = false
+    static let fromUniforms = ColorKey(uniforms: true)
   }
 
   struct PipelineKey: Hashable {
     var target: MonitorRenderTargetFormat
     var layout: UInt32
     var variant: Variant
+    var color = ColorKey()
+    /// Only in `pendingPipelines`: a compute build, kept apart from the render one.
+    var compute = false
   }
 
   struct FocusKey: Hashable {
     var layout: UInt32
-    var lutStage: Bool
+    /// `MK_LUTS` of the analysis: 0 the source, 1 after the burn-in LUT, 3 after
+    /// both (a missing one is disabled at run time). The output stage, the common
+    /// LUT stage, compiles only the one LUT it applies.
+    var luts: UInt32
+
+    init(layout: UInt32, burnInLUT: Bool, monitorLUT: Bool) {
+      self.layout = layout
+      luts = monitorLUT ? 3 : (burnInLUT ? 1 : 0)
+    }
   }
 
-  /// Binds MK_LAYOUT, the tool tiers and the target's sRGB encode to function constants 0–9.
+  /// Binds MK_LAYOUT, the tool tiers, the target's sRGB encode and the output
+  /// colour to function constants 0–15 (15: the colour stages read the uniforms,
+  /// for the all-tools stand-in).
   static let specializationPrefix = """
     #include <metal_stdlib>
     using namespace metal;
@@ -119,6 +160,12 @@ public final class MonitorEngine: @unchecked Sendable {
     constant bool mk_guidesConstant [[function_constant(7)]];
     constant bool mk_adjustConstant [[function_constant(8)]];
     constant bool mk_srgbConstant [[function_constant(9)]];
+    constant uint mk_transformConstant [[function_constant(10)]];
+    constant uint mk_pictureTFConstant [[function_constant(11)]];
+    constant uint mk_targetTFConstant [[function_constant(12)]];
+    constant bool mk_rolloffConstant [[function_constant(13)]];
+    constant bool mk_clipConstant [[function_constant(14)]];
+    constant bool mk_colorUniformsConstant [[function_constant(15)]];
     #define MK_LAYOUT(f) mk_layoutConstant
     #define MK_LUTS mk_lutsConstant
     #define MK_ZEBRAS mk_zebrasConstant
@@ -129,6 +176,11 @@ public final class MonitorEngine: @unchecked Sendable {
     #define MK_FALSE_COLOR mk_falseColorConstant
     #define MK_INTERPOLATES mk_interpolatesConstant
     #define MK_NAVIGATOR mk_navigatorConstant
+    #define MK_TRANSFORM (mk_colorUniformsConstant ? p.color.x : mk_transformConstant)
+    #define MK_PICTURE_TF (mk_colorUniformsConstant ? p.color.y : mk_pictureTFConstant)
+    #define MK_TARGET_TF (mk_colorUniformsConstant ? p.color.z : mk_targetTFConstant)
+    #define MK_ROLLOFF (mk_colorUniformsConstant ? p.colorFlags.x != 0 : mk_rolloffConstant)
+    #define MK_CLIP mk_clipConstant
     """
 
   /// Bound in place of inputs a pass does not use, so every argument is valid.
@@ -137,9 +189,14 @@ public final class MonitorEngine: @unchecked Sendable {
   let emptyLUT: MTLTexture
 
   /// Compiles the library. Pipelines are built on first use or by `prepare`.
-  public init(device: MTLDevice, specialization: PipelineSpecialization = .asynchronous) throws {
+  /// `framesInFlight` sizes the Metal 4 uniform rings (default 3).
+  public init(device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3)
+    throws
+  {
     self.device = device
     self.specialization = specialization
+    self.framesInFlight = min(16, max(1, framesInFlight))
+    residency = try MonitorResidency(device: device)
     let library = try MonitorShaders.makeLibrary(
       device: device, parts: [.lut, .decode, .monitor], prefix: Self.specializationPrefix)
     self.library = library
@@ -183,22 +240,57 @@ public final class MonitorEngine: @unchecked Sendable {
     emptyPacked = try placeholder(.type2D, .rgba32Uint, 1, 16)
     emptyFloat = try placeholder(.type2D, .rgba8Unorm, 1, 4)
     emptyLUT = try placeholder(.type3D, .rgba32Float, 2, 16)
+    residency.add(emptyPacked)
+    residency.add(emptyFloat)
+    residency.add(emptyLUT)
+    if specialization == .asynchronous { buildCopyPipelinesAsynchronously() }
   }
 
   /// Builds now, instead of on first use, everything a frame of these layouts
-  /// can need into `pixelFormat`: the all-tools picture pipelines and both focus
-  /// analysis pipelines. All five layout kinds when `layouts` is nil.
+  /// can need into `pixelFormat`: the all-tools picture pipelines, the focus
+  /// analysis pipelines of each stage and Freeze's copy kernels (so the first Freeze compiles
+  /// nothing on the encoding thread). All five layout kinds when `layouts` is nil.
   public func prepare(pixelFormat: MTLPixelFormat, layouts: [PixelLayout]? = nil) throws {
     try prepare(target: MonitorRenderTargetFormat(colorPixelFormat: pixelFormat), layouts: layouts)
   }
 
   /// `prepare(pixelFormat:layouts:)` for a host render pass with these attachments.
   public func prepare(target: MonitorRenderTargetFormat, layouts: [PixelLayout]? = nil) throws {
+    try prepare(target: target, layouts: layouts, compute: false)
+  }
+
+  /// `prepare(target:layouts:)`. The all-tools pipeline reads the output colour and
+  /// display transform from the uniforms, so the colour arguments need no pipeline
+  /// of their own: kept for source compatibility.
+  public func prepare(
+    target: MonitorRenderTargetFormat, layouts: [PixelLayout]? = nil, outputColor: MonitorOutputColor,
+    signal: SignalDescription, displayTransform: DisplayTransformSettings = .init(), monitorStageHasLUT: Bool = false
+  ) throws {
+    try prepare(target: target, layouts: layouts, compute: false)
+  }
+
+  private func prepare(target: MonitorRenderTargetFormat, layouts: [PixelLayout]?, compute: Bool) throws {
     let kinds = layouts.map { $0.map(\.shaderKind) } ?? Array(0...4)
     for kind in Set(kinds) {
-      _ = try renderPipeline(PipelineKey(target: target, layout: kind, variant: .uber))
-      for lutStage in [false, true] { _ = try focusPipeline(layout: kind, lutStage: lutStage) }
+      let key = PipelineKey(target: target, layout: kind, variant: .uber, color: .fromUniforms)
+      if compute { _ = try computePipeline(key) } else { _ = try renderPipeline(key) }
+      for (burn, monitor) in [(false, false), (true, false), (true, true)] {
+        _ = try focusPipeline(FocusKey(layout: kind, burnInLUT: burn, monitorLUT: monitor))
+      }
     }
+    _ = try copyPipeline(integer: true)
+    _ = try copyPipeline(integer: false)
+  }
+
+  /// `prepare(pixelFormat:layouts:)` for `MonitorPass.encodeCompute`, which writes
+  /// a shader-writable target from a compute kernel. The colour arguments need no
+  /// pipeline of their own (see `prepare(target:layouts:outputColor:…)`).
+  public func prepareCompute(
+    pixelFormat: MTLPixelFormat, layouts: [PixelLayout]? = nil, outputColor: MonitorOutputColor = .signalNative,
+    signal: SignalDescription = .rec709, displayTransform: DisplayTransformSettings = .init(),
+    monitorStageHasLUT: Bool = false
+  ) throws {
+    try prepare(target: MonitorRenderTargetFormat(colorPixelFormat: pixelFormat), layouts: layouts, compute: true)
   }
 
   public func makeFeed() -> MonitorFeed { MonitorFeed(engine: self) }
@@ -210,10 +302,16 @@ public final class MonitorEngine: @unchecked Sendable {
 
   /// Render pipelines built so far, all-tools and specialized.
   public var pipelinesBuilt: Int { builtPipelines.load(ordering: .relaxed) }
+  /// Picture pipelines compiled on the calling thread (by `prepare`, a first frame
+  /// of a new target format or layout, or `.synchronous` specialization). With
+  /// `.asynchronous`, a colour, transform or tool change never adds to it.
+  var pipelinesBuiltOnCaller: Int { callerBuiltPipelines.load(ordering: .relaxed) }
   /// Focus-analysis pipelines built so far.
   var focusPipelineCount: Int { focusPipelines.withLock { $0.count } }
 
-  static func constants(layout: UInt32, variant: Variant, srgbTarget: Bool = false) -> MTLFunctionConstantValues {
+  static func constants(layout: UInt32, variant: Variant, srgbTarget: Bool = false, color: ColorKey = ColorKey())
+    -> MTLFunctionConstantValues
+  {
     let values = MTLFunctionConstantValues()
     var kind = layout, luts = variant.luts, zebras = variant.zebras, falseColor = variant.falseColor
     var interpolates = variant.interpolates, navigator = variant.navigator
@@ -229,6 +327,14 @@ public final class MonitorEngine: @unchecked Sendable {
     values.setConstantValue(&adjust, type: .bool, index: 8)
     var srgb = srgbTarget
     values.setConstantValue(&srgb, type: .bool, index: 9)
+    var transform = color.transform, picture = color.picture, target = color.target
+    var rolloff = color.rolloff, clip = variant.clip, uniforms = color.uniforms
+    values.setConstantValue(&transform, type: .uint, index: 10)
+    values.setConstantValue(&picture, type: .uint, index: 11)
+    values.setConstantValue(&target, type: .uint, index: 12)
+    values.setConstantValue(&rolloff, type: .bool, index: 13)
+    values.setConstantValue(&clip, type: .bool, index: 14)
+    values.setConstantValue(&uniforms, type: .bool, index: 15)
     return values
   }
 
@@ -256,11 +362,12 @@ public final class MonitorEngine: @unchecked Sendable {
       let fragment = try library.makeFunction(
         name: "mk_picture",
         constantValues: Self.constants(
-          layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB))
+          layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color))
       state = try device.makeRenderPipelineState(descriptor: descriptor(key, fragment: fragment))
     } catch {
       throw MonitorKitError.gpu("Cannot draw into pixel format \(key.target.colorPixelFormat.rawValue): \(error)")
     }
+    callerBuiltPipelines.add(1, ordering: .relaxed)
     return store(state, for: key)
   }
 
@@ -283,7 +390,7 @@ public final class MonitorEngine: @unchecked Sendable {
       if let cached = renderPipelines.withLock({ $0[key] }) { return cached }
       guard pendingPipelines.withLock({ $0.insert(key).inserted }) else { return nil }
       let values = Self.constants(
-        layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB)
+        layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color)
       library.makeFunction(name: "mk_picture", constantValues: values) { [self] function, _ in
         guard let function else { return finish(key) }
         device.makeRenderPipelineState(descriptor: descriptor(key, fragment: function)) { [self] state, _ in
@@ -301,19 +408,131 @@ public final class MonitorEngine: @unchecked Sendable {
     pendingPipelines.withLock { _ = $0.remove(key) }
   }
 
-  /// The focus-analysis pipeline for a layout kind, on the source or a LUT stage.
-  func focusPipeline(layout: UInt32, lutStage: Bool) throws -> MTLComputePipelineState {
-    let key = FocusKey(layout: layout, lutStage: lutStage)
+  /// The compute picture pipeline for `key` (its target's colour format only), built here if not cached.
+  func computePipeline(_ key: PipelineKey) throws -> MTLComputePipelineState {
+    let key = Self.computeKey(key)
+    if let cached = computePipelines.withLock({ $0[key] }) { return cached }
+    let state: MTLComputePipelineState
+    do {
+      let function = try library.makeFunction(
+        name: "mk_pictureKernel",
+        constantValues: Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color))
+      state = try device.makeComputePipelineState(function: function)
+    } catch {
+      throw MonitorKitError.gpu("Cannot build the compute picture pipeline: \(error)")
+    }
+    callerBuiltPipelines.add(1, ordering: .relaxed)
+    return storeCompute(state, for: key)
+  }
+
+  /// A kernel writes any float or unorm format the same way: one pipeline for all of them.
+  static func computeKey(_ key: PipelineKey) -> PipelineKey {
+    var k = key
+    k.target = MonitorRenderTargetFormat(colorPixelFormat: .invalid)
+    return k
+  }
+
+  private func storeCompute(_ state: MTLComputePipelineState, for key: PipelineKey) -> MTLComputePipelineState {
+    computePipelines.withLock { cache in
+      if let raced = cache[key] { return raced }
+      cache[key] = state
+      builtPipelines.add(1, ordering: .relaxed)
+      return state
+    }
+  }
+
+  /// `specializedPipeline` for the compute picture.
+  func specializedComputePipeline(_ key: PipelineKey) throws -> MTLComputePipelineState? {
+    let key = Self.computeKey(key)
+    switch specialization {
+    case .off: return nil
+    case .synchronous: return try computePipeline(key)
+    case .asynchronous:
+      if let cached = computePipelines.withLock({ $0[key] }) { return cached }
+      let pendingKey = { var k = key; k.compute = true; return k }()
+      guard pendingPipelines.withLock({ $0.insert(pendingKey).inserted }) else { return nil }
+      let values = Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color)
+      library.makeFunction(name: "mk_pictureKernel", constantValues: values) { [self] function, _ in
+        guard let function else { return }
+        device.makeComputePipelineState(function: function) { [self] state, _ in
+          guard let state else { return }
+          _ = storeCompute(state, for: key)
+          pendingPipelines.withLock { _ = $0.remove(pendingKey) }
+        }
+      }
+      return nil
+    }
+  }
+
+  /// The focus-analysis pipeline for a layout kind and the LUTs its stage applies.
+  func focusPipeline(_ key: FocusKey) throws -> MTLComputePipelineState {
     if let cached = focusPipelines.withLock({ $0[key] }) { return cached }
     var variant = Variant.uber
-    variant.luts = lutStage ? 3 : 0
+    variant.luts = key.luts
     let function = try library.makeFunction(
-      name: "mk_focusMask", constantValues: Self.constants(layout: layout, variant: variant))
+      name: "mk_focusMask", constantValues: Self.constants(layout: key.layout, variant: variant))
     let state = try device.makeComputePipelineState(function: function)
     return focusPipelines.withLock { cache in
       if let raced = cache[key] { return raced }
       cache[key] = state
       return state
+    }
+  }
+
+  /// Freeze's copy kernel for integer (`uint`) or normalized/float textures:
+  /// started on Metal's compiler threads at init (unless specialization is
+  /// `.synchronous` or `.off`), built by `prepare`, else here on first use.
+  func copyPipeline(integer: Bool) throws -> MTLComputePipelineState {
+    if let cached = cachedCopyPipeline(integer: integer) { return cached }
+    guard let function = library.makeFunction(name: Self.copyFunction(integer: integer)) else {
+      throw MonitorKitError.gpu("MonitorKit shader function \(Self.copyFunction(integer: integer)) is missing.")
+    }
+    return storeCopy(try device.makeComputePipelineState(function: function), integer: integer)
+  }
+
+  func cachedCopyPipeline(integer: Bool) -> MTLComputePipelineState? {
+    copyPipelines.withLock { integer ? $0.uint : $0.float }
+  }
+
+  private static func copyFunction(integer: Bool) -> String { integer ? "mk_copyUint" : "mk_copyFloat" }
+
+  private func storeCopy(_ state: MTLComputePipelineState, integer: Bool) -> MTLComputePipelineState {
+    copyPipelines.withLock { cache in
+      if integer {
+        if let raced = cache.uint { return raced }
+        cache.uint = state
+      } else {
+        if let raced = cache.float { return raced }
+        cache.float = state
+      }
+      return state
+    }
+  }
+
+  /// Both copy kernels on Metal's compiler threads, so a Freeze pressed before
+  /// they are needed finds them ready. Trivial kernels without constants.
+  private func buildCopyPipelinesAsynchronously() {
+    for integer in [true, false] {
+      guard let function = library.makeFunction(name: Self.copyFunction(integer: integer)) else { continue }
+      device.makeComputePipelineState(function: function) { [self] state, _ in
+        if let state { _ = storeCopy(state, integer: integer) }
+      }
+    }
+  }
+
+  /// Counts a resource a feed or pass created outside `makeTexture` (a uniform ring).
+  func noteCreated() { createdResources.add(1, ordering: .relaxed) }
+
+  /// An argument table for one of the library's Metal 4 encoders, made once.
+  func makeArgumentTable(textures: Int, buffers: Int, label: String) throws -> any MTL4ArgumentTable {
+    let d = MTL4ArgumentTableDescriptor()
+    d.maxTextureBindCount = textures
+    d.maxBufferBindCount = buffers
+    d.label = label
+    do {
+      return try device.makeArgumentTable(descriptor: d)
+    } catch {
+      throw MonitorKitError.gpu("Cannot create the \(label) argument table: \(error)")
     }
   }
 

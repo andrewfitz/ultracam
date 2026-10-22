@@ -80,23 +80,28 @@ final class ScopeGraticuleTests: XCTestCase {
     s.display.waveformScale = .percent
     let g = ScopeGraticule(settings: s, context: ScopeContext(), viewportWidth: 1024, viewportHeight: 512)
     let hundred = g.labels.first { $0.value == 100 }!
-    XCTAssertEqual(hundred.position.y, 1 - 1.07 / 1.16, accuracy: 1e-12)
+    // The centre of the bin 100% lands in: floor(1.07 · 512 / 1.16) = 472.
+    XCTAssertEqual(hundred.position.y, 1 - 472.5 / 512, accuracy: 1e-12)
+    XCTAssertEqual(hundred.position.y, 1 - 1.07 / 1.16, accuracy: 0.5 / 512, "within half a bin of the axis")
     XCTAssertEqual(hundred.position.x, 0)
-    XCTAssertEqual(g.labels.first { $0.value == 0 }!.position.y, 1 - 0.07 / 1.16, accuracy: 1e-12)
+    XCTAssertEqual(g.labels.first { $0.value == 0 }!.position.y, 1 - 30.5 / 512, accuracy: 1e-12)
     XCTAssertEqual(g.elements.count, 11)
 
     s.display.waveformScale = .pqNits
     s.waveformMode = .rgbParade
     let pq = ScopeGraticule(settings: s, context: ScopeContext(), viewportWidth: 1024, viewportHeight: 512)
     let n203 = pq.labels.first { $0.value == 203 && $0.role == .tick }!
-    XCTAssertEqual(n203.position.y, 1 - ScopeLevelAxis.fraction(ofLevel: ScopeTransfer.pqSignal(nits: 203)), accuracy: 1e-12)
+    XCTAssertEqual(
+      n203.position.y, 1 - ScopeLevelAxis.drawnFraction(ofLevel: ScopeTransfer.pqSignal(nits: 203), bins: 512),
+      accuracy: 1e-12)
     XCTAssertEqual(pq.labels.filter { $0.role == .channel }.map(\.text), ["R", "G", "B"])
 
     s.display.waveformScale = .hlgNits
     s.kind = .histogram
     let hlg = ScopeGraticule(settings: s, context: ScopeContext(), viewportWidth: 800, viewportHeight: 300)
     let n1000 = hlg.labels.first { $0.value == 1000 }!
-    XCTAssertEqual(n1000.position.x, ScopeLevelAxis.fraction(ofLevel: 1), accuracy: 1e-7)
+    XCTAssertEqual(n1000.position.x, ScopeLevelAxis.drawnFraction(ofLevel: 1, bins: 512), accuracy: 1e-12)
+    XCTAssertEqual(n1000.position.x, ScopeLevelAxis.fraction(ofLevel: 1), accuracy: 0.5 / 512)
     XCTAssertEqual(n1000.position.y, 1)
   }
 
@@ -168,7 +173,7 @@ final class ScopeGraticuleTests: XCTestCase {
     let chroma = g.labels.filter { $0.role == .tick && $0.position.x == 1.0 / 3 }
     XCTAssertEqual(luma.map(\.text), ["4", "64", "128", "256", "384", "512", "640", "768", "896", "940", "1019"])
     XCTAssertEqual(chroma.map(\.text), ["64", "128", "256", "384", "512", "640", "768", "896", "960"])
-    func y(_ level: Double) -> Double { 1 - ScopeLevelAxis.fraction(ofLevel: level) }
+    func y(_ level: Double) -> Double { 1 - ScopeLevelAxis.drawnFraction(ofLevel: level, bins: s.waveformLevels) }
     XCTAssertEqual(chroma.first { $0.text == "512" }!.position.y, y(0.5), accuracy: 1e-12, "neutral chroma")
     XCTAssertEqual(chroma.first { $0.text == "64" }!.position.y, y(0), accuracy: 1e-12)
     XCTAssertEqual(chroma.first { $0.text == "960" }!.position.y, y(1), accuracy: 1e-12)
@@ -186,6 +191,50 @@ final class ScopeGraticuleTests: XCTestCase {
     s.display.waveformScale = .pqNits
     let pq = ScopeGraticule(settings: s, context: ScopeContext(), viewportWidth: 900, viewportHeight: 400)
     XCTAssertTrue(pq.labels.filter { $0.position.x == 1.0 / 3 }.allSatisfy { !$0.text.contains(".") })
-    XCTAssertLessThanOrEqual(pq.elements.count, ScopeDrawParameters.maximumShapes)
+    XCTAssertLessThanOrEqual(pq.elements.count, ScopeGraticuleParameters.maximumShapes)
+  }
+
+  /// A tick sits on the centre of the bin a pixel at exactly its level is
+  /// counted in, at every bin count: low counts (64 levels) used to draw legal
+  /// white a third of a bin above the 100% line and black below the 0% line.
+  func testTicksSitOnTheBinTheirLevelLandsIn() {
+    for bins in [64, 65, 100, 256, 333, 512, 1000, 2048, 4096] {
+      let scale = Float(Double(bins) / (ScopeLevelAxis.high - ScopeLevelAxis.low))
+      for level in [-0.07, 0, 0.18, 0.5, 1, 1.09] {
+        let bin = min(max(((Float(level) - Float(ScopeLevelAxis.low)) * scale).rounded(.down), 0), Float(bins - 1))
+        let drawn = ScopeLevelAxis.drawnFraction(ofLevel: level, bins: bins)
+        XCTAssertEqual(drawn * Double(bins), Double(bin) + 0.5, accuracy: 1e-9, "\(bins) bins, level \(level)")
+        XCTAssertEqual(drawn, ScopeLevelAxis.fraction(ofLevel: level), accuracy: 0.5 / Double(bins) + 1e-9)
+      }
+    }
+    var s = ScopeSettings(kind: .waveform)
+    s.waveformLevels = 64
+    let g = ScopeGraticule(settings: s, context: ScopeContext(), viewportWidth: 1000, viewportHeight: 1000)
+    // 100% is bin floor(1.07 · 64 / 1.16) = 59, 0% bin 3.
+    XCTAssertEqual(g.labels.first { $0.value == 100 }!.position.y, 1 - 59.5 / 64, accuracy: 1e-12)
+    XCTAssertEqual(g.labels.first { $0.value == 0 }!.position.y, 1 - 3.5 / 64, accuracy: 1e-12)
+    s.kind = .histogram
+    s.histogramBins = 64
+    let h = ScopeGraticule(settings: s, context: ScopeContext(), viewportWidth: 1000, viewportHeight: 300)
+    XCTAssertEqual(h.labels.first { $0.value == 100 }!.position.x, 59.5 / 64, accuracy: 1e-12)
+  }
+
+  /// Angles run 0…360 counter-clockwise from +Cb, as Docs/MATH.md section 7 lists them.
+  func testVectorscopeTargetAnglesFollowMATH() {
+    let bars = VectorscopeTarget.bars(matrix: .bt709, amplitude: 0.75)
+    let angles = Dictionary(uniqueKeysWithValues: bars.map { ($0.name, $0.angle) })
+    XCTAssertEqual(angles["Cy"]!, 282.91, accuracy: 0.01)
+    XCTAssertEqual(angles["G"]!, 229.68, accuracy: 0.01)
+    XCTAssertEqual(angles["B"]!, 354.76, accuracy: 0.01)
+    XCTAssertEqual(angles["R"]!, 102.91, accuracy: 0.01)
+    for matrix in [YCbCrMatrix.bt601, .bt709, .bt2020, .smpte240m] {
+      for bar in VectorscopeTarget.bars(matrix: matrix, amplitude: 1) {
+        XCTAssertGreaterThanOrEqual(bar.angle, 0)
+        XCTAssertLessThan(bar.angle, 360)
+        let radians = bar.angle * .pi / 180
+        XCTAssertEqual(cos(radians) * bar.magnitude, bar.cb, accuracy: 1e-12)
+        XCTAssertEqual(sin(radians) * bar.magnitude, bar.cr, accuracy: 1e-12)
+      }
+    }
   }
 }

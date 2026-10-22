@@ -144,7 +144,9 @@ final class LUTTests: XCTestCase {
 
   func testShaperLUTsMatchTheCPUReference() throws {
     let gpu = try requireGPU()
-    for (size, shaper) in [(17, 1024), (33, 4096), (2, 256), (65, 2)] {
+    // A small lattice with a long shaper (Resolve exports 65536-entry shapers)
+    // used to throw: its rows were the lattice's width, n² entries a slice.
+    for (size, shaper) in [(17, 1024), (33, 4096), (2, 256), (65, 2), (2, 65536), (5, 65536), (3, 16384)] {
       let cube = try Self.shaperCube(size: size, shaper: shaper, seed: UInt64(size))
       XCTAssertEqual(cube.shaperSize, shaper)
       XCTAssertEqual(cube.dimension, size)
@@ -153,7 +155,9 @@ final class LUTTests: XCTestCase {
       inputs += (0..<min(shaper, 600)).map { i in SIMD3(repeating: -0.1 + 1.3 * (Float(i) + 0.5) / Float(shaper - 1)) }
       for mode in [LUTInterpolation.tetrahedral, .trilinear] {
         let lut = try MonitorLUT(device: gpu.device, cube: cube, interpolation: mode)
-        XCTAssertEqual(lut.texture.depth, size + (shaper + size * size - 1) / (size * size))
+        let side = max(size, MonitorLUT.shaperOnlyLattice)
+        XCTAssertEqual(lut.texture.width, side)
+        XCTAssertEqual(lut.texture.depth, size + (shaper + side * side - 1) / (side * side))
         let out = try gpuApply(lut, inputs)
         var worst: Float = 0
         for (input, g) in zip(inputs, out) { worst = max(worst, simd_reduce_max(simd_abs(g - cube.apply(input, interpolation: mode)))) }
@@ -191,11 +195,16 @@ final class LUTTests: XCTestCase {
       // Not clamped to 0…1 by any 3D stage: HDR outputs survive.
       XCTAssertEqual(try gpuApply(lut, [SIMD3(1, 1, 0.9)])[0].z, 2.25, accuracy: 1e-5)
     }
-    // A tiny lattice cannot hold a huge shaper in 2048 slices.
+    // A tiny lattice holds the largest shaper: its slices are at least 8 × 8.
     var text = "LUT_1D_SIZE 65536\nLUT_3D_SIZE 2\n"
     for i in 0..<65536 { let x = Float(i) / 65535; text += "\(x) \(x) \(x)\n" }
     for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { text += "\(r) \(g) \(b)\n" } } }
-    XCTAssertThrowsError(try MonitorLUT(device: gpu.device, cube: try CubeLUT(text: text)))
+    let cube = try CubeLUT(text: text)
+    let lut = try MonitorLUT(device: gpu.device, cube: cube)
+    let inputs = Self.inputs(size: 9, seed: 32, domain: (0, 1))
+    for (input, g) in zip(inputs, try gpuApply(lut, inputs)) {
+      XCTAssertLessThanOrEqual(simd_reduce_max(simd_abs(g - cube.apply(input))), 2e-6)
+    }
   }
 
   /// The burned-in preview of a shaper LUT is still bit-identical to the host's fused output.

@@ -63,10 +63,12 @@ public enum PPMType: Sendable, Hashable, CaseIterable {
 
 /// Quasi-peak ballistics: two parallel charge paths (fast and slow) that only
 /// charge while the signal exceeds them, summed with `fastWeight`, falling at
-/// a constant dB rate. They charge from the true-peak signal oversampled to
-/// about 192 kHz (BS.1770-4 Annex 2), as an analog rectifier sees the
-/// continuous waveform, so the response is the same at every sample rate. The time constants are fitted to the IEC 60268-10
-/// tone-burst table (5 kHz bursts at reference level):
+/// a constant dB rate. They charge from the signal on a grid of about
+/// 192 kHz (the BS.1770-4 Annex 2 phases below 176.4 kHz, the samples
+/// themselves above), as an analog rectifier sees the continuous waveform,
+/// so the response is the same at every sample rate. The time constants are
+/// fitted against that oversampled envelope to the IEC 60268-10 tone-burst
+/// table (5 kHz bursts at reference level):
 /// Type I 10/5/3/0.4 ms -> -1/-2/-4/-15 dB; Type II 10/5/1.5/0.5 ms -> -2/-4/-9/-17 dB.
 /// A steady sine reads its peak level (the charge droop is calibrated out).
 public struct PPMBallistics: Sendable, Hashable {
@@ -144,11 +146,13 @@ public struct AudioMeterKinds: OptionSet, Sendable, Hashable {
   public init(rawValue: UInt32) { self.rawValue = rawValue }
 
   public static let samplePeak = AudioMeterKinds(rawValue: 1 << 0)
-  /// BS.1770-4 Annex 2 true peak (4x oversampled).
+  /// BS.1770-4 Annex 2 true peak: 4x oversampled below 96 kHz, 2x from 96 kHz.
   public static let truePeak = AudioMeterKinds(rawValue: 1 << 1)
   public static let rms = AudioMeterKinds(rawValue: 1 << 2)
   public static let vu = AudioMeterKinds(rawValue: 1 << 3)
-  /// Quasi-peak programme meter; reads the true-peak envelope.
+  /// Quasi-peak programme meter. It charges from the signal on a grid of
+  /// about 192 kHz: the true-peak phases below 176.4 kHz, the samples
+  /// themselves from 176.4 kHz (see `PPMBallistics`).
   public static let ppm = AudioMeterKinds(rawValue: 1 << 4)
   /// BS.1770-4 / EBU R 128 programme loudness over the configured channels.
   public static let loudness = AudioMeterKinds(rawValue: 1 << 5)
@@ -161,7 +165,9 @@ public enum LoudnessChannel: Sendable, Hashable {
   case left, right, center
   /// Low-frequency effects: excluded by BS.1770-4.
   case lfe
-  /// Surround channels (azimuth 60-120 degrees): weight 1.41 (+1.5 dB).
+  /// Surround channels at azimuth 60-120 degrees (5.1 surrounds, 7.1 side
+  /// surrounds): weight 1.41 (+1.5 dB). Rear surrounds beyond 120 degrees
+  /// weigh 1.0 (`.weighted(1)`).
   case leftSurround, rightSurround
   /// Any other position, with an explicit weight.
   case weighted(Double)
@@ -177,16 +183,48 @@ public enum LoudnessChannel: Sendable, Hashable {
     }
   }
 
-  /// Mono (1), stereo (2), 5.0 (L R C Ls Rs) and 5.1 (SMPTE order L R C LFE Ls Rs).
-  /// Any other count treats every channel as a front channel with weight 1.
+  /// Mono (1), stereo (2), 5.0 (L R C Ls Rs) and 5.1 (SMPTE order L R C LFE
+  /// Ls Rs). Any other count is read as an SDI or DeckLink embed carrying the
+  /// programme on its first pair: channels 1 and 2 as stereo, the rest
+  /// excluded (summing every pair would read 3 LU high per duplicate pair and
+  /// count a 7.1 LFE). Pass `surround71`, `programmePair` or an explicit list
+  /// for anything else.
   public static func standardLayout(channelCount: Int) -> [LoudnessChannel] {
     switch channelCount {
-    case 1: return [.center]
-    case 2: return [.left, .right]
-    case 5: return [.left, .right, .center, .leftSurround, .rightSurround]
-    case 6: return [.left, .right, .center, .lfe, .leftSurround, .rightSurround]
-    default: return Array(repeating: .weighted(1), count: max(channelCount, 0))
+    case 1: return mono
+    case 2: return stereo
+    case 5: return surround50
+    case 6: return surround51
+    default: return programmePair(channelCount: channelCount)
     }
+  }
+
+  public static let mono: [LoudnessChannel] = [.center]
+  public static let stereo: [LoudnessChannel] = [.left, .right]
+  /// L R C Ls Rs.
+  public static let surround50: [LoudnessChannel] = [.left, .right, .center, .leftSurround, .rightSurround]
+  /// SMPTE order: L R C LFE Ls Rs.
+  public static let surround51: [LoudnessChannel] = [.left, .right, .center, .lfe, .leftSurround, .rightSurround]
+  /// SMPTE 7.1 order L R C LFE Lss Rss Lrs Rrs (ITU-R BS.2051 System I,
+  /// 0+7+0): side surrounds at +/-90 degrees weigh 1.41, rear surrounds at
+  /// +/-135 to 150 degrees 1.0, LFE excluded (BS.1770-4 Annex 1 position weights).
+  public static let surround71: [LoudnessChannel] = [
+    .left, .right, .center, .lfe, .leftSurround, .rightSurround, .weighted(1), .weighted(1),
+  ]
+
+  /// One stereo programme on channels `first` and `first + 1` (0-based) of
+  /// `channelCount`, every other channel excluded; one channel (with `first`
+  /// 0) reads as mono. A pair outside the channels (a stale selection after a format
+  /// change, say) gives a layout that measures nothing, which the meters
+  /// reject with `.invalidParameter` rather than read silence for ever.
+  public static func programmePair(channelCount: Int, first: Int = 0) -> [LoudnessChannel] {
+    var layout = [LoudnessChannel](repeating: .excluded, count: max(channelCount, 0))
+    if channelCount == 1, first == 0 { return mono }
+    if first >= 0, first + 1 < channelCount {
+      layout[first] = .left
+      layout[first + 1] = .right
+    }
+    return layout
   }
 }
 
@@ -212,8 +250,28 @@ public struct AudioMeterConfiguration: Sendable, Equatable {
   /// Rectangular RMS window, rounded to the meter's 5 to 10 ms tick.
   public var rmsWindow: Double
   public var rmsScale: RMSScale
-  /// One entry per input channel. Only used when `meters` contains `.loudness`.
-  public var loudnessChannels: [LoudnessChannel]
+  /// An explicit loudness layout, or nil for the standard layout of
+  /// whatever `channelCount` is (`LoudnessChannel.standardLayout`), so a
+  /// stored configuration follows a format change by itself. An explicit
+  /// layout does not: it must be reassigned when `channelCount` changes.
+  /// Equality compares this, so nil and an explicit copy of the standard
+  /// layout are different configurations that measure the same.
+  public var loudnessLayout: [LoudnessChannel]?
+  /// One entry per input channel: `loudnessLayout`, or the standard layout
+  /// for `channelCount`. Setting it stores an explicit layout. Only used when
+  /// `meters` contains `.loudness`, and then its entries other than
+  /// `.excluded` are also the programme behind
+  /// `AudioMeterSnapshot.programmeMaximumTruePeak` (every channel otherwise).
+  public var loudnessChannels: [LoudnessChannel] {
+    get { loudnessLayout ?? LoudnessChannel.standardLayout(channelCount: channelCount) }
+    set { loudnessLayout = newValue }
+  }
+  /// Readings are published at most once per this much audio (rounded to
+  /// whole frames; 0 publishes on every `process` call). Peak holds, maxima,
+  /// clip counts and the PPM's per-publish maximum lose nothing in between;
+  /// a reset publishes at once, and `AudioMeter.flush()` (or a zero-length
+  /// `process` call) publishes what is pending when a stream stops.
+  public var publishInterval: Double
 
   public init(
     sampleRate: Double,
@@ -229,7 +287,8 @@ public struct AudioMeterConfiguration: Sendable, Equatable {
     ppmAlignment: AlignmentLevel = .ebu,
     rmsWindow: Double = 0.3,
     rmsScale: RMSScale = .aes17,
-    loudnessChannels: [LoudnessChannel]? = nil
+    loudnessChannels: [LoudnessChannel]? = nil,
+    publishInterval: Double = 0.005
   ) {
     self.sampleRate = sampleRate
     self.channelCount = channelCount
@@ -244,7 +303,8 @@ public struct AudioMeterConfiguration: Sendable, Equatable {
     self.ppmAlignment = ppmAlignment
     self.rmsWindow = rmsWindow
     self.rmsScale = rmsScale
-    self.loudnessChannels = loudnessChannels ?? LoudnessChannel.standardLayout(channelCount: channelCount)
+    self.loudnessLayout = loudnessChannels
+    self.publishInterval = publishInterval
   }
 
   /// The ballistics the PPM runs.
@@ -265,6 +325,7 @@ public struct AudioMeterConfiguration: Sendable, Equatable {
       vuBallistics.overshoot > 0, vuBallistics.overshoot < 0.5
     else { throw .invalidParameter("vuBallistics") }
     guard rmsWindow > 0, rmsWindow <= 60 else { throw .invalidParameter("rmsWindow") }
+    guard publishInterval >= 0, publishInterval <= 1 else { throw .invalidParameter("publishInterval") }
     let ppm = ppmBallistics
     guard min(ppm.fastTimeConstant, ppm.slowTimeConstant) * sampleRate >= 1,
       ppm.fastTimeConstant.isFinite, ppm.slowTimeConstant.isFinite,
@@ -284,7 +345,11 @@ func validateLoudnessChannels(_ channels: [LoudnessChannel], channelCount: Int) 
   guard channels.count == channelCount else {
     throw .channelLayoutMismatch(expected: channelCount, actual: channels.count)
   }
+  var measured = false
   for channel in channels {
     guard channel.weight >= 0, channel.weight.isFinite else { throw .invalidParameter("loudness weight") }
+    if channel.weight > 0 { measured = true }
   }
+  // Every channel excluded (or LFE) would read -infinity for ever, like silence.
+  guard measured else { throw .invalidParameter("loudness layout measures no channel") }
 }

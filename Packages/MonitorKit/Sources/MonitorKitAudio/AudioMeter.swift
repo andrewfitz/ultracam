@@ -5,7 +5,8 @@ import Synchronization
 /// Broadcast level meters for 1 to 16 channels: sample peak and true peak
 /// (BS.1770-4 Annex 2) with hold and decay, RMS, VU (IEC 60268-17), quasi-peak
 /// PPM (IEC 60268-10 Type I / IIa / IIb) and, optionally, BS.1770-4 programme
-/// loudness over a configurable channel layout.
+/// loudness over a configurable channel layout, with EBU Tech 3341 pause
+/// and continue of the integrated measurement.
 ///
 /// Realtime-safe: everything is allocated at init; `process` does no heap
 /// allocation, takes no lock and uses no Swift concurrency. Call `process` from
@@ -18,10 +19,13 @@ import Synchronization
 /// the RMS energy, the VU movement's closed-form state update and the clip
 /// count. Only the PPM's nonlinear charge is a Swift loop, four channels at a
 /// time and written to stay cheap unoptimized. The loudness engine K-weights
-/// the same planar buffers.
+/// the same planar buffers. Readings are published at most once per
+/// `publishInterval` of audio (5 ms by default), so tiny callbacks do not pay
+/// the dB conversions and snapshot stores on every call.
 public final class AudioMeter: @unchecked Sendable {
   // @unchecked: the producer state is confined to the `process` caller; the
-  // only state shared with readers is the atomic publisher and reset flags.
+  // only state shared with readers is the atomic publisher, reset requests
+  // and pause flag.
   public let configuration: AudioMeterConfiguration
 
   struct ChannelState {
@@ -40,11 +44,42 @@ public final class AudioMeter: @unchecked Sendable {
     var rmsEnergy = 0.0
   }
 
+  /// The RMS window's energy, kept as a running sum so a publish reads one
+  /// value whatever the window length. Neumaier-compensated, so adding each
+  /// new tick and subtracting the one it replaces stays exact to rounding
+  /// after any number of ticks; the count of nonzero ticks makes a window of
+  /// digital silence read exactly 0 after loud audio has left it.
+  struct RMSWindow {
+    var sum = 0.0
+    var compensation = 0.0
+    var nonzeroTicks = 0
+
+    @inline(__always) mutating func add(_ x: Double) {
+      let t = sum + x
+      compensation += abs(sum) >= abs(x) ? (sum - t) + x : (x - t) + sum
+      sum = t
+    }
+
+    @inline(__always) mutating func replace(_ old: Double, with new: Double) {
+      add(new)
+      add(-old)
+      nonzeroTicks += (new != 0 ? 1 : 0) - (old != 0 ? 1 : 0)
+    }
+
+    var energy: Double { nonzeroTicks > 0 ? max(sum + compensation, 0) : 0 }
+  }
+
   struct Scalars {
     var tickPosition = 0
     var rmsHead = 0
+    /// Ticks closed into the RMS ring since reset, up to its length; older
+    /// entries read as 0, so a reset does not have to clear the ring.
+    var rmsFilled = 0
     var frameCount: UInt64 = 0
     var publishes: UInt64 = 0
+    var framesSincePublish = 0
+    /// Samples of a PPM step still open at the end of the last chunk (folded input only).
+    var ppmCarry = 0
     /// False until the first chunk after init has filled the interpolator's
     /// history with each channel's first sample. Zeros there would put a step
     /// into the filter that a stream already running when metering starts
@@ -56,10 +91,10 @@ public final class AudioMeter: @unchecked Sendable {
 
   private let stage: PlanarStage
   private let loudness: LoudnessEngine?
-  private let publisher: SnapshotPublisher<AudioMeterSnapshot>
-  private let staging: UnsafeMutablePointer<AudioMeterSnapshot>
-  private let resetRequest = Atomic<UInt32>(0)
-  private let resetRequestCount = Atomic<UInt64>(0)
+  private let publisher: SnapshotPublisher<Published<AudioMeterSnapshot>>
+  private let staging: UnsafeMutablePointer<Published<AudioMeterSnapshot>>
+  private let requests = ResetRequests()
+  private let loudnessPaused = Atomic<Bool>(false)
 
   private let channelCount: Int
   private let groupCount: Int
@@ -70,13 +105,18 @@ public final class AudioMeter: @unchecked Sendable {
   /// `phases[l * 4 + k]`, one chunk each; magnitudes once the PPM runs (they
   /// are its lanes). Entries past the phase count alias the envelope.
   private let phases: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
-  /// The current group's interpolated envelopes (sample magnitudes at 1x),
-  /// then scratch for the clip count.
+  /// The current group's interpolated envelopes, then scratch for the VU and clip count.
   private let envelopes: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+  private let ppmInput: PPMInput
+  /// What the PPM charges from, laid out like `phases` and `envelopes`: the
+  /// same buffers for `.phases`, its own folded magnitudes for `.samples`.
+  private let ppmLanes: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+  private let ppmEnvelopes: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
   private let vu: VUMovement
   /// Per channel: the VU movement's two state values.
   private let vuStates: UnsafeMutablePointer<Double>
   private let rmsRing: UnsafeMutablePointer<Double>
+  private let rmsWindows: UnsafeMutablePointer<RMSWindow>
   private let scalars: UnsafeMutablePointer<Scalars>
 
   private let runsFIR: Bool
@@ -84,6 +124,7 @@ public final class AudioMeter: @unchecked Sendable {
   private let runsPPM: Bool
   private let runsRMS: Bool
   private let tickFrames: Int
+  private let publishFrames: Int
   private let rmsTicks: Int
   private let rmsGain: Double
   private let vuGain: Double
@@ -103,21 +144,27 @@ public final class AudioMeter: @unchecked Sendable {
     runsPPM = kinds.contains(.ppm)
     runsRMS = kinds.contains(.rms)
     interpolator = TruePeakInterpolator(oversampling: TruePeakFilter.oversampling(sampleRate: fs))
-    runsFIR = (kinds.contains(.truePeak) || runsPPM) && interpolator.phaseCount > 0
+    ppmInput = PPMInput.forSampleRate(fs)
+    precondition(ppmInput.lanes <= 4, "the PPM takes at most four values per step")
+    let ppmFromPhases = if case .phases = ppmInput { true } else { false }
+    runsFIR = kinds.contains(.truePeak) || (runsPPM && ppmFromPhases)
 
+    // The history also holds a folded PPM's open step.
     stage = PlanarStage(
-      channelCount: channelCount, history: runsFIR ? TruePeakFilter.history : 0, capacity: Self.chunkFrames)
+      channelCount: channelCount, history: runsFIR || (runsPPM && ppmInput.fold > 1) ? TruePeakFilter.history : 0,
+      capacity: Self.chunkFrames)
     loudness =
       kinds.contains(.loudness)
       ? LoudnessEngine(sampleRate: fs, weights: configuration.loudnessChannels.map(\.weight), stage: stage)
       : nil
     var initial = AudioMeterSnapshot()
     initial.channelCount = channelCount
+    initial.programmeChannelMask = Self.programmeChannelMask(configuration)
     initial.vuReferenceDBFS = Float(configuration.vuReference.dBFS)
     initial.ppmAlignmentDBFS = Float(configuration.ppmAlignment.dBFS)
-    publisher = SnapshotPublisher(initial)
+    publisher = SnapshotPublisher(Published(readings: initial))
     staging = .allocate(capacity: 1)
-    staging.initialize(to: initial)
+    staging.initialize(to: Published(readings: initial))
 
     groupCount = (channelCount + 3) / 4
     channelState = .allocate(capacity: channelCount)
@@ -136,28 +183,54 @@ public final class AudioMeter: @unchecked Sendable {
       (envelopes + l).initialize(to: envelope)
       for k in 0..<4 { (phases + l * 4 + k).initialize(to: k < interpolator.phaseCount ? chunk() : envelope) }
     }
+    if ppmFromPhases {
+      ppmLanes = phases
+      ppmEnvelopes = envelopes
+    } else {
+      // A step needs at most chunkFrames / fold + 1 values per lane.
+      ppmLanes = .allocate(capacity: 16)
+      ppmEnvelopes = .allocate(capacity: 4)
+      for l in 0..<4 {
+        for k in 0..<4 { (ppmLanes + l * 4 + k).initialize(to: chunk()) }
+        // At one value per step the envelope is the lane.
+        (ppmEnvelopes + l).initialize(to: ppmInput.lanes == 1 ? ppmLanes[l * 4] : chunk())
+      }
+    }
     vu = VUMovement(configuration.vuBallistics, sampleRate: fs, capacity: Self.chunkFrames)
     vuStates = .allocate(capacity: 2 * channelCount)
     vuStates.initialize(repeating: 0, count: 2 * channelCount)
 
     (tickFrames, _) = meterTick(sampleRate: fs)
+    publishFrames = max(1, Int((configuration.publishInterval * fs).rounded()))
     rmsTicks = max(1, Int((configuration.rmsWindow * fs / Double(tickFrames)).rounded()))
-    rmsRing = .allocate(capacity: channelCount * rmsTicks)
-    rmsRing.initialize(repeating: 0, count: channelCount * rmsTicks)
+    rmsRing = .allocate(capacity: runsRMS ? channelCount * rmsTicks : 1)
+    rmsRing.initialize(repeating: 0, count: runsRMS ? channelCount * rmsTicks : 1)
+    rmsWindows = .allocate(capacity: channelCount)
+    rmsWindows.initialize(repeating: RMSWindow(), count: channelCount)
     rmsGain = configuration.rmsScale == .aes17 ? 2.0.squareRoot() : 1
     scalars = .allocate(capacity: 1)
-    scalars.initialize(to: Scalars(primed: !runsFIR))
+    scalars.initialize(to: Scalars(primed: stage.history == 0))
 
     // A sine's rectified mean is 2/pi of its peak; 0 VU is a sine peaking at the reference.
     vuGain = Double.pi / 2 / pow(10, configuration.vuReference.dBFS / 20)
 
-    ppm = PPMCoefficients(configuration.ppmBallistics, sampleRate: fs, oversampling: interpolator.oversampling)
+    ppm = PPMCoefficients(configuration.ppmBallistics, sampleRate: fs, input: ppmInput)
     ppmGain = ppm.calibration / pow(10, configuration.ppmAlignment.dBFS / 20)
 
     decayPerFrame = -configuration.peakDecayRate * log(10) / (20 * fs)
     let hold = configuration.peakHoldTime * fs
     holdFrames = hold >= Double(Int.max / 2) ? Int.max : Int(hold.rounded())
     clipLevel = Float(pow(10, configuration.clipLevelDBFS / 20))
+  }
+
+  /// The loudness layout's channels other than `.excluded`, or every channel
+  /// when loudness is off (its layout is not validated then).
+  private static func programmeChannelMask(_ configuration: AudioMeterConfiguration) -> UInt16 {
+    let n = configuration.channelCount
+    guard configuration.meters.contains(.loudness) else { return UInt16(truncatingIfNeeded: (1 << n) - 1) }
+    var mask: UInt16 = 0
+    for (c, channel) in configuration.loudnessChannels.enumerated() where channel != .excluded { mask |= 1 << c }
+    return mask
   }
 
   /// The default configuration for a format.
@@ -176,11 +249,20 @@ public final class AudioMeter: @unchecked Sendable {
       for k in 0..<interpolator.phaseCount { phases[l * 4 + k].deallocate() }
       envelopes[l].deallocate()
     }
+    if ppmLanes != phases {
+      for l in 0..<4 {
+        for k in 0..<4 { ppmLanes[l * 4 + k].deallocate() }
+        if ppmInput.lanes > 1 { ppmEnvelopes[l].deallocate() }
+      }
+      ppmLanes.deallocate()
+      ppmEnvelopes.deallocate()
+    }
     phases.deallocate()
     envelopes.deallocate()
     vu.deallocate()
     vuStates.deallocate()
     rmsRing.deallocate()
+    rmsWindows.deallocate()
     scalars.deallocate()
   }
 
@@ -240,48 +322,75 @@ public final class AudioMeter: @unchecked Sendable {
   // MARK: Output and control
 
   /// The latest readings. Lock-free and allocation-free; safe from any thread.
-  /// A reset that `process` has not applied yet (audio stopped, say) already
-  /// shows here.
+  /// A reset shows here from the moment it is requested, before `process`
+  /// applies it (audio stopped, say, or a call in progress), and its
+  /// `sequence` moves with it.
   public func snapshot() -> AudioMeterSnapshot {
-    var value = AudioMeterSnapshot()
-    publisher.read(into: &value)
-    let pending = resetRequest.load(ordering: .acquiring)
-    if pending != 0 { Self.applyPendingResets(pending, to: &value) }
+    var published = Published(readings: AudioMeterSnapshot())
+    publisher.read(into: &published)
+    let requested = requests.load()
+    var value = published.readings
+    Self.applyPendingResets(requested: requested, applied: published.resets, to: &value)
+    value.sequence = value.sequence &+ requested.total
     return value
   }
 
   /// Advances on every publish and every reset request, so a display can
   /// skip redrawing while it is unchanged.
   public var publishCount: UInt64 {
-    publisher.publishCount &+ resetRequestCount.load(ordering: .acquiring)
+    publisher.publishCount &+ requests.load().total
   }
 
   /// Clears peak holds, maximum true peak and clip counts.
-  public func resetPeaks() { request(ResetRequest.peaks) }
+  public func resetPeaks() { requests.requestPeaks() }
 
-  /// Starts a new loudness measurement (integrated, LRA, maxima).
-  public func resetLoudness() { request(ResetRequest.loudness) }
+  /// Starts a new loudness measurement: integrated, LRA, the maxima and
+  /// `duration` start over from the next 5 or 10 ms tick boundary, while
+  /// momentary and short-term slide on over the continuous audio (EBU Tech
+  /// 3341 resets the measurement; M and S are sliding windows).
+  public func resetLoudness() { requests.requestLoudness() }
 
-  /// Returns every reading and ballistic to its initial state. The filters'
-  /// signal memory (the true-peak interpolator's history, the K-weighting) is
-  /// kept, so a reset during programme adds no transient of its own.
-  public func reset() { request(ResetRequest.all) }
+  /// Returns every reading and ballistic to its initial state, momentary and
+  /// short-term loudness included. The filters' signal memory (the true-peak
+  /// interpolator's history, the K-weighting) is kept, so a reset during
+  /// programme adds no transient of its own.
+  public func reset() { requests.requestAll() }
 
-  /// Readers see the request at once; the next `process` applies it.
-  private func request(_ bits: UInt32) {
-    resetRequest.bitwiseOr(bits, ordering: .releasing)
-    resetRequestCount.add(1, ordering: .releasing)
+  /// Puts integrated loudness, loudness range and loudness `duration` on
+  /// stand-by (EBU Tech 3341 section 2.2): audio from now on is left out of
+  /// them as if it were cut, while momentary, short-term, their maxima and
+  /// every level meter keep running. Any thread; takes effect at the first
+  /// 5 or 10 ms tick boundary the next `process` call reaches, so measured
+  /// and left-out audio are whole ticks. Resets keep the measurement paused.
+  public func pauseLoudness() { loudnessPaused.store(true, ordering: .relaxed) }
+
+  /// Continues a paused loudness measurement from where it stood.
+  public func resumeLoudness() { loudnessPaused.store(false, ordering: .relaxed) }
+
+  /// True between `pauseLoudness()` and `resumeLoudness()`.
+  public var isLoudnessPaused: Bool { loudnessPaused.load(ordering: .relaxed) }
+
+  /// Publishes audio held back by `publishInterval` and applies pending
+  /// resets, without new input: call it when a stream stops, so its last
+  /// few milliseconds (and any over in them) reach `snapshot()`. Producer
+  /// thread only, like `process`; does nothing when nothing is pending.
+  public func flush() {
+    let reset = applyResetRequests()
+    if reset || scalars.pointee.framesSincePublish > 0 { publish() }
   }
 
-  /// The latest publish with the requested resets applied, as the next `process` will publish them.
-  private static func applyPendingResets(_ pending: UInt32, to value: inout AudioMeterSnapshot) {
-    if pending & ResetRequest.all != 0 {
+  /// The resets requested after `applied` (those the publish includes),
+  /// applied to it as the next `process` will publish them.
+  private static func applyPendingResets(
+    requested: ResetGenerations, applied: ResetGenerations, to value: inout AudioMeterSnapshot
+  ) {
+    if requested.all != applied.all {
       forEachIndex(value.channelCount) { value.channels[$0] = AudioChannelLevels() }
       value.loudness = LoudnessSnapshot()
       value.frameCount = 0
       return
     }
-    if pending & ResetRequest.peaks != 0 {
+    if requested.peaks != applied.peaks {
       forEachIndex(value.channelCount) { c in
         var levels = value.channels[c]
         levels.samplePeakHold = levels.samplePeak
@@ -291,7 +400,7 @@ public final class AudioMeter: @unchecked Sendable {
         value.channels[c] = levels
       }
     }
-    if pending & ResetRequest.loudness != 0 { value.loudness = LoudnessSnapshot() }
+    if requested.loudness != applied.loudness { value.loudness = value.loudness.startingNewMeasurement }
   }
 
   // MARK: Processing
@@ -299,12 +408,7 @@ public final class AudioMeter: @unchecked Sendable {
   private func run(_ frameCount: Int, _ format: AudioSampleFormat) {
     precondition(frameCount >= 0, "negative frameCount")
     let reset = applyResetRequests()
-    // With nothing to measure, publishing would only blank the per-publish
-    // PPM maximum; a reset still publishes so its result shows.
-    guard frameCount > 0 else {
-      if reset { publish() }
-      return
-    }
+    loudness?.setMeasuring(!loudnessPaused.load(ordering: .relaxed))
     var offset = 0
     while offset < frameCount {
       let n = min(frameCount - offset, Self.chunkFrames)
@@ -315,13 +419,18 @@ public final class AudioMeter: @unchecked Sendable {
       }
       forEachIndex(groupCount) { measure(group: $0, frames: n) }
       advanceRMSTicks(n)
+      scalars.pointee.ppmCarry = (scalars.pointee.ppmCarry + n) % ppmInput.fold
       loudness?.process(frames: n)
-      // Last: the interpolator reads up to 11 samples into the history.
-      if runsFIR { forEachIndex(channelCount) { stage.carryHistory($0, frames: n) } }
+      // Last: the interpolator and a folded PPM read into the history.
+      if stage.history > 0 { forEachIndex(channelCount) { stage.carryHistory($0, frames: n) } }
       offset += n
     }
     scalars.pointee.frameCount &+= UInt64(frameCount)
-    publish()
+    scalars.pointee.framesSincePublish += frameCount
+    // A reset publishes at once, and a zero-length call flushes audio not yet
+    // published (a stream that stops); otherwise once per publish interval.
+    let pending = scalars.pointee.framesSincePublish
+    if reset || pending >= publishFrames || (frameCount == 0 && pending > 0) { publish() }
   }
 
   /// Every meter of four channels over the current chunk.
@@ -331,14 +440,14 @@ public final class AudioMeter: @unchecked Sendable {
     forEachIndex(width) { measurePeaks(channel: first + $0, slot: $0, frames: n) }
     if runsPPM {
       ppm.run(
-        ppmStates + first, channels: width, lanes: UnsafePointer(phases), envelopes: UnsafePointer(envelopes),
-        offset: 0, count: n)
+        ppmStates + first, channels: width, lanes: UnsafePointer(ppmLanes), envelopes: UnsafePointer(ppmEnvelopes),
+        offset: 0, count: (scalars.pointee.ppmCarry + n) / ppmInput.fold)
     }
     forEachIndex(width) { measureLevels(channel: first + $0, slot: $0, frames: n) }
   }
 
   /// The sample peak and, through the group's scratch slot, the interpolated
-  /// phases and envelope.
+  /// phases and envelope and the PPM's input.
   private func measurePeaks(channel c: Int, slot: Int, frames n: Int) {
     let x = UnsafePointer(stage.samples(c))
     let length = vDSP_Length(n)
@@ -350,14 +459,26 @@ public final class AudioMeter: @unchecked Sendable {
     var truePeak = peak
     if runsFIR {
       interpolator.interpolate(x, count: n, into: phases)
-      interpolator.envelope(x, phases: phases, count: n, into: envelope)
+      interpolator.envelope(phases: phases, count: n, into: envelope)
       var interpolated: Float = 0
       vDSP_maxv(envelope, 1, &interpolated, length)
       if interpolated > truePeak { truePeak = interpolated }
-      // The PPM charges from magnitudes.
-      if runsPPM { forEachIndex(interpolator.phaseCount) { vDSP_vabs(phases[$0], 1, phases[$0], 1, length) } }
-    } else if runsPPM {
-      interpolator.envelope(x, phases: phases, count: n, into: envelope)
+    }
+    if runsPPM {
+      switch ppmInput {
+      case .phases:
+        // The PPM charges from the phases' magnitudes; the envelope already is one.
+        forEachIndex(interpolator.phaseCount) { vDSP_vabs(phases[$0], 1, phases[$0], 1, length) }
+      case .samples(let fold):
+        // Step j takes samples fold * j - carry ..< fold * (j + 1) - carry; the
+        // carried ones are the last chunk's, in the history.
+        let carry = scalars.pointee.ppmCarry
+        let steps = (carry + n) / fold
+        let start = x - carry
+        let lanes = ppmLanes + slot * 4
+        forEachIndex(fold) { vDSP_vabs(start + $0, fold, lanes[$0], 1, vDSP_Length(steps)) }
+        if fold > 1 { foldedEnvelope(lanes, laneCount: fold, count: steps, into: ppmEnvelopes[slot]) }
+      }
     }
     channelState[c].chunkPeak = peak
     channelState[c].chunkTruePeak = truePeak
@@ -370,7 +491,7 @@ public final class AudioMeter: @unchecked Sendable {
     let s = channelState + c
     if runsRMS { accumulateRMS(channel: c, frames: n) }
     if runsVU {
-      // The envelope slot is free once the PPM has run.
+      // The envelope slot is free once the true peak and PPM have run.
       vDSP_vabs(x, 1, envelopes[slot], 1, length)
       vu.advance(vuStates + 2 * c, rectified: envelopes[slot], count: n)
     }
@@ -416,13 +537,16 @@ public final class AudioMeter: @unchecked Sendable {
   }
 
   /// Adds the chunk's energy to channel c's RMS ticks, closing each tick into
-  /// the ring; `advanceRMSTicks` then moves the shared tick position the same
-  /// way. A tick is at most 3840 samples; its Float sum is good to 1e-5 dB.
+  /// the ring and the running window sum; `advanceRMSTicks` then moves the
+  /// shared tick position the same way. A tick is at most 3840 samples; its
+  /// Float sum is good to 1e-5 dB.
   private func accumulateRMS(channel c: Int, frames n: Int) {
     let x = stage.samples(c)
     let s = channelState + c
+    let ring = rmsRing + c * rmsTicks
     var position = scalars.pointee.tickPosition
     var head = scalars.pointee.rmsHead
+    var filled = scalars.pointee.rmsFilled
     var i = 0
     while i < n {
       let m = min(n - i, tickFrames - position)
@@ -432,26 +556,32 @@ public final class AudioMeter: @unchecked Sendable {
       i += m
       position += m
       if position == tickFrames {
-        rmsRing[c * rmsTicks + head] = s.pointee.rmsEnergy
+        let new = s.pointee.rmsEnergy
+        rmsWindows[c].replace(filled == rmsTicks ? ring[head] : 0, with: new)
+        ring[head] = new
         s.pointee.rmsEnergy = 0
         position = 0
         head = head + 1 == rmsTicks ? 0 : head + 1
+        if filled < rmsTicks { filled += 1 }
       }
     }
   }
 
   private func advanceRMSTicks(_ n: Int) {
     let total = scalars.pointee.tickPosition + n
+    let closed = total / tickFrames
     scalars.pointee.tickPosition = total % tickFrames
-    scalars.pointee.rmsHead = (scalars.pointee.rmsHead + total / tickFrames) % rmsTicks
+    scalars.pointee.rmsHead = (scalars.pointee.rmsHead + closed) % rmsTicks
+    scalars.pointee.rmsFilled = min(rmsTicks, scalars.pointee.rmsFilled + closed)
   }
 
   private func publish() {
     let kinds = configuration.meters
     let window = Double(rmsTicks * tickFrames)
     scalars.pointee.publishes &+= 1
-    staging.pointee.sequence = scalars.pointee.publishes
-    staging.pointee.frameCount = scalars.pointee.frameCount
+    scalars.pointee.framesSincePublish = 0
+    staging.pointee.readings.sequence = scalars.pointee.publishes
+    staging.pointee.readings.frameCount = scalars.pointee.frameCount
     forEachIndex(channelCount) { c in
       let s = channelState + c
       var levels = AudioChannelLevels(clipCount: s.pointee.clipCount)
@@ -464,37 +594,36 @@ public final class AudioMeter: @unchecked Sendable {
         levels.truePeakHold = amplitudeDB(max(s.pointee.trueHold, s.pointee.sampleHold))
         levels.truePeakMax = amplitudeDB(s.pointee.trueMax)
       }
-      if runsRMS {
-        var energy = 0.0
-        vDSP_sveD(rmsRing + c * rmsTicks, 1, &energy, vDSP_Length(rmsTicks))
-        levels.rms = amplitudeDB((max(energy, 0) / window).squareRoot() * rmsGain)
-      }
+      if runsRMS { levels.rms = amplitudeDB((rmsWindows[c].energy / window).squareRoot() * rmsGain) }
       if runsVU { levels.vu = amplitudeDB(max(vuStates[2 * c], 0) * vuGain) }
       if runsPPM {
         levels.ppm = amplitudeDB(ppmStates[c].top * ppmGain)
         ppm.restart(&ppmStates[c])
       }
-      staging.pointee.channels[c] = levels
+      staging.pointee.readings.channels[c] = levels
     }
-    if let loudness { staging.pointee.loudness = loudness.state.pointee.readings }
+    if let loudness { staging.pointee.readings.loudness = loudness.state.pointee.readings }
     publisher.publish(&staging.pointee)
   }
 
-  /// True when a request was applied.
+  /// True when a request was applied; the generations go out with the next publish.
   private func applyResetRequests() -> Bool {
-    let request = resetRequest.exchange(0, ordering: .acquiring)
-    guard request != 0 else { return false }
-    if request & ResetRequest.all != 0 {
+    let requested = requests.load()
+    let applied = staging.pointee.resets
+    guard requested != applied else { return false }
+    staging.pointee.resets = requested
+    if requested.all != applied.all {
       // Readings and ballistics only; the signal memory stays (see `reset()`).
       channelState.update(repeating: ChannelState(), count: channelCount)
       ppmStates.update(repeating: PPMState(), count: channelCount)
       vuStates.update(repeating: 0, count: 2 * channelCount)
-      rmsRing.update(repeating: 0, count: channelCount * rmsTicks)
-      scalars.pointee = Scalars(publishes: scalars.pointee.publishes, primed: scalars.pointee.primed)
-      loudness?.resetMeasurement()
+      rmsWindows.update(repeating: RMSWindow(), count: channelCount)
+      scalars.pointee = Scalars(
+        publishes: scalars.pointee.publishes, ppmCarry: scalars.pointee.ppmCarry, primed: scalars.pointee.primed)
+      loudness?.resetReadings()
       return true
     }
-    if request & ResetRequest.peaks != 0 {
+    if requested.peaks != applied.peaks {
       forEachIndex(channelCount) { c in
         channelState[c].sampleHold = channelState[c].sampleBar
         channelState[c].sampleHoldAge = 0
@@ -504,7 +633,7 @@ public final class AudioMeter: @unchecked Sendable {
         channelState[c].clipCount = 0
       }
     }
-    if request & ResetRequest.loudness != 0 { loudness?.resetMeasurement() }
+    if requested.loudness != applied.loudness { loudness?.resetMeasurement() }
     return true
   }
 }

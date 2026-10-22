@@ -223,27 +223,54 @@ public struct SignalDescription: Hashable, Codable, Sendable {
   public var encoding: SignalEncoding
   /// Vertical chroma siting of 4:2:0 frames.
   public var chromaVerticalSiting: ChromaVerticalSiting
+  /// Colour primaries of a display-referred signal; nil when unlabelled
+  /// (`effectivePrimaries` then infers them). Log signals carry theirs in the gamut.
+  public var primaries: ColorPrimaries?
 
   public init(
     range: CodeRange = .legal, matrix: YCbCrMatrix = .bt709, chromaSiting: ChromaSiting = .left,
-    encoding: SignalEncoding = .display(.bt709), chromaVerticalSiting: ChromaVerticalSiting = .center
+    encoding: SignalEncoding = .display(.bt709), chromaVerticalSiting: ChromaVerticalSiting = .center,
+    primaries: ColorPrimaries? = nil
   ) {
     self.range = range
     self.matrix = matrix
     self.chromaSiting = chromaSiting
     self.encoding = encoding
     self.chromaVerticalSiting = chromaVerticalSiting
+    self.primaries = primaries
   }
 
-  private enum CodingKeys: String, CodingKey { case range, matrix, chromaSiting, encoding, chromaVerticalSiting }
-  /// Descriptions saved before vertical siting existed decode as centred.
+  /// The labelled primaries, else BT.2020 for PQ, HLG or a BT.2020 matrix (BT.2100
+  /// signals are BT.2020 by definition) and BT.709 otherwise.
+  public var effectivePrimaries: ColorPrimaries {
+    if let primaries { return primaries }
+    if case .display(let t) = encoding, t == .pq || t == .hlg { return .rec2020 }
+    return matrix == .bt2020 ? .rec2020 : .rec709
+  }
+
+  /// PQ or HLG.
+  public var isHDR: Bool {
+    if case .display(let t) = encoding { return t == .pq || t == .hlg }
+    return false
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case range, matrix, chromaSiting, encoding, chromaVerticalSiting, primaries
+  }
+  /// Lenient, like every persisted MonitorKit setting, so a description saved by
+  /// another version cannot invalidate the host's other settings: a missing or
+  /// unknown field decodes as `rec709`'s (an unknown encoding as `.unknown`,
+  /// which tools treat as unlabelled). Descriptions saved before vertical siting
+  /// or primaries existed decode as centred and unlabelled.
   public init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
+    let d = SignalDescription.rec709
     self.init(
-      range: try c.decode(CodeRange.self, forKey: .range), matrix: try c.decode(YCbCrMatrix.self, forKey: .matrix),
-      chromaSiting: try c.decode(ChromaSiting.self, forKey: .chromaSiting),
-      encoding: try c.decode(SignalEncoding.self, forKey: .encoding),
-      chromaVerticalSiting: try c.decodeIfPresent(ChromaVerticalSiting.self, forKey: .chromaVerticalSiting) ?? .center)
+      range: c.lenient(.range, d.range), matrix: c.lenient(.matrix, d.matrix),
+      chromaSiting: c.lenient(.chromaSiting, d.chromaSiting),
+      encoding: c.lenient(.encoding, SignalEncoding.unknown),
+      chromaVerticalSiting: c.lenient(.chromaVerticalSiting, d.chromaVerticalSiting),
+      primaries: c.lenient(.primaries, ColorPrimaries?.none))
   }
 
   public static let rec709 = SignalDescription()

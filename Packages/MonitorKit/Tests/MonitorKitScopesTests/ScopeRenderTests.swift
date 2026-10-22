@@ -99,12 +99,12 @@ final class ScopeRenderTests: XCTestCase {
     let renderer = engine.makeRenderer()
     try GPU.run { cb in try renderer.render(accumulator, display: display, target: target, clear: true, into: cb) }
     let image = pixels(target)
-    // The 100% line: y = (1 - 1.07 / 1.16) · 512 = 39.72 px.
+    // The 100% line, on the centre of its bin floor(1.07 · 512 / 1.16) = 472: y = 512 - 472.5 = 39.5 px.
     let line = image[39 * 1024 + 700], above = image[30 * 1024 + 700]
     XCTAssertGreaterThan(Int(line.x), 150, "an anti-aliased graticule line")
     XCTAssertEqual(above, SIMD4(0, 0, 0, 128), "background at half opacity, premultiplied")
     XCTAssertEqual(renderer.graticule.labels.count, 11)
-    XCTAssertEqual(renderer.graticule.labels.first { $0.value == 100 }!.position.y * 512, 39.72, accuracy: 0.01)
+    XCTAssertEqual(renderer.graticule.labels.first { $0.value == 100 }!.position.y * 512, 39.5, accuracy: 1e-9)
   }
 
   func testHostPassDrawMatchesOwnPassAndRespectsViewport() throws {
@@ -124,6 +124,11 @@ final class ScopeRenderTests: XCTestCase {
     pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
     pass.colorAttachments[0].storeAction = .store
     let encoder = try XCTUnwrap(cb.makeRenderCommandEncoder(descriptor: pass))
+    // State a host may leave behind: GL-style culling, wireframe, a scissor.
+    encoder.setFrontFacing(.counterClockwise)
+    encoder.setCullMode(.back)
+    encoder.setTriangleFillMode(.lines)
+    encoder.setScissorRect(MTLScissorRect(x: 0, y: 0, width: 4, height: 4))
     renderer.draw(with: encoder)
     encoder.endEncoding()
     cb.commit()
@@ -286,6 +291,90 @@ final class ScopeRenderTests: XCTestCase {
     }
   }
 
+  /// A minified parade at plot widths that do not divide by three: a lone bin
+  /// in the first or last column of a channel still lights its own panel's
+  /// edge pixels, in every panel (the panels own floor or ceil of width / 3).
+  func testParadeEdgeBinsSurviveMinification() throws {
+    let (_, _, engine) = try GPU.require()
+    var s = ScopeSettings(kind: .waveform, stage: .source)
+    s.waveformMode = .rgbParade
+    s.waveformColumns = 4096
+    s.waveformLevels = 512
+    s.display.showsGraticule = false
+    s.display.backgroundOpacity = 1
+    let n = s.normalized().waveformColumnsPerChannel
+    // 100% white in the 100% level bin, floor(1.07 · 512 / 1.16) = 472.
+    let level = 472
+    for edge in [0, n - 1] {
+      let frame = try TestFrame.make(
+        .bgra8, width: n, height: 64, signal: SignalDescription(range: .full),
+        rgb: { x, _ in x == edge ? SIMD3(repeating: 1) : .zero })
+      let accumulator = try engine.makeAccumulator(settings: s)
+      try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+      for width in [1000, 1001, 999, 1002, 320, 641] {
+        let height = 200
+        let target = try makeTarget(width: width, height: height)
+        try GPU.run { cb in try engine.makeRenderer().render(accumulator, target: target, clear: true, into: cb) }
+        let image = pixels(target)
+        let y = Int((1 - (Double(level) + 0.5) / 512) * Double(height))
+        for panel in 0..<3 {
+          // The panel's pixels: those whose centre falls in its third.
+          let columns = (0..<width).filter { min(Int((Double($0) + 0.5) * 3 / Double(width)), 2) == panel }
+          let near = edge == 0 ? Array(columns.prefix(2)) : Array(columns.suffix(2))
+          var best = 0
+          for x in near {
+            for dy in -2...2 where (0..<height).contains(y + dy) {
+              let p = image[(y + dy) * width + x]
+              best = max(best, Int(p[panel]))
+            }
+          }
+          XCTAssertGreaterThan(best, 100, "column \(edge) at \(width) px: panel \(panel) shows its edge bin")
+        }
+      }
+    }
+  }
+
+  /// A minified vectorscope whose square plot sits a half pixel into the
+  /// viewport: every lone bin still lights a pixel at its position.
+  func testVectorscopeLoneBinsSurviveMinification() throws {
+    let (_, _, engine) = try GPU.require()
+    // Pure primaries and secondaries at 75%: six lone chroma points.
+    let colors: [SIMD3<Float>] = [
+      SIMD3(0.75, 0, 0), SIMD3(0, 0.75, 0), SIMD3(0, 0, 0.75), SIMD3(0.75, 0.75, 0), SIMD3(0, 0.75, 0.75),
+      SIMD3(0.75, 0, 0.75),
+    ]
+    let frame = try TestFrame.make(
+      .rgba16Float, width: 64, height: 6, signal: SignalDescription(range: .full), rgb: { x, y in x < 2 ? colors[y] : .zero })
+    var s = ScopeSettings(kind: .vectorscope, stage: .source)
+    s.vectorscopeSize = 2048
+    s.display.backgroundOpacity = 1
+    s.display.showsGraticule = false
+    s.display.gain = 20
+    let accumulator = try engine.makeAccumulator(settings: s)
+    try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+    let k = YCbCrMatrix.bt709.coefficients
+    for (width, height) in [(501, 500), (334, 333), (257, 256), (100, 99), (61, 60)] {
+      let target = try makeTarget(width: width, height: height)
+      try GPU.run { cb in try engine.makeRenderer().render(accumulator, target: target, clear: true, into: cb) }
+      let image = pixels(target)
+      let side = Double(min(width, height))
+      let left = (Double(width) - side) / 2, top = (Double(height) - side) / 2
+      for c in colors {
+        let r = Double(c.x), g = Double(c.y), b = Double(c.z)
+        let y = k.r * r + (1 - k.r - k.b) * g + k.b * b
+        let p = VectorscopeGeometry.plotPosition(cb: (b - y) / (2 * (1 - k.b)), cr: (r - y) / (2 * (1 - k.r)), zoom: 1)
+        let x = Int(left + (0.5 + p.x / 2) * side), row = Int(top + (0.5 - p.y / 2) * side)
+        var best = 0
+        for dy in -1...1 {
+          for dx in -1...1 where (0..<width).contains(x + dx) && (0..<height).contains(row + dy) {
+            best = max(best, Int(image[(row + dy) * width + x + dx].y))
+          }
+        }
+        XCTAssertGreaterThan(best, 40, "\(width)×\(height): \(c) is visible")
+      }
+    }
+  }
+
   /// A 4096-bin histogram of an 8-bit ramp drawn 512 px wide: every populated
   /// bin lights its pixel column, so no code drops out of the comb.
   func testHistogramSpikesSurviveMinification() throws {
@@ -357,5 +446,199 @@ final class ScopeRenderTests: XCTestCase {
     XCTAssertTrue(texture === renderer.graticuleTexture, "a NaN scale neither redraws nor reallocates")
     cb.commit()
     cb.waitUntilCompleted()
+  }
+
+  /// Rows of `image` (`width` wide) between columns `x0..<x1`, brightest first by channel `c`.
+  func brightestRow(_ image: [SIMD4<UInt8>], width: Int, height: Int, columns: Range<Int>, channel c: Int) -> Int {
+    var best = 0, row = 0
+    for y in 0..<height {
+      var sum = 0
+      for x in columns { sum += Int(image[y * width + x][c]) }
+      if sum > best { (best, row) = (sum, y) }
+    }
+    return row
+  }
+
+  /// Each parade panel draws its own channel: the R, G and B (or Y', Cb, Cr)
+  /// panels light the row of that channel's bin, in that channel's colour. A
+  /// swapped panel order fails here.
+  func testParadePanelsDrawTheirOwnChannel() throws {
+    let (_, _, engine) = try GPU.require()
+    let frame = try TestFrame.make(
+      .bgra8, width: 600, height: 64, signal: SignalDescription(range: .full), rgb: { _, _ in SIMD3(0.8, 0.5, 0.2) })
+    for mode in [WaveformMode.rgbParade, .ycbcrParade] {
+      var s = ScopeSettings(kind: .waveform, stage: .source)
+      s.waveformMode = mode
+      s.waveformColumns = 600
+      s.waveformLevels = 256
+      s.display.showsGraticule = false
+      s.display.backgroundOpacity = 1
+      let accumulator = try engine.makeAccumulator(settings: s)
+      try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+      let bins = try readBins(accumulator)
+      let layout = accumulator.layout
+      let target = try makeTarget(width: 600, height: 256)
+      try GPU.run { cb in try engine.makeRenderer().render(accumulator, target: target, clear: true, into: cb) }
+      let image = pixels(target)
+      let colors = ScopeRenderer.colors(settings: s)
+      let bases = [colors.0, colors.1, colors.2]
+      for k in 0..<3 {
+        // The level this channel's bins hold (every column alike).
+        let level = try XCTUnwrap((0..<layout.rows).first { bins[layout.index(channel: k, row: $0, column: 10)] > 0 })
+        let panel = (k * 200 + 20)..<(k * 200 + 180)
+        // Panels of the strongest base component show it in that component.
+        let component = (0..<3).max { bases[k][$0] < bases[k][$1] }!
+        let row = brightestRow(image, width: 600, height: 256, columns: panel, channel: component)
+        XCTAssertEqual(row, 255 - level, "\(mode) panel \(k): its channel's level")
+        let px = image[row * 600 + panel.lowerBound + 50]
+        XCTAssertGreaterThan(Int(px[component]), 150, "\(mode) panel \(k) lit")
+        if mode == .rgbParade {
+          // The panel's colour is its channel's: R, G or B dominates.
+          for c in 0..<3 where c != k { XCTAssertGreaterThan(Int(px[k]), Int(px[c]), "\(mode) panel \(k) colour") }
+        }
+      }
+    }
+  }
+
+  /// Histogram parade panels stack R, G, B from the top, each filled at its own
+  /// channel's bin only; the logarithmic scale draws log(1 + n) / log(1 + peak).
+  func testHistogramParadeAndLogarithmicHeights() throws {
+    let (_, _, engine) = try GPU.require()
+    // 3/4 of the pixels at one level, 1/16 at another, the rest at a third.
+    let frame = try TestFrame.make(
+      .bgra8, width: 256, height: 16, signal: SignalDescription(range: .full),
+      rgb: { x, _ in
+        x < 192 ? SIMD3(0.8, 0.5, 0.2) : (x < 208 ? SIMD3(0.3, 0.9, 0.6) : SIMD3(0.1, 0.1, 0.1))
+      })
+    for scale in HistogramScale.allCases {
+      var s = ScopeSettings(kind: .histogram, stage: .source)
+      s.histogramMode = .rgbParade
+      s.histogramBins = 512
+      s.display.histogramScale = scale
+      s.display.showsGraticule = false
+      s.display.backgroundOpacity = 1
+      let accumulator = try engine.makeAccumulator(settings: s)
+      try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+      let bins = try readBins(accumulator)
+      let peak = Double(try XCTUnwrap(accumulator.statistics).histogramPeak.max())
+      XCTAssertEqual(peak, 192 * 16)
+      let target = try makeTarget(width: 512, height: 300)
+      try GPU.run { cb in try engine.makeRenderer().render(accumulator, target: target, clear: true, into: cb) }
+      let image = pixels(target)
+      for k in 0..<3 {
+        let populated = (0..<512).filter { bins[k * 512 + $0] > 0 }
+        XCTAssertEqual(populated.count, 3, "\(scale) channel \(k)")
+        for bin in populated {
+          let count = Double(bins[k * 512 + bin])
+          let height = scale == .logarithmic ? log(1 + count) / log(1 + peak) : count / peak
+          // Filled pixels of panel k in this bin's column, counted from the panel's bottom.
+          var filled = 0
+          for y in (k * 100)..<((k + 1) * 100) where image[y * 512 + bin][k] > 40 { filled += 1 }
+          XCTAssertEqual(Double(filled), height * 100, accuracy: 2, "\(scale) channel \(k) bin \(bin)")
+          // The other panels stay dark in this column unless they hold the same bin.
+          for other in 0..<3 where other != k && bins[other * 512 + bin] == 0 {
+            XCTAssertLessThan(Int(image[(other * 100 + 99) * 512 + bin][other]), 40, "\(scale) panel \(other) bin \(bin)")
+          }
+        }
+      }
+    }
+  }
+
+  /// A colorized vectorscope shows each point in the hue it measures: the
+  /// target of a flat 75% bar is drawn in that bar's colour, as the fragment
+  /// shader's formula gives it at that pixel.
+  func testColorizedVectorscopeShowsTheMeasuredHue() throws {
+    let (_, _, engine) = try GPU.require()
+    for bar in VectorscopeTarget.bars(matrix: .bt709, amplitude: 0.75) {
+      let rgb = SIMD3(Float(bar.rgb.r), Float(bar.rgb.g), Float(bar.rgb.b))
+      let frame = try TestFrame.make(
+        .rgba16Float, width: 64, height: 64, signal: SignalDescription(range: .full), rgb: { _, _ in rgb })
+      var s = ScopeSettings(kind: .vectorscope, stage: .source)
+      s.display.trace = .colorized
+      s.display.showsGraticule = false
+      s.display.backgroundOpacity = 1
+      let accumulator = try engine.makeAccumulator(settings: s)
+      try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+      let target = try makeTarget(width: 512, height: 512)
+      try GPU.run { cb in try engine.makeRenderer().render(accumulator, target: target, clear: true, into: cb) }
+      let image = pixels(target)
+      let lit = image.indices.filter { image[$0].x > 0 || image[$0].y > 0 || image[$0].z > 0 }
+      XCTAssertFalse(lit.isEmpty, bar.name)
+      for i in lit {
+        let px = SIMD2(Double(i % 512) + 0.5, Double(i / 512) + 0.5)
+        // mk_scopeFragment's colorized hue at this pixel, at full intensity (every pixel in one bin).
+        let c = SIMD2(px.x / 512 * 2 - 1, 1 - px.y / 512 * 2) * VectorscopeGeometry.halfExtent
+        let kr = 0.2126, kb = 0.0722, y = 0.5
+        let r = y + 2 * (1 - kr) * c.y, b = y + 2 * (1 - kb) * c.x
+        let hue = simd_max(SIMD3(r, (y - kr * r - kb * b) / (1 - kr - kb), b), .zero)
+        let base = SIMD3(repeating: 1) + (hue / max(hue.max(), 1e-3) - 1) * min(1, simd_length(c) * 6)
+        let expected = simd_min(base + (SIMD3(repeating: 1) - base) * 0.3, SIMD3(repeating: 1))
+        for k in 0..<3 {
+          XCTAssertEqual(Double(image[i][k]), expected[k] * 255, accuracy: 1.5, "\(bar.name) channel \(k) at \(px)")
+        }
+      }
+    }
+  }
+
+  /// Neutral pixels (Cb = Cr = 0 exactly) draw on the plot centre, under the
+  /// crosshair: symmetric about it on even plots, on its pixel on odd ones.
+  func testNeutralFrameDrawsOnTheVectorscopeCentre() throws {
+    let (_, _, engine) = try GPU.require()
+    let frame = try TestFrame.make(.v210, width: 128, height: 32, codes: { _, _ in SIMD3(502, 512, 512) })
+    for (side, zoom, viewport) in [(512, 1, 512), (512, 1, 511), (256, 2, 1024), (2048, 4, 300), (64, 1, 1000)] {
+      var s = ScopeSettings(kind: .vectorscope, stage: .source)
+      s.vectorscopeSize = side
+      s.vectorscopeZoom = zoom
+      s.display.showsGraticule = false
+      s.display.backgroundOpacity = 1
+      let accumulator = try engine.makeAccumulator(settings: s)
+      try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+      let target = try makeTarget(width: viewport, height: viewport)
+      try GPU.run { cb in try engine.makeRenderer().render(accumulator, target: target, clear: true, into: cb) }
+      let image = pixels(target)
+      var weight = 0.0, sum = SIMD2<Double>.zero
+      for y in 0..<viewport {
+        for x in 0..<viewport {
+          let w = Double(image[y * viewport + x].y)
+          weight += w
+          sum += w * SIMD2(Double(x) + 0.5, Double(y) + 0.5)
+        }
+      }
+      let label = "\(side) bins ×\(zoom) in \(viewport) px"
+      XCTAssertGreaterThan(weight, 0, label)
+      let centroid = sum / weight
+      XCTAssertEqual(centroid.x, Double(viewport) / 2, accuracy: 0.01, label)
+      XCTAssertEqual(centroid.y, Double(viewport) / 2, accuracy: 0.01, label)
+    }
+  }
+
+  /// At a low level count, legal white and black trace on the 100% and 0%
+  /// graticule lines, not a bin-fraction above or below them.
+  func testExactLevelsTraceOnTheirGraticuleLines() throws {
+    let (_, _, engine) = try GPU.require()
+    for (code, value) in [(940, 100.0), (64, 0.0)] {
+      let frame = try TestFrame.make(.v210, width: 256, height: 32, codes: { _, _ in SIMD3(code, 512, 512) })
+      for levels in [64, 100, 512] {
+        var s = ScopeSettings(kind: .waveform, stage: .source)
+        s.waveformLevels = levels
+        s.waveformColumns = 256
+        s.display.showsGraticule = false
+        s.display.backgroundOpacity = 1
+        let accumulator = try engine.makeAccumulator(settings: s)
+        try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+        let target = try makeTarget(width: 256, height: 1000)
+        let renderer = engine.makeRenderer()
+        try GPU.run { cb in try renderer.render(accumulator, target: target, clear: true, into: cb) }
+        let image = pixels(target)
+        var weight = 0.0, sum = 0.0
+        for y in 0..<1000 {
+          let w = Double(image[y * 256 + 128].y)
+          weight += w
+          sum += w * (Double(y) + 0.5)
+        }
+        let line = try XCTUnwrap(renderer.graticule.labels.first { $0.value == value }).position.y * 1000
+        XCTAssertEqual(sum / weight, line, accuracy: 0.6, "code \(code), \(levels) levels")
+      }
+    }
   }
 }

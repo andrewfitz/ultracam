@@ -195,8 +195,9 @@ final class FocusTests: XCTestCase {
     state.focus.sensitivity = 0.8
     try gpu.run { try feed.analyze(frame, focus: state.focus, into: $0) }
     let mask = gpu.readMask(feed)
-    // 2.4×, 3×, 4× and an anisotropic de-squeezed footprint (one texel wide in x).
-    for (w, h, desqueeze) in [(40, 20, 1.0), (32, 16, 1.0), (24, 12, 1.0), (96, 12, 4.0), (11, 9, 1.0)] {
+    // 2× (one gather), 2.4×, 3×, 4× (four), 6× (the gather loop), an anisotropic
+    // de-squeezed footprint (one texel wide in x) and a subsampled one.
+    for (w, h, desqueeze) in [(48, 24, 1.0), (40, 20, 1.0), (32, 16, 1.0), (24, 12, 1.0), (16, 8, 1.0), (96, 12, 4.0), (11, 9, 1.0)] {
       var s = state
       s.geometry.desqueeze = desqueeze
       var plain = s
@@ -328,12 +329,12 @@ final class FocusTests: XCTestCase {
     let engine = try MonitorEngine(device: gpu.device)
     XCTAssertEqual(engine.focusPipelineCount, 0)
     try engine.prepare(pixelFormat: .bgra8Unorm, layouts: [.v210, .p010])
-    XCTAssertEqual(engine.focusPipelineCount, 4, "source and LUT stage, per layout")
+    XCTAssertEqual(engine.focusPipelineCount, 6, "source, output and monitor stage, per layout")
     let feed = engine.makeFeed()
     var focus = FocusSettings()
     focus.enabled = true
     try gpu.run { try feed.analyze(try Self.scene().frame(gpu, signal: .rec709), focus: focus, into: $0) }
-    XCTAssertEqual(engine.focusPipelineCount, 4, "analysis built nothing on the frame path")
+    XCTAssertEqual(engine.focusPipelineCount, 6, "analysis built nothing on the frame path")
   }
 
   /// A mask replaced on a size change stays referenced for a few frames, so a

@@ -17,21 +17,23 @@ struct mk_LUTParams {
 };
 
 // Lattice is an rgba32Float texture3d; x is red, y green, z blue. Its first n
-// slices are the lattice; a 1D shaper follows, entry i at (i % n, i / n % n, n + i / n²).
+// slices hold the lattice (in their n × n corner); a 1D shaper follows in rows
+// of the texture's width w (at least 8, so a small lattice holds a 65536-entry
+// shaper): entry i at (i % w, i / w % w, n + i / w²).
 inline float3 mk_lattice(texture3d<float, access::sample> lut, uint3 i) { return lut.read(i).rgb; }
 
-inline float3 mk_shaperEntry(texture3d<float, access::sample> lut, uint i, uint n) {
-  return lut.read(uint3(i % n, i / n % n, n + i / (n * n))).rgb;
+inline float3 mk_shaperEntry(texture3d<float, access::sample> lut, uint i, uint n, uint w) {
+  return lut.read(uint3(i % w, i / w % w, n + i / (w * w))).rgb;
 }
 
 // The 1D table per channel, linear between entries (CubeLUT.applyShaper).
 float3 mk_shaper(float3 rgb, texture3d<float, access::sample> lut, mk_LUTParams p) {
-  uint m = p.shape.w, n = p.shape.x;
+  uint m = p.shape.w, n = p.shape.x, w = lut.get_width();
   float3 position = clamp((rgb - p.shaperLow.xyz) * p.shaperScale.xyz, 0.0f, 1.0f) * float(m - 1);
   uint3 lo = uint3(floor(position)), hi = min(lo + 1, uint3(m - 1));
   float3 t = position - float3(lo);
   float3 out;
-  for (uint c = 0; c < 3; c++) out[c] = mix(mk_shaperEntry(lut, lo[c], n)[c], mk_shaperEntry(lut, hi[c], n)[c], t[c]);
+  for (uint c = 0; c < 3; c++) out[c] = mix(mk_shaperEntry(lut, lo[c], n, w)[c], mk_shaperEntry(lut, hi[c], n, w)[c], t[c]);
   return out;
 }
 
@@ -44,9 +46,10 @@ float3 mk_applyLUT(float3 rgb, texture3d<float, access::sample> lut, mk_LUTParam
   uint n = p.shape.x;
   float3 position = clamp((rgb - p.domainLow.xyz) * p.domainScale.xyz, 0.0f, 1.0f) * float(n - 1);
   if (p.shape.y == 2) {
-    // Normalized per axis: a shaper's slices sit beyond the lattice in z.
+    // Normalized per axis by the texture's size: a shaper's slices sit beyond
+    // the lattice in z, and a small lattice in the corner of wider slices.
     constexpr sampler filtered(coord::normalized, address::clamp_to_edge, filter::linear);
-    return lut.sample(filtered, (position + 0.5f) / float3(n, n, lut.get_depth())).rgb;
+    return lut.sample(filtered, (position + 0.5f) / float3(lut.get_width(), lut.get_height(), lut.get_depth())).rgb;
   }
   uint3 lo = uint3(floor(position)), hi = min(lo + 1, uint3(n - 1));
   float3 t = position - float3(lo);

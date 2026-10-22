@@ -16,7 +16,7 @@ struct mk_ScopeParams {
   float4 level;   // x: axis low, y: bins per unit level, z: 1 / frame width
   float4 weights; // xyz: luma weights, w: 1 to use the decoded transport luma (no LUT, frame matrix)
   float4 chroma;  // x: 1 / (2 (1 - kb)), y: 1 / (2 (1 - kr)), z: vectorscope bins per unit chroma, w: half side
-  float4 clip;    // x: high threshold, y: low threshold (both inclusive)
+  float4 clip;    // x: high, y: low threshold in percent, both inclusive, compared as the picture's clip indicators do
 };
 
 constant uint MK_SCOPE_WAVEFORM = 0, MK_SCOPE_VECTOR = 1, MK_SCOPE_HISTOGRAM = 2;
@@ -31,20 +31,33 @@ constant float MK_ST_EXTREME_SCALE = 1048576.0f, MK_ST_SUM_SCALE = 4096.0f;
 
 // ---------------------------------------------------------------- shared
 
-// Stage R'G'B' in .rgb and its Y' in .w. With no LUT on the stage and the
-// frame's own matrix, Y' is the decoded transport luma, which is exact at
-// integral codes and is what the picture pass's zebras and IRE read
-// (mk_stageLuma); otherwise mk_luma, exact for neutrals.
-inline float4 mk_scopeSample(texture2d<uint, access::read> packed, texture2d<float, access::read> luma,
-                             texture2d<float, access::read> chroma, texture3d<float, access::sample> burnLUT,
-                             texture3d<float, access::sample> monitorLUT, uint2 xy,
-                             constant mk_FrameParams& frame, constant mk_LUTParams& burn,
-                             constant mk_LUTParams& monitor, constant mk_ScopeParams& p) {
+// One pixel of a stage: its R'G'B', the Y' the scope draws (its colorimetry's
+// weights) and the stage Y' its statistics measure.
+struct mk_ScopeSample {
+  float3 rgb;
+  float y, stageY;
+};
+
+// Rec. ITU-R BT.709-6 item 3.2 luma weights, which the picture pass gives a LUT result.
+constant float3 MK_SCOPE_LUMA_709 = float3(.2126f, .7152f, .0722f);
+
+// With no LUT on the stage and the frame's own matrix, the scope's Y' is the
+// decoded transport luma, exact at integral codes; otherwise mk_luma, exact for
+// neutrals. The statistics' Y' follows the picture's zebras, IRE and clip
+// indicators (mk_stageLuma) whatever the colorimetry: the transport luma where
+// no LUT touched the stage, Rec.709 Y' of a LUT result.
+inline mk_ScopeSample mk_scopeSample(texture2d<uint, access::read> packed, texture2d<float, access::read> luma,
+                                     texture2d<float, access::read> chroma, texture3d<float, access::sample> burnLUT,
+                                     texture3d<float, access::sample> monitorLUT, uint2 xy,
+                                     constant mk_FrameParams& frame, constant mk_LUTParams& burn,
+                                     constant mk_LUTParams& monitor, constant mk_ScopeParams& p) {
   float4 d = mk_decode(packed, luma, chroma, xy, frame);
   float3 rgb = d.rgb;
-  if (p.shape.z >= 1 && p.luts.x) rgb = mk_applyLUT(rgb, burnLUT, burn);
-  if (p.shape.z == 2 && p.luts.y) rgb = mk_applyLUT(rgb, monitorLUT, monitor);
-  return float4(rgb, p.weights.w != 0 ? d.w : mk_luma(rgb, p.weights.xyz));
+  bool burned = p.shape.z >= 1 && p.luts.x, monitored = p.shape.z == 2 && p.luts.y;
+  if (burned) rgb = mk_applyLUT(rgb, burnLUT, burn);
+  if (monitored) rgb = mk_applyLUT(rgb, monitorLUT, monitor);
+  float stageY = burned || monitored ? mk_luma(rgb, MK_SCOPE_LUMA_709) : d.w;
+  return {rgb, p.weights.w != 0 ? d.w : mk_luma(rgb, p.weights.xyz), stageY};
 }
 
 // Uniform bins over [low, low + n / scale). Out-of-range values land in the
@@ -92,7 +105,9 @@ inline void mk_statsAdd(thread mk_ScopeStats& s, float3 rgb, float y, constant m
   s.minInv = max(s.minInv, ~q);
   s.maxQ = max(s.maxQ, q);
   s.sum += uint(rint((yc + 1) * MK_ST_SUM_SCALE));
-  float4 v = float4(rgb, y);
+  // In percent, the same operations as the picture pass's clip indicators
+  // (mk_stage(…) * 100 >= level), so both classify every pixel alike.
+  float4 v = float4(rgb, y) * 100;
   s.high += uint4(v >= p.clip.x);
   s.low += uint4(v <= p.clip.y);
   s.count++;
@@ -161,46 +176,85 @@ inline void mk_clearLocal(threadgroup atomic_uint* words, uint count, threadgrou
 
 // ---------------------------------------------------------------- clear and finalize
 
-// Zeroes the bins and opens this accumulation's statistics slot. The slot is
-// a seqlock the host reads at any time: its END stamp is invalidated before
-// any other word changes, and mk_scopeFinalize writes it last.
-kernel void mk_scopeClear(constant mk_ScopeParams& p [[buffer(3)]], device uint4* bins [[buffer(4)]],
-                          device atomic_uint* stats [[buffer(5)]], uint gid [[thread_position_in_grid]]) {
-  if (gid < p.tile.w / 4) bins[gid] = uint4(0);
-  device atomic_uint* slot = stats + p.bins.w;
+// Mirrors MonitorKitScopes.ScopeMaintenanceParameters. Up to three members:
+// a fused group's waveform, histogram and vectorscope, or one accumulator.
+struct mk_ScopeMaintain {
+  uint4 words;      // xyz: uint4 words of each member's bins to clear, w: members present (bit k: member k)
+  uint4 slots;      // xyz: each member's statistics slot (words)
+  uint4 generation; // xyz: each member's generation
+  uint4 histogram;  // xyz: histogram bins per channel (0: not a histogram), w: member the fused pass measured into + 1 (0: none)
+  uint4 channels;   // xyz: channels per member
+};
+
+// Function constant 4: a group's clear and finalize (members 0–2). Without it
+// only member 0 exists, and members 1 and 2 have no bindings.
+constant bool mk_maintainGroup [[function_constant(4)]];
+
+constant uint mk_maintainMembers = mk_maintainGroup ? 3 : 1;
+
+#define MK_MAINTAIN_SLOT(k) ((mk_maintainGroup ? ((k) == 0 ? s0 : ((k) == 1 ? s1 : s2)) : s0) + m.slots[k])
+
+// Zeroes every member's bins and opens their statistics slots. A slot is a
+// seqlock the host reads at any time: its END stamp is invalidated before any
+// other word changes, and mk_scopeFinalize writes it last.
+kernel void mk_scopeClear(constant mk_ScopeMaintain& m [[buffer(3)]], device uint4* b0 [[buffer(4)]],
+                          device uint4* b1 [[buffer(6), function_constant(mk_maintainGroup)]],
+                          device uint4* b2 [[buffer(7), function_constant(mk_maintainGroup)]],
+                          device atomic_uint* s0 [[buffer(5)]],
+                          device atomic_uint* s1 [[buffer(12), function_constant(mk_maintainGroup)]],
+                          device atomic_uint* s2 [[buffer(13), function_constant(mk_maintainGroup)]],
+                          uint gid [[thread_position_in_grid]]) {
+  if (gid < m.words.x) b0[gid] = uint4(0);
+  if (mk_maintainGroup) {
+    if (gid < m.words.y) b1[gid] = uint4(0);
+    if (gid < m.words.z) b2[gid] = uint4(0);
+  }
+  uint present = m.words.w;
   // Threadgroup 0 holds every slot word (at least 32 threads per group).
-  if (gid == 0) atomic_store_explicit(&slot[MK_ST_END], 0xFFFFFFFFu, memory_order_relaxed);
+  if (gid < mk_maintainMembers && (present >> gid & 1))
+    atomic_store_explicit(&MK_MAINTAIN_SLOT(gid)[MK_ST_END], 0xFFFFFFFFu, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_device);
   if (gid < MK_ST_WORDS && gid != MK_ST_END)
-    atomic_store_explicit(&slot[gid], gid == MK_ST_BEGIN ? p.luts.z : 0u, memory_order_relaxed);
+    for (uint k = 0; k < mk_maintainMembers; k++)
+      if (present >> k & 1)
+        atomic_store_explicit(&MK_MAINTAIN_SLOT(k)[gid], gid == MK_ST_BEGIN ? m.generation[k] : 0u, memory_order_relaxed);
 }
 
-// Copies the statistics of a fused pass from its lead slot (luts.w: lead slot
-// word + 1), then histogram peaks for the renderer's normalization, then the
-// closing stamp. The copy reads words COUNT…LOW+3, which only the fused
-// accumulation writes; finalize itself writes PEAK and later words only, so the
-// members' finalizes may run in any order.
-kernel void mk_scopeFinalize(constant mk_ScopeParams& p [[buffer(3)]], device const uint* bins [[buffer(4)]],
-                             device atomic_uint* stats [[buffer(5)]], device const uint* lead [[buffer(11)]],
+// Copies a fused pass's statistics from the slot it measured into to the other
+// members (words COUNT…LOW+3, which only the accumulation writes), then
+// histogram peaks for the renderer's normalization, then each closing stamp.
+kernel void mk_scopeFinalize(constant mk_ScopeMaintain& m [[buffer(3)]], device const uint* b0 [[buffer(4)]],
+                             device const uint* b1 [[buffer(6), function_constant(mk_maintainGroup)]],
+                             device const uint* b2 [[buffer(7), function_constant(mk_maintainGroup)]],
+                             device atomic_uint* s0 [[buffer(5)]],
+                             device atomic_uint* s1 [[buffer(12), function_constant(mk_maintainGroup)]],
+                             device atomic_uint* s2 [[buffer(13), function_constant(mk_maintainGroup)]],
                              uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
-  device atomic_uint* slot = stats + p.bins.w;
-  if (p.luts.w != 0 && tid >= MK_ST_COUNT && tid < MK_ST_PEAK)
-    atomic_store_explicit(&slot[tid], lead[p.luts.w - 1 + tid], memory_order_relaxed);
-  if (p.shape.x == MK_SCOPE_HISTOGRAM) {
-    uint n = p.bins.x;
-    for (uint k = 0; k < p.shape.w; k++) {
+  uint present = m.words.w, lead = m.histogram.w;
+  if (lead != 0 && tid >= MK_ST_COUNT && tid < MK_ST_PEAK) {
+    uint v = atomic_load_explicit(&MK_MAINTAIN_SLOT(lead - 1)[tid], memory_order_relaxed);
+    for (uint k = 0; k < mk_maintainMembers; k++)
+      if ((present >> k & 1) && k != lead - 1) atomic_store_explicit(&MK_MAINTAIN_SLOT(k)[tid], v, memory_order_relaxed);
+  }
+  for (uint member = 0; member < mk_maintainMembers; member++) {
+    uint bins = m.histogram[member];
+    if (!(present >> member & 1) || bins == 0) continue;
+    device const uint* counts = mk_maintainGroup ? (member == 0 ? b0 : (member == 1 ? b1 : b2)) : b0;
+    device atomic_uint* slot = MK_MAINTAIN_SLOT(member);
+    for (uint k = 0; k < m.channels[member]; k++) {
       uint peak = 0;
-      for (uint i = tid; i < n; i += threads) peak = max(peak, bins[k * n + i]);
+      for (uint i = tid; i < bins; i += threads) peak = max(peak, counts[k * bins + i]);
       peak = simd_max(peak);
       if (simd_is_first()) atomic_fetch_max_explicit(&slot[MK_ST_PEAK + k], peak, memory_order_relaxed);
     }
   }
   threadgroup_barrier(mem_flags::mem_device);
-  if (tid == 0) {
+  if (tid < mk_maintainMembers && (present >> tid & 1)) {
+    device atomic_uint* slot = MK_MAINTAIN_SLOT(tid);
     uint peak = 0;
     for (uint k = 0; k < 3; k++) peak = max(peak, atomic_load_explicit(&slot[MK_ST_PEAK + k], memory_order_relaxed));
     atomic_store_explicit(&slot[MK_ST_PEAK_ALL], peak, memory_order_relaxed);
-    atomic_store_explicit(&slot[MK_ST_END], p.luts.z, memory_order_relaxed);
+    atomic_store_explicit(&slot[MK_ST_END], m.generation[tid], memory_order_relaxed);
   }
 }
 
@@ -285,10 +339,10 @@ kernel void mk_scopeWaveform(MK_SCOPE_INPUTS, threadgroup atomic_uint* local [[t
     uint n = tw * th;
     for (uint i = tid; i < n; i += threads) {
       uint2 xy = uint2(x0 + x, y0 + y);
-      float4 sample = MK_SCOPE_SAMPLE(xy);
-      mk_statsAdd(s, sample.rgb, sample.w, p);
+      mk_ScopeSample sample = MK_SCOPE_SAMPLE(xy);
+      mk_statsAdd(s, sample.rgb, sample.stageY, p);
       uint column = mk_waveformColumn(xy.x, C, fw, p.level.z) - c0;
-      float3 v = mk_waveformValues(sample.rgb, sample.w, p);
+      float3 v = mk_waveformValues(sample.rgb, sample.y, p);
       for (uint k = 0; k < channels; k++)
         mk_addPacked(local, (k * L + mk_levelBin(v[k], p.level.x, p.level.y, L)) * K + column);
       y += dy;
@@ -327,9 +381,9 @@ kernel void mk_scopeHistogram(MK_SCOPE_INPUTS, threadgroup atomic_uint* local [[
   for (uint i = tid; i < n; i += threads) {
     uint xs = x0 + r * run, xe = min(xs + run, x0 + tw);
     for (uint x = xs; x < xe; x++) {
-      float4 sample = MK_SCOPE_SAMPLE(uint2(x, y0 + y));
-      mk_statsAdd(s, sample.rgb, sample.w, p);
-      float3 v = p.shape.y == 0 ? float3(sample.w) : sample.rgb;
+      mk_ScopeSample sample = MK_SCOPE_SAMPLE(uint2(x, y0 + y));
+      mk_statsAdd(s, sample.rgb, sample.stageY, p);
+      float3 v = p.shape.y == 0 ? float3(sample.y) : sample.rgb;
       for (uint k = 0; k < channels; k++) mk_addPacked(local, k * B + mk_levelBin(v[k], p.level.x, p.level.y, B));
     }
     r += dr;
@@ -359,9 +413,9 @@ kernel void mk_scopeVector(MK_SCOPE_INPUTS, uint2 gid [[thread_position_in_grid]
     uint x1 = min(x0 + run, fw);
     uint current = 0xFFFFFFFFu, count = 0;
     for (uint x = x0; x < x1; x++) {
-      float4 sample = MK_SCOPE_SAMPLE(uint2(x, gid.y));
-      mk_statsAdd(s, sample.rgb, sample.w, p);
-      uint bin = mk_vectorBin(sample.rgb, sample.w, p);
+      mk_ScopeSample sample = MK_SCOPE_SAMPLE(uint2(x, gid.y));
+      mk_statsAdd(s, sample.rgb, sample.stageY, p);
+      uint bin = mk_vectorBin(sample.rgb, sample.y, p);
       if (bin == current) {
         count++;
       } else {
@@ -385,7 +439,7 @@ kernel void mk_scopeVector(MK_SCOPE_INPUTS, uint2 gid [[thread_position_in_grid]
 // waveform's in threadgroup memory; without one they tile like
 // mk_scopeHistogram. The vectorscope adds through device atomics. `p` (the
 // lead scope) carries the stage, LUTs, weights and clip levels, which every
-// fused scope shares, and receives the statistics.
+// fused scope shares, and its statistics buffer (14) receives the statistics.
 constant bool mk_fuseWaveform [[function_constant(1)]];
 constant bool mk_fuseHistogram [[function_constant(2)]];
 constant bool mk_fuseVector [[function_constant(3)]];
@@ -402,7 +456,7 @@ kernel void mk_scopeFused(texture2d<uint, access::read> packed [[texture(0)]],
                           texture3d<float, access::sample> monitorLUT [[texture(4)]],
                           constant mk_FrameParams& frame [[buffer(0)]], constant mk_LUTParams& burn [[buffer(1)]],
                           constant mk_LUTParams& monitor [[buffer(2)]], constant mk_ScopeParams& p [[buffer(3)]],
-                          device atomic_uint* stats [[buffer(5)]],
+                          device atomic_uint* stats [[buffer(14)]],
                           device atomic_uint* wbins [[buffer(4), function_constant(mk_fuseWaveform)]],
                           device atomic_uint* hbins [[buffer(6), function_constant(mk_fuseHistogram)]],
                           device atomic_uint* vbins [[buffer(7), function_constant(mk_fuseVector)]],
@@ -456,19 +510,19 @@ kernel void mk_scopeFused(texture2d<uint, access::read> packed [[texture(0)]],
     uint x = x0 + i / runs, ys = y0 + (i % runs) * MK_FUSED_RUN, ye = min(ys + MK_FUSED_RUN, y1);
     uint column = mk_fuseWaveform ? mk_waveformColumn(x, C, fw, wp.level.z) - c0 : 0;
     for (uint y = ys; y < ye; y++) {
-      float4 sample = MK_SCOPE_SAMPLE(uint2(x, y));
-      mk_statsAdd(s, sample.rgb, sample.w, p);
+      mk_ScopeSample sample = MK_SCOPE_SAMPLE(uint2(x, y));
+      mk_statsAdd(s, sample.rgb, sample.stageY, p);
       if (mk_fuseWaveform) {
-        float3 v = mk_waveformValues(sample.rgb, sample.w, wp);
+        float3 v = mk_waveformValues(sample.rgb, sample.y, wp);
         for (uint k = 0; k < wch; k++)
           mk_addPacked(local, (k * L + mk_levelBin(v[k], wp.level.x, wp.level.y, L)) * K + column);
       }
       if (mk_fuseHistogram) {
-        float3 v = hp.shape.y == 0 ? float3(sample.w) : sample.rgb;
+        float3 v = hp.shape.y == 0 ? float3(sample.y) : sample.rgb;
         for (uint k = 0; k < hch; k++) mk_addPacked(hlocal, k * B + mk_levelBin(v[k], hp.level.x, hp.level.y, B));
       }
       if (mk_fuseVector) {
-        uint bin = mk_vectorBin(sample.rgb, sample.w, vp);
+        uint bin = mk_vectorBin(sample.rgb, sample.y, vp);
         if (bin == current) {
           count++;
         } else {
@@ -489,17 +543,22 @@ kernel void mk_scopeFused(texture2d<uint, access::read> packed [[texture(0)]],
 // ---------------------------------------------------------------- rendering
 //
 // Drawing is two steps. mk_scopeResolve turns the bins into trace intensity
-// (the density curve after gain, per channel) in a scope-resolution texture,
-// once per accumulation and display change. The fragment shader then needs one
-// bilinear sample per pixel when the scope is magnified, or reads every texel
-// under its footprint when minified.
+// (the density curve after gain, per channel), once per accumulation, display
+// change or plot size. On an axis the plot shows at bin resolution or larger
+// the trace holds one texel per bin and the fragment shader samples it
+// bilinearly; on a minified axis the resolve already took the maximum of the
+// bins under each plot pixel, so the fragment reads that pixel's texel. Plot
+// pixels and their texels are matched in integers (mk_ScopeDraw.pixels), and
+// the footprints tile the bins exactly, so no non-empty bin can vanish. Either
+// way a draw is one sample per pixel.
 
 // Mirrors MonitorKitScopes.ScopeResolveParameters.
 struct mk_ScopeResolve {
   uint4 shape;      // x: kind, y: channels, z: bins packed 16-bit, w: statistics slot (words)
   uint4 bins;       // x: columns per channel | bins | side, y: levels | 1 | side, z: waveform frame width (0: none), w: frame height
-  uint4 size;       // x, y: trace texture size
+  uint4 size;       // xy: trace texels written, zw: source texels per axis
   float4 intensity; // x: density per count (waveform: per count per frame column), y: curve (0 log, 1 gamma), z: histogram gain, w: histogram log scale
+  uint4 reduce;     // xy: plot pixels a minified axis is reduced to (0: one texel per source texel), z: parade panels across x (1 or 3), w: footprints start half a source texel in
 };
 
 // Mirrors MonitorKitScopes.ScopeShape. Positions in viewport pixels.
@@ -514,13 +573,24 @@ constant uint MK_SCOPE_MAX_SHAPES = 64;
 struct mk_ScopeDraw {
   float4 viewport;   // x, y, width, height in target pixels
   float4 plot;       // x, y, width, height in viewport pixels
-  uint4 shape;       // x: kind, y: mode, z: channels, w: shape count
-  uint4 flags;       // x: has data, y: sRGB target, z: trace (0 phosphor, 1 white, 2 colorized)
+  uint4 shape;       // x: kind, y: mode, z: channels
+  uint4 flags;       // x: has data, y: sRGB target, z: trace (0 phosphor, 1 white, 2 colorized), w: reduced axes (bit 0 x, bit 1 y)
   float4 intensity;  // x: brightness
   float4 background; // x: opacity, y: graticule opacity
   float4 chroma;     // x: kr, y: kb, z: chroma per plot half side
+  float4 traceMap;   // xy: trace texels per unit of plot on an axis drawn from the bins, zw: texel offset
+  uint4 pixels;      // xy: the plot's first pixel, zw: one past its last (viewport pixels whose centre is inside)
   float4 colors[3];
   float4 graticuleColor;
+  float4 encode;        // x: output transfer (0 as authored, 1 BT.1886, 2 sRGB, 3 gamma 2.2, 4 linear, 5 PQ, 6 HLG), y: graphics white cd/m², z: HLG peak, w: HLG system gamma
+  float4 toTarget[3];   // linear BT.709 to the target primaries, by rows
+  float4 targetWeights; // luminance weights of the target primaries
+};
+
+// Mirrors MonitorKitScopes.ScopeGraticuleParameters.
+struct mk_ScopeGraticuleParams {
+  float4 plot; // x, y, width, height in viewport pixels
+  float4 size; // xy: viewport size in pixels, z: shape count
   mk_ScopeShape shapes[MK_SCOPE_MAX_SHAPES];
 };
 
@@ -558,103 +628,97 @@ inline uint mk_frameColumns(uint c, uint columns, uint frameWidth) {
   return ((c + 1) * frameWidth + columns - 1) / columns - (c * frameWidth + columns - 1) / columns;
 }
 
-// One texel per bin: trace intensity per channel before brightness, or the
-// histogram height (0…1 of the panel). A frame narrower than the waveform
-// leaves some scope columns empty; then the texture has one texel column per
+// The trace of one source texel: intensity per channel before brightness, or
+// the histogram height (0…1 of the panel). A frame narrower than the waveform
+// leaves some scope columns empty; then the source has one texel column per
 // frame column, read from the scope column that frame column was binned into,
 // so empty columns are never drawn.
+// Channels k0 up to k1 are computed; the others are 0.
+inline float4 mk_traceTexel(constant mk_ScopeResolve& r, device const uint* bins, float peak, uint2 xy, uint k0,
+                            uint k1) {
+  uint columns = r.bins.x, rows = r.bins.y;
+  float4 v = float4(0);
+  if (r.shape.x == MK_SCOPE_HISTOGRAM) {
+    for (uint k = k0; k < k1; k++) {
+      float count = float(bins[k * columns + xy.x]);
+      float h = r.intensity.w != 0 ? log(1 + count) / log(1 + peak) : count / peak;
+      v[k] = min(1.0f, h * r.intensity.z);
+    }
+    return v;
+  }
+  uint column = xy.x;
+  float weight = 1;
+  uint fw = r.bins.z;
+  if (fw != 0 && fw < columns) {
+    column = xy.x * columns / fw;
+  } else if (fw != 0) {
+    weight = 1.0f / float(max(mk_frameColumns(column, columns, fw), 1u));
+  }
+  bool packed = r.shape.z != 0;
+  for (uint k = k0; k < k1; k++) {
+    float count = float(mk_binCount(bins, (k * rows + xy.y) * columns + column, packed));
+    v[k] = mk_scopeIntensity(count * weight * r.intensity.x, uint(r.intensity.y));
+  }
+  return v;
+}
+
+// The source texels [first, end) that plot pixel `j` of `P` overlaps on an
+// axis of `n` source texels (n >= P on a reduced axis), in integers. A texel
+// straddling two pixels lights both, the first pixel starts at 0 and the last
+// ends at n, so every source texel reaches the trace. With `centred` the pixel
+// edges sit half a source texel in, as the vectorscope's bins (centred on whole
+// chroma steps) are drawn.
+inline uint2 mk_footprint(uint j, uint P, uint n, uint centred) {
+  uint first = min((2 * j * n + centred * P) / (2 * P), n - 1);
+  uint end = (2 * (j + 1) * n + centred * P + 2 * P - 1) / (2 * P);
+  return uint2(first, clamp(end, first + 1, n));
+}
+
+// Parade panel of plot pixel `i` of `W`: the third its centre falls in,
+// min(floor((i + 0.5) · 3 / W), 2), in integers. mk_panelStart(k, W) is the
+// panel's first pixel (the least i in panel k or later).
+inline uint mk_panelOf(uint i, uint W) { return min((6 * i + 3) / (2 * W), 2u); }
+inline uint mk_panelStart(uint k, uint W) { return (2 * k * W + 2) / 6; }
+
+// One trace texel: the maximum over the source texels under its footprint
+// (exactly one on an axis drawn from the bins). On a reduced parade x axis the
+// texel is the panel's own pixel index; panels may differ by a pixel, so each
+// channel is reduced over its own panel's footprint.
 kernel void mk_scopeResolve(constant mk_ScopeResolve& r [[buffer(0)]], device const uint* bins [[buffer(1)]],
                             device const uint* stats [[buffer(2)]],
                             texture2d<float, access::write> trace [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= r.size.x || gid.y >= r.size.y) return;
-  uint columns = r.bins.x, rows = r.bins.y, channels = r.shape.y;
-  bool packed = r.shape.z != 0;
+  // One scale for every histogram channel, so their heights compare.
+  float peak = r.shape.x == MK_SCOPE_HISTOGRAM ? float(max(stats[r.shape.w + MK_ST_PEAK_ALL], 1u)) : 1;
+  uint2 n = r.size.zw;
+  uint W = r.reduce.x, centred = r.reduce.w;
+  uint2 ry = r.reduce.y != 0 ? mk_footprint(gid.y, r.reduce.y, n.y, centred) : uint2(gid.y, gid.y + 1);
   float4 v = float4(0);
-  if (r.shape.x == MK_SCOPE_HISTOGRAM) {
-    // One scale for every channel, so their heights compare.
-    float peak = float(max(stats[r.shape.w + MK_ST_PEAK_ALL], 1u));
-    for (uint k = 0; k < channels; k++) {
-      float count = float(bins[k * columns + gid.x]);
-      float h = r.intensity.w != 0 ? log(1 + count) / log(1 + peak) : count / peak;
-      v[k] = min(1.0f, h * r.intensity.z);
+  if (W != 0 && r.reduce.z == 3) {
+    for (uint k = 0; k < 3; k++) {
+      uint start = mk_panelStart(k, W), P = (k == 2 ? W : mk_panelStart(k + 1, W)) - start;
+      if (gid.x >= P) continue;
+      uint2 rx = mk_footprint(gid.x, P, n.x, centred);
+      for (uint y = ry.x; y < ry.y; y++)
+        for (uint x = rx.x; x < rx.y; x++) v[k] = max(v[k], mk_traceTexel(r, bins, peak, uint2(x, y), k, k + 1)[k]);
     }
   } else {
-    uint column = gid.x;
-    float weight = 1;
-    uint fw = r.bins.z;
-    if (fw != 0 && fw < columns) {
-      column = gid.x * columns / fw;
-    } else if (fw != 0) {
-      weight = 1.0f / float(max(mk_frameColumns(column, columns, fw), 1u));
-    }
-    for (uint k = 0; k < channels; k++) {
-      float count = float(mk_binCount(bins, (k * rows + gid.y) * columns + column, packed));
-      v[k] = mk_scopeIntensity(count * weight * r.intensity.x, uint(r.intensity.y));
-    }
+    uint2 rx = W != 0 ? mk_footprint(gid.x, W, n.x, centred) : uint2(gid.x, gid.x + 1);
+    for (uint y = ry.x; y < ry.y; y++)
+      for (uint x = rx.x; x < rx.y; x++) v = max(v, mk_traceTexel(r, bins, peak, uint2(x, y), 0, r.shape.y));
   }
   trace.write(v, gid);
 }
 
-// Most texels per axis a minified pixel reads. Only footprints wider than
-// this (e.g. a 4096-bin axis drawn under 16 pixels) are subsampled.
-constant uint MK_SCOPE_MAX_TAPS = 256;
-
-// Taps of one axis over `count` texels: the texel under the pixel centre at
-// 1:1, linear between the two nearest when magnified, and the maximum of every
-// texel under the pixel's footprint when minified. Footprints of neighbouring
-// pixels tile the axis, so no non-empty bin can vanish between display pixels.
-struct mk_Axis { int first; uint n; float stride; float weight; bool maximum; };
-
-inline mk_Axis mk_axis(float position, float footprint, int count) {
-  mk_Axis a;
-  a.stride = 1;
-  a.weight = 0;
-  a.maximum = false;
-  if (footprint == 1) {
-    a.first = int(floor(position));
-    a.n = 1;
-    return a;
-  }
-  if (footprint < 1) {
-    float p = position - .5f;
-    a.first = int(floor(p));
-    a.n = 2;
-    a.weight = p - floor(p);
-    return a;
-  }
-  // Texels overlapping [start, start + footprint), clamped to the axis.
-  float start = position - footprint * .5f;
-  int first = max(int(floor(start)), 0), end = min(int(ceil(start + footprint)), count);
-  uint n = end > first ? uint(end - first) : 0;
-  a.first = first;
-  a.n = min(n, MK_SCOPE_MAX_TAPS);
-  a.stride = n > MK_SCOPE_MAX_TAPS ? float(n - 1) / float(MK_SCOPE_MAX_TAPS - 1) : 1;
-  a.maximum = true;
-  return a;
-}
-
-inline int mk_tap(mk_Axis a, uint j) { return a.first + int(float(j) * a.stride + .5f); }
-
-// The trace around `position` (in texels, inside the texture). Magnified on
-// both axes this is one hardware bilinear sample; otherwise the taps above,
-// read texel by texel. The plot's edge texels extend to its edge.
-inline float4 mk_sampleTrace(texture2d<float, access::sample> trace, float2 position, float2 footprint) {
+// The trace at plot fraction `f` (bottom to top on y): a bilinear sample on an
+// axis drawn from the bins, this plot pixel's own texel `texel` on a reduced
+// one. The plot's edge texels extend to its edge.
+inline float4 mk_sampleTrace(texture2d<float, access::sample> trace, float2 f, uint2 texel, constant mk_ScopeDraw& d) {
   constexpr sampler bilinear(coord::pixel, filter::linear, address::clamp_to_edge);
-  int2 size = int2(trace.get_width(), trace.get_height());
-  // A one-texel-high trace (the histogram) has nothing to filter vertically.
-  if (footprint.x < 1 && (footprint.y < 1 || size.y == 1)) return trace.sample(bilinear, float2(position.x, size.y == 1 ? .5f : position.y));
-  mk_Axis ax = mk_axis(position.x, footprint.x, size.x), ay = mk_axis(position.y, footprint.y, size.y);
-  float4 result = 0;
-  for (uint j = 0; j < ay.n; j++) {
-    uint row = uint(clamp(mk_tap(ay, j), 0, size.y - 1));
-    float4 line = 0;
-    for (uint i = 0; i < ax.n; i++) {
-      float4 c = trace.read(uint2(clamp(mk_tap(ax, i), 0, size.x - 1), row));
-      line = ax.maximum ? max(line, c) : line + c * (i == 0 ? 1 - ax.weight : ax.weight);
-    }
-    result = ay.maximum ? max(result, line) : result + line * (j == 0 ? 1 - ay.weight : ay.weight);
-  }
-  return result;
+  float2 position = f * d.traceMap.xy + d.traceMap.zw;
+  if (d.flags.w & 1) position.x = float(texel.x) + .5f;
+  if (d.flags.w & 2) position.y = float(texel.y) + .5f;
+  return trace.sample(bilinear, position);
 }
 
 inline float3 mk_traceColor(float3 base, float i, uint style) {
@@ -679,21 +743,80 @@ inline float mk_srgbToLinear(float v) {
   return v <= .04045f ? v / 12.92f : pow((v + .055f) / 1.055f, 2.4f);
 }
 
-// Graticule coverage at viewport pixel centres, rasterized only when the
-// graticule or viewport changes; the fragment shader reads one texel. Clipped
-// to the plot, so a zoomed vectorscope draws nothing in the side margins.
-kernel void mk_scopeGraticule(texture2d<float, access::write> out [[texture(0)]],
-                              constant mk_ScopeDraw& d [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-  float2 px = float2(gid) + .5f;
-  float g = 0;
-  if (all(px >= d.plot.xy) && all(px <= d.plot.xy + d.plot.zw)) {
-    for (uint i = 0; i < d.shape.w; i++) {
-      mk_ScopeShape s = d.shapes[i];
-      g = max(g, clamp(s.style.z + .5f - mk_shapeDistance(s, px), 0.0f, 1.0f) * s.style.y);
-    }
+// The scope's colours are authored as BT.709 SDR display R'G'B' at graphics
+// white. On another output they are taken to display light through BT.1886
+// (black 0, L = V^2.4), converted to the target primaries and encoded, as
+// MonitorColorPipeline.overlayColor does on the CPU: graphics white lands at
+// d.encode.y cd/m² (Report ITU-R BT.2408-8 Table 1: 203, which is 58% PQ and
+// 75% HLG) or 1.0 in extended linear. The hardware's fast exp2/log2 powers
+// (relative error about 1e-6, far under a 10-bit code) keep it a few ALU per pixel.
+inline float3 mk_scopeEncode(float3 c, constant mk_ScopeDraw& d) {
+  float3 l = fast::pow(saturate(c), 2.4f);
+  l = float3(dot(d.toTarget[0].xyz, l), dot(d.toTarget[1].xyz, l), dot(d.toTarget[2].xyz, l));
+  uint tf = uint(d.encode.x);
+  if (tf == 4) return l;
+  if (tf == 5) {
+    // SMPTE ST 2084 inverse EOTF.
+    const float m1 = 2610.0f / 16384, m2 = 2523.0f / 4096 * 128, c1 = 3424.0f / 4096, c2 = 2413.0f / 4096 * 32,
+                c3 = 2392.0f / 4096 * 32;
+    float3 y = fast::pow(clamp(l * d.encode.y, 0.0f, 10000.0f) / 10000, m1);
+    return fast::pow((c1 + c2 * y) / (1 + c3 * y), m2);
   }
-  out.write(float4(g), gid);
+  if (tf == 6) {
+    // BT.2100 HLG inverse EOTF: display light clipped to the peak, the inverse
+    // OOTF E = F / (peak · (Yd / peak)^((γ - 1) / γ)), then the OETF (Table 5).
+    float peak = d.encode.z, gamma = d.encode.w;
+    float3 f = clamp(l * d.encode.y, 0.0f, peak);
+    float yd = dot(d.targetWeights.xyz, f);
+    float3 e = yd > 0 ? min(f / (peak * fast::pow(yd / peak, (gamma - 1) / gamma)), 1.0f) : float3(0);
+    const float a = .17883277f, b = 1 - 4 * a, cc = .5f - a * log(4 * a);
+    return select(a * fast::log(max(12 * e - b, 1e-6f)) + cc, sqrt(3 * e), e <= 1.0f / 12);
+  }
+  l = saturate(l);
+  if (tf == 2) return select(1.055f * fast::pow(l, 1 / 2.4f) - .055f, l * 12.92f, l <= .0031308f);
+  if (tf == 3) return fast::pow(l, 1 / 2.2f);
+  return fast::pow(l, 1 / 2.4f);
+}
+
+// Graticule coverage, rasterized into an r8 texture only when the graticule or
+// the viewport size changes; the scope's fragment shader reads one texel. One
+// quad per shape covers everything the shape can touch (its half width plus a
+// pixel of anti-aliasing), and the shapes combine with a max blend, so the
+// cost follows the lines drawn rather than viewport pixels × shapes.
+struct mk_GraticuleOut {
+  float4 position [[position]];
+  uint shape [[flat]];
+};
+
+vertex mk_GraticuleOut mk_graticuleVertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                                          constant mk_ScopeGraticuleParams& g [[buffer(0)]]) {
+  mk_ScopeShape s = g.shapes[iid];
+  float e = s.style.z + 1;
+  // Triangle strip corners: (-1, -1), (1, -1), (-1, 1), (1, 1).
+  float2 corner = float2(float(vid & 1), float(vid >> 1)) * 2 - 1;
+  float2 p;
+  if (uint(s.style.x) == 0) {
+    float2 a = s.geometry.xy, b = s.geometry.zw, ab = b - a;
+    float len = length(ab);
+    float2 t = len > 1e-6f ? ab / len : float2(1, 0), n = float2(-t.y, t.x);
+    p = (a + b) * .5f + t * corner.x * (len * .5f + e) + n * corner.y * e;
+  } else {
+    p = s.geometry.xy + corner * (s.geometry.z + e);
+  }
+  mk_GraticuleOut out;
+  out.position = float4(p.x / g.size.x * 2 - 1, 1 - p.y / g.size.y * 2, 0, 1);
+  out.shape = iid;
+  return out;
+}
+
+// Coverage at the pixel centre, clipped to the plot, so a zoomed vectorscope
+// draws nothing in the side margins.
+fragment float4 mk_graticuleFragment(mk_GraticuleOut in [[stage_in]],
+                                     constant mk_ScopeGraticuleParams& g [[buffer(0)]]) {
+  float2 px = in.position.xy;
+  if (any(px < g.plot.xy) || any(px > g.plot.xy + g.plot.zw)) return float4(0);
+  mk_ScopeShape s = g.shapes[in.shape];
+  return float4(clamp(s.style.z + .5f - mk_shapeDistance(s, px), 0.0f, 1.0f) * s.style.y);
 }
 
 fragment float4 mk_scopeFragment(mk_ScopeVertexOut in [[stage_in]], constant mk_ScopeDraw& d [[buffer(0)]],
@@ -701,28 +824,34 @@ fragment float4 mk_scopeFragment(mk_ScopeVertexOut in [[stage_in]], constant mk_
                                  texture2d<float, access::sample> trace [[texture(1)]]) {
   float2 px = in.position.xy - d.viewport.xy;
   float2 uv = (px - d.plot.xy) / d.plot.zw;
+  uint2 pixel = uint2(max(px, 0.0f));
   float3 light = float3(0);
-  if (d.flags.x && all(uv >= 0) && all(uv < 1)) {
+  if (d.flags.x && all(pixel >= d.pixels.xy) && all(pixel < d.pixels.zw)) {
     uint kind = mk_drawKindDefined ? mk_drawKindConstant : d.shape.x;
     uint mode = mk_drawModeDefined ? mk_drawModeConstant : d.shape.y;
-    float2 size = float2(trace.get_width(), trace.get_height());
     float brightness = d.intensity.x;
+    // On a reduced axis, this pixel's texel: from the plot's left and bottom.
+    uint2 texel = uint2(pixel.x - d.pixels.x, d.pixels.w - 1 - pixel.y);
     if (kind == MK_SCOPE_WAVEFORM) {
       bool parade = mode == 2 || mode == 3;
       float u = uv.x;
       uint first = 0, last = mode == 0 ? 1 : 3;
       if (parade) {
-        first = min(uint(u * 3), 2u);
+        if (d.flags.w & 1) {
+          // The resolve's panel split, in integers, and the pixel's index in its panel.
+          uint W = d.pixels.z - d.pixels.x;
+          first = mk_panelOf(texel.x, W);
+          texel.x -= mk_panelStart(first, W);
+        } else {
+          first = min(uint(u * 3), 2u);
+        }
         last = first + 1;
         u = u * 3 - float(first);
       }
-      float2 position = float2(u, 1 - uv.y) * size;
-      float2 footprint = size / float2(d.plot.z / (parade ? 3 : 1), d.plot.w);
-      float4 v = mk_sampleTrace(trace, position, footprint);
+      float4 v = mk_sampleTrace(trace, float2(u, 1 - uv.y), texel, d);
       for (uint k = first; k < last; k++) light += mk_traceColor(d.colors[k].rgb, min(1.0f, v[k] * brightness), d.flags.z);
     } else if (kind == MK_SCOPE_VECTOR) {
-      float2 position = float2(uv.x, 1 - uv.y) * size;
-      float i = min(1.0f, mk_sampleTrace(trace, position, size / d.plot.zw).r * brightness);
+      float i = min(1.0f, mk_sampleTrace(trace, float2(uv.x, 1 - uv.y), texel, d).r * brightness);
       float3 base = d.colors[0].rgb;
       if (d.flags.z == 2) {
         // The hue this point measures, at a fixed luma, normalized to its peak.
@@ -744,7 +873,7 @@ fragment float4 mk_scopeFragment(mk_ScopeVertexOut in [[stage_in]], constant mk_
       }
       float panel = d.plot.w / (parade ? 3 : 1);
       float level = 1 - v;
-      float4 heights = mk_sampleTrace(trace, float2(uv.x * size.x, .5f), float2(size.x / d.plot.z, 1));
+      float4 heights = mk_sampleTrace(trace, float2(uv.x, 0), texel, d);
       for (uint k = first; k < last; k++) {
         float h = heights[k];
         float fill = clamp((h - level) * panel + .5f, 0.0f, 1.0f);
@@ -764,6 +893,9 @@ fragment float4 mk_scopeFragment(mk_ScopeVertexOut in [[stage_in]], constant mk_
   light = min(light, float3(1));
   color = min(color + light, float3(1));
   alpha = alpha + (1 - alpha) * max(light.r, max(light.g, light.b));
+  // Encoded unpremultiplied, so coverage and opacity blend as on an SDR layer.
+  // Black (most of a scope) stays black in every encoding.
+  if (d.encode.x != 0 && alpha > 0 && any(color > 0)) color = mk_scopeEncode(color / alpha, d) * alpha;
   // sRGB targets re-encode on store; exact where the scope is opaque.
   if (d.flags.y) color = float3(mk_srgbToLinear(color.r), mk_srgbToLinear(color.g), mk_srgbToLinear(color.b));
   return float4(color, alpha);

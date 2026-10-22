@@ -351,13 +351,23 @@ public struct DisplayAdjustments: Codable, Equatable, Sendable {
   public var contrast = 1.0
   /// 0 is greyscale, 1 unchanged, 2 doubled.
   public var saturation = 1.0
+  /// White-point trim: the correlated colour temperature of the white the picture's
+  /// white is moved to, in kelvin on the CIE daylight locus, 4000…10 000. 6504 (D65)
+  /// is no trim (`WhitePointTrim`).
+  public var temperature = WhitePointTrim.d65Temperature
+  /// White-point trim off the daylight locus, as the CIE 1960 Δuv of the trimmed
+  /// white, -0.02…0.02: positive is greener (above the locus), negative more
+  /// magenta (ANSI C78.377's Duv sign). 0 is no trim.
+  public var tint = 0.0
   public var monochrome: MonochromeMode = .off
   public init() {}
   public var isIdentity: Bool {
-    brightness == 0 && contrast == 1 && saturation == 1 && monochrome == .off
+    brightness == 0 && contrast == 1 && saturation == 1 && monochrome == .off && !trimsWhitePoint
   }
+  /// Whether the white-point trim moves the white.
+  public var trimsWhitePoint: Bool { temperature != WhitePointTrim.d65Temperature || tint != 0 }
 
-  private enum CodingKeys: String, CodingKey { case brightness, contrast, saturation, monochrome }
+  private enum CodingKeys: String, CodingKey { case brightness, contrast, saturation, monochrome, temperature, tint }
   public init(from decoder: Decoder) throws {
     self.init()
     let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -365,6 +375,136 @@ public struct DisplayAdjustments: Codable, Equatable, Sendable {
     contrast = c.lenient(.contrast, contrast)
     saturation = c.lenient(.saturation, saturation)
     monochrome = c.lenient(.monochrome, monochrome)
+    temperature = c.lenient(.temperature, temperature)
+    tint = c.lenient(.tint, tint)
+  }
+}
+
+/// Monitor-only picture transforms, applied after the monitor LUT (Sony "Gamma
+/// Display Assist", the Video Assist's HDR/SDR monitoring). They change only what
+/// this surface shows: zebras, false colour, peaking, clip indicators and scopes
+/// keep measuring their stage. They need the camera's own signal: with a burn-in
+/// or monitor LUT on the surface, LUT output is Rec.709 display R'G'B' (the
+/// convention of every LUT stage), so a transform is unavailable
+/// (`MonitorUnavailableReason.lutOnMonitorStage`), as Sony's Gamma Display Assist
+/// is while a LUT is applied.
+public enum DisplayTransform: String, Codable, Sendable, CaseIterable {
+  case none
+  /// A log source (S-Log3/S-Gamut3(.Cine), LogC3/AWG3, LogC4/AWG4) to Rec.709 SDR:
+  /// "MonitorKit display assist v1" (`DisplayAssist`).
+  case logToRec709
+  /// PQ or HLG to Rec.709 SDR: PQ through the BT.2408 Annex 5 EETF (display
+  /// light); HLG by MonitorKit's SDR-camera scene-light convention, BT.2408
+  /// §5.1.4.1's scaling (75% HLG is graphics white) then the BT.709 OETF
+  /// (`HDRToSDR.hlg`). It does not invert BT.2408's scene-light up-mapping.
+  case hdrToSDR
+  /// PQ or HLG stays HDR on an HDR output, its highlights rolled off to what the
+  /// output holds (the EDR headroom for extended linear).
+  case hdrPassthrough
+}
+
+public struct DisplayTransformSettings: Codable, Equatable, Sendable {
+  public var mode: DisplayTransform = .none
+  /// Peak of the PQ content's mastering display in cd/m², the EETF's source peak.
+  /// 1000 by default, the reference condition of Report ITU-R BT.2408-8 §6.2.
+  public var pqSourcePeak = 1000.0
+  public init() {}
+  public init(mode: DisplayTransform, pqSourcePeak: Double = 1000) {
+    self.mode = mode
+    self.pqSourcePeak = pqSourcePeak
+  }
+
+  private enum CodingKeys: String, CodingKey { case mode, pqSourcePeak }
+  public init(from decoder: Decoder) throws {
+    self.init()
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    mode = c.lenient(.mode, mode)
+    pqSourcePeak = c.lenient(.pqSourcePeak, pqSourcePeak)
+  }
+}
+
+public enum ClipIndicatorColoring: String, Codable, Sendable, CaseIterable {
+  /// Each channel in its own colour, added: red, green and blue, so two clipped
+  /// channels show their mix and all three white. Under-range pixels show the same
+  /// mix at half level. Luma alone (no channel shown) is white, or grey under.
+  case perChannel
+  /// `overColor` and `underColor` whatever the channel.
+  case uniform
+}
+
+/// Per-channel clip overlay. Clip percentages are scope statistics, not part of this.
+public struct ClipIndicatorSettings: Codable, Equatable, Sendable {
+  public var enabled = false
+  /// The signal measured. A channel's value is the stage's R', G' or B' in percent
+  /// (100 is nominal white: code 940 in a 10-bit legal container); luma is the stage's Y'.
+  public var stage: SignalStage = .output
+  public var red = true
+  public var green = true
+  public var blue = true
+  public var luma = true
+  /// Over: a value at or above `high` percent (inclusive).
+  public var showsOver = true
+  public var high = 100.0
+  /// Under: a value at or below `low` percent (inclusive).
+  public var showsUnder = true
+  public var low = 0.0
+  public var coloring: ClipIndicatorColoring = .perChannel
+  public var overColor = ColorRGB(r: 1, g: 0, b: 0)
+  public var underColor = ColorRGB(r: 0, g: 0, b: 1)
+  public var opacity = 1.0
+  public init() {}
+
+  private enum CodingKeys: String, CodingKey {
+    case enabled, stage, red, green, blue, luma, showsOver, high, showsUnder, low, coloring, overColor,
+      underColor, opacity
+  }
+  public init(from decoder: Decoder) throws {
+    self.init()
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    enabled = c.lenient(.enabled, enabled)
+    stage = c.lenient(.stage, stage)
+    red = c.lenient(.red, red)
+    green = c.lenient(.green, green)
+    blue = c.lenient(.blue, blue)
+    luma = c.lenient(.luma, luma)
+    showsOver = c.lenient(.showsOver, showsOver)
+    high = c.lenient(.high, high)
+    showsUnder = c.lenient(.showsUnder, showsUnder)
+    low = c.lenient(.low, low)
+    coloring = c.lenient(.coloring, coloring)
+    overColor = c.lenient(.overColor, overColor)
+    underColor = c.lenient(.underColor, underColor)
+    opacity = c.lenient(.opacity, opacity)
+  }
+
+  /// Whether anything can be flagged.
+  public var isEffective: Bool { enabled && (red || green || blue || luma) && (showsOver || showsUnder) }
+
+  /// CPU reference: the Rec.709 display colour a pixel with stage R'G'B' `rgb` and
+  /// Y' `luma` is flagged with (values normalized, 1 = 100%), or nil.
+  public func indicator(rgb: ColorRGB, luma y: Double) -> ColorRGB? {
+    guard isEffective else { return nil }
+    func over(_ v: Double) -> Bool { showsOver && v * 100 >= high }
+    func under(_ v: Double) -> Bool { showsUnder && v * 100 <= low }
+    let o = (red && over(rgb.r), green && over(rgb.g), blue && over(rgb.b), luma && over(y))
+    let u = (red && under(rgb.r), green && under(rgb.g), blue && under(rgb.b), luma && under(y))
+    if o.0 || o.1 || o.2 || o.3 {
+      return Self.color(coloring, channels: (o.0, o.1, o.2), over: true, uniform: overColor)
+    }
+    if u.0 || u.1 || u.2 || u.3 {
+      return Self.color(coloring, channels: (u.0, u.1, u.2), over: false, uniform: underColor)
+    }
+    return nil
+  }
+
+  /// The colour for a set of flagged channels; none flagged means luma alone.
+  public static func color(
+    _ coloring: ClipIndicatorColoring, channels c: (Bool, Bool, Bool), over: Bool, uniform: ColorRGB
+  ) -> ColorRGB {
+    guard coloring == .perChannel else { return uniform }
+    let level = over ? 1.0 : 0.5
+    if !c.0 && !c.1 && !c.2 { return ColorRGB(r: level, g: level, b: level) }
+    return ColorRGB(r: c.0 ? level : 0, g: c.1 ? level : 0, b: c.2 ? level : 0)
   }
 }
 
@@ -383,12 +523,17 @@ public struct MonitorState: Codable, Equatable, Sendable {
   public var display = DisplayAdjustments()
   /// Whether this surface applies the feed's monitor-only LUT.
   public var monitorLUT = true
+  /// Monitor-only display transform after the monitor LUT. Not an overlay: a
+  /// clean surface keeps it, as it keeps LUTs.
+  public var displayTransform = DisplayTransformSettings()
+  public var clipIndicators = ClipIndicatorSettings()
   public static let maximumZebraSets = 2
 
   public init() {}
 
   private enum CodingKeys: String, CodingKey {
-    case schemaVersion, clean, zebras, falseColor, focus, guides, geometry, display, monitorLUT
+    case schemaVersion, clean, zebras, falseColor, focus, guides, geometry, display, monitorLUT, displayTransform,
+      clipIndicators
   }
   /// Unknown versions and malformed values decode as defaults; this never throws,
   /// so a monitor preference cannot invalidate the host's other settings.
@@ -405,6 +550,8 @@ public struct MonitorState: Codable, Equatable, Sendable {
     geometry = c.lenient(.geometry, geometry)
     display = c.lenient(.display, display)
     monitorLUT = c.lenient(.monitorLUT, monitorLUT)
+    displayTransform = c.lenient(.displayTransform, displayTransform)
+    clipIndicators = c.lenient(.clipIndicators, clipIndicators)
     self = normalized()
   }
   public func encode(to encoder: Encoder) throws {
@@ -418,6 +565,8 @@ public struct MonitorState: Codable, Equatable, Sendable {
     try c.encode(geometry, forKey: .geometry)
     try c.encode(display, forKey: .display)
     try c.encode(monitorLUT, forKey: .monitorLUT)
+    try c.encode(displayTransform, forKey: .displayTransform)
+    try c.encode(clipIndicators, forKey: .clipIndicators)
   }
 
   /// Every value clamped to its documented range; non-finite values reset.
@@ -501,6 +650,14 @@ public struct MonitorState: Codable, Equatable, Sendable {
     v.display.brightness = b(display.brightness, -1...1, 0)
     v.display.contrast = b(display.contrast, 0...2, 1)
     v.display.saturation = b(display.saturation, 0...2, 1)
+    v.display.temperature = b(display.temperature, WhitePointTrim.temperatureRange, WhitePointTrim.d65Temperature)
+    v.display.tint = b(display.tint, WhitePointTrim.tintRange, 0)
+    v.displayTransform.pqSourcePeak = b(displayTransform.pqSourcePeak, 100...10_000, 1000)
+    v.clipIndicators.high = b(clipIndicators.high, -20...120, 100)
+    v.clipIndicators.low = b(clipIndicators.low, -20...120, 0)
+    v.clipIndicators.opacity = b(clipIndicators.opacity, 0...1, 1)
+    if !clipIndicators.overColor.isFinite { v.clipIndicators.overColor = ColorRGB(r: 1, g: 0, b: 0) }
+    if !clipIndicators.underColor.isFinite { v.clipIndicators.underColor = ColorRGB(r: 0, g: 0, b: 1) }
     return v
   }
 }

@@ -29,13 +29,18 @@ enum Reference {
     ],
   ]
 
-  /// BS.1770-4 Annex 2 oversampling to about 192 kHz.
-  static func oversampling(_ fs: Double) -> Int { fs < 88_200 ? 4 : fs < 176_400 ? 2 : 1 }
+  /// BS.1770-4 Annex 2 oversampling to at least 192 kHz from 48 kHz, and
+  /// never below 2x (Tech 3341 cases 15-19 at the meter's own rate).
+  static func oversampling(_ fs: Double) -> Int { fs < 96_000 ? 4 : 2 }
 
   /// The phases each factor evaluates (evenly spaced in time).
   static func phases(_ oversampling: Int) -> [Int] {
-    oversampling == 4 ? [0, 1, 2, 3] : oversampling == 2 ? [0, 2] : []
+    oversampling == 4 ? [0, 1, 2, 3] : [0, 2]
   }
+
+  /// The PPM's grid: below 176.4 kHz the true-peak phases of every sample;
+  /// above, `fold` consecutive samples' magnitudes per step.
+  static func ppmFold(_ fs: Double) -> Int { fs < 176_400 ? 1 : max(1, Int((fs / 192_000).rounded())) }
 
   /// The interpolated values of every sample, `values[i]` holding one per
   /// phase, or the sample itself at 1x. The signal before `x[0]` is taken as
@@ -45,8 +50,7 @@ enum Reference {
     let held = [Double](repeating: Double(x.first ?? 0), count: taps - 1) + x.map(Double.init)
     let phases = phases(oversampling)
     return x.indices.map { i in
-      if phases.isEmpty { return [Double(x[i])] }
-      return phases.map { p in
+      phases.map { p in
         var acc = 0.0
         for k in 0..<taps { acc += annex2[p][k] * held[i + taps - 1 - k] }
         return acc
@@ -62,22 +66,32 @@ enum Reference {
   }
 
   /// The PPM recursion of `PPMBallistics`, evaluated directly: each path
-  /// decays by r and charges by a toward every one of the sample's L values
+  /// decays by r and charges by a toward every one of the step's L values
   /// above the decayed state. Returns the uncalibrated reading's maximum over
-  /// each `periods` slice.
+  /// each `periods` slice (in input frames; a step counts in the period its
+  /// last sample is in).
   static func ppmMaxima(_ x: [Float], sampleRate fs: Double, ballistics b: PPMBallistics, periods: [Int]) -> [Double] {
-    let l = oversampling(fs)
-    let r = pow(10, -b.returnRate / (20 * fs))
-    let fastA = 1 - exp(-1 / (b.fastTimeConstant * Double(l) * fs))
-    let slowA = 1 - exp(-1 / (b.slowTimeConstant * Double(l) * fs))
-    let values = interpolated(x, oversampling: l)
+    let fold = ppmFold(fs)
+    let values: [[Double]] =
+      fold == 1 && fs < 176_400
+      ? interpolated(x, oversampling: oversampling(fs))
+      : stride(from: 0, to: x.count - fold + 1, by: fold).map { j in (0..<fold).map { Double(x[j + $0]) } }
+    let stepRate = fs / Double(fold)
+    let l = Double(values.first?.count ?? 1)
+    let r = pow(10, -b.returnRate / (20 * stepRate))
+    let fastA = 1 - exp(-1 / (b.fastTimeConstant * l * stepRate))
+    let slowA = 1 - exp(-1 / (b.slowTimeConstant * l * stepRate))
     var fast = 0.0
     var slow = 0.0
     var out: [Double] = []
     var i = 0
+    var frames = 0
     for length in periods {
       var top = 0.0
-      for _ in 0..<length {
+      frames += length
+      // Steps completed by the end of this period.
+      let end = frames / fold
+      for _ in i..<end {
         let rf = r * fast
         let rs = r * slow
         fast = rf + fastA * values[i].reduce(0) { $0 + max(abs($1) - rf, 0) }
@@ -108,7 +122,9 @@ enum Reference {
 }
 
 final class ReferenceTests: XCTestCase {
-  static let rates: [Double] = [44100, 48000, 96000, 192_000]
+  /// Every true-peak factor and PPM grid: 4x phases, 4x at 88.2 kHz, 2x
+  /// phases, 2x true peak with the samples as the PPM's input, and folds of 2 and 4.
+  static let rates: [Double] = [44100, 48000, 88200, 96000, 192_000, 384_000, 768_000]
 
   /// A signal that charges, holds and releases: noise bursts, a sine with a
   /// crest on every grid offset, a step, silence and a full-scale fs/4 tone.
@@ -129,7 +145,7 @@ final class ReferenceTests: XCTestCase {
   }
 
   /// The meter is exactly Annex 2 (all four phases at 4x, phases 0 and 2 at
-  /// 2x, the samples at 1x) with the sample peak as a floor.
+  /// 2x) with the sample peak as a floor.
   func testTruePeakMatchesAnnex2Reference() throws {
     for fs in Self.rates {
       for seed in [1, 2] as [UInt64] {
@@ -178,14 +194,15 @@ final class ReferenceTests: XCTestCase {
   }
 
   /// The PPM (block-skipping vDSP path, four channels per loop) reads the
-  /// direct recursion times one calibration constant, at every publish.
+  /// direct recursion times one calibration constant, at every publish. The
+  /// uneven call sizes leave folded steps open across calls.
   func testPPMMatchesDirectRecursion() throws {
     for fs in Self.rates {
       for type in [PPMType.typeI, .typeIIb] {
         let channels = 5
         let signal = Signal(sampleRate: fs, channels: (0..<channels).map { program(fs, seed: UInt64($0 + 10)) })
         let m = try AudioMeter(configuration: .init(
-          sampleRate: fs, channelCount: channels, meters: [.ppm], ppmType: type))
+          sampleRate: fs, channelCount: channels, meters: [.ppm], ppmType: type, publishInterval: 0))
         var periods: [Int] = []
         var readings: [[Double]] = []
         var offset = 0

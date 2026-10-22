@@ -12,6 +12,10 @@ public struct ScopeBinLayout: Equatable, Sendable {
   /// Waveform columns per channel, histogram bins, or vectorscope Cb bins.
   public var columns: Int
   /// Waveform levels (bottom to top), vectorscope Cr bins (bottom to top), 1 for the histogram.
+  /// Levels follow `ScopeLevelAxis`: bin k holds [low + k / scale, low + (k + 1) / scale)
+  /// with scale = bins / (high − low). Vectorscope bin j is centred on chroma
+  /// (j − side / 2) · 2 · `VectorscopeGeometry.halfExtent` / (side · zoom) on
+  /// its axis, so zero chroma is the middle of bin side / 2.
   public var rows: Int
   public var channels: Int
   public var bytesPerBin: Int
@@ -29,7 +33,13 @@ public struct ScopeBinLayout: Equatable, Sendable {
 /// accumulation clears the bins on the GPU and counts every source pixel. It
 /// encodes into the host's command buffer and never commits, waits or reads
 /// back. Confined: use from one thread at a time; read statistics from other
-/// threads through `statisticsReader`.
+/// threads through `statisticsReader`. Bins replaced by a settings change stay
+/// referenced for `MonitorFeed.retiredFrames` more accumulations, so
+/// command buffers without retained references stay valid; keep the
+/// accumulator itself alive until its last command buffer completes. On Metal 4
+/// (`accumulate(…, into: MonitorSubmission)`) the engine's residency keeps
+/// replaced bins, and on deinit everything the accumulator owns, until the
+/// submissions that used them complete.
 public final class ScopeAccumulator {
   public let engine: ScopeEngine
   /// Changes to anything but `display` apply at the next accumulation.
@@ -59,15 +69,23 @@ public final class ScopeAccumulator {
   /// Settings of the last accumulation; what the bins hold.
   public private(set) var accumulatedSettings: ScopeSettings
 
-  public var hasData: Bool { generation != 0 }
+  /// Whether the bins hold the accumulation `accumulatedSettings` describes:
+  /// false before the first, and after an accumulation that reshaped the bins
+  /// failed to encode (until the next one succeeds), so nothing draws bins of
+  /// one shape with another's settings.
+  public var hasData: Bool { generation != 0 && !binsReshaped }
 
-  /// Bytes of GPU memory this accumulator owns: the bins and the statistics slots.
+  /// Bytes of GPU memory this accumulator owns: the bins and the statistics
+  /// slots. Replaced bins held for in-flight command buffers are transient and
+  /// not counted.
   public var persistentMemoryBytes: Int { bins.allocatedSize + statisticsBuffer.allocatedSize }
 
   /// Most pixels a 16-bit device bin may need to hold. Internal so tests can
   /// force the 32-bit path on small frames.
   var packedBinLimit = 0xFFFF
   private var binKey: BinKey
+  /// The bins were reshaped by a `begin` whose `finish` has not run.
+  private var binsReshaped = false
   private var tile = Tile()
   /// What a concurrent encoder's barriers cover; rebuilt only with the bins.
   private var barrierResources: [any MTLResource]
@@ -75,6 +93,26 @@ public final class ScopeAccumulator {
   private var pipelineKey: ScopeEngine.ComputeKey?
   /// Whether `pipeline` is the specialized one `pipelineKey` asks for.
   private var pipelineIsFinal = false
+  private var retired = RetiredResources()
+
+  // Metal 4 state, made on first use.
+  var ring = MonitorUniformRing(slotLength: ScopeAccumulator.uniformLength, label: "MonitorKit scope uniforms")
+  /// Bumped per Metal 4 accumulation: every one carries a new generation.
+  var uniformGeneration: UInt64 = 0
+  var metal4Table: (any MTL4ArgumentTable)?
+  /// What this accumulator made resident in `engine.residency`, compared by identity.
+  var resident = Resident()
+
+  struct Resident {
+    var bins: MTLBuffer?
+    var statistics: MTLBuffer?
+    var burn: MonitorLUT?
+    var monitor: MonitorLUT?
+  }
+
+  /// Replaced bins still referenced, for tests.
+  var retiredResourceCount: Int { retired.count }
+  func isRetired(_ resource: any MTLResource) -> Bool { retired.holds(resource) }
 
   private struct BinKey: Equatable {
     var accumulation: ScopeSettings.AccumulationKey
@@ -103,6 +141,19 @@ public final class ScopeAccumulator {
     statisticsBuffer = stats
     statisticsReader = ScopeStatisticsReader(buffer: stats)
     barrierResources = [bins, stats]
+  }
+
+  deinit {
+    // Metal 4 retains nothing: what the GPU may still use lives until its
+    // submission completes. All nil unless a Metal 4 encode (this one's, a
+    // group's or a renderer's) used them.
+    let r = engine.residency
+    if let b = resident.bins { r.retire(b, resident: b) }
+    if let b = resident.statistics { r.retire(b, resident: b) }
+    if let lut = resident.burn { r.retire(lut, resident: lut.texture) }
+    if let lut = resident.monitor { r.retire(lut, resident: lut.texture) }
+    ring.retire(to: r)
+    r.retire(metal4Table, resident: nil)
   }
 
   static func layout(for s: ScopeSettings, packed: Bool) -> ScopeBinLayout {
@@ -141,15 +192,22 @@ public final class ScopeAccumulator {
   }
 
   /// Encodes one accumulation of `settings.stage` with the feed's LUTs, into
-  /// its own compute encoder on `commandBuffer`.
-  public func accumulate(_ frame: MonitorFrame, feed: MonitorFeed, into commandBuffer: MTLCommandBuffer) throws {
-    try accumulate(frame, burnInLUT: feed.burnInLUT, monitorLUT: feed.monitorLUT, into: commandBuffer)
+  /// its own compute encoder on `commandBuffer`. Pass the surface's
+  /// `MonitorState.monitorLUT` as `monitorLUTEnabled`, so a monitor-stage
+  /// scope measures what that surface's picture, zebras and false colour do.
+  public func accumulate(
+    _ frame: MonitorFrame, feed: MonitorFeed, monitorLUTEnabled: Bool = true, into commandBuffer: MTLCommandBuffer
+  ) throws {
+    try accumulate(
+      frame, burnInLUT: feed.burnInLUT, monitorLUT: monitorLUTEnabled ? feed.monitorLUT : nil, into: commandBuffer)
   }
 
   /// Encodes one accumulation of `settings.stage` with the feed's LUTs, into
   /// the host's compute encoder (see `accumulate(_:burnInLUT:monitorLUT:using:)`).
-  public func accumulate(_ frame: MonitorFrame, feed: MonitorFeed, using encoder: MTLComputeCommandEncoder) throws {
-    try accumulate(frame, burnInLUT: feed.burnInLUT, monitorLUT: feed.monitorLUT, using: encoder)
+  public func accumulate(
+    _ frame: MonitorFrame, feed: MonitorFeed, monitorLUTEnabled: Bool = true, using encoder: MTLComputeCommandEncoder
+  ) throws {
+    try accumulate(frame, burnInLUT: feed.burnInLUT, monitorLUT: monitorLUTEnabled ? feed.monitorLUT : nil, using: encoder)
   }
 
   /// Encodes one accumulation into its own compute encoder on `commandBuffer`.
@@ -167,47 +225,78 @@ public final class ScopeAccumulator {
 
   /// Encodes one accumulation into the host's compute encoder, so several
   /// scopes (or the host's own kernels) can share it. Sets pipelines, buffer
-  /// bindings 0–5 and 11, texture bindings 0–4 and threadgroup memory 0. On a
-  /// concurrent encoder it adds barriers on its own bins and statistics only,
-  /// so it may be accumulated more than once into one encoder.
+  /// bindings 0–5, texture bindings 0–4 and threadgroup memory 0.
+  /// On a concurrent encoder it adds barriers on its own bins and statistics
+  /// only, so it may be accumulated more than once into one encoder.
   public func accumulate(
     _ frame: MonitorFrame, burnInLUT: MonitorLUT?, monitorLUT: MonitorLUT?, using encoder: MTLComputeCommandEncoder
   ) throws {
     var pass = try begin(frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT)
+    guard let pipeline = try kernelPipeline(pass) else { return }
+    Self.bindInputs(&pass, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT, engine: engine, encoder)
+    // The only member of the clear and finalize.
+    var maintenance = ScopeMaintenanceParameters()
+    addMember(pass, to: &maintenance, at: 0)
+    bindMember(at: 0, encoder)
+    let concurrent = encoder.dispatchType == .concurrent
+    // Also orders this clear after an earlier accumulation into the same encoder.
+    if concurrent { encoder.memoryBarrier(resources: barrierResources) }
+    Self.encodeClear(&maintenance, pipeline: engine.clearPipeline, encoder)
+    if concurrent { encoder.memoryBarrier(resources: barrierResources) }
+
+    encoder.setBytes(&pass.params, length: MemoryLayout<ScopeKernelParameters>.stride, index: 3)
+    encoder.setComputePipelineState(pipeline)
+    let d = kernelDispatch(pass, pipeline: pipeline, frame: frame)
+    if d.threadgroupBytes > 0 { encoder.setThreadgroupMemoryLength(d.threadgroupBytes, index: 0) }
+    if d.byThreadgroups {
+      encoder.dispatchThreadgroups(d.grid, threadsPerThreadgroup: d.group)
+    } else {
+      encoder.dispatchThreads(d.grid, threadsPerThreadgroup: d.group)
+    }
+    if concurrent { encoder.memoryBarrier(resources: barrierResources) }
+    Self.encodeFinalize(&maintenance, pipeline: engine.finalizePipeline, encoder)
+    finish(pass, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT)
+  }
+
+  // MARK: encode steps, shared with ScopeGroup and the Metal 4 path
+
+  /// The kernel for `pass`'s scope and frame layout: specialized once built,
+  /// the general one meanwhile. Nil only if no pipeline exists.
+  func kernelPipeline(_ pass: Pass) throws -> MTLComputePipelineState? {
     let key = ScopeEngine.ComputeKey(kernel: pass.settings.kind.kernel, layout: pass.frame.shape.x)
     if pipeline == nil || pipelineKey != key || !pipelineIsFinal {
       (pipeline, pipelineIsFinal) = try engine.computePipeline(for: key)
       pipelineKey = key
     }
-    guard let pipeline else { return }
-    Self.bindInputs(&pass, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT, engine: engine, encoder)
-    let concurrent = encoder.dispatchType == .concurrent
-    // Also orders this clear after an earlier accumulation into the same encoder.
-    if concurrent { encoder.memoryBarrier(resources: barrierResources) }
-    encodeClear(&pass, encoder)
-    if concurrent { encoder.memoryBarrier(resources: barrierResources) }
+    return pipeline
+  }
 
-    encoder.setBytes(&pass.params, length: MemoryLayout<ScopeKernelParameters>.stride, index: 3)
-    encoder.setComputePipelineState(pipeline)
+  /// One compute dispatch's shape.
+  struct Dispatch {
+    var grid: MTLSize
+    var group: MTLSize
+    /// `grid` counts threadgroups (else threads).
+    var byThreadgroups: Bool
+    /// Threadgroup memory 0 (0: none).
+    var threadgroupBytes: Int
+  }
+
+  /// The accumulation kernel's dispatch for `pass`.
+  func kernelDispatch(_ pass: Pass, pipeline: MTLComputePipelineState, frame: MonitorFrame) -> Dispatch {
     switch pass.settings.kind {
     case .waveform, .histogram:
       let limit = pass.settings.kind == .waveform ? Self.waveformThreads : Self.histogramThreads
-      encoder.setThreadgroupMemoryLength(tile.threadgroupBytes, index: 0)
-      encoder.dispatchThreadgroups(
-        tile.groups,
-        threadsPerThreadgroup: MTLSize(width: min(pipeline.maxTotalThreadsPerThreadgroup, limit), height: 1, depth: 1))
+      return Dispatch(
+        grid: tile.groups,
+        group: MTLSize(width: min(pipeline.maxTotalThreadsPerThreadgroup, limit), height: 1, depth: 1),
+        byThreadgroups: true, threadgroupBytes: tile.threadgroupBytes)
     case .vectorscope:
       let height = max(1, min(Self.vectorscopeGroup.y, pipeline.maxTotalThreadsPerThreadgroup / tile.width))
-      encoder.dispatchThreads(
-        MTLSize(width: (frame.width + tile.run - 1) / tile.run, height: frame.height, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: tile.width, height: height, depth: 1))
+      return Dispatch(
+        grid: MTLSize(width: (frame.width + tile.run - 1) / tile.run, height: frame.height, depth: 1),
+        group: MTLSize(width: tile.width, height: height, depth: 1), byThreadgroups: false, threadgroupBytes: 0)
     }
-    if concurrent { encoder.memoryBarrier(resources: barrierResources) }
-    encodeFinalize(&pass, lead: nil, encoder)
-    finish(pass, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT)
   }
-
-  // MARK: encode steps, shared with ScopeGroup
 
   /// One accumulation being encoded.
   struct Pass {
@@ -221,6 +310,7 @@ public final class ScopeAccumulator {
   /// Changes nothing a reader sees until `finish`.
   func begin(_ frame: MonitorFrame, burnInLUT: MonitorLUT?, monitorLUT: MonitorLUT?) throws -> Pass {
     let s = settings
+    retired.age()
     try prepareBins(settings: s, frame: frame)
     let next = generation >= 0xFFFF_FFFE ? 1 : generation + 1
     let params = kernelParameters(
@@ -245,40 +335,70 @@ public final class ScopeAccumulator {
     encoder.setBytes(&monitor, length: MemoryLayout<LUTParameters>.stride, index: 2)
   }
 
-  /// Zeroes the bins and opens the statistics slot. Binds bytes 3 and buffers 4–5.
-  func encodeClear(_ pass: inout Pass, _ encoder: MTLComputeCommandEncoder) {
-    encoder.setBytes(&pass.params, length: MemoryLayout<ScopeKernelParameters>.stride, index: 3)
-    encoder.setBuffer(bins, offset: 0, index: 4)
-    encoder.setBuffer(statisticsBuffer, offset: 0, index: 5)
-    let clear = engine.clearPipeline
-    encoder.setComputePipelineState(clear)
-    let clearThreads = max(Int(pass.params.tile.w) / 4, ScopeStatisticsWord.slotWords)
-    encoder.dispatchThreads(
-      MTLSize(width: clearThreads, height: 1, depth: 1),
-      threadsPerThreadgroup: MTLSize(width: min(256, clear.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+  /// Buffer bindings of clear and finalize member `index`: bins 4, 6, 7 and statistics 5, 12, 13.
+  static let memberBins = SIMD3(4, 6, 7), memberStatistics = SIMD3(5, 12, 13)
+
+  /// This accumulation as member `index` of a clear or finalize.
+  func addMember(_ pass: Pass, to m: inout ScopeMaintenanceParameters, at index: Int) {
+    m.words.w |= 1 << UInt32(index)
+    m.words[index] = pass.params.tile.w / 4
+    m.slots[index] = pass.params.bins.w
+    m.generation[index] = pass.generation
+    m.histogram[index] = pass.settings.kind == .histogram ? UInt32(layout.columns) : 0
+    m.channels[index] = UInt32(layout.channels)
   }
 
-  /// Histogram peaks and the closing stamp; with `lead`, first copies the
-  /// statistics a fused pass measured into that accumulator's slot. Binds
-  /// bytes 3 and buffers 4, 5 and 11.
-  func encodeFinalize(_ pass: inout Pass, lead: (buffer: MTLBuffer, slot: UInt32)?, _ encoder: MTLComputeCommandEncoder) {
-    var params = pass.params
-    params.luts.w = lead.map { $0.slot + 1 } ?? 0
-    encoder.setBytes(&params, length: MemoryLayout<ScopeKernelParameters>.stride, index: 3)
-    encoder.setBuffer(bins, offset: 0, index: 4)
-    encoder.setBuffer(statisticsBuffer, offset: 0, index: 5)
-    encoder.setBuffer(lead?.buffer ?? statisticsBuffer, offset: 0, index: 11)
-    let finalize = engine.finalizePipeline
+  func bindMember(at index: Int, _ encoder: MTLComputeCommandEncoder) {
+    encoder.setBuffer(bins, offset: 0, index: Self.memberBins[index])
+    encoder.setBuffer(statisticsBuffer, offset: 0, index: Self.memberStatistics[index])
+  }
+
+  /// Zeroes every member's bins and opens their statistics slots, in one
+  /// dispatch of `engine.clearPipeline` (one member) or `groupClearPipeline`. Binds bytes 3.
+  static func encodeClear(
+    _ m: inout ScopeMaintenanceParameters, pipeline clear: MTLComputePipelineState, _ encoder: MTLComputeCommandEncoder
+  ) {
+    encoder.setBytes(&m, length: MemoryLayout<ScopeMaintenanceParameters>.stride, index: 3)
+    encoder.setComputePipelineState(clear)
+    let d = clearDispatch(m, pipeline: clear)
+    encoder.dispatchThreads(d.grid, threadsPerThreadgroup: d.group)
+  }
+
+  /// Threads: one per `uint4` of the largest member's bins, at least a statistics slot's words.
+  static func clearDispatch(_ m: ScopeMaintenanceParameters, pipeline clear: MTLComputePipelineState) -> Dispatch {
+    let threads = max(Int(max(m.words.x, max(m.words.y, m.words.z))), ScopeStatisticsWord.slotWords)
+    return Dispatch(
+      grid: MTLSize(width: threads, height: 1, depth: 1),
+      group: MTLSize(width: min(256, clear.maxTotalThreadsPerThreadgroup), height: 1, depth: 1), byThreadgroups: false,
+      threadgroupBytes: 0)
+  }
+
+  /// One threadgroup.
+  static func finalizeDispatch(pipeline finalize: MTLComputePipelineState) -> Dispatch {
+    Dispatch(
+      grid: MTLSize(width: 1, height: 1, depth: 1),
+      group: MTLSize(width: min(1024, finalize.maxTotalThreadsPerThreadgroup), height: 1, depth: 1),
+      byThreadgroups: true, threadgroupBytes: 0)
+  }
+
+  /// Copies a fused pass's statistics to every member (`m.histogram.w`), then
+  /// histogram peaks and the closing stamps, in one dispatch of
+  /// `engine.finalizePipeline` or `groupFinalizePipeline`. Binds bytes 3.
+  static func encodeFinalize(
+    _ m: inout ScopeMaintenanceParameters, pipeline finalize: MTLComputePipelineState,
+    _ encoder: MTLComputeCommandEncoder
+  ) {
+    encoder.setBytes(&m, length: MemoryLayout<ScopeMaintenanceParameters>.stride, index: 3)
     encoder.setComputePipelineState(finalize)
-    encoder.dispatchThreadgroups(
-      MTLSize(width: 1, height: 1, depth: 1),
-      threadsPerThreadgroup: MTLSize(width: min(1024, finalize.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+    let d = finalizeDispatch(pipeline: finalize)
+    encoder.dispatchThreadgroups(d.grid, threadsPerThreadgroup: d.group)
   }
 
   /// Publishes what an encoded accumulation measured.
   func finish(_ pass: Pass, frame: MonitorFrame, burnInLUT: MonitorLUT?, monitorLUT: MonitorLUT?) {
     let s = pass.settings
     generation = pass.generation
+    binsReshaped = false
     frameWidth = frame.width
     frameHeight = frame.height
     let (burnApplied, monitorApplied) = lutApplied(stage: s.stage, burnInLUT, monitorLUT)
@@ -315,9 +435,14 @@ public final class ScopeAccumulator {
     let key = BinKey(accumulation: s.accumulationKey, layout: Self.layout(for: s, packed: packed))
     if key != binKey {
       // Same size, different shape (e.g. RGB to Y'CbCr parade): reuse the buffer.
-      if key.layout.byteLength != bins.length { bins = try Self.makeBins(engine.device, key.layout) }
+      if key.layout.byteLength != bins.length {
+        let replacement = try Self.makeBins(engine.device, key.layout)
+        retired.retire(bins)
+        bins = replacement
+      }
       layout = key.layout
       binKey = key
+      binsReshaped = true
       tile = Tile()
     }
     let tileKey = SIMD4(frame.width, frame.height, layout.columns * 4 + layout.channels, layout.rows)
@@ -399,10 +524,12 @@ public final class ScopeAccumulator {
     let transport = !burn && !monitor && matrix(settings: s, frame: frame, burnInLUT, monitorLUT) == frame.signal.matrix
     p.weights = SIMD4(Float(k.r), Float(k.g), Float(k.b), transport ? 1 : 0)
     let side = Double(layout.columns)
+    // Zero chroma lands in the middle of bin side / 2, which the renderer draws
+    // on the plot centre: neutral pixels sit on the crosshair, not half a bin off.
     p.chroma = SIMD4(
       Float(1 / (2 * (1 - k.b))), Float(1 / (2 * (1 - k.r))),
-      Float(side * Double(s.vectorscopeZoom) / (2 * VectorscopeGeometry.halfExtent)), Float(side / 2))
-    p.clip = SIMD4(Float(s.clipHighPercent / 100), Float(s.clipLowPercent / 100), 0, 0)
+      Float(side * Double(s.vectorscopeZoom) / (2 * VectorscopeGeometry.halfExtent)), Float(side / 2 + 0.5))
+    p.clip = SIMD4(Float(s.clipHighPercent), Float(s.clipLowPercent), 0, 0)
     return p
   }
 }

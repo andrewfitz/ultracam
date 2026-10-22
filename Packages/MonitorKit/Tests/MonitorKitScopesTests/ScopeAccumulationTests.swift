@@ -42,7 +42,7 @@ final class ScopeAccumulationTests: XCTestCase {
     for y in 0..<frame.height {
       for x in 0..<frame.width {
         let rgb = stageRGB(frame.rgb[y * frame.width + x], p, luts)
-        let luma = p.stageLuma(rgb, transport: frame.luma[y * frame.width + x])
+        let luma = p.scopeLuma(rgb, transport: frame.luma[y * frame.width + x])
         switch s.kind {
         case .waveform:
           let column = (x * layout.columns) / frame.width
@@ -132,6 +132,33 @@ final class ScopeAccumulationTests: XCTestCase {
         s.vectorscopeZoom = zoom
         s.vectorscopeSize = 256
         try check(s, frame, "vectorscope ×\(zoom) \(kind)")
+      }
+    }
+  }
+
+  /// Full-range Y'CbCr on every Y'CbCr layout and depth (8, 10, 12, 16 bits), through every scope.
+  func testEveryScopeOnFullRangeYCbCr() throws {
+    let signal = SignalDescription(range: .full)
+    for kind in TestFrame.Kind.ycbcr {
+      let frame = try TestFrame.natural(kind, width: 157, height: 31, seed: 21, signal: signal)
+      var settings: [ScopeSettings] = []
+      for mode in WaveformMode.allCases {
+        var s = ScopeSettings(kind: .waveform, stage: .source)
+        s.waveformMode = mode
+        s.waveformColumns = 180
+        s.waveformLevels = 300
+        settings.append(s)
+      }
+      var h = ScopeSettings(kind: .histogram, stage: .source)
+      h.histogramMode = .rgbParade
+      h.histogramBins = 700
+      var v = ScopeSettings(kind: .vectorscope, stage: .source)
+      v.vectorscopeSize = 256
+      v.vectorscopeZoom = 2
+      for s in settings + [h, v] {
+        let label = "full \(kind) \(s.kind) \(s.waveformMode)"
+        try check(s, frame, label)
+        XCTAssertEqual(try accumulate(s, frame).0.context.range, .full, label)
       }
     }
   }
@@ -345,7 +372,7 @@ final class ScopeAccumulationTests: XCTestCase {
     waveform.waveformLevels = 512
     let (wa, wb) = try accumulate(waveform, frame)
     let p = wa.kernelParameters(settings: wa.settings, frame: frame.frame, burnInLUT: nil, monitorLUT: nil, generation: 1)
-    let luma = p.stageLuma(pixel, transport: frame.luma[spot.y * width + spot.x])
+    let luma = p.scopeLuma(pixel, transport: frame.luma[spot.y * width + spot.x])
     let level = Int(((luma - p.level.x) * p.level.y).rounded(.down))
     let column = spot.x * 1024 / width
     XCTAssertEqual(wb[level * 1024 + column], 1)
@@ -373,8 +400,9 @@ final class ScopeAccumulationTests: XCTestCase {
     // 264 × 17: the vectorscope's corner threadgroup has a single thread.
     for (kind, width, height) in [(TestFrame.Kind.v210, 640, 120), (.rgba16Float, 640, 120), (.bgra8, 264, 17)] {
       let frame = try TestFrame.natural(kind, width: width, height: height, seed: 4)
-      for scope in ScopeKind.allCases {
+      for (scope, colorimetry) in ScopeKind.allCases.map({ ($0, ScopeColorimetry.auto) }) + [(.waveform, .bt2020)] {
         var s = ScopeSettings(kind: scope, stage: .source)
+        s.colorimetry = colorimetry
         s.clipHighPercent = 90
         s.clipLowPercent = 5
         let (accumulator, _) = try accumulate(s, frame)
@@ -384,19 +412,20 @@ final class ScopeAccumulationTests: XCTestCase {
         var lo = Double.infinity, hi = -Double.infinity, sum = 0.0
         var high = SIMD4<Double>.zero, low = SIMD4<Double>.zero
         for (rgb, transport) in zip(frame.rgb, frame.luma) {
-          let y = p.stageLuma(rgb, transport: transport)
+          let y = p.statisticsLuma(rgb, transport: transport)
           let v = SIMD4(rgb.x, rgb.y, rgb.z, y)
           let yc = Double(min(3, max(-1, y)))
           lo = min(lo, yc)
           hi = max(hi, yc)
           sum += yc
+          // In percent, with the shader's Float operations.
           for i in 0..<4 {
-            if v[i] >= p.clip.x { high[i] += 1 }
-            if v[i] <= p.clip.y { low[i] += 1 }
+            if v[i] * 100 >= p.clip.x { high[i] += 1 }
+            if v[i] * 100 <= p.clip.y { low[i] += 1 }
           }
         }
         let n = Double(frame.rgb.count)
-        let label = "\(kind) \(scope)"
+        let label = "\(kind) \(scope) \(colorimetry)"
         XCTAssertEqual(stats.pixelCount, frame.rgb.count, label)
         XCTAssertEqual(stats.lumaMinimum, lo, accuracy: 2e-6, label)
         XCTAssertEqual(stats.lumaMaximum, hi, accuracy: 2e-6, label)
@@ -474,7 +503,7 @@ final class ScopeAccumulationTests: XCTestCase {
     let d = MTLRenderPipelineDescriptor()
     d.vertexFunction = engine.vertexFunction
     d.fragmentFunction = try engine.library.makeFunction(
-      name: "mk_scopeFragment", constantValues: ScopeEngine.constants(ScopeEngine.RenderKey(pixelFormat: .bgra8Unorm, scope: nil)))
+      name: "mk_scopeFragment", constantValues: ScopeEngine.constants(ScopeEngine.RenderKey(target: MonitorRenderTargetFormat(colorPixelFormat: .bgra8Unorm), scope: nil)))
     d.colorAttachments[0].pixelFormat = .bgra8Unorm
     var renderReflection: MTLRenderPipelineReflection?
     _ = try device.makeRenderPipelineState(descriptor: d, options: [.bindingInfo], reflection: &renderReflection)

@@ -75,24 +75,39 @@ final class ContractTests: XCTestCase {
     XCTAssertNil(cb.error)
   }
 
-  /// The library makes no queue, device, thread, blit, commit or wait. Checked in the
-  /// sources, since a command buffer cannot report which encoders it holds.
+  /// The library makes no queue, device, thread, blit, command buffer, commit or
+  /// wait, on either path. Checked in the sources, since a command buffer cannot
+  /// report which encoders it holds. The only commit is of the library's own
+  /// residency set (when an allocation joins or leaves it); the only buffer is the
+  /// Metal 4 uniform ring, made on first use (and when a host outruns it).
   func testSourcesNeverCreateQueuesCommitWaitOrBlit() throws {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
       .deletingLastPathComponent().appendingPathComponent("Sources/MonitorKit").resolvingSymlinksInPath()
     let files = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
       .filter { $0.pathExtension == "swift" }
     XCTAssertGreaterThan(files.count, 5)
+    var buffers: [String] = []
     for file in files {
       let text = try String(contentsOf: file, encoding: .utf8)
       for banned in [
-        "makeBlitCommandEncoder", ".commit()", "waitUntilCompleted", "waitUntilScheduled", "addCompletedHandler",
-        "addScheduledHandler", "makeCommandQueue", "MTLCreateSystemDefaultDevice", "DispatchQueue", "Thread(",
-        "makeBuffer(", "presentDrawable", ".present(",
+        "makeBlitCommandEncoder", "waitUntilCompleted", "waitUntilScheduled", "addCompletedHandler",
+        "addScheduledHandler", "makeCommandQueue", "makeMTL4CommandQueue", "makeCommandBuffer", "makeCommandAllocator",
+        "beginCommandBuffer", "endCommandBuffer", "addFeedbackHandler", "waitForDrawable", "signalDrawable",
+        "addResidencySet", "useResidencySet", "MTLCreateSystemDefaultDevice", "DispatchQueue", "Thread(",
+        "presentDrawable", ".present(", "SharedEvent",
       ] {
         XCTAssertFalse(text.contains(banned), "\(file.lastPathComponent) uses \(banned)")
       }
+      XCTAssertFalse(
+        text.replacingOccurrences(of: "set.commit()", with: "").contains(".commit("),
+        "\(file.lastPathComponent) commits something other than the residency set")
+      if text.contains("makeBuffer(") { buffers.append(file.lastPathComponent) }
     }
+    XCTAssertEqual(buffers, ["Metal4.swift"])
+    let ring = try String(contentsOf: root.appendingPathComponent("Metal4.swift"), encoding: .utf8)
+    XCTAssertEqual(ring.components(separatedBy: "makeBuffer(").count, 2, "one buffer allocation site")
+    let grow = try XCTUnwrap(ring.range(of: "private mutating func grow("))
+    XCTAssertNotNil(ring.range(of: "makeBuffer(", range: grow.upperBound..<ring.index(grow.upperBound, offsetBy: 300)))
   }
 
   func testSteadyStateAllocatesNoGPUMemory() throws {
@@ -122,6 +137,7 @@ final class ContractTests: XCTestCase {
   /// inside its own encoder calls, so the control is a host making exactly the
   /// same Metal calls inline; MonitorKit must add nothing on top.
   func testSteadyStateEncodeMakesNoHeapAllocations() throws {
+    try skipUnderTheDebugLayer()
     let gpu = try requireGPU()
     let (frame, feed, pass, state, target) = try setUp(gpu)
     for _ in 0..<3 {

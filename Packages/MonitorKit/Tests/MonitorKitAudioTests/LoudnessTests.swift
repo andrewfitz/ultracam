@@ -221,7 +221,7 @@ final class LoudnessTests: XCTestCase {
     XCTAssertEqual(Double(mono.snapshot().integrated), -23 - 10 * log10(2), accuracy: 0.1)
 
     // 16 front channels of weight 1, each at -23 - 9.03 dBFS, sum to -23 LUFS.
-    let wide = try LoudnessMeter(sampleRate: fs, channelCount: 16)
+    let wide = try LoudnessMeter(sampleRate: fs, channels: Array(repeating: .weighted(1), count: 16))
     let level = -23 - 10 * log10(8.0)
     wide.feed(.tone(dBFS: level, seconds: 5, sampleRate: fs, channels: 16))
     XCTAssertEqual(Double(wide.snapshot().integrated), -23, accuracy: 0.1)

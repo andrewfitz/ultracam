@@ -62,6 +62,8 @@ public struct MonitorFrame: @unchecked Sendable {
   /// Keep texture-cache wrappers alive with the frame (two at most, so no array).
   let retained0: AnyObject?
   let retained1: AnyObject?
+  /// Set on a frame `MonitorFeed.freeze` returned: its planes are the feed's.
+  var frozenPlanes: FrozenPlanes?
 
   private static let ids = Atomic<UInt64>(0)
   static func nextID() -> UInt64 { ids.add(1, ordering: .relaxed).newValue }
@@ -132,6 +134,46 @@ public struct MonitorFrame: @unchecked Sendable {
 
   /// The texture whose identity stands for this frame (the packed or luma/RGB texture).
   var primaryTexture: MTLTexture? { packed ?? luma }
+
+  /// Metal 4: a frame `MonitorFeed.freeze` returned whose planes the feed has
+  /// since let go (`unfreeze()` releasing them, or a freeze of another size) is
+  /// no longer in the residency set, though the frame keeps the textures alive.
+  /// This makes them resident again until the latest submission `residency`
+  /// observed completes; for any other frame it does nothing. MonitorKit's own
+  /// Metal 4 encodes (pictures, analysis, Freeze) call it after observing their
+  /// submission; other work that reads frames (e.g. scopes) calls it the same way.
+  public func keepResidentIfReleased(in residency: MonitorResidency) {
+    guard let planes = frozenPlanes, planes.released.load(ordering: .acquiring) else { return }
+    if let packed {
+      residency.add(packed)
+      residency.retire(packed, resident: packed)
+    }
+    if let luma {
+      residency.add(luma)
+      residency.retire(luma, resident: luma)
+    }
+    if let chroma {
+      residency.add(chroma)
+      residency.retire(chroma, resident: chroma)
+    }
+  }
+
+  /// Adds the frame's textures to a host residency set (Metal 4: host frames are
+  /// the host's to make resident). Does not commit the set, so a host batches
+  /// several frames into one commit. Do it when a texture is first wrapped (e.g.
+  /// in an IOSurface-keyed cache), not per frame.
+  public func addResidency(to set: MTLResidencySet) {
+    if let packed { set.addAllocation(packed) }
+    if let luma { set.addAllocation(luma) }
+    if let chroma { set.addAllocation(chroma) }
+  }
+
+  /// Removes the frame's textures from a host residency set, without committing.
+  public func removeResidency(from set: MTLResidencySet) {
+    if let packed { set.removeAllocation(packed) }
+    if let luma { set.removeAllocation(luma) }
+    if let chroma { set.removeAllocation(chroma) }
+  }
 
   /// Parameters for `mk_FrameParams`.
   public var parameters: FrameParameters {
@@ -208,9 +250,10 @@ extension MonitorFrame {
     }
   }
 
-  /// Signal description from CoreVideo attachments. Log encodings cannot be
-  /// inferred from attachments; pass them explicitly. Reads the attachments as
-  /// CF values without bridging, so it allocates nothing per frame.
+  /// Signal description from CoreVideo attachments (matrix, transfer, primaries,
+  /// chroma siting). Log encodings cannot be inferred from attachments; pass them
+  /// explicitly. Reads the attachments as CF values without bridging, so it
+  /// allocates nothing per frame.
   public static func signal(of pixelBuffer: CVPixelBuffer, range: CodeRange) -> SignalDescription {
     func attachment(_ key: CFString) -> CFTypeRef? { CVBufferCopyAttachment(pixelBuffer, key, nil) }
     func equal(_ value: CFTypeRef?, _ constant: CFString) -> Bool {
@@ -238,9 +281,16 @@ extension MonitorFrame {
       equal(l, kCVImageBufferChromaLocation_TopLeft) || equal(l, kCVImageBufferChromaLocation_Top) ? .top
       : equal(l, kCVImageBufferChromaLocation_BottomLeft) || equal(l, kCVImageBufferChromaLocation_Bottom)
         ? .bottom : .center
+    // Primaries are read on their own, never inferred from the transfer: an HLG or
+    // PQ buffer may carry BT.709 primaries. Unlisted ones stay unlabelled.
+    let p = attachment(kCVImageBufferColorPrimariesKey)
+    let primaries: ColorPrimaries? =
+      equal(p, kCVImageBufferColorPrimaries_ITU_R_709_2) ? .rec709
+      : equal(p, kCVImageBufferColorPrimaries_ITU_R_2020) ? .rec2020
+      : equal(p, kCVImageBufferColorPrimaries_P3_D65) ? .displayP3 : nil
     return SignalDescription(
       range: range, matrix: matrix, chromaSiting: centred ? .center : .left, encoding: .display(transfer),
-      chromaVerticalSiting: vertical)
+      chromaVerticalSiting: vertical, primaries: primaries)
   }
 
   /// One plane through the texture cache: the texture and the wrapper that keeps it valid.
@@ -313,4 +363,11 @@ extension MonitorFrame {
       signal: signal ?? Self.signal(of: pixelBuffer, range: range),
       pixelAspectRatio: pixelAspectRatio(of: pixelBuffer), retained: wrappers)
   }
+}
+
+/// One set of a feed's Freeze planes, shared by the frames frozen into it. The
+/// feed marks it released when it lets the planes go, so a frame still held
+/// can be made resident again (`MonitorFrame.keepResidentIfReleased(in:)`).
+final class FrozenPlanes: Sendable {
+  let released = Atomic<Bool>(false)
 }

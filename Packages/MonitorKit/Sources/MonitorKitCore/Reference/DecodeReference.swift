@@ -71,11 +71,13 @@ extension ColorMath {
     v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
   }
 
-  /// SMPTE ST 2084 EOTF: PQ signal 0…1 to display luminance in cd/m².
+  /// SMPTE ST 2084 EOTF: PQ signal 0…1 to display luminance in cd/m². The signal
+  /// is clipped to 0…1 (BT.2100 Table 4's domain): above it the curve leaves
+  /// 10 000 cd/m², and from about 1.99 its denominator turns negative (NaN).
   public static func pqNits(_ e: Double) -> Double {
     let m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128
     let c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32
-    let p = pow(max(0, e), 1 / m2)
+    let p = pow(min(max(0, e), 1), 1 / m2)
     return 10000 * pow(max(0, p - c1) / (c2 - c3 * p), 1 / m1)
   }
 

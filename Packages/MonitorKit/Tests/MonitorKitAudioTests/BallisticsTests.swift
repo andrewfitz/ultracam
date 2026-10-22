@@ -4,10 +4,15 @@ import XCTest
 
 /// VU (IEC 60268-17) and quasi-peak PPM (IEC 60268-10) dynamics.
 final class BallisticsTests: XCTestCase {
-  static let rates: [Double] = [44100, 48000, 96000, 192_000]
+  /// Every PPM grid: 4x phases, 4x at 88.2 kHz, 2x phases, the samples
+  /// (176.4 kHz is the coarsest grid, 192 kHz the design one), and folds of
+  /// 2 (384 kHz) and 4 (768 kHz).
+  static let rates: [Double] = [44100, 48000, 88200, 96000, 176_400, 192_000, 384_000, 768_000]
 
+  /// Publishing on every call, so the traces below see each ~1 ms block.
   private func vuMeter(_ fs: Double, reference: AlignmentLevel = .ebu) throws -> AudioMeter {
-    try AudioMeter(configuration: .init(sampleRate: fs, channelCount: 1, meters: [.vu], vuReference: reference))
+    try AudioMeter(configuration: .init(
+      sampleRate: fs, channelCount: 1, meters: [.vu], vuReference: reference, publishInterval: 0))
   }
 
   /// (time, linear deflection) after every block of about 1 ms.
@@ -60,7 +65,8 @@ final class BallisticsTests: XCTestCase {
   }
 
   private func ppmMeter(_ fs: Double, _ type: PPMType) throws -> AudioMeter {
-    try AudioMeter(configuration: .init(sampleRate: fs, channelCount: 1, meters: [.ppm], ppmType: type))
+    try AudioMeter(configuration: .init(
+      sampleRate: fs, channelCount: 1, meters: [.ppm], ppmType: type, publishInterval: 0))
   }
 
   /// Highest PPM reading for `signal`, in dB relative to alignment.
@@ -132,7 +138,8 @@ final class BallisticsTests: XCTestCase {
     nordic.returnRate = 20 / 1.7
     let fs = 48000.0
     let m = try AudioMeter(configuration: .init(
-      sampleRate: fs, channelCount: 1, meters: [.ppm], ppmType: .typeI, customPPMBallistics: nordic))
+      sampleRate: fs, channelCount: 1, meters: [.ppm], ppmType: .typeI, customPPMBallistics: nordic,
+      publishInterval: 0))
     m.feed(.tone(dBFS: -18, seconds: 1, sampleRate: fs, channels: 1))
     XCTAssertEqual(Double(m.snapshot()[0].ppm), 0, accuracy: 0.05)
     let fall = trace(m, .silence(seconds: 2.5, sampleRate: fs, channels: 1)) { $0.ppm }

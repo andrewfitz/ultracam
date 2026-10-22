@@ -25,19 +25,39 @@ public enum MonitorShaders {
     }.joined(separator: "\n")
   }
 
-  /// Compiles `parts` for `device`, with `prefix` before them (e.g. macro
-  /// definitions) and `extra` host source after.
-  public static func makeLibrary(device: MTLDevice, parts: [Part], prefix: String = "", extra: String = "")
-    throws -> MTLLibrary
-  {
+  /// The options every MonitorKit library compiles with: safe math (no
+  /// reassociation, so GPU results match the CPU reference and each other) and
+  /// MSL 4.1 on macOS/iOS 27, 4.0 before. A host compiling the fused sources
+  /// (`mk_applyLUT` in its own kernel) uses these to get identical results. A new
+  /// object per call.
+  public static var compileOptions: MTLCompileOptions {
     let options = MTLCompileOptions()
     options.mathMode = .safe
-    // MSL 4.1 on macOS/iOS 27; 4.0 is the floor.
     if #available(macOS 27.0, iOS 27.0, *) {
       options.languageVersion = .version4_1
     } else {
       options.languageVersion = .version4_0
     }
-    return try device.makeLibrary(source: prefix + "\n" + (try source(parts)) + "\n" + extra, options: options)
+    return options
+  }
+
+  /// Compiles `parts` for `device`, with `prefix` before them (e.g. macro
+  /// definitions) and `extra` host source after.
+  public static func makeLibrary(device: MTLDevice, parts: [Part], prefix: String = "", extra: String = "")
+    throws -> MTLLibrary
+  {
+    try device.makeLibrary(source: prefix + "\n" + (try source(parts)) + "\n" + extra, options: compileOptions)
+  }
+
+  /// The same compilation unit for a host's `MTL4Compiler`
+  /// (`compiler.makeLibrary(descriptor:)`), with `compileOptions`.
+  public static func libraryDescriptor(parts: [Part], prefix: String = "", extra: String = "", name: String? = nil)
+    throws -> MTL4LibraryDescriptor
+  {
+    let d = MTL4LibraryDescriptor()
+    d.source = prefix + "\n" + (try source(parts)) + "\n" + extra
+    d.options = compileOptions
+    d.name = name
+    return d
   }
 }

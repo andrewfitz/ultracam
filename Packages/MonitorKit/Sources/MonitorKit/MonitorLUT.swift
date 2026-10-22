@@ -29,8 +29,10 @@ public struct LUTParameters: Equatable, Sendable {
 }
 
 /// A LUT on the GPU: one `rgba32Float` 3D texture built once per load. Slices
-/// `0..<n` hold the n³ lattice; a 1D shaper follows in further slices, so the
-/// whole LUT is still one texture and `mk_applyLUT` keeps its three arguments.
+/// `0..<n` hold the n³ lattice; a 1D shaper follows in further slices of the
+/// texture's width × height (at least `shaperOnlyLattice`², so a small lattice
+/// still fits a 65536-entry shaper), so the whole LUT is still one texture and
+/// `mk_applyLUT` keeps its three arguments.
 /// Immutable and safe to share across feeds, surfaces and threads.
 ///
 /// Fused use: prepend `MonitorShaders.source([.lut])` to your kernel source,
@@ -43,15 +45,20 @@ public final class MonitorLUT: @unchecked Sendable {
   public let interpolation: LUTInterpolation
   public let parameters: LUTParameters
 
-  /// Lattice size of the placeholder 3D table of a 1D-only LUT: wide enough that
-  /// a 65536-entry shaper fits within the 2048-slice depth limit.
+  /// Lattice size of the placeholder 3D table of a 1D-only LUT, and the least
+  /// width and height of a texture with a shaper: 64 entries a slice, so a
+  /// 65536-entry shaper (`CubeLUT.maximumShaperSize`) takes 1024 slices, within
+  /// the 2048-slice depth limit beside any lattice.
   static let shaperOnlyLattice = 8
 
   public init(device: MTLDevice, cube: CubeLUT, interpolation: LUTInterpolation = .tetrahedral)
     throws
   {
     let n = cube.hasCube ? cube.dimension : Self.shaperOnlyLattice
-    let perSlice = n * n
+    // Shaper rows are the texture's width: a small lattice sits in the corner of
+    // wider slices. Without a shaper the texture is exactly the lattice.
+    let side = cube.shaperSize > 0 ? max(n, Self.shaperOnlyLattice) : n
+    let perSlice = side * side
     let shaperSlices = (cube.shaperSize + perSlice - 1) / perSlice
     guard n + shaperSlices <= 2048 else {
       throw MonitorKitError.gpu(
@@ -60,23 +67,42 @@ public final class MonitorLUT: @unchecked Sendable {
     let d = MTLTextureDescriptor()
     d.textureType = .type3D
     d.pixelFormat = .rgba32Float
-    d.width = n
-    d.height = n
+    d.width = side
+    d.height = side
     d.depth = n + shaperSlices
     d.usage = .shaderRead
     d.storageMode = .shared
     guard let texture = device.makeTexture(descriptor: d) else {
       throw MonitorKitError.gpu("Cannot allocate a \(n)³ LUT texture.")
     }
-    if cube.hasCube {
+    if cube.hasCube && side == n {
       cube.rgba.withUnsafeBytes { bytes in
         texture.replace(
           region: MTLRegionMake3D(0, 0, 0, n, n, n), mipmapLevel: 0, slice: 0,
           withBytes: bytes.baseAddress!, bytesPerRow: n * 16, bytesPerImage: n * n * 16)
       }
+    } else if cube.hasCube {
+      // A small lattice in wider slices: the padding repeats the edge, so hardware
+      // filtering at the lattice's edge (a zero weight) reads finite values.
+      var padded = [Float](repeating: 0, count: perSlice * n * 4)
+      for z in 0..<n {
+        for y in 0..<side {
+          for x in 0..<side {
+            let source = ((z * n + min(y, n - 1)) * n + min(x, n - 1)) * 4
+            let target = ((z * side + y) * side + x) * 4
+            for c in 0..<4 { padded[target + c] = cube.rgba[source + c] }
+          }
+        }
+      }
+      padded.withUnsafeBytes { bytes in
+        texture.replace(
+          region: MTLRegionMake3D(0, 0, 0, side, side, n), mipmapLevel: 0, slice: 0,
+          withBytes: bytes.baseAddress!, bytesPerRow: side * 16, bytesPerImage: perSlice * 16)
+      }
     }
     if shaperSlices > 0 {
-      // Entry i is texel (i % n, i / n % n, n + i / n²); the padding repeats the last entry.
+      // Entry i is texel (i % w, i / w % w, n + i / w²), w the texture's width; the
+      // padding repeats the last entry.
       var entries = [Float](repeating: 0, count: shaperSlices * perSlice * 4)
       for i in 0..<(shaperSlices * perSlice) {
         let source = min(i, cube.shaperSize - 1) * 3
@@ -87,8 +113,8 @@ public final class MonitorLUT: @unchecked Sendable {
       }
       entries.withUnsafeBytes { bytes in
         texture.replace(
-          region: MTLRegionMake3D(0, 0, n, n, n, shaperSlices), mipmapLevel: 0, slice: 0,
-          withBytes: bytes.baseAddress!, bytesPerRow: n * 16, bytesPerImage: n * n * 16)
+          region: MTLRegionMake3D(0, 0, n, side, side, shaperSlices), mipmapLevel: 0, slice: 0,
+          withBytes: bytes.baseAddress!, bytesPerRow: side * 16, bytesPerImage: perSlice * 16)
       }
     }
     texture.label = "MonitorKit LUT \(cube.title)"

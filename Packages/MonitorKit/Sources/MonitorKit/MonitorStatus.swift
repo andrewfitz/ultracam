@@ -25,7 +25,7 @@ public struct MonitorViewport: Equatable, Sendable {
 /// The tools a surface can show.
 public enum MonitorTool: String, Sendable, CaseIterable, Codable {
   case falseColor, zebra1, zebra2, focusPeaking, guides, burnInLUT, monitorLUT, magnification,
-    desqueeze, flip, displayAdjustments
+    desqueeze, flip, displayAdjustments, displayTransform, clipIndicators
 }
 
 /// Why a tool that is switched on is not drawn. The picture is always drawn.
@@ -45,6 +45,15 @@ public enum MonitorUnavailableReason: Equatable, Sendable, CustomStringConvertib
   case focusNotAnalyzed
   /// Guides are hidden while the picture is magnified.
   case hiddenWhileMagnified
+  /// The display transform maps PQ or HLG, and the signal is neither.
+  case requiresHDRSource
+  /// HDR passthrough needs an HDR output encoding (extended linear, PQ, HLG or
+  /// signal-native on an HDR signal).
+  case requiresHDROutput
+  /// A display transform needs the camera's signal, and a LUT produces the
+  /// monitor stage: LUT output is Rec.709 display R'G'B' (the burn-in or monitor LUT
+  /// already maps the picture for display).
+  case lutOnMonitorStage
 
   public var description: String {
     switch self {
@@ -56,6 +65,9 @@ public enum MonitorUnavailableReason: Equatable, Sendable, CustomStringConvertib
     case .requiresKnownTransfer: return "Needs a known transfer function; this signal is unlabelled."
     case .focusNotAnalyzed: return "No focus analysis for this frame and signal stage."
     case .hiddenWhileMagnified: return "Hidden while magnified."
+    case .requiresHDRSource: return "Needs a PQ or HLG signal."
+    case .requiresHDROutput: return "Needs an HDR output."
+    case .lutOnMonitorStage: return "Not available while a LUT is applied; the LUT output is Rec.709."
     }
   }
 }

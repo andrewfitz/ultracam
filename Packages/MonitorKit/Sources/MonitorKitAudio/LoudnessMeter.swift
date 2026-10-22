@@ -10,15 +10,16 @@ import Synchronization
 /// type when only loudness is wanted.
 public final class LoudnessMeter: @unchecked Sendable {
   // @unchecked: the producer state is confined to the `process` caller; the
-  // only state shared with readers is the atomic publisher and reset flags.
+  // only state shared with readers is the atomic publisher, reset requests
+  // and pause flag.
   public let sampleRate: Double
   public let channels: [LoudnessChannel]
   private let stage: PlanarStage
   private let engine: LoudnessEngine
-  private let publisher: SnapshotPublisher<LoudnessSnapshot>
-  private let staging: UnsafeMutablePointer<LoudnessSnapshot>
-  private let resetRequest = Atomic<UInt32>(0)
-  private let resetRequestCount = Atomic<UInt64>(0)
+  private let publisher: SnapshotPublisher<Published<LoudnessSnapshot>>
+  private let staging: UnsafeMutablePointer<Published<LoudnessSnapshot>>
+  private let requests = ResetRequests()
+  private let paused = Atomic<Bool>(false)
 
   static let chunkFrames = 512
 
@@ -30,9 +31,9 @@ public final class LoudnessMeter: @unchecked Sendable {
     self.channels = channels
     stage = PlanarStage(channelCount: channels.count, history: 0, capacity: Self.chunkFrames)
     engine = LoudnessEngine(sampleRate: sampleRate, weights: channels.map(\.weight), stage: stage)
-    publisher = SnapshotPublisher(LoudnessSnapshot())
+    publisher = SnapshotPublisher(Published(readings: LoudnessSnapshot()))
     staging = .allocate(capacity: 1)
-    staging.initialize(to: LoudnessSnapshot())
+    staging.initialize(to: Published(readings: LoudnessSnapshot()))
   }
 
   /// The standard layout for the channel count (see `LoudnessChannel.standardLayout`).
@@ -103,6 +104,7 @@ public final class LoudnessMeter: @unchecked Sendable {
   private func run(_ frameCount: Int, _ format: AudioSampleFormat) {
     precondition(frameCount >= 0, "negative frameCount")
     let reset = applyResetRequests()
+    engine.setMeasuring(!paused.load(ordering: .relaxed))
     guard frameCount > 0 || reset else { return }
     var offset = 0
     while offset < frameCount {
@@ -111,51 +113,67 @@ public final class LoudnessMeter: @unchecked Sendable {
       engine.process(frames: n)
       offset += n
     }
-    staging.pointee = engine.state.pointee.readings
+    staging.pointee.readings = engine.state.pointee.readings
     publisher.publish(&staging.pointee)
   }
 
-  /// True when a request was applied.
+  /// True when a request was applied; the generations go out with the next publish.
   private func applyResetRequests() -> Bool {
-    let request = resetRequest.exchange(0, ordering: .acquiring)
-    guard request != 0 else { return false }
-    if request & ResetRequest.all != 0 { engine.resetFilters() }
-    engine.resetMeasurement()
+    let requested = requests.load()
+    let applied = staging.pointee.resets
+    guard requested != applied else { return false }
+    if requested.all != applied.all {
+      engine.resetFilters()
+      engine.resetReadings()
+    } else {
+      engine.resetMeasurement()
+    }
+    staging.pointee.resets = requested
     return true
   }
 
   // MARK: Output and control
 
-  /// The latest readings. Lock-free; safe from any thread. A reset that
-  /// `process` has not applied yet (audio stopped, say) already shows here.
+  /// The latest readings. Lock-free; safe from any thread. A reset already
+  /// shows here from the moment it is requested, before `process` applies it
+  /// (audio stopped, say, or a call in progress).
   public func snapshot() -> LoudnessSnapshot {
-    var value = LoudnessSnapshot()
+    var value = Published(readings: LoudnessSnapshot())
     publisher.read(into: &value)
-    return resetRequest.load(ordering: .acquiring) != 0 ? LoudnessSnapshot() : value
+    let requested = requests.load()
+    if requested.all != value.resets.all { return LoudnessSnapshot() }
+    if requested.loudness != value.resets.loudness { return value.readings.startingNewMeasurement }
+    return value.readings
   }
 
   /// Advances on every publish and every reset request, so a display can
   /// skip redrawing while it is unchanged.
   public var publishCount: UInt64 {
-    publisher.publishCount &+ resetRequestCount.load(ordering: .acquiring)
+    publisher.publishCount &+ requests.load().total
   }
 
-  /// Starts a new programme measurement.
-  public func resetMeasurement() { request(ResetRequest.loudness) }
+  /// Starts a new programme measurement: integrated, LRA, the maxima and
+  /// `duration` start over from the next 5 or 10 ms tick boundary, while
+  /// momentary and short-term slide on over the continuous audio (EBU Tech
+  /// 3341 resets the measurement; M and S are sliding windows).
+  public func resetMeasurement() { requests.requestLoudness() }
 
-  /// Also clears the K-weighting's signal memory, as if the meter were new
-  /// (for a new source; `resetMeasurement()` is the one for a new programme).
-  public func reset() { request(ResetRequest.all) }
+  /// Clears every reading, momentary and short-term included, and the
+  /// K-weighting's signal memory, as if the meter were new (for a new
+  /// source; `resetMeasurement()` is the one for a new programme).
+  public func reset() { requests.requestAll() }
 
-  /// Readers see the request at once; the next `process` applies it.
-  private func request(_ bits: UInt32) {
-    resetRequest.bitwiseOr(bits, ordering: .releasing)
-    resetRequestCount.add(1, ordering: .releasing)
-  }
-}
+  /// Puts integrated loudness, loudness range and `duration` on stand-by
+  /// (EBU Tech 3341 section 2.2): audio from now on is left out of them as if
+  /// it were cut, while momentary, short-term and their maxima keep running.
+  /// Any thread; takes effect at the first 5 or 10 ms tick boundary the
+  /// next `process` call reaches. A reset keeps the meter paused, so reset
+  /// then resume starts a measurement.
+  public func pauseMeasurement() { paused.store(true, ordering: .relaxed) }
 
-enum ResetRequest {
-  static let peaks: UInt32 = 1
-  static let loudness: UInt32 = 2
-  static let all: UInt32 = 4
+  /// Continues a paused measurement from where it stood.
+  public func resumeMeasurement() { paused.store(false, ordering: .relaxed) }
+
+  /// True between `pauseMeasurement()` and `resumeMeasurement()`.
+  public var isMeasurementPaused: Bool { paused.load(ordering: .relaxed) }
 }

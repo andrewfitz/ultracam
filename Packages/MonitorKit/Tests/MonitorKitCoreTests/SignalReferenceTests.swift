@@ -27,6 +27,34 @@ final class SignalReferenceTests: XCTestCase {
     XCTAssertEqual(try JSONDecoder().decode(SignalDescription.self, from: JSONEncoder().encode(full)), full)
   }
 
+  /// Unknown or malformed fields (a profile saved by a newer build, a hand edit)
+  /// fall back field by field instead of failing the host's whole settings decode.
+  func testSignalDescriptionsDecodeLeniently() throws {
+    let newer = #"""
+      {"range": "full", "matrix": "bt9999", "chromaSiting": "center",
+       "encoding": {"log": {"_0": {"curve": "sLog2", "gamut": "sGamut", "transport": "native"}}},
+       "chromaVerticalSiting": 7, "primaries": "aces"}
+      """#
+    let d = try JSONDecoder().decode(SignalDescription.self, from: Data(newer.utf8))
+    XCTAssertEqual(d.range, .full, "known fields keep their values")
+    XCTAssertEqual(d.chromaSiting, .center)
+    XCTAssertEqual(d.matrix, SignalDescription.rec709.matrix)
+    XCTAssertEqual(d.encoding, .unknown, "an unknown encoding is unlabelled")
+    XCTAssertEqual(d.chromaVerticalSiting, .center)
+    XCTAssertNil(d.primaries)
+    struct Settings: Codable { var name: String; var signal: SignalDescription }
+    let wrapped = #"{"name": "A cam", "signal": \#(newer)}"#
+    XCTAssertEqual(try JSONDecoder().decode(Settings.self, from: Data(wrapped.utf8)).name, "A cam")
+    let empty = try JSONDecoder().decode(SignalDescription.self, from: Data("{}".utf8))
+    XCTAssertEqual(empty, SignalDescription(encoding: .unknown))
+    for s in [
+      SignalDescription(range: .full, matrix: .bt2020, encoding: .log(.sLog3SGamut3), primaries: nil),
+      SignalDescription(encoding: .display(.pq), primaries: .displayP3), SignalDescription(encoding: .unknown),
+    ] {
+      XCTAssertEqual(try JSONDecoder().decode(SignalDescription.self, from: JSONEncoder().encode(s)), s)
+    }
+  }
+
   func testVerticalChromaTaps() {
     // Top: chroma row j sits on luma row 2j.
     var t = DecodeReference.chromaTaps(x: 0, y: 2, width: 8, height: 8, subsampling: .s420, siting: .left, vertical: .top)

@@ -50,6 +50,16 @@ final class MonitorStateTests: XCTestCase {
     s.display.saturation = 0.4
     s.display.monochrome = .blueOnly
     s.monitorLUT = false
+    s.displayTransform = DisplayTransformSettings(mode: .hdrToSDR, pqSourcePeak: 4000)
+    s.clipIndicators.enabled = true
+    s.clipIndicators.stage = .source
+    s.clipIndicators.luma = false
+    s.clipIndicators.showsUnder = false
+    s.clipIndicators.high = 98
+    s.clipIndicators.low = 2
+    s.clipIndicators.coloring = .uniform
+    s.clipIndicators.overColor = ColorRGB(r: 1, g: 0, b: 1)
+    s.clipIndicators.opacity = 0.5
     return s
   }
 
@@ -271,5 +281,82 @@ final class DecodeReferenceTests: XCTestCase {
     XCTAssertEqual(ColorMath.bt709Linear(0.0405), 0.009, accuracy: 1e-12)
     XCTAssertEqual(ColorMath.bt709Linear(0.409), 0.18, accuracy: 2e-4)
     XCTAssertEqual(ColorMath.bt709Linear(1), 1, accuracy: 1e-12)
+  }
+}
+
+extension MonitorStateTests {
+  /// State saved before display transforms and clip indicators existed (W1)
+  /// decodes with their defaults and keeps everything else.
+  func testStateSavedBeforeW2DecodesWithDefaults() throws {
+    var old = Self.everythingChanged()
+    old.displayTransform = DisplayTransformSettings()
+    old.clipIndicators = ClipIndicatorSettings()
+    var json = try XCTUnwrap(JSONSerialization.jsonObject(with: try JSONEncoder().encode(old)) as? [String: Any])
+    json["displayTransform"] = nil
+    json["clipIndicators"] = nil
+    let decoded = try JSONDecoder().decode(MonitorState.self, from: try JSONSerialization.data(withJSONObject: json))
+    XCTAssertEqual(decoded, old)
+    XCTAssertEqual(decoded.displayTransform.mode, DisplayTransform.none)
+    XCTAssertFalse(decoded.clipIndicators.enabled)
+    // Malformed new values fall back without losing the rest.
+    json["displayTransform"] = ["mode": "sideways", "pqSourcePeak": "high"]
+    json["clipIndicators"] = ["enabled": true, "high": "x", "coloring": 3]
+    let lenient = try JSONDecoder().decode(MonitorState.self, from: try JSONSerialization.data(withJSONObject: json))
+    XCTAssertEqual(lenient.displayTransform, DisplayTransformSettings())
+    XCTAssertTrue(lenient.clipIndicators.enabled)
+    XCTAssertEqual(lenient.clipIndicators.coloring, ClipIndicatorColoring.perChannel)
+    XCTAssertEqual(lenient.clipIndicators.high, 100)
+    XCTAssertEqual(lenient.zebras, old.zebras)
+  }
+
+  func testNewSettingsNormalize() {
+    var s = MonitorState()
+    s.displayTransform.pqSourcePeak = .nan
+    s.clipIndicators.high = 500
+    s.clipIndicators.low = -.infinity
+    s.clipIndicators.opacity = 2
+    s.clipIndicators.overColor = ColorRGB(r: .nan, g: 0, b: 0)
+    let n = s.normalized()
+    XCTAssertEqual(n.displayTransform.pqSourcePeak, 1000)
+    XCTAssertEqual(n.clipIndicators.high, 120)
+    XCTAssertEqual(n.clipIndicators.low, 0)
+    XCTAssertEqual(n.clipIndicators.opacity, 1)
+    XCTAssertEqual(n.clipIndicators.overColor, ColorRGB(r: 1, g: 0, b: 0))
+    s.displayTransform.pqSourcePeak = 50
+    XCTAssertEqual(s.normalized().displayTransform.pqSourcePeak, 100)
+  }
+
+  /// 100% is inclusive (a 10-bit legal 940 is flagged, 939 is not); 0% is inclusive
+  /// below (64 is flagged, 65 is not). Per-channel colours add.
+  func testClipIndicatorBoundariesAndColours() {
+    var c = ClipIndicatorSettings()
+    c.enabled = true
+    func v(_ code: Double) -> Double { (code - 64) / 876 }
+    func flag(_ r: Double, _ g: Double, _ b: Double) -> ColorRGB? {
+      c.indicator(rgb: ColorRGB(r: r, g: g, b: b), luma: 0.2126 * r + 0.7152 * g + 0.0722 * b)
+    }
+    XCTAssertEqual(v(940), 1)
+    XCTAssertEqual(flag(v(940), 0.5, 0.5), ColorRGB(r: 1, g: 0, b: 0))
+    XCTAssertNil(flag(v(939), 0.5, 0.5))
+    XCTAssertEqual(flag(v(940), v(940), 0.5), ColorRGB(r: 1, g: 1, b: 0))
+    XCTAssertEqual(flag(v(940), v(940), v(940)), ColorRGB(r: 1, g: 1, b: 1))
+    XCTAssertEqual(flag(0.5, v(64), 0.5), ColorRGB(r: 0, g: 0.5, b: 0))
+    XCTAssertNil(flag(0.5, v(65), 0.5))
+    XCTAssertEqual(flag(v(64), v(64), v(64)), ColorRGB(r: 0.5, g: 0.5, b: 0.5))
+    // Over wins over under on the same pixel.
+    XCTAssertEqual(flag(v(940), v(64), 0.5), ColorRGB(r: 1, g: 0, b: 0))
+    // Luma alone.
+    c.red = false
+    c.green = false
+    c.blue = false
+    XCTAssertEqual(flag(1, 1, 1), ColorRGB(r: 1, g: 1, b: 1))
+    XCTAssertNil(flag(1, 0, 0))
+    c.coloring = .uniform
+    XCTAssertEqual(flag(1, 1, 1), c.overColor)
+    XCTAssertEqual(flag(0, 0, 0), c.underColor)
+    c.showsUnder = false
+    XCTAssertNil(flag(0, 0, 0))
+    c.enabled = false
+    XCTAssertNil(flag(1, 1, 1))
   }
 }

@@ -15,15 +15,33 @@ struct ScopeKernelParameters {
   var clip = SIMD4<Float>.zero
 }
 
+/// Mirrors `mk_ScopeMaintain`: the clear and finalize of up to three
+/// accumulations (a fused group's members in kind order, or one accumulator)
+/// in one dispatch each.
+struct ScopeMaintenanceParameters {
+  /// xyz: `uint4` words of each member's bins to clear (0: none), w: members
+  /// present (bit k: member k).
+  var words = SIMD4<UInt32>.zero
+  /// xyz: each member's statistics slot, in words.
+  var slots = SIMD4<UInt32>.zero
+  /// xyz: each member's generation (the slot stamps).
+  var generation = SIMD4<UInt32>.zero
+  /// xyz: histogram bins per channel (0: not a histogram), w: the member
+  /// whose slot the fused pass measured into, + 1 (0: each measured its own).
+  var histogram = SIMD4<UInt32>.zero
+  /// xyz: channels of each member.
+  var channels = SIMD4<UInt32>.zero
+}
+
 /// Mirrors `mk_ScopeShape`. Positions in viewport pixels.
 struct ScopeShape {
   var geometry = SIMD4<Float>.zero
   var style = SIMD4<Float>.zero
 }
 
-/// Mirrors `mk_ScopeDraw`. Passed with `setFragmentBytes`, so it stays under 4 KB.
-struct ScopeDrawParameters {
-  static let maximumShapes = 64
+/// Mirrors `mk_ScopeDraw`, the fragment shader's parameters (`setFragmentBytes`
+/// per draw, a uniform ring slot on Metal 4).
+struct ScopeDrawParameters: Equatable {
   var viewport = SIMD4<Float>.zero
   var plot = SIMD4<Float>.zero
   var shape = SIMD4<UInt32>.zero
@@ -31,10 +49,37 @@ struct ScopeDrawParameters {
   var intensity = SIMD4<Float>.zero
   var background = SIMD4<Float>.zero
   var chroma = SIMD4<Float>.zero
+  /// xy: trace texels per unit of plot (or of a parade panel) on an axis drawn
+  /// from the bins, zw: the texel offset. A minified axis was reduced to plot
+  /// pixels by the resolve and is read texel by texel instead (`flags.w`).
+  var traceMap = SIMD4<Float>.zero
+  /// The plot's pixels, in viewport pixels: xy the first, zw one past the last
+  /// (those whose centre is inside it). Integers, so a reduced axis's texel of
+  /// each pixel is exactly the one the resolve wrote for it.
+  var pixels = SIMD4<UInt32>.zero
   var color0 = SIMD4<Float>.zero
   var color1 = SIMD4<Float>.zero
   var color2 = SIMD4<Float>.zero
   var graticuleColor = SIMD4<Float>.zero
+  /// The output encoding of the composited colour (`ScopeRenderer.colorPipeline`):
+  /// x: `MonitorColorPipeline.Transfer` code (0: as authored), y: graphics white
+  /// in cd/m², z: HLG nominal peak, w: HLG system gamma.
+  var encode = SIMD4<Float>.zero
+  /// Linear Rec.709 to the target primaries, by rows.
+  var toTarget0 = SIMD4<Float>(1, 0, 0, 0)
+  var toTarget1 = SIMD4<Float>(0, 1, 0, 0)
+  var toTarget2 = SIMD4<Float>(0, 0, 1, 0)
+  /// Luminance weights of the target primaries (the HLG inverse OOTF).
+  var targetWeights = SIMD4<Float>.zero
+}
+
+/// Mirrors `mk_ScopeGraticuleParams`; bound only while the graticule is rasterized.
+struct ScopeGraticuleParameters {
+  static let maximumShapes = 64
+  /// The plot in viewport pixels: x, y, width, height.
+  var plot = SIMD4<Float>.zero
+  /// xy: viewport size in pixels, z: shape count.
+  var size = SIMD4<Float>.zero
   var shapes = InlineArray<64, ScopeShape>(repeating: ScopeShape())
 }
 
@@ -42,8 +87,13 @@ struct ScopeDrawParameters {
 struct ScopeResolveParameters: Equatable {
   var shape = SIMD4<UInt32>.zero
   var bins = SIMD4<UInt32>.zero
+  /// xy: trace texels written, zw: source texels per axis.
   var size = SIMD4<UInt32>.zero
   var intensity = SIMD4<Float>.zero
+  /// xy: plot pixels a minified axis is reduced to (0: one texel per source
+  /// texel), z: parade panels across x (1 or 3), w: 1 when footprints start half
+  /// a source texel in (vectorscope).
+  var reduce = SIMD4<UInt32>.zero
 }
 
 /// Words of one statistics slot. Mirrors the `MK_ST_*` constants.

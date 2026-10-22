@@ -299,7 +299,10 @@ final class FalseColorTests: XCTestCase {
         let linear = transfer.exposureLinear(v)
         let stops = linear > 0 ? log2(linear / 0.18) : -.infinity
         if Self.stopBands.contains(where: { abs($0.lower - stops) < 2e-3 }) { continue }
-        expect(out.rgb(i, 0), classified: FalseColorBands.color(stops, bands: Self.stopBands), gap: v, "\(transfer) \(i)")
+        // On an HDR signal's native layer the band colours are encoded into its
+        // transfer (graphics white at 203 cd/m²); the grey fallback is the picture's own value.
+        let band = FalseColorBands.color(stops, bands: Self.stopBands).map(pass.colorPipeline.overlayColor)
+        expect(out.rgb(i, 0), classified: band, gap: v, "\(transfer) \(i)")
       }
     }
     // The grey cards: 18% linear, BT.709 0.409, PQ at 26 cd/m², HLG at 38%.

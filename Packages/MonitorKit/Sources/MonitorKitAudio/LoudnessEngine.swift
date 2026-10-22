@@ -136,12 +136,34 @@ struct LoudnessHistogram {
 /// with weight 0 are not filtered at all. The K-weighting runs through vDSP
 /// (both sections in one `vDSP_biquadD` call per channel and tick segment),
 /// in Double, so it costs the same in debug and release builds of a host.
+///
+/// EBU Tech 3341 section 2.2 asks for start, pause and continue of the
+/// integrated loudness and LRA measurement. Momentary and short-term (and
+/// their maxima) follow all the audio; the gating blocks and LRA's
+/// short-term values are cut from a second ring that only receives ticks
+/// measured while running, so a paused stretch leaves the measurement exactly
+/// as if that audio had never been there. Pause and continue take effect at
+/// the next tick boundary (5 or 10 ms), so every tick, and `duration`, is
+/// either wholly measured or wholly left out. A measurement reset starts the
+/// gating and the maxima over the same way, while momentary and short-term
+/// slide on over the continuous audio.
 final class LoudnessEngine {
   struct State {
     var tickPosition = 0
     var ringHead = 0
     var ticks = 0
+    /// Whole ticks since the last measurement reset (-1 while the tick the
+    /// reset fell in is open). The maxima take only windows of these.
+    var resetTicks = 0
+    /// The gating ring's head and the ticks it has received since reset.
+    var gateHead = 0
+    var gateTicks = 0
+    /// Frames measured (not paused) since reset.
     var frames = 0
+    /// False while the measurement is paused.
+    var measuring = true
+    /// What `setMeasuring` asked for; becomes `measuring` when a tick starts.
+    var requestedMeasuring = true
     var readings = LoudnessSnapshot()
   }
 
@@ -162,7 +184,9 @@ final class LoudnessEngine {
   private let energies: UnsafeMutablePointer<Double>
   private let wide: UnsafeMutablePointer<Double>
   private let weighted: UnsafeMutablePointer<Double>
+  /// Tick energies: all audio (momentary, short-term) and measured audio only (gating, LRA).
   private let ring: UnsafeMutablePointer<Double>
+  private let gateRing: UnsafeMutablePointer<Double>
   private let blocks = LoudnessHistogram(storesEnergy: true)
   private let shortTerms = LoudnessHistogram(storesEnergy: false)
   let state: UnsafeMutablePointer<State>
@@ -198,6 +222,8 @@ final class LoudnessEngine {
     weighted.initialize(repeating: 0, count: stage.capacity)
     ring = .allocate(capacity: shortTermTicks)
     ring.initialize(repeating: 0, count: shortTermTicks)
+    gateRing = .allocate(capacity: shortTermTicks)
+    gateRing.initialize(repeating: 0, count: shortTermTicks)
     state = .allocate(capacity: 1)
     state.initialize(to: State())
   }
@@ -211,6 +237,7 @@ final class LoudnessEngine {
     wide.deallocate()
     weighted.deallocate()
     ring.deallocate()
+    gateRing.deallocate()
     blocks.deallocate()
     shortTerms.deallocate()
     state.deallocate()
@@ -220,11 +247,12 @@ final class LoudnessEngine {
   func process(frames: Int) {
     var i = 0
     while i < frames {
+      if state.pointee.tickPosition == 0 { state.pointee.measuring = state.pointee.requestedMeasuring }
       let n = min(frames - i, tickFrames - state.pointee.tickPosition)
       filter(offset: i, count: n)
       i += n
       state.pointee.tickPosition += n
-      state.pointee.frames += n
+      if state.pointee.measuring { state.pointee.frames += n }
       if state.pointee.tickPosition == tickFrames {
         state.pointee.tickPosition = 0
         finishTick()
@@ -246,9 +274,8 @@ final class LoudnessEngine {
     }
   }
 
-  /// Sum of the newest `count` ring entries.
-  private func windowSum(_ count: Int) -> Double {
-    let head = state.pointee.ringHead
+  /// Sum of the newest `count` entries of a ring whose next write goes to `head`.
+  private func windowSum(_ ring: UnsafeMutablePointer<Double>, head: Int, _ count: Int) -> Double {
     var sum = 0.0
     var part = 0.0
     if count <= head {
@@ -272,50 +299,85 @@ final class LoudnessEngine {
     ring[st.pointee.ringHead] = energy
     st.pointee.ringHead = st.pointee.ringHead + 1 == shortTermTicks ? 0 : st.pointee.ringHead + 1
     st.pointee.ticks += 1
+    st.pointee.resetTicks += 1
     let ticks = st.pointee.ticks
-
-    var momentary = 0.0
+    let resetTicks = st.pointee.resetTicks
     if ticks >= momentaryTicks {
-      momentary = windowSum(momentaryTicks) / Double(momentaryTicks * tickFrames)
-      let l = loudnessLUFS(momentary)
+      let l = loudnessLUFS(windowSum(ring, head: st.pointee.ringHead, momentaryTicks) / Double(momentaryTicks * tickFrames))
       st.pointee.readings.momentary = l
-      st.pointee.readings.momentaryMax = max(st.pointee.readings.momentaryMax, l)
+      if resetTicks >= momentaryTicks { st.pointee.readings.momentaryMax = max(st.pointee.readings.momentaryMax, l) }
     }
-    var shortTerm = 0.0
     if ticks >= shortTermTicks {
-      shortTerm = windowSum(shortTermTicks) / Double(shortTermTicks * tickFrames)
-      let l = loudnessLUFS(shortTerm)
+      let l = loudnessLUFS(windowSum(ring, head: st.pointee.ringHead, shortTermTicks) / Double(shortTermTicks * tickFrames))
       st.pointee.readings.shortTerm = l
-      st.pointee.readings.shortTermMax = max(st.pointee.readings.shortTermMax, l)
+      if resetTicks >= shortTermTicks { st.pointee.readings.shortTermMax = max(st.pointee.readings.shortTermMax, l) }
     }
-    // Gating blocks: 400 ms, 75 % overlap (BS.1770-4 eq. 3-7); LRA input: 3 s at 10 Hz.
-    guard ticks % ticksPerBlock == 0 else { return }
-    var changed = false
-    if ticks >= momentaryTicks, momentary > 0 {
-      let l = -0.691 + 10 * log10(momentary)
-      if l > -70 {
-        blocks.add(loudness: l, energy: momentary)
-        changed = true
+
+    guard st.pointee.measuring else { return }
+    gateRing[st.pointee.gateHead] = energy
+    st.pointee.gateHead = st.pointee.gateHead + 1 == shortTermTicks ? 0 : st.pointee.gateHead + 1
+    st.pointee.gateTicks += 1
+    let gateTicks = st.pointee.gateTicks
+    // Gating blocks: 400 ms, 75 % overlap (BS.1770-4 eqs. 3-7); LRA input: 3 s at 10 Hz.
+    guard gateTicks % ticksPerBlock == 0 else { return }
+    let head = st.pointee.gateHead
+    if gateTicks >= momentaryTicks {
+      let momentary = windowSum(gateRing, head: head, momentaryTicks) / Double(momentaryTicks * tickFrames)
+      if momentary > 0 {
+        let l = -0.691 + 10 * log10(momentary)
+        if l > -70 {
+          blocks.add(loudness: l, energy: momentary)
+          st.pointee.readings.integrated = loudnessLUFS(blocks.gatedMeanEnergy())
+        }
       }
     }
-    if ticks >= shortTermTicks, shortTerm > 0 {
-      let l = -0.691 + 10 * log10(shortTerm)
-      if l >= -70 {
-        shortTerms.add(loudness: l, energy: shortTerm)
-        st.pointee.readings.loudnessRange = Float(shortTerms.loudnessRange())
+    if gateTicks >= shortTermTicks {
+      let shortTerm = windowSum(gateRing, head: head, shortTermTicks) / Double(shortTermTicks * tickFrames)
+      if shortTerm > 0 {
+        let l = -0.691 + 10 * log10(shortTerm)
+        if l >= -70 {
+          shortTerms.add(loudness: l, energy: shortTerm)
+          st.pointee.readings.loudnessRange = Float(shortTerms.loudnessRange())
+        }
       }
     }
-    if changed { st.pointee.readings.integrated = loudnessLUFS(blocks.gatedMeanEnergy()) }
   }
 
-  /// Starts a new measurement (integrated, LRA, maxima); the filters keep running.
+  /// Pauses (false) or continues (true) integrated loudness, LRA and
+  /// duration from the next tick boundary.
+  func setMeasuring(_ measuring: Bool) { state.pointee.requestedMeasuring = measuring }
+
+  /// Starts a new measurement (integrated, LRA, maxima, duration) from the
+  /// next tick boundary; momentary, short-term and the filters run on. The
+  /// tick in progress holds audio from before the reset, so it is left out
+  /// of the new measurement like a paused one. A paused measurement stays paused.
   func resetMeasurement() {
+    gateRing.update(repeating: 0, count: shortTermTicks)
+    blocks.clear()
+    shortTerms.clear()
+    let st = state
+    st.pointee.gateHead = 0
+    st.pointee.gateTicks = 0
+    st.pointee.frames = 0
+    if st.pointee.tickPosition == 0 {
+      st.pointee.resetTicks = 0
+    } else {
+      st.pointee.resetTicks = -1
+      st.pointee.measuring = false
+    }
+    st.pointee.readings = st.pointee.readings.startingNewMeasurement
+  }
+
+  /// Clears every reading, the sliding windows included, and restarts the
+  /// tick grid here (a full meter reset); the filters keep running.
+  func resetReadings() {
     ring.update(repeating: 0, count: shortTermTicks)
+    gateRing.update(repeating: 0, count: shortTermTicks)
     blocks.clear()
     shortTerms.clear()
     energies.update(repeating: 0, count: max(activeCount, 1))
-    // The tick grid restarts at the reset, so windows align with the measurement start.
-    state.pointee = State()
+    let requested = state.pointee.requestedMeasuring
+    state.pointee = State(measuring: requested, requestedMeasuring: requested)
   }
 
   /// Clears the K-weighting's signal memory (only for a meter that starts over on a new source).

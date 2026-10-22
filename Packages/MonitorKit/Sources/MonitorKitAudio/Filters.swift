@@ -225,23 +225,24 @@ enum TruePeakFilter {
   /// Past input samples each output needs.
   static let history = tapsPerPhase - 1
 
-  /// BS.1770-4 Annex 2 oversamples to about 192 kHz: 4x at 44.1 and 48 kHz,
-  /// 2x at 88.2 and 96 kHz, none from 176.4 kHz (and 4x below 44.1 kHz). From
-  /// 44.1 kHz up every rate then sees nearly the same interpolation grid in
-  /// time (5.2 to 5.7 us), so the readings and the PPM ballistics do not
-  /// depend on the rate, and the cost stops growing with it.
+  /// BS.1770-4 Annex 2 labels a result dBTP when the oversampled rate is at
+  /// least 192 kHz: 4x below 96 kHz (192 kHz at 48 kHz, 352.8 kHz at
+  /// 88.2 kHz) and 2x from 96 kHz up. 2x stays on above 192 kHz because EBU
+  /// Tech 3341 cases 15-19 put their tones at fractions of the meter's own
+  /// rate (fs/4 at 45 degrees reads 3 dB low without interpolation). Below
+  /// 48 kHz, 4x falls short of 192 kHz (176.4 kHz at 44.1 kHz, 128 kHz at
+  /// 32 kHz) and Annex 2 defines no longer filter, so a peak between grid
+  /// points can read a little lower there; Tech 3341 cases 15-23 still pass
+  /// at 32 and 44.1 kHz (PeakTests).
   static func oversampling(sampleRate fs: Double) -> Int {
-    fs < 88_200 ? 4 : fs < 176_400 ? 2 : 1
+    fs < 96_000 ? 4 : 2
   }
 
   /// The phases a factor runs: all four at 4x; at 2x phases 0 and 2, which
   /// are half a sample apart, so the grid stays even.
   static func phaseIndices(oversampling: Int) -> [Int] {
-    switch oversampling {
-    case 4: return [0, 1, 2, 3]
-    case 2: return [0, 2]
-    default: return []
-    }
+    precondition(oversampling == 4 || oversampling == 2, "unsupported true-peak oversampling")
+    return oversampling == 4 ? [0, 1, 2, 3] : [0, 2]
   }
 }
 
@@ -250,7 +251,7 @@ enum TruePeakFilter {
 /// Allocates at init only.
 struct TruePeakInterpolator {
   let oversampling: Int
-  /// Phases computed; 0 when the rate needs no interpolation.
+  /// Phases computed: 4 or 2.
   let phaseCount: Int
   /// The phases' taps reversed, because vDSP_conv correlates.
   private let reversedTaps: UnsafeMutablePointer<Float>
@@ -260,8 +261,8 @@ struct TruePeakInterpolator {
     let indices = TruePeakFilter.phaseIndices(oversampling: oversampling)
     phaseCount = indices.count
     let taps = TruePeakFilter.tapsPerPhase
-    reversedTaps = .allocate(capacity: max(indices.count, 1) * taps)
-    reversedTaps.initialize(repeating: 0, count: max(indices.count, 1) * taps)
+    reversedTaps = .allocate(capacity: indices.count * taps)
+    reversedTaps.initialize(repeating: 0, count: indices.count * taps)
     for (k, phase) in indices.enumerated() {
       for (i, tap) in TruePeakFilter.phases[phase].reversed().enumerated() { reversedTaps[k * taps + i] = tap }
     }
@@ -281,25 +282,51 @@ struct TruePeakInterpolator {
     }
   }
 
-  /// `envelope[i]` = the largest magnitude of the phases at sample i, or of
-  /// `x` itself when nothing is interpolated.
+  /// `envelope[i]` = the largest magnitude of the phases at sample i.
   func envelope(
-    _ x: UnsafePointer<Float>, phases: UnsafePointer<UnsafeMutablePointer<Float>>, count: Int,
-    into envelope: UnsafeMutablePointer<Float>
+    phases: UnsafePointer<UnsafeMutablePointer<Float>>, count: Int, into envelope: UnsafeMutablePointer<Float>
   ) {
     let n = vDSP_Length(count)
-    switch phaseCount {
-    case 0:
-      vDSP_vabs(x, 1, envelope, 1, n)
-    case 1:
-      vDSP_vabs(phases[0], 1, envelope, 1, n)
-    default:
-      vDSP_vmaxmg(phases[0], 1, phases[1], 1, envelope, 1, n)
-      var k = 2
-      while k < phaseCount {
-        vDSP_vmaxmg(envelope, 1, phases[k], 1, envelope, 1, n)
-        k += 1
-      }
+    vDSP_vmaxmg(phases[0], 1, phases[1], 1, envelope, 1, n)
+    var k = 2
+    while k < phaseCount {
+      vDSP_vmaxmg(envelope, 1, phases[k], 1, envelope, 1, n)
+      k += 1
+    }
+  }
+}
+
+/// What the PPM charges from: L magnitudes per step, on a grid of about
+/// 192 kHz at every rate, as an analog rectifier sees the continuous
+/// waveform. Below 176.4 kHz the steps are the input samples and the values
+/// their true-peak phases; from 176.4 kHz the samples are dense enough
+/// themselves, and from 288 kHz `fold` consecutive samples make one step
+/// (their magnitudes are its L = fold values), so the work per second, the
+/// grid and with them the ballistics stop growing with the rate.
+enum PPMInput: Equatable {
+  /// The true-peak interpolator's phases (4 or 2), one step per sample.
+  case phases(Int)
+  /// The samples' own magnitudes, `fold` samples per step.
+  case samples(fold: Int)
+
+  static func forSampleRate(_ fs: Double) -> PPMInput {
+    if fs < 176_400 { return .phases(TruePeakFilter.oversampling(sampleRate: fs)) }
+    return .samples(fold: max(1, Int((fs / 192_000).rounded())))
+  }
+
+  /// Values per step.
+  var lanes: Int {
+    switch self {
+    case .phases(let l): return l
+    case .samples(let f): return f
+    }
+  }
+
+  /// Input samples per step.
+  var fold: Int {
+    switch self {
+    case .phases: return 1
+    case .samples(let f): return f
     }
   }
 }
@@ -311,12 +338,11 @@ struct PPMState {
   var top = 0.0
 }
 
-/// The PPM's per-sample recursion. Each input sample brings L envelope
-/// values (its interpolated points at L x oversampling, or the sample itself
-/// at L = 1); each path decays by r and charges with its L x-rate coefficient
-/// a toward every value above the decayed state:
+/// The PPM's per-step recursion. Each step brings L envelope values (see
+/// `PPMInput`); each path decays by r and charges with its value-rate
+/// coefficient a toward every value above the decayed state:
 ///   z' = r z + a sum_p max(|y_p| - r z, 0) = r (1 - L a) z + a sum_p max(|y_p|, r z),
-/// which keeps one dependent step per input sample.
+/// which keeps one dependent step per step.
 ///
 /// When no value exceeds r z this is z' = r z. Most samples of programme are
 /// like that, so `run` finds charge-free stretches with vDSP and only runs the
@@ -332,8 +358,8 @@ struct PPMCoefficients {
   /// Channels per `run`.
   static let width = 4
 
-  /// L: values per input sample.
-  let oversampling: Int
+  /// L: values per step.
+  let lanes: Int
   let release: Double
   let fastKeep: Double
   let fastCharge: Double
@@ -351,13 +377,15 @@ struct PPMCoefficients {
   /// Per channel: the envelope over the ramp, for the current segment.
   private let scaled: UnsafeMutablePointer<Float>
 
-  init(_ b: PPMBallistics, sampleRate fs: Double, oversampling: Int) {
-    self.oversampling = oversampling
-    let l = Double(oversampling)
-    let r = pow(10, -b.returnRate / (20 * fs))
+  init(_ b: PPMBallistics, sampleRate fs: Double, input: PPMInput) {
+    lanes = input.lanes
+    let l = Double(input.lanes)
+    // Steps per second, and values per second (the rate the charge coefficients act at).
+    let stepRate = fs / Double(input.fold)
+    let r = pow(10, -b.returnRate / (20 * stepRate))
     release = r
-    let fast = 1 - exp(-1 / (b.fastTimeConstant * l * fs))
-    let slow = 1 - exp(-1 / (b.slowTimeConstant * l * fs))
+    let fast = 1 - exp(-1 / (b.fastTimeConstant * l * stepRate))
+    let slow = 1 - exp(-1 / (b.slowTimeConstant * l * stepRate))
     fastKeep = r * (1 - l * fast)
     fastCharge = fast
     slowKeep = r * (1 - l * slow)
@@ -374,7 +402,7 @@ struct PPMCoefficients {
       (powers + k).initialize(to: pow(r, Double(k)))
     }
     for j in 0..<n { (ramp + j).initialize(to: Float(pow(r, -Double(j + 1)))) }
-    calibration = 1 / steadyReading(sampleRate: fs, oversampling: oversampling)
+    calibration = 1 / steadyReading(sampleRate: fs, input: input)
   }
 
   func deallocate() {
@@ -396,10 +424,11 @@ struct PPMCoefficients {
     s.top = release * reading(s)
   }
 
-  /// Runs samples `offset ..< offset + count` of `channels` (1 to 4)
+  /// Runs steps `offset ..< offset + count` of `channels` (1 to 4)
   /// channels. Channel c charges from the magnitudes in
-  /// `lanes[c * 4 ..< c * 4 + L]` (its interpolated phases; unused at 1x) and
-  /// `envelopes[c]`, their maximum per sample (at 1x the samples' magnitudes).
+  /// `lanes[c * 4 ..< c * 4 + L]` (unused at L = 1) and `envelopes[c]`, at
+  /// least their maximum per step (exactly the value at L = 1). An envelope
+  /// above the lanes' maximum only costs exact steps that charge nothing.
   func run(
     _ states: UnsafeMutablePointer<PPMState>, channels: Int, lanes: UnsafePointer<UnsafeMutablePointer<Float>>,
     envelopes: UnsafePointer<UnsafeMutablePointer<Float>>, offset: Int, count: Int
@@ -468,7 +497,7 @@ struct PPMCoefficients {
     let sc = slowCharge
     let fw = fastWeight
     let sw = 1 - fastWeight
-    let l = oversampling
+    let l = self.lanes
     var j = from
     while j < to {
       var c = 0
@@ -497,9 +526,22 @@ struct PPMCoefficients {
             let m1 = Double(lane[1][j])
             sumF = (m0 > rf ? m0 : rf) + (m1 > rf ? m1 : rf)
             sumW = (m0 > rw ? m0 : rw) + (m1 > rw ? m1 : rw)
-          } else {
+          } else if l == 1 {
             sumF = e > rf ? e : rf
             sumW = e > rw ? e : rw
+          } else {
+            let lane = lanes + 4 * c
+            var accF = 0.0
+            var accW = 0.0
+            var k = 0
+            while k < l {
+              let m = Double(lane[k][j])
+              accF += m > rf ? m : rf
+              accW += m > rw ? m : rw
+              k += 1
+            }
+            sumF = accF
+            sumW = accW
           }
           let nf = e > rf ? fk * f + fc * sumF : rf
           let nw = e > rw ? sk * w + sc * sumW : rw
@@ -520,45 +562,70 @@ struct PPMCoefficients {
   /// The reading of a steady full-scale sine through this rate's real signal
   /// path (the Annex 2 phases' passband sits 0.24 dB low on phases 1 and 2,
   /// and the charge droops between crests): 997 Hz, so the crests sweep the
-  /// whole interpolation grid, 0.4 s to settle, maximum of the last 20 ms.
-  /// Runs once at init.
-  private func steadyReading(sampleRate fs: Double, oversampling: Int) -> Double {
-    let interpolator = TruePeakInterpolator(oversampling: oversampling)
-    let n = Int(0.4 * fs)
-    let tail = Int(0.02 * fs)
+  /// whole grid, 0.4 s to settle, maximum of the last 20 ms. Runs once at init.
+  private func steadyReading(sampleRate fs: Double, input: PPMInput) -> Double {
+    let fold = input.fold
+    let steps = Int(0.4 * fs) / fold
+    let tail = Int(0.02 * fs) / fold
+    let n = steps * fold
     let history = TruePeakFilter.history
     let w = 2 * Double.pi * 997 / fs
     // The history holds the sine's own past, so the start does not ring.
     let x = UnsafeMutablePointer<Float>.allocate(capacity: history + n)
     for i in 0..<(history + n) { (x + i).initialize(to: Float(sin(w * Double(i - history)))) }
     let x0 = UnsafePointer(x + history)
-    let phaseCount = interpolator.phaseCount
-    let phases = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: max(phaseCount, 1))
-    // At 1x nothing is interpolated and the lanes read the envelope.
-    for k in 0..<max(phaseCount, 1) { (phases + k).initialize(to: .allocate(capacity: phaseCount > 0 ? n : 1)) }
-    let envelope = UnsafeMutablePointer<Float>.allocate(capacity: n)
+    let laneBuffers = (0..<lanes).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: steps) }
+    let envelope = UnsafeMutablePointer<Float>.allocate(capacity: steps)
     let state = UnsafeMutablePointer<PPMState>.allocate(capacity: 1)
     state.initialize(to: PPMState())
     defer {
-      for k in 0..<max(phaseCount, 1) { phases[k].deallocate() }
-      phases.deallocate()
+      laneBuffers.forEach { $0.deallocate() }
       envelope.deallocate()
       state.deallocate()
       x.deallocate()
-      interpolator.deallocate()
     }
-    interpolator.interpolate(x0, count: n, into: phases)
-    interpolator.envelope(x0, phases: phases, count: n, into: envelope)
-    forEachIndex(phaseCount) { vDSP_vabs(phases[$0], 1, phases[$0], 1, vDSP_Length(n)) }
-    let lanes = (0..<4).map { k in k < phaseCount ? phases[k] : envelope }
+    let length = vDSP_Length(steps)
+    switch input {
+    case .phases(let l):
+      let interpolator = TruePeakInterpolator(oversampling: l)
+      defer { interpolator.deallocate() }
+      laneBuffers.withUnsafeBufferPointer { interpolator.interpolate(x0, count: n, into: $0.baseAddress!) }
+      laneBuffers.withUnsafeBufferPointer { interpolator.envelope(phases: $0.baseAddress!, count: n, into: envelope) }
+      laneBuffers.forEach { vDSP_vabs($0, 1, $0, 1, length) }
+    case .samples(let f):
+      for k in 0..<f { vDSP_vabs(x0 + k, f, laneBuffers[k], 1, length) }
+      laneBuffers.withUnsafeBufferPointer {
+        foldedEnvelope($0.baseAddress!, laneCount: f, count: steps, into: envelope)
+      }
+    }
+    let lanePointers = (0..<4).map { k in k < lanes ? laneBuffers[k] : envelope }
     let envelopes = [envelope]
-    lanes.withUnsafeBufferPointer { lane in
+    lanePointers.withUnsafeBufferPointer { lane in
       envelopes.withUnsafeBufferPointer { env in
-        run(state, channels: 1, lanes: lane.baseAddress!, envelopes: env.baseAddress!, offset: 0, count: n - tail)
+        run(state, channels: 1, lanes: lane.baseAddress!, envelopes: env.baseAddress!, offset: 0, count: steps - tail)
         restart(&state.pointee)
-        run(state, channels: 1, lanes: lane.baseAddress!, envelopes: env.baseAddress!, offset: n - tail, count: tail)
+        run(state, channels: 1, lanes: lane.baseAddress!, envelopes: env.baseAddress!, offset: steps - tail, count: tail)
       }
     }
     return state.pointee.top
+  }
+}
+
+/// The maximum of `laneCount` magnitude buffers per step (a copy of the one
+/// buffer at a single lane).
+func foldedEnvelope(
+  _ lanes: UnsafePointer<UnsafeMutablePointer<Float>>, laneCount: Int, count: Int,
+  into envelope: UnsafeMutablePointer<Float>
+) {
+  let n = vDSP_Length(count)
+  if laneCount == 1 {
+    envelope.update(from: lanes[0], count: count)
+    return
+  }
+  vDSP_vmax(lanes[0], 1, lanes[1], 1, envelope, 1, n)
+  var k = 2
+  while k < laneCount {
+    vDSP_vmax(envelope, 1, lanes[k], 1, envelope, 1, n)
+    k += 1
   }
 }

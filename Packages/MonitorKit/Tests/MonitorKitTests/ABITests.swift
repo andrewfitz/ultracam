@@ -56,13 +56,24 @@ final class ABITests: XCTestCase {
       ("gamutWeights", o(\.gamutWeights)), ("focus", o(\.focus)), ("focusColor", o(\.focusColor)),
       ("guide", o(\.guide)), ("guideColor", o(\.guideColor)), ("display", o(\.display)), ("flags", o(\.flags)),
       ("luts", o(\.luts)), ("bandEdges", o(\.bandEdges)), ("bandColors", o(\.bandColors)),
+      ("color", o(\.color)), ("colorFlags", o(\.colorFlags)), ("colorLevels", o(\.colorLevels)),
+      ("hlgSource", o(\.hlgSource)), ("toneMap", o(\.toneMap)), ("assist", o(\.assist)),
+      ("pictureWeights", o(\.pictureWeights)), ("targetWeights", o(\.targetWeights)), ("toTarget", o(\.toTarget)),
+      ("transformMatrix", o(\.transformMatrix)), ("overlayWhite", o(\.overlayWhite)),
+      ("zebraColors", o(\.zebraColors)), ("navigatorColors", o(\.navigatorColors)), ("clipLevels", o(\.clipLevels)),
+      ("clipColors", o(\.clipColors)), ("whiteGain", o(\.whiteGain)), ("whiteSignalGain", o(\.whiteSignalGain)),
     ])
     let members = try XCTUnwrap(try fragmentBuffers()[3]?.bufferStructType?.members)
-    for name in ["bandEdges", "bandColors"] {
-      let array = try XCTUnwrap(members.first { $0.name == name }?.arrayType())
-      XCTAssertEqual(array.arrayLength, PassParameters.maximumBands)
-      XCTAssertEqual(array.stride, MemoryLayout<SIMD4<Float>>.stride)
+    let arrays = [
+      ("bandEdges", PassParameters.maximumBands), ("bandColors", PassParameters.maximumBands), ("toTarget", 3),
+      ("transformMatrix", 3), ("zebraColors", 2), ("navigatorColors", 2), ("clipColors", 16),
+    ]
+    for (name, length) in arrays {
+      let array = try XCTUnwrap(members.first { $0.name == name }?.arrayType(), name)
+      XCTAssertEqual(array.arrayLength, length, name)
+      XCTAssertEqual(array.stride, MemoryLayout<SIMD4<Float>>.stride, name)
     }
+    XCTAssertLessThanOrEqual(MemoryLayout<P>.stride, 4096, "setFragmentBytes takes at most 4 KB")
   }
 
   func testGuideParametersMatchMSL() throws {
@@ -70,10 +81,14 @@ final class ABITests: XCTestCase {
     try check(try fragmentBuffers()[4], G.self, [
       ("counts", MemoryLayout<G>.offset(of: \.counts)), ("reach", MemoryLayout<G>.offset(of: \.reach)),
       ("lines", MemoryLayout<G>.offset(of: \.lines)), ("others", MemoryLayout<G>.offset(of: \.others)),
+      ("cells", MemoryLayout<G>.offset(of: \.cells)),
     ])
     let members = try XCTUnwrap(try fragmentBuffers()[4]?.bufferStructType?.members)
     XCTAssertEqual(members.first { $0.name == "lines" }?.arrayType()?.arrayLength, GuideParameters.maximumLines)
     XCTAssertEqual(members.first { $0.name == "others" }?.arrayType()?.arrayLength, 2 * GuideParameters.maximumOthers)
+    let cells = try XCTUnwrap(members.first { $0.name == "cells" }?.arrayType())
+    XCTAssertEqual(cells.arrayLength, 64)
+    XCTAssertEqual(cells.stride, MemoryLayout<UInt32>.stride)
     XCTAssertLessThanOrEqual(MemoryLayout<G>.stride, 4096, "setFragmentBytes takes at most 4 KB")
   }
 

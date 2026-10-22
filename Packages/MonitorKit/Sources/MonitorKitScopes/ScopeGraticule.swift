@@ -11,6 +11,17 @@ public enum ScopeLevelAxis {
   /// 0 at the bottom of the axis, 1 at the top.
   public static func fraction(ofLevel level: Double) -> Double { (level - low) / (high - low) }
   public static func level(atFraction fraction: Double) -> Double { low + fraction * (high - low) }
+
+  /// Where a pixel at exactly `level` is drawn on an axis of `bins` uniform
+  /// bins: the centre of the bin it is counted in, with the kernels' Float
+  /// arithmetic (`mk_levelBin`). Graticule ticks sit there, so legal white
+  /// traces on the 100% line at any bin count instead of up to half a bin off.
+  public static func drawnFraction(ofLevel level: Double, bins: Int) -> Double {
+    let n = max(1, bins)
+    let scale = Float(Double(n) / (high - low))
+    let bin = min(max(((Float(level) - Float(low)) * scale).rounded(.down), 0), Float(n - 1))
+    return (Double(bin) + 0.5) / Double(n)
+  }
 }
 
 /// Vectorscope plane: Cb to the right, Cr up. At 1× the plot spans ±0.55, so
@@ -154,8 +165,11 @@ public struct VectorscopeTarget: Equatable, Sendable {
   public var rgb: ColorRGB
   public var cb: Double
   public var cr: Double
-  /// Degrees counter-clockwise from +Cb.
-  public var angle: Double { atan2(cr, cb) * 180 / .pi }
+  /// Degrees counter-clockwise from +Cb, 0 ≤ angle < 360 (Docs/MATH.md section 7).
+  public var angle: Double {
+    let degrees = atan2(cr, cb) * 180 / .pi
+    return degrees < 0 ? degrees + 360 : degrees
+  }
   public var magnitude: Double { (cb * cb + cr * cr).squareRoot() }
 
   /// The six bars (R, Mg, B, Cy, G, Yl) at `amplitude` (0.75 or 1) for `matrix`.
@@ -213,7 +227,9 @@ public struct ScopeLabel: Equatable, Sendable {
 }
 
 /// Graticule geometry for one scope in one viewport. Lines are drawn on the
-/// GPU; labels are returned as data for the UI to draw.
+/// GPU; labels are returned as data for the UI to draw. Level ticks sit where
+/// a pixel at exactly their level is drawn (`ScopeLevelAxis.drawnFraction`),
+/// within half a bin of `ScopeLevelAxis.fraction`.
 public struct ScopeGraticule: Equatable, Sendable {
   public enum Element: Equatable, Sendable {
     /// Normalized viewport coordinates.
@@ -243,7 +259,7 @@ public struct ScopeGraticule: Equatable, Sendable {
       if ycbcr { panels.append((d.waveformScale.chromaTicks(range: context.range), 1.0 / 3, 1)) }
       for panel in panels {
         for tick in panel.ticks {
-          let y = 1 - ScopeLevelAxis.fraction(ofLevel: tick.level)
+          let y = 1 - ScopeLevelAxis.drawnFraction(ofLevel: tick.level, bins: s.waveformLevels)
           elements.append(.line(from: SIMD2(panel.from, y), to: SIMD2(panel.to, y), major: tick.isMajor))
           labels.append(
             ScopeLabel(
@@ -267,7 +283,7 @@ public struct ScopeGraticule: Equatable, Sendable {
     case .histogram:
       let ticks = d.waveformScale.ticks(range: context.range)
       for tick in ticks {
-        let x = ScopeLevelAxis.fraction(ofLevel: tick.level)
+        let x = ScopeLevelAxis.drawnFraction(ofLevel: tick.level, bins: s.histogramBins)
         elements.append(.line(from: SIMD2(x, 0), to: SIMD2(x, 1), major: tick.isMajor))
         labels.append(
           ScopeLabel(

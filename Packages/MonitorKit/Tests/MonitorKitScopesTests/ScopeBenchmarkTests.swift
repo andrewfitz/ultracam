@@ -10,6 +10,8 @@ import XCTest
 /// per-command-buffer scheduling cost is amortized; the median of the samples
 /// is reported.
 final class ScopeBenchmarkTests: XCTestCase {
+  override func setUpWithError() throws { try skipTimingUnderValidation() }
+
   static func gpuMilliseconds(
     batch: Int = 10, samples: Int = 9, minimum: Bool = false, _ encode: (MTLCommandBuffer) throws -> Void) throws
     -> Double
@@ -184,5 +186,102 @@ final class ScopeBenchmarkTests: XCTestCase {
         print(line)
       }
     }
+  }
+
+  /// Small (picture-in-picture) viewports against large bin counts: the
+  /// minified axes are reduced once per accumulation, so a draw costs one
+  /// sample per pixel however many bins it shows.
+  func testBenchmarkPiPRender() throws {
+    let (device, _, _) = try GPU.require()
+    let frame = try Self.frame(.v210, .natural, width: 1920, height: 1080)
+    var vector1024 = ScopeSettings(kind: .vectorscope, stage: .source)
+    vector1024.vectorscopeSize = 1024
+    var vector2048 = vector1024
+    vector2048.vectorscopeSize = 2048
+    var overlay = ScopeSettings(kind: .waveform, stage: .source)
+    overlay.waveformMode = .rgbOverlay
+    overlay.waveformColumns = 4096
+    overlay.waveformLevels = 2048
+    let scopes = [("vectorscope 512", Self.scopes[4].1), ("vectorscope 1024", vector1024), ("vectorscope 2048", vector2048),
+                  ("waveform 1024×512", Self.scopes[0].1), ("waveform 4096×2048 RGB overlay", overlay)]
+    for (width, height) in [(3840, 2160), (480, 270), (240, 135)] {
+      let d = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+      d.usage = [.renderTarget, .shaderRead]
+      d.storageMode = .private
+      let target = try XCTUnwrap(device.makeTexture(descriptor: d))
+      let engine = Self.engines[1].1
+      var line = "PiP render \(width)×\(height), GPU ms per redraw of unchanged bins (min of 15 × 10):"
+      for (name, settings) in scopes {
+        let accumulator = try engine.makeAccumulator(settings: settings)
+        try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+        let renderer = engine.makeRenderer()
+        try GPU.run { cb in try renderer.render(accumulator, target: target, into: cb) }
+        let ms = try Self.gpuMilliseconds(samples: 15, minimum: true) { cb in
+          try renderer.render(accumulator, target: target, into: cb)
+        }
+        line += String(format: " %@ %.4f;", name, ms)
+      }
+      let empty = try engine.makeAccumulator(settings: Self.scopes[0].1)
+      let renderer = engine.makeRenderer()
+      let floor = try Self.gpuMilliseconds(samples: 15, minimum: true) { cb in try renderer.render(empty, target: target, into: cb) }
+      line += String(format: " no data (floor) %.4f;", floor)
+      print(line)
+    }
+  }
+
+  /// A viewport resized on every frame (live window or PiP resize): each draw
+  /// re-rasterizes the graticule.
+  func testBenchmarkLiveResize() throws {
+    let (device, _, _) = try GPU.require()
+    let frame = try Self.frame(.v210, .natural, width: 1920, height: 1080)
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 3840, height: 2160, mipmapped: false)
+    d.usage = [.renderTarget, .shaderRead]
+    d.storageMode = .private
+    let target = try XCTUnwrap(device.makeTexture(descriptor: d))
+    let engine = Self.engines[1].1
+    var line = "live resize near 4K, GPU ms per draw (min of 15 × 10): "
+    for (name, settings) in [("YCbCr parade", Self.scopes[2].1), ("vectorscope", Self.scopes[4].1)] {
+      let accumulator = try engine.makeAccumulator(settings: settings)
+      try GPU.run { cb in try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+      let renderer = engine.makeRenderer()
+      let steady = try Self.gpuMilliseconds(samples: 15, minimum: true) { cb in
+        try renderer.render(accumulator, target: target, into: cb)
+      }
+      var step = 0
+      let resizing = try Self.gpuMilliseconds(samples: 15, minimum: true) { cb in
+        step += 1
+        try renderer.render(
+          accumulator, target: target, viewport: MonitorViewport(width: 3840 - step % 97, height: 2160 - step % 89),
+          into: cb)
+      }
+      line += String(format: "%@ steady %.3f, resizing %.3f; ", name, steady, resizing)
+    }
+    print(line)
+  }
+
+  /// The fixed cost of a fused group accumulation (one clear, one fused pass,
+  /// one finalize) against one scope alone, on a frame small enough that the
+  /// dispatch overhead dominates.
+  func testBenchmarkGroupFixedCost() throws {
+    _ = try GPU.require()
+    let frame = try Self.frame(.v210, .natural, width: 64, height: 64)
+    let engine = Self.engines[1].1
+    let settings = [ScopeSettings(kind: .waveform), ScopeSettings(kind: .histogram), ScopeSettings(kind: .vectorscope)]
+    let single = try engine.makeAccumulator(settings: settings[0])
+    let group = try engine.makeGroup(try settings.map { try engine.makeAccumulator(settings: $0) })
+    try group.prepare(layouts: [frame.frame.layout])
+    var alone = Double.infinity, fused = Double.infinity
+    // Interleaved, minimum of several rounds: the GPU is shared.
+    for _ in 0..<5 {
+      alone = min(alone, try Self.gpuMilliseconds(samples: 9, minimum: true) { cb in
+        try single.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb)
+      })
+      fused = min(fused, try Self.gpuMilliseconds(samples: 9, minimum: true) { cb in
+        try group.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb)
+      })
+    }
+    XCTAssertEqual(group.fusedMemberCount, 3)
+    print(String(format: "64×64 v210: one scope %.1f µs, fused group of three %.1f µs per accumulation", alone * 1000, fused * 1000))
   }
 }
