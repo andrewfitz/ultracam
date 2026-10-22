@@ -80,7 +80,6 @@ private final class PreviewTestCounters: @unchecked Sendable {
       (3840, 2160, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, true),
       (3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, true),
       (3840, 2160, kCVPixelFormatType_422YpCbCr10, true),
-      (3840, 2160, kCVPixelFormatType_422YpCbCr10, false),
     ] {
       let image = try source(width: width, height: height, format: format, shareable: shareable)
       for duration in [VideoContract.fastDuration, VideoContract.slowDuration] {
@@ -89,16 +88,6 @@ private final class PreviewTestCounters: @unchecked Sendable {
         defer { renderer.flush(); window.close() }
         let count = duration == VideoContract.fastDuration ? 30 : 15
         let original = try VideoContract.sample(image, at: CMClockGetTime(CMClockGetHostTimeClock()), duration: duration)
-        if !shareable {
-          let prepared = expectation(description: "bounded raw transport preparation")
-          let prepareStarted = ProcessInfo.processInfo.systemUptime
-          renderer.prepareForInput(width: width, height: height, pixelFormat: format) { result in
-            if case .failure(let error) = result { XCTFail("Prepare raw preview: \(error)") }
-            prepared.fulfill()
-          }
-          wait(for: [prepared], timeout: 2)
-          print("PREVIEW PREPARE \(VideoContract.fourCC(format)) elapsedMS=\((ProcessInfo.processInfo.systemUptime - prepareStarted) * 1000)")
-        }
         let framesSent = expectation(description: "paced preview frames")
         let timerQueue = DispatchQueue(label: "preview-test.source", qos: .userInteractive)
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: timerQueue)
@@ -156,9 +145,6 @@ private final class PreviewTestCounters: @unchecked Sendable {
         wait(for: [metricsLoaded], timeout: 2)
         metricsResult.lock.withLock {
           let gaps = zip(sent.emissionTimes.dropFirst(), sent.emissionTimes).map { ($0 - $1) * 1000 }
-          if let raw = diagnostics.firstRawCopy {
-            print("PREVIEW RAW firstStageWallMS=\(diagnostics.firstStagingMS) firstStageCPUMS=\(diagnostics.firstStagingCPUMS) maxStageCPUMS=\(diagnostics.maxStagingCPUMS) copyMode=\(raw.mode) copyWallMS=\(raw.wallMS) copyCPUMS=\(raw.cpuMS) copyGPUMS=\(raw.gpuMS) rawInitWallMS=\(raw.initializationWallMS) rawInitCPUMS=\(raw.initializationCPUMS)")
-          }
           print("PREVIEW \(width)x\(height) \(VideoContract.fourCC(format)) IOSurface=\(shareable) fps=\(1 / duration.seconds) received=\(diagnostics.received) enqueued=\(diagnostics.enqueued) replaced=\(diagnostics.replaced) waits=\(diagnostics.backPressure) rendererFrames=\(metricsResult.frames) dropped=\(metricsResult.dropped) corrupted=\(metricsResult.corrupt) sourceGapMinMS=\(gaps.min() ?? 0) sourceGapMaxMS=\(gaps.max() ?? 0) firstStageMS=\(diagnostics.firstStagingMS) maxStageMS=\(diagnostics.maxStagingMS) avgStageMS=\(diagnostics.stagingTotalMS / Double(max(1, diagnostics.stagingFrames))) queueWaitMaxMS=\(diagnostics.maxQueueWaitMS) readinessWaitMaxMS=\(diagnostics.maxReadinessWaitMS)")
           XCTAssertGreaterThanOrEqual(metricsResult.frames - metricsResult.dropped, count - 3, "Actual renderer must consume frames at video cadence")
           XCTAssertEqual(metricsResult.corrupt, 0)

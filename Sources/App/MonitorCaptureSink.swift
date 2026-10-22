@@ -33,7 +33,10 @@ final class MonitorCaptureSink: @unchecked Sendable {
   private var signalIdentity: SignalIdentity?
   private var lastSequence: UInt64 = 0
   private var lastOfferTime = -Double.infinity
-  private var preferredHz = 60.0
+  private var lastSourcePTS: CMTime?
+  private var sourceFrameHz = 0.0
+  /// Nil accepts every camera frame. A number is only for scope analysis.
+  private var preferredHz: Double?
   private var configurationNeedsUpdate = false
 
   init(target: MonitorTargetID, runtime: MonitorRuntime) {
@@ -42,9 +45,17 @@ final class MonitorCaptureSink: @unchecked Sendable {
     criticalPipelineProducer = runtime.makeCriticalPipelineProducer(target: target)
   }
 
+  /// The camera frame rate measured from picture timestamps. Zero until two
+  /// frames have arrived.
+  var observedSourceFrameHz: Double {
+    lock.lock()
+    defer { lock.unlock() }
+    return sourceFrameHz
+  }
+
   func configure(
     _ value: MonitorConfiguration, consumers: [MonitorSurfacePresenter],
-    scopeVisible: Bool, preferredHz: Double = 60
+    scopeVisible: Bool, preferredHz: Double? = nil
   ) {
     lock.lock()
     let activeChanged = self.consumers.isEmpty != consumers.isEmpty
@@ -60,7 +71,11 @@ final class MonitorCaptureSink: @unchecked Sendable {
     }
     configuration = effective
     self.consumers = consumers
-    self.preferredHz = max(1, preferredHz)
+    if let preferredHz, preferredHz.isFinite, preferredHz > 0 {
+      self.preferredHz = preferredHz
+    } else {
+      self.preferredHz = nil
+    }
     if consumers.isEmpty {
       runtime.remove(target: target)
     } else {
@@ -196,7 +211,8 @@ final class MonitorCaptureSink: @unchecked Sendable {
       lock.unlock()
       return
     }
-    guard now - lastOfferTime >= 1 / preferredHz - 0.001 else {
+    noteSourceFrameRate(pts)
+    if let preferredHz, now - lastOfferTime < 1 / preferredHz - 0.001 {
       lock.unlock()
       return
     }
@@ -230,6 +246,17 @@ final class MonitorCaptureSink: @unchecked Sendable {
           })
       }
     }
+  }
+
+  /// Records the camera interval. The picture path calls this for every frame,
+  /// including frames a scope cap later declines to analyze.
+  private func noteSourceFrameRate(_ pts: CMTime) {
+    guard pts.isNumeric, pts.epoch == 0 else { return }
+    if let lastSourcePTS, lastSourcePTS.isNumeric {
+      let delta = CMTimeSubtract(pts, lastSourcePTS).seconds
+      if delta > 0, delta.isFinite { sourceFrameHz = 1 / delta }
+    }
+    lastSourcePTS = pts
   }
 
   private func publish(_ result: MonitorDisplayResult) {

@@ -16,6 +16,15 @@ if ! mount | /usr/bin/grep -F ' on /Volumes/8TB ' >/dev/null; then
 fi
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 build_root="$external_root/agent-work/build/ultracam/ui-verify"
+# Skip when nothing the verifier compiles has changed since its last passing run.
+# FORCE=1 runs it anyway.
+inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify Packages/MonitorTools/Sources ThirdParty scripts/ui-verify.sh \
+  -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' \) \
+  -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-strict${STRICT:-1}"
+if [[ "${FORCE:-0}" != 1 && -f "$build_root/last-pass" && "$(cat "$build_root/last-pass")" == "$inputs_hash" ]]; then
+  echo "UI verify: unchanged since the last passing run ($build_root/latest). FORCE=1 to rerun."
+  exit 0
+fi
 test_root="$build_root/$run_id"
 mkdir -p "$test_root/modules" "$test_root/tmp"
 export TMPDIR="$test_root/tmp"
@@ -27,7 +36,7 @@ monitor_package_build > "$test_root/package-build.log" 2>&1 || {
   exit 1
 }
 bash "$task_root/scripts/fetch-decklink-sdk.sh"
-sdk_dir="${DECKLINK_SDK_DIR:-$external_root/cache/ultracam/decklink-sdk}"
+sdk_dir="${DECKLINK_SDK_DIR:-$task_root/ThirdParty/DeckLinkSDK/include}"
 rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"
@@ -44,7 +53,8 @@ app_sources=()
 while IFS= read -r source_file; do
   if [[ "$source_file" != */UltracamApp.swift ]]; then app_sources+=("$source_file"); fi
 done < <(find "$task_root/Sources/App" -maxdepth 1 -name '*.swift' | sort)
-xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D UI_VERIFY \
+# Unoptimized: the checks don't need optimized code, and -O doubles the compile.
+xcrun swiftc -Onone -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D UI_VERIFY \
   -target arm64-apple-macos15.0 \
   -module-cache-path "$test_root/modules" "${monitor_link_args[@]}" \
   -Xcc -DULTRACAM_BACKEND_TESTING \
@@ -64,4 +74,5 @@ status=0
 "$test_root/ui-verify" "$test_root" > "$test_root/ui-verify.log" 2>&1 || status=$?
 grep -E '^(FAIL|PENDING)' "$test_root/ui-verify.log" | head -80 || true
 tail -4 "$test_root/ui-verify.log"
+if [[ "$status" == 0 ]]; then printf '%s\n' "$inputs_hash" > "$build_root/last-pass"; fi
 exit "$status"

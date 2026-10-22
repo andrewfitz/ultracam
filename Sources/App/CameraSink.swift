@@ -57,207 +57,17 @@ final class CameraBufferQueue {
 // DeckLink's borrowed v210 capture buffers are not necessarily IOSurfaces.
 // CMIO's interprocess transport requires shareable storage, so stage raw bytes
 // without changing format, quantizing pixels or losing sample metadata.
+/// Frames reach the camera, the preview and Program as the capture card's own
+/// IOSurface (DeckLink SDK 16), or as the processor's IOSurface output. Nothing
+/// is copied here: a frame without an IOSurface is an error, not a reason to copy.
 final class CameraFrameStager {
-  private var pool: CVPixelBufferPool?
-  private var dimensions: (Int, Int, OSType)?
-  private var prepared = false
-  private lazy var gpuCopy = GPURawFrameCopy()
-  private var cachedFormat: (source: CMVideoFormatDescription, stride: Int, staged: CMVideoFormatDescription)?
-#if CAPTURE_LIFECYCLE_TESTS
-  private(set) var lastRawCopyTiming: GPURawFrameCopy.Timing?
-#endif
-
-  // Call on the same serial owner as stage, before capture begins or before
-  // delivering the first retained frame of a new layout. Holding three images
-  // together forces actual bounded pool allocation rather than recycling one
-  // image three times. Mapping initializes the layout without changing pixels.
-  func prepare(width: Int, height: Int, pixelFormat: OSType) throws {
-    let pool = try configurePool(width: width, height: height, type: pixelFormat)
-    guard !prepared else { return }
-    if pixelFormat == kCVPixelFormatType_422YpCbCr10 { _ = gpuCopy }
-    var warmImages: [CVPixelBuffer] = []
-    warmImages.reserveCapacity(VideoContract.warmBufferCount)
-    for _ in 0..<VideoContract.warmBufferCount {
-      var image: CVPixelBuffer?
-      let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool,
-        [kCVPixelBufferPoolAllocationThresholdKey: VideoContract.outputBufferLimit] as CFDictionary, &image)
-      // Existing active frames may already occupy a warmed pool. Preparing it
-      // must not turn ordinary transport backpressure into a fatal start error.
-      if status == kCVReturnWouldExceedAllocationThreshold { break }
-      guard status == kCVReturnSuccess, let image, CVPixelBufferGetIOSurface(image) != nil else {
-        throw VideoError.message("Cannot prepare shareable camera image (\(status)).")
-      }
-      let lockStatus = CVPixelBufferLockBaseAddress(image, [])
-      guard lockStatus == kCVReturnSuccess else {
-        throw VideoError.message("Cannot prepare shareable camera layout (\(lockStatus)).")
-      }
-      CVPixelBufferUnlockBaseAddress(image, [])
-      warmImages.append(image)
-    }
-    // If the pool was already under pressure, warming can legitimately stop
-    // before all reserved images are available. Do not mark the layout as
-    // prepared in that case; a later call after consumers release frames can
-    // finish the warm-up instead of silently running cold forever.
-    withExtendedLifetime(warmImages) {
-      prepared = warmImages.count == VideoContract.warmBufferCount
-    }
-  }
-
-  private func configurePool(width: Int, height: Int, type: OSType) throws -> CVPixelBufferPool {
-    if dimensions?.0 != width || dimensions?.1 != height || dimensions?.2 != type {
-      var next: CVPixelBufferPool?
-      let status = CVPixelBufferPoolCreate(kCFAllocatorDefault,
-        [kCVPixelBufferPoolMinimumBufferCountKey: VideoContract.warmBufferCount] as CFDictionary,
-        [kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height,
-          kCVPixelBufferPixelFormatTypeKey: type,
-          kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &next)
-      guard status == kCVReturnSuccess, let next else { throw VideoError.message("Cannot allocate shareable camera pool (\(status)).") }
-      pool = next
-      dimensions = (width, height, type)
-      prepared = false
-      // A new pool may use a different plane layout/stride. Never reuse a
-      // staged CMVideoFormatDescription from the previous geometry, even when
-      // Core Media happens to report equivalent source extensions.
-      cachedFormat = nil
-    }
-    guard let pool else { throw VideoError.message("Camera staging pool is unavailable.") }
-    return pool
-  }
-
-  func stage(_ sample: CMSampleBuffer) throws -> CMSampleBuffer? {
-#if CAPTURE_LIFECYCLE_TESTS
-    lastRawCopyTiming = nil
-#endif
+  func stage(_ sample: CMSampleBuffer) throws -> CMSampleBuffer {
     guard let input = CMSampleBufferGetImageBuffer(sample) else { throw VideoError.message("Camera sample has no image.") }
     try VideoBufferLayout.validate(input)
-    if CVPixelBufferGetIOSurface(input) != nil { return sample }
-    let width = CVPixelBufferGetWidth(input)
-    let height = CVPixelBufferGetHeight(input)
-    let type = CVPixelBufferGetPixelFormatType(input)
-    let pool = try configurePool(width: width, height: height, type: type)
-    var output: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool,
-      [kCVPixelBufferPoolAllocationThresholdKey: VideoContract.outputBufferLimit] as CFDictionary, &output)
-    if status == kCVReturnWouldExceedAllocationThreshold { return nil }
-    guard status == kCVReturnSuccess, let output, CVPixelBufferGetIOSurface(output) != nil else {
-      throw VideoError.message("Cannot allocate shareable camera image (\(status)).")
+    guard CVPixelBufferGetIOSurface(input) != nil else {
+      throw VideoError.message("The camera frame is not IOSurface-backed, so it can't be shared without a copy.")
     }
-    // The raw Metal copier supports packed v210 only. Avoid initializing its
-    // device/queue for planar formats that must take the validated row copy.
-    let copiedOnGPU: Bool
-    if type == kCVPixelFormatType_422YpCbCr10 {
-      copiedOnGPU = try gpuCopy?.copy(input, to: output) ?? false
-#if CAPTURE_LIFECYCLE_TESTS
-      lastRawCopyTiming = gpuCopy?.lastTiming
-#endif
-    } else { copiedOnGPU = false }
-    if !copiedOnGPU { try copyPixels(input, to: output, type: type, width: width) }
-    return try makeStagedSample(sample, input: input, output: output, type: type, width: width, height: height)
-  }
-
-  private func copyPixels(_ input: CVPixelBuffer, to output: CVPixelBuffer,
-    type: OSType, width: Int) throws {
-    let height = CVPixelBufferGetHeight(input)
-    guard CVPixelBufferLockBaseAddress(input, .readOnly) == kCVReturnSuccess else {
-      throw VideoError.message("Cannot read captured camera image.")
-    }
-    defer { CVPixelBufferUnlockBaseAddress(input, .readOnly) }
-    guard CVPixelBufferLockBaseAddress(output, []) == kCVReturnSuccess else {
-      throw VideoError.message("Cannot write shareable camera image.")
-    }
-    defer { CVPixelBufferUnlockBaseAddress(output, []) }
-    guard CVPixelBufferGetPlaneCount(input) == CVPixelBufferGetPlaneCount(output) else {
-      throw VideoError.message("Captured and shareable camera layouts do not match.")
-    }
-    if CVPixelBufferIsPlanar(input) {
-      for plane in 0..<CVPixelBufferGetPlaneCount(input) {
-        let rows = CVPixelBufferGetHeightOfPlane(input, plane)
-        guard rows == CVPixelBufferGetHeightOfPlane(output, plane),
-          let source = CVPixelBufferGetBaseAddressOfPlane(input, plane),
-          let destination = CVPixelBufferGetBaseAddressOfPlane(output, plane) else {
-          throw VideoError.message("Captured camera plane is unavailable.")
-        }
-        let bytesPerComponent = type == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 1 : 2
-        let rowBytes = width * bytesPerComponent
-        try copyRows(source: source, sourceStride: CVPixelBufferGetBytesPerRowOfPlane(input, plane),
-          destination: destination, destinationStride: CVPixelBufferGetBytesPerRowOfPlane(output, plane),
-          rowBytes: rowBytes, rows: rows)
-      }
-    } else {
-      guard type == kCVPixelFormatType_422YpCbCr10,
-        let source = CVPixelBufferGetBaseAddress(input), let destination = CVPixelBufferGetBaseAddress(output) else {
-        throw VideoError.message("Unsupported captured camera layout.")
-      }
-      // v210 stores six pixels in four 32-bit words. Row padding is not media.
-      let rowBytes = ((width + 5) / 6) * 16
-      try copyRows(source: source, sourceStride: CVPixelBufferGetBytesPerRow(input),
-        destination: destination, destinationStride: CVPixelBufferGetBytesPerRow(output),
-        rowBytes: rowBytes, rows: height)
-    }
-  }
-
-  private func makeStagedSample(_ sample: CMSampleBuffer, input: CVPixelBuffer,
-    output: CVPixelBuffer, type: OSType, width: Int, height: Int) throws -> CMSampleBuffer {
-    CVBufferRemoveAllAttachments(output)
-    for mode in [CVAttachmentMode.shouldPropagate, .shouldNotPropagate] {
-      if let attachments = CVBufferCopyAttachments(input, mode) { CVBufferSetAttachments(output, attachments, mode) }
-    }
-    var timing = CMSampleTimingInfo()
-    var result: CMSampleBuffer?
-    var resultStatus = CMSampleBufferGetSampleTimingInfo(sample, at: 0, timingInfoOut: &timing)
-    guard resultStatus == noErr, let format = CMSampleBufferGetFormatDescription(sample) else {
-      throw VideoError.message("Captured camera timing or format is unavailable.")
-    }
-    // Packed format descriptions include BytesPerRow. Preserve source format
-    // extensions while updating that layout field for the destination stride.
-    let stride = CVPixelBufferGetBytesPerRow(output)
-    let stagedFormat: CMVideoFormatDescription
-    if let cachedFormat, cachedFormat.stride == stride, CFEqual(cachedFormat.source, format) {
-      stagedFormat = cachedFormat.staged
-    } else {
-      var extensions = CMFormatDescriptionGetExtensions(format) as? [String: Any] ?? [:]
-      if !CVPixelBufferIsPlanar(output) { extensions[kCMFormatDescriptionExtension_BytesPerRow as String] = stride }
-      var next: CMVideoFormatDescription?
-      resultStatus = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: type,
-        width: Int32(width), height: Int32(height), extensions: extensions as CFDictionary,
-        formatDescriptionOut: &next)
-      guard resultStatus == noErr, let next else { throw VideoError.message("Cannot describe staged camera image (\(resultStatus)).") }
-      cachedFormat = (format, stride, next)
-      stagedFormat = next
-    }
-    resultStatus = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
-      imageBuffer: output, formatDescription: stagedFormat, sampleTiming: &timing, sampleBufferOut: &result)
-    guard resultStatus == noErr, let result else { throw VideoError.message("Cannot stage camera sample (\(resultStatus)).") }
-    for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
-      if let attachments = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault, target: sample, attachmentMode: mode) {
-        CMSetAttachments(result, attachments: attachments, attachmentMode: mode)
-      }
-    }
-    if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[AnyHashable: Any]],
-      let destinations = CMSampleBufferGetSampleAttachmentsArray(result, createIfNecessary: true) as? [NSMutableDictionary] {
-      for (destination, attachment) in zip(destinations, attachments) { destination.addEntries(from: attachment) }
-    }
-    return result
-  }
-
-  private func copyRows(source: UnsafeMutableRawPointer, sourceStride: Int,
-    destination: UnsafeMutableRawPointer, destinationStride: Int, rowBytes: Int, rows: Int) throws {
-    let (_, totalOverflow) = rowBytes.multipliedReportingOverflow(by: rows)
-    let (_, sourceOffsetOverflow) = sourceStride.multipliedReportingOverflow(by: rows)
-    let (_, destinationOffsetOverflow) = destinationStride.multipliedReportingOverflow(by: rows)
-    guard rowBytes > 0, sourceStride >= rowBytes, destinationStride >= rowBytes,
-      rows > 0, !totalOverflow, !sourceOffsetOverflow, !destinationOffsetOverflow else {
-      throw VideoError.message("Captured camera row stride is too short for its pixel format.")
-    }
-    if sourceStride == rowBytes && destinationStride == rowBytes {
-      memcpy(destination, source, rowBytes * rows)
-      return
-    }
-    for row in 0..<rows {
-      let destinationRow = destination.advanced(by: row * destinationStride)
-      memcpy(destinationRow, source.advanced(by: row * sourceStride), rowBytes)
-      if destinationStride > rowBytes { memset(destinationRow.advanced(by: rowBytes), 0, destinationStride - rowBytes) }
-    }
+    return sample
   }
 }
 
@@ -470,8 +280,7 @@ final class CameraSink {
         throw VideoError.message("Frame does not match the virtual camera's negotiated format and timing.")
       }
     }
-    guard let staged = try stager.stage(sample) else { return false }
-    return try queue.send(staged)
+    return try queue.send(try stager.stage(sample))
   }
 
   func disconnect() {

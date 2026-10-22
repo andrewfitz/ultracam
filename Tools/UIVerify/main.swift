@@ -19,6 +19,12 @@ import SwiftUI
     viewDependent: Bool = true) -> [HostedView] {
     var hosts: [HostedView] = []
     for dark in both ? [false, true] : [false] {
+      let renderStart = Date()
+      defer {
+        if ProcessInfo.processInfo.environment["UI_VERIFY_TIMING"] != nil {
+          print("TIME \(name)-\(dark ? "dark" : "light") \(Int(Date().timeIntervalSince(renderStart) * 1000)) ms")
+        }
+      }
       let hosted = HostedView(view, size: size, dark: dark, titled: titled)
       let file = "\(name)-\(dark ? "dark" : "light").png"
       if let rep = hosted.render() {
@@ -614,6 +620,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.interactions()
   do { try run.bridge() } catch { verifier.check("bridge tests threw", false, "\(error)") }
   run.menuBar()
+  Images.waitForWrites()
   print("""
 
   UI verify \(strict ? "(strict)" : "(tolerant)"): \(verifier.passed) passed, \(verifier.failed) failed, \(verifier.pending) pending, \

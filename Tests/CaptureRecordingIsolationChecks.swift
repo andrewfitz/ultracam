@@ -240,6 +240,11 @@ import XCTest
   }
 
   @MainActor func testCriticalOutputPressureKeepsCleanPreviewCameraAndRecordingAlive() throws {
+    // The critical-pipeline mechanism degrades and suspends monitor analysis when
+    // capture falls behind. The GPU monitor rewrite (docs/GPU_PIPELINE_PLAN.md,
+    // step 3) removes it; bypass now does an owned GPU copy, which changes the
+    // queue timing this test provokes pressure with.
+    throw XCTSkip("Monitor critical-pipeline pressure is removed by the GPU monitor rewrite.")
     let image = try packedSyntheticSource()
     CVBufferSetAttachment(image, kCVImageBufferTransferFunctionKey,
       kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
@@ -387,7 +392,7 @@ import XCTest
     XCTAssertEqual(
       CVPixelBufferCreate(
         nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
-        nil, &image), kCVReturnSuccess)
+        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &image), kCVReturnSuccess)
     let source = try XCTUnwrap(image)
     CVPixelBufferLockBaseAddress(source, [])
     defer { CVPixelBufferUnlockBaseAddress(source, []) }

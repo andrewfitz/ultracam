@@ -13,6 +13,10 @@
 #include "DeckLinkAPI.h"
 #include "DeckLinkAPIConfiguration.h"
 #include "DeckLinkAPIVersion.h"
+// Capture relies on SDK 16's IOSurface-backed input buffers (ThirdParty/DeckLinkSDK).
+#if BLACKMAGIC_DECKLINK_API_VERSION < 0x10000000
+#error "Ultracam requires DeckLink SDK 16.0 or later (ThirdParty/DeckLinkSDK)."
+#endif
 #define ULTRACAM_HAS_SDK 1
 #else
 #define ULTRACAM_HAS_SDK 0
@@ -417,32 +421,20 @@ class CaptureCallback final : public IDeckLinkInputCallback {
         reportFatal(@"UltraStudio supplied an invalid frame timestamp."); return S_OK;
       }
       CVPixelBufferRef buffer = nullptr;
-#if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0e030000
       ComRef<IDeckLinkMacVideoBuffer> macBuffer;
       if (frame->QueryInterface(IID_IDeckLinkMacVideoBuffer,
         reinterpret_cast<void **>(macBuffer.out())) != S_OK ||
         macBuffer->CreateCVPixelBufferRef(reinterpret_cast<void **>(&buffer)) != S_OK || !buffer) {
         reportFatal(@"Desktop Video could not expose its native 10-bit pixel buffer. Update the Desktop Video driver."); return S_OK;
       }
-      // SDK14.3+ carries a reference to the frame and allocation internally.
-#else
-      // SDK12 uses the versioned legacy frame interface. Retain the native
-      // frame until the CVPixelBuffer's final release; do not copy ~22 MB/frame.
-      void *bytes = nullptr;
-      if (frame->GetBytes(&bytes) != S_OK || !bytes || frame->GetRowBytes() < 10240) {
-        reportFatal(@"Desktop Video could not expose its native 10-bit frame bytes."); return S_OK;
-      }
-      frame->AddRef();
-      CVReturn result = CVPixelBufferCreateWithBytes(kCFAllocatorDefault, 3840, 2160,
-        kCVPixelFormatType_422YpCbCr10, bytes, frame->GetRowBytes(),
-        [](void *context, const void *) { static_cast<IDeckLinkVideoInputFrame *>(context)->Release(); },
-        frame, nullptr, &buffer);
-      if (result != kCVReturnSuccess || !buffer) {
-        frame->Release(); reportFatal(@"Cannot wrap the native UltraStudio 10-bit frame."); return S_OK;
-      }
-#endif
+      // The SDK's buffer is IOSurface-backed and holds the frame until its final release.
       // Keep the producer contract explicit even if future SDK wrappers use a
       // different CoreVideo format. The controller's untouched sink is v210.
+      // Every consumer reads this IOSurface directly; there is no copy path.
+      if (!CVPixelBufferGetIOSurface(buffer)) {
+        CVPixelBufferRelease(buffer);
+        reportFatal(@"Desktop Video supplied a frame without an IOSurface. Update Desktop Video to 16 or later."); return S_OK;
+      }
       if (CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_422YpCbCr10) {
         CVPixelBufferRelease(buffer);
         reportFatal(@"Desktop Video supplied a pixel format incompatible with the native v210 feed."); return S_OK;
@@ -811,7 +803,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 #endif
 }
 
-#if defined(ULTRACAM_BACKEND_TESTING) && ULTRACAM_HAS_SDK && BLACKMAGIC_DECKLINK_API_VERSION < 0x0e030000
+#if defined(ULTRACAM_BACKEND_TESTING) && ULTRACAM_HAS_SDK
 - (BOOL)runOwnershipChecks:(NSError **)error {
   // Keep the legacy callback/media coverage here; its included lifecycle fixture
   // requires StopStreams on failed starts and cannot exercise owned startup.
@@ -1167,20 +1159,20 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 
 #if defined(ULTRACAM_BACKEND_TESTING)
 BOOL UltracamRunOwnershipSyntheticChecks(NSError **error) {
-#if ULTRACAM_HAS_SDK && BLACKMAGIC_DECKLINK_API_VERSION < 0x0e030000
+#if ULTRACAM_HAS_SDK
   UltracamBackend *backend = [UltracamBackend new];
   return [backend runOwnershipChecks:error];
 #else
-  return fail(error, @"Ownership SDK mocks require the pinned SDK12 interfaces.");
+  return fail(error, @"Ownership checks need the DeckLink SDK.");
 #endif
 }
 
 BOOL UltracamRunAutoSyntheticChecks(NSError **error) {
-#if ULTRACAM_HAS_SDK && BLACKMAGIC_DECKLINK_API_VERSION < 0x0e030000
+#if ULTRACAM_HAS_SDK
   UltracamBackend *backend = [UltracamBackend new];
   return [backend runAutoChecks:error];
 #else
-  return fail(error, @"Auto SDK mocks require the pinned SDK12 interfaces.");
+  return fail(error, @"Automatic-format checks need the DeckLink SDK.");
 #endif
 }
 #endif

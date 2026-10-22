@@ -179,7 +179,7 @@ private struct UIDiagnosticsMonitorSection: View {
     Section("Monitoring") {
       UIDiagnosticsRow("Status", availability)
       UIDiagnosticsRow("Source rate", "\(rate(snapshot.offeredFPS)) fps")
-      UIDiagnosticsRow("Picture rate · cap", "\(rate(snapshot.pictureFPS)) fps · \(rate(snapshot.requestedPictureHz)) Hz")
+      UIDiagnosticsRow("Picture rate · camera", "\(rate(snapshot.pictureFPS)) fps · \(rate(snapshot.requestedPictureHz)) Hz")
       UIDiagnosticsRow("Scope rate · cap", "\(rate(snapshot.scopeFPS)) fps · \(quality.scopeRefreshHz) Hz")
       UIDiagnosticsRow("Quality", quality.label)
       UIDiagnosticsRow("Picture limit · scope stride", "\(quality.pictureHeightLimit)p · \(quality.scopeSamplingStride)")

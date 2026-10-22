@@ -2,7 +2,6 @@
 #include <vector>
 #include <string>
 
-#if BLACKMAGIC_DECKLINK_API_VERSION < 0x0e030000
 class FakeTimecode final : public IDeckLinkTimecode {
  public:
   std::atomic<ULONG> references{1};
@@ -48,6 +47,30 @@ class FakeRawAudioPacket final : public IDeckLinkAudioInputPacket {
   HRESULT GetPacketTime(BMDTimeValue *result, BMDTimeScale) override { if (!result) return E_INVALIDARG; *result = packetTime; return S_OK; }
 };
 
+class FakeFrame;
+
+@interface FakeFrameLifetime : NSObject
+- (instancetype)initWithRelease:(void (^)(void))release;
+@end
+@implementation FakeFrameLifetime { void (^_release)(void); }
+- (instancetype)initWithRelease:(void (^)(void))release { if ((self = [super init])) _release = [release copy]; return self; }
+- (void)dealloc { if (_release) _release(); }
+@end
+
+// SDK 16 frames expose their buffer through IDeckLinkMacVideoBuffer. Like the
+// driver's, the CVPixelBuffer it creates keeps the frame alive until its final release.
+class FakeMacVideoBuffer final : public IDeckLinkMacVideoBuffer {
+ public:
+  std::atomic<ULONG> references{1};
+  FakeFrame *frame;
+  explicit FakeMacVideoBuffer(FakeFrame *owner);
+  ~FakeMacVideoBuffer() override;
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
+  HRESULT CreateCVPixelBufferRef(void **result) override;
+};
+
 class FakeFrame final : public IDeckLinkVideoInputFrame {
  public:
   std::atomic<ULONG> references{1};
@@ -59,7 +82,12 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   long width = 3840;
   FakeFrame(bool *result) : destroyed(result) {}
   ~FakeFrame() override { *destroyed = true; }
-  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  HRESULT QueryInterface(REFIID iid, LPVOID *result) override {
+    *result = nullptr;
+    if (!sameIID(iid, IID_IDeckLinkMacVideoBuffer)) return E_NOINTERFACE;
+    *result = static_cast<IDeckLinkMacVideoBuffer *>(new FakeMacVideoBuffer(this));
+    return S_OK;
+  }
   ULONG AddRef() override { return ++references; }
   ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
   long GetWidth() override { return width; }
@@ -67,7 +95,6 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   long GetRowBytes() override { return 10240; }
   BMDPixelFormat GetPixelFormat() override { return bmdFormat10BitYUV; }
   BMDFrameFlags GetFlags() override { return noSignal ? bmdFrameHasNoInputSource : bmdFrameFlagDefault; }
-  HRESULT GetBytes(void **result) override { *result = bytes.data(); return badBytes ? E_FAIL : S_OK; }
   HRESULT GetTimecode(BMDTimecodeFormat, IDeckLinkTimecode **result) override {
     if (!result || !timecode) return E_NOTIMPL;
     timecode->AddRef(); *result = timecode; return S_OK;
@@ -78,6 +105,26 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   }
   HRESULT GetHardwareReferenceTimestamp(BMDTimeScale, BMDTimeValue *, BMDTimeValue *) override { return E_NOTIMPL; }
 };
+
+FakeMacVideoBuffer::FakeMacVideoBuffer(FakeFrame *owner) : frame(owner) { frame->AddRef(); }
+FakeMacVideoBuffer::~FakeMacVideoBuffer() { frame->Release(); }
+HRESULT FakeMacVideoBuffer::CreateCVPixelBufferRef(void **result) {
+  if (!result) return E_INVALIDARG;
+  *result = nullptr;
+  if (frame->badBytes) return E_FAIL;
+  // An IOSurface-backed buffer like the driver's. Its attachment holds the frame
+  // until the buffer's final release, as the SDK documents.
+  CVPixelBufferRef buffer = nullptr;
+  NSDictionary *attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+  if (CVPixelBufferCreate(kCFAllocatorDefault, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
+      (__bridge CFDictionaryRef)attributes, &buffer) != kCVReturnSuccess || !buffer) return E_FAIL;
+  frame->AddRef();
+  FakeFrame *owner = frame;
+  id holder = [[FakeFrameLifetime alloc] initWithRelease:^{ owner->Release(); }];
+  CVBufferSetAttachment(buffer, CFSTR("UltracamTestFrameLifetime"), (__bridge CFTypeRef)holder, kCVAttachmentMode_ShouldNotPropagate);
+  *result = buffer;
+  return S_OK;
+}
 
 class FakeMode final : public IDeckLinkDisplayMode {
  public:
@@ -130,7 +177,8 @@ class FakeInput final : public IDeckLinkInput {
   }
   HRESULT DisableVideoInput() override { calls.push_back("disable"); return S_OK; }
   HRESULT GetAvailableVideoFrameCount(uint32_t *) override { return E_NOTIMPL; }
-  HRESULT SetVideoInputFrameMemoryAllocator(IDeckLinkMemoryAllocator *) override { return E_NOTIMPL; }
+  HRESULT EnableVideoInputWithAllocatorProvider(BMDDisplayMode mode, BMDPixelFormat format, BMDVideoInputFlags flags,
+    IDeckLinkVideoBufferAllocatorProvider *) override { return EnableVideoInput(mode, format, flags); }
   HRESULT EnableAudioInput(BMDAudioSampleRate rate, BMDAudioSampleType type, uint32_t channels) override {
     enabledAudioRate = rate; enabledAudioType = type; enabledAudioChannels = channels; return audioResult;
   }
@@ -176,6 +224,14 @@ class FakeConfiguration final : public IDeckLinkConfiguration {
   HRESULT GetFloat(BMDDeckLinkConfigurationID, double *) override { return E_NOTIMPL; }
   HRESULT SetString(BMDDeckLinkConfigurationID, CFStringRef) override { return E_NOTIMPL; }
   HRESULT GetString(BMDDeckLinkConfigurationID, CFStringRef *) override { return E_NOTIMPL; }
+  HRESULT SetFlagWithParam(BMDDeckLinkConfigurationID, uint64_t, bool) override { return E_NOTIMPL; }
+  HRESULT GetFlagWithParam(BMDDeckLinkConfigurationID, uint64_t, bool *) override { return E_NOTIMPL; }
+  HRESULT SetIntWithParam(BMDDeckLinkConfigurationID, uint64_t, int64_t) override { return E_NOTIMPL; }
+  HRESULT GetIntWithParam(BMDDeckLinkConfigurationID, uint64_t, int64_t *) override { return E_NOTIMPL; }
+  HRESULT SetFloatWithParam(BMDDeckLinkConfigurationID, uint64_t, double) override { return E_NOTIMPL; }
+  HRESULT GetFloatWithParam(BMDDeckLinkConfigurationID, uint64_t, double *) override { return E_NOTIMPL; }
+  HRESULT SetStringWithParam(BMDDeckLinkConfigurationID, uint64_t, CFStringRef) override { return E_NOTIMPL; }
+  HRESULT GetStringWithParam(BMDDeckLinkConfigurationID, uint64_t, CFStringRef *) override { return E_NOTIMPL; }
   HRESULT WriteConfigurationToPreferences() override { ++persistentWrites; return S_OK; }
 };
 
@@ -369,11 +425,3 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
     return YES;
   }
 }
-#else
-BOOL UltracamRunSyntheticChecks(NSError **error) {
-  return fail(error, @"Synthetic SDK frame mocks currently require the pinned SDK12 interfaces.");
-}
-BOOL UltracamRunRawAudioSyntheticChecks(NSError **error) {
-  return fail(error, @"Synthetic SDK frame mocks currently require the pinned SDK12 interfaces.");
-}
-#endif

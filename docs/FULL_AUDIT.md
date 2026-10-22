@@ -37,7 +37,7 @@ Confirmed after a second read of the quoted lines. Duplicates of the same path a
 | P0 | 2 | 2 |
 | P1 | 18 | 18 |
 | P2 | 16 | 16 |
-| P3 | 18 | 16, with UIACT-3 and the four-up 30 Hz cap left |
+| P3 | 18 | 17, with UIACT-3 left |
 
 File-set weight of the confirmed P0/P1 rows: virtual camera 4, recording 5, capture/app model 6, program/switcher 3, monitor 3. DeckLink’s callback deadlock is not reachable from `CaptureController` and is not in this P0/P1 set.
 
@@ -139,7 +139,7 @@ Schema: ID | Severity | File set | File:line | Path | Consequence | Refutation |
 
 ### P3
 
-Addressed, except two leftovers. `selectNumber` and `cutNumber` stay on `UIAction`, and `UISessionBridge` handles them. No control in the app sends them, and `Tools/UIVerify` still looks for `cutNumber`, so they were not deleted and no new shortcut was added. A restored four-up layout still requests 30 Hz. `MonitorCoordinatorChecks` expects that rate, so the cap was left in place.
+Addressed, except `selectNumber` and `cutNumber`. Those commands stay on `UIAction`, and `UISessionBridge` handles them. No control in the app sends them, and `Tools/UIVerify` still looks for `cutNumber`, so they were not deleted and no new shortcut was added. The monitor picture follows the camera frame interval in every layout. Scope analysis still uses the scope refresh the user picked, and only when the picture itself is the native preview.
 
 The rows below are the original defects. The code no longer does these, except the unused number commands.
 
@@ -157,7 +157,7 @@ The rows below are the original defects. The code no longer does these, except t
 | APPS-8 | open panel title | Always says FX3 log-to-Rec.709. |
 | CAM-7 | device model | Literal “FX3 LUT camera”. |
 | MON-3, MON-4, MON-5 | diagnostics, occlusion, false-color caption | Deadline text, “No Signal” while occluded, “Processed Output” over a source matte. |
-| MONU-6, MONU-7, MONU-8 | diagnostics and toolbar | “Paused / hidden” is never produced. False Color Off is labeled Sony. `MonitorWorkspaceShell` has no app caller, but a restored `.fourUp` still caps 30 Hz. |
+| MONU-6, MONU-7, MONU-8 | diagnostics and toolbar | “Paused / hidden” is never produced. False Color Off is labeled Sony. `MonitorWorkspaceShell` has no app caller, and a restored `.fourUp` used to cap the picture at 30 Hz. |
 | UIACT-3 and the other dead senders | `selectNumber`, `cutNumber` | No control sends them. |
 | CAPI-2 | audio-drop telemetry | Double-counted. Not a lost take. |
 
@@ -191,7 +191,6 @@ Checked against the callback and the recording and camera handoffs.
 Residuals:
 
 - `selectNumber` and `cutNumber` are still unused by the app UI.
-- A four-up monitor layout still requests 30 Hz. `MonitorCoordinatorChecks` expects that.
 - The virtual-camera registry property stays writable. A writer that also has the app-group suite can still publish the next generation. Generation `UInt64.max` is rejected.
 - `UserDefaults(suiteName:)` returned non-nil for every string tried here, including an empty string, so the nil-container branch is in the code and not exercised by those strings.
 - Pending-cut frames from the on-air source are still skipped until the target qualifies or 2 seconds pass.

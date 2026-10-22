@@ -60,7 +60,7 @@ import MonitorToolsUI
 
   func diagnostics(for target: MonitorTargetID) -> MonitorDiagnostics {
     var snapshot = diagnosticSnapshots[target] ?? MonitorDiagnostics()
-    snapshot.requestedPictureHz = workspace.layout == .fourUp ? 30 : 60
+    snapshot.requestedPictureHz = sinks[target]?.observedSourceFrameHz ?? 0
     snapshot.requestedScopeHz = configuration(for: target).scopes.refreshHz
     let registered = surfaces.values.filter { $0.target == target }
     if !registered.isEmpty && (!isPreviewEnabled(for: target) || registered.allSatisfy({
@@ -223,13 +223,13 @@ import MonitorToolsUI
         && $0.presenter.isPresentationAdmitted
         && isPreviewEnabled(for: target) && ($0.presented ?? true) && ($0.drawable ?? true)
     }
-    // Native pictures need only their scopes, at the scope rate.
+    // The monitor picture takes every camera frame. Native pictures already do;
+    // this sink then analyzes scopes at the scope refresh the user picked.
     let scopesOnly = !live.isEmpty && live.allSatisfy(\.usesNativePreview)
     sinks[target]?.configure(
       configuration(for: target), consumers: live.map(\.presenter),
       scopeVisible: live.contains(where: \.scopeVisible),
-      preferredHz: scopesOnly ? Double(configuration(for: target).scopes.refreshHz)
-        : workspace.layout == .fourUp ? 30 : 60)
+      preferredHz: scopesOnly ? Double(configuration(for: target).scopes.refreshHz) : nil)
   }
 
   private func refreshDemand() {

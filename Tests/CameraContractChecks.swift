@@ -485,58 +485,17 @@ import XCTest
     return try VideoContract.sample(image, at: CMTime(value: 123_456, timescale: 60_000), duration: VideoContract.fastDuration)
   }
 
-  func testBorrowedV210StagesToIOSurfaceBitExactlyWithMetadata() throws {
-    let source = try borrowedV210()
-    CMSetAttachment(source, key: "TransportTest" as CFString, value: "preserved" as CFString,
-      attachmentMode: kCMAttachmentMode_ShouldPropagate)
-    let attachmentArray = CMSampleBufferGetSampleAttachmentsArray(source, createIfNecessary: true)! as NSArray
-    let attachment = attachmentArray[0] as! NSMutableDictionary
-    attachment[kCMSampleAttachmentKey_NotSync] = true
+  func testStagerPassesIOSurfaceFramesThroughAndRejectsBorrowedMemory() throws {
+    var image: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &image), kCVReturnSuccess)
+    let shareable = try VideoContract.sample(try XCTUnwrap(image),
+      at: CMTime(value: 123_456, timescale: 60_000), duration: VideoContract.fastDuration)
     let stager = CameraFrameStager()
-    let output = try XCTUnwrap(stager.stage(source))
-    let inputImage = try XCTUnwrap(CMSampleBufferGetImageBuffer(source))
-    let outputImage = try XCTUnwrap(CMSampleBufferGetImageBuffer(output))
-    XCTAssertNotNil(CVPixelBufferGetIOSurface(outputImage), "IPC must not expose borrowed process-local pointers")
-    XCTAssertEqual(CVPixelBufferGetPixelFormatType(outputImage), kCVPixelFormatType_422YpCbCr10)
-    XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(output), CMSampleBufferGetPresentationTimeStamp(source))
-    XCTAssertEqual(CMSampleBufferGetDuration(output), CMSampleBufferGetDuration(source))
-    XCTAssertEqual(CMGetAttachment(output, key: "TransportTest" as CFString, attachmentModeOut: nil) as? String, "preserved")
-    let outputAttachments = CMSampleBufferGetSampleAttachmentsArray(output, createIfNecessary: false)! as NSArray
-    XCTAssertEqual((outputAttachments[0] as! NSDictionary)[kCMSampleAttachmentKey_NotSync] as? Bool, true)
-    XCTAssertEqual(CVPixelBufferLockBaseAddress(inputImage, .readOnly), kCVReturnSuccess)
-    XCTAssertEqual(CVPixelBufferLockBaseAddress(outputImage, .readOnly), kCVReturnSuccess)
-    defer {
-      CVPixelBufferUnlockBaseAddress(inputImage, .readOnly)
-      CVPixelBufferUnlockBaseAddress(outputImage, .readOnly)
-    }
-    let input = try XCTUnwrap(CVPixelBufferGetBaseAddress(inputImage))
-    let result = try XCTUnwrap(CVPixelBufferGetBaseAddress(outputImage))
-    let inputStride = CVPixelBufferGetBytesPerRow(inputImage)
-    let outputStride = CVPixelBufferGetBytesPerRow(outputImage)
-    let rowBytes = 3840 / 6 * 16
-    for row in 0..<2160 {
-      XCTAssertEqual(memcmp(input.advanced(by: row * inputStride), result.advanced(by: row * outputStride), rowBytes), 0,
-        "Every active v210 row must be bit-exact despite different padding")
-    }
-    XCTAssertTrue(try stager.stage(output) === output, "Already shareable buffers should stay zero-copy")
+    XCTAssertTrue(try stager.stage(shareable) === shareable, "IOSurface frames are shared as they are, never copied")
+    XCTAssertThrowsError(try stager.stage(try borrowedV210()),
+      "A frame without an IOSurface is an error, not a reason to copy")
   }
-
-  func testStagingPoolIsBoundedAndReusesReleasedBuffers() throws {
-    let source = try borrowedV210(width: 96, height: 4)
-    let stager = CameraFrameStager()
-    var held: [CMSampleBuffer] = []
-    for _ in 0..<VideoContract.outputBufferLimit {
-      let staged = try XCTUnwrap(stager.stage(source))
-      let image = try XCTUnwrap(CMSampleBufferGetImageBuffer(staged))
-      XCTAssertFalse(held.contains { CMSampleBufferGetImageBuffer($0) === image },
-        "Staging must not overwrite an output still retained by a consumer")
-      held.append(staged)
-    }
-    XCTAssertNil(try stager.stage(source), "Slow clients must not grow staging memory without bound")
-    held.removeAll()
-    XCTAssertNotNil(try stager.stage(source), "Release permits reuse after backpressure")
-  }
-
 
   func testStagerRejectsShortPackedRows() throws {
     let width = 96

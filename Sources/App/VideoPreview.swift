@@ -33,7 +33,6 @@ final class VideoPreviewRenderer: @unchecked Sendable {
     var maxReadinessWaitMS = 0.0
     var firstStagingCPUMS = 0.0
     var maxStagingCPUMS = 0.0
-    var firstRawCopy: GPURawFrameCopy.Timing?
 #endif
   }
 
@@ -245,24 +244,6 @@ final class VideoPreviewRenderer: @unchecked Sendable {
     return view
   }
 
-  // Standalone borrowed-input users can pay bounded IOSurface/Metal startup
-  // costs before their first timed frame. CaptureController normally prepares
-  // its one shared transport stager, and previews receive those IOSurfaces.
-  func prepareForInput(width: Int, height: Int, pixelFormat: OSType,
-    completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
-    let token = lock.withLock { generation }
-    queue.async { [weak self] in
-      guard let self, self.lock.withLock({ self.visible && token == self.generation }) else {
-        completion(.success(()))
-        return
-      }
-      do {
-        try self.stager.prepare(width: width, height: height, pixelFormat: pixelFormat)
-        completion(.success(()))
-      } catch { completion(.failure(error)) }
-    }
-  }
-
   func loadPerformanceMetrics(_ completion: @escaping @Sendable (AVVideoPerformanceMetrics?) -> Void) {
     videoRenderer.loadVideoPerformanceMetrics(completionHandler: completion)
   }
@@ -371,8 +352,7 @@ final class VideoPreviewRenderer: @unchecked Sendable {
       return false
     }
     do {
-      // Only borrowed, non-IOSurface capture buffers require staging. This is
-      // a bounded bit-exact copy, preserving the selected output pixel format.
+      // Preview frames are the capture or processor IOSurfaces; staging only checks that.
 #if CAPTURE_LIFECYCLE_TESTS
       let beforeStaging = lock.withLock { () -> (@Sendable () -> Void)? in
         let result = beforeStagingForTesting
@@ -383,13 +363,7 @@ final class VideoPreviewRenderer: @unchecked Sendable {
       let stagingStarted = ProcessInfo.processInfo.systemUptime
       let stagingCPUStarted = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
 #endif
-      guard let staged = try stager.stage(sample) else {
-        lock.withLock {
-          guard visible && token == generation else { return }
-          diagnostics.stagingDrops &+= 1
-        }
-        return true
-      }
+      let staged = try stager.stage(sample)
 #if CAPTURE_LIFECYCLE_TESTS
       let stagingMS = (ProcessInfo.processInfo.systemUptime - stagingStarted) * 1000
       let stagingCPUMS = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - stagingCPUStarted) / 1_000_000
@@ -398,7 +372,6 @@ final class VideoPreviewRenderer: @unchecked Sendable {
         if diagnostics.stagingFrames == 0 {
           diagnostics.firstStagingMS = stagingMS
           diagnostics.firstStagingCPUMS = stagingCPUMS
-          diagnostics.firstRawCopy = stager.lastRawCopyTiming
         }
         diagnostics.maxStagingCPUMS = max(diagnostics.maxStagingCPUMS, stagingCPUMS)
         diagnostics.maxStagingMS = max(diagnostics.maxStagingMS, stagingMS)

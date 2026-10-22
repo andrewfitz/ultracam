@@ -50,11 +50,11 @@ def contained_path(value, root, label):
     return str(candidate)
 
 
-sdk_dir = contained_path(
-    os.environ.get("DECKLINK_SDK_DIR", str(EXTERNAL_ROOT / "cache/ultracam/decklink-sdk")),
-    EXTERNAL_ROOT,
-    "DECKLINK_SDK_DIR",
-)
+# The SDK interfaces are in the repo; an override must stay in the repo or the external workspace.
+sdk_override = os.environ.get("DECKLINK_SDK_DIR")
+sdk_dir = (str((ROOT / "ThirdParty/DeckLinkSDK/include").resolve()) if sdk_override is None
+  else contained_path(sdk_override, ROOT if Path(sdk_override).expanduser().resolve(strict=False).is_relative_to(ROOT)
+    else EXTERNAL_ROOT, "DECKLINK_SDK_DIR"))
 auto_switcher_lib_dir = os.environ.get(
     "AUTO_SWITCHER_LIB_DIR",
     "$(SRCROOT)/Tools/auto-switcher/target/release",

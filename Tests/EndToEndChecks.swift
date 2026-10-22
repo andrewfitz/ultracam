@@ -507,8 +507,13 @@ private final class PacedDriverMetrics: @unchecked Sendable {
         duration: VideoContract.fastDuration)
       awaitCondition("Complete bypass must preserve every source frame") { harness.sent == frame + 1 }
       let raw = try XCTUnwrap(harness.lastSample)
-      XCTAssertTrue(CMSampleBufferGetImageBuffer(raw) === source,
-        "Already shareable input must remain bit-exact without LUT, scaling or conversion")
+      let image = try XCTUnwrap(CMSampleBufferGetImageBuffer(raw))
+      // An owned GPU copy: the capture card may reuse its own buffer while a
+      // meeting app or the window server still displays it. Pixels are unchanged.
+      XCTAssertFalse(image === source, "Bypass output must be an owned copy, not the capture buffer")
+      XCTAssertNotNil(CVPixelBufferGetIOSurface(image))
+      XCTAssertEqual(CVPixelBufferGetPixelFormatType(image), CVPixelBufferGetPixelFormatType(source))
+      XCTAssertEqual(CVPixelBufferGetWidth(image), CVPixelBufferGetWidth(source))
       XCTAssertEqual(CMSampleBufferGetDuration(raw), VideoContract.fastDuration,
         "Global bypass must also bypass the saved 59.94→29.97 reduction")
       try assertNeutralCode(raw, expected: 283)
@@ -1323,14 +1328,14 @@ private final class PacedDriverMetrics: @unchecked Sendable {
   }
 
   func testPacedNativeTenBitFeedPreservesEverySelectedPreviewSample() throws {
-    // Borrowed/non-IOSurface packed v210 follows the production capture path,
-    // including its ~22 MB CPU→GPU upload. This is synthetic cadence evidence;
-    // it cannot establish hardware transport or physical display smoothness.
+    // IOSurface-backed packed v210, as DeckLink SDK 16 delivers it: the GPU reads
+    // it with no upload. This is synthetic cadence evidence; it cannot establish
+    // hardware transport or physical display smoothness.
     var buffer: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
-      nil, &buffer), kCVReturnSuccess)
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer), kCVReturnSuccess)
     let source = try XCTUnwrap(buffer)
-    XCTAssertNil(CVPixelBufferGetIOSurface(source))
+    XCTAssertNotNil(CVPixelBufferGetIOSurface(source))
     CVPixelBufferLockBaseAddress(source, [])
     let stride = CVPixelBufferGetBytesPerRow(source) / MemoryLayout<UInt32>.stride
     let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(source)).assumingMemoryBound(to: UInt32.self)

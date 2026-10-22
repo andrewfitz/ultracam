@@ -66,9 +66,21 @@ import SwiftUI
     if titled { settle(0.4) }
   }
 
+  /// Runs the view until layout and drawing stop changing, in 16 ms slices.
+  /// `seconds` is only the upper limit: most views settle in a few slices.
   func settle(_ seconds: Double = 0.15) {
-    host.layoutSubtreeIfNeeded()
-    RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+    let deadline = Date().addingTimeInterval(seconds)
+    var quietSlices = 0
+    repeat {
+      host.layoutSubtreeIfNeeded()
+      RunLoop.main.run(until: Date().addingTimeInterval(0.016))
+      // Layout only: a ticking timecode or a progress spinner always needs display.
+      let busy = host.needsLayout || (window.contentView?.needsLayout ?? false)
+      quietSlices = busy ? 0 : quietSlices + 1
+    } while quietSlices < 3 && Date() < deadline
+    if ProcessInfo.processInfo.environment["UI_VERIFY_TIMING"] != nil {
+      print("SETTLE \(quietSlices >= 3 ? "quiet" : "limit") \(Int((seconds - deadline.timeIntervalSinceNow) * 1000)) ms")
+    }
     host.layoutSubtreeIfNeeded()
   }
 
@@ -148,9 +160,18 @@ struct AXNode {
 }
 
 @MainActor enum Images {
+  /// PNG encoding of a full window takes ~100 ms; it runs off the main thread on a
+  /// finished, unshared bitmap. `waitForWrites` blocks until every image is on disk.
+  private static let writes = DispatchGroup()
+  // One encoder thread: it overlaps rendering without competing with it for every core.
+  private static let encoder = DispatchQueue(label: "ui-verify.png", qos: .utility)
   static func write(_ rep: NSBitmapImageRep, to url: URL) {
-    if let data = rep.representation(using: .png, properties: [:]) { try? data.write(to: url) }
+    nonisolated(unsafe) let image = rep
+    encoder.async(group: writes) {
+      if let data = image.representation(using: .png, properties: [:]) { try? data.write(to: url) }
+    }
   }
+  static func waitForWrites() { writes.wait() }
 
   /// Fraction of sampled pixels equal to the most common color, optionally within a
   /// centered region (a fraction of width and height).

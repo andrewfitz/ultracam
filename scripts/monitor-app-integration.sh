@@ -22,7 +22,7 @@ monitor_package_build > "$test_root/package-build.log" 2>&1 || {
   exit 1
 }
 bash "$task_root/scripts/fetch-decklink-sdk.sh"
-sdk_dir="${DECKLINK_SDK_DIR:-/Volumes/8TB/cinesomatic-director-work/cache/ultracam/decklink-sdk}"
+sdk_dir="${DECKLINK_SDK_DIR:-$task_root/ThirdParty/DeckLinkSDK/include}"
 rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"

@@ -41,9 +41,10 @@ final class LUTProcessor {
   private static let textureCacheFlushInterval = 32
   private var pool: CVPixelBufferPool?
   private var poolConfiguration: PipelineConfiguration?
+  private var passthroughPool: CVPixelBufferPool?
+  private var passthroughFormat: (type: OSType, width: Int, height: Int)?
   private var cube: CubeLUT?
   private var cubeBuffer: MTLBuffer
-  private var packedBuffer: MTLBuffer?
   private var fullTexture: MTLTexture?
   private var horizontalTexture: MTLTexture?
   private var scaledTexture: MTLTexture?
@@ -51,7 +52,7 @@ final class LUTProcessor {
   var workingResourceDiagnostics: WorkingResourceDiagnostics {
     WorkingResourceDiagnostics(floatTextureBytes: [fullTexture, horizontalTexture, scaledTexture]
       .compactMap { $0 }.reduce(0) { $0 + $1.allocatedSize },
-      packedCopyBytes: packedBuffer?.allocatedSize ?? 0, outputPoolActive: pool != nil)
+      packedCopyBytes: 0, outputPoolActive: pool != nil)
   }
 
   private struct Parameters {
@@ -168,14 +169,99 @@ final class LUTProcessor {
   // pixel buffers remain valid; loaded LUT and compiled pipeline states stay.
   func releaseIdleResources() {
     let hadResources = fullTexture != nil || horizontalTexture != nil || scaledTexture != nil ||
-      packedBuffer != nil || pool != nil
+      pool != nil
     fullTexture = nil
     horizontalTexture = nil
     scaledTexture = nil
-    packedBuffer = nil
     pool = nil
     poolConfiguration = nil
+    passthroughPool = nil
+    passthroughFormat = nil
     if hadResources { CVMetalTextureCacheFlush(textureCache, 0) }
+  }
+
+  /// Processing off: one GPU blit of the capture frame into an IOSurface this
+  /// process owns. DeckLink reuses its buffer once our frame reference is gone,
+  /// even while the window server or a meeting app still shows it; a pool
+  /// buffer is not recycled while another process is using its IOSurface.
+  func passthrough(_ input: CVPixelBuffer) throws -> CVPixelBuffer {
+    let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
+    let type = CVPixelBufferGetPixelFormatType(input)
+    guard CVPixelBufferGetIOSurface(input) != nil else {
+      throw VideoError.message("The capture frame is not IOSurface-backed. Update Desktop Video.")
+    }
+    let planes = try Self.copyPlanes(type: type, width: width, height: height)
+    if passthroughFormat?.type != type || passthroughFormat?.width != width || passthroughFormat?.height != height {
+      var next: CVPixelBufferPool?
+      let status = CVPixelBufferPoolCreate(nil,
+        [kCVPixelBufferPoolMinimumBufferCountKey: VideoContract.warmBufferCount] as CFDictionary,
+        [kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height, kCVPixelBufferPixelFormatTypeKey: type,
+          kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &next)
+      guard status == kCVReturnSuccess, let next else { throw VideoError.message("Cannot allocate passthrough frames (\(status)).") }
+      passthroughPool = next
+      passthroughFormat = (type, width, height)
+    }
+    var output: CVPixelBuffer?
+    let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, passthroughPool!,
+      [kCVPixelBufferPoolAllocationThresholdKey: VideoContract.outputBufferLimit] as CFDictionary, &output)
+    guard status == kCVReturnSuccess, let output else { throw VideoError.message("Passthrough frames are busy (\(status)).") }
+    guard let command = commandQueue.makeCommandBuffer(), let blit = command.makeBlitCommandEncoder() else {
+      throw VideoError.message("GPU is unavailable.")
+    }
+    command.label = "Passthrough"
+    var wrappers: [CVMetalTexture] = []
+    for plane in planes {
+      let (sourceWrapper, source) = try view(input, plane: plane)
+      let (targetWrapper, target) = try view(output, plane: plane)
+      wrappers += [sourceWrapper, targetWrapper]
+      blit.copy(from: source, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+        sourceSize: MTLSize(width: plane.width, height: plane.height, depth: 1),
+        to: target, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+    }
+    blit.endEncoding()
+    command.commit()
+    command.waitUntilCompleted()
+    withExtendedLifetime(wrappers) {}
+    guard command.status == .completed else {
+      throw VideoError.message(command.error?.localizedDescription ?? "GPU passthrough failed.")
+    }
+    CVBufferRemoveAllAttachments(output)
+    for mode in [CVAttachmentMode.shouldPropagate, .shouldNotPropagate] {
+      if let attachments = CVBufferCopyAttachments(input, mode) { CVBufferSetAttachments(output, attachments, mode) }
+    }
+    return output
+  }
+
+  private struct CopyPlane { var index: Int; var format: MTLPixelFormat; var width: Int; var height: Int }
+
+  /// Texture views that cover each plane's media exactly. v210 is read as one
+  /// RGBA32Uint texel per 6-pixel group, as in the DeckLink SDK's Metal sample.
+  private static func copyPlanes(type: OSType, width: Int, height: Int) throws -> [CopyPlane] {
+    switch type {
+    case kCVPixelFormatType_422YpCbCr10:
+      return [CopyPlane(index: 0, format: .rgba32Uint, width: (width + 5) / 6, height: height)]
+    case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+      return [CopyPlane(index: 0, format: .r16Uint, width: width, height: height),
+        CopyPlane(index: 1, format: .rg16Uint, width: width / 2, height: height)]
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+      return [CopyPlane(index: 0, format: .r16Uint, width: width, height: height),
+        CopyPlane(index: 1, format: .rg16Uint, width: width / 2, height: height / 2)]
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+      return [CopyPlane(index: 0, format: .r8Uint, width: width, height: height),
+        CopyPlane(index: 1, format: .rg8Uint, width: width / 2, height: height / 2)]
+    default:
+      throw VideoError.message("Passthrough does not support \(VideoContract.fourCC(type)) frames.")
+    }
+  }
+
+  private func view(_ buffer: CVPixelBuffer, plane: CopyPlane) throws -> (CVMetalTexture, MTLTexture) {
+    var wrapper: CVMetalTexture?
+    let status = CVMetalTextureCacheCreateTextureFromImage(nil, textureCache, buffer, nil, plane.format,
+      plane.width, plane.height, plane.index, &wrapper)
+    guard status == kCVReturnSuccess, let wrapper, let texture = CVMetalTextureGetTexture(wrapper) else {
+      throw VideoError.message("Cannot map frame plane \(plane.index) for the GPU (\(status)).")
+    }
+    return (wrapper, texture)
   }
 
   private func plane(_ buffer: CVPixelBuffer, index: Int, format: MTLPixelFormat) throws -> (CVMetalTexture, MTLTexture) {
@@ -210,25 +296,6 @@ final class LUTProcessor {
     }
     guard VideoContract.tenBit422.contains(type) else { throw VideoError.message("Expected 10-bit 4:2:2 input.") }
     try VideoBufferLayout.validate(input)
-    var packedLength = 0
-    var packedRowBytes = 0
-    if type == kCVPixelFormatType_422YpCbCr10 {
-      let stride = CVPixelBufferGetBytesPerRow(input)
-      let (sourceLength, overflow) = stride.multipliedReportingOverflow(by: height)
-      // Packed shader row offsets use 32-bit word indices. A Metal device may
-      // permit a larger stride than that indexing can represent. The fallback
-      // copy below compacts each row to its active v210 bytes, so the source
-      // allocation itself does not need to fit in one GPU buffer.
-      let (activeRowBytes, rowOverflow) = ((width + 5) / 6).multipliedReportingOverflow(by: 16)
-      let (compactLength, compactOverflow) = activeRowBytes.multipliedReportingOverflow(by: height)
-      guard !overflow, !rowOverflow, !compactOverflow, sourceLength > 0,
-        stride / MemoryLayout<UInt32>.size <= Int(UInt32.max), compactLength > 0,
-        compactLength <= device.maxBufferLength else {
-        throw VideoError.message("Invalid packed 10-bit capture row stride.")
-      }
-      packedLength = compactLength
-      packedRowBytes = activeRowBytes
-    }
     if configuration.untouched { releaseIdleResources(); return input }
     guard !configuration.applyLUT || cube != nil else { throw VideoError.message("Load a LUT or turn off Apply LUT.") }
     let chromaLocation = CVBufferCopyAttachment(input, kCVImageBufferChromaLocationTopFieldKey, nil) as? String
@@ -270,39 +337,22 @@ final class LUTProcessor {
     let full = try texture(width: width, height: height, existing: &fullTexture)
     var wrappers: [CVMetalTexture] = [yWrapper, uvWrapper]
     if type == kCVPixelFormatType_422YpCbCr10 {
-      let source: MTLBuffer
-      if let shared = SharedMetalBuffer.make(pixelBuffer: input, device: device, readOnly: true) {
-        source = shared
-        packedInputDiagnostics.noCopyFrames &+= 1
-        packedInputDiagnostics.lastPath = "No copy"
-      } else {
-        guard CVPixelBufferLockBaseAddress(input, .readOnly) == kCVReturnSuccess else {
-          throw VideoError.message("Cannot lock packed capture frame.")
-        }
-        defer { CVPixelBufferUnlockBaseAddress(input, .readOnly) }
-        let length = packedLength
-        if packedBuffer == nil || packedBuffer!.length < length { packedBuffer = device.makeBuffer(length: length, options: .storageModeShared) }
-        guard let packedBuffer, let base = CVPixelBufferGetBaseAddress(input) else { throw VideoError.message("Cannot read packed capture frame.") }
-        let destination = packedBuffer.contents()
-        let sourceStride = CVPixelBufferGetBytesPerRow(input)
-        if sourceStride == packedRowBytes {
-          memcpy(destination, base, length)
-        } else {
-          // v210 rows may include producer padding. Do not upload that padding
-          // or make the shader walk it; a compact staging stride lowers CPU and
-          // GPU traffic while preserving every active media word.
-          for row in 0..<height {
-            memcpy(destination.advanced(by: row * packedRowBytes),
-              base.advanced(by: row * sourceStride), packedRowBytes)
-          }
-        }
-        parameters.geometry.z = UInt32(packedRowBytes / MemoryLayout<UInt32>.size)
-        source = packedBuffer
-        packedInputDiagnostics.copiedFrames &+= 1
-        packedInputDiagnostics.lastPath = "Copied fallback"
+      // SDK 16 capture frames are IOSurface-backed, so the GPU reads the capture
+      // memory through the texture cache. There is no copy path.
+      guard CVPixelBufferGetIOSurface(input) != nil else {
+        throw VideoError.message("The capture frame is not IOSurface-backed. Update Desktop Video.")
       }
+      var groupWrapper: CVMetalTexture?
+      let groupStatus = CVMetalTextureCacheCreateTextureFromImage(nil, textureCache, input, nil, .rgba32Uint,
+        (width + 5) / 6, height, 0, &groupWrapper)
+      guard groupStatus == kCVReturnSuccess, let groupWrapper, let groups = CVMetalTextureGetTexture(groupWrapper) else {
+        throw VideoError.message("Cannot map the capture frame for the GPU (\(groupStatus)).")
+      }
+      wrappers.append(groupWrapper)
+      packedInputDiagnostics.noCopyFrames &+= 1
+      packedInputDiagnostics.lastPath = "No copy"
       try dispatch("packedLUT", on: command, width: width, height: height) { encoder in
-        encoder.setBuffer(source, offset: 0, index: 2)
+        encoder.setTexture(groups, index: 3)
         encoder.setBuffer(cubeBuffer, offset: 0, index: 0)
         encoder.setBytes(&parameters, length: MemoryLayout<Parameters>.size, index: 1)
         encoder.setTexture(full, index: 2)

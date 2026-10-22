@@ -2,9 +2,13 @@
 # Source this helper after setting task_root and a run-specific external test_root.
 # Compile the package once; consumers link its real products and use Bundle.module.
 monitor_package="$task_root/Packages/MonitorTools"
-monitor_scratch="$test_root/monitor-package"
-export CLANG_MODULE_CACHE_PATH="$test_root/modules"
-export SWIFTPM_MODULECACHE_OVERRIDE="$test_root/modules"
+# A shared scratch and module cache keep package builds incremental across runs;
+# SwiftPM locks its scratch directory, so concurrent runs wait rather than collide.
+monitor_cache_root="${MONITOR_PACKAGE_CACHE:-/Volumes/8TB/cinesomatic-director-work/agent-work/build/ultracam/monitor-package-cache}"
+mkdir -p "$monitor_cache_root/modules"
+monitor_scratch="$monitor_cache_root/scratch"
+export CLANG_MODULE_CACHE_PATH="$monitor_cache_root/modules"
+export SWIFTPM_MODULECACHE_OVERRIDE="$monitor_cache_root/modules"
 monitor_package_build() {
   local product
   for product in MonitorToolsCore MonitorToolsMetal MonitorToolsUI; do

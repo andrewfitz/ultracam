@@ -60,23 +60,39 @@ import XCTest
     XCTAssertTrue(demand.isEmpty)
   }
 
-  func testPausedDiagnosticsAndLayoutCapsFollowCurrentState() {
+  func testPausedDiagnosticsAndLayoutCapsFollowCurrentState() throws {
     var saved = MonitorWorkspaceState()
     saved.layout = .fourUp
     let restored = MonitorCoordinator(workspace: saved)
-    XCTAssertEqual(restored.diagnostics(for: alpha).requestedPictureHz, 30)
+    XCTAssertEqual(restored.diagnostics(for: alpha).requestedPictureHz, 0)
     restored.workspace.layout = .sideBySide
-    XCTAssertEqual(restored.diagnostics(for: alpha).requestedPictureHz, 60)
+    XCTAssertEqual(restored.diagnostics(for: alpha).requestedPictureHz, 0)
     let value = coordinator()
     let id = UUID()
     let presenter = value.surface(id: id, target: alpha)
     value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
+    let sink = value.captureSink(for: alpha)
+    var monitor = MonitorConfiguration()
+    monitor.pictureStage = .source
+    monitor.toolsEnabled = false
+    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
+    var image: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA, nil, &image),
+      kCVReturnSuccess)
+    let buffer = try XCTUnwrap(image)
+    let frame = CMTime(value: 1001, timescale: 60_000)
+    sink.offer(source: buffer, output: nil, pts: .zero, captureGeneration: 1, sequence: 1,
+      processingRevision: 0, sourceOnly: true)
+    sink.offer(source: buffer, output: nil, pts: frame, captureGeneration: 1, sequence: 2,
+      processingRevision: 0, sourceOnly: true)
+    let cameraHz = 1 / frame.seconds
+    XCTAssertEqual(sink.observedSourceFrameHz, cameraHz, accuracy: 0.05)
     for layout in MonitorWorkspaceLayout.allCases {
       value.workspace.layout = layout
-      XCTAssertEqual(value.diagnostics(for: alpha).requestedPictureHz, layout == .fourUp ? 30 : 60)
+      XCTAssertEqual(value.diagnostics(for: alpha).requestedPictureHz, cameraHz, accuracy: 0.05)
     }
     value.workspace.layout = .single
-    XCTAssertEqual(value.diagnostics(for: alpha).requestedPictureHz, 60)
+    XCTAssertEqual(value.diagnostics(for: alpha).requestedPictureHz, cameraHz, accuracy: 0.05)
     presenter.onVisibilityChange?(true, false)
     XCTAssertEqual(value.diagnostics(for: alpha).availability, .paused)
     presenter.onVisibilityChange?(true, true)

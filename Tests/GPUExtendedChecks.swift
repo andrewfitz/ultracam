@@ -287,64 +287,36 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     XCTAssertEqual(held.count, 8, "Prewarm must release all warm frames before native capture starts")
   }
 
-  func testNoCopyMappingOwnsBorrowedFrameThroughGPUCommandCompletion() throws {
-    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-    let queue = try XCTUnwrap(device.makeCommandQueue())
-    let release = expectation(description: "borrowed capture allocation released exactly once")
-    let counter = GPUReleaseCounter()
-    try autoreleasepool {
-      var source: CVPixelBuffer? = try borrowedInput { counter.increment(); release.fulfill() }
-      var shared = SharedMetalBuffer.make(pixelBuffer: try XCTUnwrap(source), device: device, readOnly: true)
-      XCTAssertNotNil(shared, "Page-aligned single-region capture must bypass CPU memcpy")
-      let output = try XCTUnwrap(device.makeBuffer(length: 16, options: .storageModeShared))
-      var command = try XCTUnwrap(queue.makeCommandBuffer()) as MTLCommandBuffer?
-      let encoder = try XCTUnwrap(command?.makeBlitCommandEncoder())
-      encoder.copy(from: try XCTUnwrap(shared), sourceOffset: 0, to: output, destinationOffset: 0, size: 16)
-      encoder.endEncoding()
-      source = nil
-      shared = nil
-      XCTAssertEqual(counter.count, 0, "Encoded GPU work must retain and lock borrowed bytes even after caller release")
-      command?.commit()
-      command?.waitUntilCompleted()
-      XCTAssertEqual(command?.status, .completed)
-      XCTAssertEqual(output.contents().load(as: UInt32.self), 512 | (64 << 10) | (512 << 20))
-      command = nil
-    }
-    wait(for: [release], timeout: 2)
-    XCTAssertEqual(counter.count, 1)
-  }
-
-  func testNoCopyAndFallbackProduceIdenticalTenBitLevelsForEveryPackedLane() throws {
-    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+  func testIOSurfaceCaptureDecodesEveryPackedLaneWithoutACopy() throws {
     let processor = try LUTProcessor()
     try processor.load(CubeLUT(text: cubeText()))
     let config = PipelineConfiguration(applyLUT: true, downscale: false, convertTo420: false)
-    for (offset, stride, split, expectsNoCopy) in [
-      (0, 10240, false, true), (4, 10240, false, false),
-      (0, 10244, false, false), (0, 10240, true, false),
-    ] {
-      let source = try borrowedInput(offset: offset, stride: stride, splitVMRegion: split)
-      let shared = SharedMetalBuffer.make(pixelBuffer: source, device: device, readOnly: true)
-      XCTAssertEqual(shared != nil, expectsNoCopy)
-      let before = processor.packedInputDiagnostics
-      let output = try processor.process(source, configuration: config)
-      let after = processor.packedInputDiagnostics
-      XCTAssertEqual(after.noCopyFrames - before.noCopyFrames, expectsNoCopy ? 1 : 0)
-      XCTAssertEqual(after.copiedFrames - before.copiedFrames, expectsNoCopy ? 0 : 1)
-      if stride > 10240 {
-        XCTAssertEqual(processor.workingResourceDiagnostics.packedCopyBytes, 10240 * 2160,
-          "Fallback staging should omit producer row padding")
+    let source = try input(packed: true, luma: { x, _ in UInt16(64 + x * 876 / 3839) })
+    XCTAssertNotNil(CVPixelBufferGetIOSurface(source))
+    let before = processor.packedInputDiagnostics
+    let output = try processor.process(source, configuration: config)
+    let after = processor.packedInputDiagnostics
+    XCTAssertEqual(after.noCopyFrames - before.noCopyFrames, 1)
+    XCTAssertEqual(after.copiedFrames, 0)
+    CVPixelBufferLockBaseAddress(output, .readOnly)
+    let rowStride = CVPixelBufferGetBytesPerRowOfPlane(output, 0) / 2
+    let words = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt16.self)
+    for row in [0, 1, 1091, 2159] {
+      for x in 0..<3840 {
+        XCTAssertEqual(Double(words[row * rowStride + x] >> 6), Double(64 + x * 876 / 3839), accuracy: 1)
       }
-      CVPixelBufferLockBaseAddress(output, .readOnly)
-      let rowStride = CVPixelBufferGetBytesPerRowOfPlane(output, 0) / 2
-      let words = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt16.self)
-      for row in [0, 1, 1091, 2159] {
-        for x in 0..<3840 {
-          XCTAssertEqual(Double(words[row * rowStride + x] >> 6), Double(64 + x * 876 / 3839), accuracy: 1)
-        }
-      }
-      CVPixelBufferUnlockBaseAddress(output, .readOnly)
     }
+    CVPixelBufferUnlockBaseAddress(output, .readOnly)
+  }
+
+  func testNonIOSurfaceCaptureIsRejectedNotCopied() throws {
+    let processor = try LUTProcessor()
+    let source = try borrowedInput()
+    XCTAssertNil(CVPixelBufferGetIOSurface(source))
+    XCTAssertThrowsError(try processor.process(source,
+      configuration: PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true)))
+    XCTAssertEqual(processor.packedInputDiagnostics.noCopyFrames, 0)
+    XCTAssertEqual(processor.packedInputDiagnostics.copiedFrames, 0)
   }
 
   func testUndersizedPackedStrideRejectedBeforeAnyGPUOrPassthroughUse() throws {
@@ -360,11 +332,11 @@ private final class GPUReleaseCounter: @unchecked Sendable {
 
   func testBypassReleasesWorkingAllocationsWithoutInvalidatingPublishedFrame() throws {
     let processor = try LUTProcessor()
-    let source = try borrowedInput(offset: 4)
+    let source = try input(packed: true)
     let processed = PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true)
     let published = try processor.process(source, configuration: processed)
     XCTAssertGreaterThan(processor.workingResourceDiagnostics.floatTextureBytes, 0)
-    XCTAssertGreaterThan(processor.workingResourceDiagnostics.packedCopyBytes, 0)
+    XCTAssertEqual(processor.workingResourceDiagnostics.packedCopyBytes, 0, "The GPU reads the capture IOSurface; nothing is staged")
     XCTAssertTrue(processor.workingResourceDiagnostics.outputPoolActive)
     func middleLuma() -> UInt8 {
       CVPixelBufferLockBaseAddress(published, .readOnly)

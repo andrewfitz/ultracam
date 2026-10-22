@@ -353,9 +353,6 @@ final class CaptureController: @unchecked Sendable {
         if self.cameraConnected || hasPreview {
           if !warm.untouched, self.processor == nil { self.processor = try LUTProcessor() }
           try self.ensurePrepared(warm)
-          if warm.untouched, let type = self.services.capturePixelFormat {
-            try self.deliveryStager.prepare(width: 3840, height: 2160, pixelFormat: type)
-          }
         }
         guard self.isCurrent(token) else {
         self.stopResources(preserveRecordingCallbacks: true)
@@ -956,16 +953,17 @@ final class CaptureController: @unchecked Sendable {
         publishIfDue(token: token, force: metadataChanged)
         return
       }
-      // A complete bypass does not need a Metal device, command queue, or LUT
-      // resources. Instantiate the processor only when an active destination
-      // actually needs GPU work; this keeps idle/passthrough capture light.
-      if !effective.untouched, processor == nil { self.processor = try LUTProcessor() }
+      // Created on first demand; a complete bypass still uses it for the owned GPU copy.
+      if processor == nil { self.processor = try LUTProcessor() }
       let processor = self.processor
       try ensurePrepared(effective)
       let start = ProcessInfo.processInfo.systemUptime
       let rendered: CVPixelBuffer
       if effective.untouched {
-        rendered = input
+        // The preview, the meeting-app camera and Program get an owned copy;
+        // the capture card may reuse its buffer while they still display it.
+        guard let processor else { throw VideoError.message("GPU processor is unavailable.") }
+        rendered = try processor.passthrough(input)
       } else {
         guard let processor else { throw VideoError.message("GPU processor is unavailable.") }
         rendered = try processor.process(input, configuration: effective)
@@ -1000,12 +998,8 @@ final class CaptureController: @unchecked Sendable {
       let original = try sampleFactory.sample(rendered, at: time, duration: effective.duration)
       let sample: CMSampleBuffer
       if effective.untouched && (cameraConnected || !visible.isEmpty) {
-        if CVPixelBufferGetIOSurface(rendered) == nil {
-          try deliveryStager.prepare(width: actual.width, height: actual.height, pixelFormat: actual.type)
-        }
         guard isAccepting(token) else { return }
-        guard let shared = try deliveryStager.stage(original) else { poolDrops &+= 1; return }
-        sample = shared
+        sample = try deliveryStager.stage(original)
       } else { sample = original }
       guard isAccepting(token) else { return }
       if previewEnabled {

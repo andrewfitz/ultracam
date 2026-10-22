@@ -37,8 +37,7 @@ xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-error
   "$task_root/Sources/Shared/NaturalTalkingHeadAutoSwitcher.swift" \
   "$task_root/Sources/App/AppSettingsStore.swift" \
   "$task_root/Sources/App/LUTProcessor.swift" "$task_root/Sources/App/AppResourceUsage.swift" \
-  "$task_root/Sources/App/CameraSink.swift" "$task_root/Sources/App/GPURawFrameCopy.swift" \
-  "$task_root/Sources/App/SharedMetalBuffer.swift" "$task_root/Tools/CameraSmoke/main.swift" \
+  "$task_root/Sources/App/CameraSink.swift" "$task_root/Tools/CameraSmoke/main.swift" \
   -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Metal \
   -o "$smoke_root/camera-smoke" >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
 if ! codesign --force --sign "${SIGNING_IDENTITY:--}" --identifier org.ultracam.app "$smoke_root/camera-smoke" >> "$compile_log" 2>&1; then

@@ -46,3 +46,11 @@ Artifacts go to `/Volumes/8TB/cinesomatic-director-work/agent-work/build/ultraca
 
 - **Inspector:** `.inspector` inside a bare `NSHostingView` throws during AppKit layout, so the whole-window inspector render runs in the app self-test. `RENDER_INSPECTOR=1` attempts it here anyway.
 - **Vibrancy:** offscreen capture draws vibrant sidebar materials as a flat color.
+
+## Speed
+
+- `scripts/ui-verify.sh` skips the run when nothing it compiles has changed since its last passing run (a hash of the inputs is kept next to `latest`). `FORCE=1` reruns.
+- Views settle until layout stops changing, in 16 ms slices; the old fixed waits are only the upper limit.
+- The verifier is compiled unoptimized, and the MonitorTools package build is cached across runs.
+- PNGs are encoded on one background thread.
+- `UI_VERIFY_TIMING=1` prints each render's time and whether its layout settled or hit the limit.

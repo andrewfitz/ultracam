@@ -15,7 +15,7 @@ export TMPDIR="$test_root/tmp"
 export MACOSX_DEPLOYMENT_TARGET=15.0
 source "$task_root/scripts/monitor-tools-package.sh"
 monitor_package_build > "$test_root/package-build.log" 2>&1 || { cat "$test_root/package-build.log"; exit 1; }
-sdk_dir="${DECKLINK_SDK_DIR:-$external_root/cache/ultracam/decklink-sdk}"
+sdk_dir="${DECKLINK_SDK_DIR:-$task_root/ThirdParty/DeckLinkSDK/include}"
 [[ -d "$sdk_dir" ]] || bash "$task_root/scripts/fetch-decklink-sdk.sh" >/dev/null
 xcrun swiftc -typecheck -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
   -target arm64-apple-macos15.0 -module-cache-path "$test_root/modules" "${monitor_link_args[@]}" \

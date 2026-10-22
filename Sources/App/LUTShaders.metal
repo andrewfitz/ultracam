@@ -41,29 +41,31 @@ kernel void planarLUT(texture2d<float, access::read> y [[texture(0)]], texture2d
   rgb.write(float4(lookup(decode(luma, c, p), cube, p), 1), gid);
 }
 
-float2 packedChroma(device const uint *words, int pair, uint row, constant Parameters &p) {
+// v210 through the texture cache, as in the DeckLink SDK's Metal sample: one
+// RGBA32Uint texel is one 6-pixel group (four 32-bit words) of the IOSurface.
+float2 packedChroma(texture2d<uint, access::read> groups, int pair, uint row, constant Parameters &p) {
   pair = clamp(pair, 0, int(p.geometry.x / 2) - 1);
-  uint offset = row * p.geometry.z + uint(pair / 3) * 4;
+  uint4 g = groups.read(uint2(uint(pair / 3), row));
   uint lane = uint(pair % 3);
-  if (lane == 0) return float2(words[offset] & 1023, (words[offset] >> 20) & 1023);
-  if (lane == 1) return float2((words[offset + 1] >> 10) & 1023, words[offset + 2] & 1023);
-  return float2((words[offset + 2] >> 20) & 1023, (words[offset + 3] >> 10) & 1023);
+  if (lane == 0) return float2(g.x & 1023, (g.x >> 20) & 1023);
+  if (lane == 1) return float2((g.y >> 10) & 1023, g.z & 1023);
+  return float2((g.z >> 20) & 1023, (g.w >> 10) & 1023);
 }
 
-kernel void packedLUT(device const uint *words [[buffer(2)]], texture2d<float, access::write> rgb [[texture(2)]],
+kernel void packedLUT(texture2d<uint, access::read> groups [[texture(3)]], texture2d<float, access::write> rgb [[texture(2)]],
   device const float4 *cube [[buffer(0)]], constant Parameters &p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= p.geometry.x || gid.y >= p.geometry.y) return;
-  uint offset = gid.y * p.geometry.z + (gid.x / 6) * 4;
+  uint4 g = groups.read(uint2(gid.x / 6, gid.y));
   uint lane = gid.x % 6, value;
-  if (lane == 0) value = (words[offset] >> 10) & 1023;
-  else if (lane == 1) value = words[offset + 1] & 1023;
-  else if (lane == 2) value = (words[offset + 1] >> 20) & 1023;
-  else if (lane == 3) value = (words[offset + 2] >> 10) & 1023;
-  else if (lane == 4) value = words[offset + 3] & 1023;
-  else value = (words[offset + 3] >> 20) & 1023;
+  if (lane == 0) value = (g.x >> 10) & 1023;
+  else if (lane == 1) value = g.y & 1023;
+  else if (lane == 2) value = (g.y >> 20) & 1023;
+  else if (lane == 3) value = (g.z >> 10) & 1023;
+  else if (lane == 4) value = g.w & 1023;
+  else value = (g.w >> 20) & 1023;
   float position = (float(gid.x) - p.domainLow.w) / 2.0f;
   int pair = int(floor(position));
-  float2 c = mix(packedChroma(words, pair, gid.y, p), packedChroma(words, pair + 1, gid.y, p), position - floor(position));
+  float2 c = mix(packedChroma(groups, pair, gid.y, p), packedChroma(groups, pair + 1, gid.y, p), position - floor(position));
   rgb.write(float4(lookup(decode(float(value), c, p), cube, p), 1), gid);
 }
 

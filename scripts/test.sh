@@ -32,7 +32,7 @@ rustdoc_path="$(rustup which --toolchain stable rustdoc)"
 RUSTC="$rustc_path" RUSTDOC="$rustdoc_path" rustup run stable cargo build \
   --manifest-path "$rust_manifest" --release --locked
 auto_switcher_lib="$task_root/Tools/auto-switcher/target/release"
-sdk_dir="${DECKLINK_SDK_DIR:-$external_root/cache/ultracam/decklink-sdk}"
+sdk_dir="${DECKLINK_SDK_DIR:-$task_root/ThirdParty/DeckLinkSDK/include}"
 export ULTRACAM_SHADER="$task_root/Sources/App/LUTShaders.metal"
 frameworks="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/Frameworks"
 libraries="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib"
@@ -62,8 +62,7 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.0 -module-cache-pat
   "$task_root/Sources/App/AutoSwitcherBridge.swift" \
   "$task_root/Sources/App/AutoSwitcherTimelineRecorder.swift" \
   "$task_root/Sources/App/ProgramOutputBridge.swift" \
-  "$task_root/Sources/App/VideoPreview.swift" "$task_root/Sources/App/SharedMetalBuffer.swift" \
-  "$task_root/Sources/App/GPURawFrameCopy.swift" \
+  "$task_root/Sources/App/VideoPreview.swift" \
   "$task_root/Sources/App/AppSettingsStore.swift" \
   "$task_root/Sources/App/VirtualCameraRegistryPublishing.swift" \
   "$task_root/Sources/App/RecordingModel.swift" \
