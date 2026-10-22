@@ -63,7 +63,15 @@ func syntheticRamp() throws -> CVPixelBuffer {
     XCTAssertThrowsError(try CubeLUT(text: cubeText().replacingOccurrences(of: "0.0 0.0 0.0", with: "1e38 0 0")))
     XCTAssertThrowsError(try CubeLUT(text: String(repeating: "#", count: 251)))
     XCTAssertThrowsError(try CubeLUT(text: cubeText() + "\n0 0 0"))
-    XCTAssertThrowsError(try CubeLUT(text: "LUT_1D_SIZE 2\n0 0 0\n1 1 1"))
+  }
+  /// 1D and shaper LUTs parse (MonitorKit's parser) and burn in; see
+  /// LUTGoldenChecks.testOneDimensionalAndShaperLUTsBurnInCorrectly.
+  func testOneDimensionalLUTParses() throws {
+    let cube = try CubeLUT(text: "LUT_1D_SIZE 2\n0 0 0\n1 1 1")
+    XCTAssertFalse(cube.hasCube)
+    XCTAssertEqual(cube.dimension, 0)
+    XCTAssertEqual(cube.shaperSize, 2)
+    XCTAssertEqual(cube.apply(SIMD3(0.25, 0.5, 0.75)), SIMD3(0.25, 0.5, 0.75))
   }
   func testDomain() throws {
     let text = cubeText().replacingOccurrences(of: "LUT_3D_SIZE 2", with: "LUT_3D_SIZE 2\nDOMAIN_MIN -1 0 0\nDOMAIN_MAX 1 2 3")
@@ -81,6 +89,7 @@ func syntheticRamp() throws -> CVPixelBuffer {
     ("UTF-8 BOM", testUTF8BOMIsIgnored),
     ("title parsing", testTitlePreservesQuotedTextAndRejectsMisplacement),
     ("invalid LUT rejection", testRejectIncompleteOversizedAndNonFinite),
+    ("1D LUT parses", testOneDimensionalLUTParses),
     ("domain validation", testDomain),
   ]
 }
@@ -225,6 +234,7 @@ let suite = XCTestSuite(name: "Ultracam synthetic checks")
 suite.addTest(XCTestSuite(forTestCaseClass: CubeTests.self))
 suite.addTest(XCTestSuite(forTestCaseClass: PipelineTests.self))
 suite.addTest(XCTestSuite(forTestCaseClass: GPUExtendedChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTGoldenChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: SampleFactoryChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: EndToEndChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: CameraContractChecks.self))

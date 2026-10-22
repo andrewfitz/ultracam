@@ -504,7 +504,14 @@ final class AppModel {
     let controller = feedCoordinator.capture(for: feedID)
     let controllerGeneration = controller.generationToken
     guard generation == lutLoadGenerations[feedID] else { return }
-    controller.load(loaded.cube, expectedGeneration: controllerGeneration) { [weak self] result in
+    // One MonitorLUT per load, on the shared device: the controller burns it in
+    // and the monitor's feed shows the output stage with the same object.
+    let lut: MonitorLUT
+    do { lut = try LUTProcessor.makeLUT(loaded.cube) } catch {
+      lutLoadFailed(error, restoring: restoring, generation: generation, feedID: feedID)
+      return
+    }
+    controller.load(lut, expectedGeneration: controllerGeneration) { [weak self] result in
       MainActor.assumeIsolated {
         guard let self else { return }
         guard generation == self.lutLoadGenerations[feedID] else { return }
@@ -525,7 +532,7 @@ final class AppModel {
           self.lutBookmark = loaded.bookmark
           self.rememberedLUTEnabled = enable
           self.configuration.applyLUT = enable
-          self.lutTitle = "\(loaded.cube.title) · \(loaded.cube.dimension)³"
+          self.lutTitle = "\(loaded.cube.title) · \(loaded.cube.sizeDescription)"
           self.lutFileName = loaded.fileName
           self.saveSettings()
           self.update.message = "LUT loaded. Confirm it expects \(self.gamut) and outputs Rec.709."
@@ -1104,7 +1111,13 @@ final class AppModel {
           controller.generationToken == generation,
           let descriptor = self.feedCoordinator.descriptors.first(where: { $0.id == feedID }),
           descriptor.lutBookmark == bookmark, descriptor.applyLUT else { return }
-        controller.load(loaded.cube, expectedGeneration: generation) { [weak self] result in
+        // One MonitorLUT per load, on the shared device (see uploadLUT).
+        let lut: MonitorLUT
+        do { lut = try LUTProcessor.makeLUT(loaded.cube) } catch {
+          self.headlessLUTRestoreFailed(error, feedID: feedID, bookmark: bookmark, generation: generation)
+          return
+        }
+        controller.load(lut, expectedGeneration: generation) { [weak self] result in
           MainActor.assumeIsolated {
             guard let self else { return }
             if case .failure(let error) = result {

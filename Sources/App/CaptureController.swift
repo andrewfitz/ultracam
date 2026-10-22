@@ -134,6 +134,8 @@ final class CaptureController: @unchecked Sendable {
   private var maxQueuedFrames = 0
   // The processor, for the watchdog and status (thread-safe accessors only).
   private var gpuProcessor: LUTProcessor?
+  // The LUT the processor burns in (once loaded), for the monitor's feed.
+  private var loadedLUT: MonitorLUT?
   private var gpuStallReported = false
   private var rawAudioProvidesStats = false
   private var processedFrameHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
@@ -283,19 +285,39 @@ final class CaptureController: @unchecked Sendable {
     return try queue.sync(execute: body)
   }
 
-  func load(_ cube: CubeLUT, expectedGeneration: UInt64? = nil,
+  /// The LUT this camera burns in when Apply LUT is on: the same immutable
+  /// `MonitorLUT` the app built for the load, so the monitor can show the
+  /// output stage with it (`MonitorFeed.burnInLUT`). Thread-safe.
+  var burnInLUT: MonitorLUT? { lock.withLock { loadedLUT } }
+
+  /// Burns `lut` in from the next frame (no wait for frames in flight).
+  /// `lut` must be on `LUTProcessor.sharedDevice`, tetrahedral (the app's only
+  /// interpolation).
+  func load(_ lut: MonitorLUT, expectedGeneration: UInt64? = nil,
     completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
     queue.async {
       do {
         if let expectedGeneration, !self.isCurrent(expectedGeneration) {
           throw VideoError.message("Camera changed before its LUT finished loading.")
         }
-        try self.makeProcessor().load(cube)
+        try self.makeProcessor().load(lut)
+        self.lock.withLock { self.loadedLUT = lut }
         self.monitorProcessingRevision &+= 1
         if self.pipelineEnabled && self.configuration.applyLUT { self.flushOwnedPreviews() }
         DispatchQueue.main.async { completion(.success(())) }
       } catch { DispatchQueue.main.async { completion(.failure(error)) } }
     }
+  }
+
+  /// Uploads `cube` on the shared device, then `load(_:)`s it (tests, tools).
+  func load(_ cube: CubeLUT, expectedGeneration: UInt64? = nil,
+    completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+    let lut: MonitorLUT
+    do { lut = try LUTProcessor.makeLUT(cube) } catch {
+      DispatchQueue.main.async { completion(.failure(error)) }
+      return
+    }
+    load(lut, expectedGeneration: expectedGeneration, completion: completion)
   }
 
   func start(deviceID: String, configuration: PipelineConfiguration,
@@ -1071,7 +1093,7 @@ final class CaptureController: @unchecked Sendable {
   /// the GPU, whose offers are made when they complete.
   private func offerSourceOnlyInOrder(_ sink: MonitorCaptureSink, frame: CapturedFrame, token: UInt64) {
     let revision = monitorProcessingRevision
-    let offer = { [deliveryQueue] in
+    let offer: @Sendable () -> Void = { [deliveryQueue] in
       deliveryQueue.async {
         sink.offer(source: frame.image, output: nil, pts: frame.pts, captureGeneration: token,
           sequence: frame.sequence, processingRevision: revision, sourceOnly: true, correspondence: .identity)

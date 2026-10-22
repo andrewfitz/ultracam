@@ -1,67 +1,13 @@
+// Compiled after MonitorKit's MKLUT.msl (MonitorShaders.source([.lut])), never
+// alone: LUTProcessor builds one compilation unit, MKLUT.msl then this file, with
+// MonitorShaders.compileOptions (safe math), so the burned-in LUT is MonitorKit's
+// mk_applyLUT on the same MonitorLUT texture and LUTParameters the monitor uses.
+// A prebuilt ULTRACAM_METALLIB must be compiled from the same concatenation.
+#if !defined(MK_LUT_MSL_VERSION) || MK_LUT_MSL_VERSION != 2
+#error "Compile MonitorShaders.source([.lut]) before LUTShaders.metal (mk_LUTParams layout 2, 80 bytes)."
+#endif
 #include <metal_stdlib>
 using namespace metal;
-
-// ---------------------------------------------------------------------------
-// MonitorKit 3D LUT sampling, copied verbatim from
-// Packages/MonitorKit/Sources/MonitorKit/Shaders/MKLUT.msl so this file stays
-// self-contained (the app compiles it from source). The LUT is applied by this
-// one function only; swapping in MonitorKit's own copy is a one-line change.
-// Ultracam uses trilinear mode (shape.y == 1), which reproduces the original
-// 8-read manual interpolation exactly, now reading an rgba32Float texture3d.
-#ifndef MK_LUT_MSL
-#define MK_LUT_MSL
-
-// Mirrors MonitorKit.LUTParameters.
-struct mk_LUTParams {
-  float4 domainLow;    // xyz: DOMAIN_MIN
-  float4 domainScale;  // xyz: 1 / (DOMAIN_MAX - DOMAIN_MIN)
-  uint4 shape;         // x: lattice size, y: interpolation (0 tetrahedral, 1 trilinear, 2 hardware), z: enabled
-};
-
-// Lattice is an rgba32Float texture3d; x is red, y green, z blue.
-inline float3 mk_lattice(texture3d<float, access::sample> lut, uint3 i) { return lut.read(i).rgb; }
-
-float3 mk_applyLUT(float3 rgb, texture3d<float, access::sample> lut, mk_LUTParams p) {
-  if (p.shape.z == 0) return rgb;
-  uint n = p.shape.x;
-  float3 position = clamp((rgb - p.domainLow.xyz) * p.domainScale.xyz, 0.0f, 1.0f) * float(n - 1);
-  if (p.shape.y == 2) {
-    constexpr sampler filtered(coord::normalized, address::clamp_to_edge, filter::linear);
-    return lut.sample(filtered, (position + 0.5f) / float(n)).rgb;
-  }
-  uint3 lo = uint3(floor(position)), hi = min(lo + 1, uint3(n - 1));
-  float3 t = position - float3(lo);
-  if (p.shape.y == 1) {
-    // The original Ultracam order: x, then y, then z.
-    float3 a = mix(mk_lattice(lut, uint3(lo.x, lo.y, lo.z)), mk_lattice(lut, uint3(hi.x, lo.y, lo.z)), t.x);
-    float3 b = mix(mk_lattice(lut, uint3(lo.x, hi.y, lo.z)), mk_lattice(lut, uint3(hi.x, hi.y, lo.z)), t.x);
-    float3 c = mix(mk_lattice(lut, uint3(lo.x, lo.y, hi.z)), mk_lattice(lut, uint3(hi.x, lo.y, hi.z)), t.x);
-    float3 d = mix(mk_lattice(lut, uint3(lo.x, hi.y, hi.z)), mk_lattice(lut, uint3(hi.x, hi.y, hi.z)), t.x);
-    return mix(mix(a, b, t.y), mix(c, d, t.y), t.z);
-  }
-  float3 c000 = mk_lattice(lut, lo), c111 = mk_lattice(lut, hi);
-  if (t.x > t.y) {
-    if (t.y > t.z)
-      return (1 - t.x) * c000 + (t.x - t.y) * mk_lattice(lut, uint3(hi.x, lo.y, lo.z))
-        + (t.y - t.z) * mk_lattice(lut, uint3(hi.x, hi.y, lo.z)) + t.z * c111;
-    if (t.x > t.z)
-      return (1 - t.x) * c000 + (t.x - t.z) * mk_lattice(lut, uint3(hi.x, lo.y, lo.z))
-        + (t.z - t.y) * mk_lattice(lut, uint3(hi.x, lo.y, hi.z)) + t.y * c111;
-    return (1 - t.z) * c000 + (t.z - t.x) * mk_lattice(lut, uint3(lo.x, lo.y, hi.z))
-      + (t.x - t.y) * mk_lattice(lut, uint3(hi.x, lo.y, hi.z)) + t.y * c111;
-  }
-  if (t.z > t.y)
-    return (1 - t.z) * c000 + (t.z - t.y) * mk_lattice(lut, uint3(lo.x, lo.y, hi.z))
-      + (t.y - t.x) * mk_lattice(lut, uint3(lo.x, hi.y, hi.z)) + t.x * c111;
-  if (t.z > t.x)
-    return (1 - t.y) * c000 + (t.y - t.z) * mk_lattice(lut, uint3(lo.x, hi.y, lo.z))
-      + (t.z - t.x) * mk_lattice(lut, uint3(lo.x, hi.y, hi.z)) + t.x * c111;
-  return (1 - t.y) * c000 + (t.y - t.x) * mk_lattice(lut, uint3(lo.x, hi.y, lo.z))
-    + (t.x - t.z) * mk_lattice(lut, uint3(hi.x, hi.y, lo.z)) + t.z * c111;
-}
-
-#endif
-// ---------------------------------------------------------------------------
 
 // Mirrors LUTProcessor.Parameters (16-byte rows).
 struct Parameters {
@@ -70,8 +16,9 @@ struct Parameters {
   float4 decodeMatrix;
   float4 encodeMatrix;  // x: Kr, y: Kb
   float4 chroma;        // x: source chroma sample offset (0 cosited, 0.5 centered)
-  mk_LUTParams lut;
+  mk_LUTParams lut;     // MonitorLUT.parameters; shape.z is 0 when Apply LUT is off
 };
+static_assert(sizeof(Parameters) == 160, "Parameters is LUTProcessor.Parameters: ten 16-byte rows");
 
 float3 decode(float y, float2 c, constant Parameters &p) {
   float luma = (y - p.decodeRange.x) / p.decodeRange.y;
@@ -129,7 +76,8 @@ struct PlanarSource {
   }
 };
 
-// The only place a source pixel becomes graded RGB: decode, then the LUT.
+// The only place a source pixel becomes graded RGB: decode, then MonitorKit's
+// LUT (tetrahedral; a 1D shaper first when the LUT has one).
 template <typename Source>
 inline float3 graded(Source source, uint x, uint y, texture3d<float, access::sample> lut, constant Parameters &p) {
   return mk_applyLUT(source.pixel(x, y, p), lut, p.lut);

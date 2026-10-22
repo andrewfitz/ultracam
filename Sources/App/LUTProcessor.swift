@@ -2,6 +2,23 @@ import CoreVideo
 import Foundation
 import IOSurface
 import Metal
+import MonitorKit
+
+// MonitorKit's LUT types under the app module's names, so the files that still
+// import MonitorTools (which must not import MonitorKit beside it: MonitorRect,
+// the false-colour profiles and more collide) can name them. Remove these once
+// MonitorTools is retired and those files import MonitorKit directly.
+typealias CubeLUT = MonitorKitCore.CubeLUT
+typealias MonitorLUT = MonitorKit.MonitorLUT
+
+extension CubeLUT {
+  /// The table sizes for the UI: "33³", "1D 1024", or "1D 4096 + 33³".
+  var sizeDescription: String {
+    let cube = "\(dimension)³"
+    guard shaperSize > 0 else { return cube }
+    return hasCube ? "1D \(shaperSize) + \(cube)" : "1D \(shaperSize)"
+  }
+}
 
 /// GPU processing for one capture controller, on Metal 4.
 ///
@@ -21,9 +38,12 @@ import Metal
 /// - One MTL4CommandQueue; a ring of command allocators, command buffers,
 ///   argument tables, parameter slices and input residency sets, one per
 ///   in-flight frame. A slot is reused only after its frame completed.
-/// - A persistent residency set (LUT texture, parameters, intermediate) and
-///   an output residency set of textures cached per output IOSurface (pools
-///   recycle their surfaces, so these are created once and stay resident).
+/// - A persistent residency set (parameters, intermediate, the placeholder
+///   LUT) and an output residency set of textures cached per output IOSurface
+///   (pools recycle their surfaces, so these are created once and stay
+///   resident). The loaded `MonitorLUT` is immutable: each frame retains the
+///   one it was encoded with and puts its texture in that frame's residency
+///   set, so loading a LUT swaps it at once, without waiting for the GPU.
 /// - Capture frames belong to the driver's pool, so they are mapped per frame
 ///   through CVMetalTextureCache (which does not keep driver surfaces alive);
 ///   their CVMetalTextures live in the frame record until completion.
@@ -98,8 +118,11 @@ final class LUTProcessor: @unchecked Sendable {
   private var poolConfiguration: PipelineConfiguration?
   private var passthroughPool: CVPixelBufferPool?
   private var passthroughFormat: (type: OSType, width: Int, height: Int)?
-  private var cube: CubeLUT?
-  private var lutTexture: MTLTexture
+  /// The burned-in LUT (tetrahedral; MonitorKit's `mk_applyLUT`), shared with
+  /// the monitor. Owning queue only.
+  private(set) var lut: MonitorLUT?
+  /// Bound when no LUT is loaded; the shader returns before reading it.
+  private let placeholderLUT: MTLTexture
   private var horizontalTexture: MTLTexture?
   private var outputTextures: [SurfaceKey: SurfaceEntry] = [:]
   private var submitted: UInt64 = 0
@@ -145,7 +168,7 @@ final class LUTProcessor: @unchecked Sendable {
 
   /// One committed frame. Holds every object the command buffer references
   /// that Metal 4 does not retain: the capture frame's CVMetalTextures, the
-  /// output buffer, and the LUT/intermediate textures of that frame.
+  /// output buffer, and the MonitorLUT and intermediate texture of that frame.
   private final class InFlight: @unchecked Sendable {
     let output: CVPixelBuffer
     let retained: [AnyObject]
@@ -155,7 +178,7 @@ final class LUTProcessor: @unchecked Sendable {
     var done = false
     /// Work to run right after this frame's completion, in order (frames the
     /// caller did not put on the GPU but must order behind this one).
-    var followers: [() -> Void] = []
+    var followers: [@Sendable () -> Void] = []
     init(output: CVPixelBuffer, retained: [AnyObject], completion: @escaping Completion, timing: FrameTiming) {
       self.output = output
       self.retained = retained
@@ -164,15 +187,15 @@ final class LUTProcessor: @unchecked Sendable {
     }
   }
 
-  private struct Parameters {
+  /// Mirrors `Parameters` in LUTShaders.metal: ten 16-byte rows, the last five
+  /// MonitorKit's `mk_LUTParams`.
+  struct Parameters {
     var geometry: SIMD4<UInt32>
     var decodeRange: SIMD4<Float>
     var decodeMatrix: SIMD4<Float>
     var encodeMatrix: SIMD4<Float>
     var chroma: SIMD4<Float>
-    var lutDomainLow: SIMD4<Float>
-    var lutDomainScale: SIMD4<Float>
-    var lutShape: SIMD4<UInt32>
+    var lut: LUTParameters
   }
 
   var workingResourceDiagnostics: WorkingResourceDiagnostics {
@@ -201,8 +224,31 @@ final class LUTProcessor: @unchecked Sendable {
 
   func resetInFlightPeak() { stateLock.withLock { inFlightPeak = pending.count } }
 
-  init(qos: DispatchQoS = .userInteractive) throws {
-    guard let device = MTLCreateSystemDefaultDevice() else { throw VideoError.message("A Metal GPU is required.") }
+  /// The one GPU of the capture, LUT and monitor work. A `MonitorLUT` is bound
+  /// to the device it was built on, so the one built per LUT load serves the
+  /// burn-in and the monitor only when both run here.
+  static let sharedDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
+
+  /// The processing library: MonitorKit's MKLUT.msl, then LUTShaders.metal
+  /// (then `extra`), as one compilation unit with `MonitorShaders.compileOptions`,
+  /// so `mk_applyLUT` compiles exactly as in MonitorKit's own passes.
+  static func libraryDescriptor(extra: String = "") throws -> MTL4LibraryDescriptor {
+    let url = ProcessInfo.processInfo.environment["ULTRACAM_SHADER"].map { URL(fileURLWithPath: $0) }
+      ?? Bundle.main.url(forResource: "LUTShaders", withExtension: "metal")
+    guard let url else { throw VideoError.message("GPU shader resource is missing.") }
+    let source = try String(contentsOf: url, encoding: .utf8)
+    return try MonitorShaders.libraryDescriptor(parts: [.lut], extra: extra.isEmpty ? source : source + "\n" + extra,
+      name: "LUTShaders")
+  }
+
+  init(device: MTLDevice? = LUTProcessor.sharedDevice, qos: DispatchQoS = .userInteractive) throws {
+    guard let device else { throw VideoError.message("A Metal GPU is required.") }
+    // Parameters embed MonitorKit's mk_LUTParams, layout 2 (80 bytes); the
+    // shader source refuses to compile against any other MKLUT.msl.
+    guard MonitorShaders.lutLayoutVersion == 2, MemoryLayout<LUTParameters>.size == 80,
+      MemoryLayout<Parameters>.size == 160, MemoryLayout<Parameters>.size <= Self.parameterStride else {
+      throw VideoError.message("The LUT shader parameters do not match MonitorKit's LUT layout.")
+    }
     self.device = device
     feedbackQueue = DispatchQueue(label: "org.ultracam.gpu-completion", qos: qos)
     let queueDescriptor = MTL4CommandQueueDescriptor()
@@ -220,15 +266,11 @@ final class LUTProcessor: @unchecked Sendable {
     let compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
     let library: MTLLibrary
     if let path = ProcessInfo.processInfo.environment["ULTRACAM_METALLIB"] {
+      // Prebuilt from the same unit as `libraryDescriptor` (MKLUT.msl, then
+      // LUTShaders.metal, safe math); LUTShaders.metal alone does not compile.
       library = try device.makeLibrary(URL: URL(fileURLWithPath: path))
     } else {
-      let url = ProcessInfo.processInfo.environment["ULTRACAM_SHADER"].map { URL(fileURLWithPath: $0) }
-        ?? Bundle.main.url(forResource: "LUTShaders", withExtension: "metal")
-      guard let url else { throw VideoError.message("GPU shader resource is missing.") }
-      let descriptor = MTL4LibraryDescriptor()
-      descriptor.source = try String(contentsOf: url, encoding: .utf8)
-      descriptor.name = "LUTShaders"
-      library = try compiler.makeLibrary(descriptor: descriptor)
+      library = try compiler.makeLibrary(descriptor: Self.libraryDescriptor())
     }
     var pipelines: [String: MTLComputePipelineState] = [:]
     for name in ["fullPackedNV12", "fullPacked422", "fullPlanarNV12", "fullPlanar422",
@@ -256,7 +298,7 @@ final class LUTProcessor: @unchecked Sendable {
       }
       let residency = MTLResidencySetDescriptor()
       residency.label = "Capture frame \(index)"
-      residency.initialCapacity = 2
+      residency.initialCapacity = 3
       slots.append(Slot(allocator: allocator, commandBuffer: commandBuffer,
         tables: try (0..<2).map { _ in try device.makeArgumentTable(descriptor: tableDescriptor) },
         inputResidency: try device.makeResidencySet(descriptor: residency),
@@ -270,10 +312,8 @@ final class LUTProcessor: @unchecked Sendable {
     outputs.label = "Output surfaces"
     outputs.initialCapacity = 32
     outputResidency = try device.makeResidencySet(descriptor: outputs)
-    // Bound when no LUT is applied; the shader returns before reading it.
-    lutTexture = try Self.makeLUTTexture(device: device, dimension: 2,
-      rgba: [0, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1])
-    persistentResidency.addAllocations([parameterBuffer, lutTexture])
+    placeholderLUT = try Self.makePlaceholderLUT(device: device)
+    persistentResidency.addAllocations([parameterBuffer, placeholderLUT])
     persistentResidency.commit()
     commandQueue.addResidencySets([persistentResidency, outputResidency])
     let status = CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache)
@@ -285,35 +325,55 @@ final class LUTProcessor: @unchecked Sendable {
     commandQueue.removeResidencySets([persistentResidency, outputResidency])
   }
 
-  private static func makeLUTTexture(device: MTLDevice, dimension n: Int, rgba: [Float]) throws -> MTLTexture {
+  /// The 2³ identity lattice bound while no LUT is applied
+  /// (`LUTParameters.disabled`: the shader returns before reading it).
+  private static func makePlaceholderLUT(device: MTLDevice) throws -> MTLTexture {
     let descriptor = MTLTextureDescriptor()
     descriptor.textureType = .type3D
     descriptor.pixelFormat = .rgba32Float
-    descriptor.width = n
-    descriptor.height = n
-    descriptor.depth = n
+    descriptor.width = 2
+    descriptor.height = 2
+    descriptor.depth = 2
     descriptor.usage = .shaderRead
     descriptor.storageMode = .shared
-    guard rgba.count == n * n * n * 4, let texture = device.makeTexture(descriptor: descriptor) else {
+    guard let texture = device.makeTexture(descriptor: descriptor) else {
       throw VideoError.message("Cannot upload LUT to GPU.")
     }
+    let rgba: [Float] = [0, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]
     rgba.withUnsafeBytes { bytes in
-      texture.replace(region: MTLRegionMake3D(0, 0, 0, n, n, n), mipmapLevel: 0, slice: 0,
-        withBytes: bytes.baseAddress!, bytesPerRow: n * 16, bytesPerImage: n * n * 16)
+      texture.replace(region: MTLRegionMake3D(0, 0, 0, 2, 2, 2), mipmapLevel: 0, slice: 0,
+        withBytes: bytes.baseAddress!, bytesPerRow: 32, bytesPerImage: 64)
     }
-    texture.label = "LUT \(n)³"
+    texture.label = "No LUT"
     return texture
   }
 
+  /// Burns `lut` in from the next submitted frame. No wait: `MonitorLUT` is
+  /// immutable, and every frame in flight retains (and keeps resident) the one
+  /// it was encoded with. Ultracam interpolates tetrahedrally only, burn-in and
+  /// monitor alike. Owning queue only.
+  func load(_ lut: MonitorLUT) throws {
+    guard lut.texture.device === device else {
+      throw VideoError.message("The LUT was uploaded to a different GPU than the one processing this camera.")
+    }
+    guard lut.interpolation == .tetrahedral else {
+      throw VideoError.message("Ultracam applies LUTs with tetrahedral interpolation only.")
+    }
+    self.lut = lut
+  }
+
+  /// Uploads `cube` on this processor's device, then `load(_:)`s it.
   func load(_ cube: CubeLUT) throws {
-    let texture = try Self.makeLUTTexture(device: device, dimension: cube.dimension, rgba: cube.rgba)
-    // Frames in flight reference the old LUT; replace it only once they finish.
-    guard waitUntilIdle(timeout: 2) else { throw VideoError.message("The GPU stopped responding; the LUT was not loaded.") }
-    persistentResidency.removeAllocation(lutTexture)
-    persistentResidency.addAllocation(texture)
-    persistentResidency.commit()
-    lutTexture = texture
-    self.cube = cube
+    try load(Self.makeLUT(cube, device: device))
+  }
+
+  /// The one `MonitorLUT` of a LUT load (tetrahedral), on the shared device:
+  /// the burn-in and the monitor take this same object.
+  static func makeLUT(_ cube: CubeLUT, device: MTLDevice? = sharedDevice) throws -> MonitorLUT {
+    guard let device else { throw VideoError.message("A Metal GPU is required.") }
+    do { return try MonitorLUT(device: device, cube: cube) } catch let error as MonitorKitError {
+      throw VideoError.message("Cannot upload the LUT to the GPU: \(error.description)")
+    }
   }
 
   /// Blocks the owning queue until every committed frame has completed.
@@ -491,31 +551,12 @@ final class LUTProcessor: @unchecked Sendable {
     if try validate(input, untouched: configuration.untouched) {
       throw VideoError.message("An untouched configuration has no GPU work; use passthrough.")
     }
-    guard !configuration.applyLUT || cube != nil else { throw VideoError.message("Load a LUT or turn off Apply LUT.") }
+    let applied = configuration.applyLUT ? lut : nil
+    guard !configuration.applyLUT || applied != nil else { throw VideoError.message("Load a LUT or turn off Apply LUT.") }
     let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
     let type = CVPixelBufferGetPixelFormatType(input)
-    let chromaLocation = CVBufferCopyAttachment(input, kCVImageBufferChromaLocationTopFieldKey, nil) as? String
-    // SMPTE/QuickTime 4:2:2 is left-cosited unless the producer labels it centered.
-    let chromaOffset: Float = chromaLocation == kCVImageBufferChromaLocation_Center as String ||
-      chromaLocation == kCVImageBufferChromaLocation_Top as String ||
-      chromaLocation == kCVImageBufferChromaLocation_Bottom as String ? 0.5 : 0
     let matrix = CVBufferCopyAttachment(input, kCVImageBufferYCbCrMatrixKey, nil) as? String
-    let kr: Float = matrix == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String ? 0.2627 :
-      (matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String ? 0.299 : 0.2126)
-    let kb: Float = matrix == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String ? 0.0593 :
-      (matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String ? 0.114 : 0.0722)
-    let kg = 1 - kr - kb
-    let fullRange = type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
-    let low = cube?.domainMin ?? .zero
-    let scale = SIMD3<Float>(repeating: 1) / ((cube?.domainMax ?? SIMD3(repeating: 1)) - low)
-    var parameters = Parameters(
-      geometry: SIMD4(UInt32(width), UInt32(height), 0, 0),
-      decodeRange: SIMD4(fullRange ? 0 : 64, fullRange ? 1023 : 876, 512, fullRange ? 1023 : 896),
-      decodeMatrix: SIMD4(2 * (1 - kr), 2 * (1 - kb), 2 * kb * (1 - kb) / kg, 2 * kr * (1 - kr) / kg),
-      encodeMatrix: SIMD4(configuration.applyLUT ? 0.2126 : kr, configuration.applyLUT ? 0.0722 : kb, 0, 0),
-      chroma: SIMD4(chromaOffset, 0, 0, 0),
-      lutDomainLow: SIMD4(low, 0), lutDomainScale: SIMD4(scale, 0),
-      lutShape: SIMD4(UInt32(cube?.dimension ?? 2), 1, configuration.applyLUT ? 1 : 0, 0))
+    var parameters = Self.parameters(for: input, matrix: matrix, lut: applied)
     // Reserve output before mapping a borrowed capture frame. A consumer that
     // holds every output buffer is a stall, reported by the caller.
     let pool = try preparePool(configuration)
@@ -555,9 +596,10 @@ final class LUTProcessor: @unchecked Sendable {
     // the next frame) rather than wait for the GPU on the capture thread.
     if !configuration.downscale, horizontalTexture != nil, framesInFlight == 0 { releaseIntermediate() }
     stampAttachments(output, from: input, configuration: configuration, matrix: matrix)
-    let lut = lutTexture
-    try encode(output: output, retained: wrappers + [input, lut] + (horizontal.map { [$0] } ?? []),
-      inputResidency: inputs, timing: FrameTiming(submitted: submittedAt), isCurrent: isCurrent,
+    // The frame retains its LUT and keeps its texture resident until it completes.
+    let lutTexture = applied?.texture ?? placeholderLUT
+    try encode(output: output, retained: wrappers + [input] + (applied.map { [$0] } ?? []) + (horizontal.map { [$0] } ?? []),
+      inputResidency: inputs + (applied.map { [$0.texture] } ?? []), timing: FrameTiming(submitted: submittedAt), isCurrent: isCurrent,
       label: "LUT → Lanczos → output format", completion: completion) { encoder, slot in
       withUnsafeBytes(of: &parameters) { bytes in
         parameterBuffer.contents().advanced(by: slot.parameterOffset)
@@ -568,7 +610,7 @@ final class LUTProcessor: @unchecked Sendable {
       first.setAddress(parameterAddress, index: 0)
       first.setTexture(inputs[0].gpuResourceID, index: 0)
       if inputs.count > 1 { first.setTexture(inputs[1].gpuResourceID, index: 1) }
-      first.setTexture(lut.gpuResourceID, index: 2)
+      first.setTexture(lutTexture.gpuResourceID, index: 2)
       encoder.setArgumentTable(first)
       if let horizontal {
         first.setTexture(horizontal.gpuResourceID, index: 3)
@@ -598,6 +640,32 @@ final class LUTProcessor: @unchecked Sendable {
       }
       return true
     }
+  }
+
+  /// The kernel parameters for one input frame: its decode (size, range,
+  /// matrix `matrix`, chroma siting), the output encode, and `lut` burned in
+  /// (`LUTParameters.disabled` when nil: Apply LUT off).
+  static func parameters(for input: CVPixelBuffer, matrix: String?, lut: MonitorLUT?) -> Parameters {
+    let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
+    let type = CVPixelBufferGetPixelFormatType(input)
+    let chromaLocation = CVBufferCopyAttachment(input, kCVImageBufferChromaLocationTopFieldKey, nil) as? String
+    // SMPTE/QuickTime 4:2:2 is left-cosited unless the producer labels it centered.
+    let chromaOffset: Float = chromaLocation == kCVImageBufferChromaLocation_Center as String ||
+      chromaLocation == kCVImageBufferChromaLocation_Top as String ||
+      chromaLocation == kCVImageBufferChromaLocation_Bottom as String ? 0.5 : 0
+    let kr: Float = matrix == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String ? 0.2627 :
+      (matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String ? 0.299 : 0.2126)
+    let kb: Float = matrix == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String ? 0.0593 :
+      (matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String ? 0.114 : 0.0722)
+    let kg = 1 - kr - kb
+    let fullRange = type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
+    return Parameters(
+      geometry: SIMD4(UInt32(width), UInt32(height), 0, 0),
+      decodeRange: SIMD4(fullRange ? 0 : 64, fullRange ? 1023 : 876, 512, fullRange ? 1023 : 896),
+      decodeMatrix: SIMD4(2 * (1 - kr), 2 * (1 - kb), 2 * kb * (1 - kb) / kg, 2 * kr * (1 - kr) / kg),
+      encodeMatrix: SIMD4(lut != nil ? 0.2126 : kr, lut != nil ? 0.0722 : kb, 0, 0),
+      chroma: SIMD4(chromaOffset, 0, 0, 0),
+      lut: lut?.parameters ?? .disabled)
   }
 
   /// One thread per 2×2 (4:2:0) or 2×1 (4:2:2) output block.
@@ -723,7 +791,7 @@ final class LUTProcessor: @unchecked Sendable {
   /// in order with those completions (on the feedback queue). For work about
   /// frames that skip the GPU and must stay ordered behind the ones on it.
   /// Owning queue only.
-  func afterCommittedFrames(_ body: @escaping () -> Void) {
+  func afterCommittedFrames(_ body: @escaping @Sendable () -> Void) {
     let attached = stateLock.withLock { () -> Bool in
       // The newest committed frame completes last; attach to it while it is
       // still pending. Once it left `pending`, its completion is running or

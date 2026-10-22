@@ -21,7 +21,7 @@ source "$task_root/scripts/monitor-tools-package.sh"
 monitor_package_build > "$test_root/compile.log" 2>&1 || { cat "$test_root/compile.log"; exit 1; }
 xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
   "${monitor_link_args[@]}" "$task_root/Sources/Shared/VideoContract.swift" \
-  "$task_root/Sources/Shared/VideoBufferLayout.swift" "$task_root/Sources/Shared/CubeLUT.swift" \
+  "$task_root/Sources/Shared/VideoBufferLayout.swift" \
   "$task_root/Sources/App/LUTProcessor.swift" \
   "$task_root/Sources/App/AppResourceUsage.swift" "$task_root"/Sources/Recording/*.swift \
   "$task_root/Tools/MonitorToolsRecording/QualificationMetrics.swift" "$task_root/Tools/MonitorToolsRecording/PipelineAdmission.swift" "$task_root/Tools/MonitorToolsRecording/MonitorGPUWorkload.swift" "$task_root/Tools/MonitorToolsRecording/main.swift" -o "$test_root/monitor-recording" \
