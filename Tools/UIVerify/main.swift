@@ -462,9 +462,8 @@ import SystemExtensions
     bridge.send(.stopCamera(cameraID: beta.rawValue))
     verifier.check("bridge: no confirmation for an idle camera", interface.confirmation == nil)
 
-    // A Start that can't start says why, on any camera. The device list is the real
-    // one (the selected camera adopts the first real input), so both cameras are
-    // pointed at inputs that don't exist first: nothing here may open hardware.
+    // A Start that can't start says why, on any camera. The model runs with
+    // offline hardware (no inputs), so both cameras point at missing inputs.
     bridge.perform(.setInput(cameraID: alpha.rawValue, deviceID: "ui-verify-device-a"))
     bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: "ui-verify-device-b"))
     let missingInputs = model.selectedDevice == "ui-verify-device-a" && model.descriptor(for: beta)?.selectedDevice == "ui-verify-device-b"
@@ -636,6 +635,60 @@ import SystemExtensions
     render("main-live-model", mainWindow(live), size: CGSize(width: 1320, height: 860), titled: true).forEach { $0.close() }
   }
 
+  // MARK: Device discovery
+
+  /// Hot-plug and Start refusals against a scripted device list; no hardware.
+  func discovery() {
+    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("discovery: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let settings = AppSettingsStore(defaults: defaults)
+    let alpha = FeedID(rawValue: "ui-verify-alpha"), beta = FeedID(rawValue: "ui-verify-beta")
+    let gamma = FeedID(rawValue: "ui-verify-gamma")
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: [
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-y", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-z", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: gamma, name: "Camera 3", selectedDevice: "", applyLUT: false, automaticFeed: false),
+    ], selectedFeedID: alpha, outputMode: .separateCameras))
+    let x = InputDevice(id: "dev-x", name: "UltraStudio X"), y = InputDevice(id: "dev-y", name: "UltraStudio Y")
+    let z = InputDevice(id: "dev-z", name: "UltraStudio Z")
+    final class Publisher { var handler: (@MainActor @Sendable ([InputDevice]) -> Void)? }
+    let publisher = Publisher()
+    var hardware = AppHardware.offline
+    hardware.devices = { [x, y] }
+    hardware.observeDevices = { handler in publisher.handler = handler; return nil }
+    let model = AppModel(settingsStore: settings, registryStore: VirtualCameraRegistryStore(defaults: defaults),
+      registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    let publish = { (list: [InputDevice]) in publisher.handler?(list) }
+
+    verifier.check("discovery: launch keeps the saved input", model.selectedDevice == "dev-y", model.selectedDevice)
+    // Discovery publishes once per arrival, so the first list can be partial.
+    publish([x])
+    verifier.check("discovery: a partial list doesn't move the camera's input", model.selectedDevice == "dev-y",
+      model.selectedDevice)
+    publish([x, y])
+
+    model.startCamera(beta)
+    verifier.check("discovery: Start without its input is refused", model.startRefusal(beta) != nil)
+    publish([x, y, z])
+    verifier.check("discovery: the refusal clears when the input arrives", model.startRefusal(beta) == nil,
+      model.startRefusal(beta) ?? "")
+    publish([x, y])
+    verifier.check("discovery: a later outage doesn't revive an old refusal", model.startRefusal(beta) == nil,
+      model.startRefusal(beta) ?? "")
+
+    model.startAllCameras()
+    verifier.check("discovery: Start All skips a camera with no input", model.startRefusal(gamma) == nil,
+      model.startRefusal(gamma) ?? "")
+    model.stopAllCameras()
+
+    _ = model.selectFeed(gamma)
+    publish([x])
+    verifier.check("discovery: an empty assignment takes the arriving input",
+      model.descriptor(for: gamma)?.selectedDevice == "dev-x", model.descriptor(for: gamma)?.selectedDevice ?? "nil")
+  }
+
   // MARK: Menu bar
 
   func menuItems(_ items: [NSMenuItem]) -> [NSMenuItem] {
@@ -750,6 +803,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.accessibility()
   run.interactions()
   do { try run.bridge() } catch { verifier.check("bridge tests threw", false, "\(error)") }
+  run.discovery()
   run.menuBar()
   Images.waitForWrites()
   print("""

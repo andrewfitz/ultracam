@@ -15,9 +15,11 @@ struct InputDevice: Identifiable {
 
 extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
 
-/// Every path from AppModel to the DeckLink driver and the camera extension.
-/// Tools that build a real model, such as ui-verify, pass `.offline` so they
-/// can never open the user's capture device or send to their camera.
+/// AppModel's paths to the DeckLink driver and the per-camera extension
+/// streams. Tools that build a real model, such as ui-verify, pass `.offline`
+/// so they can never open the user's capture device or send to their camera.
+/// The Program stream connects only behind a running camera, which `.offline`
+/// can't start.
 @MainActor struct AppHardware {
   var captureServices: (FeedID) -> CaptureServices
   var devices: () throws -> [InputDevice]
@@ -57,7 +59,7 @@ final class AppModel {
       NSApplication.shared.setActivationPolicy(hideFromDock ? .accessory : .regular)
     }
   }
-  var devices: [InputDevice] = []
+  var devices: [InputDevice] = [] { didSet { expireResolvedStartRefusals() } }
   /// Set when Desktop Video is missing or older than 16.0, whose drivers
   /// reject the SDK 16 interfaces and would otherwise list no inputs.
   var driverWarning: String?
@@ -219,7 +221,7 @@ final class AppModel {
   // whenever a newer load for the same camera starts, so an old completion
   // cannot overwrite it. Each camera counts its own loads.
   private var lutLoadGenerations: [FeedID: UInt64] = [:]
-  private var lutLoadingFeeds: Set<FeedID> = []
+  private var lutLoadingFeeds: Set<FeedID> = [] { didSet { expireResolvedStartRefusals() } }
   private let demandMonitor = CameraDemandMonitor()
   private var automaticPolicy = AutomaticFeedPolicy()
   private var persistedSnapshot = AppSettingsSnapshot()
@@ -433,7 +435,10 @@ final class AppModel {
     // Discovery reports every arrival, including devices already listed.
     if fromDiscovery, next.map(\.id) == devices.map(\.id), next.map(\.name) == devices.map(\.name) { return }
     devices = next
+    // Discovery publishes after each arrival or removal, so its list can be
+    // partial; it only fills an empty assignment and never moves one.
     if !running, !capture.hasActiveFeed, let first = devices.first,
+      !fromDiscovery || selectedDevice.isEmpty,
       !devices.contains(where: { $0.id == selectedDevice }) {
       selectedDevice = first.id
     }
@@ -548,6 +553,9 @@ final class AppModel {
     // Keep the last saved bookmark and an already-loaded LUT. A missing moved
     // file is recoverable by choosing it again; it does not erase preferences.
     if restoring { lutTitle = "Saved LUT unavailable" }
+    // Selected mid-load, so selection skipped its restore and nothing is
+    // applied; bring the saved LUT back rather than run without one.
+    if !restoring, !lutLoaded, let bookmark = lutBookmark { restoreLUT(bookmark: bookmark) }
     lutError = message
     update.message = message
     reconcileAutomaticFeed()
@@ -634,6 +642,7 @@ final class AppModel {
     guard canEditFeedTopology, feedCoordinator.outputMode != mode else { return }
     saveSettings()
     feedCoordinator.setOutputMode(mode)
+    programCutIssue = nil
     if mode == .program { programMonitorTap?.restart() }
     saveSettings()
     installAutomaticFeedMonitor()
@@ -821,6 +830,15 @@ final class AppModel {
   /// instead of doing nothing. Starting or stopping the camera clears it.
   private func noteStartAttempt(_ id: FeedID, started: Bool) {
     if started { refusedStarts.remove(id) } else if refusedStarts.insert(id).inserted { cameraStateRevision &+= 1 }
+  }
+
+  /// A refusal whose cause has gone stays gone; a later, unrelated outage
+  /// must not show "Couldn't start" for a Start pressed long before.
+  private func expireResolvedStartRefusals() {
+    let resolved = refusedStarts.filter { startRefusal($0) == nil }
+    guard !resolved.isEmpty else { return }
+    refusedStarts.subtract(resolved)
+    cameraStateRevision &+= 1
   }
 
   /// Why the camera's last Start didn't start it, while that still holds.
@@ -1392,7 +1410,8 @@ final class AppModel {
 
   func startAllCameras() {
     if !running { start() }
-    for descriptor in feedDescriptors where descriptor.enabled && descriptor.id != selectedFeedID {
+    for descriptor in feedDescriptors where descriptor.enabled && descriptor.id != selectedFeedID &&
+      !descriptor.selectedDevice.isEmpty {
       startCamera(descriptor.id)
     }
   }
