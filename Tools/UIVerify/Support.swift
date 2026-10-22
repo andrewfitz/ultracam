@@ -40,6 +40,22 @@ import SwiftUI
   func savedImage() { images += 1 }
 }
 
+@MainActor enum MainLoop {
+  /// Runs the main run loop for `seconds`. A strict timer ends the wait on time:
+  /// a process started from a background shell or agent has its timers coalesced,
+  /// and a plain 16 ms run loop wait then took 110–140 ms, which made every settle
+  /// slice (and so every render) several times slower than intended.
+  static func run(seconds: Double) {
+    let end = Date().addingTimeInterval(seconds)
+    let wake = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+    wake.schedule(deadline: .now() + seconds, leeway: .nanoseconds(0))
+    wake.setEventHandler {}
+    wake.resume()
+    RunLoop.main.run(until: end)
+    wake.cancel()
+  }
+}
+
 /// An offscreen window hosting a SwiftUI view.
 @MainActor final class HostedView {
   let window: NSWindow
@@ -73,7 +89,7 @@ import SwiftUI
     var quietSlices = 0
     repeat {
       host.layoutSubtreeIfNeeded()
-      RunLoop.main.run(until: Date().addingTimeInterval(0.016))
+      MainLoop.run(seconds: 0.016)
       // Layout only: a ticking timecode or a progress spinner always needs display.
       let busy = host.needsLayout || (window.contentView?.needsLayout ?? false)
       quietSlices = busy ? 0 : quietSlices + 1
@@ -93,8 +109,12 @@ import SwiftUI
     return rep
   }
 
+  /// Closes the window and takes its content out of it. Closed windows stay alive
+  /// until the run ends, and their SwiftUI content kept updating (the status bar's
+  /// resource sampler, periodic timelines), taking main-thread time from later renders.
   func close() {
     window.orderOut(nil)
+    window.contentView = nil
     window.close()
   }
 }
@@ -192,5 +212,55 @@ struct AXNode {
     }
     guard total > 0 else { return 1 }
     return Double(counts.values.max() ?? total) / Double(total)
+  }
+}
+
+@MainActor enum Menus {
+  /// SwiftUI builds a menu button's items only when it opens. This opens each menu
+  /// button in `view` (offscreen with the window), reads its items from a timer in
+  /// the menu's tracking mode, closes it again, and returns the first menu that has
+  /// an item titled `containing`.
+  static func items(in view: NSView, containing title: String) -> [NSMenuItem] {
+    for button in buttons(in: view) {
+      let items = open(button)
+      if items.contains(where: { $0.title == title }) { return items }
+    }
+    return []
+  }
+
+  private static func buttons(in view: NSView) -> [NSButton] {
+    var result: [NSButton] = []
+    if let button = view as? NSButton, button.menu != nil { result.append(button) }
+    for subview in view.subviews { result += buttons(in: subview) }
+    return result
+  }
+
+  private final class Capture: @unchecked Sendable { var items: [NSMenuItem] = [] }
+
+  private static func open(_ button: NSButton) -> [NSMenuItem] {
+    let capture = Capture()
+    let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
+      MainActor.assumeIsolated {
+        guard let menu = button.menu else { return }
+        capture.items = menu.items
+        menu.cancelTrackingWithoutAnimation()
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    button.performClick(nil)
+    timer.invalidate()
+    return capture.items
+  }
+}
+
+@MainActor enum Keys {
+  /// Offers a key equivalent to the window, as AppKit does for a key press
+  /// that no menu in the menu bar handled.
+  @discardableResult
+  static func performKeyEquivalent(_ characters: String, keyCode: UInt16, modifiers: NSEvent.ModifierFlags, in window: NSWindow) -> Bool {
+    guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0,
+      windowNumber: window.windowNumber, context: nil, characters: characters, charactersIgnoringModifiers: characters,
+      isARepeat: false, keyCode: keyCode) else { return false }
+    return window.performKeyEquivalent(with: event)
   }
 }

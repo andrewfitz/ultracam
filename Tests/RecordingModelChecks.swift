@@ -394,10 +394,11 @@ import XCTest
     defer { try? FileManager.default.removeItem(at: root) }
     let capture = CaptureController(services: CaptureServices(
       start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
+    let idsLock = NSLock()
     var sourceIDs: [String] = []
     let driver = NativeRecordingSessionDriver(capture: capture, rawAudioCallbackAvailable: true,
       recorderFactory: { configuration in
-        sourceIDs.append(configuration.feedID.rawValue)
+        idsLock.withLock { sourceIDs.append(configuration.feedID.rawValue) }
         return try SourceRecorderCore(configuration: configuration, writerFactory: { Writer() })
       })
     let model = RecordingModel(feeds: [
@@ -407,6 +408,7 @@ import XCTest
     model.outputFolder = root
     model.recordAll()
     XCTAssertEqual(model.feeds.map(\.status), [.recording, .recording])
+    XCTAssertTrue(waitForStarts(model))
     XCTAssertTrue(model.feeds.allSatisfy { $0.error == nil })
     let firstURL = try XCTUnwrap(driver.recordingOutputURL(feedID: .primary))
     let secondURL = try XCTUnwrap(driver.recordingOutputURL(feedID: second))
@@ -415,7 +417,8 @@ import XCTest
     XCTAssertTrue(firstURL.lastPathComponent.hasPrefix("Wide Camera_"))
     XCTAssertFalse(firstURL.path.contains(FeedID.primary.rawValue))
     XCTAssertNotEqual(firstURL, secondURL)
-    XCTAssertEqual(sourceIDs, [FeedID.primary.rawValue, second.rawValue])
+    // The two takes start on workers, in either order.
+    XCTAssertEqual(Set(idsLock.withLock { sourceIDs }), [FeedID.primary.rawValue, second.rawValue])
     model.stopAll()
   }
 
@@ -532,6 +535,91 @@ import XCTest
       updated.fulfill()
     }
     wait(for: [updated], timeout: 3)
+  }
+
+  private func waitForStarts(_ model: RecordingModel, timeout: TimeInterval = 5) -> Bool {
+    let deadline = Date(timeIntervalSinceNow: timeout)
+    while model.feeds.contains(where: \.isStarting) && Date() < deadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    return !model.feeds.contains(where: \.isStarting)
+  }
+
+  private final class SlowStartingWriter: SourceRecordingWriter, @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    func start() throws {
+      entered.signal()
+      _ = release.wait(timeout: .now() + 5)
+    }
+    func appendVideo(_ sample: CMSampleBuffer) throws {}
+    func appendAudio(_ sample: CMSampleBuffer) throws {}
+    func finish() throws {}
+  }
+
+  /// Record must not wait on the main thread for the encoder (about 100 ms
+  /// cold, longer while the GPU kernel compiles): the take shows
+  /// "Starting…" at once, capture connects only once the recorder is ready,
+  /// and a Stop pressed meanwhile is honoured.
+  func testNativeStartDoesNotBlockTheMainThread() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-start-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = CaptureController(services: CaptureServices(
+      start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
+    let writer = SlowStartingWriter()
+    let driver = NativeRecordingSessionDriver(capture: capture, rawAudioCallbackAvailable: true,
+      recorderFactory: { configuration in
+        try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
+      })
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide")], driver: driver)
+    model.outputFolder = root
+    let started = ProcessInfo.processInfo.systemUptime
+    model.record(feedID: first)
+    XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.1, "Record returned only after the encoder")
+    XCTAssertEqual(writer.entered.wait(timeout: .now() + 2), .success)
+    XCTAssertEqual(model.feeds[0].status, .recording)
+    XCTAssertTrue(model.feeds[0].isStarting)
+    XCTAssertEqual(model.feeds[0].displayStatus, "Starting…")
+    XCTAssertFalse(model.canPauseAny, "Pause waits until the take records")
+    XCTAssertNil(driver.recordingOutputURL(feedID: first), "Capture is not connected before the recorder is ready")
+    var heartbeat = false
+    DispatchQueue.main.async { heartbeat = true }
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    XCTAssertTrue(heartbeat, "The main queue must run while the encoder is being prepared")
+    writer.release.signal()
+    XCTAssertTrue(waitForStarts(model))
+    XCTAssertEqual(model.feeds[0].status, .recording)
+    XCTAssertNotEqual(model.feeds[0].displayStatus, "Starting…")
+    XCTAssertNotNil(driver.recordingOutputURL(feedID: first))
+    var stopped = false
+    model.stopAll { stopped = true }
+    let deadline = Date(timeIntervalSinceNow: 3)
+    while !stopped && Date() < deadline { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01)) }
+    XCTAssertTrue(stopped)
+    XCTAssertEqual(model.feeds[0].status, .idle)
+
+    // Stop while the take is still starting: it finishes once the take exists.
+    let second = SlowStartingWriter()
+    let stopDriver = NativeRecordingSessionDriver(capture: capture, rawAudioCallbackAvailable: true,
+      recorderFactory: { configuration in
+        try SourceRecorderCore(configuration: configuration, writerFactory: { second })
+      })
+    let stopModel = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide")], driver: stopDriver)
+    stopModel.outputFolder = root
+    stopModel.record(feedID: first)
+    XCTAssertEqual(second.entered.wait(timeout: .now() + 2), .success)
+    stopModel.stop(feedID: first)
+    XCTAssertEqual(stopModel.feeds[0].status, .finishing)
+    var quit = false
+    stopModel.stopAll { quit = true }
+    XCTAssertFalse(quit)
+    second.release.signal()
+    let stopDeadline = Date(timeIntervalSinceNow: 3)
+    while !quit && Date() < stopDeadline { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01)) }
+    XCTAssertTrue(quit, "Quit waits for a take stopped while it started")
+    XCTAssertEqual(stopModel.feeds[0].status, .idle)
+    XCTAssertFalse(stopModel.feeds[0].isStarting)
+    XCTAssertNil(stopDriver.recordingOutputURL(feedID: first))
   }
 
   static let allTests = [

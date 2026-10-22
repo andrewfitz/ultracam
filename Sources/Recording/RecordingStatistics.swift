@@ -41,7 +41,19 @@ struct RecordingStatistics: Equatable, Sendable {
   var encoderID: String?
   var failed = false
   var lastError: String?
+  /// Something a healthy take should show (never its error), such as frames
+  /// VideoToolbox converted on the CPU or frames the device skipped.
+  var warning: String?
   var fileURL: URL?
+  /// How frames reach the encoder (e.g. "x422 (GPU repack from v210)"), and
+  /// how many VideoToolbox had to convert on the CPU (zero on the GPU route).
+  var encoderInput: String?
+  var cpuConvertedFrames: UInt64 = 0
+  /// Frames the capture device skipped during the take (part of `droppedVideoFrames`).
+  var deviceSkippedFrames: UInt64 = 0
+  /// Encoded media waiting for the disk, and the limit before the take fails.
+  var writerBufferedBytes = 0
+  var writerBufferCapacityBytes = 0
 
   var elapsedText: String {
     let seconds = Int(max(0, elapsed))
@@ -72,6 +84,11 @@ struct RecordingStatisticsSampler: Sendable {
       encoderPendingFrames: source.encoderPendingFrames, framesPerSecond: stopped ? 0 : fps,
       videoMegabitsPerSecond: stopped ? 0 : rate, encoderLatencyMS: source.encoderLatencyMS,
       maxEncoderLatencyMS: source.maxEncoderLatencyMS, hardwareEncoder: source.hardwareEncoder,
-      encoderID: source.encoderID, failed: source.state == .failed, lastError: source.lastError, fileURL: fileURL)
+      encoderID: source.encoderID, failed: source.state == .failed, lastError: source.lastError,
+      warning: source.warning, fileURL: fileURL,
+      encoderInput: source.encoderInputFormat, cpuConvertedFrames: source.cpuConvertedFrames,
+      deviceSkippedFrames: source.deviceSkippedFrames,
+      writerBufferedBytes: source.writerBufferedBytes,
+      writerBufferCapacityBytes: source.writerBufferCapacityBytes)
   }
 }

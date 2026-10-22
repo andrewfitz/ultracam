@@ -28,23 +28,24 @@ final class ProcessedFalseColorGeometryTests: XCTestCase {
         let value=codes[(x+3*y)%codes.count],i=(y*c.sw+x)*4
         native[i]=value;native[i+1]=value;native[i+2]=value;native[i+3]=255
       }}
-      let nativeBuffer=try XCTUnwrap(device.makeBuffer(bytes:native,length:native.count,options:.storageModeShared))
-      let picture=try XCTUnwrap(device.makeBuffer(length:c.pw*c.ph*4,options:.storageModeShared))
-      memset(picture.contents(),200,picture.length)
+      let nativeTexture=try texture(device,native,c.sw,c.sh)
+      let picture=try texture(device,[UInt8](repeating:200,count:c.pw*c.ph*4),c.pw,c.ph)
       let focus=try XCTUnwrap(device.makeTexture(descriptor:.texture2DDescriptor(pixelFormat:.r8Unorm,width:1,height:1,mipmapped:false)))
       for flag in [MonitorKernelFlag.sonySLog3,MonitorKernelFlag.elZone,MonitorKernelFlag.logC3,MonitorKernelFlag.logC4] {
-        var p=KernelParameters();p.width=UInt32(c.pw);p.height=UInt32(c.ph);p.stride=UInt32(c.pw*4);p.format=1
+        var p=KernelParameters();p.width=UInt32(c.pw);p.height=UInt32(c.ph);p.format=1;p.aperture=SIMD4(0,0,Float(c.pw),Float(c.ph))
         p.outWidth=UInt32(c.ow);p.outHeight=UInt32(c.oh);p.flags=flag;p.mapping=c.m;p.coefficients.w=1
-        var sp=KernelParameters();sp.width=UInt32(c.sw);sp.height=UInt32(c.sh);sp.stride=UInt32(c.sw*4);sp.format=1;sp.coefficients.w=1
+        var sp=KernelParameters();sp.width=UInt32(c.sw);sp.height=UInt32(c.sh);sp.format=1;sp.coefficients.w=1
         let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:c.ow,height:c.oh,mipmapped:false)
         descriptor.usage=[.shaderRead,.shaderWrite]
         let output=try XCTUnwrap(device.makeTexture(descriptor:descriptor))
         let readback=try XCTUnwrap(device.makeBuffer(length:c.ow*c.oh*4,options:.storageModeShared))
         let command=try XCTUnwrap(queue.makeCommandBuffer()),encoder=try XCTUnwrap(command.makeComputeCommandEncoder())
-        encoder.setComputePipelineState(pipeline);encoder.setBuffer(picture,offset:0,index:0)
-        encoder.setBytes(&p,length:MemoryLayout<KernelParameters>.stride,index:1)
-        encoder.setBuffer(nativeBuffer,offset:0,index:3);encoder.setBytes(&sp,length:MemoryLayout<KernelParameters>.stride,index:4)
-        encoder.setTexture(focus,index:0);encoder.setTexture(output,index:1)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(picture,index:0);encoder.setTexture(picture,index:1)
+        encoder.setTexture(nativeTexture,index:2);encoder.setTexture(nativeTexture,index:3)
+        encoder.setBytes(&p,length:MemoryLayout<KernelParameters>.stride,index:0)
+        encoder.setBytes(&sp,length:MemoryLayout<KernelParameters>.stride,index:1)
+        encoder.setTexture(focus,index:4);encoder.setTexture(output,index:5)
         encoder.dispatchThreads(.init(width:c.ow,height:c.oh,depth:1),threadsPerThreadgroup:.init(width:8,height:8,depth:1));encoder.endEncoding()
         let blit=try XCTUnwrap(command.makeBlitCommandEncoder())
         blit.copy(from:output,sourceSlice:0,sourceLevel:0,sourceOrigin:.init(x:0,y:0,z:0),sourceSize:.init(width:c.ow,height:c.oh,depth:1),to:readback,destinationOffset:0,destinationBytesPerRow:c.ow*4,destinationBytesPerImage:c.ow*c.oh*4)
@@ -71,5 +72,14 @@ final class ProcessedFalseColorGeometryTests: XCTestCase {
         }}
       }
     }
+  }
+
+  /// BGRA bytes as the rgba8Uint view the renderer reads them through.
+  private func texture(_ device:MTLDevice,_ bytes:[UInt8],_ width:Int,_ height:Int) throws -> MTLTexture {
+    let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba8Uint,width:width,height:height,mipmapped:false)
+    descriptor.usage=[.shaderRead]
+    let texture=try XCTUnwrap(device.makeTexture(descriptor:descriptor))
+    texture.replace(region:MTLRegionMake2D(0,0,width,height),mipmapLevel:0,withBytes:bytes,bytesPerRow:width*4)
+    return texture
   }
 }

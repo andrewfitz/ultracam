@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
   name: "MonitorTools",
-  platforms: [.macOS("15.0")],
+  platforms: [.macOS("26.0")],
   products: [
     .library(name: "MonitorToolsCore", type: .static, targets: ["MonitorToolsCore"]),
     .library(name: "MonitorToolsMetal", type: .static, targets: ["MonitorToolsMetal"]),

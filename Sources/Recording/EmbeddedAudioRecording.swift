@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import AudioToolbox
 import CoreMedia
@@ -84,24 +85,36 @@ public enum BlackmagicAudioConverter {
       result.withUnsafeMutableBytes { outputBytes in
         guard let sourceBase = sourceBytes.baseAddress,
               let outputBase = outputBytes.baseAddress else { return }
-        for sampleIndex in 0..<sampleCount {
-          let sourceOffset = sampleIndex * EmbeddedAudioFormat.sourceBytesPerSample
-          let raw = sourceBase.loadUnaligned(fromByteOffset: sourceOffset, as: UInt32.self)
-          let littleEndian = UInt32(littleEndian: raw)
-          let sample = Int32(bitPattern: littleEndian)
-          let significant = Int32(truncatingIfNeeded: sample >> 8)
-          let packed = UInt32(bitPattern: significant)
-          let outputOffset = sampleIndex * EmbeddedAudioFormat.recordingBytesPerSample
-          outputBase.storeBytes(of: UInt8(truncatingIfNeeded: packed),
-            toByteOffset: outputOffset, as: UInt8.self)
-          outputBase.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 8),
-            toByteOffset: outputOffset + 1, as: UInt8.self)
-          outputBase.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 16),
-            toByteOffset: outputOffset + 2, as: UInt8.self)
-        }
+        packSignificant24Bits(from: sourceBase, to: outputBase, sampleCount: sampleCount)
       }
     }
     return result
+  }
+
+  /// Keeps the top 24 bits of each little-endian Int32: `sample >> 8`, stored
+  /// as three little-endian bytes. That is exactly bytes 1...3 of each source
+  /// word, so vImage's vectorized 4-to-3 byte channel drop (ARGB8888 to
+  /// RGB888 drops byte 0) produces the identical bytes. The host is
+  /// little-endian on every supported Mac.
+  static func packSignificant24Bits(from source: UnsafeRawPointer, to destination: UnsafeMutableRawPointer,
+    sampleCount: Int) {
+    guard sampleCount > 0 else { return }
+    var input = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: source), height: 1,
+      width: vImagePixelCount(sampleCount), rowBytes: sampleCount * EmbeddedAudioFormat.sourceBytesPerSample)
+    var output = vImage_Buffer(data: destination, height: 1, width: vImagePixelCount(sampleCount),
+      rowBytes: sampleCount * EmbeddedAudioFormat.recordingBytesPerSample)
+    let status = vImageConvert_ARGB8888toRGB888(&input, &output, vImage_Flags(kvImageDoNotTile))
+    guard status == kvImageNoError else {
+      // vImage only fails on malformed buffers; keep the exact scalar path.
+      for index in 0..<sampleCount {
+        let raw = source.loadUnaligned(fromByteOffset: index * 4, as: UInt32.self)
+        let packed = UInt32(bitPattern: Int32(bitPattern: UInt32(littleEndian: raw)) >> 8)
+        destination.storeBytes(of: UInt8(truncatingIfNeeded: packed), toByteOffset: index * 3, as: UInt8.self)
+        destination.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 8), toByteOffset: index * 3 + 1, as: UInt8.self)
+        destination.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 16), toByteOffset: index * 3 + 2, as: UInt8.self)
+      }
+      return
+    }
   }
 
   /// Converts an array of host-endian Int32 samples. The host is expected to
@@ -111,18 +124,11 @@ public enum BlackmagicAudioConverter {
     _ source: [Int32]
   ) -> Data {
     var result = Data(count: source.count * EmbeddedAudioFormat.recordingBytesPerSample)
-    result.withUnsafeMutableBytes { outputBytes in
-      guard let outputBase = outputBytes.baseAddress else { return }
-      for (sampleIndex, sample) in source.enumerated() {
-        let significant = Int32(truncatingIfNeeded: sample >> 8)
-        let packed = UInt32(bitPattern: significant)
-        let outputOffset = sampleIndex * EmbeddedAudioFormat.recordingBytesPerSample
-        outputBase.storeBytes(of: UInt8(truncatingIfNeeded: packed),
-          toByteOffset: outputOffset, as: UInt8.self)
-        outputBase.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 8),
-          toByteOffset: outputOffset + 1, as: UInt8.self)
-        outputBase.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 16),
-          toByteOffset: outputOffset + 2, as: UInt8.self)
+    source.withUnsafeBytes { sourceBytes in
+      result.withUnsafeMutableBytes { outputBytes in
+        guard let sourceBase = sourceBytes.baseAddress,
+          let outputBase = outputBytes.baseAddress else { return }
+        packSignificant24Bits(from: sourceBase, to: outputBase, sampleCount: source.count)
       }
     }
     return result
@@ -252,28 +258,23 @@ public enum EmbeddedAudioRecording {
       presentationTime: presentationTime) { destination in
       sourcePCM32.withUnsafeBytes { sourceBytes in
         guard let sourceBase = sourceBytes.baseAddress else { return }
-        for sampleIndex in 0..<(sampleFrameCount * channelCount) {
-          let sourceOffset = sampleIndex * EmbeddedAudioFormat.sourceBytesPerSample
-          let raw = sourceBase.loadUnaligned(fromByteOffset: sourceOffset, as: UInt32.self)
-          let littleEndian = UInt32(littleEndian: raw)
-          let sample = Int32(bitPattern: littleEndian)
-          let significant = Int32(truncatingIfNeeded: sample >> 8)
-          let packed = UInt32(bitPattern: significant)
-          let outputOffset = sampleIndex * EmbeddedAudioFormat.recordingBytesPerSample
-          destination.storeBytes(of: UInt8(truncatingIfNeeded: packed),
-            toByteOffset: outputOffset, as: UInt8.self)
-          destination.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 8),
-            toByteOffset: outputOffset + 1, as: UInt8.self)
-          destination.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 16),
-            toByteOffset: outputOffset + 2, as: UInt8.self)
-        }
+        BlackmagicAudioConverter.packSignificant24Bits(from: sourceBase, to: destination,
+          sampleCount: sampleFrameCount * channelCount)
       }
     }
   }
 
-  private static func makeSampleBuffer(sampleFrameCount: Int,
-    presentationTime: CMTime,
-    fill: (UnsafeMutableRawPointer) -> Void) throws -> CMSampleBuffer {
+  /// Builds the shared format description now, so the first packet on the
+  /// capture thread does not pay for Core Audio's first-use setup.
+  public static func prepareFormat() { _ = cachedFormat }
+
+  private struct CachedFormat: @unchecked Sendable {
+    let result: Result<CMAudioFormatDescription, EmbeddedAudioError>
+  }
+
+  /// The embedded-audio format never changes, so one description serves
+  /// every packet. CMFormatDescription is immutable and thread-safe.
+  private static let cachedFormat: CachedFormat = {
     var streamDescription = AudioStreamBasicDescription(
       mSampleRate: EmbeddedAudioFormat.sampleRate,
       mFormatID: kAudioFormatLinearPCM,
@@ -286,7 +287,7 @@ public enum EmbeddedAudioRecording {
       mReserved: 0
     )
     var formatDescription: CMAudioFormatDescription?
-    var status = CMAudioFormatDescriptionCreate(
+    let status = CMAudioFormatDescriptionCreate(
       allocator: kCFAllocatorDefault,
       asbd: &streamDescription,
       layoutSize: 0,
@@ -297,9 +298,16 @@ public enum EmbeddedAudioRecording {
       formatDescriptionOut: &formatDescription
     )
     guard status == noErr, let formatDescription else {
-      throw EmbeddedAudioError.formatDescriptionCreationFailed(status)
+      return CachedFormat(result: .failure(.formatDescriptionCreationFailed(status)))
     }
+    return CachedFormat(result: .success(formatDescription))
+  }()
 
+  private static func makeSampleBuffer(sampleFrameCount: Int,
+    presentationTime: CMTime,
+    fill: (UnsafeMutableRawPointer) -> Void) throws -> CMSampleBuffer {
+    let formatDescription = try cachedFormat.result.get()
+    var status: OSStatus
     var blockBuffer: CMBlockBuffer?
     // Allocate storage owned by CoreMedia. Passing Data's pointer directly
     // would leave a sample buffer referring to storage that can be released as

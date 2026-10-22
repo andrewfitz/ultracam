@@ -38,7 +38,8 @@ import XCTest
       settings.saveSnapshot(AppSettingsSnapshot(feeds: feeds, selectedFeedID: alpha,
         outputMode: .separateCameras, monitorWorkspace: workspace))
       let model = AppModel(settingsStore: settings, registryStore: registry,
-        registryPublisher: publisher, recordingFolderStore: RecordingFolderStore(defaults: defaults))
+        registryPublisher: publisher, recordingFolderStore: RecordingFolderStore(defaults: defaults),
+        hardware: .offline)
       let selectedControllers = Mirror(reflecting: model).children.compactMap {
         $0.value as? CaptureController
       }

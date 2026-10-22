@@ -54,39 +54,22 @@ final class ELZoneMetalTests: XCTestCase {
     return MonitorRuntime()
   }
 
-  private final class ResultBox: @unchecked Sendable {
-    var result: Result<MonitorDisplayResult, Error>?
-  }
 
   private func render(
     _ runtime: MonitorRuntime, source: CVPixelBuffer, output: CVPixelBuffer? = nil,
     config: MonitorConfiguration, range: MonitorCodeRange, sourceProfile: String,
     transfer: String = "S-Log3", correspondence: MonitorCorrespondence? = .identity
-  ) throws -> MonitorDisplayResult {
+  ) throws -> MonitorSnapshot {
     let target = MonitorTargetID(UUID().uuidString)
     let stamp = MonitorFrameStamp(
       target: target, generation: 1, sequence: 1, sourcePTS: 1, hostTime: 1,
       configurationRevision: 1)
-    runtime.configure(target: target, generation: 1, configurationRevision: 1, configuration: config)
-    defer { runtime.remove(target: target) }
-    let done = expectation(description: "Sony published Pattern2 GPU")
-    let box = ResultBox()
     let frame = MonitorFrameBundle(
       stamp: stamp, source: source, output: output, correspondence: correspondence,
       sourceSignal: MonitorFrameSignal(
         range: range, matrix: .bt709, transfer: transfer, profileID: sourceProfile),
       outputSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "Rec709"))
-    var admitted = false
-    for _ in 0..<100 where !admitted {
-      admitted = runtime.offer(frame) { result in
-        box.result = result
-        done.fulfill()
-      }
-      if !admitted { Thread.sleep(forTimeInterval: 0.001) }
-    }
-    XCTAssertTrue(admitted)
-    wait(for: [done], timeout: 15)
-    return try XCTUnwrap(box.result).get()
+    return try runtime.renderSnapshot(frame, configuration: config.normalized())
   }
 
   private func allocate(_ format: OSType, width: Int) throws -> CVPixelBuffer {
@@ -136,12 +119,8 @@ final class ELZoneMetalTests: XCTestCase {
     return buffer
   }
 
-  private func pixels(_ display: MonitorDisplayResult) throws -> [UInt8] {
-    let buffer = try XCTUnwrap(display.decorated, "\(display.availability)").pixelBuffer
-    CVPixelBufferLockBaseAddress(buffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-    let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
-    return Array(UnsafeBufferPointer(start: base, count: CVPixelBufferGetWidth(buffer) * 4))
+  private func pixels(_ display: MonitorSnapshot) throws -> [UInt8] {
+    Array(display.pictureBytes.prefix(display.width * 4))
   }
 
   private func assertPixel(

@@ -7,7 +7,8 @@ import XCTest
 final class MonitorQualityTests: XCTestCase {
   func testShaderCompilesAndExplicitParameterLayoutMatches() throws {
     guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
-    XCTAssertEqual(MemoryLayout<KernelParameters>.stride, 144)
+    XCTAssertEqual(MemoryLayout<KernelParameters>.stride, 160)
+    XCTAssertEqual(MemoryLayout<KernelParameters>.offset(of: \.aperture), 144)
     XCTAssertEqual(MemoryLayout<KernelParameters>.offset(of: \.scopeWidth), 64)
     XCTAssertEqual(MemoryLayout<KernelParameters>.offset(of: \.referenceOffsetStops), 80)
     XCTAssertEqual(MemoryLayout<KernelParameters>.offset(of: \.coefficients), 96)
@@ -67,7 +68,7 @@ final class MonitorQualityTests: XCTestCase {
       config.zebra.enabled = true; config.zebra.thresholdIRE = 110
       let display = try render(metalRuntime(), source: source, config: config, range: .full, sourceProfile: "rec709", transfer: "rec709")
       let bytes = try pixels(display)
-      XCTAssertEqual(CVPixelBufferGetHeight(try XCTUnwrap(display.decorated).pixelBuffer), 1080)
+      XCTAssertEqual(display.height, 1080)
       for x in 2..<(192 / ratio - 2) {
         XCTAssertEqual(Int(bytes[x * 4]), 128, accuracy: 1, "Area minification must reject checkerboard aliasing at \(ratio):1")
       }
@@ -82,14 +83,11 @@ final class MonitorQualityTests: XCTestCase {
     var config = MonitorConfiguration(); config.toolsEnabled = true
     config.focus.enabled = true; config.focus.color = .red; config.focus.opacity = 1
     let display = try render(metalRuntime(), source: source, config: config, range: .full, sourceProfile: "rec709", transfer: "rec709")
-    let buffer = try XCTUnwrap(display.decorated).pixelBuffer
-    CVPixelBufferLockBaseAddress(buffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-    let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
-    let stride = CVPixelBufferGetBytesPerRow(buffer)
+    let base = display.pictureBytes
+    let stride = display.width * 4
     for y in 6...10 { for x in 6...10 {
-      let p = base + y * stride + x * 4
-      XCTAssertEqual(p[0], p[2], "A single impulse has no directional edge support")
+      let p = y * stride + x * 4
+      XCTAssertEqual(base[p], base[p + 2], "A single impulse has no directional edge support")
     }}
     XCTAssertEqual(base[16 * stride + 31 * 4 + 2], 255)
     XCTAssertEqual(base[16 * stride + 31 * 4], 0)
@@ -105,11 +103,8 @@ final class MonitorQualityTests: XCTestCase {
     config.focus.enabled = true; config.focus.opacity = 1
     let display = try render(metalRuntime(), source: source, config: config, range: .full,
       sourceProfile: "rec709", transfer: "rec709")
-    let buffer = try XCTUnwrap(display.decorated).pixelBuffer
-    CVPixelBufferLockBaseAddress(buffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-    let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
-    let stride = CVPixelBufferGetBytesPerRow(buffer)
+    let base = display.pictureBytes
+    let stride = display.width * 4
     func v(_ x: Int, _ y: Int) -> Double { Double(value(max(0,min(w-1,x)),max(0,min(h-1,y)))) / 255 }
     func median(_ a: Double, _ b: Double, _ c: Double) -> Double { [a,b,c].sorted()[1] }
     for y in 0..<h { for x in 0..<w {
@@ -141,8 +136,7 @@ final class MonitorQualityTests: XCTestCase {
     let source=try image(width:width,height:height,value:sample)
     var config=MonitorConfiguration();config.toolsEnabled=true;config.zebra.enabled=true;config.zebra.thresholdIRE=110
     let display=try render(metalRuntime(),source:source,config:config,range:.full,sourceProfile:"rec709",transfer:"rec709")
-    let buffer=try XCTUnwrap(display.decorated).pixelBuffer
-    let ow=CVPixelBufferGetWidth(buffer),oh=CVPixelBufferGetHeight(buffer)
+    let ow=display.width,oh=display.height
     let bytes=try pixels(display)
     let sx=Double(width)/Double(ow),sy=Double(height)/Double(oh),nx=min(8,Int(ceil(sx))),ny=min(8,Int(ceil(sy)))
     for x in 0..<ow {
@@ -160,23 +154,15 @@ final class MonitorQualityTests: XCTestCase {
   }
 
   func testScopeDensityIsStableAcrossSourceWidth() throws {
-    guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { throw XCTSkip("Metal unavailable") }
+    guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
     var values = [UInt8]()
     for width in [512, 1024] {
       var config = MonitorConfiguration(); config.toolsEnabled = true
       config.scopes.enabled = true; config.scopes.graticule = false
       let result = try render(metalRuntime(), source: image(width: width, height: 8) { _, _ in 100 }, config: config,
         range: .full, sourceProfile: "rec709", transfer: "rec709")
-      let scope = try XCTUnwrap(result.scope)
-      let bytes = try XCTUnwrap(device.makeBuffer(length: 768 * 256 * 4, options: .storageModeShared))
-      let command = try XCTUnwrap(queue.makeCommandBuffer())
-      let blit = try XCTUnwrap(command.makeBlitCommandEncoder())
-      blit.copy(from: scope.texture, sourceSlice: 0, sourceLevel: 0, sourceOrigin: .init(x: 0,y: 0,z: 0),
-        sourceSize: .init(width: 768,height: 256,depth: 1), to: bytes, destinationOffset: 0,
-        destinationBytesPerRow: 768 * 4, destinationBytesPerImage: 768 * 256 * 4)
-      blit.endEncoding(); command.commit(); command.waitUntilCompleted()
-      XCTAssertEqual(command.status, .completed)
-      values.append(bytes.contents().assumingMemoryBound(to: UInt8.self)[(151 * 768 + 4) * 4 + 2])
+      let bytes = try XCTUnwrap(result.scopeBytes)
+      values.append(bytes[(151 * 768 + 4) * 4 + 2])
     }
     XCTAssertGreaterThan(values[0], 0)
     XCTAssertEqual(Int(values[0]), Int(values[1]), accuracy: 1, "Density must normalize source samples per raster column")
@@ -202,40 +188,21 @@ final class MonitorQualityTests: XCTestCase {
     return MonitorRuntime()
   }
 
-  private final class ResultBox: @unchecked Sendable {
-    var result: Result<MonitorDisplayResult, Error>?
-  }
-
   private func render(
     _ runtime: MonitorRuntime, source: CVPixelBuffer, output: CVPixelBuffer? = nil,
     config: MonitorConfiguration, range: MonitorCodeRange, sourceProfile: String,
     transfer: String = "S-Log3", correspondence: MonitorCorrespondence? = .identity,
     matrix: MonitorYCbCrMatrix = .bt709
-  ) throws -> MonitorDisplayResult {
-    let target = MonitorTargetID(UUID().uuidString)
+  ) throws -> MonitorSnapshot {
     let stamp = MonitorFrameStamp(
-      target: target, generation: 1, sequence: 1, sourcePTS: 1, hostTime: 1,
-      configurationRevision: 1)
-    runtime.configure(target: target, generation: 1, configurationRevision: 1, configuration: config)
-    defer { runtime.remove(target: target) }
-    let done = expectation(description: "Sony published GPU")
-    let box = ResultBox()
+      target: MonitorTargetID(UUID().uuidString), generation: 1, sequence: 1, sourcePTS: 1,
+      hostTime: 1, configurationRevision: 1)
     let frame = MonitorFrameBundle(
       stamp: stamp, source: source, output: output, correspondence: correspondence,
       sourceSignal: MonitorFrameSignal(
         range: range, matrix: matrix, transfer: transfer, profileID: sourceProfile),
       outputSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "Rec709"))
-    var admitted = false
-    for _ in 0..<100 where !admitted {
-      admitted = runtime.offer(frame) { result in
-        box.result = result
-        done.fulfill()
-      }
-      if !admitted { Thread.sleep(forTimeInterval: 0.001) }
-    }
-    XCTAssertTrue(admitted)
-    wait(for: [done], timeout: 15)
-    return try XCTUnwrap(box.result).get()
+    return try runtime.renderSnapshot(frame, configuration: config.normalized())
   }
 
   private func allocate(_ format: OSType, width: Int) throws -> CVPixelBuffer {
@@ -285,12 +252,9 @@ final class MonitorQualityTests: XCTestCase {
     return buffer
   }
 
-  private func pixels(_ display: MonitorDisplayResult) throws -> [UInt8] {
-    let buffer = try XCTUnwrap(display.decorated, "\(display.availability)").pixelBuffer
-    CVPixelBufferLockBaseAddress(buffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-    let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
-    return Array(UnsafeBufferPointer(start: base, count: CVPixelBufferGetWidth(buffer) * 4))
+  private func pixels(_ display: MonitorSnapshot) throws -> [UInt8] {
+    XCTAssertTrue(display.availability.isEmpty, "\(display.availability)")
+    return Array(display.pictureBytes.prefix(display.width * 4))
   }
 
   private func assertPixel(

@@ -59,52 +59,16 @@ private final class FrameReleaseCounter: @unchecked Sendable {
     fanOut.close()
   }
 
-  func testDropOldestBoundsRouteAndReleasesDroppedLease() throws {
-    let counter = FrameReleaseCounter()
-    let fanOut = FrameFanOut<Int>(label: "processed-frame-test-drop-oldest")
-    let route = try fanOut.addRoute(id: "preview", capacity: 2, policy: .dropOldest)
-    var first: ProcessedFrame<Int>? = frame(1, released: counter)
-    var second: ProcessedFrame<Int>? = frame(2, released: counter)
-    var third: ProcessedFrame<Int>? = frame(3, released: counter)
-    XCTAssertEqual(fanOut.publish(try XCTUnwrap(first))["preview"], .enqueued)
-    XCTAssertEqual(fanOut.publish(try XCTUnwrap(second))["preview"], .enqueued)
-    XCTAssertEqual(fanOut.publish(try XCTUnwrap(third))["preview"], .enqueuedDroppingOldest)
-    XCTAssertEqual(route.pendingCount, 2)
-
-    first = nil
-    second = nil
-    third = nil
-    let secondLease = try XCTUnwrap(route.dequeue())
-    let thirdLease = try XCTUnwrap(route.dequeue())
-    XCTAssertEqual(secondLease.payload, 2)
-    XCTAssertEqual(thirdLease.payload, 3)
-    XCTAssertNil(route.dequeue())
-    XCTAssertEqual(counter.count, 1, "The evicted frame must release immediately")
-    fanOut.close()
-    XCTAssertEqual(counter.count, 1, "No pending route ownership remains after close")
-    secondLease.release()
-    thirdLease.release()
-    XCTAssertEqual(counter.count, 3)
-  }
-
-  func testDropNewestAndRejectPreservePendingFrame() throws {
-    let dropFanOut = FrameFanOut<Int>(label: "processed-frame-test-drop-newest")
-    let dropRoute = try dropFanOut.addRoute(id: "preview", capacity: 1, policy: .dropNewest)
-    var first: ProcessedFrame<Int>? = frame(10)
-    var second: ProcessedFrame<Int>? = frame(11)
-    XCTAssertEqual(dropFanOut.publish(try XCTUnwrap(first))["preview"], .enqueued)
-    XCTAssertEqual(dropFanOut.publish(try XCTUnwrap(second))["preview"], .droppedNewest)
-    first = nil
-    second = nil
-    XCTAssertEqual(try XCTUnwrap(dropRoute.dequeue()?.payload), 10)
-    dropFanOut.close()
-
+  func testRejectPreservesPendingFrame() throws {
     let rejectFanOut = FrameFanOut<Int>(label: "processed-frame-test-reject")
     let rejectRoute = try rejectFanOut.addRoute(id: "camera", capacity: 1, policy: .reject)
     var accepted: ProcessedFrame<Int>? = frame(20)
     var rejected: ProcessedFrame<Int>? = frame(21)
     XCTAssertEqual(rejectFanOut.publish(try XCTUnwrap(accepted))["camera"], .enqueued)
     XCTAssertEqual(rejectFanOut.publish(try XCTUnwrap(rejected))["camera"], .rejected)
+    XCTAssertEqual(rejectFanOut.publishSummary(try XCTUnwrap(rejected)),
+      FrameFanOutSummary(enqueued: 0, rejected: 1, routerClosed: false))
+    XCTAssertEqual(rejectRoute.pendingCount, 1, "A full route never evicts a pending frame")
     accepted = nil
     rejected = nil
     XCTAssertEqual(try XCTUnwrap(rejectRoute.dequeue()?.payload), 20)
@@ -208,8 +172,7 @@ private final class FrameReleaseCounter: @unchecked Sendable {
 
   static let allTests = [
     ("independent route leases", testOneProcessedFrameHasIndependentRouteLeases),
-    ("drop oldest bounds queues", testDropOldestBoundsRouteAndReleasesDroppedLease),
-    ("drop newest and reject", testDropNewestAndRejectPreservePendingFrame),
+    ("full route rejects and keeps pending", testRejectPreservesPendingFrame),
     ("route cancellation", testCancellationOnlyDrainsItsRoute),
     ("serial teardown", testCloseDrainsPendingButKeepsDequeuedLeaseValid),
     ("route validation", testInvalidAndDuplicateRoutesAreRejected),

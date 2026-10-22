@@ -5,16 +5,16 @@ task_root="$(cd "$(dirname "$0")/.." && pwd)"
 external_root=/Volumes/8TB/cinesomatic-director-work
 [[ -d /Volumes/8TB && "$(stat -f %d /Volumes/8TB)" != "$(stat -f %d /Volumes)" ]] || { echo 'External drive /Volumes/8TB is not mounted.' >&2; exit 1; }
 export TMPDIR="$external_root/tmp"
-export MACOSX_DEPLOYMENT_TARGET=15.0
+export MACOSX_DEPLOYMENT_TARGET=26.0
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$external_root/agent-work/build/ultracam/monitor-tools/$run_id"
 mkdir -p "$TMPDIR" "$test_root/modules"
 python3 "$task_root/scripts/monitor-tools-fingerprint.py" capture "$test_root/source-manifest.json"
 source "$task_root/scripts/monitor-tools-package.sh"
 monitor_package_build > "$test_root/compile.log" 2>&1 || { cat "$test_root/compile.log"; exit 1; }
-xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos15.0 \
+xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos26.0 \
   -module-cache-path "$test_root/modules" "${monitor_link_args[@]}" \
-  "$task_root/Tools/MonitorToolsRecording/QualificationMetrics.swift" "$task_root/Tools/MonitorToolsSmoke/main.swift" -o "$test_root/monitor-tools-smoke" \
+  "$task_root/Tools/MonitorToolsRecording/QualificationMetrics.swift" "$task_root/Tools/MonitorToolsRecording/MonitorGPUWorkload.swift" "$task_root/Tools/MonitorToolsSmoke/main.swift" -o "$test_root/monitor-tools-smoke" \
   >> "$test_root/compile.log" 2>&1 || { cat "$test_root/compile.log"; exit 1; }
 python3 "$task_root/scripts/monitor-tools-fingerprint.py" verify "$test_root/source-manifest.json"
 shasum -a 256 "$test_root/monitor-tools-smoke" > "$test_root/binary-sha256.txt"

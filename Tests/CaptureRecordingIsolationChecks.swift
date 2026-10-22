@@ -18,17 +18,6 @@ import XCTest
   }
 
   /// Records the first shader-device attempt. Later retries return immediately.
-  private final class FirstInitialization: @unchecked Sendable {
-    private let lock = NSLock()
-    private var started = false
-    func claim() -> Bool {
-      lock.lock()
-      defer { lock.unlock() }
-      if started { return false }
-      started = true
-      return true
-    }
-  }
 
   private final class Harness: @unchecked Sendable {
     let lock = NSLock()
@@ -91,7 +80,7 @@ import XCTest
     let duration = VideoContract.fastDuration
     harness.emit(image, pts: .zero, duration: duration)
     wait(for: [entered], timeout: 3)
-    let count = VideoContract.captureAdmissionLimit + 9
+    let count = 21
     for frame in 1..<count {
       // Pace at the actual source cadence; callback offers remain independent
       // of the deliberately stalled serial preview/processing worker.
@@ -136,25 +125,14 @@ import XCTest
     services.preview = nil
     let controller = CaptureController(services: services, previewRenderer: nil)
     let target = MonitorTargetID("capture-tap-integration")
-    let initializing = expectation(description: "Monitor initialization held on utility worker")
-    let initializationGate = DispatchSemaphore(value: 0)
-    // Shader setup retries on every later frame while the device is missing.
-    // Only the first attempt may block the worker and fulfill the expectation.
-    let firstInitialization = FirstInitialization()
-    let runtime = MonitorRuntime(sharedDevice: {
-      if firstInitialization.claim() {
-        initializing.fulfill()
-        _ = initializationGate.wait(timeout: .now() + 5)
-      }
-      return nil  // deterministic shader/device failure must preserve clean fallback
-    })
-    let sink = MonitorCaptureSink(target: target, runtime: runtime)
+    let sink = MonitorCaptureSink(target: target)
     let presenter = MonitorSurfacePresenter()
     var monitor = MonitorConfiguration()
     monitor.pictureStage = .source
     monitor.toolsEnabled = true
     monitor.zebra.enabled = true
-    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
+    // Hidden surface: frames reach the recorder, not the monitor.
+    sink.configure(monitor, consumers: [], scopeVisible: false)
     controller.setMonitorSink(sink)
     let feed = FeedID(rawValue: target.rawValue)
     let writer = Writer()
@@ -166,7 +144,6 @@ import XCTest
       configuration: recording, writerFactory: { writer })
     try recorder.start()
     defer {
-      initializationGate.signal()
       controller.onUpdate = nil
       controller.stop()
       try? recorder.stop()
@@ -181,16 +158,11 @@ import XCTest
     controller.onUpdate = nil
     let duration = VideoContract.fastDuration
     harness.emit(image, pts: .zero, duration: duration)
-    wait(for: [initializing], timeout: 3)
-    // Hide while a real capture-tap job is in flight. Its delayed completion
-    // must not revive the removed consumer, and capture callbacks keep recording.
     let callbackStart = ProcessInfo.processInfo.systemUptime
     harness.emit(image, pts: duration, duration: duration)
     XCTAssertLessThan(
       ProcessInfo.processInfo.systemUptime - callbackStart, 0.5,
-      "Capture callback must return while monitor initialization is blocked")
-    sink.configure(monitor, consumers: [], scopeVisible: false)
-    initializationGate.signal()
+      "Capture callback must return promptly with a monitor attached")
     pumpUntil { recorder.telemetry.appendedVideo == 2 }
     pumpFor(0.1)
     XCTAssertNil(presenter.currentStamp)
@@ -239,120 +211,6 @@ import XCTest
     XCTAssertEqual(presenter.currentStamp, output)
   }
 
-  @MainActor func testCriticalOutputPressureKeepsCleanPreviewCameraAndRecordingAlive() throws {
-    // The critical-pipeline mechanism degrades and suspends monitor analysis when
-    // capture falls behind. The GPU monitor rewrite (docs/GPU_PIPELINE_PLAN.md,
-    // step 3) removes it; bypass now does an owned GPU copy, which changes the
-    // queue timing this test provokes pressure with.
-    throw XCTSkip("Monitor critical-pipeline pressure is removed by the GPU monitor rewrite.")
-    let image = try packedSyntheticSource()
-    CVBufferSetAttachment(image, kCVImageBufferTransferFunctionKey,
-      kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
-    let original = try packedBytes(image)
-    let entered = expectation(description: "First native preview deliberately stalled")
-    let harness = Harness(entered: entered)
-    let camera = CameraMetrics()
-    var services = harness.services
-    services.send = { camera.append($0); return true }
-    let controller = CaptureController(services: services, previewRenderer: nil)
-    let runtime = MonitorRuntime()
-    let target = MonitorTargetID("critical-output-priority")
-    let sink = MonitorCaptureSink(target: target, runtime: runtime)
-    let presenter = MonitorSurfacePresenter()
-    var tools = MonitorConfiguration()
-    tools.toolsEnabled = true
-    tools.pictureStage = .source
-    tools.zebra.enabled = true
-    sink.configure(tools, consumers: [presenter], scopeVisible: false)
-    controller.setMonitorSink(sink)
-    let feed = FeedID(rawValue: target.rawValue)
-    let writer = Writer()
-    let recorder = try SourceRecordingCallbackAdapter(configuration:
-      SourceRecordingConfiguration(feedID: SourceRecordingFeedID(feed.rawValue),
-        outputURL: URL(fileURLWithPath:
-          "/Volumes/8TB/cinesomatic-build/synthetic-critical-priority-unused.mov"),
-        width: 3840, height: 2160, frameRate: .fps2997), writerFactory: { writer })
-    try recorder.start()
-    defer {
-      harness.release.signal()
-      controller.onUpdate = nil
-      controller.stop()
-      try? recorder.stop()
-    }
-    controller.setRecordingCallbacks(feedID: feed, callbacks: recorder.callbacks)
-    let ready = expectation(description: "Critical priority synthetic capture ready")
-    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { ready.fulfill() } }
-    controller.start(feedID: feed, deviceID: "synthetic:v210",
-      configuration: PipelineConfiguration(downscale: false, convertTo420: false),
-      pipelineEnabled: false)
-    wait(for: [ready], timeout: 3)
-    controller.onUpdate = nil
-    let duration = VideoContract.slowDuration
-    harness.emit(image, pts: .zero, duration: duration)
-    wait(for: [entered], timeout: 3)
-    for index in 1...3 {
-      Thread.sleep(forTimeInterval: duration.seconds)
-      harness.emit(image, pts: CMTimeMultiply(duration, multiplier: Int32(index)),
-        duration: duration)
-    }
-    // Queue pressure exceeds a source-frame deadline despite available monitor
-    // admission. Releasing preview lets the actual controller report that delay.
-    harness.release.signal()
-    pumpUntil { camera.samples.count == 4 && recorder.telemetry.appendedVideo == 4 }
-    pumpFor(duration.seconds)
-    harness.emit(image, pts: CMTimeMultiply(duration, multiplier: 4), duration: duration)
-    pumpUntil { camera.samples.count == 5 && recorder.telemetry.appendedVideo == 5 }
-    pumpUntil {
-      presenter.currentStamp?.sourcePTS == CMTimeMultiply(duration, multiplier: 4).seconds
-    }
-    pumpUntil { presenter.detail.contains("output pipeline pressure") }
-    XCTAssertEqual(presenter.currentStamp?.sourcePTS,
-      CMTimeMultiply(duration, multiplier: 4).seconds)
-    XCTAssertTrue(presenter.configuration.toolsEnabled,
-      "Pressure must preserve the user's requested tools")
-    try recorder.stop()
-    XCTAssertEqual(recorder.telemetry.totalDrops, 0)
-    XCTAssertEqual(writer.samples.count, 5)
-    XCTAssertEqual(camera.samples.count, 5)
-    XCTAssertEqual(try packedBytes(image), original)
-    for (index, sample) in writer.samples.enumerated() {
-      XCTAssertTrue(CMSampleBufferGetImageBuffer(sample) === image)
-      XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(sample),
-        CMTimeMultiply(duration, multiplier: Int32(index)))
-      XCTAssertEqual(CMSampleBufferGetDuration(sample), duration)
-    }
-    controller.stop()
-    let other = MonitorTargetID("after-critical-producer-stop")
-    runtime.configure(target: other, generation: 1, configurationRevision: 1,
-      configuration: tools)
-    let done = expectation(description: "Stopping producer removes shared pressure")
-    let box = MonitorResultBox()
-    let stamp = MonitorFrameStamp(target: other, generation: 1, sequence: 1,
-      sourcePTS: 0, hostTime: ProcessInfo.processInfo.systemUptime, configurationRevision: 1)
-    XCTAssertTrue(runtime.offer(MonitorFrameBundle(stamp: stamp, source: image,
-      sourceSignal: MonitorCaptureSink.signal(image, profile: nil))) { result in
-        box.store(result)
-        done.fulfill()
-      })
-    wait(for: [done], timeout: 10)
-    XCTAssertNotNil(try box.take().decorated,
-      "Stopped producers must not leave other feeds' analysis suspended")
-  }
-
-  func testHiddenProducerInvalidationClearsItsLatestHealthEpoch() {
-    let runtime = MonitorRuntime()
-    let target = MonitorTargetID("hidden-critical-epoch")
-    let sink = MonitorCaptureSink(target: target, runtime: runtime)
-    sink.invalidate(rejectingCaptureGeneration: 7)
-    // Timing continues during hidden capture even though no visible frame offer
-    // has updated the sink's presentation generation.
-    sink.reportCriticalPipeline(captureGeneration: 8, queueAge: 0.1,
-      processingTime: 0, frameInterval: 1 / 30, now: 1)
-    XCTAssertEqual(runtime.diagnostics(for: target).availability,
-      .degraded("Analysis paused: output pipeline pressure"))
-    sink.invalidate()
-    XCTAssertEqual(runtime.diagnostics(for: target).availability, .noSignal)
-  }
 
   @MainActor private func pumpUntil(_ predicate: () -> Bool) {
     let deadline = Date().addingTimeInterval(3)
@@ -423,14 +281,6 @@ import XCTest
       count: CVPixelBufferGetBytesPerRow(image) * CVPixelBufferGetHeight(image))
   }
 
-  private final class MonitorResultBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: Result<MonitorDisplayResult, Error>?
-    func store(_ result: Result<MonitorDisplayResult, Error>) { lock.withLock { value = result } }
-    func take() throws -> MonitorDisplayResult {
-      try lock.withLock { try XCTUnwrap(value).get() }
-    }
-  }
 
   func testActualDownscaleKeepsSourceFocusAlignedAcrossAsymmetricAperture() throws {
     let source = try packedSyntheticSource()
@@ -481,33 +331,21 @@ import XCTest
     configuration.focus.enabled = true
     configuration.focus.color = .red
     configuration.focus.opacity = 1
-    runtime.configure(target: target, generation: 1, configurationRevision: 1,
-      configuration: configuration)
     let stamp = MonitorFrameStamp(target: target, generation: 1, sequence: 1,
       sourcePTS: 0, hostTime: ProcessInfo.processInfo.systemUptime, configurationRevision: 1)
-    let done = expectation(description: "Source-resolution focus over actual downscaled picture")
-    let box = MonitorResultBox()
-    XCTAssertTrue(runtime.offer(MonitorFrameBundle(stamp: stamp, source: source, output: output,
-      sourceGeometry: sourceGeometry, outputGeometry: outputGeometry,
+    // The live picture shows the output's clean aperture (here the whole
+    // 1920x1080 output) with source-resolution focus mapped onto it.
+    let result = try runtime.renderSnapshot(MonitorFrameBundle(stamp: stamp, source: source,
+      output: output, sourceGeometry: sourceGeometry, outputGeometry: outputGeometry,
       correspondence: MonitorCorrespondence(scaleX: 0.5, scaleY: 0.5, offsetX: 0, offsetY: 0),
       sourceSignal: MonitorCaptureSink.signal(source, profile: nil),
-      outputSignal: MonitorCaptureSink.signal(output, profile: nil))) { result in
-        box.store(result)
-        done.fulfill()
-      })
-    wait(for: [done], timeout: 10)
-    let result = try box.take()
+      outputSignal: MonitorCaptureSink.signal(output, profile: nil)),
+      configuration: configuration.normalized(), width: 1920, height: 1080)
     XCTAssertTrue(result.availability.isEmpty, "\(result.availability)")
-    let decorated = try XCTUnwrap(result.decorated).pixelBuffer
-    XCTAssertEqual(MonitorCaptureSink.geometry(decorated), outputGeometry)
-    XCTAssertEqual(MonitorCaptureSink.geometry(result.clean.pixelBuffer), outputGeometry)
-    XCTAssertEqual(CVPixelBufferGetWidth(decorated), 1920)
-    XCTAssertEqual(CVPixelBufferGetHeight(decorated), 1080)
-    XCTAssertEqual(CVPixelBufferLockBaseAddress(decorated, .readOnly), kCVReturnSuccess)
-    defer { CVPixelBufferUnlockBaseAddress(decorated, .readOnly) }
-    let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(decorated))
-      .assumingMemoryBound(to: UInt8.self)
-    let rowBytes = CVPixelBufferGetBytesPerRow(decorated)
+    XCTAssertEqual(result.width, 1920)
+    XCTAssertEqual(result.height, 1080)
+    let base = result.pictureBytes
+    let rowBytes = result.width * 4
     for y in [100, 500, 1000] {
       let edge = y * rowBytes + 708 * 4
       XCTAssertGreaterThan(base[edge + 2], 245)
@@ -540,8 +378,7 @@ import XCTest
       let controller = CaptureController(services: services, previewRenderer: nil)
       let target = MonitorTargetID("paced-combined-\(enabled)")
       let presenter = MonitorSurfacePresenter()
-      let runtime = MonitorRuntime()
-      let sink = MonitorCaptureSink(target: target, runtime: runtime)
+      let sink = MonitorCaptureSink(target: target)
       if enabled {
         var monitor = MonitorConfiguration()
         monitor.toolsEnabled = true
@@ -549,7 +386,7 @@ import XCTest
         monitor.zebra.enabled = true
         monitor.scopes.enabled = true
         monitor.scopes.refreshHz = 15
-        sink.configure(monitor, consumers: [presenter], scopeVisible: true, preferredHz: 30)
+        sink.configure(monitor, consumers: [presenter], scopeVisible: true)
         controller.setMonitorSink(sink)
       }
       let feed = FeedID(rawValue: target.rawValue)
@@ -881,8 +718,7 @@ import XCTest
   }
 
   func testNeedsOutputTreatsABusyLockAsWanted() {
-    let runtime = MonitorRuntime(sharedDevice: { nil })
-    let sink = MonitorCaptureSink(target: MonitorTargetID("needs-output-lock"), runtime: runtime)
+    let sink = MonitorCaptureSink(target: MonitorTargetID("needs-output-lock"))
     var monitor = MonitorConfiguration()
     monitor.pictureStage = .processedOutput
     let presenter = MonitorSurfacePresenter()

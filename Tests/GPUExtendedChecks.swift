@@ -287,6 +287,33 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     XCTAssertEqual(held.count, 8, "Prewarm must release all warm frames before native capture starts")
   }
 
+  /// Live-path warm-up commits its frames ahead of the next one and returns
+  /// without waiting for the GPU; nothing fills the warm-up input on the CPU.
+  func testLivePrepareDoesNotWaitAndKeepsOrder() throws {
+    let processor = try LUTProcessor()
+    let config = PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true)
+    let started = ProcessInfo.processInfo.systemUptime
+    try processor.prepare(configuration: config, wait: false)
+    let prepareMS = (ProcessInfo.processInfo.systemUptime - started) * 1000
+    let order = OrderLog()
+    let done = DispatchSemaphore(value: 0)
+    let source = try input(packed: true)
+    for index in 0..<3 {
+      try processor.submit(source, configuration: config) { completed in
+        if case .success = completed.result { order.append(index) }
+      }
+    }
+    // A frame that skips the GPU is ordered behind the ones on it.
+    processor.afterCommittedFrames { order.append(99); done.signal() }
+    XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
+    XCTAssertEqual(order.values, [0, 1, 2, 99])
+    // Nothing in flight: it still runs, on the completion queue.
+    XCTAssertTrue(processor.waitUntilIdle(timeout: 2))
+    processor.afterCommittedFrames { done.signal() }
+    XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
+    print(String(format: "LIVE_PREPARE returnMS=%.3f (3 warm frames committed, not awaited)", prepareMS))
+  }
+
   func testIOSurfaceCaptureDecodesEveryPackedLaneWithoutACopy() throws {
     let processor = try LUTProcessor()
     try processor.load(CubeLUT(text: cubeText()))
@@ -297,7 +324,6 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     let output = try processor.process(source, configuration: config)
     let after = processor.packedInputDiagnostics
     XCTAssertEqual(after.noCopyFrames - before.noCopyFrames, 1)
-    XCTAssertEqual(after.copiedFrames, 0)
     CVPixelBufferLockBaseAddress(output, .readOnly)
     let rowStride = CVPixelBufferGetBytesPerRowOfPlane(output, 0) / 2
     let words = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt16.self)
@@ -316,7 +342,6 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     XCTAssertThrowsError(try processor.process(source,
       configuration: PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true)))
     XCTAssertEqual(processor.packedInputDiagnostics.noCopyFrames, 0)
-    XCTAssertEqual(processor.packedInputDiagnostics.copiedFrames, 0)
   }
 
   func testUndersizedPackedStrideRejectedBeforeAnyGPUOrPassthroughUse() throws {
@@ -327,7 +352,6 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     XCTAssertThrowsError(try processor.process(source,
       configuration: PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true)))
     XCTAssertEqual(processor.packedInputDiagnostics.noCopyFrames, 0)
-    XCTAssertEqual(processor.packedInputDiagnostics.copiedFrames, 0)
   }
 
   func testBypassReleasesWorkingAllocationsWithoutInvalidatingPublishedFrame() throws {
@@ -336,7 +360,6 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     let processed = PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true)
     let published = try processor.process(source, configuration: processed)
     XCTAssertGreaterThan(processor.workingResourceDiagnostics.floatTextureBytes, 0)
-    XCTAssertEqual(processor.workingResourceDiagnostics.packedCopyBytes, 0, "The GPU reads the capture IOSurface; nothing is staged")
     XCTAssertTrue(processor.workingResourceDiagnostics.outputPoolActive)
     func middleLuma() -> UInt8 {
       CVPixelBufferLockBaseAddress(published, .readOnly)
@@ -347,7 +370,6 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     let bypass = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
     try processor.prepare(configuration: bypass)
     XCTAssertEqual(processor.workingResourceDiagnostics.floatTextureBytes, 0)
-    XCTAssertEqual(processor.workingResourceDiagnostics.packedCopyBytes, 0)
     XCTAssertFalse(processor.workingResourceDiagnostics.outputPoolActive)
     XCTAssertEqual(middleLuma(), expected, "Releasing working memory must preserve an already published IOSurface")
     XCTAssertTrue(try processor.process(source, configuration: bypass) === source)
@@ -363,10 +385,12 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     _ = try processor.process(source,
       configuration: PipelineConfiguration(applyLUT: true, downscale: true, convertTo420: false))
     let scaledBytes = processor.workingResourceDiagnostics.floatTextureBytes
+    XCTAssertGreaterThan(scaledBytes, 0)
+    XCTAssertLessThan(scaledBytes, 1920 * 2160 * 16, "Downscale keeps one half-float horizontal intermediate")
     let full = try processor.process(source,
       configuration: PipelineConfiguration(applyLUT: true, downscale: false, convertTo420: false))
-    XCTAssertGreaterThan(processor.workingResourceDiagnostics.floatTextureBytes, 0)
-    XCTAssertLessThan(processor.workingResourceDiagnostics.floatTextureBytes, scaledBytes)
+    XCTAssertEqual(processor.workingResourceDiagnostics.floatTextureBytes, 0,
+      "Full resolution decodes, grades and encodes in one pass with no intermediate")
     XCTAssertEqual(read10(full, plane: 0, x: 1920), UInt16(64 + 1920 * 876 / 3839))
   }
 
@@ -405,4 +429,11 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     let recovered = try processor.process(source, configuration: configuration)
     XCTAssertEqual(read10(recovered, plane: 0, x: 16, y: 16), UInt16(399 + VideoContract.outputBufferLimit))
   }
+}
+
+private final class OrderLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored: [Int] = []
+  func append(_ value: Int) { lock.lock(); stored.append(value); lock.unlock() }
+  var values: [Int] { lock.lock(); defer { lock.unlock() }; return stored }
 }

@@ -54,9 +54,6 @@ final class CameraBufferQueue {
   }
 }
 
-// DeckLink's borrowed v210 capture buffers are not necessarily IOSurfaces.
-// CMIO's interprocess transport requires shareable storage, so stage raw bytes
-// without changing format, quantizing pixels or losing sample metadata.
 /// Frames reach the camera, the preview and Program as the capture card's own
 /// IOSurface (DeckLink SDK 16), or as the processor's IOSurface output. Nothing
 /// is copied here: a frame without an IOSurface is an error, not a reason to copy.

@@ -3,42 +3,80 @@ import CoreVideo
 import Foundation
 
 /// Consumes the bounded Program output route and forwards its image buffers to
-/// the Program virtual camera. The bridge deliberately creates a sample around
-/// the existing `CVPixelBuffer`; it never scales, converts, or copies pixels.
+/// the Program virtual camera. The bridge wraps the existing `CVPixelBuffer`
+/// in a sample; it never scales, converts, or copies pixels (conversion to the
+/// contract happens on the GPU in `ProgramOutputRoute` before the route).
 ///
-/// All state and sink calls are serialized. This matters because capture
-/// callbacks can publish frames while a CMIO client is connecting or closing.
-/// A route lease is released after `CMSampleBufferCreateReadyWithImageBuffer`
-/// and the sink enqueue return, so the sample retains the pixel buffer for
-/// CMIO independently of the route queue.
+/// Two serial queues:
+/// - `sendQueue` drains the route and calls `send`. The frame path only ever
+///   schedules it asynchronously (`schedulePump`), so the publishing thread
+///   never waits for CMIO.
+/// - `controlQueue` connects and disconnects the sink. CMIO discovery can take
+///   seconds; it never runs on the frame path or, in the app, the main actor.
+///
+/// The sink is touched by one queue at a time: before connecting or
+/// disconnecting, the control queue marks the bridge not-connected and then
+/// waits for any in-flight send (`sendQueue.sync {}`); sends only happen while
+/// connected. The send queue never waits on the control queue, so there is no
+/// lock-order cycle.
+///
+/// Timestamps: the Program clock starts at zero. Samples go out on the host
+/// clock (the camera stream's clock, like every per-camera output), anchored
+/// once per connection, so the extension never has to restamp them.
 final class ProgramOutputBridge: @unchecked Sendable {
   struct Statistics: Equatable, Sendable {
     var delivered: UInt64 = 0
+    /// CMIO's sink queue was full: the camera client is not keeping up.
     var dropped: UInt64 = 0
     var invalid: UInt64 = 0
     var sendErrors: UInt64 = 0
+    /// Released because no sink was connected yet (or it was reconnecting).
+    var withoutSink: UInt64 = 0
+    var reconnects: UInt64 = 0
+    /// Contract changes ignored because frames had already gone out on the
+    /// current connection: cuts never renegotiate the camera.
+    var contractChangesHeld: UInt64 = 0
+    /// Frames converted for a previous contract that were still queued when
+    /// the camera reconnected with a new one (before its first frame).
+    var staleFormat: UInt64 = 0
+    /// Sends issued on the main thread. Stays 0 when the app pumps from the
+    /// delivery path.
+    var mainThreadSends: UInt64 = 0
   }
 
   typealias Connect = (PipelineConfiguration, OSType) throws -> Void
   typealias Disconnect = () -> Void
   typealias Send = (CMSampleBuffer) throws -> Bool
 
-  private let queue: DispatchQueue
-  private let queueKey = DispatchSpecificKey<UInt8>()
+  private enum Link { case disconnected, connecting, connected, failed }
+
+  private let sendQueue: DispatchQueue
+  private let controlQueue: DispatchQueue
+  private let sendKey = DispatchSpecificKey<UInt8>()
+  private let controlKey = DispatchSpecificKey<UInt8>()
   private let route: FrameRoute<CVPixelBuffer>
   private let connectSink: Connect
   private let disconnectSink: Disconnect
   private let sendSink: Send
-  private let sampleFactory = VideoSampleFactory()
-  private var connected = false
+  private let hostClock: () -> CMTime
+  private let sampleFactory = VideoSampleFactory()  // sendQueue only
+  // sendQueue only: Program → host clock offset for the current connection.
+  private var hostOffset: CMTime?
+  private var lastSentTime: CMTime?
+  private var anchoredConnection: UInt64 = 0
+
+  private let lock = NSLock()
+  private var link = Link.disconnected
   private var demand = false
-  // Keep the most recent negotiated contract so a transient CMIO enqueue
-  // failure can be recovered while the camera client is still demanding the
-  // route. Without this, `connected` becomes false and every subsequent pump
-  // silently returns until a new demand transition arrives.
-  private var demandConfiguration: PipelineConfiguration?
-  private var demandPassthroughFormat: OSType?
+  private var configuration: PipelineConfiguration?
+  private var passthroughFormat: OSType?
+  private var deliveredOnConnection: UInt64 = 0
+  private var connection: UInt64 = 0
+  private var pumpScheduled = false
+  private var reconnectScheduled = false
   private var statistics = Statistics()
+  private var contractHandler: (@Sendable (ProgramOutputFormat?) -> Void)?
+  private var enforcesContract = false
 
   /// The production bridge uses the dedicated Program CMIO destination.
   convenience init(route: FrameRoute<CVPixelBuffer>, queueLabel: String = "org.ultracam.program-output-bridge") {
@@ -55,191 +93,359 @@ final class ProgramOutputBridge: @unchecked Sendable {
   /// only path that supplies the real `CameraSink`.
   init(route: FrameRoute<CVPixelBuffer>, connect: @escaping Connect,
        disconnect: @escaping Disconnect, send: @escaping Send,
-       queueLabel: String = "org.ultracam.program-output-bridge") {
+       queueLabel: String = "org.ultracam.program-output-bridge",
+       hostClock: @escaping () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) }) {
     self.route = route
     connectSink = connect
     disconnectSink = disconnect
     sendSink = send
-    queue = DispatchQueue(label: queueLabel, qos: .userInteractive)
-    queue.setSpecific(key: queueKey, value: 1)
+    self.hostClock = hostClock
+    sendQueue = DispatchQueue(label: queueLabel + ".send", qos: .userInteractive)
+    controlQueue = DispatchQueue(label: queueLabel + ".control", qos: .userInitiated)
+    sendQueue.setSpecific(key: sendKey, value: 1)
+    controlQueue.setSpecific(key: controlKey, value: 1)
   }
 
   deinit {
-    sync {
-      if connected { disconnectSink() }
-      connected = false
-      demand = false
-      drainLocked()
+    // No queue can still reference self here; tear down inline.
+    if link == .connected || link == .failed { disconnectSink() }
+    while let lease = route.dequeue() { lease.release() }
+  }
+
+  private func locked<T>(_ body: () throws -> T) rethrows -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    return try body()
+  }
+
+  var isDemanded: Bool { locked { demand } }
+  var isConnected: Bool { locked { link == .connected } }
+  var currentStatistics: Statistics { locked { statistics } }
+
+  /// The format the Program camera negotiated, or nil while not connected.
+  var contract: ProgramOutputFormat? {
+    locked {
+      guard link == .connected, let configuration, let passthroughFormat else { return nil }
+      return ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat)
     }
   }
 
-  var isDemanded: Bool { sync { demand } }
-  var isConnected: Bool { sync { connected } }
-  var currentStatistics: Statistics { sync { statistics } }
+  /// When true, a frame that doesn't match the negotiated contract is counted
+  /// as stale and skipped instead of being sent (and failing in CMIO). The
+  /// route converts every frame to the contract, so only frames queued across
+  /// a contract change can be stale. Set by `FeedCoordinator` when wired.
+  var enforceContract: Bool {
+    get { locked { enforcesContract } }
+    set { locked { enforcesContract = newValue } }
+  }
 
-  /// Opens the Program sink only while there is an active CMIO consumer. A
-  /// false transition closes the sink before draining queued leases.
+  /// Called on the control queue whenever the negotiated contract changes
+  /// (nil when the sink closes).
+  var onContractChange: (@Sendable (ProgramOutputFormat?) -> Void)? {
+    get { locked { contractHandler } }
+    set { locked { contractHandler = newValue } }
+  }
+
+  /// Opens the Program sink only while there is an active CMIO consumer, and
+  /// waits for the result. Tests use this; the app uses `requestDemand`.
   func setDemand(_ active: Bool, configuration: PipelineConfiguration,
-                 passthroughFormat: OSType) throws {
-    try sync {
-      demand = active
-      guard active else {
-        if connected { disconnectSink() }
-        connected = false
-        demandConfiguration = nil
-        demandPassthroughFormat = nil
-        drainLocked()
-        return
-      }
-      let contractChanged = connected && !Self.sameContract(demandConfiguration, configuration,
-        demandPassthroughFormat, passthroughFormat)
-      demandConfiguration = configuration
-      demandPassthroughFormat = passthroughFormat
-      if contractChanged {
-        disconnectSink()
-        connected = false
-      }
-      guard !connected else {
-        pumpLocked()
-        return
-      }
-      do {
-        try connectSink(configuration, passthroughFormat)
-      } catch {
-        demand = false
-        connected = false
-        drainLocked()
-        throw error
-      }
-      connected = true
-      pumpLocked()
+                 passthroughFormat: OSType, renegotiate: Bool = false) throws {
+    try onControl {
+      try applyDemand(active, configuration: configuration, passthroughFormat: passthroughFormat,
+        renegotiate: renegotiate)
     }
   }
 
-  /// Drains all currently queued frames. Calling this while demand is false is
-  /// intentionally a no-op: frames are discarded at the route boundary and no
-  /// hardware or GPU work is started in the background.
-  func pump() {
-    sync {
-      guard demand else { return }
-      if !connected {
-        guard let configuration = demandConfiguration,
-          let passthroughFormat = demandPassthroughFormat else { return }
-        do {
-          try connectSink(configuration, passthroughFormat)
-          connected = true
-        } catch {
-          // Keep demand asserted. The next frame gives the bridge another
-          // opportunity to reconnect without requiring a second CMIO client
-          // transition, while retaining queued frames for the eventual sink.
-          return
-        }
+  /// Asynchronous `setDemand`: returns at once; `completion` runs on the
+  /// control queue with the connection error, if any.
+  func requestDemand(_ active: Bool, configuration: PipelineConfiguration,
+                     passthroughFormat: OSType, renegotiate: Bool = false,
+                     completion: @escaping @Sendable (Error?) -> Void) {
+    controlQueue.async { [self] in
+      do {
+        try applyDemand(active, configuration: configuration, passthroughFormat: passthroughFormat,
+          renegotiate: renegotiate)
+        completion(nil)
+      } catch {
+        completion(error)
       }
-      pumpLocked()
     }
+  }
+
+  /// Drains queued frames now and waits. The frame path uses `schedulePump`.
+  func pump() {
+    if DispatchQueue.getSpecific(key: sendKey) != nil { pumpOnSendQueue(); return }
+    sendQueue.sync { pumpOnSendQueue() }
+  }
+
+  /// Schedules one drain on the send queue. Coalesces: frames published while
+  /// a drain is pending are picked up by it, in order.
+  func schedulePump() {
+    let schedule = locked { () -> Bool in
+      guard !pumpScheduled else { return false }
+      pumpScheduled = true
+      return true
+    }
+    guard schedule else { return }
+    sendQueue.async { [self] in pumpOnSendQueue() }
+  }
+
+  /// Waits until queued control and send work has run. For tests.
+  func waitUntilIdle() {
+    controlQueue.sync {}
+    sendQueue.sync {}
   }
 
   /// Closes the Program sink and releases any pending leases. The route itself
   /// remains registered so a later demand transition can resume output.
   func disconnect() {
-    sync {
-      demand = false
-      if connected { disconnectSink() }
-      connected = false
-      demandConfiguration = nil
-      demandPassthroughFormat = nil
-      drainLocked()
+    onControl {
+      locked { demand = false }
+      closeLink()
     }
   }
 
-  private func pumpLocked() {
+  // MARK: - Control queue
+
+  private func onControl<T>(_ body: () throws -> T) rethrows -> T {
+    if DispatchQueue.getSpecific(key: controlKey) != nil { return try body() }
+    return try controlQueue.sync(execute: body)
+  }
+
+  /// `renegotiate` is for the session owner's own format changes (cadence
+  /// detected after connect, settings edited); cuts never pass it.
+  private func applyDemand(_ active: Bool, configuration: PipelineConfiguration,
+                           passthroughFormat: OSType, renegotiate: Bool) throws {
+    guard active else {
+      locked { demand = false }
+      closeLink()
+      return
+    }
+    let next = ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat)
+    let keep = locked { () -> Bool in
+      demand = true
+      guard link == .connected, let current = self.configuration, let pass = self.passthroughFormat else {
+        return false
+      }
+      if ProgramOutputFormat(configuration: current, passthroughFormat: pass) == next { return true }
+      // One fixed contract per client session. Before the first frame the
+      // contract may still settle (e.g. input cadence detected after
+      // connect); after it, cuts and settings changes are converted on the
+      // GPU instead of renegotiating the camera.
+      if deliveredOnConnection > 0, !renegotiate {
+        statistics.contractChangesHeld &+= 1
+        return true
+      }
+      return false
+    }
+    if keep { schedulePump(); return }
+    try connect(configuration: configuration, passthroughFormat: passthroughFormat)
+  }
+
+  /// Connects (or reconnects) the sink. Control queue only.
+  private func connect(configuration: PipelineConfiguration, passthroughFormat: OSType) throws {
+    let wasLinked = locked { () -> Bool in
+      let linked = link == .connected || link == .failed
+      link = .connecting
+      return linked
+    }
+    sendQueue.sync {}  // no send is in flight past this point
+    if wasLinked {
+      disconnectSink()
+      locked { contractHandler }?(nil)
+    }
+    do {
+      try connectSink(configuration, passthroughFormat)
+    } catch {
+      locked {
+        link = .disconnected
+        demand = false
+      }
+      drainRoute()
+      throw error
+    }
+    let handler = locked { () -> (@Sendable (ProgramOutputFormat?) -> Void)? in
+      link = .connected
+      self.configuration = configuration
+      self.passthroughFormat = passthroughFormat
+      deliveredOnConnection = 0
+      self.connection &+= 1
+      return contractHandler
+    }
+    handler?(ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat))
+    schedulePump()
+  }
+
+  private func closeLink() {
+    let wasLinked = locked { () -> Bool in
+      let linked = link == .connected || link == .failed
+      link = .connecting  // blocks sends while the sink closes
+      return linked
+    }
+    sendQueue.sync {}
+    if wasLinked { disconnectSink() }
+    let handler = locked { () -> (@Sendable (ProgramOutputFormat?) -> Void)? in
+      link = .disconnected
+      configuration = nil
+      passthroughFormat = nil
+      return contractHandler
+    }
+    handler?(nil)
+    drainRoute()
+  }
+
+  /// After a failed send: keep demand, reconnect with the same contract.
+  /// Retries once a second while the client still wants the camera.
+  private func scheduleReconnect(after delay: TimeInterval) {
+    let schedule = locked { () -> Bool in
+      guard !reconnectScheduled else { return false }
+      reconnectScheduled = true
+      return true
+    }
+    guard schedule else { return }
+    controlQueue.asyncAfter(deadline: .now() + delay) { [self] in
+      let target = locked { () -> (PipelineConfiguration, OSType)? in
+        reconnectScheduled = false
+        guard demand, link == .failed, let configuration, let passthroughFormat else { return nil }
+        return (configuration, passthroughFormat)
+      }
+      guard let (configuration, passthroughFormat) = target else { return }
+      locked { statistics.reconnects &+= 1 }
+      do {
+        try connect(configuration: configuration, passthroughFormat: passthroughFormat)
+      } catch {
+        // `connect` cleared demand on failure; restore it and keep trying.
+        locked {
+          demand = true
+          link = .failed
+          self.configuration = configuration
+          self.passthroughFormat = passthroughFormat
+        }
+        scheduleReconnect(after: 1)
+      }
+    }
+  }
+
+  private func drainRoute() {
+    var released: UInt64 = 0
+    while let lease = route.dequeue() { lease.release(); released &+= 1 }
+    if released > 0 { locked { statistics.withoutSink &+= released } }
+  }
+
+  // MARK: - Send queue
+
+  private func pumpOnSendQueue() {
+    locked { pumpScheduled = false }
     while let lease = route.dequeue() {
       defer { lease.release() }
-      guard let image = lease.payload, let metadata = lease.metadata else { continue }
-      guard metadata.presentationTime.isValid, metadata.presentationTime.isNumeric,
+      let (connected, expected, connection) = locked { () -> (Bool, ProgramOutputFormat?, UInt64) in
+        guard link == .connected, demand else { return (false, nil, self.connection) }
+        guard enforcesContract, let configuration, let passthroughFormat else { return (true, nil, self.connection) }
+        return (true, ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat),
+          self.connection)
+      }
+      guard connected else {
+        locked { statistics.withoutSink &+= 1 }
+        continue
+      }
+      if let expected, let metadata = lease.metadata,
+        !expected.matches(metadata) || metadata.duration != expected.duration {
+        locked { statistics.staleFormat &+= 1 }
+        continue
+      }
+      guard let image = lease.payload, let metadata = lease.metadata,
+        metadata.presentationTime.isValid, metadata.presentationTime.isNumeric,
         metadata.presentationTime.epoch == 0,
         metadata.duration.isValid, metadata.duration.isNumeric,
         metadata.duration.epoch == 0, metadata.duration.value > 0,
         CVPixelBufferGetWidth(image) == metadata.width,
         CVPixelBufferGetHeight(image) == metadata.height,
         CVPixelBufferGetPixelFormatType(image) == OSType(metadata.pixelFormat) else {
-        statistics.invalid &+= 1
+        locked { statistics.invalid &+= 1 }
         continue
       }
-      var staged: CMSampleBuffer?
+      if connection != anchoredConnection {
+        anchoredConnection = connection
+        hostOffset = nil
+        lastSentTime = nil
+      }
+      let time = hostTime(for: metadata.presentationTime, duration: metadata.duration)
       do {
-        let sample = try sampleFactory.sample(image, at: metadata.presentationTime,
-          duration: metadata.duration)
-        staged = sample
-        if try sendSink(sample) { statistics.delivered &+= 1 }
-        else { statistics.dropped &+= 1 }
-      } catch {
-        statistics.sendErrors &+= 1
-        let mismatch = (error as? LocalizedError)?.errorDescription?
-          .contains("negotiated format") == true
-        if let sample = staged, mismatch, reconnectLocked(to: metadata) {
-          do {
-            if try sendSink(sample) {
-              statistics.delivered &+= 1
-              continue
-            }
+        let sample = try sampleFactory.sample(image, at: time, duration: metadata.duration)
+        let accepted = try sendSink(sample)
+        lastSentTime = time
+        locked {
+          if Thread.isMainThread { statistics.mainThreadSends &+= 1 }
+          if accepted {
+            statistics.delivered &+= 1
+            deliveredOnConnection &+= 1
+          } else {
             statistics.dropped &+= 1
-            continue
-          } catch {
-            statistics.sendErrors &+= 1
           }
         }
-        // A failed enqueue usually means the CMIO client released the
-        // virtual camera between our demand check and this send. Keep demand
-        // asserted so the next demanded frame can reconnect the sink.
-        if connected { disconnectSink() }
-        connected = false
-        drainLocked()
-        break
+      } catch {
+        // A failed enqueue usually means the CMIO client released the virtual
+        // camera between our demand check and this send. Keep demand asserted
+        // and reconnect on the control queue; never block the frame path.
+        locked {
+          statistics.sendErrors &+= 1
+          if link == .connected { link = .failed }
+        }
+        scheduleReconnect(after: 0)
       }
     }
   }
+}
 
-  /// Rebuilds the sink around the frame that was just rejected. Program
-  /// sources can change resolution, chroma, or frame rate at a cut, and the
-  /// sink's previous negotiation would otherwise drop every following frame.
-  private func reconnectLocked(to metadata: ProcessedFrameMetadata) -> Bool {
-    if connected { disconnectSink() }
-    connected = false
-    var configuration = PipelineConfiguration()
-    configuration.downscale = metadata.width <= 1920
-    configuration.convertTo420 = metadata.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-    configuration.inputFast = metadata.duration == VideoContract.fastDuration
-    configuration.reduceFrameRate = false
-    // The rejected frame's own format is the contract. Reusing the previous
-    // packed v210 passthrough makes CameraSink reject every later bi-planar frame.
-    let passthrough = OSType(metadata.pixelFormat)
-    do {
-      try connectSink(configuration, passthrough)
-      connected = true
-      demandConfiguration = configuration
-      demandPassthroughFormat = passthrough
-      return true
-    } catch {
-      connected = false
-      return false
+extension ProgramOutputBridge {
+  /// Program time on the host clock: one offset per connection, so spacing is
+  /// exactly the Program clock's. Re-anchored only when the Program clock
+  /// restarts (a reset) or strays a second from real time, never backwards.
+  fileprivate func hostTime(for programTime: CMTime, duration: CMTime) -> CMTime {
+    // On the Program timescale, so mapped spacing stays exact.
+    let now = CMTimeConvertScale(hostClock(), timescale: programTime.timescale, method: .roundTowardZero)
+    if let hostOffset {
+      let mapped = CMTimeAdd(programTime, hostOffset)
+      let ahead = CMTimeSubtract(mapped, now).seconds
+      if abs(ahead) < 1, lastSentTime.map({ CMTimeCompare(mapped, $0) > 0 }) ?? true { return mapped }
     }
+    var anchor = now
+    if let lastSentTime { anchor = CMTimeMaximum(anchor, CMTimeAdd(lastSentTime, duration)) }
+    hostOffset = CMTimeSubtract(anchor, programTime)
+    return anchor
+  }
+}
+
+/// Feeds the Program monitor from the Program route's publishing thread.
+/// `MonitorCaptureSink` is lock-based and non-blocking, so the monitor gets
+/// every Program frame in order without a main-actor hop. Generation changes
+/// at each cut so the monitor restarts its per-source state.
+final class ProgramMonitorTap: @unchecked Sendable {
+  private let sink: MonitorCaptureSink
+  private let lock = NSLock()
+  private var generation: UInt64 = 1
+  private var sequence: UInt64 = 0
+
+  init(sink: MonitorCaptureSink) { self.sink = sink }
+
+  /// Starts a new monitor generation, e.g. when Program becomes available
+  /// again after the monitor invalidated the Program sink.
+  func restart() {
+    lock.lock()
+    generation &+= 1
+    lock.unlock()
   }
 
-  private static func sameContract(_ current: PipelineConfiguration?, _ next: PipelineConfiguration,
-                                   _ currentPassthrough: OSType?, _ nextPassthrough: OSType) -> Bool {
-    guard let current, let currentPassthrough else { return false }
-    return current.width == next.width && current.height == next.height &&
-      current.pixelFormat == next.pixelFormat && current.duration == next.duration &&
-      currentPassthrough == nextPassthrough
-  }
-
-  private func drainLocked() {
-    while let lease = route.dequeue() { lease.release() }
-  }
-
-  private func sync<T>(_ body: () throws -> T) rethrows -> T {
-    if DispatchQueue.getSpecific(key: queueKey) != nil { return try body() }
-    return try queue.sync(execute: body)
+  func offer(frame: ProcessedFrame<CVPixelBuffer>, sourcePTS: CMTime, cutApplied: Bool) {
+    lock.lock()
+    if cutApplied { generation &+= 1 }
+    sequence &+= 1
+    let generation = self.generation
+    let sequence = self.sequence
+    lock.unlock()
+    sink.offer(source: frame.payload, output: frame.payload, pts: sourcePTS,
+      captureGeneration: generation, sequence: sequence,
+      processingRevision: frame.metadata.processingRevision,
+      sourceOnly: false, correspondence: nil)
   }
 }

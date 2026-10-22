@@ -1,28 +1,36 @@
 #include <metal_stdlib>
 using namespace metal;
-// ABI: nine aligned16-byte rows; mirrored by KernelParameters.swift.
+// ABI: ten aligned 16-byte rows; mirrored by MonitorKernelParameters.swift.
 struct Params {
- uint width,height,stride,format;
+ uint width,height,planes,format;
  uint outWidth,outHeight,flags,scopeMode;
  float threshold,widthIRE,opacity,focusThreshold;
  float noise,focusOpacity,gain,sourceLogRescaled;
  uint scopeWidth,scopeHeight,scopeSamplingStride,scopeSamplingPhase;
- float referenceOffsetStops,reserved0,reserved1,reserved2;
+ // originX/originY: the viewport's top-left pixel in the target.
+ float referenceOffsetStops,originX,originY,reserved2;
  float4 coefficients,mapping,peak;
+ // Picture region (x, y, width, height in picture pixels) shown across the whole target.
+ float4 aperture;
 };
 enum MonitorFlags : uint { Zebra=1u, ZebraBand=2u, Focus=4u, LogC3=8u, LogC4=16u,
  ScopeGraticule=1u, SonyARRIReference=128u, SonySGamut3=256u, SonySLog3=512u, ELZone=1024u };
-// Read native packed v210, BGRA, NV12 and high-aligned P010. Buffer storage is owned staging.
-float3 readRGB(device const uchar* raw, uint x,uint y,constant Params& p) {
+typedef texture2d<uint,access::read> plane;
+// Frames are read in place from their IOSurfaces:
+//  0 v210: rgba32Uint, one texel per 6-pixel group
+//  1 BGRA: rgba8Uint (x=B, y=G, z=R)
+//  2,3 8-bit biplanar: r8Uint luma, rg8Uint CbCr
+//  4..7 10-bit biplanar: r16Uint luma, rg16Uint CbCr, high-aligned
+float3 readRGB(plane p0,plane p1,uint x,uint y,constant Params& p) {
  float Y,Cb,Cr;
- if(p.format==0) { device const uint* row=(device const uint*)(raw+y*p.stride); uint b=(x/6)*4; uint a=row[b],c=row[b+1],d=row[b+2],e=row[b+3]; uint n=x%6;
+ if(p.format==0) { uint4 g=p0.read(uint2(x/6,y)); uint a=g.x,c=g.y,d=g.z,e=g.w; uint n=x%6;
  uint ys[6]={(a>>10)&1023,c&1023,(c>>20)&1023,(d>>10)&1023,e&1023,(e>>20)&1023};
  uint us[3]={a&1023,(c>>10)&1023,(d>>20)&1023}; uint vs[3]={(a>>20)&1023,d&1023,(e>>10)&1023};
  bool full=p.coefficients.w>0; Y=(float(ys[n])-(full?0:64))/(full?1023:876); Cb=(float(us[n/2])-512)/(full?1023:896); Cr=(float(vs[n/2])-512)/(full?1023:896);
- } else if(p.format==1) { device const uchar* a=raw+y*p.stride+x*4; return float3(a[2],a[1],a[0])/255; }
- else { bool ten=p.format>=4; bool full=p.coefficients.w>0; uint uvBase=p.stride*p.height;
- if(ten) { Y=float(((device const ushort*)(raw+y*p.stride))[x]>>6); device const ushort* uv=(device const ushort*)(raw+uvBase+(p.format>=6?y:y/2)*p.stride); Cb=float(uv[(x/2)*2]>>6); Cr=float(uv[(x/2)*2+1]>>6); Y=(Y-(full?0:64))/(full?1023:876); Cb=(Cb-512)/(full?1023:896); Cr=(Cr-512)/(full?1023:896); }
- else { Y=raw[y*p.stride+x]; Cb=raw[uvBase+(p.format>=6?y:y/2)*p.stride+(x/2)*2]; Cr=raw[uvBase+(p.format>=6?y:y/2)*p.stride+(x/2)*2+1]; Y=(Y-(full?0:16))/(full?255:219); Cb=(Cb-128)/(full?255:224); Cr=(Cr-128)/(full?255:224); }
+ } else if(p.format==1) { uint4 a=p0.read(uint2(x,y)); return float3(a.z,a.y,a.x)/255; }
+ else { bool ten=p.format>=4; bool full=p.coefficients.w>0; uint2 c=uint2(x/2,p.format>=6?y:y/2); uint2 uv=p1.read(c).xy;
+ if(ten) { Y=float(p0.read(uint2(x,y)).x>>6); Cb=float(uv.x>>6); Cr=float(uv.y>>6); Y=(Y-(full?0:64))/(full?1023:876); Cb=(Cb-512)/(full?1023:896); Cr=(Cr-512)/(full?1023:896); }
+ else { Y=float(p0.read(uint2(x,y)).x); Cb=float(uv.x); Cr=float(uv.y); Y=(Y-(full?0:16))/(full?255:219); Cb=(Cb-128)/(full?255:224); Cr=(Cr-128)/(full?255:224); }
  }
  if(Cb==0&&Cr==0)return float3(Y);
  float r=Y+2*(1-p.coefficients.x)*Cr; float b=Y+2*(1-p.coefficients.z)*Cb; return float3(r,(Y-p.coefficients.x*r-p.coefficients.z*b)/p.coefficients.y,b);
@@ -34,20 +42,20 @@ float sonyLogC3ReferenceCode(float value){return (value>.010591f?.247190f*log10(
 
 // Encoded transport Y equals declared matrix-weighted decoded RGB without
 // reconstructing chroma. Peaking never uses a scene-linear/gamma transform.
-float readSignalY(device const uchar* raw,uint x,uint y,constant Params& p) {
- if(p.format==1)return signalLuma(readRGB(raw,x,y,p),p);
+float readSignalY(plane p0,plane p1,uint x,uint y,constant Params& p) {
+ if(p.format==1)return signalLuma(readRGB(p0,p1,x,y,p),p);
  bool full=p.coefficients.w>0;
  if(p.format==0){
-  device const uint* row=(device const uint*)(raw+y*p.stride);
-  uint base=(x/6)*4,n=x%6,code;
-  switch(n){case 0:code=(row[base]>>10)&1023;break;
-   case 1:code=row[base+1]&1023;break;case 2:code=(row[base+1]>>20)&1023;break;
-   case 3:code=(row[base+2]>>10)&1023;break;case 4:code=row[base+3]&1023;break;
-   default:code=(row[base+3]>>20)&1023;break;}
+  uint4 g=p0.read(uint2(x/6,y));
+  uint n=x%6,code;
+  switch(n){case 0:code=(g.x>>10)&1023;break;
+   case 1:code=g.y&1023;break;case 2:code=(g.y>>20)&1023;break;
+   case 3:code=(g.z>>10)&1023;break;case 4:code=g.w&1023;break;
+   default:code=(g.w>>20)&1023;break;}
   return (float(code)-(full?0:64))/(full?1023:876);
  }
- if(p.format>=4){float code=float(((device const ushort*)(raw+y*p.stride))[x]>>6);return (code-(full?0:64))/(full?1023:876);}
- return (float(raw[y*p.stride+x])-(full?0:16))/(full?255:219);
+ if(p.format>=4){float code=float(p0.read(uint2(x,y)).x>>6);return (code-(full?0:64))/(full?1023:876);}
+ return (float(p0.read(uint2(x,y)).x)-(full?0:16))/(full?255:219);
 }
 float directionalMedian(float a,float b,float c){return max(min(a,b),min(max(a,b),c));}
 float3 nativeSLog3(float3 rgb,constant Params& p){
@@ -77,30 +85,36 @@ float3 elZonePublicChart(float3 native,constant Params& p){
  for(uint i=0;i<13;i++)if(stops<upper[i])return colors[i+1];
  return colors[14];
 }
-float3 bilinearRGB(device const uchar* raw,float2 point,constant Params& p){
+float3 bilinearRGB(plane p0,plane p1,float2 point,constant Params& p){
  float2 pt=clamp(point,float2(0),float2(p.width-1,p.height-1));
  uint2 lo=uint2(floor(pt)),hi=min(lo+1,uint2(p.width-1,p.height-1));float2 f=fract(pt);
- return mix(mix(readRGB(raw,lo.x,lo.y,p),readRGB(raw,hi.x,lo.y,p),f.x),
-  mix(readRGB(raw,lo.x,hi.y,p),readRGB(raw,hi.x,hi.y,p),f.x),f.y);
+ return mix(mix(readRGB(p0,p1,lo.x,lo.y,p),readRGB(p0,p1,hi.x,lo.y,p),f.x),
+  mix(readRGB(p0,p1,lo.x,hi.y,p),readRGB(p0,p1,hi.x,hi.y,p),f.x),f.y);
 }
+float2 pictureScale(constant Params& p){return p.aperture.zw/float2(p.outWidth,p.outHeight);}
 // Identity is exact. Integer minification <=8 is box averaged; fractional
 // ratios use bounded stratified bilinear quadrature (max8x8 taps). This is not
 // a calibrated chroma-siting transform; identity chroma decoding is unchanged.
-float3 filteredPicture(device const uchar* raw,uint2 xy,constant Params& p){
- float2 scale=float2(p.width,p.height)/float2(p.outWidth,p.outHeight);
- if(all(scale==float2(1)))return readRGB(raw,xy.x,xy.y,p);
+float3 filteredPicture(plane p0,plane p1,uint2 xy,constant Params& p){
+ float2 scale=pictureScale(p);
+ bool integralOrigin=all(p.aperture.xy==floor(p.aperture.xy));
+ if(all(scale==float2(1))&&integralOrigin){
+  uint2 at=min(xy+uint2(p.aperture.xy),uint2(p.width-1,p.height-1));
+  return readRGB(p0,p1,at.x,at.y,p);
+ }
  uint2 count=uint2(clamp(ceil(scale),float2(1),float2(8)));
- float3 sum=0;bool integral=all(scale==floor(scale))&&all(scale<=8);
+ float3 sum=0;bool integral=integralOrigin&&all(scale==floor(scale))&&all(scale<=8);
  for(uint y=0;y<count.y;y++)for(uint x=0;x<count.x;x++){
-  float2 pos=(float2(xy)+(float2(x,y)+.5)/float2(count))*scale-.5;
-  sum+=integral?readRGB(raw,uint(round(pos.x)),uint(round(pos.y)),p):bilinearRGB(raw,pos,p);
+  float2 pos=p.aperture.xy+(float2(xy)+(float2(x,y)+.5)/float2(count))*scale-.5;
+  if(integral){uint2 at=uint2(clamp(round(pos),float2(0),float2(p.width-1,p.height-1)));sum+=readRGB(p0,p1,at.x,at.y,p);}
+  else sum+=bilinearRGB(p0,p1,pos,p);
  }
  return sum/float(count.x*count.y);
 }
 float focusFootprint(texture2d<float,access::read> mask,uint2 xy,constant Params& p){
- float2 pictureScale=float2(p.width,p.height)/float2(p.outWidth,p.outHeight);
- float2 a=(float2(xy)*pictureScale-p.mapping.zw)/p.mapping.xy;
- float2 b=((float2(xy)+1)*pictureScale-p.mapping.zw)/p.mapping.xy;
+ float2 scale=pictureScale(p);
+ float2 a=(p.aperture.xy+float2(xy)*scale-p.mapping.zw)/p.mapping.xy;
+ float2 b=(p.aperture.xy+(float2(xy)+1)*scale-p.mapping.zw)/p.mapping.xy;
  float2 low=min(a,b),high=max(a,b);
  float2 extent=ceil(high)-floor(low);
  uint2 count=uint2(clamp(extent,float2(1),float2(8)));
@@ -113,9 +127,9 @@ float focusFootprint(texture2d<float,access::read> mask,uint2 xy,constant Params
  }
  return confidence;
 }
-// All threads participate in the clamped halo load, including padded threads.
-// Actual tail dimensions may differ from dispatch dimensions; xy-localID is origin.
-kernel void sourceFocus(device const uchar* raw [[buffer(0)]],constant Params& p [[buffer(1)]],texture2d<float,access::write> mask [[texture(0)]],uint2 xy [[thread_position_in_grid]],uint2 localID [[thread_position_in_threadgroup]],uint2 groupSize [[threads_per_threadgroup]]) {
+// Source-resolution peaking mask. All threads participate in the clamped halo
+// load, including padded threads; xy-localID is the tile origin.
+kernel void sourceFocus(plane p0 [[texture(0)]],plane p1 [[texture(1)]],constant Params& p [[buffer(0)]],texture2d<float,access::write> mask [[texture(2)]],uint2 xy [[thread_position_in_grid]],uint2 localID [[thread_position_in_threadgroup]],uint2 groupSize [[threads_per_threadgroup]]) {
  threadgroup float tile[18*18];
  float tl,tc,tr,ml,mr,bl,bc,br;
  if(groupSize.x<=16&&groupSize.y<=16){
@@ -124,7 +138,7 @@ kernel void sourceFocus(device const uchar* raw [[buffer(0)]],constant Params& p
   int2 origin=int2(xy)-int2(localID);
   for(uint i=lane;i<tileCount;i+=threads){
    int2 position=clamp(origin+int2(i%pitch,i/pitch)-1,int2(0),int2(p.width-1,p.height-1));
-   tile[i]=readSignalY(raw,uint(position.x),uint(position.y),p);
+   tile[i]=readSignalY(p0,p1,uint(position.x),uint(position.y),p);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if(xy.x>=p.width||xy.y>=p.height)return;
@@ -136,9 +150,9 @@ kernel void sourceFocus(device const uchar* raw [[buffer(0)]],constant Params& p
   // Keep other legal dispatch sizes supported without an undersized tile.
   if(xy.x>=p.width||xy.y>=p.height)return;
   uint l=xy.x?xy.x-1:0,r=min(xy.x+1,p.width-1),u=xy.y?xy.y-1:0,d=min(xy.y+1,p.height-1);
-  tl=readSignalY(raw,l,u,p);tc=readSignalY(raw,xy.x,u,p);tr=readSignalY(raw,r,u,p);
-  ml=readSignalY(raw,l,xy.y,p);mr=readSignalY(raw,r,xy.y,p);
-  bl=readSignalY(raw,l,d,p);bc=readSignalY(raw,xy.x,d,p);br=readSignalY(raw,r,d,p);
+  tl=readSignalY(p0,p1,l,u,p);tc=readSignalY(p0,p1,xy.x,u,p);tr=readSignalY(p0,p1,r,u,p);
+  ml=readSignalY(p0,p1,l,xy.y,p);mr=readSignalY(p0,p1,r,xy.y,p);
+  bl=readSignalY(p0,p1,l,d,p);bc=readSignalY(p0,p1,xy.x,d,p);br=readSignalY(p0,p1,r,d,p);
  }
  float3 dx=float3(tr-tl,mr-ml,br-bl),dy=float3(bl-tl,bc-tc,br-tr);
  float gx=dot(dx,float3(3,10,3))/16,gy=dot(dy,float3(3,10,3))/16;
@@ -146,18 +160,19 @@ kernel void sourceFocus(device const uchar* raw [[buffer(0)]],constant Params& p
  float confidence=support>p.noise?clamp((max(abs(gx),abs(gy))-p.focusThreshold)/max(.0001f,p.focusThreshold*.5f),0.0f,1.0f):0;
  mask.write(float4(confidence),xy);
 }
-kernel void compose(device const uchar* raw [[buffer(0)]],constant Params& p [[buffer(1)]],device const uchar* source [[buffer(3)]],constant Params& sp [[buffer(4)]],texture2d<float,access::read> focus [[texture(0)]],texture2d<float,access::write> output [[texture(1)]],uint2 xy [[thread_position_in_grid]]) {
+// The picture: one pass from the frame's own planes into the display target.
+kernel void compose(plane p0 [[texture(0)]],plane p1 [[texture(1)]],plane s0 [[texture(2)]],plane s1 [[texture(3)]],constant Params& p [[buffer(0)]],constant Params& sp [[buffer(1)]],texture2d<float,access::read> focus [[texture(4)]],texture2d<float,access::write> output [[texture(5)]],uint2 xy [[thread_position_in_grid]]) {
  if(xy.x>=p.outWidth||xy.y>=p.outHeight)return;
- float2 center=(float2(xy)+.5)*float2(p.width,p.height)/float2(p.outWidth,p.outHeight)-.5;
+ float2 center=p.aperture.xy+(float2(xy)+.5)*pictureScale(p)-.5;
  bool falseColor=(p.flags&(LogC3|LogC4|SonySLog3|ELZone))!=0;
  // Source classification replaces the picture: do not minify a look we discard.
- float3 c=falseColor?float3(0):filteredPicture(raw,xy,p);
+ float3 c=falseColor?float3(0):filteredPicture(p0,p1,xy,p);
  if(falseColor){
   uint2 sourceXY=uint2(clamp((center+.5-p.mapping.zw)/p.mapping.xy-.5,float2(0),float2(sp.width-1,sp.height-1)));
-  if(p.flags&ELZone){c=elZonePublicChart(nativeSLog3(readRGB(source,sourceXY.x,sourceXY.y,sp),sp),p);}
-  else if(p.flags&SonySLog3){float3 native=nativeSLog3(readRGB(source,sourceXY.x,sourceXY.y,sp),sp);c=sonyPattern2(signalLuma(native,sp));}
+  if(p.flags&ELZone){c=elZonePublicChart(nativeSLog3(readRGB(s0,s1,sourceXY.x,sourceXY.y,sp),sp),p);}
+  else if(p.flags&SonySLog3){float3 native=nativeSLog3(readRGB(s0,s1,sourceXY.x,sourceXY.y,sp),sp);c=sonyPattern2(signalLuma(native,sp));}
   else {
- float3 nativeRGB=readRGB(source,sourceXY.x,sourceXY.y,sp);float a=luma(nativeRGB);bool full=sp.coefficients.w>0||sp.sourceLogRescaled>0;float code=a*(full?1023:876)+(full?0:64);
+ float3 nativeRGB=readRGB(s0,s1,sourceXY.x,sourceXY.y,sp);float a=luma(nativeRGB);bool full=sp.coefficients.w>0||sp.sourceLogRescaled>0;float code=a*(full?1023:876)+(full?0:64);
  // Neutral native10bit samples have integral native code. Restore that exact
  // integer after float normalization; never quantize colored or rescaled input.
  if((sp.format==0||sp.format>=4)&&sp.sourceLogRescaled==0&&nativeRGB.r==nativeRGB.g&&nativeRGB.g==nativeRGB.b)code=round(code);
@@ -181,7 +196,11 @@ kernel void compose(device const uchar* raw [[buffer(0)]],constant Params& p [[b
  bool zebra=(p.flags&Zebra)&&((p.flags&ZebraBand)?(ire>=p.threshold-p.widthIRE*.5&&ire<p.threshold+p.widthIRE*.5):(ire>=p.threshold));
  if(zebra&&((xy.x+xy.y)%16<8))c=mix(c,float3(1),p.opacity);
  if(p.flags&Focus)c=mix(c,p.peak.rgb,p.focusOpacity*focusFootprint(focus,xy,p));
- output.write(float4(clamp(c,0.0f,1.0f),1),xy);
+ output.write(float4(clamp(c,0.0f,1.0f),1),xy+uint2(p.originX,p.originY));
+}
+// Black, for a surface with nothing to show.
+kernel void clearTarget(texture2d<float,access::write> output [[texture(0)]],uint2 xy [[thread_position_in_grid]]){
+ if(xy.x<output.get_width()&&xy.y<output.get_height())output.write(float4(0,0,0,1),xy);
 }
 // Exact population of a sampled lattice inside a half-open source interval.
 uint latticeCount(uint low,uint high,uint offset,uint step){
@@ -189,29 +208,59 @@ uint latticeCount(uint low,uint high,uint offset,uint step){
  uint end=high>offset?(high-offset+step-1)/step:0;
  return end>begin?end-begin:0;
 }
-kernel void scopes(device const uchar* raw [[buffer(0)]],constant Params& p [[buffer(1)]],device atomic_uint* bins [[buffer(2)]],uint2 grid [[thread_position_in_grid]]) {
- uint step=max(1u,p.scopeSamplingStride),phase=p.scopeSamplingPhase%(step*step);
- uint2 xy=grid*step+uint2(phase%step,phase/step);
- if(xy.x>=p.width||xy.y>=p.height)return;
- float3 rgb=readRGB(raw,xy.x,xy.y,p);uint channelWidth=p.scopeWidth/3;
- if(p.scopeMode==1){uint y=uint(clamp((signalLuma(rgb,p)+.1f)/1.2f,0.0f,1.0f)*float(p.scopeHeight-1));atomic_fetch_add_explicit(bins+y*p.scopeWidth+xy.x*p.scopeWidth/p.width,1,memory_order_relaxed);}
- else for(uint c=0;c<3;c++){uint y=uint(clamp((rgb[c]+.1f)/1.2f,0.0f,1.0f)*float(p.scopeHeight-1));atomic_fetch_add_explicit(bins+y*p.scopeWidth+c*channelWidth+xy.x*channelWidth/p.width,1,memory_order_relaxed);}
+// Source columns [low, high) that land in scope column `column` of `columns`.
+uint2 scopeColumnSpan(uint column,uint columns,uint width){
+ return uint2((column*width+columns-1)/columns,((column+1)*width+columns-1)/columns);
 }
 // Density population depends on x and uniform sampling metadata, never y.
 uint scopeColumnPopulation(uint x,constant Params& p){
  uint step=max(1u,p.scopeSamplingStride),phase=p.scopeSamplingPhase%(step*step);
  uint columns=p.scopeMode==1?p.scopeWidth:p.scopeWidth/3,column=x%columns;
- uint low=(column*p.width+columns-1)/columns,high=((column+1)*p.width+columns-1)/columns;
- return latticeCount(low,high,phase%step,step)*latticeCount(0,p.height,phase/step,step);
+ uint2 span=scopeColumnSpan(column,columns,p.width);
+ return latticeCount(span.x,span.y,phase%step,step)*latticeCount(0,p.height,phase/step,step);
 }
-kernel void scopeImage(device const atomic_uint* bins [[buffer(0)]],constant Params& p [[buffer(1)]],texture2d<float,access::write> output [[texture(0)]],uint2 xy [[thread_position_in_grid]]){
- if(xy.x>=p.scopeWidth||xy.y>=p.scopeHeight)return;
- uint population=scopeColumnPopulation(xy.x,p);
+uint scopeBin(float value,constant Params& p){return uint(clamp((value+.1f)/1.2f,0.0f,1.0f)*float(p.scopeHeight-1));}
+float3 scopeTexel(uint x,uint y,float n,constant Params& p){
  uint columns=p.scopeMode==1?p.scopeWidth:p.scopeWidth/3;
- float n=float(atomic_load_explicit(bins+(p.scopeHeight-1-xy.y)*p.scopeWidth+xy.x,memory_order_relaxed));
+ uint population=scopeColumnPopulation(x,p);
  float v=population?1-exp(-n*p.gain*30.72f/float(population)):0;
- float3 color=p.scopeMode==1?float3(1):xy.x<columns?float3(1,.1,.1):xy.x<2*columns?float3(.1,1,.1):float3(.1,.3,1);
+ float3 color=p.scopeMode==1?float3(1):x<columns?float3(1,.1,.1):x<2*columns?float3(.1,1,.1):float3(.1,.3,1);
  float3 rendered=color*v;
- if(p.flags&ScopeGraticule){bool horizontal=xy.y==0||xy.y==21||xy.y==128||xy.y==234||xy.y==255;bool vertical=p.scopeMode==1?xy.x%192==0:xy.x%64==0;if(horizontal||vertical)rendered=max(rendered,float3(.16));}
- output.write(float4(rendered,1),xy);
+ if(p.flags&ScopeGraticule){bool horizontal=y==0||y==21||y==128||y==234||y==255;bool vertical=p.scopeMode==1?x%192==0:x%64==0;if(horizontal||vertical)rendered=max(rendered,float3(.16));}
+ return rendered;
+}
+// Waveform / RGB parade in one pass, no device atomics or bins buffer. One
+// threadgroup per scope column accumulates every sampled pixel of its source
+// strip into threadgroup bins, then writes that column of the scope image.
+// Parade columns hold all three channels (scopeWidth/3 groups, three output
+// columns each). Dispatch scopeWidth (luma) or scopeWidth/3 (parade) groups of
+// scopeHeight threads; scopeHeight must be <= 256.
+kernel void scopeColumns(plane p0 [[texture(0)]],plane p1 [[texture(1)]],constant Params& p [[buffer(0)]],texture2d<float,access::write> output [[texture(2)]],uint group [[threadgroup_position_in_grid]],uint lane [[thread_index_in_threadgroup]],uint threads [[threads_per_threadgroup]]) {
+ threadgroup atomic_uint bins[3*256];
+ bool parade=p.scopeMode!=1;
+ uint channels=parade?3:1,columns=parade?p.scopeWidth/3:p.scopeWidth;
+ for(uint i=lane;i<channels*256;i+=threads)atomic_store_explicit(&bins[i],0,memory_order_relaxed);
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ uint step=max(1u,p.scopeSamplingStride),phase=p.scopeSamplingPhase%(step*step);
+ uint2 span=scopeColumnSpan(group,columns,p.width);
+ uint offsetX=phase%step,offsetY=phase/step;
+ uint firstX=span.x>offsetX?((span.x-offsetX+step-1)/step)*step+offsetX:offsetX;
+ uint stripWidth=firstX<span.y?(span.y-firstX+step-1)/step:0;
+ uint rows=p.height>offsetY?(p.height-offsetY+step-1)/step:0;
+ uint total=stripWidth*rows;
+ for(uint i=lane;i<total;i+=threads){
+  uint x=firstX+(i%stripWidth)*step,y=offsetY+(i/stripWidth)*step;
+  float3 rgb=readRGB(p0,p1,x,y,p);
+  if(parade){for(uint c=0;c<3;c++)atomic_fetch_add_explicit(&bins[c*256+scopeBin(rgb[c],p)],1,memory_order_relaxed);}
+  else atomic_fetch_add_explicit(&bins[scopeBin(signalLuma(rgb,p),p)],1,memory_order_relaxed);
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ for(uint row=lane;row<p.scopeHeight;row+=threads){
+  uint bin=p.scopeHeight-1-row;
+  for(uint c=0;c<channels;c++){
+   uint x=c*columns+group;
+   float n=float(atomic_load_explicit(&bins[c*256+bin],memory_order_relaxed));
+   output.write(float4(scopeTexel(x,row,n,p),1),uint2(x,row));
+  }
+ }
 }

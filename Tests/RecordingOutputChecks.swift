@@ -315,6 +315,53 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     }
   }
 
+  /// The in-take check also needs room for what the take holds in memory
+  /// and writes before the next check; feeds on one volume share it.
+  func testExternalWriterHeadroomCountsEveryTakeOnTheVolume() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let disk = ChangingRecordingOutputDiskSpace(bytes: 1_000)
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk)
+    let wide = try manager.beginExternalWriterSession(feedID: "Wide")
+    let tight = try manager.beginExternalWriterSession(feedID: "Tight")
+    XCTAssertNoThrow(try wide.checkExternalWriterCapacity(headroom: 500))
+    XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 500)) { error in
+      XCTAssertEqual(error as? RecordingOutputError, .insufficientDiskSpace(required: 1_100, available: 1_000))
+    }
+    XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 400))
+    // A finished take no longer needs its headroom.
+    wide.preserveForRecovery()
+    XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 900))
+    XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 901))
+    tight.preserveForRecovery()
+  }
+
+  /// The in-take recheck used the same URL every time, and a URL caches its
+  /// resource values, so a filling drive was never noticed. Each read must
+  /// see the volume as it is now. Writes to /tmp, whose volume is quiet.
+  func testDiskSpaceProviderReadsTheVolumeFreshEachTime() throws {
+    let directory = URL(fileURLWithPath: "/tmp", isDirectory: true)
+      .appendingPathComponent("ultracam-free-space-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let held = directory
+    let key: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey]
+    let heldBefore = try held.resourceValues(forKeys: key).volumeAvailableCapacityForImportantUsage
+    let provider = FileManagerRecordingOutputDiskSpaceProvider()
+    let before = try provider.availableBytes(at: held)
+    let fill = directory.appendingPathComponent("fill.bin")
+    let size = 256 * 1024 * 1024
+    try Data(count: size).write(to: fill)
+    let handle = try FileHandle(forWritingTo: fill)
+    try handle.synchronize()
+    try handle.close()
+    let after = try provider.availableBytes(at: held)
+    XCTAssertGreaterThan(Int64(before) - Int64(after), Int64(size / 2),
+      "The provider must see the space the new file took (before \(before), after \(after))")
+    // The stale behaviour this replaces: the held URL still reports the old value.
+    XCTAssertEqual(try held.resourceValues(forKeys: key).volumeAvailableCapacityForImportantUsage, heldBefore)
+  }
+
   func testExternalWriterAppendErrorNamesFileOwner() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

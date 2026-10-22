@@ -114,18 +114,26 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Output", update.output.isEmpty ? "—" : update.output)
           UIDiagnosticsRow("Delivered", String(format: "%.2f fps", update.outputFPS))
           UIDiagnosticsRow("Processing", String(format: "%.2f ms", update.processingMS))
+          UIDiagnosticsRow("GPU · capture CPU", String(format: "%.2f ms · %.2f ms", update.gpuMS, update.captureCPUMS))
+          UIDiagnosticsRow("Capture to output", String(format: "%.1f ms", update.latencyMS))
+          UIDiagnosticsRow("GPU frames in flight · peak", "\(update.framesInFlight) · \(update.maxFramesInFlight)")
+          UIDiagnosticsRow("Capture backlog · peak", "\(update.captureBacklog) · \(update.maxCaptureBacklog) frames",
+            warning: update.maxCaptureBacklog > 3)
           UIDiagnosticsRow("Input video bitrate", UIDiagnosticsFormat.megabits(update.videoBitrateMbps))
           UIDiagnosticsRow("Timecode (RP188)", update.timecode ?? "—")
           UIDiagnosticsRow("Video drops", UIDiagnosticsFormat.count(update.videoDrops), warning: update.videoDrops > 0)
         }
         Section {
           UIDiagnosticsRow("Source gaps", UIDiagnosticsFormat.count(update.sourceDrops), warning: update.sourceDrops > 0)
-          UIDiagnosticsRow("Capture admission", UIDiagnosticsFormat.count(update.captureDrops), warning: update.captureDrops > 0)
-          UIDiagnosticsRow("Output buffers", UIDiagnosticsFormat.count(update.poolDrops), warning: update.poolDrops > 0)
-          UIDiagnosticsRow("Camera transport", UIDiagnosticsFormat.count(update.cameraDrops), warning: update.cameraDrops > 0)
+          UIDiagnosticsRow("Device", UIDiagnosticsFormat.count(update.deviceDrops), warning: update.deviceDrops > 0)
+          UIDiagnosticsRow("Late processing", UIDiagnosticsFormat.count(update.lateFrames), warning: update.lateFrames > 0)
+          UIDiagnosticsRow("Output stalls", UIDiagnosticsFormat.count(update.poolDrops), warning: update.poolDrops > 0)
+          UIDiagnosticsRow("Camera stalls", UIDiagnosticsFormat.count(update.cameraDrops), warning: update.cameraDrops > 0)
           UIDiagnosticsRow("Preview", UIDiagnosticsFormat.count(update.previewDrops), warning: update.previewDrops > 0)
+          UIDiagnosticsRow("Preview replaced before display", UIDiagnosticsFormat.count(update.previewLateFrames),
+            warning: update.previewLateFrames > 0)
         } header: { Text("Drops by Stage") } footer: {
-          Text("Native renderer totals include prior runs. Intentional frame-rate reduction is excluded.")
+          Text("Capture keeps every frame; a stage that can't keep up is counted as a stall. Late processing counts frames started over two frame intervals after capture. Preview includes frames a newer one replaced before the display took them (the preview never queues); the camera, Program and recordings still get those frames. Native renderer totals include prior runs. Intentional frame-rate reduction is excluded.")
             .font(.caption).foregroundStyle(.secondary)
         }
         Section("Embedded Audio") {
@@ -138,6 +146,7 @@ private struct UIDiagnosticsCameraTab: View {
             peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight))
         }
       }
+      UIDiagnosticsDeviceSection(device: model.deviceDiagnostics(cameraID), driverWarning: model.driverWarning)
       Section("Recording · Encoder") {
         if let stats = state?.statistics {
           UIDiagnosticsRow("Status", state?.displayStatus ?? "Idle")
@@ -145,11 +154,17 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Encoder", stats.hardwareEncoder.map { $0 ? "Hardware accelerated" : "Software" } ?? "Waiting for encoder")
           UIDiagnosticsRow("Encode rate · bitrate", String(format: "%.1f fps · ", stats.framesPerSecond) + UIDiagnosticsFormat.megabits(stats.videoMegabitsPerSecond))
           UIDiagnosticsRow("Encode latency", "\(stats.encoderLatencyMS.map { String(format: "%.1f ms", $0) } ?? "—") · peak \(stats.maxEncoderLatencyMS.map { String(format: "%.1f ms", $0) } ?? "—")")
+          UIDiagnosticsRow("Encoder input", stats.encoderInput ?? "Waiting for encoder")
+          UIDiagnosticsRow("CPU-converted frames", UIDiagnosticsFormat.count(stats.cpuConvertedFrames), warning: stats.cpuConvertedFrames > 0)
           UIDiagnosticsRow("Writer queue · encoder pending", "\(stats.queueSamples)/\(stats.queueCapacity) samples · \(stats.encoderPendingFrames) frames")
           UIDiagnosticsRow("Dropped video frames", UIDiagnosticsFormat.count(stats.droppedVideoFrames), warning: stats.droppedVideoFrames > 0)
+          if stats.deviceSkippedFrames > 0 {
+            UIDiagnosticsRow("Skipped by the device", UIDiagnosticsFormat.count(stats.deviceSkippedFrames), warning: true)
+          }
           UIDiagnosticsRow("Audio packets dropped", UIDiagnosticsFormat.count(stats.droppedAudioPackets), warning: stats.droppedAudioPackets > 0)
           UIDiagnosticsRow("Encoder · writer errors", "\(stats.encoderErrors) · \(stats.writerErrors)", warning: stats.encoderErrors + stats.writerErrors > 0)
           UIDiagnosticsRow("File", stats.fileURL?.lastPathComponent ?? "—")
+          if let warning = stats.warning { UIDiagnosticsRow("Warning", warning, warning: true) }
           if let error = stats.lastError { UIDiagnosticsRow("Last error", error, warning: true) }
         } else {
           Text("No take yet.").foregroundStyle(.secondary)
@@ -170,37 +185,65 @@ private struct UIDiagnosticsCameraTab: View {
   }
 }
 
-/// The shared monitor target's rates, quality and budget, one value per row.
+/// The capture device and driver: cached SDK attributes plus the last
+/// session's device-side counters. Reading never calls into the driver.
+private struct UIDiagnosticsDeviceSection: View {
+  let device: UltracamDeviceDiagnostics?
+  let driverWarning: String?
+
+  var body: some View {
+    Section("Device") {
+      if let driverWarning { UIDiagnosticsRow("Desktop Video", driverWarning, warning: true) }
+      if let device {
+        UIDiagnosticsRow("Device", device.name)
+        UIDiagnosticsRow("Desktop Video", device.driverVersion)
+        UIDiagnosticsRow("HDMI audio", device.maximumHDMIAudioChannels > 0
+          ? "\(device.capturedAudioChannels) of \(device.maximumHDMIAudioChannels) ch · 32-bit" : "\(device.capturedAudioChannels) ch · 32-bit")
+        UIDiagnosticsRow("HDMI EDID dynamic range", device.hdmiDynamicRange)
+        UIDiagnosticsRow("HDR · colorspace metadata", "\(yesNo(device.supportsHDRMetadata)) · \(yesNo(device.supportsColorspaceMetadata))")
+        UIDiagnosticsRow("HDMI timecode · HFR timecode", "\(yesNo(device.supportsHDMITimecode)) · \(yesNo(device.supportsHighFrameRateTimecode))")
+        if device.sessionActive || device.signal != nil {
+          UIDiagnosticsRow("Signal", device.signal ?? "—")
+          UIDiagnosticsRow("Device drops", UIDiagnosticsFormat.count(device.deviceDroppedFrames), warning: device.deviceDroppedFrames > 0)
+          UIDiagnosticsRow("Driver backlog · peak", "\(device.frameBacklog) · \(device.maximumFrameBacklog) frames",
+            warning: device.maximumFrameBacklog > 2)
+          UIDiagnosticsRow("Host capture clock", device.hostTimeMapped ? "Mapped" : "Unavailable", warning: !device.hostTimeMapped)
+        }
+        UIDiagnosticsRow("Temperature", device.temperatureCelsius == NSNotFound ? "—" : "\(device.temperatureCelsius) °C")
+      } else if driverWarning == nil {
+        Text("No capture device is connected.").foregroundStyle(.secondary)
+      }
+    }
+  }
+
+  private func yesNo(_ value: Bool) -> String { value ? "Yes" : "No" }
+}
+
+/// The shared monitor target's rates and GPU time, one value per row.
 private struct UIDiagnosticsMonitorSection: View {
   let snapshot: MonitorDiagnostics
 
   var body: some View {
-    let quality = snapshot.effectiveQuality
     Section("Monitoring") {
       UIDiagnosticsRow("Status", availability)
       UIDiagnosticsRow("Source rate", "\(rate(snapshot.offeredFPS)) fps")
-      UIDiagnosticsRow("Picture rate · camera", "\(rate(snapshot.pictureFPS)) fps · \(rate(snapshot.requestedPictureHz)) Hz")
-      UIDiagnosticsRow("Scope rate · cap", "\(rate(snapshot.scopeFPS)) fps · \(quality.scopeRefreshHz) Hz")
-      UIDiagnosticsRow("Quality", quality.label)
-      UIDiagnosticsRow("Picture limit · scope stride", "\(quality.pictureHeightLimit)p · \(quality.scopeSamplingStride)")
-      UIDiagnosticsRow("Frames offered · admitted · skipped",
-        "\(UIDiagnosticsFormat.count(snapshot.offeredFrames)) · \(UIDiagnosticsFormat.count(snapshot.admittedFrames)) · \(UIDiagnosticsFormat.count(snapshot.skippedFrames))")
-      UIDiagnosticsRow("Rejected results", UIDiagnosticsFormat.count(snapshot.rejectedResults), warning: snapshot.rejectedResults > 0)
-      UIDiagnosticsRow("Monitor memory", "\(bytes(snapshot.retainedBytes)) retained · \(bytes(snapshot.retiredBytes)) retiring")
-      UIDiagnosticsRow("GPU deadline", deadline, warning: snapshot.softDeadlineStatus == .exceeded)
+      UIDiagnosticsRow("Presented · camera", "\(rate(snapshot.pictureFPS)) fps · \(rate(snapshot.requestedPictureHz)) Hz")
+      UIDiagnosticsRow("Scope rate · requested", "\(rate(snapshot.scopeFPS)) fps · \(snapshot.requestedScopeHz) Hz")
+      UIDiagnosticsRow("Frames offered · presented",
+        "\(UIDiagnosticsFormat.count(snapshot.offeredFrames)) · \(UIDiagnosticsFormat.count(snapshot.presentedFrames))")
+      // Frames a newer frame replaced before the display refreshed.
+      UIDiagnosticsRow("Replaced before a refresh", UIDiagnosticsFormat.count(snapshot.supersededFrames))
+      // Due scope updates not drawn; the picture never waits for a scope.
+      UIDiagnosticsRow("Scopes skipped · GPU busy · no drawable",
+        "\(UIDiagnosticsFormat.count(snapshot.scopeSkippedBusy)) · \(UIDiagnosticsFormat.count(snapshot.scopeSkippedNoDrawable))",
+        warning: snapshot.scopeSkippedBusy + snapshot.scopeSkippedNoDrawable > 0)
+      UIDiagnosticsRow("GPU per picture · per scope", "\(milliseconds(snapshot.gpuMilliseconds)) · \(milliseconds(snapshot.scopeGPUMilliseconds))")
+      UIDiagnosticsRow("Monitor failures", UIDiagnosticsFormat.count(snapshot.failures), warning: snapshot.failures > 0)
     }
   }
 
   private func rate(_ value: Double) -> String { String(format: "%.1f", value) }
-  private func bytes(_ value: Int) -> String { String(format: "%.1f MiB", Double(value) / 1_048_576) }
-
-  private var deadline: String {
-    switch snapshot.softDeadlineStatus {
-    case .unavailable: return "Unavailable"
-    case .withinDeadline: return "Within limit"
-    case .exceeded: return "Exceeded · clean picture only"
-    }
-  }
+  private func milliseconds(_ value: Double?) -> String { value.map { String(format: "%.2f ms", $0) } ?? "—" }
 
   private var availability: String {
     switch snapshot.availability {
@@ -230,8 +273,36 @@ private struct UIDiagnosticsProgramTab: View {
       Section("Output") {
         UIDiagnosticsRow("Camera", "Ultracam · Program")
         UIDiagnosticsRow("Clients", model.programInUse ? "In use" : "Not in use")
-        UIDiagnosticsRow("Camera formats", model.programFormatMismatch ? "Differ — each cut updates the output" : "Match",
-          warning: model.programFormatMismatch)
+        UIDiagnosticsRow("Camera formats", model.programFormatMismatch ? "Differ — converted on the GPU" : "Match")
+      }
+      TimelineView(.periodic(from: .now, by: 1)) { _ in
+        let stats = model.programOutputDiagnostics
+        Section("Program Frames") {
+          UIDiagnosticsRow("Output format", stats.contract?.description ?? "Not connected")
+          UIDiagnosticsRow("Accepted · delivered",
+            "\(UIDiagnosticsFormat.count(stats.route.accepted)) · \(UIDiagnosticsFormat.count(stats.camera.delivered))")
+          UIDiagnosticsRow("Converted on the GPU", UIDiagnosticsFormat.count(stats.route.normalized))
+          UIDiagnosticsRow("GPU per conversion", stats.gpu.map { String(format: "%.2f ms avg · %.2f ms max", $0.meanGPUMilliseconds, $0.maxGPUMilliseconds) } ?? "—")
+          UIDiagnosticsRow("Capture to camera queue", String(format: "%.2f ms avg · %.2f ms max",
+            stats.route.meanStageMilliseconds, stats.route.maxStageMilliseconds))
+          UIDiagnosticsRow("Frame-rate conversion", "\(UIDiagnosticsFormat.count(stats.route.cadenceSkipped)) skipped · \(UIDiagnosticsFormat.count(stats.route.cadenceRepeats)) repeated")
+          let onAirSkips = stats.route.skippedMissingSource + stats.route.skippedInvalidTimestamp
+          UIDiagnosticsRow("Skipped: other camera · timed cut",
+            "\(UIDiagnosticsFormat.count(stats.route.skippedNonSelected)) · \(UIDiagnosticsFormat.count(stats.route.skippedStaleQueued))")
+          UIDiagnosticsRow("Skipped: unavailable · bad timing",
+            "\(UIDiagnosticsFormat.count(stats.route.skippedMissingSource)) · \(UIDiagnosticsFormat.count(stats.route.skippedInvalidTimestamp))",
+            warning: onAirSkips > 0)
+          let behind = stats.route.overflowRejected
+          UIDiagnosticsRow("Dropped: Program behind", UIDiagnosticsFormat.count(behind), warning: behind > 0)
+          let stalls = (stats.gpu?.gpuStalls ?? 0) + (stats.gpu?.outputStalls ?? 0)
+          UIDiagnosticsRow("GPU conversion stalls · not ready",
+            "\(UIDiagnosticsFormat.count(stats.gpu?.gpuStalls ?? 0)) GPU · \(UIDiagnosticsFormat.count(stats.gpu?.outputStalls ?? 0)) output · \(UIDiagnosticsFormat.count(stats.route.normalizerNotReady)) not ready",
+            warning: stalls + stats.route.normalizerNotReady > 0)
+          UIDiagnosticsRow("Dropped: camera app behind", UIDiagnosticsFormat.count(stats.camera.dropped),
+            warning: stats.camera.dropped > 0)
+          let failures = stats.route.normalizationFailures + stats.camera.sendErrors + stats.camera.invalid
+          UIDiagnosticsRow("Conversion or send errors", UIDiagnosticsFormat.count(failures), warning: failures > 0)
+        }
       }
       Section("Switching") {
         UIDiagnosticsRow("On air", name(model.switcherSelectedFeedID))

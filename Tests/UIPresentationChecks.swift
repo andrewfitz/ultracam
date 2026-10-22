@@ -399,11 +399,12 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: input disconnected")
     var mismatch = program([camera(1), camera(2)])
     mismatch.programFormatMismatch = true
-    XCTAssertEqual(UIPresentationBuilder.warning(mismatch), "Program cameras use different formats")
+    // Mixed formats are converted on the GPU to the Program format: no warning.
+    XCTAssertNil(UIPresentationBuilder.warning(mismatch))
     XCTAssertNil(UIPresentationBuilder.warning(program([camera(1), camera(2)])))
-    let warned = UIPresentationBuilder.session(mismatch)
-    XCTAssertEqual(warned.statusSegments.last?.kind, .warning)
-    XCTAssertEqual(warned.statusSegments.last?.tone, .warning)
+    var issue = program([camera(1), camera(2)])
+    issue.programIssue = "Couldn't cut to Camera 2: it stopped or failed to start."
+    XCTAssertEqual(UIPresentationBuilder.warning(issue), "Couldn't cut to Camera 2: it stopped or failed to start.")
   }
 
   // MARK: Menu bar icon

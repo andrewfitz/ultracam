@@ -14,7 +14,7 @@ run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$external_root/monitor-app-integration/$run_id"
 mkdir -p "$test_root/modules" "$test_root/tmp"
 export TMPDIR="$test_root/tmp"
-export MACOSX_DEPLOYMENT_TARGET=15.0
+export MACOSX_DEPLOYMENT_TARGET=26.0
 export ULTRACAM_SHADER="$task_root/Sources/App/LUTShaders.metal"
 source "$task_root/scripts/monitor-tools-package.sh"
 monitor_package_build > "$test_root/package-build.log" 2>&1 || {
@@ -42,7 +42,7 @@ done < <(rg --files "$task_root/Sources/App" -g '*.swift' | sort)
 frameworks="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/Frameworks"
 libraries="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib"
 xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
-  -target arm64-apple-macos15.0 \
+  -target arm64-apple-macos26.0 \
   -module-cache-path "$test_root/modules" "${monitor_link_args[@]}" \
   -Xcc -DULTRACAM_BACKEND_TESTING \
   -import-objc-header "$task_root/Sources/DeckLinkBackend/BridgingHeader.h" \

@@ -129,4 +129,35 @@ import XCTest
     ("packet sample buffer PTS", testPacketAndSampleBufferRetainExactPTS),
     ("direct source sample buffer", testDirectSourceSampleBufferPacks24BitWithoutChangingPayload),
   ]
+
+  /// The vectorized packer must equal the scalar `sample >> 8` reference for
+  /// every bit pattern, including negative full-scale values.
+  func testVectorizedPackingMatchesScalarReference() throws {
+    var state: UInt32 = 0x1234_5678
+    var samples: [Int32] = [Int32.min, Int32.max, -1, 0, 255, 256, -256, -257]
+    for _ in 0..<(1_601 * 2 - samples.count) {
+      state = state &* 1_664_525 &+ 1_013_904_223
+      samples.append(Int32(bitPattern: state))
+    }
+    var reference = [UInt8]()
+    for sample in samples {
+      let packed = UInt32(bitPattern: sample >> 8)
+      reference += [UInt8(truncatingIfNeeded: packed), UInt8(truncatingIfNeeded: packed >> 8),
+        UInt8(truncatingIfNeeded: packed >> 16)]
+    }
+    XCTAssertEqual([UInt8](BlackmagicAudioConverter.convert32BitIntegerSamplesTo24BitPacked(samples)), reference)
+    let raw = samples.withUnsafeBytes { Data($0) }
+    XCTAssertEqual([UInt8](try BlackmagicAudioConverter.convert32BitIntegerPCMTo24BitPacked(raw)), reference)
+    let first = try EmbeddedAudioRecording.makeSampleBuffer(sourcePCM32: raw, sampleFrameCount: 1_601,
+      presentationTime: CMTime(value: 0, timescale: 48_000))
+    let second = try EmbeddedAudioRecording.makeSampleBuffer(sourcePCM32: raw, sampleFrameCount: 1_601,
+      presentationTime: CMTime(value: 1_601, timescale: 48_000))
+    let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(first))
+    var bytes = [UInt8](repeating: 0, count: reference.count)
+    XCTAssertEqual(CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes.count, destination: &bytes),
+      kCMBlockBufferNoErr)
+    XCTAssertEqual(bytes, reference)
+    XCTAssertTrue(CMSampleBufferGetFormatDescription(first) === CMSampleBufferGetFormatDescription(second),
+      "Every packet shares one audio format description")
+  }
 }

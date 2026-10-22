@@ -1,8 +1,32 @@
 import CoreMedia
 import CoreVideo
+import Darwin
 import MonitorToolsCore
 import MonitorToolsMetal
+import MonitorToolsUI
 import XCTest
+
+/// Counts heap allocations made by one thread through libmalloc's logger hook.
+private typealias MonitorMallocLogger = @convention(c) (UInt32, UInt, UInt, UInt, UInt, UInt32) -> Void
+nonisolated(unsafe) private var monitorCountedThread: pthread_t?
+nonisolated(unsafe) private var monitorCountedAllocations = 0
+private let monitorMallocLogger: MonitorMallocLogger = { type, _, _, _, _, _ in
+  guard type & 2 != 0, let thread = monitorCountedThread, pthread_equal(pthread_self(), thread) != 0
+  else { return }
+  monitorCountedAllocations += 1
+}
+private func countingAllocations(_ body: () -> Void) -> Int? {
+  guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "malloc_logger") else { return nil }
+  let slot = symbol.assumingMemoryBound(to: MonitorMallocLogger?.self)
+  let previous = slot.pointee
+  monitorCountedAllocations = 0
+  monitorCountedThread = pthread_self()
+  slot.pointee = monitorMallocLogger
+  body()
+  slot.pointee = previous
+  monitorCountedThread = nil
+  return monitorCountedAllocations
+}
 
 @MainActor @objcMembers final class MonitorCoordinatorChecks: XCTestCase {
   private let alpha = MonitorTargetID("alpha")
@@ -31,19 +55,12 @@ import XCTest
     XCTAssertEqual(policy.action(ready: true, running: false), .start)
     var pixelBuffer: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA,
-      nil, &pixelBuffer), kCVReturnSuccess)
-    let copied = expectation(description: "synthetic owned freeze picture")
-    let service = CleanPreviewService()
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pixelBuffer), kCVReturnSuccess)
     let stamp = MonitorFrameStamp(target: alpha, generation: 1, sequence: 1,
       sourcePTS: 0, hostTime: ProcessInfo.processInfo.systemUptime, configurationRevision: 1)
-    XCTAssertTrue(service.offer(MonitorFrameBundle(stamp: stamp, source: try XCTUnwrap(pixelBuffer))) {
-      result in
-      if let clean = try? result.get() {
-        presenter.accept(MonitorDisplayResult(clean: clean, configuration: MonitorConfiguration()))
-      } else { XCTFail("Synthetic clean copy failed") }
-      copied.fulfill()
-    })
-    wait(for: [copied], timeout: 3)
+    presenter.accept(MonitorFrameBundle(stamp: stamp, source: try XCTUnwrap(pixelBuffer)),
+      configuration: MonitorConfiguration())
+    XCTAssertEqual(presenter.currentStamp, stamp)
     presenter.setClean(false)
     presenter.toggleFreeze()
     XCTAssertTrue(presenter.isFrozen)
@@ -359,5 +376,70 @@ import XCTest
     XCTAssertEqual(observed.last?.0, "beta")
     XCTAssertEqual(observed.last?.1, 8)
     XCTAssertEqual(observed.last?.2, true)
+  }
+
+  /// The sink reads primaries, transfer and matrix tags, and a steady stream
+  /// of tagged frames reads them (and the clean aperture and pixel aspect)
+  /// without allocating on the capture thread.
+  func testSteadyOffersReadColorimetryWithoutAllocating() throws {
+    var made: CVPixelBuffer?
+    XCTAssertEqual(
+      CVPixelBufferCreate(
+        nil, 64, 36, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &made), kCVReturnSuccess)
+    let buffer = try XCTUnwrap(made)
+    CVBufferSetAttachment(
+      buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020,
+      .shouldPropagate)
+    CVBufferSetAttachment(
+      buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+      .shouldPropagate)
+    CVBufferSetAttachment(
+      buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+    // Core Video rebuilds dictionary attachments on every read (they live on
+    // the IOSurface), so the sink must not read them per frame.
+    CVBufferSetAttachment(
+      buffer, kCVImageBufferCleanApertureKey,
+      [
+        kCVImageBufferCleanApertureWidthKey: 60, kCVImageBufferCleanApertureHeightKey: 34,
+        kCVImageBufferCleanApertureHorizontalOffsetKey: 0,
+        kCVImageBufferCleanApertureVerticalOffsetKey: 0,
+      ] as CFDictionary, .shouldPropagate)
+    CVBufferSetAttachment(
+      buffer, kCVImageBufferPixelAspectRatioKey,
+      [
+        kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 4,
+        kCVImageBufferPixelAspectRatioVerticalSpacingKey: 3,
+      ] as CFDictionary, .shouldPropagate)
+    let signal = MonitorCaptureSink.signal(buffer, profile: nil)
+    XCTAssertEqual(signal.primaries, kCVImageBufferColorPrimaries_ITU_R_2020 as String)
+    XCTAssertEqual(signal.transferFunction, kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
+    XCTAssertEqual(signal.matrix, .bt2020)
+    XCTAssertEqual(signal.range, .legal)
+    let geometry = MonitorCaptureSink.geometry(buffer)
+    XCTAssertEqual(geometry.cleanAperture, MonitorRect(x: 2, y: 1, width: 60, height: 34))
+    XCTAssertEqual(geometry.pixelAspectRatio, 4.0 / 3.0, accuracy: 1e-9)
+
+    // A presenter with no GPU: offers stop at its latest-frame slot.
+    let presenter = MonitorSurfacePresenter(runtime: MonitorRuntime(sharedDevice: { nil }))
+    let sink = MonitorCaptureSink(target: alpha)
+    var configuration = MonitorConfiguration()
+    configuration.pictureStage = .source
+    configuration.scopeStage = .source
+    sink.configure(configuration, consumers: [presenter], scopeVisible: false)
+    var sequence: UInt64 = 0
+    func offer() {
+      sequence += 1
+      sink.offer(
+        source: buffer, output: nil, pts: CMTime(value: CMTimeValue(sequence), timescale: 60),
+        captureGeneration: 1, sequence: sequence, processingRevision: 3, sourceOnly: true)
+    }
+    for _ in 0..<20 { offer() }
+    XCTAssertEqual(presenter.currentStamp?.sequence, sequence)
+    guard let allocations = countingAllocations({ for _ in 0..<200 { offer() } }) else {
+      throw XCTSkip("malloc_logger unavailable")
+    }
+    XCTAssertEqual(presenter.currentStamp?.sequence, sequence)
+    XCTAssertEqual(allocations, 0, "Steady-state offers allocate on the capture thread")
   }
 }

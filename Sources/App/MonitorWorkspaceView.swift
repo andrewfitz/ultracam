@@ -24,39 +24,18 @@ private struct MonitorBoundTile: View {
     presenter.isFrozen ? presenter.configuration : configuration.wrappedValue
   }
   private var previewEnabled: Bool { coordinator.isPreviewEnabled(for: target) }
-  private var usesNativePreview: Bool {
-    guard let model else { return false }
-    return target.rawValue == model.selectedFeedID.rawValue
-      && configuration.wrappedValue.pictureStage == .processedOutput
-      && !configuration.wrappedValue.toolsEnabled && !presenter.isFrozen
-      && !presenter.isFreezePending
-  }
-  private var status: String {
-    if !previewEnabled { return "Preview hidden" }
-    if !usesNativePreview && !presenter.isPresentationAdmitted { return "Monitor unavailable" }
-    if usesNativePreview, let model {
-      return model.previewReady ? "Live" : model.running ? "Starting" : "Feed stopped"
-    }
-    return presenter.status
-  }
+  private var status: String { previewEnabled ? presenter.status : "Preview hidden" }
   var body: some View {
     MonitorTileChrome(
       target: targetBinding, configuration: configuration, choices: coordinator.targets,
       status: status,
-      detail: usesNativePreview
-        ? "Processed Output · range / transfer interpretation unavailable on native preview"
-        : presenter.detail + " · " + presenter.pictureInterpretation, compact: compact,
+      detail: presenter.detail + " · " + presenter.pictureInterpretation, compact: compact,
       legendConfiguration: presenter.isFrozen ? presenter.configuration : nil,
       showsScopes: scopesVisible
     ) {
       if !previewEnabled {
         Rectangle().fill(.black).aspectRatio(16.0 / 9, contentMode: .fit)
           .overlay { Text("Preview hidden").foregroundStyle(.secondary) }
-          .overlay { MonitorSurfaceVisibility(presenter: presenter).allowsHitTesting(false) }
-      } else if usesNativePreview, let model {
-        VideoPreview(renderer: compact ? model.miniPreviewRenderer : model.previewRenderer)
-          .aspectRatio(16.0 / 9, contentMode: .fit)
-          .modifier(MonitorPictureZoom(zoom))
           .overlay { MonitorSurfaceVisibility(presenter: presenter).allowsHitTesting(false) }
       } else {
         Rectangle().fill(.black).aspectRatio(16.0 / 9, contentMode: .fit)
@@ -77,10 +56,6 @@ private struct MonitorBoundTile: View {
                 .aspectRatio(presenter.pictureAspectRatio, contentMode: .fit)
               }
             }.modifier(MonitorPictureZoom(zoom))
-            if !presenter.isPresentationAdmitted {
-              Text(presenter.presentationStatus).font(.caption).foregroundStyle(.secondary)
-                .padding()
-            }
             if presenter.status == "No Signal" || presenter.status == "Feed stopped"
               || presenter.status == "Missing feed" || presenter.status == "Stale"
             {
@@ -155,8 +130,7 @@ private struct MonitorBoundTile: View {
           }
         }
       MonitorDiagnosticsView(
-        snapshot: coordinator.diagnostics(for: target), surfaceScopeTiming: presenter.scopeTiming,
-        presentationEstimate: presenter.presentationStatus)
+        snapshot: coordinator.diagnostics(for: target), surfaceScopeTiming: presenter.scopeTiming)
     } scopes: {
       if previewEnabled {
         VStack(alignment: .leading, spacing: 3) {
@@ -178,7 +152,6 @@ private struct MonitorBoundTile: View {
     }
     .onAppear { register() }
     .onDisappear { coordinator.unregisterSurface(id: surfaceID, target: target) }
-    .onChange(of: usesNativePreview) { _, _ in register() }
     .onChange(of: previewEnabled) { _, _ in register() }
     .onChange(of: presenter.isFreezePending) { _, _ in register() }
     .onChange(of: presenter.isFrozen) { _, _ in register() }
@@ -202,8 +175,6 @@ private struct MonitorBoundTile: View {
   private func toggleFreeze() {
     if presenter.isFreezePending {
       presenter.cancelPendingFreeze()
-    } else if usesNativePreview {
-      presenter.requestFreezeOnNextFrame()
     } else {
       presenter.toggleFreeze()
     }
@@ -214,10 +185,7 @@ private struct MonitorBoundTile: View {
       id: surfaceID, target: target, isVisible: previewEnabled,
       scopeVisible: configuration.wrappedValue.toolsEnabled
         && configuration.wrappedValue.scopes.enabled && scopesVisible && !presenter.isFrozen
-        && previewEnabled,
-      usesNativePreview: usesNativePreview,
-      presentationScopeVisible: previewEnabled && scopesVisible
-        && displayConfiguration.toolsEnabled && displayConfiguration.scopes.enabled)
+        && previewEnabled)
   }
 }
 

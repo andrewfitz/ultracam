@@ -1,5 +1,6 @@
 #!/bin/bash
-# Synthetic MonitorRuntime microbenchmark; never opens devices or installed apps.
+# Synthetic GPU monitor benchmark (picture and scope GPU time, CPU encode,
+# steady-state allocations); never opens devices or installed apps.
 set -euo pipefail
 harness_root="$(cd "$(dirname "$0")/.." && pwd)"
 source_root="${MONITOR_BENCHMARK_SOURCE_ROOT:-$harness_root}"
@@ -8,22 +9,14 @@ run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$build_root/$run_id"
 package="$source_root/Packages/MonitorTools"
 export TMPDIR=/Volumes/8TB/cinesomatic-director-work/tmp
-export MACOSX_DEPLOYMENT_TARGET=15.0
+export MACOSX_DEPLOYMENT_TARGET=26.0
 export CLANG_MODULE_CACHE_PATH="$test_root/modules"
 export SWIFTPM_MODULECACHE_OVERRIDE="$test_root/modules"
 mkdir -p "$TMPDIR" "$test_root/modules"
 shasum -a 256 "$harness_root/Tools/MonitorToolsBenchmark/main.swift" "$harness_root/scripts/monitor-tools-benchmark.sh" > "$test_root/harness-sha256.txt"
 python3 "$source_root/scripts/monitor-tools-fingerprint.py" capture "$test_root/source-manifest.json"
-resource_api="${MONITOR_BENCHMARK_RESOURCE_STATISTICS:-auto}"
-if [[ "$resource_api" == auto ]]; then
-  resource_api=0
-  if [[ -f "$package/Sources/MonitorToolsMetal/MonitorResourceCounters.swift" ]]; then resource_api=1; fi
-fi
-if [[ "$resource_api" != 0 && "$resource_api" != 1 ]]; then
-  echo 'MONITOR_BENCHMARK_RESOURCE_STATISTICS must be auto, 0 or 1.' >&2; exit 1
-fi
+resource_api=0
 defines=(-swift-version 5)
-if [[ "$resource_api" == 1 ]]; then defines+=(-D MONITOR_RESOURCE_STATISTICS); fi
 scratch="$test_root/monitor-package"
 if [[ -n "${MONITOR_BENCHMARK_REUSE_HELPER_DIR:-}" ]]; then
   # Reuse is valid only when this complete source fingerprint still matches.
@@ -49,7 +42,7 @@ for bundle in "$package_bin"/*.bundle; do
 done
 shopt -u nullglob
 [[ "$found_resource" == true ]] || { echo 'MonitorToolsMetal bundle missing.' >&2; exit 1; }
-xcrun swiftc -O -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos15.0 \
+xcrun swiftc -O -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos26.0 \
   -module-cache-path "$test_root/modules" "${defines[@]}" -I "$package_bin" -I "$package_bin/Modules" -L "$package_bin" \
   -lMonitorToolsMetal -lMonitorToolsCore -framework Metal -framework CoreVideo -framework CoreMedia \
   "$harness_root/Tools/MonitorToolsBenchmark/main.swift" -o "$test_root/monitor-benchmark" \

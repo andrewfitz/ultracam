@@ -195,21 +195,22 @@ import XCTest
     guard case .queued = switcher.requestManualCut(to: beta) else {
       return XCTFail("A cut to the second feed should queue")
     }
-    if case .skipped(.staleQueuedFrame) = switcher.ingest(ProgramSourceFrame(sourceID: alpha,
+    if case let .accepted(mapped) = switcher.ingest(ProgramSourceFrame(sourceID: alpha,
       sourceTime: CMTime(value: 1_001, timescale: 60_000), duration: duration)) {
-      // The old source is drained while the target cut is pending.
+      // The old source stays on air until the target's first frame lands.
+      XCTAssertTrue(programRuntime.receive(try sample(luma: 40, at: mapped.programTime), discontinuity: []))
     } else {
-      XCTFail("Frames from the old source must not leak through a pending cut")
+      XCTFail("The on-air source must keep flowing while the cut is pending")
     }
-    if case .cutApplied = switcher.ingest(ProgramSourceFrame(sourceID: beta,
+    if case let .cutApplied(mapped, _) = switcher.ingest(ProgramSourceFrame(sourceID: beta,
       sourceTime: firstTime, duration: duration)) {
-      XCTAssertTrue(programRuntime.receive(try sample(luma: 208,
-        at: CMTime(value: 1_001, timescale: 60_000)),
+      XCTAssertEqual(mapped.programTime, CMTime(value: 2_002, timescale: 60_000))
+      XCTAssertTrue(programRuntime.receive(try sample(luma: 208, at: mapped.programTime),
         discontinuity: CMIOExtensionStream.DiscontinuityFlags.time))
     } else {
       XCTFail("The target source frame must apply the queued cut")
     }
-    XCTAssertEqual(outputLuma, [40, 208])
+    XCTAssertEqual(outputLuma, [40, 40, 208])
     XCTAssertEqual(switcher.selectedFeedID, beta)
     try programRuntime.source.stopStream()
   }

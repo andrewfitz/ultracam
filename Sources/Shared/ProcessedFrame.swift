@@ -92,21 +92,26 @@ public final class FrameLease<Payload>: @unchecked Sendable {
   deinit { release() }
 }
 
+/// What a full route does with a new frame. Routes never drop to stay
+/// current: a full route keeps every pending lease and reports the rejection,
+/// which the producer counts and shows as a stall.
 public enum FrameQueueOverflowPolicy: Equatable, Sendable {
-  /// Release the oldest pending lease and enqueue the new frame.
-  case dropOldest
-  /// Keep all pending leases and drop the incoming frame.
-  case dropNewest
   /// Keep all pending leases and report backpressure to the producer.
   case reject
 }
 
 public enum FrameRouteEnqueueResult: Equatable, Sendable {
   case enqueued
-  case enqueuedDroppingOldest
-  case droppedNewest
   case rejected
   case cancelled
+}
+
+/// Per-publish totals across every route, without building the per-route
+/// report dictionary (the Program path publishes every frame).
+public struct FrameFanOutSummary: Equatable, Sendable {
+  public var enqueued = 0
+  public var rejected = 0
+  public var routerClosed = false
 }
 
 public struct FrameFanOutReport: Equatable, Sendable {
@@ -181,7 +186,12 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
 
   private let queue: DispatchQueue
   private let queueKey = DispatchSpecificKey<UInt8>()
-  private var routes: [String: RouteState] = [:]
+  private var routes: [String: RouteState] = [:] {
+    // Publishing visits routes in a stable order; sort once per topology
+    // change, not once per frame.
+    didSet { orderedRouteIDs = routes.keys.sorted() }
+  }
+  private var orderedRouteIDs: [String] = []
   private var closed = false
 
   public init(label: String = "org.ultracam.frame-fanout") {
@@ -209,30 +219,33 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
     sync {
       guard !closed else { return FrameFanOutReport(outcomes: [:], routerClosed: true) }
       var outcomes: [String: FrameRouteEnqueueResult] = [:]
-      // Delay release callbacks until every route has been updated. Callbacks
-      // are user code and may synchronously cancel routes or close the router.
-      var leasesToRelease: [FrameLease<Payload>] = []
-      for id in routes.keys.sorted() {
+      for id in orderedRouteIDs {
         guard let route = routes[id] else { continue }
-        if route.pending.count >= route.capacity {
-          switch route.policy {
-          case .dropOldest:
-            leasesToRelease.append(route.pending.removeFirst())
-            route.pending.append(frame.retainLease())
-            outcomes[id] = .enqueuedDroppingOldest
-          case .dropNewest:
-            outcomes[id] = .droppedNewest
-          case .reject:
-            outcomes[id] = .rejected
-          }
-        } else {
-          route.pending.append(frame.retainLease())
-          outcomes[id] = .enqueued
-        }
+        outcomes[id] = enqueueLocked(frame, on: route)
       }
-      leasesToRelease.forEach { $0.release() }
       return FrameFanOutReport(outcomes: outcomes)
     }
+  }
+
+  /// `publish` without the per-route report: counts only, no allocation.
+  @discardableResult
+  public func publishSummary(_ frame: ProcessedFrame<Payload>) -> FrameFanOutSummary {
+    sync {
+      var summary = FrameFanOutSummary()
+      guard !closed else { summary.routerClosed = true; return summary }
+      for id in orderedRouteIDs {
+        guard let route = routes[id] else { continue }
+        if enqueueLocked(frame, on: route) == .enqueued { summary.enqueued += 1 } else { summary.rejected += 1 }
+      }
+      return summary
+    }
+  }
+
+  /// A full route keeps its pending leases and rejects the new frame.
+  private func enqueueLocked(_ frame: ProcessedFrame<Payload>, on route: RouteState) -> FrameRouteEnqueueResult {
+    guard route.pending.count < route.capacity else { return .rejected }
+    route.pending.append(frame.retainLease())
+    return .enqueued
   }
 
   fileprivate func dequeue(routeID: String, token: AnyObject) -> FrameLease<Payload>? {

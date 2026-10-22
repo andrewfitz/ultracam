@@ -110,14 +110,12 @@ private final class PreviewTestCounters: @unchecked Sendable {
         }
         timer.resume()
         wait(for: [framesSent], timeout: 2)
-        // A retained FIFO is not a dropped-frame count. Give accepted work its
-        // finite queue budget to complete before measuring native consumption.
-        // Actual overflow/failure remains counted and still fails thresholds.
-        let drainDeadline = Date(timeIntervalSinceNow:
-          duration.seconds * Double(VideoContract.previewPendingLimit) + 0.25)
+        // At most one frame waits for the display. Let it reach the display
+        // before measuring native consumption; late/failed frames stay counted.
+        let drainDeadline = Date(timeIntervalSinceNow: duration.seconds * 2 + 0.25)
         while Date() < drainDeadline {
           let progress = renderer.diagnosticsSnapshot()
-          if progress.pending == 0 && progress.enqueued + progress.replaced
+          if progress.pending == 0 && progress.enqueued + progress.late
             + progress.stagingDrops + progress.failed >= progress.received { break }
           RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
         }
@@ -126,7 +124,7 @@ private final class PreviewTestCounters: @unchecked Sendable {
         XCTAssertEqual(diagnostics.received, UInt64(count))
         XCTAssertGreaterThanOrEqual(diagnostics.enqueued, UInt64(count - 3), "Native preview must not remain at 4 Hz")
         XCTAssertEqual(diagnostics.failed, 0, diagnostics.lastError ?? "Renderer must support selected format")
-        XCTAssertLessThanOrEqual(diagnostics.pending, VideoContract.previewPendingLimit, "Preview scheduling stalls must stay within its fixed FIFO budget")
+        XCTAssertLessThanOrEqual(diagnostics.pending, 1, "The preview holds at most the newest frame; it never builds latency")
         XCTAssertEqual(sent.originalSamples.count, count)
         for sample in sent.originalSamples {
           XCTAssertNil(CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false),
@@ -145,12 +143,57 @@ private final class PreviewTestCounters: @unchecked Sendable {
         wait(for: [metricsLoaded], timeout: 2)
         metricsResult.lock.withLock {
           let gaps = zip(sent.emissionTimes.dropFirst(), sent.emissionTimes).map { ($0 - $1) * 1000 }
-          print("PREVIEW \(width)x\(height) \(VideoContract.fourCC(format)) IOSurface=\(shareable) fps=\(1 / duration.seconds) received=\(diagnostics.received) enqueued=\(diagnostics.enqueued) replaced=\(diagnostics.replaced) waits=\(diagnostics.backPressure) rendererFrames=\(metricsResult.frames) dropped=\(metricsResult.dropped) corrupted=\(metricsResult.corrupt) sourceGapMinMS=\(gaps.min() ?? 0) sourceGapMaxMS=\(gaps.max() ?? 0) firstStageMS=\(diagnostics.firstStagingMS) maxStageMS=\(diagnostics.maxStagingMS) avgStageMS=\(diagnostics.stagingTotalMS / Double(max(1, diagnostics.stagingFrames))) queueWaitMaxMS=\(diagnostics.maxQueueWaitMS) readinessWaitMaxMS=\(diagnostics.maxReadinessWaitMS)")
+          print("PREVIEW \(width)x\(height) \(VideoContract.fourCC(format)) IOSurface=\(shareable) fps=\(1 / duration.seconds) received=\(diagnostics.received) enqueued=\(diagnostics.enqueued) late=\(diagnostics.late) waits=\(diagnostics.backPressure) rendererFrames=\(metricsResult.frames) dropped=\(metricsResult.dropped) corrupted=\(metricsResult.corrupt) sourceGapMinMS=\(gaps.min() ?? 0) sourceGapMaxMS=\(gaps.max() ?? 0) firstStageMS=\(diagnostics.firstStagingMS) maxStageMS=\(diagnostics.maxStagingMS) avgStageMS=\(diagnostics.stagingTotalMS / Double(max(1, diagnostics.stagingFrames))) queueWaitMaxMS=\(diagnostics.maxQueueWaitMS) readinessWaitMaxMS=\(diagnostics.maxReadinessWaitMS)")
           XCTAssertGreaterThanOrEqual(metricsResult.frames - metricsResult.dropped, count - 3, "Actual renderer must consume frames at video cadence")
           XCTAssertEqual(metricsResult.corrupt, 0)
         }
       }
     }
+  }
+
+  /// Five seconds of 59.94 into the host display: how often the newest-frame
+  /// slot replaces a frame before the display takes it. Those are preview
+  /// losses (counted and shown with a warning), so report them.
+  func testPacedFiveSecondsAt5994CountsEveryReplacedPreviewFrame() throws {
+    let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
+      reason: "Measuring live video preview cadence")
+    defer { ProcessInfo.processInfo.endActivity(activity) }
+    let renderer = VideoPreviewRenderer(renderWhenUnattached: true)
+    let window = attach(renderer)
+    defer { renderer.flush(); window.close() }
+    let image = try source(width: 1920, height: 1080, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      shareable: true)
+    let duration = VideoContract.fastDuration
+    let count = 300
+    let start = CMClockGetTime(CMClockGetHostTimeClock())
+    let sent = PreviewTestCounters()
+    let framesSent = expectation(description: "paced 59.94 preview frames")
+    let timer = DispatchSource.makeTimerSource(flags: .strict,
+      queue: DispatchQueue(label: "preview-test.paced-5994", qos: .userInteractive))
+    timer.schedule(deadline: .now(), repeating: duration.seconds, leeway: .milliseconds(1))
+    timer.setEventHandler {
+      do {
+        let time = CMTimeAdd(start, CMTimeMultiply(duration, multiplier: Int32(sent.received)))
+        renderer.enqueue(try sent.factory.sample(image, at: time, duration: duration))
+      } catch { XCTFail("Create paced preview sample: \(error)") }
+      sent.received += 1
+      if sent.received == count { timer.cancel(); framesSent.fulfill() }
+    }
+    timer.resume()
+    wait(for: [framesSent], timeout: 10)
+    let deadline = Date(timeIntervalSinceNow: 1)
+    while Date() < deadline {
+      let progress = renderer.diagnosticsSnapshot()
+      if progress.pending == 0 && progress.enqueued + progress.late + progress.failed >= progress.received { break }
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    let diagnostics = renderer.diagnosticsSnapshot()
+    let refresh = window.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 0
+    print("PREVIEW_PACED fps=59.94 frames=\(count) displayMaxHz=\(refresh) received=\(diagnostics.received) enqueued=\(diagnostics.enqueued) replaced=\(diagnostics.late) readinessWaits=\(diagnostics.backPressure) failed=\(diagnostics.failed)")
+    XCTAssertEqual(diagnostics.received, UInt64(count))
+    XCTAssertEqual(diagnostics.enqueued + diagnostics.late + diagnostics.failed, diagnostics.received,
+      "Every frame is shown or counted as replaced")
+    XCTAssertEqual(diagnostics.failed, 0)
   }
 
   func testFastProducerIsBoundedAndFlushRestartsWithoutStaleFrames() throws {
@@ -159,7 +202,7 @@ private final class PreviewTestCounters: @unchecked Sendable {
     defer { renderer.flush(); window.close() }
     let image = try source(width: 1920, height: 1080, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, shareable: true)
     let sample = try VideoContract.sample(image, at: .zero, duration: VideoContract.fastDuration)
-    for _ in 0..<2000 { renderer.enqueue(sample); XCTAssertLessThanOrEqual(renderer.diagnosticsSnapshot().pending, VideoContract.previewPendingLimit) }
+    for _ in 0..<2000 { renderer.enqueue(sample); XCTAssertLessThanOrEqual(renderer.diagnosticsSnapshot().pending, 1) }
     renderer.flush()
     RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
     XCTAssertEqual(renderer.diagnosticsSnapshot().pending, 0)
@@ -241,7 +284,7 @@ private final class PreviewTestCounters: @unchecked Sendable {
     XCTAssertEqual(renderer.diagnosticsSnapshot().received, 2)
   }
 
-  func testFIFOPreservesBurstOrderAndFlushDiscardsOldGeneration() throws {
+  func testBurstShowsNewestFrameInOrderAndFlushDiscardsOldGeneration() throws {
     let renderer = VideoPreviewRenderer(renderWhenUnattached: true)
     let window = attach(renderer)
     defer { renderer.flush(); window.close() }
@@ -249,21 +292,26 @@ private final class PreviewTestCounters: @unchecked Sendable {
       format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, shareable: true)
     let factory = VideoSampleFactory()
     let duration = VideoContract.fastDuration
-    let times = (0..<VideoContract.previewPendingLimit).map { CMTimeMultiply(duration, multiplier: Int32($0 + 100)) }
+    let times = (0..<24).map { CMTimeMultiply(duration, multiplier: Int32($0 + 100)) }
     for time in times { renderer.enqueue(try factory.sample(image, at: time, duration: duration)) }
     let deadline = Date(timeIntervalSinceNow: 2)
-    while renderer.diagnosticsSnapshot().enqueued < UInt64(times.count) && Date() < deadline {
+    while renderer.enqueuedTimesForTesting().last != times.last && Date() < deadline {
       RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
     }
-    XCTAssertEqual(renderer.diagnosticsSnapshot().enqueued, UInt64(times.count), "The finite burst must survive native readiness stalls")
-    XCTAssertEqual(renderer.diagnosticsSnapshot().replaced, 0)
-    XCTAssertEqual(renderer.enqueuedTimesForTesting(), times, "FIFO must retain source presentation order")
+    // A display shows the newest frame. A burst reaches it in source order,
+    // ending on the newest frame; every frame it skipped is counted late.
+    let shown = renderer.enqueuedTimesForTesting()
+    XCTAssertEqual(shown.last, times.last, "The newest frame of a burst must reach the display")
+    XCTAssertTrue(zip(shown, shown.dropFirst()).allSatisfy { CMTimeCompare($0, $1) < 0 }, "Preview must keep source order")
+    let afterBurst = renderer.diagnosticsSnapshot()
+    XCTAssertEqual(afterBurst.enqueued + afterBurst.late, UInt64(times.count), "Every frame is shown or counted late")
+    XCTAssertEqual(afterBurst.pending, 0)
 
     for index in 0..<2000 {
       renderer.enqueue(try factory.sample(image, at: CMTimeMultiply(duration, multiplier: Int32(index + 1000)), duration: duration))
-      XCTAssertLessThanOrEqual(renderer.diagnosticsSnapshot().pending, VideoContract.previewPendingLimit)
+      XCTAssertLessThanOrEqual(renderer.diagnosticsSnapshot().pending, 1)
     }
-    XCTAssertGreaterThan(renderer.diagnosticsSnapshot().replaced, 0, "Overload must be counted rather than growing the queue")
+    XCTAssertGreaterThan(renderer.diagnosticsSnapshot().late, 0, "Frames faster than the display are counted late, not queued")
     renderer.flush()
     let finalTime = CMTimeMultiply(duration, multiplier: 10_000)
     renderer.enqueue(try factory.sample(image, at: finalTime, duration: duration))
@@ -274,7 +322,7 @@ private final class PreviewTestCounters: @unchecked Sendable {
     XCTAssertEqual(renderer.diagnosticsSnapshot().enqueued, 1)
     XCTAssertEqual(renderer.enqueuedTimesForTesting(), [finalTime], "Old queued samples must not cross flush generation")
     renderer.setVisibilityForTesting(false)
-    XCTAssertEqual(renderer.diagnosticsSnapshot().pending, 0, "Hidden preview must release every FIFO slot")
+    XCTAssertEqual(renderer.diagnosticsSnapshot().pending, 0, "Hidden preview must release its waiting frame")
   }
 
   func testQueuedOldDrainCannotRenderNewSampleBeforeNativeFlush() throws {

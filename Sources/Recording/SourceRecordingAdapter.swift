@@ -14,6 +14,11 @@ import Foundation
 final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   let feedID: SourceRecordingFeedID
   private let recorder: SourceRecorderCore
+  /// The capture format is fixed for a take, so one description serves every
+  /// frame; it is rebuilt only when the buffer stops matching it (size,
+  /// format or color tags changed).
+  private let formatLock = RecordingLock()
+  private var cachedFormat: CMVideoFormatDescription?
 
   init(feedID: SourceRecordingFeedID, recorder: SourceRecorderCore) {
     self.feedID = feedID
@@ -65,7 +70,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
       presentationTime.epoch == 0, presentationTime.value >= 0,
       duration.isValid, duration.isNumeric, duration.epoch == 0,
       duration.value > 0 else { return reject() }
-    guard let sample = Self.makeSample(pixelBuffer: pixelBuffer,
+    guard let sample = makeSample(pixelBuffer: pixelBuffer,
       presentationTime: presentationTime, duration: duration) else {
       return reject()
     }
@@ -147,13 +152,9 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     let rawAudio: @Sendable (Data, Int, CMTime, Int, Int) -> Bool
   }
 
-  private static func makeSample(pixelBuffer: CVPixelBuffer, presentationTime: CMTime,
+  private func makeSample(pixelBuffer: CVPixelBuffer, presentationTime: CMTime,
     duration: CMTime) -> CMSampleBuffer? {
-    var formatDescription: CMVideoFormatDescription?
-    guard CMVideoFormatDescriptionCreateForImageBuffer(
-      allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
-      formatDescriptionOut: &formatDescription) == noErr,
-      let formatDescription else { return nil }
+    guard let formatDescription = formatDescription(for: pixelBuffer) else { return nil }
 
     var timing = CMSampleTimingInfo(duration: duration,
       presentationTimeStamp: presentationTime, decodeTimeStamp: .invalid)
@@ -164,6 +165,19 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
       sampleBufferOut: &sample)
     guard status == noErr else { return nil }
     return sample
+  }
+
+  private func formatDescription(for pixelBuffer: CVPixelBuffer) -> CMVideoFormatDescription? {
+    if let cached = formatLock.withLock({ cachedFormat }),
+      CMVideoFormatDescriptionMatchesImageBuffer(cached, imageBuffer: pixelBuffer) {
+      return cached
+    }
+    var created: CMVideoFormatDescription?
+    guard CMVideoFormatDescriptionCreateForImageBuffer(
+      allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+      formatDescriptionOut: &created) == noErr, let created else { return nil }
+    formatLock.withLock { cachedFormat = created }
+    return created
   }
 
   private static func hasValidTiming(_ sample: CMSampleBuffer) -> Bool {

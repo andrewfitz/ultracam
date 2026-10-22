@@ -23,6 +23,36 @@ final class DeckLinkChecks: XCTestCase {
     XCTAssertTrue(UltracamRunRawAudioSyntheticChecks(&error), error?.localizedDescription ?? "Raw embedded audio bridge failed")
   }
 
+  /// Detected-mode open, EDID and notification leases, colorimetry-only
+  /// changes, host capture time and its min-window offset filter, drop
+  /// counting, RP188 cadence detection (pairs vs full rate, reset on signal
+  /// loss and reconfiguration), buffer-size validation, active-device
+  /// removal, and refusing a busy device before its connector or EDID is
+  /// touched (restoring both when a claim fails later).
+  func testSDK16CaptureFeatures() {
+    var error: NSError?
+    XCTAssertTrue(UltracamRunSDK16SyntheticChecks(&error), error?.localizedDescription ?? "SDK 16 capture checks failed")
+  }
+
+  func testDriverVersionAndHotPlugDiscovery() {
+    var error: NSError?
+    XCTAssertTrue(UltracamRunDiscoverySyntheticChecks(&error), error?.localizedDescription ?? "Discovery checks failed")
+  }
+
+  func testCaptureHostTimeKeyAndDriverInfo() {
+    // The capture stage reads this exact attachment key.
+    XCTAssertEqual(UltracamCaptureHostTimeAttachmentKey, "UltracamCaptureHostTime")
+    // The recorder (built without the bridging header) spells it itself.
+    XCTAssertEqual(SourceRecordingConfiguration.captureHostTimeAttachmentKey, UltracamCaptureHostTimeAttachmentKey)
+    let driver = UltracamBackend.driverInfo()
+    XCTAssertFalse(driver.version.isEmpty)
+    XCTAssertEqual(driver.message == nil, driver.supported)
+    let backend = UltracamBackend()
+    XCTAssertEqual(backend.deviceDroppedFrames, 0)
+    XCTAssertEqual(backend.availableFrameBacklog, 0)
+    XCTAssertNil(UltracamBackend.diagnostics(deviceID: "synthetic:missing-device"))
+  }
+
   func testStopBeforeStartIsIdempotent() {
     let backend = UltracamBackend()
     backend.stop()
@@ -80,6 +110,9 @@ final class DeckLinkChecks: XCTestCase {
     ("native SDK callbacks, frame ownership, lifecycle and HDMI restore", testNativeSDKCallbacksAndLifecycle),
     ("input ownership and reentrant control queue", testInputOwnershipAndReentrantControlQueue),
     ("raw embedded audio bridge", testRawEmbeddedAudioBridge),
+    ("SDK 16 capture features", testSDK16CaptureFeatures),
+    ("driver version check and hot-plug discovery", testDriverVersionAndHotPlugDiscovery),
+    ("capture host-time key and driver info", testCaptureHostTimeKeyAndDriverInfo),
     ("native stop before start is idempotent", testStopBeforeStartIsIdempotent),
     ("native missing-device startup cleans up", testMissingDeviceFailsCleanlyAndCanStop),
     ("video contract preserves range and timing metadata", testVideoContractCarriesRangeAndTimingMetadata),

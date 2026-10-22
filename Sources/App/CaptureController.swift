@@ -14,18 +14,44 @@ struct CaptureUpdate: @unchecked Sendable {
   var pipelineEnabledApplied: Bool?
   var frames: UInt64 = 0
   var dropped: UInt64 = 0
+  /// Capture-to-delivery time of the latest frame: GPU queueing plus GPU work.
   var processingMS: Double = 0
   var previewDelivered = false
   var sourceDrops: UInt64 = 0
+  /// Frames the capture device itself reported dropped (DeckLink).
+  var deviceDrops: UInt64 = 0
+  /// Always zero: capture admits every frame. Kept for existing readers.
   var captureDrops: UInt64 = 0
+  /// Output stalls: frames that could not get an output buffer because a
+  /// consumer held every one (`VideoContract.outputBufferLimit`).
   var poolDrops: UInt64 = 0
+  /// Camera stalls and failures: the CMIO queue was full or the send failed.
   var cameraDrops: UInt64 = 0
+  /// Preview losses, including `previewLateFrames`.
   var previewDrops: UInt64 = 0
   var previewFrames: UInt64 = 0
+  /// Preview frames superseded by a newer one before the display took them
+  /// (the preview shows the newest frame and never queues behind the
+  /// display). A preview loss only: camera, Program and recording still get
+  /// every frame.
+  var previewLateFrames: UInt64 = 0
   var outputFPS: Double = 0
   var displayedFrames: UInt64 = 0
   var rendererDrops: UInt64 = 0
   var previewError: String?
+  /// Frames committed to the GPU and not yet complete, now and at most.
+  var framesInFlight = 0
+  var maxFramesInFlight = 0
+  /// Frames received from the driver and waiting for the capture queue.
+  var captureBacklog = 0
+  var maxCaptureBacklog = 0
+  /// Frames whose processing began more than two frame intervals after capture.
+  var lateFrames: UInt64 = 0
+  /// Latest frame: GPU execution time, capture-thread CPU time to encode it,
+  /// and capture callback → camera/preview hand-off.
+  var gpuMS: Double = 0
+  var captureCPUMS: Double = 0
+  var latencyMS: Double = 0
   var timecode: String?
   var audioChannels: Int = 0
   var audioSampleRate: Int = 0
@@ -68,12 +94,26 @@ struct CaptureRawAudio: @unchecked Sendable {
   var bytesPerSample: Int
 }
 
-// All media resources/configuration are queue-owned. Driver admission is bounded
-// to twelve retained frames, covering measured source bursts plus queue delay.
+// Queues:
+// - capture (`queue`): owns configuration, detection, the camera connection
+//   state machine and the processor. Validates, gates and encodes each frame,
+//   commits it to the GPU and returns; it never waits for a frame's GPU work.
+// - delivery: fans each completed frame out (monitor, Program, preview,
+//   camera) in commit order, after its GPU work finished.
+// - control: virtual camera connect/disconnect (up to seconds), so it never
+//   blocks the frame path.
+// - watchdog: the signal/GPU watchdog timer, on its own queue so a slow
+//   camera connect can't delay it.
+// Every frame the driver delivers is processed; nothing is dropped for being
+// busy. A stage that can't keep up shows up as a counted, visible stall.
 // Preview visibility never controls camera processing.
 final class CaptureController: @unchecked Sendable {
   private let queue = DispatchQueue(label: "org.ultracam.capture", qos: .userInteractive)
+  private let deliveryQueue = DispatchQueue(label: "org.ultracam.capture.delivery", qos: .userInteractive)
+  private let controlQueue = DispatchQueue(label: "org.ultracam.capture.control", qos: .userInitiated)
+  private let watchdogQueue = DispatchQueue(label: "org.ultracam.capture.watchdog", qos: .userInitiated)
   private let queueKey = DispatchSpecificKey<UInt8>()
+  private let controlKey = DispatchSpecificKey<UInt8>()
   private let lock = NSLock()
   private var generation: UInt64 = 0
   private var accepting = false
@@ -85,21 +125,20 @@ final class CaptureController: @unchecked Sendable {
   // FeedCapturePool sets this only after it has released the device. A start
   // on that discarded object must not open a second backend.
   private var retiredFromPool = false
-  // Keep admission counters per generation. A driver callback may pass the
-  // lock just before Stop advances the generation and enqueue stale work just
-  // after the next Start begins; one global counter would underflow when that
-  // stale work completes and could disable backpressure for the new run.
-  private var inFlight: [UInt64: UInt64] = [:]
-  private var mediaInFlight: [UInt64: UInt64] = [:]
-  private var callbackDrops: UInt64 = 0
-  private var mediaDropSamples: UInt64 = 0
-  /// Admission drops already included in `mediaDropSamples`. The next packet's
-  /// timestamp gap covers those same samples, so they must not be added again.
-  private var accountedAdmissionAudioDrops: UInt64 = 0
+  // Under `lock`: driver-thread bookkeeping and pipeline depth.
   private var sourceDrops: UInt64 = 0
   private var sourceDuration = VideoContract.fastDuration
   private var lastSourcePTS: CMTime?
   private var lastReceived: Double = 0
+  private var queuedFrames = 0
+  private var maxQueuedFrames = 0
+  // The processor, for the watchdog and status (thread-safe accessors only).
+  private var gpuProcessor: LUTProcessor?
+  private var gpuStallReported = false
+  private var rawAudioProvidesStats = false
+  private var processedFrameHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
+  private let media = MediaState()
+  private let camera = CameraLink()
   private let services: CaptureServices
   private let previewRenderers: [VideoPreviewRenderer]
   private var legacyPreviewOwner = true
@@ -109,8 +148,14 @@ final class CaptureController: @unchecked Sendable {
   private var monitorProcessingRevision: UInt64 = 0
   private var monitorPipelineConfiguration: PipelineConfiguration?
   private var ownedPreviewRenderers: [VideoPreviewRenderer] { legacyPreviewOwner ? previewRenderers : [] }
+  // Capture queue: bumped by every preview flush and frozen into each frame,
+  // so frames still on the GPU at a flush can't reach the preview after it.
+  private var previewEpoch: UInt64 = 0
+  // Delivery-queue owned.
   private let sampleFactory = VideoSampleFactory()
-  private var deliveryStager = CameraFrameStager()
+  // Boxed so the flush that deinit's teardown queues doesn't retain self.
+  private final class EpochFloor: @unchecked Sendable { var value: UInt64 = 0 }
+  private let previewEpochFloor = EpochFloor()
   private var processor: LUTProcessor?
   private var configuration = PipelineConfiguration()
   private var pipelineEnabled = true
@@ -120,41 +165,27 @@ final class CaptureController: @unchecked Sendable {
   private var preparedConfiguration: PipelineConfiguration?
   private var detected: InputFormat?
   private var renderedFormat: InputFormat?
+  private var inputMetadataChanged = false
   private var inputLabel = "No signal"
   private var outputLabel = ""
   private var applied: Bool?
   private var frames: UInt64 = 0
   private var cameraDrops: UInt64 = 0
   private var poolDrops: UInt64 = 0
+  private var lateFrames: UInt64 = 0
+  // Source → host clock mapping, advanced at encode time in commit order.
   private var firstSourceTime: CMTime?
-  private var lastDeliveredSourceTime: CMTime?
-  private var lastDeliveredHostTime: CMTime?
   private var firstHostTime: CMTime = .zero
+  private var lastMappedSourceTime: CMTime?
+  private var lastMappedHostTime: CMTime?
+  private var lastDeliveredSourceTime: CMTime?
   private var rateStart: Double = 0
   private var rateFrames: UInt64 = 0
   private var outputFPS: Double = 0
   private var processingMS: Double = 0
-  private var timecode: String?
-  private var audioChannels = 0
-  private var audioSampleRate = 0
-  private var audioPackets: UInt64 = 0
-  private var audioSamples: UInt64 = 0
-  private var audioBytes: UInt64 = 0
-  private var audioDrops: UInt64 = 0
-  private var audioPeakLeft = 0.0
-  private var audioPeakRight = 0.0
-  private var audioRMSLeft = 0.0
-  private var audioRMSRight = 0.0
-  private var audioPresent = false
-  private var lastAudioPacketTime: CMTime?
-  private var lastAudioSampleFrames: UInt64 = 0
-  private var audioRateStart: Double = 0
-  private var audioRateBytes: UInt64 = 0
-  private var audioBitrateKbps = 0.0
-  // Raw-only backends need a synthesized media-stat update. The native live
-  // backend supplies both callbacks, so its raw packet must not be counted a
-  // second time through the stats path.
-  private var rawAudioProvidesStats = false
+  private var gpuMS: Double = 0
+  private var captureCPUMS: Double = 0
+  private var latencyMS: Double = 0
   private var videoRateStart: Double = 0
   private var videoRateBytes: UInt64 = 0
   private var videoBitrateMbps = 0.0
@@ -162,7 +193,12 @@ final class CaptureController: @unchecked Sendable {
   // `fail` and the app's stopped-update handler both call `stop`. Without
   // this latch every stopped publish schedules another one.
   private var stopNotified = false
+  // Camera connection state machine (capture queue). `cameraAttempt` mirrors
+  // the CameraLink attempt; a frame carries the attempt it was encoded under
+  // and is sent only through that same connection.
   private var cameraConnected = false
+  private var cameraConnecting = false
+  private var cameraAttempt: UInt64 = 0
   private var reconnectAttempts = 0
   private var cameraOutage = false
   private var reconnectRequested = false
@@ -183,7 +219,13 @@ final class CaptureController: @unchecked Sendable {
   /// Carries the capture generation that produced the frame. Consumers that
   /// hop to another queue must compare this token before publishing so a
   /// callback already in flight cannot enter a later start session.
-  var onProcessedFrame: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
+  /// Called on the delivery queue, in capture order, after GPU completion,
+  /// and after the frame's preview and camera hand-off. Set from any thread
+  /// (stored under the lock; each frame reads it once at encode).
+  var onProcessedFrame: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)? {
+    get { lock.withLock { processedFrameHandler } }
+    set { lock.withLock { processedFrameHandler = newValue } }
+  }
 
   var activeFeed: FeedID? { lock.withLock { activeFeedID } }
 
@@ -197,14 +239,24 @@ final class CaptureController: @unchecked Sendable {
     self.services = services
     previewRenderers = (previewRenderer.map { [$0] } ?? []) + additionalPreviewRenderers
     queue.setSpecific(key: queueKey, value: 1)
+    controlQueue.setSpecific(key: controlKey, value: 1)
   }
 
   deinit {
-    // Every executing controller operation retains self. Final release has
+    // Every executing controller operation retains self, and so does every
+    // committed GPU frame and queued delivery. Final release therefore has
     // exclusive resource access, even if its owner omitted an explicit Stop.
     // Keep teardown on the capture queue; services and renderer state are
     // queue-owned and deinit may run on an arbitrary owner thread.
     syncOnQueue { stopResources() }
+    flushControlQueue()
+  }
+
+  /// Waits for queued camera connect/disconnect work. Never called from the
+  /// control queue, which never waits on the capture queue.
+  private func flushControlQueue() {
+    guard DispatchQueue.getSpecific(key: controlKey) == nil else { return }
+    controlQueue.sync {}
   }
 
   func setCameraOutputEnabled(_ enabled: Bool) {
@@ -216,8 +268,7 @@ final class CaptureController: @unchecked Sendable {
         reconnectAfter = 0
         return
       }
-      services.disconnect()
-      cameraConnected = false
+      closeCamera()
       cameraMessage = "Ultracam camera not connected"
       publishCurrent(token: token)
     }
@@ -239,12 +290,9 @@ final class CaptureController: @unchecked Sendable {
         if let expectedGeneration, !self.isCurrent(expectedGeneration) {
           throw VideoError.message("Camera changed before its LUT finished loading.")
         }
-        if self.processor == nil { self.processor = try LUTProcessor() }
-        try self.processor!.load(cube)
+        try self.makeProcessor().load(cube)
         self.monitorProcessingRevision &+= 1
-        if self.pipelineEnabled && self.configuration.applyLUT {
-          self.ownedPreviewRenderers.forEach { $0.flush() }
-        }
+        if self.pipelineEnabled && self.configuration.applyLUT { self.flushOwnedPreviews() }
         DispatchQueue.main.async { completion(.success(())) }
       } catch { DispatchQueue.main.async { completion(.failure(error)) } }
     }
@@ -268,12 +316,6 @@ final class CaptureController: @unchecked Sendable {
       if retiredFromPool { return nil }
       generation &+= 1
       accepting = false
-      // Any callbacks admitted for the previous generation are stale once a
-      // new start is requested. Their queued work still releases its token,
-      // but the old counters must not survive across runs if that work is
-      // delayed or cancelled during teardown.
-      inFlight.removeAll(keepingCapacity: true)
-      mediaInFlight.removeAll(keepingCapacity: true)
       activeFeedID = feedID
       return generation
     }
@@ -299,75 +341,70 @@ final class CaptureController: @unchecked Sendable {
         self.frames = 0
         self.cameraDrops = 0
         self.poolDrops = 0
+        self.lateFrames = 0
         self.firstSourceTime = nil
+        self.lastMappedSourceTime = nil
+        self.lastMappedHostTime = nil
         self.lastDeliveredSourceTime = nil
-        self.lastDeliveredHostTime = nil
         self.rateStart = 0
         self.rateFrames = 0
         self.outputFPS = 0
         self.processingMS = 0
-        self.timecode = nil
-        self.audioChannels = 0
-        self.audioSampleRate = 0
-        self.audioPackets = 0
-        self.audioSamples = 0
-        self.audioBytes = 0
-        self.audioDrops = 0
-        self.accountedAdmissionAudioDrops = 0
-        self.audioPeakLeft = 0
-        self.audioPeakRight = 0
-        self.audioRMSLeft = 0
-        self.audioRMSRight = 0
-        self.audioPresent = false
-        self.lastAudioPacketTime = nil
-        self.lastAudioSampleFrames = 0
-        self.audioRateStart = 0
-        self.audioRateBytes = 0
-        self.audioBitrateKbps = 0
-        self.rawAudioProvidesStats = false
+        self.gpuMS = 0
+        self.captureCPUMS = 0
+        self.latencyMS = 0
+        self.media.reset()
+        self.processor?.resetInFlightPeak()
         self.videoRateStart = 0
         self.videoRateBytes = 0
         self.videoBitrateMbps = 0
         self.lastPublished = 0
         self.lastLogged = 0
         self.frameRateGate = FrameRateGate()
-        self.sampleFactory.reset()
+        self.resetSampleFormat()
         self.cameraConnected = false
         self.cameraMessage = "Waiting for detected input"
-        // Connect and warm before enabling driver callbacks. Cold CMIO/GPU
-        // setup on the first frame can otherwise overflow the admission FIFO.
-        // The remembered rate is provisional: the first validated frame still
-        // establishes the exact contract, and only received data sets metadata.
+        // Connect and warm before enabling driver callbacks, so the first
+        // frames find the camera and GPU ready. This connection waits for the
+        // control queue; no frame can arrive yet. Later reconnects never block
+        // capture. The remembered rate is provisional: the first validated
+        // frame still establishes the exact contract, and only received data
+        // sets metadata.
         let warm = self.effectiveConfiguration(inputFast: configuration.inputFast)
         if let type = self.services.capturePixelFormat {
-          try self.establish(warm, inputType: type)
+          self.establish(warm, inputType: type, synchronous: true)
         } else if self.services.startAutomatic == nil {
-          try self.establish(warm, inputType: kCVPixelFormatType_422YpCbCr10)
+          self.establish(warm, inputType: kCVPixelFormatType_422YpCbCr10, synchronous: true)
         }
         guard self.isCurrent(token) else {
-        self.stopResources(preserveRecordingCallbacks: true)
-        return
-      }
+          self.stopResources(preserveRecordingCallbacks: true)
+          return
+        }
         let hasPreview = previewEnabled &&
           (self.ownedPreviewRenderers.contains { $0.isVisible } || self.services.preview != nil)
-        if self.cameraConnected || hasPreview {
-          if !warm.untouched, self.processor == nil { self.processor = try LUTProcessor() }
-          try self.ensurePrepared(warm)
+        // Every consumer that makes the first frame do GPU work, including a
+        // headless Program source and the monitor's processed view.
+        let hasProgram = self.lock.withLock { self.processedFrameHandler != nil }
+        if self.cameraConnected || hasPreview || hasProgram || self.monitorSink?.needsOutput == true {
+          if !warm.untouched { _ = try self.makeProcessor() }
+          try self.ensurePrepared(warm, wait: true)
         }
         guard self.isCurrent(token) else {
-        self.stopResources(preserveRecordingCallbacks: true)
-        return
-      }
+          self.stopResources(preserveRecordingCallbacks: true)
+          return
+        }
         self.lock.withLock {
           self.accepting = true
-          self.callbackDrops = 0
           self.sourceDrops = 0
-          self.mediaDropSamples = 0
-          self.accountedAdmissionAudioDrops = 0
           self.lastSourcePTS = nil
           self.sourceDuration = configuration.inputFast ? VideoContract.fastDuration : VideoContract.slowDuration
           self.lastReceived = ProcessInfo.processInfo.systemUptime
+          self.maxQueuedFrames = self.queuedFrames
+          self.gpuStallReported = false
+          self.rawAudioProvidesStats = false
         }
+        // Driver events change capture-queue state (signal loss, fatal errors);
+        // they are rare, so they stay on the capture queue.
         let event: (String) -> Void = { [weak self] value in
           guard let self else { return }
           self.queue.async {
@@ -386,19 +423,18 @@ final class CaptureController: @unchecked Sendable {
             self.publishCurrent(token: token)
           }
         }
-        let media: (CaptureMediaStats) -> Void = { [weak self] stats in
-            guard let self else { return }
-            self.receiveMedia(stats, token: token)
-          }
+        let mediaHandler: (CaptureMediaStats) -> Void = { [weak self] stats in
+          self?.receiveMedia(stats, token: token)
+        }
         if let automatic = self.services.startAutomatic {
           if let automaticWithSourceAudio = self.services.startAutomaticWithSourceAudio {
             try automaticWithSourceAudio(deviceID, { [weak self] image, pts, duration, valid in
               self?.receive(image, at: pts, duration: duration, signalValid: valid, token: token)
-            }, media, { [weak self] audio in
+            }, mediaHandler, { [weak self] audio in
               self?.receiveRawAudio(audio, token: token)
             }, event)
           } else if let automaticWithRawAudio = self.services.startAutomaticWithRawAudio {
-            self.rawAudioProvidesStats = true
+            self.lock.withLock { self.rawAudioProvidesStats = true }
             try automaticWithRawAudio(deviceID, { [weak self] image, pts, duration, valid in
               self?.receive(image, at: pts, duration: duration, signalValid: valid, token: token)
             }, { [weak self] audio in
@@ -407,7 +443,7 @@ final class CaptureController: @unchecked Sendable {
           } else if let automaticWithMedia = self.services.startAutomaticWithMedia {
             try automaticWithMedia(deviceID, { [weak self] image, pts, duration, valid in
               self?.receive(image, at: pts, duration: duration, signalValid: valid, token: token)
-            }, media, event)
+            }, mediaHandler, event)
           } else {
             try automatic(deviceID, { [weak self] image, pts, duration, valid in
               self?.receive(image, at: pts, duration: duration, signalValid: valid, token: token)
@@ -416,11 +452,11 @@ final class CaptureController: @unchecked Sendable {
         } else if let startWithSourceAudio = self.services.startWithSourceAudio {
           try startWithSourceAudio(deviceID, configuration.inputFast, { [weak self] image, pts, valid in
             self?.receive(image, at: pts, duration: nil, signalValid: valid, token: token)
-          }, media, { [weak self] audio in
+          }, mediaHandler, { [weak self] audio in
             self?.receiveRawAudio(audio, token: token)
           }, event)
         } else if let startWithRawAudio = self.services.startWithRawAudio {
-          self.rawAudioProvidesStats = true
+          self.lock.withLock { self.rawAudioProvidesStats = true }
           try startWithRawAudio(deviceID, configuration.inputFast, { [weak self] image, pts, valid in
             self?.receive(image, at: pts, duration: nil, signalValid: valid, token: token)
           }, { [weak self] audio in
@@ -429,39 +465,62 @@ final class CaptureController: @unchecked Sendable {
         } else if let startWithMedia = self.services.startWithMedia {
           try startWithMedia(deviceID, configuration.inputFast, { [weak self] image, pts, valid in
             self?.receive(image, at: pts, duration: nil, signalValid: valid, token: token)
-          }, media, event)
+          }, mediaHandler, event)
         } else {
           try self.services.start(deviceID, configuration.inputFast, { [weak self] image, pts, valid in
             self?.receive(image, at: pts, duration: nil, signalValid: valid, token: token)
           }, event)
         }
         guard self.isCurrent(token) else {
-        self.stopResources(preserveRecordingCallbacks: true)
-        return
-      }
+          self.stopResources(preserveRecordingCallbacks: true)
+          return
+        }
         self.message = "Waiting for UltraStudio signal…"
         self.publishCurrent(token: token)
-        let timer = DispatchSource.makeTimerSource(queue: self.queue)
-        timer.schedule(deadline: .now() + 2, repeating: 1)
-        timer.setEventHandler { [weak self] in
-          guard let self, self.isAccepting(token) else { return }
-          let last = self.lock.withLock { self.lastReceived }
-          if ProcessInfo.processInfo.systemUptime - last > 2 {
-            if self.services.startAutomatic != nil {
-              if self.detected != nil || self.message == "Waiting for UltraStudio signal…" {
-                self.clearSignal()
-                self.message = "No video signal — waiting for HDMI."
-                self.publishCurrent(token: token)
-              }
-            } else {
-              self.fail("No valid video signal for two seconds. Check the FX3 HDMI output.", token: token)
-            }
-          }
-        }
-        self.watchdog = timer
-        timer.resume()
+        self.startWatchdog(token: token)
       } catch { self.fail(error.localizedDescription, token: token) }
     }
+  }
+
+  /// Signal and GPU watchdog, on its own queue: it must still fire when the
+  /// capture queue is busy or a camera connect holds the control queue. It
+  /// only hops to the capture queue to act.
+  private func startWatchdog(token: UInt64) {
+    let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
+    timer.schedule(deadline: .now() + 2, repeating: 1)
+    timer.setEventHandler { [weak self] in
+      guard let self else { return }
+      let now = ProcessInfo.processInfo.systemUptime
+      let state = self.lock.withLock { () -> (accepting: Bool, last: Double, stuck: Bool) in
+        let accepting = self.generation == token && self.accepting
+        let oldest = self.gpuProcessor?.inFlight.oldestCommit
+        let stuck = accepting && !self.gpuStallReported && oldest.map { now - $0 > 2 } == true
+        if stuck { self.gpuStallReported = true }
+        return (accepting, self.lastReceived, stuck)
+      }
+      guard state.accepting else { return }
+      if state.stuck {
+        self.queue.async {
+          self.fail("The GPU stopped responding: a frame has been on the GPU for over two seconds.", token: token)
+        }
+        return
+      }
+      guard now - state.last > 2 else { return }
+      self.queue.async {
+        guard self.isAccepting(token) else { return }
+        if self.services.startAutomatic != nil {
+          if self.detected != nil || self.message == "Waiting for UltraStudio signal…" {
+            self.clearSignal()
+            self.message = "No video signal — waiting for HDMI."
+            self.publishCurrent(token: token)
+          }
+        } else {
+          self.fail("No valid video signal for two seconds. Check the FX3 HDMI output.", token: token)
+        }
+      }
+    }
+    watchdog = timer
+    timer.resume()
   }
 
   func reconfigure(configuration: PipelineConfiguration, pipelineEnabled: Bool) {
@@ -474,8 +533,8 @@ final class CaptureController: @unchecked Sendable {
       if !self.cameraConnected { self.reconnectRequested = true }
       self.applied = nil
       self.outputLabel = ""
-      self.sampleFactory.reset()
-      self.ownedPreviewRenderers.forEach { $0.flush() }
+      self.resetSampleFormat()
+      self.flushOwnedPreviews()
       self.message = self.detected == nil ? "Waiting for UltraStudio signal…" : "Updating output…"
       self.publishCurrent(token: token)
       // First new frame establishes the exact source-dependent output contract.
@@ -487,7 +546,7 @@ final class CaptureController: @unchecked Sendable {
     queue.async {
       guard self.isAccepting(token) else { return }
       self.previewEnabled = enabled
-      if !enabled { self.ownedPreviewRenderers.forEach { $0.flush() } }
+      if !enabled { self.flushOwnedPreviews() }
       self.publishCurrent(token: token)
     }
   }
@@ -505,7 +564,7 @@ final class CaptureController: @unchecked Sendable {
     let request = makeStopRequest()
     request.sink?.invalidate(rejectingCaptureGeneration: request.stoppedGeneration)
     // Admission is dropped under the lock above. Cleanup stays queued so a
-    // capture worker blocked in preview or GPU work cannot deadlock stop().
+    // capture worker busy encoding cannot deadlock stop().
     queue.async { self.performStop(request) }
   }
 
@@ -521,8 +580,6 @@ final class CaptureController: @unchecked Sendable {
       let stoppedGeneration = generation
       generation &+= 1
       accepting = false
-      inFlight.removeAll(keepingCapacity: true)
-      mediaInFlight.removeAll(keepingCapacity: true)
       activeFeedID = nil
       return StopRequest(token: generation, stoppedGeneration: stoppedGeneration,
         callbackGeneration: recordingCallbackGeneration, sink: monitorLifecycleSink)
@@ -549,6 +606,7 @@ final class CaptureController: @unchecked Sendable {
     let request = makeStopRequest()
     request.sink?.invalidate(rejectingCaptureGeneration: request.stoppedGeneration)
     syncOnQueue { self.performStop(request) }
+    flushControlQueue()
     return lock.withLock {
       generation == request.token && !accepting ? request.token : nil
     }
@@ -588,16 +646,22 @@ final class CaptureController: @unchecked Sendable {
     lock.withLock { accepting && activeFeedID != nil }
   }
 
+  /// The latest embedded (RP188) timecode label, `HH:MM:SS;FF` when the source
+  /// flags drop-frame. Recording reads it once at take start to follow the
+  /// source's drop-frame flag. Thread-safe; nil without source timecode.
+  var latestSourceTimecode: String? { media.snapshot().timecode }
+
   private func stopResources(preserveRecordingCallbacks: Bool = false,
     callbackGeneration: UInt64? = nil) {
     watchdog?.cancel()
     watchdog = nil
     if let activity = realtimeActivity { ProcessInfo.processInfo.endActivity(activity) }
     realtimeActivity = nil
-    flushPreviewsIfEnabled()
     services.stop()
-    services.disconnect()
-    cameraConnected = false
+    closeCamera()
+    // Committed frames reference GPU resources and are about to be delivered
+    // (and discarded as stale). Wait for them before releasing anything.
+    _ = processor?.waitUntilIdle(timeout: 2)
     reconnectAttempts = 0
     cameraOutage = false
     reconnectRequested = false
@@ -605,9 +669,11 @@ final class CaptureController: @unchecked Sendable {
     cameraMessage = "Ultracam camera not connected"
     activeConfiguration = nil
     activeInputType = nil
-    deliveryStager = CameraFrameStager()
+    // Every completion is now queued for delivery, where the stale generation
+    // is discarded, ahead of the preview flush below.
     processor?.releaseIdleResources()
     preparedConfiguration = nil
+    flushPreviewsIfEnabled()
     if !preserveRecordingCallbacks {
       lock.withLock {
         // Callbacks installed after this stop began belong to the next take.
@@ -619,11 +685,43 @@ final class CaptureController: @unchecked Sendable {
     }
   }
 
+  /// Stops sending at once and closes the virtual camera on the control
+  /// queue. A pending connect for an older attempt is ignored when it lands.
+  private func closeCamera() {
+    camera.invalidate()
+    cameraAttempt = camera.currentAttempt
+    cameraConnected = false
+    cameraConnecting = false
+    let services = self.services
+    controlQueue.async { services.disconnect() }
+  }
+
   /// Headless Program controllers share no UI renderer. Flushing a renderer
   /// they do not own clears the window that belongs to the selected feed.
   private func flushPreviewsIfEnabled() {
     guard previewEnabled else { return }
-    ownedPreviewRenderers.forEach { $0.flush() }
+    flushOwnedPreviews()
+  }
+
+  /// Ordered on the delivery queue, behind every frame already handed to it.
+  /// Frames still on the GPU (up to `maxFramesInFlight`) carry the previous
+  /// epoch and skip the preview when they complete, so no frame encoded
+  /// before the flush reaches the display after it. The capture thread never
+  /// waits for the GPU here.
+  private func flushOwnedPreviews() {
+    let renderers = ownedPreviewRenderers
+    guard !renderers.isEmpty else { return }
+    previewEpoch &+= 1
+    let floor = previewEpoch
+    let epochFloor = previewEpochFloor
+    deliveryQueue.async {
+      epochFloor.value = floor
+      renderers.forEach { $0.flush() }
+    }
+  }
+
+  private func resetSampleFormat() {
+    deliveryQueue.async { self.sampleFactory.reset() }
   }
 
   private func clearSignal() {
@@ -657,57 +755,115 @@ final class CaptureController: @unchecked Sendable {
     return result
   }
 
-  private func ensurePrepared(_ next: PipelineConfiguration) throws {
+  /// Creates the processor on first demand and publishes it for the watchdog.
+  private func makeProcessor() throws -> LUTProcessor {
+    if let processor { return processor }
+    let created = try LUTProcessor()
+    processor = created
+    lock.withLock {
+      gpuProcessor = created
+      gpuStallReported = false
+    }
+    return created
+  }
+
+  /// `wait` only before capture starts. On the live path the warm frames are
+  /// committed ahead of the frame and the capture thread does not wait.
+  private func ensurePrepared(_ next: PipelineConfiguration, wait: Bool) throws {
     if preparedConfiguration?.applyLUT != next.applyLUT || preparedConfiguration?.downscale != next.downscale ||
       preparedConfiguration?.convertTo420 != next.convertTo420 {
-      try processor?.prepare(configuration: next)
+      try processor?.prepare(configuration: next, wait: wait)
       preparedConfiguration = next
     }
   }
 
-  private func establish(_ next: PipelineConfiguration, inputType: OSType) throws {
+  // MARK: - Virtual camera connection (capture-queue state, control-queue work)
+
+  private func establish(_ next: PipelineConfiguration, inputType: OSType, synchronous: Bool = false) {
     let prior = activeConfiguration
     let sameContract = prior.map {
       $0.width == next.width && $0.height == next.height &&
         $0.pixelFormat == next.pixelFormat && $0.duration == next.duration &&
         $0.untouched == next.untouched && activeInputType == inputType
     } ?? false
-    let now = ProcessInfo.processInfo.systemUptime
-    if sameContract {
-      activeConfiguration = next
-      guard !cameraConnected, (reconnectRequested || reconnectAttempts > 0), now >= reconnectAfter else { return }
-      if reconnectAttempts > 0 { reconnectAttempts -= 1 }
-    }
-    let wasConnected = cameraConnected
-    services.disconnect()
-    cameraConnected = false
-    reconnectRequested = false
-    reconnectAfter = now + max(0, services.cameraRetryInterval)
-    // A retry of the same contract must preserve prepared transport resources
-    // and the existing source cadence used by the surviving local preview.
-    if prior != nil && !sameContract { deliveryStager = CameraFrameStager() }
-    guard cameraOutputEnabled else {
-      activeConfiguration = next
-      activeInputType = inputType
-      if prior?.duration != next.duration { frameRateGate = FrameRateGate() }
-      if !sameContract { sampleFactory.reset() }
-      return
-    }
-    do {
-      try services.connect(next, inputType)
-      cameraConnected = true
-      cameraMessage = "Ultracam camera connected. Choose it in your meeting app."
-    } catch {
-      cameraMessage = "Camera output unavailable — \(error.localizedDescription)"
-      // Only a lost connection retries. Each attempt blocks the capture queue
-      // for up to seconds, so a camera that never connected (extension not
-      // running) would stall capture three more times before giving up.
-      if wasConnected { beginCameraRecovery() }
-    }
     activeConfiguration = next
     activeInputType = inputType
+    if sameContract {
+      reconnectIfDue()
+      return
+    }
     if prior?.duration != next.duration { frameRateGate = FrameRateGate() }
-    if !sameContract { sampleFactory.reset() }
+    resetSampleFormat()
+    guard cameraOutputEnabled else {
+      if cameraConnected || cameraConnecting { closeCamera() }
+      return
+    }
+    requestConnect(next, inputType: inputType, synchronous: synchronous)
+  }
+
+  /// Retries a lost camera (or an explicit reconfigure request) once its
+  /// retry time has come. Driven by frames and by a timer.
+  private func reconnectIfDue() {
+    guard cameraOutputEnabled, !cameraConnected, !cameraConnecting,
+      reconnectRequested || reconnectAttempts > 0,
+      ProcessInfo.processInfo.systemUptime >= reconnectAfter,
+      let next = activeConfiguration, let type = activeInputType else { return }
+    if reconnectAttempts > 0 { reconnectAttempts -= 1 }
+    requestConnect(next, inputType: type, synchronous: false)
+  }
+
+  private func scheduleReconnect() {
+    guard cameraOutputEnabled, reconnectRequested || reconnectAttempts > 0 else { return }
+    let token = lock.withLock { generation }
+    let delay = max(0, reconnectAfter - ProcessInfo.processInfo.systemUptime)
+    queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self, self.isAccepting(token) else { return }
+      self.reconnectIfDue()
+    }
+  }
+
+  private func requestConnect(_ next: PipelineConfiguration, inputType: OSType, synchronous: Bool) {
+    let wasConnected = cameraConnected
+    cameraConnected = false
+    cameraConnecting = true
+    reconnectRequested = false
+    reconnectAfter = ProcessInfo.processInfo.systemUptime + max(0, services.cameraRetryInterval)
+    let attempt = camera.begin()
+    cameraAttempt = attempt
+    let services = self.services, link = camera
+    let work: @Sendable () -> Error? = {
+      services.disconnect()
+      do {
+        try services.connect(next, inputType)
+        // Open for sending immediately; frames encoded under this attempt
+        // need not wait for the capture queue to learn the result.
+        _ = link.enable(attempt)
+        return nil
+      } catch { return error }
+    }
+    if synchronous {
+      finishConnect(attempt, error: controlQueue.sync(execute: work), wasConnected: wasConnected)
+    } else {
+      controlQueue.async {
+        let error = work()
+        self.queue.async { self.finishConnect(attempt, error: error, wasConnected: wasConnected) }
+      }
+    }
+  }
+
+  private func finishConnect(_ attempt: UInt64, error: Error?, wasConnected: Bool) {
+    guard attempt == cameraAttempt, cameraConnecting else { return }
+    cameraConnecting = false
+    if let error {
+      cameraMessage = "Camera output unavailable — \(error.localizedDescription)"
+      // Only a lost connection retries; a camera that never connected
+      // (extension not running) stays quiet until the user reconfigures.
+      if wasConnected { beginCameraRecovery() }
+      scheduleReconnect()
+    } else {
+      cameraConnected = true
+      cameraMessage = "Ultracam camera connected. Choose it in your meeting app."
+    }
   }
 
   private func beginCameraRecovery() {
@@ -716,34 +872,19 @@ final class CaptureController: @unchecked Sendable {
     reconnectAttempts = 3
   }
 
+  // MARK: - Driver callbacks
+
   private func receive(_ image: CVPixelBuffer, at pts: CMTime, duration: CMTime?,
     signalValid: Bool, token: UInt64) {
-    let recording = lock.withLock { () -> (SourceRecordingCallbackAdapter.Callbacks?, CMTime) in
-      let frameDuration = duration ?? sourceDuration
-      guard generation == token, accepting else { return (nil, frameDuration) }
-      return (activeFeedID.flatMap { recordingCallbacks[$0] }, frameDuration)
-    }
-    // Recording admission must not depend on the bounded processing FIFO:
-    // synchronous preview/GPU work can occupy every slot for many source frames.
-    // These are metadata-only checks, with no pixel scan, conversion or waiting.
-    // Keep malformed inputs out of the recorder while retaining its invalid-sample
-    // telemetry and the processing path's existing signal/error reporting.
-    if let callbacks = recording.0 {
-      let duration = recording.1
-      let validRecordingFrame = signalValid && pts.isNumeric && pts.epoch == 0 && pts.value >= 0 &&
-        duration.epoch == 0 &&
-        (duration == VideoContract.fastDuration || duration == VideoContract.slowDuration) &&
-        CVPixelBufferGetWidth(image) == 3840 && CVPixelBufferGetHeight(image) == 2160 &&
-        VideoContract.tenBit422.contains(CVPixelBufferGetPixelFormatType(image)) &&
-        (try? VideoBufferLayout.validate(image)) != nil
-      guard isAccepting(token) else { return }
-      _ = callbacks.video(image, pts, duration, validRecordingFrame)
-    }
-    if !signalValid { return }
-    let accepted = lock.withLock { () -> CMTime? in
+    // One lock acquisition per frame on the driver thread.
+    let admitted = lock.withLock { () -> (SourceRecordingCallbackAdapter.Callbacks?, CMTime, UInt64?)? in
       guard generation == token, accepting else { return nil }
+      let callbacks = activeFeedID.flatMap { recordingCallbacks[$0] }
+      let recordingDuration = duration ?? sourceDuration
+      guard signalValid else { return (callbacks, recordingDuration, nil) }
+      let now = ProcessInfo.processInfo.systemUptime
+      lastReceived = now
       let frameDuration = duration ?? sourceDuration
-      lastReceived = ProcessInfo.processInfo.systemUptime
       if frameDuration.isNumeric, frameDuration.seconds > 0, frameDuration != sourceDuration {
         sourceDuration = frameDuration
         lastSourcePTS = nil
@@ -755,66 +896,60 @@ final class CaptureController: @unchecked Sendable {
         }
         lastSourcePTS = pts
       }
-      let pending = inFlight[token, default: 0]
-      if pending >= UInt64(VideoContract.captureAdmissionLimit) {
-        callbackDrops &+= 1
-        return nil
-      }
-      inFlight[token] = pending + 1
-      return frameDuration
+      monitorSequence &+= 1
+      queuedFrames += 1
+      maxQueuedFrames = max(maxQueuedFrames, queuedFrames)
+      return (callbacks, frameDuration, monitorSequence)
     }
-    guard let accepted else { return }
-    // Assigned on the serial driver callback route, under the admission lock.
-    let sequence = lock.withLock { monitorSequence &+= 1; return monitorSequence }
-    let frame = CapturedFrame(image: image, pts: pts, duration: accepted,
+    guard let admitted else { return }
+    // Recording takes every valid source frame directly on the driver thread,
+    // independent of processing. Metadata-only checks: no pixel scan,
+    // conversion or waiting. Malformed inputs stay out of the recorder while
+    // its invalid-sample telemetry and processing's error reporting remain.
+    if let callbacks = admitted.0 {
+      let duration = admitted.1
+      let validRecordingFrame = signalValid && pts.isNumeric && pts.epoch == 0 && pts.value >= 0 &&
+        duration.epoch == 0 &&
+        (duration == VideoContract.fastDuration || duration == VideoContract.slowDuration) &&
+        CVPixelBufferGetWidth(image) == 3840 && CVPixelBufferGetHeight(image) == 2160 &&
+        VideoContract.tenBit422.contains(CVPixelBufferGetPixelFormatType(image)) &&
+        (try? VideoBufferLayout.validate(image)) != nil
+      _ = callbacks.video(image, pts, duration, validRecordingFrame)
+    }
+    guard let sequence = admitted.2 else { return }
+    let frame = CapturedFrame(image: image, pts: pts, duration: admitted.1,
       receivedAt: ProcessInfo.processInfo.systemUptime, sequence: sequence)
     queue.async {
       // DeckLink callbacks arrive at video cadence for hours. CoreMedia and
-      // AVFoundation create autoreleased wrappers while a frame is staged,
-      // processed and fanned out; drain them after each serial work item so
-      // bounded admission also bounds Objective-C autorelease memory.
+      // AVFoundation create autoreleased wrappers while a frame is encoded;
+      // drain them after each serial work item.
       autoreleasepool {
-        defer { self.releaseFrame(token) }
+        defer { self.lock.withLock { self.queuedFrames -= 1 } }
         guard self.isAccepting(token) else { return }
         self.process(frame, token: token)
       }
     }
   }
 
+  /// Media statistics are a few counters under their own lock, recorded on
+  /// the driver thread: never queued behind video, never dropped.
   private func receiveMedia(_ stats: CaptureMediaStats, token: UInt64) {
-    let accepted = lock.withLock { () -> Bool in
-      guard generation == token, accepting else { return false }
-      let pending = mediaInFlight[token, default: 0]
-      if pending >= UInt64(VideoContract.captureAdmissionLimit) {
-        // Preserve packet sample counts when a metadata update is dropped so
-        // the resulting audio-gap counter remains useful under video stalls.
-        mediaDropSamples &+= stats.audioSampleFrames
-        return false
-      }
-      mediaInFlight[token] = pending + 1
-      return true
-    }
-    guard accepted else { return }
-    queue.async {
-      autoreleasepool {
-        defer { self.releaseMedia(token) }
-        guard self.isAccepting(token) else { return }
-        self.recordMedia(stats)
-      }
-    }
+    guard isAccepting(token) else { return }
+    media.record(stats)
   }
 
   private func receiveRawAudio(_ audio: CaptureRawAudio, token: UInt64) {
-    let recording = lock.withLock { () -> SourceRecordingCallbackAdapter.Callbacks? in
+    let state = lock.withLock { () -> (SourceRecordingCallbackAdapter.Callbacks?, Bool)? in
       guard generation == token, accepting else { return nil }
-      return activeFeedID.flatMap { recordingCallbacks[$0] }
+      return (activeFeedID.flatMap { recordingCallbacks[$0] }, rawAudioProvidesStats)
     }
+    guard let state else { return }
     let validRawFormat = audio.bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample
     if let samples = audio.samples, audio.sampleFrames > 0, audio.channels > 0, validRawFormat {
-      _ = recording?.rawAudio(samples, Int(audio.sampleFrames), audio.packetTime,
+      _ = state.0?.rawAudio(samples, Int(audio.sampleFrames), audio.packetTime,
         audio.channels, audio.bytesPerSample)
     }
-    if lock.withLock({ rawAudioProvidesStats }) {
+    if state.1 {
       receiveMedia(CaptureMediaStats(timecode: nil, audioPacketTime: audio.packetTime,
         audioSampleFrames: audio.sampleFrames, audioChannels: audio.channels,
         leftPeak: 0, rightPeak: 0, leftRMS: 0, rightRMS: 0,
@@ -822,78 +957,15 @@ final class CaptureController: @unchecked Sendable {
     }
   }
 
-  private func releaseFrame(_ token: UInt64) {
-    lock.withLock {
-      guard let pending = inFlight[token] else { return }
-      if pending <= 1 { inFlight.removeValue(forKey: token) }
-      else { inFlight[token] = pending - 1 }
-    }
-  }
-
-  private func releaseMedia(_ token: UInt64) {
-    lock.withLock {
-      guard let pending = mediaInFlight[token] else { return }
-      if pending <= 1 { mediaInFlight.removeValue(forKey: token) }
-      else { mediaInFlight[token] = pending - 1 }
-    }
-  }
-
-  private func recordMedia(_ stats: CaptureMediaStats) {
-    timecode = stats.timecode
-    audioChannels = max(0, stats.audioChannels)
-    audioPackets &+= 1
-    audioSamples &+= stats.audioSampleFrames
-    audioBytes &+= stats.audioBytes
-    audioRateBytes &+= stats.audioBytes
-    audioPresent = stats.audioPresent
-    audioPeakLeft = max(0, min(1, stats.leftPeak))
-    audioPeakRight = max(0, min(1, stats.rightPeak))
-    audioRMSLeft = max(0, min(1, stats.leftRMS))
-    audioRMSRight = max(0, min(1, stats.rightRMS))
-    // The native input is always enabled at 48 kHz (the DeckLink callback
-    // does not carry a sample-rate field). Use that fixed contract directly;
-    // inferring a rate from the previous packet hides missing packets because
-    // a gap makes the inferred rate fall in proportion to the gap.
-    if stats.audioPresent && stats.audioSampleFrames > 0 {
-      audioSampleRate = Int(EmbeddedAudioFormat.sampleRate)
-    }
-    let packetTime = stats.audioPacketTime
-    if packetTime.isNumeric, stats.audioSampleFrames > 0 {
-      if let prior = lastAudioPacketTime, prior.isNumeric {
-        let elapsed = CMTimeGetSeconds(CMTimeSubtract(packetTime, prior))
-        if elapsed > 0 {
-          let expected = Int((elapsed * EmbeddedAudioFormat.sampleRate).rounded())
-          if expected > Int(lastAudioSampleFrames) {
-            let missing = UInt64(expected - Int(lastAudioSampleFrames))
-            let admission = lock.withLock { mediaDropSamples }
-            let fresh = admission > accountedAdmissionAudioDrops ? admission - accountedAdmissionAudioDrops : 0
-            let overlap = min(missing, fresh)
-            accountedAdmissionAudioDrops += overlap
-            audioDrops &+= missing - overlap
-          }
-        }
-      }
-      // Do not move the baseline backwards after a malformed/regressed packet;
-      // the next valid packet should still be compared with the last source
-      // clock position rather than silently masking the discontinuity.
-      if let prior = lastAudioPacketTime {
-        if CMTimeCompare(packetTime, prior) >= 0 {
-          lastAudioPacketTime = packetTime
-          lastAudioSampleFrames = stats.audioSampleFrames
-        }
-      } else {
-        lastAudioPacketTime = packetTime
-        lastAudioSampleFrames = stats.audioSampleFrames
-      }
-    }
-  }
+  // MARK: - Frame path
 
   private func process(_ frame: CapturedFrame, token: UInt64) {
+    let cpuStart = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
     let input = frame.image
     videoRateBytes &+= UInt64(max(0, CVPixelBufferGetDataSize(input)))
     let actual = InputFormat(width: CVPixelBufferGetWidth(input), height: CVPixelBufferGetHeight(input),
       type: CVPixelBufferGetPixelFormatType(input), duration: frame.duration)
-    var metadataChanged = detected != actual
+    let metadataChanged = detected != actual
     if detected != actual {
       monitorProcessingRevision &+= 1
       if detected != nil { flushPreviewsIfEnabled() }
@@ -913,37 +985,31 @@ final class CaptureController: @unchecked Sendable {
     do {
       try VideoBufferLayout.validate(input)
       let effective = effectiveConfiguration(inputFast: actual.duration == VideoContract.fastDuration)
-      try establish(effective, inputType: actual.type)
-      guard isAccepting(token) else { return }
+      establish(effective, inputType: actual.type)
       if monitorPipelineConfiguration != effective {
         monitorPipelineConfiguration = effective
         monitorProcessingRevision &+= 1
       }
       let entryTime = ProcessInfo.processInfo.systemUptime
-      let inputFrameInterval = actual.duration.seconds
       let entryQueueAge = max(0, entryTime - frame.receivedAt)
-      if entryQueueAge > inputFrameInterval {
-        monitorSink?.reportCriticalPipeline(captureGeneration: token, queueAge: entryQueueAge,
-          processingTime: 0, frameInterval: inputFrameInterval, now: entryTime)
-      }
-      monitorSink?.offer(source: input, output: nil, pts: frame.pts, captureGeneration: token,
-        sequence: frame.sequence, processingRevision: monitorProcessingRevision,
-        sourceOnly: true, correspondence: .identity)
-      let visible = previewEnabled ? ownedPreviewRenderers.filter { $0.isVisible } : []
-      let hasPreview = previewEnabled && (!visible.isEmpty || services.preview != nil)
-      let hasProcessedOutput = onProcessedFrame != nil
-      let hasMonitorOutput = monitorSink?.needsOutput == true
+      if entryQueueAge > 2 * actual.duration.seconds { lateFrames &+= 1 }
+      // Every monitor offer is made on the delivery queue, in capture order:
+      // with the frame's output when the monitor wants it, source-only
+      // otherwise (and for frames that skip the GPU, ordered behind the
+      // frames still on it).
+      let sink = monitorSink
+      let hasMonitorOutput = sink?.needsOutput == true
+      let hasVisiblePreview = previewEnabled && ownedPreviewRenderers.contains { $0.isVisible }
+      let hasPreview = hasVisiblePreview || (previewEnabled && services.preview != nil)
+      // One lock for the handler and the preview source ID.
+      let (processedHandler, feedID) = lock.withLock { (processedFrameHandler, activeFeedID?.rawValue) }
       // No downstream demand: keep metadata/detection alive without allocating,
       // submitting GPU work or staging raw buffers that nobody can consume.
-      guard cameraConnected || hasPreview || hasProcessedOutput || hasMonitorOutput else {
-        let idleTime = ProcessInfo.processInfo.systemUptime
-        monitorSink?.reportCriticalPipeline(captureGeneration: token,
-          queueAge: max(0, idleTime - frame.receivedAt), processingTime: 0,
-          frameInterval: inputFrameInterval, now: idleTime)
+      guard cameraConnected || cameraConnecting || hasPreview || processedHandler != nil || hasMonitorOutput else {
+        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token) }
         if preparedConfiguration != nil {
           processor?.releaseIdleResources()
           preparedConfiguration = nil
-          deliveryStager = CameraFrameStager()
         }
         applied = nil
         outputLabel = ""
@@ -953,101 +1019,183 @@ final class CaptureController: @unchecked Sendable {
         publishIfDue(token: token, force: metadataChanged)
         return
       }
+      // Temporal selection happens before any GPU work or buffer allocation;
+      // complete bypass keeps the source duration and so every frame.
+      guard frameRateGate.shouldDeliver(frame.pts, duration: effective.duration) else {
+        if let sink, !hasMonitorOutput { offerSourceOnlyInOrder(sink, frame: frame, token: token) }
+        return
+      }
       // Created on first demand; a complete bypass still uses it for the owned GPU copy.
-      if processor == nil { self.processor = try LUTProcessor() }
-      let processor = self.processor
-      try ensurePrepared(effective)
-      let start = ProcessInfo.processInfo.systemUptime
-      let rendered: CVPixelBuffer
+      let processor = try makeProcessor()
+      try ensurePrepared(effective, wait: false)
+      // The stored renderer array (no per-frame copy); each renderer's own
+      // visibility check drops frames for a hidden one.
+      let item = DeliveryItem(token: token, sequence: frame.sequence, source: sink == nil ? nil : input,
+        pts: frame.pts, hostTime: hostTime(for: frame.pts, duration: effective.duration, image: input),
+        duration: effective.duration, receivedAt: frame.receivedAt, encodeStart: entryTime,
+        sourceWidth: actual.width, sourceHeight: actual.height,
+        pipelineEnabled: pipelineEnabled, applyLUT: effective.applyLUT,
+        renderers: hasVisiblePreview ? ownedPreviewRenderers : [], preview: previewEnabled ? services.preview : nil,
+        sourceID: hasVisiblePreview ? feedID : nil, previewEpoch: previewEpoch,
+        cameraAttempt: cameraAttempt, monitorSink: sink, monitorWantsOutput: hasMonitorOutput,
+        processingRevision: monitorProcessingRevision, processedHandler: processedHandler)
+      let completion: LUTProcessor.Completion = { [self] completed in
+        // GPU completion queue: the frame is finished. Hand it to delivery in
+        // commit order (the processor releases completions in order).
+        deliveryQueue.async { autoreleasepool { self.deliver(item, completed) } }
+      }
       if effective.untouched {
         // The preview, the meeting-app camera and Program get an owned copy;
         // the capture card may reuse its buffer while they still display it.
-        guard let processor else { throw VideoError.message("GPU processor is unavailable.") }
-        rendered = try processor.passthrough(input)
+        try processor.submitPassthrough(input, isCurrent: { isAccepting(token) }, completion: completion)
       } else {
-        guard let processor else { throw VideoError.message("GPU processor is unavailable.") }
-        rendered = try processor.process(input, configuration: effective)
+        try processor.submit(input, configuration: effective, isCurrent: { isAccepting(token) },
+          completion: completion)
       }
-      let processingEnd = ProcessInfo.processInfo.systemUptime
-      processingMS = (processingEnd - start) * 1000
-      monitorSink?.reportCriticalPipeline(captureGeneration: token,
-        queueAge: max(0, start - frame.receivedAt), processingTime: processingEnd - start,
-        frameInterval: inputFrameInterval, now: processingEnd)
-      services.didProcess(processingMS, (start - frame.receivedAt) * 1000)
-      guard isAccepting(token) else { return }
-      // Temporal selection remains last; bypass retains the source duration.
-      guard frameRateGate.shouldDeliver(frame.pts, duration: effective.duration) else { return }
-      let correspondence = MonitorCorrespondence(
-        scaleX: Double(CVPixelBufferGetWidth(rendered)) / Double(actual.width),
-        scaleY: Double(CVPixelBufferGetHeight(rendered)) / Double(actual.height),
-        offsetX: 0, offsetY: 0)
-      monitorSink?.offer(source: input, output: rendered, pts: frame.pts, captureGeneration: token,
-        sequence: frame.sequence, processingRevision: monitorProcessingRevision,
-        sourceOnly: false, correspondence: correspondence)
-      if let onProcessedFrame {
-        let metadata = ProcessedFrameMetadata(
-          presentationTime: frame.pts,
-          duration: effective.duration,
-          width: CVPixelBufferGetWidth(rendered),
-          height: CVPixelBufferGetHeight(rendered),
-          pixelFormat: UInt32(CVPixelBufferGetPixelFormatType(rendered)),
-          processingRevision: monitorProcessingRevision)
-        onProcessedFrame(ProcessedFrame(payload: rendered, metadata: metadata), token)
-      }
-      let time = hostTime(for: frame.pts, duration: effective.duration)
-      let original = try sampleFactory.sample(rendered, at: time, duration: effective.duration)
-      let sample: CMSampleBuffer
-      if effective.untouched && (cameraConnected || !visible.isEmpty) {
-        guard isAccepting(token) else { return }
-        sample = try deliveryStager.stage(original)
-      } else { sample = original }
-      guard isAccepting(token) else { return }
-      if previewEnabled {
-        let sourceID = lock.withLock { activeFeedID?.rawValue }
-        visible.forEach { $0.enqueue(sample, sourceID: sourceID) }
-        services.preview?(sample)
-      }
-      if cameraConnected {
-        do {
-          if try services.send(sample) {
-            // An opened queue is not proof of recovery. Only a successful
-            // frame send ends the outage and permits a fresh retry budget.
-            cameraOutage = false
-            reconnectAttempts = 0
-          } else { cameraDrops &+= 1 }
-        }
-        catch {
-          cameraDrops &+= 1
-          services.disconnect()
-          cameraConnected = false
-          beginCameraRecovery()
-          reconnectRequested = false
-          reconnectAfter = ProcessInfo.processInfo.systemUptime + max(0, services.cameraRetryInterval)
-          cameraMessage = "Camera output disconnected — \(error.localizedDescription)"
-        }
-      }
-      frames &+= 1
-      lastDeliveredSourceTime = frame.pts
-      lastDeliveredHostTime = time
-      metadataChanged = metadataChanged || applied != pipelineEnabled
-      applied = pipelineEnabled
-      let output = InputFormat(width: CVPixelBufferGetWidth(rendered), height: CVPixelBufferGetHeight(rendered),
-        type: CVPixelBufferGetPixelFormatType(rendered), duration: effective.duration)
-      if renderedFormat != output || outputLabel.isEmpty {
-        metadataChanged = true
-        renderedFormat = output
-        outputLabel = output.label
-      }
-      message = pipelineEnabled ? (effective.applyLUT ? "Processing enabled — LUT applied" : "Processing enabled — LUT off") : "Complete bypass — original camera signal"
-      publishIfDue(token: token, force: frames == 1 || metadataChanged)
-    } catch VideoError.outputBackPressure { poolDrops &+= 1 }
-    catch { fail(error.localizedDescription, token: token) }
+      captureCPUMS = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - cpuStart) / 1_000_000
+      // The delivered frame publishes the new input metadata.
+      if metadataChanged { inputMetadataChanged = true }
+    } catch VideoError.outputBackPressure {
+      poolDrops &+= 1
+      message = VideoError.outputBackPressure.localizedDescription
+      // The first stall is shown at once; a sustained one updates at the
+      // normal status rate instead of a main-actor hop per frame.
+      publishIfDue(token: token, force: poolDrops == 1)
+    } catch VideoError.cancelled {
+      return
+    } catch { fail(error.localizedDescription, token: token) }
   }
 
-  private func hostTime(for sourceTime: CMTime, duration: CMTime) -> CMTime {
-    let now = services.hostTime()
+  /// A monitor offer for a frame that skips the GPU (no other consumer, or
+  /// removed by the frame-rate gate). Ordered behind every frame already on
+  /// the GPU, whose offers are made when they complete.
+  private func offerSourceOnlyInOrder(_ sink: MonitorCaptureSink, frame: CapturedFrame, token: UInt64) {
+    let revision = monitorProcessingRevision
+    let offer = { [deliveryQueue] in
+      deliveryQueue.async {
+        sink.offer(source: frame.image, output: nil, pts: frame.pts, captureGeneration: token,
+          sequence: frame.sequence, processingRevision: revision, sourceOnly: true, correspondence: .identity)
+      }
+    }
+    if let processor { processor.afterCommittedFrames(offer) } else { offer() }
+  }
+
+  /// Delivery queue, in commit order, after the frame's GPU work completed.
+  /// Monitor, preview and camera first; Program last, so a Program stall
+  /// can't hold this camera's own outputs.
+  private func deliver(_ item: DeliveryItem, _ completed: LUTProcessor.Completed) {
+    let rendered: CVPixelBuffer
+    switch completed.result {
+    case .success(let output): rendered = output
+    case .failure(let error):
+      queue.async { self.fail(error.localizedDescription, token: item.token) }
+      return
+    }
+    guard isAccepting(item.token) else { return }
+    let timing = completed.timing
+    let outputWidth = CVPixelBufferGetWidth(rendered), outputHeight = CVPixelBufferGetHeight(rendered)
+    let outputType = CVPixelBufferGetPixelFormatType(rendered)
+    if let sink = item.monitorSink, let source = item.source {
+      if item.monitorWantsOutput {
+        sink.offer(source: source, output: rendered, pts: item.pts, captureGeneration: item.token,
+          sequence: item.sequence, processingRevision: item.processingRevision, sourceOnly: false,
+          correspondence: MonitorCorrespondence(
+            scaleX: Double(outputWidth) / Double(item.sourceWidth),
+            scaleY: Double(outputHeight) / Double(item.sourceHeight), offsetX: 0, offsetY: 0))
+      } else {
+        sink.offer(source: source, output: nil, pts: item.pts, captureGeneration: item.token,
+          sequence: item.sequence, processingRevision: item.processingRevision, sourceOnly: true,
+          correspondence: .identity)
+      }
+    }
+    let processingMS = (timing.completed - item.encodeStart) * 1000
+    services.didProcess(processingMS, (item.encodeStart - item.receivedAt) * 1000)
+    let sample: CMSampleBuffer
+    do { sample = try sampleFactory.sample(rendered, at: item.hostTime, duration: item.duration) }
+    catch {
+      queue.async { self.fail(error.localizedDescription, token: item.token) }
+      return
+    }
+    // Encoded before the latest preview flush: the old look or format.
+    if item.previewEpoch >= previewEpochFloor.value {
+      for renderer in item.renderers { renderer.enqueue(sample, sourceID: item.sourceID) }
+      item.preview?(sample)
+    }
+    let outcome = camera.send(sample, attempt: item.cameraAttempt, using: services.send)
+    if let handler = item.processedHandler {
+      let metadata = ProcessedFrameMetadata(
+        presentationTime: item.pts, duration: item.duration,
+        width: outputWidth, height: outputHeight,
+        pixelFormat: UInt32(outputType), processingRevision: item.processingRevision)
+      handler(ProcessedFrame(payload: rendered, metadata: metadata), item.token)
+    }
+    let report = DeliveryReport(item: item, outcome: outcome,
+      output: InputFormat(width: outputWidth, height: outputHeight, type: outputType, duration: item.duration),
+      processingMS: processingMS, gpuMS: timing.gpuMS,
+      latencyMS: (ProcessInfo.processInfo.systemUptime - item.receivedAt) * 1000)
+    queue.async { self.didDeliver(report) }
+  }
+
+  /// Capture queue: counters, camera recovery and status for a delivered frame.
+  private func didDeliver(_ report: DeliveryReport) {
+    let item = report.item
+    guard isAccepting(item.token) else { return }
+    var metadataChanged = inputMetadataChanged
+    inputMetadataChanged = false
+    switch report.outcome {
+    case .sent:
+      if item.cameraAttempt == cameraAttempt {
+        // An opened queue is not proof of recovery. Only a successful frame
+        // send ends the outage and permits a fresh retry budget.
+        cameraOutage = false
+        reconnectAttempts = 0
+      }
+    case .full:
+      // The extension's queue is full: it has stalled. Counted and shown.
+      cameraDrops &+= 1
+    case .failed(let description):
+      cameraDrops &+= 1
+      if item.cameraAttempt == cameraAttempt {
+        closeCamera()
+        beginCameraRecovery()
+        reconnectRequested = false
+        reconnectAfter = ProcessInfo.processInfo.systemUptime + max(0, services.cameraRetryInterval)
+        cameraMessage = "Camera output disconnected — \(description)"
+        scheduleReconnect()
+        metadataChanged = true
+      }
+    case .notSent: break
+    }
+    frames &+= 1
+    lastDeliveredSourceTime = item.pts
+    processingMS = report.processingMS
+    gpuMS = report.gpuMS
+    latencyMS = report.latencyMS
+    metadataChanged = metadataChanged || applied != item.pipelineEnabled
+    applied = item.pipelineEnabled
+    if renderedFormat != report.output || outputLabel.isEmpty {
+      metadataChanged = true
+      renderedFormat = report.output
+      outputLabel = report.output.label
+    }
+    message = item.pipelineEnabled ? (item.applyLUT ? "Processing enabled — LUT applied" : "Processing enabled — LUT off") : "Complete bypass — original camera signal"
+    publishIfDue(token: item.token, force: frames == 1 || metadataChanged)
+  }
+
+  /// Maps source time onto the host clock at encode time, in commit order.
+  /// The DeckLink backend attaches the frame's hardware capture time on the
+  /// host clock when it has one; that anchors the mapping instead of "now".
+  private func hostTime(for sourceTime: CMTime, duration: CMTime, image: CVPixelBuffer) -> CMTime {
+    let now: CMTime
+    if let captured = (CVBufferCopyAttachment(image, UltracamCaptureHostTimeAttachmentKey as CFString, nil)
+      as? NSNumber)?.doubleValue,
+      captured.isFinite, captured > 0 {
+      now = CMTime(seconds: captured, preferredTimescale: 1_000_000_000)
+    } else {
+      now = services.hostTime()
+    }
     var reset = firstSourceTime == nil
-    if let last = lastDeliveredSourceTime, CMTimeCompare(sourceTime, last) < 0 { reset = true }
+    if let last = lastMappedSourceTime, CMTimeCompare(sourceTime, last) < 0 { reset = true }
     if let origin = firstSourceTime {
       let mapped = CMTimeAdd(firstHostTime, CMTimeSubtract(sourceTime, origin))
       // Preserve normal source cadence independently of GPU completion jitter.
@@ -1059,11 +1207,14 @@ final class CaptureController: @unchecked Sendable {
     if reset {
       firstSourceTime = sourceTime
       firstHostTime = now
-      if let last = lastDeliveredHostTime {
+      if let last = lastMappedHostTime {
         firstHostTime = CMTimeMaximum(firstHostTime, CMTimeAdd(last, duration))
       }
     }
-    return CMTimeAdd(firstHostTime, CMTimeSubtract(sourceTime, firstSourceTime!))
+    let mapped = CMTimeAdd(firstHostTime, CMTimeSubtract(sourceTime, firstSourceTime!))
+    lastMappedSourceTime = sourceTime
+    lastMappedHostTime = mapped
+    return mapped
   }
 
   private func publishIfDue(token: UInt64, force: Bool = false) {
@@ -1073,59 +1224,66 @@ final class CaptureController: @unchecked Sendable {
     outputFPS = rateStart == 0 ? 0 : Double(frames - rateFrames) / elapsed
     rateStart = now
     rateFrames = frames
-    if audioRateStart == 0 { audioRateStart = now }
     if videoRateStart == 0 { videoRateStart = now }
-    let mediaElapsed = now - audioRateStart
-    if mediaElapsed >= 0.25 {
-      audioBitrateKbps = Double(audioRateBytes) * 8 / mediaElapsed / 1_000
-      audioRateBytes = 0
-      audioRateStart = now
-      let videoElapsed = max(0.001, now - videoRateStart)
-      videoBitrateMbps = Double(videoRateBytes) * 8 / videoElapsed / 1_000_000
+    if now - videoRateStart >= 0.25 {
+      videoBitrateMbps = Double(videoRateBytes) * 8 / (now - videoRateStart) / 1_000_000
       videoRateBytes = 0
       videoRateStart = now
     }
+    media.updateRates(now: now)
     lastPublished = now
-    ownedPreviewRenderers.filter { previewEnabled && $0.isVisible }.forEach { $0.refreshPerformanceMetrics() }
+    for renderer in ownedPreviewRenderers where previewEnabled && renderer.isVisible {
+      renderer.refreshPerformanceMetrics()
+    }
     if now - lastLogged >= 5 {
       lastLogged = now
-      if let packed = processor?.packedInputDiagnostics {
-        logger.notice("Packed input noCopy=\(packed.noCopyFrames) copiedFallback=\(packed.copiedFrames)")
-      }
-      let losses = lock.withLock { (sourceDrops, callbackDrops, mediaDropSamples) }
-      logger.notice("Live fps=\(self.outputFPS) delivered=\(self.frames) sourceDrops=\(losses.0) captureDrops=\(losses.1) mediaDropSamples=\(losses.2) poolDrops=\(self.poolDrops)")
+      let peak = processor?.inFlight.peak ?? 0
+      let depth = lock.withLock { (sourceDrops, peak, maxQueuedFrames) }
+      logger.notice("Live fps=\(self.outputFPS) delivered=\(self.frames) sourceDrops=\(depth.0) outputStalls=\(self.poolDrops) cameraStalls=\(self.cameraDrops) lateFrames=\(self.lateFrames) maxInFlight=\(depth.1) maxBacklog=\(depth.2) gpuMS=\(self.gpuMS) latencyMS=\(self.latencyMS)")
     }
     publishCurrent(token: token)
   }
 
   private func publishCurrent(token: UInt64, stopped: Bool = false) {
-    let losses = lock.withLock { (sourceDrops, callbackDrops, mediaDropSamples) }
-    let audioLosses = audioDrops &+ losses.2
+    let gpu = processor?.inFlight
+    let depth = lock.withLock {
+      (sourceDrops: sourceDrops, inFlight: gpu?.count ?? 0, maxInFlight: gpu?.peak ?? 0,
+        backlog: queuedFrames, maxBacklog: maxQueuedFrames)
+    }
+    let deviceDrops = services.deviceDroppedFrames()
+    let audio = media.snapshot()
     let diagnostics = ownedPreviewRenderers.map { $0.diagnosticsSnapshot() }
+    // Frames replaced in the newest-frame slot before the display took them
+    // are preview losses too (shown, with a warning, in diagnostics).
     let previewLosses = diagnostics.reduce(UInt64(0)) {
-      $0 + $1.stagingDrops + $1.replaced + $1.failed + $1.rendererDropped + $1.rendererCorrupted
+      $0 + $1.stagingDrops + $1.failed + $1.rendererDropped + $1.rendererCorrupted + $1.late
     }
     let visiblePreview = previewEnabled && (ownedPreviewRenderers.contains { $0.isVisible } || services.preview != nil)
+    let videoLosses = depth.sourceDrops + deviceDrops + poolDrops + cameraDrops
     let update = CaptureUpdate(message: message, input: inputLabel, output: outputLabel,
       inputFast: detected.map { $0.duration == VideoContract.fastDuration }, sourceDuration: detected?.duration,
       mediaTime: stopped ? nil : lastDeliveredSourceTime,
-      pipelineEnabledApplied: applied, frames: frames, dropped: losses.0 + losses.1 + poolDrops + cameraDrops,
+      pipelineEnabledApplied: applied, frames: frames, dropped: videoLosses,
       processingMS: processingMS, previewDelivered: visiblePreview && !outputLabel.isEmpty && !stopped,
-      sourceDrops: losses.0, captureDrops: losses.1, poolDrops: poolDrops, cameraDrops: cameraDrops,
+      sourceDrops: depth.sourceDrops, deviceDrops: deviceDrops, captureDrops: 0, poolDrops: poolDrops, cameraDrops: cameraDrops,
       previewDrops: previewLosses, previewFrames: diagnostics.reduce(0) { $0 + $1.enqueued },
+      previewLateFrames: diagnostics.reduce(0) { $0 + $1.late },
       outputFPS: outputFPS, displayedFrames: diagnostics.reduce(0) { $0 + $1.rendererFrames },
       rendererDrops: diagnostics.reduce(0) { $0 + $1.rendererDropped },
       previewError: diagnostics.compactMap(\.lastError).first,
-      timecode: stopped ? nil : timecode,
-      audioChannels: stopped ? 0 : audioChannels, audioSampleRate: stopped ? 0 : audioSampleRate,
-      audioPackets: stopped ? 0 : audioPackets, audioSamples: stopped ? 0 : audioSamples,
-      audioBytes: stopped ? 0 : audioBytes, audioDrops: stopped ? 0 : audioLosses,
-      audioPeakLeft: stopped ? 0 : audioPeakLeft, audioPeakRight: stopped ? 0 : audioPeakRight,
-      audioRMSLeft: stopped ? 0 : audioRMSLeft, audioRMSRight: stopped ? 0 : audioRMSRight,
-      audioBitrateKbps: stopped ? 0 : audioBitrateKbps, audioPresent: stopped ? false : audioPresent,
-      audioPacketTime: stopped ? nil : lastAudioPacketTime,
+      framesInFlight: depth.inFlight, maxFramesInFlight: depth.maxInFlight,
+      captureBacklog: depth.backlog, maxCaptureBacklog: depth.maxBacklog, lateFrames: lateFrames,
+      gpuMS: gpuMS, captureCPUMS: captureCPUMS, latencyMS: latencyMS,
+      timecode: stopped ? nil : audio.timecode,
+      audioChannels: stopped ? 0 : audio.channels, audioSampleRate: stopped ? 0 : audio.sampleRate,
+      audioPackets: stopped ? 0 : audio.packets, audioSamples: stopped ? 0 : audio.samples,
+      audioBytes: stopped ? 0 : audio.bytes, audioDrops: stopped ? 0 : audio.drops,
+      audioPeakLeft: stopped ? 0 : audio.peakLeft, audioPeakRight: stopped ? 0 : audio.peakRight,
+      audioRMSLeft: stopped ? 0 : audio.rmsLeft, audioRMSRight: stopped ? 0 : audio.rmsRight,
+      audioBitrateKbps: stopped ? 0 : audio.bitrateKbps, audioPresent: stopped ? false : audio.present,
+      audioPacketTime: stopped ? nil : audio.packetTime,
       videoBitrateMbps: stopped ? 0 : videoBitrateMbps,
-      videoDrops: stopped ? 0 : losses.0 + losses.1 + poolDrops + cameraDrops,
+      videoDrops: stopped ? 0 : videoLosses,
       cameraOutputActive: cameraConnected, cameraMessage: cameraMessage, stopped: stopped)
     DispatchQueue.main.async { [weak self] in
       guard let self, self.isCurrent(token) else { return }
@@ -1140,6 +1298,181 @@ private struct CapturedFrame: @unchecked Sendable {
   let duration: CMTime
   let receivedAt: Double
   let sequence: UInt64
+}
+
+/// Everything delivery needs, frozen at encode time on the capture queue.
+private struct DeliveryItem: @unchecked Sendable {
+  let token: UInt64
+  let sequence: UInt64
+  /// The capture frame, kept for the monitor's offer when there is a monitor.
+  let source: CVPixelBuffer?
+  let pts: CMTime
+  let hostTime: CMTime
+  let duration: CMTime
+  let receivedAt: Double
+  let encodeStart: Double
+  let sourceWidth: Int
+  let sourceHeight: Int
+  let pipelineEnabled: Bool
+  let applyLUT: Bool
+  let renderers: [VideoPreviewRenderer]
+  let preview: ((CMSampleBuffer) -> Void)?
+  let sourceID: String?
+  let previewEpoch: UInt64
+  let cameraAttempt: UInt64
+  let monitorSink: MonitorCaptureSink?
+  /// The monitor's offer carries the output; otherwise it is source-only.
+  let monitorWantsOutput: Bool
+  let processingRevision: UInt64
+  let processedHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
+}
+
+private struct DeliveryReport: @unchecked Sendable {
+  let item: DeliveryItem
+  let outcome: CameraLink.Outcome
+  let output: InputFormat
+  let processingMS: Double
+  let gpuMS: Double
+  let latencyMS: Double
+}
+
+/// The open virtual camera connection, shared by the capture queue (which
+/// opens and closes it through attempts), the control queue (which completes
+/// a connect) and the delivery queue (which sends). Sending holds the lock, so
+/// once `invalidate` returns no send is in progress or can start, and the
+/// sink may be disconnected without racing a send.
+private final class CameraLink: @unchecked Sendable {
+  enum Outcome: Sendable {
+    case notSent, sent, full
+    case failed(String)
+  }
+
+  private let lock = NSLock()
+  private var attempt: UInt64 = 0
+  private var openAttempt: UInt64?
+
+  var currentAttempt: UInt64 { lock.withLock { attempt } }
+
+  func begin() -> UInt64 {
+    lock.withLock {
+      attempt &+= 1
+      openAttempt = nil
+      return attempt
+    }
+  }
+
+  func invalidate() {
+    lock.withLock {
+      attempt &+= 1
+      openAttempt = nil
+    }
+  }
+
+  func enable(_ candidate: UInt64) -> Bool {
+    lock.withLock {
+      guard attempt == candidate else { return false }
+      openAttempt = candidate
+      return true
+    }
+  }
+
+  func send(_ sample: CMSampleBuffer, attempt frameAttempt: UInt64,
+    using send: (CMSampleBuffer) throws -> Bool) -> Outcome {
+    lock.lock()
+    defer { lock.unlock() }
+    guard openAttempt == frameAttempt else { return .notSent }
+    do { return try send(sample) ? .sent : .full }
+    catch {
+      openAttempt = nil
+      return .failed(error.localizedDescription)
+    }
+  }
+}
+
+/// Audio and timecode statistics, written on the driver's media callback.
+private final class MediaState: @unchecked Sendable {
+  struct Snapshot {
+    var timecode: String?
+    var channels = 0
+    var sampleRate = 0
+    var packets: UInt64 = 0
+    var samples: UInt64 = 0
+    var bytes: UInt64 = 0
+    var drops: UInt64 = 0
+    var peakLeft = 0.0
+    var peakRight = 0.0
+    var rmsLeft = 0.0
+    var rmsRight = 0.0
+    var present = false
+    var packetTime: CMTime?
+    var bitrateKbps = 0.0
+  }
+
+  private let lock = NSLock()
+  private var state = Snapshot()
+  private var lastSampleFrames: UInt64 = 0
+  private var rateStart: Double = 0
+  private var rateBytes: UInt64 = 0
+
+  func reset() {
+    lock.withLock {
+      state = Snapshot()
+      lastSampleFrames = 0
+      rateStart = 0
+      rateBytes = 0
+    }
+  }
+
+  func snapshot() -> Snapshot { lock.withLock { state } }
+
+  func updateRates(now: Double) {
+    lock.withLock {
+      if rateStart == 0 { rateStart = now }
+      let elapsed = now - rateStart
+      guard elapsed >= 0.25 else { return }
+      state.bitrateKbps = Double(rateBytes) * 8 / elapsed / 1_000
+      rateBytes = 0
+      rateStart = now
+    }
+  }
+
+  func record(_ stats: CaptureMediaStats) {
+    lock.withLock {
+      state.timecode = stats.timecode
+      state.channels = max(0, stats.audioChannels)
+      state.packets &+= 1
+      state.samples &+= stats.audioSampleFrames
+      state.bytes &+= stats.audioBytes
+      rateBytes &+= stats.audioBytes
+      state.present = stats.audioPresent
+      state.peakLeft = max(0, min(1, stats.leftPeak))
+      state.peakRight = max(0, min(1, stats.rightPeak))
+      state.rmsLeft = max(0, min(1, stats.leftRMS))
+      state.rmsRight = max(0, min(1, stats.rightRMS))
+      // The native input is always enabled at 48 kHz (the DeckLink callback
+      // does not carry a sample-rate field). Use that fixed contract directly;
+      // inferring a rate from the previous packet hides missing packets because
+      // a gap makes the inferred rate fall in proportion to the gap.
+      if stats.audioPresent && stats.audioSampleFrames > 0 {
+        state.sampleRate = Int(EmbeddedAudioFormat.sampleRate)
+      }
+      let packetTime = stats.audioPacketTime
+      guard packetTime.isNumeric, stats.audioSampleFrames > 0 else { return }
+      if let prior = state.packetTime, prior.isNumeric {
+        let elapsed = CMTimeGetSeconds(CMTimeSubtract(packetTime, prior))
+        if elapsed > 0 {
+          let expected = Int((elapsed * EmbeddedAudioFormat.sampleRate).rounded())
+          if expected > Int(lastSampleFrames) { state.drops &+= UInt64(expected - Int(lastSampleFrames)) }
+        }
+      }
+      // Do not move the baseline backwards after a malformed/regressed packet;
+      // the next valid packet should still be compared with the last source
+      // clock position rather than silently masking the discontinuity.
+      if let prior = state.packetTime, CMTimeCompare(packetTime, prior) < 0 { return }
+      state.packetTime = packetTime
+      lastSampleFrames = stats.audioSampleFrames
+    }
+  }
 }
 
 private struct InputFormat: Equatable {
@@ -1267,12 +1600,14 @@ struct CaptureServices: @unchecked Sendable {
   // displayed input metadata always comes from received buffers and duration.
   var capturePixelFormat: OSType?
   var hostTime: () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) }
+  /// Frames the device reported dropped since capture started.
+  var deviceDroppedFrames: () -> UInt64 = { 0 }
   var cameraRetryInterval: TimeInterval = 2
 
   static func live(feedID: FeedID? = nil) -> CaptureServices {
     let backend = UltracamBackend()
     let sink = CameraSink(feedID: feedID)
-    return CaptureServices(
+    var services = CaptureServices(
       start: { id, fast, frame, event in
         try backend.start(deviceID: id, inputFast: fast, frameHandler: frame, eventHandler: event)
       },
@@ -1343,5 +1678,7 @@ struct CaptureServices: @unchecked Sendable {
               bytesPerSample: Int(bytesPerSample)))
           }, eventHandler: event)
       }, capturePixelFormat: kCVPixelFormatType_422YpCbCr10)
+    services.deviceDroppedFrames = { backend.deviceDroppedFrames }
+    return services
   }
 }

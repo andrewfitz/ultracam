@@ -17,6 +17,55 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly, copy) NSArray<UltracamMode *> *modes;
 @end
 
+// The installed Desktop Video driver, read once with IDeckLinkAPIInformation.
+// SDK 16 changed the interface IDs of IDeckLinkInput, IDeckLinkConfiguration,
+// IDeckLinkProfileAttributes, IDeckLinkStatus, IDeckLinkVideoBuffer and
+// IDeckLinkNotification, so an older driver lists no usable devices.
+@interface UltracamDriverInfo : NSObject
+@property(nonatomic, readonly) BOOL installed;
+@property(nonatomic, readonly) BOOL supported;
+// BMDDeckLinkAPIVersion: major << 24 | minor << 16 | sub << 8 | extra.
+@property(nonatomic, readonly) int64_t versionValue;
+@property(nonatomic, readonly, copy) NSString *version;
+// A user-facing explanation when the driver is missing or older than 16.0.
+@property(nonatomic, readonly, copy, nullable) NSString *message;
+@end
+
+// Read-only device facts and the live counters of the session that last used
+// the device. Values are cached; reading never calls into the driver.
+@interface UltracamDeviceDiagnostics : NSObject
+@property(nonatomic, readonly, copy) NSString *identifier;
+@property(nonatomic, readonly, copy) NSString *name;
+@property(nonatomic, readonly, copy) NSString *driverVersion;
+// BMDDeckLinkMaximumHDMIAudioChannels; 0 when the driver does not report it.
+@property(nonatomic, readonly) NSInteger maximumHDMIAudioChannels;
+// Channels Ultracam enables (stereo, 32-bit integer, 48 kHz).
+@property(nonatomic, readonly) NSInteger capturedAudioChannels;
+@property(nonatomic, readonly) BOOL supportsFormatDetection;
+@property(nonatomic, readonly) BOOL supportsHDRMetadata;
+@property(nonatomic, readonly) BOOL supportsColorspaceMetadata;
+@property(nonatomic, readonly) BOOL supportsHDMITimecode;
+@property(nonatomic, readonly) BOOL supportsHighFrameRateTimecode;
+@property(nonatomic, readonly) BOOL sessionActive;
+// Frames the device skipped, from gaps in the per-frame stream time.
+@property(nonatomic, readonly) uint64_t deviceDroppedFrames;
+// GetAvailableVideoFrameCount, polled about once a second.
+@property(nonatomic, readonly) uint32_t frameBacklog;
+@property(nonatomic, readonly) uint32_t maximumFrameBacklog;
+// IDeckLinkStatistics device temperature in °C, or NSNotFound.
+@property(nonatomic, readonly) NSInteger temperatureCelsius;
+// YES once the hardware reference clock is mapped onto the host clock.
+@property(nonatomic, readonly) BOOL hostTimeMapped;
+@property(nonatomic, readonly, copy, nullable) NSString *signal;
+@property(nonatomic, readonly, copy) NSString *hdmiDynamicRange;
+@end
+
+// Each captured CVPixelBuffer carries this attachment when the frame's
+// hardware reference timestamp could be mapped to the host clock: a CFNumber
+// (Float64) in CMClockGetHostTimeClock seconds, taken when the device finished
+// receiving the frame. Absent when the mapping is unavailable.
+FOUNDATION_EXPORT NSString *const UltracamCaptureHostTimeAttachmentKey;
+
 typedef void (^UltracamMediaStatsHandler)(NSString *_Nullable timecode, CMTime audioPacketTime,
   NSUInteger audioSampleFrames, NSUInteger audioChannels, float leftPeak, float rightPeak,
   float leftRMS, float rightRMS, NSUInteger audioBytes, BOOL audioPresent);
@@ -28,10 +77,10 @@ typedef void (^UltracamRawAudioHandler)(NSData *_Nullable samples, CMTime audioP
   NSUInteger audioSampleFrames, NSUInteger audioChannels, NSUInteger bytesPerSample);
 
 // Calls start/stop on one control queue. Frames execute on Blackmagic's
-// callback thread; events may also use the native control queue. Handlers must
-// return promptly: reject a frame while processing is
-// busy, then retain the CVPixelBuffer for any accepted asynchronous work. The
-// pixel buffer owns the underlying DeckLink frame until its final release.
+// callback thread; events may also use the native control queue or, for a
+// device removal, the discovery queue. Handlers must return promptly: retain
+// the CVPixelBuffer for asynchronous work. The pixel buffer owns the
+// underlying DeckLink frame until its final release.
 // Never call stop() synchronously from a handler (it waits for callbacks).
 @interface UltracamBackend : NSObject
 + (nullable NSArray<UltracamDevice *> *)devicesWithError:(NSError *_Nullable *_Nullable)error
@@ -91,10 +140,27 @@ typedef void (^UltracamRawAudioHandler)(NSData *_Nullable samples, CMTime audioP
                        error:(NSError *_Nullable *_Nullable)error
   NS_SWIFT_NAME(startAuto(deviceID:frameHandler:eventHandler:));
 - (void)stop;
+
++ (UltracamDriverInfo *)driverInfo;
+// Hot-plug discovery (IDeckLinkDiscovery). Installs device notifications on
+// first use. The handler runs on the main queue with the complete device list
+// after every arrival or removal, and once soon after registering.
++ (id)addDeviceListObserver:(void (NS_SWIFT_UI_ACTOR ^)(NSArray<UltracamDevice *> *devices))handler
+  NS_SWIFT_NAME(addDeviceListObserver(_:));
++ (void)removeDeviceListObserver:(id)token;
++ (nullable UltracamDeviceDiagnostics *)diagnosticsForDeviceID:(NSString *)deviceID
+  NS_SWIFT_NAME(diagnostics(deviceID:));
+
+// Live session counters; safe to read from any thread.
+@property(nonatomic, readonly) uint64_t deviceDroppedFrames;
+@property(nonatomic, readonly) uint32_t availableFrameBacklog;
+@property(nonatomic, readonly) uint32_t maximumFrameBacklog;
 @end
 
 #if defined(ULTRACAM_BACKEND_TESTING)
 // Synthetic SDK callbacks only; never opens hardware or saves video.
+FOUNDATION_EXPORT BOOL UltracamRunSDK16SyntheticChecks(NSError *_Nullable *_Nullable error);
+FOUNDATION_EXPORT BOOL UltracamRunDiscoverySyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunSyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunOwnershipSyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunAutoSyntheticChecks(NSError *_Nullable *_Nullable error);

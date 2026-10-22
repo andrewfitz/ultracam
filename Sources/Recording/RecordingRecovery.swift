@@ -167,7 +167,9 @@ enum RecordingRecovery {
     let staging = take.temporaryURL.appendingPathExtension("export.ultracam-recovery")
     defer { try? fm.removeItem(at: staging) }
     try await exporter.export(to: staging, as: .mov)
-    let recoveredAsset = AVURLAsset(url: staging)
+    // The staging name has no movie extension, so state the container type,
+    // as for the source; otherwise AVFoundation cannot open the export.
+    let recoveredAsset = AVURLAsset(url: staging, options: [AVURLAssetOverrideMIMETypeKey: "video/quicktime"])
     let recoveredTracks = try await recoveredAsset.loadTracks(withMediaType: .video)
     let recoveredDuration = try await recoveredAsset.load(.duration)
     guard !recoveredTracks.isEmpty, recoveredDuration.isNumeric, recoveredDuration.seconds > 0 else {

@@ -28,7 +28,7 @@ fi
 test_root="$build_root/$run_id"
 mkdir -p "$test_root/modules" "$test_root/tmp"
 export TMPDIR="$test_root/tmp"
-export MACOSX_DEPLOYMENT_TARGET=15.0
+export MACOSX_DEPLOYMENT_TARGET=26.0
 export ULTRACAM_SHADER="$task_root/Sources/App/LUTShaders.metal"
 source "$task_root/scripts/monitor-tools-package.sh"
 monitor_package_build > "$test_root/package-build.log" 2>&1 || {
@@ -55,7 +55,7 @@ while IFS= read -r source_file; do
 done < <(find "$task_root/Sources/App" -maxdepth 1 -name '*.swift' | sort)
 # Unoptimized: the checks don't need optimized code, and -O doubles the compile.
 xcrun swiftc -Onone -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D UI_VERIFY \
-  -target arm64-apple-macos15.0 \
+  -target arm64-apple-macos26.0 \
   -module-cache-path "$test_root/modules" "${monitor_link_args[@]}" \
   -Xcc -DULTRACAM_BACKEND_TESTING \
   -import-objc-header "$task_root/Sources/DeckLinkBackend/BridgingHeader.h" \

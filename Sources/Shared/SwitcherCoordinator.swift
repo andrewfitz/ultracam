@@ -25,6 +25,30 @@ struct ProgramOutput<SourceID: Hashable> {
   }
 
   var selectedSource: SourceID? { scheduler.selectedSource }
+  var isOnAir: Bool { scheduler.isOnAir }
+  func readiness(of sourceID: SourceID) -> ProgramSourceReadiness { scheduler.readiness(of: sourceID) }
+
+  mutating func takeAbandonedCut() -> (SourceID, ProgramCutAbandonReason)? {
+    scheduler.takeAbandonedCut()
+  }
+
+  @discardableResult
+  mutating func expirePendingCutIfNeeded() -> Bool { scheduler.expirePendingCutIfNeeded() }
+
+  mutating func select(_ sourceID: SourceID) { scheduler.select(sourceID) }
+
+  mutating func markSourcesIdle() { scheduler.markSourcesIdle() }
+
+  mutating func setClock(_ clock: @escaping () -> TimeInterval) { scheduler.setClock(clock) }
+
+  var pendingCutTimeout: TimeInterval {
+    get { scheduler.pendingCutTimeout }
+    set { scheduler.pendingCutTimeout = newValue }
+  }
+  var startingCutTimeout: TimeInterval {
+    get { scheduler.startingCutTimeout }
+    set { scheduler.startingCutTimeout = newValue }
+  }
   var pendingCut: SourceID? { scheduler.pendingCut }
   var pendingCutTime: CMTime? { scheduler.pendingCutTime }
   var hasPendingCut: Bool { scheduler.hasPendingCut }
@@ -67,8 +91,12 @@ struct ProgramOutput<SourceID: Hashable> {
   }
 
   mutating func reset(selectedSource: SourceID? = nil) {
+    let timeout = scheduler.pendingCutTimeout
+    let startingTimeout = scheduler.startingCutTimeout
     scheduler = ProgramCutScheduler(selectedSource: selectedSource,
       programTimescale: scheduler.mapper.programTimescale)
+    scheduler.pendingCutTimeout = timeout
+    scheduler.startingCutTimeout = startingTimeout
   }
 
   mutating func carryTimeline(from previous: ProgramOutput<SourceID>) {
@@ -94,6 +122,9 @@ struct SwitcherCoordinator {
   private var automaticRequestPending = false
   private var anchorFeedID: FeedID?
   private var emphasisFeedID: FeedID?
+  /// The most recent cut dropped without landing, kept until the route
+  /// reports it. The scheduler reports each one once.
+  private var abandonedCut: (FeedID, ProgramCutAbandonReason)?
 
   init(settings: SwitcherSettings = .init(), feedIDs: [FeedID] = [],
     anchorFeedID: FeedID? = nil, emphasisFeedID: FeedID? = nil,
@@ -136,20 +167,62 @@ struct SwitcherCoordinator {
   var pendingCutTime: CMTime? { programOutput.pendingCutTime }
   var hasPendingCut: Bool { programOutput.hasPendingCut }
   var pendingDirectorCut: CutDecision? { pendingDirectorDecision }
+  var isOnAir: Bool { programOutput.isOnAir }
+  var isAutomaticRequestPending: Bool { automaticRequestPending }
+  func readiness(of feedID: FeedID) -> ProgramSourceReadiness { programOutput.readiness(of: feedID) }
+
+  /// Returns, once, the cut most recently dropped without landing (expired,
+  /// cancelled by health, or a target that failed to start).
+  mutating func takeAbandonedCut() -> (FeedID, ProgramCutAbandonReason)? {
+    defer { abandonedCut = nil }
+    return abandonedCut
+  }
+
+  /// Test hook for the pending-cut expiry clock. `startingTimeout` bounds
+  /// the wait for a target that has not sent its first frame.
+  mutating func setPendingCutClock(_ clock: @escaping () -> TimeInterval, timeout: TimeInterval,
+                                   startingTimeout: TimeInterval? = nil) {
+    programOutput.setClock(clock)
+    programOutput.pendingCutTimeout = timeout
+    if let startingTimeout { programOutput.startingCutTimeout = startingTimeout }
+  }
+
+  /// Keeps the automatic latch and the director decision in step with the
+  /// scheduler. Any pending cut that disappears without landing (expiry,
+  /// health, cancel) must release `automaticRequestPending`; otherwise the
+  /// fixed-interval policy stays idle forever (PROG-2).
+  private mutating func reconcilePendingState() {
+    if let (target, reason) = programOutput.takeAbandonedCut() {
+      abandonedCut = (target, reason)
+      if pendingDirectorDecision?.targetCameraID == target.rawValue {
+        pendingDirectorDecision = nil
+      }
+    }
+    if !programOutput.hasPendingCut { automaticRequestPending = false }
+  }
+
+  /// Changes the selection without a cut, for when nothing is on air. The
+  /// saved and on-air selection stay the same value.
+  mutating func selectImmediately(_ feedID: FeedID) -> ProgramCutRequestResult<FeedID> {
+    guard feedIDs.contains(feedID) else { return .rejectedMissingSource }
+    programOutput.select(feedID)
+    selectedFeedID = feedID
+    settings.selectedFeedID = feedID
+    automaticRequestPending = false
+    pendingDirectorDecision = nil
+    return .selectedImmediately
+  }
+
+  /// Producing sources return to starting; nothing is on air until a frame.
+  mutating func markSourcesIdle() { programOutput.markSourcesIdle() }
 
   mutating func setFeedHealth(_ feedID: FeedID, healthy: Bool) {
     guard feedIDs.contains(feedID) else { return }
     feedHealth[feedID] = healthy
-    let wasPendingTarget = programOutput.pendingCut == feedID
     programOutput.setSourceHealth(feedID, healthy: healthy)
     // Health can drop the pending cut inside the scheduler. The automatic
     // latch has to drop with it, or later ticks stay idle forever.
-    if wasPendingTarget, !healthy {
-      automaticRequestPending = false
-      if pendingDirectorDecision?.targetCameraID == feedID.rawValue {
-        pendingDirectorDecision = nil
-      }
-    }
+    reconcilePendingState()
   }
 
   /// Copies the Program clock and remaining source health onto a coordinator
@@ -167,7 +240,12 @@ struct SwitcherCoordinator {
     setFeedHealth(feedID, healthy: healthy)
   }
 
+  /// Updates policy. The selection is not a setting: it changes only when a
+  /// cut lands (or by `selectImmediately` when nothing is on air), so the saved
+  /// selection always names the source on air.
   mutating func updateSettings(_ settings: SwitcherSettings) {
+    var settings = settings
+    settings.selectedFeedID = selectedFeedID
     let changed = self.settings != settings
     self.settings = settings
     if changed {
@@ -181,6 +259,7 @@ struct SwitcherCoordinator {
     }
     fixedIntervalOrigin = nil
     automaticRequestPending = false
+    reconcilePendingState()
   }
 
   func isFeedHealthy(_ feedID: FeedID) -> Bool {
@@ -196,7 +275,9 @@ struct SwitcherCoordinator {
       return .rejectedMissingSource
     }
     automaticRequestPending = false
-    return programOutput.requestCut(to: feedID, noEarlierThan: at)
+    let result = programOutput.requestCut(to: feedID, noEarlierThan: at)
+    reconcilePendingState()
+    return result
   }
 
   @discardableResult
@@ -226,6 +307,10 @@ struct SwitcherCoordinator {
   mutating func evaluate(at mediaTime: CMTime) -> SwitcherEvaluation {
     guard let now = validSeconds(mediaTime) else { return .idle }
     guard settings.strategy != .dynamicAnalysis else { return .dynamicAnalysisUnavailable }
+    // Expire first: a cut that can no longer land must release the latch
+    // before the latch is consulted.
+    programOutput.expirePendingCutIfNeeded()
+    reconcilePendingState()
     guard settings.automatic, settings.strategy == .fixedInterval else { return .idle }
     guard !automaticRequestPending, !programOutput.hasPendingCut else { return .idle }
 
@@ -308,7 +393,7 @@ struct SwitcherCoordinator {
     case .queued, .coalesced:
       pendingDirectorDecision = decision
       return decision
-    case .ignoredSameSource, .rejectedMissingSource:
+    case .ignoredSameSource, .rejectedMissingSource, .selectedImmediately:
       return nil
     }
   }
@@ -328,6 +413,7 @@ struct SwitcherCoordinator {
       settings.selectedFeedID = mapped.sourceID
       automaticRequestPending = false
     }
+    reconcilePendingState()
     return decision
   }
 
@@ -388,6 +474,8 @@ struct SwitcherCoordinator {
     for (feedID, healthy) in feedHealth {
       programOutput.setSourceHealth(feedID, healthy: healthy)
     }
+    abandonedCut = nil
+    _ = programOutput.takeAbandonedCut()
     director.reset()
     pendingDirectorDecision = nil
     fixedIntervalOrigin = nil
@@ -398,6 +486,11 @@ struct SwitcherCoordinator {
     programOutput.cancelPendingCut()
     pendingDirectorDecision = nil
     automaticRequestPending = false
+  }
+
+  mutating func expirePendingCutIfNeeded() {
+    programOutput.expirePendingCutIfNeeded()
+    reconcilePendingState()
   }
 
   private func nextHealthyFeed(after feedID: FeedID?) -> FeedID? {

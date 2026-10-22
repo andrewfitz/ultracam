@@ -19,7 +19,6 @@ final class SourceInterpretationGuardTests: XCTestCase {
     }
   }
 
-  private final class Box:@unchecked Sendable { var result:Result<MonitorDisplayResult,Error>? }
   private func assertRejected(mode:MonitorFalseColorMode,focus:Bool,geometry:MonitorGeometry?,mapping:MonitorCorrespondence) throws {
     guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
     let source=try image(value:105),output=try image(value:17)
@@ -27,20 +26,20 @@ final class SourceInterpretationGuardTests: XCTestCase {
     config.sourceProfileID="sony-slog3-sgamut3cine";config.falseColor.mode=mode;config.focus.enabled=focus
     config.falseColor.profileID=mode == .sonySLog3 ? SonySLog3FalseColor.profileID : ELZoneProfile.profileID
     let runtime=MonitorRuntime(),target=MonitorTargetID(UUID().uuidString)
-    runtime.configure(target:target,generation:1,configurationRevision:1,configuration:config)
-    defer { runtime.remove(target:target) }
     let stamp=MonitorFrameStamp(target:target,generation:1,sequence:1,sourcePTS:1,hostTime:1,configurationRevision:1)
-    let done=expectation(description:"invalid source interpretation rejected"),box=Box()
-    XCTAssertTrue(runtime.offer(MonitorFrameBundle(stamp:stamp,source:source,output:output,
+    let display=try runtime.renderSnapshot(MonitorFrameBundle(stamp:stamp,source:source,output:output,
       sourceGeometry:geometry,correspondence:mapping,
       sourceSignal:MonitorFrameSignal(range:.full,matrix:.bt709,transfer:"S-Log3",profileID:config.sourceProfileID),
-      outputSignal:MonitorFrameSignal(range:.full,matrix:.bt709,transfer:"Rec709"))) { result in box.result=result;done.fulfill() })
-    wait(for:[done],timeout:10)
-    let display=try XCTUnwrap(box.result).get()
+      outputSignal:MonitorFrameSignal(range:.full,matrix:.bt709,transfer:"Rec709")),configuration:config.normalized())
     XCTAssertTrue(display.availability.contains { $0.contains("False color unavailable") },"\(display.availability),\(mapping)")
     if focus { XCTAssertTrue(display.availability.contains { $0.contains("Focus unavailable") },"\(display.availability)") }
-    try assertGray(display.clean.pixelBuffer)
-    try assertGray(XCTUnwrap(display.decorated,"Valid Rec709 picture composition remains available").pixelBuffer)
+    // The valid Rec709 output picture is still drawn, without any rejected tool.
+    let clean=try runtime.renderSnapshot(MonitorFrameBundle(stamp:stamp,source:source,output:output,
+      sourceGeometry:geometry,correspondence:mapping,
+      sourceSignal:MonitorFrameSignal(range:.full,matrix:.bt709,transfer:"S-Log3",profileID:config.sourceProfileID),
+      outputSignal:MonitorFrameSignal(range:.full,matrix:.bt709,transfer:"Rec709")),configuration:config.normalized(),clean:true)
+    assertGray(clean.pictureBytes)
+    assertGray(display.pictureBytes)
   }
 
   private func image(value:UInt8) throws -> CVPixelBuffer {
@@ -53,9 +52,7 @@ final class SourceInterpretationGuardTests: XCTestCase {
     for y in 0..<32 { for x in 0..<32 { let i=y*stride+x*4;base[i]=value;base[i+1]=value;base[i+2]=value;base[i+3]=255 }}
     return buffer
   }
-  private func assertGray(_ buffer:CVPixelBuffer,file:StaticString=#filePath,line:UInt=#line) throws {
-    CVPixelBufferLockBaseAddress(buffer,.readOnly);defer { CVPixelBufferUnlockBaseAddress(buffer,.readOnly) }
-    let bytes=try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to:UInt8.self)
+  private func assertGray(_ bytes:[UInt8],file:StaticString=#filePath,line:UInt=#line) {
     for channel in 0..<3 { XCTAssertEqual(bytes[channel],17,file:file,line:line) }
   }
 }

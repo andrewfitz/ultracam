@@ -260,9 +260,9 @@ struct UIStatusPopover: View {
       Text(segment.text)
       if context.session.programFormatMismatch {
         Label {
-          Text("Program cameras use different formats. Each cut updates the output briefly.")
+          Text("Program cameras use different formats. The GPU converts each to the Program camera's format, so cuts don't interrupt the output.")
         } icon: {
-          Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+          Image(systemName: "arrow.triangle.2.circlepath")
         }
         .font(.subheadline)
         .fixedSize(horizontal: false, vertical: true)

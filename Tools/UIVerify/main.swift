@@ -1,12 +1,27 @@
 import AppKit
 import MonitorToolsCore
 import SwiftUI
+import SystemExtensions
 
 // Offscreen verification of the new interface. See README.md.
 
 @MainActor private final class CapturingRegistryPublisher: AppVirtualCameraRegistryPublishing {
   private(set) var snapshots: [VirtualCameraRegistrySnapshot] = []
   func publish(_ snapshot: VirtualCameraRegistrySnapshot) { snapshots.append(snapshot) }
+}
+
+/// Camera extension requests that are recorded and never submitted to macOS.
+@MainActor private final class RecordingInstallerServices {
+  private(set) var submitted: [OSSystemExtensionRequest] = []
+  func services() -> ExtensionInstaller.Services {
+    ExtensionInstaller.Services(preflight: { ExtensionInstallPreflight(developerSigned: true, hasInstallEntitlement: true) },
+      makeRequest: { change in
+        switch change {
+        case .install: return .activationRequest(forExtensionWithIdentifier: VideoContract.extensionID, queue: .main)
+        case .remove: return .deactivationRequest(forExtensionWithIdentifier: VideoContract.extensionID, queue: .main)
+        }
+      }, submit: { self.submitted.append($0) })
+  }
 }
 
 @MainActor private struct UIVerify {
@@ -301,6 +316,32 @@ import SwiftUI
     }
     pressInStrip(two, "Collapse Camera 2", expect: .toggleCollapsed(cameraID: two.id))
 
+    // The ⋯ menu shows ⌃1 beside Cut to Camera 1 as a label only: the Program menu owns the key.
+    do {
+      func isCut(_ action: UIAction) -> Bool { if case .cut = action { return true }; return false }
+      // A shortcut in the window must be caught here, or the check below proves nothing.
+      let control = HostedView(Button("Cut") { log.append(.cut(cameraID: one.id)) }.keyboardShortcut("1", modifiers: .control),
+        size: CGSize(width: 120, height: 40), dark: false)
+      log.clear()
+      Keys.performKeyEquivalent("1", keyCode: 18, modifiers: .control, in: control.window)
+      control.settle()
+      verifier.check("a ⌃1 shortcut in a window is caught", log.actions.contains(where: isCut), "\(log.actions)")
+      control.close()
+      let hosted = HostedView(UIChannelStripView(camera: one, context: context), size: CGSize(width: 560, height: 230), dark: false)
+      log.clear()
+      Keys.performKeyEquivalent("1", keyCode: 18, modifiers: .control, in: hosted.window)
+      hosted.settle()
+      verifier.check("strip ⋯ menu has no ⌃1 handler", !log.actions.contains(where: isCut), "\(log.actions)")
+      let items = Menus.items(in: hosted.host, containing: "Cut to \(one.name)")
+      let cut = items.first { $0.title == "Cut to \(one.name)" }
+      verifier.check("strip ⋯ menu labels Cut to \(one.name) ⌃1 without a shortcut",
+        cut?.badge?.stringValue == "⌃1" && cut?.keyEquivalent.isEmpty == true,
+        cut.map { "badge \($0.badge?.stringValue ?? "none"), key \($0.keyEquivalent.debugDescription)" } ?? "no item", viewDependent: true)
+      verifier.check("strip ⋯ menu registers no shortcuts", !items.isEmpty && items.allSatisfy { $0.keyEquivalent.isEmpty },
+        items.filter { !$0.keyEquivalent.isEmpty }.map(\.title).joined(separator: ", "), viewDependent: true)
+      hosted.close()
+    }
+
     // Toolbar controls (rendered standalone; the window toolbar hosts the same views).
     func pressIn<V: View>(_ name: String, _ view: V, _ label: String, expect: UIAction) {
       let hosted = HostedView(view, size: CGSize(width: 520, height: 60), dark: false)
@@ -349,8 +390,10 @@ import SwiftUI
       FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "ui-verify-device-a", applyLUT: false, automaticFeed: false),
       FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "ui-verify-device-b", applyLUT: false, automaticFeed: false),
     ], selectedFeedID: alpha, outputMode: .separateCameras))
+    let installerServices = RecordingInstallerServices()
     let model = AppModel(settingsStore: settings, registryStore: VirtualCameraRegistryStore(defaults: defaults),
-      registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults))
+      registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      installer: ExtensionInstaller(services: installerServices.services()), hardware: .offline)
     let interface = UIInterfaceState(defaults: defaults)
     interface.alertsDisabled = true
     let bridge = UISessionBridge(model: model, interface: interface)
@@ -418,6 +461,54 @@ import SwiftUI
     verifier.check("bridge: stop on stopped cameras is a no-op", !model.running && !model.isCameraRunning(beta))
     bridge.send(.stopCamera(cameraID: beta.rawValue))
     verifier.check("bridge: no confirmation for an idle camera", interface.confirmation == nil)
+
+    // A Start that can't start says why, on any camera. The device list is the real
+    // one (the selected camera adopts the first real input), so both cameras are
+    // pointed at inputs that don't exist first: nothing here may open hardware.
+    bridge.perform(.setInput(cameraID: alpha.rawValue, deviceID: "ui-verify-device-a"))
+    bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: "ui-verify-device-b"))
+    let missingInputs = model.selectedDevice == "ui-verify-device-a" && model.descriptor(for: beta)?.selectedDevice == "ui-verify-device-b"
+      && !model.devices.contains { $0.id.hasPrefix("ui-verify-device-") }
+    verifier.check("bridge: cameras point at missing inputs", missingInputs, model.selectedDevice)
+    if missingInputs {
+      bridge.perform(.startCamera(cameraID: beta.rawValue))
+      let refused = bridge.snapshot().cameras[1]
+      verifier.check("bridge: a refused Start says why", !model.isCameraRunning(beta) && refused.automaticStartFailed
+        && refused.automaticStatus?.isEmpty == false && model.selectedFeedID == alpha, refused.automaticStatus ?? "no status")
+      bridge.perform(.startCamera(cameraID: alpha.rawValue))
+      let refusedSelected = bridge.snapshot().cameras[0]
+      verifier.check("bridge: a refused Start on the selected camera says why", !model.running && refusedSelected.automaticStartFailed
+        && refusedSelected.automaticStatus?.isEmpty == false, refusedSelected.automaticStatus ?? "no status")
+      verifier.check("bridge: a refused Start shows in the status bar",
+        UIPresentationBuilder.warning(bridge.snapshot())?.contains("couldn't start") == true, UIPresentationBuilder.warning(bridge.snapshot()) ?? "none")
+      bridge.perform(.stopCamera(cameraID: beta.rawValue))
+      bridge.perform(.stopCamera(cameraID: alpha.rawValue))
+      verifier.check("bridge: Stop clears a refused Start", bridge.snapshot().cameras.allSatisfy { !$0.automaticStartFailed })
+
+      // LUT loads are per camera: one camera's load neither blocks nor cancels another's.
+      model.updateCamera(beta) { $0.lutBookmark = Data([1, 2, 3]) }
+      bridge.perform(.select(cameraID: beta.rawValue))
+      verifier.check("bridge: selecting a camera restores its LUT", model.loading)
+      bridge.perform(.startCamera(cameraID: beta.rawValue))
+      verifier.check("bridge: Start while the LUT loads says so",
+        bridge.snapshot().cameras[1].automaticStatus?.contains("LUT") == true, bridge.snapshot().cameras[1].automaticStatus ?? "no status")
+      let missingCube = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-missing-\(UUID().uuidString).cube")
+      model.loadLUT(url: missingCube, feedID: alpha)
+      let lutDeadline = Date().addingTimeInterval(5)
+      // Both loads fail (a bogus bookmark, a missing file); wait for both.
+      while (model.lutError == nil || !model.canEditFeedTopology) && Date() < lutDeadline { MainLoop.run(seconds: 0.01) }
+      verifier.check("bridge: another camera's LUT load doesn't drop the selected camera's restore",
+        model.lutError?.contains("Saved LUT could not be restored") == true && model.canEditFeedTopology, model.lutError ?? "no error")
+      // A failed restore keeps the bookmark, so selecting the camera again restores it again.
+      bridge.perform(.select(cameraID: alpha.rawValue))
+      bridge.perform(.select(cameraID: beta.rawValue))
+      bridge.perform(.select(cameraID: alpha.rawValue))
+      verifier.check("bridge: a camera without a LUT isn't blocked by another camera's load",
+        !model.loading && !bridge.snapshot().cameras[0].lutLoading)
+      // Forgetting the LUT also drops its restore still in flight.
+      bridge.perform(.forgetLUT(cameraID: beta.rawValue))
+      bridge.perform(.stopCamera(cameraID: beta.rawValue))
+    }
 
     // Topology while idle.
     bridge.perform(.setOutputMode(.program))
@@ -489,6 +580,46 @@ import SwiftUI
       verifier.check("bridge: add camera for default density", false, "\(model.feedDescriptors.count)")
     }
     defaults.removeObject(forKey: "ui.collapsed.default")
+
+    // The sidebar's camera banner follows the installer: two failed removals, then an
+    // install, leave no "Requesting … removal…" behind. List rows aren't exposed to
+    // accessibility offscreen, so this reads what the sidebar's body reads, and checks
+    // that each change notifies Observation, which is what redraws the sidebar.
+    do {
+      let live = UISessionBridge.live(model: model, interface: interface).context()
+      final class Flag: @unchecked Sendable { var raised = false }
+      func banner(after step: () -> Void) -> (state: UIExtensionBanner?, observed: Bool) {
+        let flag = Flag()
+        withObservationTracking { _ = live.current.session.install } onChange: { flag.raised = true }
+        step()
+        // Delegate callbacks finish on the main actor.
+        let deadline = Date().addingTimeInterval(1)
+        while !flag.raised && Date() < deadline { MainLoop.run(seconds: 0.01) }
+        MainLoop.run(seconds: 0.02)
+        return (UIExtensionBanner.state(live.current.session.install), flag.raised)
+      }
+      func isPending(_ state: UIExtensionBanner?) -> Bool { if case .pending = state { return true }; return false }
+      for code in [13, 4] {
+        let requested = banner { model.installer.uninstall() }
+        var removalText = false
+        if case .pending(let text)? = requested.state { removalText = text.contains("Requesting camera extension removal") }
+        verifier.check("sidebar shows the removal request", removalText && requested.observed, "\(String(describing: requested.state))")
+        let failed = banner {
+          if let removal = installerServices.submitted.last {
+            model.installer.request(removal, didFailWithError: NSError(domain: OSSystemExtensionErrorDomain, code: code))
+          }
+        }
+        verifier.check("sidebar drops the removal request after error \(code)", !isPending(failed.state) && failed.observed
+          && !model.installer.status.contains("Requesting"), "\(String(describing: failed.state)) · \(model.installer.status)")
+      }
+      _ = banner { model.installer.install() }
+      let installed = banner {
+        if let activation = installerServices.submitted.last { model.installer.request(activation, didFinishWithResult: .completed) }
+      }
+      verifier.check("sidebar shows no request after the install completes", !isPending(installed.state) && installed.observed
+        && !model.installer.status.contains("removal"), "\(String(describing: installed.state)) · \(model.installer.status)")
+      verifier.check("installer requests stay in the verifier", installerServices.submitted.count == 3, "\(installerServices.submitted.count)")
+    }
 
     // Settings and Diagnostics with the real model.
     render("settings-general", UISettingsGeneralPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }

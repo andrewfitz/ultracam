@@ -4,52 +4,34 @@ import SwiftUI
 public struct MonitorDiagnosticsView: View {
   public let snapshot: MonitorDiagnostics
   public let surfaceScopeTiming: String
-  public let presentationEstimate: String
-  public init(
-    snapshot: MonitorDiagnostics, surfaceScopeTiming: String, presentationEstimate: String
-  ) {
+  public init(snapshot: MonitorDiagnostics, surfaceScopeTiming: String) {
     self.snapshot = snapshot
     self.surfaceScopeTiming = surfaceScopeTiming
-    self.presentationEstimate = presentationEstimate
   }
   public var body: some View {
     DisclosureGroup("Monitoring diagnostics") {
       VStack(alignment: .leading, spacing: 3) {
-        Text("Shared target live rates")
         Text(
-          "Picture cap \(rate(snapshot.requestedPictureHz)) Hz · source offers \(rate(snapshot.offeredFPS)) fps · delivered \(rate(snapshot.pictureFPS)) fps"
+          "Camera \(rate(snapshot.requestedPictureHz)) Hz · offered \(rate(snapshot.offeredFPS)) fps · presented \(rate(snapshot.pictureFPS)) fps"
         )
         Text(
-          "Scopes requested \(snapshot.requestedScopeHz) Hz · effective cap \(snapshot.effectiveQuality.scopeRefreshHz) Hz · delivered \(rate(snapshot.scopeFPS)) fps"
+          "Scopes requested \(snapshot.requestedScopeHz) Hz · drawn \(rate(snapshot.scopeFPS)) fps · every pixel"
         )
         Text(
-          "\(snapshot.effectiveQuality.label) · picture ≤\(snapshot.effectiveQuality.pictureHeightLimit)p · scope sample stride \(snapshot.effectiveQuality.scopeSamplingStride)"
+          "Scopes skipped: GPU busy \(snapshot.scopeSkippedBusy) · no drawable \(snapshot.scopeSkippedNoDrawable)"
         )
+        Text("GPU per picture \(milliseconds(snapshot.gpuMilliseconds)) · per scope \(milliseconds(snapshot.scopeGPUMilliseconds))")
         Text(availability)
         Text(
-          "Offers \(snapshot.offeredFrames) · admitted \(snapshot.admittedFrames) · skipped \(snapshot.skippedFrames) · rejected \(snapshot.rejectedResults)"
+          "Offered \(snapshot.offeredFrames) · presented \(snapshot.presentedFrames) · replaced before a refresh \(snapshot.supersededFrames) · failures \(snapshot.failures)"
         )
-        Text(
-          "Shared monitor budget: \(bytes(snapshot.retainedBytes)) retained, \(bytes(snapshot.retiredBytes)) retiring"
-        )
-        Text("Picture age deadline (250 ms): \(deadline)")
         Text("This surface: \(surfaceScopeTiming)")
-        if !presentationEstimate.isEmpty {
-          Text(presentationEstimate + " (estimate; existing native baseline excluded)")
-        }
       }.frame(maxWidth: .infinity, alignment: .leading).padding(.top, 3)
     }.font(.caption2).foregroundStyle(.secondary)
   }
   private func rate(_ value: Double) -> String { String(format: "%.1f", value) }
-  private func bytes(_ value: Int) -> String {
-    String(format: "%.1f MiB", Double(value) / 1_048_576)
-  }
-  var deadline: String {
-    switch snapshot.softDeadlineStatus {
-    case .unavailable: return "unavailable"
-    case .withinDeadline: return "within limit"
-    case .exceeded: return "exceeded; last delivered picture is older than limit"
-    }
+  private func milliseconds(_ value: Double?) -> String {
+    value.map { String(format: "%.2f ms", $0) } ?? "—"
   }
   private var availability: String {
     switch snapshot.availability {

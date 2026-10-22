@@ -72,16 +72,25 @@ struct ExtensionInstallPreflight: Sendable {
   }
 }
 
+/// The request in flight, readable from the delegate's nonisolated callbacks.
+/// Requests are compared by reference, not by address: a request that has
+/// finished can be freed, and a newer one allocated at the same address.
 private final class ExtensionRequestIdentity: @unchecked Sendable {
   private let lock = NSLock()
-  private var current: (request: ObjectIdentifier, token: UUID)?
+  private var current: (request: OSSystemExtensionRequest, token: UUID)?
 
-  func set(_ request: ObjectIdentifier) { lock.withLock { current = (request, UUID()) } }
+  func set(_ request: OSSystemExtensionRequest) { lock.withLock { current = (request, UUID()) } }
   func clear() { lock.withLock { current = nil } }
-  func token(for request: ObjectIdentifier) -> UUID? {
-    lock.withLock { current?.request == request ? current?.token : nil }
+  func token(for request: OSSystemExtensionRequest) -> UUID? {
+    lock.withLock { current?.request === request ? current?.token : nil }
   }
   func matches(_ token: UUID) -> Bool { lock.withLock { current?.token == token } }
+}
+
+/// Carries a callback's request to the main actor. Holding it there keeps it
+/// alive, so it can't share an address with a newer request when compared.
+private struct ExtensionRequestReference: @unchecked Sendable {
+  let request: OSSystemExtensionRequest
 }
 
 @MainActor @Observable
@@ -136,7 +145,7 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     let request = services.makeRequest(change)
     activeRequest = request
     activeChange = change
-    requestIdentity.set(ObjectIdentifier(request))
+    requestIdentity.set(request)
     pending = true
     let scope = preflight.localDevelopmentBuild ? "local development camera extension" : "camera extension"
     status = change == .install ? "Requesting \(scope) activation…" : "Requesting \(scope) removal…"
@@ -144,17 +153,13 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     services.submit(request)
   }
 
-  /// True when this callback belongs to the request that is still in flight.
-  /// A missing token still matches the active request object. A token that no
-  /// longer matches does not finish a newer request.
-  /// Takes the request's identifier: the request object itself is not Sendable.
-  private func isCurrentRequest(_ request: ObjectIdentifier) -> Bool {
-    if activeRequest.map({ ObjectIdentifier($0) == request }) == true { return true }
-    guard let token = requestIdentity.token(for: request) else { return false }
-    return requestIdentity.matches(token)
+  /// True when this callback belongs to the request that is still in flight,
+  /// even if its identity token was lost. An older request never matches.
+  private func isCurrentRequest(_ request: OSSystemExtensionRequest) -> Bool {
+    activeRequest === request
   }
 
-  private func finish(_ request: ObjectIdentifier, message: String) {
+  private func finish(_ request: OSSystemExtensionRequest, message: String) {
     guard isCurrentRequest(request) else { return }
     requestIdentity.clear()
     activeRequest?.delegate = nil
@@ -169,7 +174,7 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   func testingForgetRequestToken() { requestIdentity.clear() }
 
   nonisolated func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
-    guard let identity = requestIdentity.token(for: ObjectIdentifier(request)) else { return }
+    guard let identity = requestIdentity.token(for: request) else { return }
     Task { @MainActor in
       guard self.requestIdentity.matches(identity) else { return }
       self.status = "Approve Ultracam in System Settings › General › Login Items & Extensions › Camera Extensions."
@@ -178,11 +183,11 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
 
   nonisolated func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {
     let completed = result == .completed
-    let request = ObjectIdentifier(request)
+    let reference = ExtensionRequestReference(request: request)
     Task { @MainActor in
-      guard self.isCurrentRequest(request) else { return }
+      guard self.isCurrentRequest(reference.request) else { return }
       let removed = self.activeChange == .remove
-      self.finish(request, message: completed ? (removed ? "Camera extension removed." :
+      self.finish(reference.request, message: completed ? (removed ? "Camera extension removed." :
         "Camera extension request completed. Refresh inputs, then choose Ultracam in your meeting app.") :
         "Camera extension change requires a restart.")
     }
@@ -190,15 +195,15 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
 
   nonisolated func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
     let description = error.localizedDescription
-    let request = ObjectIdentifier(request)
+    let reference = ExtensionRequestReference(request: request)
     Task { @MainActor in
-      self.finish(request, message: "Camera extension change failed: \(description). Capture and preview still work.")
+      self.finish(reference.request, message: "Camera extension change failed: \(description). Capture and preview still work.")
     }
   }
 
   nonisolated func request(_ request: OSSystemExtensionRequest,
     actionForReplacingExtension existing: OSSystemExtensionProperties,
     withExtension replacement: OSSystemExtensionProperties) -> OSSystemExtensionRequest.ReplacementAction {
-    requestIdentity.token(for: ObjectIdentifier(request)) != nil ? .replace : .cancel
+    requestIdentity.token(for: request) != nil ? .replace : .cancel
   }
 }

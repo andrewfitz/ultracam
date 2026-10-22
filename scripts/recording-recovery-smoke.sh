@@ -11,7 +11,7 @@ export TMPDIR="$external_root/tmp"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 smoke_root="$external_root/agent-work/build/ultracam/recording-recovery/$run_id"
 mkdir -p "$TMPDIR" "$smoke_root/modules"
-xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.0 \
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 \
   -module-cache-path "$smoke_root/modules" \
   "$task_root/Sources/Shared/VideoContract.swift" \
   "$task_root/Sources/Shared/VideoBufferLayout.swift" \

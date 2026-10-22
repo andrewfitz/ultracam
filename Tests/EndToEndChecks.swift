@@ -367,6 +367,13 @@ private final class CaptureHarness: @unchecked Sendable {
   }
 }
 
+private final class ProgramOrderLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var values = [Int]()
+  func record(sentBefore: Int) { lock.withLock { values.append(sentBefore) } }
+  var counts: [Int] { lock.withLock { values } }
+}
+
 private final class CaptureStatusRecorder: @unchecked Sendable {
   private let lock = NSLock()
   private var largestDropCount: UInt64 = 0
@@ -618,7 +625,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(update.audioDrops, 320)
   }
 
-  func testMediaAdmissionIsBoundedAndCountsDroppedAudioSamples() throws {
+  func testMediaStatsAreNeverQueuedBehindOrDroppedForBlockedVideo() throws {
     let entered = expectation(description: "Capture queue held inside native start")
     let gate = DispatchSemaphore(value: 0)
     let harness = CaptureHarness(startGate: gate, started: entered)
@@ -636,15 +643,19 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let packet = CaptureMediaStats(timecode: nil, audioPacketTime: .zero,
       audioSampleFrames: 160, audioChannels: 2, leftPeak: 0, rightPeak: 0,
       leftRMS: 0, rightRMS: 0, audioBytes: 640, audioPresent: true)
-    for _ in 0...VideoContract.captureAdmissionLimit { harness.emitMedia(packet) }
+    // Media statistics do not wait for the (held) capture queue. Contiguous
+    // packets while video is blocked are all counted and none is lost.
+    for index in 0..<40 {
+      var next = packet
+      next.audioPacketTime = CMTime(value: Int64(index * 160), timescale: EmbeddedAudioFormat.sampleRateTimescale)
+      harness.emitMedia(next)
+    }
     gate.signal()
     harness.emit(try EndToEndChecks.source(), frame: 0)
-    awaitCondition("Bounded media updates must drain with the capture queue") {
-      statuses.last?.audioPackets == UInt64(VideoContract.captureAdmissionLimit)
-    }
+    awaitCondition("Every media update must be counted") { statuses.last?.audioPackets == 40 }
     let update = try XCTUnwrap(statuses.last)
-    XCTAssertEqual(update.audioDrops, 160,
-      "The dropped metadata packet must contribute its missing sample count")
+    XCTAssertEqual(update.audioSamples, 40 * 160)
+    XCTAssertEqual(update.audioDrops, 0, "Blocked video must not cost audio statistics")
   }
 
   func testPreviewOffLeavesProcessedCameraOutputRunningAndCanReenable() throws {
@@ -932,7 +943,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertNil(statuses.last?.sourceDuration)
   }
 
-  func testTwelveFrameAdmissionLimitIsBoundedAndRecoversAfterBurst() throws {
+  func testEveryFrameOfABurstBehindAHeldQueueIsDelivered() throws {
     let entered = expectation(description: "Capture queue held inside native start")
     let gate = DispatchSemaphore(value: 0)
     let harness = CaptureHarness(startGate: gate, started: entered)
@@ -943,20 +954,26 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     controller.start(deviceID: "synthetic", configuration: config)
     wait(for: [entered], timeout: 5)
     let source = try EndToEndChecks.source()
-    for frame in 0..<13 { harness.emit(source, frame: frame) }
-    XCTAssertEqual(harness.sent, 0, "The held processing queue cannot consume the admission burst yet")
+    // Half a second of 59.94 video arrives while the capture queue is held.
+    // There is no admission limit: every frame is kept and processed.
+    let burst = 30
+    for frame in 0..<burst { harness.emit(source, frame: frame) }
+    XCTAssertEqual(harness.sent, 0, "The held processing queue cannot consume the burst yet")
+    Thread.sleep(forTimeInterval: 0.1)
     gate.signal()
-    awaitCondition("Exactly twelve admitted frames must drain") { harness.sent == 12 }
-    XCTAssertEqual(harness.previewed, 12)
-    awaitCondition("Overflow must be visible in status") { statuses.last?.captureDrops == 1 }
-    XCTAssertEqual(statuses.drops, 1)
+    awaitCondition("Every frame of the burst must be delivered") { harness.sent == burst }
+    XCTAssertEqual(harness.previewed, burst)
+    awaitCondition("The backlog must be visible in status") { (statuses.last?.maxCaptureBacklog ?? 0) >= burst }
+    XCTAssertEqual(statuses.drops, 0)
+    XCTAssertEqual(statuses.last?.captureDrops, 0)
     XCTAssertEqual(statuses.last?.poolDrops, 0)
     XCTAssertEqual(statuses.last?.cameraDrops, 0)
+    XCTAssertGreaterThan(statuses.last?.lateFrames ?? 0, 0, "Frames processed long after capture are counted late")
+    XCTAssertLessThanOrEqual(statuses.last?.maxFramesInFlight ?? .max, VideoContract.maxFramesInFlight)
     XCTAssertEqual(statuses.failures, [])
-    // Admission exhaustion is transient: a drained slot accepts a new frame.
-    harness.emit(source, frame: 13)
-    awaitCondition("Capture must resume after its bounded queue drains") { harness.sent == 13 }
-    XCTAssertEqual(harness.previewed, 13)
+    harness.emit(source, frame: burst)
+    awaitCondition("Capture continues after the burst") { harness.sent == burst + 1 }
+    XCTAssertEqual(harness.previewed, burst + 1)
     XCTAssertTrue(harness.cameraAndPreviewSamplesMatch)
     XCTAssertEqual(harness.starts, 1)
     XCTAssertTrue(harness.active)
@@ -1155,6 +1172,29 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(harness.stops, 1)
   }
 
+  /// Program is handed each frame after this camera's own preview and camera
+  /// send, and its handler can be replaced from another thread while frames
+  /// flow (it is stored under the controller's lock).
+  func testProgramHandlerRunsAfterCameraAndCanBeSwappedWhileFramesFlow() throws {
+    let harness = CaptureHarness()
+    let controller = CaptureController(services: harness.services())
+    defer { controller.onUpdate = nil; controller.onProcessedFrame = nil; controller.stop() }
+    ready(controller, harness: harness, configuration: config)
+    let order = ProgramOrderLog()
+    let install = { controller.onProcessedFrame = { _, _ in order.record(sentBefore: harness.sent) } }
+    install()
+    let swapping = DispatchGroup()
+    DispatchQueue.global(qos: .userInitiated).async(group: swapping) {
+      for _ in 0..<200 { install() }
+    }
+    let source = try EndToEndChecks.source()
+    var frame = 0
+    deliver(until: 12, using: harness, image: source, frame: &frame)
+    XCTAssertEqual(swapping.wait(timeout: .now() + 3), .success)
+    awaitCondition("Program receives every delivered frame") { order.counts.count == 12 }
+    XCTAssertEqual(order.counts, Array(1...12), "Each frame reached the camera before Program")
+  }
+
   func testConsumerDisconnectKeepsLocalPreviewRunning() throws {
     let harness = CaptureHarness(failSending: true)
     let controller = CaptureController(services: harness.services())
@@ -1215,7 +1255,8 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     awaitCondition("Failed camera send must leave the first preview running") { harness.previewed == 1 }
     awaitCondition("The rejected camera frame must be counted") { statuses.last?.cameraDrops == 1 }
     XCTAssertEqual(harness.sent, 0)
-    allowQueueWork(0.04)
+    // Reconnection runs on its own timer, off the frame path.
+    awaitCondition("Camera must reconnect after the bounded retry delay") { harness.negotiated.count == 2 }
     harness.emitAutomatic(source, at: VideoContract.fastDuration, duration: VideoContract.fastDuration)
     awaitCondition("Camera must recover after the bounded retry delay") { harness.sent == 1 }
     XCTAssertEqual(harness.negotiated.count, 2)

@@ -51,6 +51,7 @@ Artifacts go to `/Volumes/8TB/cinesomatic-director-work/agent-work/build/ultraca
 
 - `scripts/ui-verify.sh` skips the run when nothing it compiles has changed since its last passing run (a hash of the inputs is kept next to `latest`). `FORCE=1` reruns.
 - Views settle until layout stops changing, in 16 ms slices; the old fixed waits are only the upper limit.
+- A strict timer ends each slice on time (a process started from a background shell or agent gets coalesced timers, which stretched 16 ms to ~130 ms), and a closed window drops its content so it stops updating.
 - The verifier is compiled unoptimized, and the MonitorTools package build is cached across runs.
 - PNGs are encoded on one background thread.
 - `UI_VERIFY_TIMING=1` prints each render's time and whether its layout settled or hit the limit.

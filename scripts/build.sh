@@ -34,8 +34,8 @@ fi
 export TMPDIR="$external_root/tmp"
 # Keep the Rust static library ABI-compatible with the app's deployment target.
 # Without this, rustc can stamp the host SDK version (for example macOS 27)
-# into dependencies even though Xcode links the application for macOS 15.
-export MACOSX_DEPLOYMENT_TARGET="15.0"
+# into dependencies even though Xcode links the application for macOS 26.
+export MACOSX_DEPLOYMENT_TARGET="26.0"
 artifact_root="$external_root/agent-work/ultracam"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 build_root="$external_root/agent-work/build/ultracam/runs/$run_id"

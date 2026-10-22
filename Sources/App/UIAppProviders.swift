@@ -2,14 +2,13 @@ import MonitorToolsCore
 import MonitorToolsUI
 import SwiftUI
 
-/// Live pictures for the app. The selected camera uses its native preview
-/// when nothing monitor-specific is needed; every other picture (other
-/// cameras, Program, frozen or tool-decorated pictures) is a monitor surface.
-/// The surface registration rules are the same as the original monitor tile,
-/// so hidden or occluded pictures do no GPU work.
+/// Live pictures for the app. Every picture (cameras, Program, the menu bar)
+/// is a monitor surface: a Metal layer that draws every camera frame on the
+/// display refresh, with any tools in the same pass. Hidden or occluded
+/// pictures do no GPU work.
 @MainActor struct UIAppPictures: UIPictureProviding {
   let model: AppModel
-  /// `compact` is reserved for the menu bar preview, which owns the second native renderer.
+  /// `compact` is the menu bar preview: no scopes and no tool chrome.
   func picture(cameraID: String, compact: Bool) -> AnyView {
     AnyView(UIAppLivePicture(model: model, coordinator: model.monitorCoordinator, cameraID: cameraID, compact: compact))
   }
@@ -73,21 +72,6 @@ private struct UIAppSurfacePicture: View {
   private var scopesShown: Bool {
     previewEnabled && displayConfiguration.toolsEnabled && displayConfiguration.scopes.enabled
   }
-  /// The selected camera's processed output uses the native renderer, which shows
-  /// every frame, whenever no tool changes the picture's pixels. Guides draw on top
-  /// and scopes are computed beside it; only zebra, false color, focus peaking, a
-  /// source picture or a freeze need the monitor's composited picture.
-  private var usesNativePreview: Bool {
-    !isProgram && target.rawValue == model.selectedFeedID.rawValue
-      && configuration.pictureStage == .processedOutput
-      && !Self.altersPicture(configuration) && !presenter.isFrozen && !presenter.isFreezePending
-  }
-
-  private static func altersPicture(_ configuration: MonitorConfiguration) -> Bool {
-    configuration.toolsEnabled
-      && (configuration.zebra.enabled || configuration.falseColor.mode != .off || configuration.focus.enabled)
-  }
-
   private var guidesShown: Bool {
     displayConfiguration.toolsEnabled && displayConfiguration.guides.enabled && !presenter.isClean
   }
@@ -97,26 +81,14 @@ private struct UIAppSurfacePicture: View {
       Color.black
       if !previewEnabled {
         Color.black.overlay { MonitorSurfaceVisibility(presenter: presenter).allowsHitTesting(false) }
-      } else if usesNativePreview {
-        VideoPreview(renderer: compact ? model.miniPreviewRenderer : model.previewRenderer)
-          .overlay { MonitorSurfaceVisibility(presenter: presenter).allowsHitTesting(false) }
-        if guidesShown {
-          // The processed output is always 16:9.
-          MonitorGuideOverlay(settings: displayConfiguration.guides)
-            .aspectRatio(16.0 / 9.0, contentMode: .fit)
-            .allowsHitTesting(false)
-        }
       } else {
         ZStack {
           MonitorNativePicture(presenter: presenter)
           if guidesShown {
             MonitorGuideOverlay(settings: displayConfiguration.guides)
               .aspectRatio(presenter.pictureAspectRatio, contentMode: .fit)
+              .allowsHitTesting(false)
           }
-        }
-        if !presenter.isPresentationAdmitted {
-          Text(presenter.presentationStatus.isEmpty ? "Monitor unavailable under load" : presenter.presentationStatus)
-            .font(.caption).foregroundStyle(.white.opacity(0.75)).padding()
         }
       }
       if scopesShown && !compact && !presenter.isClean {
@@ -160,7 +132,6 @@ private struct UIAppSurfacePicture: View {
     .onChange(of: presenter.isClean) { _, isClean in
       if !compact { UICleanViewState.shared.set(isClean, for: target.rawValue) }
     }
-    .onChange(of: usesNativePreview) { _, _ in register() }
     .onChange(of: previewEnabled) { _, _ in register() }
     .onChange(of: presenter.isFreezePending) { _, _ in register() }
     .onChange(of: presenter.isFrozen) { _, _ in register() }
@@ -169,13 +140,11 @@ private struct UIAppSurfacePicture: View {
   }
 
   private func register() {
-    if !isProgram && !compact { UIMonitorBridge.setUsesNativePreview(usesNativePreview, cameraID: target.rawValue) }
+    // One Metal picture path for every surface; nothing uses the native preview.
+    if !isProgram && !compact { UIMonitorBridge.setUsesNativePreview(false, cameraID: target.rawValue) }
     coordinator.registerSurface(
       id: surfaceID, target: target, isVisible: previewEnabled,
       scopeVisible: configuration.toolsEnabled && configuration.scopes.enabled && !presenter.isFrozen
-        && previewEnabled && !compact,
-      usesNativePreview: usesNativePreview,
-      presentationScopeVisible: previewEnabled && !compact && displayConfiguration.toolsEnabled
-        && displayConfiguration.scopes.enabled)
+        && previewEnabled && !compact)
   }
 }

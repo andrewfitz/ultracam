@@ -171,6 +171,8 @@ public enum ProgramCutRequestResult<SourceID: Hashable> {
   case coalesced(previous: SourceID, replacement: SourceID)
   case ignoredSameSource
   case rejectedMissingSource
+  /// Nothing was on air, so the selection changed at once without a cut.
+  case selectedImmediately
 }
 
 public enum ProgramFrameSkipReason: Equatable {
@@ -182,25 +184,65 @@ public enum ProgramFrameSkipReason: Equatable {
 
 public enum ProgramFrameDecision<SourceID: Hashable> {
   case accepted(ProgramMappedFrame<SourceID>)
+  /// `flushStaleFrames` is kept for source compatibility and is always false:
+  /// frames the old source already put on air precede the cut on the Program
+  /// clock and must still be delivered, in order.
   case cutApplied(ProgramMappedFrame<SourceID>, flushStaleFrames: Bool)
   case skipped(ProgramFrameSkipReason)
 }
 
+/// Where a Program source is in its lifecycle, as far as cuts are concerned.
+public enum ProgramSourceReadiness: Equatable, Sendable {
+  /// Never reported. Treated as available; a pending cut to it can expire.
+  case unknown
+  /// Started but no frame yet ("Opening UltraStudio…"). A pending cut waits
+  /// up to `startingCutTimeout` for its first frame.
+  case starting
+  /// Has delivered at least one frame since it last became available.
+  case producing
+  case unavailable
+}
+
+/// Why a pending cut was dropped without landing.
+public enum ProgramCutAbandonReason: Equatable, Sendable {
+  /// The target never produced a frame that qualified in time: a live target
+  /// within `pendingCutTimeout`, or a starting one (opened but no signal)
+  /// within `startingCutTimeout`.
+  case expired
+  /// The target stopped or failed to start.
+  case targetUnavailable
+}
+
 /// Decides when a pending cut can land at a valid frame boundary.
 ///
-/// The scheduler has no queue or media ownership. It reports when queued
-/// frames must be flushed; the route that owns the queue performs that flush.
+/// The scheduler has no queue or media ownership. The on-air source keeps
+/// flowing while a cut is pending; the cut lands on the target's first valid
+/// frame. A target that is still starting waits for its first frame up to
+/// `startingCutTimeout` (a camera that opened but has no signal never sends
+/// one), or until it is marked unavailable. A live target that produces no
+/// qualifying frame within `pendingCutTimeout` expires. Every dropped cut is
+/// reported once through `takeAbandonedCut()`.
 public struct ProgramCutScheduler<SourceID: Hashable> {
   public private(set) var selectedSource: SourceID?
   public private(set) var pendingCut: SourceID?
   public private(set) var pendingCutTime: CMTime? = nil
   public private(set) var mapper: ProgramTimestampMapper<SourceID>
-  /// How long the on-air source stays held while a pending target produces
-  /// no valid frame. The skip itself stays in place until this elapses.
+  /// How long a pending cut to a live (not starting) target may wait for a
+  /// qualifying frame. The on-air source is never held while it waits.
   public var pendingCutTimeout: TimeInterval = 2
+  /// How long a pending cut to a starting target waits for its first frame.
+  /// Opening an UltraStudio and locking to its signal takes a second or two;
+  /// a camera that opened without a signal must not hold the cut (and the
+  /// automatic switcher's latch) forever.
+  public var startingCutTimeout: TimeInterval = 8
 
-  private var availability: [SourceID: Bool] = [:]
+  private var readiness: [SourceID: ProgramSourceReadiness] = [:]
+  /// Start of the expiry clock, set when the cut is requested and restarted
+  /// when a starting target sends its first frame.
   private var pendingCutRequestedAt: TimeInterval?
+  /// The pending target had not sent a frame yet when the clock started.
+  private var pendingTargetStarting = false
+  private var abandoned: (SourceID, ProgramCutAbandonReason)?
   private var clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
 
   public mutating func setClock(_ clock: @escaping () -> TimeInterval) {
@@ -215,17 +257,50 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
 
   public var hasPendingCut: Bool { pendingCut != nil }
 
-  /// Updates source health. An unavailable pending target is discarded before
+  /// Updates source health. An unavailable pending target is abandoned before
   /// the next frame so it cannot cause a stale or duplicate cut later.
+  /// Becoming available marks a source as starting until its first frame.
   public mutating func setSource(_ sourceID: SourceID, available: Bool) {
-    availability[sourceID] = available
-    if !available, pendingCut == sourceID {
-      clearPendingCut()
+    if available {
+      if readiness[sourceID] != .producing { readiness[sourceID] = .starting }
+    } else {
+      readiness[sourceID] = .unavailable
+      if pendingCut == sourceID { abandonPendingCut(.targetUnavailable) }
     }
   }
 
+  public func readiness(of sourceID: SourceID) -> ProgramSourceReadiness {
+    readiness[sourceID] ?? .unknown
+  }
+
   public func isSourceAvailable(_ sourceID: SourceID) -> Bool {
-    availability[sourceID] ?? true
+    readiness[sourceID] != .unavailable
+  }
+
+  /// True when the selected source has delivered a frame since it became
+  /// available: something is actually on air.
+  public var isOnAir: Bool {
+    guard let selectedSource else { return false }
+    return readiness[selectedSource] == .producing
+  }
+
+  /// Producing sources go back to starting, e.g. when Program mode is left and
+  /// re-entered: nothing is on air until the next frame arrives.
+  public mutating func markSourcesIdle() {
+    for (id, state) in readiness where state == .producing { readiness[id] = .starting }
+  }
+
+  /// Returns, once, the cut most recently dropped without landing.
+  public mutating func takeAbandonedCut() -> (SourceID, ProgramCutAbandonReason)? {
+    defer { abandoned = nil }
+    return abandoned
+  }
+
+  /// Changes the selection without a cut. Only valid while nothing is on air.
+  public mutating func select(_ sourceID: SourceID) {
+    clearPendingCut()
+    selectedSource = sourceID
+    mapper.cut(to: sourceID)
   }
 
   public mutating func requestCut(to sourceID: SourceID,
@@ -276,19 +351,36 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     mapper.carryTimeline(from: other.mapper)
   }
 
+  /// Expires a pending cut whose live target has not qualified in time.
+  /// Called on every frame and by the switcher's evaluation tick, so a cut
+  /// expires even when no frame arrives.
+  @discardableResult
+  public mutating func expirePendingCutIfNeeded() -> Bool {
+    let timeout = pendingTargetStarting ? startingCutTimeout : pendingCutTimeout
+    guard pendingCut != nil, let pendingCutRequestedAt,
+      clock() - pendingCutRequestedAt >= timeout else { return false }
+    abandonPendingCut(.expired)
+    return true
+  }
+
   private mutating func notePendingTarget(_ sourceID: SourceID) {
-    if pendingCut != sourceID { pendingCutRequestedAt = clock() }
+    guard pendingCut != sourceID else { return }
+    // A starting target gets the longer bound until its first frame.
+    pendingCutRequestedAt = clock()
+    pendingTargetStarting = readiness(of: sourceID) == .starting
   }
 
   private mutating func clearPendingCut() {
     pendingCut = nil
     pendingCutTime = nil
     pendingCutRequestedAt = nil
+    pendingTargetStarting = false
   }
 
-  private func pendingCutHasExpired() -> Bool {
-    guard let pendingCutRequestedAt else { return false }
-    return clock() - pendingCutRequestedAt >= pendingCutTimeout
+  private mutating func abandonPendingCut(_ reason: ProgramCutAbandonReason) {
+    guard let pendingCut else { return }
+    abandoned = (pendingCut, reason)
+    clearPendingCut()
   }
 
   private static func validCutTime(_ time: CMTime) -> CMTime? {
@@ -308,52 +400,60 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
   public mutating func ingest(_ frame: ProgramSourceFrame<SourceID>)
     -> ProgramFrameDecision<SourceID> {
     if let pendingCut, !isSourceAvailable(pendingCut) {
-      clearPendingCut()
+      abandonPendingCut(.targetUnavailable)
     }
+    expirePendingCutIfNeeded()
     guard isSourceAvailable(frame.sourceID) else { return .skipped(.missingSource) }
-
-    if let pendingCut {
-      if frame.sourceID == pendingCut {
-        if let pendingCutTime {
-          guard Self.comparableSourceTime(frame.sourceTime) else {
-            // Preserve the mapper's more specific epoch diagnostic even
-            // though this fast path runs before the trial mapping.
-            if frame.sourceTime.isValid, frame.sourceTime.isNumeric,
-              frame.sourceTime.timescale > 0, frame.sourceTime.value >= 0,
-              frame.sourceTime.epoch != 0 {
-              return .skipped(.invalidTimestamp(
-                .sourceEpochUnsupported(frame.sourceTime.epoch)))
-            }
-            return .skipped(.invalidTimestamp(.invalidSourceTimestamp))
-          }
-          if CMTimeCompare(frame.sourceTime, pendingCutTime) < 0 {
-            return .skipped(.staleQueuedFrame)
-          }
-        }
-        // Trial the new source on a value copy. Invalid target frames are
-        // skipped while the old selection and pending cut remain intact.
-        var candidateMapper = mapper
-        candidateMapper.cut(to: pendingCut)
-        switch candidateMapper.map(frame) {
-        case let .success(mapped):
-          mapper = candidateMapper
-          selectedSource = pendingCut
-          clearPendingCut()
-          return .cutApplied(mapped, flushStaleFrames: true)
-        case let .failure(error):
-          return .skipped(.invalidTimestamp(error))
-        }
+    if readiness[frame.sourceID] != .producing {
+      readiness[frame.sourceID] = .producing
+      // The target's first frame restarts its expiry clock: from here on it
+      // is live and only needs a frame that qualifies.
+      if pendingCut == frame.sourceID, pendingTargetStarting {
+        pendingCutRequestedAt = clock()
+        pendingTargetStarting = false
       }
-      if frame.sourceID == selectedSource {
-        // Hold A until B qualifies. If B never does, resume A instead of
-        // leaving the meeting on the last Program frame forever.
-        guard pendingCutHasExpired() else { return .skipped(.staleQueuedFrame) }
-        clearPendingCut()
-      } else {
-        return .skipped(.nonSelectedSource)
+      // The selected source (re)started, e.g. stopped and started again: its
+      // clock starts over. Re-anchor it at the next Program boundary instead
+      // of rejecting every new frame as a timestamp regression.
+      if frame.sourceID == selectedSource, pendingCut != frame.sourceID {
+        mapper.cut(to: frame.sourceID)
       }
     }
 
+    if let pendingCut, frame.sourceID == pendingCut {
+      if let pendingCutTime {
+        guard Self.comparableSourceTime(frame.sourceTime) else {
+          // Preserve the mapper's more specific epoch diagnostic even
+          // though this fast path runs before the trial mapping.
+          if frame.sourceTime.isValid, frame.sourceTime.isNumeric,
+            frame.sourceTime.timescale > 0, frame.sourceTime.value >= 0,
+            frame.sourceTime.epoch != 0 {
+            return .skipped(.invalidTimestamp(
+              .sourceEpochUnsupported(frame.sourceTime.epoch)))
+          }
+          return .skipped(.invalidTimestamp(.invalidSourceTimestamp))
+        }
+        if CMTimeCompare(frame.sourceTime, pendingCutTime) < 0 {
+          return .skipped(.staleQueuedFrame)
+        }
+      }
+      // Trial the new source on a value copy. Invalid target frames are
+      // skipped while the old selection and pending cut remain intact.
+      var candidateMapper = mapper
+      candidateMapper.cut(to: pendingCut)
+      switch candidateMapper.map(frame) {
+      case let .success(mapped):
+        mapper = candidateMapper
+        selectedSource = pendingCut
+        clearPendingCut()
+        return .cutApplied(mapped, flushStaleFrames: false)
+      case let .failure(error):
+        return .skipped(.invalidTimestamp(error))
+      }
+    }
+
+    // The on-air source keeps flowing while a cut is pending, so Program
+    // never freezes waiting for a target that is still opening.
     guard frame.sourceID == selectedSource else { return .skipped(.nonSelectedSource) }
     switch mapper.map(frame) {
     case let .success(mapped): return .accepted(mapped)

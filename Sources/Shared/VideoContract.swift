@@ -12,14 +12,24 @@ enum VideoContract {
   static let demandSelector: UInt32 = 0x75646d64 // 'udmd'
   static let slowDuration = CMTime(value: 1001, timescale: 30_000)
   static let fastDuration = CMTime(value: 1001, timescale: 60_000)
-  static let captureAdmissionLimit = 12
-  static let previewPendingLimit = 24
+  // GPU frames encoded and committed but not yet complete. The capture queue
+  // encodes frame N+1 while the GPU runs frame N; it never waits for a frame.
+  static let maxFramesInFlight = 3
+  // Frames the processor warms before native capture starts.
   static let warmBufferCount = 3
-  // Budget two FIFOs/current images plus a four-image native allowance each,
-  // the three-slot CMIO queue, latest camera image and producer current image:
-  // 63 plus one safety slot. Native retention itself has no public bound; this
-  // caps our pool at 64, with allocations growing only on actual demand.
+  // Output pool minimum: frames in flight plus normal downstream retention
+  // (display layer current/next image, CMIO queue and the extension's latest
+  // image, the Program hop and the monitor). Allocation past this happens only
+  // when a consumer actually holds more.
+  static let outputPoolMinimum = maxFramesInFlight + 6
+  // Not a busy policy: a consumer that holds this many output frames has
+  // stalled. Reaching it is shown as an output stall error with a count; normal
+  // operation stays near `outputPoolMinimum`.
   static let outputBufferLimit = 64
+  // The camera extension's sink queue depth. The extension drains every ready
+  // frame on each poll, so depth only absorbs real stalls; a full queue is a
+  // counted camera stall, not a silent drop.
+  static let cameraSinkQueueSize = 8
   static let tenBit422: [OSType] = [
     kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
     kCVPixelFormatType_422YpCbCr10BiPlanarFullRange,
@@ -142,11 +152,17 @@ struct PipelineConfiguration: Equatable, Sendable {
 
 enum VideoError: LocalizedError {
   case message(String)
+  /// Every output buffer is held downstream (`outputBufferLimit`): a stalled
+  /// consumer. Reported as a visible, counted stall.
   case outputBackPressure
+  /// The frame was abandoned because capture stopped while it waited for a GPU slot.
+  case cancelled
   var errorDescription: String? {
     switch self {
     case .message(let text): return text
-    case .outputBackPressure: return "Output buffers are busy; dropping this frame."
+    case .outputBackPressure:
+      return "Output stalled: a consumer is holding all \(VideoContract.outputBufferLimit) output frames."
+    case .cancelled: return "Capture stopped before the frame was processed."
     }
   }
 }

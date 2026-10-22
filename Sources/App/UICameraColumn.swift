@@ -152,11 +152,16 @@ struct UICameraPictureView: View {
 
   /// The reason only: the title already says "Couldn't start".
   private var startFailureDetail: String {
-    var status = snapshot?.automaticStatus ?? snapshot?.message ?? ""
+    Self.startFailureReason(snapshot?.automaticStatus ?? snapshot?.message ?? "") ?? "Retry to try again."
+  }
+
+  /// A start failure's reason as a sentence, without a leading "Couldn't start: ".
+  static func startFailureReason(_ status: String) -> String? {
+    var status = status
     for prefix in ["Couldn't start: ", "Couldn’t start: "] where status.hasPrefix(prefix) {
       status = String(status.dropFirst(prefix.count))
     }
-    guard let first = status.first else { return "Retry to try again." }
+    guard let first = status.first else { return nil }
     return first.uppercased() + status.dropFirst()
   }
 
@@ -442,6 +447,12 @@ struct UIChannelStripView: View {
   private var snapshot: UICameraSnapshot? { context.snapshot(camera.id) }
   private var isRecordingOrPaused: Bool { camera.pauseTitle != nil }
 
+  /// Retry's help names the reason, which a collapsed strip doesn't show.
+  private var retryHelp: String {
+    "Couldn't start \(camera.name). "
+      + (UICameraPictureView.startFailureReason(snapshot?.automaticStatus ?? "") ?? "Try starting the camera again.")
+  }
+
   var body: some View {
     Group {
       if camera.collapsed { collapsed } else { expanded }
@@ -577,7 +588,7 @@ struct UIChannelStripView: View {
         if compact { Image(systemName: "arrow.clockwise") } else { Label("Retry", systemImage: "arrow.clockwise") }
       }
       .controlSize(.small)
-      .help("Couldn't start \(camera.name). Try starting the camera again.")
+      .help(retryHelp)
       .accessibilityLabel("Retry \(camera.name)")
     } else {
       Button { context.send(.startCamera(cameraID: camera.id)) } label: {
@@ -596,8 +607,11 @@ struct UIChannelStripView: View {
     return Menu {
       Button("Show Inspector") { context.send(.showInspector(cameraID: camera.id)) }
       if context.presentation.outputMode == .program {
+        // ⌃n belongs to the Program menu. The badge only shows it: a keyboard
+        // shortcut here would give the menu a second handler for the same key.
         Button("Cut to \(camera.name)") { context.send(.cut(cameraID: camera.id)) }
           .disabled(!camera.cutEnabled)
+          .badge(camera.number <= 4 ? Text("⌃\(camera.number)") : nil)
       }
       Divider()
       Button(camera.recordButtonActive || camera.pauseTitle == "Resume" ? "Stop Recording" : "Record") {
@@ -874,7 +888,7 @@ struct UIChannelStripView: View {
       collapsedState
       if camera.automaticStartFailed {
         Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }.controlSize(.small)
-          .help("Couldn't start \(camera.name). Try starting the camera again.")
+          .help(retryHelp)
       }
       if camera.lutError != nil {
         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.uiRow)

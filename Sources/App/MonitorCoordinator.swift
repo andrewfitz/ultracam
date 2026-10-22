@@ -1,7 +1,5 @@
 import AppKit
 import Combine
-import CoreMedia
-import CoreVideo
 import MonitorToolsCore
 import MonitorToolsMetal
 import MonitorToolsUI
@@ -24,7 +22,9 @@ import MonitorToolsUI
   var onDemandChange: ((Set<MonitorTargetID>) -> Void)?
   var onPreviewEnabledChange: ((MonitorTargetID, Bool) -> Void)?
   @Published private var diagnosticSnapshots: [MonitorTargetID: MonitorDiagnostics] = [:]
-  private var runtime: MonitorRuntime!
+  /// The shared GPU context every surface encodes through.
+  let runtime: MonitorRuntime
+  private var diagnosticsTimer: Timer?
   private var sinks: [MonitorTargetID: MonitorCaptureSink] = [:]
   private struct Surface {
     let target: MonitorTargetID
@@ -38,9 +38,6 @@ import MonitorToolsUI
   private var surfaces: [UUID: Surface] = [:]
   private var lastDemand: Set<MonitorTargetID> = []
   private var assignedDevices: [MonitorTargetID: String] = [:]
-  private var programGeneration: UInt64 = 0
-  private var programSequence: UInt64 = 0
-  private var programAvailable = false
 
   init(
     configurations: [MonitorTargetID: MonitorConfiguration] = [:],
@@ -48,14 +45,50 @@ import MonitorToolsUI
   ) {
     self.configurations = configurations
     self.workspace = workspace
-    runtime = MonitorRuntime(
-      gpuTiming: { start, end in
-        AppGPUActivity.shared.record(start: start, end: end)
-      },
-      onDiagnostics: { [weak self] target, snapshot in
-        let coordinator = self
-        DispatchQueue.main.async { coordinator?.diagnosticSnapshots[target] = snapshot }
-      })
+    runtime = MonitorRuntime(gpuTiming: { start, end in
+      AppGPUActivity.shared.record(start: start, end: end)
+    })
+    // Compile the monitor shaders off the main thread before the first surface.
+    runtime.prepare()
+    diagnosticsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+      guard let self else { return timer.invalidate() }
+      MainActor.assumeIsolated { self.refreshDiagnostics() }
+    }
+  }
+
+  /// Once a second: source rate from the sink, presented rate and GPU time
+  /// from the busiest live surface of each target.
+  private func refreshDiagnostics() {
+    var next: [MonitorTargetID: MonitorDiagnostics] = [:]
+    let now = ProcessInfo.processInfo.systemUptime
+    for (target, sink) in sinks {
+      var value = MonitorDiagnostics()
+      let offers = sink.offerStatistics
+      value.offeredFrames = offers.frames
+      value.offeredFPS = offers.fps
+      let stats = surfaces.values.filter { $0.target == target }.map(\.presenter.statistics)
+      if let best = stats.max(by: { $0.presentedFPS < $1.presentedFPS }) {
+        value.pictureFPS = best.presentedFPS
+        value.scopeFPS = stats.map(\.scopeFPS).max() ?? 0
+        value.gpuMilliseconds = best.pictureGPUMilliseconds
+        value.scopeGPUMilliseconds = stats.compactMap(\.scopeGPUMilliseconds).max()
+        value.presentedFrames = best.presentedFrames
+        value.supersededFrames = best.supersededFrames
+        value.scopeSkippedBusy = stats.reduce(0) { $0 + $1.scopeSkippedBusy }
+        value.scopeSkippedNoDrawable = stats.reduce(0) { $0 + $1.scopeSkippedNoDrawable }
+        value.failures = stats.reduce(0) { $0 + $1.failures }
+        value.pictureAge = best.lastPresented.map { max(0, now - $0.hostTime) }
+        value.scopeAge = stats.compactMap(\.lastScope).map { max(0, now - $0.hostTime) }.min()
+        if let failure = stats.compactMap(\.lastFailure).first {
+          value.availability = .degraded(failure)
+        } else if let age = value.pictureAge {
+          value.availability = age > 1 ? .stale : .live
+        }
+      }
+      if let reason = runtime.unavailableReason { value.availability = .failed(reason) }
+      next[target] = value
+    }
+    if next != diagnosticSnapshots { diagnosticSnapshots = next }
   }
 
   func diagnostics(for target: MonitorTargetID) -> MonitorDiagnostics {
@@ -114,8 +147,6 @@ import MonitorToolsUI
   }
 
   func updateTargets(feeds: [FeedDescriptor], programAvailable: Bool) {
-    if programAvailable && !self.programAvailable { programGeneration &+= 1 }
-    self.programAvailable = programAvailable
     targets = feeds.map {
       MonitorTargetOption(
         id: MonitorTargetID($0.id.rawValue), title: $0.name, isAvailable: $0.enabled)
@@ -174,20 +205,18 @@ import MonitorToolsUI
   func surface(id: UUID, target: MonitorTargetID) -> MonitorSurfacePresenter {
     if let existing = surfaces[id], existing.target == target { return existing.presenter }
     let previousTarget = surfaces[id]?.target
-    let presenter = MonitorSurfacePresenter(
-      target: target, presentationLedger: runtime.ledger,
-      gpuTiming: { [runtime] start, end in
-        runtime?.recordPresentationGPUTime(start: start, end: end)
-      })
+    let presenter = MonitorSurfacePresenter(runtime: runtime)
     surfaces[id] = Surface(target: target, presenter: presenter)
     if let previousTarget { refreshSink(previousTarget) }
-    presenter.onPresentationAdmissionChange = { [weak self] _ in self?.refreshSink(target) }
     presenter.onVisibilityChange = { [weak self] presented, drawable in
       self?.setSurfaceVisibility(id: id, target: target, presented: presented, drawable: drawable)
     }
     return presenter
   }
 
+  /// `usesNativePreview` marks a surface whose picture comes from elsewhere;
+  /// it takes no monitor frames. `presentationScopeVisible` is accepted for
+  /// source compatibility and no longer used.
   func registerSurface(
     id: UUID, target: MonitorTargetID, isVisible: Bool, scopeVisible: Bool,
     usesNativePreview: Bool = false, presentationScopeVisible: Bool? = nil
@@ -198,10 +227,6 @@ import MonitorToolsUI
     value.scopeVisible = scopeVisible
     value.usesNativePreview = usesNativePreview
     surfaces[id] = value
-    // A native picture still gets its scopes from the monitor.
-    presenter.setPresentationDemand(
-      picture: !usesNativePreview && isPreviewEnabled(for: target),
-      scopes: isPreviewEnabled(for: target) && (presentationScopeVisible ?? scopeVisible))
     _ = captureSink(for: target)
     refreshSink(target)
     refreshDemand()
@@ -210,26 +235,21 @@ import MonitorToolsUI
   func unregisterSurface(id: UUID, target: MonitorTargetID? = nil) {
     if let target, surfaces[id]?.target != target { return }
     guard let old = surfaces.removeValue(forKey: id) else { return }
-    old.presenter.setPresentationDemand(picture: false, scopes: false)
     refreshSink(old.target)
     refreshDemand()
   }
 
   private func refreshSink(_ target: MonitorTargetID) {
     let available = targets.contains { $0.id == target && $0.isAvailable }
+    // Every visible, unfrozen monitor picture takes every camera frame.
     let live = surfaces.values.filter {
-      $0.target == target && $0.visible && !$0.presenter.isFrozen
-        && (!$0.usesNativePreview || $0.scopeVisible) && available
-        && $0.presenter.isPresentationAdmitted
-        && isPreviewEnabled(for: target) && ($0.presented ?? true) && ($0.drawable ?? true)
+      $0.target == target && $0.visible && !$0.presenter.isFrozen && !$0.usesNativePreview
+        && available && isPreviewEnabled(for: target) && ($0.presented ?? true)
+        && ($0.drawable ?? true)
     }
-    // The monitor picture takes every camera frame. Native pictures already do;
-    // this sink then analyzes scopes at the scope refresh the user picked.
-    let scopesOnly = !live.isEmpty && live.allSatisfy(\.usesNativePreview)
     sinks[target]?.configure(
       configuration(for: target), consumers: live.map(\.presenter),
-      scopeVisible: live.contains(where: \.scopeVisible),
-      preferredHz: scopesOnly ? Double(configuration(for: target).scopes.refreshHz) : nil)
+      scopeVisible: live.contains(where: \.scopeVisible))
   }
 
   private func refreshDemand() {
@@ -262,20 +282,5 @@ import MonitorToolsUI
         surface.presenter.setUnavailable("Feed stopped")
       }
     }
-  }
-
-  func offerProgram(
-    feedID: FeedID, frame: ProcessedFrame<CVPixelBuffer>,
-    sourcePTS: CMTime, programPTS: CMTime, cutApplied: Bool
-  ) {
-    let target = MonitorTargetID("program")
-    if cutApplied { programGeneration &+= 1 }
-    guard lastDemand.contains(target) else { return }
-    programSequence &+= 1
-    captureSink(for: target).offer(
-      source: frame.payload, output: frame.payload, pts: sourcePTS,
-      captureGeneration: programGeneration, sequence: programSequence,
-      processingRevision: frame.metadata.processingRevision,
-      sourceOnly: false, correspondence: nil)
   }
 }

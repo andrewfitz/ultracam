@@ -36,8 +36,13 @@ public protocol RecordingOutputDiskSpaceProviding: Sendable {
 public struct FileManagerRecordingOutputDiskSpaceProvider: RecordingOutputDiskSpaceProviding {
   public init() {}
 
+  /// Reads the volume fresh every time. A URL caches resource values for its
+  /// lifetime, so reusing the stored root URL kept returning the free space
+  /// from the take's start and never noticed a filling drive.
   public func availableBytes(at directory: URL) throws -> UInt64 {
-    let values = try directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+    var fresh = URL(fileURLWithPath: directory.path, isDirectory: true)
+    fresh.removeAllCachedResourceValues()
+    let values = try fresh.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
     guard let value = values.volumeAvailableCapacityForImportantUsage, value >= 0 else {
       throw RecordingOutputError.diskSpaceUnavailable
     }
@@ -115,6 +120,10 @@ public final class RecordingOutputManager: @unchecked Sendable {
   private let fileManager: FileManager
   private let lock = NSLock()
   private var reservedBytes: UInt64 = 0
+  /// Each live external-writer session's latest headroom (media in memory
+  /// plus what it writes before its next check). Feeds sharing a volume
+  /// share its free space, so every check counts all of them.
+  private var headrooms: [ObjectIdentifier: UInt64] = [:]
   private var pathNonce: UInt64 = 0
 
   public init(configuration: RecordingOutputConfiguration,
@@ -199,7 +208,24 @@ public final class RecordingOutputManager: @unchecked Sendable {
     try checkAndReserveLocked(additional: additional)
   }
 
-  private func checkAndReserveLocked(additional: UInt64) throws {
+  /// Records `session`'s headroom and checks that it, every other live
+  /// session's headroom and every reservation fit above the floor, without
+  /// reserving anything.
+  fileprivate func checkHeadroom(_ headroom: UInt64, for session: ObjectIdentifier) throws {
+    lock.lock()
+    defer { lock.unlock() }
+    headrooms[session] = headroom
+    let total = headrooms.values.reduce(UInt64(0)) { Self.saturatingAdd($0, $1) }
+    try checkAndReserveLocked(additional: 0, headroom: total)
+  }
+
+  fileprivate func clearHeadroom(for session: ObjectIdentifier) {
+    lock.lock()
+    headrooms.removeValue(forKey: session)
+    lock.unlock()
+  }
+
+  private func checkAndReserveLocked(additional: UInt64, headroom: UInt64 = 0) throws {
     let available: UInt64
     do {
       available = try diskSpace.availableBytes(at: configuration.rootDirectory)
@@ -208,7 +234,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
     } catch {
       throw RecordingOutputError.diskSpaceUnavailable
     }
-    let required = Self.saturatingAdd(configuration.minimumFreeBytes,
+    let required = Self.saturatingAdd(Self.saturatingAdd(configuration.minimumFreeBytes, headroom),
       Self.saturatingAdd(reservedBytes, additional))
     guard available >= required else {
       throw RecordingOutputError.insufficientDiskSpace(required: required, available: available)
@@ -455,10 +481,12 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
   }
 
-  /// Called on the recorder queue before more media reaches the external
-  /// writer. Written bytes consume the initial reservation; counting them
-  /// again as reserved space would reject a take that still has room.
-  public func checkExternalWriterCapacity() throws {
+  /// Called about once a second by the recorder's space-check timer (never on
+  /// the media path). Written bytes consume the initial reservation; counting
+  /// them again as reserved space would reject a take that still has room.
+  /// `headroom` is what the writer holds in memory or will write before the
+  /// next check; it must fit above the floor too.
+  public func checkExternalWriterCapacity(headroom: UInt64 = 0) throws {
     lock.lock(); defer { lock.unlock() }
     // Samples admitted just before a pause still reach the writer after the
     // session is paused. Space is rechecked once recording resumes.
@@ -474,7 +502,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
       reservedBytes -= consumed
       bytesWrittenValue = written
     }
-    try manager.reserveAdditional(0)
+    try manager.checkHeadroom(headroom, for: ObjectIdentifier(self))
   }
 
   public func finish() throws -> URL {
@@ -588,6 +616,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     guard !releasedReservation else { return }
     releasedReservation = true
     manager.release(reserved: reservedBytes)
+    manager.clearHeadroom(for: ObjectIdentifier(self))
   }
 
   private func prepareFilesystemLocked() throws {

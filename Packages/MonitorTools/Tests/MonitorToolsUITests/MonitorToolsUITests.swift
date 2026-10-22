@@ -1,8 +1,8 @@
 import AppKit
-import AVFoundation
 import CoreVideo
-import MetalKit
+import Metal
 import MonitorToolsCore
+import QuartzCore
 import SwiftUI
 import XCTest
 
@@ -10,26 +10,28 @@ import XCTest
 @testable import MonitorToolsUI
 
 final class MonitorToolsUITests: XCTestCase {
-  @MainActor func testFailedLayerClearsIdentityWithoutUnfreezingSuccessfulHold() throws {
+  /// Freeze holds the accepted frame while a picture view exists; the AVSampleBufferDisplayLayer
+  /// identity checks this test used to make are retired with that layer.
+  @MainActor func testFrozenHoldKeepsStampWithPictureView() throws {
     let presenter = MonitorSurfacePresenter()
     let picture = try XCTUnwrap(presenter.makeView() as? MonitorPictureNSView)
-    let result = try fixture(sequence: 1, configuration: MonitorConfiguration(), requiresIOSurface: false)
+    // 10-bit Rec.709 until a frame's signal says otherwise.
+    XCTAssertEqual(picture.metalLayer.pixelFormat, .bgr10a2Unorm)
+    XCTAssertEqual(picture.metalLayer.colorspace?.name, CGColorSpace.itur_709)
+    XCTAssertFalse(picture.metalLayer.wantsExtendedDynamicRangeContent)
+    let result = try fixture(sequence: 1, configuration: MonitorConfiguration())
     presenter.accept(result)
     presenter.setClean(false)
     presenter.toggleFreeze()
     XCTAssertTrue(presenter.isFrozen)
-    XCTAssertTrue(picture.heldFrame === result.clean)
-    picture.flushIfFailed(.rendering)
-    XCTAssertTrue(picture.heldFrame === result.clean, "A successful frozen display stays held")
-    picture.flushIfFailed(.failed)
-    XCTAssertNil(picture.heldFrame, "Failure invalidates the identity even for the same frozen frame")
-    XCTAssertTrue(presenter.isFrozen)
-    XCTAssertEqual(presenter.currentStamp, result.clean.stamp)
+    presenter.accept(try fixture(sequence: 2, configuration: MonitorConfiguration()))
+    XCTAssertTrue(presenter.isFrozen, "A newer frame never replaces a held picture")
+    XCTAssertEqual(presenter.currentStamp, result.stamp)
   }
 
   @MainActor func testOcclusionAndHiddenStatusPreserveSuccessfulFreeze() async throws {
     let presenter = MonitorSurfacePresenter()
-    presenter.accept(try fixture(sequence: 1, configuration: MonitorConfiguration(), requiresIOSurface: false))
+    presenter.accept(try fixture(sequence: 1, configuration: MonitorConfiguration()))
     await Task.yield()
     presenter.setClean(false)
     presenter.reportVisibility(presented: true, drawable: false)
@@ -37,7 +39,7 @@ final class MonitorToolsUITests: XCTestCase {
     presenter.reportVisibility(presented: false, drawable: false)
     XCTAssertEqual(presenter.status, "Paused / hidden")
     presenter.reportVisibility(presented: true, drawable: true)
-    presenter.accept(try fixture(sequence: 2, configuration: MonitorConfiguration(), requiresIOSurface: false))
+    presenter.accept(try fixture(sequence: 2, configuration: MonitorConfiguration()))
     await Task.yield()
     presenter.setClean(false)
     presenter.toggleFreeze()
@@ -64,10 +66,6 @@ final class MonitorToolsUITests: XCTestCase {
       choices: [], status: "Frozen", legendConfiguration: configuration,
       picture: { EmptyView() }, scopes: { EmptyView() })
     XCTAssertTrue(matte.pictureCaption.hasPrefix("False color: Source analysis"))
-    var diagnostic = MonitorDiagnostics()
-    diagnostic.softDeadlineStatus = .exceeded
-    let view = MonitorDiagnosticsView(snapshot: diagnostic, surfaceScopeTiming: "", presentationEstimate: "")
-    XCTAssertEqual(view.deadline, "exceeded; last delivered picture is older than limit")
   }
 
   @MainActor func testExplicitSonyModeSelectionQualifiesAnExistingSonyDeclaration() {
@@ -198,6 +196,7 @@ final class MonitorToolsUITests: XCTestCase {
       XCTAssertGreaterThan(host.fittingSize.width, 0)
     }
   }
+
   @MainActor func testSideBySideMeasuresTallScopedTilesAndFollowingContent() throws {
     for width in [520.0, 800.0] {
       var workspace = MonitorWorkspaceState()
@@ -251,6 +250,7 @@ final class MonitorToolsUITests: XCTestCase {
       XCTAssertLessThanOrEqual(shellRect.width, width)
     }
   }
+
   @MainActor func testFreezeCleanKeepsConfigurationAndDoesNotFreezeOtherSurface() async throws {
     let first = MonitorSurfacePresenter()
     let second = MonitorSurfacePresenter()
@@ -285,9 +285,15 @@ final class MonitorToolsUITests: XCTestCase {
     XCTAssertTrue(first.isFrozen)
     XCTAssertEqual(first.configuration, firstConfiguration)
     first.toggleFreeze()
-    XCTAssertEqual(first.configuration, nextConfiguration)
     XCTAssertFalse(first.isFrozen)
+    // The surface took no frames while frozen: the hold stays until the next one.
+    XCTAssertEqual(first.configuration, firstConfiguration)
+    first.accept(try fixture(sequence: 3, configuration: nextConfiguration))
+    await Task.yield()
+    first.setClean(false)
+    XCTAssertEqual(first.configuration, nextConfiguration)
   }
+
   @MainActor func testStaleAvailabilityAndMissingSignalDoNotUnfreezeSnapshot() async throws {
     let presenter = MonitorSurfacePresenter()
     presenter.accept(try fixture(sequence: 1, configuration: MonitorConfiguration()))
@@ -302,6 +308,7 @@ final class MonitorToolsUITests: XCTestCase {
     XCTAssertEqual(presenter.status, "Missing feed")
     XCTAssertFalse(presenter.isFrozen)
   }
+
   @MainActor func testVisibilityTransitionsAreIndependentFromFreezeIntent() {
     let presenter = MonitorSurfacePresenter()
     var changes: [(Bool, Bool)] = []
@@ -315,6 +322,7 @@ final class MonitorToolsUITests: XCTestCase {
     XCTAssertEqual(changes.map { $0.1 }, [true, false, false])
     XCTAssertFalse(presenter.isFrozen)
   }
+
   @MainActor func testNativeWindowAttachmentAndHiddenStateReportDemand() {
     let presenter = MonitorSurfacePresenter()
     var changes: [(Bool, Bool)] = []
@@ -335,6 +343,7 @@ final class MonitorToolsUITests: XCTestCase {
     XCTAssertEqual(changes.last?.0, false)
     window.contentView = nil
   }
+
   @MainActor func testPendingFreezeUsesNextAdmittedPictureAndCanCancel() async throws {
     let presenter = MonitorSurfacePresenter()
     presenter.accept(try fixture(sequence: 1, configuration: MonitorConfiguration()))
@@ -359,6 +368,7 @@ final class MonitorToolsUITests: XCTestCase {
     XCTAssertFalse(presenter.isFreezePending)
     XCTAssertFalse(presenter.isFrozen)
   }
+
   @MainActor func testActualWindowMinimizeAncestorHideAndClose() async throws {
     _ = NSApplication.shared
     let presenter = MonitorSurfacePresenter()
@@ -398,8 +408,13 @@ final class MonitorToolsUITests: XCTestCase {
     XCTAssertEqual(changes.last?.0, false)
     XCTAssertEqual(changes.last?.1, false)
   }
+
+  /// Two real windows, each with a picture and a scope. The frozen surface keeps
+  /// its held frame, configuration and scope while the other keeps updating.
   @MainActor func testNativeFrozenCleanScopePairStaysFixedWhileOtherWindowContinues() async throws {
-    guard let device = MTLCreateSystemDefaultDevice() else {
+    MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
+    defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
+    guard MTLCreateSystemDefaultDevice() != nil else {
       throw XCTSkip("Metal device unavailable for native scope fixture")
     }
     let first = MonitorSurfacePresenter()
@@ -433,302 +448,118 @@ final class MonitorToolsUITests: XCTestCase {
     var original = MonitorConfiguration()
     original.toolsEnabled = true
     original.scopes.enabled = true
-    let old = try scopedFixture(sequence: 10, configuration: original, device: device)
+    let old = try fixture(sequence: 10, configuration: original)
     first.accept(old)
     second.accept(old)
     await Task.yield()
     first.setClean(false)
     second.setClean(false)
-    try await waitFor {
-      first.setClean(false)
-      return firstPicture.heldFrame === old.decorated
+    // Whether the display link fires depends on the windows being on screen.
+    let drawn = await waitQuietly {
+      first.statistics.lastPresented?.sequence == 10 && second.statistics.lastPresented?.sequence == 10
+        && first.statistics.lastScope?.sequence == 10
     }
     first.toggleFreeze()
-    XCTAssertTrue(firstPicture.heldFrame === old.decorated)
+    XCTAssertTrue(first.isFrozen)
     var next = original
     next.scopes.mode = .lumaWaveform
     next.guides.centerCross = true
-    let newer = try scopedFixture(sequence: 11, configuration: next, device: device)
+    let newer = try fixture(sequence: 11, configuration: next)
     first.accept(newer)
     second.accept(newer)
     await Task.yield()
     first.setClean(true)
     second.setClean(false)
-    try await waitFor {
-      first.setClean(true)
-      return firstPicture.heldFrame === old.clean
-    }
-    XCTAssertTrue(firstScope.result === old.scope)
+    XCTAssertTrue(first.isFrozen)
+    XCTAssertFalse(second.isFrozen)
+    XCTAssertEqual(first.currentStamp, old.stamp)
+    XCTAssertEqual(second.currentStamp, newer.stamp)
     XCTAssertEqual(first.configuration, original)
-    XCTAssertTrue(first.detail.contains("Scope PTS 10.000"))
-    XCTAssertTrue(first.scopeTiming.contains("Frozen"))
-    XCTAssertTrue(first.scopeTiming.contains("Scope PTS 10.000"))
-    try await waitFor {
-      second.setClean(false)
-      return secondPicture.heldFrame === newer.decorated
-    }
-    XCTAssertTrue(secondScope.result === newer.scope)
     XCTAssertEqual(second.configuration, next)
+    if drawn {
+      try await waitFor { second.statistics.lastPresented?.sequence == 11 }
+      // Let the frozen surface run a few refreshes after the newer frame.
+      try await Task.sleep(for: .milliseconds(150))
+      XCTAssertEqual(first.statistics.lastPresented?.sequence, 10, "The held picture stays fixed")
+      XCTAssertEqual(first.statistics.lastScope?.sequence, 10, "The held scope stays fixed")
+      first.setClean(true)
+      XCTAssertTrue(first.detail.contains("Scope PTS 10.000"))
+      XCTAssertTrue(first.scopeTiming.contains("Frozen"))
+      XCTAssertTrue(first.scopeTiming.contains("Scope PTS 10.000"))
+      try await waitFor { second.statistics.lastScope?.sequence == 11 }
+      XCTAssertEqual(second.statistics.lastScope?.sequence, 11, "\(second.statistics)")
+    }
     first.setClean(false)
-    try await waitFor {
-      first.setClean(false)
-      return firstPicture.heldFrame === old.decorated
-    }
-    XCTAssertTrue(firstScope.result === old.scope)
+    XCTAssertEqual(first.currentStamp, old.stamp)
     first.toggleFreeze()
-    try await waitFor {
-      first.setClean(false)
-      return firstPicture.heldFrame === newer.decorated
-    }
-    XCTAssertTrue(firstScope.result === newer.scope)
-  }
-  @MainActor private func waitFor(_ condition: () -> Bool) async throws {
-    let deadline = ProcessInfo.processInfo.systemUptime + 3
-    while !condition() && ProcessInfo.processInfo.systemUptime < deadline {
-      try await Task.sleep(for: .milliseconds(20))
-    }
-    XCTAssertTrue(condition(), "Synthetic native window transition must complete within 3 seconds")
-  }
-  private func scopedFixture(
-    sequence: UInt64, configuration: MonitorConfiguration, device: MTLDevice,
-    target: String = "synthetic", sharedLedger: MonitorAdmissionLedger? = nil
-  ) throws -> MonitorDisplayResult {
-    let cleanResult = try fixture(sequence: sequence, configuration: configuration, target: target)
-    let decoratedPixels = try fixture(sequence: sequence + 20, configuration: configuration).clean
-      .pixelBuffer
-    let decorated = MonitorOwnedFrame(
-      stamp: cleanResult.clean.stamp, pixelBuffer: decoratedPixels, releaseBudget: {})
-    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-      pixelFormat: .bgra8Unorm, width: 768, height: 256, mipmapped: false)
-    descriptor.storageMode = .shared
-    let texture = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
-    let syntheticPixels = [UInt8](
-      repeating: UInt8(truncatingIfNeeded: sequence * 3), count: 768 * 256 * 4)
-    syntheticPixels.withUnsafeBytes { bytes in
-      texture.replace(
-        region: MTLRegionMake2D(0, 0, 768, 256), mipmapLevel: 0, withBytes: bytes.baseAddress!,
-        bytesPerRow: 768 * 4)
-    }
-    let ledger = sharedLedger ?? MonitorAdmissionLedger()
-    let lease = try XCTUnwrap(
-      ledger.tryAcquire(
-        target: cleanResult.clean.stamp.target, generation: 1, kind: .presentation,
-        bytes: 768 * 256 * 4))
-    let scope = MonitorScopeResult(
-      texture: texture, stamp: cleanResult.clean.stamp, mode: configuration.scopes.mode,
-      lease: lease,
-      signal: MonitorFrameSignal(range: .legal, matrix: .bt709, transfer: "Synthetic scope"))
-    return MonitorDisplayResult(
-      clean: cleanResult.clean, decorated: decorated, scope: scope, configuration: configuration)
-  }
-  @MainActor func testCancelWinsAcceptedButNotPublishedPendingFreeze() async throws {
-    let presenter = MonitorSurfacePresenter()
-    let other = MonitorSurfacePresenter()
-    presenter.requestFreezeOnNextFrame()
-    let accepted = try fixture(sequence: 4, configuration: MonitorConfiguration())
-    presenter.accept(accepted)
-    other.accept(try fixture(sequence: 5, configuration: MonitorConfiguration()))
-    // No main-queue publication can run between admission and cancellation.
-    XCTAssertTrue(presenter.isFreezePending)
-    presenter.cancelPendingFreeze()
+    XCTAssertFalse(first.isFrozen)
+    // The frozen surface took no frames, so the hold stays on screen until
+    // the next live frame instead of a stale frame from during the freeze.
+    XCTAssertEqual(first.currentStamp, old.stamp)
+    let newest = try fixture(sequence: 12, configuration: next)
+    first.accept(newest)
+    XCTAssertEqual(first.currentStamp, newest.stamp)
     await Task.yield()
-    presenter.setClean(true)
-    other.setClean(false)
-    XCTAssertFalse(presenter.isFreezePending)
-    XCTAssertFalse(presenter.isFrozen)
-    XCTAssertEqual(presenter.currentStamp, accepted.clean.stamp)
-    XCTAssertTrue(presenter.detail.contains("4.000"))
-    XCTAssertFalse(other.isFrozen)
-    XCTAssertEqual(other.currentStamp?.sequence, 5)
-    presenter.toggleFreeze()
-    XCTAssertTrue(presenter.isFrozen)
-    presenter.cancelPendingFreeze()  // Preserve an already published freeze.
-    XCTAssertTrue(presenter.isFrozen)
-    XCTAssertEqual(presenter.currentStamp, accepted.clean.stamp)
-  }
-  @MainActor func testOutOfOrderCompletionCannotRollBackOrChangePresenterTarget() async throws {
-    let presenter = MonitorSurfacePresenter()
-    let config = MonitorConfiguration()
-    let newest = try fixture(sequence: 8, configuration: config, revision: 3, processing: 4)
-    presenter.accept(newest)
-    presenter.accept(try fixture(sequence: 7, configuration: config, revision: 3, processing: 4))
-    presenter.accept(try fixture(sequence: 9, configuration: config, revision: 2, processing: 4))
-    presenter.accept(try fixture(sequence: 9, configuration: config, revision: 3, processing: 3))
-    presenter.accept(
-      try fixture(sequence: 9, configuration: config, revision: 3, processing: 4, target: "other"))
-    XCTAssertEqual(presenter.currentStamp, newest.clean.stamp)
-    presenter.accept(newest)  // Equal sequence is a valid matching-result update.
-    presenter.setUnavailable("Feed stopped")
-    presenter.accept(try fixture(sequence: 7, configuration: config, revision: 3, processing: 4))
-    XCTAssertNil(presenter.currentStamp)
-    let restarted = try fixture(sequence: 1, configuration: config, generation: 2, revision: 1)
-    presenter.accept(restarted)
-    presenter.accept(newest)  // The retired generation cannot return after restart.
-    await Task.yield()
-    presenter.setClean(false)
-    XCTAssertEqual(presenter.currentStamp, restarted.clean.stamp)
-    XCTAssertEqual(presenter.status, "Live")
-  }
-  @MainActor func testInvalidPublicationCannotResurrectOrSatisfyPendingFreeze() async throws {
-    let presenter = MonitorSurfacePresenter()
-    let config = MonitorConfiguration()
-    presenter.accept(try fixture(sequence: 1, configuration: config))
-    presenter.setUnavailable("Preview hidden")
-    let stale = try fixture(sequence: 2, configuration: config)
-    presenter.accept(stale, ifCurrent: { false })
-    await Task.yield()
-    XCTAssertNil(presenter.currentStamp)
-    XCTAssertEqual(presenter.status, "Preview hidden")
-    presenter.requestFreezeOnNextFrame()
-    presenter.accept(stale, ifCurrent: { false })
-    await Task.yield()
-    XCTAssertTrue(presenter.isFreezePending)
-    XCTAssertFalse(presenter.isFrozen)
-    XCTAssertNil(presenter.currentStamp)
-    let current = try fixture(sequence: 3, configuration: config)
-    presenter.accept(current, ifCurrent: { true })
-    await Task.yield()
-    presenter.setClean(false)
-    XCTAssertTrue(presenter.isFrozen)
-    XCTAssertFalse(presenter.isFreezePending)
-    XCTAssertEqual(presenter.currentStamp, current.clean.stamp)
-  }
-  @MainActor func testPresentationAdmissionRejectsSecondSurfaceAndRetriesAfterHide() async throws {
-    let ledger = MonitorAdmissionLedger(maximumBytes: 20 * 1024 * 1024, cleanReserveBytes: 0)
-    let first = MonitorSurfacePresenter(
-      target: MonitorTargetID("first"), presentationLedger: ledger)
-    let second = MonitorSurfacePresenter(
-      target: MonitorTargetID("detached"), presentationLedger: ledger)
-    first.reportVisibility(presented: true, drawable: true)
-    second.reportVisibility(presented: true, drawable: true)
-    first.setPresentationDemand(picture: true, scopes: true)
-    second.setPresentationDemand(picture: true, scopes: true)
-    XCTAssertTrue(first.isPresentationAdmitted)
-    XCTAssertFalse(second.isPresentationAdmitted)
-    XCTAssertTrue(second.presentationStatus.contains("unavailable"))
-    XCTAssertLessThanOrEqual(ledger.snapshot.retainedBytes, ledger.maximumBytes)
-    first.reportVisibility(presented: true, drawable: false)
-    try await waitFor { second.isPresentationAdmitted }
-    XCTAssertGreaterThan(ledger.snapshot.retainedBytes, 0)
-    second.reportVisibility(presented: false, drawable: false)
-    XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
-    // The existing native preview carries no additional module surface allowance.
-    first.setPresentationDemand(picture: false, scopes: false)
-    first.reportVisibility(presented: true, drawable: true)
-    XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
-  }
-  @MainActor func testBackingResizeFailureClearsPresentationAndSmallerResizeRecovers() {
-    let ledger = MonitorAdmissionLedger(maximumBytes: 20 * 1024 * 1024, cleanReserveBytes: 0)
-    let presenter = MonitorSurfacePresenter(
-      target: MonitorTargetID("resize"), presentationLedger: ledger)
-    presenter.reportVisibility(presented: true, drawable: true)
-    presenter.setPresentationDemand(picture: true, scopes: false)
-    XCTAssertTrue(presenter.isPresentationAdmitted)
-    XCTAssertFalse(presenter.resizePresentationBacking(CGSize(width: 4096, height: 2160)))
-    XCTAssertFalse(presenter.isPresentationAdmitted)
-    XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
-    XCTAssertTrue(presenter.resizePresentationBacking(CGSize(width: 1280, height: 720)))
-    XCTAssertTrue(presenter.isPresentationAdmitted)
-    XCTAssertEqual(
-      ledger.snapshot.retainedBytes,
-      MonitorPresentationEstimate.pictureBytes(backingWidth: 1280, backingHeight: 720))
-    presenter.setPresentationDemand(picture: false, scopes: false)
-    XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
-  }
-  @MainActor func testScopeVisibilityIsLocalAndDoesNotChangeSharedConfiguration() throws {
-    var configuration = MonitorConfiguration()
-    configuration.toolsEnabled = true
-    configuration.scopes.enabled = true
-    var probes: [String: NSView] = [:]
-    let root = HStack {
-      ForEach([false, true], id: \.self) { visible in
-        MonitorTileChrome(
-          target: .constant(MonitorTargetID("shared")), configuration: .constant(configuration),
-          choices: [], status: "Frozen", showsScopes: visible
-        ) {
-          Color.black.frame(height: 90)
-        } scopes: {
-          Color.gray.frame(height: 120).background(
-            LayoutProbe { probes[visible ? "shown" : "hidden"] = $0 })
-        }
+    first.setClean(false)
+    XCTAssertEqual(first.configuration, next)
+    if drawn {
+      try await waitFor {
+        first.statistics.lastPresented?.sequence == 12 && first.statistics.lastScope?.sequence == 12
       }
-    }.frame(width: 600)
-    let host = NSHostingView(rootView: root)
-    host.frame = NSRect(x: 0, y: 0, width: 600, height: 500)
-    host.layoutSubtreeIfNeeded()
-    XCTAssertNil(probes["hidden"])
-    XCTAssertNotNil(probes["shown"])
-    XCTAssertTrue(configuration.scopes.enabled)
+    }
   }
-  @MainActor func testZoomTransformsPictureAndGuideTogetherAtBoundedScale() throws {
-    XCTAssertEqual(MonitorPictureZoom(.infinity).scale, 1)
-    XCTAssertEqual(MonitorPictureZoom(99).scale, 4)
-    var probes: [String: NSView] = [:]
-    let root = ZStack {
-      Color.black.background(LayoutProbe { probes["picture"] = $0 })
-      Color.clear.background(LayoutProbe { probes["guide"] = $0 })
-    }.frame(width: 80, height: 40).modifier(MonitorPictureZoom(2)).frame(width: 80, height: 40)
-    let host = NSHostingView(rootView: root)
-    host.frame = NSRect(x: 0, y: 0, width: 80, height: 40)
-    host.layoutSubtreeIfNeeded()
-    let picture = try XCTUnwrap(probes["picture"])
-    let guide = try XCTUnwrap(probes["guide"])
-    let pictureRect = picture.convert(picture.bounds, to: host)
-    let guideRect = guide.convert(guide.bounds, to: host)
-    XCTAssertEqual(pictureRect, guideRect)
-    XCTAssertEqual(pictureRect.width, 160, accuracy: 1)
-    XCTAssertEqual(pictureRect.height, 80, accuracy: 1)
-    XCTAssertEqual(pictureRect.midX, host.bounds.midX, accuracy: 1)
-    XCTAssertEqual(pictureRect.midY, host.bounds.midY, accuracy: 1)
-  }
+
+  /// A drawn scope reports its GPU interval to the runtime's timing hook and
+  /// to the surface statistics.
   @MainActor func testScopePresentationReportsItsGPUInterval() async throws {
-    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+    MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
+    defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
+    guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
     let timing = ScopeTimingProbe()
-    let presenter = MonitorSurfacePresenter(gpuTiming: { start, end in
-      timing.record(start: start, end: end)
-    })
+    let runtime = MonitorRuntime(gpuTiming: { start, end in timing.record(start: start, end: end) })
+    let presenter = MonitorSurfacePresenter(runtime: runtime)
+    let picture = try XCTUnwrap(presenter.makeView() as? MonitorPictureNSView)
     let scope = try XCTUnwrap(presenter.makeScopeView() as? MonitorScopeNSView)
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+    picture.frame = NSRect(x: 0, y: 160, width: 320, height: 160)
+    scope.frame = NSRect(x: 0, y: 0, width: 320, height: 160)
+    container.addSubview(picture)
+    container.addSubview(scope)
     let window = NSWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 320, height: 160), styleMask: [.titled],
-      backing: .buffered, defer: false)
+      contentRect: container.bounds, styleMask: [.titled], backing: .buffered, defer: false)
     window.isReleasedWhenClosed = false
-    window.contentView = scope
+    window.contentView = container
     window.orderFrontRegardless()
     defer {
       window.close()
       window.contentView = nil
     }
+    XCTAssertEqual(scope.metalLayer.maximumDrawableCount, 3)
+    XCTAssertEqual(
+      scope.metalLayer.drawableSize,
+      CGSize(width: MonitorToolsRenderer.scopeWidth, height: MonitorToolsRenderer.scopeHeight))
     var config = MonitorConfiguration()
     config.toolsEnabled = true
     config.scopes.enabled = true
-    presenter.accept(try scopedFixture(sequence: 1, configuration: config, device: device))
+    presenter.accept(try fixture(sequence: 1, configuration: config))
     await Task.yield()
     presenter.setClean(false)
-    XCTAssertEqual((scope.layer as? CAMetalLayer)?.maximumDrawableCount, 2)
-    guard scope.currentDrawable != nil else { throw XCTSkip("Native scope drawable unavailable") }
-    scope.draw()
-    try await waitFor { timing.count > 0 }
-  }
-  @MainActor func testFeedRetirementDoesNotRetireLiveSurfaceEstimate() {
-    let feed = MonitorTargetID("real-feed")
-    let ledger = MonitorAdmissionLedger(maximumBytes: 64 * 1024 * 1024, cleanReserveBytes: 0)
-    let presenter = MonitorSurfacePresenter(target: feed, presentationLedger: ledger)
-    presenter.reportVisibility(presented: true, drawable: true)
-    presenter.setPresentationDemand(picture: true, scopes: true)
-    let retained = ledger.snapshot.retainedBytes
-    XCTAssertGreaterThan(retained, 0)
-    ledger.retire(target: feed, generation: 0)
-    XCTAssertEqual(ledger.snapshot.retiredBytes, 0)
-    XCTAssertEqual(ledger.snapshot.retainedBytes, retained)
-    presenter.setPresentationDemand(picture: false, scopes: false)
-    XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
-  }
-  @MainActor func testFourUpNativeHostingReservesAllSurfaceEstimatesWithinSharedBudget() throws {
-    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
-    let ledger = MonitorAdmissionLedger()
-    let presenters = (0..<4).map {
-      MonitorSurfacePresenter(target: MonitorTargetID("tile-\($0)"), presentationLedger: ledger)
+    guard await waitQuietly({ presenter.statistics.scopeUpdates > 0 }) else {
+      throw XCTSkip("The display link did not fire for this test window (not on screen)")
     }
+    try await waitFor { timing.count >= 2 }  // the picture and the scope
+    try await waitFor { presenter.statistics.scopeGPUMilliseconds != nil }
+    XCTAssertNotNil(presenter.statistics.pictureGPUMilliseconds)
+    XCTAssertEqual(presenter.statistics.failures, 0)
+  }
+
+  /// Four tiles host their pictures and scopes and take frames independently.
+  /// (The per-surface presentation budget this test used to check is retired.)
+  @MainActor func testFourUpNativeHostingShowsEverySurface() async throws {
+    MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
+    defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
+    guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
+    let presenters = (0..<4).map { _ in MonitorSurfacePresenter() }
     var workspace = MonitorWorkspaceState()
     workspace.layout = .fourUp
     var config = MonitorConfiguration()
@@ -759,51 +590,375 @@ final class MonitorToolsUITests: XCTestCase {
     window.contentView = host
     window.orderFrontRegardless()
     defer {
-      presenters.forEach { $0.setPresentationDemand(picture: false, scopes: false) }
       window.close()
       window.contentView = nil
     }
     host.layoutSubtreeIfNeeded()
     for (index, presenter) in presenters.enumerated() {
-      // Exercise admission even if the test runner's windows are OS-occluded.
+      // Status must not depend on whether the test runner's window is OS-occluded.
       presenter.reportVisibility(presented: true, drawable: true)
-      presenter.setPresentationDemand(picture: true, scopes: true)
-      presenter.accept(
-        try scopedFixture(
-          sequence: 1, configuration: config, device: device, target: "tile-\(index)",
-          sharedLedger: ledger))
+      let frame = try fixture(sequence: 1, configuration: config, target: "tile-\(index)")
+      presenter.accept(frame)
       presenter.setClean(false)
-      XCTAssertTrue(presenter.isPresentationAdmitted)
-      XCTAssertTrue(presenter.presentationStatus.contains("allowance"))
+      XCTAssertEqual(presenter.currentStamp, frame.stamp)
+      XCTAssertEqual(presenter.status, "Live")
+      XCTAssertEqual(presenter.configuration, config)
     }
-    XCTAssertGreaterThan(ledger.snapshot.retainedBytes, MonitorPresentationEstimate.scopeBytes * 4)
-    XCTAssertLessThanOrEqual(ledger.snapshot.retainedBytes, ledger.maximumBytes)
-    XCTAssertEqual(ledger.snapshot.retiredBytes, 0)
+    if await waitQuietly({ presenters.allSatisfy { $0.statistics.presentedFrames > 0 } }) {
+      XCTAssertTrue(presenters.allSatisfy { $0.statistics.failures == 0 })
+    }
   }
+
+  /// The picture layer's format, colorspace and EDR state follow the frame's
+  /// signal tags, through the render loop's own path.
+  @MainActor func testPictureLayerPresentationFollowsSignalColorimetry() throws {
+    let presenter = MonitorSurfacePresenter()
+    let picture = try XCTUnwrap(presenter.makeView() as? MonitorPictureNSView)
+    let layer = picture.metalLayer
+    let loop = picture.renderLoop
+    func signal(_ primaries: CFString?, _ transfer: CFString?, profile: String? = nil)
+      -> MonitorFrameSignal
+    {
+      MonitorFrameSignal(
+        range: .legal, matrix: primaries == kCVImageBufferColorPrimaries_ITU_R_2020 ? .bt2020 : .bt709,
+        transfer: profile ?? (transfer as String?) ?? "Unknown", profileID: profile,
+        primaries: primaries as String?, transferFunction: transfer as String?)
+    }
+    func check(
+      _ value: MonitorFrameSignal?, _ format: MTLPixelFormat, _ space: CFString, hdr: Bool,
+      line: UInt = #line
+    ) {
+      loop.applyColor(value)
+      XCTAssertEqual(layer.pixelFormat, format, line: line)
+      XCTAssertEqual(layer.colorspace?.name, space, line: line)
+      XCTAssertEqual(layer.wantsExtendedDynamicRangeContent, hdr, line: line)
+      XCTAssertEqual(layer.edrMetadata != nil, hdr && CAEDRMetadata.isAvailable, line: line)
+    }
+    let rec709 = signal(kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2)
+    check(rec709, .bgr10a2Unorm, CGColorSpace.itur_709, hdr: false)
+    check(
+      signal(kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunction_ITU_R_2020),
+      .bgr10a2Unorm, CGColorSpace.itur_2020, hdr: false)
+    check(
+      signal(kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunction_ITU_R_2100_HLG),
+      .rgba16Float, CGColorSpace.itur_2100_HLG, hdr: true)
+    check(
+      signal(kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ),
+      .rgba16Float, CGColorSpace.itur_2100_PQ, hdr: true)
+    // Back to SDR: EDR off, metadata cleared.
+    check(rec709, .bgr10a2Unorm, CGColorSpace.itur_709, hdr: false)
+    // Untagged and declared-log pictures stay Rec.709 code values, as before.
+    check(nil, .bgr10a2Unorm, CGColorSpace.itur_709, hdr: false)
+    check(
+      signal(
+        kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+        profile: "sony-slog3-sgamut3cine"),
+      .bgr10a2Unorm, CGColorSpace.itur_709, hdr: false)
+    check(signal(nil, nil), .bgr10a2Unorm, CGColorSpace.itur_709, hdr: false)
+  }
+
+  /// Drawn through the display link: an HLG frame switches the picture layer
+  /// to half-float EDR in the HLG colorspace, and a Rec.709 frame switches it back.
+  @MainActor func testDrawnHLGFrameSwitchesThePictureLayerToEDR() async throws {
+    guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
+    MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
+    defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
+    let presenter = MonitorSurfacePresenter(runtime: MonitorRuntime())
+    let picture = try XCTUnwrap(presenter.makeView() as? MonitorPictureNSView)
+    picture.frame = NSRect(x: 0, y: 0, width: 160, height: 90)
+    let window = NSWindow(
+      contentRect: picture.frame, styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = picture
+    window.orderFrontRegardless()
+    defer {
+      window.close()
+      window.contentView = nil
+    }
+    func frame(_ sequence: UInt64, primaries: CFString, transfer: CFString) throws -> Fixture {
+      let base = try fixture(sequence: sequence, configuration: MonitorConfiguration())
+      return Fixture(
+        bundle: MonitorFrameBundle(
+          stamp: base.stamp, source: base.bundle.source,
+          sourceSignal: MonitorFrameSignal(
+            range: .full, matrix: .bt2020, transfer: transfer as String,
+            primaries: primaries as String, transferFunction: transfer as String)),
+        configuration: base.configuration)
+    }
+    presenter.accept(
+      try frame(1, primaries: kCVImageBufferColorPrimaries_ITU_R_2020,
+        transfer: kCVImageBufferTransferFunction_ITU_R_2100_HLG))
+    guard await waitQuietly({ presenter.statistics.lastPresented?.sequence == 1 }) else {
+      throw XCTSkip("The display link did not fire for this test window")
+    }
+    XCTAssertEqual(picture.metalLayer.pixelFormat, .rgba16Float)
+    XCTAssertEqual(picture.metalLayer.colorspace?.name, CGColorSpace.itur_2100_HLG)
+    XCTAssertTrue(picture.metalLayer.wantsExtendedDynamicRangeContent)
+    presenter.accept(
+      try frame(2, primaries: kCVImageBufferColorPrimaries_ITU_R_709_2,
+        transfer: kCVImageBufferTransferFunction_ITU_R_709_2))
+    try await waitFor { presenter.statistics.lastPresented?.sequence == 2 }
+    XCTAssertEqual(picture.metalLayer.pixelFormat, .bgr10a2Unorm)
+    XCTAssertEqual(picture.metalLayer.colorspace?.name, CGColorSpace.itur_709)
+    XCTAssertFalse(picture.metalLayer.wantsExtendedDynamicRangeContent)
+    // Let the half-float and 10-bit drawables finish on the GPU.
+    try await Task.sleep(for: .milliseconds(100))
+    XCTAssertEqual(presenter.statistics.failures, 0)
+  }
+
+  /// A frozen surface takes no frames, and its hold becomes a GPU copy at
+  /// once (no window, no display link), so no capture buffer stays pinned.
+  /// A surface that stops being drawable drops its waiting frame.
+  @MainActor func testFreezeAndHiddenSurfacesHoldNoProducerBuffer() async throws {
+    guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
+    let presenter = MonitorSurfacePresenter(runtime: MonitorRuntime())
+    let first = try fixture(sequence: 1, configuration: MonitorConfiguration())
+    presenter.accept(first)
+    presenter.toggleFreeze()
+    XCTAssertTrue(presenter.isFrozen)
+    presenter.accept(try fixture(sequence: 2, configuration: MonitorConfiguration()))
+    XCTAssertEqual(presenter.statistics.acceptedFrames, 1, "A frozen surface keeps no new frame")
+    XCTAssertEqual(presenter.currentStamp, first.stamp)
+    try await waitFor { !presenter.holdsProducerFrame }
+    XCTAssertEqual(presenter.statistics.failures, 0)
+    presenter.toggleFreeze()
+    presenter.reportVisibility(presented: true, drawable: true)
+    presenter.accept(try fixture(sequence: 3, configuration: MonitorConfiguration()))
+    XCTAssertTrue(presenter.holdsProducerFrame)
+    // Hidden: the waiting frame is dropped; frames replaced while the display
+    // link is paused are not counted as superseded.
+    presenter.reportVisibility(presented: false, drawable: false)
+    XCTAssertFalse(presenter.holdsProducerFrame)
+    XCTAssertEqual(presenter.status, "Paused / hidden")
+    presenter.accept(try fixture(sequence: 4, configuration: MonitorConfiguration()))
+    presenter.accept(try fixture(sequence: 5, configuration: MonitorConfiguration()))
+    XCTAssertEqual(presenter.statistics.supersededFrames, 0)
+    // Freezing while hidden still swaps the producer frame for a GPU copy.
+    presenter.toggleFreeze()
+    XCTAssertTrue(presenter.isFrozen)
+    try await waitFor { !presenter.holdsProducerFrame }
+    XCTAssertEqual(presenter.currentStamp?.sequence, 5)
+    presenter.toggleFreeze()
+    presenter.reportVisibility(presented: true, drawable: true)
+    presenter.accept(try fixture(sequence: 6, configuration: MonitorConfiguration()))
+    XCTAssertEqual(presenter.currentStamp?.sequence, 6)
+  }
+
+  /// A picture whose window cannot be seen starts with its display link
+  /// paused (it used to draw until the first visibility change), and runs
+  /// once the view becomes drawable.
+  @MainActor func testDisplayLinkStartsPausedWhileTheWindowCannotBeSeen() async throws {
+    guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
+    let presenter = MonitorSurfacePresenter(runtime: MonitorRuntime())
+    let picture = try XCTUnwrap(presenter.makeView() as? MonitorPictureNSView)
+    picture.frame = NSRect(x: 0, y: 0, width: 160, height: 90)
+    let window = NSWindow(
+      contentRect: picture.frame, styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = picture
+    window.orderFrontRegardless()
+    defer {
+      MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false
+      window.close()
+      window.contentView = nil
+    }
+    guard !picture.isDrawable else {
+      throw XCTSkip("The test window is visible; the paused start needs an unseen window")
+    }
+    presenter.accept(try fixture(sequence: 1, configuration: MonitorConfiguration()))
+    try await Task.sleep(for: .milliseconds(300))
+    XCTAssertEqual(presenter.statistics.presentedFrames, 0, "An unseen window's link stays paused")
+    MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
+    picture.reportVisibility()
+    if await waitQuietly({ presenter.statistics.presentedFrames > 0 }) {
+      XCTAssertEqual(presenter.statistics.failures, 0)
+      XCTAssertEqual(presenter.statistics.lastPresented?.sequence, 1)
+    }
+  }
+
+  /// Like waitFor, but reports instead of failing (for display-link-dependent checks).
+  @MainActor private func waitQuietly(_ condition: () -> Bool) async -> Bool {
+    let deadline = ProcessInfo.processInfo.systemUptime + 3
+    while !condition() && ProcessInfo.processInfo.systemUptime < deadline {
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    let met = condition()
+    if !met { print("MONITOR_UI_TEST display link did not draw within 3 s") }
+    return met
+  }
+
+  @MainActor private func waitFor(
+    _ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line
+  ) async throws {
+    let deadline = ProcessInfo.processInfo.systemUptime + 3
+    while !condition() && ProcessInfo.processInfo.systemUptime < deadline {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    XCTAssertTrue(
+      condition(), "Synthetic native window transition must complete within 3 seconds",
+      file: file, line: line)
+  }
+
+  @MainActor func testCancelWinsAcceptedButNotPublishedPendingFreeze() async throws {
+    let presenter = MonitorSurfacePresenter()
+    let other = MonitorSurfacePresenter()
+    presenter.requestFreezeOnNextFrame()
+    let accepted = try fixture(sequence: 4, configuration: MonitorConfiguration())
+    presenter.accept(accepted)
+    other.accept(try fixture(sequence: 5, configuration: MonitorConfiguration()))
+    // No main-queue publication can run between admission and cancellation.
+    XCTAssertTrue(presenter.isFreezePending)
+    presenter.cancelPendingFreeze()
+    await Task.yield()
+    presenter.setClean(true)
+    other.setClean(false)
+    XCTAssertFalse(presenter.isFreezePending)
+    XCTAssertFalse(presenter.isFrozen)
+    XCTAssertEqual(presenter.currentStamp, accepted.stamp)
+    XCTAssertTrue(presenter.detail.contains("4.000"))
+    XCTAssertFalse(other.isFrozen)
+    XCTAssertEqual(other.currentStamp?.sequence, 5)
+    presenter.toggleFreeze()
+    XCTAssertTrue(presenter.isFrozen)
+    presenter.cancelPendingFreeze()  // Preserve an already published freeze.
+    XCTAssertTrue(presenter.isFrozen)
+    XCTAssertEqual(presenter.currentStamp, accepted.stamp)
+  }
+
+  @MainActor func testOutOfOrderCompletionCannotRollBackOrChangePresenterTarget() async throws {
+    let presenter = MonitorSurfacePresenter()
+    let config = MonitorConfiguration()
+    let newest = try fixture(sequence: 8, configuration: config, revision: 3, processing: 4)
+    presenter.accept(newest)
+    presenter.accept(try fixture(sequence: 7, configuration: config, revision: 3, processing: 4))
+    presenter.accept(try fixture(sequence: 9, configuration: config, revision: 2, processing: 4))
+    presenter.accept(try fixture(sequence: 9, configuration: config, revision: 3, processing: 3))
+    presenter.accept(
+      try fixture(sequence: 9, configuration: config, revision: 3, processing: 4, target: "other"))
+    XCTAssertEqual(presenter.currentStamp, newest.stamp)
+    presenter.accept(newest)  // Equal sequence is a valid matching-result update.
+    presenter.setUnavailable("Feed stopped")
+    presenter.accept(try fixture(sequence: 7, configuration: config, revision: 3, processing: 4))
+    XCTAssertNil(presenter.currentStamp)
+    let restarted = try fixture(sequence: 1, configuration: config, generation: 2, revision: 1)
+    presenter.accept(restarted)
+    presenter.accept(newest)  // The retired generation cannot return after restart.
+    await Task.yield()
+    presenter.setClean(false)
+    XCTAssertEqual(presenter.currentStamp, restarted.stamp)
+    XCTAssertEqual(presenter.status, "Live")
+  }
+
+  @MainActor func testInvalidPublicationCannotResurrectOrSatisfyPendingFreeze() async throws {
+    let presenter = MonitorSurfacePresenter()
+    let config = MonitorConfiguration()
+    presenter.accept(try fixture(sequence: 1, configuration: config))
+    presenter.setUnavailable("Preview hidden")
+    let stale = try fixture(sequence: 2, configuration: config)
+    presenter.accept(stale, ifCurrent: { false })
+    await Task.yield()
+    XCTAssertNil(presenter.currentStamp)
+    XCTAssertEqual(presenter.status, "Preview hidden")
+    presenter.requestFreezeOnNextFrame()
+    presenter.accept(stale, ifCurrent: { false })
+    await Task.yield()
+    XCTAssertTrue(presenter.isFreezePending)
+    XCTAssertFalse(presenter.isFrozen)
+    XCTAssertNil(presenter.currentStamp)
+    let current = try fixture(sequence: 3, configuration: config)
+    presenter.accept(current, ifCurrent: { true })
+    await Task.yield()
+    presenter.setClean(false)
+    XCTAssertTrue(presenter.isFrozen)
+    XCTAssertFalse(presenter.isFreezePending)
+    XCTAssertEqual(presenter.currentStamp, current.stamp)
+  }
+
+  @MainActor func testScopeVisibilityIsLocalAndDoesNotChangeSharedConfiguration() throws {
+    var configuration = MonitorConfiguration()
+    configuration.toolsEnabled = true
+    configuration.scopes.enabled = true
+    var probes: [String: NSView] = [:]
+    let root = HStack {
+      ForEach([false, true], id: \.self) { visible in
+        MonitorTileChrome(
+          target: .constant(MonitorTargetID("shared")), configuration: .constant(configuration),
+          choices: [], status: "Frozen", showsScopes: visible
+        ) {
+          Color.black.frame(height: 90)
+        } scopes: {
+          Color.gray.frame(height: 120).background(
+            LayoutProbe { probes[visible ? "shown" : "hidden"] = $0 })
+        }
+      }
+    }.frame(width: 600)
+    let host = NSHostingView(rootView: root)
+    host.frame = NSRect(x: 0, y: 0, width: 600, height: 500)
+    host.layoutSubtreeIfNeeded()
+    XCTAssertNil(probes["hidden"])
+    XCTAssertNotNil(probes["shown"])
+    XCTAssertTrue(configuration.scopes.enabled)
+  }
+
+  @MainActor func testZoomTransformsPictureAndGuideTogetherAtBoundedScale() throws {
+    XCTAssertEqual(MonitorPictureZoom(.infinity).scale, 1)
+    XCTAssertEqual(MonitorPictureZoom(99).scale, 4)
+    var probes: [String: NSView] = [:]
+    let root = ZStack {
+      Color.black.background(LayoutProbe { probes["picture"] = $0 })
+      Color.clear.background(LayoutProbe { probes["guide"] = $0 })
+    }.frame(width: 80, height: 40).modifier(MonitorPictureZoom(2)).frame(width: 80, height: 40)
+    let host = NSHostingView(rootView: root)
+    host.frame = NSRect(x: 0, y: 0, width: 80, height: 40)
+    host.layoutSubtreeIfNeeded()
+    let picture = try XCTUnwrap(probes["picture"])
+    let guide = try XCTUnwrap(probes["guide"])
+    let pictureRect = picture.convert(picture.bounds, to: host)
+    let guideRect = guide.convert(guide.bounds, to: host)
+    XCTAssertEqual(pictureRect, guideRect)
+    XCTAssertEqual(pictureRect.width, 160, accuracy: 1)
+    XCTAssertEqual(pictureRect.height, 80, accuracy: 1)
+    XCTAssertEqual(pictureRect.midX, host.bounds.midX, accuracy: 1)
+    XCTAssertEqual(pictureRect.midY, host.bounds.midY, accuracy: 1)
+  }
+
   private func fixture(
     sequence: UInt64, configuration: MonitorConfiguration, transfer: String = "Synthetic signal",
     generation: UInt64 = 1, revision: UInt64? = nil, processing: UInt64 = 0,
-    target: String = "synthetic", requiresIOSurface: Bool = true
-  ) throws -> MonitorDisplayResult {
+    target: String = "synthetic"
+  ) throws -> Fixture {
     var buffer: CVPixelBuffer?
     let result = CVPixelBufferCreate(
       kCFAllocatorDefault, 16, 9, kCVPixelFormatType_32BGRA,
-      requiresIOSurface ? [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary : nil, &buffer)
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
     XCTAssertEqual(result, kCVReturnSuccess)
     let pixelBuffer = try XCTUnwrap(buffer)
     CVPixelBufferLockBaseAddress(pixelBuffer, [])
     if let address = CVPixelBufferGetBaseAddress(pixelBuffer) {
-      memset(address, Int32(sequence * 20), CVPixelBufferGetDataSize(pixelBuffer))
+      memset(address, Int32(truncatingIfNeeded: sequence * 20), CVPixelBufferGetDataSize(pixelBuffer))
     }
     CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
     let stamp = MonitorFrameStamp(
       target: MonitorTargetID(target), generation: generation, sequence: sequence,
       sourcePTS: Double(sequence), hostTime: ProcessInfo.processInfo.systemUptime,
       configurationRevision: revision ?? sequence, processingRevision: processing)
-    let frame = MonitorOwnedFrame(stamp: stamp, pixelBuffer: pixelBuffer, releaseBudget: {})
-    return MonitorDisplayResult(
-      clean: frame, decorated: nil, scope: nil, configuration: configuration, availability: [],
-      pictureSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: transfer))
+    return Fixture(
+      bundle: MonitorFrameBundle(
+        stamp: stamp, source: pixelBuffer,
+        sourceSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: transfer)),
+      configuration: configuration)
+  }
+}
+
+private struct Fixture {
+  let bundle: MonitorFrameBundle
+  let configuration: MonitorConfiguration
+  var stamp: MonitorFrameStamp { bundle.stamp }
+}
+
+extension MonitorSurfacePresenter {
+  fileprivate func accept(_ fixture: Fixture, ifCurrent: () -> Bool = { true }) {
+    accept(fixture.bundle, configuration: fixture.configuration, ifCurrent: ifCurrent)
   }
 }
 

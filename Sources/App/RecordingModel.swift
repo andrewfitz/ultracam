@@ -98,9 +98,14 @@ struct RecordingFeedState: Identifiable, Equatable, Sendable {
   var statistics: RecordingStatistics?
   /// The last take that finished and was written, kept until the next take starts.
   var savedURL: URL?
+  /// Record was pressed and the take is being prepared off the main thread
+  /// (output file, encoder). `status` is already `.recording`; capture
+  /// connects to the recorder only once it is ready.
+  var isStarting = false
   var isActive: Bool { status != .idle }
   var displayStatus: String {
     if statistics?.failed == true { return "Failed" }
+    if isStarting && status == .recording { return "Starting…" }
     if status == .idle && statistics != nil { return error == nil ? "Finished" : "Failed" }
     if status == .recording && statistics?.encodedFrames == 0 { return "Waiting for video" }
     return status.title
@@ -129,6 +134,11 @@ enum RecordingUIError: LocalizedError, Equatable {
 /// Implementations are called on the main actor by `RecordingModel`.
 protocol RecordingSessionDriver: AnyObject {
   func startRecording(feedID: FeedID, configuration: RecordingConfiguration) throws
+  /// Starts a take without blocking the caller: the slow part (output file,
+  /// encoder session, GPU converter) may run elsewhere. `completion` runs on
+  /// the main actor once the take records or has failed to start.
+  @MainActor func startRecording(feedID: FeedID, configuration: RecordingConfiguration,
+    completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void)
   func pauseRecording(feedID: FeedID) throws
   func resumeRecording(feedID: FeedID) throws
   func stopRecording(feedID: FeedID) throws
@@ -137,6 +147,11 @@ protocol RecordingSessionDriver: AnyObject {
 }
 
 extension RecordingSessionDriver {
+  @MainActor func startRecording(feedID: FeedID, configuration: RecordingConfiguration,
+    completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void) {
+    completion(Result { try startRecording(feedID: feedID, configuration: configuration) })
+  }
+
   @MainActor func stopRecording(feedID: FeedID,
     completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void) {
     completion(Result { try stopRecording(feedID: feedID) })
@@ -156,6 +171,13 @@ protocol RecordingSessionDriverStatistics: AnyObject {
 
 protocol RecordingSessionDriverArtifacts: AnyObject {
   func recordingOutputURL(feedID: FeedID) -> URL?
+  /// Where the feed's last finalized take was written. A take stopped while
+  /// it was still starting has no live output to ask for.
+  func finishedOutputURL(feedID: FeedID) -> URL?
+}
+
+extension RecordingSessionDriverArtifacts {
+  func finishedOutputURL(feedID: FeedID) -> URL? { nil }
 }
 
 /// Native source recorder used by the app. Each feed owns one callback adapter
@@ -207,7 +229,12 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
   private let sessionLock = NSLock()
   private var sessions: [FeedID: Session] = [:]
   private var stoppingFeeds = Set<FeedID>()
+  /// Feeds whose take is being prepared on a worker, and stops that arrived
+  /// meanwhile (run by that worker once the take exists).
+  private var startingFeeds = Set<FeedID>()
+  private var stopsAfterStart: [FeedID: [StopCompletion]] = [:]
   private var completedStatistics: [FeedID: RecordingStatistics] = [:]
+  private var finishedOutputs: [FeedID: URL] = [:]
   private var outputManagers: [String: RecordingOutputManager] = [:]
 
   init(capture: CaptureController, rawAudioCallbackAvailable: Bool = false,
@@ -216,6 +243,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     self.captureForFeed = captureForFeed ?? { _ in capture }
     self.rawAudioCallbackAvailable = rawAudioCallbackAvailable
     self.recorderFactory = recorderFactory
+    // The first take would otherwise compile the GPU repack kernel at start.
+    RecordingPixelConverter.prewarm()
   }
 
   var startWarning: RecordingUIError? {
@@ -226,54 +255,128 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     sessionLock.withLock { sessions[feedID]?.output.finalURL }
   }
 
+  func finishedOutputURL(feedID: FeedID) -> URL? {
+    sessionLock.withLock { finishedOutputs[feedID] }
+  }
+
+  // MARK: Start
+
+  typealias StopCompletion = @MainActor @Sendable (Result<Void, Error>) -> Void
+
+  /// What the main actor resolved for a start; the rest runs on a worker.
+  private struct StartRequest: @unchecked Sendable {
+    let feedID: FeedID
+    let configuration: RecordingConfiguration
+    let folder: URL
+    let capture: CaptureController
+    let sourceTimecode: String?
+  }
+
+  /// Synchronous start, for callers that may block (tests, tools).
   func startRecording(feedID: FeedID, configuration: RecordingConfiguration) throws {
+    let request = try beginStart(feedID: feedID, configuration: configuration)
+    let (result, stops, stopResult) = completeStart(request)
+    if !stops.isEmpty {
+      DispatchQueue.main.async { for stop in stops { stop(stopResult ?? .success(())) } }
+    }
+    try result.get()
+  }
+
+  /// Returns at once. The output file, the recorder and its encoder (about
+  /// 100 ms cold, more if the GPU converter is still compiling) are prepared
+  /// on a worker; capture connects to the recorder only once it is ready, so
+  /// no frame waits for the encoder and none is lost at the start.
+  @MainActor func startRecording(feedID: FeedID, configuration: RecordingConfiguration,
+    completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void) {
+    let request: StartRequest
+    do { request = try beginStart(feedID: feedID, configuration: configuration) }
+    catch { completion(.failure(error)); return }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let (result, stops, stopResult) = self.completeStart(request)
+      DispatchQueue.main.async {
+        completion(result)
+        for stop in stops { stop(stopResult ?? .success(())) }
+      }
+    }
+  }
+
+  /// Caller's thread (the main actor for the app): cheap checks, then the
+  /// feed's slot is claimed so a second start or a stop sees it.
+  private func beginStart(feedID: FeedID, configuration: RecordingConfiguration) throws -> StartRequest {
     let capture = captureForFeed(feedID)
     guard !capture.hasActiveFeed || capture.isAccepting(feedID: feedID) else {
       throw RecordingUIError.feedNotActive
     }
-    guard sessionLock.withLock({ sessions[feedID] == nil }) else {
+    guard sessionLock.withLock({ sessions[feedID] == nil && !startingFeeds.contains(feedID) }) else {
       throw SourceRecordingError.invalidState(.recording, operation: "start recording")
     }
     guard let folder = configuration.outputFolder else {
       throw RecordingUIError.outputFolderRequired
     }
-    let folderAccess = RecordingFolderAccess(folder)
-    defer { withExtendedLifetime(folderAccess) {} }
+    try sessionLock.withLock {
+      guard sessions[feedID] == nil, startingFeeds.insert(feedID).inserted else {
+        throw SourceRecordingError.invalidState(.recording, operation: "start recording")
+      }
+      completedStatistics.removeValue(forKey: feedID)
+      finishedOutputs.removeValue(forKey: feedID)
+    }
+    // Only record-start timecode follows the camera's drop-frame flag.
+    return StartRequest(feedID: feedID, configuration: configuration, folder: folder, capture: capture,
+      sourceTimecode: configuration.timecodeMode == .recordStart ? capture.latestSourceTimecode : nil)
+  }
+
+  /// Worker: builds and starts the session, then publishes it. A stop that
+  /// arrived meanwhile finalizes it here, before capture ever connects.
+  private func completeStart(_ request: StartRequest)
+    -> (Result<Void, Error>, [StopCompletion], Result<Void, Error>?) {
+    let prepared = Result { try prepareSession(request) }
+    let (stops, session) = sessionLock.withLock { () -> ([StopCompletion], Session?) in
+      startingFeeds.remove(request.feedID)
+      let stops = stopsAfterStart.removeValue(forKey: request.feedID) ?? []
+      guard case let .success(session) = prepared else { return (stops, nil) }
+      sessions[request.feedID] = session
+      if stops.isEmpty {
+        // Installed under the session lock: a stop that finds this session
+        // removes the callbacks only after they are in place.
+        request.capture.setRecordingCallbacks(feedID: request.feedID, callbacks: session.adapter.callbacks)
+      } else {
+        stoppingFeeds.insert(request.feedID)
+      }
+      return (stops, session)
+    }
+    guard let session else {
+      if case let .failure(error) = prepared { return (.failure(error), stops, nil) }
+      return (.success(()), stops, nil)
+    }
+    guard !stops.isEmpty else { return (.success(()), [], nil) }
+    session.clock.pause()
+    return (.success(()), stops, Result { try finalize(session, feedID: request.feedID) })
+  }
+
+  /// Worker: the output reservation (file system), the recorder and its
+  /// prepared encoder.
+  private func prepareSession(_ request: StartRequest) throws -> Session {
+    let folderAccess = RecordingFolderAccess(request.folder)
     // Allocate a per-feed atomic output before creating the writer. The
     // writer only sees the temporary path; a completed session is renamed to
     // its final path after all queued samples have drained.
-    let outputManager = try manager(for: folder, fileExtension: configuration.codec.fileExtension)
+    let outputManager = try manager(for: request.folder, fileExtension: request.configuration.codec.fileExtension)
     let output = try outputManager.beginExternalWriterSession(
-      feedID: Self.safeComponent(configuration.feedName ?? "Feed"))
+      feedID: Self.safeComponent(request.configuration.feedName ?? "Feed"))
     do {
       let sourceConfiguration = try SourceRecordingConfiguration(
-        feedID: SourceRecordingFeedID(feedID.rawValue), outputURL: output.temporaryURL,
+        feedID: SourceRecordingFeedID(request.feedID.rawValue), outputURL: output.temporaryURL,
         width: 3840, height: 2160,
-        videoCodec: configuration.codec == .proRes42210Bit
+        videoCodec: request.configuration.codec == .proRes42210Bit
           ? kCMVideoCodecType_AppleProRes422HQ : kCMVideoCodecType_HEVC,
-        timecodePolicy: Self.timecodePolicy(for: configuration.timecodeMode),
-        timecodeSamplesComputerClockAtFirstFrame: configuration.timecodeMode == .wallClock,
-        checkAvailableSpace: { try output.checkExternalWriterCapacity() })
+        timecodePolicy: Self.timecodePolicy(for: request.configuration.timecodeMode),
+        sourceTimecode: request.sourceTimecode,
+        timecodeSamplesComputerClockAtFirstFrame: request.configuration.timecodeMode == .wallClock,
+        checkAvailableSpace: { try output.checkExternalWriterCapacity(headroom: $0) })
       let recorder = try recorderFactory(sourceConfiguration)
       let adapter = SourceRecordingCallbackAdapter(feedID: sourceConfiguration.feedID, recorder: recorder)
       try adapter.start()
-      sessionLock.lock()
-      // A concurrent start for the same feed may have won while the writer
-      // was being constructed. Never overwrite that live session or leak its
-      // output reservation.
-      let available = sessions[feedID] == nil
-      if available {
-        completedStatistics.removeValue(forKey: feedID)
-        sessions[feedID] = Session(adapter: adapter, feedID: feedID, output: output, folderAccess: folderAccess)
-      }
-      sessionLock.unlock()
-      guard available else {
-        throw SourceRecordingError.invalidState(.recording, operation: "start recording")
-      }
-      // Install the callback only after winning the session slot. Otherwise a
-      // losing concurrent start could replace the active recorder's callback
-      // and leave the winning session unable to receive media.
-      capture.setRecordingCallbacks(feedID: feedID, callbacks: adapter.callbacks)
+      return Session(adapter: adapter, feedID: request.feedID, output: output, folderAccess: folderAccess)
     } catch {
       try? output.cancel()
       throw error
@@ -309,9 +412,19 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     }
   }
 
+  // MARK: Stop
+
+  private enum StopPlan {
+    case nothing
+    case afterStart
+    case session(Session)
+  }
+
   func stopRecording(feedID: FeedID) throws {
-    guard let session = try beginStop(feedID: feedID) else { return }
-    try finalize(session, feedID: feedID)
+    switch try beginStop(feedID: feedID, deferring: nil) {
+    case .nothing, .afterStart: return
+    case let .session(session): try finalize(session, feedID: feedID)
+    }
   }
 
   @MainActor func stopRecording(feedID: FeedID,
@@ -319,29 +432,37 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     do {
       // Resolve the app-owned capture controller on the caller's main actor.
       // Only detached media finalization crosses to the worker.
-      guard let session = try beginStop(feedID: feedID) else {
-        completion(.success(()))
-        return
-      }
-      DispatchQueue.global(qos: .userInitiated).async {
-        let result = Result { try self.finalize(session, feedID: feedID) }
-        DispatchQueue.main.async { completion(result) }
+      switch try beginStop(feedID: feedID, deferring: completion) {
+      case .nothing: completion(.success(()))
+      case .afterStart: break  // The starting worker finalizes and calls back.
+      case let .session(session):
+        DispatchQueue.global(qos: .userInitiated).async {
+          let result = Result { try self.finalize(session, feedID: feedID) }
+          DispatchQueue.main.async { completion(result) }
+        }
       }
     } catch { completion(.failure(error)) }
   }
 
-  private func beginStop(feedID: FeedID) throws -> Session? {
-    let session = try sessionLock.withLock { () throws -> Session? in
-      guard let session = sessions[feedID] else { return nil }
+  private func beginStop(feedID: FeedID, deferring completion: StopCompletion?) throws -> StopPlan {
+    let plan = try sessionLock.withLock { () throws -> StopPlan in
+      if startingFeeds.contains(feedID) {
+        guard let completion, stopsAfterStart[feedID] == nil else {
+          throw SourceRecordingError.invalidState(.stopping, operation: "stop recording")
+        }
+        stopsAfterStart[feedID] = [completion]
+        return .afterStart
+      }
+      guard let session = sessions[feedID] else { return .nothing }
       guard stoppingFeeds.insert(feedID).inserted else {
         throw SourceRecordingError.invalidState(.stopping, operation: "stop recording")
       }
-      return session
+      return .session(session)
     }
-    guard let session else { return nil }
+    guard case let .session(session) = plan else { return plan }
     session.clock.pause()
     captureForFeed(feedID).setRecordingCallbacks(feedID: feedID, callbacks: nil)
-    return session
+    return plan
   }
 
   private func finalize(_ session: Session, feedID: FeedID) throws {
@@ -349,6 +470,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
       let final = snapshot(session, stopped: true)
       sessionLock.withLock {
         completedStatistics[feedID] = final
+        finishedOutputs[feedID] = session.output.finalURL
         sessions.removeValue(forKey: feedID)
         stoppingFeeds.remove(feedID)
       }
@@ -568,7 +690,7 @@ final class RecordingModel {
     feeds.contains { $0.status == .idle && outputFolder(for: $0.id) != nil }
   }
 
-  var canPauseAny: Bool { feeds.contains { $0.status == .recording } }
+  var canPauseAny: Bool { feeds.contains { $0.status == .recording && !$0.isStarting } }
   var canStopAny: Bool { feeds.contains { $0.status == .recording || $0.status == .paused } }
   var hasActiveRecordings: Bool { feeds.contains(where: \.isActive) }
 
@@ -607,33 +729,59 @@ final class RecordingModel {
     if restoredFolder { refreshRecovery() }
   }
 
+  /// Returns at once: the take shows "Starting…" while the driver prepares
+  /// it off the main actor, then records. Stop during the start is honoured
+  /// as soon as the take exists; Pause waits for it.
   func record(feedID: FeedID) {
     guard let index = index(of: feedID), feeds[index].status == .idle else { return }
     guard let folder = outputFolder(for: feedID) else {
       feeds[index].error = RecordingUIError.outputFolderRequired.localizedDescription
       return
     }
-    do {
-      var take = configuration
-      take.outputFolder = folder
-      take.feedName = feeds[index].name
-      try driver.startRecording(feedID: feedID, configuration: take)
-      recordingGenerations[feedID, default: 0] &+= 1
-      feeds[index].savedURL = nil
-      feeds[index].status = .recording
-      feeds[index].statistics = (driver is RecordingSessionDriverStatistics) ? RecordingStatistics() : nil
+    var take = configuration
+    take.outputFolder = folder
+    take.feedName = feeds[index].name
+    recordingGenerations[feedID, default: 0] &+= 1
+    let generation = recordingGenerations[feedID, default: 0]
+    let previous = (savedURL: feeds[index].savedURL, statistics: feeds[index].statistics)
+    feeds[index].savedURL = nil
+    feeds[index].status = .recording
+    feeds[index].isStarting = true
+    feeds[index].error = nil
+    feeds[index].statistics = (driver is RecordingSessionDriverStatistics) ? RecordingStatistics() : nil
+    driver.startRecording(feedID: feedID, configuration: take) { [weak self] result in
+      self?.finishStart(feedID: feedID, generation: generation, result: result,
+        previousSavedURL: previous.savedURL, previousStatistics: previous.statistics)
+    }
+  }
+
+  private func finishStart(feedID: FeedID, generation: UInt64, result: Result<Void, Error>,
+    previousSavedURL: URL?, previousStatistics: RecordingStatistics?) {
+    guard let index = index(of: feedID), recordingGenerations[feedID] == generation else { return }
+    feeds[index].isStarting = false
+    switch result {
+    case .success:
       startStatisticsUpdates()
+      // A stop that arrived while starting already moved the take on.
+      guard feeds[index].status == .recording else { return }
       feeds[index].error = (driver as? RecordingSessionDriverDiagnostics)?.startWarning?.localizedDescription
       if let output = (driver as? RecordingSessionDriverArtifacts)?.recordingOutputURL(feedID: feedID) {
         onRecordingStarted?(feedID, output)
       }
-    } catch {
+    case let .failure(error):
       feeds[index].error = error.localizedDescription
+      // A stop requested meanwhile completes on its own and reports idle.
+      guard feeds[index].status == .recording else { return }
+      feeds[index].status = .idle
+      feeds[index].savedURL = previousSavedURL
+      feeds[index].statistics = previousStatistics
+      notifyFinished()
     }
   }
 
   func pause(feedID: FeedID) {
-    guard let index = index(of: feedID), feeds[index].status == .recording else { return }
+    guard let index = index(of: feedID), feeds[index].status == .recording,
+      !feeds[index].isStarting else { return }
     do {
       try driver.pauseRecording(feedID: feedID)
       feeds[index].status = .paused
@@ -657,16 +805,20 @@ final class RecordingModel {
   func stop(feedID: FeedID) {
     guard let index = index(of: feedID),
       feeds[index].status == .recording || feeds[index].status == .paused else { return }
-    let output = (driver as? RecordingSessionDriverArtifacts)?.recordingOutputURL(feedID: feedID)
+    let artifacts = driver as? RecordingSessionDriverArtifacts
+    let output = artifacts?.recordingOutputURL(feedID: feedID)
     let folder = outputFolder(for: feedID)
     feeds[index].status = .finishing
     feeds[index].error = nil
     driver.stopRecording(feedID: feedID) { [weak self] result in
       guard let self, let index = self.index(of: feedID) else { return }
       self.feeds[index].status = .idle
-      let saved = Self.existingFile(output, scope: folder)
+      self.feeds[index].isStarting = false
+      // A take stopped while it was starting had no live output to ask for.
+      let saved = Self.existingFile(output ?? artifacts?.finishedOutputURL(feedID: feedID), scope: folder)
+      // A start that failed after Stop was pressed already set the error.
       if case let .failure(error) = result { self.feeds[index].error = error.localizedDescription }
-      else { self.feeds[index].savedURL = saved }
+      else if self.feeds[index].error == nil { self.feeds[index].savedURL = saved }
       self.onRecordingFinished?(feedID, saved)
       self.refreshRecovery()
       self.notifyFinished()

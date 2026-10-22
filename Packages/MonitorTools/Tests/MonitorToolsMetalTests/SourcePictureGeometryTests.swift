@@ -119,30 +119,18 @@ final class SourcePictureGeometryTests: XCTestCase {
     let runtime = MonitorRuntime()
     let stamp = MonitorFrameStamp(target: MonitorTargetID("source-geometry"), generation: 1,
       sequence: 1, sourcePTS: 1, hostTime: 1, configurationRevision: 1)
-    runtime.configure(target: stamp.target, generation: 1, configurationRevision: 1, configuration: config)
     let profile = config.sourceProfileID
     let signal = MonitorFrameSignal(range: .full, matrix: .bt709,
       transfer: profile ?? "rec709", profileID: profile)
     let image = Image()
-    let done = expectation(description: "source geometry image")
-    XCTAssertTrue(runtime.offer(MonitorFrameBundle(stamp: stamp, source: source, output: output,
+    let displayed = try runtime.renderSnapshot(MonitorFrameBundle(stamp: stamp, source: source, output: output,
       correspondence: mapping, sourceSignal: signal,
-      outputSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "rec709"))) { result in
-        do {
-          let displayed = try result.get()
-          let buffer = try XCTUnwrap(displayed.decorated, "\(displayed.availability)").pixelBuffer
-          image.width = CVPixelBufferGetWidth(buffer); image.height = CVPixelBufferGetHeight(buffer)
-          CVPixelBufferLockBaseAddress(buffer, .readOnly)
-          defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-          let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
-          let stride = CVPixelBufferGetBytesPerRow(buffer)
-          for y in 0..<image.height {
-            image.bytes.append(contentsOf: UnsafeBufferPointer(start: base + y * stride, count: image.width * 4))
-          }
-        } catch { XCTFail("\(error)") }
-        done.fulfill()
-      })
-    wait(for: [done], timeout: 15)
+      outputSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "rec709")),
+      configuration: config.normalized())
+    XCTAssertTrue(displayed.availability.isEmpty, "\(displayed.availability)")
+    image.width = displayed.width
+    image.height = displayed.height
+    image.bytes = displayed.pictureBytes
     XCTAssertFalse(image.bytes.isEmpty)
     return image
   }

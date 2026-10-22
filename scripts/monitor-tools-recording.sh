@@ -11,7 +11,7 @@ external_root=/Volumes/8TB/cinesomatic-director-work
 if ! mount | /usr/bin/grep -F ' on /Volumes/8TB ' > /dev/null; then
   echo 'External drive not mounted.' >&2; exit 1
 fi
-export TMPDIR="$external_root/tmp" MACOSX_DEPLOYMENT_TARGET=15.0
+export TMPDIR="$external_root/tmp" MACOSX_DEPLOYMENT_TARGET=26.0
 export ULTRACAM_SHADER="$task_root/Sources/App/LUTShaders.metal"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$external_root/agent-work/build/ultracam/monitor-recording/$run_id"
@@ -19,12 +19,12 @@ mkdir -p "$TMPDIR" "$test_root/modules"
 python3 "$task_root/scripts/monitor-tools-fingerprint.py" capture "$test_root/source-manifest.json"
 source "$task_root/scripts/monitor-tools-package.sh"
 monitor_package_build > "$test_root/compile.log" 2>&1 || { cat "$test_root/compile.log"; exit 1; }
-xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos15.0 -module-cache-path "$test_root/modules" \
+xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
   "${monitor_link_args[@]}" "$task_root/Sources/Shared/VideoContract.swift" \
   "$task_root/Sources/Shared/VideoBufferLayout.swift" "$task_root/Sources/Shared/CubeLUT.swift" \
   "$task_root/Sources/App/LUTProcessor.swift" \
   "$task_root/Sources/App/AppResourceUsage.swift" "$task_root"/Sources/Recording/*.swift \
-  "$task_root/Tools/MonitorToolsRecording/QualificationMetrics.swift" "$task_root/Tools/MonitorToolsRecording/PipelineAdmission.swift" "$task_root/Tools/MonitorToolsRecording/main.swift" -o "$test_root/monitor-recording" \
+  "$task_root/Tools/MonitorToolsRecording/QualificationMetrics.swift" "$task_root/Tools/MonitorToolsRecording/PipelineAdmission.swift" "$task_root/Tools/MonitorToolsRecording/MonitorGPUWorkload.swift" "$task_root/Tools/MonitorToolsRecording/main.swift" -o "$test_root/monitor-recording" \
   >> "$test_root/compile.log" 2>&1 || { cat "$test_root/compile.log"; exit 1; }
 python3 "$task_root/scripts/monitor-tools-fingerprint.py" verify "$test_root/source-manifest.json"
 shasum -a 256 "$test_root/monitor-recording" > "$test_root/binary-sha256.txt"

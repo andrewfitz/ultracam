@@ -12,7 +12,10 @@ final class VideoPreviewRenderer: @unchecked Sendable {
   struct Diagnostics: Sendable {
     var received: UInt64 = 0
     var enqueued: UInt64 = 0
-    var replaced: UInt64 = 0
+    /// Frames superseded by a newer one before the display layer took them.
+    /// A display shows the newest frame per refresh; this counts the rest
+    /// rather than queueing them behind the screen as latency.
+    var late: UInt64 = 0
     var backPressure: UInt64 = 0
     var stagingDrops: UInt64 = 0
     var failed: UInt64 = 0
@@ -47,7 +50,6 @@ final class VideoPreviewRenderer: @unchecked Sendable {
   private let lock = NSLock()
   private var stager = CameraFrameStager()
   private var generation: UInt64 = 0
-  private static let pendingCapacity = VideoContract.previewPendingLimit
   private struct QueuedSample {
     let sample: CMSampleBuffer
     let generation: UInt64
@@ -55,9 +57,9 @@ final class VideoPreviewRenderer: @unchecked Sendable {
     let queuedAt = ProcessInfo.processInfo.systemUptime
 #endif
   }
-  private var pending = [QueuedSample?](repeating: nil, count: pendingCapacity)
-  private var pendingHead = 0
-  private var pendingCount = 0
+  // The newest frame not yet handed to the display layer. A newer frame
+  // replaces it (counted late); the preview never builds a queue.
+  private var pending: QueuedSample?
   private var scheduledGeneration: UInt64?
   private var visible = false
   private var boundSourceID: String?
@@ -121,9 +123,8 @@ final class VideoPreviewRenderer: @unchecked Sendable {
   // thread for every frame. The owning view publishes visibility on UI events.
   var isVisible: Bool { lock.withLock { visible } }
 
-  // A fixed ring absorbs short native display/host scheduling stalls. It holds
-  // only sample references, plus at most one executing sample/work item. On
-  // overflow, evict the oldest queued image so latency cannot grow unbounded.
+  // At most one frame waits for the display layer, plus at most one in the
+  // executing work item. Latency stays one frame, whatever the display does.
   func bindSource(_ sourceID: String) {
     lock.withLock {
       guard boundSourceID != sourceID else { return }
@@ -137,13 +138,8 @@ final class VideoPreviewRenderer: @unchecked Sendable {
       guard visible else { return }
       if let boundSourceID, sourceID != boundSourceID { return }
       diagnostics.received &+= 1
-      if pendingCount == Self.pendingCapacity {
-        _ = popPendingLocked()
-        diagnostics.replaced &+= 1
-      }
-      let index = (pendingHead + pendingCount) % Self.pendingCapacity
-      pending[index] = QueuedSample(sample: sample, generation: generation)
-      pendingCount += 1
+      if pending != nil { diagnostics.late &+= 1 }
+      pending = QueuedSample(sample: sample, generation: generation)
       guard scheduledGeneration != generation else { return }
       scheduleDrainLocked(generation: generation)
     }
@@ -184,9 +180,7 @@ final class VideoPreviewRenderer: @unchecked Sendable {
   // view's first enqueue. Hidden views release pending/native images promptly.
   private func flushLocked(resetDiagnostics: Bool) {
     generation &+= 1
-    for index in pending.indices { pending[index] = nil }
-    pendingHead = 0
-    pendingCount = 0
+    pending = nil
     scheduledGeneration = nil
     let token = generation
     if resetDiagnostics {
@@ -212,7 +206,7 @@ final class VideoPreviewRenderer: @unchecked Sendable {
 #endif
       self.stager = CameraFrameStager()
       self.lock.withLock {
-        guard token == self.generation, self.pendingCount > 0,
+        guard token == self.generation, self.pending != nil,
           self.scheduledGeneration != token else { return }
         self.scheduleDrainLocked(generation: token)
       }
@@ -222,7 +216,7 @@ final class VideoPreviewRenderer: @unchecked Sendable {
   func diagnosticsSnapshot() -> Diagnostics {
     lock.withLock {
       var result = diagnostics
-      result.pending = pendingCount
+      result.pending = pending == nil ? 0 : 1
       return result
     }
   }
@@ -269,16 +263,6 @@ final class VideoPreviewRenderer: @unchecked Sendable {
     }
   }
 
-  // Caller holds lock. A ring avoids shifting/retaining an array every frame.
-  private func popPendingLocked() -> QueuedSample? {
-    guard pendingCount > 0 else { return nil }
-    let next = pending[pendingHead]
-    pending[pendingHead] = nil
-    pendingHead = (pendingHead + 1) % Self.pendingCapacity
-    pendingCount -= 1
-    return next
-  }
-
   private func scheduleDrainLocked(generation token: UInt64) {
     scheduledGeneration = token
     queue.async { [weak self] in self?.drainOne(generation: token) }
@@ -289,7 +273,8 @@ final class VideoPreviewRenderer: @unchecked Sendable {
       // A queued drain from before flush must never steal the new generation's
       // samples and enqueue them ahead of the queued native flush operation.
       guard token == generation, scheduledGeneration == token else { return nil }
-      let next = popPendingLocked()
+      let next = pending
+      pending = nil
 #if CAPTURE_LIFECYCLE_TESTS
       if let next {
         diagnostics.maxQueueWaitMS = max(diagnostics.maxQueueWaitMS,
@@ -301,7 +286,7 @@ final class VideoPreviewRenderer: @unchecked Sendable {
     if let next, !render(next) { return }
     lock.withLock {
       guard token == generation, scheduledGeneration == token else { return }
-      if pendingCount == 0 { scheduledGeneration = nil }
+      if pending == nil { scheduledGeneration = nil }
       else { scheduleDrainLocked(generation: token) }
     }
   }
@@ -319,13 +304,8 @@ final class VideoPreviewRenderer: @unchecked Sendable {
       let current = lock.withLock { () -> Bool in
         guard visible && token == generation else { return false }
         diagnostics.backPressure &+= 1
-        if pendingCount < Self.pendingCapacity {
-          pendingHead = (pendingHead + Self.pendingCapacity - 1) % Self.pendingCapacity
-          pending[pendingHead] = queued
-          pendingCount += 1
-        } else {
-          diagnostics.replaced &+= 1
-        }
+        // Keep this frame for the display unless a newer one already waits.
+        if pending == nil { pending = queued } else { diagnostics.late &+= 1 }
         return true
       }
       guard current else { return true }

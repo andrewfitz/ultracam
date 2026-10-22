@@ -12,7 +12,7 @@ if ! mount | /usr/bin/grep -F ' on /Volumes/8TB ' > /dev/null; then
 fi
 export TMPDIR="$external_root/tmp"
 # Match the deployment target used by the Xcode test binary and production app.
-export MACOSX_DEPLOYMENT_TARGET="15.0"
+export MACOSX_DEPLOYMENT_TARGET="26.0"
 artifact_root="$external_root/agent-work/ultracam"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$external_root/agent-work/build/ultracam/tests/$run_id"
@@ -49,7 +49,7 @@ xcrun clang++ -std=c++17 -I "$sdk_dir" -c "$sdk_dir/DeckLinkAPIDispatch.cpp" \
   -o "$test_root/DeckLinkAPIDispatch.o" >> "$compile_log" 2>&1 || {
   cat "$compile_log"; exit 1
 }
-xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.0 -module-cache-path "$test_root/modules" \
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
   "${monitor_link_args[@]}" \
   -D CAPTURE_LIFECYCLE_TESTS -Xcc -DULTRACAM_BACKEND_TESTING \
   -import-objc-header "$task_root/Sources/DeckLinkBackend/BridgingHeader.h" \
@@ -62,6 +62,7 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.0 -module-cache-pat
   "$task_root/Sources/App/AutoSwitcherBridge.swift" \
   "$task_root/Sources/App/AutoSwitcherTimelineRecorder.swift" \
   "$task_root/Sources/App/ProgramOutputBridge.swift" \
+  "$task_root/Sources/App/ProgramNormalizer.swift" \
   "$task_root/Sources/App/VideoPreview.swift" \
   "$task_root/Sources/App/AppSettingsStore.swift" \
   "$task_root/Sources/App/VirtualCameraRegistryPublishing.swift" \

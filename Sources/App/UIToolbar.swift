@@ -15,10 +15,10 @@ struct UIToolbarContent: ToolbarContent {
     }
 
     // Grouped by function: transport (cameras, record), view (layout, collapse), then the
-    // inspector toggle on its own at the trailing edge. On macOS 26 each group gets its own
-    // glass; on macOS 15 the items sit side by side as before. Order matters: when the window
-    // narrows, macOS moves the trailing items into the overflow menu first, so the cameras and
-    // the record control stay visible; layout, collapse and the inspector are also in View.
+    // inspector toggle on its own at the trailing edge, each group on its own glass. Order
+    // matters: when the window narrows, macOS moves the trailing items into the overflow menu
+    // first, so the cameras and the record control stay visible; layout, collapse and the
+    // inspector are also in View.
     ToolbarItemGroup(placement: .primaryAction) {
       Button {
         context.send(presentation.camerasRunning ? .stopAllCameras : .startAllCameras)
@@ -32,9 +32,7 @@ struct UIToolbarContent: ToolbarContent {
       UIToolbarRecordControl(context: context)
     }
 
-    if #available(macOS 26.0, *) {
-      ToolbarSpacer(.fixed, placement: .primaryAction)
-    }
+    ToolbarSpacer(.fixed, placement: .primaryAction)
 
     ToolbarItemGroup(placement: .primaryAction) {
       if context.session.expandedFrom != nil {
@@ -69,9 +67,7 @@ struct UIToolbarContent: ToolbarContent {
       .disabled(presentation.layout == .fourUp || presentation.layout == .programView)
     }
 
-    if #available(macOS 26.0, *) {
-      ToolbarSpacer(.fixed, placement: .primaryAction)
-    }
+    ToolbarSpacer(.fixed, placement: .primaryAction)
 
     ToolbarItem(placement: .primaryAction) {
       Button {

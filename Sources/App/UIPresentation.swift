@@ -185,6 +185,8 @@ struct UISessionSnapshot: Sendable, Equatable {
   var strategyTitle = "Manual"
   var shot = UIShotTiming()
   var programFormatMismatch = false
+  /// A Program cut that did not land, or Program frames the output dropped.
+  var programIssue: String?
   var recentCuts: [UICutRecord] = []
   var codecTitle = "ProRes 422 10-bit"
   var timecodeTitle = "Mac Clock"
@@ -758,7 +760,10 @@ enum UIPresentationBuilder {
       }
     }
     if let lut = session.cameras.first(where: { $0.lutError != nil }) { return "\(lut.name): LUT unavailable" }
-    if session.outputMode == .program && session.programFormatMismatch { return "Program cameras use different formats" }
+    // Different camera formats are converted on the GPU to the Program
+    // camera's format, so they are not a warning. A cut that did not land or
+    // dropped Program frames are.
+    if session.outputMode == .program, let issue = session.programIssue { return issue }
     return nil
   }
 

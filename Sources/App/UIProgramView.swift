@@ -61,9 +61,9 @@ struct UIProgramView: View {
           }
           if session.programFormatMismatch {
             Label {
-              Text("Cameras use different formats — each cut updates the output")
+              Text("Cameras use different formats — converted to the Program format")
             } icon: {
-              Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+              Image(systemName: "arrow.triangle.2.circlepath")
             }
             .font(.subheadline.weight(.semibold))
             .uiPictureOverlay()

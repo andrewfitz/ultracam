@@ -6,6 +6,8 @@ import XCTest
   var signing = ExtensionInstallPreflight(developerSigned: true, hasInstallEntitlement: true)
   var changes = [ExtensionInstaller.Change]()
   var submitted = [OSSystemExtensionRequest]()
+  /// Runs inside `submit`, to deliver a delegate callback before submission returns.
+  var duringSubmit: ((OSSystemExtensionRequest) -> Void)?
 
   func services() -> ExtensionInstaller.Services {
     ExtensionInstaller.Services(preflight: { self.signing }, makeRequest: { change in
@@ -16,7 +18,10 @@ import XCTest
       case .install: return .activationRequest(forExtensionWithIdentifier: VideoContract.extensionID, queue: .main)
       case .remove: return .deactivationRequest(forExtensionWithIdentifier: VideoContract.extensionID, queue: .main)
       }
-    }, submit: { self.submitted.append($0) })
+    }, submit: { request in
+      self.submitted.append(request)
+      self.duringSubmit?(request)
+    })
   }
 }
 
@@ -212,5 +217,62 @@ import XCTest
     XCTAssertFalse(installer.pending)
     XCTAssertTrue(installer.status.contains("completed"))
     XCTAssertFalse(installer.status.contains("Approve"))
+  }
+
+  /// The reported sequence: a removal refused for authorization (13), one for a
+  /// missing extension (4), then an install that completes. No removal status
+  /// may survive it, and late callbacks from the removals change nothing.
+  func testFailedRemovalsThenCompletedInstallLeaveNoRemovalStatus() throws {
+    let harness = InstallerHarness()
+    let installer = ExtensionInstaller(services: harness.services())
+    for code in [13, 4] {
+      installer.uninstall()
+      XCTAssertTrue(installer.pending)
+      XCTAssertTrue(installer.status.contains("removal"))
+      installer.request(try XCTUnwrap(harness.submitted.last),
+        didFailWithError: NSError(domain: OSSystemExtensionErrorDomain, code: code))
+      callbacks()
+      XCTAssertFalse(installer.pending)
+      XCTAssertTrue(installer.status.contains("failed"))
+      XCTAssertFalse(installer.status.contains("Requesting"))
+    }
+    installer.install()
+    let activation = try XCTUnwrap(harness.submitted.last)
+    XCTAssertEqual(harness.changes, [.remove, .remove, .install])
+    XCTAssertTrue(installer.status.contains("activation"))
+    installer.requestNeedsUserApproval(activation)
+    callbacks()
+    XCTAssertTrue(installer.status.contains("Approve"))
+    installer.request(activation, didFinishWithResult: .completed)
+    callbacks()
+    XCTAssertFalse(installer.pending)
+    XCTAssertTrue(installer.status.contains("completed"))
+    let completedStatus = installer.status
+    for removal in harness.submitted.prefix(2) {
+      installer.requestNeedsUserApproval(removal)
+      installer.request(removal, didFailWithError: NSError(domain: OSSystemExtensionErrorDomain, code: 4))
+      installer.request(removal, didFinishWithResult: .completed)
+    }
+    callbacks()
+    XCTAssertFalse(installer.pending)
+    XCTAssertEqual(installer.status, completedStatus)
+  }
+
+  /// A failure delivered while the request is still being submitted finishes it.
+  func testFailureDuringSubmitReleasesPending() throws {
+    let harness = InstallerHarness()
+    let installer = ExtensionInstaller(services: harness.services())
+    harness.duringSubmit = { request in
+      installer.request(request, didFailWithError: NSError(domain: OSSystemExtensionErrorDomain, code: 4))
+    }
+    installer.uninstall()
+    callbacks()
+    XCTAssertFalse(installer.pending)
+    XCTAssertTrue(installer.status.contains("failed"))
+    XCTAssertNil(try XCTUnwrap(harness.submitted.first).delegate)
+    harness.duringSubmit = nil
+    installer.install()
+    XCTAssertTrue(installer.pending)
+    XCTAssertEqual(harness.submitted.count, 2)
   }
 }

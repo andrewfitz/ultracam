@@ -153,6 +153,10 @@ Building in-tree first, then extracting, keeps Ultracam building while GPU plan 
 - **License:** open source (MIT or Apache 2.0, chosen at extraction). The package ships no vendor code, LUTs or trademarks.
 - **Phase order:** the picture pass first.
 
+## Platform (2026-10-21)
+
+MonitorKit targets macOS 26 / iOS 26, Swift 6 language mode and MSL 4.0, with MSL 4.1 at runtime on macOS 27. Integration raises Ultracam's deployment target from 15.0 to 26.0. The user asked to target modern macOS 26/27.
+
 ## Added requirements (2026-10-21)
 
 - **Many feeds at once.** One engine per GPU is shared by every feed. Each feed has its own analysis and output objects, and each surface its own picture pass. There are no global locks, no shared per-frame state and no feed limit. Several feeds can be drawn into one drawable, one draw per viewport.

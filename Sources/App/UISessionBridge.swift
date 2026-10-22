@@ -132,7 +132,8 @@ struct UISessionBridge {
       camera.previewEnabled = descriptor.previewEnabled
       camera.previewError = update?.previewError
       camera.automaticStart = descriptor.automaticFeed
-      camera.automaticStatus = selected && descriptor.automaticFeed ? model.automaticFeedStatus : nil
+      // A refused Start says why, on any camera; otherwise the selected automatic camera's status.
+      camera.automaticStatus = model.startRefusal(id) ?? (selected && descriptor.automaticFeed ? model.automaticFeedStatus : nil)
       camera.automaticStartFailed = model.automaticStartFailed(id)
       camera.timecode = update?.timecode
       if let update {
@@ -184,6 +185,7 @@ struct UISessionBridge {
       softMaximum: switcher.naturalTalkingHead.softMaximumShotDuration,
       maximum: switcher.naturalTalkingHead.maximumShotDuration)
     session.programFormatMismatch = model.programFormatMismatch
+    session.programIssue = model.programIssue
     session.recentCuts = model.recentCuts
     session.codecTitle = recording.codec.title
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
@@ -305,7 +307,9 @@ struct UISessionBridge {
     case .refreshInputs: model.refresh()
     case .setPreviewEnabled(let id, let on): model.updateCamera(feedID(id)) { $0.previewEnabled = on }
     case .setAutomaticStart(let id, let on): model.updateCamera(feedID(id)) { $0.automaticFeed = on }
-    case .retryAutomaticStart(let id): model.retryAutomaticFeed(feedID: feedID(id))
+    case .retryAutomaticStart(let id):
+      // A refused Start retries as Start; a failed automatic start retries the automatic start.
+      if model.startRefusal(feedID(id)) != nil { model.startCamera(feedID(id)) } else { model.retryAutomaticFeed(feedID: feedID(id)) }
     case .retryPreview: model.resetPreview()
     case .addCamera:
       if let id = model.addFeed(), interface.defaultCollapsed { interface.collapsed.insert(id.rawValue) }

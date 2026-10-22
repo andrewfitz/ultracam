@@ -15,9 +15,41 @@ struct InputDevice: Identifiable {
 
 extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
 
+/// Every path from AppModel to the DeckLink driver and the camera extension.
+/// Tools that build a real model, such as ui-verify, pass `.offline` so they
+/// can never open the user's capture device or send to their camera.
+@MainActor struct AppHardware {
+  var captureServices: (FeedID) -> CaptureServices
+  var devices: () throws -> [InputDevice]
+  var driverWarning: () -> String?
+  var observeDevices: (@escaping @MainActor @Sendable ([InputDevice]) -> Void) -> Any?
+  var diagnostics: (String) -> UltracamDeviceDiagnostics?
+
+  static let live = AppHardware(
+    captureServices: { .live(feedID: $0) },
+    devices: { try UltracamBackend.devices().map { InputDevice(id: $0.identifier, name: $0.name) } },
+    driverWarning: { UltracamBackend.driverInfo().message },
+    observeDevices: { handler in
+      UltracamBackend.addDeviceListObserver { list in
+        handler(list.map { InputDevice(id: $0.identifier, name: $0.name) })
+      }
+    },
+    diagnostics: { UltracamBackend.diagnostics(deviceID: $0) })
+
+  /// No devices; starting a camera fails with an error and nothing is sent.
+  static let offline = AppHardware(
+    captureServices: { _ in
+      CaptureServices(
+        start: { _, _, _, _ in throw CocoaError(.featureUnsupported) },
+        stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in false })
+    },
+    devices: { [] }, driverWarning: { nil }, observeDevices: { _ in nil }, diagnostics: { _ in nil })
+}
+
 @MainActor @Observable
 final class AppModel {
   private let registryPublisher: any AppVirtualCameraRegistryPublishing
+  @ObservationIgnored private let hardware: AppHardware
   var hideFromDock = false {
     didSet {
       guard hideFromDock != oldValue else { return }
@@ -26,6 +58,10 @@ final class AppModel {
     }
   }
   var devices: [InputDevice] = []
+  /// Set when Desktop Video is missing or older than 16.0, whose drivers
+  /// reject the SDK 16 interfaces and would otherwise list no inputs.
+  var driverWarning: String?
+  @ObservationIgnored private var deviceListObserver: Any?
   /// Descriptors and selection are coordinated as a collection. The selected
   /// session still follows the established one-feed capture path.
   var feedDescriptors: [FeedDescriptor] { feedCoordinator.descriptors }
@@ -85,7 +121,7 @@ final class AppModel {
   }
 
   var canEditFeedTopology: Bool {
-    FeedLifecycleDemandPolicy.canEditTopology(loading: loading,
+    FeedLifecycleDemandPolicy.canEditTopology(loading: !lutLoadingFeeds.isEmpty,
       sourceActive: feedDescriptors.contains {
         feedCoordinator.isFeedRunning($0.id) ||
           feedCoordinator.capturePool.existingController(for: $0.id)?.hasActiveFeed == true
@@ -139,9 +175,10 @@ final class AppModel {
   var lutLoaded = false
   var running = false
   var previewReady = false
-  var loading = false
+  /// The selected camera's LUT is loading. Another camera's load doesn't block it.
+  var loading: Bool { lutLoadingFeeds.contains(selectedFeedID) }
   var update = CaptureUpdate(message: "Select the UltraStudio input and start the camera. LUT loading is optional.")
-  let installer = ExtensionInstaller()
+  let installer: ExtensionInstaller
   let previewRenderer: VideoPreviewRenderer
   let miniPreviewRenderer: VideoPreviewRenderer
   // The selected feed owns the capture controller used by the app-level
@@ -154,6 +191,7 @@ final class AppModel {
   private var routeDemand: [String: Bool] = [:]
   private var demandStartedFeeds: Set<FeedID> = []
   private var manuallyStoppedFeeds: Set<FeedID> = []
+  private var refusedStarts: Set<FeedID> = []
   private var programTransportRequired = false
   private var programTransportConfiguration: PipelineConfiguration?
   private var detectedInputCadence: [FeedID: Bool] = [:]
@@ -178,8 +216,10 @@ final class AppModel {
   private var lutBookmark: Data?
   private var rememberedLUTEnabled = false
   // LUT parsing and GPU uploads are asynchronous. Invalidate an operation
-  // whenever a newer load starts, so an old completion cannot overwrite it.
-  private var lutLoadGeneration: UInt64 = 0
+  // whenever a newer load for the same camera starts, so an old completion
+  // cannot overwrite it. Each camera counts its own loads.
+  private var lutLoadGenerations: [FeedID: UInt64] = [:]
+  private var lutLoadingFeeds: Set<FeedID> = []
   private let demandMonitor = CameraDemandMonitor()
   private var automaticPolicy = AutomaticFeedPolicy()
   private var persistedSnapshot = AppSettingsSnapshot()
@@ -188,11 +228,27 @@ final class AppModel {
   private var recordingTimelines: [FeedID: AutoSwitcherTimelineRecorder] = [:]
   private var pendingAutoDecisionID: UUID?
   private var pendingAutoTargetFeedID: FeedID?
+  private var programMonitorTap: ProgramMonitorTap?
+  /// A requested cut that did not land; cleared by the next cut.
+  private var programCutIssue: String?
+  /// Program frames dropped or not converted; cleared when the Program
+  /// camera reconnects.
+  private var programOutputIssue: String?
+  /// Shown as the status warning in Program mode until cleared.
+  var programIssue: String? { programCutIssue ?? programOutputIssue }
+  /// Bumped when an asynchronous Program camera connect is superseded.
+  private var programTransportRequestID: UInt64 = 0
+  /// The camera on air when the Program client connected; its format is the
+  /// session's contract.
+  private var programContractOwner: FeedID?
 
   init(settingsStore: AppSettingsStore? = nil, lutLoader: LUTFileLoader = LUTFileLoader(),
        registryStore: VirtualCameraRegistryStore? = nil,
        registryPublisher: (any AppVirtualCameraRegistryPublishing)? = nil,
-       recordingFolderStore: RecordingFolderStore? = nil) {
+       recordingFolderStore: RecordingFolderStore? = nil, installer: ExtensionInstaller? = nil,
+       hardware: AppHardware = .live) {
+    self.hardware = hardware
+    self.installer = installer ?? ExtensionInstaller()
     let store = settingsStore ?? AppSettingsStore()
     self.settingsStore = store
     self.registryPublisher = registryPublisher ?? VirtualCameraRegistryPublisher()
@@ -211,10 +267,10 @@ final class AppModel {
     let initialFeedID = snapshot.feeds.first(where: { $0.id == snapshot.selectedFeedID && $0.enabled })?.id
       ?? snapshot.feeds.first(where: \.enabled)?.id
       ?? snapshot.feeds[0].id
-    let primaryCapture = CaptureController(services: .live(feedID: initialFeedID),
+    let primaryCapture = CaptureController(services: hardware.captureServices(initialFeedID),
       previewRenderer: renderer, additionalPreviewRenderers: [miniRenderer])
     let capturePool = FeedCapturePool(initial: [initialFeedID: primaryCapture], factory: { feedID in
-      let controller = CaptureController(services: .live(feedID: feedID), previewRenderer: renderer,
+      let controller = CaptureController(services: hardware.captureServices(feedID), previewRenderer: renderer,
         additionalPreviewRenderers: [miniRenderer])
       controller.setLegacyPreviewOwnership(false)
       return controller
@@ -262,9 +318,12 @@ final class AppModel {
         self.saveSettings()
       }
     }
-    feedCoordinator.programOutput.onMonitorFrame = { [weak monitorCoordinator] feedID, frame, sourcePTS, programPTS, cutApplied in
-      monitorCoordinator?.offerProgram(feedID: feedID, frame: frame, sourcePTS: sourcePTS,
-        programPTS: programPTS, cutApplied: cutApplied)
+    // The Program route publishes from capture delivery threads; feed the
+    // Program monitor from there too, never through the main actor.
+    let programMonitorTap = ProgramMonitorTap(sink: monitorCoordinator.captureSink(for: MonitorTargetID("program")))
+    self.programMonitorTap = programMonitorTap
+    feedCoordinator.programOutput.onMonitorFrame = { _, frame, sourcePTS, _, cutApplied in
+      programMonitorTap.offer(frame: frame, sourcePTS: sourcePTS, cutApplied: cutApplied)
     }
     monitorCoordinator.updateTargets(feeds: feedCoordinator.descriptors, programAvailable: snapshot.outputMode == .program)
     recordingModel.onOutputFolderChanged = { [weak self] folder in
@@ -283,8 +342,19 @@ final class AppModel {
       guard let timeline = self.recordingTimelines.removeValue(forKey: feedID) else { return }
       timeline.recordingFinished(feedID: feedID, url: url, mediaEnd: self.update.mediaTime)
     }
+    feedCoordinator.onProgramCutAbandoned = { [weak self] feedID, reason in
+      self?.programCutAbandoned(feedID, reason: reason)
+    }
+    feedCoordinator.onProgramOutputError = { [weak self] message in
+      self?.programOutputIssue = message
+      self?.update.message = message
+    }
     feedCoordinator.onProgramCutApplied = { [weak self] feedID, sourceTime, programTime in
+      self?.programCutIssue = nil
       self?.reconcileProgramTransportDemand()
+      // The saved selection follows what is on air. Persist only the
+      // snapshot: a cut changes no device, so the camera registry is untouched.
+      self?.persistProgramSelection()
       if let self {
         let automatic = self.pendingAutoDecisionID != nil && self.pendingAutoTargetFeedID == feedID
         let name = self.feedDescriptors.first { $0.id == feedID }?.name ?? feedID.rawValue
@@ -332,6 +402,10 @@ final class AppModel {
     previewRenderer.onVisibilityChange = previewVisibilityChanged
     miniPreviewRenderer.onVisibilityChange = previewVisibilityChanged
     refresh()
+    // Hot-plug: arrivals and removals update the list without a manual refresh.
+    deviceListObserver = hardware.observeDevices { [weak self] list in
+      self?.applyDevices(list, fromDiscovery: true)
+    }
     if let bookmark = lutBookmark { restoreLUT(bookmark: bookmark) }
     demandMonitor.onRouteChange = { [weak self] change in
       guard let self else { return }
@@ -346,9 +420,19 @@ final class AppModel {
   }
 
   func refresh() {
+    driverWarning = hardware.driverWarning()
     do {
-      devices = try UltracamBackend.devices().map { InputDevice(id: $0.identifier, name: $0.name) }
-    } catch { devices = []; update.message = error.localizedDescription }
+      applyDevices(try hardware.devices(), fromDiscovery: false)
+    } catch {
+      applyDevices([], fromDiscovery: false)
+      update.message = error.localizedDescription
+    }
+  }
+
+  private func applyDevices(_ next: [InputDevice], fromDiscovery: Bool) {
+    // Discovery reports every arrival, including devices already listed.
+    if fromDiscovery, next.map(\.id) == devices.map(\.id), next.map(\.name) == devices.map(\.name) { return }
+    devices = next
     if !running, !capture.hasActiveFeed, let first = devices.first,
       !devices.contains(where: { $0.id == selectedDevice }) {
       selectedDevice = first.id
@@ -367,10 +451,13 @@ final class AppModel {
     panel.allowedContentTypes = [UTType(filenameExtension: "cube") ?? .plainText]
     panel.allowsMultipleSelection = false
     guard panel.runModal() == .OK, let url = panel.url else { return }
+    loadLUT(url: url, feedID: feedID)
+  }
+
+  /// Loads a chosen .cube file into one camera. Separate from the panel for tests.
+  func loadLUT(url: URL, feedID: FeedID) {
     if feedID == selectedFeedID { lutError = nil }
-    loading = true
-    lutLoadGeneration &+= 1
-    let loadGeneration = lutLoadGeneration
+    let loadGeneration = beginLUTLoad(feedID)
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.load(url: url)
@@ -381,11 +468,9 @@ final class AppModel {
 
   private func restoreLUT(bookmark: Data) {
     lutError = nil
-    loading = true
     update.message = "Restoring saved LUT…"
-    lutLoadGeneration &+= 1
-    let loadGeneration = lutLoadGeneration
     let feedID = selectedFeedID
+    let loadGeneration = beginLUTLoad(feedID)
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.restore(bookmark: bookmark)
@@ -396,18 +481,33 @@ final class AppModel {
     }
   }
 
+  /// Starts a LUT load for one camera and returns its generation. A newer load
+  /// for the same camera supersedes it; other cameras' loads are unaffected.
+  private func beginLUTLoad(_ feedID: FeedID) -> UInt64 {
+    let generation = (lutLoadGenerations[feedID] ?? 0) &+ 1
+    lutLoadGenerations[feedID] = generation
+    lutLoadingFeeds.insert(feedID)
+    return generation
+  }
+
+  /// Drops a camera's in-flight LUT load, if any.
+  private func cancelLUTLoad(_ feedID: FeedID) {
+    lutLoadGenerations[feedID] = (lutLoadGenerations[feedID] ?? 0) &+ 1
+    lutLoadingFeeds.remove(feedID)
+  }
+
   private func uploadLUT(_ loaded: LoadedLUT, enable: Bool, restoring: Bool = false,
                          generation: UInt64, feedID: FeedID) {
     let controller = feedCoordinator.capture(for: feedID)
     let controllerGeneration = controller.generationToken
-    guard generation == lutLoadGeneration else { return }
+    guard generation == lutLoadGenerations[feedID] else { return }
     controller.load(loaded.cube, expectedGeneration: controllerGeneration) { [weak self] result in
       MainActor.assumeIsolated {
         guard let self else { return }
-        guard generation == self.lutLoadGeneration else { return }
+        guard generation == self.lutLoadGenerations[feedID] else { return }
         switch result {
         case .success:
-          self.loading = false
+          self.lutLoadingFeeds.remove(feedID)
           let enable = restoring ? self.descriptor(for: feedID)?.applyLUT == true : enable
           guard feedID == self.selectedFeedID else {
             self.updateCamera(feedID) { descriptor in
@@ -435,8 +535,8 @@ final class AppModel {
   }
 
   private func lutLoadFailed(_ error: Error, restoring: Bool, generation: UInt64, feedID: FeedID) {
-    guard generation == lutLoadGeneration else { return }
-    loading = false
+    guard generation == lutLoadGenerations[feedID] else { return }
+    lutLoadingFeeds.remove(feedID)
     let message = "\(restoring ? "Saved LUT could not be restored" : "LUT was not changed"): \(error.localizedDescription)"
     guard feedID == selectedFeedID else {
       var cameraUpdate = cameraUpdates[feedID] ?? CaptureUpdate(message: message)
@@ -534,6 +634,7 @@ final class AppModel {
     guard canEditFeedTopology, feedCoordinator.outputMode != mode else { return }
     saveSettings()
     feedCoordinator.setOutputMode(mode)
+    if mode == .program { programMonitorTap?.restart() }
     saveSettings()
     installAutomaticFeedMonitor()
     reconcileAutoSwitcher()
@@ -563,13 +664,44 @@ final class AppModel {
       autoSwitcherTimeline?.recordRejected(decisionID: oldDecisionID)
       autoSwitcherBridge?.reject(decisionID: oldDecisionID)
     }
-    if case .queued = result {
+    switch result {
+    case .queued, .coalesced, .selectedImmediately:
       autoSwitcherBridge?.manualOverride(cameraID: feedID, at: directorClock())
-    } else if case .coalesced = result {
-      autoSwitcherBridge?.manualOverride(cameraID: feedID, at: directorClock())
+    case .ignoredSameSource, .rejectedMissingSource:
+      break
     }
     saveSettings()
     return result
+  }
+
+  /// A requested cut that will not land. The selection never changed, so the
+  /// UI already shows what is on air; say why the requested camera did not
+  /// take, and release the director's decision so it can decide again.
+  private func programCutAbandoned(_ feedID: FeedID, reason: ProgramCutAbandonReason) {
+    let name = feedDescriptors.first { $0.id == feedID }?.name ?? feedID.rawValue
+    let message: String
+    switch reason {
+    case .targetUnavailable:
+      message = "Couldn't cut to \(name): it stopped or failed to start. Program stays on the current camera."
+    case .expired:
+      // Also a camera that opened but has no signal (bounded starting wait).
+      message = "Couldn't cut to \(name): it sent no usable frame in time. Check its signal. Program stays on the current camera."
+    }
+    programCutIssue = message
+    update.message = message
+    if let decisionID = pendingAutoDecisionID, pendingAutoTargetFeedID == feedID {
+      pendingAutoDecisionID = nil
+      pendingAutoTargetFeedID = nil
+      if reason == .expired { autoSwitcherTimeline?.recordExpired(decisionID: decisionID) }
+      else { autoSwitcherTimeline?.recordRejected(decisionID: decisionID) }
+      autoSwitcherBridge?.reject(decisionID: decisionID)
+    }
+  }
+
+  private func persistProgramSelection() {
+    guard !restoringSettings, !settingsResetPending else { return }
+    persistedSnapshot = feedCoordinator.snapshot
+    settingsStore.saveSnapshot(persistedSnapshot)
   }
 
   /// Audio packet time from the selected input. That is the clock the Rust
@@ -596,8 +728,9 @@ final class AppModel {
     restoringSettings = false
     // Assignments above ran while restoring, so the automatic-feed didSet
     // did not retarget the demand monitor. Do that after the new descriptor
-    // is in place, then restore this feed's LUT.
-    if let bookmark = lutBookmark { restoreLUT(bookmark: bookmark) }
+    // is in place, then restore this feed's LUT, unless a load for it is
+    // already in flight.
+    if let bookmark = lutBookmark, !lutLoadingFeeds.contains(descriptor.id) { restoreLUT(bookmark: bookmark) }
     installAutomaticFeedMonitor()
     capture.setPreviewEnabled(previewEnabled)
   }
@@ -680,8 +813,23 @@ final class AppModel {
 
   func start() {
     manuallyStoppedFeeds.remove(selectedFeedID)
-    guard !automaticFeedEnabled else { retryAutomaticFeed(); return }
-    startFeed()
+    if automaticFeedEnabled { retryAutomaticFeed() } else { startFeed() }
+    noteStartAttempt(selectedFeedID, started: running)
+  }
+
+  /// Remembers a Start that didn't start the camera, so its strip can say why
+  /// instead of doing nothing. Starting or stopping the camera clears it.
+  private func noteStartAttempt(_ id: FeedID, started: Bool) {
+    if started { refusedStarts.remove(id) } else if refusedStarts.insert(id).inserted { cameraStateRevision &+= 1 }
+  }
+
+  /// Why the camera's last Start didn't start it, while that still holds.
+  func startRefusal(_ id: FeedID) -> String? {
+    guard refusedStarts.contains(id), let descriptor = descriptor(for: id), !feedCoordinator.isFeedRunning(id) else { return nil }
+    if id == selectedFeedID && automaticFeedEnabled { return automaticFeedStatus }
+    if id == selectedFeedID && loading { return "Its LUT is still loading. Start it again in a moment." }
+    if !devices.contains(where: { $0.id == descriptor.selectedDevice }) { return driverWarning ?? "Connect the UltraStudio." }
+    return nil
   }
 
   private func startFeed() {
@@ -733,6 +881,7 @@ final class AppModel {
 
   func stop() {
     manuallyStoppedFeeds.insert(selectedFeedID)
+    refusedStarts.remove(selectedFeedID)
     running = false
     previewReady = false
     feedCoordinator.stop(selectedFeedID)
@@ -803,7 +952,7 @@ final class AppModel {
         case .queued, .coalesced:
           self.pendingAutoDecisionID = instruction.decisionID
           self.pendingAutoTargetFeedID = instruction.targetCameraID
-        case .ignoredSameSource, .rejectedMissingSource:
+        case .ignoredSameSource, .rejectedMissingSource, .selectedImmediately:
           self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
           bridge?.reject(decisionID: instruction.decisionID)
         }
@@ -995,14 +1144,9 @@ final class AppModel {
   }
 
   private func installProcessedFrameHandler(for feedID: FeedID) {
-    feedCoordinator.setProcessedFrameHandler(feedID: feedID) { [weak self] frame in
-      // FeedCoordinator invokes this handler on MainActor after validating
-      // the capture generation, so publishing stays ordered with stop/start
-      // transitions and cannot admit a stale frame into a new session.
-      guard let self else { return }
-      _ = self.feedCoordinator.publish(frame, to: feedID)
-      self.feedCoordinator.pumpProgramOutput()
-    }
+    // Frames go from the capture delivery thread straight into the Program
+    // route (and from there to the Program camera); none pass through here.
+    feedCoordinator.installProgramFrameDelivery(feedID: feedID)
   }
 
   var cameraRequested: Bool { automaticPolicy.requested }
@@ -1025,7 +1169,7 @@ final class AppModel {
     if let cameraDemandError { return cameraDemandError }
     if !automaticCaptureRequested { return "Waiting for a camera app or visible preview. Capture and video processing are off." }
     if loading { return "Restoring your LUT…" }
-    if !devices.contains(where: { $0.id == selectedDevice }) { return "Connect the UltraStudio and refresh inputs." }
+    if !devices.contains(where: { $0.id == selectedDevice }) { return driverWarning ?? "Connect the UltraStudio." }
     return "Camera stopped. Retry to resume preview or camera output."
   }
 
@@ -1078,6 +1222,7 @@ final class AppModel {
       switch action {
       case .start:
         demandStartedFeeds.insert(id)
+        refusedStarts.remove(id)
         if id == selectedFeedID { startFeed() }
         else {
           installCaptureUpdateHandler(for: id)
@@ -1122,15 +1267,46 @@ final class AppModel {
     let contract = FeedLifecycleDemandPolicy.programContract(configuration: sourceConfiguration,
       pipelineEnabled: producer?.pipelineEnabled ?? pipelineEnabled,
       detectedInputFast: producerID.flatMap { detectedInputCadence[$0] })
-    guard required != programTransportRequired || (required && contract != programTransportConfiguration) else { return }
-    do {
-      try feedCoordinator.setProgramOutputDemand(required, configuration: contract,
-        passthroughFormat: kCVPixelFormatType_422YpCbCr10)
-      programTransportRequired = required
-      programTransportConfiguration = required ? contract : nil
-    } catch {
-      update.message = "Program camera unavailable: \(error.localizedDescription)"
+    // One contract per client session: the format of the camera on air when
+    // the client connected (its "owner"). Cuts never renegotiate; frames from
+    // cameras with other settings are converted on the GPU. Only the owner's
+    // own changes (input cadence detected after connect, or its settings
+    // edited) renegotiate, as before. The cadence update reaches the main
+    // actor after the first frame may already have been sent, so the bridge
+    // honours `renegotiate` even after delivery.
+    let renegotiate: Bool
+    if required != programTransportRequired {
+      renegotiate = false
+      // A new client session: report the next Program output failure afresh.
+      programOutputIssue = nil
+      feedCoordinator.programOutput.acknowledgeOutputError()
+      programContractOwner = required ? producerID : nil
+    } else if required, producerID == programContractOwner, contract != programTransportConfiguration {
+      renegotiate = true
+    } else {
+      return
     }
+    programTransportRequired = required
+    programTransportConfiguration = required ? contract : nil
+    programTransportRequestID &+= 1
+    let requestID = programTransportRequestID
+    // CMIO discovery can take seconds: connect on the bridge's control queue.
+    feedCoordinator.requestProgramOutputDemand(required, configuration: contract,
+      passthroughFormat: kCVPixelFormatType_422YpCbCr10, renegotiate: renegotiate) { [weak self] error in
+      guard let self, let error, requestID == self.programTransportRequestID else { return }
+      // Let the next reconcile retry the connection.
+      self.programTransportRequired = false
+      self.programTransportConfiguration = nil
+      self.programContractOwner = nil
+      self.update.message = "Program camera unavailable: \(error.localizedDescription)"
+    }
+  }
+
+  /// Program output counters for diagnostics: route, GPU conversion, camera.
+  var programOutputDiagnostics: (route: ProgramRouteStatistics, camera: ProgramOutputBridge.Statistics,
+                                 gpu: ProgramNormalizer.Statistics?, contract: ProgramOutputFormat?) {
+    (feedCoordinator.programRouteStatistics, feedCoordinator.programOutputStatistics,
+     feedCoordinator.programNormalizerStatistics, feedCoordinator.programOutput.contract)
   }
 
   func resetPreview() {
@@ -1145,11 +1321,19 @@ final class AppModel {
   /// Automatic mode asked this camera to run and it isn't running: its start failed.
   /// The interface offers Retry (one attempt per camera session, no background loop).
   func automaticStartFailed(_ id: FeedID) -> Bool {
+    if startRefusal(id) != nil { return true }
     guard let descriptor = descriptor(for: id), descriptor.automaticFeed, !feedCoordinator.isFeedRunning(id) else { return false }
     return feedPolicies[id]?.captureRequested == true || (id == selectedFeedID && automaticCaptureRequested && !running)
   }
 
   func isCameraRunning(_ id: FeedID) -> Bool { feedCoordinator.isFeedRunning(id) }
+
+  /// Cached device facts and live counters for the camera's input; never
+  /// calls into the driver.
+  func deviceDiagnostics(_ id: FeedID) -> UltracamDeviceDiagnostics? {
+    guard let deviceID = descriptor(for: id)?.selectedDevice, !deviceID.isEmpty else { return nil }
+    return hardware.diagnostics(deviceID)
+  }
 
   /// The latest status for any camera. The selected camera uses the app's live `update`.
   func cameraUpdate(_ id: FeedID) -> CaptureUpdate? { id == selectedFeedID && running ? update : cameraUpdates[id] }
@@ -1167,8 +1351,12 @@ final class AppModel {
   func startCamera(_ id: FeedID) {
     guard let descriptor = descriptor(for: id), descriptor.enabled else { return }
     if id == selectedFeedID { start(); return }
-    guard !feedCoordinator.isFeedRunning(id),
-      devices.contains(where: { $0.id == descriptor.selectedDevice }) else { return }
+    guard !feedCoordinator.isFeedRunning(id) else { return }
+    guard devices.contains(where: { $0.id == descriptor.selectedDevice }) else {
+      noteStartAttempt(id, started: false)
+      return
+    }
+    noteStartAttempt(id, started: true)
     manuallyStoppedFeeds.remove(id)
     installCaptureUpdateHandler(for: id)
     installProcessedFrameHandler(for: id)
@@ -1189,6 +1377,7 @@ final class AppModel {
   /// Stops one camera: capture, its output and its recording. Other cameras keep running.
   func stopCamera(_ id: FeedID) {
     if id == selectedFeedID { stop(); return }
+    refusedStarts.remove(id)
     guard feedCoordinator.isFeedRunning(id) else { return }
     manuallyStoppedFeeds.insert(id)
     demandStartedFeeds.remove(id)
@@ -1276,9 +1465,8 @@ final class AppModel {
 
   /// Forgets one camera's saved LUT bookmark and turns its LUT effect off.
   func forgetLUT(_ id: FeedID) {
+    cancelLUTLoad(id)
     if id == selectedFeedID {
-      lutLoadGeneration &+= 1
-      loading = false
       lutBookmark = nil
       lutLoaded = false
       lutFileName = nil
@@ -1312,8 +1500,9 @@ final class AppModel {
     updateSwitcher(settings)
   }
 
-  /// True when running Program sources would deliver different camera formats,
-  /// so each cut between them renegotiates the Program output.
+  /// True when running Program sources deliver different camera formats. Cuts
+  /// between them no longer renegotiate the Program camera: frames that don't
+  /// match its format are converted on the GPU.
   var programFormatMismatch: Bool {
     guard outputMode == .program else { return false }
     // The LUT changes pixel values, not the camera format, so it is ignored here.

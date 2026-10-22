@@ -25,7 +25,7 @@ import XCTest
     XCTAssertEqual(coordinator.selectedFeedID, a)
     if case let .cutApplied(mapped, flush) = coordinator.ingest(frame(b, 0)) {
       XCTAssertEqual(mapped.sourceID, b)
-      XCTAssertTrue(flush)
+      XCTAssertFalse(flush, "Frames already on air before the cut are never flushed")
     } else {
       XCTFail("target frame should apply the queued cut")
     }
@@ -87,10 +87,84 @@ import XCTest
     XCTAssertFalse(coordinator.acknowledgeCut(decision))
   }
 
+  /// PROG-2: a fixed-interval cut that expires (or is cancelled by health)
+  /// must release the automatic latch, or every later tick stays idle.
+  func testExpiredAutomaticCutReleasesTheFixedIntervalLatch() {
+    let a = feed("A")
+    let b = feed("B")
+    let settings = SwitcherSettings(selectedFeedID: a, automatic: true,
+      intervalSeconds: 2, strategy: .fixedInterval)
+    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b])
+    var now: TimeInterval = 100
+    coordinator.setPendingCutClock({ now }, timeout: 2)
+    _ = coordinator.ingest(frame(a, 0))
+    XCTAssertEqual(coordinator.evaluate(at: time(0)), .idle)
+    XCTAssertEqual(coordinator.evaluate(at: time(2)), .cutQueued(b))
+    XCTAssertTrue(coordinator.isAutomaticRequestPending)
+    // B is live but never sends a frame that qualifies.
+    _ = coordinator.ingest(ProgramSourceFrame(sourceID: b, sourceTime: time(1), duration: .invalid))
+    now = 103
+    XCTAssertEqual(coordinator.evaluate(at: time(3)), .idle)
+    XCTAssertFalse(coordinator.hasPendingCut)
+    XCTAssertFalse(coordinator.isAutomaticRequestPending, "Expiry releases the latch")
+    guard let abandoned = coordinator.takeAbandonedCut() else { return XCTFail("Expiry is reported") }
+    XCTAssertEqual(abandoned.0, b)
+    XCTAssertEqual(abandoned.1, .expired)
+    XCTAssertEqual(coordinator.selectedFeedID, a)
+    XCTAssertEqual(coordinator.settings.selectedFeedID, a, "The saved selection is what is on air")
+    XCTAssertEqual(coordinator.evaluate(at: time(5)), .cutQueued(b), "Fixed interval is not wedged")
+
+    coordinator.setFeedHealth(b, healthy: false)
+    XCTAssertFalse(coordinator.isAutomaticRequestPending, "A health drop releases the latch too")
+    XCTAssertEqual(coordinator.takeAbandonedCut()?.1, .targetUnavailable)
+  }
+
+  /// A camera that started but has no signal never sends a frame. A cut to
+  /// it is bounded by the starting timeout, then the latch releases.
+  func testCutToStartedCameraWithNoSignalExpiresAndReleasesTheLatch() {
+    let a = feed("A")
+    let b = feed("B")
+    let settings = SwitcherSettings(selectedFeedID: a, automatic: true,
+      intervalSeconds: 2, strategy: .fixedInterval)
+    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b])
+    var now: TimeInterval = 100
+    coordinator.setPendingCutClock({ now }, timeout: 2, startingTimeout: 8)
+    coordinator.setFeedHealth(b, healthy: true)  // started: "Opening UltraStudio…"
+    _ = coordinator.ingest(frame(a, 0))
+    XCTAssertEqual(coordinator.evaluate(at: time(0)), .idle)
+    XCTAssertEqual(coordinator.evaluate(at: time(2)), .cutQueued(b))
+    now = 107
+    XCTAssertEqual(coordinator.evaluate(at: time(9)), .idle)
+    XCTAssertTrue(coordinator.isAutomaticRequestPending, "Within the starting bound the cut waits")
+    now = 108
+    XCTAssertEqual(coordinator.evaluate(at: time(10)), .cutQueued(b),
+      "The no-signal cut expired, the latch released and fixed-interval asked again")
+    XCTAssertEqual(coordinator.takeAbandonedCut()?.1, .expired)
+    XCTAssertEqual(coordinator.selectedFeedID, a)
+  }
+
+  func testSettingsNeverMoveTheSelectionAheadOfTheCut() {
+    let a = feed("A")
+    let b = feed("B")
+    var coordinator = SwitcherCoordinator(feedIDs: [a, b])
+    _ = coordinator.ingest(frame(a, 0))
+    coordinator.updateSettings(SwitcherSettings(selectedFeedID: b, automatic: false,
+      intervalSeconds: 9, strategy: .manual))
+    XCTAssertEqual(coordinator.settings.selectedFeedID, a)
+    XCTAssertEqual(coordinator.settings.intervalSeconds, 9)
+    _ = coordinator.requestManualCut(to: b)
+    XCTAssertEqual(coordinator.settings.selectedFeedID, a, "Pending is not on air")
+    _ = coordinator.ingest(frame(b, 0))
+    XCTAssertEqual(coordinator.settings.selectedFeedID, b)
+  }
+
   static let allTests = [
     ("manual cut boundary and acknowledgement", testManualCutAppliesAtTargetFrameAndAcknowledgesSelection),
     ("fixed interval health", testFixedIntervalAdvancesInStableOrderAndSkipsUnhealthyFeed),
     ("dynamic analysis stub", testDynamicAnalysisIsAnExplicitDisabledStub),
     ("natural director acknowledgement", testNaturalDirectorDecisionRequiresExactAcknowledgement),
+    ("expired automatic cut releases latch", testExpiredAutomaticCutReleasesTheFixedIntervalLatch),
+    ("no-signal starting cut releases latch", testCutToStartedCameraWithNoSignalExpiresAndReleasesTheLatch),
+    ("settings never move selection ahead", testSettingsNeverMoveTheSelectionAheadOfTheCut),
   ]
 }

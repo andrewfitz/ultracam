@@ -6,25 +6,33 @@ class FakeTimecode final : public IDeckLinkTimecode {
  public:
   std::atomic<ULONG> references{1};
   CFStringRef value = CFSTR("01:02:03:04");
+  uint8_t frames = 4;
+  bool componentsFail = false;
+  BMDTimecodeFlags flags = bmdTimecodeIsDropFrame;
   ~FakeTimecode() override = default;
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
   ULONG AddRef() override { return ++references; }
   ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
   BMDTimecodeBCD GetBCD() override { return 0; }
-  HRESULT GetComponents(uint8_t *hours, uint8_t *minutes, uint8_t *seconds, uint8_t *frames) override {
-    if (hours) *hours = 1; if (minutes) *minutes = 2; if (seconds) *seconds = 3; if (frames) *frames = 4; return S_OK;
+  HRESULT GetComponents(uint8_t *hours, uint8_t *minutes, uint8_t *seconds, uint8_t *frameCount) override {
+    if (componentsFail) return E_FAIL;
+    if (hours) *hours = 1; if (minutes) *minutes = 2; if (seconds) *seconds = 3; if (frameCount) *frameCount = frames; return S_OK;
   }
   HRESULT GetString(CFStringRef *result) override { if (!result) return E_INVALIDARG; *result = static_cast<CFStringRef>(CFRetain(value)); return S_OK; }
-  BMDTimecodeFlags GetFlags() override { return bmdTimecodeIsDropFrame; }
+  BMDTimecodeFlags GetFlags() override { return flags; }
   HRESULT GetTimecodeUserBits(BMDTimecodeUserBits *bits) override { if (bits) *bits = 0; return S_OK; }
 };
 
+// Capture always enables 32-bit integer audio; the fixture is written as
+// 16-bit values for readability and stored left-aligned like the driver's.
 class FakeAudioPacket final : public IDeckLinkAudioInputPacket {
  public:
   std::atomic<ULONG> references{1};
-  std::vector<int16_t> samples;
+  std::vector<int32_t> samples;
   BMDTimeValue packetTime = 960;
-  explicit FakeAudioPacket(std::initializer_list<int16_t> values) : samples(values) {}
+  explicit FakeAudioPacket(std::initializer_list<int16_t> values) {
+    for (int16_t value : values) samples.push_back(int32_t(value) * 65536);
+  }
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
   ULONG AddRef() override { return ++references; }
   ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
@@ -48,6 +56,39 @@ class FakeRawAudioPacket final : public IDeckLinkAudioInputPacket {
 };
 
 class FakeFrame;
+
+class FakeVideoBuffer final : public IDeckLinkVideoBuffer {
+ public:
+  std::atomic<ULONG> references{1};
+  uint64_t size;
+  explicit FakeVideoBuffer(uint64_t bytes) : size(bytes) {}
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
+  HRESULT GetBytes(void **) override { return E_NOTIMPL; }
+  HRESULT GetSize(uint64_t *result) override { if (!result) return E_INVALIDARG; *result = size; return S_OK; }
+  HRESULT StartAccess(BMDBufferAccessFlags) override { return S_OK; }
+  HRESULT EndAccess(BMDBufferAccessFlags) override { return S_OK; }
+};
+
+class FakeMetadata final : public IDeckLinkVideoFrameMetadataExtensions {
+ public:
+  std::atomic<ULONG> references{1};
+  int64_t colorspace, eotf;
+  FakeMetadata(int64_t space, int64_t transfer) : colorspace(space), eotf(transfer) {}
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
+  HRESULT GetInt(BMDDeckLinkFrameMetadataID key, int64_t *value) override {
+    if (key == bmdDeckLinkFrameMetadataColorspace && colorspace) { *value = colorspace; return S_OK; }
+    if (key == bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc && eotf >= 0) { *value = eotf; return S_OK; }
+    return E_INVALIDARG;
+  }
+  HRESULT GetFloat(BMDDeckLinkFrameMetadataID, double *) override { return E_NOTIMPL; }
+  HRESULT GetFlag(BMDDeckLinkFrameMetadataID, bool *) override { return E_NOTIMPL; }
+  HRESULT GetString(BMDDeckLinkFrameMetadataID, CFStringRef *) override { return E_NOTIMPL; }
+  HRESULT GetBytes(BMDDeckLinkFrameMetadataID, void *, uint32_t *) override { return E_NOTIMPL; }
+};
 
 @interface FakeFrameLifetime : NSObject
 - (instancetype)initWithRelease:(void (^)(void))release;
@@ -77,16 +118,32 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   bool *destroyed;
   std::vector<uint8_t> bytes = std::vector<uint8_t>(10240 * 2160, 0);
   bool noSignal = false, invalidTime = false, negativeTime = false, badBytes = false;
-  FakeTimecode *timecode = nullptr;
+  FakeTimecode *timecode = nullptr;      // Every RP188 format except HFRTC.
+  FakeTimecode *hfrTimecode = nullptr;   // bmdTimecodeRP188HighFrameRate only.
   BMDTimeValue frameDuration = 1001;
+  BMDTimeValue streamTime = 123123;
+  BMDTimeValue hardwareTime = 0;         // Microseconds; 0 is unavailable.
+  uint64_t bufferSize = 0;               // 0: no IDeckLinkVideoBuffer interface.
+  bool hdrFlag = false;
+  int64_t metadataColorspace = 0, metadataEOTF = -1;
+  bool metadataAvailable = false;
+  CFStringRef sdkTransfer = nullptr;     // An attachment the SDK sets itself.
   long width = 3840;
   FakeFrame(bool *result) : destroyed(result) {}
   ~FakeFrame() override { *destroyed = true; }
   HRESULT QueryInterface(REFIID iid, LPVOID *result) override {
     *result = nullptr;
-    if (!sameIID(iid, IID_IDeckLinkMacVideoBuffer)) return E_NOINTERFACE;
-    *result = static_cast<IDeckLinkMacVideoBuffer *>(new FakeMacVideoBuffer(this));
-    return S_OK;
+    if (sameIID(iid, IID_IDeckLinkMacVideoBuffer)) {
+      *result = static_cast<IDeckLinkMacVideoBuffer *>(new FakeMacVideoBuffer(this)); return S_OK;
+    }
+    if (sameIID(iid, IID_IDeckLinkVideoBuffer) && bufferSize) {
+      *result = static_cast<IDeckLinkVideoBuffer *>(new FakeVideoBuffer(bufferSize)); return S_OK;
+    }
+    if (sameIID(iid, IID_IDeckLinkVideoFrameMetadataExtensions) && metadataAvailable) {
+      *result = static_cast<IDeckLinkVideoFrameMetadataExtensions *>(new FakeMetadata(metadataColorspace, metadataEOTF));
+      return S_OK;
+    }
+    return E_NOINTERFACE;
   }
   ULONG AddRef() override { return ++references; }
   ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
@@ -94,16 +151,22 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   long GetHeight() override { return 2160; }
   long GetRowBytes() override { return 10240; }
   BMDPixelFormat GetPixelFormat() override { return bmdFormat10BitYUV; }
-  BMDFrameFlags GetFlags() override { return noSignal ? bmdFrameHasNoInputSource : bmdFrameFlagDefault; }
-  HRESULT GetTimecode(BMDTimecodeFormat, IDeckLinkTimecode **result) override {
-    if (!result || !timecode) return E_NOTIMPL;
-    timecode->AddRef(); *result = timecode; return S_OK;
+  BMDFrameFlags GetFlags() override {
+    return (noSignal ? bmdFrameHasNoInputSource : bmdFrameFlagDefault) | (hdrFlag ? bmdFrameContainsHDRMetadata : 0);
+  }
+  HRESULT GetTimecode(BMDTimecodeFormat format, IDeckLinkTimecode **result) override {
+    FakeTimecode *value = format == bmdTimecodeRP188HighFrameRate ? hfrTimecode : timecode;
+    if (!result || !value) return E_NOTIMPL;
+    value->AddRef(); *result = value; return S_OK;
   }
   HRESULT GetAncillaryData(IDeckLinkVideoFrameAncillary **) override { return E_NOTIMPL; }
   HRESULT GetStreamTime(BMDTimeValue *pts, BMDTimeValue *duration, BMDTimeScale) override {
-    *pts = negativeTime ? -1 : 123123; *duration = frameDuration; return invalidTime ? E_FAIL : S_OK;
+    *pts = negativeTime ? -1 : streamTime; *duration = frameDuration; return invalidTime ? E_FAIL : S_OK;
   }
-  HRESULT GetHardwareReferenceTimestamp(BMDTimeScale, BMDTimeValue *, BMDTimeValue *) override { return E_NOTIMPL; }
+  HRESULT GetHardwareReferenceTimestamp(BMDTimeScale scale, BMDTimeValue *time, BMDTimeValue *duration) override {
+    if (!hardwareTime || scale != 1000000) return E_NOTIMPL;
+    *time = hardwareTime; if (duration) *duration = 16683; return S_OK;
+  }
 };
 
 FakeMacVideoBuffer::FakeMacVideoBuffer(FakeFrame *owner) : frame(owner) { frame->AddRef(); }
@@ -122,6 +185,8 @@ HRESULT FakeMacVideoBuffer::CreateCVPixelBufferRef(void **result) {
   FakeFrame *owner = frame;
   id holder = [[FakeFrameLifetime alloc] initWithRelease:^{ owner->Release(); }];
   CVBufferSetAttachment(buffer, CFSTR("UltracamTestFrameLifetime"), (__bridge CFTypeRef)holder, kCVAttachmentMode_ShouldNotPropagate);
+  if (frame->sdkTransfer)
+    CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, frame->sdkTransfer, kCVAttachmentMode_ShouldPropagate);
   *result = buffer;
   return S_OK;
 }
@@ -132,6 +197,7 @@ class FakeMode final : public IDeckLinkDisplayMode {
   BMDDisplayMode mode = bmdMode4K2160p5994;
   long width = 3840, height = 2160;
   bool invalidRate = false;
+  BMDDisplayModeFlags flags = bmdDisplayModeColorspaceRec709;
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
   ULONG AddRef() override { return ++references; }
   ULONG Release() override { return --references; }
@@ -143,7 +209,7 @@ class FakeMode final : public IDeckLinkDisplayMode {
     *duration = 1001; *scale = mode == bmdMode4K2160p2997 ? 30000 : 60000; return invalidRate ? E_FAIL : S_OK;
   }
   BMDFieldDominance GetFieldDominance() override { return bmdProgressiveFrame; }
-  BMDDisplayModeFlags GetFlags() override { return bmdDisplayModeColorspaceRec709; }
+  BMDDisplayModeFlags GetFlags() override { return flags; }
 };
 
 class FakeInput final : public IDeckLinkInput {
@@ -176,7 +242,14 @@ class FakeInput final : public IDeckLinkInput {
     return enableResult;
   }
   HRESULT DisableVideoInput() override { calls.push_back("disable"); return S_OK; }
-  HRESULT GetAvailableVideoFrameCount(uint32_t *) override { return E_NOTIMPL; }
+  uint32_t availableFrames = 0;
+  bool provideClock = false;
+  int64_t clockOffsetMicros = 0;  // Hardware clock = host clock - offset.
+  useconds_t clockDelayMicros = 0;  // A slow reference-clock read (a wide bracket).
+  HRESULT GetAvailableVideoFrameCount(uint32_t *count) override {
+    if (!count) return E_INVALIDARG;
+    *count = availableFrames; return S_OK;
+  }
   HRESULT EnableVideoInputWithAllocatorProvider(BMDDisplayMode mode, BMDPixelFormat format, BMDVideoInputFlags flags,
     IDeckLinkVideoBufferAllocatorProvider *) override { return EnableVideoInput(mode, format, flags); }
   HRESULT EnableAudioInput(BMDAudioSampleRate rate, BMDAudioSampleType type, uint32_t channels) override {
@@ -199,7 +272,11 @@ class FakeInput final : public IDeckLinkInput {
     if (value && callbackResult != S_OK) return callbackResult;
     if (value) value->AddRef(); if (callback) callback->Release(); callback = value; return S_OK;
   }
-  HRESULT GetHardwareReferenceClock(BMDTimeScale, BMDTimeValue *, BMDTimeValue *, BMDTimeValue *) override { return E_NOTIMPL; }
+  HRESULT GetHardwareReferenceClock(BMDTimeScale scale, BMDTimeValue *time, BMDTimeValue *inFrame, BMDTimeValue *perFrame) override {
+    if (!provideClock || scale != 1000000) return E_NOTIMPL;
+    if (clockDelayMicros) usleep(clockDelayMicros);
+    *time = hostMicroseconds() - clockOffsetMicros; *inFrame = 0; *perFrame = 16683; return S_OK;
+  }
 };
 
 class FakeConfiguration final : public IDeckLinkConfiguration {
@@ -236,7 +313,7 @@ class FakeConfiguration final : public IDeckLinkConfiguration {
 };
 
 BOOL UltracamRunRawAudioSyntheticChecks(NSError **error) {
-  @autoreleasepool {
+  {  // No inner pool: a failure returns its autoreleased NSError through the out-parameter.
     __block NSData *received = nil;
     __block CMTime packetTime = kCMTimeInvalid;
     __block NSUInteger sampleFrames = 0, channels = 0, bytesPerSample = 0;
@@ -285,7 +362,7 @@ BOOL UltracamRunRawAudioSyntheticChecks(NSError **error) {
 }
 
 BOOL UltracamRunSyntheticChecks(NSError **error) {
-  @autoreleasepool {
+  {  // No inner pool: a failure returns its autoreleased NSError through the out-parameter.
     __block CVPixelBufferRef retained = nullptr;
     __block int frames = 0, events = 0;
     __block int mediaCallbacks = 0;
@@ -304,7 +381,7 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
     auto mediaBlock = ^(NSString *timecode, CMTime packetTime, NSUInteger sampleFrames,
       NSUInteger channels, float leftPeak, float rightPeak, float leftRMS, float rightRMS,
       NSUInteger bytes, BOOL present) {
-      ++mediaCallbacks; mediaTimecodeMatches = [timecode isEqualToString:@"01:02:03:04"]; mediaTimecodeAbsent = timecode == nil; mediaPacketTime = packetTime;
+      ++mediaCallbacks; mediaTimecodeMatches = [timecode isEqualToString:@"01:02:03;08"]; mediaTimecodeAbsent = timecode == nil; mediaPacketTime = packetTime;
       mediaFrames = sampleFrames; mediaChannels = channels; mediaBytes = bytes;
       mediaLeftPeak = leftPeak; mediaRightPeak = rightPeak; mediaLeftRMS = leftRMS;
       mediaRightRMS = rightRMS; mediaPresent = present;
@@ -319,7 +396,7 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
       CVPixelBufferGetPixelFormatType(retained) != kCVPixelFormatType_422YpCbCr10 || frame->references != 2 ||
       mediaCallbacks != 1 || !mediaTimecodeMatches ||
       CMTimeCompare(mediaPacketTime, CMTimeMake(960, 48000)) != 0 || mediaFrames != 2 ||
-      mediaChannels != 2 || mediaBytes != 8 || !mediaPresent || mediaLeftPeak != 1.0f ||
+      mediaChannels != 2 || mediaBytes != 16 || !mediaPresent || mediaLeftPeak != 1.0f ||
       mediaRightPeak != 0.5f || std::abs(mediaLeftRMS - 0.728868f) > 0.0001f ||
       std::abs(mediaRightRMS - 0.5f) > 0.0001f)
       return fail(error, @"Native frame/media format, timing, metadata or reference test failed.");
@@ -345,7 +422,7 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
     // metadata. The callback still runs so consumers can clear stale meters.
     mediaCallbacks = 0; mediaChannels = 99; mediaPresent = YES; mediaTimecodeAbsent = NO;
     destroyed = false; frame = new FakeFrame(&destroyed);
-    auto emptyTimecode = new FakeTimecode(); emptyTimecode->value = CFSTR(""); frame->timecode = emptyTimecode;
+    auto emptyTimecode = new FakeTimecode(); emptyTimecode->value = CFSTR(""); emptyTimecode->componentsFail = true; frame->timecode = emptyTimecode;
     callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock);
     callback->VideoInputFrameArrived(frame, nullptr);
     if (mediaCallbacks != 1 || !mediaTimecodeAbsent || mediaChannels != 0 || mediaPresent || mediaFrames != 0 || mediaBytes != 0)
@@ -379,8 +456,9 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
       callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
       HRESULT status = startInput(&input, callback, bmdMode4K2160p5994, bmdVideoInputFlagDefault);
       if ((scenario == 0) != (status == S_OK)) return fail(error, @"SDK startup did not preserve failure status.");
-      if (input.enabledAudioType != bmdAudioSampleType16bitInteger)
-        return fail(error, @"Stats startup unexpectedly requested non-16-bit embedded audio.");
+      const bool audioRequested = scenario == 0 || scenario == 3;  // Video enabled and callback installed.
+      if (audioRequested && (input.enabledAudioType != bmdAudioSampleType32bitInteger || input.enabledAudioChannels != 2))
+        return fail(error, @"Stats startup did not request 32-bit stereo embedded audio.");
       if (scenario == 0) stopInput(&input, callback);
       if (input.callback || callback->accepting || callback->references != 1 || input.calls.size() < 4 ||
         input.calls[input.calls.size() - 3] != "stop" || input.calls[input.calls.size() - 2] != "clear" || input.calls.back() != "disable")
@@ -422,6 +500,540 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
       return fail(error, @"Capture callback did not install safe no-op handlers.");
     callback->accepting = false;
     callback->Release();
+    return YES;
+  }
+}
+
+// MARK: SDK 16 device fakes. Stack objects with non-deleting reference counts.
+
+class FakeAttributes final : public IDeckLinkProfileAttributes {
+ public:
+  ULONG references = 1;
+  int64_t persistentID = 0x1234abcd;
+  bool formatDetection = true, hdrMetadata = true, colorspaceMetadata = true;
+  bool hdmiTimecode = true, highFrameRateTimecode = false;
+  int64_t maximumHDMIAudioChannels = 8;
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { return --references; }
+  HRESULT GetFlag(BMDDeckLinkAttributeID key, bool *value) override {
+    switch (key) {
+      case BMDDeckLinkSupportsInputFormatDetection: *value = formatDetection; return S_OK;
+      case BMDDeckLinkSupportsHDRMetadata: *value = hdrMetadata; return S_OK;
+      case BMDDeckLinkSupportsColorspaceMetadata: *value = colorspaceMetadata; return S_OK;
+      case BMDDeckLinkSupportsHDMITimecode: *value = hdmiTimecode; return S_OK;
+      case BMDDeckLinkSupportsHighFrameRateTimecode: *value = highFrameRateTimecode; return S_OK;
+      default: return E_INVALIDARG;
+    }
+  }
+  HRESULT GetInt(BMDDeckLinkAttributeID key, int64_t *value) override {
+    if (key == BMDDeckLinkPersistentID) { *value = persistentID; return S_OK; }
+    if (key == BMDDeckLinkMaximumHDMIAudioChannels) { *value = maximumHDMIAudioChannels; return S_OK; }
+    return E_INVALIDARG;
+  }
+  HRESULT GetFloat(BMDDeckLinkAttributeID, double *) override { return E_NOTIMPL; }
+  HRESULT GetString(BMDDeckLinkAttributeID, CFStringRef *) override { return E_NOTIMPL; }
+  HRESULT GetStringWithParam(BMDDeckLinkAttributeID, uint64_t, CFStringRef *) override { return E_NOTIMPL; }
+};
+
+class FakeStatus final : public IDeckLinkStatus {
+ public:
+  ULONG references = 1;
+  bool available = true, interfaceAvailable = true;
+  FakeMode detectedMode;
+  int64_t formatFlags = bmdDetectedVideoInputYCbCr422 | bmdDetectedVideoInput10BitDepth;
+  int64_t colorspace = bmdColorspaceRec709, dynamicRange = bmdDynamicRangeSDR;
+  int64_t busy = 0;  // BMDDeviceBusyState
+  bool locked = true;
+  FakeStatus() { detectedMode.mode = bmdMode4K2160p2997; }
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { return --references; }
+  HRESULT GetFlag(BMDDeckLinkStatusID key, bool *value) override {
+    if (key != bmdDeckLinkStatusVideoInputSignalLocked) return E_INVALIDARG;
+    *value = locked; return S_OK;
+  }
+  HRESULT GetInt(BMDDeckLinkStatusID key, int64_t *value) override {
+    if (!available) return E_FAIL;
+    switch (key) {
+      case bmdDeckLinkStatusDetectedVideoInputMode: *value = detectedMode.mode; return S_OK;
+      case bmdDeckLinkStatusDetectedVideoInputFormatFlags: *value = formatFlags; return S_OK;
+      case bmdDeckLinkStatusDetectedVideoInputColorspace: *value = colorspace; return S_OK;
+      case bmdDeckLinkStatusDetectedVideoInputDynamicRange: *value = dynamicRange; return S_OK;
+      case bmdDeckLinkStatusBusy: *value = busy; return S_OK;
+      default: return E_INVALIDARG;
+    }
+  }
+  HRESULT GetFloat(BMDDeckLinkStatusID, double *) override { return E_NOTIMPL; }
+  HRESULT GetString(BMDDeckLinkStatusID, CFStringRef *) override { return E_NOTIMPL; }
+  HRESULT GetBytes(BMDDeckLinkStatusID, void *, uint32_t *) override { return E_NOTIMPL; }
+  HRESULT GetInterface(BMDDeckLinkStatusID key, void **result) override {
+    if (!available || !interfaceAvailable || key != bmdDeckLinkStatusDetectedVideoInputMode) return E_NOTIMPL;
+    detectedMode.AddRef(); *result = static_cast<IDeckLinkDisplayMode *>(&detectedMode); return S_OK;
+  }
+  HRESULT GetFlagWithParam(BMDDeckLinkStatusID, uint64_t, bool *) override { return E_NOTIMPL; }
+  HRESULT GetIntWithParam(BMDDeckLinkStatusID, uint64_t, int64_t *) override { return E_NOTIMPL; }
+  HRESULT GetFloatWithParam(BMDDeckLinkStatusID, uint64_t, double *) override { return E_NOTIMPL; }
+  HRESULT GetStringWithParam(BMDDeckLinkStatusID, uint64_t, CFStringRef *) override { return E_NOTIMPL; }
+  HRESULT GetBytesWithParam(BMDDeckLinkStatusID, uint64_t, void *, uint32_t *) override { return E_NOTIMPL; }
+};
+
+class FakeEDID final : public IDeckLinkHDMIInputEDID {
+ public:
+  ULONG references = 1;
+  int64_t value = bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ;
+  int writes = 0;
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  // Like the driver: the final release restores the default EDID.
+  ULONG Release() override {
+    if (--references == 1) value = bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ;
+    return references;
+  }
+  HRESULT SetInt(BMDDeckLinkHDMIInputEDIDID key, int64_t next) override {
+    if (key != bmdDeckLinkHDMIInputEDIDDynamicRange) return E_INVALIDARG;
+    value = next; return S_OK;
+  }
+  HRESULT GetInt(BMDDeckLinkHDMIInputEDIDID key, int64_t *current) override {
+    if (key != bmdDeckLinkHDMIInputEDIDDynamicRange) return E_INVALIDARG;
+    *current = value; return S_OK;
+  }
+  HRESULT WriteToEDID() override { ++writes; return S_OK; }
+};
+
+class FakeNotification final : public IDeckLinkNotification {
+ public:
+  ULONG references = 1;
+  std::vector<std::pair<BMDNotifications, IDeckLinkNotificationCallback *>> subscriptions;
+  ~FakeNotification() { for (auto &entry : subscriptions) entry.second->Release(); }
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { return --references; }
+  HRESULT Subscribe(BMDNotifications topic, IDeckLinkNotificationCallback *callback) override {
+    callback->AddRef(); subscriptions.push_back({topic, callback}); return S_OK;
+  }
+  HRESULT Unsubscribe(BMDNotifications topic, IDeckLinkNotificationCallback *callback) override {
+    for (auto it = subscriptions.begin(); it != subscriptions.end(); ++it) {
+      if (it->first != topic || it->second != callback) continue;
+      it->second->Release(); subscriptions.erase(it); return S_OK;
+    }
+    return E_INVALIDARG;
+  }
+  void post(BMDNotifications topic, uint64_t parameter) {
+    for (auto &entry : subscriptions) if (entry.first == topic) entry.second->Notify(topic, parameter, 0);
+  }
+};
+
+class FakeStatistics final : public IDeckLinkStatistics {
+ public:
+  ULONG references = 1;
+  int64_t temperature = 47;
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { return --references; }
+  HRESULT GetInt(BMDDeckLinkStatisticID key, int64_t *value) override {
+    if (key != bmdDeckLinkStatisticDeviceTemperature) return E_INVALIDARG;
+    *value = temperature; return S_OK;
+  }
+  HRESULT GetIntWithParam(BMDDeckLinkStatisticID, uint64_t, int64_t *) override { return E_NOTIMPL; }
+  HRESULT GetStringWithParam(BMDDeckLinkStatisticID, uint64_t, CFStringRef *) override { return E_NOTIMPL; }
+};
+
+class FakeDeckLink final : public IDeckLink {
+ public:
+  ULONG references = 1;
+  CFStringRef name = CFSTR("UltraStudio Mini Recorder 12G");
+  bool hasInput = true, hasStatus = true, hasEDID = true;
+  FakeInput input;
+  FakeConfiguration configuration;
+  FakeAttributes attributes;
+  FakeStatus status;
+  FakeEDID edid;
+  FakeNotification notification;
+  FakeStatistics statistics;
+  HRESULT QueryInterface(REFIID iid, LPVOID *result) override {
+    *result = nullptr;
+    IUnknown *found = nullptr;
+    if (sameIID(iid, IID_IDeckLinkInput) && hasInput) found = &input;
+    else if (sameIID(iid, IID_IDeckLinkConfiguration)) found = &configuration;
+    else if (sameIID(iid, IID_IDeckLinkProfileAttributes)) found = &attributes;
+    else if (sameIID(iid, IID_IDeckLinkStatus) && hasStatus) found = &status;
+    else if (sameIID(iid, IID_IDeckLinkHDMIInputEDID) && hasEDID) found = &edid;
+    else if (sameIID(iid, IID_IDeckLinkNotification)) found = &notification;
+    else if (sameIID(iid, IID_IDeckLinkStatistics)) found = &statistics;
+    if (!found) return E_NOINTERFACE;
+    found->AddRef(); *result = found; return S_OK;
+  }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { return --references; }
+  HRESULT GetModelName(CFStringRef *value) override { *value = static_cast<CFStringRef>(CFRetain(name)); return S_OK; }
+  HRESULT GetDisplayName(CFStringRef *value) override { *value = static_cast<CFStringRef>(CFRetain(name)); return S_OK; }
+  bool balanced() const {
+    return references == 1 && input.references == 1 && configuration.references == 1 && attributes.references == 1 &&
+      status.references == 1 && edid.references == 1 && notification.references == 1 && statistics.references == 1 &&
+      status.detectedMode.references == 1;
+  }
+};
+
+class FakeAPIInformation final : public IDeckLinkAPIInformation {
+ public:
+  ULONG references = 1;
+  int64_t version;
+  CFStringRef text;
+  FakeAPIInformation(int64_t value, CFStringRef display) : version(value), text(display) {}
+  HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { return --references; }
+  HRESULT GetFlag(BMDDeckLinkAPIInformationID, bool *) override { return E_NOTIMPL; }
+  HRESULT GetInt(BMDDeckLinkAPIInformationID key, int64_t *value) override {
+    if (key != BMDDeckLinkAPIVersion) return E_INVALIDARG;
+    *value = version; return S_OK;
+  }
+  HRESULT GetFloat(BMDDeckLinkAPIInformationID, double *) override { return E_NOTIMPL; }
+  HRESULT GetString(BMDDeckLinkAPIInformationID key, CFStringRef *value) override {
+    if (key != BMDDeckLinkAPIVersion || !text) return E_NOTIMPL;
+    *value = static_cast<CFStringRef>(CFRetain(text)); return S_OK;
+  }
+};
+
+static NSString *attachmentString(CVPixelBufferRef buffer, CFStringRef key) {
+  return CFBridgingRelease(CVBufferCopyAttachment(buffer, key, nullptr));
+}
+
+// Frame-level SDK 16 features, through the production callback.
+static BOOL runFrameFeatureChecks(NSError **error) {
+  {  // No inner pool: a failure returns its autoreleased NSError through the out-parameter.
+    __block CVPixelBufferRef retained = nullptr;
+    __block NSString *timecodeText = nil;
+    __block int frames = 0, events = 0;
+    __block NSString *lastMessage = nil;
+    auto framesBlock = ^(CVPixelBufferRef buffer, CMTime, BOOL valid) {
+      if (!valid) return;
+      ++frames;
+      if (retained) CVPixelBufferRelease(retained);
+      retained = CVPixelBufferRetain(buffer);
+    };
+    auto eventsBlock = ^(NSString *message) { ++events; lastMessage = message; };
+    auto mediaBlock = ^(NSString *timecode, CMTime, NSUInteger, NSUInteger, float, float, float, float, NSUInteger, BOOL) {
+      timecodeText = timecode;
+    };
+    auto releaseRetained = ^{ if (retained) { CVPixelBufferRelease(retained); retained = nullptr; } };
+
+    // Timecode: RP188 at 59.94 counts 0-29 with a field mark on the second
+    // frame of each pair; HFRTC already counts 0-59; 29.97 is unchanged.
+    {
+      bool destroyed = false;
+      auto frame = new FakeFrame(&destroyed);
+      auto timecode = new FakeTimecode(); frame->timecode = timecode;
+      auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock);
+      timecode->frames = 14; timecode->flags = bmdTimecodeFieldMark;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![timecodeText isEqualToString:@"01:02:03:29"]) return fail(error, @"Field-marked RP188 frame was not converted to the 59.94 label.");
+      timecode->flags = bmdTimecodeIsDropFrame;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![timecodeText isEqualToString:@"01:02:03;28"]) return fail(error, @"59.94 drop-frame RP188 label was wrong.");
+      auto hfr = new FakeTimecode(); hfr->frames = 45; hfr->flags = bmdTimecodeFlagDefault; frame->hfrTimecode = hfr;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![timecodeText isEqualToString:@"01:02:03:45"]) return fail(error, @"HFR timecode was doubled or ignored.");
+      frame->hfrTimecode = nullptr; hfr->Release();
+      callback->accepting = false; callback->Release();
+
+      // A device counting 0-59 without HFRTC: one frame per label. Four
+      // consecutive +1 steps prove it, so at most the first four are doubled.
+      callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock);
+      timecode->flags = bmdTimecodeFlagDefault;
+      NSMutableArray<NSString *> *labels = [NSMutableArray array];
+      for (uint8_t value = 10; value != 17; ++value) {
+        timecode->frames = value;
+        callback->VideoInputFrameArrived(frame, nullptr);
+        [labels addObject:timecodeText ?: @"nil"];
+      }
+      if (![labels isEqualToArray:@[@"01:02:03:20", @"01:02:03:22", @"01:02:03:24", @"01:02:03:26",
+            @"01:02:03:14", @"01:02:03:15", @"01:02:03:16"]])
+        return fail(error, [@"Full-rate RP188 was not recognised after four steps: " stringByAppendingString:[labels componentsJoinedByString:@" "]]);
+      // An unchanged label reuses its string instead of formatting a new one.
+      NSString *previous = timecodeText;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (timecodeText != previous) return fail(error, @"An unchanged RP188 label was formatted again.");
+      // Signal loss starts over: the next source may be a pair counter.
+      frame->noSignal = true;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      frame->noSignal = false; timecode->frames = 5; timecode->flags = bmdTimecodeFieldMark;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![timecodeText isEqualToString:@"01:02:03:11"]) return fail(error, @"Full-rate RP188 survived signal loss.");
+      callback->accepting = false; callback->Release();
+
+      // A pair counter (repeat, +1, ...) with one corrupt label above 29: the
+      // label is rejected and the cadence does not latch to full rate.
+      callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock);
+      auto pair = [&](uint8_t value, bool second) {
+        timecode->frames = value; timecode->flags = second ? bmdTimecodeFieldMark : bmdTimecodeFlagDefault;
+        callback->VideoInputFrameArrived(frame, nullptr);
+      };
+      for (uint8_t value = 5; value != 9; ++value) { pair(value, false); pair(value, true); }
+      if (![timecodeText isEqualToString:@"01:02:03:17"]) return fail(error, @"Paired RP188 was not doubled.");
+      pair(31, false);
+      if (timecodeText) return fail(error, @"A corrupt RP188 label above 29 was reported at 59.94.");
+      pair(9, false);
+      if (![timecodeText isEqualToString:@"01:02:03:18"]) return fail(error, @"One corrupt RP188 label latched full-rate counting.");
+      pair(9, true);
+      if (![timecodeText isEqualToString:@"01:02:03:19"]) return fail(error, @"Paired RP188 lost its field mark after a corrupt label.");
+      // A reconfiguration also starts over.
+      for (uint8_t value = 20; value != 26; ++value) pair(value, false);
+      if (![timecodeText isEqualToString:@"01:02:03:25"]) return fail(error, @"Full-rate RP188 was not recognised after a pair counter.");
+      callback->resetTimecodeCadence = true;
+      pair(4, false);
+      if (![timecodeText isEqualToString:@"01:02:03:08"]) return fail(error, @"A reconfiguration did not reset the RP188 cadence.");
+      callback->accepting = false; callback->Release();
+      // 29.97: labels pass through, with the field mark ignored.
+      callback = new CaptureCallback(bmdMode4K2160p2997, 30000, framesBlock, eventsBlock, mediaBlock);
+      frame->frameDuration = 1001; timecode->frames = 14; timecode->flags = bmdTimecodeFieldMark | bmdTimecodeIsDropFrame;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![timecodeText isEqualToString:@"01:02:03;14"]) return fail(error, @"29.97 RP188 label was altered.");
+      // Components unavailable: the SDK string is reported as-is.
+      timecode->componentsFail = true;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![timecodeText isEqualToString:@"01:02:03:04"]) return fail(error, @"Timecode string fallback was lost.");
+      callback->accepting = false; callback->Release();
+      releaseRetained();
+      frame->timecode = nullptr; timecode->Release(); frame->Release();
+      if (!destroyed) return fail(error, @"Timecode fixture leaked its frame.");
+    }
+
+    // Host capture time: the hardware reference clock mapped onto the host clock.
+    {
+      FakeInput input; input.provideClock = true; input.clockOffsetMicros = 5000000;
+      HostClockSample sample;
+      if (!sampleHostOffset(&input, &sample) || std::llabs(sample.offsetMicros - 5000000) > 1000 ||
+          sample.windowMicros >= kMaximumHostWindowMicros)
+        return fail(error, @"Hardware reference clock was not mapped to the host clock.");
+      FakeInput silent;
+      if (sampleHostOffset(&silent, &sample)) return fail(error, @"Unavailable reference clock produced a host mapping.");
+      FakeInput slow; slow.provideClock = true; slow.clockDelayMicros = 2500;
+      if (sampleHostOffset(&slow, &sample)) return fail(error, @"A reference-clock read with a 2.5 ms bracket was accepted.");
+      // The filter keeps the narrowest bracket of recent polls, smooths
+      // toward it, ignores wide brackets and adopts a genuine step at once.
+      HostOffsetFilter filter;
+      int64_t offset = 0;
+      if (filter.offer(HostClockSample{1000, 1500}, &offset)) return fail(error, @"A 1.5 ms bracket produced a host offset.");
+      if (!filter.offer(HostClockSample{1000, 400}, &offset) || offset != 1000)
+        return fail(error, @"The first usable bracket did not set the host offset.");
+      if (!filter.offer(HostClockSample{1400, 900}, &offset) || offset != 1000)
+        return fail(error, @"A wider bracket moved the host offset.");
+      if (!filter.offer(HostClockSample{1200, 50}, &offset) || offset != 1050)
+        return fail(error, @"A narrower bracket was not smoothed in.");
+      if (!filter.offer(HostClockSample{900, 800}, &offset) || offset != 1088)
+        return fail(error, @"The filter did not keep the narrowest bracket.");
+      if (!filter.offer(HostClockSample{1000, 5000}, &offset) || offset != 1088)
+        return fail(error, @"A rejected bracket changed the host offset.");
+      if (!filter.offer(HostClockSample{90000, 200}, &offset) || offset != 90000)
+        return fail(error, @"A tight reading far from the estimate was not adopted as a step.");
+      bool destroyed = false;
+      auto frame = new FakeFrame(&destroyed);
+      frame->hardwareTime = 42000000;
+      auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (!retained || CVBufferCopyAttachment(retained, CFSTR("UltracamCaptureHostTime"), nullptr))
+        return fail(error, @"Host capture time was attached before the clock was mapped.");
+      callback->stats->hostOffsetMicros = 5000000; callback->stats->hostOffsetValid = true;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      NSNumber *host = CFBridgingRelease(CVBufferCopyAttachment(retained, CFSTR("UltracamCaptureHostTime"), nullptr));
+      if (![host isKindOfClass:[NSNumber class]] || CFNumberGetType((__bridge CFNumberRef)host) != kCFNumberFloat64Type ||
+          std::abs(host.doubleValue - 47.0) > 1e-9)
+        return fail(error, @"Host capture time attachment was missing or not a Float64 in host seconds.");
+      frame->hardwareTime = 0;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (CVBufferCopyAttachment(retained, CFSTR("UltracamCaptureHostTime"), nullptr))
+        return fail(error, @"A frame without a hardware timestamp carried a host capture time.");
+      callback->accepting = false; callback->Release();
+      releaseRetained(); frame->Release();
+      if (!destroyed) return fail(error, @"Host-time fixture leaked its frame.");
+    }
+
+    // Device drops from stream-time gaps; signal loss and restarts start over.
+    {
+      bool destroyed = false;
+      auto frame = new FakeFrame(&destroyed);
+      auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
+      for (BMDTimeValue time : {0, 1001, 3003, 7007, 8008}) { frame->streamTime = time; callback->VideoInputFrameArrived(frame, nullptr); }
+      if (callback->stats->deviceDrops != 4) return fail(error, @"Stream-time gaps were not counted as device drops.");
+      frame->noSignal = true; frame->streamTime = 9009; callback->VideoInputFrameArrived(frame, nullptr);
+      frame->noSignal = false; frame->streamTime = 90090; callback->VideoInputFrameArrived(frame, nullptr);
+      callback->resetStreamClock = true; frame->streamTime = 1001; callback->VideoInputFrameArrived(frame, nullptr);
+      frame->streamTime = 2002; callback->VideoInputFrameArrived(frame, nullptr);
+      if (callback->stats->deviceDrops != 4) return fail(error, @"Signal loss or a driver restart was counted as device drops.");
+      callback->accepting = false; callback->Release();
+      releaseRetained(); frame->Release();
+      if (!destroyed) return fail(error, @"Drop fixture leaked its frame.");
+    }
+
+    // IDeckLinkVideoBuffer::GetSize validation; a missing interface is tolerated.
+    {
+      bool destroyed = false;
+      auto frame = new FakeFrame(&destroyed);
+      frame->bufferSize = 10240 * 2160;
+      events = 0; frames = 0;
+      auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (frames != 1 || events) return fail(error, @"A full-size frame buffer was rejected.");
+      frame->bufferSize = 10240 * 2000;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (frames != 1 || events != 1 || callback->accepting || ![lastMessage containsString:@"byte frame buffer"])
+        return fail(error, @"A short frame buffer was not rejected with one capture error.");
+      callback->Release();
+      releaseRetained(); frame->Release();
+      if (!destroyed) return fail(error, @"Buffer-size fixture leaked its frame.");
+    }
+
+    // Colorimetry: frame metadata overrides; detection fills only empty keys.
+    {
+      bool destroyed = false;
+      auto frame = new FakeFrame(&destroyed);
+      auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
+      callback->signalColorspace = bmdColorspaceRec709;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![attachmentString(retained, kCVImageBufferYCbCrMatrixKey) isEqualToString:(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2] ||
+          ![attachmentString(retained, kCVImageBufferColorPrimariesKey) isEqualToString:(__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_709_2] ||
+          attachmentString(retained, kCVImageBufferTransferFunctionKey))
+        return fail(error, @"Detected Rec.709 was not attached, or an unknown transfer function was invented.");
+      callback->supportsHDRMetadata = true; callback->supportsColorspaceMetadata = true;
+      frame->metadataAvailable = true; frame->hdrFlag = true;
+      frame->metadataColorspace = bmdColorspaceRec2020; frame->metadataEOTF = 3;
+      frame->sdkTransfer = kCVImageBufferTransferFunction_ITU_R_709_2;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![attachmentString(retained, kCVImageBufferYCbCrMatrixKey) isEqualToString:(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_2020] ||
+          ![attachmentString(retained, kCVImageBufferColorPrimariesKey) isEqualToString:(__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_2020] ||
+          ![attachmentString(retained, kCVImageBufferTransferFunctionKey) isEqualToString:(__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_2100_HLG] ||
+          callback->observedEOTF != 3 || callback->observedColorspace != bmdColorspaceRec2020)
+        return fail(error, @"HLG Rec.2020 frame metadata did not override the buffer attachments.");
+      frame->metadataEOTF = 2;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![attachmentString(retained, kCVImageBufferTransferFunctionKey) isEqualToString:(__bridge NSString *)kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ])
+        return fail(error, @"PQ frame metadata was not attached.");
+      // No HDR InfoFrame on an HDR-capable device: SDR, but never over the SDK's own value.
+      frame->hdrFlag = false; frame->sdkTransfer = kCVImageBufferTransferFunction_SMPTE_ST_428_1;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![attachmentString(retained, kCVImageBufferTransferFunctionKey) isEqualToString:(__bridge NSString *)kCVImageBufferTransferFunction_SMPTE_ST_428_1] ||
+          callback->observedEOTF != kEOTFUnknown)
+        return fail(error, @"Inferred SDR overrode the SDK transfer function or counted as frame metadata.");
+      frame->sdkTransfer = nullptr;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![attachmentString(retained, kCVImageBufferTransferFunctionKey) isEqualToString:(__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_709_2])
+        return fail(error, @"An SDR frame without SDK colorimetry was not labelled Rec.709.");
+      callback->accepting = false; callback->Release();
+      releaseRetained(); frame->Release();
+      if (!destroyed) return fail(error, @"Colorimetry fixture leaked its frame.");
+    }
+
+    // EDID: advertise SDR | PQ | HLG for the session; the last release restores.
+    {
+      FakeDeckLink device;
+      {
+        HDMILease lease;
+        if (lease.advertiseDynamicRange(&device) != S_OK || device.edid.writes != 1 ||
+            device.edid.value != kAdvertisedDynamicRange || device.edid.references != 2)
+          return fail(error, @"HLG was not written to the HDMI EDID for the session.");
+        HDMILease again;
+        if (again.advertiseDynamicRange(&device) != S_FALSE || device.edid.writes != 1 || device.edid.references != 2)
+          return fail(error, @"An EDID already advertising HLG was rewritten or retained.");
+      }
+      if (device.edid.value != (bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ) || !device.balanced())
+        return fail(error, @"Ending the session did not restore the default EDID.");
+      device.hasEDID = false;
+      HDMILease unsupported;
+      if (unsupported.advertiseDynamicRange(&device) != E_NOINTERFACE || unsupported.edid)
+        return fail(error, @"A device without IDeckLinkHDMIInputEDID did not skip quietly.");
+    }
+
+    // Detected-mode status read (GetInterface first, then GetInt + GetDisplayMode).
+    {
+      FakeDeckLink device;
+      auto detected = detectedStatusInput(&device.status, &device.input);
+      if (!detected || !detected->supported || detected->mode != bmdMode4K2160p2997 ||
+          detected->colorspace != bmdColorspaceRec709 || detected->eotf != kEOTFSDR ||
+          ![detected->fullDescription() containsString:@"Rec.709 · SDR"] || !device.balanced())
+        return fail(error, @"Detected input status was not read through IDeckLinkStatus::GetInterface.");
+      device.status.interfaceAvailable = false;
+      if (detectedStatusInput(&device.status, &device.input))
+        return fail(error, @"Detected status fabricated a display mode the input could not resolve.");
+      device.status.available = false;
+      if (detectedStatusInput(&device.status, &device.input)) return fail(error, @"Unavailable status produced a detection.");
+    }
+    return YES;
+  }
+}
+
+// Version check and hot-plug discovery against fake SDK objects only.
+BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
+  {  // No inner pool: a failure returns its autoreleased NSError through the out-parameter.
+    FakeAPIInformation old(0x0F030000, CFSTR("15.3")), current(0x10040000, CFSTR("16.4")), unnamed(0x10000000, nullptr);
+    UltracamDriverInfo *oldInfo = driverInfoFrom(&old), *currentInfo = driverInfoFrom(&current);
+    UltracamDriverInfo *unnamedInfo = driverInfoFrom(&unnamed), *missing = driverInfoFrom(nullptr);
+    if (oldInfo.supported || !oldInfo.installed || ![oldInfo.message containsString:@"Update Desktop Video to 16 or later"] ||
+        ![oldInfo.message containsString:@"15.3"])
+      return fail(error, @"A pre-16 Desktop Video driver was not reported with an update message.");
+    if (!currentInfo.supported || currentInfo.message || ![currentInfo.version isEqualToString:@"16.4"] ||
+        !unnamedInfo.supported || ![unnamedInfo.version isEqualToString:@"16.0.0"])
+      return fail(error, @"A Desktop Video 16 driver was not accepted.");
+    if (missing.installed || missing.supported || !missing.message)
+      return fail(error, @"A missing Desktop Video driver was not reported.");
+
+    dispatch_queue_t observers = dispatch_queue_create("org.ultracam.tests.observers", DISPATCH_QUEUE_SERIAL);
+    __block NSArray<UltracamDevice *> *published = nil;
+    __block int publications = 0;
+    FakeDeckLink first, second, outputOnly;
+    second.attributes.persistentID = 0x55;
+    second.name = CFSTR("UltraStudio Recorder 3G");
+    outputOnly.hasInput = false; outputOnly.attributes.persistentID = 0x66;
+    {
+      DeviceRegistry registry(observers);
+      id token = registry.addObserver(^(NSArray<UltracamDevice *> *list) { published = list; ++publications; });
+      auto settle = [&] { registry.drain(); dispatch_sync(observers, ^{}); };
+      DiscoveryCallback *notifications = new DiscoveryCallback(&registry);
+      notifications->DeckLinkDeviceArrived(&first);
+      notifications->DeckLinkDeviceArrived(&outputOnly);
+      notifications->DeckLinkDeviceArrived(&second);
+      notifications->DeckLinkDeviceArrived(&first);  // Duplicate arrival.
+      settle();
+      if (published.count != 2 || ![published[0].identifier isEqualToString:@"decklink:000000001234abcd"] ||
+          ![published[1].name isEqualToString:@"UltraStudio Recorder 3G"] || publications != 2 ||
+          first.references != 2 || outputOnly.references != 1)
+        return fail(error, @"Arrivals were not published once per usable device, keyed by persistent ID.");
+      DeviceCapabilities capabilities;
+      IDeckLink *held = registry.copyDevice(@"decklink:000000001234abcd", &capabilities);
+      if (held != &first || capabilities.maximumHDMIAudioChannels != 8 || !capabilities.hdrMetadata || first.references != 3)
+        return fail(error, @"Discovery did not hold the arrived device for start.");
+      held->Release();
+      UltracamDeviceDiagnostics *diagnostics = registry.diagnostics(@"decklink:000000001234abcd");
+      if (diagnostics.maximumHDMIAudioChannels != 8 || diagnostics.capturedAudioChannels != 2 || !diagnostics.supportsHDMITimecode ||
+          diagnostics.sessionActive || diagnostics.temperatureCelsius != NSNotFound)
+        return fail(error, @"Device diagnostics did not report the cached attributes.");
+
+      // Removal of the active device reports a disconnection, once.
+      __block NSString *message = nil;
+      __block int messages = 0;
+      auto session = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, ^(NSString *value) { message = value; ++messages; });
+      registry.attachSession(@"decklink:000000001234abcd", session, session->stats);
+      notifications->DeckLinkDeviceRemoved(&outputOnly);  // Never listed: ignored.
+      notifications->DeckLinkDeviceRemoved(&first);
+      settle();
+      if (published.count != 1 || ![published[0].identifier isEqualToString:@"decklink:0000000000000055"] ||
+          messages != 1 || ![message containsString:@"UltraStudio disconnected"] || session->accepting ||
+          first.references != 1 || session->references != 2)
+        return fail(error, @"Removing the active device did not update the list and report the disconnection.");
+      if (registry.copyDevice(@"decklink:000000001234abcd", nullptr))
+        return fail(error, @"A removed device was still available to start.");
+      registry.detachSession(session);
+      if (session->references != 1) return fail(error, @"Detached session kept a registry reference.");
+      session->Release();
+      registry.removeObserver(token);
+      notifications->DeckLinkDeviceRemoved(&second);
+      settle();
+      if (publications != 3) return fail(error, @"A removed observer was still notified.");
+      notifications->Release();
+    }
+    if (first.references != 1 || second.references != 1 || outputOnly.references != 1)
+      return fail(error, @"Discovery leaked device references.");
     return YES;
   }
 }

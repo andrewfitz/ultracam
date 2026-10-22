@@ -1,17 +1,19 @@
 import Foundation
 
-/// Mirrors Params in MonitorTools.metal.txt: nine aligned 16-byte rows.
+/// Mirrors Params in MonitorTools.metal.txt: ten aligned 16-byte rows.
 /// Source mapping, scope sampling and peaking thresholds have distinct fields.
 struct KernelParameters {
-  var width: UInt32 = 0, height: UInt32 = 0, stride: UInt32 = 0, format: UInt32 = 0
+  var width: UInt32 = 0, height: UInt32 = 0, planes: UInt32 = 0, format: UInt32 = 0
   var outWidth: UInt32 = 0, outHeight: UInt32 = 0, flags: UInt32 = 0, scopeMode: UInt32 = 0
   var threshold: Float = 95, widthIRE: Float = 5, opacity: Float = 0.65, focusThreshold: Float = 0.1
   var noise: Float = 0.02, focusOpacity: Float = 0.85, gain: Float = 1, sourceLogRescaled: Float = 0
-  var scopeWidth: UInt32 = 768, scopeHeight: UInt32 = 256, scopeSamplingStride: UInt32 = 2, scopeSamplingPhase: UInt32 = 0
-  var referenceOffsetStops: Float = 0, reserved0: Float = 0, reserved1: Float = 0, reserved2: Float = 0
+  var scopeWidth: UInt32 = 768, scopeHeight: UInt32 = 256, scopeSamplingStride: UInt32 = 1, scopeSamplingPhase: UInt32 = 0
+  var referenceOffsetStops: Float = 0, originX: Float = 0, originY: Float = 0, reserved2: Float = 0
   var coefficients = SIMD4<Float>(0.2126, 0.7152, 0.0722, 0)
   var mapping = SIMD4<Float>(1, 1, 0, 0)
   var peak = SIMD4<Float>(1, 0, 0, 1)
+  /// Picture region (x, y, width, height) drawn across the whole target.
+  var aperture = SIMD4<Float>(0, 0, 0, 0)
 }
 
 enum MonitorKernelFlag {

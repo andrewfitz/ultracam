@@ -4,43 +4,13 @@ import CoreVideo
 import Metal
 import MonitorToolsCore
 import MonitorToolsMetal
-import MonitorToolsUI
 
 // This executable only creates synthetic buffers. No capture/device APIs are imported.
+// Paced N-feed run of the GPU monitor path: every offered frame must produce one
+// completed picture encode, scopes run at the requested rate in their own command
+// buffers, producer buffers stay untouched, and GPU objects stop growing after warmup.
 struct Failure: Error { let reason: String }
 func require(_ value: @autoclosure () -> Bool, _ reason: String) throws { if !value() { throw Failure(reason: reason) } }
-final class Results: @unchecked Sendable {
-    let lock = NSLock()
-    var counts: [Int: Int] = [:], ages=Distribution(), releases=Distribution(), errors: [String] = []
-    var dimensions:[String:Int]=[:],stages:[String:Int]=[:]
-    private var held:[Int:MonitorOwnedFrame]=[:]
-    func releaseHeld(){lock.lock();held.removeAll();lock.unlock()}
-    func record(feed: Int, result: Result<MonitorOwnedFrame, Error>, expected: UInt8, width:Int,height:Int,useOutput:Bool,start: Double) {
-        var previous:MonitorOwnedFrame?
-        lock.lock()
-        switch result {
-        case .failure(let error): if errors.count<16 {errors.append(String(describing: error))}
-        case .success(let frame):
-            let observedWidth=CVPixelBufferGetWidth(frame.pixelBuffer),observedHeight=CVPixelBufferGetHeight(frame.pixelBuffer)
-            dimensions["\(observedWidth)x\(observedHeight)",default:0] += 1
-            stages[useOutput ? "processedOutput":"source",default:0] += 1
-            if (observedWidth != width || observedHeight != height) && errors.count<16 {errors.append("clean dimensions differ from declared native stage")}
-            CVPixelBufferLockBaseAddress(frame.pixelBuffer, .readOnly)
-            let byte = CVPixelBufferGetBaseAddress(frame.pixelBuffer)!.load(as: UInt8.self)
-            CVPixelBufferUnlockBaseAddress(frame.pixelBuffer, .readOnly)
-            if byte != expected && errors.count<16 { errors.append("feed identity/pixel copy mismatch") }
-            previous=held.updateValue(frame,forKey:feed)
-            counts[feed, default: 0] += 1
-            ages.add(ProcessInfo.processInfo.systemUptime - start)
-        }
-        lock.unlock()
-        // Releasing a native 4K surface can be expensive. Keep it outside the shared observer lock.
-        let releaseStarted=ProcessInfo.processInfo.systemUptime
-        withExtendedLifetime(previous) {};previous=nil
-        let releaseSeconds=ProcessInfo.processInfo.systemUptime-releaseStarted
-        lock.lock();releases.add(releaseSeconds);lock.unlock()
-    }
-}
 func buffer(_ value:UInt8,width:Int=320,height:Int=180,format:OSType=kCVPixelFormatType_32BGRA) throws -> CVPixelBuffer {
     var result:CVPixelBuffer?
     let attrs=[kCVPixelBufferIOSurfacePropertiesKey:[:]] as CFDictionary
@@ -53,8 +23,10 @@ func buffer(_ value:UInt8,width:Int=320,height:Int=180,format:OSType=kCVPixelFor
     if format==kCVPixelFormatType_422YpCbCr10 {
         let words=CVPixelBufferGetBaseAddress(image)!.assumingMemoryBound(to:UInt32.self),stride=CVPixelBufferGetBytesPerRow(image)/4
         memset(words,0,CVPixelBufferGetDataSize(image))
-        let cb=UInt32(512+Int(value)),cr:UInt32=512,y=UInt32(64+Int(value)*876/255)
+        let cb=UInt32(512+Int(value)),cr:UInt32=512
         for row in 0..<height {for x in Swift.stride(from:0,to:width,by:6) {
+            // A moving-free ramp with vertical edges so focus and zebra have work.
+            let y=UInt32(64+(Int(value)*876/255+x/6%7*40+(x/96%2)*200)%876)
             let i=row*stride+x/6*4
             words[i]=cb | (y<<10) | (cr<<20);words[i+1]=y | (cb<<10) | (y<<20)
             words[i+2]=cr | (y<<10) | (cb<<20);words[i+3]=y | (cr<<10) | (y<<20)
@@ -62,10 +34,6 @@ func buffer(_ value:UInt8,width:Int=320,height:Int=180,format:OSType=kCVPixelFor
     } else {memset(CVPixelBufferGetBaseAddress(image),Int32(value),CVPixelBufferGetDataSize(image))}
     CVPixelBufferUnlockBaseAddress(image,[])
     return image
-}
-func percentile(_ values: [Double], _ fraction: Double) -> Double {
-    guard !values.isEmpty else { return 0 }
-    let sorted = values.sorted(); return sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * fraction))]
 }
 let qualificationActivity=ProcessInfo.processInfo.beginActivity(options:[.userInitiated,.latencyCritical],reason:"Paced native video qualification")
 DispatchQueue.global(qos:.userInitiated).async {
@@ -85,78 +53,70 @@ do {
         else { throw Failure(reason: "usage: --seconds N --feeds 1|2|4 --width W --height H --format v210|bgra --fps29.97|59.94") }
         index += 2
     }
-    let ledger = MonitorAdmissionLedger(maximumCleanCopyJobs: 4, maximumBytes:256*1024*1024,cleanReserveBytes:64*1024*1024)
-    let a = MonitorTargetID("synthetic-a"), b = MonitorTargetID("synthetic-b")
-    let old = ledger.tryAcquire(target: a, generation: 1, kind: .analysis, bytes: 1024)!
-    ledger.retire(target: a, generation: 1)
-    try require(ledger.tryAcquire(target: a, generation: 2, kind: .analysis, bytes: 1024) == nil, "retired same-target slot was reused")
-    let other = ledger.tryAcquire(target: b, generation: 1, kind: .analysis, bytes: 1024)!
-    try require(ledger.tryAcquire(target: MonitorTargetID("third"), generation: 1, kind: .analysis, bytes: 1024) == nil, "global bound exceeded")
-    try require(ledger.snapshot.retiredBytes == 1024, "retired memory disappeared")
-    old.release(); other.release()
-    try require(ledger.snapshot.retainedBytes == 0, "retirement failed to release")
-    let oneCopy = MonitorAdmissionLedger(maximumCleanCopyJobs: 1)
-    let heldCopy = oneCopy.tryAcquireClean(target: a, generation: 1, bytes: 1024)!
-    oneCopy.retire(target: a, generation: 1)
-    try require(oneCopy.tryAcquireClean(target: b, generation: 1, bytes: 1024) == nil, "one-copy retired job bound bypassed")
-    heldCopy.copy.release(); heldCopy.presentation.release()
-    try require(oneCopy.snapshot.retainedBytes == 0 && oneCopy.snapshot.cleanCopyJobs == 0, "one-copy retirement leaked")
+    let a = MonitorTargetID("synthetic-a")
     let stale = MonitorFrameStamp(target: a, generation: 1, sequence: 1, sourcePTS: 0, hostTime: 0, configurationRevision: 1)
     try require(!stale.matches(target: a, generation: 2, configurationRevision: 1), "stale generation accepted")
     var configs = (0..<feeds).map { _ in MonitorConfiguration() }
     configs[0].zebra.thresholdIRE = 80
     if feeds > 1 { try require(configs[1].zebra.thresholdIRE == 95, "feed configuration leaked") }
-    // Exercise actual package shader resource loading and independent shader-failure clean fallback.
+    // Package shader resource loading, and a shader failure reported instead of drawn.
     let gpuAvailable = MTLCreateSystemDefaultDevice() != nil
     let fixtureSource = try buffer(32), fixtureOutput = try buffer(240)
-    func checkRuntime(shader: String?, expectDecoration: Bool) throws {
-        let runtime = MonitorRuntime(sharedDevice: { MTLCreateSystemDefaultDevice() }, shaderSource: shader)
-        var config = MonitorConfiguration(); config.toolsEnabled = true; config.zebra.enabled = true
-        config.zebra.thresholdIRE = 50; config.scopes.enabled = true
-        let target = MonitorTargetID("runtime-fixture")
-        runtime.configure(target: target, generation: 1, configurationRevision: 1, configuration: config)
-        let stamp = MonitorFrameStamp(target: target, generation: 1, sequence: 1, sourcePTS: 0, hostTime: ProcessInfo.processInfo.systemUptime, configurationRevision: 1)
-        let checked = Results(), done = DispatchSemaphore(value: 0)
-        let producerIdentity = ObjectIdentifier(fixtureOutput)
-        let accepted = runtime.offer(MonitorFrameBundle(stamp: stamp, source: fixtureSource, output: fixtureOutput, sourceSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "sRGB"), outputSignal: MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "sRGB"))) { result in
-            switch result {
-            case .failure(let error): checked.lock.lock(); if checked.errors.count < 16 { checked.errors.append(String(describing: error)) }; checked.lock.unlock()
-            case .success(let display):
-                checked.record(feed: 0, result: .success(display.clean), expected: 240,width:320,height:180,useOutput:true,start: stamp.hostTime)
-                checked.lock.lock()
-                if expectDecoration && (display.decorated == nil || display.scope == nil) { checked.errors.append("shader output/scope missing") }
-                if !expectDecoration && display.decorated != nil { checked.errors.append("invalid shader failed to fall back") }
-                if let decorated = display.decorated, ObjectIdentifier(decorated.pixelBuffer) == producerIdentity { checked.errors.append("decorated producer buffer reused") }
-                checked.lock.unlock()
-            }
-            done.signal()
-        }
-        try require(accepted, "runtime fixture not admitted")
-        try require(done.wait(timeout: .now() + 20) == .success, "runtime completion watchdog")
-        try require(checked.errors.isEmpty, checked.errors.joined(separator: ", "))
+    let fixtureSignal = MonitorFrameSignal(range: .full, matrix: .bt709, transfer: "sRGB")
+    func fixtureBundle() -> MonitorFrameBundle {
+        let stamp = MonitorFrameStamp(target: MonitorTargetID("runtime-fixture"), generation: 1, sequence: 1, sourcePTS: 0, hostTime: ProcessInfo.processInfo.systemUptime, configurationRevision: 1)
+        return MonitorFrameBundle(stamp: stamp, source: fixtureSource, output: fixtureOutput, correspondence: .identity, sourceSignal: fixtureSignal, outputSignal: fixtureSignal)
+    }
+    var fixtureConfig = MonitorConfiguration(); fixtureConfig.toolsEnabled = true; fixtureConfig.zebra.enabled = true
+    fixtureConfig.zebra.thresholdIRE = 50; fixtureConfig.scopes.enabled = true
+    let invalid = MonitorRuntime(sharedDevice: { MTLCreateSystemDefaultDevice() }, shaderSource: "deliberately invalid shader")
+    var invalidRendered = false
+    do { _ = try invalid.renderSnapshot(fixtureBundle(), configuration: fixtureConfig); invalidRendered = true } catch {}
+    try require(!invalidRendered, "invalid shader still produced a picture")
+    try require(invalid.unavailableReason != nil, "invalid shader did not report the GPU unavailable")
+    if gpuAvailable {
+        let snapshot = try MonitorRuntime().renderSnapshot(fixtureBundle(), configuration: fixtureConfig.normalized())
+        try require(snapshot.availability.isEmpty, "fixture tools unavailable: \(snapshot.availability)")
+        try require(snapshot.scope != nil, "fixture scope missing")
+        // Processed output 240 is 94 IRE: pixel (0,0) is on a zebra stripe, mixed toward white.
+        let bytes = snapshot.pictureBytes
+        try require(bytes[2] > 240 && bytes[1] > 240 && bytes[0] > 240, "fixture zebra not drawn")
         CVPixelBufferLockBaseAddress(fixtureOutput, .readOnly)
         let original = CVPixelBufferGetBaseAddress(fixtureOutput)!.load(as: UInt8.self)
         CVPixelBufferUnlockBaseAddress(fixtureOutput, .readOnly)
-        try require(original == 240, "monitor decorated source/recording branch in place")
+        try require(original == 240, "monitor wrote into the producer buffer")
     }
-    try checkRuntime(shader: "deliberately invalid shader", expectDecoration: false)
-    if gpuAvailable { try checkRuntime(shader: nil, expectDecoration: true) }
-    let presentationBytes=MonitorPresentationEstimate.bytes(backingWidth:1280,backingHeight:720,scopes:true)
-    var presentationAllowances:[MonitorResourceLease]=[]
-    for feed in 0..<feeds {
-        guard let lease=ledger.tryAcquire(target:MonitorTargetID("surface:synthetic-\(feed)"),generation:0,kind:.cleanPresentation,bytes:presentationBytes) else {throw Failure(reason:"visible workspace presentation allowance rejected")}
-        presentationAllowances.append(lease)
-    }
-    let service = CleanPreviewService(budget: ledger), results = Results(), group = DispatchGroup()
+    try require(gpuAvailable, "Metal device unavailable")
+    let runtime = MonitorRuntime()
     let sources = try (0..<feeds).map { try buffer(UInt8(20 + $0),width:width,height:height,format:format) }
     let outputs = try (0..<feeds).map { try buffer(UInt8(90 + $0),width:width,height:height,format:format) }
-    let cleanWidth=width,cleanHeight=height
+    let hashes = (sources + outputs).map(producerFingerprint)
+    let legal = format == kCVPixelFormatType_422YpCbCr10
+    let signal = MonitorFrameSignal(range: legal ? .legal : .full, matrix: .bt709, transfer: "ITU_R_709_2")
+    // Every tool on; even feeds monitor the source, odd feeds the processed output.
+    let workloads = try (0..<feeds).map { feed -> MonitorGPUWorkload in
+        var config = MonitorConfiguration()
+        config.toolsEnabled = true; config.zebra.enabled = true; config.focus.enabled = true
+        config.scopes.enabled = true; config.scopes.refreshHz = 15
+        config.pictureStage = feed % 2 == 0 ? .source : .processedOutput
+        config.scopeStage = config.pictureStage
+        return try MonitorGPUWorkload(runtime: runtime, configuration: config)
+    }
+    func bundle(feed: Int, tick: Int, now: Double) -> MonitorFrameBundle {
+        let stamp = MonitorFrameStamp(target: MonitorTargetID("synthetic-\(feed)"), generation: 1, sequence: UInt64(tick + 1), sourcePTS: Double(tick) / fps, hostTime: now, configurationRevision: 1)
+        return MonitorFrameBundle(stamp: stamp, source: sources[feed], output: outputs[feed], correspondence: .identity, sourceSignal: signal, outputSignal: signal)
+    }
+    // Shader compile and first-use resources happen outside the measured window.
+    for feed in 0..<feeds { workloads[feed].offer(bundle(feed: feed, tick: -1, now: ProcessInfo.processInfo.systemUptime)) }
+    try require(workloads.allSatisfy { $0.drain(timeout: 20) }, "warmup completion watchdog")
+    for workload in workloads { workload.resetMeasurement() }
     let heartbeat=MainQueueHeartbeat()
     let started = ProcessInfo.processInfo.systemUptime
     let startFootprint=footprint()
-    let sampler=QualificationSampler { ["footprint":Double(footprint()),"ledger":Double(ledger.snapshot.retainedBytes)] }
+    let sampler=QualificationSampler { ["footprint":Double(footprint())] }
     var producerWork=ProducerWorkMetrics()
-    var offered = 0, admitted = 0, peakBytes = 0, tick = 0
+    var tick = 0
+    var steadyStart: MonitorGPUStatistics?
     var intervals=[Distribution](repeating:Distribution(),count:feeds),lastOffer=[Double?](repeating:nil,count:feeds)
     let scheduler=try onPacedProducer(period:1/fps,feeds:feeds) {
     var nextDeadline=ProcessInfo.processInfo.systemUptime
@@ -164,55 +124,59 @@ do {
         waitForProducerDeadline(nextDeadline)
         if ProcessInfo.processInfo.systemUptime-started >= seconds {break}
         nextDeadline=ProcessInfo.processInfo.systemUptime+1/fps
+        // GPU object counts are taken one second in: after that nothing may grow.
+        if steadyStart == nil && ProcessInfo.processInfo.systemUptime - started >= min(1, seconds / 4) { steadyStart = runtime.gpuStatistics }
         let workStart=ProcessInfo.processInfo.systemUptime,cpuStart=producerThreadCPU()
         for offset in 0..<feeds {
             let feed = (tick + offset) % feeds
             let now = ProcessInfo.processInfo.systemUptime
             if let old=lastOffer[feed] {intervals[feed].add(now-old)};lastOffer[feed]=now
-            let stamp = MonitorFrameStamp(target: MonitorTargetID("synthetic-\(feed)"), generation: 1, sequence: UInt64(tick), sourcePTS: Double(tick) / fps, hostTime: now, configurationRevision: 1)
-            offered += 1; group.enter()
-            let useOutput = (tick+feed) % 2 == 0
-            let accepted = service.offer(MonitorFrameBundle(stamp: stamp, source: sources[feed], output: outputs[feed]), useOutput: useOutput) { result in
-                results.record(feed: feed, result: result, expected: UInt8((useOutput ? 90 : 20) + feed),width:cleanWidth,height:cleanHeight,useOutput:useOutput,start: now)
-                group.leave()
-            }
-            if accepted { admitted += 1 } else { group.leave() }
+            workloads[feed].offer(bundle(feed: feed, tick: tick, now: now))
         }
         producerWork.record(wallStart:workStart,cpuStart:cpuStart)
         tick += 1
-
     }
     }
     let sampled=sampler.stop()
-    peakBytes=Int(sampled.maxima["ledger"] ?? 0)
     let peakFootprint=UInt64(sampled.maxima["footprint"] ?? Double(startFootprint))
-    try require(group.wait(timeout: .now() + 10) == .success, "copy completion watchdog")
-    try require(results.errors.isEmpty, results.errors.joined(separator: ", "))
     let elapsed = ProcessInfo.processInfo.systemUptime - started
+    try require(workloads.allSatisfy { $0.drain(timeout: 10) }, "GPU completion watchdog")
     heartbeat.stop();let main=heartbeat.snapshot()
-    let heldBytesAtClose=ledger.snapshot.retainedBytes
-    results.releaseHeld()
-    for lease in presentationAllowances {lease.release()}
-    let releaseDeadline = ProcessInfo.processInfo.systemUptime + 3
-    while ledger.snapshot.retainedBytes != 0 && ProcessInfo.processInfo.systemUptime < releaseDeadline { Thread.sleep(forTimeInterval: 0.001) }
-    try require(ledger.snapshot.retainedBytes == 0, "owned-copy resources remain after completion")
-    let rates = (0..<feeds).map { Double(results.counts[$0, default: 0]) / elapsed }
-    // These are predeclared fixture minimums, not full-resolution product qualification.
-    let minimumHz = 20.0
+    let steadyEnd = runtime.gpuStatistics
+    let snapshots = workloads.map { $0.snapshot() }
+    let unchanged = zip(sources + outputs, hashes).allSatisfy { producerFingerprint($0.0) == $0.1 }
     let producerHz=Double(tick)/elapsed
+    let pictureHz = snapshots.map { Double($0.completedPictures) / elapsed }
+    let scopeHz = snapshots.map { Double($0.completedScopes) / elapsed }
+    var pictureGPU=Distribution(),scopeGPU=Distribution()
+    for s in snapshots { for (i,n) in s.pictureGPU.bins.enumerated() where n > 0 { pictureGPU.bins[i] += n; pictureGPU.count += n }; for (i,n) in s.scopeGPU.bins.enumerated() where n > 0 { scopeGPU.bins[i] += n; scopeGPU.count += n } }
+    let grownTextures = steadyEnd.wrappedTextures - (steadyStart?.wrappedTextures ?? steadyEnd.wrappedTextures)
+    let grownContexts = steadyEnd.encodeContexts - (steadyStart?.encodeContexts ?? steadyEnd.encodeContexts)
+    let requestedScopeHz = 15.0
     var failureReasons:[String]=[]
     if producerHz < fps*0.98 {failureReasons.append("producer pacing below98% target")}
-    if !rates.allSatisfy({$0>=minimumHz}) {failureReasons.append("native clean cadence below20Hz/tile")}
-    if results.ages.percentile(0.99)>200 {failureReasons.append("native clean p99 age exceeds200ms")}
+    for (feed, s) in snapshots.enumerated() {
+        if s.offered != tick {failureReasons.append("feed\(feed) offered \(s.offered) of \(tick) produced frames")}
+        if s.encoded != s.offered || s.completedPictures != s.offered {failureReasons.append("feed\(feed) skipped pictures: offered \(s.offered) encoded \(s.encoded) completed \(s.completedPictures)")}
+        if s.failures > 0 {failureReasons.append("feed\(feed) failures: \(s.encodeErrors)")}
+        if s.toolUnavailable > 0 {failureReasons.append("feed\(feed) requested tools unavailable: \(s.statusCounts)")}
+        if scopeHz[feed] < min(requestedScopeHz, fps) * 0.9 {failureReasons.append("feed\(feed) scope rate \(scopeHz[feed])Hz below90% of \(requestedScopeHz)Hz")}
+        if s.pictureAge.percentile(0.99) > 200 {failureReasons.append("feed\(feed) picture completion p99 age exceeds200ms")}
+    }
+    if !unchanged {failureReasons.append("producer buffer bytes changed")}
+    if grownTextures != 0 || grownContexts != 0 {failureReasons.append("steady-state GPU object growth: textures \(grownTextures) contexts \(grownContexts)")}
     if main.0.count<UInt64(seconds*10) || main.0.percentile(0.95)>50 || main.0.percentile(0.99)>100 {failureReasons.append("main queue responsiveness gate")}
-    let receipt: [String: Any] = ["declared_clean_stages":"alternating source/processedOutput; both native input dimensions","expected_clean_dimensions":"\(width)x\(height)","observed_clean_dimensions":results.dimensions,"observed_clean_stage_counts":results.stages,"activity_lifetime":"explicit matched end after completed workload","process_id":ProcessInfo.processInfo.processIdentifier,"source_essential_work":producerWork.dictionary(feeds:feeds),"telemetry_samples":sampled.count,"telemetry_observed_hz":Double(sampled.count)/sampled.elapsed,"status":failureReasons.isEmpty ? "passed":"failed","failure_reasons":failureReasons, "width":width,"height":height,"presentation_allowance_bytes_per_tile":presentationBytes,"presentation_allowance_total_bytes":presentationBytes*feeds,"presentation_backing_width":1280,"presentation_backing_height":720,"presentation_picture_buffer_count":2,"presentation_scope_drawable_count":2,"presentation_scope_width":768,"presentation_scope_height":256,"presentation_allowance_kind":"cleanPresentation","compositor_throughput":"unqualified: conservative budget estimate only; no actual display compositor","presentation_workload":"additional owned workspace surfaces","pixel_format":format == kCVPixelFormatType_422YpCbCr10 ? "v210":"BGRA","held_latest_frames_per_feed":1,"held_bytes_at_close":heldBytesAtClose,"teardown_retained_bytes":ledger.snapshot.retainedBytes,"process_footprint_start":startFootprint,"sampled_peak_process_footprint":peakFootprint,"process_footprint_end":footprint(),"main_queue_observed":main.0.count,"main_queue_p95_ms":main.0.percentile(0.95),"main_queue_p99_ms":main.0.percentile(0.99),"main_queue_pending_skips":main.1, "workload":"Clean\(width)x\(height)-\(format == kCVPixelFormatType_422YpCbCr10 ? "v210":"BGRA")-\(feeds)Feed-\(fps)Hz", "synthetic_only":true,
-        "producer_scheduler":scheduler.dictionary,"seconds":elapsed,"producer_effective_hz":producerHz,"producer_offer_interval_p95_ms":intervals.map{$0.percentile(0.95)},"producer_offer_interval_p99_ms":intervals.map{$0.percentile(0.99)},"producer_pacing":"latencyCritical activity; host-clock no catchup; minimum98% nominal", "offered":offered, "admitted":admitted, "skipped":offered-admitted,
-        "per_feed_hz":rates, "minimum_per_feed_hz":minimumHz, "age_p95_ms":results.ages.percentile(0.95),
-        "age_p99_ms":results.ages.percentile(0.99), "old_surface_release_p95_ms":results.releases.percentile(0.95),"old_surface_release_p99_ms":results.releases.percentile(0.99), "maximum_age_p99_ms":200, "sampled_peak_ledger_bytes":peakBytes, "ledger_sample_hz":2, "maximum_clean_copy_jobs":4, "maximum_analysis_bundles":2,
-        "camera_p95_regression_tolerance_ms":2, "camera_p99_regression_tolerance_ms":5,
-        "camera_qualification":"unqualified: no active consumer", "analysis_qualification":gpuAvailable ? "functional shader/scope fixture passed; sustained analysis pending" : "skipped: GPU unavailable",
-        "gpu_available":MTLCreateSystemDefaultDevice() != nil, "recording_qualification":"pending separate encoder comparisons"]
+    let receipt: [String: Any] = ["declared_picture_stages":"even feeds source, odd feeds processedOutput; every tool on (zebra, focus, RGB parade at 15Hz)","target":"1920x1080 offscreen drawable stand-in","process_id":ProcessInfo.processInfo.processIdentifier,"source_essential_work":producerWork.dictionary(feeds:feeds),"telemetry_samples":sampled.count,"telemetry_observed_hz":Double(sampled.count)/sampled.elapsed,"status":failureReasons.isEmpty ? "passed":"failed","failure_reasons":failureReasons,"width":width,"height":height,
+        "pixel_format":format == kCVPixelFormatType_422YpCbCr10 ? "v210":"BGRA","process_footprint_start":startFootprint,"sampled_peak_process_footprint":peakFootprint,"process_footprint_end":footprint(),"main_queue_observed":main.0.count,"main_queue_p95_ms":main.0.percentile(0.95),"main_queue_p99_ms":main.0.percentile(0.99),"main_queue_pending_skips":main.1,"workload":"Monitor\(width)x\(height)-\(format == kCVPixelFormatType_422YpCbCr10 ? "v210":"BGRA")-\(feeds)Feed-\(fps)Hz","synthetic_only":true,
+        "producer_scheduler":scheduler.dictionary,"seconds":elapsed,"producer_effective_hz":producerHz,"producer_frames":tick,"producer_offer_interval_p95_ms":intervals.map{$0.percentile(0.95)},"producer_offer_interval_p99_ms":intervals.map{$0.percentile(0.99)},"producer_pacing":"latencyCritical activity; host-clock no catchup; minimum98% nominal",
+        "offered":snapshots.map(\.offered),"encoded":snapshots.map(\.encoded),"completed_pictures":snapshots.map(\.completedPictures),"skipped":snapshots.map{$0.offered-$0.completedPictures},"scope_encodes":snapshots.map(\.scopeEncodes),"completed_scopes":snapshots.map(\.completedScopes),"failures":snapshots.map(\.failures),
+        "per_feed_picture_hz":pictureHz,"per_feed_scope_hz":scopeHz,"requested_scope_hz":requestedScopeHz,"picture_completion_age_p95_ms":snapshots.map{$0.pictureAge.percentile(0.95)},"picture_completion_age_p99_ms":snapshots.map{$0.pictureAge.percentile(0.99)},"scope_completion_age_p95_ms":snapshots.map{$0.scopeAge.percentile(0.95)},
+        "picture_gpu_p50_ms":pictureGPU.percentile(0.5),"picture_gpu_p95_ms":pictureGPU.percentile(0.95),"picture_gpu_p99_ms":pictureGPU.percentile(0.99),"scope_gpu_p50_ms":scopeGPU.percentile(0.5),"scope_gpu_p95_ms":scopeGPU.percentile(0.95),"cpu_encode_p95_ms":snapshots.map{$0.encodeWall.percentile(0.95)},
+        "renderer_status_counts":snapshots.map(\.statusCounts),"producer_buffers_unchanged":unchanged,
+        "gpu_wrapped_textures_total":steadyEnd.wrappedTextures,"gpu_encode_contexts_total":steadyEnd.encodeContexts,"steady_state_new_textures":grownTextures,"steady_state_new_contexts":grownContexts,
+        "gpu_available":gpuAvailable]
     print(String(data: try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]), encoding: .utf8)!);fflush(stdout)
+    for workload in workloads { workload.invalidate() }
     try require(failureReasons.isEmpty,failureReasons.joined(separator:", "))
     exitCode=0
 } catch { fputs("MONITOR_SYNTHETIC FAIL \(error)\n", stderr); exitCode=1 }

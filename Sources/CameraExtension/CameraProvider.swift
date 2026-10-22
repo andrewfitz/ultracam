@@ -94,14 +94,23 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
       source?.hasPendingStart == true
   }
   private var black: CVPixelBuffer?
+  // Standby frames reuse one format description for the black image.
+  private let standbyFactory = VideoSampleFactory()
   private var timer: DispatchSourceTimer?
   private var lastOutput: CMTime = .invalid
   private var nextStandby: CMTime = .invalid
   private var wasStandby = true
   /// Constant added to a producer clock that sits behind the host-time output.
-  /// Program time starts at zero, so repairing every late frame independently
-  /// restamps the whole session and marks each frame discontinuous.
+  /// One offset for the run: repairing every late frame independently would
+  /// restamp the whole session and mark each frame discontinuous.
   private var outputTimeOffset: CMTime?
+  /// Producer frames this camera refused (format, cadence or timing that
+  /// doesn't match the negotiated stream, or a failed restamp). Each one is a
+  /// frame the camera client never saw; logged at most once per interval.
+  private(set) var rejectedFrames: UInt64 = 0
+  private var rejectionsLogged: UInt64 = 0
+  private var lastRejectionLog: CMTime = .invalid
+  static let rejectionLogInterval: Double = 5
   let automaticTimers: Bool
   let clock: () -> CMTime
   private let output: ((CMSampleBuffer, CMIOExtensionStream.DiscontinuityFlags, UInt64) -> Void)?
@@ -261,16 +270,41 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
 
   // Live frames already have the selected capture cadence. Forward them once,
   // preserving metadata and timestamps, instead of sampling latest on another
-  // free-running clock (which duplicates and drops live frames).
+  // free-running clock (which duplicates and drops live frames). A refused
+  // frame is counted and logged (rate-limited).
   @discardableResult
   func receive(_ sample: CMSampleBuffer, discontinuity: CMIOExtensionStream.DiscontinuityFlags,
     producerCanNegotiate: Bool = false) -> Bool {
-    guard CMSampleBufferDataIsReady(sample), let image = CMSampleBufferGetImageBuffer(sample) else { return false }
-    guard (try? VideoBufferLayout.validate(image)) != nil else { return false }
+    if let reason = admit(sample, discontinuity: discontinuity, producerCanNegotiate: producerCanNegotiate) {
+      noteRejected(reason)
+      return false
+    }
+    return true
+  }
+
+  private func noteRejected(_ reason: String) {
+    rejectedFrames &+= 1
+    let now = clock()
+    if lastRejectionLog.isNumeric, now.isNumeric,
+      CMTimeSubtract(now, lastRejectionLog).seconds < Self.rejectionLogInterval { return }
+    let since = rejectedFrames &- rejectionsLogged
+    rejectionsLogged = rejectedFrames
+    lastRejectionLog = now
+    logger.error("Camera frame refused: \(reason, privacy: .public) (\(since, privacy: .public) since the last report, \(self.rejectedFrames, privacy: .public) total)")
+  }
+
+  /// Nil when the frame was forwarded (or stored for a later viewer);
+  /// otherwise why it was refused.
+  private func admit(_ sample: CMSampleBuffer, discontinuity: CMIOExtensionStream.DiscontinuityFlags,
+    producerCanNegotiate: Bool) -> String? {
+    guard CMSampleBufferDataIsReady(sample), let image = CMSampleBufferGetImageBuffer(sample) else {
+      return "no ready image"
+    }
+    guard (try? VideoBufferLayout.validate(image)) != nil else { return "invalid buffer layout" }
     let time = CMSampleBufferGetPresentationTimeStamp(sample)
     let sampleDuration = CMSampleBufferGetDuration(sample)
     guard time.isNumeric, time.epoch == 0, time.seconds >= 0,
-      sampleDuration.isNumeric, sampleDuration.epoch == 0 else { return false }
+      sampleDuration.isNumeric, sampleDuration.epoch == 0 else { return "invalid timestamp or duration" }
     let expected = formats[activeIndex].formatDescription
     let dimensions = CMVideoFormatDescriptionGetDimensions(expected)
     if CVPixelBufferGetWidth(image) != dimensions.width || CVPixelBufferGetHeight(image) != dimensions.height ||
@@ -284,14 +318,14 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
         let size = CMVideoFormatDescriptionGetDimensions(description)
         return size.width == CVPixelBufferGetWidth(image) && size.height == CVPixelBufferGetHeight(image) &&
           CMFormatDescriptionGetMediaSubType(description) == CVPixelBufferGetPixelFormatType(image)
-      }) else { return false }
+      }) else { return "format, size or frame rate doesn't match the negotiated stream" }
       do { try setProperties(index: index, frameDuration: sampleDuration, fromProducer: true) }
-      catch { return false }
+      catch { return "renegotiation failed: \(error.localizedDescription)" }
     }
     latest = image
     receivedAt = clock()
     nextStandby = .invalid
-    guard consumers > 0 else { return true }
+    guard consumers > 0 else { return nil }
     do {
       var outgoing = sample
       var flags = discontinuity
@@ -300,9 +334,12 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
         // Standby moved the output clock. The next live run gets one new offset.
         outputTimeOffset = nil
       }
-      // A producer clock that begins at zero stays behind host-time standby for
-      // the whole session. Anchor it once and reuse that offset. A frame that
-      // is already ahead of the output keeps its own timestamp.
+      // Producers stamp frames on the host clock (the Program bridge anchors
+      // its clock there too), so this repair normally runs for at most the
+      // first frame after standby, by less than a frame; the next frame is
+      // ahead again and is forwarded as is, with no copy. A producer clock
+      // that stays behind (one that begins at zero) is anchored once and
+      // that offset reused, which copies every frame.
       if lastOutput.isNumeric, CMTimeCompare(time, lastOutput) <= 0 {
         if outputTimeOffset == nil {
           let now = clock()
@@ -322,10 +359,9 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
       }
       wasStandby = false
       send(outgoing, discontinuity: flags)
-      return true
+      return nil
     } catch {
-      logger.error("Camera output failed: \(error.localizedDescription, privacy: .public)")
-      return false
+      return "camera output failed: \(error.localizedDescription)"
     }
   }
 
@@ -357,7 +393,7 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
         let missed = Int32(min(floor(lateness / duration.seconds), Double(Int32.max)))
         nextStandby = CMTimeAdd(nextStandby, CMTimeMultiply(duration, multiplier: missed))
       }
-      let sample = try VideoContract.sample(black, at: nextStandby, duration: duration)
+      let sample = try standbyFactory.sample(black, at: nextStandby, duration: duration)
       send(sample, discontinuity: wasStandby ? [] : [.time])
       wasStandby = true
       nextStandby = CMTimeAdd(nextStandby, duration)
@@ -670,7 +706,7 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
       result.setPropertyState(demandState, forProperty: CMIOExtensionProperty(rawValue: VideoContract.demandProperty))
     }
     if isSink {
-      result.sinkBufferQueueSize = 3
+      result.sinkBufferQueueSize = VideoContract.cameraSinkQueueSize
       result.sinkBuffersRequiredForStartup = 1
       result.sinkEndOfData = 0
     }
@@ -794,9 +830,10 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
     timer?.cancel()
     timer = nil
     let timer = DispatchSource.makeTimerSource(queue: owner.queue)
-    // Poll at twice the selected frame rate, draining ready frames immediately.
-    // This bounds ingress latency without a fixed 250 Hz wakeup rate.
-    timer.schedule(deadline: .now(), repeating: owner.duration.seconds / 2, leeway: .milliseconds(1))
+    // Poll at four times the selected frame rate (about 4 ms at 59.94),
+    // draining every ready frame each time. Polling adds at most a quarter
+    // frame of latency, without a fixed 250 Hz wakeup rate at 29.97.
+    timer.schedule(deadline: .now(), repeating: owner.duration.seconds / 4, leeway: .microseconds(500))
     timer.setEventHandler { [weak self] in self?.consume() }
     self.timer = timer
     timer.resume()
@@ -830,9 +867,8 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
         guard self.consuming, self.generation == requestedGeneration else { return }
         self.consumePending = false
         if let sample = received.sample {
-          if !self.owner.receive(sample, discontinuity: discontinuity, producerCanNegotiate: self.client != nil) {
-            self.owner.logger.error("Camera input did not match the negotiated format, frame rate or timestamp.")
-          }
+          // A refused frame is counted and logged (rate-limited) by the owner.
+          self.owner.receive(sample, discontinuity: discontinuity, producerCanNegotiate: self.client != nil)
           self.stream.notifyScheduledOutputChanged(CMIOExtensionScheduledOutput(sequenceNumber: sequence,
             hostTimeInNanoseconds: UInt64(max(0, CMTimeConvertScale(self.owner.clock(), timescale: 1_000_000_000, method: .default).value))))
         }

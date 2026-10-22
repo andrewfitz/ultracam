@@ -5,7 +5,6 @@ import Darwin
 import Foundation
 import MonitorToolsCore
 import MonitorToolsMetal
-import MonitorToolsUI
 
 struct QualificationFailure: Error { let reason: String }
 func check(_ value: Bool, _ reason: String) throws { if !value { throw QualificationFailure(reason: reason) } }
@@ -56,61 +55,6 @@ struct Options {
     }
     var workload: String { "\(feeds)Feed-\(width)x\(height)-\(nominalFPS == 60 ? "5994":"2997")-MovingV210-Paired\(outputWidth)x\(outputHeight)" }
 }
-struct MonitorMeasurements {
-    var cleanPictures=0,cleanAge=Distribution(),cleanDimensions:[String:Int]=[:],decoratedDimensions:[String:Int]=[:],scopeSamplingStrides:[String:Int]=[:]
-    var pictures = 0, scopes = 0, failures = 0, rejected = 0, offered = 0, admitted = 0
-    var pictureAge = Distribution(), scopeAge = Distribution()
-    var consumerWall=Distribution(),consumerEntryAge=Distribution(),consumerEndAge=Distribution()
-    var consumerOutliers:[[String:Double]]=[]
-    // Ignore premeasurement warmup sequence0 and count each advancing scope once.
-    var lastScopeSequence: UInt64 = 0
-    var availabilityCounts:[String:Int]=[:]
-    var requestedToolUnavailable=0
-}
-final class MonitorCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var measured = MonitorMeasurements()
-    private var latestDisplay:MonitorDisplayResult?
-    let target: MonitorTargetID
-    init(target:MonitorTargetID) {self.target=target}
-    func releaseHeld() {lock.lock();latestDisplay=nil;lock.unlock()}
-    func snapshot() -> MonitorMeasurements {lock.lock();defer{lock.unlock()};return measured}
-    func offer(_ frame:MonitorFrameBundle,runtime:MonitorRuntime) {
-        lock.lock();measured.offered += 1;lock.unlock()
-        let admitted=runtime.offer(frame){[self] result in
-            let begin=ProcessInfo.processInfo.systemUptime
-            let sourceHost:Double?;if case .success(let display)=result {sourceHost=display.clean.stamp.hostTime}else{sourceHost=nil}
-            accept(result)
-            let end=ProcessInfo.processInfo.systemUptime
-            lock.lock();measured.consumerWall.add(end-begin)
-            if let sourceHost {measured.consumerEntryAge.add(begin-sourceHost);measured.consumerEndAge.add(end-sourceHost)
-                if end-begin>=0.010 && measured.consumerOutliers.count<32 {measured.consumerOutliers.append(["source_host_time":sourceHost,"consumer_start":begin,"consumer_end":end,"wall_ms":(end-begin)*1000])}}
-            lock.unlock()
-        }
-        if admitted {lock.lock();measured.admitted += 1;lock.unlock()}
-    }
-    func accept(_ result:Result<MonitorDisplayResult,Error>) {
-        var previous:MonitorDisplayResult?
-        lock.lock();defer{lock.unlock();withExtendedLifetime(previous){}}
-        switch result {
-        case .failure: measured.failures += 1
-        case .success(let display):
-            previous=latestDisplay;latestDisplay=display
-            for status in display.availability where measured.availabilityCounts.count<16 || measured.availabilityCounts[status] != nil {measured.availabilityCounts[status,default:0] += 1}
-            if display.configuration.toolsEnabled && display.availability.contains(where:{$0.hasPrefix("False color unavailable:") || $0.hasPrefix("Focus unavailable:") || $0.hasPrefix("Picture composition unavailable:")}) {measured.requestedToolUnavailable += 1}
-            guard display.clean.stamp.target == target else {measured.rejected += 1;return}
-            let now=ProcessInfo.processInfo.systemUptime
-            measured.cleanPictures += 1;measured.cleanAge.add(now-display.clean.stamp.hostTime)
-            measured.cleanDimensions["\(CVPixelBufferGetWidth(display.clean.pixelBuffer))x\(CVPixelBufferGetHeight(display.clean.pixelBuffer))",default:0] += 1
-            if let picture=display.decorated {measured.decoratedDimensions["\(CVPixelBufferGetWidth(picture.pixelBuffer))x\(CVPixelBufferGetHeight(picture.pixelBuffer))",default:0] += 1}
-            if let scope=display.scope {measured.scopeSamplingStrides[String(scope.samplingStride),default:0] += 1}
-            if let picture=display.decorated {measured.pictures += 1;measured.pictureAge.add(now-picture.stamp.hostTime)}
-            if let scope=display.scope,scope.stamp.sequence > measured.lastScopeSequence {
-                measured.lastScopeSequence=scope.stamp.sequence;measured.scopes += 1;measured.scopeAge.add(now-scope.stamp.hostTime)
-            }
-        }
-    }
-}
 final class GPUCounter: @unchecked Sendable {
     private let lock=NSLock();private var seconds=0.0,jobs=0
     private var callbackWall=Distribution(),callbackCPU=Distribution(),callbackOutliers:[[String:Double]]=[]
@@ -138,12 +82,10 @@ struct PipelineSnapshot {
 final class PipelineWorker: @unchecked Sendable {
     private let queue=DispatchQueue(label:"synthetic.production-pipeline",qos:.userInteractive),lock=NSLock()
     private let processor:LUTProcessor
-    private let criticalProducer:MonitorCriticalPipelineProducer
-    private let admission=PipelineAdmission(capacity:VideoContract.captureAdmissionLimit)
+    private let admission=PipelineAdmission(capacity:VideoContract.maxFramesInFlight)
     private var measured=PipelineSnapshot()
     private var collectingTiming=false,currentProcessStart=0.0,lastMeterReturn=0.0
-    init(cube:CubeLUT,criticalProducer:MonitorCriticalPipelineProducer) throws {
-        self.criticalProducer=criticalProducer
+    init(cube:CubeLUT) throws {
         processor=try LUTProcessor()
         try queue.sync{try processor.load(cube)}
         queue.sync{processor.commandTimingObserver={[weak self] in self?.recordCommand($0)}}
@@ -172,8 +114,6 @@ final class PipelineWorker: @unchecked Sendable {
             var processEnd=0.0,completionStart=0.0,completionEnd=0.0,completionCPU=0.0
             autoreleasepool {
                 do {
-                    let entryTime=ProcessInfo.processInfo.systemUptime,entryQueueAge=max(0,ProcessInfo.processInfo.systemUptime-frame.stamp.hostTime)
-                    if entryQueueAge>frameInterval {criticalProducer.record(generation:frame.stamp.generation,queueAge:entryQueueAge,processingTime:0,frameInterval:frameInterval,now:entryTime)}
                     if sourceOnly {
                         let earlyStart=ProcessInfo.processInfo.systemUptime,earlyCPUStart=producerThreadCPU()
                         completion(frame)
@@ -190,7 +130,7 @@ final class PipelineWorker: @unchecked Sendable {
                     let output=try processor.process(frame.source,configuration:configuration)
                     processEnd=ProcessInfo.processInfo.systemUptime
                     let cpu=producerThreadCPU()-cpuStart
-                    criticalProducer.record(generation:frame.stamp.generation,queueAge:queueAge,processingTime:processEnd-processStart,frameInterval:frameInterval,now:processEnd)
+                    _ = queueAge
                     lock.lock();measured.queueWait.add(processStart-enqueued);measured.processWall.add(processEnd-processStart);measured.processCPU.add(cpu)
                     if lastMeterReturn>0 {measured.stages["post_meter_return",default:Distribution()].add(processEnd-lastMeterReturn)}
                     if processEnd-frame.stamp.hostTime>=0.010 && measured.outliers.count<32 {measured.outliers.append(["source_host_time":frame.stamp.hostTime,"worker_start":processStart,"worker_end":processEnd,"queue_ms":(processStart-enqueued)*1000,"process_wall_ms":(processEnd-processStart)*1000,"process_thread_cpu_ms":cpu*1000])}
@@ -210,7 +150,6 @@ final class PipelineWorker: @unchecked Sendable {
         return true
     }
     func drain(){queue.sync{processor.commandTimingObserver=nil;collectingTiming=false}}
-    func stopCriticalProducer(){queue.sync{_ = criticalProducer.stop(generation:1)}}
     func snapshot()->PipelineSnapshot{lock.lock();defer{lock.unlock()};return measured}
     func admissionSnapshot()->PipelineAdmissionSnapshot{admission.snapshot()}
 }
@@ -357,13 +296,12 @@ func run(_ o:Options) async throws {
     let pipelineConfig=PipelineConfiguration(applyLUT:true,downscale:true,convertTo420:true,reduceFrameRate:false,inputFast:o.nominalFPS==60)
     let identityCube=try CubeLUT(text:"LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1")
     let correspondence=MonitorCorrespondence(scaleX:Double(o.outputWidth)/Double(o.width),scaleY:Double(o.outputHeight)/Double(o.height),offsetX:0,offsetY:0)
-    let presentationBytes=MonitorPresentationEstimate.bytes(backingWidth:1280,backingHeight:720,scopes:true)
     let modes=o.mode == "compare" ? [false,true]:[o.mode == "enabled"]
     var receipt:[String:Any]=["source_manifest_sha256":ProcessInfo.processInfo.environment["MONITOR_SOURCE_MANIFEST_SHA256"] ?? "uncaptured diagnostic","binary_sha256":ProcessInfo.processInfo.environment["MONITOR_BINARY_SHA256"] ?? "uncaptured diagnostic","status":"running","synthetic_only":true,"false_color_profile":o.falseColor,"declared_source_profile":declaredSourceProfileID ?? "none","false_color_style_profile_id":o.falseColorProfileID ?? "none","false_color_specification":o.falseColorSpecification ?? "none","false_color_reference_ei":800,"source_log_mapping":"native10Bit","source_code_range":"legal","source_ycbcr_matrix":"bt709","source_camera_ei":"unspecified; reference EI is not a camera setting","false_color_model":o.sonySource ? "per-channel Sony SLog3 decode; selected source-gamut linear luminance; LogC3 EI800 full-code reference bands":"literal published ARRI profile or false color off","false_color_qualification":"synthetic declared-profile composition stress; no physical camera calibration","zebra_requested":true,"zebra_effective_with_false_color":o.falseColor == "off","focus_enabled":true,"scopes_enabled":true,"workload":o.workload,"seconds_per_run":o.seconds,
-        "presentation_allowance_bytes_per_tile":presentationBytes,"presentation_allowance_total_bytes":presentationBytes*o.feeds,"presentation_backing_width":1280,"presentation_backing_height":720,"presentation_picture_buffer_count":2,"presentation_scope_drawable_count":2,"presentation_scope_width":768,"presentation_scope_height":256,"presentation_allowance_kind":"cleanPresentation","presentation_allowance_comparison":"identical off/enabled conservative lease estimates, held whole run","pipeline":o.pipeline,"pipeline_queue_qos":"userInteractive (matches CaptureController.queue)","monitor_worker_qos":"production runtime defaults","source_thread_qos":"userInteractive with verified Mach time constraint","actual_pipeline_admission_limit_per_feed":VideoContract.captureAdmissionLimit,"output_basis":o.pipeline == "actual" ? "production LUTProcessor identity LUT + Lanczos4Kto1080 + NV12":"independently generated synthetic paired viewing output; not LUTProcessor","width":o.width,"height":o.height,"feeds":o.feeds,"fps":1/o.duration.seconds,"mode":o.mode,"codecs":o.codecs,
-        "maximum_decoded_luma_error":0.03,"source_seed":"moving-v210-ramp-edge-v2","audio_seed":"per-feed-constant-PCM32-v1","immutable_phases_per_feed":4,"held_latest_display_results_per_feed":1,"enabled_measurement_warmup":"one completed GPU job per feed before paced recording window","fixture_bytes":fixtureBytes,
+        "monitor_path":"production MonitorToolsRenderer: one picture encode per offered frame into a 1920x1080 offscreen drawable stand-in; scopes in their own command buffer at 15Hz","monitor_target_width":1920,"monitor_target_height":1080,"monitor_scope_width":768,"monitor_scope_height":256,"pipeline":o.pipeline,"pipeline_queue_qos":"userInteractive (matches CaptureController.queue)","source_thread_qos":"userInteractive with verified Mach time constraint","actual_pipeline_admission_limit_per_feed":VideoContract.maxFramesInFlight,"output_basis":o.pipeline == "actual" ? "production LUTProcessor identity LUT + Lanczos4Kto1080 + NV12":"independently generated synthetic paired viewing output; not LUTProcessor","width":o.width,"height":o.height,"feeds":o.feeds,"fps":1/o.duration.seconds,"mode":o.mode,"codecs":o.codecs,
+        "maximum_decoded_luma_error":0.03,"source_seed":"moving-v210-ramp-edge-v2","audio_seed":"per-feed-constant-PCM32-v1","immutable_phases_per_feed":4,"enabled_measurement_warmup":"one completed picture and scope encode per feed before paced recording window","fixture_bytes":fixtureBytes,
         "main_queue_heartbeat_hz":20,"maximum_main_queue_p95_ms":50,"maximum_main_queue_p99_ms":100,"minimum_main_queue_observed_hz":10,"producer_pacing":"host-clock no catchup; minimum98% of nominal","minimum_producer_hz":(1/o.duration.seconds)*0.98,"minimum_picture_hz":minimumPictureHz,"minimum_unique_scope_hz":minimumScopeHz,"maximum_picture_age_p95_ms":maximumPictureP95MS,"maximum_scope_age_p95_ms":maximumScopeP95MS,
-        "camera_p95_regression_tolerance_ms":2,"camera_p99_regression_tolerance_ms":5,"physical_camera":"unqualified: no receiver","presentation_workload":"additional owned workspace surfaces; off uses toolsDisabled owned clean path; selected main/tray native exception is not this workload","compositor_throughput":"unqualified: budget estimate only, no actual display compositor",
+        "camera_p95_regression_tolerance_ms":2,"camera_p99_regression_tolerance_ms":5,"physical_camera":"unqualified: no receiver","monitor_off_mode":"tools disabled: the plain picture pass still runs for every frame","compositor_throughput":"unqualified: offscreen targets, no display compositor",
         "os":ProcessInfo.processInfo.operatingSystemVersionString,"processor_count":ProcessInfo.processInfo.processorCount,
         "thermal_state_start":ProcessInfo.processInfo.thermalState.rawValue,"runs":receipts,"qualification":"pending execution"]
     try writeReceipt(receipt,root:o.root)
@@ -373,14 +311,8 @@ func run(_ o:Options) async throws {
             if enabled && o.mode == "compare" && baseline[codecName] == nil {continue}
             let gpu=GPUCounter()
             let runtime=MonitorRuntime(gpuTiming:{gpu.recordAndMeter($0,$1)}),targets=(0..<o.feeds).map{MonitorTargetID("synthetic-\($0)")}
-            var presentationAllowances:[MonitorResourceLease]=[]
-            for target in targets {
-                guard let lease=runtime.ledger.tryAcquire(target:MonitorTargetID("surface:\(target.rawValue)"),generation:0,kind:.cleanPresentation,bytes:presentationBytes) else {throw QualificationFailure(reason:"visible workspace presentation allowance rejected")}
-                presentationAllowances.append(lease)
-            }
-            defer {for lease in presentationAllowances {lease.release()}}
-            let counters=targets.map{MonitorCounter(target:$0)}
-            let processors:[PipelineWorker]=try o.pipeline == "actual" ? (0..<o.feeds).map{try PipelineWorker(cube:identityCube,criticalProducer:runtime.makeCriticalPipelineProducer(target:targets[$0]))}:[]
+            var monitorList:[MonitorGPUWorkload]=[]
+            let processors:[PipelineWorker]=try o.pipeline == "actual" ? (0..<o.feeds).map{_ in try PipelineWorker(cube:identityCube)}:[]
             var recorders:[SourceRecorderCore]=[],urls:[URL]=[],configuredPictureStages:[MonitorStage]=[],sourceOnlyRoutes:[Bool]=[],configuredFalseColorProfileIDs:[String]=[]
             defer {for recorder in recorders {try? recorder.stop()}}
             for feed in 0..<o.feeds {
@@ -397,27 +329,22 @@ func run(_ o:Options) async throws {
                 configuredFalseColorProfileIDs.append(effectiveTools.falseColor.profileID ?? "none")
                 configuredPictureStages.append(tools.pictureStage)
                 sourceOnlyRoutes.append(tools.pictureStage == .source && (!enabled || tools.scopeStage == .source))
-                runtime.configure(target:targets[feed],generation:1,configurationRevision:1,configuration:tools)
+                monitorList.append(try MonitorGPUWorkload(runtime:runtime,configuration:tools))
             }
+            let counters=monitorList
             // Prime existing producer processing resources in both baseline/enabled modes.
             if o.pipeline == "actual" {for feed in 0..<o.feeds {_ = try processors[feed].warm(patterns[feed][0].source,configuration:pipelineConfig)}}
             // Shader initialization is outside the fixed qualification window. Functional
             // startup/failure behavior is covered by the smoke fixture; receipts say warm.
-            if enabled {
-                for feed in 0..<o.feeds {
-                    let p=patterns[feed][0],done=DispatchSemaphore(value:0)
-                    let warmOutput=o.pipeline == "actual" ? try processors[feed].warm(p.source,configuration:pipelineConfig):p.output
-                    let warm=MonitorFrameStamp(target:targets[feed],generation:1,sequence:0,sourcePTS:0,hostTime:ProcessInfo.processInfo.systemUptime,configurationRevision:1)
-                    let bundle=MonitorFrameBundle(stamp:warm,source:p.source,output:warmOutput,sourceGeometry:MonitorGeometry(width:o.width,height:o.height),outputGeometry:MonitorGeometry(width:o.outputWidth,height:o.outputHeight),correspondence:correspondence,sourceSignal:signal,outputSignal:outputSignal)
-                    var accepted=false
-                    let warmDeadline=ProcessInfo.processInfo.systemUptime+5
-                    while !accepted && ProcessInfo.processInfo.systemUptime<warmDeadline {
-                        accepted=runtime.offer(bundle){_ in done.signal()}
-                        if !accepted {try await Task.sleep(nanoseconds:1_000_000)}
-                    }
-                    try check(accepted && done.wait(timeout:.now()+30) == .success,"monitor warmup admission/completion failed")
-                }
-            }
+            // Every immutable phase once, so the measured window sees no first-use textures.
+            for feed in 0..<o.feeds { for p in patterns[feed] {
+                let warmOutput=o.pipeline == "actual" ? try processors[feed].warm(p.source,configuration:pipelineConfig):p.output
+                let warm=MonitorFrameStamp(target:targets[feed],generation:1,sequence:0,sourcePTS:0,hostTime:ProcessInfo.processInfo.systemUptime,configurationRevision:1)
+                counters[feed].offer(MonitorFrameBundle(stamp:warm,source:p.source,output:warmOutput,sourceGeometry:MonitorGeometry(width:o.width,height:o.height),outputGeometry:MonitorGeometry(width:o.outputWidth,height:o.outputHeight),correspondence:correspondence,sourceSignal:signal,outputSignal:outputSignal))
+                try check(counters[feed].drain(timeout:30) && counters[feed].snapshot().failures == 0,"monitor warmup encode failed: \(counters[feed].snapshot().encodeErrors)")
+            }}
+            for counter in counters {counter.resetMeasurement()}
+            let steadyStart=runtime.gpuStatistics
             for processor in processors {processor.beginMeasurement()}
             var admission=[Distribution](repeating:Distribution(),count:o.feeds),callback=[Distribution](repeating:Distribution(),count:o.feeds)
             var offerIntervals=[Distribution](repeating:Distribution(),count:o.feeds),offerLateness=[Distribution](repeating:Distribution(),count:o.feeds)
@@ -425,8 +352,7 @@ func run(_ o:Options) async throws {
             var admissionRejected=[Int](repeating:0,count:o.feeds),pipelineAdmitted=[Int](repeating:0,count:o.feeds)
             let initialProcessFootprint=footprint()
             let sampler=QualificationSampler {
-                let state=runtime.ledger.snapshot
-                return ["footprint":Double(footprint()),"ledger":Double(state.retainedBytes),"retired":Double(state.retiredBytes),"jobs":Double(state.analysisJobs),"queue":Double(recorders.map{$0.telemetry.queueSamples}.max() ?? 0),"gpuFraction":AppGPUActivity.shared.percent(now:ProcessInfo.processInfo.systemUptime)/100]
+                return ["footprint":Double(footprint()),"inflight":Double(counters.reduce(0){$0+$1.inFlight}),"queue":Double(recorders.map{$0.telemetry.queueSamples}.max() ?? 0),"gpuFraction":AppGPUActivity.shared.percent(now:ProcessInfo.processInfo.systemUptime)/100]
             }
             var producerWork=ProducerWorkMetrics()
             let heartbeat=MainQueueHeartbeat()
@@ -460,18 +386,18 @@ func run(_ o:Options) async throws {
                     let stamp=MonitorFrameStamp(target:targets[feed],generation:1,sequence:UInt64(index+1),sourcePTS:pts.seconds,hostTime:begin,configurationRevision:1)
                     let bundle=MonitorFrameBundle(stamp:stamp,source:p.source,output:p.output,sourceGeometry:MonitorGeometry(width:o.width,height:o.height),outputGeometry:MonitorGeometry(width:o.outputWidth,height:o.outputHeight),correspondence:correspondence,sourceSignal:signal,outputSignal:outputSignal)
                     if o.pipeline == "actual" {
-                        if processors[feed].offer(bundle,configuration:pipelineConfig,sourceOnly:sourceOnlyRoutes[feed],frameInterval:o.duration.seconds,completion:{counters[feed].offer($0,runtime:runtime)}){pipelineAdmitted[feed] += 1}
-                    } else {counters[feed].offer(bundle,runtime:runtime)}
+                        if processors[feed].offer(bundle,configuration:pipelineConfig,sourceOnly:sourceOnlyRoutes[feed],frameInterval:o.duration.seconds,completion:{counters[feed].offer($0)}){pipelineAdmitted[feed] += 1}
+                    } else {counters[feed].offer(bundle)}
                     callback[feed].add(ProcessInfo.processInfo.systemUptime-begin)
                 }
                 producerWork.record(wallStart:workStart,cpuStart:cpuStart)
             }
             }
             let sampled=sampler.stop()
-            let peakMemory=UInt64(sampled.maxima["footprint"] ?? Double(initialProcessFootprint)),peakLedger=Int(sampled.maxima["ledger"] ?? 0),peakRetired=Int(sampled.maxima["retired"] ?? 0),peakJobs=Int(sampled.maxima["jobs"] ?? 0),maxQueue=Int(sampled.maxima["queue"] ?? 0),combinedMetal=sampled.gpu
+            let peakMemory=UInt64(sampled.maxima["footprint"] ?? Double(initialProcessFootprint)),peakInFlight=Int(sampled.maxima["inflight"] ?? 0),maxQueue=Int(sampled.maxima["queue"] ?? 0),combinedMetal=sampled.gpu
             for processor in processors {processor.drain()}
-            let finalDiagnostics=targets.map{runtime.diagnostics(for:$0)}
-            for processor in processors {processor.stopCriticalProducer()}
+            let monitorsDrained=counters.allSatisfy{$0.drain(timeout:10)}
+            let steadyEnd=runtime.gpuStatistics
             let finalizationStarted=ProcessInfo.processInfo.systemUptime
             for recorder in recorders {try recorder.stop()}
             let finalizationSeconds=ProcessInfo.processInfo.systemUptime-finalizationStarted
@@ -480,9 +406,6 @@ func run(_ o:Options) async throws {
             let recordingEndFootprint=footprint()
             let cpuSeconds=Double(clock()-cpuStarted)/Double(CLOCKS_PER_SEC),gpuMeasured=gpu.snapshot()
             var decoded:[DecodeResult]=[],runPassed=true
-            // One runtime-wide snapshot, after the first feed's media decode and
-            // before any target removal. Counts include this runtime's warmup.
-            var resourcesBeforeRemoval:MonitorResourceStatistics?
             for feed in 0..<o.feeds {
                 let decodeStarted=ProcessInfo.processInfo.systemUptime
                 let d=try await decode(urls[feed],options:o,feed:feed);decoded.append(d)
@@ -503,35 +426,27 @@ func run(_ o:Options) async throws {
                 let pipelinePass=o.pipeline != "actual" || (pipeline.processed==o.count && pipeline.failures==0 && pipelineAdmitted[feed]==o.count && (!enabled || o.mode != "compare" || pipelineTimingMatches))
                 let mediaPass=pipelinePass && mainResponsive && cadencePass && d.decodedPixelSamples==o.count*8 && d.maximumDecodedLumaError <= 0.03 && d.maximumAudioPTSError <= 1.0/48000.0+0.000000001 && d.maximumTimecodePTSError <= 1/Double(d.timescale)+0.000000001 && d.audioFrames==expectedAudioFrames && d.timecodeFrames==o.count && d.audioReferenceMatches && d.timecodeReferenceMatches && d.frames == o.count && d.audioTracks==1 && d.timecodeTracks==1 && t.droppedVideo==0 && t.droppedAudio==0 && t.droppedEncodedVideo==0 && t.encoderErrors==0 && admissionRejected[feed]==0 && sourceUnchanged && referencePTS
                 let paired=baseline[codecName].map{$0[feed].ptsHash==d.ptsHash && $0[feed].durationHash==d.durationHash && $0[feed].frames==d.frames && $0[feed].audioHash==d.audioHash && $0[feed].timecodeHash==d.timecodeHash} ?? false
-                let pictureHz=Double(m.pictures)/producerSeconds,scopeHz=Double(m.scopes)/producerSeconds,cleanHz=Double(m.cleanPictures)/producerSeconds
-                let diagnostic=finalDiagnostics[feed]
+                let pictureHz=Double(m.completedPictures)/producerSeconds,scopeHz=Double(m.completedScopes)/producerSeconds
                 let declaredStage:MonitorStage=declaredSourceProfileID == nil ? .processedOutput:.source
-                let expectedCleanDimensions=declaredStage == .source ? "\(o.width)x\(o.height)":"\(o.outputWidth)x\(o.outputHeight)"
-                let cleanDimensionsMatch=configuredPictureStages[feed]==declaredStage && !m.cleanDimensions.isEmpty && m.cleanDimensions.keys.allSatisfy{$0==expectedCleanDimensions}
-                let cleanPass=cleanDimensionsMatch && cleanHz>=minimumPictureHz && m.cleanAge.percentile(0.95)<=maximumPictureP95MS && m.failures==0 && m.rejected==0
-                let monitorPass = cleanPass && (!enabled || (pictureHz>=minimumPictureHz && scopeHz>=minimumScopeHz && m.pictureAge.percentile(0.95)<=maximumPictureP95MS && m.scopeAge.percentile(0.95)<=maximumScopeP95MS && m.failures==0 && m.rejected==0 && m.requestedToolUnavailable==0))
+                // Every offered frame is encoded and completes: the monitor never skips.
+                let everyFrame=monitorsDrained && m.encoded==m.offered && m.completedPictures==m.offered && m.failures==0
+                let expectedOffers=o.pipeline == "actual" ? pipelineAdmitted[feed]:o.count
+                let monitorPass=configuredPictureStages[feed]==declaredStage && everyFrame && m.offered==expectedOffers && pictureHz>=minimumPictureHz && m.pictureAge.percentile(0.95)<=maximumPictureP95MS && (!enabled || (scopeHz>=minimumScopeHz && m.scopeAge.percentile(0.95)<=maximumScopeP95MS && m.toolUnavailable==0))
                 let passed=mediaPass && monitorPass && (!enabled || o.mode != "compare" || paired)
                 runPassed = runPassed && passed;allPassed=allPassed && passed
-                if resourcesBeforeRemoval == nil {resourcesBeforeRemoval=runtime.resourceStatistics}
-                let resources=resourcesBeforeRemoval ?? runtime.resourceStatistics
-                receipts.append(["monitor_resource_statistics_scope":"runtime aggregate across all feeds; repeated per-feed rows must not be summed","monitor_resource_statistics_snapshot_point":"after first feed media decode, before any target removal","monitor_resource_statistics_counts":"cumulative since runtime creation, including warmup; byte counts are active image payload excluding row padding and zero-fill; pool capacity is a conservative cache reservation bound, not physical allocated bytes","monitor_clean_copied_bytes":resources.cleanCopiedBytes,"monitor_staging_copied_bytes":resources.stagingCopiedBytes,"monitor_owned_input_bound_bytes":resources.ownedInputBoundBytes,"monitor_owned_input_bound_bytes_semantics":"cumulative active image payload bytes bound from owned storage, excluding row padding and zero-fill; avoided payload upload, not copied bytes or extra memory","monitor_composite_allocations":resources.compositeAllocations,"monitor_composite_reuses":resources.compositeReuses,"monitor_composite_pool_failures":resources.compositePoolFailures,"monitor_composite_pool_capacity_bytes_before_removal":resources.compositePoolCapacityBytes,
-                    "monitor_offer_route":sourceOnlyRoutes[feed] ? "source-before-LUT":"paired-output-after-LUT","critical_pipeline_feedback":"production-equivalent queue-breach entry and every completed processing frame","activity_lifetime":"explicit matched end after awaited workload; prior receipt ownership unverified","process_id":ProcessInfo.processInfo.processIdentifier,"declared_picture_stage":declaredStage.rawValue,"configured_picture_stage":configuredPictureStages[feed].rawValue,"configured_false_color_profile_id":configuredFalseColorProfileIDs[feed],"configured_source_profile_id":declaredSourceProfileID ?? "none","expected_clean_dimensions":expectedCleanDimensions,"clean_dimensions_match_declared_stage":cleanDimensionsMatch,"configured_maximum_analysis_jobs":runtime.ledger.maximumAnalysisJobs,"configured_maximum_clean_copy_jobs":runtime.ledger.maximumCleanCopyJobs,"configured_monitor_budget_bytes":runtime.ledger.maximumBytes,"configured_clean_reserve_bytes":runtime.ledger.cleanReserveBytes,"producer_scheduler":scheduler.dictionary,"codec":codecName,"tools_enabled":enabled,"feed":feed,"status":passed ? "passed":"failed","elapsed_seconds":elapsed,"main_queue_responsive":mainResponsive,"main_queue_observed":main.0.count,"main_queue_pending_skips":main.1,"main_queue_p95_ms":main.0.percentile(0.95),"main_queue_p99_ms":main.0.percentile(0.99),"producer_seconds":producerSeconds,"producer_effective_hz":producerHz,"producer_cadence_pass":cadencePass,"producer_offer_interval_median_ms":offerIntervals[feed].percentile(0.5),"producer_offer_interval_p95_ms":offerIntervals[feed].percentile(0.95),"producer_offer_interval_p99_ms":offerIntervals[feed].percentile(0.99),"producer_offer_lateness_p95_ms":offerLateness[feed].percentile(0.95),"finalization_seconds":finalizationSeconds,"expected_frames":o.count,"decoded_frames":d.frames,
+                receipts.append(["monitor_offer_route":sourceOnlyRoutes[feed] ? "source-before-LUT":"paired-output-after-LUT","activity_lifetime":"explicit matched end after awaited workload; prior receipt ownership unverified","process_id":ProcessInfo.processInfo.processIdentifier,"declared_picture_stage":declaredStage.rawValue,"configured_picture_stage":configuredPictureStages[feed].rawValue,"configured_false_color_profile_id":configuredFalseColorProfileIDs[feed],"configured_source_profile_id":declaredSourceProfileID ?? "none","producer_scheduler":scheduler.dictionary,"codec":codecName,"tools_enabled":enabled,"feed":feed,"status":passed ? "passed":"failed","elapsed_seconds":elapsed,"main_queue_responsive":mainResponsive,"main_queue_observed":main.0.count,"main_queue_pending_skips":main.1,"main_queue_p95_ms":main.0.percentile(0.95),"main_queue_p99_ms":main.0.percentile(0.99),"producer_seconds":producerSeconds,"producer_effective_hz":producerHz,"producer_cadence_pass":cadencePass,"producer_offer_interval_median_ms":offerIntervals[feed].percentile(0.5),"producer_offer_interval_p95_ms":offerIntervals[feed].percentile(0.95),"producer_offer_interval_p99_ms":offerIntervals[feed].percentile(0.99),"producer_offer_lateness_p95_ms":offerLateness[feed].percentile(0.95),"finalization_seconds":finalizationSeconds,"expected_frames":o.count,"decoded_frames":d.frames,
                     "decode_seconds":decodeSeconds,"decode_frames_per_second":Double(d.frames)/decodeSeconds,"decoded_luma_samples":d.decodedPixelSamples,"maximum_decoded_luma_error":d.maximumDecodedLumaError,"maximum_audio_pts_error_ms":d.maximumAudioPTSError*1000,"maximum_timecode_pts_error_ms":d.maximumTimecodePTSError*1000,"audio_decoded_frames":d.audioFrames,"audio_expected_frames":expectedAudioFrames,"audio_bytes_match_feed_reference":d.audioReferenceMatches,"timecode_decoded_frames":d.timecodeFrames,"timecode_values_match_source_reference":d.timecodeReferenceMatches,"audio_hash":String(d.audioHash),"timecode_hash":String(d.timecodeHash),"audio_tracks":d.audioTracks,"timecode_tracks":d.timecodeTracks,"container_timescale":d.timescale,"pts_hash":String(d.ptsHash),"duration_hash":String(d.durationHash),"maximum_source_pts_error_ms":d.maximumSourcePTSError*1000,
                     "exact_off_enabled_timing_match":paired,"source_active_words_unchanged":sourceUnchanged,"recording_admission_rejected":admissionRejected[feed],"recording_dropped_video":t.droppedVideo,"recording_dropped_audio":t.droppedAudio,"encoder_dropped_video":t.droppedEncodedVideo,"encoder_errors":t.encoderErrors,"last_error":t.lastError ?? "",
                     "admission_p95_ms":admission[feed].percentile(0.95),"admission_p99_ms":admission[feed].percentile(0.99),"callback_p95_ms":callback[feed].percentile(0.95),"callback_p99_ms":callback[feed].percentile(0.99),
-                    "instrumented_combined_metal_p95_percent":combinedMetal.percentile(0.95)/10,"actual_pipeline_off_enabled_timing_match":pipelineTimingMatches,"actual_pipeline_processed":pipeline.processed,"actual_pipeline_failures":pipeline.failures,"actual_pipeline_admitted":pipelineAdmitted[feed],"actual_pipeline_admission_semantics":"blocking metadata-only lock, separate from histogram measurement; matches CaptureController","actual_pipeline_admission_capacity_rejected":processingAdmission.capacityRejected,"actual_pipeline_maximum_pending":processingAdmission.maximumPending,"actual_pipeline_pending_after_drain":processingAdmission.pending,"actual_pipeline_admission_wait_count":pipeline.admissionWait.count,"actual_pipeline_admission_wait_p95_ms":pipeline.admissionWait.percentile(0.95),"actual_pipeline_admission_wait_p99_ms":pipeline.admissionWait.percentile(0.99),"actual_pipeline_admission_wait_max_ms":pipeline.admissionWait.percentile(1),"actual_pipeline_age_p95_ms":pipeline.age.percentile(0.95),"actual_pipeline_age_p99_ms":pipeline.age.percentile(0.99),"actual_pipeline_queue_p95_ms":pipeline.queueWait.percentile(0.95),"actual_pipeline_queue_p99_ms":pipeline.queueWait.percentile(0.99),"actual_pipeline_process_wall_p95_ms":pipeline.processWall.percentile(0.95),"actual_pipeline_process_wall_p99_ms":pipeline.processWall.percentile(0.99),"actual_pipeline_process_thread_cpu_p95_ms":pipeline.processCPU.percentile(0.95),"actual_pipeline_timing_outliers_first_32":pipeline.outliers,"actual_pipeline_command_count":pipeline.commands,"actual_pipeline_stage_timings":pipeline.stages.mapValues{["count":Double($0.count),"p95_ms":$0.percentile(0.95),"p99_ms":$0.percentile(0.99)]},"actual_pipeline_command_outliers_first_32":pipeline.commandOutliers,"actual_pipeline_terminal_outliers_first_32":pipeline.terminalOutliers,"actual_pipeline_sequence_hash":String(pipeline.sequenceHash),"effective_quality_tier":diagnostic.effectiveQuality.tier.rawValue,"effective_picture_height_limit":diagnostic.effectiveQuality.pictureHeightLimit,"effective_scope_refresh_hz":diagnostic.effectiveQuality.scopeRefreshHz,"effective_scope_sampling_stride":diagnostic.effectiveQuality.scopeSamplingStride,"diagnostic_snapshot_point":"producer drained, before critical producer stop and recording finalization","module_reported_picture_age_ms":diagnostic.pictureAge.map{$0*1000} ?? -1,"module_reported_scope_age_ms":diagnostic.scopeAge.map{$0*1000} ?? -1,"module_reported_scope_stale":diagnostic.scopeStale,"module_reported_availability":String(describing:diagnostic.availability),"soft_deadline_status":diagnostic.softDeadlineStatus.rawValue,"module_reported_skipped_frames":diagnostic.skippedFrames,"module_reported_admitted_frames":diagnostic.admittedFrames,"module_reported_picture_hz":diagnostic.pictureFPS,"module_reported_scope_hz":diagnostic.scopeFPS,"module_reported_gpu_ms":diagnostic.gpuMilliseconds ?? 0,"monitor_clean_dimensions":m.cleanDimensions,"monitor_decorated_dimensions":m.decoratedDimensions,"monitor_scope_sampling_stride_counts":m.scopeSamplingStrides,"monitor_consumer_wall_p95_ms":m.consumerWall.percentile(0.95),"monitor_consumer_wall_p99_ms":m.consumerWall.percentile(0.99),"monitor_consumer_entry_age_p99_ms":m.consumerEntryAge.percentile(0.99),"monitor_consumer_end_age_p99_ms":m.consumerEndAge.percentile(0.99),"monitor_consumer_outliers_first_32":m.consumerOutliers,"monitor_clean_hz":cleanHz,"monitor_clean_frames":m.cleanPictures,"monitor_clean_age_p95_ms":m.cleanAge.percentile(0.95),"monitor_clean_age_p99_ms":m.cleanAge.percentile(0.99),"monitor_requested_tool_unavailable":m.requestedToolUnavailable,"monitor_availability_counts":m.availabilityCounts,"monitor_offer_skipped":m.offered-m.admitted,"monitor_offered":m.offered,"monitor_admitted":m.admitted,"monitor_pictures":m.pictures,"monitor_unique_scopes":m.scopes,"monitor_picture_hz":pictureHz,"monitor_scope_hz":scopeHz,"monitor_failures":m.failures,
-                    "monitor_picture_age_p95_ms":m.pictureAge.percentile(0.95),"monitor_picture_age_p99_ms":m.pictureAge.percentile(0.99),"monitor_scope_age_p95_ms":m.scopeAge.percentile(0.95),"monitor_scope_age_p99_ms":m.scopeAge.percentile(0.99),
-                    "source_essential_work":producerWork.dictionary(feeds:o.feeds),"telemetry_samples":sampled.count,"telemetry_observed_hz":Double(sampled.count)/sampled.elapsed,"process_cpu_seconds":cpuSeconds,"process_cpu_percent":cpuSeconds/elapsed*100,"instrumented_monitor_gpu_command_seconds":gpuMeasured.0,"instrumented_monitor_gpu_command_count":gpuMeasured.1,"monitor_gpu_timing_callback":gpu.callbackSnapshot(),"gpu_metric":"summed command intervals, not total GPU utilization","process_footprint_before_recording":initialProcessFootprint,"process_footprint_at_recording_end":recordingEndFootprint,"sampled_peak_process_footprint":peakMemory,"sampled_peak_retired_bytes":peakRetired,"sampled_peak_monitor_bytes":peakLedger,"sampled_peak_analysis_jobs":peakJobs,"sampled_max_recording_queue":maxQueue,"encoded_video_bytes":t.encodedVideoBytes,"path":urls[feed].path])
-                runtime.remove(target:targets[feed])
+                    "instrumented_combined_metal_p95_percent":combinedMetal.percentile(0.95)/10,"actual_pipeline_off_enabled_timing_match":pipelineTimingMatches,"actual_pipeline_processed":pipeline.processed,"actual_pipeline_failures":pipeline.failures,"actual_pipeline_admitted":pipelineAdmitted[feed],"actual_pipeline_admission_semantics":"blocking metadata-only lock, separate from histogram measurement; matches CaptureController","actual_pipeline_admission_capacity_rejected":processingAdmission.capacityRejected,"actual_pipeline_maximum_pending":processingAdmission.maximumPending,"actual_pipeline_pending_after_drain":processingAdmission.pending,"actual_pipeline_admission_wait_count":pipeline.admissionWait.count,"actual_pipeline_admission_wait_p95_ms":pipeline.admissionWait.percentile(0.95),"actual_pipeline_admission_wait_p99_ms":pipeline.admissionWait.percentile(0.99),"actual_pipeline_admission_wait_max_ms":pipeline.admissionWait.percentile(1),"actual_pipeline_age_p95_ms":pipeline.age.percentile(0.95),"actual_pipeline_age_p99_ms":pipeline.age.percentile(0.99),"actual_pipeline_queue_p95_ms":pipeline.queueWait.percentile(0.95),"actual_pipeline_queue_p99_ms":pipeline.queueWait.percentile(0.99),"actual_pipeline_process_wall_p95_ms":pipeline.processWall.percentile(0.95),"actual_pipeline_process_wall_p99_ms":pipeline.processWall.percentile(0.99),"actual_pipeline_process_thread_cpu_p95_ms":pipeline.processCPU.percentile(0.95),"actual_pipeline_timing_outliers_first_32":pipeline.outliers,"actual_pipeline_command_count":pipeline.commands,"actual_pipeline_stage_timings":pipeline.stages.mapValues{["count":Double($0.count),"p95_ms":$0.percentile(0.95),"p99_ms":$0.percentile(0.99)]},"actual_pipeline_command_outliers_first_32":pipeline.commandOutliers,"actual_pipeline_terminal_outliers_first_32":pipeline.terminalOutliers,"actual_pipeline_sequence_hash":String(pipeline.sequenceHash),
+                    "monitor_offered":m.offered,"monitor_encoded":m.encoded,"monitor_completed_pictures":m.completedPictures,"monitor_skipped":m.offered-m.completedPictures,"monitor_every_frame":everyFrame,"monitor_scope_encodes":m.scopeEncodes,"monitor_completed_scopes":m.completedScopes,"monitor_failures":m.failures,"monitor_encode_errors":m.encodeErrors,"monitor_picture_hz":pictureHz,"monitor_scope_hz":scopeHz,
+                    "monitor_picture_completion_age_p95_ms":m.pictureAge.percentile(0.95),"monitor_picture_completion_age_p99_ms":m.pictureAge.percentile(0.99),"monitor_scope_completion_age_p95_ms":m.scopeAge.percentile(0.95),"monitor_scope_completion_age_p99_ms":m.scopeAge.percentile(0.99),
+                    "monitor_picture_gpu_p50_ms":m.pictureGPU.percentile(0.5),"monitor_picture_gpu_p95_ms":m.pictureGPU.percentile(0.95),"monitor_picture_gpu_p99_ms":m.pictureGPU.percentile(0.99),"monitor_scope_gpu_p50_ms":m.scopeGPU.percentile(0.5),"monitor_scope_gpu_p95_ms":m.scopeGPU.percentile(0.95),"monitor_cpu_encode_p95_ms":m.encodeWall.percentile(0.95),"monitor_cpu_encode_p99_ms":m.encodeWall.percentile(0.99),
+                    "monitor_renderer_status_counts":m.statusCounts,"monitor_requested_tool_unavailable":m.toolUnavailable,
+                    "monitor_gpu_statistics_scope":"runtime aggregate across all feeds; repeated per-feed rows must not be summed","monitor_wrapped_iosurface_textures_total":steadyEnd.wrappedTextures,"monitor_cached_iosurface_textures":steadyEnd.cachedTextures,"monitor_encode_contexts_total":steadyEnd.encodeContexts,"monitor_steady_state_new_textures":steadyEnd.wrappedTextures-steadyStart.wrappedTextures,"monitor_steady_state_new_contexts":steadyEnd.encodeContexts-steadyStart.encodeContexts,
+                    "source_essential_work":producerWork.dictionary(feeds:o.feeds),"telemetry_samples":sampled.count,"telemetry_observed_hz":Double(sampled.count)/sampled.elapsed,"process_cpu_seconds":cpuSeconds,"process_cpu_percent":cpuSeconds/elapsed*100,"instrumented_monitor_gpu_command_seconds":gpuMeasured.0,"instrumented_monitor_gpu_command_count":gpuMeasured.1,"monitor_gpu_timing_callback":gpu.callbackSnapshot(),"gpu_metric":"summed command intervals, not total GPU utilization","process_footprint_before_recording":initialProcessFootprint,"process_footprint_at_recording_end":recordingEndFootprint,"sampled_peak_process_footprint":peakMemory,"sampled_peak_monitor_gpu_in_flight":peakInFlight,"sampled_max_recording_queue":maxQueue,"encoded_video_bytes":t.encodedVideoBytes,"path":urls[feed].path])
             }
-            let heldBytesBeforeTeardown=runtime.ledger.snapshot.retainedBytes
-            for counter in counters {counter.releaseHeld()}
-            for lease in presentationAllowances {lease.release()}
-            let drainDeadline=ProcessInfo.processInfo.systemUptime+3
-            while runtime.ledger.snapshot.retainedBytes > 0 && ProcessInfo.processInfo.systemUptime < drainDeadline {try await Task.sleep(nanoseconds:10_000_000)}
-            try check(runtime.ledger.snapshot.retainedBytes == 0,"monitor teardown retained bytes")
-            let resourcesAfterTeardown=runtime.resourceStatistics
-            for index in (receipts.count-o.feeds)..<receipts.count {receipts[index]["held_bytes_before_teardown"]=heldBytesBeforeTeardown;receipts[index]["teardown_retained_bytes"]=runtime.ledger.snapshot.retainedBytes;receipts[index]["monitor_composite_pool_capacity_bytes_after_teardown"]=resourcesAfterTeardown.compositePoolCapacityBytes;receipts[index]["monitor_resource_statistics_teardown_snapshot_point"]="after target removal, held-result release and existing bounded ledger drain"}
+            for counter in counters {counter.invalidate()}
             if !enabled && runPassed {baseline[codecName]=decoded;baselinePipeline[codecName]=processors.map{$0.snapshot()}}
             receipt["runs"]=receipts;receipt["status"]="running";try writeReceipt(receipt,root:o.root)
             print("PROGRESS codec=\(codecName) tools=\(enabled) feeds=\(o.feeds) media_and_monitor_pass=\(runPassed) elapsed=\(elapsed)");fflush(stdout)

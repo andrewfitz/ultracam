@@ -71,39 +71,144 @@ import XCTest
     XCTAssertEqual(accepted.programTime, time(0))
   }
 
-  func testCutAppliesAtTargetBoundaryAndRequestsStaleFlush() {
+  func testOnAirSourceKeepsFlowingUntilTheCutLands() {
     var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
     guard case .queued = scheduler.requestCut(to: "B") else {
       return XCTFail("A valid target should queue")
     }
-    if case .skipped(.staleQueuedFrame) = scheduler.ingest(frame("A", 0)) {} else {
-      XCTFail("Queued old-source frames must be flushed")
+    guard case let .accepted(onAir) = scheduler.ingest(frame("A", 0)) else {
+      return XCTFail("The on-air source must not freeze while a cut is pending")
     }
     guard case let .cutApplied(mapped, flushStaleFrames) = scheduler.ingest(frame("B", 0)) else {
       return XCTFail("Target frame should apply the pending cut")
     }
-    XCTAssertTrue(flushStaleFrames)
+    XCTAssertFalse(flushStaleFrames, "Frames already on air precede the cut and are kept")
     XCTAssertEqual(mapped.sourceID, "B")
+    XCTAssertEqual(mapped.programTime, CMTimeAdd(onAir.programTime, onAir.programDuration))
     XCTAssertFalse(scheduler.hasPendingCut)
+    XCTAssertNil(scheduler.takeAbandonedCut())
   }
 
-  func testPendingCutResumesOnAirSourceAfterTimeout() {
+  func testLiveTargetThatNeverQualifiesExpiresAndIsReported() {
     var now: TimeInterval = 10
     var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
     scheduler.setClock { now }
     scheduler.pendingCutTimeout = 2
-    guard case .queued = scheduler.requestCut(to: "B") else {
+    guard case .queued = scheduler.requestCut(to: "B", noEarlierThan: time(1_000_000)) else {
       return XCTFail("A valid target should queue")
     }
-    if case .skipped(.staleQueuedFrame) = scheduler.ingest(frame("A", 0)) {} else {
-      XCTFail("The on-air source stays held until the timeout")
+    guard case .skipped(.staleQueuedFrame) = scheduler.ingest(frame("B", 0)) else {
+      return XCTFail("A target frame before the bound must not land the cut")
+    }
+    guard case .accepted = scheduler.ingest(frame("A", 0)) else {
+      return XCTFail("The on-air source keeps flowing")
     }
     now = 12
     guard case .accepted = scheduler.ingest(frame("A", 1_001)) else {
-      return XCTFail("The on-air source resumes when the pending target never qualifies")
+      return XCTFail("The on-air source keeps flowing after expiry")
     }
     XCTAssertFalse(scheduler.hasPendingCut)
     XCTAssertEqual(scheduler.selectedSource, "A")
+    guard let abandoned = scheduler.takeAbandonedCut() else { return XCTFail("Expiry must be reported") }
+    XCTAssertEqual(abandoned.0, "B")
+    XCTAssertEqual(abandoned.1, .expired)
+    XCTAssertNil(scheduler.takeAbandonedCut(), "Each abandoned cut is reported once")
+  }
+
+  func testCutToStartingSourceWaitsForItsFirstFrame() {
+    var now: TimeInterval = 10
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setClock { now }
+    scheduler.pendingCutTimeout = 2
+    scheduler.startingCutTimeout = 30
+    scheduler.setSource("B", available: true)  // started; "Opening UltraStudio…"
+    XCTAssertEqual(scheduler.readiness(of: "B"), .starting)
+    guard case .queued = scheduler.requestCut(to: "B") else {
+      return XCTFail("A starting target should queue")
+    }
+    var pts: Int64 = 0
+    for second in stride(from: 10.0, through: 30.0, by: 0.5) {
+      now = second
+      guard case .accepted = scheduler.ingest(frame("A", pts)) else {
+        return XCTFail("The on-air source keeps flowing while the target opens")
+      }
+      pts += 1_001
+    }
+    XCTAssertEqual(scheduler.pendingCut, "B", "Opening can take far longer than the live timeout")
+    XCTAssertNil(scheduler.takeAbandonedCut())
+    guard case let .cutApplied(mapped, _) = scheduler.ingest(frame("B", 0)) else {
+      return XCTFail("The target's first frame lands the cut")
+    }
+    XCTAssertEqual(mapped.sourceID, "B")
+    XCTAssertEqual(scheduler.selectedSource, "B")
+  }
+
+  func testCutToStartingSourceWithNoSignalExpiresAtTheStartingBound() {
+    var now: TimeInterval = 10
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setClock { now }
+    scheduler.pendingCutTimeout = 2
+    scheduler.startingCutTimeout = 8
+    scheduler.setSource("B", available: true)  // opened, but no HDMI signal
+    guard case .queued = scheduler.requestCut(to: "B") else { return XCTFail("A starting target should queue") }
+    now = 17.9
+    XCTAssertFalse(scheduler.expirePendingCutIfNeeded(), "Still inside the starting bound")
+    XCTAssertEqual(scheduler.pendingCut, "B")
+    now = 18
+    guard case .accepted = scheduler.ingest(frame("A", 0)) else {
+      return XCTFail("The on-air source keeps flowing")
+    }
+    XCTAssertFalse(scheduler.hasPendingCut, "A camera that never sends a frame can't hold the cut forever")
+    XCTAssertEqual(scheduler.takeAbandonedCut()?.1, .expired)
+    XCTAssertEqual(scheduler.selectedSource, "A")
+  }
+
+  func testStartingTargetThatSendsItsFirstFrameGetsTheLiveTimeout() {
+    var now: TimeInterval = 0
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setClock { now }
+    scheduler.pendingCutTimeout = 2
+    scheduler.startingCutTimeout = 8
+    scheduler.setSource("B", available: true)
+    _ = scheduler.requestCut(to: "B", noEarlierThan: time(1_000_000))
+    now = 5
+    guard case .skipped(.staleQueuedFrame) = scheduler.ingest(frame("B", 0)) else {
+      return XCTFail("The first frame is before the cut bound")
+    }
+    now = 6.9
+    XCTAssertFalse(scheduler.expirePendingCutIfNeeded(), "Live now: two seconds from its first frame")
+    now = 7
+    XCTAssertTrue(scheduler.expirePendingCutIfNeeded())
+  }
+
+  func testRestartedOnAirSourceIsReanchoredNotRejected() {
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setSource("A", available: true)
+    guard case let .accepted(first) = scheduler.ingest(frame("A", 50_050)) else { return XCTFail("on air") }
+    guard case let .accepted(second) = scheduler.ingest(frame("A", 51_051)) else { return XCTFail("on air") }
+    // Stopped and started again: the source clock starts over at zero.
+    scheduler.setSource("A", available: false)
+    scheduler.setSource("A", available: true)
+    guard case let .accepted(restarted) = scheduler.ingest(frame("A", 0)) else {
+      return XCTFail("A restarted on-air source must not be skipped as a timestamp regression")
+    }
+    XCTAssertEqual(first.programTime, .zero)
+    XCTAssertEqual(restarted.programTime, CMTimeAdd(second.programTime, second.programDuration),
+      "It continues at the next Program boundary")
+  }
+
+  func testCutToStartingSourceThatFailsIsAbandonedVisibly() {
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setSource("B", available: true)
+    guard case .queued = scheduler.requestCut(to: "B") else {
+      return XCTFail("A starting target should queue")
+    }
+    scheduler.setSource("B", available: false)  // failed to start
+    XCTAssertFalse(scheduler.hasPendingCut)
+    XCTAssertEqual(scheduler.selectedSource, "A", "Selection stays on what is on air")
+    guard let abandoned = scheduler.takeAbandonedCut() else { return XCTFail("Failure must be reported") }
+    XCTAssertEqual(abandoned.0, "B")
+    XCTAssertEqual(abandoned.1, .targetUnavailable)
   }
 
   func testCarriedTimelineDoesNotRestartAtZero() {
@@ -214,7 +319,13 @@ import XCTest
     ("cut resets source origin", testCutResetsSourceOriginAtNextProgramBoundary),
     ("invalid source timing", testRejectsForeignEpochTimebaseBackwardsAndInvalidDuration),
     ("failed first frame is transactional", testFailedFirstFrameDoesNotConsumeSourceOrProgramOrigin),
-    ("cut flushes stale frames", testCutAppliesAtTargetBoundaryAndRequestsStaleFlush),
+    ("on-air source flows until the cut", testOnAirSourceKeepsFlowingUntilTheCutLands),
+    ("live target expiry is reported", testLiveTargetThatNeverQualifiesExpiresAndIsReported),
+    ("starting target waits for first frame", testCutToStartingSourceWaitsForItsFirstFrame),
+    ("failed starting target is abandoned", testCutToStartingSourceThatFailsIsAbandonedVisibly),
+    ("no-signal starting target expires", testCutToStartingSourceWithNoSignalExpiresAtTheStartingBound),
+    ("first frame switches to live timeout", testStartingTargetThatSendsItsFirstFrameGetsTheLiveTimeout),
+    ("restarted on-air source re-anchors", testRestartedOnAirSourceIsReanchoredNotRejected),
     ("rapid cuts coalesce", testRapidCutsCoalesceToLatestTarget),
     ("invalid target preserves selection", testInvalidPendingTargetDoesNotSwitchSelection),
     ("missing sources", testMissingSourcesAreRejectedAndPendingTargetIsDropped),

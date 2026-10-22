@@ -151,6 +151,26 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
     self.init(frameNumber: nominalFrames - dropped, frameRate: frameRate, dropFrame: dropFrame)
   }
 
+  /// Parses a label and takes the drop-frame flag from its separator, as the
+  /// capture boundary reports RP188: `HH:MM:SS;FF` is drop-frame and
+  /// `HH:MM:SS:FF` is not. Frames run 0–29 at 29.97 and 0–59 at 59.94.
+  public init?(string: String, frameRate: RecordingFrameRate) {
+    guard let dropFrame = Self.dropFrame(declaredBy: string) else { return nil }
+    self.init(string: string, frameRate: frameRate, dropFrame: dropFrame)
+  }
+
+  /// The drop-frame flag a `HH:MM:SS?FF` label declares with its last
+  /// separator, or nil when the label is not in that form.
+  public static func dropFrame(declaredBy label: String) -> Bool? {
+    let characters = Array(label)
+    guard characters.count == 11 else { return nil }
+    switch characters[8] {
+    case ";": return true
+    case ":": return false
+    default: return nil
+    }
+  }
+
   public var description: String { stringValue }
 
   public var stringValue: String {

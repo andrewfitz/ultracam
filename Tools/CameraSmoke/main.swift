@@ -7,6 +7,7 @@ import Darwin
 import Security
 import MonitorToolsCore
 import MonitorToolsMetal
+@preconcurrency import Metal
 
 func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
   if !condition() {
@@ -373,8 +374,10 @@ func inspect(_ sample: CMSampleBuffer, duration: CMTime, mode: SyntheticMode) th
 }
 
 /// Optional read-only subscriber, offered only after the producer has sent the
-/// original sample. Results retain module-owned pixels, never the CMIO payload.
-final class MonitorComparison: @unchecked Sendable {
+/// original sample. It runs the monitor surface's GPU path offscreen: the
+/// picture pass (zebra, focus) into a 1080p target and the scope pass in its
+/// own command buffer, reading the CMIO payload in place without copying it.
+final class MonitorComparison: MonitorEncodeCompletion, @unchecked Sendable {
   let runtime = MonitorRuntime()
   let target = MonitorTargetID("cmio-synthetic-comparison")
   private let lock = NSLock()
@@ -384,8 +387,14 @@ final class MonitorComparison: @unchecked Sendable {
   private var failure: String?
   private var offered = 0, admitted = 0, callbacks = 0
   private var failureMetadata: [String] = []
+  private var configuration = MonitorConfiguration()
+  private let renderer: MonitorToolsRenderer
+  private var targets: [MTLTexture] = []
+  private var scopeTargets: [MTLTexture] = []
+  private var pending: [Int: (sequence: UInt64, host: Double, warmup: Bool)] = [:]
+  private var nextKind = 10
+  private var lastScopeTime = -Double.infinity
   init() {
-    var configuration = MonitorConfiguration()
     configuration.toolsEnabled = true
     configuration.pictureStage = .processedOutput
     configuration.scopeStage = .processedOutput
@@ -393,15 +402,47 @@ final class MonitorComparison: @unchecked Sendable {
     configuration.focus.enabled = true
     configuration.scopes.enabled = true
     configuration.scopes.refreshHz = 15
-    runtime.configure(target: target, generation: 1, configurationRevision: 1,
-      configuration: configuration, processingRevision: 1)
+    renderer = MonitorToolsRenderer(runtime: runtime)
+    if let device = runtime.device {
+      func texture(_ width: Int, _ height: Int) -> MTLTexture? {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+          pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        descriptor.storageMode = .private
+        return device.makeTexture(descriptor: descriptor)
+      }
+      targets = (0..<3).compactMap { _ in texture(1920, 1080) }
+      scopeTargets = (0..<3).compactMap { _ in
+        texture(MonitorToolsRenderer.scopeWidth, MonitorToolsRenderer.scopeHeight)
+      }
+      if let set = try? device.makeResidencySet(descriptor: MTLResidencySetDescriptor()) {
+        for texture in targets + scopeTargets { set.addAllocation(texture) }
+        set.commit()
+        runtime.attachDrawables(set)
+      }
+    }
+  }
+  func encodeCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) {
+    lock.lock(); defer { lock.unlock() }
+    guard let entry = pending.removeValue(forKey: kind) else { return }
+    if !entry.warmup { callbacks += 1 }
+    if failed {
+      failure = "Monitor GPU work failed"
+      failureMetadata.append("gpuFailed=true sequence=\(entry.sequence)")
+      return
+    }
+    if entry.warmup { warmReady = true; return }
+    let isScope = kind % 2 == 1
+    if isScope {
+      if scopes.insert(entry.sequence).inserted { scopeAges.append(now() - entry.host) }
+    } else if pictures.insert(entry.sequence).inserted {
+      pictureAges.append(now() - entry.host)
+    }
   }
   func offer(_ sample: CMSampleBuffer, sequence: UInt64, warmup: Bool = false,
     sourceHostTime: Double? = nil) {
     let time = now()
-    // The controlled source is already qualified at 29.97/59.94Hz. Offer every
-    // successfully enqueued original sample; receiver/main scheduling jitter
-    // must not thin the intended single-feed workload (nominally up to 60Hz).
+    // Offer every successfully enqueued original sample; nothing is thinned.
     guard let image = CMSampleBufferGetImageBuffer(sample) else { return }
     if !warmup { lock.withLock { offered += 1 } }
     if let sourceHostTime, !warmup { lock.withLock { schedulingDelays.append(time - sourceHostTime) } }
@@ -414,31 +455,54 @@ final class MonitorComparison: @unchecked Sendable {
       sourceGeometry: geometry, outputGeometry: geometry, correspondence: .identity,
       sourceSignal: signal, outputSignal: signal)
     let metadata = "target=\(target.rawValue) generation=1 sequence=\(sequence) sourcePTS=\(stamp.sourcePTS) sourceHost=\(stamp.hostTime) offerHost=\(time) warmup=\(warmup)"
-    let accepted = runtime.offer(bundle) { [self] result in
-      lock.lock(); defer { lock.unlock() }
-      if !warmup { callbacks += 1 }
-      switch result {
-      case .failure(let error):
-        failure = error.localizedDescription
-        failureMetadata.append("callbackError=\(error.localizedDescription) \(metadata)")
-      case .success(let display):
-        guard display.decorated != nil, display.scope != nil, display.availability.isEmpty else {
-          failure = "GPU analysis unavailable: \(display.availability.joined(separator: ", "))"
-          failureMetadata.append("callbackUnavailable=\(display.availability.joined(separator: ",")) decorated=\(display.decorated != nil) scope=\(display.scope != nil) \(metadata)")
-          return
-        }
-        if warmup { warmReady = true; return }
-        if pictures.insert(display.clean.stamp.sequence).inserted {
-          pictureAges.append(now() - display.clean.stamp.hostTime)
-        }
-        if let scope = display.scope, scopes.insert(scope.stamp.sequence).inserted {
-          scopeAges.append(now() - scope.stamp.hostTime)
-        }
-      }
+    guard !targets.isEmpty else {
+      lock.withLock { failure = runtime.unavailableReason ?? "Monitor GPU unavailable" }
+      return
     }
-    lock.withLock {
-      if accepted { if !warmup { admitted += 1 } }
-      else { failureMetadata.append("offerRejected=true \(metadata)") }
+    let state = MonitorRenderState(configuration: configuration)
+    do {
+      let frame = try runtime.gpuFrame(bundle)
+      let context = try runtime.beginEncoding()
+      let kind: Int = lock.withLock {
+        nextKind += 2
+        pending[nextKind] = (sequence, stamp.hostTime, warmup)
+        return nextKind
+      }
+      let target = targets[Int(sequence % UInt64(targets.count))]
+      do {
+        try renderer.encode(frame: frame, state: state, target: target,
+          viewport: MonitorViewport(width: target.width, height: target.height), into: context)
+      } catch {
+        runtime.abandon(context)
+        throw error
+      }
+      runtime.commit(context, completion: self, kind: kind)
+      if !renderer.status.isEmpty {
+        lock.withLock { failure = "GPU analysis unavailable: \(renderer.status.joined(separator: ", "))" }
+      }
+      // Scopes at the requested rate, in their own command buffer.
+      if time - lastScopeTime >= 1 / Double(configuration.scopes.refreshHz) - 0.002 {
+        lastScopeTime = time
+        let scopeContext = try runtime.beginEncoding()
+        let scopeKind: Int = lock.withLock {
+          pending[kind + 1] = (sequence, stamp.hostTime, warmup)
+          return kind + 1
+        }
+        do {
+          try renderer.encodeScopes(frame: frame, state: state,
+            target: scopeTargets[Int(sequence % UInt64(scopeTargets.count))], into: scopeContext)
+        } catch {
+          runtime.abandon(scopeContext)
+          throw error
+        }
+        runtime.commit(scopeContext, completion: self, kind: scopeKind)
+      }
+      if !warmup { lock.withLock { admitted += 1 } }
+    } catch {
+      lock.withLock {
+        failure = "\(error)"
+        failureMetadata.append("encodeError=\(error) \(metadata)")
+      }
     }
   }
   func prewarm(_ sample: CMSampleBuffer) throws {
@@ -461,7 +525,6 @@ final class MonitorComparison: @unchecked Sendable {
     // add per-frame console I/O to the ordinary receiver/monitor scheduling.
     log("CMIO_MONITOR sourceAgeOrigin=successfulSenderEnqueue offered=\(metrics.0) admitted=\(metrics.1) callbacks=\(metrics.2) uniquePictures=\(snapshot.0) uniqueScopes=\(snapshot.1) monitorSchedulingP95MS=\(percentile(metrics.3,0.95)*1000) pictureHz=\(pictureHz) scopeHz=\(scopeHz) pictureAgeMS=\(percentile(snapshot.2, 0.95)*1000) scopeAgeMS=\(percentile(snapshot.3, 0.95)*1000) warmupExcluded=true")
     for metadata in metrics.4 { log("CMIO_MONITOR_DIAGNOSTIC \(metadata)") }
-    defer { runtime.remove(target: target) }
     if let failure = snapshot.4 { throw VideoError.message(failure) }
     try require(pictureHz >= 20 && scopeHz >= 10,
       "Monitor useful-rate gate failed: picture=\(pictureHz)Hz scope=\(scopeHz)Hz.")
