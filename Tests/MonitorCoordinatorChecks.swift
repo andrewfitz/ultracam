@@ -1,9 +1,8 @@
 import CoreMedia
 import CoreVideo
 import Darwin
-import MonitorToolsCore
-import MonitorToolsMetal
-import MonitorToolsUI
+import Metal
+import MonitorKit
 import XCTest
 
 /// Counts heap allocations made by one thread through libmalloc's logger hook.
@@ -15,7 +14,7 @@ private let monitorMallocLogger: MonitorMallocLogger = { type, _, _, _, _, _ in
   else { return }
   monitorCountedAllocations += 1
 }
-private func countingAllocations(_ body: () -> Void) -> Int? {
+func monitorCountingAllocations(_ body: () -> Void) -> Int? {
   guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "malloc_logger") else { return nil }
   let slot = symbol.assumingMemoryBound(to: MonitorMallocLogger?.self)
   let previous = slot.pointee
@@ -26,6 +25,33 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
   slot.pointee = previous
   monitorCountedThread = nil
   return monitorCountedAllocations
+}
+
+/// An IOSurface-backed pixel buffer, as capture delivers.
+func monitorPixelBuffer(width: Int = 16, height: Int = 16, format: OSType = kCVPixelFormatType_32BGRA) throws
+  -> CVPixelBuffer
+{
+  var made: CVPixelBuffer?
+  XCTAssertEqual(
+    CVPixelBufferCreate(
+      nil, width, height, format, [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &made),
+    kCVReturnSuccess)
+  return try XCTUnwrap(made)
+}
+
+/// Records GPU completion of one test submission.
+final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
+  private let lock = NSLock()
+  private var times: [Double] = []
+  private var failures = 0
+  func gpuCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) {
+    lock.withLock {
+      if failed { failures += 1 } else { times.append((gpuEnd - gpuStart) * 1000) }
+    }
+  }
+  var completed: Int { lock.withLock { times.count + failures } }
+  var failed: Int { lock.withLock { failures } }
+  var milliseconds: [Double] { lock.withLock { times } }
 }
 
 @MainActor @objcMembers final class MonitorCoordinatorChecks: XCTestCase {
@@ -53,21 +79,18 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     let presenter = value.surface(id: id, target: alpha)
     value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
     XCTAssertEqual(policy.action(ready: true, running: false), .start)
-    var pixelBuffer: CVPixelBuffer?
-    XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA,
-      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pixelBuffer), kCVReturnSuccess)
-    let stamp = MonitorFrameStamp(target: alpha, generation: 1, sequence: 1,
-      sourcePTS: 0, hostTime: ProcessInfo.processInfo.systemUptime, configurationRevision: 1)
-    presenter.accept(MonitorFrameBundle(stamp: stamp, source: try XCTUnwrap(pixelBuffer)),
-      configuration: MonitorConfiguration())
-    XCTAssertEqual(presenter.currentStamp, stamp)
+    let host = value.captureSink(for: alpha)
+    host.offer(try monitorPixelBuffer(), pts: .zero, captureGeneration: 1, sequence: 1)
+    XCTAssertEqual(presenter.currentStamp?.sequence, 1)
     presenter.setClean(false)
     presenter.toggleFreeze()
     XCTAssertTrue(presenter.isFrozen)
     value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
     XCTAssertEqual(demand, [alpha])
     XCTAssertNil(policy.action(ready: true, running: true))
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput, "Freeze holds display without pixel work")
+    XCTAssertFalse(host.hasConsumers, "A frozen surface takes no frames")
+    host.offer(try monitorPixelBuffer(), pts: CMTime(value: 1, timescale: 30), captureGeneration: 1, sequence: 2)
+    XCTAssertEqual(presenter.currentStamp?.sequence, 1, "Freeze holds its picture")
     value.setPreviewEnabled(false, for: alpha)
     XCTAssertTrue(demand.isEmpty)
     XCTAssertEqual(policy.action(ready: true, running: true), .stop)
@@ -78,7 +101,7 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
   }
 
   func testPausedDiagnosticsAndLayoutCapsFollowCurrentState() throws {
-    var saved = MonitorWorkspaceState()
+    var saved = MonitorWorkspacePreferences()
     saved.layout = .fourUp
     let restored = MonitorCoordinator(workspace: saved)
     XCTAssertEqual(restored.diagnostics(for: alpha).requestedPictureHz, 0)
@@ -88,23 +111,14 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     let id = UUID()
     let presenter = value.surface(id: id, target: alpha)
     value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
-    let sink = value.captureSink(for: alpha)
-    var monitor = MonitorConfiguration()
-    monitor.pictureStage = .source
-    monitor.toolsEnabled = false
-    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
-    var image: CVPixelBuffer?
-    XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA, nil, &image),
-      kCVReturnSuccess)
-    let buffer = try XCTUnwrap(image)
+    let host = value.captureSink(for: alpha)
+    let buffer = try monitorPixelBuffer()
     let frame = CMTime(value: 1001, timescale: 60_000)
-    sink.offer(source: buffer, output: nil, pts: .zero, captureGeneration: 1, sequence: 1,
-      processingRevision: 0, sourceOnly: true)
-    sink.offer(source: buffer, output: nil, pts: frame, captureGeneration: 1, sequence: 2,
-      processingRevision: 0, sourceOnly: true)
+    host.offer(buffer, pts: .zero, captureGeneration: 1, sequence: 1)
+    host.offer(buffer, pts: frame, captureGeneration: 1, sequence: 2)
     let cameraHz = 1 / frame.seconds
-    XCTAssertEqual(sink.observedSourceFrameHz, cameraHz, accuracy: 0.05)
-    for layout in MonitorWorkspaceLayout.allCases {
+    XCTAssertEqual(host.observedSourceFrameHz, cameraHz, accuracy: 0.05)
+    for layout in MonitorWorkspacePreferences.Layout.allCases {
       value.workspace.layout = layout
       XCTAssertEqual(value.diagnostics(for: alpha).requestedPictureHz, cameraHz, accuracy: 0.05)
     }
@@ -130,14 +144,14 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     XCTAssertEqual(demand, [alpha, beta])
     first.onVisibilityChange?(true, false)
     XCTAssertEqual(demand, [alpha, beta], "Occlusion preserves presented capture intent")
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput, "Occlusion suspends pixel work")
+    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers, "Occlusion suspends pixel work")
     first.onVisibilityChange?(true, true)
-    XCTAssertTrue(value.captureSink(for: alpha).needsOutput)
+    XCTAssertTrue(value.captureSink(for: alpha).hasConsumers)
     value.registerSurface(id: a, target: alpha, isVisible: false, scopeVisible: false)
     XCTAssertEqual(demand, [beta], "Hiding one surface leaves the other feed live")
     value.setPreviewEnabled(false, for: beta)
     XCTAssertEqual(demand, [])
-    XCTAssertFalse(value.captureSink(for: beta).needsOutput)
+    XCTAssertFalse(value.captureSink(for: beta).hasConsumers)
     XCTAssertTrue(value.isPreviewEnabled(for: alpha))
   }
 
@@ -146,14 +160,14 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     let id = UUID()
     value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
     let previous = value.surface(id: id, target: alpha)
-    XCTAssertTrue(value.captureSink(for: alpha).needsOutput)
+    XCTAssertTrue(value.captureSink(for: alpha).hasConsumers)
     value.registerSurface(id: id, target: beta, isVisible: true, scopeVisible: false)
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput)
-    XCTAssertTrue(value.captureSink(for: beta).needsOutput)
+    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers)
+    XCTAssertTrue(value.captureSink(for: beta).hasConsumers)
     value.unregisterSurface(id: id, target: alpha)
     previous.onVisibilityChange?(false, false)
     XCTAssertTrue(
-      value.captureSink(for: beta).needsOutput,
+      value.captureSink(for: beta).hasConsumers,
       "Late teardown/visibility from the old target must not remove its replacement")
   }
 
@@ -163,33 +177,28 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     let b = UUID()
     var demand: Set<MonitorTargetID> = []
     value.onDemandChange = { demand = $0 }
-    value.registerSurface(
-      id: a, target: alpha, isVisible: true, scopeVisible: false,
-      usesNativePreview: true)
+    value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false, usesNativePreview: true)
     value.registerSurface(id: b, target: beta, isVisible: true, scopeVisible: false)
     XCTAssertEqual(demand, [alpha, beta])
-    XCTAssertFalse(
-      value.captureSink(for: alpha).needsOutput,
-      "The native tools-off path must not introduce owned-copy work")
-    var config = value.configuration(for: alpha)
-    config.toolsEnabled = true
-    config.zebra.enabled = true
-    value.setConfiguration(config, for: alpha)
+    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers, "A native picture takes no monitor frames")
+    var preferences = value.preferences(for: alpha)
+    preferences.toolsEnabled = true
+    preferences.state.zebras[0].enabled = true
+    value.setPreferences(preferences, for: alpha)
     value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false)
-    XCTAssertTrue(value.captureSink(for: alpha).needsOutput)
-    config.toolsEnabled = false
-    value.setConfiguration(config, for: alpha)
-    value.registerSurface(
-      id: a, target: alpha, isVisible: true, scopeVisible: false,
-      usesNativePreview: true)
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput)
+    XCTAssertTrue(value.captureSink(for: alpha).hasConsumers)
+    preferences.toolsEnabled = false
+    value.setPreferences(preferences, for: alpha)
+    XCTAssertTrue(value.captureSink(for: alpha).hasConsumers, "Every monitor picture takes every frame, tools or not")
+    value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false, usesNativePreview: true)
+    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers)
     XCTAssertEqual(demand, [alpha, beta])
     value.setPreviewEnabled(false, for: alpha)
     XCTAssertEqual(demand, [beta])
     value.setPreviewEnabled(true, for: alpha)
     value.registerSurface(id: a, target: alpha, isVisible: false, scopeVisible: false)
     XCTAssertEqual(demand, [beta], "A hidden surface cannot stop another live feed")
-    XCTAssertTrue(value.captureSink(for: beta).needsOutput)
+    XCTAssertTrue(value.captureSink(for: beta).hasConsumers)
   }
 
   func testUnavailableTargetCannotReactivateMonitorConsumers() {
@@ -200,7 +209,7 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     disabled.enabled = false
     value.updateTargets(feeds: [disabled], programAvailable: false)
     value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: false)
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput)
+    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers)
   }
 
   func testRemovedAndDisabledTargetsReleaseOutputConsumersImmediately() {
@@ -209,48 +218,47 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     let b = UUID()
     value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false)
     value.registerSurface(id: b, target: beta, isVisible: true, scopeVisible: false)
-    XCTAssertTrue(value.captureSink(for: alpha).needsOutput)
-    XCTAssertTrue(value.captureSink(for: beta).needsOutput)
+    XCTAssertTrue(value.captureSink(for: alpha).hasConsumers)
+    XCTAssertTrue(value.captureSink(for: beta).hasConsumers)
     var disabled = FeedDescriptor(id: FeedID(rawValue: "alpha"), name: "Wide")
     disabled.enabled = false
 
     value.updateTargets(feeds: [disabled], programAvailable: false)
 
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput,
+    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers,
       "Disabling a target must release consumers without waiting for another view event")
-    XCTAssertFalse(value.captureSink(for: beta).needsOutput,
+    XCTAssertFalse(value.captureSink(for: beta).hasConsumers,
       "Removing a target must release consumers without waiting for another view event")
   }
 
+  /// Scopes are drawn from the frames a picture already takes: a scope view
+  /// changes neither demand nor what is offered, and its local visibility never
+  /// changes the feed's settings.
   func testLocalScopeVisibilityUnionsDemandWithoutChangingFeedSettings() {
     let value = coordinator()
-    var config = value.configuration(for: alpha)
-    config.toolsEnabled = true
-    config.pictureStage = .source
-    config.scopes.enabled = true
-    config.scopeStage = .processedOutput
-    value.setConfiguration(config, for: alpha)
+    var preferences = value.preferences(for: alpha)
+    preferences.toolsEnabled = true
+    preferences.state.pictureStage = .source
+    preferences.scopes.enabled = true
+    preferences.scopes.settings.stage = .output
+    value.setPreferences(preferences, for: alpha)
     var demand: Set<MonitorTargetID> = []
     value.onDemandChange = { demand = $0 }
     let a = UUID()
     let b = UUID()
     value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false)
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput)
+    XCTAssertTrue(value.captureSink(for: alpha).hasConsumers)
     value.registerSurface(id: b, target: alpha, isVisible: true, scopeVisible: true)
-    XCTAssertTrue(value.captureSink(for: alpha).needsOutput,
-      "One visible scope consumer keeps shared processed-scope work active")
     value.registerSurface(id: b, target: alpha, isVisible: true, scopeVisible: false)
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput)
     XCTAssertEqual(demand, [alpha], "Hiding scopes must preserve live picture demand")
-    XCTAssertTrue(value.configuration(for: alpha).scopes.enabled,
+    XCTAssertTrue(value.preferences(for: alpha).scopes.enabled,
       "Local visibility must not change persisted per-feed analysis settings")
     value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: true)
-    XCTAssertTrue(value.captureSink(for: alpha).needsOutput)
     value.registerSurface(id: b, target: alpha, isVisible: false, scopeVisible: false)
-    XCTAssertTrue(value.captureSink(for: alpha).needsOutput,
-      "Hiding the other surface must leave this live scope consumer active")
+    XCTAssertTrue(value.captureSink(for: alpha).hasConsumers,
+      "Hiding the other surface must leave this live surface's frames")
     value.registerSurface(id: a, target: alpha, isVisible: false, scopeVisible: true)
-    XCTAssertFalse(value.captureSink(for: alpha).needsOutput)
+    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers)
     XCTAssertEqual(demand, [])
   }
 
@@ -268,74 +276,92 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     XCTAssertEqual(restored.workspace.tileBindings, [nil, nil, nil, nil])
   }
 
+  /// Calibration is the destination's own signal declaration and exposure offset.
   func testCopySettingsPreservesDestinationCameraCalibration() {
     let value = coordinator()
-    var source = MonitorConfiguration()
+    var source = MonitorFeedPreferences()
     source.toolsEnabled = true
-    source.zebra.enabled = true
-    source.zebra.thresholdIRE = 85
-    source.sourceProfileID = "arri-logc3-ei800"
-    source.sourceCodeRange = .full
-    var destination = MonitorConfiguration()
-    destination.sourceProfileID = "sony-slog3-sgamut3cine"
-    destination.sourceCodeRange = .legal
-    destination.sourceLogMapping = .fullRescaledToLegal10Bit
-    destination.falseColor.referenceOffsetStops = 1
-    value.setConfiguration(source, for: alpha)
-    value.setConfiguration(destination, for: beta)
+    source.state.zebras[0].enabled = true
+    source.state.zebras[0].level = 85
+    source.signal = MonitorSignalDeclaration(logProfileID: "arri-logc3-ei800", range: .full)
+    var destination = MonitorFeedPreferences()
+    destination.signal = MonitorSignalDeclaration(
+      logProfileID: "sony-slog3-sgamut3cine", range: .legal, transport: .fullRescaledToLegal)
+    destination.state.falseColor.referenceOffsetStops = 1
+    value.setPreferences(source, for: alpha)
+    value.setPreferences(destination, for: beta)
+    var reported: (MonitorTargetID, MonitorFeedPreferences)?
+    value.onConfigurationChange = { reported = ($0, $1) }
     value.copySettings(from: alpha, to: beta)
-    let copied = value.configuration(for: beta)
-    XCTAssertTrue(copied.zebra.enabled)
-    XCTAssertEqual(copied.zebra.thresholdIRE, 85)
-    XCTAssertEqual(copied.sourceProfileID, destination.sourceProfileID)
-    XCTAssertEqual(copied.sourceCodeRange, destination.sourceCodeRange)
-    XCTAssertEqual(copied.sourceLogMapping, destination.sourceLogMapping)
-    XCTAssertEqual(copied.falseColor.referenceOffsetStops, 1)
-    XCTAssertEqual(value.configuration(for: alpha), source)
+    let copied = value.preferences(for: beta)
+    XCTAssertTrue(copied.toolsEnabled)
+    XCTAssertTrue(copied.state.zebras[0].enabled)
+    XCTAssertEqual(copied.state.zebras[0].level, 85)
+    XCTAssertEqual(copied.signal, destination.signal)
+    XCTAssertEqual(copied.state.falseColor.referenceOffsetStops, 1)
+    XCTAssertEqual(value.preferences(for: alpha), source)
+    XCTAssertEqual(reported?.0, beta, "Without an owner the copy is reported as a change")
+    XCTAssertEqual(reported?.1, copied)
   }
 
   func testCopyFalseColorModeUsesItsProfileWhilePreservingDestinationCalibration() {
-    for mode in [MonitorFalseColorMode.sonySLog3, .elZone] {
+    for mode in [FalseColorMode.sonySLog3, .elZone] {
       let value = coordinator()
-      var source = MonitorConfiguration()
+      var source = MonitorFeedPreferences()
       source.toolsEnabled = true
-      source.sourceProfileID = "sony-slog3-sgamut3cine"
-      source.falseColor.mode = mode
-      source = source.normalized()
-      var destination = MonitorConfiguration()
-      destination.sourceProfileID = "sony-slog3-sgamut3"
-      destination.sourceCodeRange = .legal
-      destination.sourceLogMapping = .fullRescaledToLegal10Bit
-      destination.falseColor.mode = mode == .elZone ? .sonySLog3 : .elZone
-      destination.falseColor.referenceOffsetStops = 1.25
-      destination.falseColor.exposureIndex = 1600
-      value.setConfiguration(source, for: alpha)
-      value.setConfiguration(destination, for: beta)
+      source.signal = MonitorSignalDeclaration(logProfileID: "sony-slog3-sgamut3cine")
+      source.state.falseColor.mode = mode
+      var destination = MonitorFeedPreferences()
+      destination.signal = MonitorSignalDeclaration(
+        logProfileID: "sony-slog3-sgamut3", range: .legal, transport: .fullRescaledToLegal)
+      destination.state.falseColor.mode = mode == .elZone ? .sonySLog3 : .elZone
+      destination.state.falseColor.referenceOffsetStops = 1.25
+      value.setPreferences(source, for: alpha)
+      value.setPreferences(destination, for: beta)
       value.copySettings(from: alpha, to: beta)
-      let copied = value.configuration(for: beta)
-      XCTAssertEqual(copied.falseColor.mode, mode)
-      XCTAssertEqual(copied.falseColor.profileID, source.falseColor.profileID)
-      XCTAssertEqual(copied.falseColor.specificationVersion, source.falseColor.specificationVersion)
-      XCTAssertEqual(copied.sourceProfileID, destination.sourceProfileID)
-      XCTAssertEqual(copied.sourceCodeRange, destination.sourceCodeRange)
-      XCTAssertEqual(copied.sourceLogMapping, destination.sourceLogMapping)
-      XCTAssertEqual(copied.falseColor.referenceOffsetStops, 1.25)
-      XCTAssertEqual(copied.falseColor.exposureIndex, 1600)
+      let copied = value.preferences(for: beta)
+      XCTAssertEqual(copied.state.falseColor.mode, mode)
+      XCTAssertEqual(copied.signal, destination.signal)
+      XCTAssertEqual(copied.state.falseColor.referenceOffsetStops, 1.25)
     }
+  }
+
+  /// Reset and copy with an owner: the owner applies them to its saved
+  /// preferences; the coordinator shows the same result and reports nothing.
+  func testResetAndCopyWithAnOwnerShowTheOwnersResult() {
+    let value = coordinator()
+    var tools = MonitorFeedPreferences()
+    tools.toolsEnabled = true
+    tools.state.guides.enabled = true
+    tools.state.zebras[1].enabled = true
+    tools.signal = MonitorSignalDeclaration(logProfileID: "sony-slog3-sgamut3cine")
+    value.setPreferences(tools, for: alpha)
+    var reported = 0
+    value.onConfigurationChange = { _, _ in reported += 1 }
+    var resets: [MonitorTargetID] = []
+    var copies: [(MonitorTargetID, MonitorTargetID)] = []
+    value.onResetSettings = { target in
+      resets.append(target)
+      return LegacyMonitorConfiguration()
+    }
+    value.onCopySettings = { source, destination in
+      copies.append((source, destination))
+      return LegacyMonitorConfiguration()
+    }
+    value.copySettings(from: alpha, to: beta)
+    XCTAssertEqual(copies.map(\.0), [alpha])
+    XCTAssertTrue(value.preferences(for: beta).state.zebras[1].enabled, "MonitorKit-only settings are copied")
+    value.resetSettings(for: alpha)
+    XCTAssertEqual(resets, [alpha])
+    XCTAssertEqual(value.preferences(for: alpha), MonitorFeedPreferences())
+    XCTAssertEqual(reported, 0, "The owner already saved them")
   }
 
   #if CAPTURE_LIFECYCLE_TESTS
     func testNativePreviewRejectsLateFramesAfterSourceRebinding() throws {
       let renderer = VideoPreviewRenderer(renderWhenUnattached: true)
-      var image: CVPixelBuffer?
-      XCTAssertEqual(
-        CVPixelBufferCreate(
-          nil, 16, 16,
-          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-          [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &image), kCVReturnSuccess)
-      let sample = try VideoContract.sample(
-        try XCTUnwrap(image), at: .zero,
-        duration: VideoContract.fastDuration)
+      let image = try monitorPixelBuffer(format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+      let sample = try VideoContract.sample(image, at: .zero, duration: VideoContract.fastDuration)
       renderer.bindSource("alpha")
       renderer.enqueue(sample, sourceID: "alpha")
       XCTAssertEqual(renderer.diagnosticsSnapshot().received, 1)
@@ -349,6 +375,9 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     }
   #endif
 
+  /// Program's monitor gets the selected camera's processed frames, restarting
+  /// at each cut, and its feed never takes a burn-in LUT: its frames are the
+  /// published picture already.
   func testProgramMonitoringPreservesProcessingRevisionAndSelectedPixels() throws {
     let route = ProgramOutputRoute(feedIDs: [FeedID(rawValue: "alpha"), FeedID(rawValue: "beta")])
     var observed: [(String, UInt64, Bool)] = []
@@ -356,13 +385,8 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
       observed.append((id.rawValue, frame.metadata.processingRevision, cut))
     }
     func frame(revision: UInt64) throws -> ProcessedFrame<CVPixelBuffer> {
-      var buffer: CVPixelBuffer?
-      XCTAssertEqual(
-        CVPixelBufferCreate(
-          nil, 16, 16, kCVPixelFormatType_32BGRA,
-          nil, &buffer), kCVReturnSuccess)
-      return ProcessedFrame(
-        payload: try XCTUnwrap(buffer),
+      ProcessedFrame(
+        payload: try monitorPixelBuffer(),
         metadata: ProcessedFrameMetadata(
           presentationTime: .zero, duration: VideoContract.fastDuration, width: 16,
           height: 16, pixelFormat: kCVPixelFormatType_32BGRA, processingRevision: revision))
@@ -376,28 +400,42 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
     XCTAssertEqual(observed.last?.0, "beta")
     XCTAssertEqual(observed.last?.1, 8)
     XCTAssertEqual(observed.last?.2, true)
+
+    let value = MonitorCoordinator()
+    let program = value.captureSink(for: .program)
+    let lut = try LUTProcessor.makeLUT(CubeLUT(text: Self.identityCube))
+    program.burnInLUT = lut
+    value.setBurnInLUTSource(for: .program) { lut }
+    XCTAssertNil(program.burnInLUT, "Program's frames are processed: no burn-in LUT")
+    let camera = value.captureSink(for: alpha)
+    value.setBurnInLUTSource(for: alpha) { lut }
+    XCTAssertTrue(camera.burnInLUT === lut, "A camera's Output picture uses the LUT it burns in")
   }
 
-  /// The sink reads primaries, transfer and matrix tags, and a steady stream
-  /// of tagged frames reads them (and the clean aperture and pixel aspect)
-  /// without allocating on the capture thread.
+  static let identityCube = """
+    LUT_3D_SIZE 2
+    0 0 0
+    1 0 0
+    0 1 0
+    1 1 0
+    0 0 1
+    1 0 1
+    0 1 1
+    1 1 1
+    """
+
+  /// The feed host reads primaries, transfer and matrix tags, and a steady stream
+  /// of tagged frames reads them (and the clean aperture and pixel aspect) without
+  /// allocating on the capture thread, up to the surface's latest-frame slot.
   func testSteadyOffersReadColorimetryWithoutAllocating() throws {
-    var made: CVPixelBuffer?
-    XCTAssertEqual(
-      CVPixelBufferCreate(
-        nil, 64, 36, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &made), kCVReturnSuccess)
-    let buffer = try XCTUnwrap(made)
+    let buffer = try monitorPixelBuffer(width: 64, height: 36, format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
     CVBufferSetAttachment(
-      buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020,
-      .shouldPropagate)
+      buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
     CVBufferSetAttachment(
-      buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG,
-      .shouldPropagate)
-    CVBufferSetAttachment(
-      buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
-    // Core Video rebuilds dictionary attachments on every read (they live on
-    // the IOSurface), so the sink must not read them per frame.
+      buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG, .shouldPropagate)
+    CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+    // Core Video rebuilds dictionary attachments on every read (they live on the
+    // IOSurface), so the host must not read them per frame.
     CVBufferSetAttachment(
       buffer, kCVImageBufferCleanApertureKey,
       [
@@ -411,35 +449,320 @@ private func countingAllocations(_ body: () -> Void) -> Int? {
         kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 4,
         kCVImageBufferPixelAspectRatioVerticalSpacingKey: 3,
       ] as CFDictionary, .shouldPropagate)
-    let signal = MonitorCaptureSink.signal(buffer, profile: nil)
-    XCTAssertEqual(signal.primaries, kCVImageBufferColorPrimaries_ITU_R_2020 as String)
-    XCTAssertEqual(signal.transferFunction, kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
+    // A surface with no GPU: offers stop at its latest-frame slot.
+    let gpu = MonitorGPUContext(device: { nil })
+    let host = MonitorFeedHost(target: alpha.rawValue, gpu: gpu)
+    let signal = host.signal(of: buffer)
+    XCTAssertEqual(signal.primaries, .rec2020)
+    XCTAssertEqual(signal.encoding, .display(.hlg))
     XCTAssertEqual(signal.matrix, .bt2020)
     XCTAssertEqual(signal.range, .legal)
-    let geometry = MonitorCaptureSink.geometry(buffer)
+    let geometry = MonitorFrame.geometry(of: buffer)
     XCTAssertEqual(geometry.cleanAperture, MonitorRect(x: 2, y: 1, width: 60, height: 34))
     XCTAssertEqual(geometry.pixelAspectRatio, 4.0 / 3.0, accuracy: 1e-9)
 
-    // A presenter with no GPU: offers stop at its latest-frame slot.
-    let presenter = MonitorSurfacePresenter(runtime: MonitorRuntime(sharedDevice: { nil }))
-    let sink = MonitorCaptureSink(target: alpha)
-    var configuration = MonitorConfiguration()
-    configuration.pictureStage = .source
-    configuration.scopeStage = .source
-    sink.configure(configuration, consumers: [presenter], scopeVisible: false)
+    let presenter = MonitorSurfacePresenter(target: alpha, host: host, gpu: gpu)
+    host.setConsumers([presenter])
     var sequence: UInt64 = 0
     func offer() {
       sequence += 1
-      sink.offer(
-        source: buffer, output: nil, pts: CMTime(value: CMTimeValue(sequence), timescale: 60),
-        captureGeneration: 1, sequence: sequence, processingRevision: 3, sourceOnly: true)
+      host.offer(buffer, pts: CMTime(value: CMTimeValue(sequence), timescale: 60), captureGeneration: 1, sequence: sequence)
     }
     for _ in 0..<20 { offer() }
     XCTAssertEqual(presenter.currentStamp?.sequence, sequence)
-    guard let allocations = countingAllocations({ for _ in 0..<200 { offer() } }) else {
+    guard let allocations = monitorCountingAllocations({ for _ in 0..<200 { offer() } }) else {
       throw XCTSkip("malloc_logger unavailable")
     }
     XCTAssertEqual(presenter.currentStamp?.sequence, sequence)
     XCTAssertEqual(allocations, 0, "Steady-state offers allocate on the capture thread")
+  }
+
+  // MARK: - Surfaces
+
+  /// A surface on `target` of a fresh coordinator, visible and taking frames.
+  private func liveSurface(_ value: MonitorCoordinator, target: MonitorTargetID? = nil)
+    -> (MonitorSurfacePresenter, MonitorFeedHost)
+  {
+    let target = target ?? alpha
+    let id = UUID()
+    let presenter = value.surface(id: id, target: target)
+    value.registerSurface(id: id, target: target, isVisible: true, scopeVisible: false)
+    return (presenter, value.captureSink(for: target))
+  }
+
+  func testPendingFreezeTakesTheNextFrameAndCancelWins() throws {
+    let value = coordinator()
+    let (presenter, host) = liveSurface(value)
+    let buffer = try monitorPixelBuffer()
+    host.offer(buffer, pts: .zero, captureGeneration: 1, sequence: 1)
+    presenter.requestFreezeOnNextFrame()
+    XCTAssertTrue(presenter.isFreezePending)
+    XCTAssertFalse(presenter.holdsFreeze, "Pending: the picture still runs")
+    host.offer(buffer, pts: CMTime(value: 1, timescale: 30), captureGeneration: 1, sequence: 2)
+    XCTAssertTrue(presenter.holdsFreeze, "The next frame is the one frozen")
+    XCTAssertEqual(presenter.currentStamp?.sequence, 2)
+    host.offer(buffer, pts: CMTime(value: 2, timescale: 30), captureGeneration: 1, sequence: 3)
+    XCTAssertEqual(presenter.currentStamp?.sequence, 2, "A frozen surface takes no new frames")
+    // The interface still shows "pending": cancelling wins over the frame that came.
+    presenter.cancelPendingFreeze()
+    XCTAssertFalse(presenter.holdsFreeze)
+    XCTAssertFalse(presenter.isFreezePending)
+    let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    XCTAssertEqual(work.stamp?.sequence, 2, "The cancelled hold lingers until a live frame arrives")
+    host.offer(buffer, pts: CMTime(value: 3, timescale: 30), captureGeneration: 1, sequence: 4)
+    XCTAssertEqual(presenter.renderWork(after: (.max, .max), force: true)?.stamp?.sequence, 4)
+  }
+
+  func testUnfreezeKeepsTheHeldPictureUntilTheNextLiveFrame() throws {
+    let value = coordinator()
+    let (presenter, host) = liveSurface(value)
+    let buffer = try monitorPixelBuffer()
+    host.offer(buffer, pts: .zero, captureGeneration: 1, sequence: 1)
+    presenter.toggleFreeze()
+    XCTAssertTrue(presenter.isFrozen)
+    XCTAssertEqual(presenter.renderWork(after: (.max, .max), force: true)?.frozenToken != nil, true)
+    presenter.toggleFreeze()
+    XCTAssertFalse(presenter.isFrozen)
+    let lingering = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    XCTAssertEqual(lingering.stamp?.sequence, 1, "No black flash: the hold stays until live frames resume")
+    XCTAssertNotNil(lingering.frozenToken)
+    host.offer(buffer, pts: CMTime(value: 1, timescale: 30), captureGeneration: 1, sequence: 2)
+    let live = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    XCTAssertEqual(live.stamp?.sequence, 2)
+    XCTAssertNil(live.frozenToken)
+    // Toggling with nothing on screen says why.
+    presenter.setUnavailable("Feed stopped")
+    presenter.toggleFreeze()
+    XCTAssertFalse(presenter.isFrozen)
+    XCTAssertEqual(presenter.detail, "Freeze unavailable: no picture")
+  }
+
+  func testFrozenPictureKeepsTheToolsItWasFrozenWith() throws {
+    let value = coordinator()
+    let (presenter, host) = liveSurface(value)
+    host.offer(try monitorPixelBuffer(), pts: .zero, captureGeneration: 1, sequence: 1)
+    presenter.toggleFreeze()
+    var tools = value.preferences(for: alpha)
+    tools.toolsEnabled = true
+    tools.state.zebras[0].enabled = true
+    value.setPreferences(tools, for: alpha)
+    let frozen = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    XCTAssertFalse(frozen.state.zebras[0].enabled, "The hold keeps its tools")
+    XCTAssertTrue(presenter.currentEncodeState.zebras[0].enabled, "Live frames get the new tools")
+    presenter.setClean(true)
+    XCTAssertTrue(
+      try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true)).state.clean,
+      "Clean View hides a held picture's overlays too")
+  }
+
+  func testOutOfOrderAndRetiredGenerationFramesAreRejected() throws {
+    let value = coordinator()
+    let (presenter, host) = liveSurface(value)
+    let buffer = try monitorPixelBuffer()
+    host.offer(buffer, pts: CMTime(value: 2, timescale: 30), captureGeneration: 1, sequence: 2)
+    host.offer(buffer, pts: CMTime(value: 1, timescale: 30), captureGeneration: 1, sequence: 1)
+    XCTAssertEqual(presenter.currentStamp?.sequence, 2, "An older frame never replaces a newer one")
+    let firstGeneration = try XCTUnwrap(presenter.currentStamp?.generation)
+    host.invalidate(rejectingCaptureGeneration: 1)
+    host.offer(buffer, pts: .zero, captureGeneration: 1, sequence: 9)
+    XCTAssertEqual(presenter.currentStamp?.sequence, 2, "A stopped capture generation is rejected")
+    host.offer(buffer, pts: .zero, captureGeneration: 2, sequence: 1)
+    XCTAssertEqual(presenter.currentStamp?.sequence, 1, "A new capture generation starts over")
+    XCTAssertGreaterThan(try XCTUnwrap(presenter.currentStamp?.generation), firstGeneration)
+  }
+
+  /// The Freeze copy is MonitorKit's (one compute copy, into planes the hold
+  /// owns); once it is adopted the hold keeps no capture buffer.
+  func testFreezeCopiesOnTheGPUAndReleasesTheCaptureBuffer() throws {
+    guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
+    let value = coordinator()
+    let (presenter, host) = liveSurface(value)
+    host.offer(try monitorPixelBuffer(width: 64, height: 36), pts: .zero, captureGeneration: 1, sequence: 1)
+    presenter.toggleFreeze()
+    XCTAssertTrue(presenter.holdsProducerFrame, "Until the copy is made the hold reads the capture buffer")
+    let deadline = Date().addingTimeInterval(5)
+    while presenter.holdsProducerFrame && Date() < deadline {
+      RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+    }
+    XCTAssertFalse(presenter.holdsProducerFrame, "The GPU copy replaced the capture buffer")
+    let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    guard case .frozenOwned(let frame, let feed, _) = work.content else {
+      return XCTFail("The hold draws its own copy")
+    }
+    XCTAssertTrue(feed.frozenFrame?.id == frame.id)
+    XCTAssertEqual(presenter.statistics.failures, 0)
+  }
+
+  /// MonitorKit's output-colour resolver tags the layer: the signal's own
+  /// encoding (EDR for HLG and PQ, with their metadata), primaries from the
+  /// primaries tag alone (HLG or PQ on BT.709 keeps BT.709), Rec.709 SDR after a LUT.
+  func testLayerColorFollowsTheSignalAndKeepsBT709Primaries() throws {
+    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let value = coordinator()
+    let (presenter, _) = liveSurface(value)
+    let layer = CAMetalLayer()
+    layer.device = core.device
+    MonitorSurfaceRenderLoop.initialColor.apply(to: layer)
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: layer)
+    let feed = core.engine.makeFeed()
+    var state = MonitorFeedPreferences().surfaceState(isProgram: false)
+    func check(
+      _ signal: SignalDescription, _ format: MTLPixelFormat, _ space: CFString, edr: Bool,
+      file: StaticString = #filePath, line: UInt = #line
+    ) {
+      loop.applyColor(signal: signal, state: state, feed: feed)
+      XCTAssertEqual(layer.pixelFormat, format, file: file, line: line)
+      XCTAssertEqual(layer.colorspace?.name, space, file: file, line: line)
+      XCTAssertEqual(layer.wantsExtendedDynamicRangeContent, edr, file: file, line: line)
+      XCTAssertEqual(layer.edrMetadata != nil, edr, file: file, line: line)
+    }
+    let hlg2020 = SignalDescription(matrix: .bt2020, encoding: .display(.hlg), primaries: .rec2020)
+    check(hlg2020, .rgba16Float, CGColorSpace.itur_2100_HLG, edr: true)
+    check(SignalDescription(encoding: .display(.hlg), primaries: .rec709), .rgba16Float, CGColorSpace.itur_709_HLG, edr: true)
+    check(
+      SignalDescription(matrix: .bt2020, encoding: .display(.pq), primaries: .rec2020), .rgba16Float,
+      CGColorSpace.itur_2100_PQ, edr: true)
+    check(SignalDescription(encoding: .display(.pq), primaries: .rec709), .rgba16Float, CGColorSpace.itur_709_PQ, edr: true)
+    check(SignalDescription(), .bgr10a2Unorm, CGColorSpace.itur_709, edr: false)
+    check(SignalDescription(matrix: .bt2020, primaries: .rec2020), .bgr10a2Unorm, CGColorSpace.itur_2020, edr: false)
+    check(SignalDescription(encoding: .log(.sLog3SGamut3Cine)), .bgr10a2Unorm, CGColorSpace.itur_709, edr: false)
+    // Output (LUT): the LUT's Rec.709 output; Source: the camera's own HLG.
+    feed.burnInLUT = try LUTProcessor.makeLUT(CubeLUT(text: Self.identityCube))
+    state.pictureStage = .output
+    check(hlg2020, .bgr10a2Unorm, CGColorSpace.itur_709, edr: false)
+    state.pictureStage = .source
+    check(hlg2020, .rgba16Float, CGColorSpace.itur_2100_HLG, edr: true)
+    let changes = loop.colorChanges
+    check(hlg2020, .rgba16Float, CGColorSpace.itur_2100_HLG, edr: true)
+    XCTAssertEqual(loop.colorChanges, changes, "Re-tagged only when the colour changes")
+  }
+
+  /// One 4K v210 frame to a 1080p bgr10a2 picture, as a surface encodes it:
+  /// no pixel copy (the frame's textures are the capture IOSurface), nothing made
+  /// per frame, no allocation beyond the Metal encoder calls themselves, and the
+  /// picture pass within its GPU budget.
+  func testSteadyPictureEncodeCopiesNothingAndStaysInBudget() throws {
+    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let value = coordinator()
+    let (presenter, host) = liveSurface(value)
+    let buffer = try monitorPixelBuffer(width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10)
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .bgr10a2Unorm, width: 1920, height: 1080, mipmapped: false)
+    descriptor.usage = .renderTarget
+    descriptor.storageMode = .private
+    let target = try XCTUnwrap(core.device.makeTexture(descriptor: descriptor))
+    core.engine.residency.add(target)
+    defer { core.engine.residency.retire(target, resident: target) }
+    let control = MTL4RenderPassDescriptor()
+    control.colorAttachments[0]!.texture = target
+    control.colorAttachments[0]!.loadAction = .load
+    control.colorAttachments[0]!.storeAction = .store
+    var sequence: UInt64 = 0
+
+    struct Counts {
+      var slot: [Int] = [], wrap: [Int] = [], encode: [Int] = [], inline: [Int] = [], begin: [Int] = []
+      var commit: [Int] = []
+    }
+    /// Draws `frames` frames, one submission each (waiting for each), measuring after `warmUp`.
+    func run(frames: Int, warmUp: Int) throws -> (Counts, [Double]) {
+      let probe = MonitorCompletionProbe()
+      var counts = Counts()
+      for index in 0..<(warmUp + frames) {
+        sequence += 1
+        host.offer(buffer, pts: CMTime(value: CMTimeValue(sequence), timescale: 30), captureGeneration: 1, sequence: sequence)
+        let before = probe.completed
+        var context: MonitorGPUContext.EncodeContext?
+        var work: MonitorSurfacePresenter.RenderWork?
+        var failure: Error?
+        let begin = monitorCountingAllocations { context = try? core.begin() }
+        let made = try XCTUnwrap(context)
+        let slot = monitorCountingAllocations { work = presenter.renderWork(after: (.max, .max), force: false) }
+        let drawn = try XCTUnwrap(work)
+        guard case .live(let delivery) = drawn.content else { throw XCTSkip("Expected a live frame") }
+        let wrap = monitorCountingAllocations {
+          do { _ = try host.frame(delivery, in: made, core: core) } catch { failure = error }
+        }
+        let encode = monitorCountingAllocations {
+          do {
+            _ = try loop.encode(drawn, feed: loop.drawingFeed(for: drawn, core: core), target: target, core: core, context: made)
+          } catch {
+            failure = error
+          }
+        }
+        if let failure { throw failure }
+        // The Metal calls the encode makes itself (a compute encoder for focus, a
+        // render encoder for the picture): what any host pays for them.
+        let inline = monitorCountingAllocations {
+          if drawn.state.focus.enabled { made.commandBuffer.makeComputeCommandEncoder()?.endEncoding() }
+          made.commandBuffer.makeRenderCommandEncoder(descriptor: control)?.endEncoding()
+        }
+        let commit = monitorCountingAllocations { core.commit(made, completion: probe, kind: 1) }
+        let deadline = Date().addingTimeInterval(2)
+        while probe.completed == before && Date() < deadline { usleep(200) }
+        guard index >= warmUp, let begin, let slot, let wrap, let encode, let inline, let commit else { continue }
+        counts.begin.append(begin)
+        counts.slot.append(slot)
+        counts.wrap.append(wrap)
+        counts.encode.append(encode)
+        counts.inline.append(inline)
+        counts.commit.append(commit)
+      }
+      XCTAssertEqual(probe.failed, 0)
+      return (counts, Array(probe.milliseconds.suffix(frames)).sorted())
+    }
+    func middle(_ values: [Int]) -> Int { values.isEmpty ? -1 : values.sorted()[values.count / 2] }
+    func report(_ name: String, _ counts: Counts, _ times: [Double]) {
+      let minimum = times.first ?? .infinity, median = times.isEmpty ? .infinity : times[times.count / 2]
+      print(
+        String(format: "MONITOR_SURFACE_MEASURE 4K v210 -> 1080p %@: GPU min %.3f ms median %.3f ms", name, minimum, median)
+          + "; heap allocations per frame: slot \(middle(counts.slot)), frame wrap \(middle(counts.wrap)), "
+          + "encode \(middle(counts.encode)) vs the same Metal encoder calls inline \(middle(counts.inline)), "
+          + "begin \(middle(counts.begin)), commit \(middle(counts.commit))")
+    }
+
+    // The picture pass alone (tools off).
+    _ = try run(frames: 0, warmUp: 10)
+    let texturesMade = core.statistics.texturesMade
+    let resources = core.engine.resourcesCreated
+    let (plain, plainTimes) = try run(frames: 60, warmUp: 0)
+    report("picture", plain, plainTimes)
+    XCTAssertEqual(core.statistics.texturesMade, texturesMade, "Every frame's planes come from the resident cache")
+    XCTAssertEqual(core.engine.resourcesCreated, resources, "Nothing is made per frame: no copy, no scratch")
+    if !["MTL_DEBUG_LAYER", "MTL_SHADER_VALIDATION"].contains(where: { ProcessInfo.processInfo.environment[$0].map { $0 != "0" } ?? false }) {
+      XCTAssertLessThanOrEqual(plainTimes.first ?? .infinity, 0.5, "GPU time per 4K-to-1080p picture over the 0.5 ms budget")
+    }
+    // Every tool a camera tile shows: focus analysis, zebra and guides.
+    var tools = MonitorFeedPreferences()
+    tools.toolsEnabled = true
+    tools.state.zebras[0].enabled = true
+    tools.state.guides.enabled = true
+    tools.state.focus.enabled = true
+    value.setPreferences(tools, for: alpha)
+    _ = try run(frames: 0, warmUp: 10)
+    let (full, fullTimes) = try run(frames: 60, warmUp: 0)
+    report("focus+zebra+guides", full, fullTimes)
+    // Metal's debug layer allocates inside every call it wraps: counts and times
+    // mean nothing there (the run checks for validation messages instead).
+    let validating = ["MTL_DEBUG_LAYER", "MTL_SHADER_VALIDATION"].contains {
+      ProcessInfo.processInfo.environment[$0].map { $0 != "0" } ?? false
+    }
+    for counts in [plain, full] where !validating {
+      XCTAssertEqual(middle(counts.slot), 0, "Taking the frame from the slot allocates")
+      XCTAssertEqual(middle(counts.wrap), 0, "Wrapping the frame allocates")
+      XCTAssertLessThanOrEqual(middle(counts.encode), middle(counts.inline), "The encode allocates beyond its Metal calls")
+    }
+    // The frame's texture is the capture IOSurface itself: no pixel copy.
+    let context = try core.begin()
+    sequence += 1
+    host.offer(buffer, pts: CMTime(value: CMTimeValue(sequence), timescale: 30), captureGeneration: 1, sequence: sequence)
+    let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    if case .live(let live) = work.content {
+      let wrapped = try host.frame(live, in: context, core: core)
+      XCTAssertTrue(wrapped.packed?.iosurface === CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue())
+    } else {
+      XCTFail("A live frame")
+    }
+    core.abandon(context)
   }
 }

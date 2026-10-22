@@ -1,5 +1,4 @@
 import AppKit
-import MonitorToolsCore
 import SwiftUI
 
 /// Diagnostics window: per-camera capture, drops, audio, encoder and

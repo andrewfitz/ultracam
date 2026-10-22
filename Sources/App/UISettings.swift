@@ -638,14 +638,14 @@ struct UISettingsMonitorPane: View {
       Section {
         Label("Each camera has its own guides, zebra, false color, focus peaking and scopes. Use the tool bar at the top right of its picture, or View › Monitor Tools.",
           systemImage: "waveform.path.ecg")
-        Label("New cameras start with monitor tools off. Zebra starts at 95 IRE, and the picture shows the processed output.",
+        Label("New cameras start with monitor tools off. Zebra starts at 95 IRE, and the picture shows the camera's output with its LUT.",
           systemImage: "plus.rectangle.on.rectangle")
         Label("Right-click a picture to copy its tools to another camera.", systemImage: "doc.on.doc")
         Label("Monitor tools never change camera output or recordings.", systemImage: "checkmark.shield")
       } header: { Text("Monitor Tools") } footer: {
         VStack(alignment: .leading, spacing: 6) {
           UISettingsFootnote("False color works when a camera's source is declared as Sony S-Log3. Declare what the camera actually sends: declarations don't calibrate the capture device or change camera output.")
-          UISettingsFootnote("Under heavy load, new monitor analysis pauses while the clean picture continues, then returns to full quality once processing keeps up. Hidden or covered monitors do no GPU work.")
+          UISettingsFootnote("Every monitor shows every camera frame with its tools, on the GPU. Only a scope may skip an update while the GPU is still drawing earlier scopes. Hidden or covered monitors do no GPU work.")
         }
       }
     }

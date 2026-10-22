@@ -6,17 +6,19 @@ import MonitorToolsCore
 import MonitorToolsMetal
 import MonitorToolsUI
 
-/// A capture-side endpoint. Every offered frame goes straight into each live
-/// surface's latest-frame slot; the surfaces draw on their own display links.
-/// Offers never visit AppKit or the main actor, never copy pixels and never
-/// wait on the GPU.
+/// MonitorTools' capture-side endpoint. Unused since the surfaces moved to
+/// MonitorKit (`MonitorFeedHost`, `MonitorSurfacePresenter`); it stays only
+/// because CaptureController's MonitorTools bridge (`extension MonitorCaptureSink:
+/// MonitorFrameSink`) still names it. Delete both together. The app's own
+/// `MonitorTargetID` and `MonitorSurfacePresenter` shadow MonitorTools' names, so
+/// those are qualified here.
 final class MonitorCaptureSink: @unchecked Sendable {
   private static let generationLock = NSLock()
   nonisolated(unsafe) private static var nextGeneration: UInt64 = 0
   private let lock = NSLock()
-  let target: MonitorTargetID
+  let target: MonitorToolsCore.MonitorTargetID
   private var configuration = MonitorConfiguration()
-  private var consumers: [MonitorSurfacePresenter] = []
+  private var consumers: [MonitorToolsUI.MonitorSurfacePresenter] = []
   private var captureGeneration: UInt64?
   private var rejectedCaptureGeneration: UInt64?
   private var generation: UInt64 = 0
@@ -54,7 +56,7 @@ final class MonitorCaptureSink: @unchecked Sendable {
   private var rateWindow = (start: 0.0, offered: UInt64(0))
   private var offeredFPS = 0.0
 
-  init(target: MonitorTargetID, runtime: MonitorRuntime? = nil) {
+  init(target: MonitorToolsCore.MonitorTargetID, runtime: MonitorRuntime? = nil) {
     self.target = target
     self.runtime = runtime
   }
@@ -82,7 +84,7 @@ final class MonitorCaptureSink: @unchecked Sendable {
   }
 
   func configure(
-    _ value: MonitorConfiguration, consumers: [MonitorSurfacePresenter], scopeVisible: Bool
+    _ value: MonitorConfiguration, consumers: [MonitorToolsUI.MonitorSurfacePresenter], scopeVisible: Bool
   ) {
     lock.lock()
     let activeChanged = self.consumers.isEmpty != consumers.isEmpty

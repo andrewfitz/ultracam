@@ -2,10 +2,11 @@ import Foundation
 import MonitorToolsCore
 import XCTest
 
-// The settings boundary while the coordinator still renders with MonitorTools:
-// `LegacyMonitorConfiguration` must read every blob exactly as MonitorTools'
-// `MonitorConfiguration` did, and a configuration must survive the trip
-// through `MonitorFeedPreferences`.
+// The settings boundary with MonitorTools' old configuration: until MonitorTools
+// is retired, `LegacyMonitorConfiguration` must read every blob exactly as
+// MonitorTools' `MonitorConfiguration` did, and a configuration must survive the
+// trip through `MonitorFeedPreferences`. The coordinator itself now keeps
+// `MonitorFeedPreferences` (MonitorKit) and reports them whole.
 extension MonitorLifecycleChecks {
   private static let boundaryBlobs = [
     "{}",
@@ -67,19 +68,19 @@ extension MonitorLifecycleChecks {
     var state = MonitorWorkspaceState()
     state.isConfigured = true
     state.layout = .sideBySide
-    state.tileBindings = [MonitorTargetID("a"), nil, MonitorTargetID("program"), nil]
+    state.tileBindings = [MonitorToolsCore.MonitorTargetID("a"), nil, MonitorToolsCore.MonitorTargetID("program"), nil]
     state.splitRatio = 0.35
-    let preferences = MonitorWorkspacePreferences(state)
-    XCTAssertEqual(preferences.tileBindings, ["a", nil, "program", nil])
-    XCTAssertEqual(MonitorWorkspaceState(preferences), state)
+    var preferences = MonitorWorkspacePreferences()
+    preferences.isConfigured = true
+    preferences.layout = .sideBySide
+    preferences.tileBindings = ["a", nil, "program", nil]
+    preferences.splitRatio = 0.35
     let stateJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? NSDictionary
     let preferencesJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(preferences)) as? NSDictionary
     XCTAssertEqual(stateJSON, preferencesJSON)
-    var snapshot = AppSettingsSnapshot(monitorWorkspace: state)
+    XCTAssertEqual(try JSONDecoder().decode(MonitorWorkspacePreferences.self, from: JSONEncoder().encode(state)), preferences)
+    let snapshot = AppSettingsSnapshot(monitorWorkspace: preferences)
     XCTAssertEqual(snapshot.monitorWorkspacePreferences, preferences)
-    XCTAssertEqual(snapshot.monitorWorkspace, state)
-    snapshot.monitorWorkspace.layout = .fourUp
-    XCTAssertEqual(snapshot.monitorWorkspacePreferences.layout, .fourUp)
   }
 
   func testBoundaryCoordinatorRestoresAndReportsPreferences() throws {
@@ -98,20 +99,19 @@ extension MonitorLifecycleChecks {
         feeds: [FeedDescriptor(id: feedID, name: "Wide", monitor: camera)], program: program,
         workspace: workspace)
       let alpha = MonitorTargetID("alpha")
-      XCTAssertEqual(coordinator.configuration(for: alpha), MonitorConfiguration(camera.legacyConfiguration))
-      XCTAssertTrue(coordinator.configuration(for: alpha).toolsEnabled)
-      XCTAssertEqual(coordinator.configuration(for: alpha).zebra.widthIRE, 8)
-      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("program")).pictureStage, .source)
+      XCTAssertEqual(coordinator.preferences(for: alpha), camera)
+      XCTAssertEqual(coordinator.preferences(for: .program).state.pictureStage, .source)
       XCTAssertEqual(coordinator.workspace.layout, .sideBySide)
-      XCTAssertEqual(coordinator.workspace.tileBindings[1], MonitorTargetID("program"))
+      XCTAssertEqual(coordinator.workspace.tileBindings[1], "program")
 
-      var reported: [(MonitorTargetID, LegacyMonitorConfiguration)] = []
+      var reported: [(MonitorTargetID, MonitorFeedPreferences)] = []
       var reportedWorkspace: MonitorWorkspacePreferences?
       coordinator.onConfigurationChange = { reported.append(($0, $1)) }
       coordinator.onWorkspaceChange = { reportedWorkspace = $0 }
-      var next = coordinator.configuration(for: alpha)
-      next.focus.enabled = true
-      coordinator.setConfiguration(next, for: alpha)
+      var next = coordinator.preferences(for: alpha)
+      next.state.focus.enabled = true
+      next.state.pictureStage = .monitor
+      coordinator.setPreferences(next, for: alpha)
       XCTAssertEqual(reported.count, 1)
       XCTAssertEqual(reported.first?.0, alpha)
       var merged = camera
@@ -119,6 +119,7 @@ extension MonitorLifecycleChecks {
       XCTAssertTrue(merged.state.focus.enabled)
       XCTAssertEqual(merged.state.zebras[0].range, 4)
       XCTAssertEqual(merged.state.displayTransform.mode, .logToRec709, "MonitorKit-only settings survive")
+      XCTAssertEqual(merged.state.pictureStage, .monitor, "So does the Monitor picture stage")
       coordinator.workspace.layout = .fourUp
       XCTAssertEqual(reportedWorkspace?.layout, .fourUp)
       XCTAssertEqual(reportedWorkspace?.tileBindings, ["alpha", "program", nil, nil])
@@ -157,26 +158,107 @@ extension MonitorLifecycleChecks {
       XCTAssertEqual(copied.state.geometry.desqueeze, 2, "MonitorKit-only settings are copied")
       XCTAssertEqual(copied.signal, beta.signal)
       XCTAssertEqual(copied.state.falseColor.referenceOffsetStops, 1)
-      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("beta")), MonitorConfiguration(copied.legacyConfiguration))
-      XCTAssertTrue(coordinator.configuration(for: MonitorTargetID("beta")).zebra.enabled)
-      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("beta")).sourceProfileID, "arri-logc3-ei800")
+      XCTAssertEqual(coordinator.preferences(for: MonitorTargetID("beta")), copied, "The coordinator shows what the owner saved")
 
       coordinator.resetSettings(for: MonitorTargetID("alpha"))
       XCTAssertEqual(owned["alpha"], MonitorFeedPreferences(), "Desqueeze and the signal are reset too")
-      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("alpha")), MonitorConfiguration(MonitorFeedPreferences().legacyConfiguration))
+      XCTAssertEqual(coordinator.preferences(for: MonitorTargetID("alpha")), MonitorFeedPreferences())
       XCTAssertEqual(merges, 0, "Applied by the owner, not merged back")
 
-      // A target the owner does not know goes through setConfiguration, as before.
-      var program = coordinator.configuration(for: MonitorTargetID("program"))
-      program.guides.enabled = true
-      coordinator.setConfiguration(program, for: MonitorTargetID("program"))
+      // A target the owner does not know is reported as a change, as before.
+      var program = coordinator.preferences(for: .program)
+      program.toolsEnabled = true
+      program.state.guides.enabled = true
+      coordinator.setPreferences(program, for: .program)
       XCTAssertEqual(merges, 1)
-      coordinator.resetSettings(for: MonitorTargetID("program"))
+      coordinator.resetSettings(for: .program)
       XCTAssertEqual(merges, 2)
-      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("program")), MonitorConfiguration().normalized())
-      coordinator.copySettings(from: MonitorTargetID("beta"), to: MonitorTargetID("program"))
+      XCTAssertEqual(coordinator.preferences(for: .program), MonitorFeedPreferences())
+      coordinator.copySettings(from: MonitorTargetID("beta"), to: .program)
       XCTAssertEqual(merges, 3)
-      XCTAssertTrue(coordinator.configuration(for: MonitorTargetID("program")).zebra.enabled)
+      XCTAssertTrue(coordinator.preferences(for: .program).state.zebras[0].enabled)
     }
+  }
+}
+
+// MonitorTools' configuration and the app's legacy copy, field by field (the
+// coordinator's old boundary, kept for the parity checks above).
+private extension MonitorConfiguration {
+  init(_ legacy: LegacyMonitorConfiguration) {
+    self.init()
+    schemaVersion = legacy.schemaVersion
+    toolsEnabled = legacy.toolsEnabled
+    guides.enabled = legacy.guides.enabled
+    guides.thirds = legacy.guides.thirds
+    guides.centerCross = legacy.guides.centerCross
+    guides.safeArea = legacy.guides.safeArea
+    guides.opacity = legacy.guides.opacity
+    guides.contrast = legacy.guides.contrast
+    zebra.enabled = legacy.zebra.enabled
+    zebra.thresholdIRE = legacy.zebra.thresholdIRE
+    zebra.widthIRE = legacy.zebra.widthIRE
+    zebra.mode = legacy.zebra.mode == .band ? .band : .aboveThreshold
+    zebra.opacity = legacy.zebra.opacity
+    falseColor.mode = MonitorFalseColorMode(rawValue: legacy.falseColor.mode.rawValue) ?? .off
+    falseColor.profileID = legacy.falseColor.profileID
+    falseColor.specificationVersion = legacy.falseColor.specificationVersion
+    falseColor.exposureIndex = legacy.falseColor.exposureIndex
+    falseColor.referenceOffsetStops = legacy.falseColor.referenceOffsetStops
+    focus.enabled = legacy.focus.enabled
+    focus.color = MonitorPeakingColor(rawValue: legacy.focus.color.rawValue) ?? .red
+    focus.sensitivity = legacy.focus.sensitivity
+    focus.noiseRejection = legacy.focus.noiseRejection
+    focus.opacity = legacy.focus.opacity
+    scopes.enabled = legacy.scopes.enabled
+    scopes.mode = legacy.scopes.mode == .lumaWaveform ? .lumaWaveform : .rgbParade
+    scopes.gain = legacy.scopes.gain
+    scopes.graticule = legacy.scopes.graticule
+    scopes.refreshHz = legacy.scopes.refreshHz
+    pictureStage = legacy.pictureStage == .source ? .source : .processedOutput
+    scopeStage = legacy.scopeStage == .source ? .source : .processedOutput
+    sourceProfileID = legacy.sourceProfileID
+    sourceCodeRange = legacy.sourceCodeRange.map { $0 == .full ? .full : .legal }
+    sourceLogMapping = legacy.sourceLogMapping == .fullRescaledToLegal10Bit
+      ? .fullRescaledToLegal10Bit : .native10Bit
+  }
+}
+
+private extension LegacyMonitorConfiguration {
+  init(_ configuration: MonitorConfiguration) {
+    self.init()
+    schemaVersion = configuration.schemaVersion
+    toolsEnabled = configuration.toolsEnabled
+    guides.enabled = configuration.guides.enabled
+    guides.thirds = configuration.guides.thirds
+    guides.centerCross = configuration.guides.centerCross
+    guides.safeArea = configuration.guides.safeArea
+    guides.opacity = configuration.guides.opacity
+    guides.contrast = configuration.guides.contrast
+    zebra.enabled = configuration.zebra.enabled
+    zebra.thresholdIRE = configuration.zebra.thresholdIRE
+    zebra.widthIRE = configuration.zebra.widthIRE
+    zebra.mode = configuration.zebra.mode == .band ? .band : .aboveThreshold
+    zebra.opacity = configuration.zebra.opacity
+    falseColor.mode = FalseColorMode(rawValue: configuration.falseColor.mode.rawValue) ?? .off
+    falseColor.profileID = configuration.falseColor.profileID
+    falseColor.specificationVersion = configuration.falseColor.specificationVersion
+    falseColor.exposureIndex = configuration.falseColor.exposureIndex
+    falseColor.referenceOffsetStops = configuration.falseColor.referenceOffsetStops
+    focus.enabled = configuration.focus.enabled
+    focus.color = PeakingColor(rawValue: configuration.focus.color.rawValue) ?? .red
+    focus.sensitivity = configuration.focus.sensitivity
+    focus.noiseRejection = configuration.focus.noiseRejection
+    focus.opacity = configuration.focus.opacity
+    scopes.enabled = configuration.scopes.enabled
+    scopes.mode = configuration.scopes.mode == .lumaWaveform ? .lumaWaveform : .rgbParade
+    scopes.gain = configuration.scopes.gain
+    scopes.graticule = configuration.scopes.graticule
+    scopes.refreshHz = configuration.scopes.refreshHz
+    pictureStage = configuration.pictureStage == .source ? .source : .processedOutput
+    scopeStage = configuration.scopeStage == .source ? .source : .processedOutput
+    sourceProfileID = configuration.sourceProfileID
+    sourceCodeRange = configuration.sourceCodeRange.map { $0 == .full ? .full : .legal }
+    sourceLogMapping = configuration.sourceLogMapping == .fullRescaledToLegal10Bit
+      ? .fullRescaledToLegal10Bit : .native10Bit
   }
 }

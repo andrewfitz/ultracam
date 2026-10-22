@@ -1,9 +1,6 @@
 import CoreMedia
 import CoreVideo
 import Foundation
-import MonitorToolsCore
-import MonitorToolsMetal
-import MonitorToolsUI
 import XCTest
 
 /// In-memory synthetic recording: no encoder, device, or media files are opened.
@@ -125,14 +122,16 @@ import XCTest
     services.preview = nil
     let controller = CaptureController(services: services, previewRenderer: nil)
     let target = MonitorTargetID("capture-tap-integration")
-    let sink = MonitorCaptureSink(target: target)
-    let presenter = MonitorSurfacePresenter()
-    var monitor = MonitorConfiguration()
-    monitor.pictureStage = .source
-    monitor.toolsEnabled = true
-    monitor.zebra.enabled = true
+    // The monitor's endpoint and one surface, without a GPU: offers stop at its slot.
+    let gpu = MonitorGPUContext(device: { nil })
+    let sink = MonitorFeedHost(target: target.rawValue, gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: target, host: sink, gpu: gpu)
+    var tools = MonitorFeedPreferences(toolsEnabled: true)
+    tools.state.pictureStage = .source
+    tools.state.zebras[0].enabled = true
+    presenter.setPreferences(tools)
     // Hidden surface: frames reach the recorder, not the monitor.
-    sink.configure(monitor, consumers: [], scopeVisible: false)
+    sink.setConsumers([])
     controller.setMonitorSink(sink)
     let feed = FeedID(rawValue: target.rawValue)
     let writer = Writer()
@@ -166,19 +165,20 @@ import XCTest
     pumpUntil { recorder.telemetry.appendedVideo == 2 }
     pumpFor(0.1)
     XCTAssertNil(presenter.currentStamp)
-    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
+    sink.setConsumers([presenter])
     harness.emit(image, pts: CMTimeMultiply(duration, multiplier: 2), duration: duration)
     pumpUntil {
       presenter.currentStamp?.sourcePTS == CMTimeMultiply(duration, multiplier: 2).seconds
     }
     let source = try XCTUnwrap(presenter.currentStamp)
-    XCTAssertEqual(source.target, target)
+    XCTAssertEqual(source.target, target.rawValue)
     XCTAssertGreaterThan(source.generation, 0)
     XCTAssertGreaterThan(source.sequence, 0)
-    XCTAssertGreaterThan(source.processingRevision, 0)
-    // Switch to the paired Output tap and change the capture processing revision.
-    monitor.pictureStage = .processedOutput
-    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
+    // A changed capture pipeline does not restart the monitor's stream: the next
+    // source frame follows in the same generation (the picture stage is the
+    // monitor's own: the source, or the source plus the burn-in LUT in its shader).
+    tools.state.pictureStage = .output
+    presenter.setPreferences(tools)
     controller.reconfigure(configuration: bypass, pipelineEnabled: false)
     pumpFor(0.03)
     harness.emit(image, pts: CMTimeMultiply(duration, multiplier: 3), duration: duration)
@@ -188,10 +188,9 @@ import XCTest
     let output = try XCTUnwrap(presenter.currentStamp)
     XCTAssertEqual(output.generation, source.generation)
     XCTAssertGreaterThan(output.sequence, source.sequence)
-    XCTAssertGreaterThan(output.processingRevision, source.processingRevision)
-    XCTAssertGreaterThan(output.configurationRevision, source.configurationRevision)
+    XCTAssertEqual(output.revision, source.revision, "The same signal and consumers: the same revision")
     // Detaching demand leaves the recorder receiving the untouched source.
-    sink.configure(monitor, consumers: [], scopeVisible: false)
+    sink.setConsumers([])
     controller.setMonitorSink(nil)
     harness.emit(image, pts: CMTimeMultiply(duration, multiplier: 4), duration: duration)
     pumpUntil { recorder.telemetry.appendedVideo == 5 }
@@ -332,16 +331,17 @@ import XCTest
       }
       let controller = CaptureController(services: services, previewRenderer: nil)
       let target = MonitorTargetID("paced-combined-\(enabled)")
-      let presenter = MonitorSurfacePresenter()
-      let sink = MonitorCaptureSink(target: target)
+      let gpu = MonitorCoordinator.sharedGPU
+      let sink = MonitorFeedHost(target: target.rawValue, gpu: gpu)
+      let presenter = MonitorSurfacePresenter(target: target, host: sink, gpu: gpu)
       if enabled {
-        var monitor = MonitorConfiguration()
-        monitor.toolsEnabled = true
-        monitor.pictureStage = .processedOutput
-        monitor.zebra.enabled = true
-        monitor.scopes.enabled = true
-        monitor.scopes.refreshHz = 15
-        sink.configure(monitor, consumers: [presenter], scopeVisible: true)
+        var tools = MonitorFeedPreferences(toolsEnabled: true)
+        tools.state.pictureStage = .output
+        tools.state.zebras[0].enabled = true
+        tools.scopes.enabled = true
+        tools.scopes.refreshHz = 15
+        presenter.setPreferences(tools)
+        sink.setConsumers([presenter])
         controller.setMonitorSink(sink)
       }
       let feed = FeedID(rawValue: target.rawValue)
@@ -672,26 +672,6 @@ import XCTest
     wait(for: [disconnected], timeout: 3)
   }
 
-  func testNeedsOutputTreatsABusyLockAsWanted() {
-    let sink = MonitorCaptureSink(target: MonitorTargetID("needs-output-lock"))
-    var monitor = MonitorConfiguration()
-    monitor.pictureStage = .processedOutput
-    let presenter = MonitorSurfacePresenter()
-    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
-    XCTAssertTrue(sink.needsOutput)
-    let entered = expectation(description: "sink lock held")
-    let release = DispatchSemaphore(value: 0)
-    DispatchQueue.global().async {
-      sink.withLockHeldForTesting {
-        entered.fulfill()
-        _ = release.wait(timeout: .now() + 3)
-      }
-    }
-    wait(for: [entered], timeout: 2)
-    XCTAssertTrue(sink.needsOutput, "A failed try-lock must not look like an absent monitor consumer")
-    release.signal()
-  }
-
   /// A MonitorTools-style endpoint that wants the processed output and records
   /// every paired offer (any thread).
   private final class OutputOfferLog: MonitorFrameSink, @unchecked Sendable {
@@ -724,9 +704,10 @@ import XCTest
     func invalidate(rejectingCaptureGeneration rejected: UInt64?) {}
   }
 
-  /// Until the surfaces move to MonitorKit, a MonitorTools Output-stage sink
-  /// keeps processing alive on its own and gets every frame's processed buffer
-  /// (here downscaled 4:2:0), paired with its source and correspondence.
+  /// While CaptureController keeps its MonitorTools bridge (delete this with it),
+  /// a MonitorTools Output-stage sink keeps processing alive on its own and gets
+  /// every frame's processed buffer (here downscaled 4:2:0), paired with its
+  /// source and correspondence.
   @MainActor func testMonitorToolsOutputSinkGetsTheProcessedOutput() throws {
     let image = try syntheticRamp()
     let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
@@ -879,53 +860,6 @@ import XCTest
     XCTAssertEqual(offers.map(\.sequence), [1, 2, 3, 4])
     XCTAssertEqual(offers.map(\.pts.value), [1, 2, 3, 4])
     XCTAssertTrue(offers.allSatisfy { $0.image === buffer })
-  }
-
-  /// Until the surfaces move to MonitorKit, the bridge keeps MonitorTools'
-  /// routing: a source-only offer reaches a Source-stage surface only, a paired
-  /// offer an Output-stage one only, and Program (always Output) takes its
-  /// frame as its own output, once per frame.
-  @MainActor func testMonitorToolsBridgeRoutesOffersByStage() throws {
-    func buffer(_ width: Int, _ height: Int) throws -> CVPixelBuffer {
-      var made: CVPixelBuffer?
-      XCTAssertEqual(
-        CVPixelBufferCreate(
-          nil, width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-          [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &made), kCVReturnSuccess)
-      return try XCTUnwrap(made)
-    }
-    let image = try buffer(64, 36)
-    let processed = try buffer(32, 18)
-    let runtime = MonitorRuntime(sharedDevice: { nil })
-    let cases: [(String, MonitorStage, sourceOnly: UInt64, paired: UInt64)] = [
-      ("bridge-source", .source, 3, 0), ("bridge-output", .processedOutput, 0, 3),
-      ("program", .source, 0, 3),
-    ]
-    for (target, stage, sourceOnly, paired) in cases {
-      let sink = MonitorCaptureSink(target: MonitorTargetID(target))
-      let presenter = MonitorSurfacePresenter(runtime: runtime)
-      var configuration = MonitorConfiguration()
-      configuration.pictureStage = stage
-      configuration.scopeStage = stage
-      sink.configure(configuration, consumers: [presenter], scopeVisible: false)
-      let endpoint: any MonitorFrameSink = sink
-      XCTAssertEqual(endpoint.needsOutput, stage == .processedOutput || target == "program", target)
-      for sequence in UInt64(1)...3 {
-        endpoint.offer(
-          image, pts: CMTime(value: CMTimeValue(sequence), timescale: 60), captureGeneration: 1,
-          sequence: sequence)
-      }
-      XCTAssertEqual(presenter.statistics.acceptedFrames, sourceOnly, target)
-      for sequence in UInt64(4)...6 {
-        endpoint.offer(
-          source: image, output: target == "program" ? image : processed,
-          pts: CMTime(value: CMTimeValue(sequence), timescale: 60), captureGeneration: 1,
-          sequence: sequence, processingRevision: 1,
-          outputScale: target == "program" ? nil : (0.5, 0.5))
-      }
-      XCTAssertEqual(presenter.statistics.acceptedFrames, sourceOnly + paired, target)
-      XCTAssertEqual(presenter.currentStamp?.sequence, paired > 0 ? 6 : 3, target)
-    }
   }
 
 }

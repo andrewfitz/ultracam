@@ -1,5 +1,4 @@
 import AppKit
-import MonitorToolsCore
 import SwiftUI
 
 struct UIInput: Identifiable, Sendable, Equatable {
@@ -11,14 +10,20 @@ struct UIInput: Identifiable, Sendable, Equatable {
 /// its native preview and other cameras through monitor surfaces; fixtures
 /// draw a stand-in so screens can be rendered and tested without hardware.
 @MainActor protocol UIPictureProviding {
-  func picture(cameraID: String, compact: Bool) -> AnyView
+  /// `zoom` magnifies the picture about its centre (1 is Fit), in this view only.
+  func picture(cameraID: String, compact: Bool, zoom: Double) -> AnyView
   func programPicture() -> AnyView
 }
 
-/// Per-camera monitor tool settings.
+extension UIPictureProviding {
+  func picture(cameraID: String, compact: Bool) -> AnyView { picture(cameraID: cameraID, compact: compact, zoom: 1) }
+}
+
+/// Per-camera monitor tool settings: MonitorKit tool state, the camera's signal
+/// declaration and its scopes.
 @MainActor protocol UIMonitorSettingsProviding {
-  func configuration(for cameraID: String) -> MonitorConfiguration
-  func setConfiguration(_ configuration: MonitorConfiguration, for cameraID: String)
+  func preferences(for cameraID: String) -> MonitorFeedPreferences
+  func setPreferences(_ preferences: MonitorFeedPreferences, for cameraID: String)
 }
 
 /// Everything a view in the new interface needs: the derived presentation,
@@ -69,8 +74,8 @@ extension EnvironmentValues {
 
 /// A stand-in picture: a soft gradient with the camera's name, never a real frame.
 @MainActor struct UIFixturePictures: UIPictureProviding {
-  func picture(cameraID: String, compact: Bool) -> AnyView {
-    AnyView(UIFixturePicture(seed: cameraID))
+  func picture(cameraID: String, compact: Bool, zoom: Double) -> AnyView {
+    AnyView(UIFixturePicture(seed: cameraID).scaleEffect(max(1, zoom)).clipped())
   }
   func programPicture() -> AnyView { AnyView(UIFixturePicture(seed: "program")) }
 }
@@ -87,18 +92,18 @@ struct UIFixturePicture: View {
 }
 
 @MainActor final class UIFixtureMonitorSettings: UIMonitorSettingsProviding {
-  private var values: [String: MonitorConfiguration] = [:]
+  private var values: [String: MonitorFeedPreferences] = [:]
   init(session: UISessionSnapshot) {
     for camera in session.cameras {
-      var configuration = MonitorConfiguration()
+      var preferences = MonitorFeedPreferences()
       for tool in camera.activeTools {
-        configuration = UIMonitorBridge.toggled(tool, in: configuration)
+        preferences = UIMonitorBridge.toggled(tool, in: preferences)
       }
-      values[camera.id] = configuration
+      values[camera.id] = preferences
     }
   }
-  func configuration(for cameraID: String) -> MonitorConfiguration { values[cameraID] ?? MonitorConfiguration() }
-  func setConfiguration(_ configuration: MonitorConfiguration, for cameraID: String) { values[cameraID] = configuration }
+  func preferences(for cameraID: String) -> MonitorFeedPreferences { values[cameraID] ?? MonitorFeedPreferences() }
+  func setPreferences(_ preferences: MonitorFeedPreferences, for cameraID: String) { values[cameraID] = preferences }
 }
 
 /// Representative sessions for every screen. Tests and the offscreen renderer use these.

@@ -1,4 +1,6 @@
-import MonitorToolsCore
+import MonitorKitCore
+import MonitorKitScopes
+import MonitorKitUI
 import SwiftUI
 
 /// Split-button monitor tools for one camera: the icon toggles the tool, the
@@ -126,14 +128,14 @@ private struct UIMonitorToolSplitButton: View {
   }
 }
 
-/// Settings for one monitor tool, bound to the camera's monitor configuration.
+/// Settings for one monitor tool, bound to the camera's monitor preferences.
 struct UIMonitorToolSettingsView: View {
   let tool: UIMonitorTool
   let cameraID: String
   let cameraName: String
   let isProgram: Bool
   let provider: any UIMonitorSettingsProviding
-  @State private var configuration: MonitorConfiguration
+  @State private var preferences: MonitorFeedPreferences
 
   init(tool: UIMonitorTool, cameraID: String, cameraName: String, isProgram: Bool, provider: any UIMonitorSettingsProviding) {
     self.tool = tool
@@ -141,7 +143,7 @@ struct UIMonitorToolSettingsView: View {
     self.cameraName = cameraName
     self.isProgram = isProgram
     self.provider = provider
-    _configuration = State(initialValue: provider.configuration(for: cameraID))
+    _preferences = State(initialValue: provider.preferences(for: cameraID))
   }
 
   static func unavailableReason(_ tool: UIMonitorTool, isProgram: Bool) -> String? {
@@ -170,100 +172,122 @@ struct UIMonitorToolSettingsView: View {
     .padding(14)
     .frame(width: 320)
     .controlSize(.small)
-    .onChange(of: configuration) { _, value in provider.setConfiguration(value, for: cameraID) }
+    .onChange(of: preferences) { _, value in provider.setPreferences(value, for: cameraID) }
   }
 
   @ViewBuilder private var settings: some View {
     switch tool {
     case .guides:
-      Toggle("Guides", isOn: binding(\.guides.enabled))
-      Toggle("Rule of thirds", isOn: $configuration.guides.thirds)
-      Toggle("Center cross", isOn: $configuration.guides.centerCross)
-      Toggle("Safe area", isOn: $configuration.guides.safeArea)
-      slider("Opacity", value: $configuration.guides.opacity, range: 0...1, percent: true)
-      slider("Contrast", value: $configuration.guides.contrast, range: 0...1, percent: true)
+      Toggle("Guides", isOn: binding(\.state.guides.enabled))
+      Toggle("Rule of thirds", isOn: $preferences.state.guides.thirds)
+      Toggle("Center cross", isOn: $preferences.state.guides.centerCross)
+      Toggle("Safe area", isOn: safeArea)
+      slider("Opacity", value: $preferences.state.guides.opacity, range: 0...1, percent: true)
+      slider("Contrast", value: $preferences.state.guides.contrast, range: 0...1, percent: true)
     case .zebra:
-      Toggle("Zebra", isOn: binding(\.zebra.enabled))
-      Picker("Mode", selection: $configuration.zebra.mode) {
-        Text("Above threshold").tag(MonitorZebraMode.aboveThreshold)
-        Text("Band").tag(MonitorZebraMode.band)
+      Toggle("Zebra", isOn: binding(\.state.zebras[0].enabled))
+      Picker("Mode", selection: $preferences.state.zebras[0].mode) {
+        Text("Above threshold").tag(ZebraMode.lowerLimit)
+        Text("Band").tag(ZebraMode.band)
       }
-      slider("Threshold", value: $configuration.zebra.thresholdIRE, range: 0...109, suffix: " IRE")
-      slider("Width", value: $configuration.zebra.widthIRE, range: 0...30, suffix: " IRE")
-        .disabled(configuration.zebra.mode != .band)
-      slider("Opacity", value: $configuration.zebra.opacity, range: 0...1, percent: true)
-      if configuration.falseColor.mode != .off {
+      slider("Threshold", value: $preferences.state.zebras[0].level, range: 0...109, suffix: " IRE")
+      // The band's full width; MonitorKit keeps its half-width (`range`).
+      slider("Width", value: Binding(get: { preferences.state.zebras[0].range * 2 },
+        set: { preferences.state.zebras[0].range = $0 / 2 }), range: 0...30, suffix: " IRE")
+        .disabled(preferences.state.zebras[0].mode != .band)
+      slider("Opacity", value: $preferences.state.zebras[0].opacity, range: 0...1, percent: true)
+      if preferences.state.falseColor.mode != .off {
         Text("Zebra is bypassed while false color is on.").font(.uiMeta).foregroundStyle(.secondary)
       }
     case .falseColor:
       falseColorSettings
     case .focus:
-      Toggle("Focus peaking", isOn: binding(\.focus.enabled))
-      Picker("Highlight", selection: $configuration.focus.color) {
-        ForEach(MonitorPeakingColor.allCases, id: \.self) { color in
+      Toggle("Focus peaking", isOn: binding(\.state.focus.enabled))
+      Picker("Highlight", selection: $preferences.state.focus.color) {
+        ForEach(PeakingColor.allCases, id: \.self) { color in
           Text(color.rawValue.capitalized).tag(color)
         }
       }
-      slider("Sensitivity", value: $configuration.focus.sensitivity, range: 0...1, percent: true)
-      slider("Noise rejection", value: $configuration.focus.noiseRejection, range: 0...1, percent: true)
-      slider("Opacity", value: $configuration.focus.opacity, range: 0...1, percent: true)
+      slider("Sensitivity", value: $preferences.state.focus.sensitivity, range: 0...1, percent: true)
+      slider("Noise rejection", value: $preferences.state.focus.noiseRejection, range: 0...1, percent: true)
+      slider("Opacity", value: $preferences.state.focus.opacity, range: 0...1, percent: true)
       Text("Edges are found on the camera's source picture at full resolution.")
         .font(.uiMeta).foregroundStyle(.secondary)
     case .scopes:
       Toggle("Scope", isOn: binding(\.scopes.enabled))
-      Picker("Type", selection: $configuration.scopes.mode) {
-        Text("RGB parade").tag(MonitorScopeMode.rgbParade)
-        Text("Luma waveform").tag(MonitorScopeMode.lumaWaveform)
+      Picker("Type", selection: $preferences.scopes.settings.waveformMode) {
+        Text("RGB parade").tag(WaveformMode.rgbParade)
+        Text("Luma waveform").tag(WaveformMode.luma)
+        if preferences.scopes.settings.waveformMode != .rgbParade && preferences.scopes.settings.waveformMode != .luma {
+          Text(preferences.scopes.title).tag(preferences.scopes.settings.waveformMode).disabled(true)
+        }
       }
-      Picker("Signal", selection: $configuration.scopeStage) {
-        Text("Source").tag(MonitorStage.source).disabled(isProgram)
-        Text("Output").tag(MonitorStage.processedOutput)
+      Picker("Signal", selection: $preferences.scopes.settings.stage) {
+        Text("Source").tag(SignalStage.source).disabled(isProgram)
+        Text("Output (LUT)").tag(SignalStage.output)
+        if preferences.scopes.settings.stage == .monitor {
+          Text("Monitor").tag(SignalStage.monitor)
+        }
       }
-      Picker("Refresh", selection: $configuration.scopes.refreshHz) {
-        ForEach([10, 15, 30], id: \.self) { Text("\($0) Hz").tag($0) }
+      Picker("Refresh", selection: $preferences.scopes.refreshHz) {
+        ForEach(MonitorScopePreferences.refreshRates, id: \.self) { Text("\($0) Hz").tag($0) }
       }
-      slider("Trace gain", value: $configuration.scopes.gain, range: 0.25...4, suffix: "×")
-      Toggle("Graticule", isOn: $configuration.scopes.graticule)
-      Text("One scope per camera. Sampled signal, −10…110 IRE.").font(.uiMeta).foregroundStyle(.secondary)
+      slider("Trace gain", value: $preferences.scopes.settings.display.gain, range: 0.25...4, suffix: "×")
+      Toggle("Graticule", isOn: $preferences.scopes.settings.display.showsGraticule)
+      Text("One scope per camera. Every pixel, \(preferences.scopes.ireScale.rangeText) IRE.")
+        .font(.uiMeta).foregroundStyle(.secondary)
     }
   }
 
+  /// MonitorTools' one safe area, 5% in from each edge: MonitorKit's 90% area.
+  private var safeArea: Binding<Bool> {
+    Binding(
+      get: { preferences.state.guides.safeAreas.contains(90) },
+      set: { on in
+        var areas = preferences.state.guides.safeAreas.filter { $0 != 90 }
+        if on { areas.append(90) }
+        preferences.state.guides.safeAreas = areas
+      })
+  }
+
   @ViewBuilder private var falseColorSettings: some View {
-    let sonySource = SonySLog3FalseColor.supports(sourceProfileID: configuration.sourceProfileID)
-    let elZoneAvailable = !isProgram && ELZoneProfile.supports(sourceProfileID: configuration.sourceProfileID)
+    let profile = preferences.signal.logProfileID
+    let sonySource = SonySLog3FalseColor.supports(sourceProfileID: profile)
+    let elZoneAvailable = !isProgram && ELZoneProfile.supports(sourceProfileID: profile)
+    let mode = preferences.state.falseColor.mode
     Picker("Mode", selection: falseColorMode) {
-      Text("Off").tag(MonitorFalseColorMode.off)
-      Text("Sony S-Log3").tag(MonitorFalseColorMode.sonySLog3).disabled(isProgram || !sonySource)
-      Text("EL Zone").tag(MonitorFalseColorMode.elZone).disabled(!elZoneAvailable)
-      if configuration.falseColor.mode == .arri {
-        Text("Unsupported saved mode").tag(MonitorFalseColorMode.arri).disabled(true)
+      Text("Off").tag(FalseColorMode.off)
+      Text("Sony S-Log3").tag(FalseColorMode.sonySLog3).disabled(isProgram || !sonySource)
+      Text("EL Zone").tag(FalseColorMode.elZone).disabled(!elZoneAvailable)
+      if mode != .off && mode != .sonySLog3 && mode != .elZone {
+        Text("Unsupported saved mode").tag(mode).disabled(true)
       }
     }
     Picker("Camera / Log", selection: sourceProfile) {
-      if configuration.sourceProfileID != "" { Text("Unknown").tag("") }
+      if profile != "" { Text("Unknown").tag("") }
       Text("Sony S-Gamut3.Cine / S-Log3").tag("sony-slog3-sgamut3cine")
       Text("Sony S-Gamut3 / S-Log3").tag("sony-slog3-sgamut3")
-      if let source = configuration.sourceProfileID, !SonySLog3FalseColor.supports(sourceProfileID: source) {
-        Text("Unsupported saved input").tag(source).disabled(true)
+      if let profile, !SonySLog3FalseColor.supports(sourceProfileID: profile) {
+        Text("Unsupported saved input").tag(profile).disabled(true)
       }
     }
-    Picker("Input code range", selection: $configuration.sourceCodeRange) {
-      Text("Format native / unspecified").tag(Optional<MonitorCodeRange>.none)
-      Text("Legal (64…940 at 10-bit)").tag(Optional(MonitorCodeRange.legal))
-      Text("Full (0…1023 at 10-bit)").tag(Optional(MonitorCodeRange.full))
+    Picker("Input code range", selection: $preferences.signal.range) {
+      Text("Format native / unspecified").tag(Optional<CodeRange>.none)
+      Text("Legal (64…940 at 10-bit)").tag(Optional(CodeRange.legal))
+      Text("Full (0…1023 at 10-bit)").tag(Optional(CodeRange.full))
     }
-    Picker("Log transport", selection: $configuration.sourceLogMapping) {
-      Text("Declared native 10-bit codes").tag(MonitorSourceLogMapping.native10Bit)
-      Text("Full codes rescaled to legal").tag(MonitorSourceLogMapping.fullRescaledToLegal10Bit)
+    Picker("Log transport", selection: $preferences.signal.transport) {
+      Text("Declared native 10-bit codes").tag(LogTransport.native)
+      Text("Full codes rescaled to legal").tag(LogTransport.fullRescaledToLegal)
     }
-    if configuration.falseColor.mode == .elZone {
-      Stepper(value: $configuration.falseColor.referenceOffsetStops, in: -10...10, step: 0.25) {
-        Text("Exposure offset \(configuration.falseColor.referenceOffsetStops, specifier: "%+.2f") stops")
+    if mode == .elZone {
+      Stepper(value: $preferences.state.falseColor.referenceOffsetStops, in: -6...6, step: 0.25) {
+        Text("Exposure offset \(preferences.state.falseColor.referenceOffsetStops, specifier: "%+.2f") stops")
       }
       .disabled(!elZoneAvailable)
       .help("Adds stops to measured source exposure. Camera EI is independent.")
     }
-    Text(configuration.falseColor.mode == .elZone
+    Text(mode == .elZone
       ? (elZoneAvailable ? "Public-chart mapping. Sony Monitor & Control match not tested." : "EL Zone needs a supported Sony S-Log3 source.")
       : sonySource ? "Sony source IRE thresholds are independent of EI and don't guarantee sensor clipping."
         : "Choose the Sony S-Log3 profile that matches the camera.")
@@ -273,66 +297,34 @@ struct UIMonitorToolSettingsView: View {
   }
 
   /// Enabling a tool from its settings also turns the camera's tools on.
-  private func binding(_ keyPath: WritableKeyPath<MonitorConfiguration, Bool>) -> Binding<Bool> {
+  private func binding(_ keyPath: WritableKeyPath<MonitorFeedPreferences, Bool>) -> Binding<Bool> {
     Binding(
-      get: { configuration.toolsEnabled && configuration[keyPath: keyPath] },
+      get: { preferences.toolsEnabled && preferences[keyPath: keyPath] },
       set: { on in
-        var next = configuration
-        if on && !next.toolsEnabled {
-          next.guides.enabled = false; next.zebra.enabled = false; next.focus.enabled = false
-          next.scopes.enabled = false; next.falseColor.mode = .off
-        }
+        var next = preferences
+        if on && !next.toolsEnabled { next.hideAllTools() }
         next[keyPath: keyPath] = on
-        next.toolsEnabled = next.guides.enabled || next.zebra.enabled || next.focus.enabled
-          || next.scopes.enabled || next.falseColor.mode != .off
-        configuration = next
+        next.toolsEnabled = next.anyToolOn
+        preferences = next
       })
   }
 
-  private var falseColorMode: Binding<MonitorFalseColorMode> {
+  private var falseColorMode: Binding<FalseColorMode> {
     Binding(
-      get: { configuration.toolsEnabled ? configuration.falseColor.mode : .off },
+      get: { preferences.toolsEnabled ? preferences.state.falseColor.mode : .off },
       set: { mode in
-        var next = configuration
-        if mode != .off && !next.toolsEnabled {
-          next.guides.enabled = false; next.zebra.enabled = false; next.focus.enabled = false
-          next.scopes.enabled = false
-        }
-        next.falseColor.mode = mode
-        if mode == .sonySLog3, SonySLog3FalseColor.supports(sourceProfileID: next.sourceProfileID) {
-          next.falseColor.profileID = SonySLog3FalseColor.profileID
-          next.falseColor.specificationVersion = SonySLog3FalseColor.specificationVersion
-        } else if mode == .elZone, ELZoneProfile.supports(sourceProfileID: next.sourceProfileID) {
-          next.falseColor.profileID = ELZoneProfile.profileID
-          next.falseColor.specificationVersion = ELZoneProfile.specificationVersion
-        }
-        next.toolsEnabled = next.guides.enabled || next.zebra.enabled || next.focus.enabled
-          || next.scopes.enabled || next.falseColor.mode != .off
-        configuration = next
+        var next = preferences
+        if mode != .off && !next.toolsEnabled { next.hideAllTools() }
+        next.state.falseColor.mode = mode
+        next.toolsEnabled = next.anyToolOn
+        preferences = next
       })
   }
 
   private var sourceProfile: Binding<String> {
     Binding(
-      get: { configuration.sourceProfileID ?? "" },
-      set: { value in
-        var next = configuration
-        next.sourceProfileID = value.isEmpty ? nil : value
-        if SonySLog3FalseColor.supports(sourceProfileID: value) {
-          if next.falseColor.mode == .elZone {
-            next.falseColor.profileID = ELZoneProfile.profileID
-            next.falseColor.specificationVersion = ELZoneProfile.specificationVersion
-          } else {
-            next.falseColor.profileID = SonySLog3FalseColor.profileID
-            next.falseColor.specificationVersion = SonySLog3FalseColor.specificationVersion
-          }
-          if next.falseColor.mode == .arri { next.falseColor.mode = .sonySLog3 }
-        } else {
-          next.falseColor.profileID = nil
-          next.falseColor.specificationVersion = nil
-        }
-        configuration = next
-      })
+      get: { preferences.signal.logProfileID ?? "" },
+      set: { value in preferences.signal.logProfileID = value.isEmpty ? nil : value })
   }
 
   private func slider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>,

@@ -1,5 +1,4 @@
-import MonitorToolsCore
-import MonitorToolsUI
+import MonitorKitCore
 import SwiftUI
 
 /// One camera: its picture with overlays, then its channel strip.
@@ -60,8 +59,7 @@ struct UICameraPictureView: View {
 
   var body: some View {
     ZStack {
-      context.pictures.picture(cameraID: camera.id, compact: compact)
-        .modifier(MonitorPictureZoom(zoom))
+      context.pictures.picture(cameraID: camera.id, compact: compact, zoom: zoom)
         .accessibilityElement()
         .accessibilityLabel(camera.accessibilityLabel)
         .accessibilityAddTraits(.isButton)
@@ -266,21 +264,22 @@ struct UICameraPictureView: View {
   }
 
   private var signalMenu: some View {
-    let stage = context.monitor.configuration(for: camera.id).pictureStage
+    let stage = context.monitor.preferences(for: camera.id).state.pictureStage
     return Menu {
       Picker("Picture", selection: Binding(
-        get: { context.monitor.configuration(for: camera.id).pictureStage },
+        get: { context.monitor.preferences(for: camera.id).state.pictureStage },
         set: { value in
-          var next = context.monitor.configuration(for: camera.id)
-          next.pictureStage = value
-          context.monitor.setConfiguration(next, for: camera.id)
+          var next = context.monitor.preferences(for: camera.id)
+          next.state.pictureStage = value
+          context.monitor.setPreferences(next, for: camera.id)
         })) {
-        Text("Output (as published)").tag(MonitorStage.processedOutput)
-        Text("Source (camera signal)").tag(MonitorStage.source)
+        Text("Source (camera signal)").tag(SignalStage.source)
+        Text("Output (LUT)").tag(SignalStage.output)
+        Text("Monitor").tag(SignalStage.monitor)
       }
       .pickerStyle(.inline)
     } label: {
-      Text(stage == .source ? "Source" : "Output").font(.uiOverlay)
+      Text(Self.stageTitle(stage)).font(.uiOverlay)
     }
     .menuStyle(.borderlessButton)
     .menuIndicator(.visible)
@@ -288,7 +287,15 @@ struct UICameraPictureView: View {
     .uiPictureOverlay()
     .help("Choose what this picture shows")
     .accessibilityLabel("Picture signal")
-    .accessibilityValue(stage == .source ? "Source" : "Output")
+    .accessibilityValue(Self.stageTitle(stage))
+  }
+
+  static func stageTitle(_ stage: SignalStage) -> String {
+    switch stage {
+    case .source: return "Source"
+    case .output: return "Output"
+    case .monitor: return "Monitor"
+    }
   }
 
   private var viewControls: some View {

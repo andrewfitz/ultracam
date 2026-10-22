@@ -1,8 +1,7 @@
 import AppKit
 import AVFoundation
 import CoreMediaIO
-import MonitorToolsCore
-import MonitorToolsUI
+import MonitorKitCore
 
 /// Recording destinations: free space, time left and recent takes.
 enum UIRecordingLibrary {
@@ -87,12 +86,6 @@ enum UIRecordingLibrary {
 enum UIMonitorBridge {
   /// Presenters of the pictures currently on screen, so menu commands can act on the selected camera.
   private static var presenters: [String: MonitorSurfacePresenter] = [:]
-  /// Cameras whose picture is currently the native preview (freeze then waits for the next frame).
-  private static var nativePreview: Set<String> = []
-
-  static func setUsesNativePreview(_ native: Bool, cameraID: String) {
-    if native { nativePreview.insert(cameraID) } else { nativePreview.remove(cameraID) }
-  }
 
   static func register(_ presenter: MonitorSurfacePresenter, cameraID: String) { presenters[cameraID] = presenter }
   static func unregister(cameraID: String, presenter: MonitorSurfacePresenter) {
@@ -100,67 +93,58 @@ enum UIMonitorBridge {
   }
   static func presenter(for cameraID: String) -> MonitorSurfacePresenter? { presenters[cameraID] }
 
-  static func activeTools(_ configuration: MonitorConfiguration) -> Set<UIMonitorTool> {
-    guard configuration.toolsEnabled else { return [] }
+  /// The tools shown as on: none while the master switch is off.
+  static func activeTools(_ preferences: MonitorFeedPreferences) -> Set<UIMonitorTool> {
+    guard preferences.toolsEnabled else { return [] }
+    let state = preferences.state
     var tools: Set<UIMonitorTool> = []
-    if configuration.guides.enabled { tools.insert(.guides) }
-    if configuration.zebra.enabled { tools.insert(.zebra) }
-    if configuration.falseColor.mode != .off { tools.insert(.falseColor) }
-    if configuration.focus.enabled { tools.insert(.focus) }
-    if configuration.scopes.enabled { tools.insert(.scopes) }
+    if state.guides.enabled { tools.insert(.guides) }
+    if state.zebras.first?.enabled == true { tools.insert(.zebra) }
+    if state.falseColor.mode != .off { tools.insert(.falseColor) }
+    if state.focus.enabled { tools.insert(.focus) }
+    if preferences.scopes.enabled { tools.insert(.scopes) }
     return tools
   }
 
-  /// Turns one tool on or off. The configuration's master switch follows the
-  /// tools: it is on while any tool is on.
-  /// Source profile for a camera's declared LUT input, used when false color
-  /// is turned on before a source profile was chosen.
+  /// Source profile for a camera's declared LUT input, used when false color is
+  /// turned on before a source profile was chosen.
   static func sourceProfile(forGamut gamut: String) -> String {
     gamut.contains("Cine") ? "sony-slog3-sgamut3cine" : "sony-slog3-sgamut3"
   }
 
-  static func toggled(_ tool: UIMonitorTool, in configuration: MonitorConfiguration,
-    defaultSourceProfile: String? = nil) -> MonitorConfiguration {
-    var next = configuration
-    let active = activeTools(configuration).contains(tool)
-    if !configuration.toolsEnabled {
-      // Turning tools back on must not resurrect tools that were left enabled underneath.
-      next.guides.enabled = false
-      next.zebra.enabled = false
-      next.focus.enabled = false
-      next.scopes.enabled = false
-      next.falseColor.mode = .off
-    }
+  /// Turns one tool on or off. The master switch follows the tools: it is on
+  /// while any tool is on, and turning tools back on never resurrects tools that
+  /// were left enabled underneath it.
+  static func toggled(_ tool: UIMonitorTool, in preferences: MonitorFeedPreferences,
+    defaultSourceProfile: String? = nil) -> MonitorFeedPreferences {
+    var next = preferences
+    let active = activeTools(preferences).contains(tool)
+    if !preferences.toolsEnabled { next.hideAllTools() }
     switch tool {
-    case .guides: next.guides.enabled = !active
-    case .zebra: next.zebra.enabled = !active
+    case .guides: next.state.guides.enabled = !active
+    case .zebra: next.state.zebras[0].enabled = !active
     case .falseColor:
       if active {
-        next.falseColor.mode = .off
+        next.state.falseColor.mode = .off
       } else {
-        if next.sourceProfileID == nil, let defaultSourceProfile { next.sourceProfileID = defaultSourceProfile }
-        if SonySLog3FalseColor.supports(sourceProfileID: next.sourceProfileID) {
-          next.falseColor.mode = .sonySLog3
-          next.falseColor.profileID = SonySLog3FalseColor.profileID
-          next.falseColor.specificationVersion = SonySLog3FalseColor.specificationVersion
-        } else if ELZoneProfile.supports(sourceProfileID: next.sourceProfileID) {
-          next.falseColor.mode = .elZone
-          next.falseColor.profileID = ELZoneProfile.profileID
-          next.falseColor.specificationVersion = ELZoneProfile.specificationVersion
+        if next.signal.logProfileID == nil, let defaultSourceProfile { next.signal.logProfileID = defaultSourceProfile }
+        if SonySLog3FalseColor.supports(sourceProfileID: next.signal.logProfileID) {
+          next.state.falseColor.mode = .sonySLog3
+        } else if ELZoneProfile.supports(sourceProfileID: next.signal.logProfileID) {
+          next.state.falseColor.mode = .elZone
         }
       }
-    case .focus: next.focus.enabled = !active
+    case .focus: next.state.focus.enabled = !active
     case .scopes: next.scopes.enabled = !active
     }
-    next.toolsEnabled = next.guides.enabled || next.zebra.enabled || next.falseColor.mode != .off ||
-      next.focus.enabled || next.scopes.enabled
+    next.toolsEnabled = next.anyToolOn
     return next
   }
 
   static func toggle(_ tool: UIMonitorTool, for cameraID: String, coordinator: MonitorCoordinator,
     defaultSourceProfile: String? = nil) {
     let target = MonitorTargetID(cameraID)
-    coordinator.setConfiguration(toggled(tool, in: coordinator.configuration(for: target),
+    coordinator.setPreferences(toggled(tool, in: coordinator.preferences(for: target),
       defaultSourceProfile: defaultSourceProfile), for: target)
   }
 
@@ -168,9 +152,7 @@ enum UIMonitorBridge {
     switch action {
     case .freeze(let id):
       guard let presenter = presenters[id] else { return }
-      if presenter.isFreezePending { presenter.cancelPendingFreeze() }
-      else if !presenter.isFrozen && nativePreview.contains(id) { presenter.requestFreezeOnNextFrame() }
-      else { presenter.toggleFreeze() }
+      if presenter.isFreezePending { presenter.cancelPendingFreeze() } else { presenter.toggleFreeze() }
     case .toggleClean(let id):
       presenters[id]?.toggleClean()
     case .detachMonitor(let id):
@@ -178,6 +160,26 @@ enum UIMonitorBridge {
     default:
       break
     }
+  }
+}
+
+extension MonitorFeedPreferences {
+  /// Whether a tool the master switch shows is on (clip indicators are set in a
+  /// detached monitor's tool bar).
+  var anyToolOn: Bool {
+    state.guides.enabled || state.zebras.first?.enabled == true || state.falseColor.mode != .off
+      || state.focus.enabled || scopes.enabled || state.clipIndicators.enabled
+  }
+
+  /// Every tool the master switch shows, off: what turning the switch back on
+  /// starts from, so tools left enabled underneath it stay off.
+  mutating func hideAllTools() {
+    state.guides.enabled = false
+    state.zebras[0].enabled = false
+    state.focus.enabled = false
+    state.falseColor.mode = .off
+    state.clipIndicators.enabled = false
+    scopes.enabled = false
   }
 }
 

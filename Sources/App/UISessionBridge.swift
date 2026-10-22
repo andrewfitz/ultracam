@@ -1,5 +1,4 @@
 import AppKit
-import MonitorToolsCore
 import SwiftUI
 
 enum UISideColumn: Sendable { case sidebar, inspector }
@@ -140,7 +139,7 @@ struct UISessionBridge {
         camera.audio = UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
           peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight)
       }
-      let monitor = model.monitorCoordinator.configuration(for: MonitorTargetID(id.rawValue))
+      let monitor = model.monitorCoordinator.preferences(for: MonitorTargetID(id.rawValue))
       camera.activeTools = UIMonitorBridge.activeTools(monitor)
       camera.message = update?.message ?? ""
       var rec = UICameraRecording()
@@ -377,7 +376,7 @@ struct UISessionBridge {
         defaultSourceProfile: UIMonitorBridge.sourceProfile(forGamut: gamut))
     case .freeze, .toggleClean, .detachMonitor: UIMonitorBridge.perform(action, coordinator: model.monitorCoordinator)
     case .resetMonitorTools(let id):
-      model.monitorCoordinator.setConfiguration(MonitorConfiguration(), for: MonitorTargetID(id))
+      model.monitorCoordinator.resetSettings(for: MonitorTargetID(id))
     case .copyMonitorSettings(let from, let to):
       model.monitorCoordinator.copySettings(from: MonitorTargetID(from), to: MonitorTargetID(to))
     case .installCameraExtension: model.installer.install()
