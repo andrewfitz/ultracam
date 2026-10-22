@@ -430,6 +430,8 @@ final class SourceRecorderCore: @unchecked Sendable {
   private var spaceTimer: DispatchSourceTimer?
   /// Space-check timer state (utility queue only).
   private var lastSpaceCheck: (time: TimeInterval, acceptedBytes: UInt64)?
+  /// What a paused or failed take last reported it still owes. Timer queue.
+  private var reportedOwedBytes: UInt64?
 
   init(configuration: SourceRecordingConfiguration, writerFactory: @escaping WriterFactory) throws {
     self.configuration = configuration
@@ -696,9 +698,13 @@ final class SourceRecorderCore: @unchecked Sendable {
         self.stateLock.withLock {
           if kind == .video { self.telemetryValue.droppedVideo &+= 1 } else { self.telemetryValue.droppedAudio &+= 1 }
           if case .writerNotReady = failure {
-            // Only a late (out-of-order) audio packet reports this now.
+            // Only a late (out-of-order) audio packet reports this now. It
+            // never replaces the reason a take already failed for: after an
+            // input restart the restarted audio arrives late too.
             self.telemetryValue.droppedWriterNotReady &+= 1
-            self.telemetryValue.lastError = failure.localizedDescription
+            if self.telemetryValue.state != .failed {
+              self.telemetryValue.lastError = failure.localizedDescription
+            }
           } else {
             self.telemetryValue.droppedAppendFailure &+= 1
             self.telemetryValue.writerErrors &+= 1
@@ -820,20 +826,36 @@ final class SourceRecorderCore: @unchecked Sendable {
     return UInt64(min(headroom, Double(UInt64.max / 2)))
   }
 
+  /// Media the take accepted that isn't on disk yet: encoded bytes in memory
+  /// and frames still being encoded. Nothing, once the file writer failed.
+  /// Timer queue only.
+  func owedBytes() -> UInt64 {
+    guard !writer.hasFailed else { return 0 }
+    let writerSnapshot = writer.telemetry
+    let rawFrames = stateLock.withLock { pendingVideo } + writerSnapshot.encoderPendingFrames
+    let frameBytes = configuration.nominalBytesPerSecond * configuration.frameRate.frameDuration.seconds
+    let owed = Double(writerSnapshot.bufferedBytes) + Double(rawFrames) * frameBytes
+    return UInt64(min(owed, Double(UInt64.max / 2)))
+  }
+
   private func runSpaceCheck(_ check: (UInt64) throws -> Void) {
     if writer.hasFailed { observeWriterFailure() }
     let state = stateLock.withLock { () -> SourceRecordingState in
       if telemetryValue.state == .recording { telemetryValue.spaceChecks &+= 1 }
       return telemetryValue.state
     }
-    if state == .failed {
-      // A failed take writes nothing more of its own: withdraw its headroom
-      // so it stops holding free space other feeds on the volume need. Its
-      // file and reservation stay until Stop.
-      try? check(0)
-      stopSpaceChecks()
+    if state == .failed || state == .paused {
+      // Nothing new is accepted, but what already was is still being written:
+      // the take holds only that, so other feeds on the volume get the rest.
+      // A failed take stops checking once it is all on disk; its file and
+      // reservation stay until Stop.
+      let owed = owedBytes()
+      if owed != reportedOwedBytes { try? check(owed) }
+      reportedOwedBytes = owed
+      if state == .failed, owed == 0 { stopSpaceChecks() }
       return
     }
+    reportedOwedBytes = nil
     guard state == .recording else { return }
     do {
       try check(spaceHeadroom())

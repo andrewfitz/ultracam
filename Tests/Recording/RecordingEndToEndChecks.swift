@@ -1160,7 +1160,7 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertFalse(telemetry.lastError?.contains("moved backwards") == true)
     XCTAssertEqual(telemetry.droppedVideo, 1)
     XCTAssertTrue(waitUntil(2) { writer.videoSamples.count == 10 }, "Frames admitted before are still written")
-    // The failed take reports a headroom of 0 once, then stops checking.
+    // The failed take reports what it still owes until that is 0, then stops checking.
     XCTAssertTrue(waitUntil(2) { space.lastHeadroom == 0 })
     let calls = space.calls
     Thread.sleep(forTimeInterval: 0.3)

@@ -495,7 +495,8 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     do { handle?.synchronizeFile() }
     stateValue = .paused
-    if externalWriterOwnsFile { manager.clearHeadroom(for: ObjectIdentifier(self)) }
+    // An external writer's headroom stays until its recorder reports what it
+    // still owes (within a check interval): admitted media is still written.
   }
 
   public func resume() throws {
@@ -567,8 +568,12 @@ public final class RecordingOutputSession: @unchecked Sendable {
   public func checkExternalWriterCapacity(headroom: UInt64 = 0) throws {
     lock.lock(); defer { lock.unlock() }
     // Samples admitted just before a pause still reach the writer after the
-    // session is paused. Space is rechecked once recording resumes.
-    if externalWriterOwnsFile, stateValue == .paused { return }
+    // session is paused: record what they still need, unchecked. Space is
+    // rechecked once recording resumes, which restores the last full headroom.
+    if externalWriterOwnsFile, stateValue == .paused {
+      manager.setHeadroom(headroom, for: ObjectIdentifier(self))
+      return
+    }
     guard externalWriterOwnsFile, stateValue == .recording else {
       throw RecordingOutputError.invalidState(stateValue, operation: "check external writer space")
     }

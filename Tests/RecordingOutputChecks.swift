@@ -388,7 +388,7 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
 
   /// A paused take keeps its file but stops holding headroom its siblings
   /// need; resuming counts it again at once.
-  func testPausedTakeWithdrawsItsHeadroomUntilResume() throws {
+  func testPausedTakeHoldsOnlyWhatItStillOwesUntilResume() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let volumes = RecordingVolumeSpaceRegistry()
@@ -400,12 +400,15 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     try wide.checkExternalWriterCapacity(headroom: 600)
     XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 600))
     try wide.pause()
-    XCTAssertEqual(volumes.usage(for: root).headroom, 600, "Only the failed check's own claim remains")
+    XCTAssertEqual(volumes.usage(for: root).headroom, 1_200, "Paused, it holds its claim until it reports what it owes")
+    // Its recorder reports what is still being written; recorded, not checked.
+    XCTAssertNoThrow(try wide.checkExternalWriterCapacity(headroom: 100))
+    XCTAssertEqual(volumes.usage(for: root).headroom, 700)
     XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 600))
     try wide.resume()
-    XCTAssertEqual(volumes.usage(for: root).headroom, 1_200)
+    XCTAssertEqual(volumes.usage(for: root).headroom, 1_200, "Resume restores the last full headroom")
     XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 600))
-    // A failed recorder reports a headroom of 0 (see SourceRecorderCore).
+    // A failed recorder reports only what it still owes; here, nothing.
     try wide.checkExternalWriterCapacity(headroom: 0)
     XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 800))
     wide.preserveForRecovery()
