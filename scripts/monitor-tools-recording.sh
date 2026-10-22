@@ -19,8 +19,11 @@ mkdir -p "$TMPDIR" "$test_root/modules"
 python3 "$task_root/scripts/monitor-tools-fingerprint.py" capture "$test_root/source-manifest.json"
 source "$task_root/scripts/monitor-tools-package.sh"
 monitor_package_build > "$test_root/compile.log" 2>&1 || { cat "$test_root/compile.log"; exit 1; }
+# LUTProcessor.swift burns LUTs in with MonitorKit's MonitorLUT and mk_applyLUT.
+source "$task_root/scripts/monitor-kit-package.sh"
+monitor_kit_package_build >> "$test_root/compile.log" 2>&1 || { cat "$test_root/compile.log"; exit 1; }
 xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
-  "${monitor_link_args[@]}" "$task_root/Sources/Shared/VideoContract.swift" \
+  "${monitor_link_args[@]}" "${monitor_kit_link_args[@]}" "$task_root/Sources/Shared/VideoContract.swift" \
   "$task_root/Sources/Shared/VideoBufferLayout.swift" \
   "$task_root/Sources/App/LUTProcessor.swift" \
   "$task_root/Sources/App/AppResourceUsage.swift" "$task_root"/Sources/Recording/*.swift \

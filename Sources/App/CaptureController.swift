@@ -134,8 +134,10 @@ final class CaptureController: @unchecked Sendable {
   private var maxQueuedFrames = 0
   // The processor, for the watchdog and status (thread-safe accessors only).
   private var gpuProcessor: LUTProcessor?
-  // The LUT the processor burns in (once loaded), for the monitor's feed.
+  // The processor's loaded LUT, and whether the effective configuration burns
+  // it in (Apply LUT on, pipeline on), for the monitor's feed.
   private var loadedLUT: MonitorLUT?
+  private var burnInActive = false
   private var gpuStallReported = false
   private var rawAudioProvidesStats = false
   private var processedFrameHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
@@ -285,10 +287,19 @@ final class CaptureController: @unchecked Sendable {
     return try queue.sync(execute: body)
   }
 
-  /// The LUT this camera burns in when Apply LUT is on: the same immutable
-  /// `MonitorLUT` the app built for the load, so the monitor can show the
-  /// output stage with it (`MonitorFeed.burnInLUT`). Thread-safe.
-  var burnInLUT: MonitorLUT? { lock.withLock { loadedLUT } }
+  /// The LUT this camera burns in, nil while it burns none in (Apply LUT off,
+  /// LUT forgotten, complete bypass, nothing loaded): the same immutable
+  /// `MonitorLUT` the app built for the load, so the monitor's output stage
+  /// (`MonitorFeed.burnInLUT`) shows exactly what Program, recording and the
+  /// virtual camera get. Follows each configuration change. Thread-safe.
+  var burnInLUT: MonitorLUT? { lock.withLock { burnInActive ? loadedLUT : nil } }
+
+  /// Capture queue: publishes whether frames burn the loaded LUT in, as
+  /// `effectiveConfiguration` decides for each frame.
+  private func publishBurnIn() {
+    let active = pipelineEnabled && configuration.applyLUT
+    lock.withLock { burnInActive = active }
+  }
 
   /// Burns `lut` in from the next frame (no wait for frames in flight).
   /// `lut` must be on `LUTProcessor.sharedDevice`, tetrahedral (the app's only
@@ -353,6 +364,7 @@ final class CaptureController: @unchecked Sendable {
           options: [.userInitiated, .latencyCritical], reason: "Live UltraStudio video processing")
         self.configuration = configuration
         self.pipelineEnabled = pipelineEnabled
+        self.publishBurnIn()
         self.previewEnabled = previewEnabled
         self.activeConfiguration = nil
         self.activeInputType = nil
@@ -551,6 +563,7 @@ final class CaptureController: @unchecked Sendable {
       guard self.isAccepting(token) else { return }
       self.configuration = configuration
       self.pipelineEnabled = pipelineEnabled
+      self.publishBurnIn()
       self.monitorProcessingRevision &+= 1
       if !self.cameraConnected { self.reconnectRequested = true }
       self.applied = nil

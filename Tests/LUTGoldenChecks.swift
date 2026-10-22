@@ -363,37 +363,51 @@ import simd
   }
 
   /// Loading a LUT never waits for the GPU: frames already committed finish with
-  /// the LUT they were encoded with, later frames get the new one at once.
+  /// the LUT they were encoded with, which only those frames keep alive, and later
+  /// frames get the new one at once. Frame 0's completion is held on a gate, so
+  /// frames 0 and 1 are provably unfinished while the load runs; a load that
+  /// waited for them would hang until the gate timed out.
   func testLoadSwapsWithoutWaitingAndFramesInFlightKeepTheirLUT() throws {
     let processor = try LUTProcessor()
-    let invert = try LUTProcessor.makeLUT(CubeLUT(text: cubeText(transform: { 1 - $0 })))
     let square = try LUTProcessor.makeLUT(CubeLUT(text: cubeText(size: 17, transform: { $0 * $0 })))
-    try processor.load(invert)
+    weak var weakInvert: MonitorLUT?
+    do {
+      let invert = try LUTProcessor.makeLUT(CubeLUT(text: cubeText(transform: { 1 - $0 })))
+      weakInvert = invert
+      try processor.load(invert)
+    }
     let configuration = PipelineConfiguration(applyLUT: true, downscale: false, convertTo420: false)
     let source = try syntheticRamp()
     _ = try processor.process(source, configuration: configuration)
     final class Results: @unchecked Sendable {
       let lock = NSLock()
       var buffers: [Int: CVPixelBuffer] = [:]
+      var gateTimedOut = false
+      let gate = DispatchSemaphore(value: 0)
       let done = DispatchSemaphore(value: 0)
     }
     let results = Results()
     func submit(_ index: Int) throws {
       try processor.submit(source, configuration: configuration) { completed in
+        // Completions run in order on one queue: holding frame 0's holds them all.
+        if index == 0, results.gate.wait(timeout: .now() + 10) == .timedOut {
+          results.lock.withLock { results.gateTimedOut = true }
+        }
         results.lock.withLock { results.buffers[index] = try? completed.result.get() }
         results.done.signal()
       }
     }
     try submit(0)
     try submit(1)
-    let inFlight = processor.framesInFlight
-    let start = ProcessInfo.processInfo.systemUptime
     try processor.load(square)
-    let loadSeconds = ProcessInfo.processInfo.systemUptime - start
-    try submit(2)
-    for _ in 0..<3 { XCTAssertEqual(results.done.wait(timeout: .now() + 2), .success) }
-    XCTAssertLessThan(loadSeconds, 0.002, "load does not wait for the \(inFlight) frames in flight")
     XCTAssertTrue(processor.lut === square)
+    XCTAssertTrue(results.lock.withLock { results.buffers.isEmpty && !results.gateTimedOut },
+      "load returned while frames 0 and 1 were unfinished")
+    XCTAssertNotNil(weakInvert, "the unfinished frames keep their LUT alive")
+    try submit(2)
+    results.gate.signal()
+    for _ in 0..<3 { XCTAssertEqual(results.done.wait(timeout: .now() + 12), .success) }
+    XCTAssertFalse(results.lock.withLock { results.gateTimedOut }, "load waited for the frames in flight")
     func middle(_ buffer: CVPixelBuffer?) throws -> Double {
       let buffer = try XCTUnwrap(buffer)
       CVPixelBufferLockBaseAddress(buffer, .readOnly)
@@ -404,6 +418,54 @@ import simd
     let buffers = results.lock.withLock { results.buffers }
     for index in [0, 1] { XCTAssertEqual(try middle(buffers[index]), 64 + 876 * 0.25, accuracy: 2, "frame \(index)") }
     XCTAssertEqual(try middle(buffers[2]), 64 + 876 * 0.5625, accuracy: 2)
+    // The frames were the old LUT's last owners: it goes once they completed.
+    let deadline = Date().addingTimeInterval(2)
+    while weakInvert != nil, Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
+    XCTAssertNil(weakInvert, "completed frames release their LUT")
+  }
+
+  /// The monitor's burn-in LUT (`CaptureController.burnInLUT`) is exactly what the
+  /// camera burns in: the loaded LUT while Apply LUT and the pipeline are on, nil
+  /// otherwise (Apply LUT off or forgotten, complete bypass), so the monitor's
+  /// output stage never shows a LUT that Program, recording and the camera lack.
+  func testBurnInLUTFollowsTheEffectiveApplyLUT() throws {
+    let services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+      send: { _ in true })
+    let controller = CaptureController(services: services, previewRenderer: nil)
+    defer { controller.onUpdate = nil; controller.stop() }
+    let started = expectation(description: "Capture start completed")
+    started.assertForOverFulfill = false
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
+    var off = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
+    off.inputFast = true
+    var on = off
+    on.applyLUT = true
+    controller.start(deviceID: "synthetic", configuration: off)
+    wait(for: [started], timeout: 5)
+    XCTAssertNil(controller.burnInLUT, "nothing loaded")
+    let lut = try LUTProcessor.makeLUT(CubeLUT(text: cubeText(size: 17, transform: { $0 * $0 })))
+    let loaded = expectation(description: "LUT loaded")
+    controller.load(lut) { result in
+      if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+      loaded.fulfill()
+    }
+    wait(for: [loaded], timeout: 5)
+    XCTAssertNil(controller.burnInLUT, "loaded with Apply LUT off: nothing is burned in")
+    func settle(_ label: String, _ condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(5)
+      while !condition(), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+      XCTAssertTrue(condition(), label)
+    }
+    controller.reconfigure(configuration: on, pipelineEnabled: true)
+    settle("Apply LUT on burns the loaded LUT in") { controller.burnInLUT === lut }
+    controller.reconfigure(configuration: off, pipelineEnabled: true)
+    settle("Apply LUT off (or Forget LUT) burns nothing in") { controller.burnInLUT == nil }
+    controller.reconfigure(configuration: on, pipelineEnabled: true)
+    settle("Apply LUT back on") { controller.burnInLUT === lut }
+    controller.reconfigure(configuration: on, pipelineEnabled: false)
+    settle("complete bypass burns nothing in") { controller.burnInLUT == nil }
+    controller.reconfigure(configuration: on, pipelineEnabled: true)
+    settle("processing back on") { controller.burnInLUT === lut }
   }
 
   /// Only tetrahedral LUTs on the processor's own device are accepted.
@@ -423,6 +485,7 @@ import simd
     ("published frame carries the probed burn-in", testPublishedFrameCarriesTheProbedBurnIn),
     ("1D and shaper LUTs burn in", testOneDimensionalAndShaperLUTsBurnInCorrectly),
     ("LUT load swaps without waiting", testLoadSwapsWithoutWaitingAndFramesInFlightKeepTheirLUT),
+    ("burn-in LUT follows the effective Apply LUT", testBurnInLUTFollowsTheEffectiveApplyLUT),
     ("tetrahedral only, shared device", testLoadRejectsOtherInterpolationsAndDevices),
   ]
 }
