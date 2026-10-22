@@ -88,6 +88,8 @@ monitor_package = add("monitor-package", "XCLocalSwiftPackageReference", relativ
 monitor_products = [add(f"monitor-product-{name}", "XCSwiftPackageProductDependency", package=monitor_package, productName=name)
                     for name in ("MonitorToolsCore", "MonitorToolsMetal", "MonitorToolsUI")]
 # MonitorKit replaces MonitorTools (W4); both are linked into the app only while it lands.
+# Xcode links package products as object files, so all five products and both resource
+# bundles ship in the app even before an app file imports them (Debug dylib +7 MB).
 monitor_kit_package = add("monitor-kit-package", "XCLocalSwiftPackageReference", relativePath="Packages/MonitorKit")
 monitor_products += [add(f"monitor-kit-product-{name}", "XCSwiftPackageProductDependency", package=monitor_kit_package, productName=name)
                      for name in ("MonitorKitCore", "MonitorKit", "MonitorKitScopes", "MonitorKitAudio", "MonitorKitUI")]

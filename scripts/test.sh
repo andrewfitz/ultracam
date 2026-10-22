@@ -26,9 +26,13 @@ xcrun swift test --package-path "$monitor_package" --scratch-path "$monitor_scra
   cat "$logs_root/monitor-package-tests-$run_id.log"; exit 1;
 }
 source "$task_root/scripts/monitor-kit-package.sh"
+monitor_kit_selftest_log="$logs_root/monitor-kit-selftest-$run_id.log"
+/bin/bash "$task_root/scripts/monitor-kit-package.sh" selftest > "$monitor_kit_selftest_log" 2>&1 || {
+  cat "$monitor_kit_selftest_log"; exit 1;
+}
 monitor_kit_package_build >> "$package_log" 2>&1 || { cat "$package_log"; exit 1; }
 monitor_kit_test_log="$logs_root/monitor-kit-package-tests-$run_id.log"
-monitor_kit_package_test "$monitor_kit_test_log" || { cat "$monitor_kit_test_log"; exit 1; }
+monitor_kit_package_test "$monitor_kit_test_log" || { monitor_kit_test_report "$monitor_kit_test_log"; exit 1; }
 bash "$task_root/scripts/fetch-decklink-sdk.sh"
 rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
 rustc_path="$(rustup which --toolchain stable rustc)"
@@ -91,5 +95,9 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-pat
 monitor_kit_tests="$(awk "/Test Suite 'All tests' (passed|failed)/ { getline; print }" "$monitor_kit_test_log" \
   | awk '{ tests += $2 } END { print tests + 0 }')"
 echo "MonitorKit package: $monitor_kit_tests tests run, all passed ($monitor_kit_test_log)"
-/usr/bin/grep -E '^FLAKY \(passed on retry\)' "$monitor_kit_test_log" || true
+# Timing budgets that passed only on their retry: report them, they are not silent.
+if /usr/bin/grep -q '^FLAKY (passed on retry)' "$monitor_kit_test_log"; then
+  echo 'WARNING: MonitorKit timing budgets missed on the first run, passed on retry:'
+  /usr/bin/grep '^FLAKY (passed on retry)' "$monitor_kit_test_log"
+fi
 tail -5 "$test_log"
