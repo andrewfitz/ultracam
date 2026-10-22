@@ -33,6 +33,8 @@ import Metal
 /// no texture at all. An entry retains only the IOSurface (never its
 /// CVPixelBuffer, which would pin the pool's buffer), so its ID cannot be
 /// reused while cached, and is evicted once idle and its last GPU use is done.
+/// When the last recorder using the converter finishes, the whole cache is
+/// released (after its GPU work completes), so no surface outlives its take.
 final class RecordingPixelConverter: @unchecked Sendable {
   enum ConversionError: Error, LocalizedError {
     case metalUnavailable(String)
@@ -114,6 +116,12 @@ final class RecordingPixelConverter: @unchecked Sendable {
   private let lock = NSLock()
   private var sequence: UInt64 = 0
   private var textures: [TextureKey: CachedTexture] = [:]
+  /// Recorders currently converting through this instance.
+  private var users = 0
+  /// A purge is waiting for in-flight GPU work (at most one is scheduled).
+  private var purgeScheduled = false
+  /// How long a purge waits for GPU work still in flight before it retries.
+  static let purgeRetryInterval: TimeInterval = 0.25
 
   /// One converter per process: the kernel compiles once and every recorder
   /// reuses the warm pipeline. Swift initializes the static exactly once.
@@ -324,6 +332,55 @@ final class RecordingPixelConverter: @unchecked Sendable {
     var removed = false
     for (key, entry) in textures where entry.lastUsed <= completed &&
       (overCap || sequence &- entry.lastUsed > Self.idleConversions) {
+      residency.removeAllocation(entry.texture)
+      textures.removeValue(forKey: key)
+      removed = true
+    }
+    return removed
+  }
+
+  /// A recorder starts converting through this instance.
+  func beginUse() {
+    lock.withLock { users += 1 }
+  }
+
+  /// A recorder finished. Once no recorder is left, every cached surface
+  /// whose GPU work is done is released at once (the x422 pool surfaces and
+  /// capture surfaces of a 4K take are about 0.5 GB), and the rest as soon
+  /// as their work completes. While other recorders still convert, the idle
+  /// eviction in `encode` releases this take's surfaces as usual.
+  func endUse() {
+    lock.withLock { users = max(0, users - 1) }
+    purgeWhenIdle()
+  }
+
+  /// `attempt` bounds the retries to about the GPU timeout's length: work
+  /// that has not completed by then has failed, and the next take's idle
+  /// eviction releases what is left.
+  private func purgeWhenIdle(attempt: Int = 0) {
+    let retry = lock.withLock { () -> Bool in
+      guard users == 0 else { return false }
+      if purgeCompletedLocked() { residency.commit() }
+      // Entries still in GPU use are retried shortly; the cache is otherwise empty.
+      guard !textures.isEmpty, !purgeScheduled,
+        Double(attempt) * Self.purgeRetryInterval < Self.gpuTimeout * 2 else { return false }
+      purgeScheduled = true
+      return true
+    }
+    guard retry else { return }
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.purgeRetryInterval) { [weak self] in
+      guard let self else { return }
+      self.lock.withLock { self.purgeScheduled = false }
+      self.purgeWhenIdle(attempt: attempt + 1)
+    }
+  }
+
+  /// Under `lock`: drops every surface whose last GPU use has completed.
+  /// Returns whether the residency set changed.
+  private func purgeCompletedLocked() -> Bool {
+    let completed = event.signaledValue
+    var removed = false
+    for (key, entry) in textures where entry.lastUsed <= completed {
       residency.removeAllocation(entry.texture)
       textures.removeValue(forKey: key)
       removed = true

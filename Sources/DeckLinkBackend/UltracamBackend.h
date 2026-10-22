@@ -47,7 +47,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) BOOL supportsHDMITimecode;
 @property(nonatomic, readonly) BOOL supportsHighFrameRateTimecode;
 @property(nonatomic, readonly) BOOL sessionActive;
-// Frames the device skipped, from gaps in the per-frame stream time.
+// Frames lost on the device side: gaps in the per-frame stream time, plus
+// valid frames discarded or flushed while the input restarted for a new
+// HDMI mode (the restarted stream clock cannot show those as a gap).
 @property(nonatomic, readonly) uint64_t deviceDroppedFrames;
 // GetAvailableVideoFrameCount, polled about once a second.
 @property(nonatomic, readonly) uint32_t frameBacklog;
@@ -151,7 +153,8 @@ typedef void (^UltracamRawAudioHandler)(NSData *_Nullable samples, CMTime audioP
 + (nullable UltracamDeviceDiagnostics *)diagnosticsForDeviceID:(NSString *)deviceID
   NS_SWIFT_NAME(diagnostics(deviceID:));
 
-// Live session counters; safe to read from any thread.
+// Live session counters; safe to read from any thread. deviceDroppedFrames
+// is as described on UltracamDeviceDiagnostics.
 @property(nonatomic, readonly) uint64_t deviceDroppedFrames;
 @property(nonatomic, readonly) uint32_t availableFrameBacklog;
 @property(nonatomic, readonly) uint32_t maximumFrameBacklog;

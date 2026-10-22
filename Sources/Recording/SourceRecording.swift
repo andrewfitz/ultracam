@@ -422,6 +422,10 @@ final class SourceRecorderCore: @unchecked Sendable {
   private var drainAdmittedAfterFailure = false
   /// The last admitted frame's capture time, for skipped-frame detection.
   private var lastAdmittedVideo: (pts: CMTime, duration: CMTime)?
+  /// The latest capture time admitted this take. Unlike `lastAdmittedVideo`
+  /// it survives a pause: capture time only moves forward within one input
+  /// run, so going back means the input restarted.
+  private var latestAdmittedVideoPTS: CMTime?
   private var invalidVideoSinceLastFrame = false
   private var spaceTimer: DispatchSourceTimer?
   /// Space-check timer state (utility queue only).
@@ -715,8 +719,18 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// counted as dropped video. When the recorder was itself holding half its
   /// raw-frame budget, it starved the capture pool: the take fails.
   private func noteCaptureTime(_ pts: CMTime, duration: CMTime) -> Bool {
+    if let latest = latestAdmittedVideoPTS, CMTimeCompare(pts, latest) < 0 {
+      // The capture clock started over: the input was reconfigured for a new
+      // HDMI format (or its driver restarted). The take's cadence, timecode
+      // and timeline no longer apply, so it ends here, visibly; everything
+      // admitted before is still written and the file is kept for recovery.
+      telemetryValue.droppedVideo &+= 1
+      failLocked("The HDMI input changed format or restarted during the take, so its capture clock started over. The take stopped here and was kept for recovery; start a new take to keep recording.")
+      return false
+    }
     defer {
       lastAdmittedVideo = (pts, duration)
+      latestAdmittedVideoPTS = pts
       invalidVideoSinceLastFrame = false
     }
     guard let last = lastAdmittedVideo, !invalidVideoSinceLastFrame,
@@ -765,7 +779,8 @@ final class SourceRecorderCore: @unchecked Sendable {
 
   /// Free space is rechecked about once a second on a utility queue, never
   /// per sample and never on the capture or encoder path. A paused take skips
-  /// the check; it resumes with the next tick after `resume()`.
+  /// the check; it resumes with the next tick after `resume()`. A failed take
+  /// reports a headroom of 0 once and stops checking.
   private func startSpaceChecks() {
     guard let check = configuration.checkAvailableSpace else { return }
     let interval = configuration.spaceCheckInterval
@@ -806,11 +821,20 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   private func runSpaceCheck(_ check: (UInt64) throws -> Void) {
-    guard stateLock.withLock({ () -> Bool in
-      guard telemetryValue.state == .recording else { return false }
-      telemetryValue.spaceChecks &+= 1
-      return true
-    }) else { return }
+    if writer.hasFailed { observeWriterFailure() }
+    let state = stateLock.withLock { () -> SourceRecordingState in
+      if telemetryValue.state == .recording { telemetryValue.spaceChecks &+= 1 }
+      return telemetryValue.state
+    }
+    if state == .failed {
+      // A failed take writes nothing more of its own: withdraw its headroom
+      // so it stops holding free space other feeds on the volume need. Its
+      // file and reservation stay until Stop.
+      try? check(0)
+      stopSpaceChecks()
+      return
+    }
+    guard state == .recording else { return }
     do {
       try check(spaceHeadroom())
     } catch {

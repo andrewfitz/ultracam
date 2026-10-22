@@ -32,8 +32,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   static let defaultMaximumBufferedBytes = 1 << 30
   /// Encoder-pool buffers (x422, 33 MB each at 2160p) VideoToolbox may hold.
   static let encoderPoolThreshold = 16
-  /// On the routes that hand VideoToolbox the capture buffer itself, the
-  /// capture frames it may hold. Together with the recorder's queue this
+  /// When a frame hands VideoToolbox the capture buffer itself (pass-through,
+  /// VideoToolbox conversion, or a GPU repack that could not run), the
+  /// frames VideoToolbox may hold before that frame waits. Together with the recorder's queue this
   /// bounds the driver frames recording can keep from the capture pool.
   static let maximumCaptureFramesInEncoder = 6
   /// An encoder that returns no frame for this long has stalled.
@@ -63,11 +64,6 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     case gpu(RecordingPixelConverter, CVPixelBufferPool)
     /// No zero-copy route: VideoToolbox converts (CPU). Counted and reported.
     case videoToolboxConverts(String)
-
-    var holdsCaptureBuffers: Bool {
-      if case .gpu = self { return false }
-      return true
-    }
   }
 
   /// A prepared compression session, built without any lock held.
@@ -199,6 +195,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private var compressionSession: VTCompressionSession?
   private var encoderInput: EncoderInput = .passThrough
   private var lastVideoPTS: CMTime?
+  /// The shared GPU converter while this take uses it; released once at
+  /// finish (or deinit) so the converter can drop the take's surfaces.
+  private var converterInUse: RecordingPixelConverter?
 
   private let timelineLock = RecordingLock()
   private var timeline = PauseTimeline()
@@ -318,6 +317,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   var hasFailed: Bool { telemetryLock.withLock { terminalError != nil } }
 
   deinit {
+    releaseConverter()
     if let poolObserver { NotificationCenter.default.removeObserver(poolObserver) }
     if let compressionSession {
       VTCompressionSessionInvalidate(compressionSession)
@@ -404,16 +404,20 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       return (CMTimeSubtract(pts, timeline.offset), held)
     }
     for audio in resumedAudio { appendHeldAudio(audio) }
-    if input.holdsCaptureBuffers { try waitForEncoderCapacity() }
+    let (encoderImage, route) = try self.encoderImage(for: imageBuffer, input: input)
+    // Decided per frame, not per route: the GPU route also hands over the
+    // capture buffer itself when its repack fails or the frame has no
+    // IOSurface. A capture buffer inside VideoToolbox is a driver frame kept
+    // from the capture pool, so their number stays bounded.
+    if encoderImage === imageBuffer { try waitForEncoderCapacity() }
+    // Counted once the frame is really handed over, never for one that failed waiting.
+    switch route {
+    case .gpu: break
+    case .passThrough: telemetryLock.withLock { telemetryValue.passThroughFrames &+= 1 }
+    case let .cpu(reason): noteCPUConversion(reason)
+    }
     let key = Self.frameKey(outputPTS)
     telemetryLock.withLock { frameStarts.push(key, start: clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) }
-    let encoderImage: CVPixelBuffer
-    do {
-      encoderImage = try self.encoderImage(for: imageBuffer, input: input)
-    } catch {
-      telemetryLock.withLock { frameStarts.removeNewest(key) }
-      throw error
-    }
     // Submission can wait for an output callback on another thread (notably
     // remote ProRes encoders). The callback only takes short locks, and none
     // is held here, so the two can never wait on each other.
@@ -431,7 +435,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     let existing = try encoderLock.withLock { () throws -> (VTCompressionSession, EncoderInput)? in
       try ensureCanAppend()
       if let lastVideoPTS, CMTimeCompare(pts, lastVideoPTS) < 0 {
-        throw SourceRecordingError.unsupportedSample("Video timestamps moved backwards.")
+        // The recorder ends the take first; this is the backstop.
+        throw SourceRecordingError.unsupportedSample(
+          "Video timestamps moved backwards: the HDMI input changed format or restarted during the take.")
       }
       return compressionSession.map { ($0, encoderInput) }
     }
@@ -458,18 +464,24 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   /// Returns the buffer handed to VideoToolbox. On the GPU route the capture
   /// buffer is released as soon as the repack completes (well under a
   /// millisecond), so a DeckLink frame is never held by the encoder or disk.
-  private func encoderImage(for source: CVPixelBuffer, input: EncoderInput) throws -> CVPixelBuffer {
+  /// How a frame reaches VideoToolbox: repacked on the GPU, handed over
+  /// natively, or converted by VideoToolbox on the CPU (with the reason).
+  private enum FrameRoute {
+    case gpu
+    case passThrough
+    case cpu(String)
+  }
+
+  private func encoderImage(for source: CVPixelBuffer, input: EncoderInput) throws
+    -> (CVPixelBuffer, FrameRoute) {
     switch input {
     case .passThrough:
-      telemetryLock.withLock { telemetryValue.passThroughFrames &+= 1 }
-      return source
+      return (source, .passThrough)
     case let .videoToolboxConverts(reason):
-      noteCPUConversion(reason)
-      return source
+      return (source, .cpu(reason))
     case let .gpu(converter, pool):
       guard CVPixelBufferGetIOSurface(source) != nil else {
-        noteCPUConversion("The capture buffer is not IOSurface-backed.")
-        return source
+        return (source, .cpu("The capture buffer is not IOSurface-backed."))
       }
       let destination = try makeEncoderBuffer(from: pool)
       do {
@@ -479,11 +491,10 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
           telemetryValue.gpuConvertedFrames &+= 1
           telemetryValue.gpuConversionMS = telemetryValue.gpuConversionMS.map { $0 * 0.9 + gpuMS * 0.1 } ?? gpuMS
         }
-        return destination
+        return (destination, .gpu)
       } catch {
         // Never lose the frame: let VideoToolbox convert it, and say so.
-        noteCPUConversion(error.localizedDescription)
-        return source
+        return (source, .cpu(error.localizedDescription))
       }
     }
   }
@@ -559,9 +570,11 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     }
   }
 
-  /// The routes that hand VideoToolbox the capture buffer itself: wait while
-  /// it holds `maximumCaptureFramesInEncoder` of them, then fail visibly, so
-  /// a stalled encoder ends the take before the capture pool runs dry.
+  /// A frame that hands VideoToolbox the capture buffer itself: wait while it
+  /// holds `maximumCaptureFramesInEncoder` frames (counting every frame in
+  /// flight, which is conservative when the GPU route falls back for one
+  /// frame), then fail visibly, so a stalled encoder ends the take before
+  /// the capture pool runs dry.
   private func waitForEncoderCapacity() throws {
     let deadline = ProcessInfo.processInfo.systemUptime + Self.encoderStallTimeout
     while true {
@@ -573,6 +586,16 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       }
       waitForEncoderProgress(after: seen)
     }
+  }
+
+  /// The take converts nothing more: let the shared converter release the
+  /// surfaces it cached for this take. Runs once.
+  private func releaseConverter() {
+    let converter = encoderLock.withLock { () -> RecordingPixelConverter? in
+      defer { converterInUse = nil }
+      return converterInUse
+    }
+    converter?.endUse()
   }
 
   private func ensureCanAppend() throws {
@@ -591,6 +614,10 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       guard compressionSession == nil, !finished, !finishing else { return false }
       encoderInput = prepared.input
       compressionSession = prepared.session
+      if case let .gpu(converter, _) = prepared.input {
+        converter.beginUse()
+        converterInUse = converter
+      }
       return true
     }
     guard installed else {
@@ -1150,6 +1177,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       return .some(self.compressionSession)
     }
     guard let compressionSession else { return }
+    // Every conversion has completed: appendVideo waits for its own, and runs
+    // on the recorder queue that is now finishing.
+    defer { releaseConverter() }
     // Audio still held for the first post-resume frame goes in as it is.
     let held = timelineLock.withLock { () -> [CMSampleBuffer] in
       defer { timeline.heldAudio.removeAll(); timeline.resumePending = false }

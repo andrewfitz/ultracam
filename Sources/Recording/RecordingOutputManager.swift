@@ -111,37 +111,96 @@ public struct RecordingOutputConfiguration: Equatable, Sendable {
   }
 }
 
+/// Free-space bookkeeping shared by every output manager writing to one
+/// volume. Feeds recording to different folders on the same drive share its
+/// free space, so admission must count all of their reservations and
+/// headrooms, not just those of one folder's manager. Process-wide by
+/// default; tests inject their own instance.
+public final class RecordingVolumeSpaceRegistry: @unchecked Sendable {
+  public static let shared = RecordingVolumeSpaceRegistry()
+
+  /// One volume's reservations and its live sessions' headrooms.
+  fileprivate final class Volume: @unchecked Sendable {
+    /// Held across one free-space read and the arithmetic that depends on
+    /// it, so two feeds on one volume can never both claim the same bytes.
+    let lock = NSLock()
+    var reservedBytes: UInt64 = 0
+    /// Each live external-writer session's latest headroom (media in memory
+    /// plus what it writes before its next check).
+    var headrooms: [ObjectIdentifier: UInt64] = [:]
+
+    var totalHeadroom: UInt64 {
+      headrooms.values.reduce(UInt64(0)) { RecordingOutputManager.saturatingAdd($0, $1) }
+    }
+  }
+
+  private let lock = NSLock()
+  private var volumes: [AnyHashable: Volume] = [:]
+
+  public init() {}
+
+  fileprivate func volume(for key: AnyHashable) -> Volume {
+    lock.lock()
+    defer { lock.unlock() }
+    if let existing = volumes[key] { return existing }
+    let volume = Volume()
+    volumes[key] = volume
+    return volume
+  }
+
+  /// The volume `directory` lives on: its file-system identifier, else its
+  /// mount point, else the directory itself (never shared, so never pooled).
+  public static func volumeKey(for directory: URL) -> AnyHashable {
+    var fresh = URL(fileURLWithPath: directory.path, isDirectory: true)
+    fresh.removeAllCachedResourceValues()
+    let values = try? fresh.resourceValues(forKeys: [.volumeIdentifierKey, .volumeURLKey])
+    if let identifier = values?.volumeIdentifier as? NSObject { return AnyHashable(identifier) }
+    if let volume = values?.volume { return AnyHashable("volume:" + volume.standardizedFileURL.path) }
+    return AnyHashable("folder:" + directory.standardizedFileURL.path)
+  }
+
+  /// Bytes reserved and headroom claimed on the volume holding `directory`.
+  /// For tests and diagnostics.
+  public func usage(for directory: URL) -> (reserved: UInt64, headroom: UInt64) {
+    let volume = volume(for: Self.volumeKey(for: directory))
+    volume.lock.lock()
+    defer { volume.lock.unlock() }
+    return (volume.reservedBytes, volume.totalHeadroom)
+  }
+}
+
 /// Owns feed directories and admission reservations. Sessions created by one
 /// manager do not share lifecycle state: pausing or failing one feed never
-/// changes another feed's state.
+/// changes another feed's state. Free-space admission is pooled per volume
+/// (see `RecordingVolumeSpaceRegistry`) across every manager on that volume.
 public final class RecordingOutputManager: @unchecked Sendable {
   private let configuration: RecordingOutputConfiguration
   private let diskSpace: any RecordingOutputDiskSpaceProviding
   private let fileManager: FileManager
+  /// Path allocation only. Space bookkeeping is under the volume's lock.
   private let lock = NSLock()
-  private var reservedBytes: UInt64 = 0
-  /// Each live external-writer session's latest headroom (media in memory
-  /// plus what it writes before its next check). Feeds sharing a volume
-  /// share its free space, so every check counts all of them.
-  private var headrooms: [ObjectIdentifier: UInt64] = [:]
+  private let volume: RecordingVolumeSpaceRegistry.Volume
   private var pathNonce: UInt64 = 0
 
   public init(configuration: RecordingOutputConfiguration,
               diskSpace: any RecordingOutputDiskSpaceProviding = FileManagerRecordingOutputDiskSpaceProvider(),
-              fileManager: FileManager = .default) throws {
+              fileManager: FileManager = .default,
+              volumes: RecordingVolumeSpaceRegistry = .shared) throws {
     self.configuration = configuration
     self.diskSpace = diskSpace
     self.fileManager = fileManager
     try Self.prepareRoot(configuration.rootDirectory, fileManager: fileManager)
+    volume = volumes.volume(for: RecordingVolumeSpaceRegistry.volumeKey(for: configuration.rootDirectory))
   }
 
   public convenience init(rootDirectory: URL, fileExtension: String = "mov",
                           minimumFreeBytes: UInt64 = 128 * 1024 * 1024,
                           diskSpace: any RecordingOutputDiskSpaceProviding = FileManagerRecordingOutputDiskSpaceProvider(),
-                          fileManager: FileManager = .default) throws {
+                          fileManager: FileManager = .default,
+                          volumes: RecordingVolumeSpaceRegistry = .shared) throws {
     try self.init(configuration: RecordingOutputConfiguration(rootDirectory: rootDirectory,
       fileExtension: fileExtension, minimumFreeBytes: minimumFreeBytes),
-      diskSpace: diskSpace, fileManager: fileManager)
+      diskSpace: diskSpace, fileManager: fileManager, volumes: volumes)
   }
 
   /// Creates an idle session after performing disk-space admission. Call
@@ -191,41 +250,50 @@ public final class RecordingOutputManager: @unchecked Sendable {
   fileprivate var fileManagerRef: FileManager { fileManager }
 
   fileprivate func release(reserved: UInt64) {
-    lock.lock()
-    reservedBytes = reservedBytes >= reserved ? reservedBytes - reserved : 0
-    lock.unlock()
+    volume.lock.lock()
+    volume.reservedBytes = volume.reservedBytes >= reserved ? volume.reservedBytes - reserved : 0
+    volume.lock.unlock()
   }
 
   fileprivate func reserve(expectedBytes: UInt64) throws {
-    lock.lock()
-    defer { lock.unlock() }
+    volume.lock.lock()
+    defer { volume.lock.unlock() }
     try checkAndReserveLocked(additional: expectedBytes)
   }
 
   fileprivate func reserveAdditional(_ additional: UInt64) throws {
-    lock.lock()
-    defer { lock.unlock() }
+    volume.lock.lock()
+    defer { volume.lock.unlock() }
     try checkAndReserveLocked(additional: additional)
   }
 
   /// Records `session`'s headroom and checks that it, every other live
-  /// session's headroom and every reservation fit above the floor, without
-  /// reserving anything.
+  /// session's headroom on the volume and every reservation there fit above
+  /// the floor, without reserving anything.
   fileprivate func checkHeadroom(_ headroom: UInt64, for session: ObjectIdentifier) throws {
-    lock.lock()
-    defer { lock.unlock() }
-    headrooms[session] = headroom
-    let total = headrooms.values.reduce(UInt64(0)) { Self.saturatingAdd($0, $1) }
-    try checkAndReserveLocked(additional: 0, headroom: total)
+    volume.lock.lock()
+    defer { volume.lock.unlock() }
+    volume.headrooms[session] = headroom
+    try checkAndReserveLocked(additional: 0)
+  }
+
+  /// Records `session`'s headroom without checking. Used when a paused take
+  /// resumes: its last known headroom counts again until its next check.
+  fileprivate func setHeadroom(_ headroom: UInt64, for session: ObjectIdentifier) {
+    volume.lock.lock()
+    volume.headrooms[session] = headroom
+    volume.lock.unlock()
   }
 
   fileprivate func clearHeadroom(for session: ObjectIdentifier) {
-    lock.lock()
-    headrooms.removeValue(forKey: session)
-    lock.unlock()
+    volume.lock.lock()
+    volume.headrooms.removeValue(forKey: session)
+    volume.lock.unlock()
   }
 
-  private func checkAndReserveLocked(additional: UInt64, headroom: UInt64 = 0) throws {
+  /// Under the volume's lock. The floor is this manager's own (it is a
+  /// margin, not something each feed consumes), so it is counted once.
+  private func checkAndReserveLocked(additional: UInt64) throws {
     let available: UInt64
     do {
       available = try diskSpace.availableBytes(at: configuration.rootDirectory)
@@ -234,12 +302,12 @@ public final class RecordingOutputManager: @unchecked Sendable {
     } catch {
       throw RecordingOutputError.diskSpaceUnavailable
     }
-    let required = Self.saturatingAdd(Self.saturatingAdd(configuration.minimumFreeBytes, headroom),
-      Self.saturatingAdd(reservedBytes, additional))
+    let required = Self.saturatingAdd(Self.saturatingAdd(configuration.minimumFreeBytes, volume.totalHeadroom),
+      Self.saturatingAdd(volume.reservedBytes, additional))
     guard available >= required else {
       throw RecordingOutputError.insufficientDiskSpace(required: required, available: available)
     }
-    reservedBytes = Self.saturatingAdd(reservedBytes, additional)
+    volume.reservedBytes = Self.saturatingAdd(volume.reservedBytes, additional)
   }
 
   private func makePaths(feedID: String, sessionID: UUID) throws -> RecordingOutputPaths {
@@ -344,6 +412,9 @@ public final class RecordingOutputSession: @unchecked Sendable {
   private var ownsTemporaryFile = false
   private var externalWriterOwnsFile = false
   private var recoveryJournal: RecordingRecoveryJournal?
+  /// The headroom of the last check, restored on resume (a paused take's is
+  /// withdrawn so it does not hold space its siblings on the volume need).
+  private var lastHeadroom: UInt64?
 
   fileprivate init(manager: RecordingOutputManager, paths: RecordingOutputPaths, expectedBytes: UInt64) {
     self.manager = manager
@@ -424,6 +495,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     do { handle?.synchronizeFile() }
     stateValue = .paused
+    if externalWriterOwnsFile { manager.clearHeadroom(for: ObjectIdentifier(self)) }
   }
 
   public func resume() throws {
@@ -441,6 +513,10 @@ public final class RecordingOutputSession: @unchecked Sendable {
       throw RecordingOutputError.ioFailure("Temporary output file is closed.")
     }
     stateValue = .recording
+    // Counted again at once, not only from the next check a second later.
+    if externalWriterOwnsFile, let lastHeadroom {
+      manager.setHeadroom(lastHeadroom, for: ObjectIdentifier(self))
+    }
   }
 
   /// Appends bytes to the current temporary output. Pausing preserves the file
@@ -485,7 +561,9 @@ public final class RecordingOutputSession: @unchecked Sendable {
   /// the media path). Written bytes consume the initial reservation; counting
   /// them again as reserved space would reject a take that still has room.
   /// `headroom` is what the writer holds in memory or will write before the
-  /// next check; it must fit above the floor too.
+  /// next check; it must fit above the floor too, together with every other
+  /// session's on the same volume. A recorder that has failed reports 0 so
+  /// it stops holding space its siblings need.
   public func checkExternalWriterCapacity(headroom: UInt64 = 0) throws {
     lock.lock(); defer { lock.unlock() }
     // Samples admitted just before a pause still reach the writer after the
@@ -502,6 +580,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
       reservedBytes -= consumed
       bytesWrittenValue = written
     }
+    lastHeadroom = headroom
     try manager.checkHeadroom(headroom, for: ObjectIdentifier(self))
   }
 

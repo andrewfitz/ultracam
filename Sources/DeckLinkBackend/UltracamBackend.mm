@@ -419,11 +419,20 @@ struct SessionStats {
 // only after kEvidenceSteps consecutive steps of one pattern, so one corrupt
 // label can never latch a cadence, and it starts over on signal loss and on
 // every input reconfiguration.
+//
+// While it relearns, labels follow the cadence the session last latched (the
+// camera is usually the same one), so a full-rate source is not shown doubled
+// for its first frames after every reconfiguration. Before anything latched,
+// labels below 30 are read as pairs, the RP188 convention (manual 3.31). That
+// default also decides what a static label shows: a camera in standby holds
+// one label, which never latches either cadence.
 struct TimecodeReader {
   enum class Cadence { unknown, pairs, fullRate };
   static constexpr int kEvidenceSteps = 4;
   bool highFrameRateSupported = true;
   Cadence cadence = Cadence::unknown;
+  // The cadence last latched this session; kept across reset().
+  Cadence previousCadence = Cadence::unknown;
   int fullRateSteps = 0, pairSteps = 0;
   bool lastWasRepeat = false;
   bool hasLast = false;
@@ -454,14 +463,17 @@ struct TimecodeReader {
         fullRateSteps += 1;
         pairSteps = lastWasRepeat ? pairSteps + 1 : 0;
         lastWasRepeat = false;
-      } else if (total == (lastSeconds + 1) % 86400 && frames <= 3) {
-        // A second boundary (drop-frame skips up to label 3): fits both.
+      } else if (total == (lastSeconds + 1) % 86400 && frames <= 4) {
+        // A second boundary: fits both. Drop-frame skips labels 00-03 at
+        // each minute not divisible by ten (SMPTE ST 12-1), so a full-rate
+        // count resumes at 4 and a pair count at 2 (its 00-01 are 00-03).
         lastWasRepeat = false;
       } else {
         fullRateSteps = 0; pairSteps = 0; lastWasRepeat = false;
       }
       if (fullRateSteps >= kEvidenceSteps) cadence = Cadence::fullRate;
       else if (pairSteps >= kEvidenceSteps) cadence = Cadence::pairs;
+      if (cadence != Cadence::unknown) previousCadence = cadence;
     }
     hasLast = true; lastSeconds = total; lastFrames = frames;
   }
@@ -488,8 +500,10 @@ struct TimecodeReader {
     if (highFrameRate && !hfr) {
       observe(hours, minutes, seconds, frames);
       // Before the cadence is known a label above 29 cannot be a pair
-      // counter's; show it as is, without deciding anything.
-      const bool pairs = cadence == Cadence::pairs || (cadence == Cadence::unknown && frames < 30);
+      // counter's; show it as is, without deciding anything. Below 30, the
+      // previously latched cadence (pairs if none) decides.
+      const bool pairs = cadence == Cadence::pairs ||
+        (cadence == Cadence::unknown && frames < 30 && previousCadence != Cadence::fullRate);
       if (pairs) frameLabel = frames * 2u + ((flags & bmdTimecodeFieldMark) ? 1u : 0u);
     }
     if (hours > 23 || minutes > 59 || seconds > 59 || frameLabel > (highFrameRate ? 59u : 29u)) return nil;
@@ -692,6 +706,10 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   std::atomic<bool> fatalReported{false};
   std::atomic<bool> framesEnabled{true};
   std::atomic<BMDDisplayMode> requestedMode;
+  // The mode the streams last started in cleanly; bmdModeUnknown while a
+  // reconfiguration is incomplete. The pixel format is always 10-bit YUV, so
+  // a detection in this mode needs no restart.
+  std::atomic<BMDDisplayMode> streamingMode;
   std::atomic<bool> audioEnabled{false};
   std::atomic<uint64_t> lastDetection{UINT64_MAX};
   // Detected colorimetry (display-mode flags or IDeckLinkStatus), the fallback
@@ -705,6 +723,15 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   std::atomic<bool> resetStreamClock{false};
   // Set with resetStreamClock: the timecode cadence is learned again.
   std::atomic<bool> resetTimecodeCadence{false};
+  // Valid frames discarded while frames are gated for a supported format
+  // change, plus frames a reconfiguration flushed. The control queue settles
+  // them when frames are enabled again (see settleGatedFrames).
+  std::atomic<uint64_t> gatedFrames{0};
+  // Whether frames gated now are lost frames of a supported signal (not the
+  // frames of a source Ultracam cannot capture, which is reported instead).
+  std::atomic<bool> gateCountsLosses{false};
+  // Control queue only: the streams restarted since frames were last enabled.
+  bool restartedWhileGated = false;
   // Device capabilities; written before StartStreams, then read-only.
   bool supportsHDRMetadata = false;
   bool supportsColorspaceMetadata = false;
@@ -715,14 +742,16 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   UltracamRawAudioHandler rawAudioHandler;
   void (^eventHandler)(NSString *);
   void (^autoFrameHandler)(CVPixelBufferRef, CMTime, CMTime, BOOL) = nil;
-  void (^modeHandler)(DetectedInput) = nil;
+  // keepFrames: the detection is supported and in the running mode, so frames
+  // stay enabled and the input is not restarted.
+  void (^modeHandler)(DetectedInput, bool keepFrames) = nil;
   // Colorimetry-only change: same mode and format, so the input keeps running.
   void (^colorimetryHandler)(void) = nil;
   TimecodeReader timecodes;  // Frame thread only after start.
   CaptureCallback(BMDDisplayMode mode, CMTimeScale scale,
     void (^frames)(CVPixelBufferRef, CMTime, BOOL), void (^events)(NSString *),
     UltracamMediaStatsHandler media = nil, UltracamRawAudioHandler rawAudio = nil)
-    : requestedMode(mode), timeScale(scale), frameHandler([frames copy]), mediaHandler([media copy]),
+    : requestedMode(mode), streamingMode(mode), timeScale(scale), frameHandler([frames copy]), mediaHandler([media copy]),
       rawAudioHandler([rawAudio copy]), eventHandler([events copy]) {
     // The automatic-format path intentionally leaves the ordinary frame
     // handler nil and installs autoFrameHandler immediately afterwards. Keep
@@ -755,9 +784,15 @@ class CaptureCallback final : public IDeckLinkInputCallback {
         DetectedInput detection = describeInput(mode, flags);
         uint64_t signature = detectionSignature(detection.mode, flags);
         if (lastDetection.exchange(signature) != signature) {
-          framesEnabled = false;
+          // Only the format flags moved (for example 10-bit to 12-bit) and the
+          // running mode still captures it as 10-bit YUV: no gap, no restart.
+          const bool keepFrames = detection.supported && detection.mode == streamingMode.load() && framesEnabled.load();
+          if (!keepFrames) {
+            gateCountsLosses = detection.supported;
+            framesEnabled = false;
+          }
           if (colorspace) signalColorspace = colorspace;
-          modeHandler(detection);
+          modeHandler(detection, keepFrames);
         } else if ((colorspace && signalColorspace.exchange(colorspace) != colorspace) ||
             (events & bmdVideoInputColorspaceChanged)) {
           // The mode|flags signature is unchanged, so only colorimetry moved
@@ -804,7 +839,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
           @"No video signal. Check the FX3 HDMI output and selected frame rate.");
         return S_OK;
       }
-      if (!framesEnabled) return S_OK;
+      if (!framesEnabled) { noteGatedFrame(); return S_OK; }
       if (frame->GetWidth() != 3840 || frame->GetHeight() != 2160 || frame->GetPixelFormat() != bmdFormat10BitYUV) {
         reportFatal([NSString stringWithFormat:@"Unsupported capture frame: %ld × %ld, pixel format 0x%08x. Requires 3840 × 2160 10-bit YUV 4:2:2.",
           frame->GetWidth(), frame->GetHeight(), (unsigned)frame->GetPixelFormat()]); return S_OK;
@@ -850,14 +885,32 @@ class CaptureCallback final : public IDeckLinkInputCallback {
       if (accepting && framesEnabled) {
         if (autoFrameHandler) autoFrameHandler(buffer, CMTimeMake(timestamp, timeScale), CMTimeMake(duration, timeScale), YES);
         else frameHandler(buffer, CMTimeMake(timestamp, timeScale), YES);
+      } else if (accepting) {
+        noteGatedFrame();
       }
       CVPixelBufferRelease(buffer);
     }
     return S_OK;
   }
 
+  // Control queue, when frames are enabled again. Gated frames are device
+  // drops only if the streams restarted meanwhile: the stream clock started
+  // over, so no timestamp gap downstream can show them. Without a restart the
+  // next delivered frame's stream time shows the gap, and consumers (capture
+  // statistics, the recorder's skipped-frame count) count it there.
+  void settleGatedFrames() {
+    const uint64_t gated = gatedFrames.exchange(0);
+    if (restartedWhileGated && gated) stats->deviceDrops.fetch_add(gated, std::memory_order_relaxed);
+    restartedWhileGated = false;
+  }
+
  private:
   BMDTimeValue lastStreamTime = -1;  // Frame thread only.
+
+  // A valid frame discarded because frames are gated for a format change.
+  void noteGatedFrame() {
+    if (gateCountsLosses.load(std::memory_order_relaxed)) gatedFrames.fetch_add(1, std::memory_order_relaxed);
+  }
   bool loggedSDKColorimetry = false;
 
   // Device-side drops: a stream-time step of two or more frame durations
@@ -977,21 +1030,31 @@ static HRESULT startInput(IDeckLinkInput *input, CaptureCallback *callback,
 }
 
 // The caller must run this on the native control queue, never a driver callback.
+// Only a real mode change gets here: the pixel format is always 10-bit YUV.
 static HRESULT reconfigureInput(IDeckLinkInput *input, CaptureCallback *callback, const DetectedInput &mode) {
+  callback->gateCountsLosses = true;
   callback->framesEnabled = false;
+  // Until StartStreams succeeds the streams are in no known mode.
+  callback->streamingMode = bmdModeUnknown;
   if (!callback->accepting) return E_FAIL;
   HRESULT status = input->PauseStreams();
   if (!callback->accepting) return E_FAIL;
+  // Frames still queued in the driver are about to be flushed: count them.
+  uint32_t queued = 0;
+  if (status == S_OK && input->GetAvailableVideoFrameCount(&queued) != S_OK) queued = 0;
   if (status == S_OK) status = input->EnableVideoInput(mode.mode, bmdFormat10BitYUV, bmdVideoInputEnableFormatDetection);
   if (!callback->accepting) return E_FAIL;
   if (status == S_OK) status = input->FlushStreams();
   if (!callback->accepting) return E_FAIL;
   if (status == S_OK) {
+    callback->gatedFrames.fetch_add(queued, std::memory_order_relaxed);
+    callback->restartedWhileGated = true;
     callback->requestedMode = mode.mode;
     // Stream time restarts with the streams; the next frame begins a new run.
     callback->resetStreamClock = true;
     callback->resetTimecodeCadence = true;
     status = input->StartStreams();
+    if (status == S_OK) callback->streamingMode = mode.mode;
   }
   return status;
 }
@@ -1759,8 +1822,8 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   callback->autoFrameHandler = [frameHandler copy];
   __weak UltracamBackend *weakSelf = self;
   dispatch_queue_t nativeQueue = _controlQueue;
-  callback->modeHandler = ^(DetectedInput detected) {
-    if (mailbox->push(detected, &callback->framesEnabled)) {
+  callback->modeHandler = ^(DetectedInput detected, bool keepFrames) {
+    if (mailbox->push(detected, keepFrames ? nullptr : &callback->framesEnabled)) {
       // Never promote the weak backend on the driver callback thread. Releasing
       // its final reference there could run dealloc/StopStreams inside the
       // very callback StopStreams is waiting to finish.
@@ -1838,14 +1901,21 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
     if (mailbox->isCurrent(current.sequence))
       callback->eventHandler([NSString stringWithFormat:@"Unsupported HDMI input: %@. Requires 4K YUV 4:2:2 at 29.97 or 59.94 fps with at least 10-bit source precision.", current.fullDescription()]);
   } else {
-    bool supported = false;
-    HRESULT status = _input->DoesSupportVideoMode(bmdVideoConnectionHDMI, current.mode,
-      bmdFormat10BitYUV, bmdNoVideoInputConversion, bmdSupportedVideoModeDefault, nullptr, &supported);
-    if (status == S_OK && supported) status = reconfigureInput(_input, callback, current);
+    // The streams already run in this mode, and every mode is captured as
+    // 10-bit YUV: only format flags changed (or a mode came back after an
+    // unsupported signal), so frames are enabled again without a restart.
+    bool supported = current.mode == callback->streamingMode.load();
+    HRESULT status = S_OK;
+    if (!supported) {
+      status = _input->DoesSupportVideoMode(bmdVideoConnectionHDMI, current.mode,
+        bmdFormat10BitYUV, bmdNoVideoInputConversion, bmdSupportedVideoModeDefault, nullptr, &supported);
+      if (status == S_OK && supported) status = reconfigureInput(_input, callback, current);
+    }
     if (status != S_OK || !supported) {
       if (mailbox->cancelCurrent(current.sequence, callback->accepting))
         callback->reportFatal([NSString stringWithFormat:@"Cannot capture detected HDMI input: %@ (0x%08x).", current.fullDescription(), (unsigned)status]);
     } else if (mailbox->enableCurrent(current.sequence, callback->framesEnabled, &callback->accepting)) {
+      callback->settleGatedFrames();
       if (current.colorspace) callback->signalColorspace = current.colorspace;
       callback->signalEOTF = current.eotf;
       [self announceDetected:current];
@@ -2497,6 +2567,94 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   callback->Release();
   return YES;
 }
+
+// A format notification at the running mode (format flags only) keeps frames
+// flowing without a restart. A real mode change restarts the streams, and
+// the frames it gated or flushed are device drops, since the restarted stream
+// clock cannot show them as a gap.
+- (BOOL)runFormatChangeChecks:(NSError **)error {
+  FakeInput input;
+  struct StopGuard {
+    __unsafe_unretained UltracamBackend *owner;
+    ~StopGuard() { [owner stop]; }
+  } stopGuard{self};
+  FakeInput *inputPointer = &input;
+  __block int frames = 0;
+  __block NSString *lastEvent = nil;
+  auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, ^(NSString *message) { lastEvent = message; });
+  callback->AddRef(); // Test retains the callback beyond backend stop.
+  ComRef<CaptureCallback> callbackReference; callbackReference.value = callback;
+  [self onControlQueue:^{
+    self->_input = inputPointer; inputPointer->AddRef(); self->_callback = callback;
+    [self configureAutoCallback:callback frameHandler:^(CVPixelBufferRef, CMTime, CMTime, BOOL valid) {
+      if (valid) ++frames;
+    }];
+    inputPointer->SetCallback(callback);
+  }];
+  bool destroyed = false;
+  auto frame = new FakeFrame(&destroyed);
+  ComRef<IDeckLinkVideoInputFrame> frameReference; frameReference.value = frame;
+  FakeMode mode;
+  const auto tenBit = bmdDetectedVideoInputYCbCr422 | bmdDetectedVideoInput10BitDepth;
+  const auto twelveBit = bmdDetectedVideoInputYCbCr422 | bmdDetectedVideoInput12BitDepth;
+  const std::vector<std::string> opened = {"callback"};
+
+  // The opened mode's own notification, then 10-bit to 12-bit: frames never stop.
+  callback->VideoInputFormatChanged(bmdVideoInputDisplayModeChanged, &mode, tenBit);
+  callback->VideoInputFrameArrived(frame, nullptr);
+  [self onControlQueue:^{}];
+  callback->VideoInputFormatChanged(bmdVideoInputColorspaceChanged, &mode, twelveBit);
+  if (!callback->framesEnabled) return fail(error, @"A format-flags change at the running mode gated frames.");
+  callback->VideoInputFrameArrived(frame, nullptr);
+  [self onControlQueue:^{}];
+  if (input.calls != opened || !callback->framesEnabled || frames != 2 || ![lastEvent containsString:@"12-bit"] ||
+      callback->stats->deviceDrops != 0)
+    return fail(error, @"A format-flags change at the running mode restarted the input or lost frames.");
+
+  // A real mode change: two frames arrive while it waits for the control
+  // queue, and three more are still queued in the driver when it pauses.
+  dispatch_semaphore_t hold = dispatch_semaphore_create(0);
+  dispatch_async(_controlQueue, ^{ dispatch_semaphore_wait(hold, DISPATCH_TIME_FOREVER); });
+  input.availableFrames = 3;
+  mode.mode = bmdMode4K2160p2997;
+  callback->VideoInputFormatChanged(bmdVideoInputDisplayModeChanged, &mode, tenBit);
+  callback->VideoInputFrameArrived(frame, nullptr);
+  callback->VideoInputFrameArrived(frame, nullptr);
+  if (callback->framesEnabled || frames != 2) return fail(error, @"A mode change did not gate stale-mode frames.");
+  dispatch_semaphore_signal(hold);
+  [self onControlQueue:^{}];
+  const std::vector<std::string> restarted = {"callback", "support", "pause", "enable", "flush", "start"};
+  if (input.calls != restarted || !callback->framesEnabled || input.enabledMode != bmdMode4K2160p2997)
+    return fail(error, @"A mode change did not restart the input in the new mode.");
+  if (callback->stats->deviceDrops != 5)
+    return fail(error, [NSString stringWithFormat:@"Frames gated and flushed by a restart were not device drops (%llu).",
+      (unsigned long long)callback->stats->deviceDrops.load()]);
+  frame->frameDuration = 2002;
+  callback->VideoInputFrameArrived(frame, nullptr);
+  if (frames != 3 || callback->stats->deviceDrops != 5) return fail(error, @"The restarted input did not resume cleanly.");
+
+  // An unsupported source's frames are not losses; the same mode coming
+  // back re-enables frames without a restart, and the gap shows in stream time.
+  callback->VideoInputFormatChanged(bmdVideoInputColorspaceChanged, &mode,
+    bmdDetectedVideoInputYCbCr422 | bmdDetectedVideoInput8BitDepth);
+  [self onControlQueue:^{}];
+  callback->VideoInputFrameArrived(frame, nullptr);
+  if (callback->framesEnabled || frames != 3 || ![lastEvent containsString:@"8-bit"])
+    return fail(error, @"An 8-bit source was not gated and reported.");
+  dispatch_async(_controlQueue, ^{ dispatch_semaphore_wait(hold, DISPATCH_TIME_FOREVER); });
+  callback->VideoInputFormatChanged(bmdVideoInputColorspaceChanged, &mode, tenBit);
+  callback->VideoInputFrameArrived(frame, nullptr);
+  dispatch_semaphore_signal(hold);
+  [self onControlQueue:^{}];
+  callback->VideoInputFrameArrived(frame, nullptr);
+  if (input.calls != restarted || !callback->framesEnabled || frames != 4 || callback->stats->deviceDrops != 5)
+    return fail(error, @"A supported source returning at the running mode restarted the input or double-counted its gap.");
+
+  [self stop];
+  frameReference.take()->Release(); callbackReference.take()->Release();
+  if (!destroyed || input.references != 1) return fail(error, @"Format-change checks leaked native frame/input references.");
+  return YES;
+}
 #endif
 
 - (void)dealloc {
@@ -2521,6 +2679,8 @@ BOOL UltracamRunSDK16SyntheticChecks(NSError **error) {
 
 BOOL UltracamRunAutoSyntheticChecks(NSError **error) {
   UltracamBackend *backend = [UltracamBackend new];
-  return [backend runAutoChecks:error];
+  if (![backend runAutoChecks:error]) return NO;
+  UltracamBackend *formatChanges = [UltracamBackend new];
+  return [formatChanges runFormatChangeChecks:error];
 }
 #endif

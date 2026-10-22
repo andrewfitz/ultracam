@@ -224,8 +224,10 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
   // Capture callbacks may arrive off the main actor while the recording
   // controls start/stop sessions on it. Keep the catalog and the output
   // reservations behind one lock so a callback can never race a session
-  // teardown. Managers are shared by folder/extension so disk reservations
-  // account for all feeds recording to the same volume.
+  // teardown. Managers are shared by folder/extension (path allocation);
+  // free-space reservations and headroom are pooled per volume across every
+  // manager (`RecordingVolumeSpaceRegistry`), so feeds recording to
+  // different folders on one drive are all counted against its free space.
   private let sessionLock = NSLock()
   private var sessions: [FeedID: Session] = [:]
   private var stoppingFeeds = Set<FeedID>()

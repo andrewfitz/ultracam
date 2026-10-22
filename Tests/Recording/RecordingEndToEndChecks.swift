@@ -596,6 +596,7 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     var failAfter: Int?
     var calls: Int { lock.withLock { count } }
     var lastHeadroom: UInt64? { lock.withLock { headrooms.last } }
+    var recordedHeadrooms: [UInt64] { lock.withLock { headrooms } }
     func check(_ headroom: UInt64) throws {
       let shouldFail = lock.withLock { () -> Bool in
         count += 1
@@ -1050,6 +1051,123 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertEqual(converter.cachedTextureCount, 3, "One source texture and two destination planes")
     try converter.convert(source, into: second)
     XCTAssertEqual(converter.cachedTextureCount, 5)
+  }
+
+  /// The shared converter kept every IOSurface it wrapped (x422 pool and
+  /// capture surfaces, about 0.5 GB for a 4K take) after the take ended. The
+  /// cache empties once the last recorder using it finishes.
+  func testConverterReleasesSurfacesWhenTheLastTakeFinishes() throws {
+    let converter = try RecordingPixelConverter()
+    let source = try v210Frame(width: 96, height: 64)
+    var buffer: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 96, 64, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer), kCVReturnSuccess)
+    let destination = try XCTUnwrap(buffer)
+    converter.beginUse()
+    converter.beginUse()
+    try converter.convert(source, into: destination)
+    XCTAssertEqual(converter.cachedTextureCount, 3)
+    converter.endUse()
+    Thread.sleep(forTimeInterval: RecordingPixelConverter.purgeRetryInterval * 2)
+    XCTAssertEqual(converter.cachedTextureCount, 3, "Another take still converts through the cache")
+    converter.endUse()
+    XCTAssertTrue(waitUntil(3) { converter.cachedTextureCount == 0 }, "The last take released every surface")
+    // A later take wraps its surfaces again.
+    converter.beginUse()
+    try converter.convert(source, into: destination)
+    XCTAssertEqual(converter.cachedTextureCount, 3)
+    converter.endUse()
+    XCTAssertTrue(waitUntil(3) { converter.cachedTextureCount == 0 })
+  }
+
+  /// On the GPU route a frame without an IOSurface (or whose repack fails)
+  /// goes to VideoToolbox as the capture buffer itself. Those frames used to
+  /// skip the capture-buffer bound, so VideoToolbox could hold any number of
+  /// driver frames. The bound is now decided per frame.
+  func testGPURouteFallbackFramesRespectTheCaptureBufferBound() throws {
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("gpu-fallback"),
+      outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("unused-fallback-\(UUID().uuidString).mov"),
+      width: 1_920, height: 1_080, videoCodec: kCMVideoCodecType_AppleProRes422HQ)
+    let lock = NSLock()
+    var received: [CVImageBuffer] = []
+    // VideoToolbox never returns a frame: everything submitted stays inside.
+    let writer = try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { _, image, _, _ in
+      lock.withLock { received.append(image) }
+      return noErr
+    })
+    try writer.start()
+    XCTAssertEqual(writer.telemetry.encoderInputFormat, "x422 (GPU repack from v210)")
+    let duration = VideoContract.fastDuration
+    // GPU-repacked frames hold no capture buffer.
+    let surfaceBacked = try v210Frame(width: 1_920, height: 1_080)
+    for index in 0..<2 {
+      try writer.appendVideo(try VideoContract.sample(surfaceBacked,
+        at: CMTimeMultiply(duration, multiplier: Int32(index)), duration: duration))
+    }
+    // A capture buffer without an IOSurface cannot be repacked.
+    var plain: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 1_920, 1_080, kCVPixelFormatType_422YpCbCr10, nil, &plain),
+      kCVReturnSuccess)
+    let capture = try XCTUnwrap(plain)
+    XCTAssertNil(CVPixelBufferGetIOSurface(capture))
+    let limit = AVAssetSourceRecordingWriter.maximumCaptureFramesInEncoder
+    for index in 2..<limit {
+      try writer.appendVideo(try VideoContract.sample(capture,
+        at: CMTimeMultiply(duration, multiplier: Int32(index)), duration: duration))
+    }
+    XCTAssertEqual(lock.withLock { received.filter { $0 === capture }.count }, limit - 2,
+      "The fallback hands VideoToolbox the capture buffer itself")
+    let started = ProcessInfo.processInfo.systemUptime
+    XCTAssertThrowsError(try writer.appendVideo(try VideoContract.sample(capture,
+      at: CMTimeMultiply(duration, multiplier: Int32(limit)), duration: duration))) { error in
+      XCTAssertTrue(error.localizedDescription.contains("capture frames waited in VideoToolbox"),
+        error.localizedDescription)
+    }
+    XCTAssertGreaterThan(ProcessInfo.processInfo.systemUptime - started, 1.5,
+      "The frame waited for the encoder before failing")
+    XCTAssertEqual(lock.withLock { received.count }, limit, "The over-limit frame never reached VideoToolbox")
+    XCTAssertEqual(writer.telemetry.cpuConvertedFrames, UInt64(limit - 2))
+  }
+
+  /// A restarted input (a new HDMI format) starts its capture clock over.
+  /// The take used to fail inside the writer with "Video timestamps moved
+  /// backwards" and lose what was queued; the recorder now ends it itself,
+  /// says why, still writes everything admitted before, and withdraws its
+  /// free-space headroom.
+  func testRestartedCaptureClockEndsTheTakeVisibly() throws {
+    let space = CountingSpaceCheck()
+    let writer = SyntheticSourceWriter()
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("clock-restart"),
+      outputURL: URL(fileURLWithPath: "/tmp/clock-restart.mov"), width: 16, height: 16,
+      spaceCheckInterval: 0.05, checkAvailableSpace: { try space.check($0) })
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    let adapter = SourceRecordingCallbackAdapter(feedID: config.feedID, recorder: recorder)
+    try adapter.start()
+    let duration = VideoContract.fastDuration
+    let image = try v210Frame(width: 16, height: 16)
+    for frame in 100..<110 {
+      XCTAssertTrue(adapter.appendRawVideo(pixelBuffer: image,
+        presentationTime: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration))
+    }
+    // A pause does not hide the restart.
+    try adapter.pause()
+    try adapter.resume()
+    XCTAssertTrue(waitUntil(2) { space.lastHeadroom.map { $0 > 0 } == true })
+    XCTAssertFalse(adapter.appendRawVideo(pixelBuffer: image, presentationTime: duration, duration: duration))
+    let telemetry = adapter.telemetry
+    XCTAssertEqual(telemetry.state, .failed)
+    XCTAssertTrue(telemetry.lastError?.contains("changed format or restarted") == true, telemetry.lastError ?? "")
+    XCTAssertFalse(telemetry.lastError?.contains("moved backwards") == true)
+    XCTAssertEqual(telemetry.droppedVideo, 1)
+    XCTAssertTrue(waitUntil(2) { writer.videoSamples.count == 10 }, "Frames admitted before are still written")
+    // The failed take reports a headroom of 0 once, then stops checking.
+    XCTAssertTrue(waitUntil(2) { space.lastHeadroom == 0 })
+    let calls = space.calls
+    Thread.sleep(forTimeInterval: 0.3)
+    XCTAssertEqual(space.calls, calls)
+    XCTAssertEqual(space.recordedHeadrooms.filter { $0 == 0 }.count, 1)
+    try? adapter.stop()
+    XCTAssertEqual(adapter.telemetry.state, .failed)
   }
 
   static let allTests = [

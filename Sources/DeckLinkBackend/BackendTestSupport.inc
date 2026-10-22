@@ -7,6 +7,7 @@ class FakeTimecode final : public IDeckLinkTimecode {
   std::atomic<ULONG> references{1};
   CFStringRef value = CFSTR("01:02:03:04");
   uint8_t frames = 4;
+  uint8_t minutes = 2, seconds = 3;
   bool componentsFail = false;
   BMDTimecodeFlags flags = bmdTimecodeIsDropFrame;
   ~FakeTimecode() override = default;
@@ -14,9 +15,10 @@ class FakeTimecode final : public IDeckLinkTimecode {
   ULONG AddRef() override { return ++references; }
   ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
   BMDTimecodeBCD GetBCD() override { return 0; }
-  HRESULT GetComponents(uint8_t *hours, uint8_t *minutes, uint8_t *seconds, uint8_t *frameCount) override {
+  HRESULT GetComponents(uint8_t *hours, uint8_t *minuteCount, uint8_t *secondCount, uint8_t *frameCount) override {
     if (componentsFail) return E_FAIL;
-    if (hours) *hours = 1; if (minutes) *minutes = 2; if (seconds) *seconds = 3; if (frameCount) *frameCount = frames; return S_OK;
+    if (hours) *hours = 1; if (minuteCount) *minuteCount = minutes; if (secondCount) *secondCount = seconds;
+    if (frameCount) *frameCount = frames; return S_OK;
   }
   HRESULT GetString(CFStringRef *result) override { if (!result) return E_INVALIDARG; *result = static_cast<CFStringRef>(CFRetain(value)); return S_OK; }
   BMDTimecodeFlags GetFlags() override { return flags; }
@@ -755,12 +757,33 @@ static BOOL runFrameFeatureChecks(NSError **error) {
       NSString *previous = timecodeText;
       callback->VideoInputFrameArrived(frame, nullptr);
       if (timecodeText != previous) return fail(error, @"An unchanged RP188 label was formatted again.");
-      // Signal loss starts over: the next source may be a pair counter.
+      // Signal loss relearns the cadence, but meanwhile labels follow the
+      // one latched before, so a full-rate source is not shown doubled again.
       frame->noSignal = true;
       callback->VideoInputFrameArrived(frame, nullptr);
       frame->noSignal = false; timecode->frames = 5; timecode->flags = bmdTimecodeFieldMark;
       callback->VideoInputFrameArrived(frame, nullptr);
-      if (![timecodeText isEqualToString:@"01:02:03:11"]) return fail(error, @"Full-rate RP188 survived signal loss.");
+      if (![timecodeText isEqualToString:@"01:02:03:05"]) return fail(error, @"Full-rate RP188 was doubled again after signal loss.");
+      // A pair counter after it is recognised by its own evidence.
+      for (uint8_t value = 6; value != 9; ++value) {
+        timecode->frames = value; timecode->flags = bmdTimecodeFlagDefault;
+        callback->VideoInputFrameArrived(frame, nullptr);
+        timecode->flags = bmdTimecodeFieldMark;
+        callback->VideoInputFrameArrived(frame, nullptr);
+      }
+      if (![timecodeText isEqualToString:@"01:02:03:17"]) return fail(error, @"A pair counter after signal loss was not recognised.");
+      callback->accepting = false; callback->Release();
+
+      // 59.94 drop-frame skips labels 00-03 at a minute not divisible by
+      // ten: a full-rate count goes 59 -> 04. That boundary keeps the evidence.
+      callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock);
+      timecode->flags = bmdTimecodeIsDropFrame; timecode->seconds = 59;
+      for (uint8_t value = 56; value != 60; ++value) { timecode->frames = value; callback->VideoInputFrameArrived(frame, nullptr); }
+      timecode->minutes = 3; timecode->seconds = 0;
+      for (uint8_t value = 4; value != 8; ++value) { timecode->frames = value; callback->VideoInputFrameArrived(frame, nullptr); }
+      if (![timecodeText isEqualToString:@"01:03:00;07"])
+        return fail(error, [@"A drop-frame minute boundary reset the full-rate RP188 evidence: " stringByAppendingString:timecodeText ?: @"nil"]);
+      timecode->minutes = 2; timecode->seconds = 3;
       callback->accepting = false; callback->Release();
 
       // A pair counter (repeat, +1, ...) with one corrupt label above 29: the
@@ -778,12 +801,14 @@ static BOOL runFrameFeatureChecks(NSError **error) {
       if (![timecodeText isEqualToString:@"01:02:03:18"]) return fail(error, @"One corrupt RP188 label latched full-rate counting.");
       pair(9, true);
       if (![timecodeText isEqualToString:@"01:02:03:19"]) return fail(error, @"Paired RP188 lost its field mark after a corrupt label.");
-      // A reconfiguration also starts over.
+      // A reconfiguration also starts over, following the latched cadence meanwhile.
       for (uint8_t value = 20; value != 26; ++value) pair(value, false);
       if (![timecodeText isEqualToString:@"01:02:03:25"]) return fail(error, @"Full-rate RP188 was not recognised after a pair counter.");
       callback->resetTimecodeCadence = true;
       pair(4, false);
-      if (![timecodeText isEqualToString:@"01:02:03:08"]) return fail(error, @"A reconfiguration did not reset the RP188 cadence.");
+      if (![timecodeText isEqualToString:@"01:02:03:04"]) return fail(error, @"A reconfiguration doubled a full-rate RP188 label.");
+      for (uint8_t value = 5; value != 8; ++value) { pair(value, false); pair(value, true); }
+      if (![timecodeText isEqualToString:@"01:02:03:15"]) return fail(error, @"A reconfiguration did not relearn the RP188 cadence.");
       callback->accepting = false; callback->Release();
       // 29.97: labels pass through, with the field mark ignored.
       callback = new CaptureCallback(bmdMode4K2160p2997, 30000, framesBlock, eventsBlock, mediaBlock);

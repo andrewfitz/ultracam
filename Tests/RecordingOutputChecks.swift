@@ -99,7 +99,7 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100,
-      diskSpace: FixedRecordingOutputDiskSpace(bytes: 110))
+      diskSpace: FixedRecordingOutputDiskSpace(bytes: 110), volumes: RecordingVolumeSpaceRegistry())
     XCTAssertThrowsError(try manager.makeSession(feedID: "too-large", expectedBytes: 11)) { error in
       XCTAssertEqual(error as? RecordingOutputError,
         .insufficientDiskSpace(required: 111, available: 110))
@@ -297,7 +297,8 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let disk = ChangingRecordingOutputDiskSpace(bytes: 1_000)
-    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk)
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk,
+      volumes: RecordingVolumeSpaceRegistry())
     for expectedBytes: UInt64 in [0, 80] {
       disk.bytes = 1_000
       let session = try manager.beginExternalWriterSession(feedID: "Wide", expectedBytes: expectedBytes)
@@ -321,7 +322,8 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let disk = ChangingRecordingOutputDiskSpace(bytes: 1_000)
-    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk)
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk,
+      volumes: RecordingVolumeSpaceRegistry())
     let wide = try manager.beginExternalWriterSession(feedID: "Wide")
     let tight = try manager.beginExternalWriterSession(feedID: "Tight")
     XCTAssertNoThrow(try wide.checkExternalWriterCapacity(headroom: 500))
@@ -333,6 +335,80 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     wide.preserveForRecovery()
     XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 900))
     XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 901))
+    tight.preserveForRecovery()
+  }
+
+  /// Three ProRes HQ feeds recording to three folders on one drive each saw
+  /// only their own folder's headroom, so the drive filled before any check
+  /// failed. Reservations, headroom and the floor are pooled per volume.
+  func testManagersOnTheSameVolumeShareFreeSpace() throws {
+    let first = try makeRoot()
+    let second = try makeRoot()
+    defer {
+      try? FileManager.default.removeItem(at: first)
+      try? FileManager.default.removeItem(at: second)
+    }
+    XCTAssertEqual(RecordingVolumeSpaceRegistry.volumeKey(for: first),
+      RecordingVolumeSpaceRegistry.volumeKey(for: second), "Both folders are on the test volume")
+    let volumes = RecordingVolumeSpaceRegistry()
+    let disk = ChangingRecordingOutputDiskSpace(bytes: 1_000)
+    let wideManager = try RecordingOutputManager(rootDirectory: first, minimumFreeBytes: 100,
+      diskSpace: disk, volumes: volumes)
+    let tightManager = try RecordingOutputManager(rootDirectory: second, minimumFreeBytes: 100,
+      diskSpace: disk, volumes: volumes)
+
+    // Reservations made through one folder's manager count for the other.
+    let reserved = try wideManager.makeSession(feedID: "Reserved", expectedBytes: 500)
+    XCTAssertThrowsError(try tightManager.makeSession(feedID: "Reserved", expectedBytes: 500)) { error in
+      XCTAssertEqual(error as? RecordingOutputError, .insufficientDiskSpace(required: 1_100, available: 1_000))
+    }
+    try reserved.cancel()
+
+    // So does each live take's headroom; the floor is counted once.
+    let wide = try wideManager.beginExternalWriterSession(feedID: "Wide")
+    let tight = try tightManager.beginExternalWriterSession(feedID: "Tight")
+    XCTAssertNoThrow(try wide.checkExternalWriterCapacity(headroom: 450))
+    XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 451)) { error in
+      XCTAssertEqual(error as? RecordingOutputError, .insufficientDiskSpace(required: 1_001, available: 1_000))
+    }
+    XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 450))
+    XCTAssertEqual(volumes.usage(for: second).headroom, 900)
+    wide.preserveForRecovery()
+    tight.preserveForRecovery()
+    XCTAssertEqual(volumes.usage(for: first).headroom, 0)
+    XCTAssertEqual(volumes.usage(for: first).reserved, 0)
+
+    // A different registry (a different volume) is not affected.
+    let elsewhere = try RecordingOutputManager(rootDirectory: second, minimumFreeBytes: 100,
+      diskSpace: disk, volumes: RecordingVolumeSpaceRegistry())
+    let held = try wideManager.makeSession(feedID: "Held", expectedBytes: 800)
+    XCTAssertNoThrow(try elsewhere.makeSession(feedID: "Other", expectedBytes: 800).cancel())
+    try held.cancel()
+  }
+
+  /// A paused take keeps its file but stops holding headroom its siblings
+  /// need; resuming counts it again at once.
+  func testPausedTakeWithdrawsItsHeadroomUntilResume() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let volumes = RecordingVolumeSpaceRegistry()
+    let disk = ChangingRecordingOutputDiskSpace(bytes: 1_000)
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk,
+      volumes: volumes)
+    let wide = try manager.beginExternalWriterSession(feedID: "Wide")
+    let tight = try manager.beginExternalWriterSession(feedID: "Tight")
+    try wide.checkExternalWriterCapacity(headroom: 600)
+    XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 600))
+    try wide.pause()
+    XCTAssertEqual(volumes.usage(for: root).headroom, 600, "Only the failed check's own claim remains")
+    XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 600))
+    try wide.resume()
+    XCTAssertEqual(volumes.usage(for: root).headroom, 1_200)
+    XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 600))
+    // A failed recorder reports a headroom of 0 (see SourceRecorderCore).
+    try wide.checkExternalWriterCapacity(headroom: 0)
+    XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 800))
+    wide.preserveForRecovery()
     tight.preserveForRecovery()
   }
 
