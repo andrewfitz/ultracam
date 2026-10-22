@@ -997,6 +997,10 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate,
   /// The last drawn frame, held only until its scope has been drawn.
   private var scopePendingFrame: MonitorGPUFrame?
   private var scopePendingKey: ScopeKey?
+  /// When the pending live frame was wrapped. Its cached textures leave
+  /// residency once idle (1 s after a flush), so it must be drawn well before.
+  private var scopePendingAt = 0.0
+  private static let pendingScopeLifetime = 0.5
   private var scopedKey: ScopeKey?
   /// When the pending scope became due, and when the next skip may be counted.
   private var scopeDueAt = 0.0
@@ -1131,6 +1135,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate,
         }
         scopePendingFrame = shownFrame
         scopePendingKey = key
+        scopePendingAt = now
         setScopeRate(key.state.configuration.scopes.refreshHz)
       }
     }
@@ -1225,6 +1230,14 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate,
       return
     }
     let now = update.targetTimestamp
+    // A live frame the scope link couldn't draw for this long is dropped,
+    // counted, rather than encoded from textures that may be gone; it also
+    // stops pinning the producer's buffer. Held (frozen) frames own theirs.
+    if key.frozenToken == nil, now - scopePendingAt > Self.pendingScopeLifetime {
+      dropPendingScope()
+      presenter.recordScopeSkip(busy: false)
+      return
+    }
     let interval = scopeInterval(key)
     guard isImmediate(key) || now >= nextScopeTime - 0.002 else { return }
     // At most two scope submissions on the GPU. Beyond that the GPU is behind:
