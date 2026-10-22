@@ -2,6 +2,8 @@
 # MonitorFeedHost and MonitorGPUContext checks (W4 step 5): every app source plus
 # Tests/MonitorKitHost, built like monitor-app-integration.sh (strict concurrency,
 # warnings as errors). Synthetic only: no AppModel, no camera, no CMIO.
+# scripts/test.sh (gate U) runs the same suite in its test binary; this script
+# is the standalone strict build.
 set -euo pipefail
 if [[ $# -ne 0 ]]; then
   echo 'Usage: monitor-feed-host-checks.sh' >&2

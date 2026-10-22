@@ -65,7 +65,9 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-pat
   -I "$libraries" -L "$libraries" -lXCTestSwiftSupport -Xlinker -rpath -Xlinker "$libraries" \
   "$task_root"/Sources/Shared/*.swift "$task_root/Sources/App/LUTProcessor.swift" "$task_root/Sources/App/AppResourceUsage.swift" \
   "$task_root"/Sources/Recording/*.swift \
-  "$task_root/Sources/App/MonitorCoordinator.swift" "$task_root/Sources/App/MonitorCaptureSink.swift" \
+  "$task_root/Sources/App/MonitorCoordinator.swift" \
+  "$task_root/Sources/App/MonitorFeedHost.swift" "$task_root/Sources/App/MonitorGPUContext.swift" \
+  "$task_root"/Sources/App/MonitorSurface*.swift \
   "$task_root/Sources/App/CameraSink.swift" "$task_root/Sources/App/CaptureController.swift" \
   "$task_root/Sources/App/AutoSwitcherBridge.swift" \
   "$task_root/Sources/App/AutoSwitcherTimelineRecorder.swift" \
@@ -81,6 +83,7 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-pat
   "$task_root/Sources/App/UIPresentation.swift" "$task_root/Sources/App/UIAction.swift" \
   "$task_root/Sources/CameraExtension/CameraProvider.swift" \
   "$task_root"/Tests/*.swift "$task_root"/Tests/Recording/*.swift \
+  "$task_root/Tests/MonitorKitHost/MonitorFeedHostChecks.swift" \
   "$test_root/UltracamBackend.o" "$test_root/DeckLinkAPIDispatch.o" -L "$auto_switcher_lib" -lauto_switcher \
   -framework Security -framework CoreFoundation -framework SystemConfiguration -lz -liconv -lc++ \
   -o "$test_root/lut-tests" >> "$compile_log" 2>&1 || {

@@ -289,11 +289,11 @@ final class AppModel {
     self.lutLoader = lutLoader
     monitorCoordinator.onConfigurationChange = { [weak self] target, configuration in
       guard let self else { return }
-      // Merged, so MonitorKit settings the configuration cannot carry survive.
+      // The coordinator reports a target's whole preferences: they replace the saved ones.
       if target.rawValue == "program" {
-        self.feedCoordinator.programMonitor.merge(configuration)
+        self.feedCoordinator.programMonitor = configuration
       } else if var descriptor = self.feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
-        descriptor.monitor.merge(configuration)
+        descriptor.monitor = configuration
         self.feedCoordinator.update(descriptor)
       }
       self.saveSettings()
@@ -617,6 +617,7 @@ final class AppModel {
     let wasSelected = id == selectedFeedID
     saveSettings()
     guard feedCoordinator.remove(id) else { return false }
+    monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(id.rawValue), nil)
     syncRecordingFeeds()
     if wasSelected {
       capture.setLegacyPreviewOwnership(false)
@@ -1079,6 +1080,11 @@ final class AppModel {
     let controller = feedCoordinator.capture(for: feedID)
     controller.setLegacyPreviewOwnership(feedID == selectedFeedID)
     controller.setMonitorSink(monitorCoordinator.captureSink(for: MonitorTargetID(feedID.rawValue)))
+    // The Output (LUT) picture and Output-stage tools show the very MonitorLUT
+    // this camera burns in (nil while Apply LUT is off), read at each encode.
+    monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(feedID.rawValue)) { [weak controller] in
+      controller?.burnInLUT
+    }
     controller.onUpdate = { [weak self] update in
       MainActor.assumeIsolated {
         guard let self, self.feedDescriptors.contains(where: { $0.id == feedID }) else { return }

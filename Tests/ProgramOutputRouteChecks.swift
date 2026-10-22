@@ -458,19 +458,28 @@ import XCTest
     let uhd = try ioSurfaceFrame(3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, fill: fillX422)
     let output = coordinator.programOutput
     let done = expectation(description: "paced capture thread")
-    DispatchQueue.global(qos: .userInteractive).async {
-      for index in 0..<240 {
-        if index == 120 {
-          _ = output.requestCut(to: b.id)
-        }
-        let source = index < 120 ? a.id : b.id
-        let image = index < 120 ? matching : uhd
-        clock.ingest(Int64(index))
-        output.ingest(fromCapture: source, frame: self.processed(image, at: Int64(index)))
-        Thread.sleep(forTimeInterval: 1.0 / 59.94)
+    // A strict timer paces the frames: a process started from a background shell
+    // or agent has its timers coalesced, and a Thread.sleep(1/59.94) loop then
+    // took about 32 s instead of 4 s.
+    let pacer = DispatchSource.makeTimerSource(flags: .strict,
+      queue: DispatchQueue(label: "paced capture", qos: .userInteractive))
+    var index = 0
+    pacer.schedule(deadline: .now(), repeating: 1.0 / 59.94, leeway: .nanoseconds(0))
+    pacer.setEventHandler {
+      if index == 120 {
+        _ = output.requestCut(to: b.id)
       }
-      done.fulfill()
+      let source = index < 120 ? a.id : b.id
+      let image = index < 120 ? matching : uhd
+      clock.ingest(Int64(index))
+      output.ingest(fromCapture: source, frame: self.processed(image, at: Int64(index)))
+      index += 1
+      if index == 240 {
+        pacer.cancel()
+        done.fulfill()
+      }
     }
+    pacer.resume()
     wait(for: [done], timeout: 30)
     bridge.waitUntilIdle()
     let deadline = Date().addingTimeInterval(5)

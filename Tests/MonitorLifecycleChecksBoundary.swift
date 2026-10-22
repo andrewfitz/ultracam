@@ -114,8 +114,8 @@ extension MonitorLifecycleChecks {
       coordinator.setPreferences(next, for: alpha)
       XCTAssertEqual(reported.count, 1)
       XCTAssertEqual(reported.first?.0, alpha)
-      var merged = camera
-      merged.merge(try XCTUnwrap(reported.first?.1))
+      // The whole preferences are reported; the owner saves them as they are.
+      let merged = try XCTUnwrap(reported.first?.1)
       XCTAssertTrue(merged.state.focus.enabled)
       XCTAssertEqual(merged.state.zebras[0].range, 4)
       XCTAssertEqual(merged.state.displayTransform.mode, .logToRec709, "MonitorKit-only settings survive")

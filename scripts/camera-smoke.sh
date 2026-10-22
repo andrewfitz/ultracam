@@ -36,7 +36,7 @@ xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-error
   "$task_root/Sources/Shared/VirtualCameraRegistry.swift" \
   "$task_root/Sources/Shared/VirtualCameraRegistryTransport.swift" \
   "$task_root/Sources/Shared/NaturalTalkingHeadAutoSwitcher.swift" \
-  "$task_root/Sources/App/AppSettingsStore.swift" \
+  "$task_root/Sources/App/AppSettingsStore.swift" "$task_root/Sources/Shared/MonitorWorkspace.swift" \
   "$task_root/Sources/App/LUTProcessor.swift" "$task_root/Sources/App/AppResourceUsage.swift" \
   "$task_root/Sources/App/CameraSink.swift" "$task_root/Tools/CameraSmoke/main.swift" \
   -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Metal \

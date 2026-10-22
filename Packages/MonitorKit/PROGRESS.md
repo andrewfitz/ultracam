@@ -84,9 +84,16 @@ Next: W3 (two audit rounds of the W2 work + fixes; README, FEATURES, API, INTEGR
   6. NEEDS sweep;
   7. s7 retire (alone).
   Then library W4 fixes, a 4-lens whole-diff audit, fix, final verify. Heavy gates are serialized with `/usr/bin/lockf -k /tmp/ultracam-gates.lock`. Each unit is implement → audit → fix.
+- W4 binary cost of the step-1 linking (measured by s1, 0415118). Xcode links all five MonitorKit products as object files, plus both resource bundles. So the Debug `Ultracam.debug.dylib` grew from 28.75 MB to 35.83 MB (24,293 MonitorKit symbols) before any app file imported MonitorKit. A Release build keeps whatever dead-stripping leaves. The earlier claims that "nothing is pulled into the binaries" and "zero added overhead" were wrong for the Xcode app. Re-measure Release once MonitorTools is retired (s7).
+- W4 MonitorTools output bridge removed (NEEDS sweep after s5). The surfaces draw with MonitorKit, so `Sources/App/MonitorCaptureSink.swift` is deleted along with all of its plumbing:
+  - `MonitorFrameSink` is back to source-only: `offer(_:pts:captureGeneration:sequence:)` and `invalidate`, with no `needsOutput` and no paired `offer(source:output:…)`.
+  - `CaptureController` no longer has `monitorProcessingRevision`/`monitorPipelineConfiguration`, the `needsOutput` terms in its warm-up, no-demand and frame-rate-gate checks, or the paired deliver branch. `ProgramMonitorTap` offers Program's frame once, as its source.
+  - The monitor never keeps processing alive. Every monitor picture shows the capture source, plus the burn-in LUT in MonitorKit's shader.
+  - `AppModel` hands each camera's `CaptureController.burnInLUT` to `MonitorCoordinator.setBurnInLUTSource`. It does this at every `installCaptureUpdateHandler` and clears it when a feed is removed. So Output (LUT) and the Output-stage tools show the LUT the camera burns in.
 - Heartbeat 2026-10-22 10:21: W3+W4 (wf_811d7738-f78) running: library audits, docs and W4 s1-plumbing in progress
 
 ## Queued peer findings (ultracam-18, 2026-10-22) — fold in after W4 final-verify, before releasing the freeze
 1. AppModel refused-Start expiry: drop the camera's `refusedStarts` entry (or call expireResolvedStartRefusals()) whenever its selectedDevice changes — selectedDevice didSet for the selected camera, updateCamera/setInput for others. Today a stale "Couldn't start" can resurface on a later unplug.
 2. AppModel.startRefusal: `selectedDevice.isEmpty` should say "Choose an input for this camera." not "Connect the UltraStudio."
 3. ProgramOutputBridge ~404-416 host-time anchoring: re-anchor when mapped time is more than ~2 frame durations behind/ahead of now, not only past ±1 s (short on-air gaps leave a lasting latency offset). Low priority.
+- Heartbeat 2026-10-22 15:21: W3+W4 (wf_811d7738-f78) still running; W4 through s4-feedhost committed (8e1808b, 15:00), feed-host gates in progress

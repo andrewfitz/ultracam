@@ -21,7 +21,7 @@ import MonitorKit
   @Published private var preferences: [MonitorTargetID: MonitorFeedPreferences]
   @Published private var previewEnabled: [MonitorTargetID: Bool] = [:]
   /// A target's tools changed (from the interface): its whole preferences, which
-  /// replace the saved ones (`MonitorFeedPreferences.merge(_:)`).
+  /// replace the saved ones.
   var onConfigurationChange: ((MonitorTargetID, MonitorFeedPreferences) -> Void)?
   /// Reset and copy: the owner applies them to its saved preferences (the
   /// coordinator applies the same change to its own); nil for a target it does not
@@ -337,12 +337,6 @@ import MonitorKit
 }
 
 extension MonitorFeedPreferences {
-  /// The coordinator reports a target's whole preferences: they replace the saved
-  /// ones. (The owner merged MonitorTools configurations field by field; with
-  /// MonitorKit surfaces nothing is lost in between, MonitorKit-only settings and
-  /// the "Monitor" picture stage included.)
-  mutating func merge(_ preferences: MonitorFeedPreferences) { self = preferences }
-
   /// Shows `stage` as the picture. Zebra measures the picture shown, as in
   /// MonitorTools (map §5.3), so the first zebra set's stage follows it; every
   /// picture menu changes the stage through here.

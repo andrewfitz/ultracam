@@ -379,6 +379,91 @@ import SystemExtensions
 
   // MARK: Real model bridge
 
+  /// AppModel's LUT path end to end, offline: a 3D and a 1D load, a failed parse
+  /// that keeps the loaded LUT, a restore from the saved bookmark, a missing file
+  /// on restore and Forget LUT. (Burn-in identity needs a running camera; it is
+  /// covered at controller level by LUTGoldenChecks.)
+  func lutModel() throws {
+    let suiteName = "org.ultracam.ui-verify-lut.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    var lattice = ["TITLE \"Check LUT\"", "LUT_3D_SIZE 2"]
+    for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lattice.append("\(1 - Float(r)) \(1 - Float(g)) \(1 - Float(b))") } } }
+    let cube3D = folder.appendingPathComponent("check-3d.cube")
+    let cube1D = folder.appendingPathComponent("check-1d.cube")
+    let broken = folder.appendingPathComponent("broken.cube")
+    try lattice.joined(separator: "\n").write(to: cube3D, atomically: true, encoding: .utf8)
+    try "TITLE \"Shaper\"\nLUT_1D_SIZE 2\n0 0 0\n1 1 1".write(to: cube1D, atomically: true, encoding: .utf8)
+    try "LUT_3D_SIZE 2\n0 0 0".write(to: broken, atomically: true, encoding: .utf8)
+
+    let settings = AppSettingsStore(defaults: defaults)
+    let alpha = FeedID(rawValue: "ui-verify-lut-alpha"), beta = FeedID(rawValue: "ui-verify-lut-beta")
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: [
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "ui-verify-lut-a", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "ui-verify-lut-b", applyLUT: false, automaticFeed: false),
+    ], selectedFeedID: alpha, outputMode: .separateCameras))
+    let installerServices = RecordingInstallerServices()
+    let model = AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+      registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      installer: ExtensionInstaller(services: installerServices.services()), hardware: .offline)
+    func settle(until condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(10)
+      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+    }
+    func bookmark(_ id: FeedID) -> Data? { settings.loadSnapshot().feeds.first { $0.id == id }?.lutBookmark }
+
+    model.loadLUT(url: cube3D, feedID: alpha)
+    settle { !model.loading && (model.lutLoaded || model.lutError != nil) }
+    verifier.check("lut: a 3D cube loads", model.lutLoaded && model.lutError == nil, model.lutError ?? "")
+    verifier.check("lut: a 3D cube's title", model.lutTitle == "Check LUT · 2³", model.lutTitle)
+    verifier.check("lut: loading turns Apply LUT on", model.configuration.applyLUT)
+    verifier.check("lut: a load saves its bookmark", bookmark(alpha) != nil)
+
+    model.loadLUT(url: cube1D, feedID: alpha)
+    settle { !model.loading && model.lutTitle != "Check LUT · 2³" }
+    verifier.check("lut: a 1D cube's title", model.lutTitle == "Shaper · 1D 2", model.lutTitle)
+
+    model.loadLUT(url: broken, feedID: alpha)
+    settle { !model.loading && model.lutError != nil }
+    verifier.check("lut: a file that does not parse says so",
+      model.lutError?.hasPrefix("LUT was not changed") == true, model.lutError ?? "no error")
+    verifier.check("lut: a failed load keeps the loaded LUT",
+      model.lutLoaded && model.lutTitle == "Shaper · 1D 2", model.lutTitle)
+
+    model.loadLUT(url: cube3D, feedID: alpha)
+    settle { !model.loading && model.lutTitle == "Check LUT · 2³" }
+    model.selectFeed(beta)
+    settle { !model.loading }
+    verifier.check("lut: another camera has its own (no) LUT",
+      !model.lutLoaded && model.lutTitle == "No LUT loaded", model.lutTitle)
+    model.selectFeed(alpha)
+    verifier.check("lut: selecting a camera restores its LUT", model.loading)
+    settle { !model.loading }
+    verifier.check("lut: the restore loads", model.lutLoaded && model.lutError == nil, model.lutError ?? "")
+    verifier.check("lut: the restore's title", model.lutTitle == "Check LUT · 2³", model.lutTitle)
+    verifier.check("lut: the restore keeps Apply LUT on", model.configuration.applyLUT)
+
+    model.loadLUT(url: cube1D, feedID: beta)
+    settle { !model.loading && bookmark(beta) != nil }
+    try FileManager.default.removeItem(at: cube1D)
+    model.selectFeed(beta)
+    settle { !model.loading }
+    verifier.check("lut: a missing file on restore is unavailable", model.lutTitle == "Saved LUT unavailable", model.lutTitle)
+    verifier.check("lut: a missing file on restore says so",
+      model.lutError?.hasPrefix("Saved LUT could not be restored") == true, model.lutError ?? "no error")
+
+    model.selectFeed(alpha)
+    settle { !model.loading }
+    model.forgetLUT(alpha)
+    verifier.check("lut: Forget LUT clears it",
+      !model.lutLoaded && model.lutTitle == "No LUT loaded" && !model.configuration.applyLUT, model.lutTitle)
+    verifier.check("lut: Forget LUT persists", bookmark(alpha) == nil)
+  }
+
   func bridge() throws {
     let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("defaults suite", false); return }
@@ -803,6 +888,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.accessibility()
   run.interactions()
   do { try run.bridge() } catch { verifier.check("bridge tests threw", false, "\(error)") }
+  do { try run.lutModel() } catch { verifier.check("LUT model tests threw", false, "\(error)") }
   run.discovery()
   run.menuBar()
   Images.waitForWrites()
