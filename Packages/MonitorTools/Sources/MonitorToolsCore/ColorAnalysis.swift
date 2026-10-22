@@ -76,7 +76,7 @@ public enum MonitorRGBGamut: String, Codable, Sendable {
     case .rec709: return MonitorRGB(r: 0.2126, g: 0.7152, b: 0.0722)
     case .rec2020: return MonitorRGB(r: 0.2627, g: 0.6780, b: 0.0593)
     case .sGamut3:
-      return MonitorRGB(r: 0.258685550974646, g: 0.724718154617408, b: 0.016596294407946)
+      return MonitorRGB(r: 0.2709796708, g: 0.7866064112, b: -0.0575860820)
     case .sGamut3Cine:
       return MonitorRGB(r: 0.215075820115587, g: 0.885068501743727, b: -0.100144321859314)
     }

@@ -74,7 +74,7 @@ float3 sonyPattern2(float signal){
 // midpoint interval convention. This does not assert Sony M&C bit-exactness.
 float3 elZonePublicChart(float3 native,constant Params& p){
  float3 linear=float3(sonySLog3Decode(native.r),sonySLog3Decode(native.g),sonySLog3Decode(native.b));
- float3 weights=(p.flags&SonySGamut3)?float3(.258685550974646f,.724718154617408f,.016596294407946f):float3(.215075820115587f,.885068501743727f,-.100144321859314f);
+ float3 weights=(p.flags&SonySGamut3)?float3(.2709796708f,.7866064112f,-.0575860820f):float3(.215075820115587f,.885068501743727f,-.100144321859314f);
  float Y=dot(linear,weights);
  if(Y<=0)return float3(0);
  if(!isfinite(Y))return float3(luma(native));
@@ -181,7 +181,7 @@ kernel void compose(plane p0 [[texture(0)]],plane p1 [[texture(1)]],plane s0 [[t
  // that container interpretation to recover original normalized native S-Log3.
  float3 slog3=sp.format==1?(sp.sourceLogRescaled>0?(nativeRGB*1023-64)/876:nativeRGB):(full?nativeRGB:(nativeRGB*876+64)/1023);
  float3 linear=float3(sonySLog3Decode(slog3.r),sonySLog3Decode(slog3.g),sonySLog3Decode(slog3.b));
- float3 weights=(p.flags&SonySGamut3)?float3(.258685550974646f,.724718154617408f,.016596294407946f):float3(.215075820115587f,.885068501743727f,-.100144321859314f);
+ float3 weights=(p.flags&SonySGamut3)?float3(.2709796708f,.7866064112f,-.0575860820f):float3(.215075820115587f,.885068501743727f,-.100144321859314f);
  code=sonyLogC3ReferenceCode(dot(linear,weights));a=luma(slog3);full=true;
  }
  float2 z3legal[6]={float2(878,940),float2(857,878),float2(461,480),float2(397,415),float2(152,172),float2(64,152)};

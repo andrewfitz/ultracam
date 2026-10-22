@@ -55,16 +55,15 @@ final class ELZoneProfileTests: XCTestCase {
   }
 
   func testSaturatedChannelsDecodeBeforeSourceGamutLuminance() {
-    // Linear red=.65, green=blue=0; Cine exposure=-.36464, S-Gamut3=-.09829.
+    // Linear red=.65, green=blue=0; Cine exposure=-.36464, S-Gamut3=-.03130.
     let red = MonitorRGB(r: 0.5487944012659178, g: 95.0 / 1023, b: 95.0 / 1023)
     XCTAssertEqual(ELZoneProfile.color(rgb: red, gamut: .sGamut3Cine), MonitorRGB(r: 0, g: 1, b: 0))
     XCTAssertEqual(
       ELZoneProfile.color(rgb: red, gamut: .sGamut3), MonitorRGB(r: 0.533, g: 0.537, b: 0.506))
-    // Cine's negative blue Y stays nonpositive and black; S-Gamut3's exposure=-3.76099.
+    // Both gamuts give saturated blue a negative Y, so it reads black.
     let blue = MonitorRGB(r: 95.0 / 1023, g: 95.0 / 1023, b: 0.5715295853251243)
     XCTAssertEqual(ELZoneProfile.color(rgb: blue, gamut: .sGamut3Cine), MonitorRGB(r: 0, g: 0, b: 0))
-    XCTAssertEqual(
-      ELZoneProfile.color(rgb: blue, gamut: .sGamut3), MonitorRGB(r: 0, g: 0.439, b: 0.753))
+    XCTAssertEqual(ELZoneProfile.color(rgb: blue, gamut: .sGamut3), MonitorRGB(r: 0, g: 0, b: 0))
   }
 
   func testNonpositiveFiniteLuminanceIsBlackDespitePositiveOffset() {
