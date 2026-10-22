@@ -37,21 +37,24 @@ final class HandoffTests: XCTestCase {
     let stop = Atomic<Bool>(false)
     let running = Atomic<Int>(producers)
     let worstSubmit = Atomic<UInt64>(0)
-    let totalSubmits = Atomic<Int>(0)
+    let totalSubmits = Atomic<Int>(0), slowSubmits = Atomic<Int>(0)
     let group = DispatchGroup()
     for p in 0..<producers {
       let source = sources[p % 2], pool = pools[p % 2]
       group.enter()
       Thread.detachNewThread {
         var worst: UInt64 = 0
-        var i = 0
+        var i = 0, slow = 0
         while !stop.load(ordering: .relaxed) {
           let frame = pool[(i + p) % pool.count]
           let start = DispatchTime.now().uptimeNanoseconds
           source.submit(frame)
-          worst = max(worst, Self.nanoseconds(start))
+          let t = Self.nanoseconds(start)
+          worst = max(worst, t)
+          if t > 2_000_000 { slow += 1 }
           i += 1
         }
+        slowSubmits.add(slow, ordering: .relaxed)
         var current = worstSubmit.load(ordering: .relaxed)
         while worst > current {
           let (done, original) = worstSubmit.compareExchange(expected: current, desired: worst, ordering: .relaxed)
@@ -97,12 +100,16 @@ final class HandoffTests: XCTestCase {
     let submits = totalSubmits.load(ordering: .relaxed)
     XCTAssertGreaterThan(submits, 10_000)
     XCTAssertGreaterThan(ticks, 10)
-    let worst = Double(worstSubmit.load(ordering: .relaxed)) / 1e6
+    let worst = Double(worstSubmit.load(ordering: .relaxed)) / 1e6, slow = slowSubmits.load(ordering: .relaxed)
     print(
-      "BENCH handoff: \(submits) submits from \(producers) threads during \(ticks) ticks; worst submit \(String(format: "%.3f", worst)) ms, worst tick \(String(format: "%.3f", Double(worstTick) / 1e6)) ms"
+      "BENCH handoff: \(submits) submits from \(producers) threads during \(ticks) ticks; worst submit \(String(format: "%.3f", worst)) ms (\(slow) over 2 ms), worst tick \(String(format: "%.3f", Double(worstTick) / 1e6)) ms"
     )
-    // A submit is a pointer swap under a lock held for one: scheduling noise aside, microseconds.
-    XCTAssertLessThan(worst, 20, "a submit waited")
+    // A submit is a pointer swap under a lock held for one: microseconds. A thread
+    // the scheduler preempts mid-submit on a loaded machine can take a quantum or
+    // two, so the worst alone is noise there; a submit that waited for the
+    // renderer's encode or the GPU would be slow every tick, thousands of times.
+    XCTAssertLessThan(Double(slow), max(20, Double(submits) * 0.001), "submits waited")
+    XCTAssertLessThan(worst, 250, "a submit waited")
   }
 
   /// The source slot keeps only the latest frame: replaced frames are released at

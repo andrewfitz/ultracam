@@ -522,7 +522,7 @@ float4 mk_filtered(float2 d, float4 map, bool nearest, uint maxTaps, thread cons
   mk_Axis ax = mk_axis(centre.x, footprint.x, nearest, maxTaps), ay = mk_axis(centre.y, footprint.y, nearest, maxTaps);
   // The frame's reciprocals from the uniforms (MonitorPass sets them), else here.
   float3 inverse = in.pass.reciprocals.x != 0 ? in.pass.reciprocals.xyz
-                                               : float3(1.0f / f.levels.y, 1.0f / f.levels.w, 1.0f / f.matrix.y);
+                                               : mk_reciprocals(f);
   if (ax.count == 1 && ay.count == 1) return mk_decodeCodes(mk_tapCodes(mk_clampPixel(centre, f), in), f, inverse);
   bool packed422 = MK_LAYOUT(f) == MK_V210 || MK_LAYOUT(f) == MK_UYVY8 || MK_LAYOUT(f) == MK_YUYV8;
   uint x0 = mk_clampPixel(float2(ax.first, 0), f).x;
@@ -1125,7 +1125,7 @@ kernel void mk_focusMask(texture2d<uint, access::read> packed [[texture(0)]],
   uint y0 = (group.y * groupSize.y + local.y) * MK_FOCUS_ROWS;
   uint cx = uint(clamp(x, 0, int(w) - 1));
   bool lastLane = local.x == groupSize.x - 1, writes = local.x != 0 && !lastLane && x < int(w);
-  float3 inverse = float3(1.0f / f.levels.y, 1.0f / f.levels.w, 1.0f / f.matrix.y);
+  float3 inverse = mk_reciprocals(f);
   float inverseSpan = 1.0f / max(.0001f, thresholds.x * .5f);
   // Rows y0 - 1 … y0 + MK_FOCUS_ROWS, stopping after the picture's last row (one
   // past it, clamped, closes the last mask row). Uniform per SIMD-group, so every

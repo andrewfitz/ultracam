@@ -16,6 +16,17 @@ final class ExactQuotientTests: XCTestCase {
       float a = input[i].x, b = input[i].y;
       out[i] = uint2(as_type<uint>(a / b), as_type<uint>(mk_quotient(a, b, 1.0f / b)));
     }
+    // mk_decode and its exact-quotient form, bit patterns side by side.
+    kernel void test_decodes(texture2d<uint, access::read> packed [[texture(0)]],
+                             texture2d<float, access::read> luma [[texture(1)]],
+                             texture2d<float, access::read> chroma [[texture(2)]],
+                             constant mk_FrameParams& f [[buffer(0)]], device uint4* out [[buffer(1)]],
+                             uint2 xy [[thread_position_in_grid]]) {
+      if (xy.x >= f.shape.y || xy.y >= f.shape.z) return;
+      uint i = (xy.y * f.shape.y + xy.x) * 2;
+      out[i] = as_type<uint4>(mk_decode(packed, luma, chroma, xy, f));
+      out[i + 1] = as_type<uint4>(mk_decode(packed, luma, chroma, xy, f, mk_reciprocals(f)));
+    }
     // A 16-bit unorm plane's value as mk_lumaCode reads it (texel × codeScale.x), less
     // the black level, over the span: every stored sample of a biplanar layout.
     kernel void test_planeQuotient(texture2d<float, access::read> plane [[texture(0)]], device uint2* out [[buffer(1)]],
@@ -133,6 +144,53 @@ final class ExactQuotientTests: XCTestCase {
       }
     }
     XCTAssertEqual(checked, 12)
+  }
+
+  /// MKDecode's exact-quotient `mk_decode` (the scopes' decode) returns `mk_decode`'s
+  /// bits for every layout family, both ranges, every matrix and both sitings,
+  /// over random codes covering the whole code space.
+  func testExactQuotientDecodeIsMKDecodeBitForBit() throws {
+    let gpu = try requireGPU()
+    let pipeline = try gpu.device.makeComputePipelineState(function: XCTUnwrap(library(gpu).makeFunction(name: "test_decodes")))
+    let layouts: [PixelLayout] = [
+      .v210, .uyvy8, .yuyv8, .biplanar(.s420, bitDepth: 8), .biplanar(.s420, bitDepth: 10),
+      .biplanar(.s422, bitDepth: 10), .biplanar(.s444, bitDepth: 10), .biplanar(.s422, bitDepth: 16),
+      .rgb(bitDepth: 8, float: false), .rgb(bitDepth: 16, float: true),
+    ]
+    var checked = 0
+    for layout in layouts {
+      for (i, range) in [CodeRange.legal, .full].enumerated() {
+        for matrix in [YCbCrMatrix.bt601, .bt709, .bt2020, .smpte240m] {
+          let siting: ChromaSiting = i == 0 ? .left : .center
+          let signal = SignalDescription(range: range, matrix: matrix, chromaSiting: siting)
+          let w = 97, h = 23
+          let frame = try SyntheticFrame.random(layout, width: w, height: h, seed: UInt64(checked + 3)).frame(gpu, signal: signal)
+          let out = gpu.buffer(length: w * h * 32)
+          gpu.run { cb in
+            let e = cb.makeComputeCommandEncoder()!
+            e.setComputePipelineState(pipeline)
+            e.setTexture(frame.packed ?? gpu.engine.emptyPacked, index: 0)
+            e.setTexture(frame.luma ?? gpu.engine.emptyFloat, index: 1)
+            e.setTexture(frame.chroma ?? gpu.engine.emptyFloat, index: 2)
+            var f = frame.parameters
+            e.setBytes(&f, length: MemoryLayout<FrameParameters>.stride, index: 0)
+            e.setBuffer(out, offset: 0, index: 1)
+            e.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+            e.endEncoding()
+          }
+          let r = UnsafeBufferPointer(start: out.contents().assumingMemoryBound(to: SIMD4<UInt32>.self), count: w * h * 2)
+          var differing = 0
+          var k = 0
+          while k < w * h {
+            if r[2 * k] != r[2 * k + 1] { differing += 1 }
+            k += 1
+          }
+          XCTAssertEqual(differing, 0, "\(layout) \(range) \(matrix) \(siting)")
+          checked += 1
+        }
+      }
+    }
+    XCTAssertEqual(checked, layouts.count * 8)
   }
 
   /// Random finite numerators of every magnitude the decode meets (and well beyond),

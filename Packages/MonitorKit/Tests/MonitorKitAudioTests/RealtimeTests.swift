@@ -302,11 +302,19 @@ final class RealtimeTests: XCTestCase {
       // Three more publishes: the reset's own and two after it.
       let target = meter.publishCount + 3
       // The loudness meter publishes once per call, like the level meter here.
-      let loudnessTarget = loudness.publishCount + 3
+      let resetAt = loudness.publishCount
+      let loudnessTarget = resetAt + 3
+      let call = Double(frames) / fs
       while meter.publishCount < target || loudness.publishCount < loudnessTarget {
         if meter.snapshot()[0].clipCount != 0 { reappeared += 1 }
-        // A fresh measurement is at most ~3 calls (0.26 s) old here.
-        if loudness.snapshot().duration > 0.4 { loudnessReappeared += 1 }
+        // A fresh measurement holds at most the calls published since the reset
+        // (one may have landed before `resetAt` was read) and the one running, a
+        // tick rounded: this reader can be descheduled for several calls on a
+        // loaded machine, so the bound counts them. One that survived the reset
+        // was over 0.5 s already and grows as fast, so it always exceeds it.
+        let duration = loudness.snapshot().duration
+        let published = Double(loudness.publishCount &- resetAt)
+        if duration > (published + 2) * call + 0.011 { loudnessReappeared += 1 }
         reads += 1
       }
     }

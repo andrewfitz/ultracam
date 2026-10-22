@@ -166,6 +166,28 @@ float4 mk_decode(texture2d<uint, access::read> packed, texture2d<float, access::
   return float4(mk_ycbcrToRGB(y, c, f.matrix), y);
 }
 
+// The reciprocals of mk_decode's divisors (luma span, chroma span, kg), correctly
+// rounded, for its exact-quotient form: a thread that decodes many pixels pays
+// these three divisions once.
+inline float3 mk_reciprocals(constant mk_FrameParams& f) {
+  return float3(1.0f / f.levels.y, 1.0f / f.levels.w, 1.0f / f.matrix.y);
+}
+
+// mk_decode with its quotients taken from `inverse` (mk_reciprocals): the same values.
+float4 mk_decode(texture2d<uint, access::read> packed, texture2d<float, access::read> luma,
+                 texture2d<float, access::read> chroma, uint2 xy, constant mk_FrameParams& f, float3 inverse) {
+  if (MK_LAYOUT(f) == MK_RGB) {
+    float3 rgb = luma.read(xy).rgb;
+    if (f.codeScale.w == 0 && !f.options.y) rgb = mk_quotient(rgb * f.codeScale.z - f.levels.x, f.levels.y, inverse.x);
+    return float4(rgb, mk_luma(rgb, f.matrix.xyz));
+  }
+  float3 codes = MK_LAYOUT(f) == MK_V210 && !f.options.x
+                   ? mk_v210Codes(packed, xy, f)
+                   : float3(mk_lumaCode(packed, luma, xy, f), mk_chromaCode(packed, chroma, xy, f));
+  float y = mk_quotient(codes.x - f.levels.x, f.levels.y, inverse.x);
+  return float4(mk_ycbcrToRGB(y, mk_quotient(codes.yz - f.levels.z, f.levels.w, inverse.y), f.matrix, inverse.z), y);
+}
+
 float3 mk_decodeRGB(texture2d<uint, access::read> packed, texture2d<float, access::read> luma,
                     texture2d<float, access::read> chroma, uint2 xy, constant mk_FrameParams& f) {
   return mk_decode(packed, luma, chroma, xy, f).rgb;

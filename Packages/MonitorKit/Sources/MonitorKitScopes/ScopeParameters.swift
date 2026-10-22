@@ -99,8 +99,24 @@ struct ScopeResolveParameters: Equatable {
 /// Words of one statistics slot. Mirrors the `MK_ST_*` constants.
 enum ScopeStatisticsWord {
   static let begin = 0, count = 1, minimum = 2, maximum = 3, sumLow = 4, sumHigh = 5
-  static let high = 6, low = 10, peak = 14, end = 17, peakAll = 18
+  static let high = 6, low = 10, peak = 14, end = 17, peakAll = 18, check = 19
   static let slotWords = 32
+
+  /// `mk_statsChecksum`: words `begin`…`peakAll` but `end`, FNV-1a by word with a
+  /// final avalanche. A copy whose words do not all belong to one accumulation fails it.
+  static func checksum(_ words: InlineArray<32, UInt32>) -> UInt32 {
+    var h: UInt32 = 2_166_136_261
+    var i = begin
+    while i <= peakAll {
+      if i != end { h = (h ^ words[i]) &* 16_777_619 }
+      i += 1
+    }
+    h ^= h >> 16
+    h = h &* 0x85EB_CA6B
+    h ^= h >> 13
+    h = h &* 0xC2B2_AE35
+    return h ^ (h >> 16)
+  }
   static let extremeScale = 1_048_576.0
   static let sumScale = 4096.0
 }
@@ -127,7 +143,9 @@ public struct ScopeStatistics: Equatable, Sendable {
 
   /// Decodes one slot; nil while the GPU is writing it. A seqlock read: the
   /// words are copied between two reads of the stamps, and the copy counts only
-  /// if no accumulation opened the slot in between.
+  /// if no accumulation opened the slot in between and its checksum holds (the
+  /// GPU's stores reach the host in no guaranteed order, so the stamps alone
+  /// can pass a copy that caught a word of the next accumulation).
   init?(slot: UnsafePointer<UInt32>) {
     typealias W = ScopeStatisticsWord
     let end = slot[W.end]
@@ -140,7 +158,8 @@ public struct ScopeStatistics: Equatable, Sendable {
       i += 1
     }
     atomicMemoryFence(ordering: .acquiring)
-    guard words[W.begin] == end, slot[W.begin] == end, slot[W.end] == end else { return nil }
+    guard words[W.begin] == end, slot[W.begin] == end, slot[W.end] == end, words[W.check] == W.checksum(words)
+    else { return nil }
     self.init(words: words)
   }
 

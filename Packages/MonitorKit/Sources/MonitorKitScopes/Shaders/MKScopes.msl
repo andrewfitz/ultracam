@@ -1,6 +1,7 @@
 // MonitorKit scopes. Compiled after MKLUT.msl and MKDecode.msl.
 //
-// Accumulation reads every source pixel once, decodes it with mk_decode,
+// Accumulation reads every source pixel once, decodes it with mk_decode (its
+// exact-quotient form: the reciprocals once per thread, the same values),
 // applies the stage's LUTs and adds it to threadgroup-private bins that are
 // merged into persistent device bins. Every count is an integer, so results
 // are identical however the GPU schedules the work.
@@ -24,7 +25,22 @@ constant uint MK_SCOPE_WAVEFORM = 0, MK_SCOPE_VECTOR = 1, MK_SCOPE_HISTOGRAM = 2
 // Statistics slot, in 32-bit words. Mirrors ScopeStatisticsWord.
 constant uint MK_ST_BEGIN = 0, MK_ST_COUNT = 1, MK_ST_MIN = 2, MK_ST_MAX = 3, MK_ST_SUM_LO = 4,
               MK_ST_SUM_HI = 5, MK_ST_HIGH = 6, MK_ST_LOW = 10, MK_ST_PEAK = 14, MK_ST_END = 17,
-              MK_ST_PEAK_ALL = 18, MK_ST_WORDS = 32;
+              MK_ST_PEAK_ALL = 18, MK_ST_CHECK = 19, MK_ST_WORDS = 32;
+
+// The slot's checksum (MonitorKitScopes.ScopeStatisticsWord.checksum): words
+// BEGIN…PEAK_ALL but END, FNV-1a by word with a final avalanche. The GPU's
+// stores need not reach the host in program order, so a host copy that caught
+// the stamps of one accumulation and a word of another fails it.
+inline uint mk_statsChecksum(device atomic_uint* slot) {
+  uint h = 2166136261u;
+  for (uint i = MK_ST_BEGIN; i <= MK_ST_PEAK_ALL; i++)
+    if (i != MK_ST_END) h = (h ^ atomic_load_explicit(&slot[i], memory_order_relaxed)) * 16777619u;
+  h ^= h >> 16;
+  h *= 0x85EBCA6Bu;
+  h ^= h >> 13;
+  h *= 0xC2B2AE35u;
+  return h ^ (h >> 16);
+}
 // Luma quantization for min/max (2^-20) and for the sum (2^-12), offset by 1
 // so that sub-black stays positive.
 constant float MK_ST_EXTREME_SCALE = 1048576.0f, MK_ST_SUM_SCALE = 4096.0f;
@@ -50,8 +66,8 @@ inline mk_ScopeSample mk_scopeSample(texture2d<uint, access::read> packed, textu
                                      texture2d<float, access::read> chroma, texture3d<float, access::sample> burnLUT,
                                      texture3d<float, access::sample> monitorLUT, uint2 xy,
                                      constant mk_FrameParams& frame, constant mk_LUTParams& burn,
-                                     constant mk_LUTParams& monitor, constant mk_ScopeParams& p) {
-  float4 d = mk_decode(packed, luma, chroma, xy, frame);
+                                     constant mk_LUTParams& monitor, constant mk_ScopeParams& p, float3 inverse) {
+  float4 d = mk_decode(packed, luma, chroma, xy, frame, inverse);
   float3 rgb = d.rgb;
   bool burned = p.shape.z >= 1 && p.luts.x, monitored = p.shape.z == 2 && p.luts.y;
   if (burned) rgb = mk_applyLUT(rgb, burnLUT, burn);
@@ -172,7 +188,7 @@ inline void mk_clearLocal(threadgroup atomic_uint* words, uint count, threadgrou
   constant mk_LUTParams& monitor [[buffer(2)]], constant mk_ScopeParams& p [[buffer(3)]],  \
   device atomic_uint* bins [[buffer(4)]], device atomic_uint* stats [[buffer(5)]]
 
-#define MK_SCOPE_SAMPLE(xy) mk_scopeSample(packed, luma, chroma, burnLUT, monitorLUT, xy, frame, burn, monitor, p)
+#define MK_SCOPE_SAMPLE(xy) mk_scopeSample(packed, luma, chroma, burnLUT, monitorLUT, xy, frame, burn, monitor, p, inverse)
 
 // ---------------------------------------------------------------- clear and finalize
 
@@ -222,7 +238,8 @@ kernel void mk_scopeClear(constant mk_ScopeMaintain& m [[buffer(3)]], device uin
 
 // Copies a fused pass's statistics from the slot it measured into to the other
 // members (words COUNT…LOW+3, which only the accumulation writes), then
-// histogram peaks for the renderer's normalization, then each closing stamp.
+// histogram peaks for the renderer's normalization, then each slot's checksum
+// and closing stamp.
 kernel void mk_scopeFinalize(constant mk_ScopeMaintain& m [[buffer(3)]], device const uint* b0 [[buffer(4)]],
                              device const uint* b1 [[buffer(6), function_constant(mk_maintainGroup)]],
                              device const uint* b2 [[buffer(7), function_constant(mk_maintainGroup)]],
@@ -254,6 +271,7 @@ kernel void mk_scopeFinalize(constant mk_ScopeMaintain& m [[buffer(3)]], device 
     uint peak = 0;
     for (uint k = 0; k < 3; k++) peak = max(peak, atomic_load_explicit(&slot[MK_ST_PEAK + k], memory_order_relaxed));
     atomic_store_explicit(&slot[MK_ST_PEAK_ALL], peak, memory_order_relaxed);
+    atomic_store_explicit(&slot[MK_ST_CHECK], mk_statsChecksum(slot), memory_order_relaxed);
     atomic_store_explicit(&slot[MK_ST_END], m.generation[tid], memory_order_relaxed);
   }
 }
@@ -323,6 +341,7 @@ kernel void mk_scopeWaveform(MK_SCOPE_INPUTS, threadgroup atomic_uint* local [[t
   uint threads = size.x * size.y;
   uint K = p.tile.x, C = p.bins.x, L = p.bins.y, channels = p.shape.w;
   mk_clearLocal(local, K * L * channels / 2, t, tid, threads);
+  float3 inverse = mk_reciprocals(frame);  // MK_SCOPE_SAMPLE's exact quotients
 
   uint fw = frame.shape.y, fh = frame.shape.z;
   uint c0 = group.x * K, c1 = min(c0 + K, C);
@@ -368,6 +387,7 @@ kernel void mk_scopeHistogram(MK_SCOPE_INPUTS, threadgroup atomic_uint* local [[
   uint B = p.bins.x, channels = p.shape.w;
   uint words = B * channels / 2;
   mk_clearLocal(local, words, t, tid, threads);
+  float3 inverse = mk_reciprocals(frame);  // MK_SCOPE_SAMPLE's exact quotients
 
   uint fw = frame.shape.y, fh = frame.shape.z;
   uint x0 = group.x * p.tile.x, y0 = group.y * p.tile.y;
@@ -407,6 +427,7 @@ kernel void mk_scopeVector(MK_SCOPE_INPUTS, uint2 gid [[thread_position_in_grid]
   mk_clearLocal(t, 0, t, tid, size.x * size.y);
 
   uint fw = frame.shape.y, fh = frame.shape.z, run = p.tile.z;
+  float3 inverse = mk_reciprocals(frame);  // MK_SCOPE_SAMPLE's exact quotients
   mk_ScopeStats s = mk_statsInit();
   uint x0 = gid.x * run;
   if (gid.y < fh && x0 < fw) {
@@ -486,6 +507,7 @@ kernel void mk_scopeFused(texture2d<uint, access::read> packed [[texture(0)]],
   }
   threadgroup atomic_uint* hlocal = local + hoffset;
   mk_clearLocal(local, hoffset + hwords, t, tid, threads);
+  float3 inverse = mk_reciprocals(frame);  // MK_SCOPE_SAMPLE's exact quotients
 
   uint fw = frame.shape.y, fh = frame.shape.z;
   uint x0, x1, y0, y1, c0 = 0;

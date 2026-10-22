@@ -434,8 +434,44 @@ final class ScopeContractTests: XCTestCase {
     words[ScopeStatisticsWord.end] = 5
     XCTAssertNil(decode(), "reopened by a later accumulation")
     words[ScopeStatisticsWord.end] = 7
+    XCTAssertNil(decode(), "stamps agree, checksum missing")
+    func seal() {
+      var inline = InlineArray<32, UInt32>(repeating: 0)
+      for i in 0..<32 { inline[i] = words[i] }
+      words[ScopeStatisticsWord.check] = ScopeStatisticsWord.checksum(inline)
+    }
+    seal()
     XCTAssertEqual(decode()?.generation, 7)
     XCTAssertEqual(decode()?.pixelCount, 10)
+    // A copy that caught one word of the next accumulation (its clear) fails the
+    // checksum though both stamps agree: the torn read the stamps alone let through.
+    for word in [ScopeStatisticsWord.count, ScopeStatisticsWord.minimum, ScopeStatisticsWord.high + 3, ScopeStatisticsWord.peakAll] {
+      let kept = words[word]
+      words[word] = kept == 0 ? 1 : 0
+      XCTAssertNil(decode(), "torn word \(word)")
+      words[word] = kept
+    }
+    XCTAssertEqual(decode()?.pixelCount, 10)
+    // A cleared slot (every word 0 but the stamps) never checks out.
+    words = [UInt32](repeating: 0, count: 32)
+    words[ScopeStatisticsWord.begin] = 7
+    words[ScopeStatisticsWord.end] = 7
+    XCTAssertNil(decode(), "cleared words")
+  }
+
+  /// The GPU writes the checksum the host verifies: every completed slot decodes.
+  func testGPUChecksumMatchesTheHost() throws {
+    let (_, _, engine) = try GPU.require()
+    let frame = try TestFrame.natural(.v210, width: 320, height: 90, seed: 9)
+    for kind in [ScopeKind.waveform, .histogram, .vectorscope] {
+      let accumulator = try engine.makeAccumulator(settings: ScopeSettings(kind: kind, stage: .source))
+      for generation in 1...3 {
+        try GPU.run { try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: $0) }
+        let stats = try XCTUnwrap(accumulator.statistics, "\(kind) #\(generation)")
+        XCTAssertEqual(stats.generation, UInt32(generation))
+        XCTAssertEqual(stats.pixelCount, 320 * 90)
+      }
+    }
   }
 
   /// The feed overload measures the stage with the feed's LUTs and reports which it applied.

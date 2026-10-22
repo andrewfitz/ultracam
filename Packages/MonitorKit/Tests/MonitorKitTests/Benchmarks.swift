@@ -424,7 +424,8 @@ final class Benchmarks: XCTestCase {
         // Interpolated labels: `%@` with Swift strings garbled and dropped lines here.
         print("BENCH 4K v210 -> 1080p f16 \(label), \(c.0): " + String(format: "%.3f ms (%+.1f%%)", ms, (ms / baseline - 1) * 100))
         // Every output encoding, PQ and HLG included, within 10% of the baseline (plus
-        // 10 µs of timer noise): about +8% on a bare picture, less with tools.
+        // 10 µs of timer noise): 5–14 µs on a bare picture (+5 to +14 % of its
+        // 0.106 ms since the exact-quotient decode; +2 to +8 % before), less with tools.
         if i <= 6 { XCTAssertLessThanOrEqual(ms, baseline * 1.1 + 0.01, "\(label) \(c.0)") }
       }
     }
