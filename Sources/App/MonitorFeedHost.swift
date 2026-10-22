@@ -385,6 +385,12 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// The submission is observed before the textures are looked up, so a sweep or
   /// flush that retires one of them at any later moment ties its release to this
   /// submission; a texture swept earlier is simply made (and made resident) again.
+  ///
+  /// Use the result only within `context`'s submission and never store it: it has
+  /// no release tokens, so a later submission is not kept resident by it, and a
+  /// stop's flush in between would leave it reading non-resident textures. Keep
+  /// the `Delivery` instead (a pending scope tick, a Freeze source) and wrap it
+  /// again at each encode.
   func frame(
     _ delivery: Delivery, in context: MonitorGPUContext.EncodeContext, core: MonitorGPUContext.Core
   ) throws -> MonitorFrame {

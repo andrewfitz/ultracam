@@ -158,6 +158,10 @@ final class MonitorGPUContext: @unchecked Sendable {
     /// Submissions handed out, and the contiguous completion watermark.
     var submissions: UInt64 = 0
     var completedSubmissions: UInt64 = 0
+    /// Submissions whose encode failed, and those of them that held a drawable (the
+    /// GPU waited for it and signalled it; it was not presented).
+    var failedEncodes = 0
+    var abandonedDrawables = 0
   }
 
   // MARK: - Core
@@ -180,6 +184,8 @@ final class MonitorGPUContext: @unchecked Sendable {
     private var free: [EncodeContext] = []
     private var contexts = 0
     private var grownChunks = 0
+    private var failedEncodes = 0
+    private var abandonedDrawables = 0
     private var maintenance: DispatchSourceTimer?
 
     init(device: MTLDevice, gpuTiming: @escaping @Sendable (Double, Double) -> Void) throws {
@@ -246,10 +252,11 @@ final class MonitorGPUContext: @unchecked Sendable {
       return context
     }
 
-    /// Ends and commits `context`. With a drawable, the GPU waits for it and presents it after.
+    /// Ends and commits `context`. With a drawable, the GPU waits for it before the
+    /// work and signals it after, and the drawable is presented unless `present` is false.
     func commit(
       _ context: EncodeContext, drawable: MTLDrawable? = nil, completion: MonitorGPUCompletion? = nil,
-      kind: Int = 0
+      kind: Int = 0, present: Bool = true
     ) {
       context.completion = completion
       context.kind = kind
@@ -267,13 +274,23 @@ final class MonitorGPUContext: @unchecked Sendable {
       queue.commit(context.commitList, options: options)
       if let drawable {
         queue.signalDrawable(drawable)
-        drawable.present()
+        if present {
+          drawable.present()
+        } else {
+          lock.withLock { abandonedDrawables += 1 }
+        }
       }
     }
 
-    /// A context whose encoding failed: committed with whatever it holds and no
-    /// drawable, so its submission index completes and the watermark moves on.
-    func abandon(_ context: EncodeContext) { commit(context) }
+    /// A context whose encoding failed: committed with whatever it holds, so its
+    /// submission index completes and the watermark moves on. The body may already
+    /// have rendered into `drawable`, so the GPU still waits for the drawable before
+    /// that work and signals it after; the half-drawn drawable is not presented (the
+    /// layer keeps its last good picture).
+    func abandon(_ context: EncodeContext, drawable: MTLDrawable? = nil) {
+      lock.withLock { failedEncodes += 1 }
+      commit(context, drawable: drawable, present: false)
+    }
 
     /// Encodes one submission and commits it (also when `body` throws, then rethrows).
     func submit(
@@ -284,7 +301,7 @@ final class MonitorGPUContext: @unchecked Sendable {
       do {
         try body(context)
       } catch {
-        abandon(context)
+        abandon(context, drawable: drawable)
         throw error
       }
       commit(context, drawable: drawable, completion: completion, kind: kind)
@@ -314,15 +331,26 @@ final class MonitorGPUContext: @unchecked Sendable {
       return buffer
     }
 
+    /// Takes a replaced uniform chunk out of residency. Its context's previous
+    /// submission has completed (contexts are reused only then), so nothing reads it.
+    fileprivate func retireUniformChunk(_ buffer: MTLBuffer) {
+      lock.withLock {
+        hostResidency.removeAllocation(buffer)
+        hostResidency.commit()
+      }
+    }
+
     fileprivate func noteChunkGrown() { lock.withLock { grownChunks += 1 } }
 
     var statistics: Statistics {
-      let (contexts, grown) = lock.withLock { (self.contexts, grownChunks) }
+      let (contexts, grown, failed, abandoned) = lock.withLock {
+        (self.contexts, grownChunks, failedEncodes, abandonedDrawables)
+      }
       let (reserved, completed) = clock.counts
       return Statistics(
         texturesMade: frames.texturesMade, texturesCached: frames.count, encodeContexts: contexts,
         uniformChunksGrown: grown, residencyCommits: engine.residency.commitCount, submissions: reserved,
-        completedSubmissions: completed)
+        completedSubmissions: completed, failedEncodes: failed, abandonedDrawables: abandoned)
     }
   }
 
@@ -387,7 +415,9 @@ final class MonitorGPUContext: @unchecked Sendable {
           core.noteChunkGrown()
         }
         if chunks[chunk].length < size, let core {
+          let replaced = chunks[chunk]
           chunks[chunk] = core.makeUniformChunk(length: size)
+          core.retireUniformChunk(replaced)
           core.noteChunkGrown()
         }
       }
@@ -456,6 +486,8 @@ final class MonitorGPUContext: @unchecked Sendable {
     private final class State: @unchecked Sendable {
       let lock = NSLock()
       var runLoop: CFRunLoop?
+      /// The thread's `RunLoop`, published with `runLoop` when the thread starts.
+      var foundationRunLoop: RunLoop?
       var stopped = false
       var exited = false
       let ready = DispatchSemaphore(value: 0)
@@ -487,7 +519,11 @@ final class MonitorGPUContext: @unchecked Sendable {
       if first {
         let thread = Thread {
           let loop = CFRunLoopGetCurrent()
-          state.lock.withLock { state.runLoop = loop }
+          let foundationLoop = RunLoop.current
+          state.lock.withLock {
+            state.runLoop = loop
+            state.foundationRunLoop = foundationLoop
+          }
           // A port keeps the run loop alive between display link callbacks.
           RunLoop.current.add(NSMachPort(), forMode: .default)
           state.ready.signal()
@@ -496,6 +532,7 @@ final class MonitorGPUContext: @unchecked Sendable {
           }
           state.lock.withLock {
             state.runLoop = nil
+            state.foundationRunLoop = nil
             state.exited = true
           }
         }
@@ -510,21 +547,17 @@ final class MonitorGPUContext: @unchecked Sendable {
       return state.lock.withLock { state.stopped ? nil : state.runLoop }
     }
 
-    /// The run loop display links are scheduled on (nil once stopped).
+    /// The run loop display links are scheduled on (nil once stopped). Never waits on
+    /// the render thread, so it is safe from any thread, the render thread included,
+    /// and while `stop()` runs.
     var runLoopForDisplayLinks: RunLoop? {
-      guard let loop = start() else { return nil }
-      nonisolated(unsafe) var result: RunLoop?
-      let done = DispatchSemaphore(value: 0)
-      CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue) {
-        result = RunLoop.current
-        done.signal()
-      }
-      CFRunLoopWakeUp(loop)
-      done.wait()
-      return result
+      guard start() != nil else { return nil }
+      return state.lock.withLock { state.stopped ? nil : state.foundationRunLoop }
     }
 
-    /// Runs `block` on the render thread; dropped once the thread has stopped.
+    /// Runs `block` on the render thread; dropped once the thread has stopped. A
+    /// block queued just before `stop()` may also be dropped, so never use one for
+    /// cleanup that must happen (detach residency sets directly; that is thread-safe).
     func perform(_ block: @escaping () -> Void) {
       guard let loop = start() else { return }
       CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue, block)

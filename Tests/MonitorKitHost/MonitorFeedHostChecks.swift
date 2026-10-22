@@ -3,6 +3,7 @@ import CoreVideo
 import Darwin
 import Metal
 import MonitorKit
+import QuartzCore
 import XCTest
 
 /// Counts heap allocations made by one thread through libmalloc's logger hook.
@@ -425,6 +426,22 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     let completion = Completion()
     core.commit(context, completion: completion)
     XCTAssertTrue(completion.wait())
+    // The pooled context comes back with [32 KB, 32 KB]. A request larger than
+    // its second chunk replaces it: the replaced buffer leaves residency, so the
+    // host set holds exactly the live chunks however often that happens.
+    let resident = core.hostResidency.allocationCount
+    for round in 1...3 {
+      let reused = try core.begin()
+      XCTAssertTrue(reused === context, "the completed context is reused")
+      _ = reused.allocateUniforms(length: MonitorGPUContext.uniformCapacity)
+      let large = reused.allocateUniforms(length: MonitorGPUContext.uniformCapacity + 4096 * round)
+      XCTAssertEqual(large.gpuAddress % 256, 0)
+      XCTAssertEqual(core.hostResidency.allocationCount, resident, "round \(round)")
+      let done = Completion()
+      core.commit(reused, completion: done)
+      XCTAssertTrue(done.wait())
+    }
+    XCTAssertEqual(core.statistics.uniformChunksGrown, grown + 4)
   }
 
   /// Every submission handed out completes, also one whose encode threw, so the
@@ -433,11 +450,95 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     let (_, core) = try gpuCore()
     struct Failure: Error {}
     XCTAssertThrowsError(try core.submit { _ in throw Failure() })
+    XCTAssertEqual(core.statistics.failedEncodes, 1)
+    XCTAssertEqual(core.statistics.abandonedDrawables, 0)
     let reserved = core.statistics.submissions
     let deadline = Date().addingTimeInterval(5)
     while core.clock.completedIndex < reserved, Date() < deadline { usleep(1000) }
     XCTAssertEqual(core.clock.completedIndex, reserved)
     XCTAssertEqual(core.engine.residency.completedSubmission, reserved)
+  }
+
+  /// An encode that throws after rendering into a drawable still waits for the
+  /// drawable before that work and signals it after, so the layer's drawables keep
+  /// cycling (more failures than the layer has drawables) and every submission
+  /// completes.
+  func testAFailedEncodeIntoADrawableStillWaitsForAndSignalsIt() throws {
+    let (gpu, core) = try gpuCore()
+    let layer = CAMetalLayer()
+    layer.device = core.device
+    layer.pixelFormat = .bgra8Unorm
+    layer.framebufferOnly = false
+    layer.drawableSize = CGSize(width: 64, height: 36)
+    gpu.attachDrawables(layer.residencySet)
+    defer { gpu.detachDrawables(layer.residencySet) }
+    struct Failure: Error {}
+    for attempt in 0..<(layer.maximumDrawableCount * 3) {
+      let drawable = try XCTUnwrap(layer.nextDrawable(), "drawable \(attempt)")
+      XCTAssertThrowsError(
+        try core.submit(drawable: drawable) { context in
+          let pass = MTL4RenderPassDescriptor()
+          pass.colorAttachments[0].texture = drawable.texture
+          pass.colorAttachments[0].loadAction = .clear
+          pass.colorAttachments[0].storeAction = .store
+          pass.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 0, blue: 0, alpha: 1)
+          let encoder = try XCTUnwrap(context.commandBuffer.makeRenderCommandEncoder(descriptor: pass))
+          encoder.endEncoding()
+          throw Failure()
+        })
+    }
+    let attempts = layer.maximumDrawableCount * 3
+    XCTAssertEqual(core.statistics.failedEncodes, attempts)
+    XCTAssertEqual(
+      core.statistics.abandonedDrawables, attempts,
+      "every failed encode waited for and signalled its drawable")
+    let reserved = core.statistics.submissions
+    let deadline = Date().addingTimeInterval(5)
+    while core.clock.completedIndex < reserved, Date() < deadline { usleep(1000) }
+    XCTAssertEqual(core.clock.completedIndex, reserved)
+  }
+
+  /// The display-link run loop is read without a hop to the render thread: it
+  /// answers on the render thread itself (no self-deadlock), never hangs while
+  /// `stop()` races it, and is nil once stopped.
+  func testDisplayLinkRunLoopNeverWaitsOnTheRenderThread() throws {
+    let render = MonitorGPUContext.RenderThread(name: "test.render.loop")
+    final class Box: @unchecked Sendable {
+      let lock = NSLock()
+      var loop: RunLoop?
+      var current: RunLoop?
+    }
+    let box = Box()
+    let answered = expectation(description: "answered on the render thread")
+    render.perform {
+      let loop = render.runLoopForDisplayLinks
+      box.lock.withLock {
+        box.loop = loop
+        box.current = RunLoop.current
+      }
+      answered.fulfill()
+    }
+    wait(for: [answered], timeout: 2)
+    box.lock.withLock {
+      XCTAssertNotNil(box.loop)
+      XCTAssertTrue(box.loop === box.current, "the render thread's own run loop")
+    }
+    XCTAssertTrue(render.runLoopForDisplayLinks === box.lock.withLock { box.loop })
+    render.stop()
+    XCTAssertNil(render.runLoopForDisplayLinks)
+    // stop() racing the accessor on fresh threads: every call returns.
+    let races = 40
+    let returned = expectation(description: "every racing call returns")
+    returned.expectedFulfillmentCount = races
+    for index in 0..<races {
+      let racing = MonitorGPUContext.RenderThread(name: "test.render.race.\(index)")
+      DispatchQueue.global(qos: .userInitiated).async {
+        _ = racing.runLoopForDisplayLinks
+        returned.fulfill()
+      }
+      DispatchQueue.global(qos: .userInitiated).async { racing.stop() }
+    }
+    wait(for: [returned], timeout: 5)
   }
 
   /// Must-check (b): the render thread exits once stopped, or once its owner goes away.

@@ -175,9 +175,8 @@ import XCTest
     XCTAssertEqual(source.target, target)
     XCTAssertGreaterThan(source.generation, 0)
     XCTAssertGreaterThan(source.sequence, 0)
-    // An Output-stage surface takes the same source-only offer (the monitor's
-    // Output stage is computed from the source); a reconfigure changes nothing
-    // the monitor is offered.
+    XCTAssertGreaterThan(source.processingRevision, 0)
+    // Switch to the paired Output tap and change the capture processing revision.
     monitor.pictureStage = .processedOutput
     sink.configure(monitor, consumers: [presenter], scopeVisible: false)
     controller.reconfigure(configuration: bypass, pipelineEnabled: false)
@@ -189,7 +188,7 @@ import XCTest
     let output = try XCTUnwrap(presenter.currentStamp)
     XCTAssertEqual(output.generation, source.generation)
     XCTAssertGreaterThan(output.sequence, source.sequence)
-    XCTAssertEqual(output.processingRevision, 0)
+    XCTAssertGreaterThan(output.processingRevision, source.processingRevision)
     XCTAssertGreaterThan(output.configurationRevision, source.configurationRevision)
     // Detaching demand leaves the recorder receiving the untouched source.
     sink.configure(monitor, consumers: [], scopeVisible: false)
@@ -282,6 +281,38 @@ import XCTest
       count: CVPixelBufferGetBytesPerRow(image) * CVPixelBufferGetHeight(image))
   }
 
+
+  /// The published feed (meeting apps, Program, the preview) never inherits a 4K
+  /// source's clean aperture or display dimensions on its 1080p downscale, which
+  /// would crop or offset it; an output at source size keeps both.
+  func testDownscaleDropsTheSourceApertureAndFullSizeKeepsIt() throws {
+    let source = try packedSyntheticSource()
+    let aperture = [kCVImageBufferCleanApertureWidthKey: 3500,
+      kCVImageBufferCleanApertureHeightKey: 1900,
+      kCVImageBufferCleanApertureHorizontalOffsetKey: -47,
+      kCVImageBufferCleanApertureVerticalOffsetKey: 53] as CFDictionary
+    let display = [kCVImageBufferDisplayWidthKey: 3500,
+      kCVImageBufferDisplayHeightKey: 1900] as CFDictionary
+    CVBufferSetAttachment(source, kCVImageBufferCleanApertureKey, aperture, .shouldPropagate)
+    CVBufferSetAttachment(source, kCVImageBufferDisplayDimensionsKey, display, .shouldPropagate)
+    CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey,
+      kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+    let processor = try LUTProcessor()
+    let downscaled = try processor.process(source, configuration:
+      PipelineConfiguration(downscale: true, convertTo420: true, inputFast: false))
+    XCTAssertEqual(CVPixelBufferGetWidth(downscaled), 1920)
+    XCTAssertEqual(CVPixelBufferGetHeight(downscaled), 1080)
+    XCTAssertNil(CVBufferCopyAttachment(downscaled, kCVImageBufferCleanApertureKey, nil))
+    XCTAssertNil(CVBufferCopyAttachment(downscaled, kCVImageBufferDisplayDimensionsKey, nil))
+    let fullSize = try processor.process(source, configuration:
+      PipelineConfiguration(downscale: false, convertTo420: true, inputFast: false))
+    XCTAssertEqual(CVPixelBufferGetWidth(fullSize), 3840)
+    XCTAssertEqual(CVPixelBufferGetHeight(fullSize), 2160)
+    let keptAperture = try XCTUnwrap(CVBufferCopyAttachment(fullSize, kCVImageBufferCleanApertureKey, nil))
+    XCTAssertTrue(CFEqual(keptAperture, aperture))
+    let keptDisplay = try XCTUnwrap(CVBufferCopyAttachment(fullSize, kCVImageBufferDisplayDimensionsKey, nil))
+    XCTAssertTrue(CFEqual(keptDisplay, display))
+  }
 
   @MainActor func testPacedProcessedCameraAndRecordingWithMonitorGPUEnabled() throws {
     let source = try packedSyntheticSource()
@@ -641,6 +672,104 @@ import XCTest
     wait(for: [disconnected], timeout: 3)
   }
 
+  func testNeedsOutputTreatsABusyLockAsWanted() {
+    let sink = MonitorCaptureSink(target: MonitorTargetID("needs-output-lock"))
+    var monitor = MonitorConfiguration()
+    monitor.pictureStage = .processedOutput
+    let presenter = MonitorSurfacePresenter()
+    sink.configure(monitor, consumers: [presenter], scopeVisible: false)
+    XCTAssertTrue(sink.needsOutput)
+    let entered = expectation(description: "sink lock held")
+    let release = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      sink.withLockHeldForTesting {
+        entered.fulfill()
+        _ = release.wait(timeout: .now() + 3)
+      }
+    }
+    wait(for: [entered], timeout: 2)
+    XCTAssertTrue(sink.needsOutput, "A failed try-lock must not look like an absent monitor consumer")
+    release.signal()
+  }
+
+  /// A MonitorTools-style endpoint that wants the processed output and records
+  /// every paired offer (any thread).
+  private final class OutputOfferLog: MonitorFrameSink, @unchecked Sendable {
+    struct Offer {
+      let source: CVPixelBuffer
+      let output: CVPixelBuffer?
+      let sequence: UInt64
+      let processingRevision: UInt64
+      let outputScale: (x: Double, y: Double)?
+    }
+    let lock = NSLock()
+    private var values: [Offer] = []
+    private var sourceOnly = 0
+    var offers: [Offer] { lock.withLock { values } }
+    var sourceOnlyOffers: Int { lock.withLock { sourceOnly } }
+    var needsOutput: Bool { true }
+    func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64) {
+      lock.withLock { sourceOnly += 1 }
+    }
+    func offer(
+      source: CVPixelBuffer, output: CVPixelBuffer?, pts: CMTime, captureGeneration: UInt64,
+      sequence: UInt64, processingRevision: UInt64, outputScale: (x: Double, y: Double)?
+    ) {
+      lock.withLock {
+        values.append(Offer(
+          source: source, output: output, sequence: sequence,
+          processingRevision: processingRevision, outputScale: outputScale))
+      }
+    }
+    func invalidate(rejectingCaptureGeneration rejected: UInt64?) {}
+  }
+
+  /// Until the surfaces move to MonitorKit, a MonitorTools Output-stage sink
+  /// keeps processing alive on its own and gets every frame's processed buffer
+  /// (here downscaled 4:2:0), paired with its source and correspondence.
+  @MainActor func testMonitorToolsOutputSinkGetsTheProcessedOutput() throws {
+    let image = try syntheticRamp()
+    let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
+    var services = harness.services
+    services.preview = nil
+    let controller = CaptureController(services: services, previewRenderer: nil)
+    let sink = OutputOfferLog()
+    controller.setCameraOutputEnabled(false)
+    controller.setMonitorSink(sink)
+    defer {
+      controller.onUpdate = nil
+      controller.stop()
+    }
+    let started = expectation(description: "Synthetic controller ready")
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
+    controller.start(
+      feedID: FeedID(rawValue: "monitor-tools-output"), deviceID: "synthetic",
+      configuration: PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true),
+      pipelineEnabled: true)
+    wait(for: [started], timeout: 3)
+    controller.onUpdate = nil
+    let duration = VideoContract.fastDuration
+    let count = 4
+    for frame in 0..<count {
+      harness.emit(image, pts: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration)
+    }
+    pumpUntil { sink.offers.count == count }
+    let offers = sink.offers
+    XCTAssertEqual(offers.count, count)
+    XCTAssertEqual(sink.sourceOnlyOffers, 0)
+    for (index, offer) in offers.enumerated() {
+      XCTAssertTrue(offer.source === image, "The paired offer carries the capture buffer")
+      let output = try XCTUnwrap(offer.output, "An Output-stage sink gets the processed buffer")
+      XCTAssertFalse(output === image)
+      XCTAssertEqual(CVPixelBufferGetWidth(output), 1920)
+      XCTAssertEqual(CVPixelBufferGetHeight(output), 1080)
+      XCTAssertEqual(offer.outputScale?.x, 0.5)
+      XCTAssertEqual(offer.outputScale?.y, 0.5)
+      XCTAssertGreaterThan(offer.processingRevision, 0)
+      if index > 0 { XCTAssertEqual(offer.sequence, offers[index - 1].sequence + 1) }
+    }
+  }
+
   /// A monitor endpoint that records every offer (any thread).
   private final class SourceOfferLog: MonitorFrameSink, @unchecked Sendable {
     struct Offer {
@@ -752,20 +881,27 @@ import XCTest
     XCTAssertTrue(offers.allSatisfy { $0.image === buffer })
   }
 
-  /// Until the surfaces move to MonitorKit, the source-only offer still reaches
-  /// MonitorTools' surfaces of either picture stage, and Program's, once per frame.
-  @MainActor func testSourceOnlyOffersReachMonitorToolsSurfacesOfEitherStage() throws {
-    var made: CVPixelBuffer?
-    XCTAssertEqual(
-      CVPixelBufferCreate(
-        nil, 64, 36, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &made), kCVReturnSuccess)
-    let image = try XCTUnwrap(made)
+  /// Until the surfaces move to MonitorKit, the bridge keeps MonitorTools'
+  /// routing: a source-only offer reaches a Source-stage surface only, a paired
+  /// offer an Output-stage one only, and Program (always Output) takes its
+  /// frame as its own output, once per frame.
+  @MainActor func testMonitorToolsBridgeRoutesOffersByStage() throws {
+    func buffer(_ width: Int, _ height: Int) throws -> CVPixelBuffer {
+      var made: CVPixelBuffer?
+      XCTAssertEqual(
+        CVPixelBufferCreate(
+          nil, width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+          [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &made), kCVReturnSuccess)
+      return try XCTUnwrap(made)
+    }
+    let image = try buffer(64, 36)
+    let processed = try buffer(32, 18)
     let runtime = MonitorRuntime(sharedDevice: { nil })
-    let cases: [(String, MonitorStage)] = [
-      ("bridge-source", .source), ("bridge-output", .processedOutput), ("program", .source),
+    let cases: [(String, MonitorStage, sourceOnly: UInt64, paired: UInt64)] = [
+      ("bridge-source", .source, 3, 0), ("bridge-output", .processedOutput, 0, 3),
+      ("program", .source, 0, 3),
     ]
-    for (target, stage) in cases {
+    for (target, stage, sourceOnly, paired) in cases {
       let sink = MonitorCaptureSink(target: MonitorTargetID(target))
       let presenter = MonitorSurfacePresenter(runtime: runtime)
       var configuration = MonitorConfiguration()
@@ -773,13 +909,22 @@ import XCTest
       configuration.scopeStage = stage
       sink.configure(configuration, consumers: [presenter], scopeVisible: false)
       let endpoint: any MonitorFrameSink = sink
+      XCTAssertEqual(endpoint.needsOutput, stage == .processedOutput || target == "program", target)
       for sequence in UInt64(1)...3 {
         endpoint.offer(
           image, pts: CMTime(value: CMTimeValue(sequence), timescale: 60), captureGeneration: 1,
           sequence: sequence)
       }
-      XCTAssertEqual(presenter.statistics.acceptedFrames, 3, target)
-      XCTAssertEqual(presenter.currentStamp?.sequence, 3, target)
+      XCTAssertEqual(presenter.statistics.acceptedFrames, sourceOnly, target)
+      for sequence in UInt64(4)...6 {
+        endpoint.offer(
+          source: image, output: target == "program" ? image : processed,
+          pts: CMTime(value: CMTimeValue(sequence), timescale: 60), captureGeneration: 1,
+          sequence: sequence, processingRevision: 1,
+          outputScale: target == "program" ? nil : (0.5, 0.5))
+      }
+      XCTAssertEqual(presenter.statistics.acceptedFrames, sourceOnly + paired, target)
+      XCTAssertEqual(presenter.currentStamp?.sequence, paired > 0 ? 6 : 3, target)
     }
   }
 
