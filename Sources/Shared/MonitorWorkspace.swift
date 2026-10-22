@@ -16,17 +16,28 @@ import MonitorKitScopes
 struct MonitorFeedPreferences: Codable, Equatable, Sendable {
   static let schemaVersion = 1
 
+  /// Ultracam's default tools: MonitorKit's, looking as MonitorTools' did
+  /// (`LegacyMonitorConfiguration()`). The zebra band is 5 IRE wide (MonitorKit's
+  /// `range` is the half-width), and the picture shows the output stage, the
+  /// source with the burn-in LUT ("Output (LUT)").
+  static let defaultState: MonitorState = {
+    var value = MonitorState()
+    value.zebras[0].range = 2.5
+    value.pictureStage = .output
+    return value
+  }()
+
   /// The "Monitor tools" master switch. Off hides every tool and the scopes
   /// while their settings stay as they are, so turning it back on restores them.
   var toolsEnabled = false
   /// Tool settings shared by every surface of this target. `clean` and
   /// `geometry.magnification` belong to a surface and are never persisted.
-  var state = MonitorState()
+  var state = Self.defaultState
   /// How this target's camera signal is read. Per target, not per surface.
   var signal = MonitorSignalDeclaration()
   var scopes = MonitorScopePreferences()
 
-  init(toolsEnabled: Bool = false, state: MonitorState = MonitorState(),
+  init(toolsEnabled: Bool = false, state: MonitorState = Self.defaultState,
     signal: MonitorSignalDeclaration = MonitorSignalDeclaration(),
     scopes: MonitorScopePreferences = MonitorScopePreferences()) {
     self.toolsEnabled = toolsEnabled
@@ -66,15 +77,16 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
 
   /// What a surface of this target draws: the saved tools with Ultracam's
   /// rules applied. The master switch hides every tool; false colour
-  /// suppresses zebra (as configured, like MonitorTools'
-  /// `effectiveZebraEnabled`); Program has no focus peaking and no log false
+  /// suppresses zebra when the declared signal can show it
+  /// (`falseColorDeclared`, MonitorTools' `effectiveZebraEnabled` on its
+  /// normalized configuration); Program has no focus peaking and no log false
   /// colour, because its frames are not a camera's source signal.
   func surfaceState(isProgram: Bool, clean: Bool = false,
     magnification: Magnification = Magnification()) -> MonitorState {
     var value = state
     value.clean = clean
     value.geometry.magnification = magnification
-    let suppressesZebra = !toolsEnabled || value.falseColor.mode != .off
+    let suppressesZebra = !toolsEnabled || falseColorDeclared
     if suppressesZebra {
       for index in value.zebras.indices where value.zebras[index].enabled {
         value.zebras[index].enabled = false
@@ -93,20 +105,58 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     return value
   }
 
+  /// Whether the false-colour mode can classify this target's declared signal,
+  /// as MonitorTools' normalization decided: a log mode needs a declared camera
+  /// profile it reads. A mode that cannot neither draws nor suppresses zebra.
+  var falseColorDeclared: Bool {
+    let profile = signal.logProfileID
+    switch state.falseColor.mode {
+    case .off: return false
+    case .sonySLog3: return SonySLog3FalseColor.supports(sourceProfileID: profile)
+    case .elZone: return ELZoneProfile.supports(sourceProfileID: profile)
+    case .arriStyleSLog3: return SonyARRIStyleFalseColor.supports(sourceProfileID: profile)
+    case .arriLogC: return profile.flatMap(ARRIFalseColorProfile.init(rawValue:)) != nil
+    case .sixBand, .custom: return true
+    }
+  }
+
   /// Another camera is now on this feed: its signal declaration and exposure
-  /// offset no longer apply, and a log false-colour mode loses its source
-  /// (MonitorTools' normalization turned it off the same way).
+  /// offset no longer apply. The false-colour mode stays selected: it shows
+  /// nothing until a log source it reads is declared again (as in MonitorTools,
+  /// whose normalization hid it the same way).
   mutating func forgetCameraCalibration() {
     signal = MonitorSignalDeclaration()
     state.falseColor.referenceOffsetStops = 0
-    if state.falseColor.mode.needsLogSource { state.falseColor.mode = .off }
+  }
+
+  /// "Reset monitor tools": every setting back to the defaults, the signal
+  /// declaration included (resetting MonitorTools' configuration cleared it too).
+  mutating func resetTools() {
+    self = MonitorFeedPreferences()
+  }
+
+  /// "Copy settings from": `source`'s tools and scopes, settings MonitorTools
+  /// cannot express included. This target keeps its own camera: the signal
+  /// declaration and the exposure offset (map §5.3, `copySettings`). A log
+  /// false-colour mode this target's camera cannot show is turned off, as
+  /// MonitorTools' copy did.
+  mutating func copyTools(from source: MonitorFeedPreferences) {
+    let offset = state.falseColor.referenceOffsetStops
+    toolsEnabled = source.toolsEnabled
+    state = source.state
+    scopes = source.scopes
+    state.falseColor.referenceOffsetStops = offset
+    if state.falseColor.mode.needsLogSource && !falseColorDeclared { state.falseColor.mode = .off }
   }
 
   /// Whether a surface of this target shows scopes.
   var scopesShown: Bool { toolsEnabled && scopes.enabled }
 
   /// These preferences as a MonitorTools configuration, for the coordinator
-  /// while it still renders with MonitorTools. Normalized.
+  /// while it still renders with MonitorTools. Normalized, except that a
+  /// false-colour mode the declared signal cannot show stays selected, as it did
+  /// in MonitorTools' session configuration after a camera change: its renderer
+  /// normalizes it away, and declaring the source again brings it back.
   var legacyConfiguration: LegacyMonitorConfiguration {
     var c = LegacyMonitorConfiguration()
     c.toolsEnabled = toolsEnabled
@@ -116,7 +166,7 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     c.guides.safeArea = !state.guides.safeAreas.isEmpty
     c.guides.opacity = state.guides.opacity
     c.guides.contrast = state.guides.contrast
-    let zebra = state.zebras.first ?? ZebraSet()
+    let zebra = state.zebras.first ?? Self.defaultState.zebras[0]
     c.zebra.enabled = zebra.enabled
     c.zebra.thresholdIRE = zebra.level
     c.zebra.widthIRE = zebra.range * 2
@@ -155,7 +205,13 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     c.scopes.graticule = scopes.settings.display.showsGraticule
     c.pictureStage = state.pictureStage == .source ? .source : .processedOutput
     c.scopeStage = scopes.settings.stage == .source ? .source : .processedOutput
-    return c.normalized()
+    var value = c.normalized()
+    if value.falseColor.mode == .off && c.falseColor.mode != .off {
+      value.falseColor.mode = c.falseColor.mode
+      value.falseColor.profileID = c.falseColor.profileID
+      value.falseColor.specificationVersion = c.falseColor.specificationVersion
+    }
+    return value
   }
 
   /// Takes every value of `legacy` that differs from what these preferences
@@ -178,7 +234,7 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     if new.guides.opacity != old.guides.opacity { state.guides.opacity = new.guides.opacity }
     if new.guides.contrast != old.guides.contrast { state.guides.contrast = new.guides.contrast }
 
-    if state.zebras.isEmpty { state.zebras = [ZebraSet(), ZebraSet()] }
+    if state.zebras.isEmpty { state.zebras = Self.defaultState.zebras }
     if new.zebra.enabled != old.zebra.enabled { state.zebras[0].enabled = new.zebra.enabled }
     if new.zebra.thresholdIRE != old.zebra.thresholdIRE { state.zebras[0].level = new.zebra.thresholdIRE }
     // MonitorTools' width was the whole band, [t - w/2, t + w/2); MonitorKit's
@@ -191,8 +247,9 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
 
     // The picture stage first: MonitorTools' zebra measured the picture.
     if new.pictureStage != old.pictureStage {
-      // `.monitor` is the output stage while the feed has no monitor-only LUT.
-      state.pictureStage = new.pictureStage == .source ? .source : .monitor
+      // MonitorTools' processed output is the source with the burn-in LUT:
+      // MonitorKit's output stage ("Output (LUT)").
+      state.pictureStage = new.pictureStage == .source ? .source : .output
       state.zebras[0].stage = new.pictureStage == .source ? .source : .output
     }
 

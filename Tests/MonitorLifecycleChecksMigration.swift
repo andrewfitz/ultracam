@@ -344,9 +344,11 @@ extension MonitorLifecycleChecks {
     XCTAssertEqual(source.pictureStage, .source)
     XCTAssertFalse(source.pictureHasLUT(burnInLUT: true, monitorLUT: false), "Source: no burn-in")
     let output = try migrated(#"{"pictureStage":"processedOutput"}"#).state
-    XCTAssertEqual(output.pictureStage, .monitor, "The output stage while there is no monitor LUT")
+    XCTAssertEqual(output.pictureStage, .output, "Output (LUT): the source with the burn-in LUT")
     XCTAssertTrue(output.pictureHasLUT(burnInLUT: true, monitorLUT: false))
-    XCTAssertEqual(try migrated("{}").state.pictureStage, MonitorState().pictureStage)
+    XCTAssertFalse(output.pictureHasLUT(burnInLUT: false, monitorLUT: true), "Never the monitor-only LUT")
+    XCTAssertEqual(try migrated("{}").state.pictureStage, .output)
+    XCTAssertEqual(MonitorFeedPreferences().state.pictureStage, .output, "Fresh feeds agree")
   }
 
   func testMigrationSourceProfileBecomesTheSignalDeclaration() throws {
@@ -559,11 +561,34 @@ extension MonitorLifecycleChecks {
       {"toolsEnabled":true,"falseColor":{"mode":"sonySLog3","referenceOffsetStops":2},
        "sourceProfileID":"sony-slog3-sgamut3cine","sourceCodeRange":"full","zebra":{"enabled":true}}
       """#)
+    XCTAssertTrue(value.falseColorDeclared)
     value.forgetCameraCalibration()
     XCTAssertEqual(value.signal, MonitorSignalDeclaration())
     XCTAssertEqual(value.state.falseColor.referenceOffsetStops, 0)
-    XCTAssertEqual(value.state.falseColor.mode, .off)
     XCTAssertTrue(value.state.zebras[0].enabled, "Tools stay")
     XCTAssertTrue(value.toolsEnabled)
+    // The mode stays selected but cannot show, so zebra shows instead
+    // (MonitorTools normalized it away at render time).
+    XCTAssertEqual(value.state.falseColor.mode, .sonySLog3)
+    XCTAssertFalse(value.falseColorDeclared)
+    XCTAssertTrue(value.surfaceState(isProgram: false).zebras[0].enabled)
+    XCTAssertEqual(value.legacyConfiguration.falseColor.mode, .sonySLog3, "Still selected in the tools")
+    XCTAssertEqual(value.legacyConfiguration.sourceProfileID, nil)
+    // Declaring the camera again brings it back, as before.
+    var declared = value.legacyConfiguration
+    declared.sourceProfileID = Self.sonyCine
+    value.merge(declared)
+    XCTAssertEqual(value.signal.logProfileID, Self.sonyCine)
+    XCTAssertEqual(value.state.falseColor.mode, .sonySLog3)
+    XCTAssertTrue(value.falseColorDeclared)
+    XCTAssertEqual(value.legacyConfiguration, declared.normalized())
+    XCTAssertFalse(value.surfaceState(isProgram: false).zebras[0].enabled, "False colour suppresses zebra again")
+    // Any other change made while no source is declared drops it, as MonitorTools'
+    // normalized configuration did.
+    value.forgetCameraCalibration()
+    var other = value.legacyConfiguration
+    other.focus.enabled = true
+    value.merge(other)
+    XCTAssertEqual(value.state.falseColor.mode, .off)
   }
 }

@@ -124,4 +124,59 @@ extension MonitorLifecycleChecks {
       XCTAssertEqual(reportedWorkspace?.tileBindings, ["alpha", "program", nil, nil])
     }
   }
+
+  func testBoundaryResetAndCopyReplaceTheWholePreferences() throws {
+    try MainActor.assumeIsolated {
+      var alpha = MonitorFeedPreferences(toolsEnabled: true)
+      alpha.state.zebras[0].enabled = true
+      alpha.state.geometry.desqueeze = 2
+      alpha.signal = MonitorSignalDeclaration(logProfileID: "sony-slog3-sgamut3cine")
+      var beta = MonitorFeedPreferences()
+      beta.state.falseColor.referenceOffsetStops = 1
+      beta.signal = MonitorSignalDeclaration(logProfileID: "arri-logc3-ei800")
+      var owned = ["alpha": alpha, "beta": beta]
+      let coordinator = MonitorCoordinator(
+        feeds: [
+          FeedDescriptor(id: FeedID(rawValue: "alpha"), name: "A", monitor: alpha),
+          FeedDescriptor(id: FeedID(rawValue: "beta"), name: "B", monitor: beta),
+        ], program: MonitorFeedPreferences(), workspace: MonitorWorkspacePreferences())
+      var merges = 0
+      coordinator.onConfigurationChange = { _, _ in merges += 1 }
+      coordinator.onCopySettings = { source, destination in
+        guard let tools = owned[source.rawValue], owned[destination.rawValue] != nil else { return nil }
+        owned[destination.rawValue]?.copyTools(from: tools)
+        return owned[destination.rawValue]?.legacyConfiguration
+      }
+      coordinator.onResetSettings = { target in
+        owned[target.rawValue]?.resetTools()
+        return owned[target.rawValue]?.legacyConfiguration
+      }
+
+      coordinator.copySettings(from: MonitorTargetID("alpha"), to: MonitorTargetID("beta"))
+      let copied = try XCTUnwrap(owned["beta"])
+      XCTAssertEqual(copied.state.geometry.desqueeze, 2, "MonitorKit-only settings are copied")
+      XCTAssertEqual(copied.signal, beta.signal)
+      XCTAssertEqual(copied.state.falseColor.referenceOffsetStops, 1)
+      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("beta")), MonitorConfiguration(copied.legacyConfiguration))
+      XCTAssertTrue(coordinator.configuration(for: MonitorTargetID("beta")).zebra.enabled)
+      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("beta")).sourceProfileID, "arri-logc3-ei800")
+
+      coordinator.resetSettings(for: MonitorTargetID("alpha"))
+      XCTAssertEqual(owned["alpha"], MonitorFeedPreferences(), "Desqueeze and the signal are reset too")
+      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("alpha")), MonitorConfiguration(MonitorFeedPreferences().legacyConfiguration))
+      XCTAssertEqual(merges, 0, "Applied by the owner, not merged back")
+
+      // A target the owner does not know goes through setConfiguration, as before.
+      var program = coordinator.configuration(for: MonitorTargetID("program"))
+      program.guides.enabled = true
+      coordinator.setConfiguration(program, for: MonitorTargetID("program"))
+      XCTAssertEqual(merges, 1)
+      coordinator.resetSettings(for: MonitorTargetID("program"))
+      XCTAssertEqual(merges, 2)
+      XCTAssertEqual(coordinator.configuration(for: MonitorTargetID("program")), MonitorConfiguration().normalized())
+      coordinator.copySettings(from: MonitorTargetID("beta"), to: MonitorTargetID("program"))
+      XCTAssertEqual(merges, 3)
+      XCTAssertTrue(coordinator.configuration(for: MonitorTargetID("program")).zebra.enabled)
+    }
+  }
 }

@@ -19,6 +19,13 @@ import MonitorToolsUI
   @Published private var previewEnabled: [MonitorTargetID: Bool] = [:]
   /// A target's tools changed; merge them into its `MonitorFeedPreferences`.
   var onConfigurationChange: ((MonitorTargetID, LegacyMonitorConfiguration) -> Void)?
+  /// Reset and copy replace a target's whole `MonitorFeedPreferences`, settings
+  /// a `MonitorConfiguration` cannot carry included, so they are not a field
+  /// merge: the owner applies them and returns what the target now shows.
+  /// Without an owner, or for a target it does not know (nil), they go through
+  /// `setConfiguration`.
+  var onResetSettings: ((MonitorTargetID) -> LegacyMonitorConfiguration?)?
+  var onCopySettings: ((_ source: MonitorTargetID, _ destination: MonitorTargetID) -> LegacyMonitorConfiguration?)?
   var onWorkspaceChange: ((MonitorWorkspacePreferences) -> Void)?
   var onDemandChange: ((Set<MonitorTargetID>) -> Void)?
   var onPreviewEnabledChange: ((MonitorTargetID, Bool) -> Void)?
@@ -126,7 +133,25 @@ import MonitorToolsUI
     onConfigurationChange?(target, LegacyMonitorConfiguration(value))
   }
 
+  /// "Reset monitor tools" for `target`.
+  func resetSettings(for target: MonitorTargetID) {
+    guard let replaced = onResetSettings?(target) else {
+      return setConfiguration(MonitorConfiguration(), for: target)
+    }
+    replaceConfiguration(MonitorConfiguration(replaced), for: target)
+  }
+
+  /// Already in the owner's preferences: shown, not reported back.
+  private func replaceConfiguration(_ value: MonitorConfiguration, for target: MonitorTargetID) {
+    guard configurations[target] != value else { return }
+    configurations[target] = value
+    refreshSink(target)
+  }
+
   func copySettings(from source: MonitorTargetID, to destination: MonitorTargetID) {
+    if let replaced = onCopySettings?(source, destination) {
+      return replaceConfiguration(MonitorConfiguration(replaced), for: destination)
+    }
     var value = configuration(for: source)
     let previous = configuration(for: destination)
     value.sourceProfileID = previous.sourceProfileID

@@ -298,6 +298,13 @@ final class AppModel {
       }
       self.saveSettings()
     }
+    monitorCoordinator.onResetSettings = { [weak self] target in
+      self?.replaceMonitorPreferences(of: target) { $0.resetTools() }
+    }
+    monitorCoordinator.onCopySettings = { [weak self] source, destination in
+      guard let self, let tools = self.monitorPreferences(of: source) else { return nil }
+      return self.replaceMonitorPreferences(of: destination) { $0.copyTools(from: tools) }
+    }
     monitorCoordinator.onWorkspaceChange = { [weak self] workspace in
       guard let self else { return }
       self.feedCoordinator.monitorWorkspace = workspace
@@ -778,6 +785,29 @@ final class AppModel {
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
     publishVirtualCameraRegistry(persistedSnapshot)
     monitorCoordinator.updateTargets(feeds: feedDescriptors, programAvailable: outputMode == .program)
+  }
+
+  /// The monitor preferences of a feed or Program, nil for an unknown target.
+  private func monitorPreferences(of target: MonitorTargetID) -> MonitorFeedPreferences? {
+    if target.rawValue == "program" { return feedCoordinator.programMonitor }
+    return feedDescriptors.first(where: { $0.id.rawValue == target.rawValue })?.monitor
+  }
+
+  /// Changes a target's whole monitor preferences (reset, copy), saves them and
+  /// returns what its monitors now show; nil for an unknown target.
+  private func replaceMonitorPreferences(
+    of target: MonitorTargetID, _ change: (inout MonitorFeedPreferences) -> Void
+  ) -> LegacyMonitorConfiguration? {
+    if target.rawValue == "program" {
+      change(&feedCoordinator.programMonitor)
+    } else if var descriptor = feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
+      change(&descriptor.monitor)
+      feedCoordinator.update(descriptor)
+    } else {
+      return nil
+    }
+    saveSettings()
+    return monitorPreferences(of: target)?.legacyConfiguration
   }
 
   private func syncRecordingFeeds() {
