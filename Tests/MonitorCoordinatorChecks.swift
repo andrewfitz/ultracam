@@ -553,6 +553,57 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertTrue(
       try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true)).state.clean,
       "Clean View hides a held picture's overlays too")
+    let before = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    var zoom = Magnification()
+    zoom.zoom = 2
+    zoom.showsNavigator = false
+    presenter.setMagnification(zoom)
+    let zoomed = try XCTUnwrap(
+      presenter.renderWork(after: (before.latestVersion, before.stateVersion), force: false),
+      "Zooming a held picture redraws it")
+    XCTAssertEqual(zoomed.state.geometry.magnification.zoom, 2, "Zoom applies to a held picture")
+    XCTAssertFalse(zoomed.state.zebras[0].enabled, "Zooming keeps the hold's tools")
+    presenter.toggleFreeze()
+    let lingering = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    XCTAssertNotNil(lingering.frozenToken, "The released hold stays on screen until the next frame")
+    XCTAssertEqual(lingering.state.geometry.magnification.zoom, 2, "Unfreezing keeps the surface's zoom")
+  }
+
+  /// Zebra measures the picture shown (MonitorTools' zebra did; map §5.3), so
+  /// choosing the picture stage moves the first zebra set with it.
+  func testPictureStageMovesTheFirstZebraStage() {
+    var value = MonitorFeedPreferences()
+    XCTAssertEqual(value.state.pictureStage, .output)
+    value.state.zebras[0].stage = .monitor
+    value.setPictureStage(.source)
+    XCTAssertEqual(value.state.pictureStage, .source)
+    XCTAssertEqual(value.state.zebras[0].stage, .source, "Zebra measures the camera signal shown")
+    value.setPictureStage(.output)
+    XCTAssertEqual(value.state.zebras[0].stage, .output, "Zebra measures the LUT output shown")
+    value.setPictureStage(.monitor)
+    XCTAssertEqual(value.state.zebras[0].stage, .monitor, "Zebra measures the monitor picture shown")
+    let coordinator = coordinator()
+    var tools = coordinator.preferences(for: alpha)
+    tools.state.zebras[0].enabled = true
+    tools.toolsEnabled = true
+    tools.setPictureStage(.source)
+    coordinator.setPreferences(tools, for: alpha)
+    XCTAssertEqual(coordinator.surface(id: UUID(), target: alpha).currentEncodeState.zebras[0].stage, .source)
+  }
+
+  /// The second zebra (set in a detached tile's tool bar) counts for the master
+  /// switch, and turning tools off clears it, so turning them back on never
+  /// resurrects it.
+  func testEveryZebraSetCountsForTheMasterSwitch() {
+    var value = MonitorFeedPreferences()
+    XCTAssertGreaterThanOrEqual(value.state.zebras.count, 1)
+    while value.state.zebras.count < MonitorState.maximumZebraSets { value.state.zebras.append(ZebraSet()) }
+    XCTAssertFalse(value.anyToolOn)
+    value.state.zebras[1].enabled = true
+    XCTAssertTrue(value.anyToolOn, "Zebra 2 alone keeps the tools on")
+    value.hideAllTools()
+    XCTAssertFalse(value.state.zebras.contains(where: \.enabled), "Hiding the tools clears every zebra set")
+    XCTAssertFalse(value.anyToolOn)
   }
 
   func testOutOfOrderAndRetiredGenerationFramesAreRejected() throws {

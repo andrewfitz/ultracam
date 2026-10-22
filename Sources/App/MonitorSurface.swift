@@ -263,12 +263,17 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     }
   }
 
-  /// A hold's tools with this surface's current Clean View: Clean View hides
-  /// overlays, so it applies to a held picture too. Called with the lock held.
+  /// A hold's tools with this surface's current Clean View and magnification:
+  /// both belong to the surface, not to the tools, so they apply to a held
+  /// picture too (zooming in on a frozen frame checks its focus). Called with
+  /// the lock held.
   private func frozenState(_ held: Frozen) -> MonitorState {
-    guard held.state.clean != clean else { return held.state }
+    guard held.state.clean != clean || held.state.geometry.magnification != magnification else {
+      return held.state
+    }
     var value = held.state
     value.clean = clean
+    value.geometry.magnification = magnification
     return value
   }
 
@@ -447,12 +452,14 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
 
   /// This surface's magnification (Fit, a zoom about the centre, pixel exact).
   @MainActor func setMagnification(_ value: Magnification) {
-    lock.withLock {
-      guard magnification != value else { return }
+    let changed: Bool = lock.withLock {
+      guard magnification != value else { return false }
       magnification = value
       rebuildState()
+      return true
     }
     if zoom != value { zoom = value }
+    if changed { refresh(force: true) }
   }
 
   @MainActor func reportVisibility(presented: Bool, drawable: Bool) {

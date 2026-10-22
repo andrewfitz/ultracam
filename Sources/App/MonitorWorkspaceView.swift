@@ -223,6 +223,17 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
       })
   }
 
+  /// The picture stage, with zebra measuring the picture shown.
+  private var pictureStage: Binding<SignalStage> {
+    Binding(
+      get: { preferences.state.pictureStage },
+      set: { stage in
+        var next = preferences
+        next.setPictureStage(stage)
+        if next != preferences { preferences = next }
+      })
+  }
+
   private var unavailableTools: [MonitorTileTool: String] {
     guard isProgram else { return [:] }
     return [
@@ -245,7 +256,7 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
       }
       picture()
       HStack {
-        Picker("Picture signal", selection: $preferences.state.pictureStage) {
+        Picker("Picture signal", selection: pictureStage) {
           Text("Source").tag(SignalStage.source).disabled(isProgram)
           Text("Output (LUT)").tag(SignalStage.output)
           Text("Monitor").tag(SignalStage.monitor)

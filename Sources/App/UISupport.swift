@@ -99,7 +99,7 @@ enum UIMonitorBridge {
     let state = preferences.state
     var tools: Set<UIMonitorTool> = []
     if state.guides.enabled { tools.insert(.guides) }
-    if state.zebras.first?.enabled == true { tools.insert(.zebra) }
+    if state.zebras.contains(where: \.enabled) { tools.insert(.zebra) }
     if state.falseColor.mode != .off { tools.insert(.falseColor) }
     if state.focus.enabled { tools.insert(.focus) }
     if preferences.scopes.enabled { tools.insert(.scopes) }
@@ -122,7 +122,9 @@ enum UIMonitorBridge {
     if !preferences.toolsEnabled { next.hideAllTools() }
     switch tool {
     case .guides: next.state.guides.enabled = !active
-    case .zebra: next.state.zebras[0].enabled = !active
+    case .zebra:
+      // As the detached tool bar: off clears every zebra set, on shows the first.
+      for index in next.state.zebras.indices { next.state.zebras[index].enabled = !active && index == 0 }
     case .falseColor:
       if active {
         next.state.falseColor.mode = .off
@@ -160,26 +162,6 @@ enum UIMonitorBridge {
     default:
       break
     }
-  }
-}
-
-extension MonitorFeedPreferences {
-  /// Whether a tool the master switch shows is on (clip indicators are set in a
-  /// detached monitor's tool bar).
-  var anyToolOn: Bool {
-    state.guides.enabled || state.zebras.first?.enabled == true || state.falseColor.mode != .off
-      || state.focus.enabled || scopes.enabled || state.clipIndicators.enabled
-  }
-
-  /// Every tool the master switch shows, off: what turning the switch back on
-  /// starts from, so tools left enabled underneath it stay off.
-  mutating func hideAllTools() {
-    state.guides.enabled = false
-    state.zebras[0].enabled = false
-    state.focus.enabled = false
-    state.falseColor.mode = .off
-    state.clipIndicators.enabled = false
-    scopes.enabled = false
   }
 }
 

@@ -342,4 +342,31 @@ extension MonitorFeedPreferences {
   /// MonitorKit surfaces nothing is lost in between, MonitorKit-only settings and
   /// the "Monitor" picture stage included.)
   mutating func merge(_ preferences: MonitorFeedPreferences) { self = preferences }
+
+  /// Shows `stage` as the picture. Zebra measures the picture shown, as in
+  /// MonitorTools (map §5.3), so the first zebra set's stage follows it; every
+  /// picture menu changes the stage through here.
+  mutating func setPictureStage(_ stage: SignalStage) {
+    state.pictureStage = stage
+    if state.zebras.isEmpty { state.zebras = Self.defaultState.zebras }
+    state.zebras[0].stage = stage
+  }
+
+  /// Whether a tool the master switch shows is on (clip indicators and the
+  /// second zebra are set in a detached monitor's tool bar).
+  var anyToolOn: Bool {
+    state.guides.enabled || state.zebras.contains(where: \.enabled) || state.falseColor.mode != .off
+      || state.focus.enabled || scopes.enabled || state.clipIndicators.enabled
+  }
+
+  /// Every tool the master switch shows, off: what turning the switch back on
+  /// starts from, so tools left enabled underneath it stay off.
+  mutating func hideAllTools() {
+    state.guides.enabled = false
+    for index in state.zebras.indices { state.zebras[index].enabled = false }
+    state.focus.enabled = false
+    state.falseColor.mode = .off
+    state.clipIndicators.enabled = false
+    scopes.enabled = false
+  }
 }

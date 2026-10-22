@@ -270,7 +270,7 @@ struct UICameraPictureView: View {
         get: { context.monitor.preferences(for: camera.id).state.pictureStage },
         set: { value in
           var next = context.monitor.preferences(for: camera.id)
-          next.state.pictureStage = value
+          next.setPictureStage(value)
           context.monitor.setPreferences(next, for: camera.id)
         })) {
         Text("Source (camera signal)").tag(SignalStage.source)
