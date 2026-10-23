@@ -15,11 +15,14 @@ enum MonitorDetachedRules {
   }
 
   /// The caption under the picture: its stage ("Program Output" on Program),
-  /// or, with false colour on a camera, that false colour analyses the source.
+  /// or, with false colour on a camera, the stage false colour analyses (the
+  /// Source for log modes, else the mode's own stage).
   static func pictureCaption(isProgram: Bool, preferences: MonitorFeedPreferences) -> String {
     let stage = isProgram ? "Program Output" : stageTitle(preferences.state.pictureStage)
-    if !isProgram && preferences.toolsEnabled && preferences.state.falseColor.mode != .off {
-      return "False color: Source analysis · selected picture signal: \(stage)"
+    let mode = preferences.state.falseColor.mode
+    if !isProgram && preferences.toolsEnabled && mode != .off {
+      let analysed = stageTitle(mode.needsLogSource ? .source : preferences.state.falseColor.stage)
+      return "False color: \(analysed) analysis · selected picture signal: \(stage)"
     }
     return "Picture: \(stage)"
   }

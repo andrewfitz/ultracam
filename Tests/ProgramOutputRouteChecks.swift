@@ -188,6 +188,44 @@ import XCTest
     XCTAssertFalse(bridge.isConnected)
   }
 
+  /// Host time keeps the Program clock's spacing through delivery jitter of up to
+  /// two frames, and after a short gap on air (Program time continues where it left
+  /// off, real time moved on) the next frames go out at real time, not the gap late.
+  func testProgramBridgeReanchorsAfterAShortGapButNotOnJitter() throws {
+    let source = feed("alpha")
+    let route = ProgramOutputRoute(feedIDs: [source])
+    let consumer = try route.addConsumerRoute(capacity: 4)
+    final class Clock { var now = CMTime(value: 1_000 * 60_000, timescale: 60_000) }
+    let clock = Clock()
+    var sent: [CMTime] = []
+    let bridge = ProgramOutputBridge(route: consumer, connect: { _, _ in }, disconnect: {},
+      send: { sample in sent.append(CMSampleBufferGetPresentationTimeStamp(sample)); return true },
+      hostClock: { clock.now })
+    try bridge.setDemand(true, configuration: PipelineConfiguration(),
+      passthroughFormat: kCVPixelFormatType_32BGRA)
+    let image = try frame(source, at: 0).payload
+    let start = clock.now
+    // `frames` Program frame durations (1001/60000 s) after `start`, plus `extra`.
+    func host(_ frames: Double, extra: CMTime = .zero) -> CMTime {
+      CMTimeAdd(CMTimeAdd(start, CMTime(value: CMTimeValue((frames * 1001).rounded()), timescale: 60_000)), extra)
+    }
+    func deliver(_ index: Int, at time: CMTime) {
+      clock.now = time
+      _ = route.ingest(feedID: source, frame: processed(image, at: Int64(index)))
+      bridge.pump()
+    }
+    // Each frame up to 1.9 frames late or 0.9 early.
+    let jitter = [0, 1.5, -0.9, 0.7, 1.9, -0.5, 0.2, 1.2]
+    for (index, offset) in jitter.enumerated() { deliver(index, at: host(Double(index) + offset)) }
+    XCTAssertEqual(sent, (0..<8).map { host(Double($0)) }, "Jitter within two frames keeps the anchor")
+
+    let gap = CMTime(value: 12_000, timescale: 60_000)  // 0.2 s
+    for index in 8..<11 { deliver(index, at: host(Double(index), extra: gap)) }
+    XCTAssertEqual(Array(sent.suffix(3)), (8..<11).map { host(Double($0), extra: gap) },
+      "After a gap the frames go out at real time, spaced as Program")
+    XCTAssertEqual(bridge.currentStatistics.delivered, 11)
+  }
+
   func testProgramBridgeReconnectsAfterTransientSinkFailure() throws {
     let source = feed("alpha")
     let route = ProgramOutputRoute(feedIDs: [source])

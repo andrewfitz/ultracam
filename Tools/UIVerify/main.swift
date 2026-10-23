@@ -762,15 +762,36 @@ import SystemExtensions
     verifier.check("discovery: a later outage doesn't revive an old refusal", model.startRefusal(beta) == nil,
       model.startRefusal(beta) ?? "")
 
+    // A refused Start, then another input chosen for that camera: the refusal was
+    // for the old input, so unplugging the new one later revives nothing.
+    model.startCamera(beta)
+    verifier.check("discovery: Start without its input is refused again", model.startRefusal(beta) != nil)
+    model.updateCamera(beta) { $0.selectedDevice = "dev-x" }
+    verifier.check("discovery: choosing another input clears the refusal", model.startRefusal(beta) == nil,
+      model.startRefusal(beta) ?? "")
+    publish([y])
+    verifier.check("discovery: unplugging the newly chosen input revives no old refusal",
+      model.startRefusal(beta) == nil, model.startRefusal(beta) ?? "")
+    model.updateCamera(beta) { $0.selectedDevice = "dev-z" }
+    publish([x, y])
+
     model.startAllCameras()
     verifier.check("discovery: Start All skips a camera with no input", model.startRefusal(gamma) == nil,
       model.startRefusal(gamma) ?? "")
     model.stopAllCameras()
 
+    model.startCamera(gamma)
+    verifier.check("discovery: Start with no input chosen says to choose one",
+      model.startRefusal(gamma) == "Choose an input for this camera.", model.startRefusal(gamma) ?? "nil")
     _ = model.selectFeed(gamma)
     publish([x])
     verifier.check("discovery: an empty assignment takes the arriving input",
       model.descriptor(for: gamma)?.selectedDevice == "dev-x", model.descriptor(for: gamma)?.selectedDevice ?? "nil")
+    verifier.check("discovery: the adopted input clears the selected camera's refusal",
+      model.startRefusal(gamma) == nil, model.startRefusal(gamma) ?? "")
+    publish([])
+    verifier.check("discovery: unplugging the adopted input revives no old refusal",
+      model.startRefusal(gamma) == nil, model.startRefusal(gamma) ?? "")
   }
 
   // MARK: Menu bar

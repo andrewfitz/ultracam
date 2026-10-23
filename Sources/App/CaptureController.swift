@@ -979,8 +979,6 @@ final class CaptureController: @unchecked Sendable {
       return (activeFeedID.flatMap { recordingCallbacks[$0] }, rawAudioProvidesStats)
     }
     guard let state else { return }
-    // After the generation guard: a stopped stream's packets are never metered.
-    audioMeterTap.ingest(audio)
     let validRawFormat = audio.bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample
     if let samples = audio.samples, audio.sampleFrames > 0, audio.channels > 0, validRawFormat {
       _ = state.0?.rawAudio(samples, Int(audio.sampleFrames), audio.packetTime,
@@ -992,6 +990,9 @@ final class CaptureController: @unchecked Sendable {
         leftPeak: 0, rightPeak: 0, leftRMS: 0, rightRMS: 0,
         audioBytes: UInt64(audio.samples?.count ?? 0), audioPresent: audio.samples != nil), token: token)
     }
+    // Last, after the generation guard: recording admission never waits on the
+    // meters, and a stopped stream's packets are never metered.
+    audioMeterTap.ingest(audio)
   }
 
   // MARK: - Frame path

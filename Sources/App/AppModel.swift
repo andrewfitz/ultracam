@@ -136,7 +136,15 @@ final class AppModel {
     feedCoordinator.selectedDescriptor.name
   }
 
-  var selectedDevice = "" { didSet { if selectedDevice != oldValue { saveSettings() } } }
+  var selectedDevice = "" {
+    didSet {
+      guard selectedDevice != oldValue else { return }
+      // The selected camera's own input changed (not a selection switch, which
+      // restores): a Start refused for the old input no longer applies.
+      if !restoringSettings { forgetStartRefusal(selectedFeedID) }
+      saveSettings()
+    }
+  }
   var configuration = PipelineConfiguration() {
     didSet {
       guard configuration != oldValue, !restoringSettings else { return }
@@ -474,9 +482,17 @@ final class AppModel {
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.load(url: url)
-        self?.uploadLUT(loaded, enable: true, generation: loadGeneration, feedID: feedID)
+        let lut = try await Self.makeMonitorLUT(loaded.cube)
+        self?.uploadLUT(loaded, lut: lut, enable: true, generation: loadGeneration, feedID: feedID)
       } catch { self?.lutLoadFailed(error, restoring: false, generation: loadGeneration, feedID: feedID) }
     }
+  }
+
+  /// One MonitorLUT per load, on the shared device: the controller burns it in and
+  /// the monitor's feed shows the output stage with the same object. Built off the
+  /// main actor (the 3D texture upload is megabytes for a 65³ lattice).
+  nonisolated private static func makeMonitorLUT(_ cube: CubeLUT) async throws -> MonitorLUT {
+    try LUTProcessor.makeLUT(cube)
   }
 
   private func restoreLUT(bookmark: Data) {
@@ -487,8 +503,9 @@ final class AppModel {
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.restore(bookmark: bookmark)
+        let lut = try await Self.makeMonitorLUT(loaded.cube)
         guard let self else { return }
-        self.uploadLUT(loaded, enable: self.descriptor(for: feedID)?.applyLUT == true, restoring: true,
+        self.uploadLUT(loaded, lut: lut, enable: self.descriptor(for: feedID)?.applyLUT == true, restoring: true,
           generation: loadGeneration, feedID: feedID)
       } catch { self?.lutLoadFailed(error, restoring: true, generation: loadGeneration, feedID: feedID) }
     }
@@ -509,18 +526,11 @@ final class AppModel {
     lutLoadingFeeds.remove(feedID)
   }
 
-  private func uploadLUT(_ loaded: LoadedLUT, enable: Bool, restoring: Bool = false,
+  private func uploadLUT(_ loaded: LoadedLUT, lut: MonitorLUT, enable: Bool, restoring: Bool = false,
                          generation: UInt64, feedID: FeedID) {
     let controller = feedCoordinator.capture(for: feedID)
     let controllerGeneration = controller.generationToken
     guard generation == lutLoadGenerations[feedID] else { return }
-    // One MonitorLUT per load, on the shared device: the controller burns it in
-    // and the monitor's feed shows the output stage with the same object.
-    let lut: MonitorLUT
-    do { lut = try LUTProcessor.makeLUT(loaded.cube) } catch {
-      lutLoadFailed(error, restoring: restoring, generation: generation, feedID: feedID)
-      return
-    }
     controller.load(lut, expectedGeneration: controllerGeneration) { [weak self] result in
       MainActor.assumeIsolated {
         guard let self else { return }
@@ -864,6 +874,11 @@ final class AppModel {
     if started { refusedStarts.remove(id) } else if refusedStarts.insert(id).inserted { cameraStateRevision &+= 1 }
   }
 
+  /// A camera's input changed: a Start refused for its old input is history.
+  private func forgetStartRefusal(_ id: FeedID) {
+    if refusedStarts.remove(id) != nil { cameraStateRevision &+= 1 }
+  }
+
   /// A refusal whose cause has gone stays gone; a later, unrelated outage
   /// must not show "Couldn't start" for a Start pressed long before.
   private func expireResolvedStartRefusals() {
@@ -878,6 +893,7 @@ final class AppModel {
     guard refusedStarts.contains(id), let descriptor = descriptor(for: id), !feedCoordinator.isFeedRunning(id) else { return nil }
     if id == selectedFeedID && automaticFeedEnabled { return automaticFeedStatus }
     if id == selectedFeedID && loading { return "Its LUT is still loading. Start it again in a moment." }
+    if descriptor.selectedDevice.isEmpty { return driverWarning ?? "Choose an input for this camera." }
     if !devices.contains(where: { $0.id == descriptor.selectedDevice }) { return driverWarning ?? "Connect the UltraStudio." }
     return nil
   }
@@ -1138,8 +1154,11 @@ final class AppModel {
     let generation = controller.generationToken
     Task { [weak self, lutLoader] in
       let loaded: LoadedLUT
-      do { loaded = try await lutLoader.restore(bookmark: bookmark) }
-      catch {
+      let lut: MonitorLUT
+      do {
+        loaded = try await lutLoader.restore(bookmark: bookmark)
+        lut = try await Self.makeMonitorLUT(loaded.cube)
+      } catch {
         await MainActor.run { [weak self] in
           self?.headlessLUTRestoreFailed(error, feedID: feedID, bookmark: bookmark, generation: generation)
         }
@@ -1150,12 +1169,6 @@ final class AppModel {
           controller.generationToken == generation,
           let descriptor = self.feedCoordinator.descriptors.first(where: { $0.id == feedID }),
           descriptor.lutBookmark == bookmark, descriptor.applyLUT else { return }
-        // One MonitorLUT per load, on the shared device (see uploadLUT).
-        let lut: MonitorLUT
-        do { lut = try LUTProcessor.makeLUT(loaded.cube) } catch {
-          self.headlessLUTRestoreFailed(error, feedID: feedID, bookmark: bookmark, generation: generation)
-          return
-        }
         controller.load(lut, expectedGeneration: generation) { [weak self] result in
           MainActor.assumeIsolated {
             guard let self else { return }
@@ -1230,6 +1243,7 @@ final class AppModel {
     if let cameraDemandError { return cameraDemandError }
     if !automaticCaptureRequested { return "Waiting for a camera app or visible preview. Capture and video processing are off." }
     if loading { return "Restoring your LUT…" }
+    if selectedDevice.isEmpty { return driverWarning ?? "Choose an input for this camera." }
     if !devices.contains(where: { $0.id == selectedDevice }) { return driverWarning ?? "Connect the UltraStudio." }
     return "Camera stopped. Retry to resume preview or camera output."
   }
@@ -1501,6 +1515,7 @@ final class AppModel {
     if feedCoordinator.isFeedRunning(id) && descriptor.selectedDevice != before.selectedDevice {
       descriptor.selectedDevice = before.selectedDevice
     }
+    if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
     feedCoordinator.update(descriptor)
     persistedSnapshot = feedCoordinator.snapshot
     settingsStore.saveSnapshot(persistedSnapshot)

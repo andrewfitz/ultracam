@@ -60,8 +60,16 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     /// Nil for a pixel format MonitorKit does not read.
     let layout: PixelLayout?
-    /// The attachments' signal with the feed's declaration applied.
+    /// The attachments' signal with the feed's declaration applied: how the Source
+    /// stage, and the log classifiers, read the frame.
     let signal: SignalDescription
+    /// How the Output and Monitor stages read the frame: as the camera's processing
+    /// decodes it for the burn-in LUT (`LUTProcessor.parameters`: the pixel format's
+    /// code range and its Y'CbCr matrix, BT.709 for any but BT.2020 and BT.601),
+    /// with the declared log encoding. A declared code range is the Source stage's
+    /// alone, so the Output (LUT) picture is what Program, recording and the
+    /// virtual camera get. Program's is `signal`.
+    let outputSignal: SignalDescription
     /// Size, pixel aspect ratio and clean aperture (top-left origin, ISO/IEC 14496-12).
     let geometry: MonitorFrameGeometry
     /// The `MonitorFrame.id` every surface of the feed gives this frame, so the
@@ -69,6 +77,42 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let frameID: UInt64
     /// Program's frames are a mix, not a camera's signal: no log false colour, no peaking.
     let isProcessed: Bool
+
+    init(
+      stamp: Stamp, pixelBuffer: CVPixelBuffer, layout: PixelLayout?, signal: SignalDescription,
+      outputSignal: SignalDescription? = nil, geometry: MonitorFrameGeometry, frameID: UInt64, isProcessed: Bool
+    ) {
+      self.stamp = stamp
+      self.pixelBuffer = pixelBuffer
+      self.layout = layout
+      self.signal = signal
+      self.outputSignal = outputSignal ?? signal
+      self.geometry = geometry
+      self.frameID = frameID
+      self.isProcessed = isProcessed
+    }
+
+    /// The signal a pass that measures `stage` reads the frame with.
+    func signal(reading stage: SignalStage) -> SignalDescription {
+      stage == .source ? signal : outputSignal
+    }
+  }
+
+  /// The stage whose reading a picture of `state` takes: its picture stage, or,
+  /// while false colour replaces the picture, the stage it classifies (the Source
+  /// for a log mode on a log signal; six-band and custom bands their own stage).
+  /// Other tools on another stage than the picture's read it as the picture
+  /// does: MonitorKit decodes a frame once per pass.
+  static func pictureReading(_ state: MonitorState, signal: SignalDescription) -> SignalStage {
+    let falseColor = state.falseColor
+    guard !state.clean else { return state.pictureStage }
+    switch falseColor.mode {
+    case .off: return state.pictureStage
+    case .sixBand: return falseColor.stage
+    case .custom: return falseColor.customBands.isEmpty ? state.pictureStage : falseColor.stage
+    case .sonySLog3, .arriStyleSLog3, .arriLogC, .elZone:
+      return signal.encoding.log != nil ? .source : state.pictureStage
+    }
   }
 
   /// One lock for the process-wide generation and frame-ID counters.
@@ -95,7 +139,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private var revision: UInt64 = 1
   private struct Identity: Equatable {
     let layout: PixelLayout?
-    let signal: SignalDescription
+    let signals: Signals
     let geometry: MonitorFrameGeometry
   }
   private var identity: Identity?
@@ -127,21 +171,48 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private var monitorLUTChoice: MonitorLUTChoice?
   private var monitorLUTLoad: UInt64 = 0
   private var monitorLUTPhase = MonitorLUTState.none
+  /// When the shown choice last failed to load: it is read again no sooner than
+  /// `monitorLUTRetryInterval` later.
+  private var monitorLUTFailedAt: Double?
+  /// The choice a refresh replaced, until another is made: the owner may still
+  /// hand it back before it has saved the refreshed one, and that is no new choice.
+  private var monitorLUTRefreshedFrom: MonitorLUTChoice?
+  private let clock: @Sendable () -> Double
+  /// A failed monitor LUT is read again at most this often (seconds): the
+  /// coordinator refreshes its hosts on every preferences change, and each read
+  /// resolves the bookmark and parses the whole file.
+  static let monitorLUTRetryInterval = 5.0
+  /// Called (on the loading task) when the shown choice's file resolved to another
+  /// bookmark (it was moved or renamed) or name: the choice the host now holds,
+  /// with the same pick. The owner saves it; handing it back does not reload.
+  var onMonitorLUTChoiceRefresh: (@Sendable (_ old: MonitorLUTChoice, _ new: MonitorLUTChoice) -> Void)? {
+    get { lock.withLock { choiceRefresh } }
+    set { lock.withLock { choiceRefresh = newValue } }
+  }
+  private var choiceRefresh: (@Sendable (MonitorLUTChoice, MonitorLUTChoice) -> Void)?
+  private var mismatch: String?
 
   /// Render thread only.
   private var renderFeed: MonitorFeed?
   private var appliedLUTVersion: UInt64 = .max
-  private(set) var lutMismatch: String?
+
+  /// Why a LUT is not applied (made on another GPU than the monitor's); nil when
+  /// they are. Set on the render thread, read anywhere.
+  var lutMismatch: String? { lock.withLock { mismatch } }
 
   /// The file loader monitor-only LUTs go through: the interface makes their
   /// bookmarks with it (read-only, security-scoped), and hosts resolve them with it.
   static let monitorLUTLoader = LUTFileLoader()
 
-  init(target: String, gpu: MonitorGPUContext?, lutLoader: LUTFileLoader = MonitorFeedHost.monitorLUTLoader) {
+  init(
+    target: String, gpu: MonitorGPUContext?, lutLoader: LUTFileLoader = MonitorFeedHost.monitorLUTLoader,
+    clock: @escaping @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime }
+  ) {
     self.target = target
     isProgram = target == Self.programTarget
     self.gpu = gpu
     self.lutLoader = lutLoader
+    self.clock = clock
     owner = Self.counterLock.withLock {
       Self.nextOwner &+= 1
       return Self.nextOwner
@@ -225,19 +296,29 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// device; the LUT shown until then stays, and frames already encoded keep
   /// theirs (no wait). The same choice again does nothing while it is loading
   /// or shown, so this can be called on every preferences refresh; a choice
-  /// whose file could not be read is tried again (the volume may be mounted by
+  /// whose file could not be read is tried again, no sooner than
+  /// `monitorLUTRetryInterval` after it failed (the volume may be mounted by
   /// now). A new pick of the same file (`MonitorLUTChoice.pick`) reads it again.
   /// Nil clears it at once; a file that cannot be read clears it and is reported
   /// in `monitorLUTState`. Ignored for Program, whose frames are already processed.
   func setMonitorLUT(_ value: MonitorLUTChoice?) {
-    let choice = isProgram ? nil : value
-    let load: UInt64? = lock.withLock {
+    let now = clock()
+    let started: (load: UInt64, choice: MonitorLUTChoice)? = lock.withLock {
+      var choice = isProgram ? nil : value
+      if choice != nil, choice == monitorLUTRefreshedFrom { choice = monitorLUTChoice }
       if choice == monitorLUTChoice {
-        guard choice != nil, case .failed = monitorLUTPhase else { return nil }
+        guard let choice, case .failed = monitorLUTPhase else { return nil }
+        guard now - (monitorLUTFailedAt ?? -.infinity) >= Self.monitorLUTRetryInterval else { return nil }
+        monitorLUTLoad &+= 1
+        monitorLUTFailedAt = nil
+        monitorLUTPhase = .loading
+        return (monitorLUTLoad, choice)
       }
       monitorLUTChoice = choice
+      monitorLUTRefreshedFrom = nil
       monitorLUTLoad &+= 1
-      guard choice != nil else {
+      monitorLUTFailedAt = nil
+      guard let choice else {
         monitorLUTPhase = .none
         if monitorOnly != nil {
           monitorOnly = nil
@@ -246,19 +327,19 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
         return nil
       }
       monitorLUTPhase = .loading
-      return monitorLUTLoad
+      return (monitorLUTLoad, choice)
     }
-    guard let load, let bookmark = choice?.bookmark else { return }
+    guard let (load, choice) = started else { return }
     let loader = lutLoader
     Task.detached { [weak self] in
-      let result: Result<MonitorLUT, any Error>
+      let result: Result<(MonitorLUT, LoadedLUT), any Error>
       do {
-        let file = try await loader.restore(bookmark: bookmark)
-        result = .success(try LUTProcessor.makeLUT(file.cube))
+        let file = try await loader.restore(bookmark: choice.bookmark)
+        result = .success((try LUTProcessor.makeLUT(file.cube), file))
       } catch {
         result = .failure(error)
       }
-      self?.finishMonitorLUTLoad(load, result)
+      self?.finishMonitorLUTLoad(load, choice, result)
     }
   }
 
@@ -267,22 +348,40 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     setMonitorLUT(value.map { MonitorLUTChoice(bookmark: $0, fileName: "") })
   }
 
-  private func finishMonitorLUTLoad(_ load: UInt64, _ result: Result<MonitorLUT, any Error>) {
-    lock.withLock {
-      guard load == monitorLUTLoad else { return }
+  private func finishMonitorLUTLoad(
+    _ load: UInt64, _ choice: MonitorLUTChoice, _ result: Result<(MonitorLUT, LoadedLUT), any Error>
+  ) {
+    let refresh: ((MonitorLUTChoice, MonitorLUTChoice) -> Void, MonitorLUTChoice)? = lock.withLock {
+      guard load == monitorLUTLoad else { return nil }
       let lut: MonitorLUT?
+      var refreshed: MonitorLUTChoice?
       switch result {
-      case .success(let value):
+      case .success(let (value, file)):
         lut = value
         monitorLUTPhase = .loaded(value.cube.title)
+        // A moved or renamed file: hold the refreshed choice first, so the owner
+        // handing it back is the same choice and does not reload.
+        if file.bookmark != choice.bookmark || (!file.fileName.isEmpty && file.fileName != choice.fileName) {
+          var value = choice
+          value.bookmark = file.bookmark
+          if !file.fileName.isEmpty { value.fileName = file.fileName }
+          monitorLUTRefreshedFrom = monitorLUTRefreshedFrom ?? choice
+          monitorLUTChoice = value
+          refreshed = value
+        }
       case .failure(let error):
         lut = nil
         monitorLUTPhase = .failed(error.localizedDescription)
+        monitorLUTFailedAt = clock()
       }
-      guard monitorOnly !== lut else { return }
-      monitorOnly = lut
-      lutVersion &+= 1
+      if monitorOnly !== lut {
+        monitorOnly = lut
+        lutVersion &+= 1
+      }
+      guard let refreshed, let choiceRefresh else { return nil }
+      return (choiceRefresh, refreshed)
     }
+    if let (report, refreshed) = refresh { report(choice, refreshed) }
   }
 
   /// The camera frame rate measured from picture timestamps. Zero until two frames arrived.
@@ -336,10 +435,11 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     }
     let format = CVPixelBufferGetPixelFormatType(image)
     let layout = MonitorFrame.layout(for: format)
-    let signal = Self.interpret(
-      image, format: format, range: layout?.range ?? .legal, declaration: declaration, cache: &interpretation)
+    let signals = Self.interpret(
+      image, format: format, range: layout?.range ?? .legal, declaration: declaration, processed: isProgram,
+      cache: &interpretation)
     let geometry = cachedGeometry(image, format: format)
-    let current = Identity(layout: layout?.layout, signal: signal, geometry: geometry)
+    let current = Identity(layout: layout?.layout, signals: signals, geometry: geometry)
     if identity != current {
       identity = current
       revision &+= 1
@@ -354,8 +454,8 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       stamp: Stamp(
         target: target, generation: generation, sequence: sequence, sourcePTS: pts.seconds, hostTime: now,
         revision: revision),
-      pixelBuffer: image, layout: layout?.layout, signal: signal, geometry: geometry, frameID: frameID,
-      isProcessed: isProgram)
+      pixelBuffer: image, layout: layout?.layout, signal: signals.source, outputSignal: signals.output,
+      geometry: geometry, frameID: frameID, isProcessed: isProgram)
     // Under the lock, so a setConsumers that removes a surface cannot race a frame
     // into it. accept() only swaps a slot; it never calls back here.
     for consumer in consumers { consumer.accept(delivery) }
@@ -412,37 +512,59 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     }
   }
 
+  /// A frame's readings: the Source stage's and the Output and Monitor stages'
+  /// (`Delivery.signal`, `Delivery.outputSignal`).
+  private struct Signals: Equatable {
+    let source: SignalDescription
+    let output: SignalDescription
+  }
+
   private struct Interpretation {
     let tags: ColorTags
     let format: OSType
     let declaration: MonitorSignalDeclaration?
-    let signal: SignalDescription
+    let signals: Signals
   }
 
-  /// The cached signal while nothing it depends on changed; otherwise a fresh one
+  /// The cached signals while nothing they depend on changed; otherwise fresh ones
   /// (which may allocate), cached for the next frame. Primaries are read on their
   /// own, so HLG or PQ with BT.709 primaries keeps BT.709.
   private static func interpret(
     _ image: CVPixelBuffer, format: OSType, range: CodeRange, declaration: MonitorSignalDeclaration?,
-    cache: inout Interpretation?
-  ) -> SignalDescription {
+    processed: Bool, cache: inout Interpretation?
+  ) -> Signals {
     let tags = ColorTags(image)
     if let cached = cache, cached.format == format, cached.declaration == declaration, cached.tags.matches(tags) {
-      return cached.signal
+      return cached.signals
     }
-    var value = MonitorFrame.signal(of: image, range: range)
-    if let declaration { value = declaration.applied(to: value) }
-    cache = Interpretation(tags: tags, format: format, declaration: declaration, signal: value)
-    return value
+    let native = MonitorFrame.signal(of: image, range: range)
+    let signals: Signals
+    if processed {
+      signals = Signals(source: native, output: native)
+    } else {
+      let source = declaration?.applied(to: native) ?? native
+      // The burn-in decode: the format's range, and the matrices LUTProcessor reads.
+      var output = source
+      output.range = native.range
+      if output.matrix == .smpte240m { output.matrix = .bt709 }
+      signals = Signals(source: source, output: output)
+    }
+    cache = Interpretation(tags: tags, format: format, declaration: declaration, signals: signals)
+    return signals
   }
 
-  /// `image` read as this host reads every offered frame (tests, tools).
-  func signal(of image: CVPixelBuffer) -> SignalDescription {
+  /// `image` read as this host reads every offered frame on the Source stage (tests, tools).
+  func signal(of image: CVPixelBuffer) -> SignalDescription { signals(of: image).source }
+
+  /// `image` read as this host reads every offered frame on the Output and Monitor stages.
+  func outputSignal(of image: CVPixelBuffer) -> SignalDescription { signals(of: image).output }
+
+  private func signals(of image: CVPixelBuffer) -> Signals {
     let format = CVPixelBufferGetPixelFormatType(image)
     var cache: Interpretation?
     return Self.interpret(
       image, format: format, range: MonitorFrame.layout(for: format)?.range ?? .legal,
-      declaration: lock.withLock { declaration }, cache: &cache)
+      declaration: lock.withLock { declaration }, processed: isProgram, cache: &cache)
   }
 
   // MARK: - Render thread
@@ -469,11 +591,24 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       }
       feed.burnInLUT = usable(burn)
       feed.monitorLUT = usable(monitor)
-      lutMismatch =
+      let reason =
         (burn != nil && feed.burnInLUT == nil) || (monitor != nil && feed.monitorLUT == nil)
         ? "The LUT was made on another GPU than the monitor's." : nil
+      lock.withLock { mismatch = reason }
     }
     return feed
+  }
+
+  /// Lets go of the feed's render state once its camera is gone: the `MonitorFeed`
+  /// (focus mask, LUT references, residency) is released on the render thread,
+  /// and the feed's textures leave the shared cache. A surface still bound to the
+  /// target makes a bare feed again if it draws.
+  func releaseRenderState() {
+    gpu?.renderThread.perform { [self] in
+      renderFeed = nil
+      appliedLUTVersion = .max
+    }
+    gpu?.flushFrames(owner: owner)
   }
 
   /// `delivery` as a `MonitorFrame` over the shared, resident texture cache, with the
@@ -490,8 +625,12 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// stop's flush in between would leave it reading non-resident textures. Keep
   /// the `Delivery` instead (a pending scope tick, a Freeze source) and wrap it
   /// again at each encode.
+  ///
+  /// `stage` is the stage the pass measures: the frame carries that stage's
+  /// reading (`Delivery.signal(reading:)`).
   func frame(
-    _ delivery: Delivery, in context: MonitorGPUContext.EncodeContext, core: MonitorGPUContext.Core
+    _ delivery: Delivery, in context: MonitorGPUContext.EncodeContext, core: MonitorGPUContext.Core,
+    reading stage: SignalStage = .source
   ) throws -> MonitorFrame {
     let buffer = delivery.pixelBuffer
     guard let layout = delivery.layout else {
@@ -533,7 +672,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     }
     var frame = try MonitorFrame(
       layout: layout, width: width, height: height, packed: packed, luma: luma, chroma: chroma,
-      signal: delivery.signal, pixelAspectRatio: delivery.geometry.pixelAspectRatio,
+      signal: delivery.signal(reading: stage), pixelAspectRatio: delivery.geometry.pixelAspectRatio,
       cleanAperture: delivery.geometry.cleanAperture)
     frame.id = delivery.frameID
     frame.isProcessed = delivery.isProcessed

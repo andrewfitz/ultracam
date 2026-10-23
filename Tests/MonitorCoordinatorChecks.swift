@@ -4,6 +4,7 @@ import Darwin
 import Metal
 import MonitorKit
 import XCTest
+import simd
 
 /// Counts heap allocations made by one thread through libmalloc's logger hook.
 private typealias MonitorMallocLogger = @convention(c) (UInt32, UInt, UInt, UInt, UInt, UInt32) -> Void
@@ -637,7 +638,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     }
     XCTAssertFalse(presenter.holdsProducerFrame, "The GPU copy replaced the capture buffer")
     let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
-    guard case .frozenOwned(let frame, let feed, _) = work.content else {
+    guard case .frozenOwned(let frame, let feed, _, _) = work.content else {
       return XCTFail("The hold draws its own copy")
     }
     XCTAssertTrue(feed.frozenFrame?.id == frame.id)
@@ -815,5 +816,176 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
       XCTFail("A live frame")
     }
     core.abandon(context)
+  }
+
+  /// A v210 frame of one colour: Y, Cb, Cr codes in every pixel, BT.709 tagged.
+  private func flatV210(y: UInt32, cb: UInt32, cr: UInt32, width: Int = 48, height: Int = 16,
+    matrix: CFString = kCVImageBufferYCbCrMatrix_ITU_R_709_2) throws -> CVPixelBuffer {
+    var made: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_422YpCbCr10,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &made),
+      kCVReturnSuccess)
+    let image = try XCTUnwrap(made)
+    CVPixelBufferLockBaseAddress(image, [])
+    let stride = CVPixelBufferGetBytesPerRow(image) / 4
+    let words = try XCTUnwrap(CVPixelBufferGetBaseAddress(image)).assumingMemoryBound(to: UInt32.self)
+    let group = [cb | y << 10 | cr << 20, y | cb << 10 | y << 20, cr | y << 10 | cb << 20, y | cr << 10 | y << 20]
+    for row in 0..<height {
+      for index in 0..<((width + 5) / 6 * 4) { words[row * stride + index] = group[index % 4] }
+    }
+    CVPixelBufferUnlockBaseAddress(image, [])
+    CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+    CVBufferSetAttachment(image, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+      .shouldPropagate)
+    CVBufferSetAttachment(image, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
+      .shouldPropagate)
+    return image
+  }
+
+  /// BT.709 R'G'B' of 10-bit codes read with `range`.
+  private static func decode709(y: UInt32, cb: UInt32, cr: UInt32, range: CodeRange) -> SIMD3<Float> {
+    let full = range == .full
+    let luma = (Float(y) - (full ? 0 : 64)) / (full ? 1023 : 876)
+    let b = (Float(cb) - 512) / (full ? 1023 : 896), r = (Float(cr) - 512) / (full ? 1023 : 896)
+    let red = luma + 2 * (1 - 0.2126) * r, blue = luma + 2 * (1 - 0.0722) * b
+    return SIMD3(red, (luma - 0.2126 * red - 0.0722 * blue) / 0.7152, blue)
+  }
+
+  /// A declared code range is the Source stage's alone (as in MonitorTools): a legal
+  /// v210 camera declared Full shows on Output (LUT) the burn-in LUT on the legal
+  /// decode, which is what LUTProcessor publishes, within a code, live and frozen;
+  /// its Source picture reads the declared range.
+  func testDeclaredRangeIsTheSourceStagesAndOutputPictureIsTheBurnIn() throws {
+    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let value = coordinator()
+    var tools = value.preferences(for: alpha)
+    tools.signal.range = .full
+    tools.setPictureStage(.output)
+    value.setPreferences(tools, for: alpha)
+    // A non-separable 9³ lattice, so the two decodes cannot meet on it.
+    var lines = ["LUT_3D_SIZE 9"]
+    for b in 0..<9 {
+      for g in 0..<9 {
+        for r in 0..<9 {
+          let (x, y, z) = (Double(r) / 8, Double(g) / 8, Double(b) / 8)
+          lines.append("\(y * 0.7 + z * 0.2) \(x * x) \(0.9 - z * y)")
+        }
+      }
+    }
+    let cube = try CubeLUT(text: lines.joined(separator: "\n"))
+    let lut = try LUTProcessor.makeLUT(cube, device: core.device)
+    let (presenter, host) = liveSurface(value)
+    value.setBurnInLUTSource(for: alpha) { lut }
+    let codes: (y: UInt32, cb: UInt32, cr: UInt32) = (600, 420, 640)
+    let buffer = try flatV210(y: codes.y, cb: codes.cb, cr: codes.cr)
+    var sequence: UInt64 = 0
+    func offer() {
+      sequence += 1
+      host.offer(buffer, pts: CMTime(value: CMTimeValue(sequence), timescale: 30), captureGeneration: 1,
+        sequence: sequence)
+    }
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba32Float, width: 48, height: 16, mipmapped: false)
+    descriptor.usage = [.renderTarget, .shaderRead]
+    descriptor.storageMode = .shared
+    let target = try XCTUnwrap(core.device.makeTexture(descriptor: descriptor))
+    core.engine.residency.add(target)
+    defer { core.engine.residency.retire(target, resident: target) }
+    func draw() throws -> SIMD3<Float> {
+      let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+      presenter.refreshBurnInLUT()
+      let probe = MonitorCompletionProbe()
+      let context = try core.begin()
+      _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
+        context: context)
+      core.commit(context, completion: probe, kind: 1)
+      let deadline = Date().addingTimeInterval(5)
+      while probe.completed == 0 && Date() < deadline { usleep(200) }
+      XCTAssertEqual(probe.failed, 0)
+      var pixel = SIMD4<Float>(repeating: 0)
+      target.getBytes(&pixel, bytesPerRow: 48 * 16, from: MTLRegionMake2D(24, 8, 1, 1), mipmapLevel: 0)
+      return SIMD3(pixel.x, pixel.y, pixel.z)
+    }
+    let legal = Self.decode709(y: codes.y, cb: codes.cb, cr: codes.cr, range: .legal)
+    let declared = Self.decode709(y: codes.y, cb: codes.cb, cr: codes.cr, range: .full)
+    let burned = simd_clamp(cube.apply(legal, interpolation: .tetrahedral), SIMD3(repeating: 0), SIMD3(repeating: 1))
+    let wrong = simd_clamp(cube.apply(declared, interpolation: .tetrahedral), SIMD3(repeating: 0), SIMD3(repeating: 1))
+    XCTAssertGreaterThan(simd_reduce_max(simd_abs(burned - wrong)), 8.0 / 1023, "The fixture tells the ranges apart")
+    let code = Float(1) / 1023
+
+    offer()
+    let output = try draw()
+    XCTAssertLessThanOrEqual(simd_reduce_max(simd_abs(output - burned)), code,
+      "Output (LUT) is the burn-in on the legal decode: \(output) vs \(burned)")
+
+    tools.setPictureStage(.source)
+    value.setPreferences(tools, for: alpha)
+    offer()
+    let source = try draw()
+    XCTAssertLessThanOrEqual(simd_reduce_max(simd_abs(source - declared)), code,
+      "The Source picture reads the declared range: \(source) vs \(declared)")
+
+    tools.setPictureStage(.output)
+    value.setPreferences(tools, for: alpha)
+    offer()
+    presenter.toggleFreeze()
+    let deadline = Date().addingTimeInterval(5)
+    while presenter.holdsProducerFrame && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    guard case .frozenOwned = work.content else { return XCTFail("The hold draws its own copy") }
+    let frozen = try draw()
+    XCTAssertLessThanOrEqual(simd_reduce_max(simd_abs(frozen - burned)), code,
+      "A held Output (LUT) picture is the burn-in too: \(frozen) vs \(burned)")
+    presenter.toggleFreeze()
+  }
+
+  /// The stage a picture reads: its own, or the one false colour classifies while
+  /// it replaces the picture; scopes and focus read their own stage.
+  func testPictureReadingFollowsTheStageItShows() throws {
+    let log = SignalDescription(encoding: .log(try XCTUnwrap(LogEncoding(profileID: "sony-slog3-sgamut3cine"))))
+    let display = SignalDescription()
+    var state = MonitorState()
+    state.pictureStage = .output
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .output)
+    state.falseColor.mode = .sonySLog3
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .source, "Log false colour classifies the source")
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: display), .output, "Unavailable: the picture shows")
+    state.falseColor.mode = .sixBand
+    state.falseColor.stage = .monitor
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: display), .monitor, "Six bands classify their stage")
+    state.falseColor.mode = .custom
+    state.falseColor.customBands = []
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: display), .output, "No bands: the picture shows")
+    state.falseColor.mode = .sixBand
+    state.clean = true
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: display), .output, "Clean View shows the picture")
+  }
+
+  /// A removed camera's feed host goes, with its tools and LUTs; a disabled one,
+  /// still listed, keeps its host; Program's is never dropped.
+  func testRemovedCameraReleasesItsFeedHost() throws {
+    let value = coordinator()
+    let program = value.captureSink(for: .program)
+    let (presenter, host) = liveSurface(value, target: beta)
+    _ = value.captureSink(for: alpha)
+    host.burnInLUT = try LUTProcessor.makeLUT(try CubeLUT(text: Self.identityCube))
+    var tools = value.preferences(for: beta)
+    tools.state.guides.enabled.toggle()
+    value.setPreferences(tools, for: beta)
+    XCTAssertEqual(value.hostTargets, [alpha, beta, .program])
+    value.updateTargets(
+      feeds: [
+        FeedDescriptor(id: FeedID(rawValue: "alpha"), name: "Wide", enabled: false),
+        FeedDescriptor(id: FeedID(rawValue: "beta"), name: "Tight"),
+      ], programAvailable: false)
+    XCTAssertEqual(value.hostTargets, [alpha, beta, .program], "A disabled camera is still listed")
+    value.updateTargets(feeds: [FeedDescriptor(id: FeedID(rawValue: "alpha"), name: "Wide")], programAvailable: false)
+    XCTAssertEqual(value.hostTargets, [alpha, .program], "The removed camera's host is released")
+    XCTAssertNil(host.burnInLUT, "Its LUTs go with it")
+    XCTAssertFalse(host.hasConsumers)
+    XCTAssertNotEqual(value.preferences(for: beta), tools, "Its tools are forgotten (the owner keeps the saved ones)")
+    XCTAssertTrue(value.captureSink(for: .program) === program)
+    XCTAssertEqual(presenter.target, beta, "A surface still bound to it says so")
   }
 }

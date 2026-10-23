@@ -399,15 +399,20 @@ final class ProgramOutputBridge: @unchecked Sendable {
 
 extension ProgramOutputBridge {
   /// Program time on the host clock: one offset per connection, so spacing is
-  /// exactly the Program clock's. Re-anchored only when the Program clock
-  /// restarts (a reset) or strays a second from real time, never backwards.
+  /// exactly the Program clock's. Re-anchored, never backwards, when the Program
+  /// clock restarts or steps back, or strays more than two frames from real time:
+  /// after a short gap on air Program time continues where it left off while real
+  /// time moved on, and every later frame would go out that much late. Delivery
+  /// jitter within two frames keeps the offset; a burst at one moment keeps the
+  /// spacing (the anchor is then the previous frame plus one duration).
   fileprivate func hostTime(for programTime: CMTime, duration: CMTime) -> CMTime {
     // On the Program timescale, so mapped spacing stays exact.
     let now = CMTimeConvertScale(hostClock(), timescale: programTime.timescale, method: .roundTowardZero)
     if let hostOffset {
       let mapped = CMTimeAdd(programTime, hostOffset)
       let ahead = CMTimeSubtract(mapped, now).seconds
-      if abs(ahead) < 1, lastSentTime.map({ CMTimeCompare(mapped, $0) > 0 }) ?? true { return mapped }
+      let tolerance = 2 * duration.seconds
+      if abs(ahead) <= tolerance, lastSentTime.map({ CMTimeCompare(mapped, $0) > 0 }) ?? true { return mapped }
     }
     var anchor = now
     if let lastSentTime { anchor = CMTimeMaximum(anchor, CMTimeAdd(lastSentTime, duration)) }

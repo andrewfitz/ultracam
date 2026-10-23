@@ -229,6 +229,11 @@ import MonitorKit
         }
       }
     }
+    // A removed camera's host, tools and LUTs go (re-adding it makes a new feed).
+    let listed = Set(feeds.map { MonitorTargetID($0.id.rawValue) })
+    for target in Array(assignedDevices.keys) where !listed.contains(target) && !target.isProgram {
+      release(target)
+    }
     for target in Array(hosts.keys) where !available.contains(target) {
       hosts[target]?.invalidate(rejectingCaptureGeneration: nil)
       refreshHost(target)
@@ -248,13 +253,55 @@ import MonitorKit
     refreshDemand()
   }
 
+  /// Lets go of a camera that is no longer listed: its host stops taking frames
+  /// and drops its LUTs and render state (the feed, its focus mask, their GPU
+  /// residency), and its tools, burn-in source and assignment are forgotten (the
+  /// owner keeps the saved ones). Surfaces still bound to it say so.
+  private func release(_ target: MonitorTargetID) {
+    if let host = hosts.removeValue(forKey: target) {
+      host.onMonitorLUTChoiceRefresh = nil
+      host.setMonitorLUT(nil)
+      host.burnInLUT = nil
+      host.setConsumers([])
+      host.invalidate(rejectingCaptureGeneration: nil)
+      host.releaseRenderState()
+    }
+    preferences[target] = nil
+    burnInSources[target] = nil
+    assignedDevices[target] = nil
+    previewEnabled[target] = nil
+    diagnosticSnapshots[target] = nil
+    for surface in surfaces.values where surface.target == target {
+      surface.presenter.setBurnInLUTSource(nil)
+      surface.presenter.setUnavailable("Missing feed")
+    }
+  }
+
+  /// Feed hosts (tests): one per camera listed or bound, and Program.
+  var hostTargets: Set<MonitorTargetID> { Set(hosts.keys) }
+
   /// The target's feed host: the endpoint its producer offers frames to.
   func captureSink(for target: MonitorTargetID) -> MonitorFeedHost {
     if let host = hosts[target] { return host }
     let host = MonitorFeedHost(target: target.rawValue, gpu: gpu)
+    host.onMonitorLUTChoiceRefresh = { [weak self] old, new in
+      DispatchQueue.main.async { [weak self] in
+        MainActor.assumeIsolated { self?.monitorLUTChoiceRefreshed(target, from: old, to: new) }
+      }
+    }
     hosts[target] = host
     refreshHost(target)
     return host
+  }
+
+  /// The host resolved the target's monitor LUT to a refreshed bookmark or name
+  /// (the file moved or was renamed): saved through the owner, unless the choice
+  /// changed meanwhile. The host already holds it, so this does not reload.
+  private func monitorLUTChoiceRefreshed(_ target: MonitorTargetID, from old: MonitorLUTChoice, to new: MonitorLUTChoice) {
+    var value = preferences(for: target)
+    guard value.monitorLUT == old else { return }
+    value.monitorLUT = new
+    setPreferences(value, for: target)
   }
 
   /// Where `target`'s burn-in LUT is read: the camera's capture controller

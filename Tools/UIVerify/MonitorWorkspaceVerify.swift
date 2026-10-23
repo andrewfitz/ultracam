@@ -30,6 +30,16 @@ import MonitorKitCore
     expect("false colour names the selected picture signal",
       MonitorDetachedRules.pictureCaption(isProgram: false, preferences: falseColor),
       "False color: Source analysis · selected picture signal: Source")
+    var sixBand = preferences
+    sixBand.state.falseColor.mode = .sixBand
+    expect("six-band false colour names its own stage",
+      MonitorDetachedRules.pictureCaption(isProgram: false, preferences: sixBand),
+      "False color: \(MonitorDetachedRules.stageTitle(sixBand.state.falseColor.stage)) analysis · selected picture signal: Output (LUT)")
+    sixBand.state.falseColor.stage = .monitor
+    sixBand.setPictureStage(.source)
+    expect("six-band false colour on the Monitor stage says so",
+      MonitorDetachedRules.pictureCaption(isProgram: false, preferences: sixBand),
+      "False color: Monitor analysis · selected picture signal: Source")
     expect("false colour on Program keeps the picture caption",
       MonitorDetachedRules.pictureCaption(isProgram: true, preferences: falseColor), "Picture: Program Output")
     var hidden = falseColor

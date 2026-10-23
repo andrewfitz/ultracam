@@ -35,6 +35,9 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     var feed: MonitorFeed?
     let stamp: MonitorFeedHost.Stamp
     let signal: SignalDescription
+    /// The Output and Monitor stages' reading (`Delivery.outputSignal`); the owned
+    /// copy carries `signal` and takes this one for a pass on those stages.
+    let outputSignal: SignalDescription
     let geometry: MonitorFrameGeometry
     var fromPendingRequest = false
   }
@@ -76,7 +79,6 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   private var published = MonitorSurfaceStatistics()
   private var refreshScheduled = false
   private weak var scopeLayer: CAMetalLayer?
-  private var statusTimer: Timer?
   private var lastStatusUpdate = 0.0
 
   @MainActor @Published private(set) var status = "No Signal"
@@ -107,14 +109,15 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     self.host = host
     self.gpu = gpu
     DispatchQueue.main.async { [weak self] in
-      self?.statusTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-        let presenter = self
-        MainActor.assumeIsolated { presenter?.refresh(force: true) }
+      guard self != nil else { return }
+      // The timer invalidates itself, on the main run loop it runs on, once the
+      // presenter is gone: the last release may be on a Metal completion thread.
+      Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
+        guard let self else { return timer.invalidate() }
+        MainActor.assumeIsolated { self.refresh(force: true) }
       }
     }
   }
-
-  deinit { statusTimer?.invalidate() }
 
   var isProgram: Bool { target.isProgram }
 
@@ -188,7 +191,8 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       nextFreezeToken &+= 1
       frozen = Frozen(
         token: nextFreezeToken, preferences: preferences, state: encodeState, live: delivery, stamp: stamp,
-        signal: delivery.signal, geometry: delivery.geometry, fromPendingRequest: true)
+        signal: delivery.signal, outputSignal: delivery.outputSignal, geometry: delivery.geometry,
+        fromPendingRequest: true)
       copyToken = nextFreezeToken
       latest = nil
       stateVersion &+= 1
@@ -216,7 +220,8 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       case none
       case live(MonitorFeedHost.Delivery)
       case frozenLive(MonitorFeedHost.Delivery, token: UInt64)
-      case frozenOwned(MonitorFrame, MonitorFeed, token: UInt64)
+      /// The owned copy carries the Source reading; `outputSignal` is the other.
+      case frozenOwned(MonitorFrame, MonitorFeed, token: UInt64, outputSignal: SignalDescription)
     }
     let content: Content
     /// The shown frame's stamp (a hold's, while frozen or lingering).
@@ -227,7 +232,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let stateVersion: UInt64
     var frozenToken: UInt64? {
       switch content {
-      case .frozenLive(_, let token), .frozenOwned(_, _, let token): token
+      case .frozenLive(_, let token), .frozenOwned(_, _, let token, _): token
       default: nil
       }
     }
@@ -236,7 +241,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       switch content {
       case .none: nil
       case .live(let delivery), .frozenLive(let delivery, _): delivery.signal
-      case .frozenOwned(let frame, _, _): frame.signal
+      case .frozenOwned(let frame, _, _, _): frame.signal
       }
     }
   }
@@ -250,7 +255,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       if let held = frozen ?? (latest == nil ? lingering : nil) {
         let content: RenderWork.Content
         if let owned = held.owned, let feed = held.feed {
-          content = .frozenOwned(owned, feed, token: held.token)
+          content = .frozenOwned(owned, feed, token: held.token, outputSignal: held.outputSignal)
         } else if let live = held.live {
           content = .frozenLive(live, token: held.token)
         } else {
@@ -278,6 +283,15 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     value.clean = clean
     value.geometry.magnification = magnification
     return value
+  }
+
+  /// An owned copy (`owned`, which carries the Source reading) as a pass that
+  /// measures `stage` reads it: the same planes and ID with that stage's signal.
+  static func reading(_ owned: MonitorFrame, _ stage: SignalStage, outputSignal: SignalDescription) -> MonitorFrame {
+    guard stage != .source else { return owned }
+    var frame = owned
+    frame.signal = outputSignal
+    return frame
   }
 
   /// Copies the held frame on the GPU, on the render thread, as soon as a freeze
@@ -576,7 +590,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       nextFreezeToken &+= 1
       frozen = Frozen(
         token: nextFreezeToken, preferences: preferences, state: encodeState, live: held, stamp: held.stamp,
-        signal: held.signal, geometry: held.geometry)
+        signal: held.signal, outputSignal: held.outputSignal, geometry: held.geometry)
       // Hand the slot's buffer to the freeze; the render thread swaps it for a GPU copy.
       latest = nil
       latestVersion &+= 1
@@ -791,12 +805,16 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       return
     }
     let signal = shown?.signal ?? live?.signal
+    let outputSignal = shown?.outputSignal ?? live?.outputSignal
     let geometry = shown?.geometry ?? live?.geometry
     if shownSignal != signal { shownSignal = signal }
-    let interpretation = Self.describe(signal)
+    /// How a pass on `stage` reads the frame (a declared range is the Source's alone).
+    func reading(_ stage: SignalStage) -> SignalDescription? { stage == .source ? signal : outputSignal }
+    let interpretation = Self.describe(
+      signal.flatMap { reading(MonitorFeedHost.pictureReading(shown?.state ?? state, signal: $0)) })
     if pictureInterpretation != interpretation { pictureInterpretation = interpretation }
     // Scopes measure the stage their settings name; with no LUT on it that is the signal itself.
-    let scopeSignal = scopeMeasuresLUT(shownTools) ? nil : signal
+    let scopeSignal = scopeMeasuresLUT(shownTools) ? nil : reading(shownTools.scopes.settings.stage)
     let scopeText = scopeSignal.map { Self.describe($0) } ?? "Rec.709 (after the LUT)"
     if scopeInterpretation != scopeText { scopeInterpretation = scopeText }
     if let geometry {
@@ -1098,7 +1116,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   /// The newest drawn picture, held only until its scope has been drawn.
   enum ScopeSource {
     case live(MonitorFeedHost.Delivery)
-    case frozen(MonitorFrame, MonitorFeed)
+    /// An owned copy (the Source reading), the feed it belongs to, and the Output reading.
+    case frozen(MonitorFrame, MonitorFeed, outputSignal: SignalDescription)
   }
   private var scopePending: (source: ScopeSource, key: ScopeKey)?
   /// When the pending live frame was drawn. Its cached textures leave residency
@@ -1250,31 +1269,41 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       try encodeClear(target, into: context)
       return nil
     case .live(let delivery), .frozenLive(let delivery, _):
-      let frame = try host.frame(delivery, in: context, core: core)
-      try drawPicture(frame, feed: feed, state: work.state, target: target, core: core, context: context)
+      let stage = MonitorFeedHost.pictureReading(work.state, signal: delivery.signal)
+      let frame = try host.frame(delivery, in: context, core: core, reading: stage)
+      try drawPicture(
+        frame, feed: feed, state: work.state, target: target, core: core, context: context,
+        focusSignal: delivery.signal(reading: work.state.focus.stage))
       return .live(delivery)
-    case .frozenOwned(let frame, let owner, _):
-      try drawPicture(frame, feed: owner, state: work.state, target: target, core: core, context: context)
-      return .frozen(frame, owner)
+    case .frozenOwned(let owned, let owner, _, let outputSignal):
+      let stage = MonitorFeedHost.pictureReading(work.state, signal: owned.signal)
+      try drawPicture(
+        MonitorSurfacePresenter.reading(owned, stage, outputSignal: outputSignal), feed: owner, state: work.state,
+        target: target, core: core, context: context,
+        focusSignal: MonitorSurfacePresenter.reading(owned, work.state.focus.stage, outputSignal: outputSignal).signal)
+      return .frozen(owned, owner, outputSignal: outputSignal)
     }
   }
 
   /// The feed `work` is drawn with: a hold's own, else the host's (made on first use).
   func drawingFeed(for work: MonitorSurfacePresenter.RenderWork, core: MonitorGPUContext.Core) -> MonitorFeed {
-    if case .frozenOwned(_, let owner, _) = work.content { return owner }
+    if case .frozenOwned(_, let owner, _, _) = work.content { return owner }
     return host.feed(engine: core.engine)
   }
 
   /// The picture of `frame` into `target`: focus analysis (once per frame and
   /// feed: MonitorKit skips a frame it already analysed), then the picture pass.
+  /// The analysis reads the frame as its own stage does (`focusSignal`).
   private func drawPicture(
     _ frame: MonitorFrame, feed: MonitorFeed, state: MonitorState, target: MTLTexture,
-    core: MonitorGPUContext.Core, context: MonitorGPUContext.EncodeContext
+    core: MonitorGPUContext.Core, context: MonitorGPUContext.EncodeContext, focusSignal: SignalDescription
   ) throws {
     let pass = try picturePass(core)
     context.keep(frame)
     if state.focus.enabled && !state.clean {
-      try feed.analyze(frame, focus: state.focus, into: context.submission)
+      var analysed = frame
+      analysed.signal = focusSignal
+      try feed.analyze(analysed, focus: state.focus, into: context.submission)
     }
     try pass.encode(frame: frame, feed: feed, state: state, target: target, clear: true, into: context.submission)
   }
@@ -1450,10 +1479,10 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       let feed: MonitorFeed
       switch pending.source {
       case .live(let delivery):
-        frame = try host.frame(delivery, in: context, core: core)
+        frame = try host.frame(delivery, in: context, core: core, reading: key.scopes.settings.stage)
         feed = host.feed(engine: core.engine)
-      case .frozen(let held, let owner):
-        frame = held
+      case .frozen(let held, let owner, let outputSignal):
+        frame = MonitorSurfacePresenter.reading(held, key.scopes.settings.stage, outputSignal: outputSignal)
         feed = owner
       }
       context.keep(frame)

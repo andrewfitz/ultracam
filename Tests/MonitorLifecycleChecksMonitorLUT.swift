@@ -288,8 +288,10 @@ extension MonitorLifecycleChecks {
       "Two picks of the same file are different preferences")
   }
 
-  /// A choice whose file could not be read is tried again on the next refresh
-  /// (the volume may be mounted, the file fixed by now); a loaded one is not.
+  /// A choice whose file could not be read is tried again on a refresh (the
+  /// volume may be mounted, the file fixed by now), but no sooner than the retry
+  /// interval after it failed: refreshes come with every preferences change, and
+  /// each read parses the whole file. A loaded one is not read again.
   func testFeedHostRetriesAMonitorLUTThatFailed() throws {
     guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
     let folder = try Self.monitorLUTFolder()
@@ -297,13 +299,26 @@ extension MonitorLifecycleChecks {
     let file = try Self.chosenMonitorLUT(Self.invertCube, named: "later.cube", in: folder)
     let url = folder.appendingPathComponent("later.cube")
     try "LUT_3D_SIZE 2\n0 0 0".write(to: url, atomically: false, encoding: .utf8)
-    let host = MonitorFeedHost(target: "monitor-lut-retry", gpu: nil)
+    final class Clock: @unchecked Sendable {
+      private let lock = NSLock()
+      private var value = 100.0
+      var now: Double {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+      }
+    }
+    let clock = Clock()
+    let host = MonitorFeedHost(target: "monitor-lut-retry", gpu: nil, clock: { clock.now })
     let choice = MonitorLUTChoice(bookmark: file.bookmark, fileName: file.fileName, pick: UUID())
     host.setMonitorLUT(choice)
-    XCTAssertTrue(Self.isFailure(waitForMonitorLUT(host) { Self.isFailure($0) }))
+    let failed = waitForMonitorLUT(host) { Self.isFailure($0) }
+    XCTAssertTrue(Self.isFailure(failed))
     XCTAssertNil(host.monitorLUT)
 
     try Self.invertCube.write(to: url, atomically: false, encoding: .utf8)
+    for _ in 0..<20 { host.setMonitorLUT(choice) }
+    XCTAssertEqual(host.monitorLUTState, failed, "Refreshes within the retry interval do not read the file again")
+    clock.now += MonitorFeedHost.monitorLUTRetryInterval
     host.setMonitorLUT(choice)
     XCTAssertEqual(waitForMonitorLUT(host) { !Self.isFailure($0) && $0 != .loading }, .loaded("Monitor Invert"),
       "The same choice is read again after a failure")
@@ -334,6 +349,63 @@ extension MonitorLifecycleChecks {
     host.setMonitorLUT(second)
     XCTAssertEqual(waitForMonitorLUT(host) { $0 != .loading }, .loaded("Edited"), "A new pick reads the file again")
     XCTAssertEqual(host.monitorLUT?.cube.title, "Edited")
+  }
+
+  /// A moved or renamed file resolves to another name (and, when the bookmark is
+  /// stale, a refreshed bookmark): the host holds the refreshed choice, with the
+  /// same pick, and reports it so the owner saves it; handing it back does not
+  /// reload. The coordinator saves it in the target's preferences.
+  func testMovedMonitorLUTRefreshesTheSavedChoice() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
+    let folder = try Self.monitorLUTFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = try Self.chosenMonitorLUT(Self.invertCube, named: "before.cube", in: folder)
+    try FileManager.default.moveItem(
+      at: folder.appendingPathComponent("before.cube"), to: folder.appendingPathComponent("after.cube"))
+    final class Reports: @unchecked Sendable {
+      private let lock = NSLock()
+      private var values: [(MonitorLUTChoice, MonitorLUTChoice)] = []
+      func append(_ value: (MonitorLUTChoice, MonitorLUTChoice)) { lock.withLock { values.append(value) } }
+      var all: [(MonitorLUTChoice, MonitorLUTChoice)] { lock.withLock { values } }
+    }
+    let reports = Reports()
+    let host = MonitorFeedHost(target: "monitor-lut-moved", gpu: nil)
+    host.onMonitorLUTChoiceRefresh = { old, new in reports.append((old, new)) }
+    let choice = MonitorLUTChoice(bookmark: file.bookmark, fileName: "before.cube", pick: UUID())
+    host.setMonitorLUT(choice)
+    XCTAssertEqual(waitForMonitorLUT(host) { $0 != .loading }, .loaded("Monitor Invert"))
+    let report = try XCTUnwrap(reports.all.first, "The moved file is reported")
+    XCTAssertEqual(report.0, choice)
+    XCTAssertEqual(report.1.fileName, "after.cube")
+    XCTAssertEqual(report.1.pick, choice.pick, "The same pick")
+    let lut = try XCTUnwrap(host.monitorLUT)
+    host.setMonitorLUT(report.1)
+    XCTAssertEqual(host.monitorLUTState, .loaded("Monitor Invert"), "The refreshed choice does not reload")
+    XCTAssertTrue(host.monitorLUT === lut)
+    XCTAssertEqual(reports.all.count, 1)
+
+    // Through the coordinator: the target's preferences take the refreshed choice.
+    MainActor.assumeIsolated { coordinatorSavesTheRefreshedChoice(choice) }
+  }
+
+  @MainActor private func coordinatorSavesTheRefreshedChoice(_ choice: MonitorLUTChoice) {
+    let coordinator = MonitorCoordinator()
+    let target = MonitorTargetID("monitor-lut-moved-camera")
+    coordinator.updateTargets(feeds: [FeedDescriptor(id: FeedID(rawValue: target.rawValue), name: "Wide")],
+      programAvailable: false)
+    var saved: MonitorFeedPreferences?
+    coordinator.onConfigurationChange = { _, value in saved = value }
+    _ = coordinator.captureSink(for: target)
+    var tools = coordinator.preferences(for: target)
+    tools.monitorLUT = choice
+    coordinator.setPreferences(tools, for: target)
+    let deadline = Date().addingTimeInterval(10)
+    while saved?.monitorLUT?.fileName != "after.cube" && Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    XCTAssertEqual(saved?.monitorLUT?.fileName, "after.cube", "The owner saves the refreshed choice")
+    XCTAssertEqual(coordinator.preferences(for: target).monitorLUT?.pick, choice.pick)
+    XCTAssertEqual(coordinator.monitorLUTState(for: target), .loaded("Monitor Invert"))
   }
 
   private static func isFailure(_ state: MonitorFeedHost.MonitorLUTState) -> Bool {

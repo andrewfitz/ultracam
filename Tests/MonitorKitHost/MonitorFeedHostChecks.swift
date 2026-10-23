@@ -248,6 +248,11 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     let declared = try XCTUnwrap(cameraSlot.latest)
     XCTAssertEqual(declared.signal.encoding, .log(try XCTUnwrap(LogEncoding(profileID: "sony-slog3-sgamut3cine"))))
     XCTAssertEqual(declared.signal.range, .full)
+    XCTAssertEqual(declared.outputSignal.range, .legal, "The burn-in reads the format's range, as LUTProcessor does")
+    XCTAssertEqual(declared.outputSignal.encoding, declared.signal.encoding)
+    XCTAssertEqual(declared.signal(reading: .source), declared.signal)
+    XCTAssertEqual(declared.signal(reading: .output), declared.outputSignal)
+    XCTAssertEqual(declared.signal(reading: .monitor), declared.outputSignal)
     XCTAssertGreaterThan(declared.stamp.revision, before.stamp.revision)
     XCTAssertTrue(declared.stamp.follows(before.stamp))
 
@@ -258,6 +263,7 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     let mix = try XCTUnwrap(programSlot.latest)
     XCTAssertTrue(mix.isProcessed)
     XCTAssertEqual(mix.signal.encoding, .display(.bt709))
+    XCTAssertEqual(mix.outputSignal, mix.signal, "Program has one reading")
     if let device = LUTProcessor.sharedDevice {
       let lut = try LUTProcessor.makeLUT(try CubeLUT(text: "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"), device: device)
       program.burnInLUT = lut
@@ -265,6 +271,39 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
       camera.burnInLUT = lut
       XCTAssertTrue(camera.burnInLUT === lut)
     }
+  }
+
+  /// The Output and Monitor stages decode as the burn-in does: SMPTE 240M as
+  /// BT.709 (LUTProcessor's matrices are BT.2020, BT.601 and otherwise BT.709),
+  /// and a declared range never; the Source stage keeps the tag and the
+  /// declaration. A frame wrapped for a stage carries that stage's levels.
+  func testOutputStagesDecodeAsTheBurnIn() throws {
+    let image = try greyV210()
+    CVBufferSetAttachment(
+      image, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995, .shouldPropagate)
+    let (gpu, core) = try gpuCore()
+    let (camera, slot) = host("cam-240m", gpu: gpu)
+    camera.setSignalDeclaration(MonitorSignalDeclaration(range: .full))
+    XCTAssertEqual(camera.signal(of: image).matrix, .smpte240m)
+    XCTAssertEqual(camera.outputSignal(of: image).matrix, .bt709)
+    offer(camera, image, sequence: 1)
+    let delivery = try XCTUnwrap(slot.latest)
+    XCTAssertEqual(delivery.signal.matrix, .smpte240m)
+    XCTAssertEqual(delivery.outputSignal.matrix, .bt709)
+    let completion = Completion()
+    try core.submit(completion: completion) { context in
+      let source = try camera.frame(delivery, in: context, core: core)
+      let output = try camera.frame(delivery, in: context, core: core, reading: .output)
+      let monitor = try camera.frame(delivery, in: context, core: core, reading: .monitor)
+      XCTAssertEqual(source.parameters.levels, SIMD4(0, 1023, 512, 1023), "Source: the declared Full range")
+      XCTAssertEqual(output.parameters.levels, SIMD4(64, 876, 512, 896), "Output: the legal range LUTProcessor reads")
+      XCTAssertEqual(monitor.parameters.levels, output.parameters.levels)
+      let decode = LUTProcessor.parameters(for: image, matrix: kCVImageBufferYCbCrMatrix_SMPTE_240M_1995 as String,
+        lut: nil).decodeRange
+      XCTAssertEqual(output.parameters.levels, decode, "The same levels as the burn-in's decode")
+      XCTAssertEqual(source.id, output.id, "One picture, analysed once")
+    }
+    XCTAssertTrue(completion.wait())
   }
 
   /// Generations: a new capture generation gets a newer stamp generation; after an
