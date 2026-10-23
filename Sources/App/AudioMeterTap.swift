@@ -19,13 +19,19 @@ import Synchronization
 /// its frame, and the controller hands the packet to recording before the
 /// meters), so metering can never delay or drop either.
 ///
-/// Backpressure: a full ring (the meter queue `packetCapacity` packets
-/// behind, about two seconds of 60p callbacks by default) leaves the packet out
-/// of the meters, counted in `Counters.coalesced`, and the next metered packet
-/// is marked as following a gap, so the meter primes its true-peak
-/// interpolator and K-weighting there (`AudioMeter.noteDiscontinuity()`)
-/// instead of interpolating across missing audio. The driver thread never
-/// waits for the meters.
+/// Backpressure: the meters take every packet. The default ring holds 4096
+/// callbacks (68 s at 59.94p, 137 s at 29.97p), far longer than any stall of a
+/// userInitiated queue whose work is a few microseconds a packet, so the
+/// meters never lose audio to a busy queue in practice. Only a ring that is
+/// still full (the meter queue `packetCapacity` packets behind) leaves a packet
+/// out of the meters: never waiting and never allocating on the driver thread
+/// leaves no other choice. That packet is counted in `Counters.coalesced`
+/// (shown per capture in `CaptureUpdate.audioMeterCoalesced`), and the next
+/// metered packet is marked as following a gap, so the meter primes its
+/// true-peak interpolator and K-weighting there
+/// (`AudioMeter.noteDiscontinuity()`) instead of interpolating across missing
+/// audio. A stall holds its packets (a retain of each one's `Data`, at most
+/// about 26 MB for a full ring of 2-channel 59.94p packets), never copies.
 ///
 /// Demand driven: the meters run only while a view shows them (`attach` /
 /// `detach`), so a feed nobody is metering pays one atomic load per packet.
@@ -57,9 +63,11 @@ final class AudioMeterTap: @unchecked Sendable {
   static let configuration = AudioMeterConfiguration(
     sampleRate: EmbeddedAudioFormat.sampleRate, channelCount: EmbeddedAudioFormat.channelCount)
 
-  /// Packets the hand-off holds before the meters coalesce: 128 DeckLink
-  /// callbacks, 2.1 s at 59.94p and 4.3 s at 29.97p.
-  static let defaultPacketCapacity = 128
+  /// Packets the hand-off holds before the meters coalesce: 4096 DeckLink
+  /// callbacks, 68 s at 59.94p and 137 s at 29.97p. The slots are
+  /// preallocated (about 48 B each, 192 KB in all); a packet's samples are
+  /// only retained while it waits.
+  static let defaultPacketCapacity = 4096
 
   /// The meters' owner; `attach` and `detach`, and the meter queue when a
   /// packet of a new session arrives. Never the driver thread.
@@ -285,7 +293,8 @@ final class AudioMeterTap: @unchecked Sendable {
     var overlapped: UInt64
     /// Packets left out of the meters because the hand-off ring was full (the
     /// meter queue was `packetCapacity` packets behind). Recording and video
-    /// never miss these; only the meters do, and they note the gap.
+    /// never miss these; only the meters do, and they note the gap. Counts
+    /// over the tap's whole life; the capture publishes its own share.
     var coalesced: UInt64
     /// Packets of a session the meter queue had already moved past, dropped.
     var stale: UInt64

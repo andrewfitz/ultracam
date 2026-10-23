@@ -148,7 +148,9 @@ import Synchronization
   /// the meter queue holds the meter it is metering into, so no session start
   /// ever releases a meter in use.
   private static func concurrent(verifier: Verifier) {
-    let tap = AudioMeterTap()
+    // A short ring: the default holds thousands of these 5 s packets.
+    let capacity = 128
+    let tap = AudioMeterTap(packetCapacity: capacity)
     let sampleFrames = 240_000
     let packet = sine(dBFS: -6, phase: 0, frames: sampleFrames)
     let stop = Stop()
@@ -185,7 +187,7 @@ import Synchronization
         && replaced == 300 && last.snapshot().frameCount > 0 && tap.queuedPackets == 0,
       "\(counters), \(replaced) new meters")
     verifier.check("audio meter tap: a meter queue far behind coalesces, counted, and the driver never waits",
-      counters.coalesced > 0 && counters.maxQueued == AudioMeterTap.defaultPacketCapacity, "\(counters)")
+      counters.coalesced > 0 && counters.maxQueued == capacity, "\(counters)")
     verifier.check("audio meter tap: the last session meters whole packets of its own",
       last.snapshot().frameCount % UInt64(sampleFrames) == 0, "\(counters)")
     let next = tap.attach()

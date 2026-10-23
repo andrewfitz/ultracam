@@ -65,9 +65,10 @@ struct CaptureUpdate: @unchecked Sendable {
   var audioBitrateKbps: Double = 0
   var audioPresent = false
   var audioPacketTime: CMTime?
-  /// Embedded-audio packets left out of the broadcast meters because the
-  /// meter queue fell a full hand-off ring behind (`AudioMeterTap.Counters.coalesced`).
-  /// A meter-only loss: recording and video got every packet and frame.
+  /// This capture's embedded-audio packets left out of the broadcast meters
+  /// because the meter queue fell a full hand-off ring behind
+  /// (`AudioMeterTap.Counters.coalesced` since the capture started; 0 when
+  /// stopped). A meter-only loss: recording and video got every packet and frame.
   var audioMeterCoalesced: UInt64 = 0
   var videoBitrateMbps: Double = 0
   var videoDrops: UInt64 = 0
@@ -124,7 +125,19 @@ final class CaptureController: @unchecked Sendable {
   private var generation: UInt64 = 0
   private var accepting = false
   private var activeFeedID: FeedID?
-  private var recordingCallbacks: [FeedID: SourceRecordingCallbackAdapter.Callbacks] = [:]
+  /// One feed's installed recording callbacks (one take). A take starts on
+  /// video: its audio is forwarded only after the take admitted its first
+  /// frame. Callbacks installed between one DeckLink callback's frame and its
+  /// audio would otherwise open the take on that audio, and the writer, which
+  /// starts its session at the earliest sample, would begin the movie with a
+  /// frame of no picture.
+  private struct RecordingRoute {
+    let callbacks: SourceRecordingCallbackAdapter.Callbacks
+    /// `recordingCallbackGeneration` at install: names this take's callbacks.
+    let install: UInt64
+    var videoStarted = false
+  }
+  private var recordingCallbacks: [FeedID: RecordingRoute] = [:]
   // Bumped under `lock` on every setRecordingCallbacks. stop()'s queued
   // cleanup captures the value it observed and must not delete a newer map.
   private var recordingCallbackGeneration: UInt64 = 0
@@ -197,6 +210,8 @@ final class CaptureController: @unchecked Sendable {
   private var videoRateStart: Double = 0
   private var videoRateBytes: UInt64 = 0
   private var videoBitrateMbps = 0.0
+  /// `audioMeterTap.counters.coalesced` when this capture started; capture queue.
+  private var audioMeterCoalescedAtStart: UInt64 = 0
   private var lastPublished: Double = 0
   // `fail` and the app's stopped-update handler both call `stop`. Without
   // this latch every stopped publish schedules another one.
@@ -391,6 +406,7 @@ final class CaptureController: @unchecked Sendable {
         self.captureCPUMS = 0
         self.latencyMS = 0
         self.media.reset()
+        self.audioMeterCoalescedAtStart = self.audioMeterTap.counters.coalesced
         self.processor?.resetInFlightPeak()
         self.videoRateStart = 0
         self.videoRateBytes = 0
@@ -673,8 +689,11 @@ final class CaptureController: @unchecked Sendable {
     callbacks: SourceRecordingCallbackAdapter.Callbacks?) {
     lock.withLock {
       recordingCallbackGeneration &+= 1
-      if let callbacks { recordingCallbacks[feedID] = callbacks }
-      else { recordingCallbacks.removeValue(forKey: feedID) }
+      if let callbacks {
+        recordingCallbacks[feedID] = RecordingRoute(callbacks: callbacks, install: recordingCallbackGeneration)
+      } else {
+        recordingCallbacks.removeValue(forKey: feedID)
+      }
     }
   }
 
@@ -916,12 +935,13 @@ final class CaptureController: @unchecked Sendable {
 
   private func receive(_ image: CVPixelBuffer, at pts: CMTime, duration: CMTime?,
     signalValid: Bool, token: UInt64) {
-    // One lock acquisition per frame on the driver thread.
-    let admitted = lock.withLock { () -> (SourceRecordingCallbackAdapter.Callbacks?, CMTime, UInt64?)? in
+    // One lock acquisition per frame on the driver thread (two on a take's first frame).
+    let admitted = lock.withLock { () -> (RecordingRoute?, CMTime, UInt64?, FeedID?)? in
       guard generation == token, accepting else { return nil }
-      let callbacks = activeFeedID.flatMap { recordingCallbacks[$0] }
+      let feed = activeFeedID
+      let route = feed.flatMap { recordingCallbacks[$0] }
       let recordingDuration = duration ?? sourceDuration
-      guard signalValid else { return (callbacks, recordingDuration, nil) }
+      guard signalValid else { return (route, recordingDuration, nil, feed) }
       let now = ProcessInfo.processInfo.systemUptime
       lastReceived = now
       let frameDuration = duration ?? sourceDuration
@@ -939,14 +959,14 @@ final class CaptureController: @unchecked Sendable {
       monitorSequence &+= 1
       queuedFrames += 1
       maxQueuedFrames = max(maxQueuedFrames, queuedFrames)
-      return (callbacks, frameDuration, monitorSequence)
+      return (route, frameDuration, monitorSequence, feed)
     }
     guard let admitted else { return }
     // Recording takes every valid source frame directly on the driver thread,
     // independent of processing. Metadata-only checks: no pixel scan,
     // conversion or waiting. Malformed inputs stay out of the recorder while
     // its invalid-sample telemetry and processing's error reporting remain.
-    if let callbacks = admitted.0 {
+    if let route = admitted.0 {
       let duration = admitted.1
       let validRecordingFrame = signalValid && pts.isNumeric && pts.epoch == 0 && pts.value >= 0 &&
         duration.epoch == 0 &&
@@ -954,7 +974,14 @@ final class CaptureController: @unchecked Sendable {
         CVPixelBufferGetWidth(image) == 3840 && CVPixelBufferGetHeight(image) == 2160 &&
         VideoContract.tenBit422.contains(CVPixelBufferGetPixelFormatType(image)) &&
         (try? VideoBufferLayout.validate(image)) != nil
-      _ = callbacks.video(image, pts, duration, validRecordingFrame)
+      // The take's first admitted frame opens it to audio, on this thread
+      // before this callback's audio arrives; a newer install starts over.
+      if route.callbacks.video(image, pts, duration, validRecordingFrame), !route.videoStarted,
+        let feed = admitted.3 {
+        lock.withLock {
+          if recordingCallbacks[feed]?.install == route.install { recordingCallbacks[feed]?.videoStarted = true }
+        }
+      }
     }
     guard let sequence = admitted.2 else { return }
     let frame = CapturedFrame(image: image, pts: pts, duration: admitted.1,
@@ -981,7 +1008,9 @@ final class CaptureController: @unchecked Sendable {
   private func receiveRawAudio(_ audio: CaptureRawAudio, token: UInt64) {
     let state = lock.withLock { () -> (SourceRecordingCallbackAdapter.Callbacks?, Bool)? in
       guard generation == token, accepting else { return nil }
-      return (activeFeedID.flatMap { recordingCallbacks[$0] }, rawAudioProvidesStats)
+      // A take takes audio from its first frame on (see `RecordingRoute`).
+      let route = activeFeedID.flatMap { recordingCallbacks[$0] }
+      return (route.flatMap { $0.videoStarted ? $0.callbacks : nil }, rawAudioProvidesStats)
     }
     guard let state else { return }
     let validRawFormat = audio.bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample
@@ -1311,7 +1340,7 @@ final class CaptureController: @unchecked Sendable {
       audioRMSLeft: stopped ? 0 : audio.rmsLeft, audioRMSRight: stopped ? 0 : audio.rmsRight,
       audioBitrateKbps: stopped ? 0 : audio.bitrateKbps, audioPresent: stopped ? false : audio.present,
       audioPacketTime: stopped ? nil : audio.packetTime,
-      audioMeterCoalesced: audioMeterTap.counters.coalesced,
+      audioMeterCoalesced: stopped ? 0 : audioMeterTap.counters.coalesced &- audioMeterCoalescedAtStart,
       videoBitrateMbps: stopped ? 0 : videoBitrateMbps,
       videoDrops: stopped ? 0 : videoLosses,
       cameraOutputActive: cameraConnected, cameraMessage: cameraMessage, stopped: stopped)

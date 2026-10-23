@@ -231,21 +231,158 @@ extension DeckLinkChecks {
     XCTAssertEqual(recorded.2, callbacks * packet.count)
     let stalled = tap.counters
     XCTAssertEqual(stalled.metered, 0)
-    XCTAssertEqual(stalled.coalesced, UInt64(callbacks - AudioMeterTap.defaultPacketCapacity))
-    XCTAssertEqual(tap.queuedPackets, AudioMeterTap.defaultPacketCapacity)
+    XCTAssertEqual(stalled.coalesced, 0, "The default ring holds over a minute of callbacks: a stall loses no audio")
+    XCTAssertEqual(tap.queuedPackets, callbacks)
 
     gate.signal()
     tap.waitUntilMetered()
-    XCTAssertEqual(tap.counters.metered, UInt64(AudioMeterTap.defaultPacketCapacity))
+    XCTAssertEqual(tap.counters.metered, UInt64(callbacks), "Every packet the stall held back is metered")
     meter.flush()
-    XCTAssertEqual(meter.snapshot().frameCount, UInt64(AudioMeterTap.defaultPacketCapacity) * UInt64(samplesPerFrame))
+    XCTAssertEqual(meter.snapshot().frameCount, UInt64(callbacks) * UInt64(samplesPerFrame))
+  }
 
-    // The coalescing reaches the capture's diagnostics.
-    let published = expectation(description: "diagnostics published")
+  /// The default ring is sized so a meter queue stall cannot realistically
+  /// fill it: over a minute of DeckLink callbacks at the highest frame rate.
+  @objc func testDefaultMeterRingHoldsOverAMinuteOfCallbacks() {
+    let fastest = VideoContract.fastDuration.seconds
+    XCTAssertGreaterThanOrEqual(Double(AudioMeterTap.defaultPacketCapacity) * fastest, 60)
+  }
+
+  private static func waitForUpdate(_ test: XCTestCase, _ controller: CaptureController, _ label: String,
+    trigger: () -> Void, _ match: @escaping @Sendable (CaptureUpdate) -> Bool) {
+    let seen = test.expectation(description: label)
+    seen.assertForOverFulfill = false
     controller.onUpdate = { update in
-      if update.audioMeterCoalesced == stalled.coalesced { published.fulfill() }
+      if match(update) { seen.fulfill() }
     }
-    controller.setPreviewEnabled(false)
-    wait(for: [published], timeout: 3)
+    trigger()
+    test.wait(for: [seen], timeout: 3)
+    controller.onUpdate = nil
+  }
+
+  /// Fills the controller tap's ring with its meter queue blocked, so exactly
+  /// `extra` packets coalesce, then lets the queue drain.
+  private static func coalesce(_ tap: AudioMeterTap, extra: Int) {
+    let gate = DispatchSemaphore(value: 0)
+    let blocked = DispatchSemaphore(value: 0)
+    tap.meterQueue.async { blocked.signal(); gate.wait() }
+    blocked.wait()
+    let packet = stereoPacket(1 << 24, frames: 16)
+    var index = 0
+    while index < AudioMeterTap.defaultPacketCapacity + extra {
+      ingest(tap, packet, frames: 16)
+      index += 1
+    }
+    gate.signal()
+    tap.waitUntilMetered()
+  }
+
+  /// `CaptureUpdate.audioMeterCoalesced` is this capture's count: a stopped
+  /// capture reports none, and a new start begins again at zero, so one past
+  /// stall never leaves a warning on later captures.
+  @objc func testCoalescedMeterPacketsArePerCaptureAndZeroWhenStopped() throws {
+    let harness = DriverHarness()
+    let controller = CaptureController(services: harness.services, previewRenderer: nil)
+    defer {
+      controller.onUpdate = nil
+      controller.stop()
+    }
+    let tap = controller.audioMeterTap
+    tap.attach()
+    defer { tap.detach() }
+    let configuration = PipelineConfiguration(downscale: false, convertTo420: false)
+    let start = {
+      controller.start(feedID: FeedID(rawValue: "meter-coalesced"), deviceID: "synthetic",
+        configuration: configuration, pipelineEnabled: false, previewEnabled: false)
+    }
+    Self.waitForUpdate(self, controller, "first start", trigger: start) { $0.message.hasPrefix("Waiting") }
+
+    Self.coalesce(tap, extra: 5)
+    XCTAssertEqual(tap.counters.coalesced, 5)
+    Self.waitForUpdate(self, controller, "coalesced published",
+      trigger: { controller.setPreviewEnabled(false) }) { $0.audioMeterCoalesced == 5 }
+
+    Self.waitForUpdate(self, controller, "stopped", trigger: { controller.stop() }) {
+      $0.message == "Stopped" && $0.audioMeterCoalesced == 0
+    }
+
+    Self.waitForUpdate(self, controller, "second start", trigger: start) {
+      $0.message.hasPrefix("Waiting") && $0.audioMeterCoalesced == 0
+    }
+    XCTAssertEqual(tap.counters.coalesced, 5, "The tap's own count still covers its whole life")
+    Self.waitForUpdate(self, controller, "fresh capture starts at zero",
+      trigger: { controller.setPreviewEnabled(false) }) { $0.audioMeterCoalesced == 0 }
+
+    Self.coalesce(tap, extra: 3)
+    Self.waitForUpdate(self, controller, "the second capture's own count",
+      trigger: { controller.setPreviewEnabled(false) }) { $0.audioMeterCoalesced == 3 }
+  }
+
+  /// Recording callbacks installed between one DeckLink callback's frame and
+  /// its audio: the take starts on video. The split callback's audio, which
+  /// precedes the take's first frame, is not recorded, so the writer's session
+  /// (the earliest sample) starts at the first recorded frame instead of one
+  /// frame earlier with no picture. Installing another feed's callbacks
+  /// mid-take never holds back the running take's audio.
+  @objc func testATakeArmedMidCallbackStartsOnItsFirstFrame() throws {
+    let image = try syntheticRamp()
+    let harness = DriverHarness()
+    let other = DriverHarness()
+    let controller = CaptureController(services: harness.services, previewRenderer: nil)
+    defer {
+      controller.onUpdate = nil
+      controller.stop()
+    }
+    let feed = FeedID(rawValue: "take-start")
+    Self.waitForUpdate(self, controller, "capture started", trigger: {
+      controller.start(feedID: feed, deviceID: "synthetic",
+        configuration: PipelineConfiguration(downscale: false, convertTo420: false),
+        pipelineEnabled: false, previewEnabled: false)
+    }) { $0.message.hasPrefix("Waiting") }
+    let (frames, audio) = harness.lock.withLock { (harness.frames, harness.audio) }
+    let deliver = try XCTUnwrap(frames)
+    let report = try XCTUnwrap(audio)
+    let duration = VideoContract.fastDuration
+    let samplesPerFrame = Int64(800)
+    let packet = Self.stereoPacket(1 << 26, frames: Int(samplesPerFrame))
+    let video = { (index: Int64) in CMTimeMultiply(duration, multiplier: Int32(index)) }
+    // Each packet starts with its callback's frame (59.94p packets alternate 800 and 801 samples).
+    let audioTime = { (index: Int64) in CMTimeMultiply(duration, multiplier: Int32(index)) }
+    let sound = { (index: Int64) in
+      report(CaptureRawAudio(samples: packet, packetTime: audioTime(index), sampleFrames: UInt64(samplesPerFrame),
+        channels: 2, bytesPerSample: EmbeddedAudioFormat.sourceBytesPerSample))
+    }
+
+    deliver(image, video(0), duration, true)
+    controller.setRecordingCallbacks(feedID: feed, callbacks: harness.callbacks)
+    sound(0)
+    deliver(image, video(1), duration, true)
+    sound(1)
+    deliver(image, video(2), duration, true)
+    controller.setRecordingCallbacks(feedID: FeedID(rawValue: "another-feed"), callbacks: other.callbacks)
+    sound(2)
+    deliver(image, video(3), duration, true)
+    sound(3)
+
+    var recorded = harness.lock.withLock { (harness.recordedVideo, harness.recordedAudio) }
+    XCTAssertEqual(recorded.0, [video(1), video(2), video(3)])
+    XCTAssertEqual(recorded.1, [audioTime(1), audioTime(2), audioTime(3)],
+      "Audio before the take's first frame is left out; after it, every packet is recorded")
+    let first = try XCTUnwrap(recorded.0.first)
+    let sessionStart = CMTimeMinimum(first, try XCTUnwrap(recorded.1.first))
+    XCTAssertEqual(sessionStart, first, "The take's session starts at its first recorded frame")
+    XCTAssertTrue(other.lock.withLock { other.recordedVideo.isEmpty && other.recordedAudio.isEmpty })
+
+    // A new take on the same feed, armed mid-callback again, starts on its own
+    // first frame (frame 4 still went to the take before it).
+    deliver(image, video(4), duration, true)
+    controller.setRecordingCallbacks(feedID: feed, callbacks: nil)
+    controller.setRecordingCallbacks(feedID: feed, callbacks: harness.callbacks)
+    sound(4)
+    deliver(image, video(5), duration, true)
+    sound(5)
+    recorded = harness.lock.withLock { (harness.recordedVideo, harness.recordedAudio) }
+    XCTAssertEqual(recorded.0, [video(1), video(2), video(3), video(4), video(5)])
+    XCTAssertEqual(recorded.1, [audioTime(1), audioTime(2), audioTime(3), audioTime(5)])
   }
 }
