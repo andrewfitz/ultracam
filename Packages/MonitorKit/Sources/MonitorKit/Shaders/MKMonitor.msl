@@ -645,16 +645,16 @@ float3 mk_logDecodeFast(float3 v, uint curve) {
 // decode the picture transfer to linear light (1 = graphics white) → primaries →
 // optional roll-off → target encode. Overlays are then mixed in target values.
 
-// The monitor stage (in the source's encoding) to the picture encoding.
-float3 mk_displayTransform(float3 c, thread const mk_Inputs& in) {
+// The monitor stage (in the source's encoding) to the picture encoding. `f` is
+// the reading `c` was decoded with (its range sets the log curve's signal): the
+// picture stage's for the picture, the measured stage's for a false-colour grey.
+float3 mk_displayTransform(float3 c, constant mk_FrameParams& f, thread const mk_Inputs& in) {
   constant mk_PassParams& p = in.pass;
   if (MK_TRANSFORM == 1) {
     // MonitorKit display assist v1: scene light, Rec.709, the BT.709 OETF with a
     // shoulder. One log2 and one exp2 per channel serve both branches: the OETF's
     // x^0.45 and the shoulder's (x / xk)^-q.
-    // The picture stage's reading: its range sets the log curve's signal.
-    float3 x = mk_rows(p.transformMatrix,
-                       mk_logDecodeFast(mk_logSignalFast(c, MK_LOG_CURVE, mk_stageFrame(MK_PICTURE_STAGE, in)), MK_LOG_CURVE));
+    float3 x = mk_rows(p.transformMatrix, mk_logDecodeFast(mk_logSignalFast(c, MK_LOG_CURVE, f), MK_LOG_CURVE));
     bool3 over = x > p.assist.x;
     float3 lx = fast::log2(max(x, .018f));
     float3 t = fast::exp2(select(.45f * lx, -p.assist.z * (lx - p.assist.w), over));
@@ -716,14 +716,16 @@ float3 mk_present(float3 v, constant mk_PassParams& p) {
 
 // First band containing `value` (lower inclusive, upper exclusive), else `fallback`:
 // a grey in the monitor stage's encoding, so it goes through the display transform
-// and the output conversion like the picture. Both come out in target values.
-float3 mk_bands(float value, float3 fallback, thread const mk_Inputs& in) {
+// and the output conversion like the picture. Both come out in target values. `f`
+// is the reading the grey was decoded with, whatever stage the picture shows, so
+// false colour is the same image on every picture stage.
+float3 mk_bands(float value, float3 fallback, constant mk_FrameParams& f, thread const mk_Inputs& in) {
   constant mk_PassParams& p = in.pass;
   // Scanned from the last band without an early exit, so the tests do not wait on each other.
   int band = -1;
   for (int i = int(p.modes.z) - 1; i >= 0; i--)
     if (value >= p.bandEdges[i].x && value < p.bandEdges[i].y) band = i;
-  return band >= 0 ? p.bandColors[band].rgb : mk_present(mk_displayTransform(fallback, in), p);
+  return band >= 0 ? p.bandColors[band].rgb : mk_present(mk_displayTransform(fallback, f, in), p);
 }
 
 // Log modes classify the source pixel under the display pixel's centre, never a
@@ -740,7 +742,7 @@ float3 mk_logFalseColor(float4 centre, thread const mk_Inputs& in) {
   if (measure == MK_FC_SONY) {
     // Sony Pattern 2 on native signal luma, in native IRE: (code - 64) / 876.
     float signal = mk_nativeLog(centre.w, f);
-    return mk_bands((signal * 1023 - 64) / 876 * 100, transformed ? float3(saturate(centre.w)) : float3(signal), in);
+    return mk_bands((signal * 1023 - 64) / 876 * 100, transformed ? float3(saturate(centre.w)) : float3(signal), f, in);
   }
   if (measure == MK_FC_ARRI_LOGC) {
     // The 10-bit transport code, classified in the table of the declared range.
@@ -752,22 +754,25 @@ float3 mk_logFalseColor(float4 centre, thread const mk_Inputs& in) {
     // float normalization, before any rescale, so table edges stay exact.
     if (p.modes.w != 0 && centre.r == centre.g && centre.g == centre.b) code = round(code);
     if (f.options.z) code = (f.options.y ? mk_unsqueezeLegal(float3(code), f).x : (code - 64) / 876) * 1023;
-    return mk_bands(code, transformed ? decodedGrey : float3(mk_luma709(p.falseColor.y != 0 ? native : centre.rgb)), in);
+    return mk_bands(code, transformed ? decodedGrey : float3(mk_luma709(p.falseColor.y != 0 ? native : centre.rgb)), f,
+                    in);
   }
   float y = dot(mk_logDecode(native, 1), p.gamutWeights.rgb);
   float3 nativeGrey = transformed ? decodedGrey : float3(mk_luma709(native));
-  if (measure == MK_FC_ARRI_STYLE) return mk_bands(mk_logC3ReferenceCode(y), nativeGrey, in);
+  if (measure == MK_FC_ARRI_STYLE) return mk_bands(mk_logC3ReferenceCode(y), nativeGrey, f, in);
   // EL Zone: stops over 18% grey of source-gamut scene-linear Y, plus the user offset.
   if (y <= 0) return float3(0);
-  return mk_bands(log2(y) - log2(.18f) + p.falseColor.x, nativeGrey, in);
+  return mk_bands(log2(y) - log2(.18f) + p.falseColor.x, nativeGrey, f, in);
 }
 
 // Display-referred modes measure the stage of the filtered display pixel.
 float3 mk_stageFalseColor(thread const mk_Stages& s, thread const mk_Inputs& in) {
   constant mk_PassParams& p = in.pass;
   uint stage = p.modes.y;
+  // The grey is the measured stage's, decoded with that stage's reading.
+  constant mk_FrameParams& f = mk_stageFrame(stage, in);
   float3 fallback = float3(clamp(mk_luma709(mk_stage(s, stage)), 0.0f, 1.0f));
-  if (p.modes.x == MK_FC_STAGE_IRE) return mk_bands(mk_stageLuma(s, stage, p) * 100, fallback, in);
+  if (p.modes.x == MK_FC_STAGE_IRE) return mk_bands(mk_stageLuma(s, stage, p) * 100, fallback, f, in);
   // Stops over 18% grey. A LUT result is Rec.709 display R'G'B'; an untouched
   // stage is linearized by the source's own curve, read as the stage reads the
   // codes: the log decode in source-gamut Y, else its display transfer, each
@@ -777,7 +782,6 @@ float3 mk_stageFalseColor(thread const mk_Stages& s, thread const mk_Inputs& in)
     float3 c = stage == 2 && p.luts.y != 0 ? s.monitor : s.output;
     linear = mk_luma709(float3(mk_bt709Linear(c.r), mk_bt709Linear(c.g), mk_bt709Linear(c.b)));
   } else {
-    constant mk_FrameParams& f = mk_stageFrame(stage, in);
     float3 v = stage == 0 ? s.source : s.output;
     if (p.luts.z != 0) {
       linear = dot(mk_logDecode(mk_logSignal(v, p.luts.z, f), p.luts.z), p.gamutWeights.rgb);
@@ -788,7 +792,7 @@ float3 mk_stageFalseColor(thread const mk_Stages& s, thread const mk_Inputs& in)
     }
   }
   float stops = linear > 0 ? log2(linear) - log2(.18f) + p.falseColor.x : -INFINITY;
-  return mk_bands(stops, fallback, in);
+  return mk_bands(stops, fallback, f, in);
 }
 
 // ---------------------------------------------------------------- overlays
@@ -966,10 +970,11 @@ float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float
   float3 codes = mk_filteredCodes(d, map, !navigator && (p.flags.x != 0 || logFalseColor), navigator ? 2 : 8, in);
   float4 sample = mk_sourceDecode(codes, in);
   mk_Stages s = mk_stages(codes, sample, in);
+  constant mk_FrameParams& pictureReading = mk_stageFrame(MK_PICTURE_STAGE, in);
 
   if (navigator) {
     // The whole picture, dimmed (never above graphics white), with the visible region outlined.
-    c = clamp(mk_present(mk_adjust(mk_displayTransform(mk_stage(s, MK_PICTURE_STAGE), in), p), p), 0.0f,
+    c = clamp(mk_present(mk_adjust(mk_displayTransform(mk_stage(s, MK_PICTURE_STAGE), pictureReading, in), p), p), 0.0f,
               p.overlayWhite.rgb) * .85f;
     float4 n = p.navigatorRect, r = p.navigatorVisible;
     if (any(d < n.xy + 1) || any(d >= n.zw - 1)) c = p.navigatorColors[0].rgb;
@@ -978,7 +983,7 @@ float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float
   } else {
     if (logFalseColor) c = mk_logFalseColor(sample, in);
     else if (stageFalseColor) c = mk_stageFalseColor(s, in);
-    else c = mk_present(mk_adjust(mk_displayTransform(mk_stage(s, MK_PICTURE_STAGE), in), p), p);
+    else c = mk_present(mk_adjust(mk_displayTransform(mk_stage(s, MK_PICTURE_STAGE), pictureReading, in), p), p);
     // Overlays mix in target values with colours encoded for the target.
     {
       int2 px = int2(corner);

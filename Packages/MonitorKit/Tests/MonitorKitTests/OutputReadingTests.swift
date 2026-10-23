@@ -290,6 +290,72 @@ final class OutputReadingTests: XCTestCase {
     }
   }
 
+  /// False colour under the log display transform, with a distinct output
+  /// reading: an unbanded pixel's grey is transformed with the reading it was
+  /// decoded with (the false-colour stage's, the source's for the log modes),
+  /// never the picture stage's, so the image is the same whatever stage the
+  /// picture shows (with no LUT turning the transform off), and a stage tool's
+  /// image is that stage's single reading's.
+  /// S-Log3's signal depends on the range (full codes as they are, legal ones
+  /// re-expanded), so reading a grey with the other range lifts or crushes it.
+  func testFalseColorGreyUnderTheDisplayTransformKeepsItsReading() throws {
+    let gpu = try requireGPU()
+    let luts = try Self.luts(gpu)
+    let picture = PictureTests.picture(.v210, width: 64, height: 24, seed: 9)
+    let signals = [
+      SignalDescription(
+        range: .full, encoding: .log(.sLog3SGamut3Cine), outputReading: SignalReading(range: .legal, matrix: .bt709)),
+      SignalDescription(
+        range: .legal, encoding: .log(.sLog3SGamut3Cine), outputReading: SignalReading(range: .full, matrix: .bt709)),
+    ]
+    for signal in signals {
+      let frame = try picture.frame(gpu, signal: signal)
+      for withLUTs in [false, true] {
+        let lut = withLUTs ? luts : nil
+        var modes: [(String, SignalStage?, (inout MonitorState) -> Void)] = []
+        for stage in SignalStage.allCases {
+          // A band no pixel reaches: every pixel is the fallback grey.
+          modes.append(("custom IRE, all grey", stage, {
+            $0.falseColor.mode = .custom
+            $0.falseColor.customUnit = .ire
+            $0.falseColor.stage = stage
+            $0.falseColor.customBands = [FalseColorBand(lower: 1000, upper: 2000, color: ColorRGB(r: 1, g: 0, b: 0))]
+          }))
+          modes.append(("custom stops", stage, {
+            $0.falseColor.mode = .custom
+            $0.falseColor.customUnit = .stops
+            $0.falseColor.stage = stage
+            $0.falseColor.customBands = [FalseColorBand(lower: -0.5, upper: 0.5, color: ColorRGB(r: 0, g: 1, b: 0))]
+          }))
+        }
+        for mode in [FalseColorMode.sonySLog3, .arriStyleSLog3, .elZone] {
+          modes.append(("\(mode)", nil, { $0.falseColor.mode = mode }))
+        }
+        for (name, stage, configure) in modes {
+          let label = "\(signal.range) declared, \(name) on \(stage.map { "\($0)" } ?? "the source")"
+            + (withLUTs ? ", LUTs" : "")
+          var base = MonitorState()
+          base.displayTransform.mode = .logToRec709
+          configure(&base)
+          // The fallback grey follows the picture through the display transform,
+          // which a LUT on the picture stage turns off: with LUTs only the source
+          // picture keeps it.
+          base.pictureStage = .source
+          let expected = try gpu.render(Self.single(frame, stage ?? .source), state: base, feed: feed(gpu, luts: lut))
+          for shown in withLUTs ? [.source] : SignalStage.allCases {
+            var state = base
+            state.pictureStage = shown
+            let status = gpu.engine.makePass()
+            let got = try gpu.render(frame, state: state, feed: feed(gpu, luts: lut), pass: status)
+            XCTAssertTrue(status.status.isActive(.falseColor), "\(label), picture \(shown)")
+            XCTAssertTrue(status.status.isActive(.displayTransform), "\(label), picture \(shown)")
+            assertSamePixels(got.values, expected.values, "\(label), picture \(shown)")
+          }
+        }
+      }
+    }
+  }
+
   /// Focus analysis of the Output and Monitor stages decodes with the output
   /// reading (its mask is the single reading's, bit for bit), and a mask analysed
   /// on another reading is not taken for the stage a surface shows.
