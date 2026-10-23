@@ -63,8 +63,9 @@ final class ProgramOutputBridge: @unchecked Sendable {
   // sendQueue only: Program → host clock offset for the current connection.
   private var hostOffset: CMTime?
   private var lastSentTime: CMTime?
-  /// Host time (seconds) since which frames have been more than two frames late.
-  private var lateSince: Double?
+  /// Since when (host seconds) frames have been more than two frames late with
+  /// nothing queued behind them, and how late (seconds) they were then.
+  private var lateSince: (start: Double, lateness: Double)?
   private var anchoredConnection: UInt64 = 0
 
   private let lock = NSLock()
@@ -372,7 +373,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
         lateSince = nil
         lastSentTime = nil
       }
-      let time = hostTime(for: metadata.presentationTime, duration: metadata.duration)
+      let time = hostTime(for: metadata.presentationTime, duration: metadata.duration,
+        backlogged: route.pendingCount > 0)
       do {
         let sample = try sampleFactory.sample(image, at: time, duration: metadata.duration)
         let accepted = try sendSink(sample)
@@ -401,20 +403,24 @@ final class ProgramOutputBridge: @unchecked Sendable {
 }
 
 extension ProgramOutputBridge {
-  /// How long frames must stay late before the host-time anchor moves (seconds):
-  /// longer than a stall's catch-up burst, short against a gap on air.
+  /// How long frames must stay equally late before the host-time anchor moves
+  /// (seconds): longer than a stall's catch-up burst, short against a gap on air.
   static let lateReanchorDelay = 0.25
 
   /// Program time on the host clock: one offset per connection, so spacing is
   /// exactly the Program clock's. Re-anchored, never backwards, when the Program
   /// clock restarts or steps back, strays more than two frames ahead of real time,
-  /// or stays more than two frames behind it for `lateReanchorDelay`: after a short
-  /// gap on air Program time continues where it left off while real time moved
-  /// on, and every later frame would go out that much late. Delivery jitter within
-  /// two frames, and one late frame or a stalled burst catching up, keep the
+  /// or falls behind it as a gap on air does: after a short gap Program time
+  /// continues where it left off while real time moved on, and every later frame
+  /// would go out that much late. Such frames arrive at the Program spacing with
+  /// nothing queued behind them, equally late (within two frames) for
+  /// `lateReanchorDelay`. Lateness that changes or has a backlog behind it (a slow
+  /// send, a starved send queue, a stalled burst catching up) recovers once the
+  /// backlog drains, so it keeps the offset: moving the anchor then would leave
+  /// every later frame that far ahead. Delivery jitter within two frames keeps the
   /// offset; a burst at one moment keeps the spacing (the anchor is then the
   /// previous frame plus one duration).
-  fileprivate func hostTime(for programTime: CMTime, duration: CMTime) -> CMTime {
+  fileprivate func hostTime(for programTime: CMTime, duration: CMTime, backlogged: Bool) -> CMTime {
     // On the Program timescale, so mapped spacing stays exact.
     let clock = hostClock()
     let now = CMTimeConvertScale(clock, timescale: programTime.timescale, method: .roundTowardZero)
@@ -423,12 +429,21 @@ extension ProgramOutputBridge {
       let ahead = CMTimeSubtract(mapped, now).seconds
       let tolerance = 2 * duration.seconds
       if lastSentTime.map({ CMTimeCompare(mapped, $0) > 0 }) ?? true {
-        if ahead >= -tolerance { lateSince = nil }
-        if abs(ahead) <= tolerance { return mapped }
+        if abs(ahead) <= tolerance {
+          lateSince = nil
+          return mapped
+        }
         if ahead < -tolerance {
-          let since = lateSince ?? clock.seconds
-          lateSince = since
-          if clock.seconds - since < Self.lateReanchorDelay { return mapped }
+          let lateness = -ahead
+          if backlogged {
+            lateSince = nil
+            return mapped
+          }
+          guard let since = lateSince, abs(lateness - since.lateness) <= tolerance else {
+            lateSince = (clock.seconds, lateness)
+            return mapped
+          }
+          if clock.seconds - since.start < Self.lateReanchorDelay { return mapped }
         }
       }
     }

@@ -231,6 +231,60 @@ import XCTest
     XCTAssertEqual(bridge.currentStatistics.delivered, 34)
   }
 
+  /// A send that stays slow for longer than `lateReanchorDelay` and then recovers
+  /// leaves a backlog whose frames grow late and then catch up: it is no gap on
+  /// air, so the anchor stays and every frame, those after the recovery too, goes
+  /// out at real time (moving it would leave them all ahead).
+  func testProgramBridgeKeepsTheAnchorThroughASlowSendThatRecovers() throws {
+    let source = feed("alpha")
+    let route = ProgramOutputRoute(feedIDs: [source])
+    let consumer = try route.addConsumerRoute()
+    final class Clock {
+      var now = CMTime(value: 1_000 * 60_000, timescale: 60_000)
+      var sendCost = CMTime.zero
+    }
+    let clock = Clock()
+    var sent: [CMTime] = []
+    let bridge = ProgramOutputBridge(route: consumer, connect: { _, _ in }, disconnect: {},
+      send: { sample in
+        sent.append(CMSampleBufferGetPresentationTimeStamp(sample))
+        clock.now = CMTimeAdd(clock.now, clock.sendCost)
+        return true
+      },
+      hostClock: { clock.now })
+    try bridge.setDemand(true, configuration: PipelineConfiguration(),
+      passthroughFormat: kCVPixelFormatType_32BGRA)
+    let image = try frame(source, at: 0).payload
+    let start = clock.now
+    let frameDuration = CMTime(value: 1001, timescale: 60_000)
+    func host(_ index: Int) -> CMTime { CMTimeAdd(start, CMTimeMultiply(frameDuration, multiplier: Int32(index))) }
+    // Program makes frame `index` at host(index); each pump sends everything made by then.
+    var made = 0
+    func pump() {
+      while made < 64, CMTimeCompare(host(made), clock.now) <= 0 {
+        _ = route.ingest(feedID: source, frame: processed(image, at: Int64(made)))
+        made += 1
+      }
+      bridge.pump()
+    }
+    // Each send takes two frames for 30 frames (0.5 s): frames go out up to 14 late.
+    clock.sendCost = CMTimeMultiply(frameDuration, multiplier: 2)
+    while made < 15 { pump() }
+    XCTAssertEqual(sent.count, 15)
+    XCTAssertEqual(CMTimeCompare(clock.now, host(30)), 0)
+    // The send recovers: the backlog drains at once, then frames come in real time.
+    clock.sendCost = .zero
+    pump()
+    XCTAssertEqual(sent.count, 31)
+    for index in 31..<40 {
+      clock.now = host(index)
+      pump()
+    }
+    XCTAssertEqual(sent, (0..<40).map(host),
+      "Every frame goes out at its real time: the late backlog does not move the anchor")
+    XCTAssertEqual(bridge.currentStatistics.delivered, 40)
+  }
+
   func testProgramBridgeReconnectsAfterTransientSinkFailure() throws {
     let source = feed("alpha")
     let route = ProgramOutputRoute(feedIDs: [source])

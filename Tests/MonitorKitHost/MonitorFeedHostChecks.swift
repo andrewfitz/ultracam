@@ -304,6 +304,29 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
       XCTAssertEqual(source.id, output.id, "One picture, analysed once")
     }
     XCTAssertTrue(completion.wait())
+
+    // A camera that publishes the frame untouched (its passthrough copy keeps the
+    // tags): the Output and Monitor stages keep SMPTE 240M, and still the format's range.
+    XCTAssertEqual(camera.outputSignal(of: image, untouched: true).matrix, .smpte240m)
+    camera.offer(image, pts: CMTime(value: 2, timescale: 60), captureGeneration: 1, sequence: 2, untouched: true)
+    let untouched = try XCTUnwrap(slot.latest)
+    XCTAssertEqual(untouched.stamp.sequence, 2)
+    XCTAssertEqual(untouched.signal.matrix, .smpte240m)
+    XCTAssertEqual(untouched.outputSignal.matrix, .smpte240m, "Published untouched: the tag stays")
+    XCTAssertEqual(untouched.outputSignal.range, .legal)
+    XCTAssertGreaterThan(untouched.stamp.revision, delivery.stamp.revision, "The Output reading changed")
+    offer(camera, image, sequence: 3)
+    XCTAssertEqual(try XCTUnwrap(slot.latest).outputSignal.matrix, .bt709, "Processed again: the burn-in's BT.709")
+    let passthrough = Completion()
+    try core.submit(completion: passthrough) { context in
+      let source = try camera.frame(untouched, in: context, core: core)
+      let output = try camera.frame(untouched, in: context, core: core, reading: .output)
+      XCTAssertEqual(output.parameters.levels, SIMD4(64, 876, 512, 896), "Output: the format's legal range")
+      XCTAssertEqual(output.parameters.matrix, source.parameters.matrix, "Output: the tagged SMPTE 240M decode")
+      let processed = try camera.frame(delivery, in: context, core: core, reading: .output)
+      XCTAssertNotEqual(output.parameters.matrix, processed.parameters.matrix, "Not the burn-in's BT.709")
+    }
+    XCTAssertTrue(passthrough.wait())
   }
 
   /// Generations: a new capture generation gets a newer stamp generation; after an

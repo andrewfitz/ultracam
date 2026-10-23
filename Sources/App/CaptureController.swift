@@ -1038,7 +1038,7 @@ final class CaptureController: @unchecked Sendable {
       // No downstream demand: keep metadata/detection alive without allocating,
       // submitting GPU work or staging raw buffers that nobody can consume.
       guard cameraConnected || cameraConnecting || hasPreview || processedHandler != nil else {
-        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token) }
+        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token, untouched: effective.untouched) }
         if preparedConfiguration != nil {
           processor?.releaseIdleResources()
           preparedConfiguration = nil
@@ -1054,7 +1054,7 @@ final class CaptureController: @unchecked Sendable {
       // Temporal selection happens before any GPU work or buffer allocation;
       // complete bypass keeps the source duration and so every frame.
       guard frameRateGate.shouldDeliver(frame.pts, duration: effective.duration) else {
-        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token) }
+        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token, untouched: effective.untouched) }
         return
       }
       // Created on first demand; a complete bypass still uses it for the owned GPU copy.
@@ -1068,7 +1068,8 @@ final class CaptureController: @unchecked Sendable {
         pipelineEnabled: pipelineEnabled, applyLUT: effective.applyLUT,
         renderers: hasVisiblePreview ? ownedPreviewRenderers : [], preview: previewEnabled ? services.preview : nil,
         sourceID: hasVisiblePreview ? feedID : nil, previewEpoch: previewEpoch,
-        cameraAttempt: cameraAttempt, monitorSink: sink, processedHandler: processedHandler)
+        cameraAttempt: cameraAttempt, monitorSink: sink, untouched: effective.untouched,
+        processedHandler: processedHandler)
       let completion: LUTProcessor.Completion = { [self] completed in
         // GPU completion queue: the frame is finished. Hand it to delivery in
         // commit order (the processor releases completions in order).
@@ -1099,10 +1100,13 @@ final class CaptureController: @unchecked Sendable {
   /// A monitor offer for a frame that skips the GPU (no other consumer, or
   /// removed by the frame-rate gate). Ordered behind every frame already on
   /// the GPU, whose offers are made when they complete.
-  private func offerSourceOnlyInOrder(_ sink: any MonitorFrameSink, frame: CapturedFrame, token: UInt64) {
+  private func offerSourceOnlyInOrder(
+    _ sink: any MonitorFrameSink, frame: CapturedFrame, token: UInt64, untouched: Bool
+  ) {
     let offer: @Sendable () -> Void = { [deliveryQueue] in
       deliveryQueue.async {
-        sink.offer(frame.image, pts: frame.pts, captureGeneration: token, sequence: frame.sequence)
+        sink.offer(frame.image, pts: frame.pts, captureGeneration: token, sequence: frame.sequence,
+          untouched: untouched)
       }
     }
     if let processor { processor.afterCommittedFrames(offer) } else { offer() }
@@ -1124,7 +1128,8 @@ final class CaptureController: @unchecked Sendable {
     let outputWidth = CVPixelBufferGetWidth(rendered), outputHeight = CVPixelBufferGetHeight(rendered)
     let outputType = CVPixelBufferGetPixelFormatType(rendered)
     if let sink = item.monitorSink, let source = item.source {
-      sink.offer(source, pts: item.pts, captureGeneration: item.token, sequence: item.sequence)
+      sink.offer(source, pts: item.pts, captureGeneration: item.token, sequence: item.sequence,
+        untouched: item.untouched)
     }
     let processingMS = (timing.completed - item.encodeStart) * 1000
     services.didProcess(processingMS, (item.encodeStart - item.receivedAt) * 1000)
@@ -1336,6 +1341,8 @@ private struct DeliveryItem: @unchecked Sendable {
   let previewEpoch: UInt64
   let cameraAttempt: UInt64
   let monitorSink: (any MonitorFrameSink)?
+  /// Published as captured (the passthrough copy): the monitor's offer says so.
+  let untouched: Bool
   let processedHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
 }
 
@@ -1702,8 +1709,18 @@ struct CaptureServices: @unchecked Sendable {
 /// (source plus burn-in LUT) in its own shader. Never blocks, never waits for
 /// the GPU, never copies pixels. `MonitorFeedHost` is the MonitorKit endpoint.
 protocol MonitorFrameSink: AnyObject, Sendable {
-  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64)
+  /// `untouched`: the camera publishes this frame as captured, its tags included
+  /// (`PipelineConfiguration.untouched`, the passthrough copy); otherwise
+  /// LUTProcessor decodes it for the published frame.
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64, untouched: Bool)
   /// The capture stopped: rejects `rejected` (and every older generation) and
   /// drops the stopped generation's state.
   func invalidate(rejectingCaptureGeneration rejected: UInt64?)
+}
+
+extension MonitorFrameSink {
+  /// A frame the camera processes (or Program's, already processed).
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64) {
+    offer(image, pts: pts, captureGeneration: captureGeneration, sequence: sequence, untouched: false)
+  }
 }

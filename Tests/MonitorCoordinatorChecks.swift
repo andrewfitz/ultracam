@@ -951,6 +951,23 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     state.falseColor.mode = .sonySLog3
     XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .source, "Log false colour classifies the source")
     XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: display), .output, "Unavailable: the picture shows")
+    // A log mode that does not read the signal's log is unavailable too (MonitorKit's
+    // resolution): the picture, zebra and clip indicators read the picture stage.
+    let logC3 = SignalDescription(encoding: .log(LogEncoding(curve: .arriLogC3, gamut: .arriWideGamut3)))
+    let logC4 = SignalDescription(encoding: .log(LogEncoding(curve: .arriLogC4, gamut: .arriWideGamut4)))
+    let sLog3Rec2020 = SignalDescription(encoding: .log(LogEncoding(curve: .sLog3, gamut: .rec2020)))
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC3), .output, "Sony's tables on LogC3")
+    state.falseColor.mode = .arriLogC
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC3), .source, "ARRI's table on LogC3")
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC4), .source, "ARRI's table on LogC4")
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .output, "ARRI's table on S-Log3")
+    for mode in [FalseColorMode.arriStyleSLog3, .elZone] {
+      state.falseColor.mode = mode
+      XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .source, "\(mode) on S-Gamut3.Cine")
+      XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC3), .output, "\(mode) on LogC3")
+      XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: sLog3Rec2020), .output,
+        "\(mode) on S-Log3 outside S-Gamut3")
+    }
     state.falseColor.mode = .sixBand
     state.falseColor.stage = .monitor
     XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: display), .monitor, "Six bands classify their stage")

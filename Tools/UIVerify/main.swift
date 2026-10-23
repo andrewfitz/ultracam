@@ -792,6 +792,18 @@ import SystemExtensions
     publish([])
     verifier.check("discovery: unplugging the adopted input revives no old refusal",
       model.startRefusal(gamma) == nil, model.startRefusal(gamma) ?? "")
+
+    // No input listed at all: there is none to choose, so a camera without one
+    // asks for the UltraStudio, selected or not. (The automatic feed's status
+    // gives the same reason; the verifier has no virtual camera to demand it.)
+    model.updateCamera(beta) { $0.selectedDevice = "" }
+    model.startCamera(beta)
+    verifier.check("discovery: with no inputs, Start with none chosen asks for the UltraStudio",
+      model.startRefusal(beta) == "Connect the UltraStudio.", model.startRefusal(beta) ?? "nil")
+    model.updateCamera(gamma) { $0.selectedDevice = "" }
+    model.startCamera(gamma)
+    verifier.check("discovery: with no inputs, the selected camera's Start asks for the UltraStudio",
+      model.startRefusal(gamma) == "Connect the UltraStudio.", model.startRefusal(gamma) ?? "nil")
   }
 
   // MARK: Menu bar

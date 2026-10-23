@@ -66,9 +66,10 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     /// How the Output and Monitor stages read the frame: as the camera's processing
     /// decodes it for the burn-in LUT (`LUTProcessor.parameters`: the pixel format's
     /// code range and its Y'CbCr matrix, BT.709 for any but BT.2020 and BT.601),
-    /// with the declared log encoding. A declared code range is the Source stage's
-    /// alone, so the Output (LUT) picture is what Program, recording and the
-    /// virtual camera get. Program's is `signal`.
+    /// with the declared log encoding; a frame the camera publishes untouched keeps
+    /// its tagged matrix, as its passthrough copy does. A declared code range is the
+    /// Source stage's alone, so the Output (LUT) picture is what Program, recording
+    /// and the virtual camera get. Program's is `signal`.
     let outputSignal: SignalDescription
     /// Size, pixel aspect ratio and clean aperture (top-left origin, ISO/IEC 14496-12).
     let geometry: MonitorFrameGeometry
@@ -100,9 +101,9 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
 
   /// The stage whose reading a picture of `state` takes: its picture stage, or,
   /// while false colour replaces the picture, the stage it classifies (the Source
-  /// for a log mode on a log signal; six-band and custom bands their own stage).
-  /// Other tools on another stage than the picture's read it as the picture
-  /// does: MonitorKit decodes a frame once per pass.
+  /// for a log mode that reads the signal's log encoding; six-band and custom
+  /// bands their own stage). Other tools on another stage than the picture's
+  /// read it as the picture does: MonitorKit decodes a frame once per pass.
   static func pictureReading(_ state: MonitorState, signal: SignalDescription) -> SignalStage {
     let falseColor = state.falseColor
     guard !state.clean else { return state.pictureStage }
@@ -111,7 +112,23 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     case .sixBand: return falseColor.stage
     case .custom: return falseColor.customBands.isEmpty ? state.pictureStage : falseColor.stage
     case .sonySLog3, .arriStyleSLog3, .arriLogC, .elZone:
-      return signal.encoding.log != nil ? .source : state.pictureStage
+      return logFalseColor(falseColor.mode, reads: signal.encoding.log) ? .source : state.pictureStage
+    }
+  }
+
+  /// Whether log false colour `mode` classifies `log`, as MonitorKit resolves it:
+  /// Sony's tables need S-Log3, the ARRI-style and EL Zone scales S-Log3 in
+  /// S-Gamut3 or S-Gamut3.Cine, ARRI's an ARRI LogC curve. Otherwise MonitorKit
+  /// reports it unavailable and the picture stage shows.
+  private static func logFalseColor(_ mode: FalseColorMode, reads log: LogEncoding?) -> Bool {
+    guard let log else { return false }
+    let sony = log.curve == .sLog3
+    let sGamut = sony && (log.gamut == .sGamut3 || log.gamut == .sGamut3Cine)
+    switch mode {
+    case .sonySLog3: return sony
+    case .arriStyleSLog3, .elZone: return sGamut
+    case .arriLogC: return FalseColorTable.arriProfile(for: log.curve) != nil
+    case .off, .sixBand, .custom: return false
     }
   }
 
@@ -419,7 +436,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     gpu?.flushFrames(owner: owner)
   }
 
-  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64) {
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64, untouched: Bool) {
     let now = ProcessInfo.processInfo.systemUptime
     lock.lock()
     defer { lock.unlock() }
@@ -437,7 +454,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let layout = MonitorFrame.layout(for: format)
     let signals = Self.interpret(
       image, format: format, range: layout?.range ?? .legal, declaration: declaration, processed: isProgram,
-      cache: &interpretation)
+      untouched: untouched, cache: &interpretation)
     let geometry = cachedGeometry(image, format: format)
     let current = Identity(layout: layout?.layout, signals: signals, geometry: geometry)
     if identity != current {
@@ -523,18 +540,22 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let tags: ColorTags
     let format: OSType
     let declaration: MonitorSignalDeclaration?
+    let untouched: Bool
     let signals: Signals
   }
 
   /// The cached signals while nothing they depend on changed; otherwise fresh ones
   /// (which may allocate), cached for the next frame. Primaries are read on their
-  /// own, so HLG or PQ with BT.709 primaries keeps BT.709.
+  /// own, so HLG or PQ with BT.709 primaries keeps BT.709. `untouched`: the camera
+  /// publishes the frame as captured, tags included, so the Output stage keeps
+  /// the tagged matrix (SMPTE 240M too) where the burn-in would read BT.709.
   private static func interpret(
     _ image: CVPixelBuffer, format: OSType, range: CodeRange, declaration: MonitorSignalDeclaration?,
-    processed: Bool, cache: inout Interpretation?
+    processed: Bool, untouched: Bool, cache: inout Interpretation?
   ) -> Signals {
     let tags = ColorTags(image)
-    if let cached = cache, cached.format == format, cached.declaration == declaration, cached.tags.matches(tags) {
+    if let cached = cache, cached.format == format, cached.declaration == declaration,
+      cached.untouched == untouched, cached.tags.matches(tags) {
       return cached.signals
     }
     let native = MonitorFrame.signal(of: image, range: range)
@@ -543,28 +564,33 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       signals = Signals(source: native, output: native)
     } else {
       let source = declaration?.applied(to: native) ?? native
-      // The burn-in decode: the format's range, and the matrices LUTProcessor reads.
+      // As published: the format's range, and the matrices LUTProcessor reads
+      // (an untouched frame keeps its tag, as the passthrough copy does).
       var output = source
       output.range = native.range
-      if output.matrix == .smpte240m { output.matrix = .bt709 }
+      if output.matrix == .smpte240m && !untouched { output.matrix = .bt709 }
       signals = Signals(source: source, output: output)
     }
-    cache = Interpretation(tags: tags, format: format, declaration: declaration, signals: signals)
+    cache = Interpretation(tags: tags, format: format, declaration: declaration, untouched: untouched,
+      signals: signals)
     return signals
   }
 
   /// `image` read as this host reads every offered frame on the Source stage (tests, tools).
-  func signal(of image: CVPixelBuffer) -> SignalDescription { signals(of: image).source }
+  func signal(of image: CVPixelBuffer) -> SignalDescription { signals(of: image, untouched: false).source }
 
-  /// `image` read as this host reads every offered frame on the Output and Monitor stages.
-  func outputSignal(of image: CVPixelBuffer) -> SignalDescription { signals(of: image).output }
+  /// `image` read as this host reads every offered frame on the Output and Monitor
+  /// stages; `untouched` as `offer` takes it.
+  func outputSignal(of image: CVPixelBuffer, untouched: Bool = false) -> SignalDescription {
+    signals(of: image, untouched: untouched).output
+  }
 
-  private func signals(of image: CVPixelBuffer) -> Signals {
+  private func signals(of image: CVPixelBuffer, untouched: Bool) -> Signals {
     let format = CVPixelBufferGetPixelFormatType(image)
     var cache: Interpretation?
     return Self.interpret(
       image, format: format, range: MonitorFrame.layout(for: format)?.range ?? .legal,
-      declaration: lock.withLock { declaration }, processed: isProgram, cache: &cache)
+      declaration: lock.withLock { declaration }, processed: isProgram, untouched: untouched, cache: &cache)
   }
 
   // MARK: - Render thread

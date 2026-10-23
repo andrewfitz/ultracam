@@ -893,8 +893,14 @@ final class AppModel {
     guard refusedStarts.contains(id), let descriptor = descriptor(for: id), !feedCoordinator.isFeedRunning(id) else { return nil }
     if id == selectedFeedID && automaticFeedEnabled { return automaticFeedStatus }
     if id == selectedFeedID && loading { return "Its LUT is still loading. Start it again in a moment." }
-    if descriptor.selectedDevice.isEmpty { return driverWarning ?? "Choose an input for this camera." }
-    if !devices.contains(where: { $0.id == descriptor.selectedDevice }) { return driverWarning ?? "Connect the UltraStudio." }
+    return inputUnavailableReason(descriptor.selectedDevice)
+  }
+
+  /// Why a camera on input `device` can't start, nil while that input is listed.
+  /// With no input listed there is none to choose: the UltraStudio is missing.
+  private func inputUnavailableReason(_ device: String) -> String? {
+    if device.isEmpty && !devices.isEmpty { return driverWarning ?? "Choose an input for this camera." }
+    if !devices.contains(where: { $0.id == device }) { return driverWarning ?? "Connect the UltraStudio." }
     return nil
   }
 
@@ -1243,8 +1249,7 @@ final class AppModel {
     if let cameraDemandError { return cameraDemandError }
     if !automaticCaptureRequested { return "Waiting for a camera app or visible preview. Capture and video processing are off." }
     if loading { return "Restoring your LUT…" }
-    if selectedDevice.isEmpty { return driverWarning ?? "Choose an input for this camera." }
-    if !devices.contains(where: { $0.id == selectedDevice }) { return driverWarning ?? "Connect the UltraStudio." }
+    if let reason = inputUnavailableReason(selectedDevice) { return reason }
     return "Camera stopped. Retry to resume preview or camera output."
   }
 

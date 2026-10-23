@@ -679,15 +679,17 @@ import XCTest
       let pts: CMTime
       let captureGeneration: UInt64
       let sequence: UInt64
+      let untouched: Bool
     }
     let lock = NSLock()
     private var values: [Offer] = []
     private var rejections: [UInt64?] = []
     var offers: [Offer] { lock.withLock { values } }
     var invalidations: [UInt64?] { lock.withLock { rejections } }
-    func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64) {
+    func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64, untouched: Bool) {
       lock.withLock {
-        values.append(Offer(image: image, pts: pts, captureGeneration: captureGeneration, sequence: sequence))
+        values.append(Offer(image: image, pts: pts, captureGeneration: captureGeneration, sequence: sequence,
+          untouched: untouched))
       }
     }
     func invalidate(rejectingCaptureGeneration rejected: UInt64?) {
@@ -697,8 +699,25 @@ import XCTest
 
   /// The monitor is a source-only consumer: alone it never makes a frame do GPU
   /// work (even with a processing pipeline configured), and it still gets every
-  /// source frame, in capture order, under one capture generation.
+  /// source frame, in capture order, under one capture generation. Each offer says
+  /// whether the camera publishes the frame processed.
   @MainActor func testMonitorAloneTakesEverySourceFrameWithoutProcessing() throws {
+    let offers = try monitorAloneOffers(
+      PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true), pipelineEnabled: true)
+    XCTAssertTrue(offers.allSatisfy { !$0.untouched }, "Downscaled and 4:2:0: published processed")
+  }
+
+  /// A camera that publishes its frames untouched (here with processing off) tells
+  /// the monitor, whose Output stage then reads the frame's own tags.
+  @MainActor func testMonitorOffersSayWhenTheCameraPublishesUntouched() throws {
+    let offers = try monitorAloneOffers(
+      PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true), pipelineEnabled: false)
+    XCTAssertTrue(offers.allSatisfy(\.untouched), "Processing off: published untouched")
+  }
+
+  @MainActor private func monitorAloneOffers(
+    _ configuration: PipelineConfiguration, pipelineEnabled: Bool
+  ) throws -> [SourceOfferLog.Offer] {
     let image = try syntheticRamp()
     let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
     var services = harness.services
@@ -731,8 +750,7 @@ import XCTest
     var updates: [CaptureUpdate] { log.lock.withLock { log.values } }
     controller.start(
       feedID: FeedID(rawValue: "monitor-only"), deviceID: "synthetic",
-      configuration: PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true),
-      pipelineEnabled: true)
+      configuration: configuration, pipelineEnabled: pipelineEnabled)
     wait(for: [started], timeout: 3)
     let duration = VideoContract.fastDuration
     let count = 6
@@ -753,8 +771,9 @@ import XCTest
       "A monitor-only feed submits no GPU work")
     controller.stop()
     pumpUntil { !sink.invalidations.isEmpty }
-    XCTAssertEqual(sink.invalidations.first ?? nil, offers[0].captureGeneration,
+    XCTAssertEqual(sink.invalidations.first ?? nil, offers.first?.captureGeneration,
       "Stop rejects the stopped capture generation at the monitor")
+    return offers
   }
 
   /// Program's monitor gets each Program frame once, as its only picture, and a
