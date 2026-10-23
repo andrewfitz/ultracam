@@ -1,10 +1,12 @@
+#if UI_VERIFY
 import MonitorKit
 import MonitorKitScopes
 import SwiftUI
 
 /// The scopes pane and its settings in representative states, for the offscreen
-/// renderer (ui-verify) and the self-test, plus the checks of what they show.
-/// The scope image is a drawn stand-in: the real one is MonitorKit's GPU image.
+/// renderer (ui-verify), plus the checks of what they show. Compiled only into
+/// ui-verify. The scope image is a drawn stand-in: the real one is MonitorKit's
+/// GPU image.
 @MainActor enum UIScopeScreens {
   struct Screen {
     let name: String
@@ -37,6 +39,13 @@ import SwiftUI
     value.settings = choice.applied(to: value.settings)
     edit(&value.settings)
     return value
+  }
+
+  /// Records every check with `verifier` and hands every screen to `render`
+  /// (ui-verify's renderer: name, view, size).
+  static func run(verifier: Verifier, render: (String, AnyView, CGSize) -> Void) {
+    for check in checks() { verifier.check(check.name, check.passed, check.detail) }
+    for screen in screens() { render(screen.name, screen.view, screen.size) }
   }
 
   static func screens() -> [Screen] {
@@ -142,8 +151,14 @@ import SwiftUI
       docked.joined(separator: ", "))
     let expanded = UIScopeDescription(scopes: scopes(.luma), signal: .rec709, burnInLUT: false, isProgram: false)
       .visibleLabels(width: 560, height: 240).filter { $0.role == .tick }.map(\.text)
-    check("an expanded waveform keeps the −10 and 110 ends", expanded.contains("-10") && expanded.contains("110"),
-      expanded.joined(separator: ", "))
+    check("an expanded waveform labels −10, 0, 50, 100 and 110 IRE, as before",
+      expanded == ["-10", "0", "50", "100", "110"], expanded.joined(separator: ", "))
+    let tallCodes = UIScopeDescription(
+      scopes: scopes(.luma) { $0.display.waveformScale = .codeValues }, signal: .rec709, burnInLUT: false,
+      isProgram: false
+    ).visibleLabels(width: 560, height: 480).filter { $0.role == .tick }
+    check("a tall code-value waveform labels every line it draws",
+      tallCodes.count > 5 && tallCodes.contains { !$0.isMajor }, tallCodes.map(\.text).joined(separator: ", "))
     let parade = UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, burnInLUT: false, isProgram: false)
     check("the RGB parade names its channels",
       parade.labels.filter { $0.role == .channel }.map(\.text) == ["R", "G", "B"])
@@ -162,6 +177,23 @@ import SwiftUI
     check("targets are labelled only with the graticule", !noGraticule.labels.contains { $0.role == .target })
     check("a vectorscope keeps the image's shape",
       UIScopeDescription.imageAspectRatio == 3 && vector.settings.kind == .vectorscope)
+    let matrixKinds = UIScopeChoice.allCases.filter {
+      UIScopeDescription(scopes: scopes($0), signal: .rec709, burnInLUT: false, isProgram: false).usesMatrix
+    }
+    check("the matrix applies to the luma waveform, Y'CbCr parade and vectorscope",
+      matrixKinds == [.luma, .ycbcrParade, .vectorscope], "\(matrixKinds)")
+    let lumaHistogram = UIScopeDescription(
+      scopes: scopes(.histogram) { $0.histogramMode = .luma }, signal: .rec709, burnInLUT: false, isProgram: false)
+    check("the matrix applies to the luma histogram", lumaHistogram.usesMatrix)
+    let bt601 = UIScopeDescription(
+      scopes: scopes(.luma) { $0.colorimetry = .bt601 }, signal: .rec709, burnInLUT: false, isProgram: false)
+    check("a chosen matrix is named under the waveform", bt601.caption.contains("BT.601"), bt601.caption)
+    check("the automatic matrix is not named under the waveform", !sdr.caption.contains("BT."), sdr.caption)
+    let rgb601 = UIScopeDescription(
+      scopes: scopes(.rgbParade) { $0.colorimetry = .bt601 }, signal: .rec709, burnInLUT: false, isProgram: false)
+    check("the RGB parade, which ignores the matrix, does not name it", !rgb601.caption.contains("BT."), rgb601.caption)
+    check("the waveforms are the four waveform choices",
+      UIScopeChoice.allCases.filter(\.isWaveform) == [.rgbParade, .luma, .rgbOverlay, .ycbcrParade])
     check("Program's scope says Program Output",
       UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, burnInLUT: false, isProgram: true).title
         == "RGB parade · Program Output")
@@ -227,3 +259,4 @@ private struct UIScopeStandIn: View {
     .background(Color.black)
   }
 }
+#endif

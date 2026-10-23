@@ -11,6 +11,9 @@ enum UIScopeChoice: String, CaseIterable, Identifiable, Sendable {
 
   var id: String { rawValue }
 
+  /// One of the waveforms (not the vectorscope or histogram).
+  var isWaveform: Bool { self != .vectorscope && self != .histogram }
+
   var title: String {
     switch self {
     case .rgbParade: return "RGB parade"
@@ -166,6 +169,17 @@ struct UIScopeDescription: Equatable, Sendable {
   /// Whether the scope has a level axis (waveform and histogram).
   var hasLevelAxis: Bool { settings.kind != .vectorscope }
 
+  /// Whether the trace uses the colorimetry's Y'CbCr weights: the luma
+  /// waveform, the Y'CbCr parade, the luma histogram and the vectorscope. The
+  /// RGB traces draw R'G'B' as it is (`mk_waveformValues`, the histogram pass).
+  var usesMatrix: Bool {
+    switch settings.kind {
+    case .vectorscope: return true
+    case .histogram: return settings.histogramMode == .luma
+    case .waveform: return settings.waveformMode == .luma || settings.waveformMode == .ycbcrParade
+    }
+  }
+
   var levelRangeText: String {
     ScopeIREScale(axis: settings.levelRange.low...settings.levelRange.high).rangeText
   }
@@ -230,8 +244,10 @@ struct UIScopeDescription: Equatable, Sendable {
       let skin = d.showsSkinToneLine ? " · skin tone line" : ""
       return "Every pixel · Cb/Cr, \(Self.matrixTitle(context.matrix)) · \(settings.vectorscopeZoom)× · \(targets)\(skin)"
     case .waveform, .histogram:
-      let counts = settings.kind == .histogram
-        ? (d.histogramScale == .logarithmic ? " · logarithmic counts" : " · linear counts") : ""
+      // A chosen matrix is named; Automatic is the stage's own Y'.
+      let matrix = usesMatrix && settings.colorimetry != .auto ? " · \(Self.matrixTitle(context.matrix)) Y'" : ""
+      let counts = (settings.kind == .histogram
+        ? (d.histogramScale == .logarithmic ? " · logarithmic counts" : " · linear counts") : "") + matrix
       switch d.waveformScale {
       case .percent:
         return "Every pixel · \(levelRangeText) IRE · levels outside clamp to the edges\(counts)"
@@ -267,8 +283,11 @@ struct UIScopeDescription: Equatable, Sendable {
 
   /// The labels that fit an image `width` × `height` points: every tick label
   /// when they keep `spacing` apart, otherwise the major ticks that keep clear
-  /// of each other and then the axis ends that keep clear of those. Measured
-  /// where the labels are drawn (kept inside the image), per parade panel.
+  /// of each other and then the axis ends that keep clear of those. The IRE %
+  /// scale always labels only its majors and ends (−10, 0, 50, 100, 110 on the
+  /// classic axis, as Ultracam's scopes always have); its 10% lines go
+  /// unlabelled. Measured where the labels are drawn (kept inside the image),
+  /// per parade panel.
   func visibleLabels(width: Double, height: Double, spacing: Double = 11) -> [ScopeLabel] {
     let all = labels
     let ticks = all.filter { $0.role == .tick }
@@ -285,11 +304,12 @@ struct UIScopeDescription: Equatable, Sendable {
     func clear(_ label: ScopeLabel, of others: [ScopeLabel]) -> Bool {
       others.allSatisfy { abs(drawn($0) - drawn(label)) >= spacing }
     }
+    let everyTick = settings.display.waveformScale != .percent
     var kept: [ScopeLabel] = []
     // The Y'CbCr parade's chroma panel has its own ticks at its own x.
     for panel in Set(ticks.map { horizontal ? 0 : $0.position.x }) {
       let group = ticks.filter { (horizontal ? 0 : $0.position.x) == panel }.sorted { drawn($0) < drawn($1) }
-      if zip(group, group.dropFirst()).allSatisfy({ drawn($1) - drawn($0) >= spacing }) {
+      if everyTick && zip(group, group.dropFirst()).allSatisfy({ drawn($1) - drawn($0) >= spacing }) {
         kept += group
         continue
       }

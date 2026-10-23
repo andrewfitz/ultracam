@@ -114,7 +114,8 @@ struct UIScopeClipReadoutView: View {
 }
 
 /// The scopes pane of a monitor tile: title (scope · stage), Dock/Expand, the
-/// scope with its labels, the clip readout, timing, interpretation and footnote.
+/// scope with its labels, the clip readout (with a statistics reader or held
+/// numbers), timing, interpretation and footnote.
 struct UIScopePanel<Scope: View>: View {
   let description: UIScopeDescription
   @Binding var expanded: Bool
@@ -142,7 +143,11 @@ struct UIScopePanel<Scope: View>: View {
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(description.title)
-      UIScopeClipReadoutView(reader: statistics, settings: description.settings, isLive: isLive, held: heldReadout)
+      // Only where there are numbers to show: a surface without a statistics
+      // reader would show three lines of dashes that never fill in.
+      if statistics != nil || heldReadout != nil {
+        UIScopeClipReadoutView(reader: statistics, settings: description.settings, isLive: isLive, held: heldReadout)
+      }
       if !timing.isEmpty { Text(timing).font(.caption2).foregroundStyle(.secondary) }
       if !interpretation.isEmpty { Text(interpretation).font(.caption2).foregroundStyle(.secondary) }
       Text(description.caption).font(.caption2).foregroundStyle(.secondary)

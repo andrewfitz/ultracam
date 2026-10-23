@@ -19,6 +19,14 @@ struct UIScopeSettingsView: View {
   var signal: SignalDescription?
   var burnInLUT: Bool
 
+  /// Whether the menus offer every MonitorKit scope and scale. The main
+  /// window's scope strip and its camera Scopes popover still draw, label and
+  /// edit an IRE waveform only, and they show these same per-camera settings,
+  /// so until they handle the vectorscope, the histogram and the code-value
+  /// and nits scales those stay out of the menus here too. A setting already
+  /// saved is still listed, so it can be changed back.
+  static let offersEveryScope = false
+
   private var description: UIScopeDescription {
     UIScopeDescription(scopes: scopes, signal: signal, burnInLUT: burnInLUT, isProgram: isProgram)
   }
@@ -35,9 +43,11 @@ struct UIScopeSettingsView: View {
   var body: some View {
     let d = description
     Picker("Scope", selection: choice) {
-      ForEach(UIScopeChoice.allCases) { Text($0.title).tag($0) }
+      ForEach(UIScopeChoice.allCases.filter { Self.offersEveryScope || $0.isWaveform || $0 == d.choice }) {
+        Text($0.title).tag($0)
+      }
     }
-    .accessibilityHint("Waveform, parade, vectorscope or histogram")
+    .accessibilityHint(Self.offersEveryScope ? "Waveform, parade, vectorscope or histogram" : "Waveform or parade")
     if d.settings.kind == .histogram {
       Picker("Channels", selection: settings.histogramMode) {
         Text("Luma").tag(HistogramMode.luma)
@@ -61,17 +71,21 @@ struct UIScopeSettingsView: View {
         }
       }
       .help("Classic is the earlier Ultracam scope: −10…110 IRE with its trace colours.")
-      Picker("Scale", selection: settings.display.waveformScale) {
-        ForEach(WaveformScale.allCases, id: \.self) { scale in
-          Text(UIScopeDescription.scaleTitle(scale)).tag(scale)
-            .disabled(!d.offers(scale) && scopes.settings.display.waveformScale != scale)
+      if scales.count > 1 {
+        Picker("Scale", selection: settings.display.waveformScale) {
+          ForEach(scales, id: \.self) { scale in
+            Text(UIScopeDescription.scaleTitle(scale)).tag(scale)
+              .disabled(!d.offers(scale) && scopes.settings.display.waveformScale != scale)
+          }
         }
+        .help("Nits scales read light levels on PQ and HLG signals.")
       }
-      .help("Nits scales read light levels on PQ and HLG signals.")
-      if let note = d.scaleNote {
+      if let note = d.scaleNote, Self.offersEveryScope || scopes.settings.display.waveformScale != .percent {
         HStack(alignment: .firstTextBaseline) {
           Text(note).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-          if let suggested = d.suggestedHDRScale, scopes.settings.display.waveformScale != suggested {
+          if let suggested = d.suggestedHDRScale, scopes.settings.display.waveformScale != suggested,
+            scales.contains(suggested)
+          {
             Spacer(minLength: 4)
             Button("Use \(UIScopeDescription.scaleTitle(suggested))") {
               settings.wrappedValue.display.waveformScale = suggested
@@ -92,6 +106,15 @@ struct UIScopeSettingsView: View {
         Text("75% and 100%").tag(VectorscopeTargets.both)
       }
       Toggle("Skin tone line", isOn: settings.display.showsSkinToneLine)
+    case .histogram:
+      Picker("Counts", selection: settings.display.histogramScale) {
+        Text("Linear").tag(HistogramScale.linear)
+        Text("Logarithmic").tag(HistogramScale.logarithmic)
+      }
+    case .waveform:
+      EmptyView()
+    }
+    if d.usesMatrix {
       Picker("Matrix", selection: settings.colorimetry) {
         Text("Automatic").tag(ScopeColorimetry.auto)
         Text("BT.601").tag(ScopeColorimetry.bt601)
@@ -101,14 +124,7 @@ struct UIScopeSettingsView: View {
           Text("SMPTE 240M").tag(ScopeColorimetry.smpte240m)
         }
       }
-      .help("Automatic uses the camera's matrix for the source and BT.709 after a LUT.")
-    case .histogram:
-      Picker("Counts", selection: settings.display.histogramScale) {
-        Text("Linear").tag(HistogramScale.linear)
-        Text("Logarithmic").tag(HistogramScale.logarithmic)
-      }
-    case .waveform:
-      EmptyView()
+      .help("The Y'CbCr weights of the drawn luma and chroma. Automatic uses the camera's matrix for the source and BT.709 after a LUT.")
     }
     Picker("Refresh", selection: $scopes.refreshHz) {
       ForEach(MonitorScopePreferences.refreshRates, id: \.self) { Text("\($0) Hz").tag($0) }
@@ -121,6 +137,13 @@ struct UIScopeSettingsView: View {
       .help("The clip readout counts pixels at or below this level, per R, G, B and luma.")
     Text("One scope per camera. \(d.caption).")
       .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+  }
+
+  /// The scales in the menu: every one, or IRE % and the saved one.
+  private var scales: [WaveformScale] {
+    WaveformScale.allCases.filter {
+      Self.offersEveryScope || $0 == .percent || $0 == scopes.settings.display.waveformScale
+    }
   }
 
   private var choice: Binding<UIScopeChoice> {
