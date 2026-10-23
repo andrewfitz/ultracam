@@ -940,7 +940,7 @@ extension MonitorCoordinatorChecks {
   /// the zoom is bounded as the pass bounds it (non-finite: 1, at most 64). The
   /// old SwiftUI zoom scaled the guide overlay with the picture; MonitorKit's
   /// guides follow the unmagnified picture and are hidden while magnified.
-  func testZoomTransformsPictureAndGuideTogetherAtBoundedScale() throws {
+  func testZoomScalesThePictureWithinBoundsAndHidesGuidesWhileMagnified() throws {
     let (presenter, _) = portedDetachedPresenter()
     let frame = MonitorFrameGeometry(width: 80, height: 40)
     func layout(_ state: MonitorState) -> MonitorLayout {
