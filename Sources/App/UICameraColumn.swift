@@ -1,5 +1,7 @@
+import AppKit
 import MonitorKitCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// One camera: its picture with overlays, then its channel strip.
 struct UICameraColumnView: View {
@@ -386,6 +388,82 @@ private struct UICopySettingsMenu: View {
   }
 }
 
+/// A camera's monitor-only LUT: a .cube file its pictures show on the Monitor
+/// stage, over the burn-in LUT. Never burned in: Program, recording and the
+/// camera output keep the burn-in LUT only. Saved in the camera's monitor
+/// preferences as a read-only bookmark, like the burn-in LUT.
+struct UIMonitorLUTMenu: View {
+  let cameraID: String
+  let cameraName: String
+  let monitor: any UIMonitorSettingsProviding
+
+  var body: some View {
+    let preferences = monitor.preferences(for: cameraID)
+    let choice = preferences.monitorLUT
+    Menu("Monitor LUT") {
+      if let choice {
+        Text(choice.fileName.isEmpty ? "Monitor LUT chosen" : choice.fileName)
+      }
+      Button(choice == nil ? "Load Monitor LUT…" : "Replace Monitor LUT…") {
+        Self.choose(cameraID: cameraID, cameraName: cameraName, monitor: monitor)
+      }
+      Toggle("Show Monitor LUT", isOn: Binding(
+        get: { choice != nil && monitor.preferences(for: cameraID).monitorLUTEnabled },
+        set: { Self.setShown($0, cameraID: cameraID, monitor: monitor) }))
+        .disabled(choice == nil)
+      Button("Remove Monitor LUT") { Self.remove(cameraID: cameraID, monitor: monitor) }
+        .disabled(choice == nil)
+    }
+    .help("A LUT for this camera's monitor pictures only (the Monitor picture). It is never burned in.")
+  }
+
+  /// Asks for a .cube file, reads it (so a file that does not parse is refused
+  /// before it is saved) and makes its read-only bookmark.
+  static func choose(cameraID: String, cameraName: String, monitor: any UIMonitorSettingsProviding) {
+    let panel = NSOpenPanel()
+    panel.title = "Choose a monitor LUT for \(cameraName)"
+    panel.allowedContentTypes = [UTType(filenameExtension: "cube") ?? .plainText]
+    panel.allowsMultipleSelection = false
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    Task { @MainActor in
+      do {
+        chosen(try await MonitorFeedHost.monitorLUTLoader.load(url: url), cameraID: cameraID, monitor: monitor)
+      } catch {
+        let alert = NSAlert()
+        alert.messageText = "Monitor LUT was not changed"
+        alert.informativeText = error.localizedDescription
+        alert.runModal()
+      }
+    }
+  }
+
+  /// Saves a chosen file as the camera's monitor LUT, shows it, and switches the
+  /// camera's pictures to the Monitor stage, the one that shows it.
+  static func chosen(_ file: LoadedLUT, cameraID: String, monitor: any UIMonitorSettingsProviding) {
+    var next = monitor.preferences(for: cameraID)
+    next.monitorLUT = MonitorLUTChoice(bookmark: file.bookmark, fileName: file.fileName)
+    next.monitorLUTEnabled = true
+    next.setPictureStage(.monitor)
+    monitor.setPreferences(next, for: cameraID)
+  }
+
+  static func setShown(_ shown: Bool, cameraID: String, monitor: any UIMonitorSettingsProviding) {
+    var next = monitor.preferences(for: cameraID)
+    guard next.monitorLUT != nil else { return }
+    next.monitorLUTEnabled = shown
+    monitor.setPreferences(next, for: cameraID)
+  }
+
+  /// Forgets the file. A Monitor picture then shows what Output (LUT) shows.
+  static func remove(cameraID: String, monitor: any UIMonitorSettingsProviding) {
+    var next = monitor.preferences(for: cameraID)
+    guard next.monitorLUT != nil else { return }
+    next.monitorLUT = nil
+    next.monitorLUTEnabled = true
+    monitor.setPreferences(next, for: cameraID)
+  }
+}
+
 /// Adds the named "Cut to Camera N" accessibility action only when a cut is possible.
 private struct UICutAccessibilityAction: ViewModifier {
   let camera: UICameraPresentation
@@ -630,6 +708,7 @@ struct UIChannelStripView: View {
       }
       Divider()
       Button("Load LUT…") { context.send(.chooseLUT(cameraID: camera.id)) }
+      UIMonitorLUTMenu(cameraID: camera.id, cameraName: camera.name, monitor: context.monitor)
       Button("Choose Recording Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }
       if snapshot?.recording.folderIsCustom == true {
         Button("Use Default Folder") { context.send(.useDefaultFolder(cameraID: camera.id)) }

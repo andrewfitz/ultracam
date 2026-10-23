@@ -121,16 +121,27 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private var burnIn: MonitorLUT?
   private var monitorOnly: MonitorLUT?
   private var lutVersion: UInt64 = 0
+  /// The monitor-only LUT's file: the bookmark being shown or loaded, the load
+  /// that may still replace it (older loads are ignored), and how it went.
+  private let lutLoader: LUTFileLoader
+  private var monitorLUTBookmark: Data?
+  private var monitorLUTLoad: UInt64 = 0
+  private var monitorLUTPhase = MonitorLUTState.none
 
   /// Render thread only.
   private var renderFeed: MonitorFeed?
   private var appliedLUTVersion: UInt64 = .max
   private(set) var lutMismatch: String?
 
-  init(target: String, gpu: MonitorGPUContext?) {
+  /// The file loader monitor-only LUTs go through: the interface makes their
+  /// bookmarks with it (read-only, security-scoped), and hosts resolve them with it.
+  static let monitorLUTLoader = LUTFileLoader()
+
+  init(target: String, gpu: MonitorGPUContext?, lutLoader: LUTFileLoader = MonitorFeedHost.monitorLUTLoader) {
     self.target = target
     isProgram = target == Self.programTarget
     self.gpu = gpu
+    self.lutLoader = lutLoader
     owner = Self.counterLock.withLock {
       Self.nextOwner &+= 1
       return Self.nextOwner
@@ -183,6 +194,75 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
         monitorOnly = newValue
         lutVersion &+= 1
       }
+    }
+  }
+
+  /// Where the monitor-only LUT's file stands.
+  enum MonitorLUTState: Equatable, Sendable {
+    case none
+    case loading
+    /// Shown on the Monitor stage; the LUT's title.
+    case loaded(String)
+    /// Nothing is shown; why.
+    case failed(String)
+  }
+
+  var monitorLUTState: MonitorLUTState { lock.withLock { monitorLUTPhase } }
+
+  /// The camera's monitor-only LUT file (`MonitorFeedPreferences.monitorLUT`).
+  /// A new bookmark is resolved and read off the calling thread, inside its
+  /// security scope, and built once as a tetrahedral `MonitorLUT` on the shared
+  /// device; the LUT shown until then stays, and frames already encoded keep
+  /// theirs (no wait). The same bookmark again does nothing, so this can be
+  /// called on every preferences refresh. Nil clears it at once; a file that
+  /// cannot be read clears it and is reported in `monitorLUTState`. Ignored for
+  /// Program, whose frames are already processed.
+  func setMonitorLUTBookmark(_ value: Data?) {
+    let bookmark = isProgram ? nil : value
+    let load: UInt64? = lock.withLock {
+      guard bookmark != monitorLUTBookmark else { return nil }
+      monitorLUTBookmark = bookmark
+      monitorLUTLoad &+= 1
+      guard bookmark != nil else {
+        monitorLUTPhase = .none
+        if monitorOnly != nil {
+          monitorOnly = nil
+          lutVersion &+= 1
+        }
+        return nil
+      }
+      monitorLUTPhase = .loading
+      return monitorLUTLoad
+    }
+    guard let load, let bookmark else { return }
+    let loader = lutLoader
+    Task.detached { [weak self] in
+      let result: Result<MonitorLUT, any Error>
+      do {
+        let file = try await loader.restore(bookmark: bookmark)
+        result = .success(try LUTProcessor.makeLUT(file.cube))
+      } catch {
+        result = .failure(error)
+      }
+      self?.finishMonitorLUTLoad(load, result)
+    }
+  }
+
+  private func finishMonitorLUTLoad(_ load: UInt64, _ result: Result<MonitorLUT, any Error>) {
+    lock.withLock {
+      guard load == monitorLUTLoad else { return }
+      let lut: MonitorLUT?
+      switch result {
+      case .success(let value):
+        lut = value
+        monitorLUTPhase = .loaded(value.cube.title)
+      case .failure(let error):
+        lut = nil
+        monitorLUTPhase = .failed(error.localizedDescription)
+      }
+      guard monitorOnly !== lut else { return }
+      monitorOnly = lut
+      lutVersion &+= 1
     }
   }
 

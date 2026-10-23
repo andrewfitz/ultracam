@@ -686,7 +686,7 @@ struct UISettingsAdvancedPane: View {
           Button("Forget Saved LUTs…") { confirmForgetLUTs = true }
         } label: {
           Text("Saved LUT access")
-          Text("Read-only bookmarks for each camera's .cube file").font(.caption).foregroundStyle(.secondary)
+          Text("Read-only bookmarks for each camera's .cube files, burn-in and monitor").font(.caption).foregroundStyle(.secondary)
         }
       } header: { Text("LUTs") } footer: {
         UISettingsFootnote("A missing LUT never blocks capture. The camera keeps its choice so it can be located again.")
@@ -722,13 +722,18 @@ struct UISettingsAdvancedPane: View {
     .confirmationDialog("Forget saved LUTs?", isPresented: $confirmForgetLUTs) {
       Button("Forget Saved LUTs", role: .destructive) { forgetLUTs() }
     } message: {
-      Text("Each camera stops applying its saved LUT until you choose a .cube file again.")
+      Text("Each camera stops applying its saved LUT and its monitor LUT until you choose a .cube file again.")
     }
   }
 
   private func forgetLUTs() {
     // forgetLUT also clears the selected camera's loaded LUT, which updateCamera can't.
     for descriptor in model.feedDescriptors { model.forgetLUT(descriptor.id) }
+    // Monitor LUTs live in each camera's monitor preferences; the coordinator saves them.
+    let monitor = UIAppMonitorSettings(model: model)
+    for descriptor in model.feedDescriptors {
+      UIMonitorLUTMenu.remove(cameraID: descriptor.id.rawValue, monitor: monitor)
+    }
   }
 }
 

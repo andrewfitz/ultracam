@@ -239,6 +239,17 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   /// its tools. Only migrated from, never decoded as a `MonitorState`.
   var legacyMonitorConfiguration: PreservedJSON?
 
+  /// The monitor-only LUT's saved bookmark. It lives in the monitor preferences
+  /// (`monitor.monitorLUT`, under the key `monitor`), which every save path
+  /// carries whole, so `version` stays 1. The burn-in LUT is `lutBookmark`.
+  var monitorLUTBookmark: Data? { monitor.monitorLUT?.bookmark }
+
+  /// Whether the monitor-only LUT is shown (`MonitorState.monitorLUT`).
+  var monitorLUTEnabled: Bool {
+    get { monitor.monitorLUTEnabled }
+    set { monitor.monitorLUTEnabled = newValue }
+  }
+
   init(id: FeedID = .primary, name: String = "Camera 1", selectedDevice: String = "",
     applyLUT: Bool = false, downscale: Bool = true, convertTo420: Bool = true,
     reduceFrameRate: Bool = false, gamut: String = "S-Gamut3.Cine / S-Log3",

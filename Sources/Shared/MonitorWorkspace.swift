@@ -36,14 +36,27 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
   /// How this target's camera signal is read. Per target, not per surface.
   var signal = MonitorSignalDeclaration()
   var scopes = MonitorScopePreferences()
+  /// This camera's monitor-only LUT (key `monitorLUT`), shown on the Monitor
+  /// picture stage over the burn-in LUT and never burned in. Per camera, like
+  /// the signal declaration: Reset and Copy keep it. Program has none.
+  var monitorLUT: MonitorLUTChoice?
 
   init(toolsEnabled: Bool = false, state: MonitorState = Self.defaultState,
     signal: MonitorSignalDeclaration = MonitorSignalDeclaration(),
-    scopes: MonitorScopePreferences = MonitorScopePreferences()) {
+    scopes: MonitorScopePreferences = MonitorScopePreferences(), monitorLUT: MonitorLUTChoice? = nil) {
     self.toolsEnabled = toolsEnabled
     self.state = state
     self.signal = signal
     self.scopes = scopes
+    self.monitorLUT = monitorLUT
+  }
+
+  /// Whether the monitor-only LUT is shown: `MonitorState.monitorLUT`, the
+  /// switch MonitorKit's pipelines, status and scopes read. The file stays
+  /// loaded while it is off, so turning it back on is immediate.
+  var monitorLUTEnabled: Bool {
+    get { state.monitorLUT }
+    set { state.monitorLUT = newValue }
   }
 
   /// The settings an old MonitorTools configuration described (map §5.3).
@@ -52,7 +65,7 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     merge(legacy)
   }
 
-  private enum CodingKeys: String, CodingKey { case schemaVersion, toolsEnabled, state, signal, scopes }
+  private enum CodingKeys: String, CodingKey { case schemaVersion, toolsEnabled, state, signal, scopes, monitorLUT }
 
   /// Throws unless `state` is a genuine MonitorKit `MonitorState`; callers use
   /// `KeyedDecodingContainer.monitorPreferences(_:legacy:)`, which never throws.
@@ -64,6 +77,7 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
       ?? MonitorSignalDeclaration()
     scopes = ((try? c.decodeIfPresent(MonitorScopePreferences.self, forKey: .scopes)) ?? nil)
       ?? MonitorScopePreferences()
+    monitorLUT = (try? c.decodeIfPresent(MonitorLUTChoice.self, forKey: .monitorLUT)) ?? nil
   }
 
   func encode(to encoder: Encoder) throws {
@@ -73,6 +87,7 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     try c.encode(state.persisted, forKey: .state)
     try c.encode(signal, forKey: .signal)
     try c.encode(scopes, forKey: .scopes)
+    try c.encodeIfPresent(monitorLUT, forKey: .monitorLUT)
   }
 
   /// What a surface of this target draws: the saved tools with Ultracam's
@@ -131,21 +146,30 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
 
   /// "Reset monitor tools": every setting back to the defaults, the signal
   /// declaration included (resetting MonitorTools' configuration cleared it too).
+  /// The monitor LUT and whether it shows stay.
   mutating func resetTools() {
+    let lut = monitorLUT, lutEnabled = monitorLUTEnabled
     self = MonitorFeedPreferences()
+    // The monitor LUT is this camera's file choice, not a tool (like the burn-in LUT).
+    monitorLUT = lut
+    monitorLUTEnabled = lutEnabled
   }
 
   /// "Copy settings from": `source`'s tools and scopes, settings MonitorTools
   /// cannot express included. This target keeps its own camera: the signal
-  /// declaration and the exposure offset (map §5.3, `copySettings`). A log
+  /// declaration, the exposure offset (map §5.3, `copySettings`) and the
+  /// monitor LUT, shown or hidden as it was. A log
   /// false-colour mode this target's camera cannot show is turned off, as
   /// MonitorTools' copy did.
   mutating func copyTools(from source: MonitorFeedPreferences) {
     let offset = state.falseColor.referenceOffsetStops
+    let lutEnabled = monitorLUTEnabled
     toolsEnabled = source.toolsEnabled
     state = source.state
     scopes = source.scopes
     state.falseColor.referenceOffsetStops = offset
+    // The monitor LUT stays this camera's own, shown or hidden as it was.
+    monitorLUTEnabled = lutEnabled
     if state.falseColor.mode.needsLogSource && !falseColorDeclared { state.falseColor.mode = .off }
   }
 
@@ -320,6 +344,31 @@ extension MonitorState {
     value.clean = false
     value.geometry.magnification = Magnification()
     return value
+  }
+}
+
+/// A camera's monitor-only LUT file: its read-only security-scoped bookmark
+/// (as saved for the burn-in LUT; the contents are never persisted) and the
+/// file name the interface shows while the bookmark is not resolved.
+struct MonitorLUTChoice: Codable, Equatable, Sendable {
+  var bookmark: Data
+  var fileName: String
+
+  init(bookmark: Data, fileName: String) {
+    self.bookmark = bookmark
+    self.fileName = fileName
+  }
+
+  private enum CodingKeys: String, CodingKey { case bookmark, fileName }
+
+  /// Throws without a bookmark; a missing name reads as empty.
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    bookmark = try c.decode(Data.self, forKey: .bookmark)
+    guard !bookmark.isEmpty else {
+      throw DecodingError.dataCorruptedError(forKey: .bookmark, in: c, debugDescription: "empty bookmark")
+    }
+    fileName = ((try? c.decodeIfPresent(String.self, forKey: .fileName)) ?? nil) ?? ""
   }
 }
 
