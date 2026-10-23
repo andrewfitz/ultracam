@@ -108,17 +108,11 @@ private struct MonitorBoundTile: View {
       MonitorDiagnosticsDisclosure(snapshot: coordinator.diagnostics(for: target), surfaceScopeTiming: presenter.scopeTiming)
     } scopes: {
       if previewEnabled {
-        VStack(alignment: .leading, spacing: 3) {
-          HStack {
-            Text("\(displayed.scopes.title) · \(scopeStageTitle)").font(.caption)
-            Spacer()
-            Button(scopeExpanded ? "Dock" : "Expand") { scopeExpanded.toggle() }.font(.caption)
-          }
-          MonitorNativeScope(presenter: presenter).frame(height: scopeExpanded ? 240 : 120)
-            .overlay { ScopeIREScaleView(scale: displayed.scopes.ireScale, showsGrid: false) }
-          Text(presenter.scopeTiming).font(.caption2).foregroundStyle(.secondary)
-          Text(presenter.scopeInterpretation).font(.caption2).foregroundStyle(.secondary)
-          Text(displayed.scopes.ireScale.caption).font(.caption2).foregroundStyle(.secondary)
+        UIScopePanel(
+          description: scopeDescription, expanded: $scopeExpanded, statistics: nil,
+          isLive: !presenter.isFrozen, timing: presenter.scopeTiming, interpretation: presenter.scopeInterpretation
+        ) {
+          MonitorNativeScope(presenter: presenter)
         }
       }
     }
@@ -134,13 +128,11 @@ private struct MonitorBoundTile: View {
     .onChange(of: scopesVisible) { _, _ in register() }
     .onChange(of: preferences.wrappedValue.scopesShown) { _, _ in register() }
   }
-  private var scopeStageTitle: String {
-    if target.isProgram { return "Program Output" }
-    switch displayed.scopes.settings.stage {
-    case .source: return "Source"
-    case .output: return "Output (LUT)"
-    case .monitor: return "Monitor"
-    }
+  /// What the shown scope measures: the frozen settings while frozen.
+  private var scopeDescription: UIScopeDescription {
+    UIScopeDescription(
+      scopes: displayed.scopes, signal: presenter.shownSignal, burnInLUT: presenter.host.burnInLUT != nil,
+      isProgram: target.isProgram)
   }
   @ViewBuilder private var surfaceViewActions: some View {
     if displayed.scopes.enabled {
@@ -279,7 +271,11 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
           next.toolsEnabled = next.anyToolOn
           preferences = next
         }
-      )
+      ) {
+        UIScopeSettingsView(
+          scopes: $preferences.scopes, isProgram: isProgram, signal: presenter?.shownSignal,
+          burnInLUT: presenter?.host.burnInLUT != nil)
+      }
       .disabled(target == nil)
       if !detail.isEmpty {
         Text(detail).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
