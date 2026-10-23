@@ -297,40 +297,53 @@ import XCTest
         // start, the scope link's 2 ms slack and the picture count's own edge.
         XCTAssertLessThanOrEqual(scopes, min(Double(hz) * elapsed, presented) + 3,
           "Scopes never draw faster than their rate or than new pictures arrive")
+        XCTAssertEqual(end.failures, 0)
+        // The rate checks below depend on the render thread getting its display
+        // links' callbacks, which a loaded machine delays (both links run on that
+        // one thread), so a round that misses any of them is re-measured, up to
+        // three rounds, and they are asserted together once a round meets them all
+        // or on the last. The ceiling and the failure count above hold in every round.
+        let scopeRateMet: Bool
+        let scopeFloor: Double
         if Double(hz) * 2 <= pictureHz {
           // Two or more new pictures per scope slot: every slot finds one whatever
           // the phase, so the chosen rate is met exactly.
-          XCTAssertEqual(scopeFPS, Double(hz), accuracy: max(1.5, Double(hz) * 0.15), "Scopes keep the chosen rate")
+          scopeFloor = 0
+          scopeRateMet = abs(scopeFPS - Double(hz)) <= max(1.5, Double(hz) * 0.15)
         } else {
-          // A scope rate at the picture's rate is phase-bound: when picture
-          // presentation jitter straddles the scope link's tick, one slot finds no
-          // new picture and the next finds two (the older is never scoped). Over the
-          // slots the scope link could have had (the chosen rate, scaled by the share
-          // of refreshes the render thread's display link actually delivered) and the
-          // pictures there were: n arrivals fully decorrelated from n slots fill
-          // 1 - (1 - 1/n)^n > 1 - 1/e (0.632) of them on average (the occupancy
-          // problem), and bounded jitter fills at least half; a scope that drew only
-          // every other slot would fill at most half. The floor sits between them.
-          let delivered = min(1, refreshesFPS / displayHz)
-          let ceiling = min(Double(hz) * elapsed * delivered, presented)
-          XCTAssertGreaterThanOrEqual(scopes, 0.6 * ceiling,
-            "Scopes at the picture's rate fill most slots a new picture reached (phase-bound ceiling \(ceiling))")
+          // A scope rate at the picture's rate: a slot finds a new picture unless
+          // presentation jitter straddles the scope link's tick (one slot then finds
+          // none and the next finds two, the older never scoped). Both links tick on
+          // the display's own refresh grid, so this is rare: an idle machine fills
+          // 93-100% of the slots there were (the chosen rate, and no more than the
+          // pictures presented). The floor is the chosen rate's 15% tolerance, which
+          // a scope that drew two slots in three (67%) or every other slot (50%) misses.
+          scopeFloor = 0.85 * min(Double(hz) * elapsed, presented)
+          scopeRateMet = scopes >= scopeFloor
         }
+        let skipsMet = skipped.0 + skipped.1 <= 2
         // Strict: a 30 Hz picture has every frame presented. A frame goes
         // unpresented only if the display link delivered no refresh for a whole
         // picture interval, at least displayHz / pictureHz - 1 refreshes in a row
-        // (the render thread starved). So a miss is re-measured, up to three
-        // rounds, only when the refreshes the link failed to deliver account for
-        // every unpresented frame; otherwise it fails at once.
+        // (the render thread starved). So a picture miss is re-measured only when
+        // the refreshes the link failed to deliver account for every unpresented
+        // frame; otherwise it fails at once.
         let pictureMet = presentedFPS > 28
         let missedRefreshes = max(0, displayHz * elapsed - refreshesFPS * elapsed)
         let starved = max(0, offered - presented) * (displayHz / pictureHz - 1) <= missedRefreshes
-        if pictureMet || !starved || round == rounds {
+        if (pictureMet && scopeRateMet && skipsMet) || (!pictureMet && !starved) || round == rounds {
+          if Double(hz) * 2 <= pictureHz {
+            XCTAssertEqual(scopeFPS, Double(hz), accuracy: max(1.5, Double(hz) * 0.15),
+              "Scopes keep the chosen rate in one of \(rounds) rounds (the last shown)")
+          } else {
+            XCTAssertGreaterThanOrEqual(scopes, scopeFloor,
+              "Scopes at the picture's rate fill the slots a new picture reached in one of \(rounds) rounds (the last shown)")
+          }
+          XCTAssertLessThanOrEqual(skipped.0 + skipped.1, 2,
+            "Scopes are rarely skipped in one of \(rounds) rounds (the last shown)")
           XCTAssertGreaterThan(presentedFPS, 28, "The picture keeps every frame while scopes draw")
           settled = true
         }
-        XCTAssertLessThanOrEqual(skipped.0 + skipped.1, 2, "Scopes are rarely skipped on an idle GPU")
-        XCTAssertEqual(end.failures, 0)
       }
     }
   }
@@ -415,7 +428,8 @@ import XCTest
   /// frame is presented or counted as replaced before a refresh. A 30 Hz and a
   /// 60 Hz source on a faster display have every frame presented and none
   /// replaced; a source at the display's own rate is presented on most of the
-  /// refreshes the display link delivers. The GPU time per 4K picture is reported.
+  /// refreshes the display link delivers, and the link delivers 90% of the
+  /// display's refreshes with a 4K picture's GPU time inside one refresh.
   func testSyntheticSourcePresentsEveryFrameAtTheSourceRate() throws {
     guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
     let coordinator = MonitorCoordinator()
@@ -497,27 +511,41 @@ import XCTest
             floorsMet = true
           }
         } else {
-          // A source at the refresh rate is phase-bound: when offer jitter
-          // straddles the display link's tick, one refresh finds no new frame and
-          // the next finds two (the older is superseded, and counted above). n
-          // offers fully decorrelated from n refreshes fill 1 - (1 - 1/n)^n >
-          // 1 - 1/e (0.632) of them on average (the occupancy problem), and bounded
-          // jitter fills at least half; a presenter that took only every other
-          // refresh would fill at most half. The floor sits between them, and a
-          // round under it is re-measured.
+          // The display link itself is the regression check. It calls back only
+          // when it has a drawable, so a picture path that takes longer than a
+          // refresh (render thread or GPU), or a link capped below the display's
+          // rate, delivers fewer refreshes and presents one picture on each: the
+          // floors relative to delivered refreshes would hold, and the frames it
+          // cannot take are superseded, which the accounting above also balances.
+          // So the link must deliver 90% of the display's refreshes (an idle
+          // machine delivers 98-100%; a picture path of 5 ms on a 240 Hz display
+          // delivers 83%), and a 4K picture's GPU time must fit in one refresh
+          // (about 0.3 ms measured). A loaded machine delivers fewer, so a round
+          // under them is re-measured.
+          let refreshFloor = 0.9 * refresh
+          let gpuBudget = 1000 / refresh
+          let gpuMilliseconds = end.pictureGPUMilliseconds ?? .infinity
+          // A source at the refresh rate is phase-bound: when offer or callback
+          // jitter straddles the display link's tick, one refresh finds no new
+          // frame and the next finds two (the older is superseded, and counted
+          // above). With jitter shorter than a refresh and independent from one to
+          // the next, a refresh is empty only when its own frame is late and the
+          // one before was not, q(1 - q) <= 1/4 of them, so a correct presenter
+          // fills at least 3/4 at any phase (idle rounds fill 86-100%); a presenter
+          // that took only every other refresh fills at most 1/2. A loaded
+          // machine's late callbacks come in bursts and fill less (58% has been
+          // seen at 229 refreshes/s), so the floor between them is a smoke check,
+          // re-measured, beside the refresh floor and the accounting.
           let presentationFloor = 0.6 * Double(ceiling)
-          // The display link itself: a loaded machine delivers fewer refreshes than
-          // the display's rate, but a link held to half the rate or less (a frame
-          // rate cap, or a picture that takes longer than a refresh) is a defect.
-          // A cap at half delivers at most half; the 4% margin covers the window's
-          // timing.
-          let refreshFloor = 0.52 * refresh
-          floorsMet = Double(presented) >= presentationFloor && refreshesFPS > refreshFloor
+          floorsMet = Double(presented) >= presentationFloor && refreshesFPS >= refreshFloor
+            && gpuMilliseconds < gpuBudget
           if !floorsMet && round == rounds {
             XCTAssertGreaterThanOrEqual(Double(presented), presentationFloor,
               "A display-rate source fills most refreshes in one of \(rounds) rounds (the last shown)")
-            XCTAssertGreaterThan(refreshesFPS, refreshFloor,
-              "The display link delivers over half the display's refreshes in one of \(rounds) rounds (the last shown)")
+            XCTAssertGreaterThanOrEqual(refreshesFPS, refreshFloor,
+              "The display link delivers 90% of the display's refreshes in one of \(rounds) rounds (the last shown)")
+            XCTAssertLessThan(gpuMilliseconds, gpuBudget,
+              "A 4K picture's GPU time fits in one refresh in one of \(rounds) rounds (the last shown)")
           }
         }
       }
