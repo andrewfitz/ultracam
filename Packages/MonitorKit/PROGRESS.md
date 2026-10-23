@@ -7,9 +7,9 @@ The autonomous build log. The heartbeat (every 5 hours) reads this file to resum
 - [x] P0 Foundation (main session, 2026-10-21): package skeleton (macOS 26, Swift 6, MSL 4.0), Core model, ported reference math (23 tests), shaders written and compiling, contract in `Docs/ARCHITECTURE.md`
 - [x] W1 Build, then audit round 1 (3 lenses) and fixes per module: picture pass, scopes, audio, math verification. Ends with an integration agent. Done 2026-10-22: every audit finding fixed; the integration step fixed the math stream's open discrepancies (Docs/MATH.md section 9: S-Gamut3 weights, AWG3/AWG4 gamuts, depth-aware full-container rescale, ARRI range convention, six-band comment, skin-tone doc), removed every XCTExpectFailure, added the picture/scope agreement test, and updated ARCHITECTURE.md and MATH.md. Open for W2: HDR/EDR output encoding and the analytic display transforms, Freeze, per-channel clip indicators, MonitorKitUI (empty so far).
 - [x] W2 HDR/display transforms + EDR; MonitorKitUI; a dedicated performance/optimization pass; audit round 2 of the W1 modules + fixes. Done 2026-10-22 (integration step: see "W2 result" below). Added beyond the plan: the Metal 4 encode path for every GPU object (bit-identical to classic), MonitorMultiview, white-point trim, scope HDR colours.
-- [ ] W3 Two audit rounds of the W2 work + fixes; docs (README, FEATURES, API, INTEGRATION, MATH, LICENSE); final benchmarks
-- [ ] W4 (GATED: starts only after session "ultracam-18" commits its app work: GPU monitor in MonitorTools, pipelined LUTProcessor, Program, Recording, DeckLink SDK 16. Its app files are off limits until then) Ultracam integration: LUT fused into LUTProcessor, monitor surfaces on MonitorKit, UI, then 2 audits and regression tests
-- [ ] W5 Final verification and report
+- [x] W3 Two audit rounds of the W2 work + fixes; docs (README, FEATURES, API, INTEGRATION, MATH, LICENSE); final benchmarks. Done 2026-10-22: fd87db8 (final perf pass + the W3 library work: docs, CHANGELOG, NOTICE, ported tests, texture cache, warm-up, UI chrome), ff54124 (exact-quotient scope decode, checksummed statistics slots, stress-test hardening: 759 tests, 0 failures), 97fd185 (gate helper), then the W4-found library fixes 96fdeb6 and 12e6b11. See "W3 + W4 result" below.
+- [x] W4 Ultracam integration: LUT fused into LUTProcessor, monitor surfaces on MonitorKit, UI, then audits and regression tests; MonitorTools retired (74de953). Done 2026-10-23 at 1baddab; all gates green (see "W3 + W4 result" below).
+- [ ] W5 Final verification and report. Offline verification done 2026-10-23 (final-verify at 1baddab, every gate run; see below). Still open: plan step 9, the hands-on check with the UltraStudio (needs `LIVE=1` or the installed app quit, so only with the user's go-ahead), and the final report to the user.
 
 ## Workflow runs
 
@@ -92,8 +92,59 @@ Next: W3 (two audit rounds of the W2 work + fixes; README, FEATURES, API, INTEGR
   - `AppModel` hands each camera's `CaptureController.burnInLUT` to `MonitorCoordinator.setBurnInLUTSource`. It does this at every `installCaptureUpdateHandler` and clears it when a feed is removed. So Output (LUT) and the Output-stage tools show the LUT the camera burns in.
 - Heartbeat 2026-10-22 10:21: W3+W4 (wf_811d7738-f78) running: library audits, docs and W4 s1-plumbing in progress
 
-## Queued peer findings (ultracam-18, 2026-10-22) — fold in after W4 final-verify, before releasing the freeze
-1. AppModel refused-Start expiry: drop the camera's `refusedStarts` entry (or call expireResolvedStartRefusals()) whenever its selectedDevice changes — selectedDevice didSet for the selected camera, updateCamera/setInput for others. Today a stale "Couldn't start" can resurface on a later unplug.
-2. AppModel.startRefusal: `selectedDevice.isEmpty` should say "Choose an input for this camera." not "Connect the UltraStudio."
-3. ProgramOutputBridge ~404-416 host-time anchoring: re-anchor when mapped time is more than ~2 frame durations behind/ahead of now, not only past ±1 s (short on-air gaps leave a lasting latency offset). Low priority.
+## Queued peer findings (ultracam-18, 2026-10-22) — DONE 2026-10-23 (folded into the W4 fix pass; verified by final-verify)
+1. DONE in 2367ed1. AppModel refused-Start expiry: drop the camera's `refusedStarts` entry (or call expireResolvedStartRefusals()) whenever its selectedDevice changes — selectedDevice didSet for the selected camera, updateCamera/setInput for others. Today a stale "Couldn't start" can resurface on a later unplug.
+2. DONE in 2367ed1, refined in 1baddab. AppModel.startRefusal: `selectedDevice.isEmpty` should say "Choose an input for this camera." not "Connect the UltraStudio." Shipped: `inputUnavailableReason` says "Choose an input for this camera." when inputs are listed but none is chosen, and "Connect the UltraStudio." only when no input is listed at all (nothing to choose).
+3. DONE in 2367ed1, then 5345245 and 1baddab. ProgramOutputBridge ~404-416 host-time anchoring: re-anchor when mapped time is more than ~2 frame durations behind/ahead of now, not only past ±1 s (short on-air gaps leave a lasting latency offset). Low priority. Shipped: frames more than two frames off re-anchor only when they stay equally late with nothing queued behind them (a gap on air), after 0.25 s of host time; a single late frame, a slow send or a stalled burst catching up keeps the anchor.
 - Heartbeat 2026-10-22 15:21: W3+W4 (wf_811d7738-f78) still running; W4 through s4-feedhost committed (8e1808b, 15:00), feed-host gates in progress
+- Heartbeat 2026-10-22 20:21: W3+W4 (wf_811d7738-f78) still running; wave 5 in progress (tools UI 83ac74e, scopes UI 2a0afaa, audio 0f611af committed; s6d fix gates running)
+- 2026-10-23 00:01: W3+W4 run finished except the final whole-diff audits (4 lenses) and final:verify, which failed on a lost login. Resumed wf_811d7738-f78 (task wwbftbspq); completed agents replay from cache.
+- 2026-10-23 00:21: resuming wf_811d7738-f78 did NOT replay from cache: it re-ran library fixes and W4 step-1 audit/fix live and would have re-run committed W4 steps, so it was stopped (task wwbftbspq). Its killed fix agents left uncommitted edits (MonitorKit Sources/Tests, scripts/monitor-kit-package.sh, the integration map). DO NOT resume wf_811d7738-f78 again.
+- 2026-10-23 00:35: CURRENT RUN = wf_92e6fc1e-b47 (task wuj709vro), script workflows/scripts/monitorkit-w4-finish.js: finish the interrupted fixes → whole-diff 4-lens W4 audit → fix-w4-all (+ the 3 queued peer findings, all gates, Metal validation) → re-audit of the fixes → final-verify (PROGRESS, commit). Heartbeat: resume THIS run id/script if it is interrupted.
+- 2026-10-23 03:58: wf_92e6fc1e-b47 reached final-verify: every gate green at 1baddab (below). Only W5's hands-on step and the report remain. Tell ultracam-18 that W4 is done and its freeze on the W4 files, generate_project.py and build.sh is released.
+
+## W3 + W4 result (final-verify, 2026-10-23, HEAD 1baddab)
+
+W4 commits, in order: 0415118 (s1 plumbing), 0969f83 (settings schema, legacy blob migrated and kept), 230fa4d, d771ef3, 57b1dab (burn-in LUT on MonitorKit's `mk_applyLUT`, one shared `MonitorLUT`), 8e1808b, 5541949 (GPU context, feed host), cc1548a, ce8c586 (surfaces), 0ed64da (output bridge removed, Output (LUT) in the shader), dfa6566, 9008b8a, b7ef7b1, f9802a6 (ported UI tests), 5ecdd8e, 0f611af (audio meters), e6fbcde, 6bd5d2f (monitor-only LUT), 83ac74e, 2a0afaa, 2aa3686, f33d024, af549cf (tools and scopes UI), 001c229 (wiring and checks), 74de953 (MonitorTools retired), 63ee7c9 (CameraSmoke on the Metal 4 path), 96fdeb6, 12e6b11 (library findings), 5188d0d (retry only on missed timing budgets), 2367ed1, 5345245, 1baddab (whole-diff audit findings and the three peer findings).
+
+Gates at 1baddab (M4 Max; logs in /tmp/fv):
+- T `ui-typecheck.sh`: OK.
+- U `test.sh`: app 592/592, 0 failures; MonitorKit 796, 0 failures, 0 FLAKY retries. Baseline 459: +133, all deliberate W4 tests: LUTGoldenChecks +6, MonitorCoordinatorChecks +13, MonitorCoordinatorChecksFalseColor +11 and MonitorCoordinatorChecksSurfaces +22 (the ported MonitorToolsUITests and SonyFalseColorUITests), MonitorKitHost/MonitorFeedHostChecks +16, MonitorLifecycleChecksBoundary +5, Defaults +5, Migration +38, MonitorLUT +12, CaptureRecordingIsolationChecks +2, ProgramOutputRouteChecks +2 (host-time anchoring), main.swift +1. None removed.
+- V `FORCE=1 ui-verify.sh`: 791 passed, 0 failed, 189 images. Baseline 457 checks / 117 images: +334 checks, +72 images, all added by W4 (monitor tool and scope popover screens via UIMonitorToolScreens/UIMonitorToolVerify, MonitorLUTVerify, MonitorWorkspaceVerify, AudioMeterTapVerify, the main.swift additions). None removed.
+- I `monitor-app-integration.sh`: OK on reruns 2 and 3 (32 tests). Run 1 failed one timing case: `testSyntheticSourcePresentsEveryFrameAtTheSourceRate`, display-rate source on this 240 Hz display, presented 212.98 fps against a 0.9 × 239.94 = 215.94 floor (80 superseded, 239.3 refreshes/s). Rerun 2: 239.86 fps, 0 superseded. Rerun 3: 220.70 fps, 58 superseded, with the display link at only 225.7 refreshes/s. The 30 and 60 Hz cases presented every frame with 0 superseded in all three runs. Open (see below).
+- K MonitorKit `swift test`: 796 tests, 2 skipped (the opt-in window tests), 0 failures. MonitorKitTests 256, MonitorKitScopesTests 152, MonitorKitCoreTests 159, MonitorKitAudioTests 79, MonitorKitUITests 150 (W2: 169, 123, 140, 74, 115 = 621; ff54124: 759).
+- `swift build -c release` of the package: clean, 0 warnings.
+- B `build.sh --debug`: built; `validate_bundle.py` passes ("no MonitorTools shipped"); the regenerated project matches the committed one.
+- S `SKIP_BUILD=1 app-self-test.sh` (non-live, Debug preferences backed up and restored by path): 39 passed, 0 failed.
+
+Integration readings (I, run 2): 4K v210 → 1080p picture GPU median 0.211 ms (min 0.185); with focus, zebra and guides median 0.474 ms (min 0.460), under the 0.5 ms budget. Heap allocations per frame: slot 0, frame wrap 0, encode 2, the same as the same Metal encoder calls written inline. Scopes at 10/15/30 Hz beside a 30 Hz picture: 0 skipped, 0.80 ms GPU per scope. U's capture stage: 4K 29.97 v210 with a monitor, 90/90 camera and recording frames, monitor updates 89.
+
+Release binary (W2 measured Debug only). Baseline: the Release build of 1fab7f5 (2026-10-22 04:14, with MonitorTools). HEAD: a Release build of 1baddab in its own derived-data directory; the agent-work symlink was not touched.
+- `Contents/MacOS/Ultracam`: 20,301,696 → 25,017,704 B (+4.72 MB, +23 %). __TEXT +1.59 MB (`__text` 6.85 → 8.16 MB), __DATA/__DATA_CONST +0.33 MB, __LINKEDIT +2.88 MB (the Release product is not stripped).
+- Swift code by module (nm, `__text`): MonitorKit* 991 KB (UI 414, Core 198, MonitorKit 178, Scopes 142, Audio 60) replaces MonitorTools* 350 KB (UI 208, Core 73, Metal 68): +641 KB. The app's own module +465 KB (the W4 glue and UI); non-Swift (specializations, runtime) +121 KB.
+- Resource bundles: 24 KB (MonitorToolsMetal) → 140 KB (MonitorKit 88 + Scopes 52). App bundle 20.5 → 25.1 MB.
+- So MonitorKit is not size-neutral: it adds about 0.64 MB of code over MonitorTools, plus symbols. There is no per-frame cost: allocations per frame match inline encoding, and there are no CPU pixel copies.
+
+Behaviour decisions, rechecked at HEAD:
+- The app has no trilinear path. The only mention is `LUTGoldenChecks` asserting `LUTProcessor.load` rejects a trilinear `MonitorLUT`.
+- The menu says "Output (LUT)" (`UIScopeDescription`).
+- No camera-extension file changed since 1fab7f5 (no extension bump).
+- No TODO/FIXME was added since 1fab7f5.
+- No `import MonitorTools` remains. The remaining mentions are historical comments, the pinned boundary JSON in the tests, and `validate_bundle.py`'s guard.
+
+Open after W4:
+- I gate: the display-rate case of `testSyntheticSourcePresentsEveryFrameAtTheSourceRate` is phase-sensitive on a 240 Hz display (1 of 3 runs under its 0.9 floor). A source at exactly the refresh rate supersedes frames whenever offer jitter straddles vsync, and the display link itself sometimes ticks below 240/s. Either widen the floor to the refreshes actually counted or accept it as a timing budget in a retry policy; the sub-refresh cases are exact.
+- On disk, not in git: `Packages/MonitorTools/` still holds only the retired package's ignored `.build`/`.swiftpm` (about 512 MB). Moving it to the Trash was refused by the permission classifier, so remove it by hand. `/tmp` scratch: the mk-* build directories went to ~/.Trash. Left in place: the orchestrator's `/tmp/mk-w4-commits.json` and `/tmp/mk-resume-findings.json`, `/tmp/mk-*.log`, `/tmp/monitor-audit-*`, `/tmp/ultracam-monitor-package-cache-*` and `/tmp/fv` (final-verify logs).
+- Library doc nit: `Docs/MATH.md` §9 item 1 still says "The old read-only MonitorTools package still has the wrong constant"; the package is gone.
+- Release size: +4.72 MB binary (above). If it matters, check whether MonitorKitUI (414 KB) is reachable from the app and whether dead-stripping can drop more.
+- Carried from the W2 list, not re-verified here:
+  - Metal 4 pipelines are not MTL4Compiler/serializer warm-started.
+  - Display transforms cost +8 to +16 % over SDR.
+  - HLG → SDR hard-clips (no BT.2446 soft knee).
+  - HDR-to-HDR LUTs are not modelled.
+  - MonitorKitUI on iOS is compile-checked only.
+  - Feeds and scope bins are not shared across renderers.
+  - Audio below 48 kHz is not formally dBTP.
+- Closed from that list: LUT-stage focus 0.48 → 0.35 ms tetrahedral (fd87db8); the flaky scopes statistics test (ff54124, checksummed slots).
+- final-verify did not repeat the Metal validation run (`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`). That run was assigned to the workflow's fix-w4-all step.
+- W5: plan step 9, hands-on with the UltraStudio (LIVE=1 or the installed app quit), needs the user. Then the final report.
