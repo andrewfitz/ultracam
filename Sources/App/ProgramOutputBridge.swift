@@ -63,6 +63,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
   // sendQueue only: Program → host clock offset for the current connection.
   private var hostOffset: CMTime?
   private var lastSentTime: CMTime?
+  /// Host time (seconds) since which frames have been more than two frames late.
+  private var lateSince: Double?
   private var anchoredConnection: UInt64 = 0
 
   private let lock = NSLock()
@@ -367,6 +369,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
       if connection != anchoredConnection {
         anchoredConnection = connection
         hostOffset = nil
+        lateSince = nil
         lastSentTime = nil
       }
       let time = hostTime(for: metadata.presentationTime, duration: metadata.duration)
@@ -398,22 +401,38 @@ final class ProgramOutputBridge: @unchecked Sendable {
 }
 
 extension ProgramOutputBridge {
+  /// How long frames must stay late before the host-time anchor moves (seconds):
+  /// longer than a stall's catch-up burst, short against a gap on air.
+  static let lateReanchorDelay = 0.25
+
   /// Program time on the host clock: one offset per connection, so spacing is
   /// exactly the Program clock's. Re-anchored, never backwards, when the Program
-  /// clock restarts or steps back, or strays more than two frames from real time:
-  /// after a short gap on air Program time continues where it left off while real
-  /// time moved on, and every later frame would go out that much late. Delivery
-  /// jitter within two frames keeps the offset; a burst at one moment keeps the
-  /// spacing (the anchor is then the previous frame plus one duration).
+  /// clock restarts or steps back, strays more than two frames ahead of real time,
+  /// or stays more than two frames behind it for `lateReanchorDelay`: after a short
+  /// gap on air Program time continues where it left off while real time moved
+  /// on, and every later frame would go out that much late. Delivery jitter within
+  /// two frames, and one late frame or a stalled burst catching up, keep the
+  /// offset; a burst at one moment keeps the spacing (the anchor is then the
+  /// previous frame plus one duration).
   fileprivate func hostTime(for programTime: CMTime, duration: CMTime) -> CMTime {
     // On the Program timescale, so mapped spacing stays exact.
-    let now = CMTimeConvertScale(hostClock(), timescale: programTime.timescale, method: .roundTowardZero)
+    let clock = hostClock()
+    let now = CMTimeConvertScale(clock, timescale: programTime.timescale, method: .roundTowardZero)
     if let hostOffset {
       let mapped = CMTimeAdd(programTime, hostOffset)
       let ahead = CMTimeSubtract(mapped, now).seconds
       let tolerance = 2 * duration.seconds
-      if abs(ahead) <= tolerance, lastSentTime.map({ CMTimeCompare(mapped, $0) > 0 }) ?? true { return mapped }
+      if lastSentTime.map({ CMTimeCompare(mapped, $0) > 0 }) ?? true {
+        if ahead >= -tolerance { lateSince = nil }
+        if abs(ahead) <= tolerance { return mapped }
+        if ahead < -tolerance {
+          let since = lateSince ?? clock.seconds
+          lateSince = since
+          if clock.seconds - since < Self.lateReanchorDelay { return mapped }
+        }
+      }
     }
+    lateSince = nil
     var anchor = now
     if let lastSentTime { anchor = CMTimeMaximum(anchor, CMTimeAdd(lastSentTime, duration)) }
     hostOffset = CMTimeSubtract(anchor, programTime)

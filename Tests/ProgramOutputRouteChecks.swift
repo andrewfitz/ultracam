@@ -189,8 +189,10 @@ import XCTest
   }
 
   /// Host time keeps the Program clock's spacing through delivery jitter of up to
-  /// two frames, and after a short gap on air (Program time continues where it left
-  /// off, real time moved on) the next frames go out at real time, not the gap late.
+  /// two frames and through one late frame; after a short gap on air (Program time
+  /// continues where it left off, real time moved on) frames that stay late for
+  /// `lateReanchorDelay` move the anchor, so later frames go out at real time,
+  /// not the gap late.
   func testProgramBridgeReanchorsAfterAShortGapButNotOnJitter() throws {
     let source = feed("alpha")
     let route = ProgramOutputRoute(feedIDs: [source])
@@ -214,16 +216,19 @@ import XCTest
       _ = route.ingest(feedID: source, frame: processed(image, at: Int64(index)))
       bridge.pump()
     }
-    // Each frame up to 1.9 frames late or 0.9 early.
-    let jitter = [0, 1.5, -0.9, 0.7, 1.9, -0.5, 0.2, 1.2]
+    // Each frame up to 1.9 frames late or 0.9 early, then one frame 3 frames late.
+    let jitter = [0, 1.5, -0.9, 0.7, 1.9, -0.5, 0.2, 1.2, 3, 0, 0.4, 0]
     for (index, offset) in jitter.enumerated() { deliver(index, at: host(Double(index) + offset)) }
-    XCTAssertEqual(sent, (0..<8).map { host(Double($0)) }, "Jitter within two frames keeps the anchor")
+    XCTAssertEqual(sent, (0..<12).map { host(Double($0)) }, "Jitter and one late frame keep the anchor")
 
     let gap = CMTime(value: 12_000, timescale: 60_000)  // 0.2 s
-    for index in 8..<11 { deliver(index, at: host(Double(index), extra: gap)) }
-    XCTAssertEqual(Array(sent.suffix(3)), (8..<11).map { host(Double($0), extra: gap) },
-      "After a gap the frames go out at real time, spaced as Program")
-    XCTAssertEqual(bridge.currentStatistics.delivered, 11)
+    for index in 12..<34 { deliver(index, at: host(Double(index), extra: gap)) }
+    // 15 frames (0.25 s) after the gap the anchor moves to real time.
+    XCTAssertEqual(Array(sent[12..<27]), (12..<27).map { host(Double($0)) },
+      "Frames late for less than the delay keep the anchor")
+    XCTAssertEqual(Array(sent[27..<34]), (27..<34).map { host(Double($0), extra: gap) },
+      "Then they go out at real time, spaced as Program")
+    XCTAssertEqual(bridge.currentStatistics.delivered, 34)
   }
 
   func testProgramBridgeReconnectsAfterTransientSinkFailure() throws {
