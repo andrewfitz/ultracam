@@ -445,4 +445,121 @@ final class PipelineArchiveTests: XCTestCase {
     XCTAssertEqual(archiveFiles(d).count, 1)
     XCTAssertFalse(archive.save(), "nothing new")
   }
+
+  // MARK: - Files removed under a live archive
+
+  /// A loaded archive whose file is removed before any build used it (a host
+  /// clearing its caches, another engine evicting it) still builds: hits load,
+  /// misses compile. Metal converts an archive at its first compiler use and
+  /// raises an uncaught exception there when the file is gone, so each archive is
+  /// used once when it is opened.
+  func testRemovedFilesNeverBreakABuild() throws {
+    let gpu = try requireGPU()
+    let d = try directory()
+    let source = Self.kernel(8)
+    let writer = try MonitorPipelineArchive(
+      device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions)
+    _ = try writer.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(writer, source), offset: 1))
+    XCTAssertTrue(writer.save())
+    let reader = try MonitorPipelineArchive(
+      device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions)
+    XCTAssertEqual(reader.statistics.filesLoaded, 1)
+    let readerLibrary = try Self.library(reader, source)
+    for f in archiveFiles(d) { try FileManager.default.removeItem(at: f) }
+    // The saved file's archive, removed before any build used it.
+    XCTAssertEqual(
+      try Self.run(try writer.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(writer, source), offset: 2)))[3],
+      26)
+    // The loaded file's archive: a hit and a miss.
+    XCTAssertEqual(try Self.run(try reader.makeComputePipelineState(descriptor: Self.descriptor(readerLibrary, offset: 1)))[3], 25)
+    XCTAssertEqual(try Self.run(try reader.makeComputePipelineState(descriptor: Self.descriptor(readerLibrary, offset: 3)))[3], 27)
+    XCTAssertEqual(reader.statistics.hits + reader.statistics.misses, 2)
+    XCTAssertGreaterThanOrEqual(reader.statistics.misses, 1)
+    XCTAssertTrue(writer.save())
+    XCTAssertTrue(reader.save())
+  }
+
+  /// Two archives of one key at their file cap on one directory: one saves and
+  /// evicts the oldest file, which the other loaded but has not built with yet;
+  /// the other's next builds still work.
+  func testEvictionByAnotherArchiveNeverBreaksABuild() throws {
+    let gpu = try requireGPU()
+    let d = try directory()
+    let source = Self.kernel(9)
+    func open() throws -> MonitorPipelineArchive {
+      try MonitorPipelineArchive(
+        device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions,
+        maximumFiles: 2)
+    }
+    let seed = try open()
+    let seedLibrary = try Self.library(seed, source)
+    var offset: UInt32 = 0
+    while offset < 2 {
+      _ = try seed.makeComputePipelineState(descriptor: Self.descriptor(seedLibrary, offset: offset))
+      XCTAssertTrue(seed.save())
+      usleep(20_000)  // distinct modification dates
+      offset += 1
+    }
+    let oldest = Set(archiveFiles(d))
+    XCTAssertEqual(oldest.count, 2)
+    let a = try open(), b = try open()
+    XCTAssertEqual(a.statistics.filesLoaded, 2)
+    XCTAssertEqual(b.statistics.filesLoaded, 2)
+    _ = try b.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(b, source), offset: 5))
+    XCTAssertTrue(b.save())
+    XCTAssertEqual(Set(archiveFiles(d)).intersection(oldest).count, 1, "the oldest file was evicted")
+    let aLibrary = try Self.library(a, source)
+    XCTAssertEqual(try Self.run(try a.makeComputePipelineState(descriptor: Self.descriptor(aLibrary, offset: 0)))[2], 18)
+    XCTAssertEqual(try Self.run(try a.makeComputePipelineState(descriptor: Self.descriptor(aLibrary, offset: 7)))[2], 25)
+    a.save()
+    seed.save()
+  }
+
+  // MARK: - Failed saves, duplicate builds
+
+  /// A save that fails (here: the cache directory cannot be created) keeps the
+  /// session's pipelines, so the next save, once it can, writes them.
+  func testFailedSaveIsRetriedByTheNextSave() throws {
+    let gpu = try requireGPU()
+    let parent = try directory()
+    let d = parent.appendingPathComponent("cache")
+    try Data([1]).write(to: d)  // a file where the directory should be
+    let source = Self.kernel(10)
+    let archive = try MonitorPipelineArchive(
+      device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions)
+    _ = try archive.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(archive, source), offset: 1))
+    XCTAssertFalse(archive.save())
+    XCTAssertNotNil(archive.statistics.lastError)
+    XCTAssertEqual(archive.statistics.saves, 0)
+    try FileManager.default.removeItem(at: d)
+    XCTAssertTrue(archive.save(), "the failed save's pipelines are saved now")
+    XCTAssertEqual(archive.statistics.saves, 1)
+    XCTAssertEqual(archiveFiles(d).count, 1)
+    XCTAssertFalse(archive.save(), "nothing new")
+    let reader = try MonitorPipelineArchive(
+      device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions)
+    _ = try reader.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(reader, source), offset: 1))
+    XCTAssertEqual(reader.statistics.hits, 1)
+  }
+
+  /// A pipeline built twice (two threads racing for one key) is recorded once;
+  /// a hit made from an archive is the archive's pipeline and computes the same.
+  func testRepeatedBuildsAreRecordedOnce() throws {
+    let gpu = try requireGPU()
+    let d = try directory()
+    let source = Self.kernel(11)
+    let archive = try MonitorPipelineArchive(
+      device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions)
+    let lib = try Self.library(archive, source)
+    DispatchQueue.concurrentPerform(iterations: 4) { i in
+      _ = try? archive.makeComputePipelineState(descriptor: Self.descriptor(lib, offset: UInt32(i % 2)))
+    }
+    XCTAssertEqual(archive.statistics.misses, 4)
+    XCTAssertEqual(archive.recipeCount, 2)
+    XCTAssertTrue(archive.save())
+    let again = try archive.makeComputePipelineState(descriptor: Self.descriptor(lib, offset: 1))
+    XCTAssertEqual(archive.statistics.hits, 1, "made from the saved file")
+    XCTAssertEqual(archive.recipeCount, 2)
+    XCTAssertEqual(try Self.run(again)[3], 34)
+  }
 }

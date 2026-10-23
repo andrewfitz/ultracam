@@ -132,8 +132,10 @@ public final class ScopeEngine: @unchecked Sendable {
   /// `MonitorEngine`'s: the files are named per engine). The library and every
   /// pipeline are then built by `pipelineArchive`'s `MTL4Compiler`, looked up in
   /// the archive files of earlier launches first, and new ones are saved at the
-  /// end of each `prepare` call and shortly after any built later (off the frame
-  /// path). A stale or damaged archive is ignored. Pixels are identical with or
+  /// end of `prepare(pixelFormats:)` and `prepare(settings:layouts:pixelFormats:)`
+  /// (the start-up warm-up calls: they block for the file I/O) and shortly after
+  /// any built otherwise, `prepare(target:)` included (off the caller's thread and
+  /// the frame path). A stale or damaged archive is ignored. Pixels are identical with or
   /// without one. Nil: no cache, as the other initializer.
   public init(
     device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3,
@@ -366,7 +368,6 @@ public final class ScopeEngine: @unchecked Sendable {
   /// ahead of the first draw: built on this thread, or waited for when an
   /// asynchronous build of it is already running.
   public func prepare(target: MonitorRenderTargetFormat) throws {
-    defer { pipelineArchive?.save() }
     _ = try preparedRenderPipeline(RenderKey(target: target, scope: nil))
   }
 
@@ -385,11 +386,10 @@ public final class ScopeEngine: @unchecked Sendable {
   /// formats. Every pipeline is tried even after one fails; the first error is
   /// thrown at the end.
   public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], target: MonitorRenderTargetFormat?) throws {
-    defer { pipelineArchive?.save() }
     try prepareUnsaved(settings: settings, layouts: layouts, target: target)
   }
 
-  /// `prepare(settings:layouts:target:)` without saving the archive (its callers save once).
+  /// `prepare(settings:layouts:target:)`; the bulk callers save the archive once at the end.
   private func prepareUnsaved(settings: [ScopeSettings], layouts: [PixelLayout], target: MonitorRenderTargetFormat?)
     throws
   {

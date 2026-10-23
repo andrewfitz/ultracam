@@ -132,4 +132,27 @@ final class ScopePipelineArchiveTests: XCTestCase {
     XCTAssertEqual(second.pipelineArchive?.statistics.misses, 0)
     XCTAssertEqual(archiveFiles(d), files)
   }
+
+  /// `prepare(target:)` (a host may call it on its render thread) builds the one
+  /// pipeline and returns without saving: the scheduled save writes it shortly after.
+  func testPrepareTargetLeavesTheSaveToTheScheduledOne() throws {
+    let (device, _, _) = try GPU.require()
+    let d = try directory()
+    let engine = try ScopeEngine(device: device, specialization: .synchronous, cacheDirectory: d)
+    let archive = try XCTUnwrap(engine.pipelineArchive)
+    archive.save()
+    // Any save scheduled by init's builds has run (and found nothing new).
+    usleep(useconds_t((MonitorPipelineArchive.saveDelay + 0.5) * 1e6))
+    let saves = archive.statistics.saves
+    let misses = archive.statistics.misses
+    let target = MonitorRenderTargetFormat(colorPixelFormat: .rgba32Float)
+    try engine.prepare(target: target)
+    XCTAssertTrue(engine.isPrepared(target: target))
+    XCTAssertEqual(archive.statistics.misses, misses + 1)
+    XCTAssertEqual(archive.statistics.saves, saves, "not saved on the caller's thread")
+    let deadline = Date().addingTimeInterval(MonitorPipelineArchive.saveDelay + 20)
+    while archive.statistics.saves == saves, Date() < deadline { usleep(20_000) }
+    XCTAssertEqual(archive.statistics.saves, saves + 1, "saved by the scheduled save")
+    XCTAssertNil(archive.statistics.lastError)
+  }
 }

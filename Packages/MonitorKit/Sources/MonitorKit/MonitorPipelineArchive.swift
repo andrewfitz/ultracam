@@ -6,13 +6,14 @@ import Synchronization
 /// A persistent warm start for an engine's pipelines (Metal 4 archives).
 ///
 /// An engine made with a `cacheDirectory` builds its library and every pipeline
-/// with this archive's `compiler`, passing the archive files of earlier launches
-/// as lookup archives (`MTL4CompilerTaskOptions.lookupArchives`), so a pipeline
-/// built before is loaded instead of compiled. `save()` builds each pipeline of
+/// through this archive: a pipeline built before is made from the archive file of
+/// an earlier launch that holds it (`MTL4Archive.make…PipelineState`, one load, no
+/// compile); any other is compiled by `compiler`. `save()` builds each pipeline of
 /// the session again with a second compiler whose `MTL4PipelineDataSetSerializer`
-/// records the GPU binaries (each found in an archive or in the system's shader
-/// cache, which the first compile filled: about half a millisecond apiece) and
-/// writes them to a new file (`serializeAsArchiveAndFlush`).
+/// records the GPU binaries (each found in an archive, passed as
+/// `MTL4CompilerTaskOptions.lookupArchives`, or in the system's shader cache,
+/// which the first compile filled: about half a millisecond apiece) and writes
+/// them to a new file (`serializeAsArchiveAndFlush`).
 ///
 /// Why two compilers: the first is a plain one, so it reads and fills the
 /// system's shader cache as a host's compiler does; a compiler with a serializer
@@ -33,6 +34,15 @@ import Synchronization
 ///   after its bytes hash to its name, so a truncated, corrupt or foreign file is
 ///   ignored (and removed) before Metal reads it; Metal can crash on arbitrary bytes.
 ///
+/// Each archive is used once by `compiler` (a trivial kernel, with it as the only
+/// lookup archive) as soon as it is opened. Metal reads an `MTL4Archive`'s file
+/// again at its first use in a compiler build, and when the file is gone by then
+/// raises an uncaught exception (`-[__NSArrayM insertObject:atIndex:]: object
+/// cannot be nil` in AGX's `convertBinaryArchives`, macOS 27.0.1), which would end
+/// the host. Once used, the archive no longer needs its file, so a host clearing
+/// its caches, or another engine of this key evicting a file this one loaded,
+/// changes nothing but what the next launch finds.
+///
 /// Each save writes a new file (a temporary file renamed into place, so a
 /// concurrent reader or another engine saving the same key never sees a partial
 /// file), holding every pipeline built this session, including those loaded from
@@ -44,11 +54,12 @@ import Synchronization
 /// whole pipeline descriptor (functions, constants, attachments) matches, and the
 /// GPU binary is the one the compiler made for it.
 ///
-/// Thread-safe. Lookups take a short lock; `save()` does file I/O (a few hundred
-/// milliseconds) and is never called on a frame: engines save at the end of
-/// `warmUp`/`prepare` calls and, for pipelines built later, from a utility-priority
-/// task `saveDelay` seconds after the last new pipeline (no thread or queue of the
-/// library's own).
+/// Thread-safe. Lookups take a short lock; `save()` records every pipeline of the
+/// session again and writes a file (tens to a few hundred milliseconds) and is
+/// never called on a frame: engines save at the end of `MonitorEngine.warmUp` and
+/// the bulk `ScopeEngine.prepare` calls and, for pipelines built later, from a
+/// utility-priority task `saveDelay` seconds after the last new pipeline (no
+/// thread or queue of the library's own).
 public final class MonitorPipelineArchive: @unchecked Sendable {
   /// Counters for logs and tests.
   public struct Statistics: Equatable, Sendable {
@@ -64,7 +75,7 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
     public var misses = 0
     /// Archive files written.
     public var saves = 0
-    /// The last save or load failure, if any.
+    /// The last save, recording or load failure, if any.
     public var lastError: String?
   }
 
@@ -81,8 +92,8 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   public let key: String
   /// Files kept per key.
   public let maximumFiles: Int
-  /// Builds the library and every pipeline (a plain compiler: it uses the system
-  /// shader cache), looking each up in the loaded archives first.
+  /// Builds the library and every pipeline no loaded archive holds (a plain
+  /// compiler: it uses and fills the system shader cache).
   package let compiler: any MTL4Compiler
   /// Records the pipelines for `save()`: builds them again with its serializer.
   private let recorder: any MTL4Compiler
@@ -93,6 +104,9 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   /// `<gpuPrefix><key prefix>-`: the files of this key.
   private let keyPrefix: String
   private let saveLock = NSLock()
+  /// The trivial pipeline each archive is first used with (see the type), made on
+  /// the first archive opened.
+  private let primer = Mutex<MTL4ComputePipelineDescriptor?>(nil)
 
   private struct Loaded {
     var url: URL
@@ -105,12 +119,19 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
     case compute(MTL4ComputePipelineDescriptor)
   }
 
+  /// A recipe's descriptor as a set member (MTL4 pipeline descriptors compare by value).
+  private struct Recorded: Hashable, @unchecked Sendable {
+    let descriptor: NSObject
+  }
+
   private struct State {
     /// Newest first.
     var loaded: [Loaded] = []
-    /// Every pipeline built this session, in order. Each save records them all,
-    /// so each new file holds the whole session.
+    /// Every pipeline built this session, in order, each once. Each save records
+    /// them all, so each new file holds the whole session.
     var built: [Recipe] = []
+    /// The descriptors in `built`.
+    var recorded = Set<Recorded>()
     var options = MTL4CompilerTaskOptions()
     var statistics = Statistics()
     /// A pipeline was compiled (not found) since the last save.
@@ -156,21 +177,25 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
     } catch {
       throw MonitorKitError.gpu("Cannot create the \(name) pipeline compiler: \(error)")
     }
-    var initial = State()
+    state = Mutex(State())
+    var loaded: [Loaded] = []
     var rejected = 0
     for url in Self.files(in: directory, prefix: keyPrefix).sorted(by: Self.newestFirst) {
-      guard initial.loaded.count < self.maximumFiles else { break }
-      if let archive = Self.verifiedArchive(url, keyPrefix: keyPrefix, device: device) {
-        initial.loaded.append(Loaded(url: url, archive: archive))
-      } else {
+      guard loaded.count < self.maximumFiles else { break }
+      switch verifiedArchive(url) {
+      case .opened(let archive): loaded.append(Loaded(url: url, archive: archive))
+      case .rejected:
         rejected += 1
         try? FileManager.default.removeItem(at: url)
+      case .unavailable: break
       }
     }
-    initial.statistics.filesLoaded = initial.loaded.count
-    initial.statistics.filesRejected = rejected
-    initial.options.lookupArchives = initial.loaded.map(\.archive)
-    state = Mutex(initial)
+    state.withLock { s in
+      s.loaded = loaded
+      s.statistics.filesLoaded = loaded.count
+      s.statistics.filesRejected = rejected
+      s.options.lookupArchives = loaded.map(\.archive)
+    }
   }
 
   public var statistics: Statistics { state.withLock { $0.statistics } }
@@ -178,39 +203,54 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   /// The archive files in use for lookups, newest first.
   public var files: [URL] { state.withLock { $0.loaded.map(\.url) } }
 
+  /// The pipelines the next save records (each descriptor once).
+  var recipeCount: Int { state.withLock { $0.built.count } }
+
   // MARK: Building
 
   package func makeLibrary(descriptor: MTL4LibraryDescriptor) throws -> MTLLibrary {
     try compiler.makeLibrary(descriptor: descriptor)
   }
 
-  /// The render pipeline for `descriptor`: from an archive when one has it,
-  /// otherwise compiled. Either way kept for the next save to record.
+  /// The render pipeline for `descriptor`: made from the newest loaded archive
+  /// that holds it, otherwise compiled. Either way kept for the next save to record.
   package func makeRenderPipelineState(descriptor: MTL4RenderPipelineDescriptor) throws -> MTLRenderPipelineState {
-    let (options, hit) = lookup { try $0.makeRenderPipelineState(descriptor: descriptor) }
-    let made = try compiler.makeRenderPipelineState(descriptor: descriptor, compilerTaskOptions: options)
     // A copy: the caller's descriptor is its own to change.
-    note(hit: hit, .render(descriptor.copy() as! MTL4RenderPipelineDescriptor))
+    let recipe = descriptor.copy() as! MTL4RenderPipelineDescriptor
+    if let found = lookup({ try $0.makeRenderPipelineState(descriptor: descriptor) }) {
+      note(hit: true, recipe, .render(recipe))
+      return found
+    }
+    let made = try compiler.makeRenderPipelineState(descriptor: descriptor)
+    note(hit: false, recipe, .render(recipe))
     return made
   }
 
-  /// The compiler's asynchronous build (Metal's compiler threads). Only the plain
-  /// build compiler is used asynchronously: on macOS 27 (SDK 27.0) an asynchronous
-  /// build by a compiler with a pipeline data set serializer crashes in Metal's
-  /// compiler scheduler, so the recorder builds synchronously, in `save()`.
+  /// The compiler's asynchronous build (Metal's compiler threads) on a miss. Only
+  /// the plain build compiler is used asynchronously: on macOS 27 (SDK 27.0) an
+  /// asynchronous build by a compiler with a pipeline data set serializer crashes
+  /// in Metal's compiler scheduler, so the recorder builds synchronously, in `save()`.
   package func makeRenderPipelineState(descriptor: MTL4RenderPipelineDescriptor) async throws
     -> MTLRenderPipelineState
   {
-    let (options, hit) = lookup { try $0.makeRenderPipelineState(descriptor: descriptor) }
-    let made = try await compiler.makeRenderPipelineState(descriptor: descriptor, compilerTaskOptions: options)
-    note(hit: hit, .render(descriptor.copy() as! MTL4RenderPipelineDescriptor))
+    let recipe = descriptor.copy() as! MTL4RenderPipelineDescriptor
+    if let found = lookup({ try $0.makeRenderPipelineState(descriptor: descriptor) }) {
+      note(hit: true, recipe, .render(recipe))
+      return found
+    }
+    let made = try await compiler.makeRenderPipelineState(descriptor: descriptor)
+    note(hit: false, recipe, .render(recipe))
     return made
   }
 
   package func makeComputePipelineState(descriptor: MTL4ComputePipelineDescriptor) throws -> MTLComputePipelineState {
-    let (options, hit) = lookup { try $0.makeComputePipelineState(descriptor: descriptor) }
-    let made = try compiler.makeComputePipelineState(descriptor: descriptor, compilerTaskOptions: options)
-    note(hit: hit, .compute(descriptor.copy() as! MTL4ComputePipelineDescriptor))
+    let recipe = descriptor.copy() as! MTL4ComputePipelineDescriptor
+    if let found = lookup({ try $0.makeComputePipelineState(descriptor: descriptor) }) {
+      note(hit: true, recipe, .compute(recipe))
+      return found
+    }
+    let made = try compiler.makeComputePipelineState(descriptor: descriptor)
+    note(hit: false, recipe, .compute(recipe))
     return made
   }
 
@@ -218,28 +258,34 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   package func makeComputePipelineState(descriptor: MTL4ComputePipelineDescriptor) async throws
     -> MTLComputePipelineState
   {
-    let (options, hit) = lookup { try $0.makeComputePipelineState(descriptor: descriptor) }
-    let made = try await compiler.makeComputePipelineState(descriptor: descriptor, compilerTaskOptions: options)
-    note(hit: hit, .compute(descriptor.copy() as! MTL4ComputePipelineDescriptor))
+    let recipe = descriptor.copy() as! MTL4ComputePipelineDescriptor
+    if let found = lookup({ try $0.makeComputePipelineState(descriptor: descriptor) }) {
+      note(hit: true, recipe, .compute(recipe))
+      return found
+    }
+    let made = try await compiler.makeComputePipelineState(descriptor: descriptor)
+    note(hit: false, recipe, .compute(recipe))
     return made
   }
 
-  /// The lookup options, and whether an archive holds the pipeline (`probe` makes it
-  /// from one archive; a miss marks the archive for saving). The compiler then
-  /// builds it with the same archives, so a hit is loaded, not compiled.
-  private func lookup<T>(_ probe: (any MTL4Archive) throws -> T) -> (MTL4CompilerTaskOptions, Bool) {
-    let (options, archives) = state.withLock { ($0.options, $0.loaded.map(\.archive)) }
+  /// The pipeline `make` makes from the newest loaded archive that holds it (Metal
+  /// returns one only when the whole descriptor matches), or nil.
+  private func lookup<T>(_ make: (any MTL4Archive) throws -> T) -> T? {
+    let archives = state.withLock { $0.loaded.map(\.archive) }
     var i = 0
     while i < archives.count {
-      if (try? probe(archives[i])) != nil { return (options, true) }
+      if let found = try? make(archives[i]) { return found }
       i += 1
     }
-    return (options, false)
+    return nil
   }
 
-  private func note(hit: Bool, _ recipe: Recipe) {
+  /// Counts the build and keeps `recipe` for the next save (once per descriptor:
+  /// two threads may build the same pipeline); a miss schedules a save.
+  private func note(hit: Bool, _ descriptor: NSObject, _ recipe: Recipe) {
+    let key = Recorded(descriptor: descriptor)
     let schedule = state.withLock { s -> Bool in
-      s.built.append(recipe)
+      if s.recorded.insert(key).inserted { s.built.append(recipe) }
       if hit {
         s.statistics.hits += 1
         return false
@@ -255,8 +301,9 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   }
 
   /// One save `saveDelay` seconds after the last new pipeline of a burst, from a
-  /// utility-priority task (no thread or queue of the library's own). Holds the
-  /// archive until then.
+  /// utility-priority task (the library makes no thread or queue of its own, so
+  /// the save's file I/O blocks one cooperative-pool thread for its tens to a few
+  /// hundred milliseconds). Holds the archive until then.
   private func scheduleSave(after delay: TimeInterval) {
     Task.detached(priority: .utility) { [self] in
       var wait = delay
@@ -281,7 +328,8 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   /// GPU's files of other keys, files past `maximumFiles` and stale temporary
   /// files. Blocks for the file I/O; call it off the frame path (engines call it
   /// after warm-up). Returns whether a file was written. Never throws: a failure
-  /// is in `statistics.lastError` and the next launch starts cold.
+  /// is in `statistics.lastError`, and the session's pipelines stay to be saved by
+  /// the next call.
   @discardableResult
   public func save() -> Bool {
     saveLock.lock()
@@ -291,30 +339,54 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       return (s.dirty, s.built, s.options)
     }
     guard dirty else { return false }
+    /// Leaves the session to the next save (misses since stay counted).
+    func failed(_ message: String) -> Bool {
+      state.withLock { s in
+        s.dirty = true
+        s.statistics.lastError = message
+      }
+      return false
+    }
     // Into the serializer: archive or system-cache hits, as the build compiler
-    // just compiled any that were missing. One that fails is left out.
+    // just compiled any that were missing. One that fails is left out (reported).
+    var failures = 0
+    var firstFailure: (any Error)?
     var i = 0
     while i < built.count {
-      switch built[i] {
-      case .render(let d): _ = try? recorder.makeRenderPipelineState(descriptor: d, compilerTaskOptions: options)
-      case .compute(let d): _ = try? recorder.makeComputePipelineState(descriptor: d, compilerTaskOptions: options)
+      do {
+        switch built[i] {
+        case .render(let d): _ = try recorder.makeRenderPipelineState(descriptor: d, compilerTaskOptions: options)
+        case .compute(let d): _ = try recorder.makeComputePipelineState(descriptor: d, compilerTaskOptions: options)
+        }
+      } catch {
+        failures += 1
+        firstFailure = firstFailure ?? error
       }
       i += 1
     }
+    let recorderError = firstFailure.map { "recorder: \(failures) of \(built.count) pipelines failed: \($0)" }
     let fm = FileManager.default
     let temporary = directory.appendingPathComponent(".\(name)-\(UUID().uuidString).tmp")
     defer { try? fm.removeItem(at: temporary) }
     let url: URL
+    let archive: any MTL4Archive
     do {
       try fm.createDirectory(at: directory, withIntermediateDirectories: true)
       do {
         try serializer.serializeAsArchiveAndFlush(url: temporary)
       } catch let error as NSError where error.domain == MTLBinaryArchiveDomain && error.code == 3 {
-        return false  // Nothing to serialize: everything was already written.
+        // "Nothing to serialize": `built` is not empty, so every recording failed.
+        return failed(recorderError ?? "recorder: nothing recorded of \(built.count) pipelines")
       }
-      let data = try Data(contentsOf: temporary, options: .uncached)
+      // Hashed once: the archive is opened (and used once) from this file, which
+      // only this save knows, before it is renamed into place.
+      let data = try Data(contentsOf: temporary, options: .mappedIfSafe)
       url = directory.appendingPathComponent(
         keyPrefix + Self.hex(SHA256.hash(data: data)).prefix(32) + "." + Self.fileExtension)
+      guard let opened = try? device.makeArchive(url: temporary), prime(opened) else {
+        return failed("save: Metal cannot open the archive it wrote")
+      }
+      archive = opened
       if fm.fileExists(atPath: url.path) {
         // The same bytes, written by another engine of this key.
         try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
@@ -326,17 +398,14 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
         }
       }
     } catch {
-      state.withLock { $0.statistics.lastError = "save: \(error)" }
-      return false
+      return failed("save: \(error)")
     }
-    let archive = Self.verifiedArchive(url, keyPrefix: keyPrefix, device: device)
     state.withLock { s in
       s.statistics.saves += 1
-      if let archive {
-        s.loaded.removeAll { $0.url == url }
-        s.loaded.insert(Loaded(url: url, archive: archive), at: 0)
-        s.statistics.filesLoaded += 1
-      }
+      if let recorderError { s.statistics.lastError = recorderError }
+      s.loaded.removeAll { $0.url == url }
+      s.loaded.insert(Loaded(url: url, archive: archive), at: 0)
+      s.statistics.filesLoaded += 1
       if s.loaded.count > maximumFiles { s.loaded.removeLast(s.loaded.count - maximumFiles) }
       s.options = MTL4CompilerTaskOptions()
       s.options.lookupArchives = s.loaded.map(\.archive)
@@ -384,16 +453,53 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       .map { directory.appendingPathComponent($0) }
   }
 
+  private enum Opened {
+    case opened(any MTL4Archive)
+    /// Damaged: the bytes do not hash to the name, or Metal cannot open them.
+    case rejected
+    /// Gone (removed by another engine or the host) or not usable now.
+    case unavailable
+  }
+
   /// The archive at `url` if its bytes hash to the content hash in its name (so
-  /// Metal never reads a truncated or corrupt file) and Metal opens it.
-  private static func verifiedArchive(_ url: URL, keyPrefix: String, device: MTLDevice) -> (any MTL4Archive)? {
+  /// Metal never reads a truncated or corrupt file) and Metal opens it, used once
+  /// (`prime`), so it no longer needs the file.
+  private func verifiedArchive(_ url: URL) -> Opened {
     let file = url.deletingPathExtension().lastPathComponent
-    guard file.hasPrefix(keyPrefix) else { return nil }
+    guard file.hasPrefix(keyPrefix) else { return .rejected }
     let expected = file.dropFirst(keyPrefix.count)
-    guard expected.count == 32, let data = try? Data(contentsOf: url, options: .mappedIfSafe), !data.isEmpty,
-      hex(SHA256.hash(data: data)).prefix(32) == expected
-    else { return nil }
-    return try? device.makeArchive(url: url)
+    guard expected.count == 32 else { return .rejected }
+    guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return .unavailable }
+    guard !data.isEmpty, Self.hex(SHA256.hash(data: data)).prefix(32) == expected,
+      let archive = try? device.makeArchive(url: url)
+    else { return .rejected }
+    return prime(archive) ? .opened(archive) : .unavailable
+  }
+
+  /// Uses `archive` once in a compiler build (a trivial kernel, `archive` its only
+  /// lookup archive): Metal reads the archive's file again at its first compiler
+  /// use and raises an uncaught exception there when the file is gone, so this runs
+  /// while the file is known to be present. Measured: about 0.2 ms (a few ms for
+  /// the first in a process). False when the build fails: the archive is not used.
+  private func prime(_ archive: any MTL4Archive) -> Bool {
+    let descriptor = primer.withLock { made -> MTL4ComputePipelineDescriptor? in
+      if let made { return made }
+      let l = MTL4LibraryDescriptor()
+      l.name = "\(name) archive primer"
+      l.source = "kernel void mk_archive_prime() {}"
+      guard let library = try? compiler.makeLibrary(descriptor: l) else { return nil }
+      let f = MTL4LibraryFunctionDescriptor()
+      f.name = "mk_archive_prime"
+      f.library = library
+      let d = MTL4ComputePipelineDescriptor()
+      d.computeFunctionDescriptor = f
+      made = d
+      return d
+    }
+    guard let descriptor else { return false }
+    let options = MTL4CompilerTaskOptions()
+    options.lookupArchives = [archive]
+    return (try? compiler.makeComputePipelineState(descriptor: descriptor, compilerTaskOptions: options)) != nil
   }
 
   private static func newestFirst(_ a: URL, _ b: URL) -> Bool {
