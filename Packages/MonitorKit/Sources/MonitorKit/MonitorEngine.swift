@@ -305,7 +305,7 @@ public final class MonitorEngine: @unchecked Sendable {
     try prepare(target: target, layouts: layouts, compute: false)
   }
 
-  private func prepare(target: MonitorRenderTargetFormat, layouts: [PixelLayout]?, compute: Bool) throws {
+  func prepare(target: MonitorRenderTargetFormat, layouts: [PixelLayout]?, compute: Bool) throws {
     let kinds = layouts.map { $0.map(\.shaderKind) } ?? Array(0...4)
     for kind in Set(kinds) {
       let key = PipelineKey(target: target, layout: kind, variant: .uber, color: .fromUniforms)

@@ -340,7 +340,26 @@ extension MonitorFrame {
   /// chroma siting). Log encodings cannot be inferred from attachments; pass them
   /// explicitly. Reads the attachments as CF values without bridging, so it
   /// allocates nothing per frame.
+  ///
+  /// A buffer with no transfer function attachment, or one MonitorKit does not
+  /// read (e.g. SMPTE ST 428-1, a gamma), is taken as BT.709. This is also what
+  /// `wrap` and `MonitorTextureCache.frame` use when given no `signal`. A host that
+  /// wants such a picture shown as unlabelled code values (the code-value view,
+  /// and `.requiresKnownTransfer` for tools that need light) passes
+  /// `signal(of:range:untaggedTransfer: .unknown)` as the frame's `signal`.
   public static func signal(of pixelBuffer: CVPixelBuffer, range: CodeRange) -> SignalDescription {
+    signal(of: pixelBuffer, range: range, untaggedTransfer: .display(.bt709))
+  }
+
+  /// `signal(of:range:)` with `untaggedTransfer` as the encoding of a buffer whose
+  /// transfer function is missing or not one MonitorKit reads. It reads BT.709
+  /// (`kCVImageBufferTransferFunction_ITU_R_709_2`, and `ITU_R_2020`, the same
+  /// OETF per ITU-R BT.2020 Table 4), PQ, HLG, sRGB and linear. `.unknown` makes an
+  /// untagged capture-card buffer unlabelled code values, as MonitorTools showed it.
+  /// Allocates nothing per frame. The range comes from `layout(for:)`.
+  public static func signal(
+    of pixelBuffer: CVPixelBuffer, range: CodeRange, untaggedTransfer: SignalEncoding
+  ) -> SignalDescription {
     func attachment(_ key: CFString) -> CFTypeRef? { CVBufferCopyAttachment(pixelBuffer, key, nil) }
     func equal(_ value: CFTypeRef?, _ constant: CFString) -> Bool {
       guard let value else { return false }
@@ -352,11 +371,13 @@ extension MonitorFrame {
       : equal(m, kCVImageBufferYCbCrMatrix_ITU_R_601_4) ? .bt601
       : equal(m, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995) ? .smpte240m : .bt709
     let t = attachment(kCVImageBufferTransferFunctionKey)
-    let transfer: DisplayTransfer =
+    let transfer: DisplayTransfer? =
       equal(t, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) ? .pq
       : equal(t, kCVImageBufferTransferFunction_ITU_R_2100_HLG) ? .hlg
       : equal(t, kCVImageBufferTransferFunction_sRGB) ? .sRGB
-      : equal(t, kCVImageBufferTransferFunction_Linear) ? .linear : .bt709
+      : equal(t, kCVImageBufferTransferFunction_Linear) ? .linear
+      : equal(t, kCVImageBufferTransferFunction_ITU_R_709_2) || equal(t, kCVImageBufferTransferFunction_ITU_R_2020)
+        ? .bt709 : nil
     // H.273 chroma sample location types. SMPTE/QuickTime 4:2:2 is left-cosited
     // unless the producer labels it otherwise; 4:2:0 is vertically centred by default.
     let l = attachment(kCVImageBufferChromaLocationTopFieldKey)
@@ -375,7 +396,8 @@ extension MonitorFrame {
       : equal(p, kCVImageBufferColorPrimaries_ITU_R_2020) ? .rec2020
       : equal(p, kCVImageBufferColorPrimaries_P3_D65) ? .displayP3 : nil
     return SignalDescription(
-      range: range, matrix: matrix, chromaSiting: centred ? .center : .left, encoding: .display(transfer),
+      range: range, matrix: matrix, chromaSiting: centred ? .center : .left,
+      encoding: transfer.map { .display($0) } ?? untaggedTransfer,
       chromaVerticalSiting: vertical, primaries: primaries)
   }
 

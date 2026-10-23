@@ -26,14 +26,19 @@ public struct MonitorSurfaceConfiguration: Sendable {
   public var cleanAperture: MonitorRect?
   /// The compute picture (`MonitorPass.encodeCompute`) instead of the render pipeline.
   public var compute: Bool
+  /// The surface shows processed pictures (`MonitorFrame.isProcessed`, e.g. a
+  /// Program output), where peaking and the log false-colour modes are off: the
+  /// pass then specializes on that tool set, not the camera signal's.
+  public var isProcessed: Bool
 
   public init(
     target: MonitorRenderTargetFormat, layout: PixelLayout, state: MonitorState = MonitorState(),
     signal: SignalDescription = .rec709, outputColor: MonitorOutputColor = .signalNative, hasBurnInLUT: Bool = false,
     hasMonitorLUT: Bool = false, frameSize: (width: Int, height: Int)? = nil,
     viewportSize: (width: Int, height: Int)? = nil, compute: Bool = false, pixelAspectRatio: Double = 1,
-    cleanAperture: MonitorRect? = nil
+    cleanAperture: MonitorRect? = nil, isProcessed: Bool = false
   ) {
+    self.isProcessed = isProcessed
     self.pixelAspectRatio = pixelAspectRatio
     self.cleanAperture = cleanAperture
     self.target = target
@@ -59,9 +64,12 @@ extension MonitorEngine {
   /// - for each of `targets` and `layouts` (nil: all five layout kinds), the
   ///   all-tools picture pipeline, the focus-analysis pipelines and Freeze's copy
   ///   kernels (`prepare(target:layouts:)`);
-  /// - for each of `surfaces`, the pipeline specialized to its tool set and colour
-  ///   path, the one `MonitorPass` switches to once it is ready (peaking counted as
-  ///   drawn when `state.focus.enabled`, i.e. the frame analysed).
+  /// - for each of `surfaces`, the same for its own target (or, for a compute
+  ///   surface, the all-tools compute kernel) and layout, which a pass draws with
+  ///   while the pipeline for a changed tool set or colour path compiles; and the
+  ///   pipeline specialized to its tool set and colour path, the one `MonitorPass`
+  ///   switches to once it is ready (peaking counted as drawn when
+  ///   `state.focus.enabled`, i.e. the frame analysed; `isProcessed` as the frames say).
   ///
   /// Call it off the frame path, e.g. from a background task at start-up: it may
   /// take a few hundred milliseconds. Thread-safe; concurrent encodes keep drawing
@@ -75,6 +83,8 @@ extension MonitorEngine {
     let before = pipelinesBuilt
     for target in targets { try prepare(target: target, layouts: layouts) }
     for surface in surfaces {
+      // The stand-in a state change draws with while its specialized pipeline compiles.
+      try prepare(target: surface.target, layouts: [surface.layout], compute: surface.compute)
       for key in try Self.pipelineKeys(for: surface, placeholder: warmUpLUT()) {
         if surface.compute { _ = try computePipeline(key) } else { _ = try renderPipeline(key) }
       }
@@ -116,7 +126,7 @@ extension MonitorEngine {
             .shownRect) : nil
       let key = MonitorPass.Key(
         state: state, layout: surface.layout, width: max(1, frame.width), height: max(1, frame.height),
-        pixelAspectRatio: par, cleanAperture: aperture, processed: false, signal: surface.signal,
+        pixelAspectRatio: par, cleanAperture: aperture, processed: surface.isProcessed, signal: surface.signal,
         viewport: MonitorViewport(width: max(1, viewport.width), height: max(1, viewport.height)),
         target: surface.target, burnInLUT: surface.hasBurnInLUT ? placeholder : nil,
         monitorLUT: surface.hasMonitorLUT ? placeholder : nil, maskValid: state.focus.enabled, output: output)

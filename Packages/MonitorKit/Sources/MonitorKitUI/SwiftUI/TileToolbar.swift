@@ -124,6 +124,47 @@ public enum MonitorTileTool: String, CaseIterable, Sendable, Identifiable {
     case .arriLogC3, .arriLogC4: return .arriLogC
     }
   }
+
+  /// Whether the pass classifies `mode` on `signal`, by its source rule
+  /// (`MonitorPass.resolveFalseColor`): Sony Pattern 2 on S-Log3 in any gamut,
+  /// EL Zone and the ARRI-style bands on S-Log3 in S-Gamut3 or S-Gamut3.Cine
+  /// (`FalseColorLegend.classifies`), the ARRI table on a curve it has a
+  /// literal table for (`FalseColorTable.arriProfile`). Six band and custom
+  /// need no log source. Without a signal nothing is judged (true).
+  static func draws(_ mode: FalseColorMode, on signal: SignalDescription?) -> Bool {
+    guard let signal else { return true }
+    let log = signal.encoding.log
+    guard FalseColorLegend.classifies(mode, log: log) else { return false }
+    if mode == .arriLogC { return log.flatMap { FalseColorTable.arriProfile(for: $0.curve) } != nil }
+    return true
+  }
+
+  /// The mode a false-colour toggle turns on: `remembered` when `signal` can
+  /// draw it and the host allows it, else the signal's suggestion when allowed,
+  /// else six band, else the first other allowed mode; nil when none is.
+  /// `allowed` nil allows every mode.
+  static func falseColorModeToTurnOn(
+    remembered: FalseColorMode?, signal: SignalDescription?, allowed: [FalseColorMode]?
+  ) -> FalseColorMode? {
+    func isAllowed(_ m: FalseColorMode) -> Bool { m != .off && (allowed?.contains(m) ?? true) }
+    if let remembered, isAllowed(remembered), draws(remembered, on: signal) { return remembered }
+    let suggested = suggestedFalseColorMode(for: signal)
+    if isAllowed(suggested) { return suggested }
+    if isAllowed(.sixBand) { return .sixBand }
+    return FalseColorMode.allCases.first { isAllowed($0) && draws($0, on: signal) }
+      ?? FalseColorMode.allCases.first(where: isAllowed)
+  }
+
+  /// The false-colour modes a menu lists: `.off`, then the `allowed` ones in
+  /// `FalseColorMode` order (nil: all), plus `current` when it is not one of
+  /// them, so a restored or host-set mode keeps its tag.
+  public static func falseColorChoices(allowed: [FalseColorMode]?, current: FalseColorMode) -> [FalseColorMode] {
+    var out: [FalseColorMode] = []
+    for m in FalseColorMode.allCases where m == .off || m == current || (allowed?.contains(m) ?? true) {
+      out.append(m)
+    }
+    return out
+  }
 }
 
 /// The host's freeze state, which the Freeze button shows.
@@ -223,12 +264,25 @@ struct MonitorTileMemory: Equatable {
   var falseColor: FalseColorMode?
   var magnify: MonitorMagnifyChoice = .zoom(2)
 
-  /// Toggles `tool` in `state`, remembering what it turns off.
-  mutating func toggle(_ tool: MonitorTileTool, in state: inout MonitorState, signal: SignalDescription?) {
+  /// Toggles `tool` in `state`, remembering what it turns off. False colour
+  /// turns back on with the remembered mode only when `signal` can draw it and
+  /// it is `allowedFalseColor` (nil: every mode); otherwise with the signal's
+  /// suggestion, or six band (`MonitorTileTool.falseColorModeToTurnOn`).
+  mutating func toggle(
+    _ tool: MonitorTileTool, in state: inout MonitorState, signal: SignalDescription?,
+    allowedFalseColor: [FalseColorMode]? = nil
+  ) {
     switch tool {
     case .falseColor:
-      if state.falseColor.mode != .off { falseColor = state.falseColor.mode }
-      let mode = falseColor ?? MonitorTileTool.suggestedFalseColorMode(for: signal)
+      if state.falseColor.mode != .off {
+        falseColor = state.falseColor.mode
+        if let next = tool.toggled(state) { state = next }
+        return
+      }
+      guard
+        let mode = MonitorTileTool.falseColorModeToTurnOn(
+          remembered: falseColor, signal: signal, allowed: allowedFalseColor)
+      else { return }
       if let next = tool.toggled(state, falseColorMode: mode) { state = next }
     case .magnify:
       let current = MonitorMagnifyChoice(state.geometry.magnification)
@@ -256,7 +310,9 @@ struct MonitorTileMemory: Equatable {
 /// `GeometryControls`) for the settings, and hands Scopes and Freeze to the host.
 ///
 /// `unavailable` disables tools for this tile with the reason as help (for
-/// example focus peaking and log false colour on a programme feed); `status`
+/// example focus peaking on a programme feed); `falseColorModes` narrows false
+/// colour to some modes (on a programme feed, the ones that need no log
+/// source: `FalseColorMode.allCases.filter { !$0.needsLogSource }`); `status`
 /// marks a tool that is on but not drawn. In `.chrome` placement it uses system
 /// materials and label colours, so it follows the light or dark appearance.
 public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
@@ -266,6 +322,8 @@ public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
   let status: MonitorStatus?
   let tools: [MonitorTileTool]
   let unavailable: [MonitorTileTool: String]
+  let falseColorModes: [FalseColorMode]?
+  let layout: PixelLayout?
   let placement: MonitorTileToolbarPlacement
   let scopesEnabled: Bool
   let onScopes: (@MainActor (Bool) -> Void)?
@@ -285,12 +343,17 @@ public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
   ///   - status: the surface's status; marks tools that are on but not drawn.
   ///   - tools: the tools to show, in order.
   ///   - unavailable: tools disabled on this tile, with the reason.
+  ///   - falseColorModes: the false-colour modes this tile offers and turns on
+  ///     (`.off` is always offered); nil offers every mode.
+  ///   - layout: the shown frame's pixel layout; picks the ARRI legend's range
+  ///     as the pass does (a float container classifies full range).
   ///   - scopesEnabled, onScopes: the host's scope switch; no Scopes button without `onScopes`.
   ///   - freeze, onFreeze: the host's freeze state and toggle; no Freeze button without `onFreeze`.
   ///   - scopeSettings: the host's scope settings, shown from the Scopes chevron.
   public init(
     state: Binding<MonitorState>, name: String = "", signal: SignalDescription? = nil, status: MonitorStatus? = nil,
     tools: [MonitorTileTool] = MonitorTileTool.standard, unavailable: [MonitorTileTool: String] = [:],
+    falseColorModes: [FalseColorMode]? = nil, layout: PixelLayout? = nil,
     placement: MonitorTileToolbarPlacement = .chrome,
     scopesEnabled: Bool = false, onScopes: (@MainActor (Bool) -> Void)? = nil,
     freeze: MonitorFreezeState = .live, onFreeze: (@MainActor () -> Void)? = nil,
@@ -302,6 +365,8 @@ public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
     self.status = status
     self.tools = tools
     self.unavailable = unavailable
+    self.falseColorModes = falseColorModes
+    self.layout = layout
     self.placement = placement
     self.scopesEnabled = scopesEnabled
     self.onScopes = onScopes
@@ -370,7 +435,7 @@ public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
     case .freeze: onFreeze?()
     default:
       var s = state
-      memory.toggle(tool, in: &s, signal: signal)
+      memory.toggle(tool, in: &s, signal: signal, allowedFalseColor: falseColorModes)
       state = s
     }
   }
@@ -468,7 +533,9 @@ public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
         .disabled(unavailable[tool] != nil)
     case .falseColor:
       Picker(tool.title, selection: falseColorSelection) {
-        ForEach(FalseColorMode.allCases, id: \.self) { Text($0.title).tag($0) }
+        ForEach(falseColorChoices, id: \.self) { m in
+          Text(m.title).tag(m).disabled(!isFalseColorModeAllowed(m))
+        }
       }
       .disabled(unavailable[tool] != nil)
     case .magnify:
@@ -484,11 +551,22 @@ public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
     }
   }
 
-  private var falseColorSelection: Binding<FalseColorMode> {
+  /// The modes the false-colour pickers list (`MonitorTileTool.falseColorChoices`).
+  var falseColorChoices: [FalseColorMode] {
+    MonitorTileTool.falseColorChoices(allowed: falseColorModes, current: state.falseColor.mode)
+  }
+
+  /// Whether a picker may select `mode` on this tile (`.off` always).
+  func isFalseColorModeAllowed(_ mode: FalseColorMode) -> Bool {
+    mode == .off || (falseColorModes?.contains(mode) ?? true)
+  }
+
+  /// The collapsed menu's mode picker: writes an allowed mode through the memory.
+  var falseColorSelection: Binding<FalseColorMode> {
     Binding(
       get: { state.falseColor.mode },
       set: { mode in
-        guard unavailable[.falseColor] == nil else { return }
+        guard unavailable[.falseColor] == nil, isFalseColorModeAllowed(mode) else { return }
         var s = state
         memory.select(mode, in: &s)
         state = s
@@ -521,7 +599,8 @@ public struct MonitorTileToolbar<ScopeSettingsContent: View>: View {
           switch tool {
           case .guides: GuideControls(state: $state, status: status)
           case .zebra: ZebraControls(state: $state, status: status)
-          case .falseColor: FalseColorControls(state: $state, status: status, signal: signal)
+          case .falseColor:
+            FalseColorControls(state: $state, status: status, signal: signal, layout: layout, modes: falseColorModes)
           case .focusPeaking: PeakingControls(state: $state, status: status)
           case .clipIndicators: ClipIndicatorControls(state: $state, status: status)
           case .magnify: GeometryControls(state: $state, status: status)
@@ -545,13 +624,14 @@ extension MonitorTileToolbar where ScopeSettingsContent == EmptyView {
   public init(
     state: Binding<MonitorState>, name: String = "", signal: SignalDescription? = nil, status: MonitorStatus? = nil,
     tools: [MonitorTileTool] = MonitorTileTool.standard, unavailable: [MonitorTileTool: String] = [:],
+    falseColorModes: [FalseColorMode]? = nil, layout: PixelLayout? = nil,
     placement: MonitorTileToolbarPlacement = .chrome,
     scopesEnabled: Bool = false, onScopes: (@MainActor (Bool) -> Void)? = nil,
     freeze: MonitorFreezeState = .live, onFreeze: (@MainActor () -> Void)? = nil
   ) {
     self.init(
       state: state, name: name, signal: signal, status: status, tools: tools, unavailable: unavailable,
-      placement: placement, scopesEnabled: scopesEnabled, onScopes: onScopes, freeze: freeze, onFreeze: onFreeze
+      falseColorModes: falseColorModes, layout: layout, placement: placement, scopesEnabled: scopesEnabled, onScopes: onScopes, freeze: freeze, onFreeze: onFreeze
     ) { EmptyView() }
   }
 }

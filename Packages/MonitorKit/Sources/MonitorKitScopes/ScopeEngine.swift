@@ -304,7 +304,10 @@ public final class ScopeEngine: @unchecked Sendable {
 
   /// Makes every pipeline `settings` needs for frames of `layouts` drawn into
   /// `pixelFormat` ready (built on this thread, or waited for when already
-  /// building asynchronously), so the first frames use specialized ones.
+  /// building asynchronously), so the first frames use specialized ones. A
+  /// `.off` engine draws with the general pipelines only, so it builds just
+  /// the general render pipeline for `pixelFormat` (its general kernels are
+  /// made at init).
   public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], pixelFormat: MTLPixelFormat?) throws {
     try prepare(
       settings: settings, layouts: layouts, target: pixelFormat.map { MonitorRenderTargetFormat(colorPixelFormat: $0) })
@@ -319,14 +322,18 @@ public final class ScopeEngine: @unchecked Sendable {
       do { try build() } catch { firstError = firstError ?? error }
     }
     if let target { attempt { _ = try preparedRenderPipeline(RenderKey(target: target, scope: nil)) } }
-    for s in settings.map({ $0.normalized() }) {
-      for layout in layouts {
-        attempt { _ = try preparedComputePipeline(ComputeKey(kernel: s.kind.kernel, layout: layout.scopeLayoutCode)) }
-      }
-      if let target {
-        attempt {
-          _ = try preparedRenderPipeline(
-            RenderKey(target: target, scope: DrawVariant(kind: s.kind.shaderCode, mode: s.shaderMode)))
+    // `.off` never draws with a specialized pipeline: building one would only
+    // cost start-up compile time and memory.
+    if specialization != .off {
+      for s in settings.map({ $0.normalized() }) {
+        for layout in layouts {
+          attempt { _ = try preparedComputePipeline(ComputeKey(kernel: s.kind.kernel, layout: layout.scopeLayoutCode)) }
+        }
+        if let target {
+          attempt {
+            _ = try preparedRenderPipeline(
+              RenderKey(target: target, scope: DrawVariant(kind: s.kind.shaderCode, mode: s.shaderMode)))
+          }
         }
       }
     }
@@ -388,8 +395,9 @@ public final class ScopeEngine: @unchecked Sendable {
   /// otherwise the general one while it builds. The bool is whether the result
   /// is final: the one asked for, or the general one for good after its build
   /// failed (on this thread too: a failed synchronous build is not retried).
+  /// `.off` returns the general one even when `key` itself is cached.
   func computePipeline(for key: ComputeKey) throws -> (MTLComputePipelineState, Bool) {
-    if let cached = computePipelines.withLock({ $0[key] }) { return (cached, true) }
+    if specialization != .off, let cached = computePipelines.withLock({ $0[key] }) { return (cached, true) }
     var general = key
     general.layout = nil
     switch specialization {
@@ -412,7 +420,7 @@ public final class ScopeEngine: @unchecked Sendable {
   /// so no frame waits for the compiler. The bool is whether the result is
   /// final (nil and final: this group cannot be fused, e.g. both builds failed).
   func fusedPipeline(for key: ComputeKey) -> (MTLComputePipelineState?, Bool) {
-    if let cached = computePipelines.withLock({ $0[key] }) { return (cached, true) }
+    if specialization != .off, let cached = computePipelines.withLock({ $0[key] }) { return (cached, true) }
     var general = key
     general.layout = nil
     switch specialization {
@@ -513,8 +521,9 @@ public final class ScopeEngine: @unchecked Sendable {
   /// or for good once the specialized build failed. With `.asynchronous` the
   /// general one is never built here either: nil until it is ready. The bool
   /// is whether the result is final. Throws only when the general one failed.
+  /// `.off` returns the general one even when `key` itself is cached.
   func renderPipeline(for key: RenderKey) throws -> (MTLRenderPipelineState?, Bool) {
-    if let cached = renderPipelines.withLock({ $0[key] }) { return (cached, true) }
+    if specialization != .off, let cached = renderPipelines.withLock({ $0[key] }) { return (cached, true) }
     let general = RenderKey(target: key.target, scope: nil)
     switch specialization {
     case .off: return (try renderPipeline(general), true)
@@ -622,9 +631,14 @@ public final class ScopeEngine: @unchecked Sendable {
     return d
   }
 
-  /// Specialized pipelines built so far (compute, render).
+  /// Specialized pipelines built so far (compute: one frame layout's kernels,
+  /// fused or not; render: one scope's drawing). The all-tools fused kernels
+  /// are general and not counted.
   var specializedPipelineCount: (compute: Int, render: Int) {
-    (computePipelines.withLock { $0.count }, renderPipelines.withLock { $0.keys.filter { $0.scope != nil }.count })
+    (
+      computePipelines.withLock { $0.keys.filter { $0.layout != nil }.count },
+      renderPipelines.withLock { $0.keys.filter { $0.scope != nil }.count }
+    )
   }
 
   /// An argument table for one of the scopes' Metal 4 encoders, made once per object.

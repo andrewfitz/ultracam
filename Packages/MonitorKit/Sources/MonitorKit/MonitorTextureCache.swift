@@ -54,7 +54,10 @@ public final class MonitorTextureCache: @unchecked Sendable {
   struct Entry {
     var key: Key
     var texture: MTLTexture
-    /// Retained: its identity tells a reused IOSurface ID from the surface the texture wraps.
+    /// Retained, which keeps the surface alive and so its ID from being reused
+    /// while the entry exists. Another ref to the same surface (from
+    /// `IOSurfaceLookupFromMachPort`, an XPC object or
+    /// `CVPixelBufferCreateWithIOSurface`) is a different pointer to it: a hit.
     var surface: IOSurfaceRef
     var lastUse: Double
     var owner: UInt64
@@ -159,12 +162,13 @@ public final class MonitorTextureCache: @unchecked Sendable {
     // the residency's own lock and never calls back here).
     let (kept, replaced) = locked { s -> ((MTLTexture, FrozenPlanes), MTLTexture?) in
       if let i = Self.index(of: key, in: s.entries) {
-        if s.entries[i].surface === iosurface {
+        if Self.same(s.entries[i].surface, iosurface) {
           s.entries[i].lastUse = t
           s.entries[i].owner = owner
           return ((s.entries[i].texture, s.entries[i].token), nil)
         }
-        // A reused IOSurface ID: the old texture wraps a surface that is gone.
+        // A different surface under the entry's ID. The retained ref should make
+        // this impossible; replace the texture rather than read the wrong surface.
         let old = s.entries[i]
         old.token.markReleased()
         residency.add(texture)
@@ -321,7 +325,7 @@ public final class MonitorTextureCache: @unchecked Sendable {
     let hit = locked { s -> (texture: MTLTexture, token: FrozenPlanes)? in
       due = now - s.lastSweep >= interval && Self.hasIdle(s, now: now, life: life)
       if !due && now - s.lastSweep >= interval { s.lastSweep = now }
-      guard let i = Self.index(of: key, in: s.entries), s.entries[i].surface === surface else { return nil }
+      guard let i = Self.index(of: key, in: s.entries), Self.same(s.entries[i].surface, surface) else { return nil }
       s.entries[i].lastUse = now
       if s.entries[i].owner != owner { s.entries[i].owner = owner }
       return (s.entries[i].texture, s.entries[i].token)
@@ -329,6 +333,10 @@ public final class MonitorTextureCache: @unchecked Sendable {
     if due { sweep(now: now) }
     return hit
   }
+
+  /// Whether two refs name one surface: the same pointer, or (a ref reached
+  /// another way) an equal one. The caller has matched their IDs already.
+  private static func same(_ a: IOSurfaceRef, _ b: IOSurfaceRef) -> Bool { a === b || CFEqual(a, b) }
 
   private static func index(of key: Key, in entries: [Entry]) -> Int? {
     var i = 0

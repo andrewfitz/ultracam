@@ -363,14 +363,14 @@ public final class MonitorMetalView: MonitorPlatformView {
   /// scene is shown in another view of another size too.
   struct GestureBase {
     var viewport: MonitorViewport
-    var pictureWidth: Int
-    var pictureHeight: Int
-    var pixelAspectRatio: Double
+    /// The frame's shape: its size, pixel aspect ratio and clean aperture.
+    var frame: MonitorFrameGeometry
 
-    func layout(_ geometry: ViewGeometry) -> MonitorLayout {
-      MonitorLayout(
-        pictureWidth: pictureWidth, pictureHeight: pictureHeight, pixelAspectRatio: pixelAspectRatio,
-        viewportWidth: viewport.width, viewportHeight: viewport.height, geometry: geometry)
+    /// The layout `MonitorPass` draws `state` with (`MonitorLayout(frame:state:…)`:
+    /// the clean aperture, the usable pixel aspect ratio and the normalized
+    /// geometry), so a gesture maps through the picture as shown.
+    func layout(_ state: MonitorState) -> MonitorLayout {
+      MonitorLayout(frame: frame, state: state, viewportWidth: viewport.width, viewportHeight: viewport.height)
     }
   }
 
@@ -379,8 +379,7 @@ public final class MonitorMetalView: MonitorPlatformView {
     guard let frame = surface.source.latestFrame,
       let vp = surface.region.viewport(width: Int(size.width), height: Int(size.height))
     else { return nil }
-    return GestureBase(
-      viewport: vp, pictureWidth: frame.width, pictureHeight: frame.height, pixelAspectRatio: frame.pixelAspectRatio)
+    return GestureBase(viewport: vp, frame: frame.geometry)
   }
 
   /// The topmost surface under `point` (view points, origin top left), the layout
@@ -396,7 +395,7 @@ public final class MonitorMetalView: MonitorPlatformView {
       let vp = base.viewport
       let x = px - Double(vp.x), y = py - Double(vp.y)
       if x >= 0, y >= 0, x < Double(vp.width), y < Double(vp.height) {
-        return (s, base.layout(s.state.geometry), (x, y))
+        return (s, base.layout(s.state), (x, y))
       }
     }
     return nil
@@ -409,7 +408,7 @@ public final class MonitorMetalView: MonitorPlatformView {
     var changed = false
     surface.updateState { s in
       changed = false
-      if let m = body(s.geometry.magnification, base.layout(s.geometry)), m != s.geometry.magnification {
+      if let m = body(s.geometry.magnification, base.layout(s)), m != s.geometry.magnification {
         s.geometry.magnification = m
         changed = true
       }

@@ -59,19 +59,44 @@ public struct FalseColorControls: View {
   @Binding var state: MonitorState
   let status: MonitorStatus?
   let signal: SignalDescription?
+  let layout: PixelLayout?
+  let modes: [FalseColorMode]?
 
-  /// `signal` picks the ARRI table the legend shows (LogC3 or LogC4, legal or full range).
-  public init(state: Binding<MonitorState>, status: MonitorStatus? = nil, signal: SignalDescription? = nil) {
+  /// `signal` picks the ARRI table the legend shows (LogC3 or LogC4), and with
+  /// `layout` its range by the pass's rule
+  /// (`FalseColorTable.usesFullRangeARRI(signal:layout:)`: a float container is
+  /// full range). `modes` narrows the modes offered (`.off` always is, and the
+  /// current mode stays listed); nil offers all.
+  public init(
+    state: Binding<MonitorState>, status: MonitorStatus? = nil, signal: SignalDescription? = nil,
+    layout: PixelLayout? = nil, modes: [FalseColorMode]? = nil
+  ) {
     _state = state
     self.status = status
     self.signal = signal
+    self.layout = layout
+    self.modes = modes
+  }
+
+  /// The legend shown: the bands the pass classifies with for this signal and layout.
+  var legend: FalseColorLegend? { FalseColorLegend(settings: state.falseColor, signal: signal, layout: layout) }
+
+  /// The mode picker: an allowed mode is written, others are ignored.
+  var modeSelection: Binding<FalseColorMode> {
+    let mode = $state.normalizing.falseColor.mode
+    let modes = modes
+    return Binding(
+      get: { mode.wrappedValue },
+      set: { m in if m == .off || (modes?.contains(m) ?? true) { mode.wrappedValue = m } })
   }
 
   public var body: some View {
     let fc = $state.normalizing.falseColor
     MonitorControlSection("False colour") {
-      Picker("Mode", selection: fc.mode) {
-        ForEach(FalseColorMode.allCases, id: \.self) { Text($0.title).tag($0) }
+      Picker("Mode", selection: modeSelection) {
+        ForEach(MonitorTileTool.falseColorChoices(allowed: modes, current: state.falseColor.mode), id: \.self) { m in
+          Text(m.title).tag(m).disabled(!(m == .off || (modes?.contains(m) ?? true)))
+        }
       }
       let mode = state.falseColor.mode
       if mode == .sixBand || mode == .custom {
@@ -87,7 +112,7 @@ public struct FalseColorControls: View {
         ValueSlider("Offset", value: fc.referenceOffsetStops, in: -6...6, step: 0.1, format: MonitorFormat.stops)
       }
       UnavailableNote(reason: status?.reason(for: .falseColor))
-      if let legend = FalseColorLegend(settings: state.falseColor, signal: signal) {
+      if let legend {
         FalseColorLegendView(legend: legend)
       }
     }

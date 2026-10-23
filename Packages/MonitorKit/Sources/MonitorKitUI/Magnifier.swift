@@ -77,9 +77,11 @@ public enum MonitorMagnifier {
     guard let nav = layout.navigatorRect, point.x >= nav.x, point.x < nav.maxX, point.y >= nav.y, point.y < nav.maxY
     else { return nil }
     var v = m
+    // Frame pixels inside the aperture, so as a fraction of the aperture.
     let p = layout.navigatorToPicture.apply(x: point.x, y: point.y)
-    v.centerX = min(1, max(0, p.x / layout.pictureWidth))
-    v.centerY = min(1, max(0, p.y / layout.pictureHeight))
+    let c = layout.pictureFraction(x: p.x, y: p.y)
+    v.centerX = min(1, max(0, c.x))
+    v.centerY = min(1, max(0, c.y))
     return v
   }
 
@@ -91,10 +93,11 @@ public enum MonitorMagnifier {
   }
 
   /// The picture point under `point` as fractions of the picture (the centre's
-  /// coordinates, so flipped pictures map back to their own pixels).
+  /// coordinates, so flipped pictures map back to their own pixels). With a
+  /// clean aperture the fractions are of the aperture, not the frame.
   public static func pictureFraction(at point: (x: Double, y: Double), layout: MonitorLayout) -> (x: Double, y: Double) {
-    let p = layout.displayToPicture.apply(x: point.x, y: point.y)
-    return (min(1, max(0, p.x / layout.pictureWidth)), min(1, max(0, p.y / layout.pictureHeight)))
+    let c = layout.pictureFraction(displayX: point.x, displayY: point.y)
+    return (min(1, max(0, c.x)), min(1, max(0, c.y)))
   }
 
   /// Displayed size over fitted size: the zoom pixel-exact amounts to.
