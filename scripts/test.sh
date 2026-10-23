@@ -18,19 +18,13 @@ run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$external_root/agent-work/build/ultracam/tests/$run_id"
 logs_root="$artifact_root/logs"
 mkdir -p "$TMPDIR" "$test_root/modules" "$artifact_root" "$logs_root"
-source "$task_root/scripts/monitor-tools-package.sh"
 package_log="$logs_root/monitor-package-$run_id.log"
-monitor_package_build > "$package_log" 2>&1 || { cat "$package_log"; exit 1; }
-xcrun swift test --package-path "$monitor_package" --scratch-path "$monitor_scratch" --cache-path "$test_root/package-cache" \
-  --configuration release --arch arm64 > "$logs_root/monitor-package-tests-$run_id.log" 2>&1 || {
-  cat "$logs_root/monitor-package-tests-$run_id.log"; exit 1;
-}
 source "$task_root/scripts/monitor-kit-package.sh"
 monitor_kit_selftest_log="$logs_root/monitor-kit-selftest-$run_id.log"
 /bin/bash "$task_root/scripts/monitor-kit-package.sh" selftest > "$monitor_kit_selftest_log" 2>&1 || {
   cat "$monitor_kit_selftest_log"; exit 1;
 }
-monitor_kit_package_build >> "$package_log" 2>&1 || { cat "$package_log"; exit 1; }
+monitor_kit_package_build > "$package_log" 2>&1 || { cat "$package_log"; exit 1; }
 monitor_kit_test_log="$logs_root/monitor-kit-package-tests-$run_id.log"
 monitor_kit_package_test "$monitor_kit_test_log" || { monitor_kit_test_report "$monitor_kit_test_log"; exit 1; }
 bash "$task_root/scripts/fetch-decklink-sdk.sh"
@@ -58,7 +52,7 @@ xcrun clang++ -std=c++17 -I "$sdk_dir" -c "$sdk_dir/DeckLinkAPIDispatch.cpp" \
   cat "$compile_log"; exit 1
 }
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
-  "${monitor_link_args[@]}" "${monitor_kit_link_args[@]}" \
+  "${monitor_kit_link_args[@]}" \
   -D CAPTURE_LIFECYCLE_TESTS -Xcc -DULTRACAM_BACKEND_TESTING \
   -import-objc-header "$task_root/Sources/DeckLinkBackend/BridgingHeader.h" \
   -F "$frameworks" -Xlinker -rpath -Xlinker "$frameworks" \

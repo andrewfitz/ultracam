@@ -4,6 +4,8 @@ Status: preparation. No UI code changes yet. This document lists what the curren
 app window and menu bar panel show and do, so a clean-room design can cover all
 of it. Mockups come next and are reviewed before any real SwiftUI is written.
 
+> Note (2026-10-22): `Packages/MonitorTools` and its `MonitorToolsUI` views named below were retired in W4; the monitor now runs on MonitorKit with app-owned surfaces (see [the integration map](MONITORKIT_INTEGRATION_MAP.md)).
+
 Sources read: `Sources/App/UltracamApp.swift`, `MenuBarInterface.swift`,
 `FeedInterface.swift`, `RecordingInterface.swift`, `MonitorWorkspaceView.swift`,
 `AppModel.swift`, `AppSettingsStore.swift`, `RecordingModel.swift`, and

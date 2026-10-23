@@ -143,22 +143,17 @@ first two, or detach a camera into its own window. Tools are off by default, and
 each camera retains its own settings. Each tool is a split button on the picture:
 click it to toggle the tool, or use its chevron for settings.
 
-Enable **Monitor tools** for thirds/center/safe-area guides, IRE zebras, red or
-other colored source-focus highlights, RGB parade and luma waveform. Picture and
-scope signals can independently use Source or Processed Output. **Freeze** and
-**Clean**, scope visibility and 1×–4× zoom affect only their own view.
-Hidden/occluded views suspend monitor work; recording and virtual-camera output
-keep their existing image branches. The diagnostics show requested and delivered
-rates, skips, picture/scope ages and shared monitoring memory. Under pressure,
-monitoring can reduce display size and scope sampling/cadence while preserving
-source-resolution focus analysis, then recover after five healthy seconds.
-If output processing exceeds a source-frame deadline, new monitor analysis
-pauses while clean preview continues. Fresh healthy processing for one second
-allows reduced analysis; five further healthy seconds restore normal quality.
-This preserves the requested tools and keeps pressure from one producer visible
-to the shared monitor governor, including when that producer's views are hidden.
-Additional windows can report insufficient presentation capacity and retry when
-a window closes or becomes smaller.
+Monitor tools are drawn by [MonitorKit](Packages/MonitorKit/README.md) on the GPU,
+for every camera frame, with no CPU pixel copies: thirds, center and safe-area
+guides, IRE zebras, focus peaking, false color, and RGB parade, luma waveform,
+vectorscope and histogram scopes. The **Picture** menu chooses what a view shows:
+Source (camera signal), Output (LUT), which is the source with the burn-in LUT applied
+in the shader exactly as the published output applies it, or Monitor, which adds the
+camera's optional Monitor LUT. **Freeze** and **Clean**, scope visibility and zoom
+affect only their own view. Hidden or covered views do no monitor work, and only a
+scope may skip an update while the GPU is still drawing earlier scopes; recording
+and virtual-camera output keep their own image branches. The diagnostics show the
+source and presented rates, scope skips and GPU time.
 
 **Sony S-Log3** false color uses Sony Monitor & Control's published source IRE
 bands with Ultracam display colors. It supports S-Gamut3.Cine and S-Gamut3;
@@ -170,25 +165,24 @@ EL Zone matching is not tested. Neither mode claims Sony sensor clipping/noise
 limits. Historical Sony ARRI-style settings migrate to Sony S-Log3; legacy literal
 ARRI data remains readable as an unsupported saved choice. Select the matching source
 profile, input range and Log transport mapping; these declarations do not
-calibrate the capture device. Source Log overlays are labeled as code-value views. Program supports output guides, zebras and scopes;
-source-focus and false color require source correspondence unavailable on Program.
-PQ, HLG and unknown-transfer pictures retain clean native presentation; composed
-overlays are unavailable for those signals. Numeric scopes can remain available
-with their signal interpretation labeled.
+calibrate the capture device. Source Log pictures without a LUT are labeled as
+code-value views. While false color draws, zebras are suppressed. Program supports
+guides, zebras and scopes; focus peaking and Log false color need the camera's own
+signal and stay off on Program. PQ and HLG pictures are shown on an EDR layer in
+their own primaries, with overlays at BT.2408 graphics white.
 
-Peaking uses a noise-rejecting Scharr confidence mask, with source-resolution
-edges preserved when the display is reduced. Reduced previews use bounded
-footprint filtering. Scopes rotate sampled positions and normalize density by
-the actual sample population. Composite storage has a bounded pool; eligible
-already-owned monitor buffers avoid a second CPU upload, with a guarded copy
-fallback for other memory layouts.
+Peaking uses a noise-rejecting Scharr mask computed from the camera signal at
+source resolution. Scopes count every pixel of the frame into GPU bins; nothing
+is read back to the CPU.
 
 Both false-color references, including EL's explicit interval convention, are
 documented in [the color reference receipt](docs/MONITOR_COLOR_REFERENCES.md).
 See [the Sony quality execution plan](docs/MONITOR_SONY_QUALITY_PLAN.md) for the
 current change and measurement gates.
-See [the implementation and qualification plan](docs/MONITOR_TOOLS_PLAN.md) for
-current test coverage and outstanding hardware checks.
+MonitorKit replaced the earlier in-app MonitorTools package (retired in W4; see
+[the integration map](docs/MONITORKIT_INTEGRATION_MAP.md)). [The MonitorTools
+plan](docs/MONITOR_TOOLS_PLAN.md) and [audit](docs/MONITOR_TOOLS_AUDIT.md) are kept
+as historical records.
 
 ## Recording and interrupted takes
 

@@ -1,5 +1,7 @@
 # Monitor Tools implementation plan
 
+> **Historical.** `Packages/MonitorTools` was retired in W4 (step 8, 2026-10-22): [MonitorKit](../Packages/MonitorKit/README.md) replaced it, as planned in [the integration map](MONITORKIT_INTEGRATION_MAP.md). The package, its tools and its `monitor-tools-*` scripts no longer exist; this plan is kept as the record of what it did and how it was qualified.
+
 Status: implementation present with focused synthetic verification; release qualification
 is incomplete. The historical milestones below remain the acceptance plan, not a
 claim that every release gate has passed. Continuous EL Zone and physical receiver qualification remain explicit dependencies.

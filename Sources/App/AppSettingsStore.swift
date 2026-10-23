@@ -1,5 +1,4 @@
 import Foundation
-import MonitorToolsCore
 
 /// Stable identity for a configured feed. The raw value is persisted instead of
 /// relying on array position, so reordering feeds does not change their

@@ -1,5 +1,4 @@
 import AppKit
-import MonitorToolsCore
 import CoreVideo
 import Observation
 import UniformTypeIdentifiers

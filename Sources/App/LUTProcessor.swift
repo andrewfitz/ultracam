@@ -4,10 +4,9 @@ import IOSurface
 import Metal
 import MonitorKit
 
-// MonitorKit's LUT types under the app module's names, so the files that still
-// import MonitorTools (which must not import MonitorKit beside it: MonitorRect,
-// the false-colour profiles and more collide) can name them. Remove these once
-// MonitorTools is retired and those files import MonitorKit directly.
+// MonitorKit's LUT types under the app module's names, so the app files that do
+// not import MonitorKit (AppModel, AppSettingsStore, CaptureController and the
+// tests) can name them.
 typealias CubeLUT = MonitorKitCore.CubeLUT
 typealias MonitorLUT = MonitorKit.MonitorLUT
 

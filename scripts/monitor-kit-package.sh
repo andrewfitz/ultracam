@@ -1,8 +1,8 @@
 #!/bin/bash
 # Source this helper after setting task_root and a run-specific external test_root.
 # Compile the MonitorKit package; consumers link a per-run copy of its real products and
-# use Bundle.module. Every name is monitor_kit_* so it can be sourced beside
-# monitor-tools-package.sh while both packages are linked.
+# use Bundle.module. Every name is monitor_kit_*, so it leaves a sourcing script's own
+# names alone.
 # Run directly, `monitor-kit-package.sh selftest` checks the test-log analysis and the
 # retry policy against fixture logs and a stub xcrun.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then task_root="$(cd "$(dirname "$0")/.." && pwd)"; fi
@@ -14,8 +14,8 @@ monitor_kit_cache_root="${MONITOR_KIT_PACKAGE_CACHE:-/Volumes/8TB/cinesomatic-di
 mkdir -p "$monitor_kit_cache_root/modules"
 monitor_kit_scratch="$monitor_kit_cache_root/scratch"
 monitor_kit_build_lock="$monitor_kit_cache_root/build.lock"
-# The module caches are set per command, not exported, so sourcing this beside
-# monitor-tools-package.sh leaves that package's environment untouched.
+# The module caches are set per command, not exported, so sourcing this leaves the
+# caller's environment untouched.
 monitor_kit_env=(env CLANG_MODULE_CACHE_PATH="$monitor_kit_cache_root/modules" SWIFTPM_MODULECACHE_OVERRIDE="$monitor_kit_cache_root/modules")
 monitor_kit_products=(MonitorKitCore MonitorKit MonitorKitScopes MonitorKitAudio MonitorKitUI)
 # One XCTest bundle per test target; a complete run finishes every one of them.

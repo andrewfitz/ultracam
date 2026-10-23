@@ -2,6 +2,8 @@
 
 Date: 2026-10-21. Status: phase 1 in progress. Name: **MonitorKit**.
 
+> Update 2026-10-22: Ultracam has adopted MonitorKit (W4, [integration map](MONITORKIT_INTEGRATION_MAP.md)) and `Packages/MonitorTools` is retired (W4 step 8). Mentions of MonitorTools below describe the package as it was.
+
 Goal: a software equivalent of the monitoring assists on a Sony FX3 and a Blackmagic Video Assist 12G HDR, as a standalone Swift/Metal package that any Apple-silicon app can use. Ultracam is its first client. Using the library must cost nothing compared with code built directly into the app: no extra copies, command buffers, queues, threads or allocations.
 
 Related docs:

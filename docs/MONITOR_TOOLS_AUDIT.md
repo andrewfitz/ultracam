@@ -1,5 +1,7 @@
 # Monitor Tools audit and qualification
 
+> **Historical.** `Packages/MonitorTools` was retired in W4 (step 8, 2026-10-22): [MonitorKit](../Packages/MonitorKit/README.md) replaced it, as planned in [the integration map](MONITORKIT_INTEGRATION_MAP.md). The findings below are about the retired package and are kept as a record.
+
 Reviewed October 20, 2026. The [plan](MONITOR_TOOLS_PLAN.md) records intended
 behavior and release gates; [VALIDATION.md](../VALIDATION.md) records executed
 checks. Historical design findings below do not themselves prove implementation

@@ -24,7 +24,7 @@ Fix: the UltraStudio writes into IOSurfaces. **Now on SDK 16.0** (`ThirdParty/De
 - `rgba32Float` intermediates: about 490 MB of traffic per frame. The LUT does manual trilinear interpolation with 8 buffer reads per pixel.
 - Four compute encoders per frame; decode+LUT and scale+encode can be fused.
 
-**Monitor** (`Packages/MonitorTools`)
+**Monitor** (`Packages/MonitorTools`, retired in W4: MonitorKit replaced it; see [the integration map](MONITORKIT_INTEGRATION_MAP.md))
 - A CPU memcpy of the whole picture into a newly allocated `CVPixelBuffer` on every analysed frame, plus extra staging copies when the source and picture differ.
 - Skips everywhere:
   - try-locks in the sink and ledger, plus a rate limiter

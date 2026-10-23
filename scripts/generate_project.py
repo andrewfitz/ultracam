@@ -84,15 +84,11 @@ def configs(key, settings):
 project_configs = configs("project", dict(SDKROOT="macosx", MACOSX_DEPLOYMENT_TARGET="26.0", SWIFT_VERSION="5.0", CLANG_ENABLE_MODULES="YES", CLANG_ENABLE_OBJC_ARC="YES", CLANG_CXX_LANGUAGE_STANDARD="c++17", ENABLE_HARDENED_RUNTIME="YES", CODE_SIGN_STYLE="Automatic", SWIFT_STRICT_CONCURRENCY="complete", SWIFT_TREAT_WARNINGS_AS_ERRORS="YES", ARCHS="arm64"))
 
 
-monitor_package = add("monitor-package", "XCLocalSwiftPackageReference", relativePath="Packages/MonitorTools")
-monitor_products = [add(f"monitor-product-{name}", "XCSwiftPackageProductDependency", package=monitor_package, productName=name)
-                    for name in ("MonitorToolsCore", "MonitorToolsMetal", "MonitorToolsUI")]
-# MonitorKit replaces MonitorTools (W4); both are linked into the app only while it lands.
-# Xcode links package products as object files, so all five products and both resource
-# bundles ship in the app even before an app file imports them (Debug dylib +7 MB).
+# MonitorKit, linked into the app only (never the camera extension). Xcode links package
+# products as object files, so all five products and both resource bundles ship in the app.
 monitor_kit_package = add("monitor-kit-package", "XCLocalSwiftPackageReference", relativePath="Packages/MonitorKit")
-monitor_products += [add(f"monitor-kit-product-{name}", "XCSwiftPackageProductDependency", package=monitor_kit_package, productName=name)
-                     for name in ("MonitorKitCore", "MonitorKit", "MonitorKitScopes", "MonitorKitAudio", "MonitorKitUI")]
+monitor_products = [add(f"monitor-kit-product-{name}", "XCSwiftPackageProductDependency", package=monitor_kit_package, productName=name)
+                    for name in ("MonitorKitCore", "MonitorKit", "MonitorKitScopes", "MonitorKitAudio", "MonitorKitUI")]
 
 
 def target(key, name, sources, product, product_type, bundle_id, plist, entitlements):
@@ -128,7 +124,7 @@ embed_file = add("embed-camera-file", "PBXBuildFile", fileRef=camera_product, se
 embed = add("embed-camera", "PBXCopyFilesBuildPhase", buildActionMask=2147483647, dstPath="$(CONTENTS_FOLDER_PATH)/Library/SystemExtensions", dstSubfolderSpec=16, files=[embed_file], name="Embed Camera Extension", runOnlyForDeploymentPostprocessing=0)
 objects[app_id]["dependencies"] = [dependency]
 objects[app_id]["buildPhases"].append(embed)
-project = add("project", "PBXProject", attributes=dict(BuildIndependentTargetsInParallel=1, LastUpgradeCheck="2700"), buildConfigurationList=project_configs, compatibilityVersion="Xcode 14.0", developmentRegion="en", hasScannedForEncodings=0, knownRegions=["en", "Base"], mainGroup=group, productRefGroup=products, projectDirPath="", projectRoot="", targets=[app_id, camera_id], packageReferences=[monitor_package, monitor_kit_package])
+project = add("project", "PBXProject", attributes=dict(BuildIndependentTargetsInParallel=1, LastUpgradeCheck="2700"), buildConfigurationList=project_configs, compatibilityVersion="Xcode 14.0", developmentRegion="en", hasScannedForEncodings=0, knownRegions=["en", "Base"], mainGroup=group, productRefGroup=products, projectDirPath="", projectRoot="", targets=[app_id, camera_id], packageReferences=[monitor_kit_package])
 
 
 def encode(value, level=0):

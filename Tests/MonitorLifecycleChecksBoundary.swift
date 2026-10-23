@@ -1,12 +1,12 @@
 import Foundation
-import MonitorToolsCore
 import XCTest
 
-// The settings boundary with MonitorTools' old configuration: until MonitorTools
-// is retired, `LegacyMonitorConfiguration` must read every blob exactly as
-// MonitorTools' `MonitorConfiguration` did, and a configuration must survive the
-// trip through `MonitorFeedPreferences`. The coordinator itself now keeps
-// `MonitorFeedPreferences` (MonitorKit) and reports them whole.
+// The settings boundary with MonitorTools' old configuration (the package is
+// retired, W4 step 8): `LegacyMonitorConfiguration` must read every blob exactly
+// as MonitorTools' `MonitorConfiguration` did, pinned below as the JSON that
+// MonitorToolsCore produced, and a configuration must survive the trip through
+// `MonitorFeedPreferences`. The coordinator itself keeps `MonitorFeedPreferences`
+// (MonitorKit) and reports them whole.
 extension MonitorLifecycleChecks {
   private static let boundaryBlobs = [
     "{}",
@@ -25,32 +25,59 @@ extension MonitorLifecycleChecks {
     #"{"zebra":{"enabled":"yes"},"guides":{"enabled":true}}"#,
     #"[1,2,3]"#,
   ]
+  /// What MonitorToolsCore's `MonitorConfiguration` decoded each of `boundaryBlobs`
+  /// to, re-encoded with sorted keys. Captured from the package at 001c229, before
+  /// it was retired. Its decoder always normalized, so these are also the
+  /// normalized configurations.
+  private static let monitorToolsDecoded = [
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":true,"contrast":0.4,"enabled":true,"opacity":1,"safeArea":true,"thirds":false},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","toolsEnabled":true,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","toolsEnabled":false,"zebra":{"enabled":true,"mode":"band","opacity":0.2,"thresholdIRE":120,"widthIRE":30}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"sonySLog3","profileID":"sony-slog3-false-color-v1","referenceOffsetStops":10,"specificationVersion":"sony-monitor-control-pattern2-v1"},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","sourceProfileID":"sony-slog3-sgamut3cine","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"elZone","profileID":"ultracam-elzone-public-chart-v1","referenceOffsetStops":0,"specificationVersion":"Ultracam-PanasonicFW9-Midpoints-v1"},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","sourceProfileID":"sony-slog3-sgamut3","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"sonySLog3","profileID":"sony-slog3-false-color-v1","referenceOffsetStops":0,"specificationVersion":"sony-monitor-control-pattern2-v1"},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","sourceProfileID":"sony-slog3-sgamut3cine","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"arri","profileID":"arri-logc3-ei800","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","sourceProfileID":"arri-logc3-ei800","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":1600,"mode":"off","profileID":"arri-alexa35-logc4-ei800","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","sourceProfileID":"arri-alexa35-logc4-ei800","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"arri","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","sourceProfileID":"arri-logc3-ei800","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"yellow","enabled":true,"noiseRejection":0.5,"opacity":0.3,"sensitivity":0},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"source","scopes":{"enabled":true,"gain":4,"graticule":false,"mode":"lumaWaveform","refreshHz":30},"sourceLogMapping":"native10Bit","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"source","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceCodeRange":"full","sourceLogMapping":"fullRescaledToLegal10Bit","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+    #"{"falseColor":{"exposureIndex":800,"mode":"off","referenceOffsetStops":0},"focus":{"color":"red","enabled":false,"noiseRejection":0.02,"opacity":0.85,"sensitivity":0.5},"guides":{"centerCross":false,"contrast":1,"enabled":false,"opacity":0.65,"safeArea":false,"thirds":true},"pictureStage":"processedOutput","schemaVersion":1,"scopeStage":"processedOutput","scopes":{"enabled":false,"gain":1,"graticule":true,"mode":"rgbParade","refreshHz":15},"sourceLogMapping":"native10Bit","toolsEnabled":false,"zebra":{"enabled":false,"mode":"aboveThreshold","opacity":0.65,"thresholdIRE":95,"widthIRE":5}}"#,
+  ]
+  /// MonitorToolsCore's `MonitorWorkspaceState` JSON for the workspace built in
+  /// `testBoundaryWorkspaceConvertsBothWaysWithTheSameJSON` (captured at 001c229).
+  private static let monitorToolsWorkspace =
+    #"{"isConfigured":true,"layout":"sideBySide","schemaVersion":1,"splitRatio":0.35,"tileBindings":["a",null,"program",null]}"#
 
   func testBoundaryLegacyDecoderMatchesMonitorTools() throws {
-    for blob in Self.boundaryBlobs {
-      let data = Data(blob.utf8)
-      let tools = try JSONDecoder().decode(MonitorConfiguration.self, from: data)
-      let legacy = try JSONDecoder().decode(LegacyMonitorConfiguration.self, from: data)
-      XCTAssertEqual(MonitorConfiguration(legacy), tools, blob)
-      XCTAssertEqual(LegacyMonitorConfiguration(tools), legacy, blob)
-      XCTAssertEqual(LegacyMonitorConfiguration(tools.normalized()), legacy.normalized(), blob)
-      let toolsJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(tools)) as? NSDictionary
+    XCTAssertEqual(Self.boundaryBlobs.count, Self.monitorToolsDecoded.count)
+    for (blob, golden) in zip(Self.boundaryBlobs, Self.monitorToolsDecoded) {
+      let legacy = try JSONDecoder().decode(LegacyMonitorConfiguration.self, from: Data(blob.utf8))
+      let toolsJSON = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(golden.utf8)) as? NSDictionary, blob)
       let legacyJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? NSDictionary
-      XCTAssertEqual(toolsJSON, legacyJSON, blob)
+      XCTAssertEqual(legacyJSON, toolsJSON, blob)
+      let normalizedJSON =
+        try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy.normalized())) as? NSDictionary
+      XCTAssertEqual(normalizedJSON, toolsJSON, blob)
+      // MonitorTools' JSON reads back as the same configuration.
+      XCTAssertEqual(try JSONDecoder().decode(LegacyMonitorConfiguration.self, from: Data(golden.utf8)), legacy, blob)
     }
   }
 
   func testBoundaryConfigurationSurvivesThePreferences() throws {
-    for blob in Self.boundaryBlobs {
-      let tools = try JSONDecoder().decode(MonitorConfiguration.self, from: Data(blob.utf8))
-      let preferences = MonitorFeedPreferences(migrating: LegacyMonitorConfiguration(tools))
+    for blob in Self.monitorToolsDecoded {
+      // MonitorTools' own decoding of each blob (the parity test above pins it).
+      let tools = try JSONDecoder().decode(LegacyMonitorConfiguration.self, from: Data(blob.utf8))
+      let preferences = MonitorFeedPreferences(migrating: tools)
       var expected = tools.normalized()
       // MonitorKit's exposure offset range is ±6 stops.
       expected.falseColor.referenceOffsetStops = min(6, max(-6, expected.falseColor.referenceOffsetStops))
       if expected.falseColor.mode == .arri && expected.falseColor.profileID == nil {
         expected.falseColor.mode = .off  // Never drawn: no ARRI profile to classify by.
       }
-      let back = MonitorConfiguration(preferences.legacyConfiguration)
+      let back = preferences.legacyConfiguration
       XCTAssertEqual(back.falseColor.mode, expected.falseColor.mode, blob)
       if back.falseColor.mode != .off {
         XCTAssertEqual(back.falseColor.profileID, expected.falseColor.profileID, blob)
@@ -65,20 +92,16 @@ extension MonitorLifecycleChecks {
   }
 
   func testBoundaryWorkspaceConvertsBothWaysWithTheSameJSON() throws {
-    var state = MonitorWorkspaceState()
-    state.isConfigured = true
-    state.layout = .sideBySide
-    state.tileBindings = [MonitorToolsCore.MonitorTargetID("a"), nil, MonitorToolsCore.MonitorTargetID("program"), nil]
-    state.splitRatio = 0.35
+    let state = Data(Self.monitorToolsWorkspace.utf8)  // MonitorTools' `MonitorWorkspaceState`
     var preferences = MonitorWorkspacePreferences()
     preferences.isConfigured = true
     preferences.layout = .sideBySide
     preferences.tileBindings = ["a", nil, "program", nil]
     preferences.splitRatio = 0.35
-    let stateJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? NSDictionary
+    let stateJSON = try JSONSerialization.jsonObject(with: state) as? NSDictionary
     let preferencesJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(preferences)) as? NSDictionary
     XCTAssertEqual(stateJSON, preferencesJSON)
-    XCTAssertEqual(try JSONDecoder().decode(MonitorWorkspacePreferences.self, from: JSONEncoder().encode(state)), preferences)
+    XCTAssertEqual(try JSONDecoder().decode(MonitorWorkspacePreferences.self, from: state), preferences)
     let snapshot = AppSettingsSnapshot(monitorWorkspace: preferences)
     XCTAssertEqual(snapshot.monitorWorkspacePreferences, preferences)
   }
@@ -178,87 +201,5 @@ extension MonitorLifecycleChecks {
       XCTAssertEqual(merges, 3)
       XCTAssertTrue(coordinator.preferences(for: .program).state.zebras[0].enabled)
     }
-  }
-}
-
-// MonitorTools' configuration and the app's legacy copy, field by field (the
-// coordinator's old boundary, kept for the parity checks above).
-private extension MonitorConfiguration {
-  init(_ legacy: LegacyMonitorConfiguration) {
-    self.init()
-    schemaVersion = legacy.schemaVersion
-    toolsEnabled = legacy.toolsEnabled
-    guides.enabled = legacy.guides.enabled
-    guides.thirds = legacy.guides.thirds
-    guides.centerCross = legacy.guides.centerCross
-    guides.safeArea = legacy.guides.safeArea
-    guides.opacity = legacy.guides.opacity
-    guides.contrast = legacy.guides.contrast
-    zebra.enabled = legacy.zebra.enabled
-    zebra.thresholdIRE = legacy.zebra.thresholdIRE
-    zebra.widthIRE = legacy.zebra.widthIRE
-    zebra.mode = legacy.zebra.mode == .band ? .band : .aboveThreshold
-    zebra.opacity = legacy.zebra.opacity
-    falseColor.mode = MonitorFalseColorMode(rawValue: legacy.falseColor.mode.rawValue) ?? .off
-    falseColor.profileID = legacy.falseColor.profileID
-    falseColor.specificationVersion = legacy.falseColor.specificationVersion
-    falseColor.exposureIndex = legacy.falseColor.exposureIndex
-    falseColor.referenceOffsetStops = legacy.falseColor.referenceOffsetStops
-    focus.enabled = legacy.focus.enabled
-    focus.color = MonitorPeakingColor(rawValue: legacy.focus.color.rawValue) ?? .red
-    focus.sensitivity = legacy.focus.sensitivity
-    focus.noiseRejection = legacy.focus.noiseRejection
-    focus.opacity = legacy.focus.opacity
-    scopes.enabled = legacy.scopes.enabled
-    scopes.mode = legacy.scopes.mode == .lumaWaveform ? .lumaWaveform : .rgbParade
-    scopes.gain = legacy.scopes.gain
-    scopes.graticule = legacy.scopes.graticule
-    scopes.refreshHz = legacy.scopes.refreshHz
-    pictureStage = legacy.pictureStage == .source ? .source : .processedOutput
-    scopeStage = legacy.scopeStage == .source ? .source : .processedOutput
-    sourceProfileID = legacy.sourceProfileID
-    sourceCodeRange = legacy.sourceCodeRange.map { $0 == .full ? .full : .legal }
-    sourceLogMapping = legacy.sourceLogMapping == .fullRescaledToLegal10Bit
-      ? .fullRescaledToLegal10Bit : .native10Bit
-  }
-}
-
-private extension LegacyMonitorConfiguration {
-  init(_ configuration: MonitorConfiguration) {
-    self.init()
-    schemaVersion = configuration.schemaVersion
-    toolsEnabled = configuration.toolsEnabled
-    guides.enabled = configuration.guides.enabled
-    guides.thirds = configuration.guides.thirds
-    guides.centerCross = configuration.guides.centerCross
-    guides.safeArea = configuration.guides.safeArea
-    guides.opacity = configuration.guides.opacity
-    guides.contrast = configuration.guides.contrast
-    zebra.enabled = configuration.zebra.enabled
-    zebra.thresholdIRE = configuration.zebra.thresholdIRE
-    zebra.widthIRE = configuration.zebra.widthIRE
-    zebra.mode = configuration.zebra.mode == .band ? .band : .aboveThreshold
-    zebra.opacity = configuration.zebra.opacity
-    falseColor.mode = FalseColorMode(rawValue: configuration.falseColor.mode.rawValue) ?? .off
-    falseColor.profileID = configuration.falseColor.profileID
-    falseColor.specificationVersion = configuration.falseColor.specificationVersion
-    falseColor.exposureIndex = configuration.falseColor.exposureIndex
-    falseColor.referenceOffsetStops = configuration.falseColor.referenceOffsetStops
-    focus.enabled = configuration.focus.enabled
-    focus.color = PeakingColor(rawValue: configuration.focus.color.rawValue) ?? .red
-    focus.sensitivity = configuration.focus.sensitivity
-    focus.noiseRejection = configuration.focus.noiseRejection
-    focus.opacity = configuration.focus.opacity
-    scopes.enabled = configuration.scopes.enabled
-    scopes.mode = configuration.scopes.mode == .lumaWaveform ? .lumaWaveform : .rgbParade
-    scopes.gain = configuration.scopes.gain
-    scopes.graticule = configuration.scopes.graticule
-    scopes.refreshHz = configuration.scopes.refreshHz
-    pictureStage = configuration.pictureStage == .source ? .source : .processedOutput
-    scopeStage = configuration.scopeStage == .source ? .source : .processedOutput
-    sourceProfileID = configuration.sourceProfileID
-    sourceCodeRange = configuration.sourceCodeRange.map { $0 == .full ? .full : .legal }
-    sourceLogMapping = configuration.sourceLogMapping == .fullRescaledToLegal10Bit
-      ? .fullRescaledToLegal10Bit : .native10Bit
   }
 }

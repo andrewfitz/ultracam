@@ -5,9 +5,9 @@ import CoreMediaIO
 import Foundation
 import Darwin
 import Security
-import MonitorToolsCore
-import MonitorToolsMetal
 @preconcurrency import Metal
+import MonitorKit
+import MonitorKitScopes
 
 func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
   if !condition() {
@@ -374,12 +374,27 @@ func inspect(_ sample: CMSampleBuffer, duration: CMTime, mode: SyntheticMode) th
 }
 
 /// Optional read-only subscriber, offered only after the producer has sent the
-/// original sample. It runs the monitor surface's GPU path offscreen: the
-/// picture pass (zebra, focus) into a 1080p target and the scope pass in its
-/// own command buffer, reading the CMIO payload in place without copying it.
-final class MonitorComparison: MonitorEncodeCompletion, @unchecked Sendable {
-  let runtime = MonitorRuntime()
-  let target = MonitorTargetID("cmio-synthetic-comparison")
+/// original sample. It runs the monitor surface's MonitorKit GPU path offscreen
+/// on classic Metal: focus analysis and the picture pass (zebra, focus peaking,
+/// the output stage) into a 1080p target, and the scope (the earlier 768 × 256
+/// RGB parade) in its own command buffer. The CMIO payload is read in place
+/// through a texture cache, without copying it.
+final class MonitorComparison: @unchecked Sendable {
+  /// MonitorKit's objects for one feed and one surface. They are confined:
+  /// only the offering thread (the producer loop, and `prewarm` before it)
+  /// touches them.
+  private struct GPU {
+    let engine: MonitorEngine
+    let queue: MTLCommandQueue
+    let cache: CVMetalTextureCache
+    let feed: MonitorFeed
+    let pass: MonitorPass
+    let scope: ScopeAccumulator
+    let scopeRenderer: ScopeRenderer
+    let targets: [MTLTexture]
+    let scopeTargets: [MTLTexture]
+  }
+  let target = "cmio-synthetic-comparison"
   private let lock = NSLock()
   private var warmReady = false
   private var pictures = Set<UInt64>(), scopes = Set<UInt64>()
@@ -387,57 +402,81 @@ final class MonitorComparison: MonitorEncodeCompletion, @unchecked Sendable {
   private var failure: String?
   private var offered = 0, admitted = 0, callbacks = 0
   private var failureMetadata: [String] = []
-  private var configuration = MonitorConfiguration()
-  private let renderer: MonitorToolsRenderer
-  private var targets: [MTLTexture] = []
-  private var scopeTargets: [MTLTexture] = []
-  private var pending: [Int: (sequence: UInt64, host: Double, warmup: Bool)] = [:]
-  private var nextKind = 10
+  private let gpu: GPU?
+  private let unavailableReason: String?
+  private var state = MonitorState()
+  private let scopeRefreshHz = 15
   private var lastScopeTime = -Double.infinity
   init() {
-    configuration.toolsEnabled = true
-    configuration.pictureStage = .processedOutput
-    configuration.scopeStage = .processedOutput
-    configuration.zebra.enabled = true
-    configuration.focus.enabled = true
-    configuration.scopes.enabled = true
-    configuration.scopes.refreshHz = 15
-    renderer = MonitorToolsRenderer(runtime: runtime)
-    if let device = runtime.device {
-      func texture(_ width: Int, _ height: Int) -> MTLTexture? {
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-          pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
-        descriptor.usage = [.shaderRead, .shaderWrite]
-        descriptor.storageMode = .private
-        return device.makeTexture(descriptor: descriptor)
-      }
-      targets = (0..<3).compactMap { _ in texture(1920, 1080) }
-      scopeTargets = (0..<3).compactMap { _ in
-        texture(MonitorToolsRenderer.scopeWidth, MonitorToolsRenderer.scopeHeight)
-      }
-      if let set = try? device.makeResidencySet(descriptor: MTLResidencySetDescriptor()) {
-        for texture in targets + scopeTargets { set.addAllocation(texture) }
-        set.commit()
-        runtime.attachDrawables(set)
-      }
+    state.pictureStage = .output
+    state.zebras[0].enabled = true
+    state.focus.enabled = true
+    do {
+      gpu = try Self.makeGPU()
+      unavailableReason = nil
+    } catch {
+      gpu = nil
+      unavailableReason = "Monitor GPU unavailable: \(error)"
     }
   }
-  func encodeCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) {
+  private static func makeGPU() throws -> GPU {
+    guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
+      throw VideoError.message("No Metal device or command queue.")
+    }
+    var textureCache: CVMetalTextureCache?
+    guard CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache) == kCVReturnSuccess,
+      let cache = textureCache
+    else { throw VideoError.message("Cannot create a Metal texture cache.") }
+    // Every pipeline a first frame needs is built here, before any measurement.
+    let engine = try MonitorEngine(device: device)
+    try engine.warmUp(targets: [MonitorRenderTargetFormat(colorPixelFormat: .bgra8Unorm)])
+    let scopeEngine = try ScopeEngine(device: device, residency: engine.residency)
+    try scopeEngine.prepare(pixelFormats: [.bgra8Unorm])
+    let scope = try scopeEngine.makeAccumulator(settings: .ultracamLegacy(mode: .rgbParade, stage: .output))
+    func texture(_ width: Int, _ height: Int) throws -> MTLTexture {
+      let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+      descriptor.usage = [.shaderRead, .renderTarget]
+      descriptor.storageMode = .private
+      guard let texture = device.makeTexture(descriptor: descriptor) else {
+        throw VideoError.message("Cannot allocate a \(width)x\(height) monitor target.")
+      }
+      return texture
+    }
+    return GPU(
+      engine: engine, queue: queue, cache: cache, feed: engine.makeFeed(), pass: engine.makePass(), scope: scope,
+      scopeRenderer: scopeEngine.makeRenderer(), targets: try (0..<3).map { _ in try texture(1920, 1080) },
+      scopeTargets: try (0..<3).map { _ in
+        try texture(ScopeSettings.ultracamLegacyImageWidth, ScopeSettings.ultracamLegacyImageHeight)
+      })
+  }
+  private func completed(sequence: UInt64, host: Double, warmup: Bool, isScope: Bool, failed: Bool) {
     lock.lock(); defer { lock.unlock() }
-    guard let entry = pending.removeValue(forKey: kind) else { return }
-    if !entry.warmup { callbacks += 1 }
+    if !warmup { callbacks += 1 }
     if failed {
       failure = "Monitor GPU work failed"
-      failureMetadata.append("gpuFailed=true sequence=\(entry.sequence)")
+      failureMetadata.append("gpuFailed=true sequence=\(sequence)")
       return
     }
-    if entry.warmup { warmReady = true; return }
-    let isScope = kind % 2 == 1
+    if warmup { warmReady = true; return }
     if isScope {
-      if scopes.insert(entry.sequence).inserted { scopeAges.append(now() - entry.host) }
-    } else if pictures.insert(entry.sequence).inserted {
-      pictureAges.append(now() - entry.host)
+      if scopes.insert(sequence).inserted { scopeAges.append(now() - host) }
+    } else if pictures.insert(sequence).inserted {
+      pictureAges.append(now() - host)
     }
+  }
+  /// Commits `commandBuffer`; `frame` (the payload's textures) stays alive until
+  /// the GPU has finished with it.
+  private func commit(
+    _ commandBuffer: MTLCommandBuffer, frame: MonitorFrame, sequence: UInt64, host: Double, warmup: Bool,
+    isScope: Bool
+  ) {
+    commandBuffer.addCompletedHandler { [self] buffer in
+      withExtendedLifetime(frame) {
+        completed(sequence: sequence, host: host, warmup: warmup, isScope: isScope, failed: buffer.status != .completed)
+      }
+    }
+    commandBuffer.commit()
   }
   func offer(_ sample: CMSampleBuffer, sequence: UInt64, warmup: Bool = false,
     sourceHostTime: Double? = nil) {
@@ -446,56 +485,51 @@ final class MonitorComparison: MonitorEncodeCompletion, @unchecked Sendable {
     guard let image = CMSampleBufferGetImageBuffer(sample) else { return }
     if !warmup { lock.withLock { offered += 1 } }
     if let sourceHostTime, !warmup { lock.withLock { schedulingDelays.append(time - sourceHostTime) } }
-    let geometry = MonitorGeometry(width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image))
-    let signal = MonitorFrameSignal(range: .legal, matrix: .bt709, transfer: "Rec.709")
-    let stamp = MonitorFrameStamp(target: target, generation: 1, sequence: sequence,
-      sourcePTS: CMSampleBufferGetPresentationTimeStamp(sample).seconds, hostTime: sourceHostTime ?? time,
-      configurationRevision: 1, processingRevision: 1)
-    let bundle = MonitorFrameBundle(stamp: stamp, source: image, output: image,
-      sourceGeometry: geometry, outputGeometry: geometry, correspondence: .identity,
-      sourceSignal: signal, outputSignal: signal)
-    let metadata = "target=\(target.rawValue) generation=1 sequence=\(sequence) sourcePTS=\(stamp.sourcePTS) sourceHost=\(stamp.hostTime) offerHost=\(time) warmup=\(warmup)"
-    guard !targets.isEmpty else {
-      lock.withLock { failure = runtime.unavailableReason ?? "Monitor GPU unavailable" }
+    let host = sourceHostTime ?? time
+    let sourcePTS = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+    let metadata = "target=\(target) generation=1 sequence=\(sequence) sourcePTS=\(sourcePTS) sourceHost=\(host) offerHost=\(time) warmup=\(warmup)"
+    guard let gpu else {
+      lock.withLock { failure = unavailableReason ?? "Monitor GPU unavailable" }
       return
     }
-    let state = MonitorRenderState(configuration: configuration)
     do {
-      let frame = try runtime.gpuFrame(bundle)
-      let context = try runtime.beginEncoding()
-      let kind: Int = lock.withLock {
-        nextKind += 2
-        pending[nextKind] = (sequence, stamp.hostTime, warmup)
-        return nextKind
+      // The synthetic source is legal-range Rec.709.
+      let frame = try MonitorFrame.wrap(image, cache: gpu.cache, signal: .rec709)
+      guard let commandBuffer = gpu.queue.makeCommandBuffer() else {
+        throw VideoError.message("Cannot create a monitor command buffer.")
       }
-      let target = targets[Int(sequence % UInt64(targets.count))]
       do {
-        try renderer.encode(frame: frame, state: state, target: target,
-          viewport: MonitorViewport(width: target.width, height: target.height), into: context)
+        try gpu.feed.analyze(frame, focus: state.focus, into: commandBuffer)
+        try gpu.pass.encode(
+          frame: frame, feed: gpu.feed, state: state, target: gpu.targets[Int(sequence % UInt64(gpu.targets.count))],
+          into: commandBuffer)
       } catch {
-        runtime.abandon(context)
+        // What was encoded still runs; the failure is reported below.
+        commit(commandBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: false)
         throw error
       }
-      runtime.commit(context, completion: self, kind: kind)
-      if !renderer.status.isEmpty {
-        lock.withLock { failure = "GPU analysis unavailable: \(renderer.status.joined(separator: ", "))" }
+      commit(commandBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: false)
+      let unavailable = gpu.pass.status.unavailable
+      if !unavailable.isEmpty {
+        let reasons = unavailable.map { "\($0.tool.rawValue): \($0.reason)" }.joined(separator: ", ")
+        lock.withLock { failure = "GPU analysis unavailable: \(reasons)" }
       }
       // Scopes at the requested rate, in their own command buffer.
-      if time - lastScopeTime >= 1 / Double(configuration.scopes.refreshHz) - 0.002 {
+      if time - lastScopeTime >= 1 / Double(scopeRefreshHz) - 0.002 {
         lastScopeTime = time
-        let scopeContext = try runtime.beginEncoding()
-        let scopeKind: Int = lock.withLock {
-          pending[kind + 1] = (sequence, stamp.hostTime, warmup)
-          return kind + 1
+        guard let scopeBuffer = gpu.queue.makeCommandBuffer() else {
+          throw VideoError.message("Cannot create a scope command buffer.")
         }
         do {
-          try renderer.encodeScopes(frame: frame, state: state,
-            target: scopeTargets[Int(sequence % UInt64(scopeTargets.count))], into: scopeContext)
+          try gpu.scope.accumulate(frame, feed: gpu.feed, into: scopeBuffer)
+          try gpu.scopeRenderer.render(
+            gpu.scope, target: gpu.scopeTargets[Int(sequence % UInt64(gpu.scopeTargets.count))], clear: true,
+            into: scopeBuffer)
         } catch {
-          runtime.abandon(scopeContext)
+          commit(scopeBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: true)
           throw error
         }
-        runtime.commit(scopeContext, completion: self, kind: scopeKind)
+        commit(scopeBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: true)
       }
       if !warmup { lock.withLock { admitted += 1 } }
     } catch {

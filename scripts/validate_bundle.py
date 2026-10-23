@@ -56,12 +56,10 @@ def validate(app):
                 raise ValueError("The camera extension must retain library validation; only the host loads DeckLink.")
             if not any(service.startswith(group + ".") for group in groups):
                 raise ValueError("Camera Mach service must be prefixed with an entitled app group.")
-    # Runtime shader source is a SwiftPM Bundle.module resource in the host only.
-    monitor_bundles = list((app / "Contents/Resources").glob("*MonitorToolsMetal.bundle"))
-    if not monitor_bundles or not any(list(bundle.rglob("MonitorTools.metal.txt")) for bundle in monitor_bundles):
-        raise ValueError("Host MonitorToolsMetal shader resource bundle is missing.")
-    if any("MonitorTools" in path.name for path in extension.rglob("*")):
-        raise ValueError("Monitor Tools must not be packaged into the camera extension.")
+    # MonitorTools is retired (MonitorKit replaced it): nothing of it may ship, e.g. a
+    # resource bundle left behind by an incremental build from before the retirement.
+    if any("MonitorTools" in path.name for path in app.rglob("*")):
+        raise ValueError("The retired MonitorTools package must not be packaged into the app.")
     # MonitorKit's runtime shaders: SwiftPM `.copy("Shaders")` resources, host only.
     for name, shaders in (
         ("MonitorKit_MonitorKit.bundle", ("MKLUT.msl", "MKDecode.msl", "MKMonitor.msl")),
@@ -78,7 +76,7 @@ def validate(app):
     # Static linking leaves no file behind, so also check the extension's code for MonitorKit symbols.
     if any(b"MonitorKit" in path.read_bytes() for path in (extension / "Contents/MacOS").iterdir() if path.is_file()):
         raise ValueError("MonitorKit must not be linked into the camera extension.")
-    print("Camera metadata and host-only Monitor Tools and MonitorKit resources validated.")
+    print("Camera metadata and host-only MonitorKit resources validated; no MonitorTools shipped.")
 
 
 if __name__ == "__main__":

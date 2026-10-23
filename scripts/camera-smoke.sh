@@ -26,12 +26,10 @@ mkdir -p "$TMPDIR" "$smoke_root/modules"
 compile_log="$smoke_root/compile.log"
 export MACOSX_DEPLOYMENT_TARGET=26.0
 test_root="$smoke_root"
-source "$task_root/scripts/monitor-tools-package.sh"
 source "$task_root/scripts/monitor-kit-package.sh"
-monitor_package_build >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
 monitor_kit_package_build >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
 xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
-  -target arm64-apple-macos26.0 -module-cache-path "$smoke_root/modules" "${monitor_link_args[@]}" "${monitor_kit_link_args[@]}" \
+  -target arm64-apple-macos26.0 -module-cache-path "$smoke_root/modules" "${monitor_kit_link_args[@]}" \
   "$task_root/Sources/Shared/VideoContract.swift" "$task_root/Sources/Shared/VideoBufferLayout.swift" \
   "$task_root/Sources/Shared/VirtualCameraRegistry.swift" \
   "$task_root/Sources/Shared/VirtualCameraRegistryTransport.swift" \

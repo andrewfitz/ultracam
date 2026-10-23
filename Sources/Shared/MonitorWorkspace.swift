@@ -3,9 +3,9 @@ import MonitorKitCore
 import MonitorKitScopes
 
 // App-owned monitor preferences (integration map §5). The names differ from
-// MonitorTools' (`MonitorWorkspaceState`, `MonitorTargetID`, ...) on purpose:
-// a module-level declaration would shadow the imported type in every app file
-// that still renders with MonitorTools.
+// the retired MonitorTools package's (`MonitorWorkspaceState`, ...): they were
+// chosen while both packages were linked, when a same-named app type would have
+// shadowed the imported one.
 
 /// Monitor settings of one target (a camera feed or Program): MonitorKit tool
 /// state plus the app glue MonitorKit has no field for.
@@ -215,11 +215,12 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
   /// Whether a surface of this target shows scopes.
   var scopesShown: Bool { toolsEnabled && scopes.enabled }
 
-  /// These preferences as a MonitorTools configuration, for the coordinator
-  /// while it still renders with MonitorTools. Normalized, except that a
-  /// false-colour mode the declared signal cannot show stays selected, as it did
-  /// in MonitorTools' session configuration after a camera change: its renderer
-  /// normalizes it away, and declaring the source again brings it back.
+  /// These preferences as an old MonitorTools configuration (the shape the
+  /// coordinator's legacy callbacks and the migration checks use). Normalized,
+  /// except that a false-colour mode the declared signal cannot show stays
+  /// selected, as it did in MonitorTools' session configuration after a camera
+  /// change: its renderer normalized it away, and declaring the source again
+  /// brought it back.
   var legacyConfiguration: LegacyMonitorConfiguration {
     var c = LegacyMonitorConfiguration()
     c.toolsEnabled = toolsEnabled
@@ -279,9 +280,9 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
 
   /// Takes every value of `legacy` that differs from what these preferences
   /// already describe (`legacyConfiguration`), field by field (map §5.3).
-  /// Settings MonitorTools cannot express (a second zebra, frame guides,
+  /// Settings MonitorTools could not express (a second zebra, frame guides,
   /// several safe areas, display transforms, other scope kinds...) survive a
-  /// change made through the MonitorTools UI.
+  /// change made in that shape.
   mutating func merge(_ newValue: LegacyMonitorConfiguration) {
     let new = newValue.normalized()
     let old = legacyConfiguration

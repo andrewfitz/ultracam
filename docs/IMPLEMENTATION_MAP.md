@@ -4,6 +4,8 @@ Read-only mapping, written 2026-10-21 against the working tree on `main`. It lis
 new SwiftUI UI needs, what's per-feed vs selected-only today, the build and test hooks, and a gap
 list.
 
+> Note (2026-10-22): `Packages/MonitorTools` and its `MonitorToolsUI` views named below were retired in W4; the monitor now runs on MonitorKit with app-owned surfaces (see [the integration map](MONITORKIT_INTEGRATION_MAP.md)).
+
 The target design is round 3 plus audit decisions D1–D8 (`docs/mockups/r3/audit/REPORT.md`).
 Line numbers are approximate; re-check them before editing.
 
