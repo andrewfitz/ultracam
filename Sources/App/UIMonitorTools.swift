@@ -239,11 +239,35 @@ struct UIMonitorToolSettingsView: View {
 
   /// What the popover's header names beside the camera: the signal the tool reads.
   private var subtitle: String {
-    let stage = isProgram ? "Program Output" : UIMonitorToolText.stage(preferences.state.pictureStage)
+    Self.subtitle(panel, cameraName: cameraName, isProgram: isProgram, preferences: preferences)
+  }
+
+  /// The header's camera and the signal `panel` measures. Log false color reads
+  /// the source; six band and custom bands, clip indicators and focus peaking
+  /// read their own stage, as does each zebra set that is on; guides and the
+  /// picture follow the picture.
+  /// Off, false color names the signal its toggle would read.
+  static func subtitle(_ panel: UIMonitorPanel, cameraName: String, isProgram: Bool,
+    preferences: MonitorFeedPreferences) -> String {
+    let state = preferences.state
+    func on(_ stage: SignalStage) -> String { "\(cameraName) · \(UIMonitorToolText.stage(stage))" }
+    func analysis(_ stage: SignalStage) -> String { "\(cameraName) · analysis on \(UIMonitorToolText.stage(stage))" }
     switch panel {
-    case .tool(.falseColor) where !isProgram, .tool(.focus) where !isProgram: return "\(cameraName) · analysis on Source"
     case .tool(.scopes): return "\(cameraName) · below the picture"
-    default: return "\(cameraName) · \(stage)"
+    case _ where isProgram: return "\(cameraName) · Program Output"
+    case .tool(.falseColor):
+      let mode = state.falseColor.mode == .off
+        ? UIFalseColorChoices.suggestedMode(profile: preferences.signal.logProfileID) : state.falseColor.mode
+      return analysis(mode.needsLogSource ? .source : state.falseColor.stage)
+    case .tool(.focus): return analysis(state.focus.stage)
+    case .clipIndicators: return on(state.clipIndicators.stage)
+    case .tool(.zebra):
+      // Each set on measures its own stage (zebra 1's follows the picture).
+      var stages: [SignalStage] = []
+      for zebra in state.zebras where zebra.enabled && !stages.contains(zebra.stage) { stages.append(zebra.stage) }
+      if stages.isEmpty { stages = [state.pictureStage] }
+      return "\(cameraName) · " + stages.map(UIMonitorToolText.stage).joined(separator: " + ")
+    case .tool(.guides), .picture: return on(state.pictureStage)
     }
   }
 

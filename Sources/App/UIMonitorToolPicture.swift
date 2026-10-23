@@ -15,10 +15,27 @@ struct UIPictureSettingsForm: View {
   /// The PQ mastering peaks offered for HDR transforms, in cd/m².
   static let pqPeaks: [Double] = [300, 500, 800, 1000, 2000, 4000]
 
-  /// Whether anything here differs from the picture as published.
+  /// Whether anything here differs from the picture as published: the signal
+  /// shown (published is Output (LUT)), the display transform, geometry or
+  /// display adjustments.
   static func isAdjusted(_ state: MonitorState) -> Bool {
-    state.displayTransform.mode != .none || state.geometry.desqueeze != 1 || state.geometry.flip != .none
+    state.pictureStage != MonitorFeedPreferences.defaultState.pictureStage
+      || state.displayTransform.mode != .none || state.geometry.desqueeze != 1 || state.geometry.flip != .none
       || !state.display.isIdentity
+  }
+
+  /// The temperature slider's 50 K steps run from 4000 K, so they miss D65
+  /// (6504 K): a value within half a step of it is D65, so the slider can
+  /// return to no white-point trim.
+  static func snappedTemperature(_ value: Double) -> Double {
+    abs(value - WhitePointTrim.d65Temperature) < 25 ? WhitePointTrim.d65Temperature : value
+  }
+
+  /// The temperature, snapped to D65 near it (drag and accessibility steps alike).
+  private var temperature: Binding<Double> {
+    Binding(
+      get: { preferences.state.display.temperature },
+      set: { preferences.state.display.temperature = Self.snappedTemperature($0) })
   }
 
   var body: some View {
@@ -77,7 +94,7 @@ struct UIPictureSettingsForm: View {
         ForEach(MonochromeMode.allCases, id: \.self) { Text(UIMonitorToolText.monochrome($0)).tag($0) }
       }
       .pickerStyle(.segmented)
-      UIMonitorSlider("Temperature", value: display.temperature, in: WhitePointTrim.temperatureRange, step: 50) {
+      UIMonitorSlider("Temperature", value: temperature, in: WhitePointTrim.temperatureRange, step: 50) {
         String(format: "%.0f K", $0)
       }
       UIMonitorSlider("Tint", value: display.tint, in: WhitePointTrim.tintRange, step: 0.001) { String(format: "%+.3f", $0) }

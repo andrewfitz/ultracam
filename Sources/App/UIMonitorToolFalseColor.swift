@@ -81,16 +81,20 @@ struct UISignalDeclarationFields: View {
   private var sourceProfile: Binding<String> {
     Binding(
       get: { preferences.signal.logProfileID ?? "" },
-      set: { value in
-        var next = preferences
-        next.signal.logProfileID = value.isEmpty ? nil : value
-        let mode = next.state.falseColor.mode
-        if mode.needsLogSource, !UIFalseColorChoices.isAvailable(mode, profile: next.signal.logProfileID) {
-          let suggested = UIFalseColorChoices.suggestedMode(profile: next.signal.logProfileID)
-          if suggested.needsLogSource { next.state.falseColor.mode = suggested }
-        }
-        preferences = next
-      })
+      set: { value in preferences = Self.declaring(value.isEmpty ? nil : value, in: preferences) })
+  }
+
+  /// `preferences` with `profile` declared. A log mode the new profile can't
+  /// show switches to the log mode it can; with none, it stays (and shows why).
+  static func declaring(_ profile: String?, in preferences: MonitorFeedPreferences) -> MonitorFeedPreferences {
+    var next = preferences
+    next.signal.logProfileID = profile
+    let mode = next.state.falseColor.mode
+    if mode.needsLogSource, !UIFalseColorChoices.isAvailable(mode, profile: profile) {
+      let suggested = UIFalseColorChoices.suggestedMode(profile: profile)
+      if suggested.needsLogSource { next.state.falseColor.mode = suggested }
+    }
+    return next
   }
 }
 
