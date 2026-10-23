@@ -20,19 +20,30 @@ monitor_kit_env=(env CLANG_MODULE_CACHE_PATH="$monitor_kit_cache_root/modules" S
 monitor_kit_products=(MonitorKitCore MonitorKit MonitorKitScopes MonitorKitAudio MonitorKitUI)
 # One XCTest bundle per test target; a complete run finishes every one of them.
 monitor_kit_test_bundles="$(cd "$monitor_kit_package/Tests" 2>/dev/null && ls -d */ | tr -d / | tr '\n' ' ')"
-# The only cases a failing run may retry: CPU and GPU timing budgets that a loaded
-# machine can miss. Correctness, race and order checks fail on their first failure.
+# The only failures a run may retry: CPU and GPU timing budgets that a loaded machine can
+# miss. Correctness, race and order checks fail on their first failure, so a retry needs
+# both the case and every assertion it failed to be allowed. The list holds pairs: a regex
+# for Module.Class/test, then one that each of that case's failure messages (the text after
+# "error: -[Module.Class test] : ") must match whole. A benchmark's pixel, pipeline, fusion
+# and command-buffer checks are XCTAssertEqual, True or Nil, so they never match; only a
+# numeric less-than is a budget (a GreaterThan is a throughput or sanity floor).
+monitor_kit_budget='XCTAssertLessThan(OrEqual)? failed: \("[-+0-9.einfa]+"\) is (not less than|greater than) \("[-+0-9.einfa]+"\)'
 monitor_kit_retry_allowlist=(
-  'MonitorKitTests\.Benchmarks/.*'
-  'MonitorKitTests\.Metal4Benchmarks/.*'
+  'MonitorKitTests\.Benchmarks/.*' "$monitor_kit_budget( - .*)?"
+  'MonitorKitTests\.Metal4Benchmarks/.*' "$monitor_kit_budget( - .*)?"
+  # The GPU-time budget only; its pixel-identity and pipeline checks are never retried.
   'MonitorKitTests\.ContractTests/testLibraryMatchesAHostsInlineShaderInPixelsAndGPUTime'
-  'MonitorKitScopesTests\.ScopeBenchmarkTests/.*'
-  'MonitorKitScopesTests\.ScopeMetal4Benchmarks/.*'
-  'MonitorKitScopesTests\.ScopeContractTests/testEncodeCPUCost'
-  'MonitorKitUITests\.GPUBenchmarks/.*'
-  'MonitorKitUITests\.TickBenchmarks/.*'
+  "$monitor_kit_budget - [^ ]+: the library costs more than inline code"
+  'MonitorKitScopesTests\.ScopeBenchmarkTests/.*' "$monitor_kit_budget( - .*)?"
+  'MonitorKitScopesTests\.ScopeMetal4Benchmarks/.*' "$monitor_kit_budget( - .*)?"
+  'MonitorKitScopesTests\.ScopeContractTests/testEncodeCPUCost' "$monitor_kit_budget"
+  'MonitorKitUITests\.GPUBenchmarks/.*' "$monitor_kit_budget( - .*)?"
+  'MonitorKitUITests\.TickBenchmarks/.*' "$monitor_kit_budget( - .*)?"
+  # The submit latency budgets only; its deadlock, latest-frame and throughput checks and
+  # its retired-frame bound (a less-than with no message) are never retried.
   'MonitorKitUITests\.HandoffTests/testHandoffUnderStressNeverBlocksEitherSide'
-  'MonitorKitAudioTests\.RealtimeTests/testBenchmarkSixteenChannels'
+  "$monitor_kit_budget - (a submit waited|submits waited)"
+  'MonitorKitAudioTests\.RealtimeTests/testBenchmarkSixteenChannels' "$monitor_kit_budget - .*"
 )
 
 # Runs under the cache lock (see monitor_kit_package_build): build every product, check
@@ -102,17 +113,33 @@ monitor_kit_failed_cases() {
   { LC_ALL=C grep -aE "^Test Case '-\[[^ ]+ [^]]+\]' failed" "$1" || true; } \
     | sed -E "s/^Test Case '-\[([^ ]+) ([^]]+)\]'.*/\1\/\2/" | sort -u
 }
+# Prints the failure messages the case $2 (Module.Class/test) logged in $1, one per line,
+# each cut short: a pixel array's message can be hundreds of megabytes.
+monitor_kit_case_failures() {
+  LC_ALL=C awk -v prefix=": error: -[${2%%/*} ${2#*/}] : " \
+    '{ i = index($0, prefix); if (!i) next; m = substr($0, i + length(prefix))
+       print (length(m) > 2000 ? substr(m, 1, 2000) " [cut]" : m) }' "$1"
+}
 # Prints the cases a failed run may retry, one per line. Returns 1, printing why, unless the
-# log accounts for every test and every failed case is on the timing allowlist.
+# log accounts for every test and every failed case is an allowlisted case that failed only
+# its timing budgets.
 monitor_kit_retry_plan() {
-  local log="$1" problems failed others pattern
+  local log="$1" problems failed case i rule count other
   problems="$(monitor_kit_log_problems "$log" "${2:-}")"
   [[ -z "$problems" ]] || { printf 'not retried, the run is incomplete: %s\n' "$problems"; return 1; }
   failed="$(monitor_kit_failed_cases "$log")"
   [[ -n "$failed" ]] || { echo 'not retried: the run failed with no failed test case'; return 1; }
-  pattern="^($(IFS='|'; echo "${monitor_kit_retry_allowlist[*]}"))$"
-  others="$(printf '%s\n' "$failed" | { LC_ALL=C grep -vE "$pattern" || true; })"
-  [[ -z "$others" ]] || { printf 'not retried, not a timing budget: %s\n' $others; return 1; }
+  for case in $failed; do
+    rule=''
+    for ((i = 0; i < ${#monitor_kit_retry_allowlist[@]}; i += 2)); do
+      if [[ "$case" =~ ^(${monitor_kit_retry_allowlist[i]})$ ]]; then rule="${monitor_kit_retry_allowlist[i + 1]}"; break; fi
+    done
+    [[ -n "$rule" ]] || { printf 'not retried, not a timing budget: %s\n' "$case"; return 1; }
+    count="$(monitor_kit_case_failures "$log" "$case" | wc -l | tr -d ' ')"
+    [[ "$count" -gt 0 ]] || { printf 'not retried, no assertion failure logged: %s\n' "$case"; return 1; }
+    other="$(monitor_kit_case_failures "$log" "$case" | { LC_ALL=C grep -vE "^($rule)$" || true; } | head -1 | cut -c1-300)" || true
+    [[ -z "$other" ]] || { printf 'not retried, not a timing budget: %s: %s\n' "$case" "$other"; return 1; }
+  done
   printf '%s\n' "$failed"
 }
 # The package's swift test on a scratch of this run's own, logged to $1, so concurrent runs
@@ -166,16 +193,43 @@ monitor_kit_selftest() {
   dir="$(mktemp -d "${TMPDIR:-/tmp}/monitor-kit-selftest.XXXXXX")"
   test_root="$dir"
   monitor_kit_test_bundles="MonitorKitTests MonitorKitAudioTests"
+  # failure "Module.Class test" KIND prints the assertion failures a failed case logs, in
+  # XCTest's own wording (budget, the default, is one missed timing budget).
+  failure() {
+    local at="/x/File.swift:9: error: -[$1] : " over='XCTAssertLessThanOrEqual failed: ("0.42") is greater than ("0.35")' n
+    case "$2" in
+      budget) echo "$at$over - 1080p every tool" ;;
+      three) for n in 1 2 3; do echo "$at$over - Metal 4 encode $n"; done ;;
+      bare) echo "${at}XCTAssertLessThan failed: (\"12.5\") is not less than (\"10\")" ;;
+      inline) echo "$at$over - 1920×1080: the library costs more than inline code" ;;
+      pixels) echo "${at}XCTAssertEqual failed: (\"[SIMD4<Float>(0.29, 0.0, 0.98, 1.0)]\") is not equal to (\"[SIMD4<Float>(0.28, 0.0, 0.95, 1.0)]\") - 1920×1080: identical pixels" ;;
+      # A message longer than is read whole whose tail would pass for the budget's.
+      hugepixels) printf '%sXCTAssertEqual failed: ("[%s]") is not equal to ("[0]") - 1920×1080: the library costs more than inline code\n' \
+        "$at" "$(head -c 3000000 /dev/zero | tr '\0' '1')" ;;
+      mixed) failure "$1" inline; failure "$1" pixels ;;
+      waited) echo "${at}XCTAssertLessThan failed: (\"30.424875\") is not less than (\"20.0\") - a submit waited" ;;
+      leak) echo "${at}XCTAssertLessThanOrEqual failed: (\"9\") is greater than (\"8\")" ;;
+      deadlock) echo "${at}XCTAssertEqual failed: (\"timedOut\") is not equal to (\"success\") - a producer is stuck: a deadlock" ;;
+      floor) echo "${at}XCTAssertGreaterThan failed: (\"812\") is not greater than (\"10000\")" ;;
+      thrown) echo "<unknown>:0: error: -[$1] : failed: caught error: \"device lost\"" ;;
+      none) ;;
+    esac
+  }
   # bundle NAME passed|failed|crash CASE... where CASE is Class/test/passed|failed|skipped|started
+  # and Class/test/failed:KIND names the failure (see failure).
   bundle() {
-    local name="$1" end="$2" spec cls t res
+    local name="$1" end="$2" spec cls t res kind
     shift 2
     echo "Test Suite 'All tests' started at 2026-10-22 11:08:46.931."
     echo "Test Suite '$name.xctest' started at 2026-10-22 11:08:46.932."
     for spec in "$@"; do
       IFS=/ read -r cls t res <<< "$spec"
       echo "Test Case '-[$name.$cls $t]' started."
-      [[ "$res" != failed ]] || echo "/x/$cls.swift:9: error: -[$name.$cls $t] : XCTAssertLessThan failed: (\"[1, 2, 3]\")"
+      if [[ "$res" == failed* ]]; then
+        kind="${res#failed}"; kind="${kind#:}"
+        failure "$name.$cls $t" "${kind:-budget}"
+        res=failed
+      fi
       [[ "$res" == started ]] || echo "Test Case '-[$name.$cls $t]' $res (0.010 seconds)."
     done
     if [[ "$end" == crash ]]; then
@@ -252,6 +306,54 @@ STUB
     bundle MonitorKitAudioTests passed RealtimeTests/testResetNeverReappearsWhileProcessRuns/passed; } > "$dir/retry.log"
   scenario 'race check failure' 1 0 1 1
   expect "$(grep -c '^not retried, not a timing budget: MonitorKitAudioTests.RealtimeTests/testResetNeverReappearsWhileProcessRuns$' "$dir/run.log")" 1 'race failure is named'
+  # An allowlisted case retries only when every assertion it failed is a timing budget.
+  plan_case() {  # plan_case LABEL BUNDLE CASE EXPECTED_RC EXPECTED_FIRST_LINE (cut to 200)
+    local out got=0 b
+    { bundle "$2" failed "$3"
+      for b in MonitorKitTests MonitorKitAudioTests; do [[ "$b" == "$2" ]] || bundle "$b" passed; done; } > "$dir/first.log"
+    out="$(monitor_kit_retry_plan "$dir/first.log")" || got=$?
+    expect "$got" "$4" "$1: retried?"
+    expect "$(printf '%s\n' "$out" | head -1 | cut -c1-200)" "$5" "$1: plan"
+  }
+  local inline=ContractTests/testLibraryMatchesAHostsInlineShaderInPixelsAndGPUTime
+  local handoff=HandoffTests/testHandoffUnderStressNeverBlocksEitherSide
+  local equal='XCTAssertEqual failed: ("[SIMD4<Float>(0.29, 0.0, 0.98, 1.0)]") is not equal to ("[SIMD4<Float>(0.28, 0.0, 0.95, 1.0)]") - 1920×1080: identical pixels'
+  local refused='not retried, not a timing budget'
+  plan_case 'three missed budgets in one case' MonitorKitTests Metal4Benchmarks/testMetal4CPUEncodeCost/failed:three 0 \
+    MonitorKitTests.Metal4Benchmarks/testMetal4CPUEncodeCost
+  plan_case 'a budget without a message' MonitorKitTests "$bench/failed:bare" 0 "MonitorKitTests.$bench"
+  plan_case 'a pixel check in a benchmark class' MonitorKitTests "$bench/failed:pixels" 1 \
+    "$(printf '%s: %s: %s' "$refused" "MonitorKitTests.$bench" "$equal" | cut -c1-200)"
+  plan_case 'a budget beside a pixel check' MonitorKitTests "$bench/failed:mixed" 1 \
+    "$(printf '%s: %s: %s' "$refused" "MonitorKitTests.$bench" "$equal" | cut -c1-200)"
+  plan_case 'a thrown error in a benchmark' MonitorKitTests "$bench/failed:thrown" 1 \
+    "$refused: MonitorKitTests.$bench: failed: caught error: \"device lost\""
+  plan_case 'a failed case with no assertion line' MonitorKitTests "$bench/failed:none" 1 \
+    "not retried, no assertion failure logged: MonitorKitTests.$bench"
+  plan_case 'the inline-shader GPU-time budget' MonitorKitTests "$inline/failed:inline" 0 "MonitorKitTests.$inline"
+  plan_case 'the inline-shader pixel identity' MonitorKitTests "$inline/failed:pixels" 1 \
+    "$(printf '%s: %s: %s' "$refused" "MonitorKitTests.$inline" "$equal" | cut -c1-200)"
+  plan_case 'the inline-shader budget beside its pixel identity' MonitorKitTests "$inline/failed:mixed" 1 \
+    "$(printf '%s: %s: %s' "$refused" "MonitorKitTests.$inline" "$equal" | cut -c1-200)"
+  plan_case 'the inline-shader case with another budget label' MonitorKitTests "$inline/failed:budget" 1 \
+    "$(printf '%s: %s: %s' "$refused" "MonitorKitTests.$inline" 'XCTAssertLessThanOrEqual failed: ("0.42") is greater than ("0.35") - 1080p every tool' | cut -c1-200)"
+  plan_case 'a pixel message too long to read whole' MonitorKitTests "$inline/failed:hugepixels" 1 \
+    "$(printf '%s: %s: XCTAssertEqual failed: ("[%s' "$refused" "MonitorKitTests.$inline" "$(head -c 300 /dev/zero | tr '\0' '1')" | cut -c1-200)"
+  plan_case 'the handoff submit budget' MonitorKitUITests "$handoff/failed:waited" 0 "MonitorKitUITests.$handoff"
+  plan_case 'the handoff retired-frame bound' MonitorKitUITests "$handoff/failed:leak" 1 \
+    "$refused: MonitorKitUITests.$handoff: XCTAssertLessThanOrEqual failed: (\"9\") is greater than (\"8\")"
+  plan_case 'the handoff deadlock check' MonitorKitUITests "$handoff/failed:deadlock" 1 \
+    "$(printf '%s: %s: %s' "$refused" "MonitorKitUITests.$handoff" 'XCTAssertEqual failed: ("timedOut") is not equal to ("success") - a producer is stuck: a deadlock' | cut -c1-200)"
+  plan_case 'the handoff throughput floor' MonitorKitUITests "$handoff/failed:floor" 1 \
+    "$(printf '%s: %s: %s' "$refused" "MonitorKitUITests.$handoff" 'XCTAssertGreaterThan failed: ("812") is not greater than ("10000")' | cut -c1-200)"
+  # End to end: the pixel identity fails once and would pass alone; it is never retried.
+  { bundle MonitorKitTests failed "$inline/failed:pixels"; bundle MonitorKitAudioTests passed; } > "$dir/first.log"
+  { bundle MonitorKitTests passed "$inline/passed"; bundle MonitorKitAudioTests passed; } > "$dir/retry.log"
+  scenario 'pixel identity failure' 1 0 1 1
+  expect "$(grep -c "^$refused: MonitorKitTests.$inline: XCTAssertEqual" "$dir/run.log")" 1 'pixel failure is named'
+  # Its GPU-time budget alone is retried.
+  { bundle MonitorKitTests failed "$inline/failed:inline"; bundle MonitorKitAudioTests passed; } > "$dir/first.log"
+  scenario 'inline-shader budget flake' 1 0 0 2
   # A non-zero exit with every case passing (a build or tool failure).
   { bundle MonitorKitTests passed "$bench/passed"; bundle MonitorKitAudioTests passed; } > "$dir/first.log"
   scenario 'exit without a failed case' 1 0 1 1

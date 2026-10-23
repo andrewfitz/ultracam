@@ -404,11 +404,13 @@ Details:
    - `ScopeGroup` binds up to buffer 10 and `ScopeAccumulator` up to index 11 (`ScopeGroup.swift:234-248`, `ScopeAccumulator.swift:238-270`)
 
    Reusing a table across frames and command buffers is safe, because Metal 4 captures the bindings at draw/dispatch encode time. `MonitorToolsRenderer.swift:68-98` already depends on that.
-3. **Uniforms (R2).** No `set*Bytes` in Metal 4: everything goes through `setAddress`. Per-surface frame sizes, measured from the W1 types:
-   - `FrameParameters` 80 B, burn-in and monitor `LUTParameters` 80 + 80 B, `PassParameters` **848 B**, `GuideParameters` **2,336 B**: ≈ 3.4 KB per picture.
-   - Focus: 80 + 8 + 80 + 80 B.
+3. **Uniforms (R2).** No `set*Bytes` in Metal 4: everything goes through `setAddress`. Size a host allocator from the shipped `uniformLength` constants (each block at a 256-byte offset), never from hand-computed struct sizes, which change:
+   - `MonitorPass.uniformLength` **5120 B** per picture encode (the frame and two LUT blocks, then `PassParameters` at offset 768 and `GuideParameters` at 2304).
+   - `MonitorFeed.uniformLength` **1024 B** per focus analysis.
+   - `ScopeAccumulator.uniformLength` **1280 B** per accumulation; `ScopeGroup.uniformLength` **2048 B** per fused pass (each unfused member asks its own 1280).
+   - `ScopeRenderer.uniformLength` **768 B** per `prepare`, plus `ScopeRenderer.graticuleUniformLength` **2304 B** only when the graticule changes.
 
-   **The app's `MonitorEncodeContext.uniform` cannot hold these.** Its stride is 256 B, a precondition (`MonitorRuntime.swift:347-358`), and its capacity is 4 KB. W4 changes it to a variable-size bump allocator: about 32 KB per context, 256-B aligned, reset in `begin()`, resident as today. That is still zero allocation per frame.
+   **The app's `MonitorEncodeContext.uniform` cannot hold these.** Its stride is 256 B, a precondition (`MonitorRuntime.swift:347-358`), and its capacity is 4 KB. W4 changes it to a variable-size bump allocator: about 32 KB per context, 256-B aligned, reset in `begin()`, resident as today. That is still zero allocation per frame. 32 KB holds a picture and its analysis (6144 B) five times over, and a scope tick of three scopes in one group with every graticule rebuilt (2048 + 3 × 768 + 3 × 2304 = 11,264 B). Without a host allocator (`MonitorSubmission.uniforms` nil) each object uses its own ring of `framesInFlight` slots instead.
 4. **Residency (R4).**
    - The library's persistent allocations go into the host's set once (`MonitorResidencyHost.makeResident`). Retirement, on a size change or a freeze release, goes through `retireAfterCompletion`. The app maps that onto its existing graveyard (`MonitorRuntime.swift:525-549`).
    - A `MonitorLUT` texture must be addable to several sets (the processor's and the monitor's). It already exposes `texture`.
@@ -562,6 +564,8 @@ MonitorKitUI's `MonitorMetalView` should not replace the app's surfaces unless i
 | `swift test --package-path Packages/MonitorKit --scratch-path <own>` | MonitorKit's tests; GPU tests skip without Metal | Yes | — |
 | Anything with `LIVE=1`, installer actions, or quitting or killing the installed app | Real UltraStudio or extension | **No** | — |
 
+**MonitorKit test retries** (`monitor-kit-package.sh`, used by `test.sh`): a failed `swift test` run is retried once, from the same build, only when the log accounts for every case and each failed case is allowlisted *and* every assertion it failed is a numeric less-than timing budget (CPU or GPU); in the two mixed cases (the inline-shader contract test and the handoff stress test) it must also carry that budget's own message. A pixel-identity, pipeline, deadlock, leak, race or order check (`XCTAssertEqual`/`True`/`Nil`, a floor, a thrown error), a failed case with no assertion line, or an incomplete run fails at once. Each retried case is logged as FLAKY. `monitor-kit-package.sh selftest` (run by `test.sh`) holds the fixtures.
+
 **`AppHardware`** (`AppModel.swift:23-50`): `AppModel.init` defaults to `hardware: .live`. **Any tool or test that builds an `AppModel` must pass `.offline`**, as `MonitorAppIntegration` and `UIVerify` do. Only `UIAppEnvironment.model` (the real app) uses `.live`.
 
 ---
@@ -630,28 +634,45 @@ Gates:
 
 ## 11. Library requirements before W4 (beyond what exists)
 
+Status as of 2026-10-22, before W4 (W2 is `a1b652a`; the W3 gap work landed in the MonitorKit commits after it). Each requirement keeps its original wording; the indented line says what shipped.
+
 - **R1** A Metal 4 encode path for `MonitorFeed.analyze`, `MonitorPass.encode`/`prepare`/`draw`, `ScopeGroup`/`ScopeAccumulator.accumulate`, `ScopeRenderer.render` and Freeze. It takes the host's `MTL4CommandBuffer` through a confined host protocol (`MonitorMetal4Encoding`, §6.2) and never creates command buffers or queues, commits, waits or adds handlers.
+  - **Done (W2).** As a value, not a protocol: `MonitorSubmission` (the host's `MTL4CommandBuffer`, its index ≥ 1, the contiguous `completedIndex`, optional `uniforms`) is taken by `MonitorFeed.analyze`/`freeze`, `MonitorPass.encode`/`prepare`/`draw`/`encodeCompute`, `MonitorMultiview.encode`, `ScopeAccumulator`/`ScopeGroup.accumulate` and `ScopeRenderer.render`/`prepare`/`draw`, each also with a host-encoder overload. No queue, command buffer, allocator, commit, wait or handler (source-scan contract test).
 - **R2** Uniforms through a host transient allocator (`allocateUniforms(length:) -> (pointer, gpuAddress)`, 256 B aligned; ≈ 3.4 KB per picture, ≈ 250 B per focus pass, plus the scope sizes, documented). No `set*Bytes`.
+  - **Done (W2).** `MonitorUniformAllocator.allocateUniforms(length:) -> MonitorUniformAllocation` in `MonitorSubmission.uniforms`, or the library's own `MonitorUniformRing`s when nil. Sizes are the `uniformLength` constants (§6.2 item 3): `MonitorPass` 5120, `MonitorFeed` 1024, `ScopeAccumulator` 1280, `ScopeGroup` 2048, `ScopeRenderer` 768 + `graticuleUniformLength` 2304.
 - **R3** Library-owned `MTL4ArgumentTable`s, one per pass, feed or scope object, created at init with documented bind counts. Reused across frames, relying on Metal 4's binding snapshot at encode time.
+  - **Done (W2).** One table per object, made on its first Metal 4 encode or ahead of it (`ScopeAccumulator`/`ScopeGroup`/`ScopeRenderer.prepareMetal4()`): pass 7 textures / 5 buffers, feed 6 / 4, accumulator 5 / 6, group 5 / 15, renderer 2 / 3. Hosts rebind their own table after a library draw in their encoder.
 - **R4** Residency through a host hook (`MonitorResidencyHost.makeResident` when an allocation is created; `retireAfterCompletion` when one is replaced). No residency commit per frame. All persistent allocations are enumerable (placeholders, masks, bins, stats, trace and graticule textures, freeze copies).
+  - **Done (W2), shaped differently.** The library owns a `MonitorResidency` (`MonitorEngine.residency`, shared with `ScopeEngine(…, residency:)`): the host attaches `residency.set` to its queue once. Allocations are added once and committed only when membership changes; replaced or deinitialised resources are retired by submission index (`retire`, `observe`, `release(through:)`). Host frames stay host-resident (`MonitorFrame.addResidency(to:)`, `MonitorTextureCache`).
 - **R5** Correct Metal 4 barriers inside the library's encoders (§6.2, item 5). Documented requirement: all MonitorKit work for an engine goes on one `MTL4CommandQueue`.
+  - **Done (W2).** Barriers per ARCHITECTURE.md "Barriers", skipped once the writer's submission is known complete; the one-queue rule is in the contract.
 - **R6** `MTL4Compiler`-built pipelines with `mathMode = .safe` and MSL 4.0/4.1, asynchronous specialization through compiler tasks, and a public `MonitorShaders.compileOptions` so `LUTProcessor` compiles `mk_applyLUT` identically. Verify whether classic `MTLRenderPipelineState`s work with `MTL4RenderCommandEncoder`.
+  - **Done (W3 gap work), picture engine only.** `MonitorEngine(…, compiler: (any MTL4Compiler)?)` builds the library and every picture, focus and Freeze pipeline with the host's compiler and `MonitorShaders.compileOptions` (public; safe math, MSL 4.0/4.1); asynchronous specialization awaits the compiler's async API from `Task.detached`. Device-built pipeline states are verified to draw in MTL4 encoders. `ScopeEngine` still builds with the device (no `compiler:` parameter).
 - **R7** Render-target picture and scope passes into `bgr10a2Unorm`, `rgba16Float` and `bgra8Unorm` drawables with `framebufferOnly = true`; a warm-up API for those formats.
+  - **Done.** Render passes into `framebufferOnly` drawables in all three formats (tested for the picture). Warm-up: `MonitorEngine.warmUp(targets:layouts:surfaces:)` with `MonitorEngine.standardTargetFormats` and `MonitorSurfaceConfiguration`; `ScopeEngine.prepare(pixelFormats:)` with `ScopeEngine.drawablePixelFormats`, `isPrepared(pixelFormat:)`. Still open: a Metal 4 scope test into a `framebufferOnly` drawable.
 - **R8** HDR/EDR output that matches §2:
   - a signal-native write mode
   - an output-colour resolver (pixel format, `CGColorSpace` name, `wantsExtendedDynamicRangeContent`, `CAEDRMetadata` kind) from the stage signal
   - `SignalDescription.primaries`, read from `kCVImageBufferColorPrimariesKey` in `signal(of:range:)`
   - a declared output encoding per `MonitorLUT`, default Rec.709
   - the overlay white level in HDR, defined and documented
+  - **Done (W2).** `MonitorOutputColor.signalNative` (pixel-identical to W1), `MonitorOutputColor.layer(for:displayTransform:monitorStageHasLUT:)` → `MonitorLayerColor` (pixel format, `ColorSpace`, EDR, `EDRMetadata`; MonitorKitUI's `apply(to:)`), `SignalDescription.primaries` read independently of the transfer, `MonitorLUT.outputEncoding` (`LUTOutputEncoding.rec709`), overlays at BT.2408 graphics white (203 cd/m²: 58 % PQ, 75 % HLG).
 - **R9** A picture-stage selection per surface (`MonitorState.pictureStage: SignalStage` or equivalent), so the app's Source/Output picture menu survives.
+  - **Done (W3 gap work).** `MonitorState.pictureStage` (default `.monitor`), function constant 16 (`MK_PICTURE_STAGE`); `MonitorStatus.pictureStage`; `MonitorState.pictureHasLUT(burnInLUT:monitorLUT:)`, and `MonitorFeed.monitorStageHasLUT(for:)` now follows the picture stage.
 - **R10** A clean-aperture or region-of-interest crop on `MonitorFrame`, and a public, allocation-free display-aspect query (`MonitorLayout` for frame + state) for sizing the layer on the main thread.
+  - **Done (W3 gap work).** `MonitorFrame.cleanAperture` (validated in `init`; read by `wrap`, `MonitorTextureCache.frame` and static `MonitorFrame.cleanAperture(of:)`), `MonitorFrameGeometry` (`shownRect`, `displayAspectRatio(for:)`), `MonitorFrame.geometry(of:)`, `MonitorLayout(frame:state:viewport:)` and `MonitorLayout.aperture`. The aperture's vertical offset points down (ISO/IEC 14496-12 `clap`): the app's `(H−h)/2 − verticalOffset` in `MonitorCaptureSink` is mirrored; use `MonitorFrame.cleanAperture(of:)`.
 - **R11** Freeze:
   - Encoded into the host's buffer with the compute encoder's copy.
   - Owned `.private` textures registered through R4 and released through `retireAfterCompletion`.
   - A stable `MonitorFrame.id` for the frozen frame.
   - Copies only the source planes.
   - Documented memory.
+  - **Done (W2), with two differences.** `MonitorFeed.freeze(_:into:)` (classic and Metal 4) copies with a compute kernel (`mk_copyUint`/`mk_copyFloat`), not the encoder's `copy`, into `.private` feed-owned planes made resident in `engine.residency` and retired by submission index; only the source planes are copied; the frozen frame keeps a stable `id`; 22.3 MB for 4K v210 (`persistentMemoryBytes`). `unfreeze(keepingMemory:)` releases them.
 - **R12** Documented texture formats for host-built `MonitorFrame`s. Optionally an IOSurface-keyed, residency-aware texture cache helper (a port of `MonitorSurfaceTextureCache`), because `wrap(cache:)` per frame does not suit Metal 4 residency.
+  - **Done.** The format table is on `MonitorFrame`; `MonitorTextureCache` (IOSurface-keyed, residency-aware, idle sweep, `flush(owner:)`) is the port of `MonitorSurfaceTextureCache`.
 - **R13** Optional: make foreign `schemaVersion: 1` JSON fail closed (a type discriminator or schema 2) before any host persists `MonitorState`.
+  - **Done (W3 gap work).** `MonitorState` writes `"kind": "MonitorKit.MonitorState"` and `schemaVersion` 2 and throws `DecodingError.dataCorrupted` for anything else, MonitorKit's own discriminator-less W1/W2 JSON included. `ScopeSettings` is still lenient (schema 1, no `kind`).
 - **R14** `MonitorStatus` reasons covering every old refusal string (§7, item 11), and a "code-value view" label for declared log sources shown without a transform.
+  - **Done (W3 gap work).** New `MonitorUnavailableReason.requiresCameraSignal` (with `MonitorFrame.isProcessed`) and `.unsupportedGeometry` (on the new `MonitorTool.picture`); `MonitorStatus.isCodeValueView` and `codeValueViewNote`, with a `.picture` label such as "S-Log3 code values". The EI ≠ 800 and profileID/specVersion refusals have no equivalent by design.
 - **R15** MonitorKitUI parity, or a decision that the app keeps its ports: the false-colour legends (Sony Pattern 2, EL Zone, ARRI), the scope scale labels (−10…110 IRE), the tile toolbar.
+  - **Done (W3 gap work).** `FalseColorLegendView(legend:style: .captioned, unavailable:)` with the captioned legend fields, `ScopeIREScale`/`ScopeIREScaleView` (−10…110 IRE), `MonitorTileToolbar` with `MonitorTileTool`, `MonitorFreezeState`, `MonitorMagnifyChoice`; `ScopeSettings.ultracamLegacy(mode:stage:)` for the old 768 × 256 scope look.
