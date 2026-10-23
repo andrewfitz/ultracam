@@ -105,6 +105,15 @@ public enum WhitePointTrim {
   public static let temperatureRange = 4000.0...10_000.0
   public static let tintRange = -0.02...0.02
 
+  /// `temperature`, or exactly `d65Temperature` when it lies within `tolerance`
+  /// kelvin of it. D65's 6504 K is on no round-number grid, so a control stepping
+  /// through it (a 50 K slider lands on 6500 K) would leave a small trim on
+  /// (`DisplayAdjustments.trimsWhitePoint` compares exactly); snapping within half
+  /// the control's step lets it reach "no trim". Not finite: returned unchanged.
+  public static func snappedToD65(_ temperature: Double, within tolerance: Double) -> Double {
+    abs(temperature - d65Temperature) <= tolerance ? d65Temperature : temperature
+  }
+
   /// The CIE daylight chromaticity at correlated colour temperature `t` kelvin.
   public static func daylight(_ t: Double) -> Chromaticity {
     let t = min(25_000, max(4000, t)), t2 = t * t, t3 = t2 * t

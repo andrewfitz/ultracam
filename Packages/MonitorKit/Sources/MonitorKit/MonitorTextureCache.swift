@@ -9,8 +9,10 @@ import Foundation
 /// Metal 4 host's replacement for wrapping every frame through a
 /// `CVMetalTextureCache` (whose per-frame textures would each need a residency
 /// change). Capture and processing pools recycle a small set of IOSurfaces, so in
-/// steady state `frame(_:)` makes no texture, changes no residency and allocates
-/// nothing: it finds the plane textures by IOSurface ID, plane, format and size.
+/// steady state `frame(_:)` makes no texture and changes no residency: it finds the
+/// plane textures by IOSurface ID, plane, format and size. It allocates nothing of
+/// its own; reading a buffer's clean-aperture or pixel-aspect attachment makes
+/// CoreVideo allocate, which `frame(_:signal:geometry:owner:now:)` avoids.
 ///
 /// Every texture is added to `residency` once, when it is made, and leaves it
 /// (`MonitorResidency.retire`) once the submissions that may read it complete:
@@ -184,8 +186,38 @@ public final class MonitorTextureCache: @unchecked Sendable {
   /// attachments say; the pixel aspect ratio and clean aperture come from them.
   /// The frame retains `pixelBuffer`. Throws for a format MonitorKit does not read
   /// or a buffer without an IOSurface.
+  ///
+  /// Reading a dictionary attachment (the clean aperture, the pixel aspect ratio)
+  /// makes CoreVideo allocate, one small block per attachment per call on macOS 27,
+  /// even to test that it is there. A host that must not allocate per frame reads
+  /// the geometry once (`MonitorFrame.geometry(of:)`, e.g. when the format changes)
+  /// and passes it to `frame(_:signal:geometry:owner:now:)`.
   public func frame(
     _ pixelBuffer: CVPixelBuffer, signal: SignalDescription? = nil, owner: UInt64 = 0, now: Double? = nil
+  ) throws -> MonitorFrame {
+    try makeFrame(pixelBuffer, signal: signal, geometry: nil, owner: owner, now: now)
+  }
+
+  /// `frame(_:signal:owner:now:)` with the frame's geometry given instead of read
+  /// from the buffer's attachments, so a steady-state lookup allocates nothing at
+  /// all: the frame carries `geometry`'s pixel aspect ratio and clean aperture (as
+  /// `MonitorFrame.geometry(of:)` reports them: a ratio of 0 is a broken tag, an
+  /// aperture is clipped to the frame when shown) and, like every cache frame, the
+  /// release tokens that keep a stored frame drawable after its textures leave the
+  /// cache (`MonitorFrame.keepResidentIfReleased(in:)`). `signal` nil reads the
+  /// colour attachments (CFString values, which CoreVideo hands out without
+  /// allocating). Throws, besides the reasons above, when `geometry` is not the
+  /// buffer's size.
+  public func frame(
+    _ pixelBuffer: CVPixelBuffer, signal: SignalDescription? = nil, geometry: MonitorFrameGeometry,
+    owner: UInt64 = 0, now: Double? = nil
+  ) throws -> MonitorFrame {
+    try makeFrame(pixelBuffer, signal: signal, geometry: geometry, owner: owner, now: now)
+  }
+
+  private func makeFrame(
+    _ pixelBuffer: CVPixelBuffer, signal: SignalDescription?, geometry: MonitorFrameGeometry?, owner: UInt64,
+    now: Double?
   ) throws -> MonitorFrame {
     let type = CVPixelBufferGetPixelFormatType(pixelBuffer)
     guard let (layout, range) = MonitorFrame.layout(for: type) else {
@@ -194,8 +226,12 @@ public final class MonitorTextureCache: @unchecked Sendable {
     guard let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
       throw MonitorKitError.invalidFrame("the pixel buffer is not IOSurface-backed")
     }
-    let t = now ?? Self.uptime()
     let width = CVPixelBufferGetWidth(pixelBuffer), height = CVPixelBufferGetHeight(pixelBuffer)
+    if let geometry, geometry.width != width || geometry.height != height {
+      throw MonitorKitError.invalidFrame(
+        "the geometry is \(geometry.width)×\(geometry.height), the pixel buffer \(width)×\(height)")
+    }
+    let t = now ?? Self.uptime()
     var packed: MTLTexture?, luma: MTLTexture?, chroma: MTLTexture?
     // Each plane's entry token: a sweep or flush between the two lookups (or any
     // time later) marks it, and the frame's encodes then make its planes resident again.
@@ -226,11 +262,11 @@ public final class MonitorTextureCache: @unchecked Sendable {
       (luma, first) = try entry(
         iosurface: surface, plane: 0, format: format, width: width, height: height, owner: owner, now: t)
     }
+    let shape = geometry ?? MonitorFrame.geometry(of: pixelBuffer)
     var frame = try MonitorFrame(
       layout: layout, width: width, height: height, packed: packed, luma: luma, chroma: chroma,
       signal: signal ?? MonitorFrame.signal(of: pixelBuffer, range: range),
-      pixelAspectRatio: MonitorFrame.pixelAspectRatio(of: pixelBuffer), retained: (pixelBuffer, nil),
-      cleanAperture: MonitorFrame.cleanAperture(of: pixelBuffer))
+      pixelAspectRatio: shape.pixelAspectRatio, retained: (pixelBuffer, nil), cleanAperture: shape.cleanAperture)
     frame.frozenPlanes = first
     frame.secondPlanes = second
     return frame

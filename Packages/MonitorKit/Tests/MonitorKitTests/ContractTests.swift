@@ -1,3 +1,4 @@
+import CoreVideo
 import Darwin
 import Metal
 import XCTest
@@ -108,6 +109,57 @@ final class ContractTests: XCTestCase {
     XCTAssertEqual(ring.components(separatedBy: "makeBuffer(").count, 2, "one buffer allocation site")
     let grow = try XCTUnwrap(ring.range(of: "private mutating func grow("))
     XCTAssertNotNil(ring.range(of: "makeBuffer(", range: grow.upperBound..<ring.index(grow.upperBound, offsetBy: 300)))
+  }
+
+  /// Every encoder MonitorKit opens is closed before anything after it can throw
+  /// (or by a `defer`): a host's commit or `endCommandBuffer` must never meet an
+  /// encoder the library left open (an assertion under the Metal debug layer,
+  /// undefined in release). Scans every module's sources.
+  func testEveryEncoderIsClosedBeforeAnythingCanThrow() throws {
+    let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+      .deletingLastPathComponent().appendingPathComponent("Sources").resolvingSymlinksInPath()
+    var sites = 0
+    for module in ["MonitorKit", "MonitorKitScopes", "MonitorKitUI"] {
+      let root = sources.appendingPathComponent(module)
+      let files = try XCTUnwrap(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
+        .compactMap { $0 as? URL }.filter { $0.pathExtension == "swift" }
+      for file in files {
+        let lines = try String(contentsOf: file, encoding: .utf8).components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() where line.contains("CommandEncoder(") && line.contains("let encoder") {
+          sites += 1
+          // From the encoder's creation to its end (a `defer`, an `endEncoding()`, or
+          // a helper that ends it at the end of the function), nothing may throw.
+          var j = i + 1
+          var depth = 0
+          while j < lines.count {
+            let next = lines[j].trimmingCharacters(in: .whitespaces)
+            if next.hasPrefix("//") || next.hasPrefix("///") {
+              j += 1
+              continue
+            }
+            if next.contains("encoder.endEncoding()") { break }
+            XCTAssertFalse(
+              next.contains("try "),
+              "\(file.lastPathComponent):\(j + 1) can throw while the encoder opened at line \(i + 1) is open")
+            depth += next.filter { $0 == "{" }.count - next.filter { $0 == "}" }.count
+            if depth < 0 { break }  // the function ends
+            j += 1
+          }
+        }
+      }
+    }
+    XCTAssertGreaterThan(sites, 15)
+  }
+
+  /// `MonitorKitError` is a `LocalizedError`: a host's `localizedDescription` is the description.
+  func testErrorsDescribeThemselvesToHosts() {
+    for error in [
+      MonitorKitError.unsupportedPixelFormat(kCVPixelFormatType_OneComponent8), .invalidFrame("empty frame"),
+      .textureMapping(plane: 1, status: -6660), .gpu("Cannot create a compute encoder for Freeze."),
+    ] {
+      XCTAssertEqual((error as Error).localizedDescription, error.description)
+      XCTAssertEqual(error.errorDescription, error.description)
+    }
   }
 
   func testSteadyStateAllocatesNoGPUMemory() throws {

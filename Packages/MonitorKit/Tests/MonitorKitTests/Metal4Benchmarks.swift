@@ -98,10 +98,10 @@ final class Metal4Benchmarks: XCTestCase {
         build, render, best.compute, best.draw, best.analysis, classicMedian))
     // ≤ 10 µs per surface in steady state. Metal's own render encoder creation is
     // about 4 µs of an unoptimized build's render encode, so it gets 15 there.
-    XCTAssertLessThanOrEqual(render, renderBudget, "Metal 4 render encode")
-    XCTAssertLessThanOrEqual(best.draw, 10, "Metal 4 prepare + draw")
-    XCTAssertLessThanOrEqual(best.compute, 10, "Metal 4 compute encode")
-    XCTAssertLessThanOrEqual(best.analysis, 10, "Metal 4 analysis")
+    try assertWithinBudget(render, renderBudget, "Metal 4 render encode, µs")
+    try assertWithinBudget(best.draw, 10, "Metal 4 prepare + draw, µs")
+    try assertWithinBudget(best.compute, 10, "Metal 4 compute encode, µs")
+    try assertWithinBudget(best.analysis, 10, "Metal 4 analysis, µs")
   }
 
   /// GPU time, 4K v210 to a 1080p target with every tool and the focus analysis,

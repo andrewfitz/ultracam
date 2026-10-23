@@ -91,24 +91,26 @@ extension MonitorFeed {
     guard let encoder = submission.commandBuffer.makeComputeCommandEncoder() else {
       throw MonitorKitError.gpu("Cannot create a compute encoder for Freeze.")
     }
+    // Closed on every path: the host must never end its command buffer with an encoder open.
+    defer { encoder.endEncoding() }
     encoder.label = "MonitorKit freeze"
     if f.reused {
       encoder.barrier(afterQueueStages: [.fragment, .dispatch, .blit], beforeStages: .dispatch, visibilityOptions: [])
     }
     encoder.setArgumentTable(table)
-    try copy(f.sources.0, into: f.planes.0, integer: f.integer.0, encoder, table)
-    if let b = f.planes.1 { try copy(f.sources.1, into: b, integer: f.integer.1, encoder, table) }
+    copy(f.sources.0, into: f.planes.0, f.pipelines.0, encoder, table)
+    if let b = f.planes.1, let source = f.sources.1, let pipeline = f.pipelines.1 {
+      copy(source, into: b, pipeline, encoder, table)
+    }
     encoder.barrier(afterStages: .dispatch, beforeQueueStages: [.dispatch, .fragment, .blit], visibilityOptions: .device)
-    encoder.endEncoding()
     return try finishFreeze(frame, f)
   }
 
   private func copy(
-    _ source: MTLTexture?, into copy: MTLTexture, integer: Bool, _ encoder: any MTL4ComputeCommandEncoder,
-    _ table: any MTL4ArgumentTable
-  ) throws {
-    guard let source else { throw MonitorKitError.invalidFrame("a frame plane is missing") }
-    encoder.setComputePipelineState(try engine.copyPipeline(integer: integer))
+    _ source: MTLTexture, into copy: MTLTexture, _ pipeline: MTLComputePipelineState,
+    _ encoder: any MTL4ComputeCommandEncoder, _ table: any MTL4ArgumentTable
+  ) {
+    encoder.setComputePipelineState(pipeline)
     table.setTexture(source.gpuResourceID, index: 0)
     table.setTexture(copy.gpuResourceID, index: 1)
     encoder.dispatchThreadgroups(

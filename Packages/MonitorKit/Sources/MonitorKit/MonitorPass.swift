@@ -33,6 +33,13 @@ public final class MonitorPass {
   private var key: Key?
   private var guideKey: GuideKey?
   var guides = GuideParameters()
+  /// The strokes, rebuilt in place (capacity reserved once) so a pinch or a live
+  /// resize that moves them every frame allocates nothing.
+  private var guideRaster: GuideRaster = {
+    var r = GuideRaster()
+    r.segments.reserveCapacity(4 * GuideRaster.maximumSegments)
+    return r
+  }()
   private var falseColorKey: FalseColorKey?
   private var falseColor = FalseColorResolution.off
   private var statusKey: StatusKey?
@@ -150,6 +157,7 @@ public final class MonitorPass {
     var focusStage: SignalStage
     var maskValid: Bool
     var guidesEnabled: Bool
+    var guidesShown: Bool
     var magnified: Bool
     var pixelExact: Bool
     var zoomLabel: Double
@@ -442,7 +450,7 @@ public final class MonitorPass {
     let vp = k.viewport
     let layout = MonitorLayout(frame: k.geometry, state: s, viewportWidth: vp.width, viewportHeight: vp.height)
 
-    let showGuides = s.guides.enabled && !s.clean && !layout.isMagnified
+    let showGuides = s.guides.isShown(on: layout) && !s.clean
     // Colour, opacity and contrast are uniforms: only geometry rebuilds the strokes.
     var geometryOnly = s.guides
     geometryOnly.color = ColorRGB(r: 1, g: 1, b: 1)
@@ -450,12 +458,13 @@ public final class MonitorPass {
     geometryOnly.contrast = 1
     let nextGuideKey =
       showGuides ? GuideKey(layout: layout, guides: geometryOnly, pixelsPerPoint: vp.pixelsPerPoint) : nil
-    var raster = GuideRaster()
     if nextGuideKey != guideKey {
-      raster = showGuides ? GuideRaster(layout: layout, guides: s.guides, pixelsPerPoint: vp.pixelsPerPoint) : GuideRaster()
+      var hidden = s.guides
+      if !showGuides { hidden.enabled = false }
+      guideRaster.rebuild(layout: layout, guides: hidden, pixelsPerPoint: vp.pixelsPerPoint)
       // The dark outline is a point wide, at least a pixel.
-      guides = GuideParameters(raster, outline: max(1, vp.pixelsPerPoint.rounded()))
-      guideMatte = (raster.matteRect, raster.matteOpacity)
+      guides.update(guideRaster, outline: max(1, vp.pixelsPerPoint.rounded()))
+      guideMatte = (guideRaster.matteRect, guideRaster.matteOpacity)
       guideKey = nextGuideKey
       guideBuildCount += 1
     }
@@ -503,7 +512,8 @@ public final class MonitorPass {
       zebraModes: SIMD2(s.zebras[0].mode == .band ? 1 : 0, s.zebras[1].mode == .band ? 1 : 0),
       zebraLevels: SIMD4(s.zebras[0].level, s.zebras[0].range, s.zebras[1].level, s.zebras[1].range),
       focusEnabled: s.focus.enabled, focusStyle: s.focus.style, focusStage: s.focus.stage, maskValid: k.maskValid,
-      guidesEnabled: s.guides.enabled, magnified: layout.isMagnified, pixelExact: m.pixelExact,
+      guidesEnabled: s.guides.enabled, guidesShown: s.guides.isShown(on: layout), magnified: layout.isMagnified,
+      pixelExact: m.pixelExact,
       zoomLabel: Self.zoomLabel(m.zoom), desqueeze: s.geometry.desqueeze, flip: s.geometry.flip,
       monochrome: s.display.monochrome, displayIdentity: s.display.isIdentity,
       burnInLUT: k.burnInLUT.map(ObjectIdentifier.init),
@@ -780,7 +790,7 @@ public final class MonitorPass {
 
     let g = s.guides
     let lines = guides.counts.x + guides.counts.y + guides.counts.z > 0
-    let guidesOn = g.enabled && !clean && !layout.isMagnified && (lines || matte.rect != nil)
+    let guidesOn = g.isShown(on: layout) && !clean && (lines || matte.rect != nil)
     p.guide = SIMD4(Float(g.opacity), Float(g.contrast * g.opacity), guidesOn ? 1 : 0, Float(matte.opacity))
     p.guideColor = overlay(g.color, guidesOn && lines ? 1 : 0)
     if guidesOn, let m = matte.rect { p.matte = rect(m) }
@@ -967,7 +977,7 @@ public final class MonitorPass {
     }
     if s.guides.enabled {
       if s.clean { off(.guides, .cleanFeed) }
-      else if layout.isMagnified { off(.guides, .hiddenWhileMagnified) }
+      else if !s.guides.isShown(on: layout) { off(.guides, .hiddenWhileMagnified) }
       else { on(.guides, "Guides") }
     }
     let m = s.geometry.magnification

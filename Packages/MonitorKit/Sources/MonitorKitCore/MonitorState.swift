@@ -260,11 +260,24 @@ public struct GuideSettings: Codable, Equatable, Sendable {
   public var contrast = 1.0
   /// In points; multiplied by the surface's pixels per point.
   public var lineWidth = 1.0
+  /// While the picture is magnified (zoomed, or pixel-exact and larger than the
+  /// view) the guides lie on the magnified picture: they zoom and pan with it and
+  /// the part on screen is drawn, as an overlay scaled with the picture would be
+  /// (line widths stay as set). True hides them while magnified instead
+  /// (`MonitorUnavailableReason.hiddenWhileMagnified`), as a camera's focus
+  /// magnifier hides its frame lines.
+  public var hidesWhileMagnified = false
   public init() {}
+
+  /// Whether guides are drawn on a picture laid out as `layout`: enabled, and not
+  /// hidden while it is magnified. What `GuideRaster` and `MonitorPass` follow.
+  public func isShown(on layout: MonitorLayout) -> Bool {
+    enabled && !(hidesWhileMagnified && layout.isMagnified)
+  }
 
   private enum CodingKeys: String, CodingKey {
     case enabled, frameGuides, safeAreas, followsFrameGuide, thirds, squareGrid, squareGridRows,
-      diagonals, centerCross, centerDot, color, opacity, contrast, lineWidth
+      diagonals, centerCross, centerDot, color, opacity, contrast, lineWidth, hidesWhileMagnified
   }
   public init(from decoder: Decoder) throws {
     self.init()
@@ -283,6 +296,7 @@ public struct GuideSettings: Codable, Equatable, Sendable {
     opacity = c.lenient(.opacity, opacity)
     contrast = c.lenient(.contrast, contrast)
     lineWidth = c.lenient(.lineWidth, lineWidth)
+    hidesWhileMagnified = c.lenient(.hidesWhileMagnified, hidesWhileMagnified)
   }
 }
 

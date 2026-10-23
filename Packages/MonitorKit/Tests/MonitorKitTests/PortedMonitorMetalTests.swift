@@ -10,15 +10,15 @@ import simd
 ///
 /// | MonitorTools case (line) | Here |
 /// | --- | --- |
-/// | `testActualGPUZebraAndSpatialScope` (97) | `testZebraOnTheGPU` (the zebra half; the scope half needs `MonitorKitScopes`) |
+/// | `testActualGPUZebraAndSpatialScope` (97) | `testZebraOnTheGPU` (the zebra half; the scope half: `MonitorKitScopesTests`, see `ScopePortedMonitorToolsTests`) |
 /// | `testARRIUsesSourceBeforeOutputLUT` (117) | `testARRIUsesTheSourceBeforeTheOutputLUT` |
 /// | `testSourceFocusUsesSourceEdgeDespiteFlatOutput` (145) | `testSourceFocusUsesTheSourceEdgeDespiteAFlatOutput` |
-/// | `testScopeRGBOrderAndExtendedRangeAxesOnGPU` (176) | not here: needs `MonitorKitScopes` |
+/// | `testScopeRGBOrderAndExtendedRangeAxesOnGPU` (176) | `MonitorKitScopesTests`: `ScopeRenderTests.testParadePanelsDrawTheirOwnChannel` and `ScopeLegacyLookTests.testLegacyRangeBins` (see `ScopePortedMonitorToolsTests`) |
 /// | `testZebraBandIsCenteredLikeIndependentScalarClassifier` (195) | `testZebraBandIsCentredLikeTheScalarClassifier` |
 /// | `testUnknownOrHDRTransferDoesNotGetRetaggedAsSDR` (223) | `testUnknownAndHDRSignalsAreNotRetaggedAsSDR` (semantic difference) |
 /// | `testARRIFullRescaledToLegalUsesIndependentlyRoundedFullTable` (243) | `testARRIFullRescaledToLegalUsesTheIndependentlyRoundedFullTable` |
 /// | `testAsymmetricApertureShowsTheTopLeftOriginedCleanRect` (282) | `PortedCleanApertureTests.testAsymmetricApertureShowsTheTopLeftOriginedCleanRect` (R10) |
-/// | `testGraticuleToggleChangesOnlyScopeGridPixels` (315) | not here: needs `MonitorKitScopes` |
+/// | `testGraticuleToggleChangesOnlyScopeGridPixels` (315) | `MonitorKitScopesTests/ScopePortedMonitorToolsTests.testGraticuleToggleChangesOnlyGraticulePixels` |
 /// | `testMalformedPlanarHeightCannotBeRead` (336) | `testMalformedPlanarHeightCannotBeRead` |
 /// | `testEveryPublishedARRINativeTenBitBoundaryOnGPU` (359) | `testEveryPublishedARRINativeTenBitBoundaryThroughIOSurfaces` |
 /// | `testDeclaredSourceLogShowsCodeViewWithNumericZebraAndSourceFocus` (414) | `testDeclaredLogSourceShowsTheCodeValueViewWithZebraAndSourceFocus` |

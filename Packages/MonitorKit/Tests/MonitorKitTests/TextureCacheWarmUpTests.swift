@@ -160,6 +160,106 @@ final class TextureCacheWarmUpTests: XCTestCase {
     }
   }
 
+  /// A buffer with every attachment a capture source sets, the clean aperture and
+  /// pixel aspect ratio included (dictionaries, which CoreVideo allocates to read).
+  func taggedBuffer(_ layout: PixelLayout = .v210) throws -> CVPixelBuffer {
+    let pb = try XCTUnwrap(PictureTests.picture(layout, width: 66, height: 38, seed: 9).pixelBuffer(range: .legal))
+    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+    let aspect =
+      [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 4, kCVImageBufferPixelAspectRatioVerticalSpacingKey: 3]
+      as CFDictionary
+    CVBufferSetAttachment(pb, kCVImageBufferPixelAspectRatioKey, aspect, .shouldPropagate)
+    let clap =
+      [
+        kCVImageBufferCleanApertureWidthKey: 64, kCVImageBufferCleanApertureHeightKey: 36,
+        kCVImageBufferCleanApertureHorizontalOffsetKey: 0, kCVImageBufferCleanApertureVerticalOffsetKey: 0,
+      ] as CFDictionary
+    CVBufferSetAttachment(pb, kCVImageBufferCleanApertureKey, clap, .shouldPropagate)
+    return pb
+  }
+
+  /// With the geometry given, a steady-state lookup allocates nothing, whatever the
+  /// attachments; reading them instead costs only CoreVideo's own block per
+  /// dictionary attachment (two here), nothing of MonitorKit's.
+  func testGeometryOverloadAllocatesNothingWithEveryAttachment() throws {
+    try skipUnderTheDebugLayer()
+    let gpu = try requireGPU()
+    let cache = MonitorTextureCache(device: gpu.device, residency: try MonitorResidency(device: gpu.device))
+    for layout in [PixelLayout.v210, .biplanar(.s420, bitDepth: 10), .bgra8] {
+      let pb = try taggedBuffer(layout)
+      let geometry = MonitorFrame.geometry(of: pb)
+      XCTAssertEqual(geometry.pixelAspectRatio, 4.0 / 3, accuracy: 1e-12)
+      XCTAssertEqual(geometry.cleanAperture, MonitorRect(x: 1, y: 1, width: 64, height: 36))
+      _ = try cache.frame(pb, geometry: geometry, now: 1)
+      var id: UInt64 = 0
+      let given = try XCTUnwrap(
+        AllocationCounter.measure {
+          var i = 0
+          while i < 20 {
+            id &+= try cache.frame(pb, signal: .rec709, geometry: geometry, now: 1).id
+            id &+= try cache.frame(pb, geometry: geometry, now: 1).id
+            i += 1
+          }
+        })
+      XCTAssertEqual(given, 0, "\(layout)")
+      let read = try XCTUnwrap(AllocationCounter.measure { id &+= try cache.frame(pb, now: 1).id })
+      XCTAssertLessThanOrEqual(read, 2, "\(layout): at most CoreVideo's block per dictionary attachment")
+      XCTAssertGreaterThan(id, 0)
+    }
+  }
+
+  /// The overload's frame is the attachment-read frame: same planes, signal and
+  /// geometry; a given geometry wins over the attachments; the wrong size throws.
+  func testGeometryOverloadMatchesTheAttachmentFrame() throws {
+    let gpu = try requireGPU()
+    let cache = MonitorTextureCache(device: gpu.device, residency: try MonitorResidency(device: gpu.device))
+    let pb = try taggedBuffer()
+    let read = try cache.frame(pb, now: 1)
+    let given = try cache.frame(pb, geometry: MonitorFrame.geometry(of: pb), now: 1)
+    XCTAssertTrue(read.packed === given.packed)
+    XCTAssertEqual(read.signal, given.signal)
+    XCTAssertEqual(read.geometry, given.geometry)
+    XCTAssertEqual(cache.texturesMade, 1)
+    let square = MonitorFrameGeometry(width: 66, height: 38)
+    let plain = try cache.frame(pb, signal: .rec709, geometry: square, now: 1)
+    XCTAssertEqual(plain.geometry, square, "the given geometry, not the attachments")
+    XCTAssertEqual(plain.pixelAspectRatio, 1)
+    let broken = try cache.frame(pb, geometry: MonitorFrameGeometry(width: 66, height: 38, pixelAspectRatio: 0), now: 1)
+    XCTAssertEqual(broken.geometry.pixelAspectRatio, 0, "a broken tag stays reported as broken")
+    XCTAssertThrowsError(try cache.frame(pb, geometry: MonitorFrameGeometry(width: 64, height: 38), now: 1)) { error in
+      guard case .invalidFrame? = error as? MonitorKitError else { return XCTFail("\(error)") }
+    }
+  }
+
+  /// A stored overload frame keeps the release tokens: once its textures leave the
+  /// cache, a MonitorKit encode (`keepResidentIfReleased`) makes them resident again,
+  /// which a frame a host builds from `makeTexture` cannot do.
+  func testGeometryOverloadFramesKeepTheirReleaseTokens() throws {
+    let gpu = try requireMTL4().gpu
+    let residency = try MonitorResidency(device: gpu.device)
+    let cache = MonitorTextureCache(device: gpu.device, residency: residency)
+    let pb = try taggedBuffer(.biplanar(.s420, bitDepth: 10))
+    let stored = try cache.frame(pb, geometry: MonitorFrame.geometry(of: pb), owner: 7, now: 1)
+    let luma = try XCTUnwrap(stored.luma), chroma = try XCTUnwrap(stored.chroma)
+    let hostBuilt = try MonitorFrame(
+      layout: stored.layout, width: stored.width, height: stored.height, luma: luma, chroma: chroma,
+      signal: stored.signal)
+    cache.flush(owner: 7)
+    XCTAssertFalse(residency.contains(luma))
+    // A later encode, submission 5, still draws the stored frame.
+    let cb = try XCTUnwrap(gpu.device.makeCommandBuffer())
+    residency.observe(MonitorSubmission(commandBuffer: cb, index: 5, completedIndex: 0))
+    hostBuilt.keepResidentIfReleased(in: residency)
+    XCTAssertFalse(residency.contains(luma), "a host-built frame carries no token")
+    stored.keepResidentIfReleased(in: residency)
+    XCTAssertTrue(residency.contains(luma), "resident again for submission 5")
+    XCTAssertTrue(residency.contains(chroma))
+    residency.release(through: 5)
+    XCTAssertFalse(residency.contains(luma))
+  }
+
   // MARK: - R6/R7 warm-up
 
   /// After `warmUp`, a surface's first frame draws with its specialized pipeline

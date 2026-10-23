@@ -117,19 +117,22 @@ public final class LoudnessMeter: @unchecked Sendable {
     publisher.publish(&staging.pointee)
   }
 
-  /// True when a request was applied; the generations go out with the next publish.
+  /// True when a reading reset was applied; the generations go out with the next publish.
   private func applyResetRequests() -> Bool {
     let requested = requests.load()
     let applied = staging.pointee.resets
     guard requested != applied else { return false }
+    staging.pointee.resets = requested
+    let resets = requested.resetsReadings(since: applied)
     if requested.all != applied.all {
       engine.resetFilters()
       engine.resetReadings()
-    } else {
+    } else if requested.loudness != applied.loudness {
       engine.resetMeasurement()
     }
-    staging.pointee.resets = requested
-    return true
+    // After a full reset's zeroing: the audio after the break starts the filters.
+    if requested.discontinuities != applied.discontinuities { engine.primeFilters() }
+    return resets
   }
 
   // MARK: Output and control
@@ -162,6 +165,14 @@ public final class LoudnessMeter: @unchecked Sendable {
   /// K-weighting's signal memory, as if the meter were new (for a new
   /// source; `resetMeasurement()` is the one for a new programme).
   public func reset() { requests.requestAll() }
+
+  /// The audio the next `process` call brings does not follow the last call's
+  /// (a dropped, skipped or rejected packet, a source switch without a reset):
+  /// the K-weighting starts from that call's first sample, as if the signal had
+  /// held it, instead of filtering on from the stale memory, which would put a
+  /// step and its decay into momentary loudness. Every reading carries on. Any
+  /// thread; applied by the next `process` call that brings audio.
+  public func noteDiscontinuity() { requests.requestDiscontinuity() }
 
   /// Puts integrated loudness, loudness range and `duration` on stand-by
   /// (EBU Tech 3341 section 2.2): audio from now on is left out of them as if

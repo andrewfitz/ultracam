@@ -387,12 +387,22 @@ public struct DisplayAdjustmentControls: View {
       }
       .pickerStyle(.segmented)
       ValueSlider(
-        "Temperature", value: display.temperature, in: WhitePointTrim.temperatureRange, step: 50,
-        format: MonitorFormat.kelvin)
+        "Temperature", value: Self.temperatureBinding(display.temperature, step: Self.temperatureStep),
+        in: WhitePointTrim.temperatureRange, step: Self.temperatureStep, format: MonitorFormat.kelvin)
       ValueSlider("Tint", value: display.tint, in: WhitePointTrim.tintRange, step: 0.001, format: MonitorFormat.duv)
       Button("Reset") { state.display = DisplayAdjustments() }
         .disabled(state.display.isIdentity)
     }
+  }
+
+  static let temperatureStep = 50.0
+
+  /// The slider's grid misses D65 (6504 K): a value within half a step of it is
+  /// stored as D65 exactly, so dragging back to the middle removes the trim.
+  static func temperatureBinding(_ temperature: Binding<Double>, step: Double) -> Binding<Double> {
+    Binding(
+      get: { temperature.wrappedValue },
+      set: { temperature.wrappedValue = WhitePointTrim.snappedToD65($0, within: step / 2) })
   }
 }
 

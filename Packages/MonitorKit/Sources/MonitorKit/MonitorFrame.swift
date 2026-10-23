@@ -1,9 +1,12 @@
 import CoreVideo
+import Foundation
 import Metal
 import MonitorKitCore
 import Synchronization
 
-public enum MonitorKitError: Error, Equatable, CustomStringConvertible {
+/// Errors from MonitorKit's encodes, frames and engines. `LocalizedError`, so
+/// `localizedDescription` in a host's UI is `description`, not a generic message.
+public enum MonitorKitError: LocalizedError, Equatable, CustomStringConvertible {
   case unsupportedPixelFormat(OSType)
   case invalidFrame(String)
   case textureMapping(plane: Int, status: CVReturn)
@@ -18,6 +21,8 @@ public enum MonitorKitError: Error, Equatable, CustomStringConvertible {
     case .gpu(let reason): return reason
     }
   }
+
+  public var errorDescription: String? { description }
 }
 
 func fourCC(_ type: OSType) -> String {
@@ -394,7 +399,9 @@ extension MonitorFrame {
   /// `clap`: pcY = vertOff + (height − 1) / 2), so the top edge is
   /// (height − apertureHeight) / 2 + verticalOffset, which is what
   /// `CVImageBufferGetCleanRect` returns once its lower-left origin is flipped.
-  /// Reads CF values without bridging: allocation-free.
+  /// Reads CF values without bridging; CoreVideo itself allocates a small block to
+  /// hand out a dictionary attachment (macOS 27), so read it once per format, not
+  /// per frame, where that matters.
   public static func cleanAperture(of pixelBuffer: CVPixelBuffer) -> MonitorRect? {
     guard let value = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCleanApertureKey, nil),
       CFGetTypeID(value) == CFDictionaryGetTypeID()
@@ -412,7 +419,10 @@ extension MonitorFrame {
   }
 
   /// The geometry of `pixelBuffer` (size, pixel aspect ratio, clean aperture) without
-  /// mapping any texture: for sizing a layer on the main thread. Allocation-free.
+  /// mapping any texture: for sizing a layer on the main thread, or once per format
+  /// for `MonitorTextureCache.frame(_:signal:geometry:owner:now:)`. MonitorKit
+  /// allocates nothing here; CoreVideo allocates a small block for each dictionary
+  /// attachment present (clean aperture, pixel aspect ratio) on macOS 27.
   public static func geometry(of pixelBuffer: CVPixelBuffer) -> MonitorFrameGeometry {
     MonitorFrameGeometry(
       width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer),

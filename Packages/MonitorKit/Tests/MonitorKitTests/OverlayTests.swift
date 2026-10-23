@@ -545,7 +545,108 @@ final class GuideTests: XCTestCase {
     }
   }
 
-  func testHiddenWhileMagnifiedAndRebuiltOnlyOnChange() throws {
+  /// Magnified, the guides lie on the zoomed, panned picture: every pixel against
+  /// the Double reference of the clipped strokes, thin and thick.
+  func testMagnifiedGuidesMatchTheReferenceEverywhere() throws {
+    for (ppp, width, zoom, center) in [(1.0, 1.0, 2.5, (0.3, 0.6)), (2.0, 1.5, 4.0, (0.9, 0.1))] {
+      var g = GuideTests.plain()
+      g.thirds = true
+      g.squareGrid = true
+      g.diagonals = true
+      g.centerCross = true
+      g.centerDot = true
+      g.safeAreas = [80, 93]
+      g.frameGuides = [FrameGuide(aspect: 2.39, style: .linesAndMatte, matteOpacity: 0.5)]
+      g.contrast = 1
+      g.opacity = 0.7
+      g.lineWidth = width
+      g.color = ColorRGB(r: 1, g: 0.5, b: 0)
+      let (out, pass) = try render(g, code: 502, width: 480, height: 270, ppp: ppp) {
+        $0.geometry.magnification.zoom = zoom
+        $0.geometry.magnification.centerX = center.0
+        $0.geometry.magnification.centerY = center.1
+        $0.geometry.magnification.showsNavigator = false
+      }
+      let layout = try XCTUnwrap(pass.layout)
+      XCTAssertTrue(layout.isMagnified)
+      XCTAssertTrue(pass.status.isActive(.guides))
+      let raster = GuideRaster(layout: layout, guides: g, pixelsPerPoint: ppp)
+      XCTAssertGreaterThan(raster.segments.count, 4)
+      let guides = pass.currentGuides
+      XCTAssertEqual(Int(guides.counts.x + guides.counts.y + guides.counts.z), raster.segments.count)
+      let matte = raster.matteRect ?? MonitorRect(x: 0, y: 0, width: 0, height: 0)
+      let o = max(1, ppp.rounded())
+      var worst = 0.0
+      for y in 0..<270 {
+        for x in 0..<480 {
+          let px = Double(x) + 0.5, py = Double(y) + 0.5
+          var v = SIMD3<Double>(repeating: 0.5)
+          if raster.matteRect != nil && !(px >= matte.x && px < matte.maxX && py >= matte.y && py < matte.maxY) { v *= 0.5 }
+          let k = Self.coverage(raster, x: px, y: py, outline: o)
+          v += (SIMD3(repeating: 0) - v) * (k.outline * 0.7)
+          v += (SIMD3(1, 0.5, 0) - v) * (k.line * 0.7)
+          let gpu = out.rgb(x, y)
+          worst = max(worst, simd_reduce_max(simd_abs(SIMD3(Double(gpu.x), Double(gpu.y), Double(gpu.z)) - v)))
+        }
+      }
+      XCTAssertLessThanOrEqual(worst, 2e-4, "ppp \(ppp) width \(width) zoom \(zoom)")
+    }
+  }
+
+  /// Repacking in place (the pass's per-frame path) leaves exactly what packing a
+  /// fresh struct does, whatever the struct held before: fewer lines, other kinds.
+  func testRepackingInPlaceMatchesAFreshPack() {
+    func layout(_ zoom: Double) -> MonitorLayout {
+      var g = ViewGeometry()
+      g.magnification.zoom = zoom
+      return MonitorLayout(pictureWidth: 960, pictureHeight: 540, viewportWidth: 480, viewportHeight: 270, geometry: g)
+    }
+    var many = GuideTests.plain()
+    many.squareGrid = true
+    many.squareGridRows = 16
+    many.diagonals = true
+    many.centerDot = true
+    many.safeAreas = [80, 90]
+    var few = GuideTests.plain()
+    few.thirds = true
+    var reused = GuideParameters()
+    for (g, zoom) in [(many, 1.0), (few, 1), (many, 3), (few, 2), (GuideSettings(), 1), (many, 1)] {
+      let raster = GuideRaster(layout: layout(zoom), guides: g)
+      reused.update(raster, outline: 1)
+      let fresh = GuideParameters(raster, outline: 1)
+      XCTAssertEqual(reused.counts, fresh.counts)
+      XCTAssertEqual(reused.reach, fresh.reach)
+      for i in 0..<GuideParameters.maximumLines { XCTAssertEqual(reused.lines[i], fresh.lines[i], "line \(i)") }
+      for i in 0..<(2 * GuideParameters.maximumOthers) { XCTAssertEqual(reused.others[i], fresh.others[i], "other \(i)") }
+      for i in 0..<64 { XCTAssertEqual(reused.cells[i], fresh.cells[i], "cell word \(i)") }
+      // Each axis sorted.
+      let nv = Int(fresh.counts.x), nh = Int(fresh.counts.y)
+      for i in 1..<max(1, nv) { XCTAssertLessThanOrEqual(fresh.lines[i - 1].x, fresh.lines[i].x) }
+      for i in (nv + 1)..<max(nv + 1, nv + nh) { XCTAssertLessThanOrEqual(fresh.lines[i - 1].x, fresh.lines[i].x) }
+    }
+  }
+
+  /// The navigator inset shows the whole picture and its visible box, never guides.
+  func testNavigatorShowsNoGuides() throws {
+    var g = GuideTests.plain()
+    g.thirds = true
+    g.squareGrid = true
+    g.squareGridRows = 16
+    func zoomed(_ s: inout MonitorState) { s.geometry.magnification.zoom = 2 }
+    let (with, pass) = try render(g, code: 502, width: 480, height: 270, state: zoomed)
+    var off = g
+    off.enabled = false
+    let (without, _) = try render(off, code: 502, width: 480, height: 270, state: zoomed)
+    let nav = try XCTUnwrap(pass.layout?.navigatorRect)
+    var differs = 0
+    for y in Int(nav.y)..<Int(nav.maxY) {
+      for x in Int(nav.x)..<Int(nav.maxX) where with.rgb(x, y) != without.rgb(x, y) { differs += 1 }
+    }
+    XCTAssertEqual(differs, 0)
+    XCTAssertGreaterThan(pass.currentGuides.counts.x, 2, "the grid's columns cross the navigator's region")
+  }
+
+  func testGuidesFollowTheMagnifiedPictureAndRebuildOnlyOnChange() throws {
     let gpu = try requireGPU()
     let frame = try SyntheticFrame.neutral(.v210, width: 320, height: 180) { _, _ in 64 }.frame(gpu, signal: .rec709)
     var state = MonitorState()
@@ -570,10 +671,36 @@ final class GuideTests: XCTestCase {
       try gpu.run { try pass.encode(frame: frame, feed: feed, state: state, target: t, viewport: MonitorViewport(width: w, height: 150), into: $0) }
     }
     XCTAssertEqual(gpu.engine.resourcesCreated, created)
+    // Magnified 2×: the thirds of the zoomed picture (-160…480 across, -90…270
+    // down) and the centre cross, at the view's centre.
+    let builds = pass.guideBuildCount
     state.geometry.magnification.zoom = 2
+    state.geometry.magnification.showsNavigator = false
+    try gpu.run { try pass.encode(frame: frame, feed: feed, state: state, target: t, into: $0) }
+    XCTAssertEqual(pass.guideBuildCount, builds + 1, "the zoom moves the strokes")
+    XCTAssertTrue(pass.status.isActive(.guides))
+    XCTAssertEqual(pass.currentGuides.counts.x, 3)
+    XCTAssertEqual(pass.currentGuides.counts.y, 3)
+    var zoomed = Pixels(t)
+    // White at the 0.5 opacity set above, over black.
+    let line = SIMD3<Float>(repeating: 0.5)
+    XCTAssertEqual(zoomed.rgb(53, 60), line, "a vertical third at x = -160 + 640 / 3")
+    XCTAssertEqual(zoomed.rgb(266, 60), line, "and at -160 + 1280 / 3")
+    XCTAssertEqual(zoomed.rgb(100, 30), line, "a horizontal third at y = -90 + 360 / 3")
+    XCTAssertEqual(zoomed.rgb(52, 60), .zero, "one pixel wide")
+    XCTAssertEqual(zoomed.rgb(160, 60), .zero)
+    for _ in 0..<3 { try gpu.run { try pass.encode(frame: frame, feed: feed, state: state, target: t, into: $0) } }
+    XCTAssertEqual(pass.guideBuildCount, builds + 1, "a steady zoom rebuilds nothing")
+    // Hidden while magnified on request, as a camera's focus magnifier does.
+    state.guides.hidesWhileMagnified = true
     try gpu.run { try pass.encode(frame: frame, feed: feed, state: state, target: t, into: $0) }
     XCTAssertEqual(pass.status.reason(for: .guides), .hiddenWhileMagnified)
     XCTAssertEqual(pass.currentGuides.counts, .zero)
-    XCTAssertEqual(Pixels(t).rgb(160, 60), .zero)
+    zoomed = Pixels(t)
+    XCTAssertEqual(zoomed.rgb(53, 60), .zero)
+    state.geometry.magnification.zoom = 1
+    try gpu.run { try pass.encode(frame: frame, feed: feed, state: state, target: t, into: $0) }
+    XCTAssertTrue(pass.status.isActive(.guides), "and shown again unmagnified")
+    XCTAssertEqual(gpu.engine.resourcesCreated, created)
   }
 }

@@ -270,32 +270,44 @@ public final class MonitorFeed {
     guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
       throw MonitorKitError.gpu("Cannot create a compute encoder for Freeze.")
     }
+    // Closed on every path, so a failure never leaves the host's buffer with an open encoder.
+    defer { encoder.endEncoding() }
     encoder.label = "MonitorKit freeze"
-    try copy(f.sources.0, into: f.planes.0, integer: f.integer.0, encoder)
-    if let b = f.planes.1 { try copy(f.sources.1, into: b, integer: f.integer.1, encoder) }
-    encoder.endEncoding()
+    copy(f.sources.0, into: f.planes.0, f.pipelines.0, encoder)
+    if let b = f.planes.1, let source = f.sources.1, let pipeline = f.pipelines.1 {
+      copy(source, into: b, pipeline, encoder)
+    }
     return try finishFreeze(frame, f)
   }
 
-  /// The owned planes of one freeze and what is copied into them.
+  /// The owned planes of one freeze and what is copied into them, resolved before
+  /// anything is encoded: every source plane and copy pipeline is known to exist,
+  /// so the copy cannot fail half-way (which would leave an encoder open, and a
+  /// reused plane of the frame frozen now overwritten while its other is not).
   struct Freeze {
     var planes: (MTLTexture, MTLTexture?)
-    var sources: (MTLTexture?, MTLTexture?)
-    var integer: (Bool, Bool)
+    var sources: (MTLTexture, MTLTexture?)
+    var pipelines: (MTLComputePipelineState, MTLComputePipelineState?)
     /// Whether an existing plane is overwritten (so earlier readers must finish first).
     var reused: Bool
   }
 
   func prepareFreeze(_ frame: MonitorFrame) throws -> Freeze {
     let (first, second) = Self.planes(of: frame)
+    // What can fail comes first, before any plane is made or replaced.
+    guard let source0 = frame.packed ?? frame.luma else {
+      throw MonitorKitError.invalidFrame("a frame plane is missing")
+    }
+    let source1 = second == nil ? nil : frame.chroma
+    if second != nil && source1 == nil { throw MonitorKitError.invalidFrame("a frame plane is missing") }
+    let pipeline0 = try engine.copyPipeline(integer: first.integer)
+    let pipeline1 = try second.map { try engine.copyPipeline(integer: $0.integer) }
     if second == nil { replaceFreezePlane(1, with: nil) }
     let before = (freezePlanes.0, freezePlanes.1)
-    let a = try plane(0, first, source: frame.packed ?? frame.luma)
-    let b = try second.map { try plane(1, $0, source: frame.chroma) }
+    let a = try plane(0, first, source: source0)
+    let b = try second.map { try plane(1, $0, source: source1) }
     let reused = (before.0 != nil && before.0 === a) || (b != nil && before.1 === b)
-    return Freeze(
-      planes: (a, b), sources: (frame.packed ?? frame.luma, frame.chroma),
-      integer: (first.integer, second?.integer ?? false), reused: reused)
+    return Freeze(planes: (a, b), sources: (source0, source1), pipelines: (pipeline0, pipeline1), reused: reused)
   }
 
   func finishFreeze(_ frame: MonitorFrame, _ f: Freeze) throws -> MonitorFrame {
@@ -385,11 +397,11 @@ public final class MonitorFeed {
     return t
   }
 
-  private func copy(_ source: MTLTexture?, into copy: MTLTexture, integer: Bool, _ encoder: MTLComputeCommandEncoder)
-    throws
-  {
-    guard let source else { throw MonitorKitError.invalidFrame("a frame plane is missing") }
-    encoder.setComputePipelineState(try engine.copyPipeline(integer: integer))
+  private func copy(
+    _ source: MTLTexture, into copy: MTLTexture, _ pipeline: MTLComputePipelineState,
+    _ encoder: MTLComputeCommandEncoder
+  ) {
+    encoder.setComputePipelineState(pipeline)
     encoder.setTexture(source, index: 0)
     encoder.setTexture(copy, index: 1)
     encoder.dispatchThreadgroups(

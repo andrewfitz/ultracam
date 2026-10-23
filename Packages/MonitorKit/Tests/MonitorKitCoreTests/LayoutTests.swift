@@ -223,7 +223,12 @@ final class GuideRasterTests: XCTestCase {
 
   func testDisabledHiddenAndCapped() {
     XCTAssertEqual(GuideRaster(layout: layout(), guides: GuideSettings()).segments.count, 0)
-    XCTAssertEqual(GuideRaster(layout: layout(zoom: 2), guides: settings { $0.thirds = true }).segments.count, 0)
+    XCTAssertEqual(
+      GuideRaster(layout: layout(zoom: 2), guides: settings { $0.thirds = true; $0.hidesWhileMagnified = true })
+        .segments.count, 0, "hidden while magnified on request")
+    XCTAssertEqual(
+      GuideRaster(layout: layout(), guides: settings { $0.thirds = true; $0.hidesWhileMagnified = true }).segments.count, 4,
+      "and shown unmagnified")
     let many = GuideRaster(
       layout: layout(), guides: settings {
         $0.squareGrid = true
@@ -233,6 +238,160 @@ final class GuideRasterTests: XCTestCase {
         $0.thirds = true
       }.normalizedGuides, pixelsPerPoint: 0.5)
     XCTAssertLessThanOrEqual(many.segments.count, GuideRaster.maximumSegments)
+  }
+}
+
+/// Guides on a magnified picture lie on it as shown (zoomed and panned with it,
+/// as an overlay scaled with the picture would) and are clipped to the view.
+final class MagnifiedGuideTests: XCTestCase {
+  func layout(zoom: Double = 1, center: (Double, Double) = (0.5, 0.5), exact: Bool = false) -> MonitorLayout {
+    var g = ViewGeometry()
+    g.magnification.zoom = zoom
+    g.magnification.centerX = center.0
+    g.magnification.centerY = center.1
+    g.magnification.pixelExact = exact
+    return MonitorLayout(pictureWidth: 960, pictureHeight: 540, viewportWidth: 480, viewportHeight: 270, geometry: g)
+  }
+
+  func guides(_ configure: (inout GuideSettings) -> Void = { _ in }) -> GuideSettings {
+    var g = GuideSettings()
+    g.enabled = true
+    configure(&g)
+    return g
+  }
+
+  /// The view grown by half a stroke: every clipped endpoint lies in it.
+  func inView(_ s: GuideRaster.Segment, _ l: MonitorLayout) -> Bool {
+    let h = s.halfWidth + 1e-9
+    return [s.x0, s.x1].allSatisfy { $0 >= -h && $0 <= l.viewportWidth + h }
+      && [s.y0, s.y1].allSatisfy { $0 >= -h && $0 <= l.viewportHeight + h }
+  }
+
+  /// Thirds at 2× sit at a third and two thirds of the zoomed picture; panned,
+  /// the ones scrolled out of view are dropped and the rest cut to the view.
+  func testThirdsFollowTheZoomAndPan() {
+    for (zoom, center) in [(2.0, (0.5, 0.5)), (3.0, (0.2, 0.7)), (4.0, (1.0, 0.0)), (1.5, (0.0, 1.0))] {
+      let l = layout(zoom: zoom, center: center)
+      XCTAssertTrue(l.isMagnified)
+      let r = GuideRaster(layout: l, guides: guides())
+      let image = l.imageRect
+      func onPicture(_ fraction: Double, _ origin: Double, _ size: Double, _ view: Double) -> Double? {
+        let v = (origin + size * fraction).rounded(.down) + 0.5
+        return v >= -0.5 && v <= view + 0.5 ? v : nil
+      }
+      let xs = [1.0 / 3, 2.0 / 3].compactMap { onPicture($0, image.x, image.width, l.viewportWidth) }
+      let ys = [1.0 / 3, 2.0 / 3].compactMap { onPicture($0, image.y, image.height, l.viewportHeight) }
+      XCTAssertEqual(r.segments.filter { $0.x0 == $0.x1 }.map(\.x0).sorted(), xs, "zoom \(zoom) \(center)")
+      XCTAssertEqual(r.segments.filter { $0.y0 == $0.y1 }.map(\.y0).sorted(), ys, "zoom \(zoom) \(center)")
+      for s in r.segments {
+        XCTAssertTrue(inView(s, l), "\(s) is cut to the view")
+        if s.x0 == s.x1 {
+          XCTAssertEqual(s.y0, max(image.y.rounded(), -0.5))
+          XCTAssertEqual(s.y1, min(image.maxY.rounded(), l.viewportHeight + 0.5))
+        }
+      }
+    }
+  }
+
+  /// The guides of a magnified picture are the guides of the same picture fitted
+  /// into a view of the zoomed size, moved with it and cut to the real view: every
+  /// kind (frame guide and matte, safe areas, grid, diagonals, cross, dot), at
+  /// whole-pixel pans where both are exact.
+  func testEveryGuideIsThePictureSizedGuideMovedAndCut() throws {
+    let g = guides {
+      $0.safeAreas = [90, 80]
+      $0.frameGuides = [FrameGuide(aspect: 2.39, style: .linesAndMatte, matteOpacity: 0.5), FrameGuide(aspect: 1)]
+      $0.squareGrid = true
+      $0.diagonals = true
+      $0.centerCross = true
+      $0.centerDot = true
+    }
+    for (zoom, center) in [(2.0, (0.5, 0.5)), (2.0, (0.25, 0.75)), (4.0, (0.3, 0.6))] {
+      let l = layout(zoom: zoom, center: center)
+      let image = l.imageRect
+      XCTAssertEqual(image.x, image.x.rounded(), "a whole-pixel pan")
+      XCTAssertEqual(image.y, image.y.rounded(), "a whole-pixel pan")
+      let full = MonitorLayout(
+        pictureWidth: 960, pictureHeight: 540, viewportWidth: Int(image.width), viewportHeight: Int(image.height),
+        geometry: ViewGeometry())
+      let reference = GuideRaster(layout: full, guides: g)
+      let view = MonitorRect(x: 0, y: 0, width: l.viewportWidth, height: l.viewportHeight)
+      let expected = reference.segments.compactMap { s in
+        GuideRaster.clipped(
+          GuideRaster.Segment(
+            x0: s.x0 + image.x, y0: s.y0 + image.y, x1: s.x1 + image.x, y1: s.y1 + image.y, halfWidth: s.halfWidth),
+          to: view)
+      }
+      let r = GuideRaster(layout: l, guides: g)
+      XCTAssertGreaterThan(expected.count, 4, "zoom \(zoom) \(center)")
+      // Equal up to the rounding of a sum taken in another order.
+      XCTAssertEqual(r.segments.count, expected.count, "zoom \(zoom) \(center)")
+      for (a, b) in zip(r.segments, expected) {
+        for (x, y) in [(a.x0, b.x0), (a.y0, b.y0), (a.x1, b.x1), (a.y1, b.y1), (a.halfWidth, b.halfWidth)] {
+          XCTAssertEqual(x, y, accuracy: 1e-9, "zoom \(zoom) \(center): \(a) against \(b)")
+        }
+      }
+      let matte = try XCTUnwrap(reference.matteRect), shown = try XCTUnwrap(r.matteRect)
+      for (x, y) in [(shown.x, matte.x + image.x), (shown.y, matte.y + image.y), (shown.width, matte.width), (shown.height, matte.height)] {
+        XCTAssertEqual(x, y, accuracy: 1e-9)
+      }
+      XCTAssertEqual(r.strokeWidth, reference.strokeWidth, "line widths stay as set")
+      for s in r.segments { XCTAssertTrue(inView(s, l), "\(s)") }
+    }
+  }
+
+  /// Pixel-exact larger than the view is magnified too; a fitted pixel-exact picture is not.
+  func testPixelExactLargerThanTheViewKeepsTheGuides() {
+    let big = layout(exact: true)
+    XCTAssertTrue(big.isMagnified)
+    let r = GuideRaster(layout: big, guides: guides())
+    XCTAssertEqual(r.segments.filter { $0.x0 == $0.x1 }.count, 2, "960 px across: both verticals in the 480 px view")
+    XCTAssertEqual(GuideRaster(layout: big, guides: guides { $0.hidesWhileMagnified = true }).segments.count, 0)
+  }
+
+  /// `clipped`: axis-aligned strokes keep their position and are cut along their
+  /// length; those wholly off the view are dropped; diagonals end on the grown view.
+  func testClipping() throws {
+    let view = MonitorRect(x: 0, y: 0, width: 100, height: 50)
+    typealias S = GuideRaster.Segment
+    let v = try XCTUnwrap(GuideRaster.clipped(S(x0: 10.5, y0: -400, x1: 10.5, y1: 400, halfWidth: 0.5), to: view))
+    XCTAssertEqual(v, S(x0: 10.5, y0: -0.5, x1: 10.5, y1: 50.5, halfWidth: 0.5))
+    let reversed = try XCTUnwrap(GuideRaster.clipped(S(x0: 10.5, y0: 400, x1: 10.5, y1: 20, halfWidth: 0.5), to: view))
+    XCTAssertEqual(reversed, S(x0: 10.5, y0: 50.5, x1: 10.5, y1: 20, halfWidth: 0.5))
+    XCTAssertNil(GuideRaster.clipped(S(x0: -2, y0: 0, x1: -2, y1: 50, halfWidth: 1), to: view))
+    XCTAssertNotNil(GuideRaster.clipped(S(x0: -1, y0: 0, x1: -1, y1: 50, halfWidth: 1), to: view), "its edge touches the view")
+    XCTAssertNil(GuideRaster.clipped(S(x0: 0, y0: 20, x1: 100, y1: 20, halfWidth: 0.5).moved(y: 60), to: view))
+    let h = try XCTUnwrap(GuideRaster.clipped(S(x0: -50, y0: 20.5, x1: 30, y1: 20.5, halfWidth: 0.5), to: view))
+    XCTAssertEqual(h, S(x0: -0.5, y0: 20.5, x1: 30, y1: 20.5, halfWidth: 0.5))
+    XCTAssertNil(GuideRaster.clipped(S(x0: 200, y0: 20, x1: 200, y1: 20, halfWidth: 2), to: view), "a dot off the view")
+    XCTAssertNotNil(GuideRaster.clipped(S(x0: 50, y0: 20, x1: 50, y1: 20, halfWidth: 2), to: view))
+    // A diagonal through the view from far outside: it ends on the grown view's edges, on its own line.
+    let d = try XCTUnwrap(GuideRaster.clipped(S(x0: -100, y0: -100, x1: 200, y1: 200, halfWidth: 1), to: view))
+    XCTAssertEqual(d.x0, -1, accuracy: 1e-12)
+    XCTAssertEqual(d.y0, -1, accuracy: 1e-12)
+    XCTAssertEqual(d.x1, 51, accuracy: 1e-12)
+    XCTAssertEqual(d.y1, 51, accuracy: 1e-12)
+    XCTAssertNil(GuideRaster.clipped(S(x0: 120, y0: -100, x1: 300, y1: 60, halfWidth: 1), to: view), "a diagonal that misses")
+    // Inside the view: unchanged.
+    let inside = S(x0: 10, y0: 10, x1: 90, y1: 40, halfWidth: 1)
+    XCTAssertEqual(GuideRaster.clipped(inside, to: view), inside)
+  }
+
+  /// The new setting round-trips, and state saved before it decodes as "shown".
+  func testHidesWhileMagnifiedCodable() throws {
+    var g = GuideSettings()
+    g.hidesWhileMagnified = true
+    let data = try JSONEncoder().encode(g)
+    XCTAssertEqual(try JSONDecoder().decode(GuideSettings.self, from: data), g)
+    let old = try JSONDecoder().decode(GuideSettings.self, from: Data(#"{"enabled":true,"thirds":true}"#.utf8))
+    XCTAssertFalse(old.hidesWhileMagnified)
+    XCTAssertTrue(old.isShown(on: layout(zoom: 2)))
+  }
+}
+
+extension GuideRaster.Segment {
+  fileprivate func moved(y: Double) -> GuideRaster.Segment {
+    GuideRaster.Segment(x0: x0, y0: y0 + y, x1: x1, y1: y1 + y, halfWidth: halfWidth)
   }
 }
 

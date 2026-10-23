@@ -16,7 +16,7 @@ import simd
 /// | `testProcessedPictureKeepsSourceFocusMappedToTheDownscaledOutput` | `…testMinifiedPictureKeepsSourceFocusOnTheSourceEdge` |
 /// | `testSonyAndFocusRejectSourceGeometryThatDoesNotDescribeSourceBuffer` | `PortedSourceInterpretationGuardTests.testToolsNeverReadOutsideTheDeclaredFrame` |
 /// | `testELZoneRejectsFiniteDoubleCorrespondenceThatBecomesZeroOrInfiniteFloat` | `…testExtremeFiniteGeometryStaysFiniteOnTheGPU` |
-/// | `testScopeLatticeCountsEveryPixelOnceIncludingPartialEdgeCells` | not here: needs `MonitorKitScopes`, which this test target cannot import |
+/// | `testScopeLatticeCountsEveryPixelOnceIncludingPartialEdgeCells` | `MonitorKitScopesTests`: `ScopeAccumulationTests.testWaveformLumaEveryLayout` and `ScopeGroupTests.testOddAndTinyFrames` (see `ScopePortedMonitorToolsTests`) |
 /// | `testDirectYMatchesMatrixWeightedRGBForEverySupportedLayoutAndRange` | `PortedSamplingTests.testTransportLumaMatchesTheMatrixWeightedRGBForEveryLayoutAndRange` |
 ///
 /// The scaled and cropped processed outputs (`MonitorCorrespondence` 0.5× with and

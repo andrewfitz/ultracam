@@ -50,7 +50,7 @@ public enum MonitorUnavailableReason: Equatable, Sendable, CustomStringConvertib
   /// Peaking is on, but the feed has no focus mask for this frame on this
   /// surface's stage: call `analyze` with the same `FocusSettings.stage` first.
   case focusNotAnalyzed
-  /// Guides are hidden while the picture is magnified.
+  /// Guides are hidden while the picture is magnified (`GuideSettings.hidesWhileMagnified`).
   case hiddenWhileMagnified
   /// The display transform maps PQ or HLG, and the signal is neither.
   case requiresHDRSource

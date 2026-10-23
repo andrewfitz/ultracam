@@ -207,7 +207,7 @@ final class Benchmarks: XCTestCase {
           try feed.analyze(frame, focus: focus, into: $0)
         })
       }
-      XCTAssertLessThanOrEqual(ms, budget, "\(mode)")
+      try assertWithinBudget(ms, budget, "focus mask on a LUT stage, \(mode), ms")
     }
   }
 

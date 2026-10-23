@@ -21,6 +21,38 @@ func skipTimingUnderValidation() throws {
   }
 }
 
+/// The machine's run queue against its performance cores: (1-minute load average,
+/// performance cores). Other agents' builds and test runs push the load past the
+/// performance cores, and then this process's encode thread and GPU work share
+/// them, so a timing says nothing about MonitorKit.
+func machineLoad() -> (load: Double, cores: Int) {
+  var load = [0.0, 0.0, 0.0]
+  let n = getloadavg(&load, 3)
+  var cores: Int32 = 0
+  var size = MemoryLayout<Int32>.size
+  if sysctlbyname("hw.perflevel0.logicalcpu", &cores, &size, nil, 0) != 0 || cores <= 0 {
+    cores = Int32(ProcessInfo.processInfo.activeProcessorCount)
+  }
+  return (n > 0 ? load[0] : 0, Int(cores))
+}
+
+/// For a timing budget that every re-measured round missed: fails on a quiet
+/// machine, skips (with the numbers) on one whose load average exceeds its
+/// performance cores, where the miss measures the other load. Call it only
+/// after the re-measured rounds, so a quiet machine still fails a regression.
+func assertWithinBudget(
+  _ value: Double, _ budget: Double, _ message: @autoclosure () -> String, file: StaticString = #filePath,
+  line: UInt = #line
+) throws {
+  guard value > budget else { return }
+  let (load, cores) = machineLoad()
+  if load > Double(cores) {
+    throw XCTSkip(
+      "\(message()): \(String(format: "%.3g", value)) over the budget of \(String(format: "%.3g", budget)) on a loaded machine (load \(String(format: "%.1f", load)) on \(cores) performance cores)")
+  }
+  XCTFail("\(message()): \(value) is over the budget of \(budget) (load \(String(format: "%.1f", load)) on \(cores) performance cores)", file: file, line: line)
+}
+
 /// Counts differing pixels instead of printing whole images.
 func assertSamePixels(
   _ a: [SIMD4<Float>], _ b: [SIMD4<Float>], _ message: String = "", file: StaticString = #filePath, line: UInt = #line

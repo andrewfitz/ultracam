@@ -178,6 +178,11 @@ final class LoudnessEngine {
   private let weights: UnsafeMutablePointer<Double>
   /// The shelf and high-pass as one two-section cascade.
   private let kWeighting: vDSP_biquad_SetupD
+  /// The cascade's gain at DC after the shelf and after both stages: H(1) =
+  /// (b0 + b1 + b2) / (1 + a1 + a2) per section.
+  private let dcGains: (shelf: Double, cascade: Double)
+  /// Set by `primeFilters()`: the next `process` starts the cascade from its first sample.
+  private var primesFilters = false
   /// Per active channel: the cascade's 2 * 2 + 2 delay values.
   private let delays: UnsafeMutablePointer<Double>
   /// Per active channel: K-weighted energy of the current tick.
@@ -212,6 +217,8 @@ final class LoudnessEngine {
       fatalError("vDSP_biquad_CreateSetupD failed")
     }
     kWeighting = setup
+    func dcGain(_ b: Biquad) -> Double { (b.b0 + b.b1 + b.b2) / (1 + b.a1 + b.a2) }
+    dcGains = (dcGain(shelf), dcGain(shelf) * dcGain(highPass))
     delays = .allocate(capacity: max(active.count, 1) * Self.delaysPerChannel)
     delays.initialize(repeating: 0, count: max(active.count, 1) * Self.delaysPerChannel)
     energies = .allocate(capacity: max(active.count, 1))
@@ -245,6 +252,7 @@ final class LoudnessEngine {
 
   /// Measures the first `frames` samples of the stage's current chunk.
   func process(frames: Int) {
+    if primesFilters && frames > 0 { applyFilterPriming() }
     var i = 0
     while i < frames {
       if state.pointee.tickPosition == 0 { state.pointee.measuring = state.pointee.requestedMeasuring }
@@ -382,6 +390,32 @@ final class LoudnessEngine {
 
   /// Clears the K-weighting's signal memory (only for a meter that starts over on a new source).
   func resetFilters() {
+    primesFilters = false
     delays.update(repeating: 0, count: max(activeCount, 1) * Self.delaysPerChannel)
+  }
+
+  /// The input breaks here (a dropped or skipped packet): the next `process`
+  /// starts the K-weighting from its first sample instead of the stale memory.
+  func primeFilters() { primesFilters = true }
+
+  /// Sets each channel's cascade to its steady state for a constant input equal
+  /// to the chunk's first sample, as if the signal had held it: the new audio
+  /// starts with no step (zeros, or the old audio's memory, would put one into
+  /// the filter, and its decay into momentary loudness). vDSP's direct-form I
+  /// delays hold the cascade's input pair, then each section's output pair.
+  private func applyFilterPriming() {
+    primesFilters = false
+    var c = 0
+    while c < activeCount {
+      let u = Double(inputs[c][0])
+      let d = delays + c * Self.delaysPerChannel
+      d[0] = u
+      d[1] = u
+      d[2] = dcGains.shelf * u
+      d[3] = dcGains.shelf * u
+      d[4] = dcGains.cascade * u
+      d[5] = dcGains.cascade * u
+      c += 1
+    }
   }
 }

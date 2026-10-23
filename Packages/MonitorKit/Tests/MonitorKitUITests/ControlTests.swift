@@ -32,6 +32,29 @@ final class BindingTests: XCTestCase {
     XCTAssertEqual(box.value, box.value.normalized())
   }
 
+  /// The temperature slider steps 50 K, which misses D65's 6504 K: within half a
+  /// step it stores D65 exactly, so the trim can be dragged off again.
+  func testTemperatureSliderSnapsToD65() {
+    let box = Box(MonitorState())
+    let temperature = DisplayAdjustmentControls.temperatureBinding(
+      box.binding.normalizing.display.temperature, step: DisplayAdjustmentControls.temperatureStep)
+    temperature.wrappedValue = 6000
+    XCTAssertTrue(box.value.display.trimsWhitePoint)
+    for grid in [6500.0, 6529, 6479] {
+      temperature.wrappedValue = grid
+      XCTAssertEqual(box.value.display.temperature, WhitePointTrim.d65Temperature, "\(grid)")
+      XCTAssertFalse(box.value.display.trimsWhitePoint, "\(grid)")
+      XCTAssertTrue(box.value.display.isIdentity, "\(grid)")
+    }
+    temperature.wrappedValue = 6550
+    XCTAssertEqual(box.value.display.temperature, 6550, "a step away is a trim")
+    temperature.wrappedValue = 6450
+    XCTAssertEqual(box.value.display.temperature, 6450)
+    XCTAssertEqual(WhitePointTrim.snappedToD65(6504 + 25, within: 25), WhitePointTrim.d65Temperature)
+    XCTAssertEqual(WhitePointTrim.snappedToD65(6504 + 25.5, within: 25), 6529.5)
+    XCTAssertTrue(WhitePointTrim.snappedToD65(.nan, within: 25).isNaN)
+  }
+
   func testFrameGuideAspectBinding() {
     let box = Box(GuideSettings())
     let aspect = GuideControls.aspectBinding(box.binding)

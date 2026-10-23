@@ -295,78 +295,164 @@ public struct GuideRaster: Equatable, Sendable {
 
   public init() {}
 
-  /// Guides follow the shown picture (`imageRect`) and are hidden while magnified.
+  /// Guides follow the shown picture (`imageRect`). While it is magnified they lie
+  /// on the magnified picture and are clipped to the viewport (`GuideSettings.isShown(on:)`
+  /// decides whether they show then).
   public init(layout: MonitorLayout, guides: GuideSettings, pixelsPerPoint: Double = 1) {
-    guard guides.enabled, !layout.isMagnified else { return }
+    rebuild(layout: layout, guides: guides, pixelsPerPoint: pixelsPerPoint)
+  }
+
+  /// Lays the guides out again into this raster's storage, as `init` would: with
+  /// enough capacity reserved in `segments` (e.g. `reserveCapacity(4 * maximumSegments)`),
+  /// it allocates nothing, so a pinch or live resize that moves the guides every
+  /// frame stays allocation-free.
+  public mutating func rebuild(layout: MonitorLayout, guides: GuideSettings, pixelsPerPoint: Double = 1) {
+    segments.removeAll(keepingCapacity: true)
+    matteRect = nil
+    matteOpacity = 0
+    strokeWidth = 1
+    guard guides.isShown(on: layout) else { return }
     let fit = layout.imageRect
     let stroke = max(1, (guides.lineWidth * max(0.5, pixelsPerPoint)).rounded())
     strokeWidth = stroke
-    let half = stroke / 2
-    // Odd strokes centre on a pixel centre, even strokes on a pixel edge; ends
-    // land on pixel edges, so every stroke covers whole pixels.
-    let odd = Int(stroke) % 2 == 1
-    func snap(_ v: Double) -> Double { odd ? v.rounded(.down) + 0.5 : v.rounded() }
-    func across(_ v: Double, _ low: Double, _ high: Double) -> Double {
-      min(max(snap(v), low + half), high - half)
-    }
-    func vertical(_ x: Double, _ r: MonitorRect) {
-      let s = across(x, r.x, r.maxX)
-      segments.append(Segment(x0: s, y0: r.y.rounded(), x1: s, y1: r.maxY.rounded(), halfWidth: half))
-    }
-    func horizontal(_ y: Double, _ r: MonitorRect) {
-      let s = across(y, r.y, r.maxY)
-      segments.append(Segment(x0: r.x.rounded(), y0: s, x1: r.maxX.rounded(), y1: s, halfWidth: half))
-    }
-    func outline(_ r: MonitorRect) {
-      let x0 = across(r.x, r.x, r.maxX), x1 = across(r.maxX, r.x, r.maxX)
-      let y0 = across(r.y, r.y, r.maxY), y1 = across(r.maxY, r.y, r.maxY)
-      // Verticals run the full outer height, so the corners close.
-      segments.append(Segment(x0: x0, y0: y0 - half, x1: x0, y1: y1 + half, halfWidth: half))
-      segments.append(Segment(x0: x1, y0: y0 - half, x1: x1, y1: y1 + half, halfWidth: half))
-      segments.append(Segment(x0: x0, y0: y0, x1: x1, y1: y0, halfWidth: half))
-      segments.append(Segment(x0: x0, y0: y1, x1: x1, y1: y1, halfWidth: half))
-    }
+    let b = Builder(half: stroke / 2, odd: Int(stroke) % 2 == 1)
 
     var basis = fit
-    for (index, guide) in guides.frameGuides.enumerated() {
+    var index = 0
+    while index < guides.frameGuides.count {
+      let guide = guides.frameGuides[index]
       let rect = fit.fitting(aspect: guide.aspect)
       if index == 0 && guides.followsFrameGuide { basis = rect }
-      if guide.style != .matte { outline(rect) }
+      if guide.style != .matte { b.outline(rect, &segments) }
       if guide.style != .lines && matteRect == nil {
         matteRect = rect
         matteOpacity = guide.matteOpacity
       }
+      index += 1
     }
-    for percent in guides.safeAreas { outline(basis.scaled(percent / 100)) }
+    index = 0
+    while index < guides.safeAreas.count {
+      b.outline(basis.scaled(guides.safeAreas[index] / 100), &segments)
+      index += 1
+    }
     if guides.thirds {
-      for i in 1...2 {
-        vertical(basis.x + basis.width * Double(i) / 3, basis)
-        horizontal(basis.y + basis.height * Double(i) / 3, basis)
+      var i = 1
+      while i <= 2 {
+        b.vertical(basis.x + basis.width * Double(i) / 3, basis, &segments)
+        b.horizontal(basis.y + basis.height * Double(i) / 3, basis, &segments)
+        i += 1
       }
     }
     if guides.squareGrid {
       let rows = max(2, guides.squareGridRows), cell = basis.height / Double(rows)
-      for i in 1..<rows { horizontal(basis.y + cell * Double(i), basis) }
+      var i = 1
+      while i < rows {
+        b.horizontal(basis.y + cell * Double(i), basis, &segments)
+        i += 1
+      }
       var k = 0.0
-      while basis.midX + k * cell < basis.maxX - half {
-        vertical(basis.midX + k * cell, basis)
-        if k > 0 { vertical(basis.midX - k * cell, basis) }
+      while basis.midX + k * cell < basis.maxX - b.half {
+        b.vertical(basis.midX + k * cell, basis, &segments)
+        if k > 0 { b.vertical(basis.midX - k * cell, basis, &segments) }
         k += 1
       }
     }
+    let half = b.half
     if guides.diagonals {
       segments.append(Segment(x0: basis.x, y0: basis.y, x1: basis.maxX, y1: basis.maxY, halfWidth: half))
       segments.append(Segment(x0: basis.maxX, y0: basis.y, x1: basis.x, y1: basis.maxY, halfWidth: half))
     }
-    let cx = snap(basis.midX), cy = snap(basis.midY)
+    let cx = b.snap(basis.midX), cy = b.snap(basis.midY)
     if guides.centerCross {
-      let arm = (0.04 * basis.height).rounded() + (odd ? 0.5 : 0)
+      let arm = (0.04 * basis.height).rounded() + (b.odd ? 0.5 : 0)
       segments.append(Segment(x0: cx - arm, y0: cy, x1: cx + arm, y1: cy, halfWidth: half))
       segments.append(Segment(x0: cx, y0: cy - arm, x1: cx, y1: cy + arm, halfWidth: half))
     }
     if guides.centerDot {
       segments.append(Segment(x0: cx, y0: cy, x1: cx, y1: cy, halfWidth: max(2, stroke * 1.5)))
     }
+    // A magnified picture extends past the view: keep the part of each stroke on
+    // screen, in place (a fitted picture is inside it already, so its strokes stay
+    // as laid out).
+    if layout.isMagnified {
+      let view = MonitorRect(x: 0, y: 0, width: layout.viewportWidth, height: layout.viewportHeight)
+      var kept = 0, i = 0
+      while i < segments.count {
+        if let c = Self.clipped(segments[i], to: view) {
+          segments[kept] = c
+          kept += 1
+        }
+        i += 1
+      }
+      segments.removeLast(segments.count - kept)
+    }
     if segments.count > Self.maximumSegments { segments.removeLast(segments.count - Self.maximumSegments) }
+  }
+
+  /// Stroke placement for one stroke width. Odd strokes centre on a pixel centre,
+  /// even strokes on a pixel edge; ends land on pixel edges, so every stroke covers
+  /// whole pixels.
+  private struct Builder {
+    let half: Double
+    let odd: Bool
+
+    func snap(_ v: Double) -> Double { odd ? v.rounded(.down) + 0.5 : v.rounded() }
+    func across(_ v: Double, _ low: Double, _ high: Double) -> Double {
+      min(max(snap(v), low + half), high - half)
+    }
+    func vertical(_ x: Double, _ r: MonitorRect, _ out: inout [Segment]) {
+      let s = across(x, r.x, r.maxX)
+      out.append(Segment(x0: s, y0: r.y.rounded(), x1: s, y1: r.maxY.rounded(), halfWidth: half))
+    }
+    func horizontal(_ y: Double, _ r: MonitorRect, _ out: inout [Segment]) {
+      let s = across(y, r.y, r.maxY)
+      out.append(Segment(x0: r.x.rounded(), y0: s, x1: r.maxX.rounded(), y1: s, halfWidth: half))
+    }
+    func outline(_ r: MonitorRect, _ out: inout [Segment]) {
+      let x0 = across(r.x, r.x, r.maxX), x1 = across(r.maxX, r.x, r.maxX)
+      let y0 = across(r.y, r.y, r.maxY), y1 = across(r.maxY, r.y, r.maxY)
+      // Verticals run the full outer height, so the corners close.
+      out.append(Segment(x0: x0, y0: y0 - half, x1: x0, y1: y1 + half, halfWidth: half))
+      out.append(Segment(x0: x1, y0: y0 - half, x1: x1, y1: y1 + half, halfWidth: half))
+      out.append(Segment(x0: x0, y0: y0, x1: x1, y1: y0, halfWidth: half))
+      out.append(Segment(x0: x0, y0: y1, x1: x1, y1: y1, halfWidth: half))
+    }
+  }
+
+  /// The part of `s` whose stroke can cover a pixel of `view` (the view grown by the
+  /// half width, so caps and strokes at the edges stay whole), or nil. Axis-aligned
+  /// strokes keep their position and are cut along their length; diagonals are
+  /// clipped with Liang and Barsky's parametric test ("A New Concept and Method for
+  /// Line Clipping", ACM TOG 3(1), 1984).
+  static func clipped(_ s: Segment, to view: MonitorRect) -> Segment? {
+    let h = s.halfWidth
+    let x0 = view.x - h, x1 = view.maxX + h, y0 = view.y - h, y1 = view.maxY + h
+    if s.x0 == s.x1 {
+      guard s.x0 >= x0, s.x0 <= x1 else { return nil }
+      let low = max(min(s.y0, s.y1), y0), high = min(max(s.y0, s.y1), y1)
+      guard low <= high else { return nil }
+      return s.y0 <= s.y1
+        ? Segment(x0: s.x0, y0: low, x1: s.x1, y1: high, halfWidth: h)
+        : Segment(x0: s.x0, y0: high, x1: s.x1, y1: low, halfWidth: h)
+    }
+    if s.y0 == s.y1 {
+      guard s.y0 >= y0, s.y0 <= y1 else { return nil }
+      let low = max(min(s.x0, s.x1), x0), high = min(max(s.x0, s.x1), x1)
+      guard low <= high else { return nil }
+      return s.x0 <= s.x1
+        ? Segment(x0: low, y0: s.y0, x1: high, y1: s.y1, halfWidth: h)
+        : Segment(x0: high, y0: s.y0, x1: low, y1: s.y1, halfWidth: h)
+    }
+    let dx = s.x1 - s.x0, dy = s.y1 - s.y0
+    var t0 = 0.0, t1 = 1.0
+    // p · t ≤ q for each edge (left, right, top, bottom).
+    func edge(_ p: Double, _ q: Double) -> Bool {
+      if p == 0 { return q >= 0 }
+      let t = q / p
+      if p < 0 { t0 = max(t0, t) } else { t1 = min(t1, t) }
+      return t0 <= t1
+    }
+    guard edge(-dx, s.x0 - x0), edge(dx, x1 - s.x0), edge(-dy, s.y0 - y0), edge(dy, y1 - s.y0) else { return nil }
+    return Segment(x0: s.x0 + t0 * dx, y0: s.y0 + t0 * dy, x1: s.x0 + t1 * dx, y1: s.y0 + t1 * dy, halfWidth: h)
   }
 }

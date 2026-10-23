@@ -356,6 +356,23 @@ public final class AudioMeter: @unchecked Sendable {
   /// programme adds no transient of its own.
   public func reset() { requests.requestAll() }
 
+  /// `reset()` for audio that does not follow what came before (a new stream, or
+  /// the same one after a gap): every reading and ballistic starts over, and the
+  /// filters' signal memory starts from the next `process` call's first sample
+  /// (see `noteDiscontinuity()`), so a restart never interpolates or K-weights
+  /// across stale samples. Any thread; applied by the next `process` or `flush()`.
+  public func restart() { requests.requestRestart() }
+
+  /// The audio the next `process` call brings does not follow the last call's
+  /// (a dropped, skipped or rejected packet): the true-peak interpolator's history
+  /// is primed with that call's first sample, a folded PPM starts its step there,
+  /// and the K-weighting starts as if the signal had held that sample, instead of
+  /// running on from stale samples (which can draw a true-peak over that was never
+  /// in either stretch of audio, and a step into momentary loudness). Every
+  /// reading, hold and ballistic carries on. Any thread; changes no reading, so
+  /// `sequence` does not move.
+  public func noteDiscontinuity() { requests.requestDiscontinuity() }
+
   /// Puts integrated loudness, loudness range and loudness `duration` on
   /// stand-by (EBU Tech 3341 section 2.2): audio from now on is left out of
   /// them as if it were cut, while momentary, short-term, their maxima and
@@ -606,12 +623,22 @@ public final class AudioMeter: @unchecked Sendable {
     publisher.publish(&staging.pointee)
   }
 
-  /// True when a request was applied; the generations go out with the next publish.
+  /// True when a reading reset was applied; the generations go out with the next publish.
   private func applyResetRequests() -> Bool {
     let requested = requests.load()
     let applied = staging.pointee.resets
     guard requested != applied else { return false }
     staging.pointee.resets = requested
+    // After the reading resets (a full one keeps `primed`): the audio after the
+    // break re-primes the interpolator history from its first sample, starts a
+    // folded PPM's step there and starts the K-weighting from it.
+    defer {
+      if requested.discontinuities != applied.discontinuities {
+        scalars.pointee.primed = stage.history == 0
+        scalars.pointee.ppmCarry = 0
+        loudness?.primeFilters()
+      }
+    }
     if requested.all != applied.all {
       // Readings and ballistics only; the signal memory stays (see `reset()`).
       channelState.update(repeating: ChannelState(), count: channelCount)
@@ -634,6 +661,6 @@ public final class AudioMeter: @unchecked Sendable {
       }
     }
     if requested.loudness != applied.loudness { loudness?.resetMeasurement() }
-    return true
+    return requested.resetsReadings(since: applied)
   }
 }

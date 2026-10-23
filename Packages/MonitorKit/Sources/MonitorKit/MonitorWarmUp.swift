@@ -143,7 +143,7 @@ extension MonitorPass {
     let s = k.state
     let layout = MonitorLayout(
       frame: k.geometry, state: s, viewportWidth: k.viewport.width, viewportHeight: k.viewport.height)
-    let showGuides = s.guides.enabled && !s.clean && !layout.isMagnified
+    let showGuides = s.guides.isShown(on: layout) && !s.clean
     let raster =
       showGuides ? GuideRaster(layout: layout, guides: s.guides, pixelsPerPoint: k.viewport.pixelsPerPoint) : GuideRaster()
     let guides = GuideParameters(raster, outline: max(1, k.viewport.pixelsPerPoint.rounded()))

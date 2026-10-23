@@ -16,7 +16,7 @@ import simd
 /// | `testScharrConfidenceMatchesIndependentCPUOracleOnSlantedEdgeAndNoise` | `testScharrConfidenceMatchesAnIndependentCPUOracle` |
 /// | `testThinSourceFocusSurvivesTwoToOnePreviewMinification` | `testThinSourceFocusSurvivesTwoToOneMinification` |
 /// | `testFractionalMinificationMatchesBoundedBilinearQuadratureOracle` | `testFractionalMinificationMatchesTheStratifiedBoxOracle` (semantic difference) |
-/// | `testScopeDensityIsStableAcrossSourceWidth` | not here: needs `MonitorKitScopes`, which this test target cannot import |
+/// | `testScopeDensityIsStableAcrossSourceWidth` | `MonitorKitScopesTests/ScopePortedMonitorToolsTests.testTraceDensityIsStableAcrossSourceWidth` (this target cannot import `MonitorKitScopes`) |
 final class PortedQualityTests: XCTestCase {
   /// MonitorTools checked its `KernelParameters` offsets by hand. MonitorKit's
   /// structs are checked against shader reflection in `ABITests`; this port pins

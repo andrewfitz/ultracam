@@ -117,32 +117,79 @@ public struct GuideParameters: Sendable {
 
   /// Packs `raster`'s segments. `outline` is the dark outline's width in pixels.
   public init(_ raster: GuideRaster, outline: Double) {
-    var verticals: [SIMD4<Float>] = [], horizontals: [SIMD4<Float>] = [], others: [GuideRaster.Segment] = []
+    update(raster, outline: outline)
+  }
+
+  /// Repacks `raster`'s segments in place, as `init(_:outline:)` does, allocating
+  /// nothing: verticals sorted by x, then horizontals sorted by y (each sort
+  /// stable; at most `maximumLines` in all, verticals first, the first ones in the
+  /// raster's order when a hand-built raster holds more), then up to
+  /// `maximumOthers` diagonals and dots in order.
+  public mutating func update(_ raster: GuideRaster, outline: Double) {
+    let segments = raster.segments
     var widest = 0.0
-    for s in raster.segments {
+    var verticals = 0, horizontals = 0, others = 0
+    var i = 0
+    while i < segments.count {
+      let s = segments[i]
       widest = max(widest, s.halfWidth)
       if s.x0 == s.x1 && s.y0 != s.y1 {
-        verticals.append(SIMD4(Float(s.x0), Float(min(s.y0, s.y1)), Float(max(s.y0, s.y1)), Float(s.halfWidth)))
+        verticals += 1
       } else if s.y0 == s.y1 && s.x0 != s.x1 {
-        horizontals.append(SIMD4(Float(s.y0), Float(min(s.x0, s.x1)), Float(max(s.x0, s.x1)), Float(s.halfWidth)))
-      } else {
-        others.append(s)
+        horizontals += 1
+      } else if others < Self.maximumOthers {
+        self.others[2 * others] = SIMD4(Float(s.x0), Float(s.y0), Float(s.x1), Float(s.y1))
+        self.others[2 * others + 1] = SIMD4(Float(s.halfWidth), 0, 0, 0)
+        others += 1
       }
+      i += 1
     }
-    verticals.sort { $0.x < $1.x }
-    horizontals.sort { $0.x < $1.x }
-    let lines = (verticals + horizontals).prefix(Self.maximumLines)
-    for (i, l) in lines.enumerated() { self.lines[i] = l }
-    let nv = min(verticals.count, Self.maximumLines)
-    counts.x = UInt32(nv)
-    counts.y = UInt32(lines.count - nv)
-    for (i, s) in others.prefix(Self.maximumOthers).enumerated() {
-      self.others[2 * i] = SIMD4(Float(s.x0), Float(s.y0), Float(s.x1), Float(s.y1))
-      self.others[2 * i + 1] = SIMD4(Float(s.halfWidth), 0, 0, 0)
+    let nv = min(verticals, Self.maximumLines)
+    let nh = min(horizontals, Self.maximumLines - nv)
+    // Insertion into the sorted run of each axis: stable, and at most 128 lines.
+    var placed = (0, 0)
+    i = 0
+    while i < segments.count {
+      let s = segments[i]
+      if s.x0 == s.x1 && s.y0 != s.y1 && placed.0 < nv {
+        Self.insert(
+          SIMD4(Float(s.x0), Float(min(s.y0, s.y1)), Float(max(s.y0, s.y1)), Float(s.halfWidth)), into: &lines,
+          start: 0, count: placed.0)
+        placed.0 += 1
+      } else if s.y0 == s.y1 && s.x0 != s.x1 && placed.1 < nh {
+        Self.insert(
+          SIMD4(Float(s.y0), Float(min(s.x0, s.x1)), Float(max(s.x0, s.x1)), Float(s.halfWidth)), into: &lines,
+          start: nv, count: placed.1)
+        placed.1 += 1
+      }
+      i += 1
     }
-    counts.z = UInt32(min(others.count, Self.maximumOthers))
+    i = nv + nh
+    while i < Self.maximumLines {
+      lines[i] = .zero
+      i += 1
+    }
+    i = 2 * others
+    while i < 2 * Self.maximumOthers {
+      self.others[i] = .zero
+      i += 1
+    }
+    counts = SIMD4(UInt32(nv), UInt32(nh), UInt32(others), 0)
     reach = SIMD4(Float(widest + outline + 1), Float(outline), 0, 0)
     updateCells()
+  }
+
+  /// Inserts `line` into `lines[start..<start + count]`, kept sorted by `x`, after
+  /// any equal key.
+  private static func insert(
+    _ line: SIMD4<Float>, into lines: inout InlineArray<128, SIMD4<Float>>, start: Int, count: Int
+  ) {
+    var j = start + count
+    while j > start && lines[j - 1].x > line.x {
+      lines[j] = lines[j - 1]
+      j -= 1
+    }
+    lines[j] = line
   }
 
   /// Recomputes `cells` from `counts`, `reach` and `lines`: a bit is set wherever
