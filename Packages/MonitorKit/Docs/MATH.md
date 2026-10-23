@@ -349,7 +349,7 @@ Each entry gives the location, the value found, the correct value and the source
    - Impact: ARRI-style false colour, EL Zone and stops on S-Gamut3 sources (S-Gamut3.Cine is correct). The GPU gets the value from Core, so fixing Core fixes both.
    - Test: `testSGamut3LuminanceDerivesFromSonyPrimaries`.
    - Knock-on, updated with the fix: `ELZoneProfileTests.testSaturatedChannelsDecodeBeforeSourceGamutLuminance` (S-Gamut3 blue = 0.8 linear now has Y = −0.0461, black; red 0.65 reads −0.031 stops, same zone) and the comment in `ColorAnalysisTests.testSonyARRIStyleUsesDecodedSourceGamutLuminance` (Y = 0.2167837, code 419.49, still unclassified).
-   - The old read-only `MonitorTools` package still has the wrong constant.
+   - The retired `MonitorTools` package had the wrong constant; the app now uses MonitorKit's.
 2. **Six-band comment** (**fixed**), `Sources/MonitorKitCore/FalseColorScales.swift`, doc comment on `SixBandFalseColor.bands`.
    - Was: "one stop over it is 59.4 IRE". Now 59.5 IRE (BT.709 OETF(0.36) = 0.594959).
    - The pink band [56.4, 62.4) still contains 59.5. If the band is meant to be centred ±3 IRE, the edges would be 56.5–62.5. That would be a versioned profile change, so it is optional.
