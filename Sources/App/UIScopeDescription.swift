@@ -115,11 +115,15 @@ struct UIScopeDescription: Equatable, Sendable {
   let lutApplied: Bool
   let context: ScopeContext
 
-  init(scopes: MonitorScopePreferences, signal: SignalDescription?, burnInLUT: Bool, isProgram: Bool) {
+  /// `stageLUT`: whether a LUT is on the path to the scope's stage, by
+  /// `MonitorState.pictureHasLUT`'s rule for that stage (the burn-in LUT on
+  /// Output and Monitor, a shown monitor LUT on Monitor);
+  /// `MonitorSurfacePresenter.scopeMeasuresLUT` decides it for a surface.
+  init(scopes: MonitorScopePreferences, signal: SignalDescription?, stageLUT: Bool, isProgram: Bool) {
     let s = scopes.settings.normalized()
     settings = s
     self.isProgram = isProgram
-    let lut = s.stage != .source && burnInLUT
+    let lut = s.stage != .source && stageLUT
     lutApplied = lut
     self.signal = lut ? nil : signal
     // As `ScopeAccumulator` measures it: the frame's range, the matrix the

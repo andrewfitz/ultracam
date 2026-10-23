@@ -64,6 +64,8 @@ struct MonitorDiagnostics: Equatable, Sendable {
   /// Encode or GPU failures; each is shown, never silently dropped.
   var failures: UInt64 = 0
   var availability: MonitorAvailability = .noSignal
+  /// Where the target's monitor-only LUT file stands; a failed load is shown.
+  var monitorLUT: MonitorFeedHost.MonitorLUTState = .none
   init() {}
 }
 

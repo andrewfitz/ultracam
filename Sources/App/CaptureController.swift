@@ -114,6 +114,8 @@ final class CaptureController: @unchecked Sendable {
   private let queueKey = DispatchSpecificKey<UInt8>()
   private let controlKey = DispatchSpecificKey<UInt8>()
   private let lock = NSLock()
+  /// This capture's broadcast audio meters, fed on the driver thread while shown.
+  let audioMeterTap = AudioMeterTap()
   private var generation: UInt64 = 0
   private var accepting = false
   private var activeFeedID: FeedID?
@@ -977,6 +979,8 @@ final class CaptureController: @unchecked Sendable {
       return (activeFeedID.flatMap { recordingCallbacks[$0] }, rawAudioProvidesStats)
     }
     guard let state else { return }
+    // After the generation guard: a stopped stream's packets are never metered.
+    audioMeterTap.ingest(audio)
     let validRawFormat = audio.bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample
     if let samples = audio.samples, audio.sampleFrames > 0, audio.channels > 0, validRawFormat {
       _ = state.0?.rawAudio(samples, Int(audio.sampleFrames), audio.packetTime,

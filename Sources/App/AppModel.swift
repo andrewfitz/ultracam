@@ -67,6 +67,10 @@ final class AppModel {
   /// Descriptors and selection are coordinated as a collection. The selected
   /// session still follows the established one-feed capture path.
   var feedDescriptors: [FeedDescriptor] { feedCoordinator.descriptors }
+  /// A camera's broadcast audio meters; never creates a capture controller.
+  func audioMeterTap(for id: FeedID) -> AudioMeterTap? {
+    feedCoordinator.capturePool.existingController(for: id)?.audioMeterTap
+  }
   var selectedFeedID: FeedID { feedCoordinator.selectedFeedID }
 
   /// The virtual-camera topology is a persisted app setting. UI callers use

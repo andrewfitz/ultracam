@@ -104,6 +104,76 @@ import XCTest
     }
   }
 
+  /// The burn-in LUT reaches the camera's feed host through the real AppModel
+  /// wiring (`installCaptureUpdateHandler` hands the controller's `burnInLUT`
+  /// to the coordinator): the very `MonitorLUT` the controller burns in while
+  /// Apply LUT is on, nil while it is off, and nil at once when the feed is
+  /// removed. The controller is started with `.offline` services, whose start
+  /// fails before any device or camera is touched; the burn-in decision is
+  /// made before that.
+  func testBurnInLUTReachesTheFeedHostThroughAppModel() throws {
+    let suiteName = "org.ultracam.monitor-app-integration.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let settings = AppSettingsStore(defaults: defaults)
+    let feeds = [
+      FeedDescriptor(id: alpha, name: "Integration Wide", selectedDevice: "integration-device-a",
+        applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Integration Tight", selectedDevice: "integration-device-b",
+        applyLUT: false, automaticFeed: false),
+    ]
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: feeds, selectedFeedID: alpha, outputMode: .separateCameras))
+    let model = AppModel(settingsStore: settings, registryStore: VirtualCameraRegistryStore(defaults: defaults),
+      registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      hardware: .offline)
+    let controller = try XCTUnwrap(Mirror(reflecting: model).children.compactMap { $0.value as? CaptureController }.first)
+    defer { controller.stop() }
+    let coordinator = model.monitorCoordinator
+    let target = MonitorTargetID(alpha.rawValue)
+    let host = coordinator.captureSink(for: target)
+    let surfaceID = UUID()
+    let presenter = coordinator.surface(id: surfaceID, target: target)
+    defer { coordinator.unregisterSurface(id: surfaceID) }
+    /// What the feed host shows after an encode reads the camera's LUT. A test
+    /// probe: `refreshBurnInLUT` runs on the render thread in the app, but only
+    /// reads the source and sets the host's LUT under their locks.
+    func shown() -> MonitorLUT? {
+      presenter.refreshBurnInLUT()
+      return host.burnInLUT
+    }
+    XCTAssertNil(shown(), "Nothing loaded: no burn-in LUT")
+
+    let lut = try LUTProcessor.makeLUT(CubeLUT(text: MonitorCoordinatorChecks.identityCube))
+    let loaded = expectation(description: "LUT loaded")
+    controller.load(lut) { result in
+      if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+      loaded.fulfill()
+    }
+    wait(for: [loaded], timeout: 5)
+    var off = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
+    off.inputFast = true
+    var on = off
+    on.applyLUT = true
+
+    controller.start(deviceID: "monitor-integration-offline", configuration: on)
+    XCTAssertTrue(spinUntil { controller.burnInLUT === lut }, "Apply LUT on burns the loaded LUT in")
+    let withLUT = shown()
+    XCTAssertNotNil(withLUT, "Apply LUT on: the feed host has the burn-in LUT")
+    XCTAssertTrue(withLUT === controller.burnInLUT, "The feed host shows the very LUT the camera burns in")
+
+    controller.start(deviceID: "monitor-integration-offline", configuration: off)
+    XCTAssertTrue(spinUntil { controller.burnInLUT == nil }, "Apply LUT off burns nothing in")
+    XCTAssertNil(shown(), "Apply LUT off: the feed host has no burn-in LUT")
+
+    controller.start(deviceID: "monitor-integration-offline", configuration: on)
+    XCTAssertTrue(spinUntil { controller.burnInLUT === lut })
+    XCTAssertTrue(shown() === lut)
+    XCTAssertFalse(model.running)
+    XCTAssertTrue(model.removeFeed(alpha))
+    XCTAssertNil(host.burnInLUT, "Removing the feed clears its burn-in LUT at once")
+    XCTAssertNil(shown(), "A removed feed's surfaces no longer read the old controller")
+  }
+
   func testDetachedWindowCanClearAndRebindTheTargetUsedByItsChooser() throws {
     let alphaTarget = MonitorTargetID(alpha.rawValue)
     let betaTarget = MonitorTargetID(beta.rawValue)

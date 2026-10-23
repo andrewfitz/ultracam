@@ -69,6 +69,7 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-pat
   "$task_root/Sources/App/MonitorFeedHost.swift" "$task_root/Sources/App/MonitorGPUContext.swift" \
   "$task_root"/Sources/App/MonitorSurface*.swift \
   "$task_root/Sources/App/CameraSink.swift" "$task_root/Sources/App/CaptureController.swift" \
+  "$task_root"/Sources/App/AudioMeterTap*.swift \
   "$task_root/Sources/App/AutoSwitcherBridge.swift" \
   "$task_root/Sources/App/AutoSwitcherTimelineRecorder.swift" \
   "$task_root/Sources/App/ProgramOutputBridge.swift" \

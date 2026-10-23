@@ -301,7 +301,9 @@ struct UIMonitorToolSettingsView: View {
     case .tool(.zebra): UIZebraSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
     case .tool(.falseColor): UIFalseColorSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
     case .tool(.focus): UIFocusSettingsForm(preferences: $preferences, cameraID: cameraID)
-    case .tool(.scopes): UIScopeSettingsForm(preferences: $preferences, isProgram: isProgram)
+    case .tool(.scopes):
+      UIScopeSettingsForm(preferences: $preferences, isProgram: isProgram,
+        measurement: provider.scopeMeasurement(for: cameraID))
     case .clipIndicators: UIClipIndicatorSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
     case .picture: UIPictureSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
     }

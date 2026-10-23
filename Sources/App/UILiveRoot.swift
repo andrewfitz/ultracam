@@ -21,6 +21,7 @@ struct UILiveRoot<Content: View>: View {
     let bridge = UISessionBridge.live(model: model, interface: interface, openWindow: { openWindow(id: $0) },
       openSettings: { openSettings() })
     content(bridge.context())
+      .environment(\.uiAudioMeters, UIAudioMeterSource { [model] in model.audioMeterTap(for: FeedID(rawValue: $0)) })
   }
 }
 

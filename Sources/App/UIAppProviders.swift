@@ -39,6 +39,12 @@ import SwiftUI
   func setPreferences(_ preferences: MonitorFeedPreferences, for cameraID: String) {
     model.monitorCoordinator.setPreferences(preferences, for: MonitorTargetID(cameraID))
   }
+  func monitorLUTState(for cameraID: String) -> MonitorFeedHost.MonitorLUTState {
+    model.monitorCoordinator.monitorLUTState(for: MonitorTargetID(cameraID))
+  }
+  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: Bool) {
+    model.monitorCoordinator.scopeMeasurement(for: MonitorTargetID(cameraID))
+  }
 }
 
 extension Magnification {
@@ -97,10 +103,12 @@ private struct UIAppSurfacePicture: View {
       if scopesShown && !compact && !presenter.isClean {
         VStack {
           Spacer(minLength: 0)
-          MonitorNativeScope(presenter: presenter)
-            // MonitorKit draws the graticule lines; the IRE labels are SwiftUI.
-            .overlay { ScopeIREScaleView(scale: displayed.scopes.ireScale, showsGrid: false) }
-            .frame(maxWidth: .infinity)
+          // MonitorKit draws the scope and its graticule; the labels are SwiftUI.
+          // UIScopeImage keeps a vectorscope's aspect ratio itself.
+          UIScopeImage(description: UIScopeDescription(scopes: displayed.scopes, signal: presenter.shownSignal,
+            stageLUT: presenter.scopeMeasuresLUT(displayed), isProgram: isProgram)) {
+            MonitorNativeScope(presenter: presenter)
+          }
             .frame(height: 96)
             .background(Color.black.opacity(0.55))
             .clipShape(RoundedRectangle(cornerRadius: 8))

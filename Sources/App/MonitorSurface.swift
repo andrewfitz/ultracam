@@ -94,6 +94,9 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   /// The signal of the picture on screen, and what MonitorKit says about its tools.
   @MainActor @Published private(set) var shownSignal: SignalDescription?
   @MainActor @Published private(set) var shownStatus = MonitorStatus()
+  /// The statistics (clip readout) of this surface's scope accumulator, readable
+  /// from any thread; nil until its first scope.
+  @MainActor @Published private(set) var scopeStatisticsReader: ScopeStatisticsReader?
   @MainActor var onVisibilityChange: ((Bool, Bool) -> Void)?
   @MainActor private weak var visibilityView: MonitorVisibilityNSView?
   @MainActor private var visibility = (presented: false, drawable: false)
@@ -379,6 +382,27 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       pictureStatus = status
       rendererStatus = Self.describe(status)
     }
+  }
+
+  /// Render thread: a new scope accumulator was made; its statistics reader is
+  /// published on the main thread.
+  func publishScopeStatisticsReader(_ reader: ScopeStatisticsReader) {
+    DispatchQueue.main.async { [weak self] in
+      MainActor.assumeIsolated {
+        guard let self, self.scopeStatisticsReader !== reader else { return }
+        self.scopeStatisticsReader = reader
+      }
+    }
+  }
+
+  /// Whether a scope of `preferences` measures a LUT's output (then Rec.709):
+  /// `MonitorState.pictureHasLUT`'s rule for the scope's stage, with the LUTs
+  /// the host has now (the burn-in LUT on Output and Monitor, the monitor LUT
+  /// on Monitor while it is shown).
+  func scopeMeasuresLUT(_ preferences: MonitorFeedPreferences) -> Bool {
+    var state = preferences.state
+    state.pictureStage = preferences.scopes.settings.stage
+    return state.pictureHasLUT(burnInLUT: host.burnInLUT != nil, monitorLUT: host.monitorLUT != nil)
   }
 
   func recordScope(_ stamp: MonitorFeedHost.Stamp) {
@@ -772,7 +796,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let interpretation = Self.describe(signal)
     if pictureInterpretation != interpretation { pictureInterpretation = interpretation }
     // Scopes measure the stage their settings name; with no LUT on it that is the signal itself.
-    let scopeSignal = shownTools.scopes.settings.stage == .source || host.burnInLUT == nil ? signal : nil
+    let scopeSignal = scopeMeasuresLUT(shownTools) ? nil : signal
     let scopeText = scopeSignal.map { Self.describe($0) } ?? "Rec.709 (after the LUT)"
     if scopeInterpretation != scopeText { scopeInterpretation = scopeText }
     if let geometry {
@@ -1459,6 +1483,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let renderer = core.scopeEngine.makeRenderer()
     accumulator = made
     scopeRenderer = renderer
+    presenter?.publishScopeStatisticsReader(made.statisticsReader)
     return (made, renderer)
   }
 

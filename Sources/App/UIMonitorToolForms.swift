@@ -270,35 +270,19 @@ struct UIClipIndicatorSettingsForm: View {
   }
 }
 
-/// Scopes: one per camera, under the picture.
+/// Scopes: one per camera, under the picture. The same settings as the detached
+/// tile's (`UIScopeSettingsView`), so a setting made there can be seen and undone here.
 struct UIScopeSettingsForm: View {
   @Binding var preferences: MonitorFeedPreferences
   let isProgram: Bool
+  /// The shown picture's signal and whether a LUT is on the scope's stage.
+  var measurement: (signal: SignalDescription?, stageLUT: Bool) = (nil, false)
 
   var body: some View {
-    let settings = $preferences.scopes.settings
     Section {
       Toggle("Scope", isOn: UIMonitorToolBindings.enabling($preferences, \.scopes.enabled))
-      Picker("Type", selection: settings.waveformMode) {
-        Text("RGB parade").tag(WaveformMode.rgbParade)
-        Text("Luma waveform").tag(WaveformMode.luma)
-        if preferences.scopes.settings.waveformMode != .rgbParade && preferences.scopes.settings.waveformMode != .luma {
-          Text(preferences.scopes.title).tag(preferences.scopes.settings.waveformMode).disabled(true)
-        }
-      }
-      Picker("Signal", selection: settings.stage) {
-        Text("Source").tag(SignalStage.source).disabled(isProgram)
-        Text("Output (LUT)").tag(SignalStage.output)
-        if preferences.scopes.settings.stage == .monitor {
-          Text("Monitor").tag(SignalStage.monitor)
-        }
-      }
-      Picker("Refresh", selection: $preferences.scopes.refreshHz) {
-        ForEach(MonitorScopePreferences.refreshRates, id: \.self) { Text("\($0) Hz").tag($0) }
-      }
-      UIMonitorSlider("Trace gain", value: settings.display.gain, in: 0.25...4) { String(format: "%.2f×", $0) }
-      Toggle("Graticule", isOn: settings.display.showsGraticule)
-      UIMonitorToolCaption("One scope per camera. Every pixel, \(preferences.scopes.ireScale.rangeText) IRE.")
+      UIScopeSettingsView(scopes: $preferences.scopes, isProgram: isProgram, signal: measurement.signal,
+        stageLUT: measurement.stageLUT)
     }
   }
 }

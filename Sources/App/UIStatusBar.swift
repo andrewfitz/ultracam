@@ -329,7 +329,7 @@ struct UIStatusPopover: View {
       ForEach(live) { camera in
         VStack(alignment: .leading, spacing: 4) {
           Text(camera.name).font(.callout.weight(.medium))
-          UIAudioMeter(audio: camera.audio)
+          UIAudioMeterPanel(cameraID: camera.id, levels: camera.audio)
         }
       }
       Text("48 kHz stereo from each input. Not sent through the Ultracam cameras.")

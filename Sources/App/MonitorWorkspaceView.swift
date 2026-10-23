@@ -4,6 +4,36 @@ import MonitorKit
 import MonitorKitUI
 import SwiftUI
 
+/// The detached tile's rules that are not drawing, internal so ui-verify checks them.
+enum MonitorDetachedRules {
+  static func stageTitle(_ stage: SignalStage) -> String {
+    switch stage {
+    case .source: return "Source"
+    case .output: return "Output (LUT)"
+    case .monitor: return "Monitor"
+    }
+  }
+
+  /// The caption under the picture: its stage ("Program Output" on Program),
+  /// or, with false colour on a camera, that false colour analyses the source.
+  static func pictureCaption(isProgram: Bool, preferences: MonitorFeedPreferences) -> String {
+    let stage = isProgram ? "Program Output" : stageTitle(preferences.state.pictureStage)
+    if !isProgram && preferences.toolsEnabled && preferences.state.falseColor.mode != .off {
+      return "False color: Source analysis · selected picture signal: \(stage)"
+    }
+    return "Picture: \(stage)"
+  }
+
+  /// Whether a tile registers its scope as visible: the feed's tools show
+  /// scopes, this tile has not hidden them locally ("Hide scopes in this
+  /// view", which never changes the feed's tools), the picture is not held and
+  /// the preview is shown.
+  static func registersScope(preferences: MonitorFeedPreferences, locallyVisible: Bool, frozen: Bool,
+    previewEnabled: Bool) -> Bool {
+    preferences.scopesShown && locallyVisible && !frozen && previewEnabled
+  }
+}
+
 /// Detached monitor windows. The main window and the menu bar use the new interface;
 /// a detached window keeps this monitor tile with its full tool chrome.
 private struct MonitorBoundTile: View {
@@ -109,7 +139,7 @@ private struct MonitorBoundTile: View {
     } scopes: {
       if previewEnabled {
         UIScopePanel(
-          description: scopeDescription, expanded: $scopeExpanded, statistics: nil,
+          description: scopeDescription, expanded: $scopeExpanded, statistics: presenter.scopeStatisticsReader,
           isLive: !presenter.isFrozen, timing: presenter.scopeTiming, interpretation: presenter.scopeInterpretation
         ) {
           MonitorNativeScope(presenter: presenter)
@@ -131,7 +161,7 @@ private struct MonitorBoundTile: View {
   /// What the shown scope measures: the frozen settings while frozen.
   private var scopeDescription: UIScopeDescription {
     UIScopeDescription(
-      scopes: displayed.scopes, signal: presenter.shownSignal, burnInLUT: presenter.host.burnInLUT != nil,
+      scopes: displayed.scopes, signal: presenter.shownSignal, stageLUT: presenter.scopeMeasuresLUT(displayed),
       isProgram: target.isProgram)
   }
   @ViewBuilder private var surfaceViewActions: some View {
@@ -156,7 +186,8 @@ private struct MonitorBoundTile: View {
   private func register() {
     coordinator.registerSurface(
       id: surfaceID, target: target, isVisible: previewEnabled,
-      scopeVisible: preferences.wrappedValue.scopesShown && scopesVisible && !presenter.isFrozen && previewEnabled)
+      scopeVisible: MonitorDetachedRules.registersScope(preferences: preferences.wrappedValue,
+        locallyVisible: scopesVisible, frozen: presenter.isFrozen, previewEnabled: previewEnabled))
   }
 }
 
@@ -180,21 +211,7 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
   private var isProgram: Bool { target?.isProgram == true }
   private var displayed: MonitorFeedPreferences { frozenPreferences ?? preferences }
 
-  private static func stageTitle(_ stage: SignalStage) -> String {
-    switch stage {
-    case .source: return "Source"
-    case .output: return "Output (LUT)"
-    case .monitor: return "Monitor"
-    }
-  }
-
-  var pictureCaption: String {
-    let stage = isProgram ? "Program Output" : Self.stageTitle(displayed.state.pictureStage)
-    if !isProgram && displayed.toolsEnabled && displayed.state.falseColor.mode != .off {
-      return "False color: Source analysis · selected picture signal: \(stage)"
-    }
-    return "Picture: \(stage)"
-  }
+  var pictureCaption: String { MonitorDetachedRules.pictureCaption(isProgram: isProgram, preferences: displayed) }
 
   /// The tools as the toolbar shows them: hidden while the master switch is off.
   /// A change turns the switch on for the tools that are then on; Clean View and
@@ -274,7 +291,7 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
       ) {
         UIScopeSettingsView(
           scopes: $preferences.scopes, isProgram: isProgram, signal: presenter?.shownSignal,
-          burnInLUT: presenter?.host.burnInLUT != nil)
+          stageLUT: presenter?.scopeMeasuresLUT(preferences) == true)
       }
       .disabled(target == nil)
       if !detail.isEmpty {
@@ -318,6 +335,7 @@ private struct MonitorDiagnosticsDisclosure: View {
           "Offered \(snapshot.offeredFrames) · presented \(snapshot.presentedFrames) · replaced before a refresh \(snapshot.supersededFrames) · failures \(snapshot.failures)"
         )
         Text("This surface: \(surfaceScopeTiming)")
+        if let lut = MonitorFeedHost.describe(snapshot.monitorLUT) { Text(lut) }
       }.frame(maxWidth: .infinity, alignment: .leading).padding(.top, 3)
     }.font(.caption2).foregroundStyle(.secondary)
   }

@@ -110,6 +110,7 @@ import MonitorKit
         }
       }
       if let reason = gpu.unavailableReason { value.availability = .failed(reason) }
+      value.monitorLUT = host.monitorLUTState
       next[target] = value
     }
     if next != diagnosticSnapshots { diagnosticSnapshots = next }
@@ -129,6 +130,22 @@ import MonitorKit
       snapshot.availability = .paused
     }
     return snapshot
+  }
+
+  /// Where the target's monitor-only LUT file stands: loading, shown, or why it
+  /// failed. Also in its diagnostics, so a change is published within a second.
+  func monitorLUTState(for target: MonitorTargetID) -> MonitorFeedHost.MonitorLUTState {
+    hosts[target]?.monitorLUTState ?? .none
+  }
+
+  /// What the target's scope measures: the signal of a picture of it on screen
+  /// (nil before a frame) and whether a LUT is on the scope's stage
+  /// (`MonitorSurfacePresenter.scopeMeasuresLUT`).
+  func scopeMeasurement(for target: MonitorTargetID) -> (signal: SignalDescription?, stageLUT: Bool) {
+    let presenter = surfaces.values.first { $0.target == target && $0.presenter.shownSignal != nil }?.presenter
+      ?? surfaces.values.first { $0.target == target }?.presenter
+    guard let presenter else { return (nil, false) }
+    return (presenter.shownSignal, presenter.scopeMeasuresLUT(preferences(for: target)))
   }
 
   /// A target's tools, signal declaration and scopes.
@@ -298,6 +315,9 @@ import MonitorKit
     for surface in all { surface.presenter.setPreferences(value) }
     guard let host = hosts[target] else { return }
     host.setSignalDeclaration(value.signal)
+    // The whole choice, pick included, so choosing the same file again reloads
+    // it; an unchanged choice does nothing, and Program ignores it.
+    host.setMonitorLUT(value.monitorLUT)
     let available = targets.contains { $0.id == target && $0.isAvailable }
     let live = all.filter {
       $0.visible && !$0.presenter.holdsFreeze && !$0.usesNativePreview && available

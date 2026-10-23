@@ -18,21 +18,15 @@ enum UIFalseColorChoices {
   /// The modes, in menu order.
   static let modes: [FalseColorMode] = [.off, .sonySLog3, .arriStyleSLog3, .arriLogC, .elZone, .sixBand, .custom]
 
-  static func isAvailable(_ mode: FalseColorMode, profile: String?) -> Bool {
-    var preferences = MonitorFeedPreferences()
-    preferences.signal.logProfileID = profile
-    preferences.state.falseColor.mode = mode
-    return mode == .off || preferences.falseColorDeclared
+  /// `MonitorFeedPreferences.falseColorModeIsAvailable`: no log mode on Program.
+  static func isAvailable(_ mode: FalseColorMode, profile: String?, isProgram: Bool = false) -> Bool {
+    MonitorFeedPreferences.falseColorModeIsAvailable(mode, profile: profile, isProgram: isProgram)
   }
 
-  /// The mode a false-color toggle turns on for `profile`: Sony's Pattern 2 on
-  /// S-Log3, ARRI's table on LogC, else EL Zone where it reads the source, else
-  /// the six display-IRE bands, which need no log source.
-  static func suggestedMode(profile: String?) -> FalseColorMode {
-    if SonySLog3FalseColor.supports(sourceProfileID: profile) { return .sonySLog3 }
-    if profile.flatMap(ARRIFalseColorProfile.init(rawValue:)) != nil { return .arriLogC }
-    if ELZoneProfile.supports(sourceProfileID: profile) { return .elZone }
-    return .sixBand
+  /// The mode a false-color toggle turns on for `profile`
+  /// (`MonitorFeedPreferences.suggestedFalseColorMode`).
+  static func suggestedMode(profile: String?, isProgram: Bool = false) -> FalseColorMode {
+    MonitorFeedPreferences.suggestedFalseColorMode(profile: profile, isProgram: isProgram)
   }
 
   /// A new custom band after `bands`: 10 IRE or 1 stop wide, the next color.
@@ -61,16 +55,18 @@ struct UISignalDeclarationFields: View {
         Text("Unsupported saved profile").tag(profile).disabled(true)
       }
     }
+    .disabled(isProgram)
     Picker("Input code range", selection: $preferences.signal.range) {
       Text("Format native").tag(Optional<CodeRange>.none)
       Text("Legal (64…940 at 10-bit)").tag(Optional(CodeRange.legal))
       Text("Full (0…1023 at 10-bit)").tag(Optional(CodeRange.full))
     }
+    .disabled(isProgram)
     Picker("Log transport", selection: $preferences.signal.transport) {
       Text("Native 10-bit codes").tag(LogTransport.native)
       Text("Full codes rescaled to legal").tag(LogTransport.fullRescaledToLegal)
     }
-    .disabled(profile == nil)
+    .disabled(profile == nil || isProgram)
     UIMonitorToolCaption(isProgram
       ? "Program is not a camera signal, so it has no camera log to declare."
       : "Match the camera's actual output. These settings don't change the camera output.")
@@ -84,17 +80,10 @@ struct UISignalDeclarationFields: View {
       set: { value in preferences = Self.declaring(value.isEmpty ? nil : value, in: preferences) })
   }
 
-  /// `preferences` with `profile` declared. A log mode the new profile can't
-  /// show switches to the log mode it can; with none, it stays (and shows why).
+  /// `preferences` with `profile` declared
+  /// (`MonitorFeedPreferences.declaringCameraLog`, which scripts/test.sh covers).
   static func declaring(_ profile: String?, in preferences: MonitorFeedPreferences) -> MonitorFeedPreferences {
-    var next = preferences
-    next.signal.logProfileID = profile
-    let mode = next.state.falseColor.mode
-    if mode.needsLogSource, !UIFalseColorChoices.isAvailable(mode, profile: profile) {
-      let suggested = UIFalseColorChoices.suggestedMode(profile: profile)
-      if suggested.needsLogSource { next.state.falseColor.mode = suggested }
-    }
-    return next
+    preferences.declaringCameraLog(profile)
   }
 }
 
@@ -113,7 +102,7 @@ struct UIFalseColorSettingsForm: View {
       Picker("Mode", selection: UIMonitorToolBindings.falseColorMode($preferences)) {
         ForEach(UIFalseColorChoices.modes, id: \.self) { choice in
           Text(UIMonitorToolText.falseColor(choice)).tag(choice)
-            .disabled(!UIFalseColorChoices.isAvailable(choice, profile: profile))
+            .disabled(!UIFalseColorChoices.isAvailable(choice, profile: profile, isProgram: isProgram))
         }
       }
       if mode == .sixBand || mode == .custom {
@@ -136,7 +125,9 @@ struct UIFalseColorSettingsForm: View {
         }
         .help("Adds stops to measured source exposure. Camera EI is independent.")
       }
-      UIMonitorToolCaption(Self.caption(mode, profile: profile))
+      UIMonitorToolCaption(isProgram && mode.needsLogSource
+        ? "Program is not a camera signal, so log false color is off. Six band and custom bands work on Program."
+        : Self.caption(mode, profile: profile))
       UIMonitorStatusNote(cameraID: cameraID, tools: [.falseColor])
     }
     if mode == .custom {

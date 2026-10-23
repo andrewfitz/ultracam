@@ -52,7 +52,7 @@ import SwiftUI
     var screens: [Screen] = []
     func panel(_ name: String, _ scopes: MonitorScopePreferences, signal: SignalDescription? = .rec709,
       lut: Bool = false, program: Bool = false, expanded: Bool = false, readout: UIScopeReadout? = nil) {
-      let description = UIScopeDescription(scopes: scopes, signal: signal, burnInLUT: lut, isProgram: program)
+      let description = UIScopeDescription(scopes: scopes, signal: signal, stageLUT: lut, isProgram: program)
       screens.append(Screen(
         name: "scope-\(name)",
         view: AnyView(
@@ -124,78 +124,78 @@ import SwiftUI
         && standard.waveformColumns == classic.waveformColumns && UIScopeLook(standard) == .standard
         && UIScopeLook.classic.applied(to: standard) == classic)
 
-    let pqScope = UIScopeDescription(scopes: scopes(.luma), signal: pq, burnInLUT: false, isProgram: false)
+    let pqScope = UIScopeDescription(scopes: scopes(.luma), signal: pq, stageLUT: false, isProgram: false)
     check("a PQ stage offers the PQ nits scale and suggests it",
       pqScope.offers(.pqNits) && !pqScope.offers(.hlgNits) && pqScope.suggestedHDRScale == .pqNits
         && pqScope.scaleNote != nil)
-    let hlgScope = UIScopeDescription(scopes: scopes(.luma), signal: hlg, burnInLUT: false, isProgram: false)
+    let hlgScope = UIScopeDescription(scopes: scopes(.luma), signal: hlg, stageLUT: false, isProgram: false)
     check("an HLG stage offers the HLG nits scale", hlgScope.offers(.hlgNits) && !hlgScope.offers(.pqNits))
-    let afterLUT = UIScopeDescription(scopes: scopes(.luma), signal: pq, burnInLUT: true, isProgram: false)
+    let afterLUT = UIScopeDescription(scopes: scopes(.luma), signal: pq, stageLUT: true, isProgram: false)
     check("after the burn-in LUT the stage is Rec.709: no nits scale",
       afterLUT.hdrTransfer == nil && !afterLUT.offers(.pqNits) && afterLUT.context.matrix == .bt709)
     let sourceStage = UIScopeDescription(
-      scopes: scopes(.luma) { $0.stage = .source }, signal: pq, burnInLUT: true, isProgram: false)
+      scopes: scopes(.luma) { $0.stage = .source }, signal: pq, stageLUT: true, isProgram: false)
     check("the source stage of a LUT camera measures the camera signal",
       sourceStage.hdrTransfer == .pq && sourceStage.context.matrix == .bt2020)
-    let sdr = UIScopeDescription(scopes: scopes(.luma), signal: .rec709, burnInLUT: false, isProgram: false)
+    let sdr = UIScopeDescription(scopes: scopes(.luma), signal: .rec709, stageLUT: false, isProgram: false)
     check("an SDR stage has no nits scale or note", !sdr.offers(.pqNits) && sdr.scaleNote == nil)
     let mismatch = UIScopeDescription(
-      scopes: scopes(.luma) { $0.display.waveformScale = .pqNits }, signal: .rec709, burnInLUT: false,
+      scopes: scopes(.luma) { $0.display.waveformScale = .pqNits }, signal: .rec709, stageLUT: false,
       isProgram: false)
     check("a nits scale on an SDR stage says so", mismatch.scaleNote?.contains("not PQ") == true,
       mismatch.scaleNote ?? "no note")
 
-    let docked = UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, burnInLUT: false, isProgram: false)
+    let docked = UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, stageLUT: false, isProgram: false)
       .visibleLabels(width: 560, height: 120).filter { $0.role == .tick }.map(\.text)
     check("a docked waveform labels 0, 50 and 100 IRE without overlaps", docked == ["0", "50", "100"],
       docked.joined(separator: ", "))
-    let expanded = UIScopeDescription(scopes: scopes(.luma), signal: .rec709, burnInLUT: false, isProgram: false)
+    let expanded = UIScopeDescription(scopes: scopes(.luma), signal: .rec709, stageLUT: false, isProgram: false)
       .visibleLabels(width: 560, height: 240).filter { $0.role == .tick }.map(\.text)
     check("an expanded waveform labels −10, 0, 50, 100 and 110 IRE, as before",
       expanded == ["-10", "0", "50", "100", "110"], expanded.joined(separator: ", "))
     let tallCodes = UIScopeDescription(
-      scopes: scopes(.luma) { $0.display.waveformScale = .codeValues }, signal: .rec709, burnInLUT: false,
+      scopes: scopes(.luma) { $0.display.waveformScale = .codeValues }, signal: .rec709, stageLUT: false,
       isProgram: false
     ).visibleLabels(width: 560, height: 480).filter { $0.role == .tick }
     check("a tall code-value waveform labels every line it draws",
       tallCodes.count > 5 && tallCodes.contains { !$0.isMajor }, tallCodes.map(\.text).joined(separator: ", "))
-    let parade = UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, burnInLUT: false, isProgram: false)
+    let parade = UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, stageLUT: false, isProgram: false)
     check("the RGB parade names its channels",
       parade.labels.filter { $0.role == .channel }.map(\.text) == ["R", "G", "B"])
     let ycbcr = UIScopeDescription(
-      scopes: scopes(.ycbcrParade) { $0.display.waveformScale = .codeValues }, signal: .rec709, burnInLUT: false,
+      scopes: scopes(.ycbcrParade) { $0.display.waveformScale = .codeValues }, signal: .rec709, stageLUT: false,
       isProgram: false)
     check("the YCbCr parade labels its chroma codes",
       ycbcr.visibleLabels(width: 560, height: 240).contains { $0.role == .tick && $0.text == "512" })
     let vector = UIScopeDescription(
-      scopes: scopes(.vectorscope) { $0.display.vectorscopeTargets = .percent75 }, signal: .rec709, burnInLUT: false,
+      scopes: scopes(.vectorscope) { $0.display.vectorscopeTargets = .percent75 }, signal: .rec709, stageLUT: false,
       isProgram: false)
     check("the vectorscope labels its six 75% targets", vector.labels.filter { $0.role == .target }.count == 6)
     let noGraticule = UIScopeDescription(
-      scopes: scopes(.vectorscope) { $0.display.showsGraticule = false }, signal: .rec709, burnInLUT: false,
+      scopes: scopes(.vectorscope) { $0.display.showsGraticule = false }, signal: .rec709, stageLUT: false,
       isProgram: false)
     check("targets are labelled only with the graticule", !noGraticule.labels.contains { $0.role == .target })
     check("a vectorscope keeps the image's shape",
       UIScopeDescription.imageAspectRatio == 3 && vector.settings.kind == .vectorscope)
     let matrixKinds = UIScopeChoice.allCases.filter {
-      UIScopeDescription(scopes: scopes($0), signal: .rec709, burnInLUT: false, isProgram: false).usesMatrix
+      UIScopeDescription(scopes: scopes($0), signal: .rec709, stageLUT: false, isProgram: false).usesMatrix
     }
     check("the matrix applies to the luma waveform, Y'CbCr parade and vectorscope",
       matrixKinds == [.luma, .ycbcrParade, .vectorscope], "\(matrixKinds)")
     let lumaHistogram = UIScopeDescription(
-      scopes: scopes(.histogram) { $0.histogramMode = .luma }, signal: .rec709, burnInLUT: false, isProgram: false)
+      scopes: scopes(.histogram) { $0.histogramMode = .luma }, signal: .rec709, stageLUT: false, isProgram: false)
     check("the matrix applies to the luma histogram", lumaHistogram.usesMatrix)
     let bt601 = UIScopeDescription(
-      scopes: scopes(.luma) { $0.colorimetry = .bt601 }, signal: .rec709, burnInLUT: false, isProgram: false)
+      scopes: scopes(.luma) { $0.colorimetry = .bt601 }, signal: .rec709, stageLUT: false, isProgram: false)
     check("a chosen matrix is named under the waveform", bt601.caption.contains("BT.601"), bt601.caption)
     check("the automatic matrix is not named under the waveform", !sdr.caption.contains("BT."), sdr.caption)
     let rgb601 = UIScopeDescription(
-      scopes: scopes(.rgbParade) { $0.colorimetry = .bt601 }, signal: .rec709, burnInLUT: false, isProgram: false)
+      scopes: scopes(.rgbParade) { $0.colorimetry = .bt601 }, signal: .rec709, stageLUT: false, isProgram: false)
     check("the RGB parade, which ignores the matrix, does not name it", !rgb601.caption.contains("BT."), rgb601.caption)
     check("the waveforms are the four waveform choices",
       UIScopeChoice.allCases.filter(\.isWaveform) == [.rgbParade, .luma, .rgbOverlay, .ycbcrParade])
     check("Program's scope says Program Output",
-      UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, burnInLUT: false, isProgram: true).title
+      UIScopeDescription(scopes: scopes(.rgbParade), signal: .rec709, stageLUT: false, isProgram: true).title
         == "RGB parade · Program Output")
 
     let lines = UIScopeReadout.lines(
@@ -218,7 +218,7 @@ private struct UIScopeSettingsPreview: View {
   let signal: SignalDescription?
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      UIScopeSettingsView(scopes: $scopes, isProgram: false, signal: signal, burnInLUT: false)
+      UIScopeSettingsView(scopes: $scopes, isProgram: false, signal: signal, stageLUT: false)
     }
     .padding(12).frame(width: 320, alignment: .topLeading).controlSize(.small)
     .frame(maxHeight: .infinity, alignment: .top)

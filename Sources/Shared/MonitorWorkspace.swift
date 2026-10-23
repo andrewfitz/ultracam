@@ -135,6 +135,45 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     }
   }
 
+  /// Whether `mode` can show on a camera declared as `profile`
+  /// (`falseColorDeclared` for that declaration). Off always can; on Program,
+  /// whose frames are not a camera's source signal, no log mode can.
+  static func falseColorModeIsAvailable(_ mode: FalseColorMode, profile: String?,
+    isProgram: Bool = false) -> Bool {
+    if mode == .off { return true }
+    if isProgram && mode.needsLogSource { return false }
+    var preferences = MonitorFeedPreferences()
+    preferences.signal.logProfileID = profile
+    preferences.state.falseColor.mode = mode
+    return preferences.falseColorDeclared
+  }
+
+  /// The mode a false-colour toggle turns on for `profile`: Sony's Pattern 2 on
+  /// S-Log3, ARRI's table on LogC, else EL Zone where it reads the source, else
+  /// the six display-IRE bands, which need no log source (always on Program).
+  static func suggestedFalseColorMode(profile: String?, isProgram: Bool = false) -> FalseColorMode {
+    if isProgram { return .sixBand }
+    if SonySLog3FalseColor.supports(sourceProfileID: profile) { return .sonySLog3 }
+    if profile.flatMap(ARRIFalseColorProfile.init(rawValue:)) != nil { return .arriLogC }
+    if ELZoneProfile.supports(sourceProfileID: profile) { return .elZone }
+    return .sixBand
+  }
+
+  /// These preferences with the camera declared as `id` (the Camera log
+  /// picker). False colour stays on: a log mode the new profile cannot show
+  /// switches to the log mode it can; with none (or no declaration), it stays
+  /// selected and explains itself. Modes that need no log source are untouched.
+  func declaringCameraLog(_ id: String?) -> MonitorFeedPreferences {
+    var next = self
+    next.signal.logProfileID = id
+    let mode = next.state.falseColor.mode
+    if mode.needsLogSource, !Self.falseColorModeIsAvailable(mode, profile: id) {
+      let suggested = Self.suggestedFalseColorMode(profile: id)
+      if suggested.needsLogSource { next.state.falseColor.mode = suggested }
+    }
+    return next
+  }
+
   /// Another camera is now on this feed: its signal declaration and exposure
   /// offset no longer apply. The false-colour mode stays selected: it shows
   /// nothing until a log source it reads is declared again (as in MonitorTools,

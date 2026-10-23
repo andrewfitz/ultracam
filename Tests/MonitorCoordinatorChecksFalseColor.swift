@@ -17,10 +17,9 @@ import XCTest
 // normalization did) whether the mode can show, and so whether it suppresses
 // zebra. Choosing a mode or a camera is one complete publication of the whole
 // preferences. The switch of a log mode the new camera cannot show to one it
-// can (ARRI LogC to Sony S-Log3) is the settings' Camera log picker's
-// (`UISignalDeclarationFields.sourceProfile`), which these checks do not
-// compile: they cover the preferences and the coordinator, which keep and
-// publish whatever the interface sets.
+// can (ARRI LogC to Sony S-Log3) is `MonitorFeedPreferences.declaringCameraLog`,
+// which the settings' Camera log picker calls and these checks cover; the
+// coordinator keeps and publishes whatever the interface sets.
 extension MonitorCoordinatorChecks {
   private static let portedSonySources = ["sony-slog3-sgamut3cine", "sony-slog3-sgamut3"]
   private static let portedARRISources = ["arri-logc3-ei800", "arri-alexa35-logc4-ei800"]
@@ -203,6 +202,54 @@ extension MonitorCoordinatorChecks {
       XCTAssertNil(try portedSignal(alpha, program: true).encoding.log)
       portedExpectProgramZebra(alpha)
     }
+  }
+
+  /// The Camera log picker's rule (MonitorToolsUITests:99/124/143): a log mode
+  /// the new camera cannot show switches to the one it can, back again on the
+  /// old camera; a mode that needs no log source is untouched, and clearing the
+  /// declaration leaves a log mode selected to explain itself.
+  func testDeclaringCameraLogSwitchesLogFalseColorBetweenCameras() throws {
+    for sonySource in Self.portedSonySources {
+      for arriSource in Self.portedARRISources {
+        var arri = MonitorFeedPreferences()
+        arri.toolsEnabled = true
+        arri.signal.logProfileID = arriSource
+        arri.state.falseColor.mode = .arriLogC
+        XCTAssertTrue(arri.falseColorDeclared)
+
+        let sony = arri.declaringCameraLog(sonySource)
+        XCTAssertEqual(sony.signal.logProfileID, sonySource)
+        XCTAssertEqual(sony.state.falseColor.mode, .sonySLog3, "ARRI LogC becomes Sony's table on S-Log3")
+        XCTAssertTrue(sony.falseColorDeclared)
+
+        let back = sony.declaringCameraLog(arriSource)
+        XCTAssertEqual(back.signal.logProfileID, arriSource)
+        XCTAssertEqual(back.state.falseColor.mode, .arriLogC, "Back on ARRI: ARRI's table again")
+
+        let cleared = sony.declaringCameraLog(nil)
+        XCTAssertNil(cleared.signal.logProfileID)
+        XCTAssertEqual(cleared.state.falseColor.mode, .sonySLog3, "No declaration: the mode stays and explains itself")
+        XCTAssertFalse(cleared.falseColorDeclared)
+
+        for mode in [FalseColorMode.sixBand, .custom, .off] {
+          var other = arri
+          other.state.falseColor.mode = mode
+          XCTAssertEqual(other.declaringCameraLog(sonySource).state.falseColor.mode, mode, "\(mode) is untouched")
+        }
+      }
+      var elZone = MonitorFeedPreferences()
+      elZone.signal.logProfileID = sonySource
+      elZone.state.falseColor.mode = .elZone
+      let otherSony = Self.portedSonySources.first { $0 != sonySource }
+      XCTAssertEqual(elZone.declaringCameraLog(otherSony).state.falseColor.mode, .elZone, "Another S-Log3 keeps EL Zone")
+    }
+    // Program: no log mode is available and a toggle suggests six band.
+    XCTAssertFalse(MonitorFeedPreferences.falseColorModeIsAvailable(.sonySLog3, profile: "sony-slog3-sgamut3",
+      isProgram: true))
+    XCTAssertTrue(MonitorFeedPreferences.falseColorModeIsAvailable(.sixBand, profile: nil, isProgram: true))
+    XCTAssertTrue(MonitorFeedPreferences.falseColorModeIsAvailable(.off, profile: nil, isProgram: true))
+    XCTAssertEqual(MonitorFeedPreferences.suggestedFalseColorMode(profile: "arri-logc3-ei800", isProgram: true), .sixBand)
+    XCTAssertEqual(MonitorFeedPreferences.suggestedFalseColorMode(profile: "arri-logc3-ei800"), .arriLogC)
   }
 
   /// MonitorToolsUITests:162. Declaring a literal ARRI camera keeps its own

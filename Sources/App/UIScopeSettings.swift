@@ -14,21 +14,21 @@ import SwiftUI
 struct UIScopeSettingsView: View {
   @Binding var scopes: MonitorScopePreferences
   var isProgram: Bool
-  /// The picture's signal and whether the target has a burn-in LUT: they decide
-  /// which stage signal the scope measures, and so which scales fit it.
+  /// The picture's signal and whether a LUT is on the scope's stage
+  /// (`MonitorSurfacePresenter.scopeMeasuresLUT`): they decide which stage
+  /// signal the scope measures, and so which scales fit it.
   var signal: SignalDescription?
-  var burnInLUT: Bool
+  var stageLUT: Bool
 
   /// Whether the menus offer every MonitorKit scope and scale. The main
-  /// window's scope strip and its camera Scopes popover still draw, label and
-  /// edit an IRE waveform only, and they show these same per-camera settings,
-  /// so until they handle the vectorscope, the histogram and the code-value
-  /// and nits scales those stay out of the menus here too. A setting already
-  /// saved is still listed, so it can be changed back.
-  static let offersEveryScope = false
+  /// window's scope strip draws and labels every scope (`UIScopeImage`) and
+  /// its camera Scopes popover is these same settings, so they do. With false
+  /// only the waveforms and the IRE scale would be offered (a setting already
+  /// saved is still listed, so it can be changed back).
+  static let offersEveryScope = true
 
   private var description: UIScopeDescription {
-    UIScopeDescription(scopes: scopes, signal: signal, burnInLUT: burnInLUT, isProgram: isProgram)
+    UIScopeDescription(scopes: scopes, signal: signal, stageLUT: stageLUT, isProgram: isProgram)
   }
 
   private var settings: Binding<ScopeSettings> {

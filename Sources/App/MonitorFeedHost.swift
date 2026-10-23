@@ -209,6 +209,16 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
 
   var monitorLUTState: MonitorLUTState { lock.withLock { monitorLUTPhase } }
 
+  /// One line for the interface and diagnostics; nil when no monitor LUT is chosen.
+  static func describe(_ state: MonitorLUTState) -> String? {
+    switch state {
+    case .none: return nil
+    case .loading: return "Monitor LUT: loading…"
+    case .loaded(let title): return title.isEmpty ? "Monitor LUT: loaded" : "Monitor LUT: \(title)"
+    case .failed(let reason): return "Monitor LUT failed to load: \(reason)"
+    }
+  }
+
   /// The camera's monitor-only LUT file (`MonitorFeedPreferences.monitorLUT`).
   /// A new choice is resolved and read off the calling thread, inside its
   /// security scope, and built once as a tetrahedral `MonitorLUT` on the shared

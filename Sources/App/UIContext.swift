@@ -1,4 +1,5 @@
 import AppKit
+import MonitorKitCore
 import SwiftUI
 
 struct UIInput: Identifiable, Sendable, Equatable {
@@ -24,6 +25,18 @@ extension UIPictureProviding {
 @MainActor protocol UIMonitorSettingsProviding {
   func preferences(for cameraID: String) -> MonitorFeedPreferences
   func setPreferences(_ preferences: MonitorFeedPreferences, for cameraID: String)
+  /// Where the camera's monitor-only LUT file stands (loading, shown, failed).
+  func monitorLUTState(for cameraID: String) -> MonitorFeedHost.MonitorLUTState
+  /// What the camera's scope measures: the shown picture's signal (nil before a
+  /// frame) and whether a LUT is on the scope's stage.
+  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: Bool)
+}
+
+extension UIMonitorSettingsProviding {
+  /// Fixtures have no feed host: no monitor LUT is loading or loaded.
+  func monitorLUTState(for cameraID: String) -> MonitorFeedHost.MonitorLUTState { .none }
+  /// Fixtures have no picture: no signal yet and no LUT.
+  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: Bool) { (nil, false) }
 }
 
 /// Everything a view in the new interface needs: the derived presentation,

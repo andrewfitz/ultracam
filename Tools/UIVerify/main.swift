@@ -885,10 +885,21 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   let run = UIVerify(verifier: verifier)
   let started = Date()
   run.screens()
+  // The monitor tool popovers and the scope pane, with their own fixtures.
+  for screen in UIMonitorToolScreens.screens() {
+    run.render(screen.name, screen.view, size: screen.size).forEach { $0.close() }
+  }
+  UIScopeScreens.run(verifier: verifier) { name, view, size in
+    run.render(name, view, size: size).forEach { $0.close() }
+  }
+  UIMonitorToolVerify.run(verifier: verifier)
+  MonitorWorkspaceVerify.run(verifier: verifier)
+  AudioMeterTapVerify.run(verifier: verifier)
   run.accessibility()
   run.interactions()
   do { try run.bridge() } catch { verifier.check("bridge tests threw", false, "\(error)") }
   do { try run.lutModel() } catch { verifier.check("LUT model tests threw", false, "\(error)") }
+  do { try MonitorLUTVerify.run(verifier: verifier) } catch { verifier.check("monitor LUT tests threw", false, "\(error)") }
   run.discovery()
   run.menuBar()
   Images.waitForWrites()

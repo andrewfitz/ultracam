@@ -116,7 +116,7 @@ enum UIMonitorBridge {
   /// while any tool is on, and turning tools back on never resurrects tools that
   /// were left enabled underneath it.
   static func toggled(_ tool: UIMonitorTool, in preferences: MonitorFeedPreferences,
-    defaultSourceProfile: String? = nil) -> MonitorFeedPreferences {
+    defaultSourceProfile: String? = nil, isProgram: Bool = false) -> MonitorFeedPreferences {
     var next = preferences
     let active = activeTools(preferences).contains(tool)
     if !preferences.toolsEnabled { next.hideAllTools() }
@@ -129,10 +129,13 @@ enum UIMonitorBridge {
       if active {
         next.state.falseColor.mode = .off
       } else {
-        if next.signal.logProfileID == nil, let defaultSourceProfile { next.signal.logProfileID = defaultSourceProfile }
-        // Sony's Pattern 2 on S-Log3, ARRI's table on LogC, else the six
-        // display-IRE bands, which need no log source.
-        next.state.falseColor.mode = UIFalseColorChoices.suggestedMode(profile: next.signal.logProfileID)
+        if !isProgram, next.signal.logProfileID == nil, let defaultSourceProfile {
+          next.signal.logProfileID = defaultSourceProfile
+        }
+        // Sony's Pattern 2 on S-Log3, ARRI's table on LogC, else (and always
+        // on Program) the six display-IRE bands, which need no log source.
+        next.state.falseColor.mode = UIFalseColorChoices.suggestedMode(profile: next.signal.logProfileID,
+          isProgram: isProgram)
       }
     case .focus: next.state.focus.enabled = !active
     case .scopes: next.scopes.enabled = !active
@@ -160,7 +163,7 @@ enum UIMonitorBridge {
     defaultSourceProfile: String? = nil) {
     let target = MonitorTargetID(cameraID)
     coordinator.setPreferences(toggled(tool, in: coordinator.preferences(for: target),
-      defaultSourceProfile: defaultSourceProfile), for: target)
+      defaultSourceProfile: defaultSourceProfile, isProgram: target.isProgram), for: target)
   }
 
   static func perform(_ action: UIAction, coordinator: MonitorCoordinator) {

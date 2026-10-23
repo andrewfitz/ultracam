@@ -403,6 +403,11 @@ struct UIMonitorLUTMenu: View {
     Menu("Monitor LUT") {
       if let choice {
         Text(choice.fileName.isEmpty ? "Monitor LUT chosen" : choice.fileName)
+        // A file that is missing or does not parse shows nothing on the picture: say so here.
+        if case .failed = monitor.monitorLUTState(for: cameraID),
+          let failure = MonitorFeedHost.describe(monitor.monitorLUTState(for: cameraID)) {
+          Text(failure)
+        }
       }
       Button(choice == nil ? "Load Monitor LUT…" : "Replace Monitor LUT…") {
         Self.choose(cameraID: cameraID, cameraName: cameraName, monitor: monitor)
