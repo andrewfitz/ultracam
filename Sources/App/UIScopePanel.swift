@@ -152,7 +152,10 @@ struct UIScopePanel<Scope: View>: View {
       if !interpretation.isEmpty { Text(interpretation).font(.caption2).foregroundStyle(.secondary) }
       Text(description.caption).font(.caption2).foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
-      if let note = description.scaleNote {
+      // The note suggests scales the settings may not offer yet (UIScopeSettingsView.offersEveryScope).
+      if let note = description.scaleNote,
+        UIScopeSettingsView.offersEveryScope || description.settings.display.waveformScale != .percent
+      {
         Text(note).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
     }
