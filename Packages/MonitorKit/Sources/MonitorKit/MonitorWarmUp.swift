@@ -74,13 +74,17 @@ extension MonitorEngine {
   /// Call it off the frame path, e.g. from a background task at start-up: it may
   /// take a few hundred milliseconds. Thread-safe; concurrent encodes keep drawing
   /// with whatever is built. Already built pipelines are skipped. Returns the
-  /// number of pipelines built by this call.
+  /// number of pipelines built by this call. With a `pipelineArchive`, pipelines
+  /// saved by an earlier launch load from it instead of compiling, and any built
+  /// here are saved to it before this returns.
   @discardableResult
   public func warmUp(
     targets: [MonitorRenderTargetFormat] = standardTargetFormats.map { MonitorRenderTargetFormat(colorPixelFormat: $0) },
     layouts: [PixelLayout]? = nil, surfaces: [MonitorSurfaceConfiguration] = []
   ) throws -> Int {
     let before = pipelinesBuilt
+    // Saved even when a build throws, so what was built is kept.
+    defer { pipelineArchive?.save() }
     for target in targets { try prepare(target: target, layouts: layouts) }
     for surface in surfaces {
       // The stand-in a state change draws with while its specialized pipeline compiles.

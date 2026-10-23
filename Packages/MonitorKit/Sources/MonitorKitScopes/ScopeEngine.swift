@@ -31,6 +31,10 @@ public final class ScopeEngine: @unchecked Sendable {
   /// with deferred release. Attach `residency.set` to the host's `MTL4CommandQueue`
   /// once, or pass `MonitorEngine.residency` at init so one set covers both.
   public let residency: MonitorResidency
+  /// The persistent warm start, when the engine was made with a `cacheDirectory`:
+  /// the library and every pipeline are built by its `MTL4Compiler`, looked up in
+  /// it first, and new ones are saved to it.
+  public let pipelineArchive: MonitorPipelineArchive?
   /// Clear and finalize of one accumulation, and of a fused group's members (function constant 4).
   let clearPipeline: MTLComputePipelineState
   let finalizePipeline: MTLComputePipelineState
@@ -114,28 +118,64 @@ public final class ScopeEngine: @unchecked Sendable {
 
   /// `residency` nil makes the engine its own set; pass a `MonitorEngine`'s to
   /// share it (all of its Metal 4 work then goes on that engine's queue).
-  public init(
+  public convenience init(
     device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3,
     residency: MonitorResidency? = nil
+  ) throws {
+    try self.init(
+      device: device, specialization: specialization, framesInFlight: framesInFlight, residency: residency,
+      cacheDirectory: nil)
+  }
+
+  /// `init(device:specialization:framesInFlight:residency:)` with a persistent
+  /// warm start in `cacheDirectory` (created when missing; it may be the
+  /// `MonitorEngine`'s: the files are named per engine). The library and every
+  /// pipeline are then built by `pipelineArchive`'s `MTL4Compiler`, looked up in
+  /// the archive files of earlier launches first, and new ones are saved at the
+  /// end of each `prepare` call and shortly after any built later (off the frame
+  /// path). A stale or damaged archive is ignored. Pixels are identical with or
+  /// without one. Nil: no cache, as the other initializer.
+  public init(
+    device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3,
+    residency: MonitorResidency? = nil, cacheDirectory: URL?
   ) throws {
     self.device = device
     self.specialization = specialization
     self.framesInFlight = min(16, max(1, framesInFlight))
     self.residency = try residency ?? MonitorResidency(device: device, label: "MonitorKit scopes")
-    let library = try MonitorShaders.makeLibrary(
-      device: device, parts: [.lut, .decode], prefix: Self.specializationPrefix, extra: Self.scopeSource())
+    let libraryDescriptor = try MonitorShaders.libraryDescriptor(
+      parts: [.lut, .decode], prefix: Self.specializationPrefix, extra: Self.scopeSource(), name: "MonitorKitScopes")
+    let archive = try cacheDirectory.map {
+      try MonitorPipelineArchive(
+        device: device, directory: $0, name: "MonitorKitScopes", source: libraryDescriptor.source ?? "",
+        options: MonitorShaders.compileOptions)
+    }
+    pipelineArchive = archive
+    let library: MTLLibrary
+    if let archive {
+      do {
+        library = try archive.makeLibrary(descriptor: libraryDescriptor)
+      } catch {
+        throw MonitorKitError.gpu("The MTL4Compiler cannot build the MonitorKit scope library: \(error)")
+      }
+    } else {
+      library = try MonitorShaders.makeLibrary(
+        device: device, parts: [.lut, .decode], prefix: Self.specializationPrefix, extra: Self.scopeSource())
+    }
     self.library = library
     func function(_ name: String, group: Bool? = nil) throws -> MTLFunction {
-      let values = MTLFunctionConstantValues()
-      if var group { values.setConstantValue(&group, type: .bool, index: 4) }
       do {
-        return try library.makeFunction(name: name, constantValues: values)
+        return try library.makeFunction(name: name, constantValues: Self.groupConstants(group))
       } catch {
         throw MonitorKitError.gpu("MonitorKit scope function \(name) is missing: \(error)")
       }
     }
     func pipeline(_ name: String, group: Bool? = nil) throws -> MTLComputePipelineState {
-      try device.makeComputePipelineState(function: function(name, group: group))
+      if let archive {
+        return try archive.makeComputePipelineState(
+          descriptor: Self.computeDescriptor(library, name, Self.groupConstants(group)))
+      }
+      return try device.makeComputePipelineState(function: function(name, group: group))
     }
     var general: [Kernel: MTLComputePipelineState] = [:]
     for kernel in [Kernel.waveform, .vectorscope, .histogram] { general[kernel] = try pipeline(kernel.rawValue) }
@@ -147,21 +187,38 @@ public final class ScopeEngine: @unchecked Sendable {
     resolvePipeline = try pipeline("mk_scopeResolve")
     vertexFunction = try function("mk_scopeVertex")
 
-    let graticule = MTLRenderPipelineDescriptor()
-    graticule.label = "MonitorKit scope graticule"
-    graticule.vertexFunction = try function("mk_graticuleVertex")
-    graticule.fragmentFunction = try function("mk_graticuleFragment")
-    let coverage = graticule.colorAttachments[0]!
-    coverage.pixelFormat = .r8Unorm
-    // Overlapping shapes keep the larger coverage, as one pass over all of them would.
-    coverage.isBlendingEnabled = true
-    coverage.rgbBlendOperation = .max
-    coverage.alphaBlendOperation = .max
-    coverage.sourceRGBBlendFactor = .one
-    coverage.destinationRGBBlendFactor = .one
-    coverage.sourceAlphaBlendFactor = .one
-    coverage.destinationAlphaBlendFactor = .one
-    graticulePipeline = try device.makeRenderPipelineState(descriptor: graticule)
+    if let archive {
+      let graticule = MTL4RenderPipelineDescriptor()
+      graticule.label = "MonitorKit scope graticule"
+      graticule.vertexFunctionDescriptor = Self.functionDescriptor(library, "mk_graticuleVertex", nil)
+      graticule.fragmentFunctionDescriptor = Self.functionDescriptor(library, "mk_graticuleFragment", nil)
+      let coverage = graticule.colorAttachments[0]!
+      coverage.pixelFormat = .r8Unorm
+      coverage.blendingState = .enabled
+      coverage.rgbBlendOperation = .max
+      coverage.alphaBlendOperation = .max
+      coverage.sourceRGBBlendFactor = .one
+      coverage.destinationRGBBlendFactor = .one
+      coverage.sourceAlphaBlendFactor = .one
+      coverage.destinationAlphaBlendFactor = .one
+      graticulePipeline = try archive.makeRenderPipelineState(descriptor: graticule)
+    } else {
+      let graticule = MTLRenderPipelineDescriptor()
+      graticule.label = "MonitorKit scope graticule"
+      graticule.vertexFunction = try function("mk_graticuleVertex")
+      graticule.fragmentFunction = try function("mk_graticuleFragment")
+      let coverage = graticule.colorAttachments[0]!
+      coverage.pixelFormat = .r8Unorm
+      // Overlapping shapes keep the larger coverage, as one pass over all of them would.
+      coverage.isBlendingEnabled = true
+      coverage.rgbBlendOperation = .max
+      coverage.alphaBlendOperation = .max
+      coverage.sourceRGBBlendFactor = .one
+      coverage.destinationRGBBlendFactor = .one
+      coverage.sourceAlphaBlendFactor = .one
+      coverage.destinationAlphaBlendFactor = .one
+      graticulePipeline = try device.makeRenderPipelineState(descriptor: graticule)
+    }
 
     let ds = MTLDepthStencilDescriptor()
     ds.depthCompareFunction = .always
@@ -251,10 +308,16 @@ public final class ScopeEngine: @unchecked Sendable {
   /// A format that fails does not stop the others: every format is tried, then
   /// the first error is thrown (`pipelineBuildFailures` lists each).
   public func prepare(pixelFormats: [MTLPixelFormat] = ScopeEngine.drawablePixelFormats) throws {
+    defer { pipelineArchive?.save() }
     var firstError: (any Error)?
     var i = 0
     while i < pixelFormats.count {
-      do { try prepare(pixelFormat: pixelFormats[i]) } catch { firstError = firstError ?? error }
+      do {
+        let target = MonitorRenderTargetFormat(colorPixelFormat: pixelFormats[i])
+        _ = try preparedRenderPipeline(RenderKey(target: target, scope: nil))
+      } catch {
+        firstError = firstError ?? error
+      }
       i += 1
     }
     if let firstError { throw firstError }
@@ -264,11 +327,15 @@ public final class ScopeEngine: @unchecked Sendable {
   /// `pixelFormats`. Every pipeline is tried even after one fails; the first
   /// error is thrown at the end.
   public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], pixelFormats: [MTLPixelFormat]) throws {
-    if pixelFormats.isEmpty { return try prepare(settings: settings, layouts: layouts, target: nil) }
+    defer { pipelineArchive?.save() }
+    if pixelFormats.isEmpty { return try prepareUnsaved(settings: settings, layouts: layouts, target: nil) }
     var firstError: (any Error)?
     var i = 0
     while i < pixelFormats.count {
-      do { try prepare(settings: settings, layouts: layouts, pixelFormat: pixelFormats[i]) } catch {
+      do {
+        try prepareUnsaved(
+          settings: settings, layouts: layouts, target: MonitorRenderTargetFormat(colorPixelFormat: pixelFormats[i]))
+      } catch {
         firstError = firstError ?? error
       }
       i += 1
@@ -299,6 +366,7 @@ public final class ScopeEngine: @unchecked Sendable {
   /// ahead of the first draw: built on this thread, or waited for when an
   /// asynchronous build of it is already running.
   public func prepare(target: MonitorRenderTargetFormat) throws {
+    defer { pipelineArchive?.save() }
     _ = try preparedRenderPipeline(RenderKey(target: target, scope: nil))
   }
 
@@ -317,6 +385,14 @@ public final class ScopeEngine: @unchecked Sendable {
   /// formats. Every pipeline is tried even after one fails; the first error is
   /// thrown at the end.
   public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], target: MonitorRenderTargetFormat?) throws {
+    defer { pipelineArchive?.save() }
+    try prepareUnsaved(settings: settings, layouts: layouts, target: target)
+  }
+
+  /// `prepare(settings:layouts:target:)` without saving the archive (its callers save once).
+  private func prepareUnsaved(settings: [ScopeSettings], layouts: [PixelLayout], target: MonitorRenderTargetFormat?)
+    throws
+  {
     var firstError: (any Error)?
     func attempt(_ build: () throws -> Void) {
       do { try build() } catch { firstError = firstError ?? error }
@@ -456,6 +532,9 @@ public final class ScopeEngine: @unchecked Sendable {
     }
     builtOnCallerThread.withLock { $0.compute += 1 }
     do {
+      if let pipelineArchive {
+        return store(try pipelineArchive.makeComputePipelineState(descriptor: computeDescriptor(key)), for: key)
+      }
       let function = try library.makeFunction(name: key.kernel.rawValue, constantValues: Self.constants(key))
       return store(try device.makeComputePipelineState(function: function), for: key)
     } catch {
@@ -467,6 +546,18 @@ public final class ScopeEngine: @unchecked Sendable {
   /// Starts building `key` on Metal's compiler threads unless it is cached or already started.
   private func buildAsync(_ key: ComputeKey) {
     guard pendingCompute.withLock({ $0.insert(key).inserted }) else { return }
+    if let pipelineArchive {
+      // The compiler's asynchronous build (Metal's compiler threads) awaited from a
+      // task; no thread or queue of the library's own.
+      Task.detached(priority: .utility) { [self] in
+        do {
+          built(try await pipelineArchive.makeComputePipelineState(descriptor: computeDescriptor(key)), for: key)
+        } catch {
+          failed(key, error)
+        }
+      }
+      return
+    }
     library.makeFunction(name: key.kernel.rawValue, constantValues: Self.constants(key)) { [self] function, error in
       guard let function else { return failed(key, error) }
       device.makeComputePipelineState(function: function) { [self] state, error in
@@ -551,6 +642,9 @@ public final class ScopeEngine: @unchecked Sendable {
     }
     builtOnCallerThread.withLock { $0.render += 1 }
     do {
+      if let pipelineArchive {
+        return store(try pipelineArchive.makeRenderPipelineState(descriptor: metal4Descriptor(key)), for: key)
+      }
       let fragment = try library.makeFunction(name: "mk_scopeFragment", constantValues: Self.constants(key))
       return store(try device.makeRenderPipelineState(descriptor: descriptor(key, fragment: fragment)), for: key)
     } catch {
@@ -561,6 +655,16 @@ public final class ScopeEngine: @unchecked Sendable {
 
   private func buildAsync(_ key: RenderKey) {
     guard pendingRender.withLock({ $0.insert(key).inserted }) else { return }
+    if let pipelineArchive {
+      Task.detached(priority: .utility) { [self] in
+        do {
+          built(try await pipelineArchive.makeRenderPipelineState(descriptor: metal4Descriptor(key)), for: key)
+        } catch {
+          failed(key, error)
+        }
+      }
+      return
+    }
     library.makeFunction(name: "mk_scopeFragment", constantValues: Self.constants(key)) { [self] function, error in
       guard let function else { return failed(key, error) }
       device.makeRenderPipelineState(descriptor: descriptor(key, fragment: function)) { [self] state, error in
@@ -629,6 +733,67 @@ public final class ScopeEngine: @unchecked Sendable {
     d.stencilAttachmentPixelFormat = target.stencilPixelFormat
     d.rasterSampleCount = target.sampleCount
     return d
+  }
+
+  /// `descriptor(_:fragment:)` for the archive's `MTL4Compiler`: the same functions,
+  /// constants, blending and attachments (a Metal 4 render pipeline has no depth
+  /// or stencil format, so it draws in any host pass).
+  func metal4Descriptor(_ key: RenderKey) -> MTL4RenderPipelineDescriptor {
+    let d = MTL4RenderPipelineDescriptor()
+    d.label = "MonitorKit scope"
+    d.vertexFunctionDescriptor = Self.functionDescriptor(library, "mk_scopeVertex", nil)
+    d.fragmentFunctionDescriptor = Self.functionDescriptor(library, "mk_scopeFragment", Self.constants(key))
+    let target = key.target
+    let attachment = d.colorAttachments[0]!
+    attachment.pixelFormat = target.colorPixelFormat
+    attachment.blendingState = .enabled
+    attachment.sourceRGBBlendFactor = .one
+    attachment.sourceAlphaBlendFactor = .one
+    attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+    attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+    var i = 0
+    while i < min(target.additionalColorPixelFormats.count, 7) {
+      d.colorAttachments[i + 1].pixelFormat = target.additionalColorPixelFormats[i]
+      d.colorAttachments[i + 1].writeMask = []
+      i += 1
+    }
+    d.rasterSampleCount = target.sampleCount
+    return d
+  }
+
+  /// The compute pipeline for `key`, for the archive's `MTL4Compiler`.
+  func computeDescriptor(_ key: ComputeKey) -> MTL4ComputePipelineDescriptor {
+    Self.computeDescriptor(library, key.kernel.rawValue, Self.constants(key))
+  }
+
+  static func computeDescriptor(_ library: MTLLibrary, _ name: String, _ values: MTLFunctionConstantValues)
+    -> MTL4ComputePipelineDescriptor
+  {
+    let d = MTL4ComputePipelineDescriptor()
+    d.label = "MonitorKit \(name)"
+    d.computeFunctionDescriptor = functionDescriptor(library, name, values)
+    return d
+  }
+
+  /// `name` in `library`, specialized with `values` (empty when nil), as
+  /// `makeFunction(name:constantValues:)` makes it on the device path.
+  static func functionDescriptor(_ library: MTLLibrary, _ name: String, _ values: MTLFunctionConstantValues?)
+    -> MTL4FunctionDescriptor
+  {
+    let function = MTL4LibraryFunctionDescriptor()
+    function.name = name
+    function.library = library
+    let specialized = MTL4SpecializedFunctionDescriptor()
+    specialized.functionDescriptor = function
+    specialized.constantValues = values ?? MTLFunctionConstantValues()
+    return specialized
+  }
+
+  /// Function constant 4 (a fused group's clear and finalize) when `group` is set.
+  static func groupConstants(_ group: Bool?) -> MTLFunctionConstantValues {
+    let values = MTLFunctionConstantValues()
+    if var group { values.setConstantValue(&group, type: .bool, index: 4) }
+    return values
   }
 
   /// Specialized pipelines built so far (compute: one frame layout's kernels,

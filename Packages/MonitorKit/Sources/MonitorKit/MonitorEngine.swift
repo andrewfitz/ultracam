@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 import MonitorKitCore
 import Synchronization
@@ -80,8 +81,12 @@ public final class MonitorEngine: @unchecked Sendable {
   /// and every pipeline then come from it (`MTL4LibraryDescriptor`,
   /// `MTL4RenderPipelineDescriptor`, `MTL4ComputePipelineDescriptor`, its
   /// asynchronous compiler tasks for specialization), so they land in its
-  /// pipeline data set serializer and lookup archives. Nil: the device builds them.
+  /// pipeline data set serializer and lookup archives. With a `cacheDirectory` it
+  /// is `pipelineArchive`'s compiler. Nil: the device builds them.
   public let compiler: (any MTL4Compiler)?
+  /// The persistent warm start, when the engine was made with a `cacheDirectory`:
+  /// every pipeline is looked up in it first, and new ones are saved to it.
+  public let pipelineArchive: MonitorPipelineArchive?
 
   private let vertexFunction: MTLFunction
   private let renderPipelines = Mutex<[PipelineKey: MTLRenderPipelineState]>([:])
@@ -211,21 +216,47 @@ public final class MonitorEngine: @unchecked Sendable {
   /// the pixels are the same either way. Its pipelines draw in Metal 4 and classic
   /// encoders alike; a Metal 4 render pipeline carries no depth or stencil format,
   /// which suits any host pass.
-  public init(
+  public convenience init(
     device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3,
     compiler: (any MTL4Compiler)? = nil
+  ) throws {
+    try self.init(
+      device: device, specialization: specialization, framesInFlight: framesInFlight, compiler: compiler,
+      cacheDirectory: nil)
+  }
+
+  /// `init(device:specialization:framesInFlight:compiler:)` with a persistent warm
+  /// start in `cacheDirectory` (the host's caches directory, e.g. a subdirectory
+  /// of `.cachesDirectory`; created when missing). The engine then builds with
+  /// `pipelineArchive`'s own `MTL4Compiler`, which records every pipeline (a host
+  /// `compiler` is not used), looks each one up in the archive files saved by
+  /// earlier launches, and saves new ones at the end of `warmUp` and shortly after
+  /// any built later (off the frame path). An archive of other shaders, another
+  /// OS build or another GPU, or a damaged file, is ignored: those pipelines
+  /// compile as without a cache. Pixels are identical with or without one. Nil:
+  /// no cache, as the other initializer.
+  public init(
+    device: MTLDevice, specialization: PipelineSpecialization = .asynchronous, framesInFlight: Int = 3,
+    compiler: (any MTL4Compiler)? = nil, cacheDirectory: URL?
   ) throws {
     self.device = device
     self.specialization = specialization
     self.framesInFlight = min(16, max(1, framesInFlight))
-    self.compiler = compiler
     residency = try MonitorResidency(device: device)
+    let libraryDescriptor = try MonitorShaders.libraryDescriptor(
+      parts: [.lut, .decode, .monitor], prefix: Self.specializationPrefix, name: "MonitorKit")
+    let archive = try cacheDirectory.map {
+      try MonitorPipelineArchive(
+        device: device, directory: $0, name: "MonitorKit", source: libraryDescriptor.source ?? "",
+        options: MonitorShaders.compileOptions)
+    }
+    pipelineArchive = archive
+    let compiler = archive?.compiler ?? compiler
+    self.compiler = compiler
     let library: MTLLibrary
     if let compiler {
       do {
-        library = try compiler.makeLibrary(
-          descriptor: MonitorShaders.libraryDescriptor(
-            parts: [.lut, .decode, .monitor], prefix: Self.specializationPrefix, name: "MonitorKit"))
+        library = try compiler.makeLibrary(descriptor: libraryDescriptor)
       } catch let error as MonitorKitError {
         throw error
       } catch {
@@ -440,7 +471,7 @@ public final class MonitorEngine: @unchecked Sendable {
   /// A compute pipeline for `name` (specialized with `values`), by the compiler or the device.
   func makeComputeState(_ name: String, _ values: MTLFunctionConstantValues?) throws -> MTLComputePipelineState {
     if let compiler {
-      return try compiler.makeComputePipelineState(descriptor: metal4ComputeDescriptor(name, values))
+      return try makeComputeState(metal4ComputeDescriptor(name, values), compiler)
     }
     let function: MTLFunction
     if let values {
@@ -454,6 +485,36 @@ public final class MonitorEngine: @unchecked Sendable {
     return try device.makeComputePipelineState(function: function)
   }
 
+  /// Builds with `pipelineArchive` (looked up in its files first, recorded for the
+  /// next save) when the engine has one, else with the host's `compiler`.
+  private func makeRenderState(_ d: MTL4RenderPipelineDescriptor, _ compiler: any MTL4Compiler) throws
+    -> MTLRenderPipelineState
+  {
+    if let pipelineArchive { return try pipelineArchive.makeRenderPipelineState(descriptor: d) }
+    return try compiler.makeRenderPipelineState(descriptor: d)
+  }
+
+  private func makeRenderState(_ d: MTL4RenderPipelineDescriptor, _ compiler: any MTL4Compiler) async throws
+    -> MTLRenderPipelineState
+  {
+    if let pipelineArchive { return try await pipelineArchive.makeRenderPipelineState(descriptor: d) }
+    return try await compiler.makeRenderPipelineState(descriptor: d)
+  }
+
+  private func makeComputeState(_ d: MTL4ComputePipelineDescriptor, _ compiler: any MTL4Compiler) throws
+    -> MTLComputePipelineState
+  {
+    if let pipelineArchive { return try pipelineArchive.makeComputePipelineState(descriptor: d) }
+    return try compiler.makeComputePipelineState(descriptor: d)
+  }
+
+  private func makeComputeState(_ d: MTL4ComputePipelineDescriptor, _ compiler: any MTL4Compiler) async throws
+    -> MTLComputePipelineState
+  {
+    if let pipelineArchive { return try await pipelineArchive.makeComputePipelineState(descriptor: d) }
+    return try await compiler.makeComputePipelineState(descriptor: d)
+  }
+
   /// The picture pipeline for `key`, built on this thread if it is not cached.
   func renderPipeline(_ key: PipelineKey) throws -> MTLRenderPipelineState {
     if let cached = renderPipelines.withLock({ $0[key] }) { return cached }
@@ -462,7 +523,7 @@ public final class MonitorEngine: @unchecked Sendable {
       let values = Self.constants(
         layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color)
       if let compiler {
-        state = try compiler.makeRenderPipelineState(descriptor: metal4Descriptor(key, values: values))
+        state = try makeRenderState(metal4Descriptor(key, values: values), compiler)
       } else {
         let fragment = try library.makeFunction(name: "mk_picture", constantValues: values)
         state = try device.makeRenderPipelineState(descriptor: descriptor(key, fragment: fragment))
@@ -501,7 +562,7 @@ public final class MonitorEngine: @unchecked Sendable {
           guard let compiler else { return }
           let descriptor = metal4Descriptor(key, values: Self.constants(
             layout: key.layout, variant: key.variant, srgbTarget: key.target.colorPixelFormat.isSRGB, color: key.color))
-          if let state = try? await compiler.makeRenderPipelineState(descriptor: descriptor) {
+          if let state = try? await makeRenderState(descriptor, compiler) {
             _ = store(state, for: key)
           }
           finish(key)
@@ -574,7 +635,7 @@ public final class MonitorEngine: @unchecked Sendable {
           let d = metal4ComputeDescriptor(
             "mk_pictureKernel",
             Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color))
-          guard let state = try? await compiler.makeComputePipelineState(descriptor: d) else { return }
+          guard let state = try? await makeComputeState(d, compiler) else { return }
           _ = storeCompute(state, for: key)
           pendingPipelines.withLock { _ = $0.remove(pendingKey) }
         }
@@ -640,7 +701,7 @@ public final class MonitorEngine: @unchecked Sendable {
         Task.detached(priority: .utility) { [self] in
           guard let compiler else { return }
           let d = metal4ComputeDescriptor(Self.copyFunction(integer: integer), nil)
-          if let state = try? await compiler.makeComputePipelineState(descriptor: d) { _ = storeCopy(state, integer: integer) }
+          if let state = try? await makeComputeState(d, compiler) { _ = storeCopy(state, integer: integer) }
         }
         continue
       }
