@@ -321,6 +321,43 @@ final class PipelineArchiveTests: XCTestCase {
     XCTAssertEqual(reopened.statistics.hits, 0)
     XCTAssertEqual(reopened.statistics.misses, 1)
     XCTAssertEqual(try Self.run(state)[3], 10, "the current code's result")
+    reopened.save()  // Not left for a scheduled save after the directory is gone.
+  }
+
+  /// Each save writes a new file holding the whole session; at most
+  /// `maximumFiles` per key are kept and the oldest go first.
+  func testSavesKeepTheNewestFiles() throws {
+    let gpu = try requireGPU()
+    let d = try directory()
+    let archive = try MonitorPipelineArchive(
+      device: gpu.device, directory: d, name: "MKTest", source: Self.kernel(4), options: MonitorShaders.compileOptions,
+      maximumFiles: 2)
+    let lib = try Self.library(archive, Self.kernel(4))
+    var written: [String] = []
+    var offset: UInt32 = 0
+    while offset < 3 {
+      _ = try archive.makeComputePipelineState(descriptor: Self.descriptor(lib, offset: offset))
+      XCTAssertTrue(archive.save())
+      let names = Set(archiveFiles(d).map(\.lastPathComponent)).subtracting(written)
+      XCTAssertEqual(names.count, 1, "one new file per save")
+      written += names
+      usleep(20_000)  // distinct modification dates
+      offset += 1
+    }
+    XCTAssertEqual(Set(archiveFiles(d).map(\.lastPathComponent)), Set(written.suffix(2)), "the oldest is removed")
+    XCTAssertEqual(archive.files.count, 2)
+    // The newest file alone holds the whole session.
+    let newest = try copy([d.appendingPathComponent(written[2])])
+    let reader = try MonitorPipelineArchive(
+      device: gpu.device, directory: newest, name: "MKTest", source: Self.kernel(4), options: MonitorShaders.compileOptions)
+    let readerLibrary = try Self.library(reader, Self.kernel(4))
+    offset = 0
+    while offset < 3 {
+      _ = try reader.makeComputePipelineState(descriptor: Self.descriptor(readerLibrary, offset: offset))
+      offset += 1
+    }
+    XCTAssertEqual(reader.statistics.hits, 3)
+    XCTAssertEqual(reader.statistics.misses, 0)
   }
 
   /// Several archives of one key on one directory build and save at the same time
@@ -330,7 +367,7 @@ final class PipelineArchiveTests: XCTestCase {
     let gpu = try requireGPU()
     let d = try directory()
     let source = Self.kernel(5)
-    // Enough files kept that no pipeline is evicted (eviction is tested elsewhere).
+    // Enough files kept that no pipeline is evicted (`testSavesKeepTheNewestFiles`).
     let archives = try (0..<3).map { _ in
       try MonitorPipelineArchive(
         device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions,
