@@ -65,6 +65,10 @@ struct CaptureUpdate: @unchecked Sendable {
   var audioBitrateKbps: Double = 0
   var audioPresent = false
   var audioPacketTime: CMTime?
+  /// Embedded-audio packets left out of the broadcast meters because the
+  /// meter queue fell a full hand-off ring behind (`AudioMeterTap.Counters.coalesced`).
+  /// A meter-only loss: recording and video got every packet and frame.
+  var audioMeterCoalesced: UInt64 = 0
   var videoBitrateMbps: Double = 0
   var videoDrops: UInt64 = 0
   var cameraOutputActive = false
@@ -114,7 +118,8 @@ final class CaptureController: @unchecked Sendable {
   private let queueKey = DispatchSpecificKey<UInt8>()
   private let controlKey = DispatchSpecificKey<UInt8>()
   private let lock = NSLock()
-  /// This capture's broadcast audio meters, fed on the driver thread while shown.
+  /// This capture's broadcast audio meters: handed each packet on the driver
+  /// thread while shown, metered on the tap's own queue.
   let audioMeterTap = AudioMeterTap()
   private var generation: UInt64 = 0
   private var accepting = false
@@ -991,7 +996,9 @@ final class CaptureController: @unchecked Sendable {
         audioBytes: UInt64(audio.samples?.count ?? 0), audioPresent: audio.samples != nil), token: token)
     }
     // Last, after the generation guard: recording admission never waits on the
-    // meters, and a stopped stream's packets are never metered.
+    // meters, and a stopped stream's packets are never metered. The tap only
+    // hands the packet to its meter queue (a retain and an atomic publish);
+    // the metering itself never runs on the driver thread.
     audioMeterTap.ingest(audio)
   }
 
@@ -1304,6 +1311,7 @@ final class CaptureController: @unchecked Sendable {
       audioRMSLeft: stopped ? 0 : audio.rmsLeft, audioRMSRight: stopped ? 0 : audio.rmsRight,
       audioBitrateKbps: stopped ? 0 : audio.bitrateKbps, audioPresent: stopped ? false : audio.present,
       audioPacketTime: stopped ? nil : audio.packetTime,
+      audioMeterCoalesced: audioMeterTap.counters.coalesced,
       videoBitrateMbps: stopped ? 0 : videoBitrateMbps,
       videoDrops: stopped ? 0 : videoLosses,
       cameraOutputActive: cameraConnected, cameraMessage: cameraMessage, stopped: stopped)

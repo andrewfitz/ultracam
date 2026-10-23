@@ -23,6 +23,15 @@ final class DeckLinkChecks: XCTestCase {
     XCTAssertTrue(UltracamRunRawAudioSyntheticChecks(&error), error?.localizedDescription ?? "Raw embedded audio bridge failed")
   }
 
+  /// Each callback's video frame is wrapped and handed off before its audio,
+  /// and the audio is reported on every frame path (delivered, no signal,
+  /// gated, refused, absent), for both the fixed-mode and automatic handlers.
+  func testCallbackHandsOffVideoBeforeAudio() {
+    var error: NSError?
+    XCTAssertTrue(UltracamRunCallbackOrderSyntheticChecks(&error),
+      error?.localizedDescription ?? "Callback order checks failed")
+  }
+
   /// Detected-mode open, EDID and notification leases, colorimetry-only
   /// changes, host capture time and its min-window offset filter, drop
   /// counting, RP188 cadence detection (pairs vs full rate, reset on signal

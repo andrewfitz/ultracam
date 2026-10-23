@@ -75,6 +75,10 @@ typedef void (^UltracamMediaStatsHandler)(NSString *_Nullable timecode, CMTime a
 // Raw embedded audio packets are copied on the DeckLink callback thread before
 // the SDK packet is released. Samples are interleaved signed 32-bit PCM when
 // this handler is used (48 kHz, two channels, little-endian native bytes).
+// Within one callback the video frame goes first: the frame handler has
+// returned (or the frame was gated or refused) before the callback's media
+// statistics and raw audio are reported. Audio is reported on every path,
+// including a callback without a video frame or with an invalid one.
 typedef void (^UltracamRawAudioHandler)(NSData *_Nullable samples, CMTime audioPacketTime,
   NSUInteger audioSampleFrames, NSUInteger audioChannels, NSUInteger bytesPerSample);
 
@@ -168,6 +172,7 @@ FOUNDATION_EXPORT BOOL UltracamRunSyntheticChecks(NSError *_Nullable *_Nullable 
 FOUNDATION_EXPORT BOOL UltracamRunOwnershipSyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunAutoSyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunRawAudioSyntheticChecks(NSError *_Nullable *_Nullable error);
+FOUNDATION_EXPORT BOOL UltracamRunCallbackOrderSyntheticChecks(NSError *_Nullable *_Nullable error);
 #endif
 
 NS_ASSUME_NONNULL_END

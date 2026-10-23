@@ -817,80 +817,90 @@ class CaptureCallback final : public IDeckLinkInputCallback {
       // Above 30 fps: 1001/60000 stream durations, or the opened mode before time is valid.
       const bool highFrameRate = timeValid ? duration * 30 < timeScale :
         requestedMode.load() == bmdMode4K2160p5994;
-      // Desktop Video can deliver an audio packet while the video input is
-      // absent (for example during a source reconnect).  Keep reporting that
-      // packet even when the paired video frame is nil; the media path owns
-      // its own clock and should not acquire an artificial audio hole merely
-      // because no video object was supplied for this callback.
       if (resetTimecodeCadence.load(std::memory_order_relaxed) && resetTimecodeCadence.exchange(false)) timecodes.reset();
-      if (mediaHandler) reportMedia(timecodes.read(frame, highFrameRate), audioPacket, mediaHandler);
+      // Read before the frame is delivered: a signal loss there starts the cadence over.
+      NSString *timecode = mediaHandler ? timecodes.read(frame, highFrameRate) : nil;
+      // The callback's video frame is wrapped and handed off first, so the
+      // frame consumers (recording admission, the capture queue) never wait
+      // behind the audio work. Then the callback's audio, whatever path the
+      // frame took, or with no frame at all: Desktop Video can deliver an
+      // audio packet while the video input is absent (for example during a
+      // source reconnect), and the media path owns its own clock, so it never
+      // acquires an artificial audio hole for want of a video object.
+      if (frame) deliverVideo(frame, timeValid, timestamp, duration);
+      if (mediaHandler) reportMedia(timecode, audioPacket, mediaHandler);
       reportRawAudio(audioPacket, rawAudioHandler);
-      if (!frame) return S_OK;
-      bool valid = !(frame->GetFlags() & bmdFrameHasNoInputSource);
-      int prior = signalState.exchange(valid ? 1 : 0);
-      trackStreamTime(timeValid, timestamp, duration, valid && prior == 0);
-      // Embedded audio has its own packet clock. Preserve it across video
-      // signal loss and format reconfiguration so recordings do not acquire
-      // an artificial audio hole merely because the paired video frame is
-      // flagged invalid.
-      if (!valid) {
-        if (prior != 0) timecodes.reset();
-        if (prior != 0) eventHandler(modeHandler ? @"No HDMI video signal — waiting for the camera to reconnect." :
-          @"No video signal. Check the FX3 HDMI output and selected frame rate.");
-        return S_OK;
-      }
-      if (!framesEnabled) { noteGatedFrame(); return S_OK; }
-      if (frame->GetWidth() != 3840 || frame->GetHeight() != 2160 || frame->GetPixelFormat() != bmdFormat10BitYUV) {
-        reportFatal([NSString stringWithFormat:@"Unsupported capture frame: %ld × %ld, pixel format 0x%08x. Requires 3840 × 2160 10-bit YUV 4:2:2.",
-          frame->GetWidth(), frame->GetHeight(), (unsigned)frame->GetPixelFormat()]); return S_OK;
-      }
-      if (!timeValid) {
-        reportFatal(@"UltraStudio supplied an invalid frame timestamp."); return S_OK;
-      }
-      // SDK 16 reports the buffer length (IDeckLinkVideoBuffer::GetSize, manual
-      // 2.5.53.2). A short buffer would let GPU readers run past the image.
-      {
-        ComRef<IDeckLinkVideoBuffer> videoBuffer;
-        uint64_t size = 0;
-        const long rowBytes = frame->GetRowBytes();
-        if (frame->QueryInterface(IID_IDeckLinkVideoBuffer, reinterpret_cast<void **>(videoBuffer.out())) == S_OK &&
-            videoBuffer && videoBuffer->GetSize(&size) == S_OK &&
-            (rowBytes < 10240 || size < uint64_t(rowBytes) * uint64_t(frame->GetHeight()))) {
-          reportFatal([NSString stringWithFormat:@"Desktop Video supplied a %llu-byte frame buffer; 3840 × 2160 v210 needs %llu bytes.",
-            (unsigned long long)size, (unsigned long long)(uint64_t(std::max(rowBytes, 10240L)) * 2160)]); return S_OK;
-        }
-      }
-      CVPixelBufferRef buffer = nullptr;
-      ComRef<IDeckLinkMacVideoBuffer> macBuffer;
-      if (frame->QueryInterface(IID_IDeckLinkMacVideoBuffer,
-        reinterpret_cast<void **>(macBuffer.out())) != S_OK ||
-        macBuffer->CreateCVPixelBufferRef(reinterpret_cast<void **>(&buffer)) != S_OK || !buffer) {
-        reportFatal(@"Desktop Video could not expose its native 10-bit pixel buffer. Update the Desktop Video driver."); return S_OK;
-      }
-      // The SDK's buffer is IOSurface-backed and holds the frame until its final release.
-      // Keep the producer contract explicit even if future SDK wrappers use a
-      // different CoreVideo format. The controller's untouched sink is v210.
-      // Every consumer reads this IOSurface directly; there is no copy path.
-      if (!CVPixelBufferGetIOSurface(buffer)) {
-        CVPixelBufferRelease(buffer);
-        reportFatal(@"Desktop Video supplied a frame without an IOSurface. Update Desktop Video to 16 or later."); return S_OK;
-      }
-      if (CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_422YpCbCr10) {
-        CVPixelBufferRelease(buffer);
-        reportFatal(@"Desktop Video supplied a pixel format incompatible with the native v210 feed."); return S_OK;
-      }
-      attachColorimetry(buffer, frame);
-      attachHostTime(buffer, frame);
-      // Swift retaining the buffer safely extends the native frame lifetime.
-      if (accepting && framesEnabled) {
-        if (autoFrameHandler) autoFrameHandler(buffer, CMTimeMake(timestamp, timeScale), CMTimeMake(duration, timeScale), YES);
-        else frameHandler(buffer, CMTimeMake(timestamp, timeScale), YES);
-      } else if (accepting) {
-        noteGatedFrame();
-      }
-      CVPixelBufferRelease(buffer);
     }
     return S_OK;
+  }
+
+  // Frame thread, from VideoInputFrameArrived only: validates the callback's
+  // frame, wraps its native buffer and hands it to the frame handler (or
+  // counts it as gated). Input faults are reported here; the caller reports
+  // the callback's audio afterwards on every path.
+  void deliverVideo(IDeckLinkVideoInputFrame *frame, bool timeValid, BMDTimeValue timestamp, BMDTimeValue duration) {
+    bool valid = !(frame->GetFlags() & bmdFrameHasNoInputSource);
+    int prior = signalState.exchange(valid ? 1 : 0);
+    trackStreamTime(timeValid, timestamp, duration, valid && prior == 0);
+    // Embedded audio has its own packet clock: the caller reports this
+    // callback's audio whatever happens to the frame here, so signal loss and
+    // format reconfiguration never put an artificial hole in a recording.
+    if (!valid) {
+      if (prior != 0) timecodes.reset();
+      if (prior != 0) eventHandler(modeHandler ? @"No HDMI video signal — waiting for the camera to reconnect." :
+        @"No video signal. Check the FX3 HDMI output and selected frame rate.");
+      return;
+    }
+    if (!framesEnabled) { noteGatedFrame(); return; }
+    if (frame->GetWidth() != 3840 || frame->GetHeight() != 2160 || frame->GetPixelFormat() != bmdFormat10BitYUV) {
+      reportFatal([NSString stringWithFormat:@"Unsupported capture frame: %ld × %ld, pixel format 0x%08x. Requires 3840 × 2160 10-bit YUV 4:2:2.",
+        frame->GetWidth(), frame->GetHeight(), (unsigned)frame->GetPixelFormat()]); return;
+    }
+    if (!timeValid) {
+      reportFatal(@"UltraStudio supplied an invalid frame timestamp."); return;
+    }
+    // SDK 16 reports the buffer length (IDeckLinkVideoBuffer::GetSize, manual
+    // 2.5.53.2). A short buffer would let GPU readers run past the image.
+    {
+      ComRef<IDeckLinkVideoBuffer> videoBuffer;
+      uint64_t size = 0;
+      const long rowBytes = frame->GetRowBytes();
+      if (frame->QueryInterface(IID_IDeckLinkVideoBuffer, reinterpret_cast<void **>(videoBuffer.out())) == S_OK &&
+          videoBuffer && videoBuffer->GetSize(&size) == S_OK &&
+          (rowBytes < 10240 || size < uint64_t(rowBytes) * uint64_t(frame->GetHeight()))) {
+        reportFatal([NSString stringWithFormat:@"Desktop Video supplied a %llu-byte frame buffer; 3840 × 2160 v210 needs %llu bytes.",
+          (unsigned long long)size, (unsigned long long)(uint64_t(std::max(rowBytes, 10240L)) * 2160)]); return;
+      }
+    }
+    CVPixelBufferRef buffer = nullptr;
+    ComRef<IDeckLinkMacVideoBuffer> macBuffer;
+    if (frame->QueryInterface(IID_IDeckLinkMacVideoBuffer,
+      reinterpret_cast<void **>(macBuffer.out())) != S_OK ||
+      macBuffer->CreateCVPixelBufferRef(reinterpret_cast<void **>(&buffer)) != S_OK || !buffer) {
+      reportFatal(@"Desktop Video could not expose its native 10-bit pixel buffer. Update the Desktop Video driver."); return;
+    }
+    // The SDK's buffer is IOSurface-backed and holds the frame until its final release.
+    // Keep the producer contract explicit even if future SDK wrappers use a
+    // different CoreVideo format. The controller's untouched sink is v210.
+    // Every consumer reads this IOSurface directly; there is no copy path.
+    if (!CVPixelBufferGetIOSurface(buffer)) {
+      CVPixelBufferRelease(buffer);
+      reportFatal(@"Desktop Video supplied a frame without an IOSurface. Update Desktop Video to 16 or later."); return;
+    }
+    if (CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_422YpCbCr10) {
+      CVPixelBufferRelease(buffer);
+      reportFatal(@"Desktop Video supplied a pixel format incompatible with the native v210 feed."); return;
+    }
+    attachColorimetry(buffer, frame);
+    attachHostTime(buffer, frame);
+    // Swift retaining the buffer safely extends the native frame lifetime.
+    if (accepting && framesEnabled) {
+      if (autoFrameHandler) autoFrameHandler(buffer, CMTimeMake(timestamp, timeScale), CMTimeMake(duration, timeScale), YES);
+      else frameHandler(buffer, CMTimeMake(timestamp, timeScale), YES);
+    } else if (accepting) {
+      noteGatedFrame();
+    }
+    CVPixelBufferRelease(buffer);
   }
 
   // Control queue, when frames are enabled again. Gated frames are device

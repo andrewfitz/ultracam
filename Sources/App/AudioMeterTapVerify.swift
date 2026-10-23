@@ -6,8 +6,9 @@ import Synchronization
 /// AudioMeterTap's metering sessions, against the real MonitorKitAudio: a
 /// session that starts after a gap reads exactly like a meter that never ran
 /// (no stale filter history: no false true-peak over, no loudness in silence),
-/// viewers share a session, and a driver thread metering through repeated
-/// sessions never meets a released meter.
+/// viewers share a session, and a driver thread handing packets over through
+/// repeated sessions never waits for the meter queue, which meters each
+/// session's packets into that session's meter only.
 @MainActor enum AudioMeterTapVerify {
   static let frames = 1600
 
@@ -25,11 +26,13 @@ import Synchronization
 
   static let silence = Data(count: frames * 2 * EmbeddedAudioFormat.sourceBytesPerSample)
 
+  /// Hands `times` packets over (fewer than the ring holds), then waits for the meter queue.
   static func feed(_ tap: AudioMeterTap, _ packet: Data, times: Int) {
     for _ in 0..<times {
       tap.ingest(samples: packet, sampleFrames: UInt64(frames), channels: 2,
         bytesPerSample: EmbeddedAudioFormat.sourceBytesPerSample)
     }
+    tap.waitUntilMetered()
   }
 
   /// A meter that never ran, fed only `packets`.
@@ -109,7 +112,8 @@ import Synchronization
     verifier.check("audio meter tap: reopened on programme reads as a meter that never ran",
       same(programme, freshProgramme), "tap \(describe(programme)); fresh \(describe(freshProgramme))")
     tap.detach()
-    verifier.check("audio meter tap: sessions on one thread retire nothing", tap.retiredMeterCount == 0)
+    verifier.check("audio meter tap: sessions one after another leave nothing stale or coalesced",
+      tap.counters.stale == 0 && tap.counters.coalesced == 0, "\(tap.counters)")
   }
 
   /// A second viewer shares the session; an unpaired detach cannot end it.
@@ -138,10 +142,11 @@ import Synchronization
     let done = DispatchSemaphore(value: 0)
   }
 
-  /// A driver thread metering without pause while views come and go: every
-  /// session start replaces the meter under it, and none is released in use.
-  /// Long packets (5 s each) keep the driver inside the meter across most
-  /// session starts, so the previous meter has to be kept alive.
+  /// A driver thread handing packets over without pause while views come and
+  /// go. Long packets (5 s each) keep the meter queue far behind, so the ring
+  /// stays full: the driver never waits (the meters coalesce, counted), and
+  /// the meter queue holds the meter it is metering into, so no session start
+  /// ever releases a meter in use.
   private static func concurrent(verifier: Verifier) {
     let tap = AudioMeterTap()
     let sampleFrames = 240_000
@@ -157,13 +162,11 @@ import Synchronization
     driver.start()
     var previous: AudioMeter?
     var replaced = 0
-    var retired = 0
     for _ in 0..<300 {
       let meter = tap.attach()
       // Holding the previous meter only keeps a new one from reusing its address.
       if meter !== previous { replaced += 1 }
       previous = meter
-      retired = max(retired, tap.retiredMeterCount)
       tap.attach()
       tap.detach()
       usleep(200)
@@ -173,19 +176,21 @@ import Synchronization
     usleep(20_000)
     stop.requested.store(true, ordering: .relaxed)
     stop.done.wait()
+    tap.waitUntilMetered()
     tap.detach()
     last.flush()
     let counters = tap.counters
-    verifier.check("audio meter tap: a driver thread meters through 300 session starts",
+    verifier.check("audio meter tap: a driver thread hands packets over through 300 session starts",
       counters.metered > 0 && counters.overlapped == 0 && counters.rejected == 0
-        && replaced == 300 && last.snapshot().frameCount > 0,
+        && replaced == 300 && last.snapshot().frameCount > 0 && tap.queuedPackets == 0,
       "\(counters), \(replaced) new meters")
-    verifier.check("audio meter tap: a session start during a driver's packet keeps the previous meter", retired > 0,
-      "never more than \(retired) kept")
+    verifier.check("audio meter tap: a meter queue far behind coalesces, counted, and the driver never waits",
+      counters.coalesced > 0 && counters.maxQueued == AudioMeterTap.defaultPacketCapacity, "\(counters)")
+    verifier.check("audio meter tap: the last session meters whole packets of its own",
+      last.snapshot().frameCount % UInt64(sampleFrames) == 0, "\(counters)")
     let next = tap.attach()
     tap.detach()
-    verifier.check("audio meter tap: a session start with the driver idle releases retired meters",
-      tap.retiredMeterCount == 0 && next !== last, "retired \(tap.retiredMeterCount)")
+    verifier.check("audio meter tap: a session start with the driver idle starts a new meter", next !== last)
   }
 }
 #endif

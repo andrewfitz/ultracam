@@ -363,6 +363,86 @@ BOOL UltracamRunRawAudioSyntheticChecks(NSError **error) {
   }
 }
 
+// Within one callback the video frame is wrapped and handed off before the
+// callback's audio is reported, and the audio is reported on every path the
+// frame takes (delivered, no signal, gated, refused, absent).
+BOOL UltracamRunCallbackOrderSyntheticChecks(NSError **error) {
+  {  // No inner pool: a failure returns its autoreleased NSError through the out-parameter.
+    // V: frame handler, M: media statistics, A: raw audio, E: event.
+    std::string log;
+    std::string *order = &log;  // Blocks capture the pointer.
+    __block CVPixelBufferRef held = nullptr;
+    auto framesBlock = ^(CVPixelBufferRef buffer, CMTime, BOOL valid) {
+      *order += valid ? "V" : "v";
+      if (!held) held = CVPixelBufferRetain(buffer);
+    };
+    auto autoFramesBlock = ^(CVPixelBufferRef, CMTime, CMTime, BOOL) { *order += "V"; };
+    auto eventsBlock = ^(NSString *) { *order += "E"; };
+    auto mediaBlock = ^(NSString *, CMTime, NSUInteger, NSUInteger, float, float, float, float, NSUInteger, BOOL) {
+      *order += "M";
+    };
+    auto rawBlock = ^(NSData *samples, CMTime, NSUInteger, NSUInteger, NSUInteger) {
+      *order += samples ? "A" : "a";
+    };
+    auto expect = [&](const char *expected, NSString *message) -> bool {
+      if (log == expected) { log.clear(); return true; }
+      fail(error, [NSString stringWithFormat:@"%@ Order was \"%s\", expected \"%s\".", message, log.c_str(), expected]);
+      return false;
+    };
+
+    auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock, mediaBlock, rawBlock);
+    bool destroyed = false;
+    auto frame = new FakeFrame(&destroyed);
+    auto audio = new FakeRawAudioPacket({1, 2, 3, 4});
+    callback->VideoInputFrameArrived(frame, audio);
+    if (!expect("VMA", @"A delivered frame was not handed off before its callback's audio.")) return NO;
+
+    // Signal loss: the event, then the audio, with no frame delivered.
+    frame->noSignal = true;
+    callback->VideoInputFrameArrived(frame, audio);
+    if (!expect("EMA", @"Audio was not reported after a frame without signal.")) return NO;
+    frame->noSignal = false;
+    frame->streamTime += frame->frameDuration;
+    callback->VideoInputFrameArrived(frame, audio);
+    if (!expect("VMA", @"The frame after signal returned was not handed off before its audio.")) return NO;
+
+    // Frames gated for a format change: audio still reported.
+    callback->framesEnabled = false;
+    frame->streamTime += frame->frameDuration;
+    callback->VideoInputFrameArrived(frame, audio);
+    if (!expect("MA", @"Audio was not reported while frames were gated.")) return NO;
+    callback->framesEnabled = true;
+
+    // No video object at all (a source reconnect): audio only.
+    callback->VideoInputFrameArrived(nullptr, audio);
+    if (!expect("MA", @"Audio was not reported for a callback without a frame.")) return NO;
+
+    // A refused frame (fatal): the fault, then the same callback's audio; later callbacks are ignored.
+    frame->width = 1920;
+    frame->streamTime += frame->frameDuration;
+    callback->VideoInputFrameArrived(frame, audio);
+    if (!expect("EMA", @"A refused frame's callback did not report its audio after the fault.")) return NO;
+    frame->width = 3840;
+    callback->VideoInputFrameArrived(frame, audio);
+    if (!expect("", @"A failed capture reported a later callback.")) return NO;
+    callback->Release();
+
+    // The automatic-format handler takes the same order.
+    callback = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, eventsBlock, nil, rawBlock);
+    callback->autoFrameHandler = [autoFramesBlock copy];
+    frame->streamTime += frame->frameDuration;
+    callback->VideoInputFrameArrived(frame, audio);
+    if (!expect("VA", @"The automatic-format frame was not handed off before its callback's audio.")) return NO;
+    callback->accepting = false;
+    callback->Release();
+
+    if (held) { CVPixelBufferRelease(held); held = nullptr; }
+    audio->Release(); frame->Release();
+    if (!destroyed) return fail(error, @"The order check leaked its frame.");
+    return YES;
+  }
+}
+
 BOOL UltracamRunSyntheticChecks(NSError **error) {
   {  // No inner pool: a failure returns its autoreleased NSError through the out-parameter.
     __block CVPixelBufferRef retained = nullptr;
