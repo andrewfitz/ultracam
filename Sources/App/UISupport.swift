@@ -130,15 +130,28 @@ enum UIMonitorBridge {
         next.state.falseColor.mode = .off
       } else {
         if next.signal.logProfileID == nil, let defaultSourceProfile { next.signal.logProfileID = defaultSourceProfile }
-        if SonySLog3FalseColor.supports(sourceProfileID: next.signal.logProfileID) {
-          next.state.falseColor.mode = .sonySLog3
-        } else if ELZoneProfile.supports(sourceProfileID: next.signal.logProfileID) {
-          next.state.falseColor.mode = .elZone
-        }
+        // Sony's Pattern 2 on S-Log3, ARRI's table on LogC, else the six
+        // display-IRE bands, which need no log source.
+        next.state.falseColor.mode = UIFalseColorChoices.suggestedMode(profile: next.signal.logProfileID)
       }
     case .focus: next.state.focus.enabled = !active
     case .scopes: next.scopes.enabled = !active
     }
+    next.toolsEnabled = next.anyToolOn
+    return next
+  }
+
+  /// Whether clip indicators show (they are not one of the interface's tools).
+  static func clipIndicatorsOn(_ preferences: MonitorFeedPreferences) -> Bool {
+    preferences.toolsEnabled && preferences.state.clipIndicators.enabled
+  }
+
+  /// Clip indicators on or off, with the master-switch rules of `toggled`.
+  static func toggledClipIndicators(in preferences: MonitorFeedPreferences) -> MonitorFeedPreferences {
+    var next = preferences
+    let active = clipIndicatorsOn(preferences)
+    if !preferences.toolsEnabled { next.hideAllTools() }
+    next.state.clipIndicators.enabled = !active
     next.toolsEnabled = next.anyToolOn
     return next
   }
