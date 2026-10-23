@@ -790,9 +790,14 @@ extension MonitorCoordinatorChecks {
 
   // MARK: Layouts and zoom
 
-  /// MonitorToolsUITests:179. Every workspace layout's tiles, bound to feeds, an
-  /// empty slot and a missing feed, construct their pictures without starting
-  /// capture and without changing the bindings.
+  /// MonitorToolsUITests:179, retargeted. The old case laid out MonitorTools'
+  /// `MonitorWorkspaceShell`, which the app never used (not at 1fab7f5 either), so
+  /// this checks the coordinator's side of a tile's life for every workspace
+  /// layout: tiles bound to feeds, an empty slot and a missing feed construct
+  /// their pictures without starting capture or changing the bindings; tiles
+  /// registered as `MonitorBoundTile.register()` registers them demand exactly the
+  /// bound, available feeds (never the missing one), and capture stops when they
+  /// go (`onDisappear`).
   func testAllLayoutsConstructWithoutCaptureOrChangingBindings() {
     for layout in MonitorWorkspacePreferences.Layout.allCases {
       var workspace = MonitorWorkspacePreferences()
@@ -809,7 +814,10 @@ extension MonitorCoordinatorChecks {
           FeedDescriptor(id: FeedID(rawValue: "beta"), name: "Tight"),
         ], programAvailable: false)
       let tiles = Array(workspace.tileBindings.prefix(layout.tileCount).enumerated())
-      let presenters = tiles.map { _, binding in binding.map { value.surface(id: UUID(), target: MonitorTargetID($0)) } }
+      let ids = tiles.map { _ in UUID() }
+      let presenters = tiles.map { index, binding in
+        binding.map { value.surface(id: ids[index], target: MonitorTargetID($0)) }
+      }
       let root = VStack {
         ForEach(tiles, id: \.offset) { index, _ in
           if let presenter = presenters[index] {
@@ -828,11 +836,36 @@ extension MonitorCoordinatorChecks {
       for target in ["alpha", "beta", "missing"] {
         XCTAssertFalse(value.captureSink(for: MonitorTargetID(target)).hasConsumers, "\(layout) \(target)")
       }
+
+      // The tiles appear: each registers as the workspace tile does.
+      for (index, binding) in tiles {
+        guard let binding else { continue }
+        value.registerSurface(id: ids[index], target: MonitorTargetID(binding), isVisible: true, scopeVisible: false)
+      }
+      let bound = Set(tiles.compactMap(\.element).filter { $0 != "missing" }.map { MonitorTargetID($0) })
+      XCTAssertEqual(demand, bound, "Shown tiles demand exactly their available feeds (\(layout))")
+      for target in bound {
+        XCTAssertTrue(value.captureSink(for: target).hasConsumers, "\(layout) \(target)")
+      }
+      XCTAssertFalse(value.captureSink(for: MonitorTargetID("missing")).hasConsumers, "A missing feed never takes frames")
+      XCTAssertEqual(value.workspace, original, "Registering tiles never changes the bindings (\(layout))")
+
+      for (index, binding) in tiles {
+        guard let binding else { continue }
+        value.unregisterSurface(id: ids[index], target: MonitorTargetID(binding))
+      }
+      XCTAssertEqual(demand, [], "Capture stops when the tiles go (\(layout))")
+      for target in ["alpha", "beta", "missing"] {
+        XCTAssertFalse(value.captureSink(for: MonitorTargetID(target)).hasConsumers, "\(layout) \(target)")
+      }
     }
   }
 
-  /// MonitorToolsUITests:200. Two side-by-side tiles with a tall picture column and
-  /// scopes measure their whole content, so content after them stays below.
+  /// MonitorToolsUITests:200, retargeted. The old case measured MonitorTools'
+  /// `MonitorWorkspaceShell` (never used by the app); this measures the app's own
+  /// picture and scope views (`MonitorNativePicture`, `MonitorNativeScope` with
+  /// MonitorKitUI's IRE scale) in two side-by-side tiles with a tall picture
+  /// column: they report their whole content, so content after them stays below.
   func testSideBySideMeasuresTallScopedTilesAndFollowingContent() throws {
     let value = portedCoordinator()
     let presenters = [portedAlpha, portedBeta].map { value.surface(id: UUID(), target: $0) }
@@ -936,11 +969,14 @@ extension MonitorCoordinatorChecks {
   }
 
   /// MonitorToolsUITests:903. Zoom is a surface's MonitorKit magnification: the
-  /// picture scales about its centre, the guides lie on the picture as shown, and
-  /// the zoom is bounded as the pass bounds it (non-finite: 1, at most 64). The
-  /// old SwiftUI zoom scaled the guide overlay with the picture; MonitorKit's
-  /// guides follow the unmagnified picture and are hidden while magnified.
-  func testZoomScalesThePictureWithinBoundsAndHidesGuidesWhileMagnified() throws {
+  /// picture scales about its centre, the guides lie on the picture as shown
+  /// (zoomed with it, as the old SwiftUI zoom scaled the guide overlay), and the
+  /// zoom is bounded as the pass bounds it (non-finite: 1, at most 64).
+  /// MonitorKit currently hides guides while magnified (GuideRaster and
+  /// MonitorPass gate them on `!layout.isMagnified`), a regression routed as a
+  /// library defect: the zoomed half is an expected failure until it is fixed,
+  /// and the `XCTExpectFailure` comes out with the fix.
+  func testZoomScalesPictureAndGuidesTogetherWithinBounds() throws {
     let (presenter, _) = portedDetachedPresenter()
     let frame = MonitorFrameGeometry(width: 80, height: 40)
     func layout(_ state: MonitorState) -> MonitorLayout {
@@ -969,7 +1005,24 @@ extension MonitorCoordinatorChecks {
     XCTAssertEqual(zoomed.imageRect.height, 80, accuracy: 1)
     XCTAssertEqual(zoomed.imageRect.x + zoomed.imageRect.width / 2, 40, accuracy: 1)
     XCTAssertEqual(zoomed.imageRect.y + zoomed.imageRect.height / 2, 20, accuracy: 1)
-    XCTAssertTrue(GuideRaster(layout: zoomed, guides: guides).segments.isEmpty, "MonitorKit hides guides while magnified")
+    XCTExpectFailure("LIBRARY: MonitorKit hides guides while magnified; they should follow the zoomed picture") {
+      let zoomedGuides = GuideRaster(layout: zoomed, guides: guides)
+      // The default thirds, on the zoomed picture: verticals at a third and two
+      // thirds of its width (40 ± 160 / 6), the shown part inside the viewport.
+      let verticals = zoomedGuides.segments.filter { $0.x0 == $0.x1 }.map(\.x0).sorted()
+      XCTAssertEqual(verticals.count, 2, "Thirds stay on while zoomed")
+      for (x, expected) in zip(verticals, [zoomed.imageRect.x + zoomed.imageRect.width / 3,
+        zoomed.imageRect.x + zoomed.imageRect.width * 2 / 3])
+      {
+        XCTAssertEqual(x, expected, accuracy: 1, "Guides follow the zoomed picture")
+      }
+      for segment in zoomedGuides.segments {
+        XCTAssertTrue(
+          zoomed.imageRect.portedInset(-1).portedContains(x: segment.x0, y: segment.y0)
+            && zoomed.imageRect.portedInset(-1).portedContains(x: segment.x1, y: segment.y1),
+          "Guides lie on the zoomed picture")
+      }
+    }
 
     for (requested, expected) in [(Double.infinity, 1.0), (.nan, 1), (0.25, 1), (99, 64)] {
       var bounded = Magnification()

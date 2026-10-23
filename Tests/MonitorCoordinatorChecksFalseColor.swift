@@ -11,12 +11,16 @@ import XCTest
 //
 // What changed by design: MonitorTools qualified a mode with a false-colour
 // profile ID, a specification version and an exposure index, and its
-// normalization switched a mode to match the source. MonitorKit has none of
-// these: the mode is a setting of its own, the declared camera profile says what
-// the signal is, and `falseColorDeclared` decides (as MonitorTools'
+// normalization switched a mode to match the source. MonitorKit has no such
+// qualification: the mode is a setting of its own, the declared camera profile
+// says what the signal is, and `falseColorDeclared` decides (as MonitorTools'
 // normalization did) whether the mode can show, and so whether it suppresses
 // zebra. Choosing a mode or a camera is one complete publication of the whole
-// preferences.
+// preferences. The switch of a log mode the new camera cannot show to one it
+// can (ARRI LogC to Sony S-Log3) is the settings' Camera log picker's
+// (`UISignalDeclarationFields.sourceProfile`), which these checks do not
+// compile: they cover the preferences and the coordinator, which keep and
+// publish whatever the interface sets.
 extension MonitorCoordinatorChecks {
   private static let portedSonySources = ["sony-slog3-sgamut3cine", "sony-slog3-sgamut3"]
   private static let portedARRISources = ["arri-logc3-ei800", "arri-alexa35-logc4-ei800"]
@@ -50,6 +54,22 @@ extension MonitorCoordinatorChecks {
 
   private func portedLegend(_ preferences: MonitorFeedPreferences) throws -> FalseColorLegend? {
     FalseColorLegend(settings: preferences.state.falseColor, signal: try portedSignal(preferences))
+  }
+
+  /// Program with a declared log mode and zebra on: the log false colour Program
+  /// turns off must not suppress zebra, which then still shows. Only false colour
+  /// that draws suppresses zebra (MonitorTools' `effectiveZebraEnabled`).
+  private func portedExpectProgramZebra(_ preferences: MonitorFeedPreferences) {
+    var value = preferences
+    value.toolsEnabled = true
+    value.state.zebras[0].enabled = true
+    XCTAssertTrue(value.state.falseColor.mode.needsLogSource && value.falseColorDeclared)
+    let program = value.surfaceState(isProgram: true)
+    XCTAssertEqual(program.falseColor.mode, .off)
+    XCTAssertFalse(value.surfaceState(isProgram: false).zebras[0].enabled, "A camera's log false colour suppresses zebra")
+    XCTExpectFailure("NEEDS: surfaceState suppresses zebra for the log false colour Program turns off") {
+      XCTAssertTrue(program.zebras[0].enabled, "Program shows zebra when its log false colour is off")
+    }
   }
 
   // MARK: MonitorToolsUITests
@@ -178,6 +198,7 @@ extension MonitorCoordinatorChecks {
       // Program: no log false colour, and its frames ignore a camera declaration.
       XCTAssertEqual(alpha.surfaceState(isProgram: true).falseColor.mode, .off)
       XCTAssertNil(try portedSignal(alpha, program: true).encoding.log)
+      portedExpectProgramZebra(alpha)
     }
   }
 
@@ -220,6 +241,7 @@ extension MonitorCoordinatorChecks {
       value.onConfigurationChange = { _, preferences in published.append(preferences) }
       XCTAssertTrue(ELZoneProfile.supports(sourceProfileID: saved.signal.logProfileID))
       XCTAssertEqual(saved.surfaceState(isProgram: true).falseColor.mode, .off, "EL Zone needs a camera's source")
+      portedExpectProgramZebra(portedSelecting(.elZone, in: saved))
 
       value.setPreferences(portedSelecting(.elZone, in: saved), for: MonitorTargetID("alpha"))
 
@@ -343,12 +365,14 @@ extension MonitorCoordinatorChecks {
     }
   }
 
-  /// SonyFalseColorUITests:143. Switching an ARRI feed to a Sony camera is one
-  /// publication that keeps range, transport, tools and scopes. MonitorTools'
-  /// normalization also switched the ARRI mode to Sony; MonitorKit keeps the mode
-  /// the user chose, which cannot show on the Sony camera (no legend, no zebra
-  /// suppression) until a Sony mode is chosen. Saved MonitorTools settings still
-  /// migrate an ARRI-style mode to Sony (MonitorLifecycleChecks migration tests).
+  /// SonyFalseColorUITests:143, the coordinator's half. Switching an ARRI feed to
+  /// a Sony camera is one publication that keeps range, transport, tools and
+  /// scopes. The preferences and the coordinator keep the mode they are given: an
+  /// ARRI mode left on a Sony camera cannot show (no legend, no zebra
+  /// suppression). The interface never leaves it there: the Camera log picker
+  /// switches it to the Sony mode, as MonitorTools' normalization did, and that
+  /// rule is not compiled here. Saved MonitorTools settings migrate an
+  /// ARRI-style mode to Sony (MonitorLifecycleChecks migration tests).
   func testSonySourceSelectionKeepsTheChosenModeAndEveryOtherSetting() throws {
     for source in Self.portedSonySources {
       var saved = MonitorFeedPreferences()
