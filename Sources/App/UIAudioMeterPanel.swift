@@ -40,11 +40,13 @@ struct UIAudioMeterPanel: View {
   }
 }
 
-/// The meters of one tap. Metering runs only while this view is shown.
+/// The meters of one tap. Metering runs only while this view is shown, each
+/// showing on the meter `attach` hands it (a new one when metering starts).
 private struct UIAudioMeterTapView: View {
   let tap: AudioMeterTap
   let present: Bool
   @State private var kind: AudioMeterBarKind = .truePeak
+  @State private var meter: AudioMeter?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
@@ -54,20 +56,22 @@ private struct UIAudioMeterTapView: View {
       .pickerStyle(.segmented)
       .labelsHidden()
       .help("Meter scale for the channel bars. Loudness is EBU R 128 (−23 LUFS target).")
-      AudioMeterView(meter: tap.meter, kind: kind)
-        .frame(height: 160)
-        .opacity(present ? 1 : 0.4)
-        .overlay {
-          if !present {
-            Text("No embedded audio").font(.callout).foregroundStyle(.secondary)
-              .padding(.horizontal, 8).padding(.vertical, 4)
-              .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
-          }
+      Group {
+        if let meter { AudioMeterView(meter: meter, kind: kind) } else { Color.clear }
+      }
+      .frame(height: 160)
+      .opacity(present ? 1 : 0.4)
+      .overlay {
+        if !present {
+          Text("No embedded audio").font(.callout).foregroundStyle(.secondary)
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
         }
+      }
       Text("Click the bars to reset peaks; right-click to reset loudness. Loudness is measured while shown.")
         .font(.caption).foregroundStyle(.secondary)
     }
-    .onAppear { tap.attach() }
+    .onAppear { meter = tap.attach() }
     .onDisappear { tap.detach() }
   }
 }
