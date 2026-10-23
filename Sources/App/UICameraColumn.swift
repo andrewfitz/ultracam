@@ -438,10 +438,12 @@ struct UIMonitorLUTMenu: View {
   }
 
   /// Saves a chosen file as the camera's monitor LUT, shows it, and switches the
-  /// camera's pictures to the Monitor stage, the one that shows it.
+  /// camera's pictures to the Monitor stage, the one that shows it. Every choice
+  /// is a new pick, so choosing the same file again (edited, or on a volume that
+  /// was not mounted) makes the feed host read it again.
   static func chosen(_ file: LoadedLUT, cameraID: String, monitor: any UIMonitorSettingsProviding) {
     var next = monitor.preferences(for: cameraID)
-    next.monitorLUT = MonitorLUTChoice(bookmark: file.bookmark, fileName: file.fileName)
+    next.monitorLUT = MonitorLUTChoice(bookmark: file.bookmark, fileName: file.fileName, pick: UUID())
     next.monitorLUTEnabled = true
     next.setPictureStage(.monitor)
     monitor.setPreferences(next, for: cameraID)

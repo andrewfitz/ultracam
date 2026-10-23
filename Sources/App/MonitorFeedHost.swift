@@ -121,10 +121,10 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private var burnIn: MonitorLUT?
   private var monitorOnly: MonitorLUT?
   private var lutVersion: UInt64 = 0
-  /// The monitor-only LUT's file: the bookmark being shown or loaded, the load
+  /// The monitor-only LUT's file: the choice being shown or loaded, the load
   /// that may still replace it (older loads are ignored), and how it went.
   private let lutLoader: LUTFileLoader
-  private var monitorLUTBookmark: Data?
+  private var monitorLUTChoice: MonitorLUTChoice?
   private var monitorLUTLoad: UInt64 = 0
   private var monitorLUTPhase = MonitorLUTState.none
 
@@ -210,20 +210,24 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   var monitorLUTState: MonitorLUTState { lock.withLock { monitorLUTPhase } }
 
   /// The camera's monitor-only LUT file (`MonitorFeedPreferences.monitorLUT`).
-  /// A new bookmark is resolved and read off the calling thread, inside its
+  /// A new choice is resolved and read off the calling thread, inside its
   /// security scope, and built once as a tetrahedral `MonitorLUT` on the shared
   /// device; the LUT shown until then stays, and frames already encoded keep
-  /// theirs (no wait). The same bookmark again does nothing, so this can be
-  /// called on every preferences refresh. Nil clears it at once; a file that
-  /// cannot be read clears it and is reported in `monitorLUTState`. Ignored for
-  /// Program, whose frames are already processed.
-  func setMonitorLUTBookmark(_ value: Data?) {
-    let bookmark = isProgram ? nil : value
+  /// theirs (no wait). The same choice again does nothing while it is loading
+  /// or shown, so this can be called on every preferences refresh; a choice
+  /// whose file could not be read is tried again (the volume may be mounted by
+  /// now). A new pick of the same file (`MonitorLUTChoice.pick`) reads it again.
+  /// Nil clears it at once; a file that cannot be read clears it and is reported
+  /// in `monitorLUTState`. Ignored for Program, whose frames are already processed.
+  func setMonitorLUT(_ value: MonitorLUTChoice?) {
+    let choice = isProgram ? nil : value
     let load: UInt64? = lock.withLock {
-      guard bookmark != monitorLUTBookmark else { return nil }
-      monitorLUTBookmark = bookmark
+      if choice == monitorLUTChoice {
+        guard choice != nil, case .failed = monitorLUTPhase else { return nil }
+      }
+      monitorLUTChoice = choice
       monitorLUTLoad &+= 1
-      guard bookmark != nil else {
+      guard choice != nil else {
         monitorLUTPhase = .none
         if monitorOnly != nil {
           monitorOnly = nil
@@ -234,7 +238,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       monitorLUTPhase = .loading
       return monitorLUTLoad
     }
-    guard let load, let bookmark else { return }
+    guard let load, let bookmark = choice?.bookmark else { return }
     let loader = lutLoader
     Task.detached { [weak self] in
       let result: Result<MonitorLUT, any Error>
@@ -246,6 +250,11 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       }
       self?.finishMonitorLUTLoad(load, result)
     }
+  }
+
+  /// `setMonitorLUT` for a bare bookmark.
+  func setMonitorLUTBookmark(_ value: Data?) {
+    setMonitorLUT(value.map { MonitorLUTChoice(bookmark: $0, fileName: "") })
   }
 
   private func finishMonitorLUTLoad(_ load: UInt64, _ result: Result<MonitorLUT, any Error>) {

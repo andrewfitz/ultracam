@@ -353,13 +353,19 @@ extension MonitorState {
 struct MonitorLUTChoice: Codable, Equatable, Sendable {
   var bookmark: Data
   var fileName: String
+  /// One choice of the file in the interface. Bookmarks for the same file are
+  /// byte-identical (also after it is edited in place), so choosing it again
+  /// gets a new pick: the preferences change and the feed host reads the file
+  /// again. Saved, so a relaunch does not reload; nil in older saves.
+  var pick: UUID?
 
-  init(bookmark: Data, fileName: String) {
+  init(bookmark: Data, fileName: String, pick: UUID? = nil) {
     self.bookmark = bookmark
     self.fileName = fileName
+    self.pick = pick
   }
 
-  private enum CodingKeys: String, CodingKey { case bookmark, fileName }
+  private enum CodingKeys: String, CodingKey { case bookmark, fileName, pick }
 
   /// Throws without a bookmark; a missing name reads as empty.
   init(from decoder: Decoder) throws {
@@ -369,6 +375,7 @@ struct MonitorLUTChoice: Codable, Equatable, Sendable {
       throw DecodingError.dataCorruptedError(forKey: .bookmark, in: c, debugDescription: "empty bookmark")
     }
     fileName = ((try? c.decodeIfPresent(String.self, forKey: .fileName)) ?? nil) ?? ""
+    pick = (try? c.decodeIfPresent(UUID.self, forKey: .pick)) ?? nil
   }
 }
 

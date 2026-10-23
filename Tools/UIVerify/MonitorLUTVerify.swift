@@ -155,5 +155,17 @@ import SystemExtensions
     verifier.check("monitor LUT: Remove forgets the bookmark", saved(beta)?.monitorLUTBookmark == nil)
     verifier.check("monitor LUT: Remove clears the host at once", restoredHost.monitorLUTState == .none && restoredHost.monitorLUT == nil)
     verifier.check("monitor LUT: Remove leaves the other camera's", saved(alpha)?.monitorLUTBookmark == file.bookmark)
+
+    // Choosing the same file again after editing it in place (its bookmark is
+    // byte-identical) is a new pick, so the feed host reads it again.
+    let firstPick = saved(alpha)?.monitor.monitorLUT?.pick
+    lattice[0] = "TITLE \"Monitor Edited\""
+    try lattice.joined(separator: "\n").write(to: cube, atomically: false, encoding: .utf8)
+    UIMonitorLUTMenu.chosen(file, cameraID: alpha.rawValue, monitor: monitor)
+    verifier.check("monitor LUT: choosing the same file again is a new pick",
+      firstPick != nil && saved(alpha)?.monitor.monitorLUT?.pick != firstPick && saved(alpha)?.monitorLUTBookmark == file.bookmark)
+    settle { host.monitorLUTState == .loaded("Monitor Edited") }
+    verifier.check("monitor LUT: choosing the same file again reloads it", host.monitorLUTState == .loaded("Monitor Edited"),
+      "\(host.monitorLUTState)")
   }
 }

@@ -258,6 +258,84 @@ extension MonitorLifecycleChecks {
     XCTAssertNil(program.monitorLUT, "Program's frames are processed; a monitor LUT is per camera")
   }
 
+  /// Each choice in the interface is a pick, saved with the bookmark so a
+  /// relaunch restores the same choice; older saves have none.
+  func testMonitorLUTPickRoundTripsAndOlderSavesHaveNone() throws {
+    let pick = UUID()
+    var tools = MonitorFeedPreferences()
+    tools.monitorLUT = MonitorLUTChoice(bookmark: Data([1, 2]), fileName: "Show.cube", pick: pick)
+    let data = try JSONEncoder().encode(tools)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let lut = try XCTUnwrap(object["monitorLUT"] as? [String: Any])
+    XCTAssertEqual(lut["pick"] as? String, pick.uuidString)
+    let decoded = try JSONDecoder().decode(MonitorFeedPreferences.self, from: data)
+    XCTAssertEqual(decoded, tools, "A relaunch restores the same pick, so the host does not reload")
+
+    var older = object
+    older["monitorLUT"] = ["bookmark": Data([1, 2]).base64EncodedString(), "fileName": "Show.cube"]
+    let restored = try JSONDecoder().decode(
+      MonitorFeedPreferences.self, from: JSONSerialization.data(withJSONObject: older))
+    XCTAssertEqual(restored.monitorLUT, MonitorLUTChoice(bookmark: Data([1, 2]), fileName: "Show.cube"))
+    XCTAssertNil(restored.monitorLUT?.pick)
+    older["monitorLUT"] = ["bookmark": Data([1, 2]).base64EncodedString(), "fileName": "Show.cube", "pick": 7]
+    let damaged = try JSONDecoder().decode(
+      MonitorFeedPreferences.self, from: JSONSerialization.data(withJSONObject: older))
+    XCTAssertEqual(damaged.monitorLUT, MonitorLUTChoice(bookmark: Data([1, 2]), fileName: "Show.cube"),
+      "A damaged pick costs only the pick")
+    XCTAssertNotEqual(
+      MonitorLUTChoice(bookmark: Data([1, 2]), fileName: "Show.cube", pick: UUID()),
+      MonitorLUTChoice(bookmark: Data([1, 2]), fileName: "Show.cube", pick: UUID()),
+      "Two picks of the same file are different preferences")
+  }
+
+  /// A choice whose file could not be read is tried again on the next refresh
+  /// (the volume may be mounted, the file fixed by now); a loaded one is not.
+  func testFeedHostRetriesAMonitorLUTThatFailed() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
+    let folder = try Self.monitorLUTFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = try Self.chosenMonitorLUT(Self.invertCube, named: "later.cube", in: folder)
+    let url = folder.appendingPathComponent("later.cube")
+    try "LUT_3D_SIZE 2\n0 0 0".write(to: url, atomically: false, encoding: .utf8)
+    let host = MonitorFeedHost(target: "monitor-lut-retry", gpu: nil)
+    let choice = MonitorLUTChoice(bookmark: file.bookmark, fileName: file.fileName, pick: UUID())
+    host.setMonitorLUT(choice)
+    XCTAssertTrue(Self.isFailure(waitForMonitorLUT(host) { Self.isFailure($0) }))
+    XCTAssertNil(host.monitorLUT)
+
+    try Self.invertCube.write(to: url, atomically: false, encoding: .utf8)
+    host.setMonitorLUT(choice)
+    XCTAssertEqual(waitForMonitorLUT(host) { !Self.isFailure($0) && $0 != .loading }, .loaded("Monitor Invert"),
+      "The same choice is read again after a failure")
+    let lut = try XCTUnwrap(host.monitorLUT)
+    host.setMonitorLUT(choice)
+    XCTAssertEqual(host.monitorLUTState, .loaded("Monitor Invert"), "A loaded choice is not read again")
+    XCTAssertTrue(host.monitorLUT === lut)
+  }
+
+  /// Bookmarks for the same file are byte-identical, also after the file is
+  /// edited in place, so a new pick of it reads it again; the same pick does not.
+  func testFeedHostReloadsANewPickOfTheSameFile() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
+    let folder = try Self.monitorLUTFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = try Self.chosenMonitorLUT(Self.invertCube, named: "edited.cube", in: folder)
+    let host = MonitorFeedHost(target: "monitor-lut-pick", gpu: nil)
+    let first = MonitorLUTChoice(bookmark: file.bookmark, fileName: file.fileName, pick: UUID())
+    host.setMonitorLUT(first)
+    XCTAssertEqual(waitForMonitorLUT(host) { $0 != .loading }, .loaded("Monitor Invert"))
+
+    let edited = Self.invertCube.replacingOccurrences(of: "Monitor Invert", with: "Edited")
+    try edited.write(to: folder.appendingPathComponent("edited.cube"), atomically: false, encoding: .utf8)
+    host.setMonitorLUT(first)
+    XCTAssertEqual(host.monitorLUTState, .loaded("Monitor Invert"), "The same pick does not reload")
+    var second = first
+    second.pick = UUID()
+    host.setMonitorLUT(second)
+    XCTAssertEqual(waitForMonitorLUT(host) { $0 != .loading }, .loaded("Edited"), "A new pick reads the file again")
+    XCTAssertEqual(host.monitorLUT?.cube.title, "Edited")
+  }
+
   private static func isFailure(_ state: MonitorFeedHost.MonitorLUTState) -> Bool {
     if case .failed = state { return true }
     return false
