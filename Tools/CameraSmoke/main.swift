@@ -1,6 +1,7 @@
 // Installed-extension IPC checks. --run uses synthetic pixels; --consumer
 // requests the source only, allowing the host's automatic feed to start.
 // Neither mode displays/records images or submits an extension request.
+// --monitor-gpu-check runs the monitor load offline, without CMIO.
 import CoreMediaIO
 import Foundation
 import Darwin
@@ -374,31 +375,38 @@ func inspect(_ sample: CMSampleBuffer, duration: CMTime, mode: SyntheticMode) th
 }
 
 /// Optional read-only subscriber, offered only after the producer has sent the
-/// original sample. It runs the monitor surface's MonitorKit GPU path offscreen
-/// on classic Metal: focus analysis and the picture pass (zebra, focus peaking,
-/// the output stage) into a 1080p target, and the scope (the earlier 768 × 256
-/// RGB parade) in its own command buffer. The CMIO payload is read in place
-/// through a texture cache, without copying it.
-final class MonitorComparison: @unchecked Sendable {
-  /// MonitorKit's objects for one feed and one surface. They are confined:
-  /// only the offering thread (the producer loop, and `prewarm` before it)
-  /// touches them.
+/// original sample. It runs the app's monitor GPU path offscreen: the app's own
+/// `MonitorGPUContext` core (one `MTL4CommandQueue`, pooled encode contexts with
+/// their allocators and uniforms, the engine's residency set and the IOSurface
+/// texture cache), MonitorKit's Metal 4 encodes, focus analysis and the picture
+/// pass (zebra, focus peaking, the output stage) into a 1080p target, and the
+/// scope (the earlier 768 × 256 RGB parade) in its own submission. The targets
+/// join the queue through a residency set, as the app's drawables do. The CMIO
+/// payload is read in place through the cache's IOSurface textures, never copied.
+final class MonitorComparison: MonitorGPUCompletion, @unchecked Sendable {
+  /// The app's GPU core and MonitorKit's objects for one feed and one surface.
+  /// The encoders are confined: only the offering thread (the producer loop, and
+  /// `prewarm` before it) touches them.
   private struct GPU {
-    let engine: MonitorEngine
-    let queue: MTLCommandQueue
-    let cache: CVMetalTextureCache
+    let context: MonitorGPUContext
+    let core: MonitorGPUContext.Core
     let feed: MonitorFeed
     let pass: MonitorPass
     let scope: ScopeAccumulator
     let scopeRenderer: ScopeRenderer
     let targets: [MTLTexture]
     let scopeTargets: [MTLTexture]
+    let targetResidency: MTLResidencySet
   }
+  /// Submission kinds: bit 0 scope, bit 1 warmup, the sequence above them.
+  private static let scopeBit = 1, warmupBit = 2, sequenceShift = 2
   let target = "cmio-synthetic-comparison"
   private let lock = NSLock()
   private var warmReady = false
   private var pictures = Set<UInt64>(), scopes = Set<UInt64>()
   private var pictureAges: [Double] = [], scopeAges: [Double] = [], schedulingDelays: [Double] = []
+  /// Source host time per measured sequence, for the completion handler (one run's worth).
+  private var hostTimes: [UInt64: Double] = [:]
   private var failure: String?
   private var offered = 0, admitted = 0, callbacks = 0
   private var failureMetadata: [String] = []
@@ -419,20 +427,17 @@ final class MonitorComparison: @unchecked Sendable {
       unavailableReason = "Monitor GPU unavailable: \(error)"
     }
   }
+  deinit {
+    if let gpu { gpu.context.detachDrawables(gpu.targetResidency) }
+  }
   private static func makeGPU() throws -> GPU {
-    guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
-      throw VideoError.message("No Metal device or command queue.")
-    }
-    var textureCache: CVMetalTextureCache?
-    guard CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache) == kCVReturnSuccess,
-      let cache = textureCache
-    else { throw VideoError.message("Cannot create a Metal texture cache.") }
-    // Every pipeline a first frame needs is built here, before any measurement.
-    let engine = try MonitorEngine(device: device)
-    try engine.warmUp(targets: [MonitorRenderTargetFormat(colorPixelFormat: .bgra8Unorm)])
-    let scopeEngine = try ScopeEngine(device: device, residency: engine.residency)
-    try scopeEngine.prepare(pixelFormats: [.bgra8Unorm])
-    let scope = try scopeEngine.makeAccumulator(settings: .ultracamLegacy(mode: .rgbParade, stage: .output))
+    // The app's context, built and warmed here (every pipeline a first frame
+    // needs), before any measurement.
+    let context = MonitorGPUContext(gpuTiming: { _, _ in })
+    let core = try context.core()
+    try core.warmUp()
+    let device = core.device
+    let scope = try core.scopeEngine.makeAccumulator(settings: .ultracamLegacy(mode: .rgbParade, stage: .output))
     func texture(_ width: Int, _ height: Int) throws -> MTLTexture {
       let descriptor = MTLTextureDescriptor.texture2DDescriptor(
         pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
@@ -443,14 +448,30 @@ final class MonitorComparison: @unchecked Sendable {
       }
       return texture
     }
+    let targets = try (0..<3).map { _ in try texture(1920, 1080) }
+    let scopeTargets = try (0..<3).map { _ in
+      try texture(ScopeSettings.ultracamLegacyImageWidth, ScopeSettings.ultracamLegacyImageHeight)
+    }
+    let residency = MTLResidencySetDescriptor()
+    residency.label = "CameraSmoke monitor targets"
+    residency.initialCapacity = targets.count + scopeTargets.count
+    let targetResidency = try device.makeResidencySet(descriptor: residency)
+    for texture in targets + scopeTargets { targetResidency.addAllocation(texture) }
+    targetResidency.commit()
+    context.attachDrawables(targetResidency)
     return GPU(
-      engine: engine, queue: queue, cache: cache, feed: engine.makeFeed(), pass: engine.makePass(), scope: scope,
-      scopeRenderer: scopeEngine.makeRenderer(), targets: try (0..<3).map { _ in try texture(1920, 1080) },
-      scopeTargets: try (0..<3).map { _ in
-        try texture(ScopeSettings.ultracamLegacyImageWidth, ScopeSettings.ultracamLegacyImageHeight)
-      })
+      context: context, core: core, feed: core.engine.makeFeed(), pass: core.engine.makePass(), scope: scope,
+      scopeRenderer: core.scopeEngine.makeRenderer(), targets: targets, scopeTargets: scopeTargets,
+      targetResidency: targetResidency)
   }
-  private func completed(sequence: UInt64, host: Double, warmup: Bool, isScope: Bool, failed: Bool) {
+  private static func kind(sequence: UInt64, warmup: Bool, isScope: Bool) -> Int {
+    Int(sequence) << sequenceShift | (warmup ? warmupBit : 0) | (isScope ? scopeBit : 0)
+  }
+  /// MonitorGPUCompletion: one committed submission finished on the GPU (Metal's feedback queue).
+  func gpuCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) {
+    let sequence = UInt64(kind >> Self.sequenceShift)
+    let warmup = kind & Self.warmupBit != 0, isScope = kind & Self.scopeBit != 0
+    let finished = now()
     lock.lock(); defer { lock.unlock() }
     if !warmup { callbacks += 1 }
     if failed {
@@ -459,24 +480,12 @@ final class MonitorComparison: @unchecked Sendable {
       return
     }
     if warmup { warmReady = true; return }
+    guard let host = hostTimes[sequence] else { return }
     if isScope {
-      if scopes.insert(sequence).inserted { scopeAges.append(now() - host) }
+      if scopes.insert(sequence).inserted { scopeAges.append(finished - host) }
     } else if pictures.insert(sequence).inserted {
-      pictureAges.append(now() - host)
+      pictureAges.append(finished - host)
     }
-  }
-  /// Commits `commandBuffer`; `frame` (the payload's textures) stays alive until
-  /// the GPU has finished with it.
-  private func commit(
-    _ commandBuffer: MTLCommandBuffer, frame: MonitorFrame, sequence: UInt64, host: Double, warmup: Bool,
-    isScope: Bool
-  ) {
-    commandBuffer.addCompletedHandler { [self] buffer in
-      withExtendedLifetime(frame) {
-        completed(sequence: sequence, host: host, warmup: warmup, isScope: isScope, failed: buffer.status != .completed)
-      }
-    }
-    commandBuffer.commit()
   }
   func offer(_ sample: CMSampleBuffer, sequence: UInt64, warmup: Bool = false,
     sourceHostTime: Double? = nil) {
@@ -492,44 +501,37 @@ final class MonitorComparison: @unchecked Sendable {
       lock.withLock { failure = unavailableReason ?? "Monitor GPU unavailable" }
       return
     }
+    if !warmup { lock.withLock { hostTimes[sequence] = host } }
+    let core = gpu.core
     do {
-      // The synthetic source is legal-range Rec.709.
-      let frame = try MonitorFrame.wrap(image, cache: gpu.cache, signal: .rec709)
-      guard let commandBuffer = gpu.queue.makeCommandBuffer() else {
-        throw VideoError.message("Cannot create a monitor command buffer.")
-      }
-      do {
-        try gpu.feed.analyze(frame, focus: state.focus, into: commandBuffer)
+      // The synthetic source is legal-range Rec.709. The cache's textures wrap the
+      // payload's IOSurface; the frame retains the pixel buffer.
+      let frame = try core.frames.frame(image, signal: .rec709)
+      // A failed body is committed (abandoned) by `submit`, which then rethrows.
+      try core.submit(completion: self, kind: Self.kind(sequence: sequence, warmup: warmup, isScope: false)) {
+        context in
+        context.keep(frame)
+        try gpu.feed.analyze(frame, focus: state.focus, into: context.submission)
         try gpu.pass.encode(
           frame: frame, feed: gpu.feed, state: state, target: gpu.targets[Int(sequence % UInt64(gpu.targets.count))],
-          into: commandBuffer)
-      } catch {
-        // What was encoded still runs; the failure is reported below.
-        commit(commandBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: false)
-        throw error
+          clear: true, into: context.submission)
       }
-      commit(commandBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: false)
       let unavailable = gpu.pass.status.unavailable
       if !unavailable.isEmpty {
         let reasons = unavailable.map { "\($0.tool.rawValue): \($0.reason)" }.joined(separator: ", ")
         lock.withLock { failure = "GPU analysis unavailable: \(reasons)" }
       }
-      // Scopes at the requested rate, in their own command buffer.
+      // Scopes at the requested rate, in their own submission.
       if time - lastScopeTime >= 1 / Double(scopeRefreshHz) - 0.002 {
         lastScopeTime = time
-        guard let scopeBuffer = gpu.queue.makeCommandBuffer() else {
-          throw VideoError.message("Cannot create a scope command buffer.")
-        }
-        do {
-          try gpu.scope.accumulate(frame, feed: gpu.feed, into: scopeBuffer)
+        try core.submit(completion: self, kind: Self.kind(sequence: sequence, warmup: warmup, isScope: true)) {
+          context in
+          context.keep(frame)
+          try gpu.scope.accumulate(frame, feed: gpu.feed, into: context.submission)
           try gpu.scopeRenderer.render(
             gpu.scope, target: gpu.scopeTargets[Int(sequence % UInt64(gpu.scopeTargets.count))], clear: true,
-            into: scopeBuffer)
-        } catch {
-          commit(scopeBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: true)
-          throw error
+            into: context.submission)
         }
-        commit(scopeBuffer, frame: frame, sequence: sequence, host: host, warmup: warmup, isScope: true)
       }
       if !warmup { lock.withLock { admitted += 1 } }
     } catch {
@@ -555,11 +557,14 @@ final class MonitorComparison: @unchecked Sendable {
     let snapshot = lock.withLock { (pictures.count, scopes.count, pictureAges, scopeAges, failure) }
     let pictureHz = Double(snapshot.0) / seconds, scopeHz = Double(snapshot.1) / seconds
     let metrics = lock.withLock { (offered, admitted, callbacks, schedulingDelays, failureMetadata) }
+    let gpuStatistics = gpu?.context.statistics ?? MonitorGPUContext.Statistics()
     // Defer diagnostic output until measurement ends; failure reporting must not
     // add per-frame console I/O to the ordinary receiver/monitor scheduling.
     log("CMIO_MONITOR sourceAgeOrigin=successfulSenderEnqueue offered=\(metrics.0) admitted=\(metrics.1) callbacks=\(metrics.2) uniquePictures=\(snapshot.0) uniqueScopes=\(snapshot.1) monitorSchedulingP95MS=\(percentile(metrics.3,0.95)*1000) pictureHz=\(pictureHz) scopeHz=\(scopeHz) pictureAgeMS=\(percentile(snapshot.2, 0.95)*1000) scopeAgeMS=\(percentile(snapshot.3, 0.95)*1000) warmupExcluded=true")
+    log("CMIO_MONITOR_GPU path=metal4 texturesMade=\(gpuStatistics.texturesMade) texturesCached=\(gpuStatistics.texturesCached) encodeContexts=\(gpuStatistics.encodeContexts) uniformChunksGrown=\(gpuStatistics.uniformChunksGrown) residencyCommits=\(gpuStatistics.residencyCommits) submissions=\(gpuStatistics.submissions) completedSubmissions=\(gpuStatistics.completedSubmissions) failedEncodes=\(gpuStatistics.failedEncodes)")
     for metadata in metrics.4 { log("CMIO_MONITOR_DIAGNOSTIC \(metadata)") }
     if let failure = snapshot.4 { throw VideoError.message(failure) }
+    try require(gpuStatistics.failedEncodes == 0, "Monitor encodes failed: \(gpuStatistics.failedEncodes).")
     try require(pictureHz >= 20 && scopeHz >= 10,
       "Monitor useful-rate gate failed: picture=\(pictureHz)Hz scope=\(scopeHz)Hz.")
     try require(percentile(snapshot.2, 0.95) <= 0.100 && percentile(snapshot.3, 0.95) <= 0.200,
@@ -976,6 +981,48 @@ func runCase(fast: Bool, pool: CVPixelBufferPool, mode: SyntheticMode,
   return CameraReceipt(latencyMS: latenciesMS, retries: retries)
 }
 
+/// --monitor-gpu-check: MonitorComparison's monitor load (the app's Metal 4
+/// monitor path) over the same synthetic IOSurface frames, offered at both camera
+/// cadences, with no CMIO connection: it never touches the installed extension.
+/// --full adds the 4K ten-bit x422 and v210 profiles. The rate, age and
+/// failed-encode gates are MonitorComparison's.
+func monitorGPUCheck(full: Bool) throws {
+  DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 120) {
+    fputs("CMIO_SMOKE FAIL process watchdog expired.\n", stderr)
+    _exit(124)
+  }
+  var modes = [SyntheticMode(width: 1920, height: 1080, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)]
+  if full {
+    modes += [SyntheticMode(width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange),
+      SyntheticMode(width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10)]
+  }
+  let factory = VideoSampleFactory()
+  let hostClock = CMClockGetHostTimeClock()
+  for mode in modes {
+    let pool = try makePool(mode)
+    for fast in [false, true] {
+      let duration = fast ? VideoContract.fastDuration : VideoContract.slowDuration
+      let count = 180
+      let monitor = MonitorComparison()
+      let warm = try factory.sample(image(marker: 63, pool: pool, mode: mode),
+        at: CMClockGetTime(hostClock), duration: duration)
+      try monitor.prewarm(warm)
+      let fixtures = try (0..<8).map { try image(marker: UInt16(64 + $0), pool: pool, mode: mode) }
+      let epoch = CMClockGetTime(hostClock)
+      let start = now()
+      for index in 0..<count {
+        let deadline = start + Double(index) * duration.seconds
+        while now() < deadline { pollPause() }
+        let sample = try factory.sample(fixtures[index % fixtures.count],
+          at: CMTimeAdd(epoch, CMTimeMultiply(duration, multiplier: Int32(index))), duration: duration)
+        monitor.offer(sample, sequence: UInt64(index + 1), sourceHostTime: now())
+      }
+      try monitor.finish(seconds: Double(count) * duration.seconds)
+      log("CMIO_MONITOR_GPU_CHECK PASS requested=\(mode.summary(duration: duration)) frames=\(count) cmio=false")
+    }
+  }
+}
+
 func currentRoute() throws -> CameraSinkRoute {
   let registry = try VirtualCameraRegistryTransport.read(VirtualCameraRegistryTransport.providerID())
   guard let descriptor = registry.devices.first(where: \.enabled) else {
@@ -1051,6 +1098,9 @@ func registryCheck() throws {
 do {
   let args = Array(CommandLine.arguments.dropFirst())
   if args == ["--registry-check"] { try registryCheck() }
+  else if args == ["--monitor-gpu-check"] || args == ["--monitor-gpu-check", "--full"] {
+    try monitorGPUCheck(full: args.count == 2)
+  }
   else if args.count == 2, args[0] == "--consumer", let seconds = Double(args[1]) {
     try consumerRequest(seconds: seconds)
   } else { try smoke() }

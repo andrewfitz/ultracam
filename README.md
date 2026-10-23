@@ -329,6 +329,9 @@ Use `bash scripts/camera-smoke.sh --consumer` for a bounded 20-second source-onl
 client request to test automatic start/stop. That mode may start physical capture
 through the running host app; it inspects frame metadata only and never reads,
 displays or records image pixels.
+`bash scripts/camera-smoke.sh --monitor-gpu-check` (or `--monitor-gpu-check-full`
+for the 4K profiles) runs the `--monitor` load, the app's Metal 4 monitor path, over
+the same synthetic frames without CMIO; it never touches the installed extension.
 
 Configure the FX3 for clean 4K 10-bit 4:2:2 HDMI log output, with RAW output off
 and any HDMI display LUT disabled. Optionally load the matching LUT here. Select the

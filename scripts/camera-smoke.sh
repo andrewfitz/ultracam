@@ -4,11 +4,13 @@
 # authorization requires the explicit local development extension build.
 # --consumer requests only the virtual source for 20 seconds; the running host
 # may start physical capture automatically. It inspects metadata, never pixels.
+# --monitor-gpu-check[-full] runs the monitor load (the app's Metal 4 monitor
+# path) over synthetic frames without CMIO; it never touches the extension.
 # This script never installs or activates extensions.
 set -euo pipefail
-usage() { echo 'Usage: camera-smoke.sh [--run | --full | --consumer | --registry-check | --monitor | --monitor-full] [--segment-seconds 1..60 (monitor only)]' >&2; exit 2; }
+usage() { echo 'Usage: camera-smoke.sh [--run | --full | --consumer | --registry-check | --monitor | --monitor-full | --monitor-gpu-check | --monitor-gpu-check-full] [--segment-seconds 1..60 (monitor only)]' >&2; exit 2; }
 if [[ $# -gt 0 ]]; then
-  case "$1" in --run|--full|--consumer|--registry-check|--monitor|--monitor-full) ;; *) usage ;; esac
+  case "$1" in --run|--full|--consumer|--registry-check|--monitor|--monitor-full|--monitor-gpu-check|--monitor-gpu-check-full) ;; *) usage ;; esac
 fi
 if [[ $# -gt 1 ]]; then
   [[ $# -eq 3 && ( "$1" == --monitor || "$1" == --monitor-full ) && "$2" == --segment-seconds && "$3" =~ ^[0-9]+([.][0-9]+)?$ ]] || usage
@@ -36,6 +38,7 @@ xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-error
   "$task_root/Sources/Shared/NaturalTalkingHeadAutoSwitcher.swift" \
   "$task_root/Sources/App/AppSettingsStore.swift" "$task_root/Sources/Shared/MonitorWorkspace.swift" \
   "$task_root/Sources/App/LUTProcessor.swift" "$task_root/Sources/App/AppResourceUsage.swift" \
+  "$task_root/Sources/App/MonitorGPUContext.swift" \
   "$task_root/Sources/App/CameraSink.swift" "$task_root/Tools/CameraSmoke/main.swift" \
   -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Metal \
   -o "$smoke_root/camera-smoke" >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
@@ -48,7 +51,7 @@ if ! codesign --verify --strict "$smoke_root/camera-smoke" >> "$compile_log" 2>&
   exit 1
 fi
 echo "Synthetic camera helper built: $smoke_root/camera-smoke"
-if [[ "${1:-}" == --run || "${1:-}" == --full || "${1:-}" == --consumer || "${1:-}" == --registry-check || "${1:-}" == --monitor || "${1:-}" == --monitor-full ]]; then
+if [[ -n "${1:-}" ]]; then
   run_log="$smoke_root/run.log"
   arguments=(--run)
   if [[ "$1" == --full ]]; then arguments+=(--full); fi
@@ -56,6 +59,8 @@ if [[ "${1:-}" == --run || "${1:-}" == --full || "${1:-}" == --consumer || "${1:
   if [[ "$1" == --monitor-full ]]; then arguments+=(--monitor --full); fi
   if [[ "$1" == --consumer ]]; then arguments=(--consumer 20); fi
   if [[ "$1" == --registry-check ]]; then arguments=(--registry-check); fi
+  if [[ "$1" == --monitor-gpu-check ]]; then arguments=(--monitor-gpu-check); fi
+  if [[ "$1" == --monitor-gpu-check-full ]]; then arguments=(--monitor-gpu-check --full); fi
   if [[ $# -eq 3 ]]; then arguments+=(--segment-seconds "$3"); fi
   "$smoke_root/camera-smoke" "${arguments[@]}" > "$run_log" 2>&1 || { cat "$run_log"; exit 1; }
   cat "$run_log"
