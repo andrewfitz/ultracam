@@ -316,7 +316,9 @@ public final class ScopeAccumulator {
     let next = generation >= 0xFFFF_FFFE ? 1 : generation + 1
     let params = kernelParameters(
       settings: s, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT, generation: next)
-    return Pass(settings: s, frame: frame.parameters, params: params, generation: next)
+    // The stage's own reading of the codes: the output reading at the Output and
+    // Monitor stages when the signal declares one.
+    return Pass(settings: s, frame: frame.parameters(for: s.stage), params: params, generation: next)
   }
 
   /// The frame and LUT bindings every accumulation kernel reads: textures 0–4, bytes 0–2.
@@ -405,7 +407,8 @@ public final class ScopeAccumulator {
     let (burnApplied, monitorApplied) = lutApplied(stage: s.stage, burnInLUT, monitorLUT)
     appliedBurnInLUT = burnApplied
     appliedMonitorLUT = monitorApplied
-    let measured = ScopeContext(range: frame.signal.range, matrix: matrix(settings: s, frame: frame, burnInLUT, monitorLUT))
+    let measured = ScopeContext(
+      range: frame.signal.signal(for: s.stage).range, matrix: matrix(settings: s, frame: frame, burnInLUT, monitorLUT))
     if context != measured { context = measured }
     if accumulatedSettings != s { accumulatedSettings = s }
   }
@@ -420,7 +423,7 @@ public final class ScopeAccumulator {
     -> YCbCrMatrix
   {
     let (burn, monitor) = lutApplied(stage: s.stage, burnInLUT, monitorLUT)
-    return s.colorimetry.matrix(source: frame.signal.matrix, lutApplied: burn || monitor)
+    return s.colorimetry.matrix(source: frame.signal.signal(for: s.stage).matrix, lutApplied: burn || monitor)
   }
 
   /// Recreates the bins only when their shape changes, and the dispatch
@@ -524,7 +527,9 @@ public final class ScopeAccumulator {
       Float(1 / Double(max(1, frame.width))), 0)
     // The transport luma is the stage's Y' when nothing re-graded the pixel and
     // the scope weighs with the frame's own matrix.
-    let transport = !burn && !monitor && matrix(settings: s, frame: frame, burnInLUT, monitorLUT) == frame.signal.matrix
+    let transport =
+      !burn && !monitor
+      && matrix(settings: s, frame: frame, burnInLUT, monitorLUT) == frame.signal.signal(for: s.stage).matrix
     p.weights = SIMD4(Float(k.r), Float(k.g), Float(k.b), transport ? 1 : 0)
     let side = Double(layout.columns)
     // Zero chroma lands in the middle of bin side / 2, which the renderer draws

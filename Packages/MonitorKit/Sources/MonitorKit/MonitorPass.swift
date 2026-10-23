@@ -67,7 +67,8 @@ public final class MonitorPass {
 
   struct Pending {
     var frame: MonitorFrame
-    var frameParameters: FrameParameters
+    /// The source reading, then the Output and Monitor stages' (buffer 0).
+    var frames: PassFrameParameters
     var burnInLUT: MonitorLUT?
     var monitorLUT: MonitorLUT?
     var focusMask: MTLTexture?
@@ -84,7 +85,7 @@ public final class MonitorPass {
   var ring = MonitorUniformRing(slotLength: MonitorPass.uniformLength, label: "MonitorKit pass uniforms")
   /// Changes whenever any uniform does, so a ring slot is rewritten only then.
   var uniformGeneration: UInt64 = 0
-  private var lastFrameParameters: FrameParameters?
+  private var lastFrameParameters: PassFrameParameters?
 
   /// Everything the cached state depends on: the normalized state (so no NaN,
   /// which never equals itself, can force a rebuild per frame). LUTs compare by identity.
@@ -268,6 +269,11 @@ public final class MonitorPass {
     // The aperture as shown (finite, inside the frame), so a NaN cannot force a rebuild per frame.
     let aperture = frame.cleanAperture == nil ? nil : Optional(frame.geometry.shownRect)
     let frameParameters = frame.parameters
+    // The Output and Monitor stages' reading: the same parameters unless the signal
+    // declares its own (`SignalDescription.outputReading`).
+    let frames = PassFrameParameters(
+      source: frameParameters,
+      output: frame.signal.hasDistinctOutputReading ? frame.parameters(for: .output) : frameParameters)
     // Steady state: the state is bit for bit the last one, so `key.state` is its
     // normalized form already, and the rest compares field by field without
     // building a key (a structural compare of the whole key is most of an
@@ -288,7 +294,7 @@ public final class MonitorPass {
         cleanAperture: aperture, processed: frame.isProcessed, signal: frame.signal, viewport: viewport, target: target, burnInLUT: feed.burnInLUT,
         monitorLUT: feed.monitorLUT, maskValid: maskValid, output: output.withoutHeadroom)
       if key != next {
-        rebuild(next, frameParameters: frameParameters, headroom: output.headroom)
+        rebuild(next, frames: frames, headroom: output.headroom)
         key = next
         uniformGeneration &+= 1
         rebuilt = true
@@ -298,13 +304,14 @@ public final class MonitorPass {
       applyHeadroom(output.headroom)
       uniformGeneration &+= 1
     }
-    let frameChanged = lastFrameParameters != frameParameters
+    let frameChanged = lastFrameParameters != frames
     if frameChanged {
-      lastFrameParameters = frameParameters
+      lastFrameParameters = frames
       uniformGeneration &+= 1
     }
     if rebuilt || frameChanged {
       parameters.reciprocals = PassParameters.reciprocals(frameParameters, zebraPeriod: parameters.zebra.w)
+      parameters.outputReading = PassParameters.outputReading(frames.output, source: frameParameters)
     }
     if compute {
       try updateComputePipeline(layout: frame.layout.shaderKind)
@@ -312,14 +319,15 @@ public final class MonitorPass {
       try updatePipeline(target: target, layout: frame.layout.shaderKind)
     }
     pending = Pending(
-      frame: frame, frameParameters: frameParameters, burnInLUT: feed.burnInLUT,
+      frame: frame, frames: frames, burnInLUT: feed.burnInLUT,
       monitorLUT: s.monitorLUT ? feed.monitorLUT : nil, focusMask: maskValid ? feed.focusMask : nil,
       viewport: viewport)
   }
 
   /// Draws the prepared frame. Sets the encoder's pipeline, viewport, a scissor
   /// rectangle of the viewport, no culling, fill mode, fragment textures 0–5 and
-  /// fragment buffers 0–4, and, when the target has depth or stencil, a
+  /// fragment buffers 0–4 (buffer 0 holds the source and the output reading's
+  /// `FrameParameters`, 160 bytes), and, when the target has depth or stencil, a
   /// depth-stencil state that always passes and never writes, so the host's
   /// render state cannot hide the picture. The viewport must lie inside the
   /// host's target.
@@ -344,8 +352,8 @@ public final class MonitorPass {
     encoder.setFragmentTexture(p.burnInLUT?.texture ?? engine.emptyLUT, index: 3)
     encoder.setFragmentTexture(p.monitorLUT?.texture ?? engine.emptyLUT, index: 4)
     encoder.setFragmentTexture(p.focusMask ?? engine.emptyFloat, index: 5)
-    var frameParameters = p.frameParameters
-    encoder.setFragmentBytes(&frameParameters, length: MemoryLayout<FrameParameters>.stride, index: 0)
+    var frames = p.frames
+    encoder.setFragmentBytes(&frames, length: MemoryLayout<PassFrameParameters>.stride, index: 0)
     var burn = p.burnInLUT?.parameters ?? .disabled
     encoder.setFragmentBytes(&burn, length: MemoryLayout<LUTParameters>.stride, index: 1)
     var monitor = p.monitorLUT?.parameters ?? .disabled
@@ -444,7 +452,8 @@ public final class MonitorPass {
 
   // MARK: - Rebuild on change
 
-  private func rebuild(_ k: Key, frameParameters: FrameParameters, headroom: Double) {
+  private func rebuild(_ k: Key, frames: PassFrameParameters, headroom: Double) {
+    let frameParameters = frames.source
     rebuildCount += 1
     let s = k.state
     let vp = k.viewport
@@ -495,11 +504,13 @@ public final class MonitorPass {
     parameters = Self.makeParameters(
       s, key: k, layout: layout, guides: guides, matte: guideMatte, falseColor: falseColor,
       frameParameters: frameParameters, color: colorPipeline)
+    // Before the variant, which fixes a shared source decode in the pipeline.
+    parameters.outputReading = PassParameters.outputReading(frames.output, source: frameParameters)
     applyHeadroom(headroom)
     variant = Self.variant(parameters, state: s, layout: layout)
     // The LUTs something drawn passes through: the pipeline's, and those of the
     // stage peaking's mask was analysed on.
-    var appliedLUTs = variant.luts
+    var appliedLUTs = variant.luts & 3
     if parameters.focus.z != 0 {
       if s.focus.stage != .source && k.burnInLUT != nil { appliedLUTs |= 1 }
       if s.focus.stage == .monitor && monitorLUT { appliedLUTs |= 2 }
@@ -552,7 +563,10 @@ public final class MonitorPass {
     if zebra1 { stage = max(stage, p.zebra.y) }
     let clip = p.colorFlags.y != 0
     if clip { stage = max(stage, p.colorFlags.w) }
-    let luts: UInt32 = (stage >= 1 && p.luts.x != 0 ? 1 : 0) | (stage == 2 && p.luts.y != 0 ? 2 : 0)
+    // Bit 2: the Output and Monitor stages share the source decode (no distinct
+    // output reading), so the pipeline compiles no second decode.
+    let luts: UInt32 =
+      (stage >= 1 && p.luts.x != 0 ? 1 : 0) | (stage == 2 && p.luts.y != 0 ? 2 : 0) | (p.outputReading.w == 0 ? 4 : 0)
     let nearest = p.flags.x != 0 || logFalseColor
     let magnifiedMain = !nearest && (layout.footprintX < 1 || layout.footprintY < 1)
     let navigatorMap = layout.navigatorToPicture

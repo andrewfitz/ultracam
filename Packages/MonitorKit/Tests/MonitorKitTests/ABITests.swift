@@ -62,7 +62,7 @@ final class ABITests: XCTestCase {
       ("transformMatrix", o(\.transformMatrix)), ("overlayWhite", o(\.overlayWhite)),
       ("zebraColors", o(\.zebraColors)), ("navigatorColors", o(\.navigatorColors)), ("clipLevels", o(\.clipLevels)),
       ("clipColors", o(\.clipColors)), ("whiteGain", o(\.whiteGain)), ("whiteSignalGain", o(\.whiteSignalGain)),
-      ("reciprocals", o(\.reciprocals)),
+      ("reciprocals", o(\.reciprocals)), ("outputReading", o(\.outputReading)),
     ])
     let members = try XCTUnwrap(try fragmentBuffers()[3]?.bufferStructType?.members)
     let arrays = [
@@ -96,11 +96,25 @@ final class ABITests: XCTestCase {
   func testFrameAndLUTParametersMatchMSL() throws {
     let buffers = try fragmentBuffers()
     typealias F = FrameParameters
-    try check(buffers[0], F.self, [
+    typealias P = PassFrameParameters
+    // Buffer 0 holds the source reading, then the output reading, back to back.
+    try check(buffers[0], P.self, [
+      ("source", MemoryLayout<P>.offset(of: \.source)), ("output", MemoryLayout<P>.offset(of: \.output)),
+    ])
+    XCTAssertLessThanOrEqual(MemoryLayout<P>.stride, 256, "fits the Metal 4 frame block")
+    let fields = [
       ("shape", MemoryLayout<F>.offset(of: \.shape)), ("options", MemoryLayout<F>.offset(of: \.options)),
       ("matrix", MemoryLayout<F>.offset(of: \.matrix)), ("levels", MemoryLayout<F>.offset(of: \.levels)),
       ("codeScale", MemoryLayout<F>.offset(of: \.codeScale)),
-    ])
+    ]
+    for member in try XCTUnwrap(buffers[0]?.bufferStructType?.members) {
+      let reading = try XCTUnwrap(member.structType(), member.name)
+      XCTAssertEqual(reading.members.map(\.name), fields.map(\.0), member.name)
+      for (m, (name, offset)) in zip(reading.members, fields) {
+        XCTAssertEqual(m.offset, try XCTUnwrap(offset), "\(member.name).\(name)")
+      }
+    }
+    XCTAssertEqual(MemoryLayout<F>.stride, 80, "mk_FrameParams is five 16-byte rows")
     typealias L = LUTParameters
     for index in [1, 2] {
       try check(buffers[index], L.self, [

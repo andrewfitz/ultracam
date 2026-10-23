@@ -134,6 +134,15 @@ final class Metal4Tests: XCTestCase {
         name: "HLG native", frame: try frame(.v210, Self.hlg), state: all, format: .rgba16Float, luts: false),
       Case(name: "bgra8 source", frame: try frame(.bgra8, SignalDescription(range: .full)), state: all),
       Case(name: "half-float source", frame: try frame(.rgba16Float, SignalDescription(range: .full)), state: all),
+      // The per-stage decode: the Output and Monitor stages read the codes their own way.
+      Case(
+        name: "declared full, output legal + every tool + LUTs",
+        frame: try frame(.v210, SignalDescription(range: .full, outputReading: SignalReading(range: .legal, matrix: .bt709))),
+        state: all, luts: true),
+      Case(
+        name: "240M, output BT.709 + clip on the monitor stage",
+        frame: try frame(.p010, SignalDescription(matrix: .smpte240m, outputReading: SignalReading(range: .full, matrix: .bt709))),
+        state: { var s = clip; s.clipIndicators.stage = .monitor; s.pictureStage = .source; return s }(), luts: true),
     ]
   }
 

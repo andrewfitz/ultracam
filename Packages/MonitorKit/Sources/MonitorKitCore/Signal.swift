@@ -214,6 +214,26 @@ public enum SignalEncoding: Hashable, Codable, Sendable {
   public var log: LogEncoding? { if case .log(let value) = self { return value } else { return nil } }
 }
 
+/// How a stage reads a frame's codes: the code range that expands them and the
+/// Y'CbCr matrix that decodes them to R'G'B' (an RGB frame uses the range alone,
+/// and the matrix for its transport luma).
+public struct SignalReading: Hashable, Codable, Sendable {
+  public var range: CodeRange
+  public var matrix: YCbCrMatrix
+
+  public init(range: CodeRange, matrix: YCbCrMatrix) {
+    self.range = range
+    self.matrix = matrix
+  }
+
+  private enum CodingKeys: String, CodingKey { case range, matrix }
+  /// Lenient: a missing or unknown field decodes as legal BT.709.
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(range: c.lenient(.range, CodeRange.legal), matrix: c.lenient(.matrix, YCbCrMatrix.bt709))
+  }
+}
+
 /// Everything needed to turn a frame's codes into normalized values.
 public struct SignalDescription: Hashable, Codable, Sendable {
   public var range: CodeRange
@@ -226,11 +246,20 @@ public struct SignalDescription: Hashable, Codable, Sendable {
   /// Colour primaries of a display-referred signal; nil when unlabelled
   /// (`effectivePrimaries` then infers them). Log signals carry theirs in the gamut.
   public var primaries: ColorPrimaries?
+  /// How the Output and Monitor stages read the codes, when that differs from
+  /// the source's `range` and `matrix`; nil (the default) reads them as the source
+  /// does. The source stage, log false colour and the classifiers of the camera's
+  /// own signal keep `range` and `matrix` (the camera's declared reading); the
+  /// Output and Monitor stages, with or without a LUT, and every tool and scope
+  /// measuring them decode the same codes with this reading, the one the host's
+  /// burn-in LUT and real output use. E.g. a camera declared full range on a
+  /// legal-range link, or a SMPTE 240M source whose output path decodes BT.709.
+  public var outputReading: SignalReading?
 
   public init(
     range: CodeRange = .legal, matrix: YCbCrMatrix = .bt709, chromaSiting: ChromaSiting = .left,
     encoding: SignalEncoding = .display(.bt709), chromaVerticalSiting: ChromaVerticalSiting = .center,
-    primaries: ColorPrimaries? = nil
+    primaries: ColorPrimaries? = nil, outputReading: SignalReading? = nil
   ) {
     self.range = range
     self.matrix = matrix
@@ -238,6 +267,38 @@ public struct SignalDescription: Hashable, Codable, Sendable {
     self.encoding = encoding
     self.chromaVerticalSiting = chromaVerticalSiting
     self.primaries = primaries
+    self.outputReading = outputReading
+  }
+
+  /// The source's own reading: `range` and `matrix`.
+  public var sourceReading: SignalReading { SignalReading(range: range, matrix: matrix) }
+
+  /// The Output and Monitor stages' reading: `outputReading`, else the source's.
+  public var effectiveOutputReading: SignalReading { outputReading ?? sourceReading }
+
+  /// Whether the Output and Monitor stages read the codes differently from the
+  /// source (an `outputReading` equal to the source's reading is no difference).
+  public var hasDistinctOutputReading: Bool {
+    guard let r = outputReading else { return false }
+    return r.range != range || r.matrix != matrix
+  }
+
+  /// This signal as the Output and Monitor stages read it before any LUT: the
+  /// output reading's range and matrix, everything else the same (and no
+  /// `outputReading` of its own).
+  public var outputSignal: SignalDescription {
+    var s = self
+    let r = effectiveOutputReading
+    s.range = r.range
+    s.matrix = r.matrix
+    s.outputReading = nil
+    return s
+  }
+
+  /// The signal a stage reads: this one at `.source`, `outputSignal` at `.output`
+  /// and `.monitor` (unchanged when there is no distinct output reading).
+  public func signal(for stage: SignalStage) -> SignalDescription {
+    stage == .source || !hasDistinctOutputReading ? self : outputSignal
   }
 
   /// The labelled primaries, else BT.2020 for PQ, HLG or a BT.2020 matrix (BT.2100
@@ -255,13 +316,14 @@ public struct SignalDescription: Hashable, Codable, Sendable {
   }
 
   private enum CodingKeys: String, CodingKey {
-    case range, matrix, chromaSiting, encoding, chromaVerticalSiting, primaries
+    case range, matrix, chromaSiting, encoding, chromaVerticalSiting, primaries, outputReading
   }
   /// Lenient, like every persisted MonitorKit setting, so a description saved by
   /// another version cannot invalidate the host's other settings: a missing or
   /// unknown field decodes as `rec709`'s (an unknown encoding as `.unknown`,
   /// which tools treat as unlabelled). Descriptions saved before vertical siting
-  /// or primaries existed decode as centred and unlabelled.
+  /// or primaries existed decode as centred and unlabelled, and those saved
+  /// before `outputReading` existed read every stage as the source does.
   public init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     let d = SignalDescription.rec709
@@ -270,7 +332,8 @@ public struct SignalDescription: Hashable, Codable, Sendable {
       chromaSiting: c.lenient(.chromaSiting, d.chromaSiting),
       encoding: c.lenient(.encoding, SignalEncoding.unknown),
       chromaVerticalSiting: c.lenient(.chromaVerticalSiting, d.chromaVerticalSiting),
-      primaries: c.lenient(.primaries, ColorPrimaries?.none))
+      primaries: c.lenient(.primaries, ColorPrimaries?.none),
+      outputReading: c.lenient(.outputReading, SignalReading?.none))
   }
 
   public static let rec709 = SignalDescription()

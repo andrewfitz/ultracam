@@ -81,7 +81,8 @@ public final class MonitorFeed {
 
   /// Once per frame, before any pass that shows peaking. Analyses `focus.stage`:
   /// the source luma, or the luma after the burn-in LUT (output) and the monitor
-  /// LUT too (monitor). Encodes one compute pass; never commits. With
+  /// LUT too (monitor). The Output and Monitor stages decode the codes with the
+  /// signal's `outputReading` when it has one (`MonitorFrame.parameters(for:)`). Encodes one compute pass; never commits. With
   /// `focus.enabled` false (peaking is off on every surface of the feed) it encodes
   /// nothing and releases the mask, an r8 texture at source size (8.3 MB at 4K),
   /// once the frames in flight are done with it; turning peaking back on makes a
@@ -179,7 +180,7 @@ public final class MonitorFeed {
     }
     guard let pipeline = focusPipeline else { throw MonitorKitError.gpu("No focus-analysis pipeline.") }
     let uniforms = AnalysisUniforms(
-      frame: frame.parameters,
+      frame: frame.parameters(for: focus.stage),
       thresholds: SIMD2(Float(focus.edgeThreshold), Float(min(1, max(0, focus.noiseRejection)))),
       burn: burn?.parameters ?? .disabled, monitor: monitor?.parameters ?? .disabled)
     return Analysis(mask: mask, pipeline: pipeline, burn: burn, monitor: monitor, uniforms: uniforms)
@@ -204,12 +205,15 @@ public final class MonitorFeed {
   }
 
   /// Whether `focusMask` was analysed from `frame` on the stage a surface shows:
-  /// the LUTs it applied are the ones that surface's stage has.
+  /// the LUTs it applied are the ones that surface's stage has, and so is its
+  /// reading of the codes (a distinct output reading tells the source apart from
+  /// an Output stage with no LUT).
   func hasFocusMask(for frame: MonitorFrame, stage: SignalStage, monitorLUTEnabled: Bool) -> Bool {
     guard focusMask != nil, let key = maskKey, key.matches(frame) else { return false }
     let burn = stage != .source ? burnInLUT : nil
     let monitor = stage == .monitor && monitorLUTEnabled ? monitorLUT : nil
-    return key.burn === burn && key.monitor === monitor
+    guard key.burn === burn && key.monitor === monitor else { return false }
+    return !frame.signal.hasDistinctOutputReading || key.uniforms.frame == frame.parameters(for: stage)
   }
 
   /// Marks the mask stale, e.g. when the host stops analysing.

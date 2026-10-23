@@ -28,8 +28,10 @@ final class PortedQualityTests: XCTestCase {
       XCTAssertNotNil(gpu.engine.library.makeFunction(name: name), name)
     }
     XCTAssertEqual(MemoryLayout<FrameParameters>.stride, 80)
+    // The picture pass binds two at buffer 0 (the source and the output reading).
+    XCTAssertEqual(MemoryLayout<PassFrameParameters>.stride, 160)
     // The documented sizes: a change here must update ARCHITECTURE.md's uniform sizes too.
-    XCTAssertEqual(MemoryLayout<PassParameters>.stride, 1472)
+    XCTAssertEqual(MemoryLayout<PassParameters>.stride, 1488)
     XCTAssertEqual(MemoryLayout<GuideParameters>.stride, 2592)
     XCTAssertEqual(MonitorPass.uniformLength, 5120)
     XCTAssertEqual(MonitorFeed.uniformLength, 1024)

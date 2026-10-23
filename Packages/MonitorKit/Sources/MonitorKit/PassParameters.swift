@@ -75,14 +75,40 @@ public struct PassParameters: Sendable {
   /// in a host's own parameters) makes the shader compute them per pixel: the same
   /// pixels, slower.
   public var reciprocals = SIMD4<Float>.zero
+  /// The Output and Monitor stages' own reading of the codes
+  /// (`SignalDescription.outputReading`). The picture pass's buffer 0 holds two
+  /// `FrameParameters` (`mk_PassFrames`): the source reading, then this one
+  /// (`MonitorFrame.parameters(for: .output)`). w: 1 when the Output and Monitor
+  /// stages decode with it, from the same filtered codes as the source. 0 (the
+  /// default, as in a host's own parameters): every stage shares the source decode
+  /// and the second `FrameParameters` is not read; a specialized pipeline then
+  /// compiles no second decode (`MK_LUTS` bit 2). xyz: that reading's correctly
+  /// rounded reciprocals, as `reciprocals` (0: computed per pixel).
+  public var outputReading = SIMD4<Float>.zero
 
   public init() {}
 
   /// `reciprocals` for `frame`'s parameters and the stripe period `zebra.w`.
   static func reciprocals(_ frame: FrameParameters, zebraPeriod: UInt32) -> SIMD4<Float> {
-    func inverse(_ v: Float) -> Float { v == 0 || !v.isFinite ? 0 : 1 / v }
-    return SIMD4(inverse(frame.levels.y), inverse(frame.levels.w), inverse(frame.matrix.y), inverse(Float(zebraPeriod)))
+    SIMD4(inverse(frame.levels.y), inverse(frame.levels.w), inverse(frame.matrix.y), inverse(Float(zebraPeriod)))
   }
+
+  /// `outputReading` for the Output and Monitor stages' parameters `output`,
+  /// given the source's `frame`: zero when they are the same reading.
+  static func outputReading(_ output: FrameParameters, source frame: FrameParameters) -> SIMD4<Float> {
+    guard output != frame else { return .zero }
+    return SIMD4(inverse(output.levels.y), inverse(output.levels.w), inverse(output.matrix.y), 1)
+  }
+
+  private static func inverse(_ v: Float) -> Float { v == 0 || !v.isFinite ? 0 : 1 / v }
+}
+
+/// Mirrors `mk_PassFrames`, the picture pass's buffer 0: the source reading, then
+/// the Output and Monitor stages' reading (`PassParameters.outputReading`), 160
+/// bytes (`mk_FrameParams` is 80, a multiple of its 16-byte alignment).
+struct PassFrameParameters: Equatable {
+  var source: FrameParameters
+  var output: FrameParameters
 }
 
 /// Mirrors `mk_Guides` in MKMonitor.msl: the guide strokes the picture pass

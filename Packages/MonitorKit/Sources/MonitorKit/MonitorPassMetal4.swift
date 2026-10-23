@@ -212,7 +212,8 @@ extension MonitorPass {
   }
 
   private func write(_ p: Pending, _ base: UnsafeMutableRawPointer) {
-    store(p.frameParameters, base, 0)
+    // The source and the output reading, 160 bytes of the 256-byte frame block.
+    store(p.frames, base, 0)
     store(p.burnInLUT?.parameters ?? .disabled, base, 256)
     store(p.monitorLUT?.parameters ?? .disabled, base, 512)
     store(parameters, base, Self.passOffset)

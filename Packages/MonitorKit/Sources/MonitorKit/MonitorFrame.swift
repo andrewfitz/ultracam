@@ -261,8 +261,21 @@ public struct MonitorFrame: @unchecked Sendable {
     if let chroma { set.removeAllocation(chroma) }
   }
 
-  /// Parameters for `mk_FrameParams`.
-  public var parameters: FrameParameters {
+  /// Parameters for `mk_FrameParams`: the source reading (`signal.range` and `signal.matrix`).
+  public var parameters: FrameParameters { parameters(reading: signal) }
+
+  /// Parameters for `mk_FrameParams` as `stage` reads the codes: the source
+  /// reading at `.source`; at `.output` and `.monitor` the signal's
+  /// `effectiveOutputReading` (the same parameters when it has no distinct one).
+  /// A kernel that measures one stage (focus analysis, a scope) binds these, so
+  /// it decodes the codes with that stage's own exact quotients.
+  public func parameters(for stage: SignalStage) -> FrameParameters {
+    parameters(reading: signal.signal(for: stage))
+  }
+
+  /// `mk_FrameParams` for this frame's layout and size, decoding with `signal`'s
+  /// range, matrix, siting and log transport.
+  func parameters(reading signal: SignalDescription) -> FrameParameters {
     let kind = layout.shaderKind
     let sub: UInt32 = layout.subsampling == .s444 ? 0 : (layout.subsampling == .s422 ? 1 : 2)
     let depth = layout.bitDepth

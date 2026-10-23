@@ -204,7 +204,9 @@ final class ContractTests: XCTestCase {
     control.colorAttachments[0].texture = target
     control.colorAttachments[0].loadAction = .clear
     control.colorAttachments[0].storeAction = .store
-    var parameters = pass.currentParameters, frameParameters = frame.parameters, guides = pass.currentGuides
+    var parameters = pass.currentParameters, guides = pass.currentGuides
+    // mk_picture's buffer 0: the source reading, then the output reading (the same here).
+    var frameParameters = PassFrameParameters(source: frame.parameters, output: frame.parameters)
     var lut = feed.burnInLUT!.parameters
     var library: [Int] = [], inline: [Int] = [], prepare: [Int] = []
     for _ in 0..<30 {
@@ -225,7 +227,7 @@ final class ContractTests: XCTestCase {
         e.setFragmentTexture(feed.burnInLUT!.texture, index: 3)
         e.setFragmentTexture(feed.monitorLUT!.texture, index: 4)
         e.setFragmentTexture(feed.focusMask, index: 5)
-        e.setFragmentBytes(&frameParameters, length: MemoryLayout<FrameParameters>.stride, index: 0)
+        e.setFragmentBytes(&frameParameters, length: MemoryLayout<PassFrameParameters>.stride, index: 0)
         e.setFragmentBytes(&lut, length: MemoryLayout<LUTParameters>.stride, index: 1)
         e.setFragmentBytes(&lut, length: MemoryLayout<LUTParameters>.stride, index: 2)
         e.setFragmentBytes(&parameters, length: MemoryLayout<PassParameters>.stride, index: 3)

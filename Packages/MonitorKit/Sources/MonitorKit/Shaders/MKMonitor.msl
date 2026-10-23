@@ -6,7 +6,7 @@ using namespace metal;
 // pipeline per tool set, so a surface pays only for the tools it shows (dead
 // code still costs registers and occupancy). Compiled on its own, every tier is on.
 #ifndef MK_LUTS
-#define MK_LUTS 3u            // bit 0: the burn-in LUT is read, bit 1: the monitor LUT
+#define MK_LUTS 3u            // bit 0: the burn-in LUT is read, bit 1: the monitor LUT, bit 2: no distinct output reading
 #endif
 #ifndef MK_ADJUST
 #define MK_ADJUST true        // display adjustments other than identity
@@ -258,6 +258,7 @@ struct mk_PassParams {
   float4 whiteGain;          // white-point trim: xyz linear-light gains in the picture primaries, w: picture transfer (0 off)
   float4 whiteSignalGain;    // the same gains on the signal of a power-law picture (BT.1886, gamma 2.2, linear)
   float4 reciprocals;        // correctly rounded: x: 1 / luma span (levels.y), y: 1 / chroma span (levels.w), z: 1 / kg (matrix.y), w: 1 / zebra stripe period; 0: computed here
+  float4 outputReading;      // w: 1 when the output and monitor stages decode with their own reading (mk_PassFrames.output), 0: the source's; xyz: its reciprocals as above
 };
 
 // Mirrors MonitorKit.GuideParameters: guide strokes in viewport pixels, drawn
@@ -289,10 +290,15 @@ struct mk_Inputs {
   texture2d<float, access::read> chroma;
   texture3d<float, access::sample> burnLUT;
   texture3d<float, access::sample> monitorLUT;
-  constant mk_FrameParams& frame;
+  constant mk_FrameParams& frame;   // the source reading
   constant mk_LUTParams& burn;
   constant mk_LUTParams& monitor;
   constant mk_PassParams& pass;
+  // The output and monitor stages' reading: mk_PassFrames.output when
+  // mk_readsOutput (mk_outputFrame). Last and defaulted, so a host
+  // that fuses this file and initializes the nine members above reads every
+  // stage with `frame`, as it does with that flag clear.
+  constant mk_FrameParams& output = frame;
 };
 
 // ---------------------------------------------------------------- v210 in the picture pass
@@ -513,17 +519,14 @@ float3 mk_row(uint y, thread const mk_Axis& ax, bool pairs, thread const mk_Inpu
   return mk_mean(sum, float(ax.count), ax.inverse, f);
 }
 
-// Source R'G'B' and transport Y' over the picture footprint of display pixel `d`
-// (its centre is i + 0.5), filtered separably in code space and decoded once.
-// The LUTs run once on the result, not per tap.
-float4 mk_filtered(float2 d, float4 map, bool nearest, uint maxTaps, thread const mk_Inputs& in) {
+// The codes (mk_tapCodes' form) over the picture footprint of display pixel `d`
+// (its centre is i + 0.5), filtered separably in code space. Each reading decodes
+// them once (mk_decodeCodes); the LUTs run once on the result, not per tap.
+float3 mk_filteredCodes(float2 d, float4 map, bool nearest, uint maxTaps, thread const mk_Inputs& in) {
   constant mk_FrameParams& f = in.frame;
   float2 centre = d * map.xy + map.zw, footprint = abs(map.xy);
   mk_Axis ax = mk_axis(centre.x, footprint.x, nearest, maxTaps), ay = mk_axis(centre.y, footprint.y, nearest, maxTaps);
-  // The frame's reciprocals from the uniforms (MonitorPass sets them), else here.
-  float3 inverse = in.pass.reciprocals.x != 0 ? in.pass.reciprocals.xyz
-                                               : mk_reciprocals(f);
-  if (ax.count == 1 && ay.count == 1) return mk_decodeCodes(mk_tapCodes(mk_clampPixel(centre, f), in), f, inverse);
+  if (ax.count == 1 && ay.count == 1) return mk_tapCodes(mk_clampPixel(centre, f), in);
   bool packed422 = MK_LAYOUT(f) == MK_V210 || MK_LAYOUT(f) == MK_UYVY8 || MK_LAYOUT(f) == MK_YUYV8;
   uint x0 = mk_clampPixel(float2(ax.first, 0), f).x;
   bool pairs = packed422 && !f.options.x && !ax.cubic && ax.step == 1 && (ax.count & 1) == 0 && ax.first >= 0
@@ -539,17 +542,53 @@ float4 mk_filtered(float2 d, float4 map, bool nearest, uint maxTaps, thread cons
     for (uint j = 0; j < ay.count; j++) sum += mk_row(mk_clampPixel(float2(0, ay.first + float(j) * ay.step), f).y, ax, pairs, in);
     codes = mk_mean(sum, float(ay.count), ay.inverse, f);
   }
-  return mk_decodeCodes(codes, f, inverse);
+  return codes;
 }
 
-// Source, output (after the burn-in LUT) and monitor (after the monitor LUT) values.
-struct mk_Stages { float3 source, output, monitor; float sourceLuma; };
+// The source decode (R'G'B', transport Y') of filtered codes. The frame's
+// reciprocals come from the uniforms (MonitorPass sets them), else from here.
+float4 mk_sourceDecode(float3 codes, thread const mk_Inputs& in) {
+  float3 inverse = in.pass.reciprocals.x != 0 ? in.pass.reciprocals.xyz : mk_reciprocals(in.frame);
+  return mk_decodeCodes(codes, in.frame, inverse);
+}
 
-mk_Stages mk_stages(float4 decoded, thread const mk_Inputs& in) {
+// Source R'G'B' and transport Y' over the picture footprint of display pixel `d`:
+// the source decode of mk_filteredCodes (for hosts that fuse this file).
+float4 mk_filtered(float2 d, float4 map, bool nearest, uint maxTaps, thread const mk_Inputs& in) {
+  return mk_sourceDecode(mk_filteredCodes(d, map, nearest, maxTaps, in), in);
+}
+
+// Source, output (after the burn-in LUT) and monitor (after the monitor LUT) values,
+// and the transport Y' of the source and of the output reading.
+struct mk_Stages { float3 source, output, monitor; float sourceLuma, outputLuma; };
+
+// Whether the output and monitor stages decode the codes with their own reading.
+// Bit 2 of MK_LUTS fixes "no" in a specialized pipeline (the identity costs
+// nothing there); otherwise PassParameters.outputReading.w decides.
+inline bool mk_readsOutput(constant mk_PassParams& p) { return (MK_LUTS & 4) == 0 && p.outputReading.w != 0; }
+
+// The reading a stage decodes the codes with: the source's at stage 0, the output
+// reading at the output and monitor stages (the same unless pass.outputReading.w).
+inline constant mk_FrameParams& mk_stageFrame(uint stage, thread const mk_Inputs& in) {
+  return stage == 0 ? in.frame : in.output;
+}
+
+// `codes` are the filtered codes, `decoded` their source decode. The output and
+// monitor stages start from the output reading's own decode of the same codes
+// (exact quotients, as the source's), before the burn-in LUT; with no distinct
+// output reading they share the source decode.
+mk_Stages mk_stages(float3 codes, float4 decoded, thread const mk_Inputs& in) {
   mk_Stages s;
   s.source = decoded.rgb;
   s.sourceLuma = decoded.w;
   float3 c = s.source;
+  s.outputLuma = s.sourceLuma;
+  if (mk_readsOutput(in.pass)) {
+    float4 o = mk_decodeCodes(codes, in.output,
+                              in.pass.outputReading.x != 0 ? in.pass.outputReading.xyz : mk_reciprocals(in.output));
+    c = o.rgb;
+    s.outputLuma = o.w;
+  }
   if ((MK_LUTS & 1) != 0 && in.pass.luts.x != 0) c = mk_applyLUT(c, in.burnLUT, in.burn);
   s.output = c;
   if ((MK_LUTS & 2) != 0 && in.pass.luts.y != 0) c = mk_applyLUT(c, in.monitorLUT, in.monitor);
@@ -565,9 +604,9 @@ bool mk_stageIsLUT(uint stage, constant mk_PassParams& p) {
 }
 
 // Y' of a stage. The source and anything no LUT has touched use the transport
-// luma; LUT results are display R'G'B', weighted as Rec.709.
+// luma of the stage's reading; LUT results are display R'G'B', weighted as Rec.709.
 float mk_stageLuma(thread const mk_Stages& s, uint stage, constant mk_PassParams& p) {
-  if (!mk_stageIsLUT(stage, p)) return s.sourceLuma;
+  if (!mk_stageIsLUT(stage, p)) return stage == 0 ? s.sourceLuma : s.outputLuma;
   return mk_luma709(stage == 2 && p.luts.y != 0 ? s.monitor : s.output);
 }
 
@@ -613,7 +652,9 @@ float3 mk_displayTransform(float3 c, thread const mk_Inputs& in) {
     // MonitorKit display assist v1: scene light, Rec.709, the BT.709 OETF with a
     // shoulder. One log2 and one exp2 per channel serve both branches: the OETF's
     // x^0.45 and the shoulder's (x / xk)^-q.
-    float3 x = mk_rows(p.transformMatrix, mk_logDecodeFast(mk_logSignalFast(c, MK_LOG_CURVE, in.frame), MK_LOG_CURVE));
+    // The picture stage's reading: its range sets the log curve's signal.
+    float3 x = mk_rows(p.transformMatrix,
+                       mk_logDecodeFast(mk_logSignalFast(c, MK_LOG_CURVE, mk_stageFrame(MK_PICTURE_STAGE, in)), MK_LOG_CURVE));
     bool3 over = x > p.assist.x;
     float3 lx = fast::log2(max(x, .018f));
     float3 t = fast::exp2(select(.45f * lx, -p.assist.z * (lx - p.assist.w), over));
@@ -728,18 +769,23 @@ float3 mk_stageFalseColor(thread const mk_Stages& s, thread const mk_Inputs& in)
   float3 fallback = float3(clamp(mk_luma709(mk_stage(s, stage)), 0.0f, 1.0f));
   if (p.modes.x == MK_FC_STAGE_IRE) return mk_bands(mk_stageLuma(s, stage, p) * 100, fallback, in);
   // Stops over 18% grey. A LUT result is Rec.709 display R'G'B'; an untouched
-  // source is linearized by its own curve: the log decode in source-gamut Y, else
-  // its display transfer, each channel, weighted by its Y'CbCr matrix.
+  // stage is linearized by the source's own curve, read as the stage reads the
+  // codes: the log decode in source-gamut Y, else its display transfer, each
+  // channel, weighted by the stage reading's Y'CbCr matrix.
   float linear;
   if (mk_stageIsLUT(stage, p)) {
     float3 c = stage == 2 && p.luts.y != 0 ? s.monitor : s.output;
     linear = mk_luma709(float3(mk_bt709Linear(c.r), mk_bt709Linear(c.g), mk_bt709Linear(c.b)));
-  } else if (p.luts.z != 0) {
-    linear = dot(mk_logDecode(mk_logSignal(s.source, p.luts.z, in.frame), p.luts.z), p.gamutWeights.rgb);
   } else {
-    uint t = p.luts.w;
-    float3 c = float3(mk_exposureLinear(s.source.r, t), mk_exposureLinear(s.source.g, t), mk_exposureLinear(s.source.b, t));
-    linear = mk_luma(c, in.frame.matrix.xyz);
+    constant mk_FrameParams& f = mk_stageFrame(stage, in);
+    float3 v = stage == 0 ? s.source : s.output;
+    if (p.luts.z != 0) {
+      linear = dot(mk_logDecode(mk_logSignal(v, p.luts.z, f), p.luts.z), p.gamutWeights.rgb);
+    } else {
+      uint t = p.luts.w;
+      float3 c = float3(mk_exposureLinear(v.r, t), mk_exposureLinear(v.g, t), mk_exposureLinear(v.b, t));
+      linear = mk_luma(c, f.matrix.xyz);
+    }
   }
   float stops = linear > 0 ? log2(linear) - log2(.18f) + p.falseColor.x : -INFINITY;
   return mk_bands(stops, fallback, in);
@@ -878,6 +924,18 @@ bool mk_inside(float2 d, float4 r) { return r.x < r.z && all(d >= r.xy) && all(d
 
 struct mk_VertexOut { float4 position [[position]]; };
 
+// Buffer 0 of the picture (MonitorKit.PassFrameParameters): the source reading,
+// then the output and monitor stages' reading, read only when mk_readsOutput.
+// A fixed-size struct, so the GPU can preload it like any small constant block.
+struct mk_PassFrames {
+  mk_FrameParams source;
+  mk_FrameParams output;
+};
+
+inline constant mk_FrameParams& mk_outputFrame(constant mk_PassFrames& frames, constant mk_PassParams& p) {
+  return mk_readsOutput(p) ? frames.output : frames.source;
+}
+
 // One triangle covering the viewport.
 vertex mk_VertexOut mk_fullscreen(uint id [[vertex_id]]) {
   float2 uv = float2((id << 1) & 2, id & 2);
@@ -905,8 +963,9 @@ float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float
   // A log false-colour picture classifies the source pixel under the display
   // pixel's centre, so the image is point-sampled while it is shown.
   float4 map = navigator ? p.navigatorToPicture : p.displayToPicture;
-  float4 sample = mk_filtered(d, map, !navigator && (p.flags.x != 0 || logFalseColor), navigator ? 2 : 8, in);
-  mk_Stages s = mk_stages(sample, in);
+  float3 codes = mk_filteredCodes(d, map, !navigator && (p.flags.x != 0 || logFalseColor), navigator ? 2 : 8, in);
+  float4 sample = mk_sourceDecode(codes, in);
+  mk_Stages s = mk_stages(codes, sample, in);
 
   if (navigator) {
     // The whole picture, dimmed (never above graphics white), with the visible region outlined.
@@ -980,12 +1039,12 @@ fragment float4 mk_picture(mk_VertexOut v [[stage_in]],
                            texture3d<float, access::sample> burnLUT [[texture(3)]],
                            texture3d<float, access::sample> monitorLUT [[texture(4)]],
                            texture2d<float, access::sample> focusMask [[texture(5)]],
-                           constant mk_FrameParams& frame [[buffer(0)]],
+                           constant mk_PassFrames& frames [[buffer(0)]],
                            constant mk_LUTParams& burn [[buffer(1)]],
                            constant mk_LUTParams& monitor [[buffer(2)]],
                            constant mk_PassParams& p [[buffer(3)]],
                            constant mk_Guides& guides [[buffer(4)]]) {
-  mk_Inputs in = {packed, luma, chroma, burnLUT, monitorLUT, frame, burn, monitor, p};
+  mk_Inputs in = {packed, luma, chroma, burnLUT, monitorLUT, frames.source, burn, monitor, p, mk_outputFrame(frames, p)};
   return mk_pictureAt(v.position.xy, in, focusMask, guides);
 }
 
@@ -999,14 +1058,14 @@ kernel void mk_pictureKernel(texture2d<uint, access::read> packed [[texture(0)]]
                              texture3d<float, access::sample> monitorLUT [[texture(4)]],
                              texture2d<float, access::sample> focusMask [[texture(5)]],
                              texture2d<float, access::write> target [[texture(6)]],
-                             constant mk_FrameParams& frame [[buffer(0)]],
+                             constant mk_PassFrames& frames [[buffer(0)]],
                              constant mk_LUTParams& burn [[buffer(1)]],
                              constant mk_LUTParams& monitor [[buffer(2)]],
                              constant mk_PassParams& p [[buffer(3)]],
                              constant mk_Guides& guides [[buffer(4)]],
                              uint2 xy [[thread_position_in_grid]]) {
   if (xy.x >= uint(p.viewport.z) || xy.y >= uint(p.viewport.w)) return;
-  mk_Inputs in = {packed, luma, chroma, burnLUT, monitorLUT, frame, burn, monitor, p};
+  mk_Inputs in = {packed, luma, chroma, burnLUT, monitorLUT, frames.source, burn, monitor, p, mk_outputFrame(frames, p)};
   uint2 pixel = xy + uint2(p.viewport.xy);
   target.write(mk_pictureAt(float2(pixel) + .5f, in, focusMask, guides), pixel);
 }
