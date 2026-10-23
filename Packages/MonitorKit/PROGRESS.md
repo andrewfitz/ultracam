@@ -9,7 +9,7 @@ The autonomous build log. The heartbeat (every 5 hours) reads this file to resum
 - [x] W2 HDR/display transforms + EDR; MonitorKitUI; a dedicated performance/optimization pass; audit round 2 of the W1 modules + fixes. Done 2026-10-22 (integration step: see "W2 result" below). Added beyond the plan: the Metal 4 encode path for every GPU object (bit-identical to classic), MonitorMultiview, white-point trim, scope HDR colours.
 - [x] W3 Two audit rounds of the W2 work + fixes; docs (README, FEATURES, API, INTEGRATION, MATH, LICENSE); final benchmarks. Done 2026-10-22: fd87db8 (final perf pass + the W3 library work: docs, CHANGELOG, NOTICE, ported tests, texture cache, warm-up, UI chrome), ff54124 (exact-quotient scope decode, checksummed statistics slots, stress-test hardening: 759 tests, 0 failures), 97fd185 (gate helper), then the W4-found library fixes 96fdeb6 and 12e6b11. See "W3 + W4 result" below.
 - [x] W4 Ultracam integration: LUT fused into LUTProcessor, monitor surfaces on MonitorKit, UI, then audits and regression tests; MonitorTools retired (74de953). Done 2026-10-23 at 1baddab; all gates green (see "W3 + W4 result" below).
-- [ ] W5 Final verification and report. Offline verification done 2026-10-23 (final-verify at 1baddab, every gate run; see below). Still open: plan step 9, the hands-on check with the UltraStudio (needs `LIVE=1` or the installed app quit, so only with the user's go-ahead), and the final report to the user.
+- [ ] W5 Final verification and report. Offline verification done 2026-10-23 (final-verify at 1baddab, every gate run; see below). Still open: plan step 9, the hands-on check with the UltraStudio (needs `LIVE=1` or the installed app quit, so only with the user's go-ahead), and the final report to the user (report delivered 2026-10-23).
 
 ## Workflow runs
 
@@ -148,3 +148,4 @@ Open after W4:
 - Closed from that list: LUT-stage focus 0.48 → 0.35 ms tetrahedral (fd87db8); the flaky scopes statistics test (ff54124, checksummed slots).
 - final-verify did not repeat the Metal validation run (`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`). That run was assigned to the workflow's fix-w4-all step.
 - W5: plan step 9, hands-on with the UltraStudio (LIVE=1 or the installed app quit), needs the user. Then the final report.
+- Heartbeat 2026-10-23 05:21: no workflow running; W1–W4 complete (HEAD da5e0b8), W4 freeze released and ultracam-18 told, final report delivered. Only W5's hands-on UltraStudio check remains; it waits for the user's go-ahead, so nothing to resume.
