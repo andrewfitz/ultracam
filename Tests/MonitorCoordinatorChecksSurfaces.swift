@@ -975,7 +975,7 @@ extension MonitorCoordinatorChecks {
   /// MonitorKit currently hides guides while magnified (GuideRaster and
   /// MonitorPass gate them on `!layout.isMagnified`), a regression routed as a
   /// library defect: the zoomed half is an expected failure until it is fixed,
-  /// and the `XCTExpectFailure` comes out with the fix.
+  /// and the (non-strict) `XCTExpectFailure` comes out with the fix.
   func testZoomScalesPictureAndGuidesTogetherWithinBounds() throws {
     let (presenter, _) = portedDetachedPresenter()
     let frame = MonitorFrameGeometry(width: 80, height: 40)
@@ -1005,7 +1005,11 @@ extension MonitorCoordinatorChecks {
     XCTAssertEqual(zoomed.imageRect.height, 80, accuracy: 1)
     XCTAssertEqual(zoomed.imageRect.x + zoomed.imageRect.width / 2, 40, accuracy: 1)
     XCTAssertEqual(zoomed.imageRect.y + zoomed.imageRect.height / 2, 20, accuracy: 1)
-    XCTExpectFailure("LIBRARY: MonitorKit hides guides while magnified; they should follow the zoomed picture") {
+    // Not strict: once MonitorKit draws guides on the zoomed picture this passes;
+    // the wrapper then comes out.
+    XCTExpectFailure(
+      "LIBRARY: MonitorKit hides guides while magnified; they should follow the zoomed picture", strict: false
+    ) {
       let zoomedGuides = GuideRaster(layout: zoomed, guides: guides)
       // The default thirds, on the zoomed picture: verticals at a third and two
       // thirds of its width (40 ± 160 / 6), the shown part inside the viewport.

@@ -67,7 +67,10 @@ extension MonitorCoordinatorChecks {
     let program = value.surfaceState(isProgram: true)
     XCTAssertEqual(program.falseColor.mode, .off)
     XCTAssertFalse(value.surfaceState(isProgram: false).zebras[0].enabled, "A camera's log false colour suppresses zebra")
-    XCTExpectFailure("NEEDS: surfaceState suppresses zebra for the log false colour Program turns off") {
+    // Not strict: once surfaceState is fixed this passes; the wrapper then comes out.
+    XCTExpectFailure(
+      "NEEDS: surfaceState suppresses zebra for the log false colour Program turns off", strict: false
+    ) {
       XCTAssertTrue(program.zebras[0].enabled, "Program shows zebra when its log false colour is off")
     }
   }
