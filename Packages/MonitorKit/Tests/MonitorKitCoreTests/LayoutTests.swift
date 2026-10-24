@@ -525,7 +525,7 @@ extension GuideSettings {
 
 private final class GeometryContractRegressionTests: XCTestCase {
   func testDirectLayoutUsesSquarePixelsForUnsupportedPixelAspectRatios() {
-    var g = ViewGeometry()
+    let g = ViewGeometry()
     let baseline = MonitorLayout(pictureWidth: 1920, pictureHeight: 1080, pixelAspectRatio: 1,
       viewportWidth: 1920, viewportHeight: 1080, geometry: g)
     for par in [0.0, -1.0, 0.01, 17.0, .nan, .infinity] {
