@@ -209,6 +209,26 @@ final class RendererRegressionTests: XCTestCase {
     XCTAssertFalse(try renderer.update())
   }
 
+  /// A frame with the same id and textures can still change geometry or whether
+  /// it is a camera signal. Those fields must invalidate the renderer's skip key.
+  func testResubmittedFrameWithChangedGeometryOrProcessingIsTaken() throws {
+    let gpu = try requireGPU()
+    let source = MonitorSource()
+    var frame = try gpu.sdrFrame()
+    source.submit(frame)
+    let renderer = MonitorRenderer(engine: gpu.engine, scene: MonitorScene(surfaces: [MonitorSurface(source: source)]))
+    try renderer.update()
+
+    frame.cleanAperture = MonitorRect(
+      x: 2, y: 1, width: Double(frame.width - 4), height: Double(frame.height - 2))
+    source.submit(frame)
+    XCTAssertTrue(try renderer.update(), "a changed clean aperture must invalidate the draw")
+
+    frame.isProcessed = true
+    source.submit(frame)
+    XCTAssertTrue(try renderer.update(), "a changed processed flag must invalidate the draw")
+  }
+
   /// Waveform, vectorscope and histogram of one source and stage accumulate in
   /// one fused group pass, with the pixels of three separate accumulations.
   func testScopesOfASourceShareOneFusedGroup() throws {

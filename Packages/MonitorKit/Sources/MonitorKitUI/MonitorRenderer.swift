@@ -777,8 +777,11 @@ public final class MonitorRenderer {
   /// Whether `a` and `b` draw the same: the same picture, signal, pixel aspect and textures.
   static func same(_ a: MonitorFrame?, _ b: MonitorFrame?) -> Bool {
     guard let a, let b else { return a == nil && b == nil }
-    return a.id == b.id && a.signal == b.signal && a.pixelAspectRatio == b.pixelAspectRatio && a.packed === b.packed
-      && a.luma === b.luma && a.chroma === b.chroma
+    // The renderer can skip a whole encode when this is true, so include every
+    // frame property consumed by MonitorPass's cache key. A recycled texture
+    // with the same id can still carry a new aperture, layout, or processed flag.
+    return a.id == b.id && a.layout == b.layout && a.geometry == b.geometry && a.isProcessed == b.isProcessed
+      && a.signal == b.signal && a.packed === b.packed && a.luma === b.luma && a.chroma === b.chroma
   }
 
   private func retire(_ frame: MonitorFrame?, _ burnIn: MonitorLUT?, _ monitor: MonitorLUT?, lastUse: UInt64) {
