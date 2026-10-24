@@ -584,6 +584,8 @@ public final class ScopeEngine: @unchecked Sendable {
 
   /// A build of `key` failed. Internal for tests.
   func failed(_ key: ComputeKey, _ error: (any Error)?) {
+    // A failed asynchronous task is terminal; do not retain it as in-flight.
+    _ = pendingCompute.withLock { $0.remove(key) }
     _ = failedCompute.withLock { $0.insert(key) }
     record("scope kernel \(key.kernel.rawValue) \(key): \(error.map { "\($0)" } ?? "unknown error")")
     signalBuildFinished()
@@ -691,6 +693,7 @@ public final class ScopeEngine: @unchecked Sendable {
 
   /// A build of `key` failed. Internal for tests.
   func failed(_ key: RenderKey, _ error: (any Error)?) {
+    _ = pendingRender.withLock { $0.remove(key) }
     _ = failedRender.withLock { $0.insert(key) }
     record("scope render pipeline \(key): \(error.map { "\($0)" } ?? "unknown error")")
     signalBuildFinished()

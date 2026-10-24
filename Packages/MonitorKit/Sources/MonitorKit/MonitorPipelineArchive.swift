@@ -326,8 +326,11 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       }
       i += 1
     }
-    state.withLock { s in
-      // Older than every loaded file (a save since put its own first).
+    let keptArchives: [any MTL4Archive] = state.withLock { s in
+      // Older than every loaded file (a save since put its own first). Never
+      // return archives that exceed the configured retention limit: using an
+      // evicted archive here would silently defeat `maximumFiles` and could
+      // keep arbitrarily old GPU binaries alive for the session.
       let room = max(0, maximumFiles - s.loaded.count)
       let kept = opened.prefix(room).filter { o in !s.loaded.contains { $0.url == o.url } }
       s.loaded.append(contentsOf: kept)
@@ -336,8 +339,9 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       let options = MTL4CompilerTaskOptions()
       options.lookupArchives = s.loaded.map(\.archive)
       s.options = options
+      return kept.map(\.archive)
     }
-    return opened.map(\.archive)
+    return keptArchives
   }
 
   /// Counts the build and keeps `recipe` for the next save (once per descriptor:
