@@ -56,20 +56,43 @@ extension View {
   /// Dark backing for text drawn over video, so it stays readable over bright pictures (≥ 4.5:1).
   /// A caller's own `.font` wins; the default is the overlay style.
   func uiPictureOverlay() -> some View {
+    uiPictureMenuBacking()
+      .foregroundStyle(.white)
+      .environment(\.colorScheme, .dark)
+  }
+
+  /// The overlay's capsule for a menu on the picture. No dark scheme: a menu
+  /// takes its appearance from the scheme around its button, so a forced dark
+  /// scheme gave light mode a dark menu. The label colors itself white.
+  func uiPictureMenuBacking() -> some View {
     font(.uiOverlay)
       .padding(.horizontal, 8).frame(height: 24)
       .background(Color.black.opacity(0.72), in: Capsule())
-      .foregroundStyle(.white)
-      .environment(\.colorScheme, .dark)
   }
 
   /// Backing for the interactive bars on the picture (monitor tools, view controls):
   /// the same dark capsule as the other picture overlays, so the bar reads the same over
   /// any video. (Glass here drew as a blank white panel in offscreen renders.)
+  /// The controls color themselves white; the bar keeps the app's scheme, because
+  /// the menus and popovers it opens inherit it and must match light mode.
   func uiPictureControls() -> some View {
     padding(.horizontal, 4).frame(height: 28)
       .background(Color.black.opacity(0.72), in: Capsule())
-      .environment(\.colorScheme, .dark)
+  }
+}
+
+/// A menu's label on the picture: white text and chevron over the dark capsule.
+/// The system indicator follows the app's scheme, so it would draw dark here.
+struct UIPictureMenuLabel: View {
+  let title: String
+
+  var body: some View {
+    HStack(spacing: 3) {
+      Text(title)
+      Image(systemName: "chevron.down").font(.caption2.weight(.bold)).imageScale(.small)
+    }
+    .foregroundStyle(.white)
+    .contentShape(Rectangle())
   }
 }
 

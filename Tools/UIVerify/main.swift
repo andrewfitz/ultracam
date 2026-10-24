@@ -719,6 +719,40 @@ import SystemExtensions
     render("main-live-model", mainWindow(live), size: CGSize(width: 1320, height: 860), titled: true).forEach { $0.close() }
   }
 
+  // MARK: Picture menus
+
+  /// Menus and popovers take the scheme around the control that opens them. The
+  /// picture's bars once forced dark, which gave light mode dark menus with white text.
+  func pictureMenus() {
+    final class Seen { var schemes: [String: ColorScheme] = [:] }
+    struct Probe: View {
+      let name: String
+      let seen: Seen
+      @Environment(\.colorScheme) private var scheme
+      var body: some View {
+        let _ = (seen.schemes[name] = scheme)
+        Color.clear.frame(width: 8, height: 8)
+      }
+    }
+    for dark in [false, true] {
+      let seen = Seen()
+      let expected: ColorScheme = dark ? .dark : .light
+      let hosted = HostedView(HStack {
+        Probe(name: "controls", seen: seen).uiPictureControls()
+        Probe(name: "menu", seen: seen).uiPictureMenuBacking()
+        Probe(name: "overlay", seen: seen).uiPictureOverlay()
+      }, size: CGSize(width: 200, height: 40), dark: dark)
+      let mode = dark ? "dark" : "light"
+      verifier.check("picture control bar keeps the \(mode) scheme for its menus", seen.schemes["controls"] == expected,
+        "\(String(describing: seen.schemes["controls"]))")
+      verifier.check("picture menu keeps the \(mode) scheme", seen.schemes["menu"] == expected,
+        "\(String(describing: seen.schemes["menu"]))")
+      verifier.check("picture overlay text stays dark in \(mode) mode", seen.schemes["overlay"] == .dark,
+        "\(String(describing: seen.schemes["overlay"]))")
+      hosted.close()
+    }
+  }
+
   // MARK: Device discovery
 
   /// Hot-plug and Start refusals against a scripted device list; no hardware.
@@ -933,6 +967,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   do { try run.lutModel() } catch { verifier.check("LUT model tests threw", false, "\(error)") }
   do { try MonitorLUTVerify.run(verifier: verifier) } catch { verifier.check("monitor LUT tests threw", false, "\(error)") }
   run.discovery()
+  run.pictureMenus()
   run.menuBar()
   Images.waitForWrites()
   print("""

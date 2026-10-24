@@ -281,12 +281,13 @@ struct UICameraPictureView: View {
       }
       .pickerStyle(.inline)
     } label: {
-      Text(Self.stageTitle(stage)).font(.uiOverlay)
+      UIPictureMenuLabel(title: Self.stageTitle(stage))
     }
-    .menuStyle(.borderlessButton)
-    .menuIndicator(.visible)
+    .menuStyle(.button)
+    .buttonStyle(.plain)
+    .menuIndicator(.hidden)
     .fixedSize()
-    .uiPictureOverlay()
+    .uiPictureMenuBacking()
     .help("Choose what this picture shows")
     .accessibilityLabel("Picture signal")
     .accessibilityValue(Self.stageTitle(stage))
@@ -314,9 +315,11 @@ struct UICameraPictureView: View {
         }
         .pickerStyle(.inline)
       } label: {
-        Text(zoom == 1 ? "Fit" : "\(Int(zoom * 100))%").font(.uiOverlay)
+        UIPictureMenuLabel(title: zoom == 1 ? "Fit" : "\(Int(zoom * 100))%").font(.uiOverlay)
       }
-      .menuStyle(.borderlessButton)
+      .menuStyle(.button)
+      .buttonStyle(.plain)
+      .menuIndicator(.hidden)
       .fixedSize()
       .padding(.horizontal, 6)
       .frame(minWidth: 36, minHeight: 24)
