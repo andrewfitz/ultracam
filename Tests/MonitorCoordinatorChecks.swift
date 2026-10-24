@@ -1227,4 +1227,30 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertTrue(value.captureSink(for: .program) === program)
     XCTAssertEqual(presenter.target, beta, "A surface still bound to it says so")
   }
+
+  func testFocusAnalysisUsesTheStageAvailableToThePicture() {
+    XCTAssertEqual(
+      MonitorSurfaceRenderLoop.focusAnalysisStage(
+        requested: .monitor, monitorLUTEnabled: false, hasMonitorLUT: true, hasBurnInLUT: true,
+        hasDistinctOutputReading: false),
+      .output,
+      "A disabled monitor LUT makes monitor-stage peaking use the output stage")
+    XCTAssertEqual(
+      MonitorSurfaceRenderLoop.focusAnalysisStage(
+        requested: .monitor, monitorLUTEnabled: true, hasMonitorLUT: true, hasBurnInLUT: true,
+        hasDistinctOutputReading: false),
+      .monitor)
+    XCTAssertEqual(
+      MonitorSurfaceRenderLoop.focusAnalysisStage(
+        requested: .monitor, monitorLUTEnabled: false, hasMonitorLUT: true, hasBurnInLUT: false,
+        hasDistinctOutputReading: false),
+      .source,
+      "With no LUT at all, monitor-stage peaking uses the source stage")
+    XCTAssertEqual(
+      MonitorSurfaceRenderLoop.focusAnalysisStage(
+        requested: .output, monitorLUTEnabled: true, hasMonitorLUT: false, hasBurnInLUT: false,
+        hasDistinctOutputReading: true),
+      .output,
+      "A distinct output reading remains observable without a burn-in LUT")
+  }
 }

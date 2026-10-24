@@ -1289,9 +1289,28 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let pass = try picturePass(core)
     context.keep(frame)
     if state.focus.enabled && !state.clean {
-      try feed.analyze(frame, focus: state.focus, into: context.submission)
+      var focus = state.focus
+      focus.stage = Self.focusAnalysisStage(
+        requested: focus.stage, monitorLUTEnabled: state.monitorLUT, hasMonitorLUT: feed.monitorLUT != nil,
+        hasBurnInLUT: feed.burnInLUT != nil, hasDistinctOutputReading: frame.signal.hasDistinctOutputReading)
+      try feed.analyze(frame, focus: focus, into: context.submission)
     }
     try pass.encode(frame: frame, feed: feed, state: state, target: target, clear: true, into: context.submission)
+  }
+
+  /// Resolves the focus stage to the stage MonitorPass will validate. A monitor
+  /// stage without an enabled monitor LUT is the output stage; an output stage
+  /// without a burn-in LUT is the source stage unless its distinct output
+  /// reading still makes it observable. Keeping analysis and pass validation on
+  /// the same effective stage avoids rebuilding a mask that the pass rejects.
+  static func focusAnalysisStage(
+    requested: SignalStage, monitorLUTEnabled: Bool, hasMonitorLUT: Bool, hasBurnInLUT: Bool,
+    hasDistinctOutputReading: Bool
+  ) -> SignalStage {
+    var stage = requested
+    if stage == .monitor && !(monitorLUTEnabled && hasMonitorLUT) { stage = .output }
+    if stage == .output && !hasBurnInLUT && !hasDistinctOutputReading { stage = .source }
+    return stage
   }
 
   private func picturePass(_ core: MonitorGPUContext.Core) throws -> MonitorPass {
