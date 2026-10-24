@@ -425,7 +425,12 @@ extension MonitorLifecycleChecks {
     let shown = snapshot.programMonitor.surfaceState(isProgram: true)
     XCTAssertFalse(shown.focus.enabled, "No peaking on Program")
     XCTAssertEqual(shown.falseColor.mode, .off, "No log false colour on Program")
-    XCTAssertFalse(shown.zebras[0].enabled, "The configured false colour still suppresses zebra")
+    // dcf3325: a false-colour mode suppresses zebra only where it is drawn, so
+    // Program, which draws no log false colour, keeps its zebra.
+    XCTAssertTrue(shown.zebras[0].enabled, "Log false colour is not drawn on Program, so zebra stays")
+    let camera = snapshot.programMonitor.surfaceState(isProgram: false)
+    XCTAssertEqual(camera.falseColor.mode, .sonySLog3)
+    XCTAssertFalse(camera.zebras[0].enabled, "Where the declared false colour is drawn it suppresses zebra")
   }
 
   func testMigrationWorkspaceKeepsItsJSON() throws {

@@ -361,7 +361,8 @@ extension MonitorCoordinatorChecks {
 
   /// MonitorToolsUITests:828. An older sequence, an older revision, another
   /// target's frame and a retired generation never replace the newest frame, and
-  /// an equal stamp is a valid repeat. (MonitorTools' processing revision has no
+  /// an equal stamp is the same source frame, so it is not accepted again
+  /// (5475c82; MonitorTools took it as a repeat). (MonitorTools' processing revision has no
   /// counterpart: the Output stage is the source plus the LUT in the shader.)
   func testOutOfOrderCompletionCannotRollBackOrChangeTheSurfaceTarget() throws {
     let recorder = PortedDeliveryRecorder()
@@ -390,8 +391,9 @@ extension MonitorCoordinatorChecks {
     presenter.accept(delivery(9, revision: 2))
     presenter.accept(delivery(9, revision: 3, target: "other"))
     XCTAssertEqual(presenter.currentStamp, newest.stamp)
-    presenter.accept(newest)  // An equal stamp is a valid repeat.
-    XCTAssertEqual(presenter.statistics.acceptedFrames, 2)
+    presenter.accept(newest)  // An equal stamp is the same frame: not accepted again.
+    XCTAssertEqual(presenter.currentStamp, newest.stamp)
+    XCTAssertEqual(presenter.statistics.acceptedFrames, 1)
     presenter.setUnavailable("Feed stopped")
     presenter.accept(delivery(7, revision: 3))
     XCTAssertNil(presenter.currentStamp)
