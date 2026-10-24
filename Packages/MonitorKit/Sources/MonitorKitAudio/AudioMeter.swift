@@ -120,6 +120,10 @@ public final class AudioMeter: @unchecked Sendable {
   private let scalars: UnsafeMutablePointer<Scalars>
 
   private let runsFIR: Bool
+  private let runsSamplePeak: Bool
+  private let runsTruePeak: Bool
+  private let runsPeakBallistics: Bool
+  private let runsPPMFromPhases: Bool
   private let runsVU: Bool
   private let runsPPM: Bool
   private let runsRMS: Bool
@@ -140,14 +144,17 @@ public final class AudioMeter: @unchecked Sendable {
     let fs = configuration.sampleRate
     let kinds = configuration.meters
     channelCount = configuration.channelCount
+    runsSamplePeak = kinds.contains(.samplePeak)
+    runsTruePeak = kinds.contains(.truePeak)
+    runsPeakBallistics = runsSamplePeak || runsTruePeak
     runsVU = kinds.contains(.vu)
     runsPPM = kinds.contains(.ppm)
     runsRMS = kinds.contains(.rms)
     interpolator = TruePeakInterpolator(oversampling: TruePeakFilter.oversampling(sampleRate: fs))
     ppmInput = PPMInput.forSampleRate(fs)
     precondition(ppmInput.lanes <= 4, "the PPM takes at most four values per step")
-    let ppmFromPhases = if case .phases = ppmInput { true } else { false }
-    runsFIR = kinds.contains(.truePeak) || (runsPPM && ppmFromPhases)
+    runsPPMFromPhases = if case .phases = ppmInput { true } else { false }
+    runsFIR = runsTruePeak || (runsPPM && runsPPMFromPhases)
 
     // The history also holds a folded PPM's open step.
     stage = PlanarStage(
@@ -183,7 +190,7 @@ public final class AudioMeter: @unchecked Sendable {
       (envelopes + l).initialize(to: envelope)
       for k in 0..<4 { (phases + l * 4 + k).initialize(to: k < interpolator.phaseCount ? chunk() : envelope) }
     }
-    if ppmFromPhases {
+    if runsPPMFromPhases {
       ppmLanes = phases
       ppmEnvelopes = envelopes
     } else {
@@ -429,12 +436,15 @@ public final class AudioMeter: @unchecked Sendable {
     var offset = 0
     while offset < frameCount {
       let n = min(frameCount - offset, Self.chunkFrames)
+      // The decay factor depends only on this chunk's length. Compute it once
+      // instead of paying for the same exp() once per channel group member.
+      let decay = runsPeakBallistics ? exp(decayPerFrame * Double(n)) : 0
       stage.load(offset: offset, frames: n, format: format)
       if !scalars.pointee.primed {
         forEachIndex(channelCount) { stage.primeHistory($0) }
         scalars.pointee.primed = true
       }
-      forEachIndex(groupCount) { measure(group: $0, frames: n) }
+      forEachIndex(groupCount) { measure(group: $0, frames: n, decay: decay) }
       advanceRMSTicks(n)
       scalars.pointee.ppmCarry = (scalars.pointee.ppmCarry + n) % ppmInput.fold
       loudness?.process(frames: n)
@@ -451,7 +461,7 @@ public final class AudioMeter: @unchecked Sendable {
   }
 
   /// Every meter of four channels over the current chunk.
-  private func measure(group g: Int, frames n: Int) {
+  private func measure(group g: Int, frames n: Int, decay: Double) {
     let first = g * 4
     let width = min(4, channelCount - first)
     forEachIndex(width) { measurePeaks(channel: first + $0, slot: $0, frames: n) }
@@ -460,7 +470,7 @@ public final class AudioMeter: @unchecked Sendable {
         ppmStates + first, channels: width, lanes: UnsafePointer(ppmLanes), envelopes: UnsafePointer(ppmEnvelopes),
         offset: 0, count: (scalars.pointee.ppmCarry + n) / ppmInput.fold)
     }
-    forEachIndex(width) { measureLevels(channel: first + $0, slot: $0, frames: n) }
+    forEachIndex(width) { measureLevels(channel: first + $0, slot: $0, frames: n, decay: decay) }
   }
 
   /// The sample peak and, through the group's scratch slot, the interpolated
@@ -476,10 +486,14 @@ public final class AudioMeter: @unchecked Sendable {
     var truePeak = peak
     if runsFIR {
       interpolator.interpolate(x, count: n, into: phases)
-      interpolator.envelope(phases: phases, count: n, into: envelope)
-      var interpolated: Float = 0
-      vDSP_maxv(envelope, 1, &interpolated, length)
-      if interpolated > truePeak { truePeak = interpolated }
+      // Phase-based PPM shares this envelope buffer with true peak. Keep
+      // producing it when PPM is enabled even if the true-peak reading is off.
+      if runsTruePeak || (runsPPM && runsPPMFromPhases) {
+        interpolator.envelope(phases: phases, count: n, into: envelope)
+        var interpolated: Float = 0
+        vDSP_maxv(envelope, 1, &interpolated, length)
+        if interpolated > truePeak { truePeak = interpolated }
+      }
     }
     if runsPPM {
       switch ppmInput {
@@ -502,7 +516,7 @@ public final class AudioMeter: @unchecked Sendable {
   }
 
   /// VU, RMS, peak ballistics and clip count.
-  private func measureLevels(channel c: Int, slot: Int, frames n: Int) {
+  private func measureLevels(channel c: Int, slot: Int, frames n: Int, decay: Double) {
     let x = UnsafePointer(stage.samples(c))
     let length = vDSP_Length(n)
     let s = channelState + c
@@ -515,14 +529,17 @@ public final class AudioMeter: @unchecked Sendable {
 
     let peak = s.pointee.chunkPeak
     let truePeak = s.pointee.chunkTruePeak
-    let decay = exp(decayPerFrame * Double(n))
-    Self.ballistics(
-      bar: &s.pointee.sampleBar, hold: &s.pointee.sampleHold, age: &s.pointee.sampleHoldAge,
-      peak: Double(peak), decay: decay, frames: n, holdFrames: holdFrames)
-    Self.ballistics(
-      bar: &s.pointee.trueBar, hold: &s.pointee.trueHold, age: &s.pointee.trueHoldAge,
-      peak: Double(truePeak), decay: decay, frames: n, holdFrames: holdFrames)
-    if Double(truePeak) > s.pointee.trueMax { s.pointee.trueMax = Double(truePeak) }
+    if runsSamplePeak {
+      Self.ballistics(
+        bar: &s.pointee.sampleBar, hold: &s.pointee.sampleHold, age: &s.pointee.sampleHoldAge,
+        peak: Double(peak), decay: decay, frames: n, holdFrames: holdFrames)
+    }
+    if runsTruePeak {
+      Self.ballistics(
+        bar: &s.pointee.trueBar, hold: &s.pointee.trueHold, age: &s.pointee.trueHoldAge,
+        peak: Double(truePeak), decay: decay, frames: n, holdFrames: holdFrames)
+      if Double(truePeak) > s.pointee.trueMax { s.pointee.trueMax = Double(truePeak) }
+    }
     if peak >= clipLevel {
       // vclipc counts strictly outside its bounds, so these count |x| >= clipLevel.
       var low = -clipLevel.nextDown
