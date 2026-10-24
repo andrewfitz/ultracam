@@ -215,6 +215,9 @@ final class ColorAnalysisTests: XCTestCase {
     XCTAssertNil(CodeRange.legal.normalizeLuma(code: 1, bitDepth: 0))
     XCTAssertNil(CodeRange.full.normalizeChroma(code: .nan, bitDepth: 10))
     XCTAssertNil(NativeLogCodeMapping(transportedBlack: 10, transportedWhite: 10))
+    let hugeMapping = NativeLogCodeMapping(transportedBlack: -.greatestFiniteMagnitude, transportedWhite: 0)!
+    XCTAssertNil(hugeMapping.nativeNormalized(transportCode: .greatestFiniteMagnitude),
+                 "overflow must not escape as infinity")
     XCTAssertNil(ColorMath.scopeBin(normalized: .nan, binCount: 256))
     XCTAssertNil(ColorMath.scopeBin(normalized: 0.5, binCount: 0))
     XCTAssertFalse(ColorMath.zebra(ire: .nan, threshold: 70, width: 10, above: true))

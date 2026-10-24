@@ -50,7 +50,8 @@ public struct NativeLogCodeMapping: Equatable, Sendable {
   }
   public func nativeNormalized(transportCode: Double) -> Double? {
     guard transportCode.isFinite else { return nil }
-    return (transportCode - transportedBlack) / (transportedWhite - transportedBlack)
+    let value = (transportCode - transportedBlack) / (transportedWhite - transportedBlack)
+    return value.isFinite ? value : nil
   }
   public static let native10Bit = NativeLogCodeMapping(transportedBlack: 0, transportedWhite: 1023)!
   public static let fullRescaledToLegal10Bit = NativeLogCodeMapping(
