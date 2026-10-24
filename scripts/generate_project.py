@@ -72,11 +72,13 @@ products = add("products", "PBXGroup", children=[app_product, camera_product], n
 group = add("root-group", "PBXGroup", children=list(source_refs.values()) + config_refs + [products], sourceTree="<group>")
 
 
-def configs(key, settings):
+def configs(key, settings, release=None):
     ids = []
     for name in ("Debug", "Release"):
         build = dict(settings)
         build.update(SWIFT_OPTIMIZATION_LEVEL="-Onone" if name == "Debug" else "-O", SWIFT_COMPILATION_MODE="singlefile" if name == "Debug" else "wholemodule")
+        if name == "Release":
+            build.update(release or {})
         ids.append(add(f"{key}-{name}", "XCBuildConfiguration", buildSettings=build, name=name))
     return add(f"{key}-configs", "XCConfigurationList", buildConfigurations=ids, defaultConfigurationIsVisible=0, defaultConfigurationName="Debug")
 
@@ -97,9 +99,19 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
     package_builds = [add(f"{key}-package-{product}", "PBXBuildFile", productRef=product) for product in monitor_products] if key == "app" else []
     frameworks = add(f"{key}-frameworks", "PBXFrameworksBuildPhase", buildActionMask=2147483647, files=package_builds, runOnlyForDeploymentPostprocessing=0)
     settings = dict(PRODUCT_NAME=name, PRODUCT_BUNDLE_IDENTIFIER=bundle_id, INFOPLIST_FILE=plist, CODE_SIGN_ENTITLEMENTS=entitlements, GENERATE_INFOPLIST_FILE="NO", LD_RUNPATH_SEARCH_PATHS="$(inherited) @executable_path/../Frameworks", COMBINE_HIDPI_IMAGES="YES")
+    release = None
     if key == "camera":
         settings.update(PRODUCT_NAME=bundle_id, SKIP_INSTALL="YES")
     else:
+        # Release app only: the linker drops code nothing reaches (-dead_strip; MonitorKit,
+        # the Rust switcher and the app keep every live symbol, ObjC classes and Swift
+        # conformance/metadata sections), and the built product is stripped
+        # (STRIP_INSTALLED_PRODUCT/STRIP_STYLE take effect only with DEPLOYMENT_POSTPROCESSING).
+        # The symbols move to Ultracam.app.dSYM beside the product, so crash logs still
+        # symbolicate. Debug keeps everything; the camera extension's settings are unchanged.
+        release = dict(DEAD_CODE_STRIPPING="YES", DEPLOYMENT_POSTPROCESSING="YES",
+                       STRIP_INSTALLED_PRODUCT="YES", STRIP_STYLE="all",
+                       DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")
         settings.update(ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon",
                         SWIFT_OBJC_BRIDGING_HEADER="Sources/DeckLinkBackend/BridgingHeader.h", DECKLINK_SDK_DIR=sdk_dir,
                         HEADER_SEARCH_PATHS=["$(inherited)", "$(DECKLINK_SDK_DIR)"],
@@ -113,7 +125,7 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
     if key == "app":
         icon_build = add("app-icon-build", "PBXBuildFile", fileRef=icon_catalog_ref)
         phases.append(add("app-icon-resources", "PBXResourcesBuildPhase", buildActionMask=2147483647, files=[icon_build], runOnlyForDeploymentPostprocessing=0))
-    return add(f"{key}-target", "PBXNativeTarget", buildConfigurationList=configs(key, settings), buildPhases=phases, buildRules=[], dependencies=[], packageProductDependencies=monitor_products if key == "app" else [], name=name, productName=name, productReference=product, productType=product_type)
+    return add(f"{key}-target", "PBXNativeTarget", buildConfigurationList=configs(key, settings, release), buildPhases=phases, buildRules=[], dependencies=[], packageProductDependencies=monitor_products if key == "app" else [], name=name, productName=name, productReference=product, productType=product_type)
 
 
 camera_id = target("camera", "UltracamCamera", camera, camera_product, "com.apple.product-type.system-extension", "org.ultracam.app.camera", "Config/Camera-Info.plist", "Config/Camera.entitlements")

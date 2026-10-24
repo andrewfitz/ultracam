@@ -1237,6 +1237,11 @@
 				"OTHER_LDFLAGS" = ("$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv", "-framework", "Security", "-framework", "CoreFoundation", "-framework", "SystemConfiguration");
 				"SWIFT_OPTIMIZATION_LEVEL" = "-O";
 				"SWIFT_COMPILATION_MODE" = "wholemodule";
+				"DEAD_CODE_STRIPPING" = "YES";
+				"DEPLOYMENT_POSTPROCESSING" = "YES";
+				"STRIP_INSTALLED_PRODUCT" = "YES";
+				"STRIP_STYLE" = "all";
+				"DEBUG_INFORMATION_FORMAT" = "dwarf-with-dsym";
 			};
 			"name" = "Release";
 		};
