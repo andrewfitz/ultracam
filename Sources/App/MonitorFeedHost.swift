@@ -49,7 +49,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       guard target == previous.target, generation >= previous.generation else { return false }
       guard generation == previous.generation else { return true }
       guard revision >= previous.revision else { return false }
-      return revision != previous.revision || sequence >= previous.sequence
+      return revision != previous.revision || sequence > previous.sequence
     }
   }
 

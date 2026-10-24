@@ -415,6 +415,10 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     var older = second
     older.sequence = 0
     XCTAssertFalse(older.follows(second), "An older sequence never replaces a newer one")
+    // A retried delivery with the same sequence is the same source frame; it
+    // must not replace the slot or inflate accepted-frame diagnostics.
+    offer(host, image, generation: 2, sequence: 1)
+    XCTAssertEqual(slot.accepted, 2, "Duplicate source sequence is ignored")
     host.invalidate(rejectingCaptureGeneration: 2)
     offer(host, image, generation: 2, sequence: 2)
     offer(host, image, generation: 1, sequence: 3)
