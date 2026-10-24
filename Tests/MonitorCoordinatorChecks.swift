@@ -940,6 +940,106 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     presenter.toggleFreeze()
   }
 
+  /// Every tool reads its own stage's codes the way that stage is decoded, on one
+  /// picture of any stage: a declared range is the Source's alone and the Output
+  /// stage reads as the burn-in does (the format's range; BT.709 for a processed
+  /// SMPTE 240M camera, the tag for one published untouched). Clip indicators at a
+  /// threshold between the two readings tell them apart.
+  func testEveryToolReadsItsOwnStagesReadingOnOnePicture() throws {
+    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let value = coordinator()
+    let (presenter, host) = liveSurface(value)
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba32Float, width: 48, height: 16, mipmapped: false)
+    descriptor.usage = [.renderTarget, .shaderRead]
+    descriptor.storageMode = .shared
+    let target = try XCTUnwrap(core.device.makeTexture(descriptor: descriptor))
+    core.engine.residency.add(target)
+    defer { core.engine.residency.retire(target, resident: target) }
+    var sequence: UInt64 = 0
+    /// The picture of `buffer` with `tools`, every pixel.
+    func draw(_ buffer: CVPixelBuffer, _ tools: MonitorFeedPreferences, untouched: Bool = false) throws
+      -> [SIMD4<Float>]
+    {
+      value.setPreferences(tools, for: alpha)
+      sequence += 1
+      host.offer(buffer, pts: CMTime(value: CMTimeValue(sequence), timescale: 30), captureGeneration: 1,
+        sequence: sequence, untouched: untouched)
+      let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+      let probe = MonitorCompletionProbe()
+      let context = try core.begin()
+      _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
+        context: context)
+      core.commit(context, completion: probe, kind: 1)
+      let deadline = Date().addingTimeInterval(5)
+      while probe.completed == 0 && Date() < deadline { usleep(200) }
+      XCTAssertEqual(probe.failed, 0)
+      var pixels = [SIMD4<Float>](repeating: SIMD4(repeating: 0), count: 48 * 16)
+      target.getBytes(&pixels, bytesPerRow: 48 * 16, from: MTLRegionMake2D(0, 0, 48, 16), mipmapLevel: 0)
+      return pixels
+    }
+    /// Whether the clip indicator marked any pixel: the picture differs from the same one without it.
+    func marks(_ buffer: CVPixelBuffer, picture: SignalStage, clip: ClipIndicatorSettings, untouched: Bool = false,
+      declared range: CodeRange?) throws -> Bool
+    {
+      var tools = value.preferences(for: alpha)
+      tools.toolsEnabled = true
+      tools.signal.range = range
+      tools.setPictureStage(picture)
+      tools.state.clipIndicators = clip
+      tools.state.clipIndicators.enabled = false
+      let plain = try draw(buffer, tools, untouched: untouched)
+      tools.state.clipIndicators.enabled = true
+      let marked = try draw(buffer, tools, untouched: untouched)
+      var index = 0, most: Float = 0
+      while index < plain.count {
+        most = max(most, simd_reduce_max(simd_abs(marked[index] - plain[index])))
+        index += 1
+      }
+      return most > 0.25
+    }
+    var clip = ClipIndicatorSettings()
+    clip.coloring = .uniform
+    clip.overColor = ColorRGB(r: 1, g: 0, b: 1)
+    clip.underColor = ColorRGB(r: 1, g: 0, b: 1)
+    clip.opacity = 1
+
+    // Code 940, a legal 100% white, declared Full (91.9%): over 100% on the Output
+    // stage only, whichever stage the picture shows.
+    let white = try flatV210(y: 940, cb: 512, cr: 512)
+    clip.showsUnder = false
+    clip.high = 100
+    for picture in [SignalStage.source, .output] {
+      clip.stage = .output
+      XCTAssertTrue(try marks(white, picture: picture, clip: clip, declared: .full),
+        "Output-stage clip on a \(picture) picture reads the burn-in's legal range")
+      clip.stage = .source
+      XCTAssertFalse(try marks(white, picture: picture, clip: clip, declared: .full),
+        "Source-stage clip on a \(picture) picture reads the declared Full range")
+      XCTAssertTrue(try marks(white, picture: picture, clip: clip, declared: nil),
+        "Undeclared, the Source stage reads the legal range too")
+    }
+
+    // SMPTE 240M tagged, Y' 940 and Cb 64: B' is Kb, 7.22% as BT.709 reads it and
+    // 8.70% as SMPTE 240M does (ITU-R BT.709-6 §3; SMPTE 240M-1999 §5). Under 8% on blue.
+    let blue = try flatV210(y: 940, cb: 64, cr: 512, matrix: kCVImageBufferYCbCrMatrix_SMPTE_240M_1995)
+    clip.showsOver = false
+    clip.showsUnder = true
+    clip.low = 8
+    (clip.red, clip.green, clip.luma, clip.blue) = (false, false, false, true)
+    for picture in [SignalStage.source, .output] {
+      clip.stage = .output
+      XCTAssertTrue(try marks(blue, picture: picture, clip: clip, declared: nil),
+        "Processed, the Output stage reads BT.709 as the burn-in does (\(picture) picture)")
+      XCTAssertFalse(try marks(blue, picture: picture, clip: clip, untouched: true, declared: nil),
+        "Published untouched, the Output stage keeps the tagged SMPTE 240M (\(picture) picture)")
+      clip.stage = .source
+      XCTAssertFalse(try marks(blue, picture: picture, clip: clip, declared: nil),
+        "The Source stage reads the tagged SMPTE 240M (\(picture) picture)")
+    }
+  }
+
   /// The stage a picture reads: its own, or the one false colour classifies while
   /// it replaces the picture; scopes and focus read their own stage.
   func testPictureReadingFollowsTheStageItShows() throws {

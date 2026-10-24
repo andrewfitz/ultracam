@@ -60,17 +60,19 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     /// Nil for a pixel format MonitorKit does not read.
     let layout: PixelLayout?
-    /// The attachments' signal with the feed's declaration applied: how the Source
-    /// stage, and the log classifiers, read the frame.
+    /// The attachments' signal with the feed's declaration applied, carrying both
+    /// readings of the codes. Its range and matrix are the Source stage's (and the
+    /// log classifiers'). Its `outputReading`, set when it differs, is how the
+    /// Output and Monitor stages read them: as the camera's processing decodes the
+    /// frame for the burn-in LUT (`LUTProcessor.parameters`: the pixel format's
+    /// code range and its Y'CbCr matrix, BT.709 for any but BT.2020 and BT.601); a
+    /// frame the camera publishes untouched keeps its tagged matrix, as its
+    /// passthrough copy does. A declared code range is the Source stage's alone,
+    /// so the Output (LUT) picture, and every tool on the Output and Monitor
+    /// stages, read what Program, recording and the virtual camera get. MonitorKit
+    /// decodes each stage with its own reading in the same pass. Program's frames
+    /// have one reading.
     let signal: SignalDescription
-    /// How the Output and Monitor stages read the frame: as the camera's processing
-    /// decodes it for the burn-in LUT (`LUTProcessor.parameters`: the pixel format's
-    /// code range and its Y'CbCr matrix, BT.709 for any but BT.2020 and BT.601),
-    /// with the declared log encoding; a frame the camera publishes untouched keeps
-    /// its tagged matrix, as its passthrough copy does. A declared code range is the
-    /// Source stage's alone, so the Output (LUT) picture is what Program, recording
-    /// and the virtual camera get. Program's is `signal`.
-    let outputSignal: SignalDescription
     /// Size, pixel aspect ratio and clean aperture (top-left origin, ISO/IEC 14496-12).
     let geometry: MonitorFrameGeometry
     /// The `MonitorFrame.id` every surface of the feed gives this frame, so the
@@ -81,29 +83,31 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
 
     init(
       stamp: Stamp, pixelBuffer: CVPixelBuffer, layout: PixelLayout?, signal: SignalDescription,
-      outputSignal: SignalDescription? = nil, geometry: MonitorFrameGeometry, frameID: UInt64, isProcessed: Bool
+      geometry: MonitorFrameGeometry, frameID: UInt64, isProcessed: Bool
     ) {
       self.stamp = stamp
       self.pixelBuffer = pixelBuffer
       self.layout = layout
       self.signal = signal
-      self.outputSignal = outputSignal ?? signal
       self.geometry = geometry
       self.frameID = frameID
       self.isProcessed = isProcessed
     }
 
-    /// The signal a pass that measures `stage` reads the frame with.
-    func signal(reading stage: SignalStage) -> SignalDescription {
-      stage == .source ? signal : outputSignal
-    }
+    /// The Output and Monitor stages' reading as a signal of its own
+    /// (`SignalDescription.outputSignal`); `signal` when there is no other reading.
+    var outputSignal: SignalDescription { signal.signal(for: .output) }
+
+    /// The signal a pass that measures `stage` alone reads the frame with
+    /// (`SignalDescription.signal(for:)`).
+    func signal(reading stage: SignalStage) -> SignalDescription { signal.signal(for: stage) }
   }
 
-  /// The stage whose reading a picture of `state` takes: its picture stage, or,
-  /// while false colour replaces the picture, the stage it classifies (the Source
-  /// for a log mode that reads the signal's log encoding; six-band and custom
-  /// bands their own stage). Other tools on another stage than the picture's
-  /// read it as the picture does: MonitorKit decodes a frame once per pass.
+  /// The stage whose reading a picture of `state` shows, for describing it: its
+  /// picture stage, or, while false colour replaces the picture, the stage it
+  /// classifies (the Source for a log mode that reads the signal's log encoding;
+  /// six-band and custom bands their own stage). It does not change how a frame
+  /// is decoded: every stage's tools read that stage's own reading.
   static func pictureReading(_ state: MonitorState, signal: SignalDescription) -> SignalStage {
     let falseColor = state.falseColor
     guard !state.clean else { return state.pictureStage }
@@ -156,7 +160,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private var revision: UInt64 = 1
   private struct Identity: Equatable {
     let layout: PixelLayout?
-    let signals: Signals
+    let signal: SignalDescription
     let geometry: MonitorFrameGeometry
   }
   private var identity: Identity?
@@ -452,11 +456,11 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     }
     let format = CVPixelBufferGetPixelFormatType(image)
     let layout = MonitorFrame.layout(for: format)
-    let signals = Self.interpret(
+    let signal = Self.interpret(
       image, format: format, range: layout?.range ?? .legal, declaration: declaration, processed: isProgram,
       untouched: untouched, cache: &interpretation)
     let geometry = cachedGeometry(image, format: format)
-    let current = Identity(layout: layout?.layout, signals: signals, geometry: geometry)
+    let current = Identity(layout: layout?.layout, signal: signal, geometry: geometry)
     if identity != current {
       identity = current
       revision &+= 1
@@ -471,8 +475,8 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       stamp: Stamp(
         target: target, generation: generation, sequence: sequence, sourcePTS: pts.seconds, hostTime: now,
         revision: revision),
-      pixelBuffer: image, layout: layout?.layout, signal: signals.source, outputSignal: signals.output,
-      geometry: geometry, frameID: frameID, isProcessed: isProgram)
+      pixelBuffer: image, layout: layout?.layout, signal: signal, geometry: geometry, frameID: frameID,
+      isProcessed: isProgram)
     // Under the lock, so a setConsumers that removes a surface cannot race a frame
     // into it. accept() only swaps a slot; it never calls back here.
     for consumer in consumers { consumer.accept(delivery) }
@@ -529,22 +533,15 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     }
   }
 
-  /// A frame's readings: the Source stage's and the Output and Monitor stages'
-  /// (`Delivery.signal`, `Delivery.outputSignal`).
-  private struct Signals: Equatable {
-    let source: SignalDescription
-    let output: SignalDescription
-  }
-
   private struct Interpretation {
     let tags: ColorTags
     let format: OSType
     let declaration: MonitorSignalDeclaration?
     let untouched: Bool
-    let signals: Signals
+    let signal: SignalDescription
   }
 
-  /// The cached signals while nothing they depend on changed; otherwise fresh ones
+  /// The cached signal while nothing it depends on changed; otherwise a fresh one
   /// (which may allocate), cached for the next frame. Primaries are read on their
   /// own, so HLG or PQ with BT.709 primaries keeps BT.709. `untouched`: the camera
   /// publishes the frame as captured, tags included, so the Output stage keeps
@@ -552,45 +549,41 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private static func interpret(
     _ image: CVPixelBuffer, format: OSType, range: CodeRange, declaration: MonitorSignalDeclaration?,
     processed: Bool, untouched: Bool, cache: inout Interpretation?
-  ) -> Signals {
+  ) -> SignalDescription {
     let tags = ColorTags(image)
     if let cached = cache, cached.format == format, cached.declaration == declaration,
       cached.untouched == untouched, cached.tags.matches(tags) {
-      return cached.signals
+      return cached.signal
     }
     let native = MonitorFrame.signal(of: image, range: range)
-    let signals: Signals
-    if processed {
-      signals = Signals(source: native, output: native)
-    } else {
-      let source = declaration?.applied(to: native) ?? native
-      // As published: the format's range, and the matrices LUTProcessor reads
-      // (an untouched frame keeps its tag, as the passthrough copy does).
-      var output = source
-      output.range = native.range
-      if output.matrix == .smpte240m && !untouched { output.matrix = .bt709 }
-      signals = Signals(source: source, output: output)
+    var signal = native
+    if !processed {
+      signal = declaration?.applied(to: native) ?? native
+      // The Output and Monitor stages read the frame as it is published: the
+      // format's range, and the matrices LUTProcessor reads (an untouched frame
+      // keeps its tag, as the passthrough copy does).
+      let output = SignalReading(
+        range: native.range, matrix: signal.matrix == .smpte240m && !untouched ? .bt709 : signal.matrix)
+      signal.outputReading = output == signal.sourceReading ? nil : output
     }
     cache = Interpretation(tags: tags, format: format, declaration: declaration, untouched: untouched,
-      signals: signals)
-    return signals
+      signal: signal)
+    return signal
   }
 
-  /// `image` read as this host reads every offered frame on the Source stage (tests, tools).
-  func signal(of image: CVPixelBuffer) -> SignalDescription { signals(of: image, untouched: false).source }
-
-  /// `image` read as this host reads every offered frame on the Output and Monitor
-  /// stages; `untouched` as `offer` takes it.
-  func outputSignal(of image: CVPixelBuffer, untouched: Bool = false) -> SignalDescription {
-    signals(of: image, untouched: untouched).output
-  }
-
-  private func signals(of image: CVPixelBuffer, untouched: Bool) -> Signals {
+  /// `image` read as this host reads every offered frame (`Delivery.signal`, both
+  /// readings); `untouched` as `offer` takes it (tests, tools).
+  func signal(of image: CVPixelBuffer, untouched: Bool = false) -> SignalDescription {
     let format = CVPixelBufferGetPixelFormatType(image)
     var cache: Interpretation?
     return Self.interpret(
       image, format: format, range: MonitorFrame.layout(for: format)?.range ?? .legal,
       declaration: lock.withLock { declaration }, processed: isProgram, untouched: untouched, cache: &cache)
+  }
+
+  /// `image` as the Output and Monitor stages alone read it (`Delivery.outputSignal`).
+  func outputSignal(of image: CVPixelBuffer, untouched: Bool = false) -> SignalDescription {
+    signal(of: image, untouched: untouched).signal(for: .output)
   }
 
   // MARK: - Render thread
@@ -652,8 +645,11 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// the `Delivery` instead (a pending scope tick, a Freeze source) and wrap it
   /// again at each encode.
   ///
-  /// `stage` is the stage the pass measures: the frame carries that stage's
-  /// reading (`Delivery.signal(reading:)`).
+  /// The frame carries `Delivery.signal`, both readings, whatever `stage` a pass
+  /// measures: MonitorKit decodes each stage with its own (the picture's Source
+  /// and Output tools, a scope, a focus analysis), so `stage` changes nothing.
+  /// Relabelling a frame with one stage's reading would make the other stages'
+  /// tools read the codes with it.
   func frame(
     _ delivery: Delivery, in context: MonitorGPUContext.EncodeContext, core: MonitorGPUContext.Core,
     reading stage: SignalStage = .source
@@ -698,7 +694,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     }
     var frame = try MonitorFrame(
       layout: layout, width: width, height: height, packed: packed, luma: luma, chroma: chroma,
-      signal: delivery.signal(reading: stage), pixelAspectRatio: delivery.geometry.pixelAspectRatio,
+      signal: delivery.signal, pixelAspectRatio: delivery.geometry.pixelAspectRatio,
       cleanAperture: delivery.geometry.cleanAperture)
     frame.id = delivery.frameID
     frame.isProcessed = delivery.isProcessed

@@ -41,6 +41,9 @@ final class MonitorGPUContext: @unchecked Sendable {
   private let buildLock = NSLock()
   private let deviceProvider: @Sendable () -> MTLDevice?
   private let gpuTiming: @Sendable (Double, Double) -> Void
+  /// Where MonitorKit keeps its pipeline warm start (`MonitorPipelineArchive`
+  /// files of both engines); nil for none.
+  let pipelineCacheDirectory: URL?
   private var built: Core?
   private var failure: Error?
   private var retryAt = 0.0
@@ -52,10 +55,30 @@ final class MonitorGPUContext: @unchecked Sendable {
     device: @escaping @Sendable () -> MTLDevice? = { LUTProcessor.sharedDevice },
     gpuTiming: @escaping @Sendable (Double, Double) -> Void = { start, end in
       AppGPUActivity.shared.record(start: start, end: end)
-    }
+    },
+    pipelineCacheDirectory: URL? = nil
   ) {
     deviceProvider = device
     self.gpuTiming = gpuTiming
+    self.pipelineCacheDirectory = pipelineCacheDirectory
+  }
+
+  /// The app's pipeline warm start: `Library/Caches/<bundle id>/MonitorKitPipelines`
+  /// (inside the app's container under the sandbox). Nil in a process with no
+  /// bundle identifier (tests, tools), so they never touch the app's files: an
+  /// archive save removes the files other shader builds left there. The directory
+  /// is made by the first save (`MonitorPipelineArchive.save`), off the frame path.
+  static func pipelineCacheDirectory(bundleIdentifier: String?, caches: URL?) -> URL? {
+    guard let bundleIdentifier, !bundleIdentifier.isEmpty, let caches else { return nil }
+    return caches.appendingPathComponent(bundleIdentifier, isDirectory: true)
+      .appendingPathComponent("MonitorKitPipelines", isDirectory: true)
+  }
+
+  /// `pipelineCacheDirectory(bundleIdentifier:caches:)` for this process.
+  static var appPipelineCacheDirectory: URL? {
+    pipelineCacheDirectory(
+      bundleIdentifier: Bundle.main.bundleIdentifier,
+      caches: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first)
   }
 
   deinit { renderThread.stop() }
@@ -72,7 +95,7 @@ final class MonitorGPUContext: @unchecked Sendable {
       guard let device = deviceProvider() else {
         throw MonitorKitError.gpu("No Metal device for the monitor.")
       }
-      made = try Core(device: device, gpuTiming: gpuTiming)
+      made = try Core(device: device, gpuTiming: gpuTiming, pipelineCacheDirectory: pipelineCacheDirectory)
     } catch {
       stateLock.withLock {
         failure = error
@@ -188,7 +211,14 @@ final class MonitorGPUContext: @unchecked Sendable {
     private var abandonedDrawables = 0
     private var maintenance: DispatchSourceTimer?
 
-    init(device: MTLDevice, gpuTiming: @escaping @Sendable (Double, Double) -> Void) throws {
+    /// With `pipelineCacheDirectory`, both engines warm-start from the pipeline
+    /// archives earlier launches saved there and save this session's (MonitorKit
+    /// builds with the archive's own compiler then); an engine that cannot be made
+    /// with the cache is made without it, so a bad cache never costs the monitor.
+    init(
+      device: MTLDevice, gpuTiming: @escaping @Sendable (Double, Double) -> Void,
+      pipelineCacheDirectory: URL? = nil
+    ) throws {
       guard device.supportsFamily(.metal4) else {
         throw MonitorKitError.gpu("The monitor needs a Metal 4 device.")
       }
@@ -197,9 +227,16 @@ final class MonitorGPUContext: @unchecked Sendable {
       let queueDescriptor = MTL4CommandQueueDescriptor()
       queueDescriptor.label = "Ultracam monitor"
       queue = try device.makeMTL4CommandQueue(descriptor: queueDescriptor)
-      compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
-      engine = try MonitorEngine(device: device, compiler: compiler)
-      scopeEngine = try ScopeEngine(device: device, residency: engine.residency)
+      let hostCompiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
+      let cached = pipelineCacheDirectory.flatMap { try? MonitorEngine(device: device, cacheDirectory: $0) }
+      let engine = try cached ?? MonitorEngine(device: device, compiler: hostCompiler)
+      let shared = engine.residency
+      let cachedScopes = pipelineCacheDirectory.flatMap {
+        try? ScopeEngine(device: device, residency: shared, cacheDirectory: $0)
+      }
+      self.engine = engine
+      compiler = engine.compiler ?? hostCompiler
+      scopeEngine = try cachedScopes ?? ScopeEngine(device: device, residency: shared)
       frames = MonitorTextureCache(device: device, residency: engine.residency)
       let residency = MTLResidencySetDescriptor()
       residency.label = "Ultracam monitor host"
@@ -221,7 +258,8 @@ final class MonitorGPUContext: @unchecked Sendable {
 
     /// Builds every picture, focus, Freeze and scope pipeline the app's three layer
     /// formats can need, so a switch to an HDR layer never compiles on the render
-    /// thread. Returns the pipelines built.
+    /// thread. Returns the pipelines built. With a pipeline cache both engines save
+    /// their archives before returning (`prepare()` runs this off the main thread).
     @discardableResult
     func warmUp() throws -> Int {
       let built = try engine.warmUp()

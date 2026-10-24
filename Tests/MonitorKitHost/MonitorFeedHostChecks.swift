@@ -248,11 +248,17 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     let declared = try XCTUnwrap(cameraSlot.latest)
     XCTAssertEqual(declared.signal.encoding, .log(try XCTUnwrap(LogEncoding(profileID: "sony-slog3-sgamut3cine"))))
     XCTAssertEqual(declared.signal.range, .full)
-    XCTAssertEqual(declared.outputSignal.range, .legal, "The burn-in reads the format's range, as LUTProcessor does")
+    XCTAssertNil(before.signal.outputReading, "Undeclared: the stages read the codes alike")
+    XCTAssertEqual(declared.signal.outputReading, SignalReading(range: .legal, matrix: .bt709),
+      "The burn-in reads the format's range, as LUTProcessor does; the signal carries both readings")
+    XCTAssertTrue(declared.signal.hasDistinctOutputReading)
+    XCTAssertEqual(declared.outputSignal.range, .legal)
+    XCTAssertNil(declared.outputSignal.outputReading)
     XCTAssertEqual(declared.outputSignal.encoding, declared.signal.encoding)
     XCTAssertEqual(declared.signal(reading: .source), declared.signal)
     XCTAssertEqual(declared.signal(reading: .output), declared.outputSignal)
     XCTAssertEqual(declared.signal(reading: .monitor), declared.outputSignal)
+    XCTAssertEqual(camera.signal(of: image), declared.signal)
     XCTAssertGreaterThan(declared.stamp.revision, before.stamp.revision)
     XCTAssertTrue(declared.stamp.follows(before.stamp))
 
@@ -264,6 +270,10 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertTrue(mix.isProcessed)
     XCTAssertEqual(mix.signal.encoding, .display(.bt709))
     XCTAssertEqual(mix.outputSignal, mix.signal, "Program has one reading")
+    XCTAssertNil(mix.signal.outputReading)
+    program.setSignalDeclaration(MonitorSignalDeclaration(range: .full))
+    offer(program, image, sequence: 2)
+    XCTAssertNil(try XCTUnwrap(programSlot.latest).signal.outputReading, "Program takes no declaration")
     if let device = LUTProcessor.sharedDevice {
       let lut = try LUTProcessor.makeLUT(try CubeLUT(text: "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"), device: device)
       program.burnInLUT = lut
@@ -276,7 +286,8 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
   /// The Output and Monitor stages decode as the burn-in does: SMPTE 240M as
   /// BT.709 (LUTProcessor's matrices are BT.2020, BT.601 and otherwise BT.709),
   /// and a declared range never; the Source stage keeps the tag and the
-  /// declaration. A frame wrapped for a stage carries that stage's levels.
+  /// declaration. The frame carries both readings whatever stage a pass
+  /// measures, so each stage decodes with its own levels and matrix.
   func testOutputStagesDecodeAsTheBurnIn() throws {
     let image = try greyV210()
     CVBufferSetAttachment(
@@ -289,19 +300,25 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     offer(camera, image, sequence: 1)
     let delivery = try XCTUnwrap(slot.latest)
     XCTAssertEqual(delivery.signal.matrix, .smpte240m)
+    XCTAssertEqual(delivery.signal.outputReading, SignalReading(range: .legal, matrix: .bt709))
     XCTAssertEqual(delivery.outputSignal.matrix, .bt709)
+    let decode = LUTProcessor.parameters(for: image, matrix: kCVImageBufferYCbCrMatrix_SMPTE_240M_1995 as String,
+      lut: nil).decodeRange
     let completion = Completion()
     try core.submit(completion: completion) { context in
-      let source = try camera.frame(delivery, in: context, core: core)
-      let output = try camera.frame(delivery, in: context, core: core, reading: .output)
-      let monitor = try camera.frame(delivery, in: context, core: core, reading: .monitor)
-      XCTAssertEqual(source.parameters.levels, SIMD4(0, 1023, 512, 1023), "Source: the declared Full range")
-      XCTAssertEqual(output.parameters.levels, SIMD4(64, 876, 512, 896), "Output: the legal range LUTProcessor reads")
-      XCTAssertEqual(monitor.parameters.levels, output.parameters.levels)
-      let decode = LUTProcessor.parameters(for: image, matrix: kCVImageBufferYCbCrMatrix_SMPTE_240M_1995 as String,
-        lut: nil).decodeRange
-      XCTAssertEqual(output.parameters.levels, decode, "The same levels as the burn-in's decode")
-      XCTAssertEqual(source.id, output.id, "One picture, analysed once")
+      let frame = try camera.frame(delivery, in: context, core: core)
+      XCTAssertEqual(frame.signal, delivery.signal, "Both readings reach MonitorKit")
+      let source = frame.parameters(for: .source), output = frame.parameters(for: .output)
+      XCTAssertEqual(source.levels, SIMD4(0, 1023, 512, 1023), "Source: the declared Full range")
+      XCTAssertEqual(output.levels, SIMD4(64, 876, 512, 896), "Output: the legal range LUTProcessor reads")
+      XCTAssertEqual(frame.parameters(for: .monitor), output)
+      XCTAssertEqual(output.levels, decode, "The same levels as the burn-in's decode")
+      XCTAssertNotEqual(output.matrix, source.matrix, "Output: BT.709, not the tagged SMPTE 240M")
+      for stage in [SignalStage.source, .output, .monitor] {
+        let measured = try camera.frame(delivery, in: context, core: core, reading: stage)
+        XCTAssertEqual(measured.signal, frame.signal, "A pass on \(stage) is never relabelled")
+        XCTAssertEqual(measured.id, frame.id, "One picture, analysed once")
+      }
     }
     XCTAssertTrue(completion.wait())
 
@@ -312,6 +329,7 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     let untouched = try XCTUnwrap(slot.latest)
     XCTAssertEqual(untouched.stamp.sequence, 2)
     XCTAssertEqual(untouched.signal.matrix, .smpte240m)
+    XCTAssertEqual(untouched.signal.outputReading, SignalReading(range: .legal, matrix: .smpte240m))
     XCTAssertEqual(untouched.outputSignal.matrix, .smpte240m, "Published untouched: the tag stays")
     XCTAssertEqual(untouched.outputSignal.range, .legal)
     XCTAssertGreaterThan(untouched.stamp.revision, delivery.stamp.revision, "The Output reading changed")
@@ -319,14 +337,68 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertEqual(try XCTUnwrap(slot.latest).outputSignal.matrix, .bt709, "Processed again: the burn-in's BT.709")
     let passthrough = Completion()
     try core.submit(completion: passthrough) { context in
-      let source = try camera.frame(untouched, in: context, core: core)
-      let output = try camera.frame(untouched, in: context, core: core, reading: .output)
-      XCTAssertEqual(output.parameters.levels, SIMD4(64, 876, 512, 896), "Output: the format's legal range")
-      XCTAssertEqual(output.parameters.matrix, source.parameters.matrix, "Output: the tagged SMPTE 240M decode")
-      let processed = try camera.frame(delivery, in: context, core: core, reading: .output)
-      XCTAssertNotEqual(output.parameters.matrix, processed.parameters.matrix, "Not the burn-in's BT.709")
+      let frame = try camera.frame(untouched, in: context, core: core)
+      let source = frame.parameters(for: .source), output = frame.parameters(for: .output)
+      XCTAssertEqual(output.levels, SIMD4(64, 876, 512, 896), "Output: the format's legal range")
+      XCTAssertEqual(output.matrix, source.matrix, "Output: the tagged SMPTE 240M decode")
+      let processed = try camera.frame(delivery, in: context, core: core).parameters(for: .output)
+      XCTAssertNotEqual(output.matrix, processed.matrix, "Not the burn-in's BT.709")
     }
     XCTAssertTrue(passthrough.wait())
+
+    // Undeclared and untouched, the stages read the codes alike: no second reading,
+    // so MonitorKit draws exactly as for a single-reading frame.
+    camera.setSignalDeclaration(nil)
+    camera.offer(image, pts: CMTime(value: 4, timescale: 60), captureGeneration: 1, sequence: 4, untouched: true)
+    let alike = try XCTUnwrap(slot.latest)
+    XCTAssertNil(alike.signal.outputReading)
+    XCTAssertEqual(alike.outputSignal, alike.signal)
+  }
+
+  /// Peaking on the Output stage of a camera declared Full: the mask the surface
+  /// analyses (the frame, or the frame read as its Output stage alone) is the one
+  /// the picture shows; a mask analysed with the declared range is not.
+  func testOutputStageFocusMaskIsAnalysedWithTheBurnInReading() throws {
+    let (gpu, core) = try gpuCore()
+    let (camera, slot) = host("focus", gpu: gpu)
+    camera.setSignalDeclaration(MonitorSignalDeclaration(range: .full))
+    let image = try greyV210()
+    let pass = core.engine.makePass()
+    let target = try target(core, width: 48, height: 16)
+    defer {
+      core.hostResidency.removeAllocation(target)
+      core.hostResidency.commit()
+    }
+    var state = MonitorState()
+    state.pictureStage = .source
+    state.focus.enabled = true
+    state.focus.stage = .output
+    var sequence: UInt64 = 0
+    /// Whether the picture finds a mask after analysing the frame labelled `label`.
+    func analysed(_ label: (MonitorFeedHost.Delivery) -> SignalDescription?) throws -> Bool {
+      sequence += 1
+      offer(camera, image, sequence: sequence)
+      let delivery = try XCTUnwrap(slot.latest)
+      XCTAssertTrue(delivery.signal.hasDistinctOutputReading)
+      let completion = Completion()
+      try core.submit(completion: completion) { context in
+        let frame = try camera.frame(delivery, in: context, core: core)
+        let feed = camera.feed(engine: core.engine)
+        var analysis = frame
+        if let signal = label(delivery) { analysis.signal = signal }
+        try feed.analyze(analysis, focus: state.focus, into: context.submission)
+        try pass.encode(frame: frame, feed: feed, state: state, target: target, into: context.submission)
+      }
+      XCTAssertTrue(completion.wait())
+      var missing = false
+      for entry in pass.status.unavailable where entry.tool == .focusPeaking {
+        if case .focusNotAnalyzed = entry.reason { missing = true }
+      }
+      return !missing
+    }
+    XCTAssertTrue(try analysed { _ in nil }, "The frame itself: each stage reads its own")
+    XCTAssertTrue(try analysed { $0.signal(reading: .output) }, "The Output stage's reading alone")
+    XCTAssertFalse(try analysed { $0.signal(reading: .source).sourceOnly }, "Analysed with the declared Full range")
   }
 
   /// Generations: a new capture generation gets a newer stamp generation; after an
@@ -646,5 +718,69 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertNil(gpu.builtCore)
     XCTAssertThrowsError(try gpu.core())
     XCTAssertEqual(gpu.statistics, MonitorGPUContext.Statistics())
+  }
+
+  /// The app keeps its pipeline warm start under its own Caches directory (its
+  /// container's, sandboxed); a process with no bundle identifier keeps none.
+  func testPipelineCacheLivesInTheAppsCaches() {
+    let caches = URL(fileURLWithPath: "/Users/x/Library/Containers/org.ultracam.app/Data/Library/Caches")
+    XCTAssertEqual(
+      MonitorGPUContext.pipelineCacheDirectory(bundleIdentifier: "org.ultracam.app", caches: caches)?.path,
+      "/Users/x/Library/Containers/org.ultracam.app/Data/Library/Caches/org.ultracam.app/MonitorKitPipelines")
+    XCTAssertNil(MonitorGPUContext.pipelineCacheDirectory(bundleIdentifier: nil, caches: caches))
+    XCTAssertNil(MonitorGPUContext.pipelineCacheDirectory(bundleIdentifier: "", caches: caches))
+    XCTAssertNil(MonitorGPUContext.pipelineCacheDirectory(bundleIdentifier: "org.ultracam.app", caches: nil))
+    XCTAssertEqual(MonitorCoordinator.sharedGPU.pipelineCacheDirectory, MonitorGPUContext.appPipelineCacheDirectory)
+    XCTAssertNil(MonitorGPUContext().pipelineCacheDirectory, "Only the app's shared context keeps one")
+  }
+
+  /// With a cache directory both engines warm-start: the first context's warm-up
+  /// saves an archive for each (made lazily, in a directory that did not exist),
+  /// and a second context on it builds every warm-up pipeline from them.
+  func testWarmUpSavesAndAWarmStartCompilesNothing() throws {
+    guard let device = LUTProcessor.sharedDevice, device.supportsFamily(.metal4) else {
+      throw XCTSkip("No Metal 4 device")
+    }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-pipelines-\(UUID().uuidString)")
+    let directory = root.appendingPathComponent("MonitorKitPipelines")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let plain = try MonitorGPUContext(device: { device }).core()
+    XCTAssertNil(plain.engine.pipelineArchive)
+    XCTAssertNil(plain.scopeEngine.pipelineArchive)
+
+    let cold = try MonitorGPUContext(device: { device }, pipelineCacheDirectory: directory).core()
+    XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path), "Nothing is written before a save")
+    let coldEngine = try XCTUnwrap(cold.engine.pipelineArchive)
+    let coldScopes = try XCTUnwrap(cold.scopeEngine.pipelineArchive)
+    XCTAssertEqual(coldEngine.directory, directory)
+    XCTAssertEqual(coldScopes.directory, directory)
+    XCTAssertTrue(cold.engine.compiler.map { $0 === cold.compiler } == true,
+      "The core reports the compiler the archive builds with")
+    XCTAssertGreaterThan(try cold.warmUp(), 0)
+    XCTAssertGreaterThanOrEqual(coldEngine.statistics.saves, 1, "\(coldEngine.statistics)")
+    XCTAssertGreaterThanOrEqual(coldScopes.statistics.saves, 1, "\(coldScopes.statistics)")
+    let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    XCTAssertTrue(names.contains { $0.hasPrefix("MonitorKit-") }, "\(names)")
+    XCTAssertTrue(names.contains { $0.hasPrefix("MonitorKitScopes-") }, "\(names)")
+
+    let warm = try MonitorGPUContext(device: { device }, pipelineCacheDirectory: directory).core()
+    let warmEngine = try XCTUnwrap(warm.engine.pipelineArchive)
+    let warmScopes = try XCTUnwrap(warm.scopeEngine.pipelineArchive)
+    XCTAssertGreaterThanOrEqual(warmEngine.statistics.filesLoaded, 1)
+    XCTAssertGreaterThanOrEqual(warmScopes.statistics.filesLoaded, 1)
+    try warm.warmUp()
+    XCTAssertEqual(warmEngine.statistics.misses, 0, "\(warmEngine.statistics)")
+    XCTAssertEqual(warmScopes.statistics.misses, 0, "\(warmScopes.statistics)")
+    XCTAssertGreaterThan(warmEngine.statistics.hits, 0)
+    XCTAssertGreaterThan(warmScopes.statistics.hits, 0)
+  }
+}
+
+private extension SignalDescription {
+  /// This signal with the Source stage's reading on every stage.
+  var sourceOnly: SignalDescription {
+    var value = self
+    value.outputReading = nil
+    return value
   }
 }
