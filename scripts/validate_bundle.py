@@ -76,7 +76,46 @@ def validate(app):
     # Static linking leaves no file behind, so also check the extension's code for MonitorKit symbols.
     if any(b"MonitorKit" in path.read_bytes() for path in (extension / "Contents/MacOS").iterdir() if path.is_file()):
         raise ValueError("MonitorKit must not be linked into the camera extension.")
+    validate_symbols(app)
     print("Camera metadata and host-only MonitorKit resources validated; no MonitorTools shipped.")
+
+
+def binary_uuids(path):
+    """The (arch, LC_UUID) pairs of a Mach-O file or a dSYM bundle."""
+    result = subprocess.run(["/usr/bin/dwarfdump", "--uuid", str(path)], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ValueError(f"Cannot read the UUIDs of {path}: {result.stderr.strip()}")
+    uuids = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == "UUID:":
+            uuids.add((fields[2].strip("()"), fields[1]))
+    if not uuids:
+        raise ValueError(f"{path} carries no UUID.")
+    return uuids
+
+
+def validate_symbols(app):
+    """A stripped app executable must ship beside a dSYM built from the same link.
+
+    Release strips the executable (STRIP_STYLE=all), which drops every local symbol, so
+    crash reports and samples can name a function only by symbolicating against
+    Ultracam.app.dSYM by UUID. Debug keeps its symbol table and needs no dSYM, but any
+    dSYM beside it must still match.
+    """
+    with (app / "Contents/Info.plist").open("rb") as stream:
+        executable = app / "Contents/MacOS" / plistlib.load(stream)["CFBundleExecutable"]
+    dsym = app.parent / (app.name + ".dSYM")
+    symbols = subprocess.run(["/usr/bin/nm", str(executable)], capture_output=True, text=True)
+    if symbols.returncode != 0:
+        raise ValueError(f"Cannot read the symbol table of {executable}: {symbols.stderr.strip()}")
+    stripped = " t " not in symbols.stdout
+    if not dsym.is_dir():
+        if stripped:
+            raise ValueError(f"{executable} is stripped but {dsym} is missing; its crash reports could not be symbolicated.")
+        return
+    if binary_uuids(dsym) != binary_uuids(executable):
+        raise ValueError(f"{dsym} does not match {executable} (UUIDs differ); it is from another build.")
 
 
 if __name__ == "__main__":

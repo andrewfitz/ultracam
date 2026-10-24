@@ -107,8 +107,11 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
         # the Rust switcher and the app keep every live symbol, ObjC classes and Swift
         # conformance/metadata sections), and the built product is stripped
         # (STRIP_INSTALLED_PRODUCT/STRIP_STYLE take effect only with DEPLOYMENT_POSTPROCESSING).
-        # The symbols move to Ultracam.app.dSYM beside the product, so crash logs still
-        # symbolicate. Debug keeps everything; the camera extension's settings are unchanged.
+        # The symbols move to Ultracam.app.dSYM beside the product: the shipped binary keeps
+        # no function names (STRIP_STYLE=debugging would keep them at about twice the size),
+        # so crash reports and samples symbolicate only against that dSYM, matched by UUID.
+        # validate_bundle.py refuses a stripped app without it. Debug keeps everything; the
+        # camera extension's settings are unchanged.
         release = dict(DEAD_CODE_STRIPPING="YES", DEPLOYMENT_POSTPROCESSING="YES",
                        STRIP_INSTALLED_PRODUCT="YES", STRIP_STYLE="all",
                        DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")
