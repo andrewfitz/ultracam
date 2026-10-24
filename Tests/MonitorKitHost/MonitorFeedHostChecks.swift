@@ -765,6 +765,11 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
     guard let device = LUTProcessor.sharedDevice, device.supportsFamily(.metal4) else {
       throw XCTSkip("No Metal 4 device")
     }
+    // Metal cannot load the archives it records under GPU shader validation, so
+    // MonitorKit writes none there (MonitorPipelineArchive.save).
+    if ProcessInfo.processInfo.environment["MTL_SHADER_VALIDATION"].map({ $0 != "0" }) ?? false {
+      throw XCTSkip("MTL_SHADER_VALIDATION: MonitorKit writes no pipeline archive")
+    }
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-pipelines-\(UUID().uuidString)")
     let directory = root.appendingPathComponent("MonitorKitPipelines")
     defer { try? FileManager.default.removeItem(at: root) }
