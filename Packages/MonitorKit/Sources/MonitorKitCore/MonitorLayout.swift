@@ -227,8 +227,13 @@ public struct MonitorLayout: Equatable, Sendable {
         w = (h * aspect).rounded()
       }
       let rect = MonitorRect(x: vw - margin - w, y: vh - margin - h, width: w, height: h)
-      navigatorRect = rect.isEmpty ? nil : rect
-      navigatorToPicture = AxisMap.display(rect, toPicture: crop, flip: g.flip)
+      if rect.isEmpty {
+        navigatorRect = nil
+        navigatorToPicture = .identity
+      } else {
+        navigatorRect = rect
+        navigatorToPicture = AxisMap.display(rect, toPicture: crop, flip: g.flip)
+      }
     } else {
       navigatorRect = nil
       navigatorToPicture = .identity

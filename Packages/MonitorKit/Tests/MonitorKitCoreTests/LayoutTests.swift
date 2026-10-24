@@ -543,3 +543,12 @@ private final class GeometryContractRegressionTests: XCTestCase {
     XCTAssertEqual(layout.fitRect.width, 4000, accuracy: 1e-9)
   }
 }
+
+private final class TinyNavigatorGeometryTests: XCTestCase {
+  func testEmptyNavigatorDoesNotCreateNonFiniteMap() {
+    var g = ViewGeometry(); g.magnification.zoom = 2
+    let l = MonitorLayout(pictureWidth: 10, pictureHeight: 10, viewportWidth: 1, viewportHeight: 1, geometry: g)
+    XCTAssertNil(l.navigatorRect)
+    XCTAssertEqual(l.navigatorToPicture, .identity)
+  }
+}
