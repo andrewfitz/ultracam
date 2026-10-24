@@ -61,6 +61,9 @@ auto_switcher_lib_dir = os.environ.get(
 )
 if "$(" not in auto_switcher_lib_dir:
     auto_switcher_lib_dir = contained_path(auto_switcher_lib_dir, ROOT, "AUTO_SWITCHER_LIB_DIR")
+    # Relative to the checkout like DECKLINK_SDK_DIR, so build.sh (which exports an
+    # absolute path) regenerates the committed, relocatable project.
+    auto_switcher_lib_dir = "$(SRCROOT)/" + Path(auto_switcher_lib_dir).relative_to(ROOT).as_posix()
 dispatch_path = str(Path(sdk_dir) / "DeckLinkAPIDispatch.cpp")
 dispatch_file = Path(dispatch_path)
 if dispatch_file.is_relative_to(ROOT):
