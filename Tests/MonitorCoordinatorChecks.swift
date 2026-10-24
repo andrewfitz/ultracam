@@ -638,7 +638,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     }
     XCTAssertFalse(presenter.holdsProducerFrame, "The GPU copy replaced the capture buffer")
     let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
-    guard case .frozenOwned(let frame, let feed, _, _) = work.content else {
+    guard case .frozenOwned(let frame, let feed, _) = work.content else {
       return XCTFail("The hold draws its own copy")
     }
     XCTAssertTrue(feed.frozenFrame?.id == frame.id)
@@ -1107,19 +1107,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
       }
       let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
       guard case .frozenOwned = work.content else { return XCTFail("The hold draws its own copy: \(label)") }
-      let held = try draw()
-      guard picture != .source && clip.stage == .source else {
-        return XCTAssertLessThanOrEqual(difference(held, live), 1e-4, "Held from its GPU copy: \(label)")
-      }
-      // Known: MonitorSurfacePresenter.reading still relabels the owned copy with
-      // the Output reading on a non-Source picture, so Source-stage tools read it
-      // with the burn-in's range and matrix. Remove this once it returns the copy
-      // unchanged (the copy already carries both readings).
-      let options = XCTExpectedFailure.Options()
-      options.isStrict = false
-      XCTExpectFailure("Owned freeze copy relabelled with the Output reading", options: options) {
-        XCTAssertLessThanOrEqual(difference(held, live), 1e-4, "Held from its GPU copy: \(label)")
-      }
+      XCTAssertLessThanOrEqual(difference(try draw(), live), 1e-4, "Held from its GPU copy: \(label)")
     }
     var clip = ClipIndicatorSettings()
     clip.coloring = .uniform

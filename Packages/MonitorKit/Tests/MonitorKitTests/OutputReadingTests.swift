@@ -418,6 +418,62 @@ final class OutputReadingTests: XCTestCase {
     }
   }
 
+  /// The specialized pipeline compiles the second decode only when something drawn
+  /// reads the Output or Monitor stage: with the picture and every tool on the
+  /// Source, a distinct output reading changes neither the pipeline (`MK_LUTS`
+  /// bit 2 set, as with no output reading) nor a pixel (the same as the all-tools
+  /// pipeline, which reads it from the uniforms). Warm-up derives the same
+  /// pipeline as the pass, with and without a distinct reading.
+  func testTheSecondDecodeIsCompiledOnlyForAStageThatReadsIt() throws {
+    let gpu = try requireGPU()
+    let engine = try MonitorEngine(device: gpu.device, specialization: .synchronous)
+    let uber = try MonitorEngine(device: gpu.device, specialization: .off)
+    let lut = try engine.warmUpLUT()
+    let target = MonitorRenderTargetFormat(colorPixelFormat: .rgba32Float)
+    let (width, height) = (64, 24)
+    func state(_ stage: SignalStage, tool: SignalStage) -> MonitorState {
+      var s = MonitorState()
+      s.pictureStage = stage
+      s.zebras[0] = ZebraSet(mode: .lowerLimit, level: 60, stage: tool)
+      s.zebras[1] = ZebraSet(mode: .band, level: 30, range: 8, stage: tool)
+      s.clipIndicators.enabled = true
+      s.clipIndicators.stage = tool
+      s.clipIndicators.high = 90
+      s.clipIndicators.low = 8
+      return s
+    }
+    let cases: [(SignalStage, SignalStage, Bool)] = [
+      (.source, .source, false), (.output, .source, true), (.source, .output, true), (.monitor, .monitor, true),
+    ]
+    for c in Self.cases(width: width, height: height) {
+      let frame = try c.picture.frame(gpu, signal: c.signal)
+      for (picture, tool, reads) in cases {
+        let s = state(picture, tool: tool)
+        let label = "\(c.name), picture \(picture), tools \(tool)"
+        let pass = engine.makePass()
+        let got = try gpu.render(frame, state: s, feed: engine.makeFeed(), pass: pass)
+        XCTAssertTrue(pass.usesSpecializedPipeline, label)
+        XCTAssertEqual(pass.currentParameters.outputReading.w, 1, label)
+        XCTAssertEqual(pass.currentVariant.luts & 4, reads ? 0 : 4, "\(label): second decode compiled")
+        // `.off`: always the all-tools pipeline (second decode compiled in).
+        let reference = try gpu.render(frame, state: s, feed: uber.makeFeed(), pass: uber.makePass())
+        assertSamePixels(got.values, reference.values, "\(label): specialized against the all-tools pipeline")
+        // Warm-up builds exactly the pipeline the pass then draws with.
+        for signal in [c.signal, Self.single(frame, .source).signal] {
+          let keys = try MonitorEngine.pipelineKeys(
+            for: MonitorSurfaceConfiguration(
+              target: target, layout: c.picture.layout, state: s, signal: signal, frameSize: (width, height),
+              viewportSize: (width, height)), placeholder: lut)
+          let plainPass = engine.makePass()
+          var labelled = frame
+          labelled.signal = signal
+          _ = try gpu.render(labelled, state: s, feed: engine.makeFeed(), pass: plainPass)
+          XCTAssertEqual(keys.map(\.variant), [plainPass.currentVariant], "\(label), warm-up for \(signal.hasDistinctOutputReading ? "distinct" : "one") reading")
+        }
+      }
+    }
+  }
+
   /// The second reading is a uniform: switching it on and off rebuilds the
   /// parameters once each and draws the right reading every time.
   func testSwitchingTheOutputReadingFollowsEachFrame() throws {

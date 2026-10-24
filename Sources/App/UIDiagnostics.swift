@@ -141,6 +141,9 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Audio bitrate", UIDiagnosticsFormat.kilobits(update.audioBitrateKbps))
           UIDiagnosticsRow("Packets · samples", "\(UIDiagnosticsFormat.count(update.audioPackets)) · \(UIDiagnosticsFormat.count(update.audioSamples))")
           UIDiagnosticsRow("Audio drops · gaps", UIDiagnosticsFormat.count(update.audioDrops), warning: update.audioDrops > 0)
+          // Meters only: recording and video still get every packet.
+          UIDiagnosticsRow("Meter packets coalesced", UIDiagnosticsFormat.count(update.audioMeterCoalesced),
+            warning: update.audioMeterCoalesced > 0)
           UIAudioMeter(audio: UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
             peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight))
         }

@@ -309,8 +309,13 @@ public final class ScopeEngine: @unchecked Sendable {
   ///
   /// A format that fails does not stop the others: every format is tried, then
   /// the first error is thrown (`pipelineBuildFailures` lists each).
-  public func prepare(pixelFormats: [MTLPixelFormat] = ScopeEngine.drawablePixelFormats) throws {
-    defer { pipelineArchive?.save() }
+  ///
+  /// With a `pipelineArchive`, what was built is saved before this returns, unless
+  /// `save` is false: a host warming several engines saves each archive once at
+  /// the end (`pipelineArchive?.save()`), so one engine's save never delays the
+  /// next engine's builds; anything unsaved is saved by the scheduled save anyway.
+  public func prepare(pixelFormats: [MTLPixelFormat] = ScopeEngine.drawablePixelFormats, save: Bool = true) throws {
+    defer { if save { pipelineArchive?.save() } }
     var firstError: (any Error)?
     var i = 0
     while i < pixelFormats.count {
@@ -327,9 +332,12 @@ public final class ScopeEngine: @unchecked Sendable {
 
   /// `prepare(settings:layouts:pixelFormat:)` for every format in
   /// `pixelFormats`. Every pipeline is tried even after one fails; the first
-  /// error is thrown at the end.
-  public func prepare(settings: [ScopeSettings], layouts: [PixelLayout], pixelFormats: [MTLPixelFormat]) throws {
-    defer { pipelineArchive?.save() }
+  /// error is thrown at the end. With a `pipelineArchive`, saved before this
+  /// returns unless `save` is false (as `prepare(pixelFormats:save:)`).
+  public func prepare(
+    settings: [ScopeSettings], layouts: [PixelLayout], pixelFormats: [MTLPixelFormat], save: Bool = true
+  ) throws {
+    defer { if save { pipelineArchive?.save() } }
     if pixelFormats.isEmpty { return try prepareUnsaved(settings: settings, layouts: layouts, target: nil) }
     var firstError: (any Error)?
     var i = 0

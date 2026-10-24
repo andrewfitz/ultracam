@@ -32,6 +32,10 @@ Picture (`MonitorKit`, `MonitorKitCore`):
 - `MonitorState.codingKind`; non-throwing decodes `MonitorState(decodingOrDefault:)` and `MonitorState.decodedOrDefault(from:)`; the `@LenientMonitorState` property wrapper, so a host's own `Codable` settings survive a foreign or old monitor blob.
 - `MonitorLayout.pictureFraction(x:y:)`, `picturePoint(fractionX:fractionY:)` and `pictureFraction(displayX:displayY:)`: frame pixels to and from fractions of the clean aperture.
 - `MonitorSurfaceConfiguration.pixelAspectRatio` and `cleanAperture`, so warm-up builds the filter variant anamorphic or cropped frames draw with.
+- Per-stage decode: `SignalReading` (`range`, `matrix`) and `SignalDescription.outputReading`, how the Output and Monitor stages read the codes when that differs from the source's declared `range` and `matrix` (a camera declared full range on a legal link, a SMPTE 240M source whose output path decodes BT.709); `sourceReading`, `effectiveOutputReading`, `hasDistinctOutputReading`, `outputSignal`, `signal(for:)`; `MonitorFrame.parameters(for:)`. The picture pass decodes those stages a second time with that reading (exact at integral codes), in the same pass; focus analysis, scopes and scope groups bind their stage's reading. A specialized pipeline compiles the second decode only when a drawn tool reads those stages. Lenient JSON key `outputReading`.
+- Persistent pipeline warm start: `MonitorPipelineArchive` (`statistics`, `files`, `save()`, `saveDelay`, `directory`, `name`, `key`, `maximumFiles`), `MonitorEngine(device:specialization:framesInFlight:compiler:cacheDirectory:)`, `ScopeEngine(device:specialization:framesInFlight:residency:cacheDirectory:)` and `pipelineArchive` on both. Metal 4 archives in the host's caches directory, named `<name>-<gpu>-<key>-<content>.mtl4archive`: the key hashes the shader source, compile options, GPU, OS build and validation settings, the content hash is verified before Metal reads a file. Only the newest file is opened at launch, older ones (3 kept per key) at the first pipeline it lacks.
+- `save:` (default true) on `MonitorEngine.warmUp(targets:layouts:surfaces:save:)`, `ScopeEngine.prepare(pixelFormats:save:)` and `prepare(settings:layouts:pixelFormats:save:)`: warm several engines, then save each archive once (source-compatible; defaulted parameters).
+- Report ITU-R BT.2446-1 Method C for HLG → SDR (`BT2446MethodC` in `MonitorKitCore`, `HDRToSDR.hlg`): 38 % HLG → 53.2 % SDR, 50 % → 70 %, 75 % → 96 %; both HDR → SDR transforms then go into BT.709 by Report ITU-R BT.2407 §2.
 
 Scopes (`MonitorKitScopes`):
 
@@ -65,6 +69,9 @@ Documentation: README, FEATURES, API, INTEGRATION, ARCHITECTURE and MATH (every 
 - `MonitorFrame.wrap(_:cache:signal:)` reads the clean aperture attachment, so a picture that carries one is cropped to it.
 - `MonitorFrame.pixelAspectRatio` still reads finite and positive (1 otherwise), but the declared value is kept: a broken tag reaches `geometry` and is reported as `.unsupportedGeometry`.
 - Log and unlabelled pictures with no LUT and no display transform are labelled as a code-value view.
+- **Behaviour:** HLG → SDR (`DisplayTransform.hdrToSDR` on HLG) is BT.2446-1 Method C instead of the scene-light convention (75 % HLG scaled to 100 % SDR with the BT.709 OETF and a hard clip above reference white): mid-tones are brighter and highlights roll off up to 100 % SDR at about 82.9 % HLG.
+- `MonitorFeed` keeps a focus mask analysed with one reading apart from another: with a distinct output reading, an Output-stage mask with no LUT is not the source's. `MonitorRenderer` analyses such a surface on its own stage.
+- `PassParameters` is 1520 bytes (`outputReading`, `hlgToSDR`, `sourceWeights`), and the picture pass's buffer 0 is the 160-byte `mk_PassFrames` (the source and the output reading's `FrameParameters`); `MonitorPass.uniformLength` stays 5120. Bind by the constants and `MemoryLayout`, as before.
 
 ### Fixed
 

@@ -103,7 +103,9 @@ public final class MonitorEngine: @unchecked Sendable {
 
   /// A tool set: the tiers of `mk_picture` a pipeline compiles in.
   struct Variant: Hashable {
-    /// Bit 0: the burn-in LUT is read, bit 1: the monitor LUT.
+    /// Bit 0: the burn-in LUT is read, bit 1: the monitor LUT, bit 2: no distinct
+    /// output reading is read (`MK_LUTS` bit 2: the Output and Monitor stages share
+    /// the source decode, or nothing drawn reads them), so no second decode is compiled.
     var luts: UInt32
     var zebras: Bool
     var peaking: Bool

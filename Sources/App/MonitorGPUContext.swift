@@ -1,3 +1,4 @@
+import CoreGraphics
 import CoreVideo
 import Foundation
 import IOSurface
@@ -259,11 +260,18 @@ final class MonitorGPUContext: @unchecked Sendable {
     /// Builds every picture, focus, Freeze and scope pipeline the app's three layer
     /// formats can need, so a switch to an HDR layer never compiles on the render
     /// thread. Returns the pipelines built. With a pipeline cache both engines save
-    /// their archives before returning (`prepare()` runs this off the main thread).
+    /// their archives before returning (`prepare()` runs this off the main thread),
+    /// once both are warm, so the picture engine's save (a few hundred milliseconds
+    /// on a cold key) never delays the scope pipelines. Each save is a no-op when
+    /// nothing new was compiled.
     @discardableResult
     func warmUp() throws -> Int {
-      let built = try engine.warmUp()
-      try scopeEngine.prepare()
+      defer {
+        engine.pipelineArchive?.save()
+        scopeEngine.pipelineArchive?.save()
+      }
+      let built = try engine.warmUp(save: false)
+      try scopeEngine.prepare(save: false)
       return built
     }
 
@@ -556,6 +564,7 @@ final class MonitorGPUContext: @unchecked Sendable {
       state.lock.unlock()
       if first {
         let thread = Thread {
+          Self.applyRealTimeSchedule()
           let loop = CFRunLoopGetCurrent()
           let foundationLoop = RunLoop.current
           state.lock.withLock {
@@ -616,5 +625,71 @@ final class MonitorGPUContext: @unchecked Sendable {
 
     /// Whether the thread has left its run loop (tests).
     var hasExited: Bool { state.lock.withLock { state.exited } }
+
+    /// The render thread's schedule: real time (Mach `THREAD_TIME_CONSTRAINT_POLICY`)
+    /// with a period of one refresh of the fastest active display, about 1 ms of
+    /// work per period, to be done within 4 ms (at most a period), preemptible: the
+    /// display links' callbacks arrive once a refresh and each encodes in tens of
+    /// microseconds. At `.userInteractive` alone, other processes' load preempted the
+    /// thread for more than a source frame, so a frame was replaced before a refresh
+    /// took it. The parameters are a capture thread's (the integration tool's
+    /// synthetic source). Called on the thread itself.
+    @discardableResult
+    static func applyRealTimeSchedule() -> kern_return_t {
+      var policy = realTimeSchedule(refreshHz: fastestDisplayRefreshRate())
+      let count = mach_msg_type_number_t(
+        MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
+      return withUnsafeMutablePointer(to: &policy) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+          thread_policy_set(
+            pthread_mach_thread_np(pthread_self()), thread_policy_flavor_t(THREAD_TIME_CONSTRAINT_POLICY), $0, count)
+        }
+      }
+    }
+
+    /// `applyRealTimeSchedule`'s policy for a display refreshing `refreshHz` times a
+    /// second, in Mach absolute time units.
+    static func realTimeSchedule(refreshHz: Double) -> thread_time_constraint_policy_data_t {
+      var timebase = mach_timebase_info_data_t()
+      mach_timebase_info(&timebase)
+      let ticksPerSecond = 1e9 * Double(timebase.denom) / Double(timebase.numer)
+      let period = ticksPerSecond / min(1000, max(1, refreshHz))
+      return thread_time_constraint_policy_data_t(
+        period: UInt32(period), computation: UInt32(ticksPerSecond * 0.001),
+        constraint: UInt32(min(period, ticksPerSecond * 0.004)), preemptible: 1)
+    }
+
+    /// The highest refresh rate of the active displays (CoreGraphics, any thread);
+    /// 240 Hz when none reports one (the period is the scheduler's hint, so a
+    /// shorter one than the display's only asks for the thread a little more often).
+    static func fastestDisplayRefreshRate() -> Double {
+      var count: UInt32 = 0
+      guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return 240 }
+      var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+      guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return 240 }
+      var fastest = 0.0
+      var i = 0
+      while i < Int(count) {
+        if let mode = CGDisplayCopyDisplayMode(displays[i]) { fastest = max(fastest, mode.refreshRate) }
+        i += 1
+      }
+      return fastest > 0 ? fastest : 240
+    }
+
+    /// The calling thread's time-constraint policy, nil when it has none (tests).
+    static func currentTimeConstraint() -> thread_time_constraint_policy_data_t? {
+      var policy = thread_time_constraint_policy_data_t()
+      var count = mach_msg_type_number_t(
+        MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
+      var isDefault: boolean_t = 0
+      let result = withUnsafeMutablePointer(to: &policy) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+          thread_policy_get(
+            pthread_mach_thread_np(pthread_self()), thread_policy_flavor_t(THREAD_TIME_CONSTRAINT_POLICY), $0, &count,
+            &isDefault)
+        }
+      }
+      return result == KERN_SUCCESS && isDefault == 0 ? policy : nil
+    }
   }
 }

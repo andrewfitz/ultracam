@@ -91,7 +91,9 @@ struct FeedPreferences: Codable {
 
 | Type | Purpose |
 | --- | --- |
-| `SignalDescription` | `range` (`CodeRange`), `matrix` (`YCbCrMatrix`), `chromaSiting`, `chromaVerticalSiting`, `encoding` (`SignalEncoding`), `primaries` (`ColorPrimaries?`). `effectivePrimaries`, `isHDR`, `levels(bitDepth:)`, `.rec709` |
+| `SignalDescription` | `range` (`CodeRange`), `matrix` (`YCbCrMatrix`), `chromaSiting`, `chromaVerticalSiting`, `encoding` (`SignalEncoding`), `primaries` (`ColorPrimaries?`), `outputReading` (`SignalReading?`). `effectivePrimaries`, `isHDR`, `levels(bitDepth:)`, `.rec709` |
+| Per-stage reading | `outputReading`: how the Output and Monitor stages read the codes when that differs from the source's `range` and `matrix` (nil, the default: as the source does), e.g. a camera declared full range on a legal-range link, or a SMPTE 240M source whose output path decodes BT.709. The Source stage, log false colour and the camera-signal classifiers keep `range` and `matrix`; the Output and Monitor stages, with or without a LUT, and every tool, scope and focus analysis on them, decode the same codes with `outputReading`. `sourceReading`, `effectiveOutputReading`, `hasDistinctOutputReading` (an `outputReading` equal to the source's is none), `outputSignal` (the signal as those stages read it, no `outputReading` of its own) and `signal(for: SignalStage)`. Lenient JSON key `outputReading` (absent: one reading) |
+| `SignalReading` | `range` (`CodeRange`) and `matrix` (`YCbCrMatrix`): one reading of a frame's codes. Lenient `Codable` (missing fields: legal BT.709) |
 | `SignalEncoding` | `.display(DisplayTransfer)`, `.log(LogEncoding)`, `.unknown`; `log` |
 | `DisplayTransfer` | `.bt709`, `.sRGB`, `.pq`, `.hlg`, `.linear`; `exposureLinear(_:)` |
 | `LogEncoding`, `LogCurve`, `LogTransport` | `curve` (`.sLog3`, `.arriLogC3`, `.arriLogC4`), `gamut` (`ColorGamut`), `transport` (`.native`, `.fullRescaledToLegal`); `.sLog3SGamut3Cine`, `.sLog3SGamut3`; `profileID`, `init?(profileID:transport:)`; `LogCurve.signal(expanded:range:transport:bitDepth:)`, `decode(_:)` |
@@ -192,9 +194,11 @@ One per GPU, shared by every feed and surface (`Sendable`).
 | Member | Meaning |
 | --- | --- |
 | `init(device:specialization:framesInFlight:compiler:)` | Compiles the library. `specialization`: `.asynchronous` (default: draw with the all-tools pipeline while the specialized one builds on Metal's compiler threads), `.synchronous`, `.off`. `framesInFlight` (default 3, 1…16) sizes the Metal 4 uniform rings. `compiler`: a Metal 4 host's `MTL4Compiler`; nil lets the device build |
-| `device`, `specialization`, `framesInFlight`, `compiler` | |
+| `init(device:specialization:framesInFlight:compiler:cacheDirectory:)` | The same with a persistent warm start (`MonitorPipelineArchive`, 3.12) in `cacheDirectory`, e.g. a subdirectory of the host's `.cachesDirectory` (made by the first save). The engine then builds with the archive's own `MTL4Compiler` (a host `compiler` is unused), looks each pipeline up in the files earlier launches saved, and saves new ones. Nil: no cache |
+| `device`, `specialization`, `framesInFlight`, `compiler` | `compiler`: the one the engine builds with (the archive's with a `cacheDirectory`) |
+| `pipelineArchive` | The `MonitorPipelineArchive` of an engine made with a `cacheDirectory`, else nil |
 | `residency` | A `MonitorResidency`: attach `residency.set` to your `MTL4CommandQueue` once |
-| `warmUp(targets:layouts:surfaces:) -> Int` | Builds every pipeline a first frame could need, on the calling thread (call it at start-up, off the frame path). Default targets: `standardTargetFormats` (`bgr10a2Unorm`, `rgba16Float`, `bgra8Unorm`); `surfaces`: `MonitorSurfaceConfiguration`s for the exact specialized pipelines |
+| `warmUp(targets:layouts:surfaces:save:) -> Int` | Builds every pipeline a first frame could need, on the calling thread (call it at start-up, off the frame path). Default targets: `standardTargetFormats` (`bgr10a2Unorm`, `rgba16Float`, `bgra8Unorm`); `surfaces`: `MonitorSurfaceConfiguration`s for the exact specialized pipelines (a surface's `signal` with a distinct `outputReading` warms the pipeline with the second decode when a tool reads the Output or Monitor stage). With a `pipelineArchive`, saves it before returning unless `save` (default true) is false: warm several engines with `save: false`, then call `pipelineArchive?.save()` on each |
 | `prepare(pixelFormat:layouts:)`, `prepare(target:layouts:)`, `prepareCompute(pixelFormat:layouts:…)` | Narrower warm-ups: all-tools pipelines, focus kernels, Freeze kernels |
 | `makeFeed()`, `makePass()` | |
 | `resourcesCreated`, `pipelinesBuilt` | Counters for tests and diagnostics; constant in steady state |
@@ -228,7 +232,8 @@ One borrowed video frame: textures plus a layout and a signal. Allocation-free t
 | `layout(for:)`, `signal(of:range:)`, `cleanAperture(of:)`, `geometry(of:)` | CoreVideo helpers, allocation-free |
 | `id` | Fresh per frame; what the focus mask belongs to. Set a new one if you reuse a value for another picture |
 | `layout`, `width`, `height`, `signal`, `pixelAspectRatio`, `cleanAperture`, `isProcessed`, `geometry` | `isProcessed`: not the camera's own signal (a programme mix, a scaled or graded render): log false colour and peaking are then unavailable |
-| `packed`, `luma`, `chroma`, `parameters` | The textures and the `FrameParameters` (`mk_FrameParams`) a fused kernel binds |
+| `packed`, `luma`, `chroma`, `parameters` | The textures and the `FrameParameters` (`mk_FrameParams`, the source reading) a fused kernel binds |
+| `parameters(for: SignalStage)` | That stage's `FrameParameters`: the source reading at `.source`, `signal.effectiveOutputReading` at `.output` and `.monitor`. A kernel that measures one stage binds these |
 | `addResidency(to:)`, `removeResidency(from:)`, `keepResidentIfReleased(in:)` | Metal 4 residency of host frames (once per texture, not per frame) and of released frozen frames |
 
 | Layout | Plane | Texture format | Size |
@@ -451,6 +456,41 @@ final class BumpUniforms: MonitorUniformAllocator {
 
 `FrameParameters` (80 B) and `LUTParameters` (80 B) mirror the MSL structs; `PassParameters` and `GuideParameters` are the picture pass's uniforms (public for diagnostics; never hand-size them).
 
+### 3.12 `MonitorPipelineArchive`
+
+The persistent warm start of `MonitorEngine(…, cacheDirectory:)` and `ScopeEngine(…, cacheDirectory:)` (`Sendable`, thread-safe). Engines make it; hosts read its counters and may call `save()`.
+
+| Member | Meaning |
+| --- | --- |
+| `statistics` (`Statistics`) | `filesLoaded` (verified files opened: the newest at init, older ones at the first pipeline it lacks, or written since), `filesRejected` (damaged files of this key, removed), `staleFilesRemoved` (other keys' files on this GPU, removed by a save), `hits`, `misses` (compiled, recorded for the next save), `saves`, `lastError` |
+| `files` | The archive files in use for lookups, newest first |
+| `save() -> Bool` | When something was compiled since the last save: records the whole session with a second compiler (its `MTL4PipelineDataSetSerializer`) and writes a new file, then removes this GPU's stale and surplus files. Blocks for the file I/O (tens to a few hundred milliseconds): never on a frame. A no-op otherwise. A failure is in `statistics.lastError`, and the next save retries |
+| `saveDelay` | 2 s: pipelines built after warm-up are saved this long after the last one, from a utility-priority task |
+| `directory`, `name`, `key`, `maximumFiles` | `name`: `MonitorKit` or `MonitorKitScopes`; `key`: hex SHA-256 of the identity below; `maximumFiles`: 3 per key |
+
+Files are `<name>-<gpu>-<key>-<content>.mtl4archive`: `gpu` hashes `MTLDevice.name` and the architecture, `key` the exact shader source, compile options, GPU, OS version and build, Metal validation settings and the format version, so an archive of other shaders, another OS build or GPU is never opened; `content` hashes the file's bytes, checked before Metal reads them. Each save holds every pipeline of the session, so the newest file holds what the last launch used. A pipeline is returned from an archive only when its whole descriptor matches, so pixels are identical with or without a cache. The directory is the host's: only files with the engine's prefix are touched.
+
+```swift
+import Foundation
+import Metal
+import MonitorKit
+import MonitorKitScopes
+
+/// Both engines warm-start from one caches subdirectory; each archive is saved once,
+/// after both are warm.
+func makeEngines(device: MTLDevice) throws -> (MonitorEngine, ScopeEngine) {
+  let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+  let directory = caches.appendingPathComponent("MonitorKit pipelines", isDirectory: true)
+  let engine = try MonitorEngine(device: device, cacheDirectory: directory)
+  let scopes = try ScopeEngine(device: device, residency: engine.residency, cacheDirectory: directory)
+  try engine.warmUp(save: false)
+  try scopes.prepare(save: false)
+  engine.pipelineArchive?.save()
+  scopes.pipelineArchive?.save()
+  return (engine, scopes)
+}
+```
+
 ## 4. MonitorKitScopes
 
 ### 4.1 `ScopeEngine`
@@ -460,8 +500,9 @@ Compiled scope kernels and render pipelines for one device (`Sendable`).
 | Member | Meaning |
 | --- | --- |
 | `init(device:specialization:framesInFlight:residency:)` | Pass `MonitorEngine.residency` so one set covers both |
-| `prepare(pixelFormats:)` | Warm-up of the render pipelines for `drawablePixelFormats` (`bgr10a2Unorm`, `rgba16Float`, `bgra8Unorm`) by default. An asynchronous engine draws nothing into a format until its pipeline is built |
-| `prepare(pixelFormat:)`, `prepare(target:)`, `prepare(settings:layouts:pixelFormats:)` / `(…pixelFormat:)` / `(…target:)`, `isPrepared(target:)`, `isPrepared(pixelFormat:)` | |
+| `init(device:specialization:framesInFlight:residency:cacheDirectory:)` | The same with a persistent warm start in `cacheDirectory` (it may be the `MonitorEngine`'s: files are named per engine kind); `pipelineArchive` is then set |
+| `prepare(pixelFormats:save:)` | Warm-up of the render pipelines for `drawablePixelFormats` (`bgr10a2Unorm`, `rgba16Float`, `bgra8Unorm`) by default. An asynchronous engine draws nothing into a format until its pipeline is built. Saves the archive before returning unless `save` is false |
+| `prepare(pixelFormat:)`, `prepare(target:)`, `prepare(settings:layouts:pixelFormats:save:)` / `(…pixelFormat:)` / `(…target:)`, `isPrepared(target:)`, `isPrepared(pixelFormat:)` | `prepare(target:)` and the single-format forms leave the save to the scheduled one |
 | `makeAccumulator(settings:)`, `makeGroup(_:)`, `makeRenderer()` | |
 | `pipelineBuildFailures`, `library`, `scopeSource()` | |
 

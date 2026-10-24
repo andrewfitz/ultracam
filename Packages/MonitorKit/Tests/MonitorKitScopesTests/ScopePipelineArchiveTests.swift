@@ -77,14 +77,15 @@ final class ScopePipelineArchiveTests: XCTestCase {
     XCTAssertEqual(coldStatistics.hits, 0)
     XCTAssertGreaterThan(coldStatistics.misses, 10)
     XCTAssertGreaterThanOrEqual(coldStatistics.saves, 2, "prepare saved, and what was built after it")
-    XCTAssertEqual(archiveFiles(d).count, coldStatistics.saves)
+    let kept = min(coldStatistics.saves, try XCTUnwrap(cold.pipelineArchive).maximumFiles)
+    XCTAssertEqual(archiveFiles(d).count, kept)
     XCTAssertTrue(archiveFiles(d).allSatisfy { $0.hasPrefix("MonitorKitScopes-") })
 
     let warm = try ScopeEngine(device: device, specialization: .synchronous, cacheDirectory: d)
     try prepare(warm)
     let warmResults = try results(warm)
     let s = try XCTUnwrap(warm.pipelineArchive?.statistics)
-    XCTAssertEqual(s.filesLoaded, coldStatistics.saves)
+    XCTAssertEqual(s.filesLoaded, 1, "the newest file holds the whole session: the older ones are never opened")
     XCTAssertEqual(s.misses, 0, "nothing compiled")
     XCTAssertEqual(s.hits, coldStatistics.misses)
     XCTAssertEqual(s.saves, 0)
@@ -118,15 +119,15 @@ final class ScopePipelineArchiveTests: XCTestCase {
     // Any save still scheduled runs within `saveDelay` of the last build.
     usleep(useconds_t((MonitorPipelineArchive.saveDelay + 1) * 1e6))
     let files = archiveFiles(d)
-    XCTAssertEqual(files.count, archive.statistics.saves)
+    XCTAssertEqual(files.count, min(archive.statistics.saves, archive.maximumFiles))
     // A truncated copy under another content name of the same key is rejected.
     let data = try Data(contentsOf: d.appendingPathComponent(files[0]))
     let damaged = String(files[0].dropLast(".mtl4archive".count + 32)) + String(repeating: "f", count: 32) + ".mtl4archive"
     try data.prefix(data.count - 1).write(to: d.appendingPathComponent(damaged))
 
     let second = try ScopeEngine(device: device, specialization: .asynchronous, cacheDirectory: d)
-    XCTAssertEqual(second.pipelineArchive?.statistics.filesRejected, 1)
-    XCTAssertEqual(second.pipelineArchive?.statistics.filesLoaded, files.count)
+    XCTAssertEqual(second.pipelineArchive?.statistics.filesRejected, 1, "the newest name, tried first")
+    XCTAssertEqual(second.pipelineArchive?.statistics.filesLoaded, 1, "the newest verified file")
     try second.prepare()
     XCTAssertTrue(ScopeEngine.drawablePixelFormats.allSatisfy { second.isPrepared(pixelFormat: $0) })
     XCTAssertEqual(second.pipelineArchive?.statistics.misses, 0)

@@ -38,6 +38,69 @@ final class RendererRegressionTests: XCTestCase {
     }
   }
 
+  /// Peaking on the Output or the Monitor stage with no LUT, on a signal whose
+  /// Output and Monitor stages read the codes their own way (declared full range
+  /// on a legal-range output), is analysed with that reading, not collapsed onto
+  /// the source: the mask is valid and drawn on every frame, the same pixels as a
+  /// feed analysed and drawn by hand, and unlike the picture without peaking.
+  func testOutputStagePeakingWithADistinctOutputReadingAndNoLUT() throws {
+    let gpu = try requireGPU()
+    let width = 64, height = 36
+    /// 8-pixel squares, so the picture has edges to peak.
+    func checkerboard(_ seed: UInt8) throws -> MonitorFrame {
+      let t = gpu.texture(.bgra8Unorm, width, height, usage: [.shaderRead])
+      var bytes = [UInt8](repeating: 255, count: width * height * 4)
+      for y in 0..<height {
+        for x in 0..<width {
+          let v: UInt8 = (x / 8 + y / 8) % 2 == 0 ? 40 &+ seed : 200
+          bytes[(y * width + x) * 4 + 0] = v
+          bytes[(y * width + x) * 4 + 1] = v
+          bytes[(y * width + x) * 4 + 2] = v
+        }
+      }
+      t.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: bytes, bytesPerRow: width * 4)
+      return try MonitorFrame(
+        layout: .bgra8, width: width, height: height, luma: t,
+        signal: SignalDescription(
+          range: .full, encoding: .display(.bt709), outputReading: SignalReading(range: .legal, matrix: .bt709)))
+    }
+    for stage in [SignalStage.output, .monitor] {
+      let source = MonitorSource()
+      var state = MonitorState()
+      state.focus.enabled = true
+      state.focus.stage = stage
+      state.focus.opacity = 1
+      state.focus.color = .red
+      let surface = MonitorSurface(source: source, state: state)
+      let renderer = MonitorRenderer(engine: gpu.engine, scene: MonitorScene(surfaces: [surface]))
+      let target = gpu.texture(.bgra8Unorm, width, height)
+      var frame = try checkerboard(0)
+      for i in 0..<2 {
+        frame = try checkerboard(UInt8(i))
+        XCTAssertTrue(frame.signal.hasDistinctOutputReading)
+        source.submit(frame)
+        try renderer.update()
+        try gpu.run { try renderer.encode(target: target, into: $0) }
+        XCTAssertTrue(surface.status.isActive(.focusPeaking), "\(stage) frame \(i): \(surface.status)")
+        XCTAssertEqual(renderer.feed(for: surface)?.hasFocusMask(for: frame), true, "\(stage) frame \(i)")
+      }
+      let reference = gpu.texture(.bgra8Unorm, width, height)
+      let plain = gpu.texture(.bgra8Unorm, width, height)
+      var off = state
+      off.focus.enabled = false
+      try gpu.run { cb in
+        let feed = gpu.engine.makeFeed()
+        try feed.analyze(frame, focus: state.focus, into: cb)
+        let pass = gpu.engine.makePass()
+        try pass.encode(frame: frame, feed: feed, state: state, target: reference, into: cb)
+        XCTAssertTrue(pass.status.isActive(.focusPeaking), "\(stage) by hand: \(pass.status)")
+        try gpu.engine.makePass().encode(frame: frame, feed: gpu.engine.makeFeed(), state: off, target: plain, into: cb)
+      }
+      XCTAssertEqual(Texels(target), Texels(reference), "\(stage): the renderer draws the hand-analysed mask")
+      XCTAssertNotEqual(Texels(target), Texels(plain), "\(stage): peaking is drawn")
+    }
+  }
+
   /// Surfaces of one source with different analyses (stage, level) each draw
   /// with their own mask, the same pixels as each analysed and drawn alone;
   /// surfaces that ask for the same analysis share one.

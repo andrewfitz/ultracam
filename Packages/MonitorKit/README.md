@@ -359,8 +359,8 @@ Version 0.1.0, unreleased. The API is complete for the features above; Ultracam,
 Planned:
 
 - More camera log encodings for false colour and the display transforms: Canon Log 2/3, Panasonic V-Log, Blackmagic Film, RED Log3G10, Apple Log, Fujifilm F-Log2, Nikon N-Log, DJI D-Log, with their gamuts. Today: S-Log3 (S-Gamut3, S-Gamut3.Cine), ARRI LogC3 (AWG3) and LogC4 (AWG4).
-- Sony Pattern 1 (SDR) false colour; a BT.2446 soft-knee HLG-to-SDR mode; HDR and wide-gamut LUT outputs (today every LUT outputs Rec.709).
-- Scopes that follow the clean aperture; fail-closed JSON for `ScopeSettings`; `MTL4Compiler` pipelines for the scopes.
+- Sony Pattern 1 (SDR) false colour; a hue-preserving BT.709 gamut step for HDR → SDR (BT.2407 Annex 5; today §2's clip); HDR and wide-gamut LUT outputs (today every LUT outputs Rec.709).
+- Scopes that follow the clean aperture; fail-closed JSON for `ScopeSettings`.
 - Performance: the LUT-stage focus mask (over its original 0.4 ms target), large-window pictures (2560 × 1440, 4K 1:1), the compute picture's threadgroup shape.
 - iOS: verified at compile time only so far (gestures, `UIScreen` headroom and background pausing have not run on a device).
 - An example host app, DocC documentation and CI.

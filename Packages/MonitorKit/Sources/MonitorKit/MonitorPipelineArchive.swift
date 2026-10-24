@@ -50,6 +50,12 @@ import Synchronization
 /// happens only when something was compiled. At most `maximumFiles` per key are
 /// kept, newest first; a pipeline only in an evicted file compiles once more.
 ///
+/// Only the newest verified file is opened at init: it holds the whole last
+/// session, so a launch that uses what the last one did reads, hashes and primes
+/// one file (about 3–5 ms for the 4 MB picture archive). The older files are
+/// opened at the first pipeline the open ones lack, before it compiles; a launch
+/// that finds everything never touches them.
+///
 /// An archive never changes pixels: Metal returns a pipeline from it only when the
 /// whole pipeline descriptor (functions, constants, attachments) matches, and the
 /// GPU binary is the one the compiler made for it.
@@ -63,7 +69,8 @@ import Synchronization
 public final class MonitorPipelineArchive: @unchecked Sendable {
   /// Counters for logs and tests.
   public struct Statistics: Equatable, Sendable {
-    /// Verified archive files loaded at init or written since.
+    /// Verified archive files opened (the newest at init, the older ones at the
+    /// first pipeline the open ones lack) or written since.
     public var filesLoaded = 0
     /// Files of this key that were truncated, corrupt or unreadable: ignored and removed.
     public var filesRejected = 0
@@ -90,7 +97,7 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   public let name: String
   /// Hex SHA-256 of the shader source, compile options, GPU and OS (see the type).
   public let key: String
-  /// Files kept per key.
+  /// Files kept per key (3 by default: the newest holds the whole last session).
   public let maximumFiles: Int
   /// Builds the library and every pipeline no loaded archive holds (a plain
   /// compiler: it uses and fills the system shader cache).
@@ -127,6 +134,9 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   private struct State {
     /// Newest first.
     var loaded: [Loaded] = []
+    /// Older files of this key not opened yet, newest first: opened at the first
+    /// lookup the loaded archives miss (`openOlderFiles`).
+    var older: [URL] = []
     /// Every pipeline built this session, in order, each once. Each save records
     /// them all, so each new file holds the whole session.
     var built: [Recipe] = []
@@ -143,13 +153,14 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
 
   private let state: Mutex<State>
 
-  /// Makes the compiler and loads this key's verified archives from `directory`
-  /// (created when missing). `source` is the exact library source the engine
+  /// Makes the compiler and opens this key's newest verified archive in
+  /// `directory` (created by the first save when missing); the older ones open at
+  /// the first pipeline it lacks. `source` is the exact library source the engine
   /// compiles, `options` its compile options. Throws only when Metal cannot make a
   /// compiler; an unusable directory or file just means a cold start.
   package init(
     device: MTLDevice, directory: URL, name: String, source: String, options: MTLCompileOptions,
-    maximumFiles: Int = 8
+    maximumFiles: Int = 3
   ) throws {
     self.device = device
     self.directory = directory
@@ -180,8 +191,10 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
     state = Mutex(State())
     var loaded: [Loaded] = []
     var rejected = 0
-    for url in Self.files(in: directory, prefix: keyPrefix).sorted(by: Self.newestFirst) {
-      guard loaded.count < self.maximumFiles else { break }
+    var candidates = Self.files(in: directory, prefix: keyPrefix).sorted(by: Self.newestFirst)
+    // The newest file that verifies; the rest wait for a miss.
+    while loaded.isEmpty && !candidates.isEmpty {
+      let url = candidates.removeFirst()
       switch verifiedArchive(url) {
       case .opened(let archive): loaded.append(Loaded(url: url, archive: archive))
       case .rejected:
@@ -190,8 +203,10 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       case .unavailable: break
       }
     }
+    let older = Array(candidates.prefix(max(0, self.maximumFiles - loaded.count)))
     state.withLock { s in
       s.loaded = loaded
+      s.older = older
       s.statistics.filesLoaded = loaded.count
       s.statistics.filesRejected = rejected
       s.options.lookupArchives = loaded.map(\.archive)
@@ -200,7 +215,8 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
 
   public var statistics: Statistics { state.withLock { $0.statistics } }
 
-  /// The archive files in use for lookups, newest first.
+  /// The archive files in use for lookups, newest first (older files of the key
+  /// join once a lookup missed in these).
   public var files: [URL] { state.withLock { $0.loaded.map(\.url) } }
 
   /// The pipelines the next save records (each descriptor once).
@@ -269,7 +285,8 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   }
 
   /// The pipeline `make` makes from the newest loaded archive that holds it (Metal
-  /// returns one only when the whole descriptor matches), or nil.
+  /// returns one only when the whole descriptor matches), or nil. When none holds
+  /// it, the key's older files are opened first (once) and tried too.
   private func lookup<T>(_ make: (any MTL4Archive) throws -> T) -> T? {
     let archives = state.withLock { $0.loaded.map(\.archive) }
     var i = 0
@@ -277,7 +294,50 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       if let found = try? make(archives[i]) { return found }
       i += 1
     }
+    let older = openOlderFiles()
+    i = 0
+    while i < older.count {
+      if let found = try? make(older[i]) { return found }
+      i += 1
+    }
     return nil
+  }
+
+  /// Opens the key's older files (verified and primed, as at init) the first time
+  /// a lookup misses, and adds them after the loaded ones within `maximumFiles`.
+  /// Returns those opened by this call (none once done, or while another thread
+  /// opens them: that lookup then compiles, which is only slower).
+  private func openOlderFiles() -> [any MTL4Archive] {
+    let urls = state.withLock { s -> [URL] in
+      defer { s.older = [] }
+      return s.older
+    }
+    guard !urls.isEmpty else { return [] }
+    var opened: [Loaded] = []
+    var rejected = 0
+    var i = 0
+    while i < urls.count {
+      switch verifiedArchive(urls[i]) {
+      case .opened(let archive): opened.append(Loaded(url: urls[i], archive: archive))
+      case .rejected:
+        rejected += 1
+        try? FileManager.default.removeItem(at: urls[i])
+      case .unavailable: break
+      }
+      i += 1
+    }
+    state.withLock { s in
+      // Older than every loaded file (a save since put its own first).
+      let room = max(0, maximumFiles - s.loaded.count)
+      let kept = opened.prefix(room).filter { o in !s.loaded.contains { $0.url == o.url } }
+      s.loaded.append(contentsOf: kept)
+      s.statistics.filesLoaded += kept.count
+      s.statistics.filesRejected += rejected
+      let options = MTL4CompilerTaskOptions()
+      options.lookupArchives = s.loaded.map(\.archive)
+      s.options = options
+    }
+    return opened.map(\.archive)
   }
 
   /// Counts the build and keeps `recipe` for the next save (once per descriptor:

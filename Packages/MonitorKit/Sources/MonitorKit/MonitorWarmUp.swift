@@ -76,15 +76,19 @@ extension MonitorEngine {
   /// with whatever is built. Already built pipelines are skipped. Returns the
   /// number of pipelines built by this call. With a `pipelineArchive`, pipelines
   /// saved by an earlier launch load from it instead of compiling, and any built
-  /// here are saved to it before this returns.
+  /// here are saved to it before this returns, unless `save` is false: a host
+  /// warming several engines (e.g. this one, then a `ScopeEngine`) saves each
+  /// archive once at the end (`pipelineArchive?.save()`), so this save, a few
+  /// hundred milliseconds on a cold key, never delays the next engine's builds;
+  /// anything left unsaved is saved by the scheduled save anyway.
   @discardableResult
   public func warmUp(
     targets: [MonitorRenderTargetFormat] = standardTargetFormats.map { MonitorRenderTargetFormat(colorPixelFormat: $0) },
-    layouts: [PixelLayout]? = nil, surfaces: [MonitorSurfaceConfiguration] = []
+    layouts: [PixelLayout]? = nil, surfaces: [MonitorSurfaceConfiguration] = [], save: Bool = true
   ) throws -> Int {
     let before = pipelinesBuilt
     // Saved even when a build throws, so what was built is kept.
-    defer { pipelineArchive?.save() }
+    defer { if save { pipelineArchive?.save() } }
     for target in targets { try prepare(target: target, layouts: layouts) }
     for surface in surfaces {
       // The stand-in a state change draws with while its specialized pipeline compiles.
@@ -173,9 +177,17 @@ extension MonitorPass {
     let frameParameters = FrameParameters(
       shape: SIMD4(k.layout.shaderKind, UInt32(k.width), UInt32(k.height), 0), options: SIMD4(0, 0, 0, 0),
       matrix: .zero, levels: .zero, codeScale: .zero)
-    let p = makeParameters(
+    var p = makeParameters(
       s, key: k, layout: layout, guides: guides, matte: (raster.matteRect, raster.matteOpacity),
       falseColor: falseColor, frameParameters: frameParameters, color: color)
+    // As `prepare` sets it: whether the Output and Monitor stages read the codes
+    // their own way decides `MK_LUTS` bit 2 (the second decode).
+    if k.signal.hasDistinctOutputReading {
+      let source = MonitorFrame.parameters(layout: k.layout, width: k.width, height: k.height, reading: k.signal)
+      let output = MonitorFrame.parameters(
+        layout: k.layout, width: k.width, height: k.height, reading: k.signal.signal(for: .output))
+      p.outputReading = PassParameters.outputReading(output, source: source)
+    }
     return (variant(p, state: s, layout: layout), colorKey(color))
   }
 }

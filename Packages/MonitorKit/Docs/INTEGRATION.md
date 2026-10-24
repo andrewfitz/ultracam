@@ -56,6 +56,21 @@ func cameraSignal(_ pixelBuffer: CVPixelBuffer, declaredLog: LogEncoding?) -> Si
 }
 ```
 
+When your output path reads the codes differently from the camera's declaration, give the signal both readings rather than drawing each stage from a relabelled frame: `signal.outputReading = SignalReading(range:matrix:)` is how your burn-in LUT and real output decode them (for example the pixel format's legal range when the user declares a camera full range, or BT.709 when your processing decodes a SMPTE 240M source as BT.709). The Source stage and log false colour keep `range` and `matrix`; the Output and Monitor stages, and every tool, scope and focus analysis on them, use `outputReading`, all in one pass of one frame. Leave it nil when the readings agree. Hand the same frame to every pass (picture, analysis, scopes, Freeze): MonitorKit resolves each stage itself (`SignalDescription.signal(for:)`, `MonitorFrame.parameters(for:)`), and a frozen copy keeps both readings. Labels that describe one stage (a scope's graticule, an interpretation line) use `signal.signal(for: stage)`.
+
+```swift
+import MonitorKit
+
+/// A camera the user declared full range, on a legal-range link that the burn-in reads as legal.
+func declaredFull(_ native: SignalDescription) -> SignalDescription {
+  var signal = native
+  signal.range = .full
+  let output = SignalReading(range: native.range, matrix: native.matrix)
+  signal.outputReading = output == signal.sourceReading ? nil : output
+  return signal
+}
+```
+
 Mark processed pictures (a programme mix, a scaled or graded render) with `frame.isProcessed = true`: log false colour and peaking need the camera's own signal and then report `.requiresCameraSignal`. Each new picture needs a new `MonitorFrame` (a fresh `id`); the focus mask belongs to the `id`.
 
 Keep every frame alive until the GPU work that reads it has completed.
@@ -105,7 +120,7 @@ The library never begins, ends or commits a Metal 4 command buffer and never cre
 5. **Uniforms.** By default each object writes a small ring of `framesInFlight` slots (made on first use, rewritten only when its parameters change). To use your own transient memory, pass a `MonitorUniformAllocator` in `MonitorSubmission.uniforms`: 256-byte-aligned, resident, valid until the submission completes, sized from the constants (`MonitorPass.uniformLength` 5120 per picture, `MonitorFeed.uniformLength` 1024 per analysis, `ScopeAccumulator.uniformLength` 1280, `ScopeGroup.uniformLength` 2048, `ScopeRenderer.uniformLength` 768 plus `graticuleUniformLength` 2304 when the graticule changes). Never size them from struct sizes.
 6. **Argument tables.** Each object owns one and binds it itself. When it draws or dispatches inside your encoder, rebind your own table afterwards. `prepareMetal4()` on scope objects makes theirs ahead of the first frame.
 7. **Barriers.** The library encodes the barriers its own reads and writes need (focus mask, Freeze planes, scope bins, loads of shared targets), and skips them once the writer's submission is known complete. You order your own writes to frames and targets. A host that reads a persistent target MonitorKit writes (samples or blits a multiview texture) ends its reading encoder with a producer barrier, so the next frame's write does not overtake the read. Drawables are covered by `waitForDrawable`.
-8. **Warm-up.** As on the classic path, plus `MonitorEngine(device:compiler:)` with your `MTL4Compiler` if your pipelines go through its serializer and archives.
+8. **Warm-up.** As on the classic path, plus `MonitorEngine(device:compiler:)` with your `MTL4Compiler` if your pipelines go through its lookup archives (asynchronous specialization uses it from compiler tasks; a compiler with a pipeline data set serializer crashes there on macOS 27, so give MonitorKit a plain one). For a warm start across launches, make both engines with a `cacheDirectory` instead (a subdirectory of your caches directory; the same one may serve both): they then build through their own `MonitorPipelineArchive` and a host `compiler` is unused. Warm them with `save: false` and save each archive once at the end (`engine.pipelineArchive?.save()`, `scopeEngine.pipelineArchive?.save()`), off the main thread; pipelines built later are saved by themselves a couple of seconds after the last one.
 
 The minimal host is in the [README](../README.md#3-encode-tier-metal-4); [section 10](#10-worked-example-an-ultracam-style-monitor) is a complete one. The submission clock:
 
@@ -283,9 +298,11 @@ final class MonitorGPUContext: @unchecked Sendable {
     }
     self.device = device
     self.queue = queue
-    let compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
-    engine = try MonitorEngine(device: device, compiler: compiler)
-    scopeEngine = try ScopeEngine(device: device, residency: engine.residency)
+    // Pipelines compiled once load from the caches directory at the next launch.
+    let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    let pipelines = caches.appendingPathComponent("MonitorKit pipelines", isDirectory: true)
+    engine = try MonitorEngine(device: device, cacheDirectory: pipelines)
+    scopeEngine = try ScopeEngine(device: device, residency: engine.residency, cacheDirectory: pipelines)
     frames = MonitorTextureCache(device: device, residency: engine.residency)
     let d = MTLResidencySetDescriptor()
     d.label = "Monitor host"
@@ -294,10 +311,15 @@ final class MonitorGPUContext: @unchecked Sendable {
     queue.addResidencySet(hostResidency)
   }
 
-  /// At start-up, off the main thread.
+  /// At start-up, off the main thread. Each archive is saved once, after both
+  /// engines are warm (a no-op when nothing new was compiled).
   func warmUp() throws {
-    try engine.warmUp()
-    try scopeEngine.prepare()
+    defer {
+      engine.pipelineArchive?.save()
+      scopeEngine.pipelineArchive?.save()
+    }
+    try engine.warmUp(save: false)
+    try scopeEngine.prepare(save: false)
   }
 
   /// A layer's drawables; call again after a re-tag that changed its pixel format.
@@ -526,6 +548,7 @@ How the app's pieces map onto it:
 - Any LUT on the picture's stage makes it Rec.709 SDR and every display transform unavailable (`.lutOnMonitorStage`). To see a display transform while a LUT is burned in, show `pictureStage = .source`.
 - Re-tag the layer when `outputColor.layer(…)` changes, and pass `feed.monitorStageHasLUT(for: state)`, which follows `pictureStage`.
 - On a layer shared with an HDR picture, set `scopeRenderer.colorPipeline = pass.colorPipeline`.
+- Never relabel a frame with one stage's reading for a pass (say, the Output reading for an Output-stage picture): the other stages' tools on that pass would read the codes with it. Set `signal.outputReading` once and hand every pass the same frame.
 - Declare log encodings; they are never inferred. An unlabelled or log signal shown without a LUT or transform is a code-value view (`status.isCodeValueView`): its brightness is not exposure.
 
 **LUTs and fused kernels**

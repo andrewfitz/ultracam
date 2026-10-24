@@ -487,6 +487,75 @@ final class Benchmarks: XCTestCase {
     }
   }
 
+  /// The second decode of a distinct output reading (`SignalDescription.outputReading`,
+  /// e.g. a camera declared full range on a legal link), 4K v210 → 1080p f16 with
+  /// the picture, both zebras and the clip indicators on one stage, no LUT;
+  /// interleaved, each case's minimum, up to three rounds. On the Source stage the
+  /// pipeline compiles no second decode (`MK_LUTS` bit 2), so the reading costs
+  /// nothing there; on the Output stage it is one more decode of the same codes
+  /// (measured about +7 % of the pass with these tools).
+  func testOutputReadingGPUTime() throws {
+    let gpu = try requireGPU()
+    let frame = try Self.frame4K(gpu)
+    try warmUp(gpu, frame)
+    let distinct = try MonitorFrame(
+      layout: .v210, width: Self.width, height: Self.height, packed: frame.packed,
+      signal: SignalDescription(range: .full, outputReading: SignalReading(range: .legal, matrix: .bt709)))
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1920, height: 1080, mipmapped: false)
+    d.usage = .renderTarget
+    d.storageMode = .private
+    let target = gpu.device.makeTexture(descriptor: d)!
+    func tools(_ stage: SignalStage) -> MonitorState {
+      var s = MonitorState()
+      s.pictureStage = stage
+      s.zebras[0] = ZebraSet(mode: .lowerLimit, level: 95, stage: stage)
+      s.zebras[1] = ZebraSet(mode: .band, level: 50, range: 5, stage: stage)
+      s.clipIndicators.enabled = true
+      s.clipIndicators.stage = stage
+      return s
+    }
+    let cases: [(String, MonitorFrame, MonitorState)] = [
+      ("Source tools, one reading", frame, tools(.source)),
+      ("Source tools, distinct reading", distinct, tools(.source)),
+      ("Output tools, one reading", frame, tools(.output)),
+      ("Output tools, distinct reading", distinct, tools(.output)),
+    ]
+    let feed = gpu.engine.makeFeed()
+    let passes = cases.map { _ in gpu.engine.makePass() }
+    func measure() throws -> [Double] {
+      var times = [[Double]](repeating: [], count: cases.count)
+      for round in 0..<70 {
+        for (i, c) in cases.enumerated() {
+          let cb = gpu.queue.makeCommandBuffer()!
+          try passes[i].encode(frame: c.1, feed: feed, state: c.2, target: target, into: cb)
+          cb.commit()
+          cb.waitUntilCompleted()
+          XCTAssertNil(cb.error)
+          if round >= 10 { times[i].append((cb.gpuEndTime - cb.gpuStartTime) * 1000) }
+        }
+      }
+      return times.map { $0.min()! }
+    }
+    // Source: the same pipeline either way (within timer noise); Output: one more
+    // decode, bounded at +15 % (measured about +7 %).
+    func over(_ ms: [Double]) -> Bool { ms[1] > ms[0] * 1.05 + 0.005 || ms[3] > ms[2] * 1.15 + 0.005 }
+    var ms = try measure()
+    var rounds = 1
+    while rounds < 3 && over(ms) {
+      ms = try measure()
+      rounds += 1
+    }
+    for (i, c) in cases.enumerated() {
+      XCTAssertTrue(passes[i].usesSpecializedPipeline, c.0)
+      let reference = ms[i < 2 ? 0 : 2]
+      print("BENCH 4K v210 -> 1080p f16 \(c.0): " + String(format: "%.4f ms (%+.1f%%)", ms[i], (ms[i] / reference - 1) * 100))
+    }
+    XCTAssertEqual(passes[1].currentVariant.luts & 4, 4, "no second decode while only the Source is read")
+    XCTAssertEqual(passes[3].currentVariant.luts & 4, 0)
+    try assertWithinBudget(ms[1], ms[0] * 1.05 + 0.005, "a distinct output reading with Source-stage tools, ms")
+    try assertWithinBudget(ms[3], ms[2] * 1.15 + 0.005, "a distinct output reading with Output-stage tools, ms")
+  }
+
   /// Freeze's compute copy of a 4K v210 frame (22 MB), into planes allocated once.
   func testFreezeCopyGPUTime() throws {
     let gpu = try requireGPU()

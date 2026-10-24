@@ -436,9 +436,11 @@ public final class MonitorRenderer {
     init(feed: MonitorFeed) { self.feed = feed }
   }
 
-  /// What a focus mask depends on besides the frame: the LUTs of the effective
-  /// stage (a monitor stage without a monitor LUT is the output stage, an output
-  /// stage without a burn-in LUT the source) and the two thresholds.
+  /// What a focus mask depends on besides the frame: the LUTs and reading of the
+  /// effective stage (a monitor stage without a monitor LUT is the output stage,
+  /// an output stage without a burn-in LUT the source unless the frame's signal
+  /// has a distinct output reading) and the two thresholds. A change of reading
+  /// comes with a new frame, which `AnalysisKey.frame` already moves on.
   struct AnalysisSpec: Equatable {
     var stage: SignalStage
     var sensitivity: Double
@@ -1055,13 +1057,19 @@ public final class MonitorRenderer {
     retire(feed: old, lastUse: s.lastUse)
   }
 
-  /// The analysis `s` asks for, its stage reduced to the LUTs that stage actually has.
+  /// The analysis `s` asks for, its stage reduced to the LUTs that stage actually
+  /// has. A Monitor stage with no monitor LUT is the Output stage (both read the
+  /// codes with the output reading); an Output stage with no burn-in LUT is the
+  /// source only when the signal has no distinct output reading
+  /// (`SignalDescription.outputReading`), else it decodes the codes its own way and
+  /// `MonitorFeed` keeps its mask apart from the source's.
   private func spec(_ s: SurfaceState) -> AnalysisSpec {
     let focus = s.state.focus
     let feed = s.source.feed
     var stage = focus.stage
     if stage == .monitor && !(s.state.monitorLUT && feed.monitorLUT != nil) { stage = .output }
-    if stage == .output && feed.burnInLUT == nil { stage = .source }
+    let distinctReading = s.source.frame?.signal.hasDistinctOutputReading ?? false
+    if stage == .output && feed.burnInLUT == nil && !distinctReading { stage = .source }
     return AnalysisSpec(stage: stage, sensitivity: focus.sensitivity, noiseRejection: focus.noiseRejection)
   }
 

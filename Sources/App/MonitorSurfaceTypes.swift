@@ -73,6 +73,9 @@ struct MonitorDiagnostics: Equatable, Sendable {
 struct MonitorSurfaceStatistics: Equatable, Sendable {
   /// Display refreshes the picture's display link offered (drawn or not).
   var refreshes: UInt64 = 0
+  /// Callbacks the scope's display link delivered (a scope drawn or not), at the
+  /// scope rate it asks for: a scope is drawn on at most one of each.
+  var scopeRefreshes: UInt64 = 0
   var acceptedFrames: UInt64 = 0
   var presentedFrames: UInt64 = 0
   /// Frames replaced by a newer one before any display refresh took them.

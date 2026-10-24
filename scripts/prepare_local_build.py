@@ -56,6 +56,17 @@ def main():
         shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, destination, symlinks=True)
+    # A stripped Release executable symbolicates only against the dSYM of its link
+    # (validate_bundle.validate_symbols); keep a copy beside the staged app. Signing
+    # does not change the executable's LC_UUID, so the copy still matches.
+    source_symbols = source.parent / (source.name + ".dSYM")
+    destination_symbols = destination.parent / (destination.name + ".dSYM")
+    if destination_symbols.is_symlink() or destination_symbols.is_file():
+        destination_symbols.unlink()
+    elif destination_symbols.exists():
+        shutil.rmtree(destination_symbols)
+    if source_symbols.is_dir():
+        shutil.copytree(source_symbols, destination_symbols, symlinks=True)
     extension = destination / "Contents/Library/SystemExtensions" / (EXTENSION_ID + ".systemextension")
     version = str(int(time.time()))
     for bundle in (destination, extension):

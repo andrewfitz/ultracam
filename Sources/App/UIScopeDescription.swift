@@ -115,9 +115,13 @@ struct UIScopeDescription: Equatable, Sendable {
   let lutApplied: Bool
   let context: ScopeContext
 
-  /// `stageLUT`: whether a LUT is on the path to the scope's stage, by
-  /// `MonitorState.pictureHasLUT`'s rule for that stage (the burn-in LUT on
-  /// Output and Monitor, a shown monitor LUT on Monitor);
+  /// `signal` is the shown frame's, with both readings (`shownSignal`,
+  /// `MonitorCoordinator.scopeMeasurement`): the description takes its own stage's
+  /// (`SignalDescription.signal(for:)`), as `ScopeAccumulator` does, so an Output
+  /// or Monitor scope of a camera declared Full is labelled with the legal range
+  /// the scope measures. `stageLUT`: whether a LUT is on the path to the scope's
+  /// stage, by `MonitorState.pictureHasLUT`'s rule for that stage (the burn-in LUT
+  /// on Output and Monitor, a shown monitor LUT on Monitor);
   /// `MonitorSurfacePresenter.scopeMeasuresLUT` decides it for a surface.
   init(scopes: MonitorScopePreferences, signal: SignalDescription?, stageLUT: Bool, isProgram: Bool) {
     let s = scopes.settings.normalized()
@@ -125,12 +129,13 @@ struct UIScopeDescription: Equatable, Sendable {
     self.isProgram = isProgram
     let lut = s.stage != .source && stageLUT
     lutApplied = lut
-    self.signal = lut ? nil : signal
-    // As `ScopeAccumulator` measures it: the frame's range, the matrix the
-    // colorimetry picks for the stage.
+    let staged = signal?.signal(for: s.stage)
+    self.signal = lut ? nil : staged
+    // As `ScopeAccumulator` measures it: the stage's range, the matrix the
+    // colorimetry picks for the stage's reading.
     context = ScopeContext(
-      range: signal?.range ?? .legal,
-      matrix: s.colorimetry.matrix(source: signal?.matrix ?? .bt709, lutApplied: lut))
+      range: staged?.range ?? .legal,
+      matrix: s.colorimetry.matrix(source: staged?.matrix ?? .bt709, lutApplied: lut))
   }
 
   var choice: UIScopeChoice { UIScopeChoice(settings) }

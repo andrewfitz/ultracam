@@ -137,6 +137,25 @@ import SwiftUI
       scopes: scopes(.luma) { $0.stage = .source }, signal: pq, stageLUT: true, isProgram: false)
     check("the source stage of a LUT camera measures the camera signal",
       sourceStage.hdrTransfer == .pq && sourceStage.context.matrix == .bt2020)
+    // A camera declared Full on a legal link, whose SMPTE 240M tag the burn-in path
+    // reads as BT.709: the shown signal carries both readings, and each stage's
+    // description labels the reading ScopeAccumulator measures it with.
+    let declared = SignalDescription(
+      range: .full, matrix: .smpte240m, outputReading: SignalReading(range: .legal, matrix: .bt709))
+    let outputStage = UIScopeDescription(scopes: scopes(.luma), signal: declared, stageLUT: false, isProgram: false)
+    let declaredSource = UIScopeDescription(
+      scopes: scopes(.luma) { $0.stage = .source }, signal: declared, stageLUT: false, isProgram: false)
+    let monitorStage = UIScopeDescription(
+      scopes: scopes(.vectorscope) { $0.stage = .monitor }, signal: declared, stageLUT: false, isProgram: false)
+    check("an Output-stage scope of a camera declared Full is labelled with the legal range it measures",
+      outputStage.context.range == .legal && outputStage.context.matrix == .bt709
+        && outputStage.signal == declared.signal(for: .output),
+      "\(outputStage.context)")
+    check("the Source stage of that camera keeps its declared Full range and SMPTE 240M",
+      declaredSource.context.range == .full && declaredSource.context.matrix == .smpte240m,
+      "\(declaredSource.context)")
+    check("a Monitor-stage vectorscope of that camera reads the output's BT.709",
+      monitorStage.context.range == .legal && monitorStage.context.matrix == .bt709, "\(monitorStage.context)")
     let sdr = UIScopeDescription(scopes: scopes(.luma), signal: .rec709, stageLUT: false, isProgram: false)
     check("an SDR stage has no nits scale or note", !sdr.offers(.pqNits) && sdr.scaleNote == nil)
     let mismatch = UIScopeDescription(

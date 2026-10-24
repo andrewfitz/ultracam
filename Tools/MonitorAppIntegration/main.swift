@@ -285,12 +285,16 @@ import XCTest
         let scopeFPS = scopes / elapsed
         let presentedFPS = presented / elapsed
         let refreshesFPS = Double(end.refreshes - start.refreshes) / elapsed
+        let scopeTicks = Double(end.scopeRefreshes - start.scopeRefreshes)
         let skipped = (end.scopeSkippedBusy - start.scopeSkippedBusy, end.scopeSkippedNoDrawable - start.scopeSkippedNoDrawable)
         print(
           String(
-            format: "MONITOR_SURFACE_MEASURE scopes at %d Hz beside a %.0f Hz picture, round %d (%.1f refreshes/s on a %.0f Hz display): drawn %.2f fps, picture %.2f fps, skipped busy %llu no drawable %llu, GPU per scope %@",
-            hz, pictureHz, round, refreshesFPS, displayHz, scopeFPS, presentedFPS, skipped.0, skipped.1,
-            end.scopeGPUMilliseconds.map { String(format: "%.3f ms", $0) } ?? "n/a"))
+            format: "MONITOR_SURFACE_MEASURE scopes at %d Hz beside a %.0f Hz picture, round %d (%.1f refreshes/s on a %.0f Hz display, scope link %.1f ticks/s): drawn %.2f fps, picture %.2f fps, skipped busy %llu no drawable %llu, GPU per scope %@",
+            hz, pictureHz, round, refreshesFPS, displayHz, scopeTicks / elapsed, scopeFPS, presentedFPS, skipped.0,
+            skipped.1, end.scopeGPUMilliseconds.map { String(format: "%.3f ms", $0) } ?? "n/a"))
+        // A scope is drawn only on a callback of the scope's own display link
+        // (`MonitorSurfaceStatistics.scopeRefreshes`), at most one per callback.
+        XCTAssertLessThanOrEqual(scopes, scopeTicks + 2, "A scope is drawn on at most one scope-link tick each")
         // A scope draws at most once per slot of its rate and once per new picture
         // (a scope of a picture already scoped is never redrawn): the physical
         // ceiling. The tolerance is the window's edges: a scope pending at its
@@ -534,9 +538,10 @@ import XCTest
           // fills at least 3/4 at any phase (idle rounds fill 86-100%); a presenter
           // that took only every other refresh fills at most 1/2. A loaded
           // machine's late callbacks come in bursts and fill less (58% has been
-          // seen at 229 refreshes/s), so the floor between them is a smoke check,
-          // re-measured, beside the refresh floor and the accounting.
-          let presentationFloor = 0.6 * Double(ceiling)
+          // seen at 229 refreshes/s); such a round is re-measured. The floor is
+          // the model's 3/4, so a presenter that drops one frame in three (2/3)
+          // fails it as one taking every other refresh does.
+          let presentationFloor = 0.75 * Double(ceiling)
           floorsMet = Double(presented) >= presentationFloor && refreshesFPS >= refreshFloor
             && gpuMilliseconds < gpuBudget
           if !floorsMet && round == rounds {

@@ -276,6 +276,15 @@ public struct MonitorFrame: @unchecked Sendable {
   /// `mk_FrameParams` for this frame's layout and size, decoding with `signal`'s
   /// range, matrix, siting and log transport.
   func parameters(reading signal: SignalDescription) -> FrameParameters {
+    Self.parameters(layout: layout, width: width, height: height, reading: signal)
+  }
+
+  /// `mk_FrameParams` for a frame of `layout` and size, decoding with `signal`'s
+  /// range, matrix, siting and log transport (no textures needed: warm-up derives
+  /// a surface's pipeline from it).
+  static func parameters(layout: PixelLayout, width: Int, height: Int, reading signal: SignalDescription)
+    -> FrameParameters
+  {
     let kind = layout.shaderKind
     let sub: UInt32 = layout.subsampling == .s444 ? 0 : (layout.subsampling == .s422 ? 1 : 2)
     let depth = layout.bitDepth

@@ -314,11 +314,9 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
       XCTAssertEqual(frame.parameters(for: .monitor), output)
       XCTAssertEqual(output.levels, decode, "The same levels as the burn-in's decode")
       XCTAssertNotEqual(output.matrix, source.matrix, "Output: BT.709, not the tagged SMPTE 240M")
-      for stage in [SignalStage.source, .output, .monitor] {
-        let measured = try camera.frame(delivery, in: context, core: core, reading: stage)
-        XCTAssertEqual(measured.signal, frame.signal, "A pass on \(stage) is never relabelled")
-        XCTAssertEqual(measured.id, frame.id, "One picture, analysed once")
-      }
+      let again = try camera.frame(delivery, in: context, core: core)
+      XCTAssertEqual(again.signal, frame.signal, "Every pass draws the same frame, never relabelled")
+      XCTAssertEqual(again.id, frame.id, "One picture, analysed once")
     }
     XCTAssertTrue(completion.wait())
 
@@ -681,6 +679,10 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
       let lock = NSLock()
       var thread: Thread?
     }
+    final class PolicyBox: @unchecked Sendable {
+      let lock = NSLock()
+      var policy: thread_time_constraint_policy_data_t?
+    }
     func runningThread(_ render: MonitorGPUContext.RenderThread) throws -> Thread {
       let box = Box()
       let ran = expectation(description: "ran on the render thread")
@@ -699,6 +701,24 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
       return thread.isFinished
     }
     let stopped = MonitorGPUContext.RenderThread(name: "test.render.stop")
+    // The render thread runs on a real-time schedule of one display refresh.
+    let scheduled = expectation(description: "read the render thread's schedule")
+    let policyBox = PolicyBox()
+    stopped.perform {
+      policyBox.lock.withLock { policyBox.policy = MonitorGPUContext.RenderThread.currentTimeConstraint() }
+      scheduled.fulfill()
+    }
+    wait(for: [scheduled], timeout: 2)
+    let policy = try XCTUnwrap(policyBox.lock.withLock { policyBox.policy }, "a time-constraint policy")
+    let expected = MonitorGPUContext.RenderThread.realTimeSchedule(
+      refreshHz: MonitorGPUContext.RenderThread.fastestDisplayRefreshRate())
+    XCTAssertEqual(policy.period, expected.period, "one refresh of the fastest display")
+    // The kernel may raise the computation (XNU makes it at least half the constraint).
+    XCTAssertGreaterThanOrEqual(policy.computation, expected.computation)
+    XCTAssertLessThanOrEqual(policy.computation, policy.constraint)
+    XCTAssertEqual(policy.constraint, expected.constraint)
+    XCTAssertLessThanOrEqual(expected.constraint, expected.period)
+    XCTAssertEqual(policy.preemptible, 1)
     let first = try runningThread(stopped)
     stopped.stop()
     XCTAssertTrue(waitUntilFinished(first))

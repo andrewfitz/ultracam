@@ -360,6 +360,48 @@ final class PipelineArchiveTests: XCTestCase {
     XCTAssertEqual(reader.statistics.misses, 0)
   }
 
+  /// Only the newest file is opened at init. A pipeline it lacks opens the older
+  /// files (verified and primed then) before anything compiles, and is found there;
+  /// a launch that finds everything in the newest never opens them.
+  func testOlderFilesOpenAtTheFirstMiss() throws {
+    let gpu = try requireGPU()
+    let d = try directory()
+    let source = Self.kernel(6)
+    func open() throws -> MonitorPipelineArchive {
+      try MonitorPipelineArchive(
+        device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions)
+    }
+    // Two sessions of their own: the older file holds offset 0, the newer offset 1.
+    var offset: UInt32 = 0
+    while offset < 2 {
+      let writer = try open()
+      _ = try writer.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(writer, source), offset: offset))
+      XCTAssertTrue(writer.save())
+      usleep(20_000)  // distinct modification dates
+      offset += 1
+    }
+    XCTAssertEqual(archiveFiles(d).count, 2)
+    let newestOnly = try open()
+    XCTAssertEqual(newestOnly.statistics.filesLoaded, 1)
+    XCTAssertEqual(newestOnly.files.count, 1)
+    XCTAssertEqual(
+      try Self.run(try newestOnly.makeComputePipelineState(
+        descriptor: Self.descriptor(try Self.library(newestOnly, source), offset: 1)))[2], 13)
+    XCTAssertEqual(newestOnly.statistics.hits, 1)
+    XCTAssertEqual(newestOnly.statistics.filesLoaded, 1, "a hit in the newest opens nothing more")
+
+    let reader = try open()
+    let library = try Self.library(reader, source)
+    XCTAssertEqual(try Self.run(try reader.makeComputePipelineState(descriptor: Self.descriptor(library, offset: 0)))[2], 12)
+    XCTAssertEqual(reader.statistics.filesLoaded, 2, "the older file, opened at the miss")
+    XCTAssertEqual(reader.files.count, 2)
+    XCTAssertEqual(reader.statistics.hits, 1, "found in the older file, not compiled")
+    XCTAssertEqual(reader.statistics.misses, 0)
+    XCTAssertEqual(try Self.run(try reader.makeComputePipelineState(descriptor: Self.descriptor(library, offset: 3)))[2], 15)
+    XCTAssertEqual(reader.statistics.misses, 1)
+    XCTAssertEqual(reader.statistics.filesLoaded, 2, "opened once")
+  }
+
   /// Several archives of one key on one directory build and save at the same time
   /// as other threads: every file stays valid, and a later archive loads them all
   /// and finds every pipeline any of them built.
@@ -396,7 +438,7 @@ final class PipelineArchiveTests: XCTestCase {
       device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions,
       maximumFiles: 64)
     XCTAssertEqual(reader.statistics.filesRejected, 0)
-    XCTAssertEqual(reader.statistics.filesLoaded, files.count)
+    XCTAssertEqual(reader.statistics.filesLoaded, 1, "the newest file at init")
     let readerLibrary = try Self.library(reader, source)
     var i = 0
     while i < 12 {
@@ -406,6 +448,8 @@ final class PipelineArchiveTests: XCTestCase {
     }
     XCTAssertEqual(reader.statistics.hits, 12)
     XCTAssertEqual(reader.statistics.misses, 0)
+    XCTAssertEqual(reader.statistics.filesRejected, 0)
+    XCTAssertEqual(reader.statistics.filesLoaded, files.count, "the older files, at the first pipeline the newest lacked")
   }
 
   /// Two engines on one cache directory warm up at the same time, both from the archive.
@@ -503,9 +547,10 @@ final class PipelineArchiveTests: XCTestCase {
     let oldest = Set(archiveFiles(d))
     XCTAssertEqual(oldest.count, 2)
     let a = try open(), b = try open()
-    XCTAssertEqual(a.statistics.filesLoaded, 2)
-    XCTAssertEqual(b.statistics.filesLoaded, 2)
+    XCTAssertEqual(a.statistics.filesLoaded, 1, "the newest at init")
+    XCTAssertEqual(b.statistics.filesLoaded, 1)
     _ = try b.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(b, source), offset: 5))
+    XCTAssertEqual(b.statistics.filesLoaded, 2, "the older file, opened at the miss")
     XCTAssertTrue(b.save())
     XCTAssertEqual(Set(archiveFiles(d)).intersection(oldest).count, 1, "the oldest file was evicted")
     let aLibrary = try Self.library(a, source)

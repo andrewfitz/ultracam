@@ -82,6 +82,56 @@ final class PipelineArchiveBenchmarks: XCTestCase {
     }
   }
 
+  /// Engine init plus `warmUp()` on a directory written by several launches, each
+  /// adding one specialized pipeline (a new file holding the whole session), against
+  /// the host-compiler path with no cache. Only the newest file is opened at init,
+  /// so the cost stays that of one file however many are kept.
+  func testInitAndWarmUpWithSeveralFiles() throws {
+    let gpu = try requireGPU()
+    let target = MonitorRenderTargetFormat(colorPixelFormat: .bgr10a2Unorm)
+    let states: [(inout MonitorState) -> Void] = [
+      { $0.zebras[0].enabled = true }, { $0.clipIndicators.enabled = true }, { $0.falseColor.mode = .sixBand },
+      { $0.guides.enabled = true }, { $0.display.monochrome = .luma },
+    ]
+    func surface(_ i: Int) -> MonitorSurfaceConfiguration {
+      var state = MonitorState()
+      states[i](&state)
+      return MonitorSurfaceConfiguration(
+        target: target, layout: .v210, state: state, frameSize: (1920, 1080), viewportSize: (1280, 720))
+    }
+    for sessions in [1, 3, 5] {
+      var best = (initMs: Double.infinity, warmUpMs: Double.infinity, plainInit: Double.infinity, plainWarmUp: Double.infinity)
+      var files = 0, opened = 0
+      for _ in 0..<rounds {
+        let dir = try directory()
+        var i = 0
+        while i < sessions {
+          let e = try engine(.cold, gpu, dir, specialization: .asynchronous)
+          try e.warmUp(surfaces: [surface(i)])
+          usleep(20_000)  // distinct modification dates
+          i += 1
+        }
+        files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter {
+          $0.hasSuffix(".mtl4archive")
+        }.count
+        var e: MonitorEngine?
+        let initMs = try Self.milliseconds { e = try engine(.warm, gpu, dir, specialization: .asynchronous) }
+        let warmMs = try Self.milliseconds { _ = try e!.warmUp() }
+        XCTAssertEqual(e!.pipelineArchive?.statistics.misses, 0)
+        opened = e!.pipelineArchive?.statistics.filesLoaded ?? 0
+        var p: MonitorEngine?
+        let plainInit = try Self.milliseconds { p = try engine(.compiler, gpu, dir, specialization: .asynchronous) }
+        let plainWarm = try Self.milliseconds { _ = try p!.warmUp() }
+        best = (min(best.initMs, initMs), min(best.warmUpMs, warmMs), min(best.plainInit, plainInit), min(best.plainWarmUp, plainWarm))
+      }
+      print(
+        String(
+          format: "WARMSTART (system shader cache warm) %d launches, %d files kept, %d opened: archive init %.1f ms + warmUp %.1f ms = %.1f ms; compiler, no cache: init %.1f ms + warmUp %.1f ms = %.1f ms, min of %d",
+          sessions, files, opened, best.initMs, best.warmUpMs, best.initMs + best.warmUpMs, best.plainInit, best.plainWarmUp,
+          best.plainInit + best.plainWarmUp, rounds))
+    }
+  }
+
   /// From engine init to the first frame drawn with the pipeline specialized to
   /// its tool set (asynchronous specialization, no warm-up), into a 1080p
   /// `bgr10a2Unorm` target with every tool on; also the first frame drawn at all.

@@ -374,6 +374,8 @@ public final class MonitorPass {
   /// Whether the pipeline in use is specialized to this surface's tool set
   /// (false while it compiles asynchronously and the all-tools pipeline stands in).
   public var usesSpecializedPipeline: Bool { pipelineIsSpecialized }
+  /// The tool set the specialized pipeline is built for (tests).
+  var currentVariant: MonitorEngine.Variant { variant }
 
   private var lastInput: MonitorState?
   private var lastNormalized = MonitorState()
@@ -563,10 +565,15 @@ public final class MonitorPass {
     if zebra1 { stage = max(stage, p.zebra.y) }
     let clip = p.colorFlags.y != 0
     if clip { stage = max(stage, p.colorFlags.w) }
-    // Bit 2: the Output and Monitor stages share the source decode (no distinct
-    // output reading), so the pipeline compiles no second decode.
+    // Bit 2: the pipeline compiles no second decode, because the Output and
+    // Monitor stages share the source decode (no distinct output reading) or
+    // nothing drawn reads them. The pixels are the same: with the bit set those
+    // stages fall back to the source reading, which no Source-stage consumer reads
+    // differently (zebra and clip stages are uniforms, so only the variant can
+    // drop the decode they would not use).
+    let readsOutput = stage >= 1 && p.outputReading.w != 0
     let luts: UInt32 =
-      (stage >= 1 && p.luts.x != 0 ? 1 : 0) | (stage == 2 && p.luts.y != 0 ? 2 : 0) | (p.outputReading.w == 0 ? 4 : 0)
+      (stage >= 1 && p.luts.x != 0 ? 1 : 0) | (stage == 2 && p.luts.y != 0 ? 2 : 0) | (readsOutput ? 0 : 4)
     let nearest = p.flags.x != 0 || logFalseColor
     let magnifiedMain = !nearest && (layout.footprintX < 1 || layout.footprintY < 1)
     let navigatorMap = layout.navigatorToPicture

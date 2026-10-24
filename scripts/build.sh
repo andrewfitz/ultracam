@@ -75,6 +75,26 @@ if [[ -e "$stable_product" && ! -L "$stable_product" ]]; then
   exit 1
 fi
 ln -sfn "$product" "$stable_product"
+# Release keeps its symbols only in the dSYM beside the stripped product: link it
+# beside the stable product, and keep a copy per build UUID, so a crash report of
+# any earlier build still symbolicates after its run directory is pruned.
+dsym="$build_root/Build/Products/$configuration/Ultracam.app.dSYM"
+stable_dsym="$artifact_root/Ultracam.app.dSYM"
+if [[ -e "$stable_dsym" && ! -L "$stable_dsym" ]]; then
+  echo "Refusing to replace existing non-symlink dSYM: $stable_dsym" >&2
+  exit 1
+fi
+if [[ ! -d "$dsym" ]]; then
+  # A Debug product carries its symbols; never leave another build's dSYM beside it.
+  rm -f "$stable_dsym"
+else
+  ln -sfn "$dsym" "$stable_dsym"
+  uuid="$(/usr/bin/dwarfdump --uuid "$dsym" | /usr/bin/awk 'NR==1{print $2}')"
+  if [[ -n "$uuid" ]]; then
+    mkdir -p "$artifact_root/symbols/$uuid"
+    /usr/bin/ditto "$dsym" "$artifact_root/symbols/$uuid/Ultracam.app.dSYM"
+  fi
+fi
 if [[ "$local_development" == true ]]; then
   python3 "$task_root/scripts/prepare_local_build.py" "$product" \
     "$artifact_root/local-development/Ultracam.app"

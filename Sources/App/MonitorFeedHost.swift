@@ -645,14 +645,13 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// the `Delivery` instead (a pending scope tick, a Freeze source) and wrap it
   /// again at each encode.
   ///
-  /// The frame carries `Delivery.signal`, both readings, whatever `stage` a pass
+  /// The frame carries `Delivery.signal`, both readings, whatever stage a pass
   /// measures: MonitorKit decodes each stage with its own (the picture's Source
-  /// and Output tools, a scope, a focus analysis), so `stage` changes nothing.
-  /// Relabelling a frame with one stage's reading would make the other stages'
-  /// tools read the codes with it.
+  /// and Output tools, a scope, a focus analysis), so every pass draws the same
+  /// frame. Relabelling a frame with one stage's reading would make the other
+  /// stages' tools read the codes with it.
   func frame(
-    _ delivery: Delivery, in context: MonitorGPUContext.EncodeContext, core: MonitorGPUContext.Core,
-    reading stage: SignalStage = .source
+    _ delivery: Delivery, in context: MonitorGPUContext.EncodeContext, core: MonitorGPUContext.Core
   ) throws -> MonitorFrame {
     let buffer = delivery.pixelBuffer
     guard let layout = delivery.layout else {
