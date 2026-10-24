@@ -62,8 +62,17 @@ auto_switcher_lib_dir = os.environ.get(
 if "$(" not in auto_switcher_lib_dir:
     auto_switcher_lib_dir = contained_path(auto_switcher_lib_dir, ROOT, "AUTO_SWITCHER_LIB_DIR")
 dispatch_path = str(Path(sdk_dir) / "DeckLinkAPIDispatch.cpp")
-source_refs[dispatch_path] = add("sdk-dispatch-reference", "PBXFileReference", lastKnownFileType="sourcecode.cpp.cpp", path=dispatch_path, sourceTree="<absolute>")
-app.append(dispatch_path)
+dispatch_file = Path(dispatch_path)
+if dispatch_file.is_relative_to(ROOT):
+    # Keep the generated project relocatable when the SDK is vendored.  The
+    # previous absolute reference captured the generator's checkout path in
+    # project.pbxproj, so a direct xcodebuild from another checkout failed.
+    dispatch_ref_path = dispatch_file.relative_to(ROOT).as_posix()
+    source_refs[dispatch_ref_path] = add("sdk-dispatch-reference", "PBXFileReference", lastKnownFileType="sourcecode.cpp.cpp", path=dispatch_ref_path, sourceTree="<group>")
+else:
+    dispatch_ref_path = dispatch_path
+    source_refs[dispatch_ref_path] = add("sdk-dispatch-reference", "PBXFileReference", lastKnownFileType="sourcecode.cpp.cpp", path=dispatch_path, sourceTree="<absolute>")
+app.append(dispatch_ref_path)
 config_refs = [file(p.relative_to(ROOT).as_posix(), "text.plist.xml") for p in sorted((ROOT / "Config").glob("*")) if p.is_file() and p.name != "Signing.xcconfig"]
 config_refs.append(icon_catalog_ref)
 app_product = add("app-product", "PBXFileReference", explicitFileType="wrapper.application", path="Ultracam.app", sourceTree="BUILT_PRODUCTS_DIR")
@@ -116,7 +125,8 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
                        STRIP_INSTALLED_PRODUCT="YES", STRIP_STYLE="all",
                        DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")
         settings.update(ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon",
-                        SWIFT_OBJC_BRIDGING_HEADER="Sources/DeckLinkBackend/BridgingHeader.h", DECKLINK_SDK_DIR=sdk_dir,
+                        SWIFT_OBJC_BRIDGING_HEADER="Sources/DeckLinkBackend/BridgingHeader.h",
+                        DECKLINK_SDK_DIR=("$(SRCROOT)/" + Path(sdk_dir).relative_to(ROOT).as_posix() if Path(sdk_dir).is_relative_to(ROOT) else sdk_dir),
                         HEADER_SEARCH_PATHS=["$(inherited)", "$(DECKLINK_SDK_DIR)"],
                         LIBRARY_SEARCH_PATHS=["$(inherited)", auto_switcher_lib_dir],
                         OTHER_LDFLAGS=["$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv",
