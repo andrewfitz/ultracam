@@ -198,6 +198,12 @@ public final class ScopeRenderer {
     // Don't keep the host's target alive past this call.
     defer { attachment.texture = nil }
     guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+      // `prepare` may already have encoded a resolve/rasterize and marked those
+      // results current. If the host command buffer cannot create the render
+      // encoder, no draw will consume them; invalidate the encoded state so the
+      // next attempt re-encodes the trace and graticule instead of drawing stale
+      // or missing resources.
+      forgetEncodedState()
       throw MonitorKitError.gpu("Cannot create a render encoder for the scope.")
     }
     draw(with: encoder)
