@@ -89,7 +89,10 @@ inline void mk_addPacked(threadgroup atomic_uint* words, uint bin) {
   uint leader = simd_broadcast_first(bin);
   uint unit = 1u << ((bin & 1u) << 4);
   if (bin == leader) {
-    uint n = popcount(uint(uint64_t(simd_ballot(true))));
+    // Count only lanes that target this bin.  Using ballot(true) here counts
+    // every active lane in the SIMD group and folds unrelated bins into the
+    // leader whenever a group straddles multiple bins.
+    uint n = popcount(uint(uint64_t(simd_ballot(bin == leader))));
     if (simd_is_first()) atomic_fetch_add_explicit(&words[bin >> 1], unit * n, memory_order_relaxed);
   } else {
     atomic_fetch_add_explicit(&words[bin >> 1], unit, memory_order_relaxed);
