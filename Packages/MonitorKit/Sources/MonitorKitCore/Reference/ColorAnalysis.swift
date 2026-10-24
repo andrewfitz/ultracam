@@ -18,20 +18,20 @@ public enum CodeRange: String, Codable, Sendable {
   case full, legal
   public func normalizeLuma(code: Double, bitDepth: Int) -> Double? {
     guard code.isFinite, (8...16).contains(bitDepth) else { return nil }
-    let scale = pow(2, Double(bitDepth - 8))
+    let scale = Double(1 << (bitDepth - 8))
     return self == .full
-      ? code / (pow(2, Double(bitDepth)) - 1) : (code - 16 * scale) / (219 * scale)
+      ? code / (Double((1 << bitDepth) - 1)) : (code - 16 * scale) / (219 * scale)
   }
   public func lumaCode(normalized: Double, bitDepth: Int) -> Double? {
     guard normalized.isFinite, (8...16).contains(bitDepth) else { return nil }
-    let scale = pow(2, Double(bitDepth - 8))
+    let scale = Double(1 << (bitDepth - 8))
     return self == .full
-      ? normalized * (pow(2, Double(bitDepth)) - 1) : normalized * 219 * scale + 16 * scale
+      ? normalized * (Double((1 << bitDepth) - 1)) : normalized * 219 * scale + 16 * scale
   }
   public func normalizeChroma(code: Double, bitDepth: Int) -> Double? {
     guard code.isFinite, (8...16).contains(bitDepth) else { return nil }
-    let center = pow(2, Double(bitDepth - 1))
-    let span = self == .full ? pow(2, Double(bitDepth)) - 1 : 224 * pow(2, Double(bitDepth - 8))
+    let center = Double(1 << (bitDepth - 1))
+    let span = self == .full ? Double((1 << bitDepth) - 1) : 224 * Double(1 << (bitDepth - 8))
     return (code - center) / span
   }
 }
