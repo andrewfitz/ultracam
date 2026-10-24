@@ -183,6 +183,10 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private var offered: UInt64 = 0
   private var rateWindow = (start: 0.0, offered: UInt64(0))
   private var offeredFPS = 0.0
+  /// The newest delivery sent to consumers. A producer retry with the same
+  /// generation, revision, and sequence is the same source frame and must not
+  /// inflate offer statistics or make every consumer inspect it again.
+  private var lastOfferedStamp: Stamp?
   private var burnIn: MonitorLUT?
   private var monitorOnly: MonitorLUT?
   private var lutVersion: UInt64 = 0
@@ -465,6 +469,11 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       identity = current
       revision &+= 1
     }
+    let stamp = Stamp(
+      target: target, generation: generation, sequence: sequence, sourcePTS: pts.seconds, hostTime: now,
+      revision: revision)
+    guard stamp.follows(lastOfferedStamp) else { return }
+    lastOfferedStamp = stamp
     noteSourceFrameRate(pts)
     offered &+= 1
     let frameID = Self.counterLock.withLock {
@@ -472,9 +481,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       return Self.nextFrameID
     }
     let delivery = Delivery(
-      stamp: Stamp(
-        target: target, generation: generation, sequence: sequence, sourcePTS: pts.seconds, hostTime: now,
-        revision: revision),
+      stamp: stamp,
       pixelBuffer: image, layout: layout?.layout, signal: signal, geometry: geometry, frameID: frameID,
       isProcessed: isProgram)
     // Under the lock, so a setConsumers that removes a surface cannot race a frame
