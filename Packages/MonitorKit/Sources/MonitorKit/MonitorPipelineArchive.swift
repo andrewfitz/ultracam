@@ -41,7 +41,12 @@ import Synchronization
 /// cannot be nil` in AGX's `convertBinaryArchives`, macOS 27.0.1), which would end
 /// the host. Once used, the archive no longer needs its file, so a host clearing
 /// its caches, or another engine of this key evicting a file this one loaded,
-/// changes nothing but what the next launch finds.
+/// changes nothing but what the next launch finds. Until then (from the read to
+/// the prime) the file is in a process-wide set that every save's removal skips,
+/// so no archive of this process evicts a file another is opening, at init or at
+/// a miss mid-session; the next save removes it. The set is per process: two
+/// processes saving to one `cacheDirectory` at once (two running instances of a
+/// host) are not covered, so give concurrent processes directories of their own.
 ///
 /// Each save writes a new file (a temporary file renamed into place, so a
 /// concurrent reader or another engine saving the same key never sees a partial
@@ -199,7 +204,7 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       case .opened(let archive): loaded.append(Loaded(url: url, archive: archive))
       case .rejected:
         rejected += 1
-        try? FileManager.default.removeItem(at: url)
+        Self.remove(url)
       case .unavailable: break
       }
     }
@@ -321,7 +326,7 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       case .opened(let archive): opened.append(Loaded(url: urls[i], archive: archive))
       case .rejected:
         rejected += 1
-        try? FileManager.default.removeItem(at: urls[i])
+        Self.remove(urls[i])
       case .unavailable: break
       }
       i += 1
@@ -494,7 +499,8 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
 
   /// Deletes this GPU's files of other keys, this key's files past
   /// `maximumFiles` (oldest first) and temporary files over an hour old. Only files
-  /// with this engine's prefix are touched: the directory is the host's.
+  /// with this engine's prefix are touched: the directory is the host's. A file
+  /// another archive in this process is opening stays (`remove`) for a later save.
   private func removeOldFiles(keeping newest: URL) {
     let fm = FileManager.default
     var stale = 0
@@ -502,14 +508,14 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
     for url in Self.files(in: directory, prefix: gpuPrefix) {
       if url.lastPathComponent.hasPrefix(keyPrefix) {
         current.append(url)
-      } else if (try? fm.removeItem(at: url)) != nil {
+      } else if Self.remove(url) {
         stale += 1
       }
     }
     current.sort(by: Self.newestFirst)
     current.removeAll { $0 == newest }
     if current.count > maximumFiles - 1 {
-      for url in current[(maximumFiles - 1)...] { try? fm.removeItem(at: url) }
+      for url in current[(maximumFiles - 1)...] { Self.remove(url) }
     }
     let hourAgo = Date(timeIntervalSinceNow: -3600)
     if let names = try? fm.contentsOfDirectory(atPath: directory.path) {
@@ -542,16 +548,55 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   /// The archive at `url` if its bytes hash to the content hash in its name (so
   /// Metal never reads a truncated or corrupt file) and Metal opens it, used once
   /// (`prime`), so it no longer needs the file.
+  /// While it reads the file, makes the archive and primes it, the file is in
+  /// `opening`, so no save in this process removes it (`remove`).
   private func verifiedArchive(_ url: URL) -> Opened {
     let file = url.deletingPathExtension().lastPathComponent
     guard file.hasPrefix(keyPrefix) else { return .rejected }
     let expected = file.dropFirst(keyPrefix.count)
     guard expected.count == 32 else { return .rejected }
+    let path = Self.identity(url)
+    // Before the read: a file removed before this point is just unavailable, and
+    // none is removed after it until the archive is primed.
+    Self.opening.withLock { $0[path, default: 0] += 1 }
+    defer {
+      Self.opening.withLock { o in
+        if let n = o[path], n > 1 { o[path] = n - 1 } else { o[path] = nil }
+      }
+    }
     guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return .unavailable }
     guard !data.isEmpty, Self.hex(SHA256.hash(data: data)).prefix(32) == expected,
       let archive = try? device.makeArchive(url: url)
     else { return .rejected }
+    if let hook = Self.willPrime.withLock({ $0 }) { hook(url) }
     return prime(archive) ? .opened(archive) : .unavailable
+  }
+
+  /// The archive files this process is opening (`verifiedArchive`), by resolved
+  /// path, with their number of openers. Metal reads an archive's file again at its
+  /// first compiler use and raises an uncaught exception when it is gone (see the
+  /// type), so `remove` never deletes one of these: another archive of the key
+  /// (another engine on the directory, or this one at a miss) saving and evicting
+  /// it would end the host. Process-wide: every archive of every engine shares it.
+  private static let opening = Mutex<[String: Int]>([:])
+
+  /// Tests only: called with each file's URL after Metal made its archive and
+  /// before it is primed (no lock held).
+  static let willPrime = Mutex<(@Sendable (URL) -> Void)?>(nil)
+
+  private static func identity(_ url: URL) -> String {
+    url.standardizedFileURL.resolvingSymlinksInPath().path
+  }
+
+  /// Removes the archive file at `url` unless this process is opening it (then a
+  /// later save removes it). Whether it was removed.
+  @discardableResult
+  private static func remove(_ url: URL) -> Bool {
+    let path = identity(url)
+    return opening.withLock { o in
+      guard o[path] == nil else { return false }
+      return (try? FileManager.default.removeItem(at: url)) != nil
+    }
   }
 
   /// Uses `archive` once in a compiler build (a trivial kernel, `archive` its only
@@ -601,9 +646,6 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
     return "\(ProcessInfo.processInfo.operatingSystemVersionString) build \(build)"
   }()
 
-  /// Metal's API and shader validation settings (`MTL_DEBUG_LAYER*`,
-  /// `MTL_SHADER_VALIDATION*`): validated pipelines are instrumented binaries, so
-  /// they never share an archive with plain ones.
   /// Whether Metal's GPU shader validation is on in `environment`
   /// (`MTL_SHADER_VALIDATION` set and not "0"). Archives are then never written.
   static func shaderValidation(_ environment: [String: String]) -> Bool {
@@ -616,6 +658,9 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   static let shaderValidationNote =
     "save: off under MTL_SHADER_VALIDATION (Metal cannot load the instrumented binaries it would record)"
 
+  /// Metal's API and shader validation settings (`MTL_DEBUG_LAYER*`,
+  /// `MTL_SHADER_VALIDATION*`): validated pipelines are instrumented binaries, so
+  /// they never share an archive with plain ones.
   static var validationIdentity: String {
     ProcessInfo.processInfo.environment
       .filter { $0.key.hasPrefix("MTL_DEBUG_LAYER") || $0.key.hasPrefix("MTL_SHADER_VALIDATION") }

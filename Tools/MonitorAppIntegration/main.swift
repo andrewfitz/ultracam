@@ -538,10 +538,12 @@ import XCTest
           // fills at least 3/4 at any phase (idle rounds fill 86-100%); a presenter
           // that took only every other refresh fills at most 1/2. A loaded
           // machine's late callbacks come in bursts and fill less (58% has been
-          // seen at 229 refreshes/s); such a round is re-measured. The floor is
-          // the model's 3/4, so a presenter that drops one frame in three (2/3)
-          // fails it as one taking every other refresh does.
-          let presentationFloor = 0.75 * Double(ceiling)
+          // seen at 229 refreshes/s); such a round is re-measured. The floor sits
+          // midway between a presenter that drops one frame in three (2/3) and the
+          // model's worst correct phase (3/4, about 0.71 of the ceiling): the
+          // dropping presenter fails it, as one taking every other refresh does,
+          // and a correct one at the worst phase keeps a margin for sampling noise.
+          let presentationFloor = (2.0 / 3.0 + 3.0 / 4.0) / 2 * Double(ceiling)
           floorsMet = Double(presented) >= presentationFloor && refreshesFPS >= refreshFloor
             && gpuMilliseconds < gpuBudget
           if !floorsMet && round == rounds {

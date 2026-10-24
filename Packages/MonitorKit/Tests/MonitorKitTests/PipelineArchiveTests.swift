@@ -568,6 +568,74 @@ final class PipelineArchiveTests: XCTestCase {
     seed.save()
   }
 
+  /// Older files open mid-session (at the first miss), while other archives of the
+  /// key save. One saving at its file cap while another is between making an
+  /// archive of the oldest file and priming it never deletes that file (Metal
+  /// would raise an uncaught exception at the prime); a later save removes it.
+  func testEvictionWhileAnOlderFileOpensKeepsIt() throws {
+    let gpu = try requireGPU()
+    let d = try directory()
+    let source = Self.kernel(12)
+    func open() throws -> MonitorPipelineArchive {
+      try MonitorPipelineArchive(
+        device: gpu.device, directory: d, name: "MKTest", source: source, options: MonitorShaders.compileOptions,
+        maximumFiles: 3)
+    }
+    // Three sessions of their own: the oldest file holds offset 0, then 1, the newest 2.
+    var offset: UInt32 = 0
+    var seeded: [URL] = []
+    while offset < 3 {
+      let writer = try open()
+      _ = try writer.makeComputePipelineState(descriptor: Self.descriptor(try Self.library(writer, source), offset: offset))
+      XCTAssertTrue(writer.save())
+      seeded.append(try XCTUnwrap(writer.files.first))
+      usleep(20_000)  // distinct modification dates
+      offset += 1
+    }
+    let oldest = seeded[0]
+    XCTAssertEqual(Set(archiveFiles(d)), Set(seeded))
+    // Another archive of the key, at its cap once it saves: its save keeps its
+    // new file and the two newest, so it would evict the oldest. It builds and
+    // saves only in the hook, so no scheduled save of its own runs before.
+    let evictor = try open()
+    let evictorLibrary = try Self.library(evictor, source)
+    let reader = try open()
+    XCTAssertEqual(reader.files, [seeded[2]], "the newest at init")
+    let readerLibrary = try Self.library(reader, source)
+    let fired = Atomic<Bool>(false)
+    let saved = Atomic<Bool>(false)
+    let present = Atomic<Bool>(false)
+    MonitorPipelineArchive.willPrime.withLock { hook in
+      hook = { url in
+        guard url.lastPathComponent == oldest.lastPathComponent, !fired.exchange(true, ordering: .relaxed) else { return }
+        _ = try? evictor.makeComputePipelineState(descriptor: Self.descriptor(evictorLibrary, offset: 5))
+        saved.store(evictor.save(), ordering: .relaxed)
+        present.store(FileManager.default.fileExists(atPath: url.path), ordering: .relaxed)
+      }
+    }
+    defer { MonitorPipelineArchive.willPrime.withLock { $0 = nil } }
+    // Misses the newest, so the older files open; the evictor saves as the oldest is.
+    let state = try reader.makeComputePipelineState(descriptor: Self.descriptor(readerLibrary, offset: 0))
+    MonitorPipelineArchive.willPrime.withLock { $0 = nil }
+    XCTAssertTrue(fired.load(ordering: .relaxed), "the save ran while the oldest file opened")
+    XCTAssertTrue(saved.load(ordering: .relaxed))
+    XCTAssertEqual(evictor.statistics.misses, 1)
+    XCTAssertTrue(present.load(ordering: .relaxed), "the file being opened is not evicted")
+    XCTAssertEqual(try Self.run(state)[2], 24)
+    XCTAssertEqual(reader.statistics.hits, 1, "found in the oldest file, not compiled")
+    XCTAssertEqual(reader.statistics.misses, 0)
+    XCTAssertEqual(archiveFiles(d).count, 4, "one over the cap until the next save")
+    // Opened and primed: the next save evicts it, and both archives keep building.
+    _ = try evictor.makeComputePipelineState(descriptor: Self.descriptor(evictorLibrary, offset: 6))
+    usleep(20_000)
+    XCTAssertTrue(evictor.save())
+    XCTAssertEqual(archiveFiles(d).count, 3)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: oldest.path))
+    XCTAssertEqual(try Self.run(try reader.makeComputePipelineState(descriptor: Self.descriptor(readerLibrary, offset: 1)))[2], 25)
+    XCTAssertEqual(try Self.run(try reader.makeComputePipelineState(descriptor: Self.descriptor(readerLibrary, offset: 9)))[2], 33)
+    reader.save()
+  }
+
   // MARK: - Failed saves, duplicate builds
 
   /// A save that fails (here: the cache directory cannot be created) keeps the

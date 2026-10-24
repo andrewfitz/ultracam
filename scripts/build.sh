@@ -70,30 +70,29 @@ xcodebuild "${args[@]}" build > "$build_log" 2>&1 || {
 product="$build_root/Build/Products/$configuration/Ultracam.app"
 python3 "$task_root/scripts/validate_bundle.py" "$product"
 stable_product="$artifact_root/Ultracam.app"
+dsym="$build_root/Build/Products/$configuration/Ultracam.app.dSYM"
+stable_dsym="$artifact_root/Ultracam.app.dSYM"
+# Both checks before either link moves, so a refusal leaves the install link as it was.
 if [[ -e "$stable_product" && ! -L "$stable_product" ]]; then
   echo "Refusing to replace existing non-symlink bundle: $stable_product" >&2
   exit 1
 fi
-ln -sfn "$product" "$stable_product"
-# Release keeps its symbols only in the dSYM beside the stripped product: link it
-# beside the stable product, and keep a copy per build UUID, so a crash report of
-# any earlier build still symbolicates after its run directory is pruned.
-dsym="$build_root/Build/Products/$configuration/Ultracam.app.dSYM"
-stable_dsym="$artifact_root/Ultracam.app.dSYM"
 if [[ -e "$stable_dsym" && ! -L "$stable_dsym" ]]; then
   echo "Refusing to replace existing non-symlink dSYM: $stable_dsym" >&2
   exit 1
 fi
+ln -sfn "$product" "$stable_product"
+# Release keeps its symbols only in the dSYM beside the stripped product: link it
+# beside the stable product, and keep a copy per build (the newest 20, found by
+# UUID), so a crash report of an earlier build still symbolicates after its run
+# directory is pruned. Best effort: the product is linked, so a failure only warns.
 if [[ ! -d "$dsym" ]]; then
   # A Debug product carries its symbols; never leave another build's dSYM beside it.
   rm -f "$stable_dsym"
 else
   ln -sfn "$dsym" "$stable_dsym"
-  uuid="$(/usr/bin/dwarfdump --uuid "$dsym" | /usr/bin/awk 'NR==1{print $2}')"
-  if [[ -n "$uuid" ]]; then
-    mkdir -p "$artifact_root/symbols/$uuid"
-    /usr/bin/ditto "$dsym" "$artifact_root/symbols/$uuid/Ultracam.app.dSYM"
-  fi
+  /bin/bash "$task_root/scripts/archive-dsym.sh" "$dsym" "$artifact_root/symbols" "$run_id" 20 ||
+    echo "warning: the dSYM was not archived under $artifact_root/symbols" >&2
 fi
 if [[ "$local_development" == true ]]; then
   python3 "$task_root/scripts/prepare_local_build.py" "$product" \
