@@ -522,3 +522,24 @@ extension GuideSettings {
     XCTAssertEqual(query.fitRect.width / query.fitRect.height, g.displayAspectRatio(for: state.normalized()), accuracy: 0.01)
   }
 }
+
+private final class GeometryContractRegressionTests: XCTestCase {
+  func testDirectLayoutUsesSquarePixelsForUnsupportedPixelAspectRatios() {
+    var g = ViewGeometry()
+    let baseline = MonitorLayout(pictureWidth: 1920, pictureHeight: 1080, pixelAspectRatio: 1,
+      viewportWidth: 1920, viewportHeight: 1080, geometry: g)
+    for par in [0.0, -1.0, 0.01, 17.0, .nan, .infinity] {
+      let layout = MonitorLayout(pictureWidth: 1920, pictureHeight: 1080, pixelAspectRatio: par,
+        viewportWidth: 1920, viewportHeight: 1080, geometry: g)
+      XCTAssertEqual(layout.fitRect, baseline.fitRect, "unsupported PAR \(par) must use square pixels")
+    }
+  }
+
+  func testDirectLayoutClampsDesqueezeToDocumentedMaximum() {
+    var g = ViewGeometry()
+    g.desqueeze = 99
+    let layout = MonitorLayout(pictureWidth: 1000, pictureHeight: 1000, viewportWidth: 5000,
+      viewportHeight: 1000, geometry: g)
+    XCTAssertEqual(layout.fitRect.width, 4000, accuracy: 1e-9)
+  }
+}

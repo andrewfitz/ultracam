@@ -166,8 +166,8 @@ public struct MonitorLayout: Equatable, Sendable {
     let crop = MonitorFrameGeometry(width: pictureWidth, height: pictureHeight, cleanAperture: cleanAperture).shownRect
     let pw = crop.width, ph = crop.height
     let vw = Double(max(1, viewportWidth)), vh = Double(max(1, viewportHeight))
-    let par = pixelAspectRatio.isFinite && pixelAspectRatio > 0 ? pixelAspectRatio : 1
-    let desqueeze = g.desqueeze.isFinite && g.desqueeze >= 1 ? g.desqueeze : 1
+    let par = MonitorFrameGeometry.pixelAspectRatioRange.contains(pixelAspectRatio) ? pixelAspectRatio : 1
+    let desqueeze = g.desqueeze.isFinite ? min(4, max(1, g.desqueeze)) : 1
     let aspect = pw * par * desqueeze / ph
     self.viewportWidth = vw
     self.viewportHeight = vh
