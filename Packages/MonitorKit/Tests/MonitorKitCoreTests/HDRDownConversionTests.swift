@@ -63,7 +63,30 @@ final class HDRDownConversionTests: XCTestCase {
       XCTAssertGreaterThanOrEqual(s, last)
       last = s
     }
-    XCTAssertEqual(c.luminance(1000), 118.38, accuracy: 0.01, "109% SDR, Table 1's 120 cd/m² output peak")
+    XCTAssertEqual(c.luminance(1000), 118.38, accuracy: 0.01, "eq. (5) at the 1000 cd/m² peak")
+    XCTAssertEqual(pow(c.luminance(1000) / c.sdrPeak, 1 / 2.4), 1.0728, accuracy: 5e-5, "107.3% SDR on BT.1886")
+  }
+
+  /// Where Method C reaches 100% SDR (the 100 cd/m² display's peak): eq. (5)
+  /// solved for 100 cd/m², Y = Y_ip·(e^((100 − k4)/k2) + k3) = 332.58 cd/m², the
+  /// display light of 82.93% HLG on the 1000 cd/m² display. `HDRToSDR.hlg` is
+  /// below 1 just under that signal and exactly 1 just over it.
+  func testMethodCReachesSDRPeakAt332Point6Nits() {
+    let c = BT2446MethodC.self
+    let peak = c.inflection * (exp((c.sdrPeak - c.k4) / c.k2) + c.k3)
+    XCTAssertEqual(peak, 332.58, accuracy: 0.01)
+    XCTAssertEqual(c.luminance(peak), c.sdrPeak, accuracy: 1e-9)
+    // The HLG signal whose display light (BT.2100 EOTF, γ 1.2, 1000 cd/m²) is that peak.
+    var low = 0.5, high = 1.0
+    for _ in 0..<100 {
+      let mid = (low + high) / 2
+      if 1000 * pow(ColorMath.hlgInverseOETF(mid), 1.2) < peak { low = mid } else { high = mid }
+    }
+    XCTAssertEqual(low, 0.8293, accuracy: 1e-4)
+    func sdr(_ v: Double) -> Double { HDRToSDR.hlg(ColorRGB(r: v, g: v, b: v), primaries: .rec2020).g }
+    XCTAssertLessThan(sdr(low - 1e-4), 1)
+    XCTAssertGreaterThan(sdr(low - 1e-4), 0.9999)
+    XCTAssertEqual(sdr(low + 1e-4), 1)
   }
 
   /// §6.1.3–6.1.6 keep x, y and map Y alone, so the crosstalk matrix and its

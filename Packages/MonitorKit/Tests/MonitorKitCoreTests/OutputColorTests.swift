@@ -225,8 +225,8 @@ final class OutputColorTests: XCTestCase {
     XCTAssertEqual(sdr(0.38), pow(BT2446MethodC.k1 * greyNits / 100, 1 / 2.4), accuracy: 1e-12)
     XCTAssertEqual(sdr(0.38), 0.532, accuracy: 5e-4)
     XCTAssertEqual(sdr(0), 0)
-    // SDR peak white from 334 cd/m² (about 83% HLG) up; eq. (5) continues to 118 cd/m²
-    // (109%) at 1000, which the SDR picture holds no more than the 100 cd/m² display.
+    // SDR peak white from 332.6 cd/m² (about 82.9% HLG) up; eq. (5) continues to 118.4 cd/m²
+    // (107.3% on BT.1886) at 1000, which the SDR picture holds no more than the 100 cd/m² display.
     XCTAssertLessThan(sdr(0.828), 1)
     XCTAssertEqual(sdr(0.84), 1)
     XCTAssertEqual(sdr(1), 1)

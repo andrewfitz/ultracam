@@ -59,8 +59,8 @@ public enum HDRToSDR {
   /// 100 cd/m² SDR display, BT.2020 to BT.709 in linear light clipped to 0…1
   /// (Report ITU-R BT.2407 §2, to which §6.1 refers), and the BT.1886 inverse
   /// EOTF. 18% grey (38% HLG) lands at 53.2%, skin (50% HLG) at 70%, HDR
-  /// Reference White (75% HLG) at 96%; luminance reaches 100% SDR at 334 cd/m²
-  /// (about 83% HLG), and brighter light is the SDR peak, as on the 100 cd/m²
+  /// Reference White (75% HLG) at 96%; luminance reaches 100% SDR at 332.6 cd/m²
+  /// (about 82.9% HLG), and brighter light is the SDR peak, as on the 100 cd/m²
   /// display.
   public static func hlg(_ v: ColorRGB, primaries: ColorPrimaries) -> ColorRGB {
     let display = ColorMath.hlgEOTF(
