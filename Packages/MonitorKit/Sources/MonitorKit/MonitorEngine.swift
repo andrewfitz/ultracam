@@ -582,9 +582,8 @@ public final class MonitorEngine: @unchecked Sendable {
     }
   }
 
-  /// A failed build stays pending, so it is not retried every frame; the pass keeps the all-tools pipeline.
+  /// Completes an asynchronous build, including a terminal failure.
   private func finish(_ key: PipelineKey) {
-    if renderPipelines.withLock({ $0[key] }) == nil { return }
     pendingPipelines.withLock { _ = $0.remove(key) }
   }
 
@@ -637,16 +636,25 @@ public final class MonitorEngine: @unchecked Sendable {
           let d = metal4ComputeDescriptor(
             "mk_pictureKernel",
             Self.constants(layout: key.layout, variant: key.variant, srgbTarget: false, color: key.color))
-          guard let state = try? await makeComputeState(d, compiler) else { return }
+          guard let state = try? await makeComputeState(d, compiler) else {
+            pendingPipelines.withLock { _ = $0.remove(pendingKey) }
+            return
+          }
           _ = storeCompute(state, for: key)
           pendingPipelines.withLock { _ = $0.remove(pendingKey) }
         }
         return nil
       }
       library.makeFunction(name: "mk_pictureKernel", constantValues: values) { [self] function, _ in
-        guard let function else { return }
+        guard let function else {
+          pendingPipelines.withLock { _ = $0.remove(pendingKey) }
+          return
+        }
         device.makeComputePipelineState(function: function) { [self] state, _ in
-          guard let state else { return }
+          guard let state else {
+            pendingPipelines.withLock { _ = $0.remove(pendingKey) }
+            return
+          }
           _ = storeCompute(state, for: key)
           pendingPipelines.withLock { _ = $0.remove(pendingKey) }
         }
