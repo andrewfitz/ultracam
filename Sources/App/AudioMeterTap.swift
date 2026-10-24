@@ -209,7 +209,13 @@ final class AudioMeterTap: @unchecked Sendable {
         // If this is the first packet drained after a rapid attach/detach cycle,
         // adopt the packet's own session. Once the consumer has advanced, use
         // the current session so packets from sessions it passed are stale.
-        if consumerSession == 0, let meter = sessions.withLock({ $0.history[packetSession] }) {
+        if consumerSession == 0, let meter = sessions.withLock({
+          let meter = $0.history[packetSession]
+          // The first drain establishes the consumer's session. Older meters
+          // are no longer reachable by queued packets after this point.
+          $0.history.removeAll(keepingCapacity: true)
+          return meter
+        }) {
           consumerMeter = meter
           consumerSession = packetSession
         } else {
@@ -241,7 +247,13 @@ final class AudioMeterTap: @unchecked Sendable {
   /// packet of an earlier one is stale. Meter queue only; at most once per
   /// session start.
   private func adoptCurrentSession() {
-    let current = sessions.withLock { ($0.live, $0.number) }
+    let current = sessions.withLock { sessions in
+      let current = (sessions.live, sessions.number)
+      // Once the consumer advances, queued packets from earlier sessions are
+      // intentionally stale; release their retained meters promptly.
+      sessions.history.removeAll(keepingCapacity: true)
+      return current
+    }
     consumerMeter = current.0
     consumerSession = current.1
   }
