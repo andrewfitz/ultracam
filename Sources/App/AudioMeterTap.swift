@@ -76,6 +76,8 @@ final class AudioMeterTap: @unchecked Sendable {
     var live: AudioMeter?
     /// Starts at 0 (no session); each session start adds one.
     var number: UInt64 = 0
+    /// Meters retained by session number until the meter queue first adopts them.
+    var history: [UInt64: AudioMeter] = [:]
   }
 
   /// One handed-over packet. Producer-written from `tail` to `head`, read and
@@ -203,7 +205,17 @@ final class AudioMeterTap: @unchecked Sendable {
       let slot = slots + (next & slotMask)
       let packetSession = slot.pointee.session
       // Sessions only move forward: an older packet is stale without a look at the sessions.
-      if packetSession > consumerSession { adoptCurrentSession() }
+      if packetSession > consumerSession {
+        // If this is the first packet drained after a rapid attach/detach cycle,
+        // adopt the packet's own session. Once the consumer has advanced, use
+        // the current session so packets from sessions it passed are stale.
+        if consumerSession == 0, let meter = sessions.withLock({ $0.history[packetSession] }) {
+          consumerMeter = meter
+          consumerSession = packetSession
+        } else {
+          adoptCurrentSession()
+        }
+      }
       if packetSession == consumerSession, let meter = consumerMeter, let samples = slot.pointee.samples {
         if slot.pointee.followsGap { meter.noteDiscontinuity() }
         let frames = slot.pointee.frames
@@ -273,6 +285,7 @@ final class AudioMeterTap: @unchecked Sendable {
     }
     sessions.live = meter
     sessions.number &+= 1
+    sessions.history[sessions.number] = meter
     session.store(sessions.number, ordering: .releasing)
   }
 

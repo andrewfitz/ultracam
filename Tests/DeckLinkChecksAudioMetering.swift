@@ -65,6 +65,25 @@ extension DeckLinkChecks {
     XCTAssertEqual(meter.snapshot().frameCount, UInt64(9 * Self.meterFrames))
   }
 
+  /// A packet queued before the first meter-queue turn remains owned by its session
+  /// even when views detach and reattach before the queue drains.
+  @objc func testQueuedFirstSessionPacketSurvivesRapidSessionChange() {
+    let tap = AudioMeterTap(packetCapacity: 8)
+    let first = tap.attach()
+    let gate = DispatchSemaphore(value: 0)
+    let blocked = DispatchSemaphore(value: 0)
+    tap.meterQueue.async { blocked.signal(); gate.wait() }
+    blocked.wait()
+    Self.ingest(tap, Self.stereoPacket(1 << 28))
+    tap.detach()
+    _ = tap.attach()
+    tap.detach()
+    gate.signal()
+    tap.waitUntilMetered()
+    XCTAssertEqual(first.snapshot().frameCount, UInt64(Self.meterFrames))
+    XCTAssertEqual(tap.counters.stale, 0)
+  }
+
   /// The tap meters exactly what a meter fed directly reads, and a packet a
   /// previous session left in the ring never reaches the next session's meter.
   @objc func testHandOffMetersExactlyAndKeepsSessionsApart() throws {
