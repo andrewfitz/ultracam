@@ -101,12 +101,6 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     var value = state
     value.clean = clean
     value.geometry.magnification = magnification
-    let suppressesZebra = !toolsEnabled || falseColorDeclared
-    if suppressesZebra {
-      for index in value.zebras.indices where value.zebras[index].enabled {
-        value.zebras[index].enabled = false
-      }
-    }
     if !toolsEnabled {
       value.guides.enabled = false
       value.focus.enabled = false
@@ -116,6 +110,16 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     if isProgram {
       value.focus.enabled = false
       if value.falseColor.mode.needsLogSource { value.falseColor.mode = .off }
+    }
+    // Suppress zebra only when false colour is actually drawn on this surface.
+    // A Program cannot classify camera log encodings, so its log mode is turned
+    // off above and zebra must remain available there.
+    let suppressesZebra = value.falseColor.mode != .off &&
+      (value.falseColor.mode.needsLogSource ? falseColorDeclared : true)
+    if !toolsEnabled || suppressesZebra {
+      for index in value.zebras.indices where value.zebras[index].enabled {
+        value.zebras[index].enabled = false
+      }
     }
     return value
   }
