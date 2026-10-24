@@ -279,3 +279,9 @@ Open after W6:
 - 2026-10-24: Publish prep done (wf_71f59cf2-a67). User decisions: EL Zone is removed from the public library (trademark + patent US 11,223,776 B1) and Ultracam loses the mode, with saved EL Zone looks migrated to off. Commits use the GitHub noreply address. CURRENT RUN = wf_af0ffbbc-1b9 (task wus9v2jao): EL Zone removal in /Users/andrew/Projects/ai/MonitorKit. Next: initial commit, gh repo create --public, push, tag 0.1.0, then the app submodule switch (API renames plainWaveform/.plain, profileID values monitorkit-*, EL Zone removal + migration in the app).
 - Heartbeat 2026-10-24 12:44: EL Zone removal run (wf_af0ffbbc-1b9) is still in progress; the publish is waiting on it.
 - 2026-10-24: PUBLISHED github.com/andrewfitz/MonitorKit 0.1.0 (4752cf0, public, release created, noreply author). Ultracam now has Packages/MonitorKit as a submodule at 0.1.0 (staged, not committed) and this file lives at docs/monitorkit/PROGRESS.md. CURRENT RUN = wf_e411ca5d-7ad (task wuay53k9c): app update for 0.1.0 (renames, migrations, EL Zone removal) → audits → fix → all gates; the orchestrator commits after review, then tells ultracam-18.
+- Heartbeat 2026-10-24 17:56: no workflow running.
+  - The app switch to the 0.1.0 submodule is committed as f9794b3; every gate passed.
+  - The first public CI run failed on Xcode 26.x (type-checker timeouts).
+  - The fix is 3e65270 plus the 0.1.1 changelog (269a50f), pushed to main with the user's approval. CI for it is being watched.
+  - Next, once CI is green: tag and release 0.1.1, bump the submodule, run the app gates, commit and tell ultracam-18.
+- 2026-10-24 18:28: MonitorKit 0.1.1 released (Xcode 26 compile fixes; CI green on Xcode 26.0.1 build-only, 26.6 and 27.0 build+test, iOS 26.6/27.0; GitHub VM runners skip about 470 GPU/timing tests). Submodule bumped to 0.1.1: T OK, U 608/608 + MonitorKit 837, V 802/802, I OK.
