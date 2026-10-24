@@ -8,6 +8,14 @@ import XCTest
 
 /// The scopes' persistent pipeline warm start (`ScopeEngine(…, cacheDirectory:)`).
 final class ScopePipelineArchiveTests: XCTestCase {
+  /// Under GPU shader validation the archive writes no file (MonitorKit's
+  /// `PipelineArchiveValidationTests`); these tests need files.
+  override func setUpWithError() throws {
+    if ProcessInfo.processInfo.environment["MTL_SHADER_VALIDATION"].map({ $0 != "0" }) ?? false {
+      throw XCTSkip("MTL_SHADER_VALIDATION: archives are not written")
+    }
+  }
+
   func directory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("mk-scope-archive-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

@@ -7,6 +7,14 @@ import XCTest
 
 /// The persistent pipeline warm start (`MonitorPipelineArchive`, `MonitorEngine(…, cacheDirectory:)`).
 final class PipelineArchiveTests: XCTestCase {
+  /// Under GPU shader validation Metal cannot load the archives it records, so the
+  /// archive writes none (`PipelineArchiveValidationTests`); these tests need files.
+  override func setUpWithError() throws {
+    if MonitorPipelineArchive.shaderValidationEnabled {
+      throw XCTSkip("MTL_SHADER_VALIDATION: archives are not written (PipelineArchiveValidationTests)")
+    }
+  }
+
   /// A unique, empty directory under the temporary directory, removed after the test.
   func directory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("mk-archive-\(UUID().uuidString)")
@@ -606,5 +614,36 @@ final class PipelineArchiveTests: XCTestCase {
     XCTAssertEqual(archive.statistics.hits, 1, "made from the saved file")
     XCTAssertEqual(archive.recipeCount, 2)
     XCTAssertEqual(try Self.run(again)[3], 34)
+  }
+}
+
+/// The archive under Metal's GPU shader validation, whose recorded binaries Metal
+/// refuses to load ("deployment target … not compatible with current OS"): it
+/// writes no file and builds as without a cache, with the reason in `lastError`.
+final class PipelineArchiveValidationTests: XCTestCase {
+  func testShaderValidationIsReadFromTheEnvironment() {
+    XCTAssertTrue(MonitorPipelineArchive.shaderValidation(["MTL_SHADER_VALIDATION": "1"]))
+    XCTAssertFalse(MonitorPipelineArchive.shaderValidation(["MTL_SHADER_VALIDATION": "0"]))
+    XCTAssertFalse(MonitorPipelineArchive.shaderValidation(["MTL_DEBUG_LAYER": "1"]), "the API layer alone records loadable archives")
+    XCTAssertFalse(MonitorPipelineArchive.shaderValidation([:]))
+  }
+
+  func testAValidatedSessionBuildsAndWritesNothing() throws {
+    guard MonitorPipelineArchive.shaderValidationEnabled else {
+      throw XCTSkip("runs under MTL_SHADER_VALIDATION=1 (the validation pass of test.sh)")
+    }
+    let gpu = try requireGPU()
+    let d = FileManager.default.temporaryDirectory.appendingPathComponent("mk-archive-validated-\(UUID().uuidString)")
+    addTeardownBlock { try? FileManager.default.removeItem(at: d) }
+    let archive = try MonitorPipelineArchive(
+      device: gpu.device, directory: d, name: "MKTest", source: PipelineArchiveTests.kernel(11),
+      options: MonitorShaders.compileOptions)
+    let library = try PipelineArchiveTests.library(archive, PipelineArchiveTests.kernel(11))
+    let state = try archive.makeComputePipelineState(descriptor: PipelineArchiveTests.descriptor(library, offset: 2))
+    XCTAssertEqual(try PipelineArchiveTests.run(state)[1], 13, "built as without a cache")
+    XCTAssertFalse(archive.save())
+    XCTAssertEqual(archive.statistics.saves, 0)
+    XCTAssertEqual(archive.statistics.lastError, MonitorPipelineArchive.shaderValidationNote)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: d.path), "no file, no directory")
   }
 }

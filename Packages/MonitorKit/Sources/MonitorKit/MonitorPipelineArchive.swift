@@ -396,6 +396,16 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   /// the next call.
   @discardableResult
   public func save() -> Bool {
+    if Self.shaderValidationEnabled {
+      // Metal cannot load the instrumented binaries it records under GPU shader
+      // validation ("deployment target … not compatible with current OS", macOS
+      // 27.0.1), so a validated session builds as without a cache and writes nothing.
+      state.withLock { s in
+        s.dirty = false
+        if s.statistics.lastError == nil { s.statistics.lastError = Self.shaderValidationNote }
+      }
+      return false
+    }
     saveLock.lock()
     defer { saveLock.unlock() }
     let (dirty, built, options) = state.withLock { s -> (Bool, [Recipe], MTL4CompilerTaskOptions) in
@@ -447,9 +457,13 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
       let data = try Data(contentsOf: temporary, options: .mappedIfSafe)
       url = directory.appendingPathComponent(
         keyPrefix + Self.hex(SHA256.hash(data: data)).prefix(32) + "." + Self.fileExtension)
-      guard let opened = try? device.makeArchive(url: temporary), prime(opened) else {
-        return failed("save: Metal cannot open the archive it wrote")
+      let opened: any MTL4Archive
+      do {
+        opened = try device.makeArchive(url: temporary)
+      } catch {
+        return failed("save: Metal cannot open the archive it wrote: \(error)")
       }
+      guard prime(opened) else { return failed("save: the archive it wrote fails its first build") }
       archive = opened
       if fm.fileExists(atPath: url.path) {
         // The same bytes, written by another engine of this key.
@@ -590,6 +604,18 @@ public final class MonitorPipelineArchive: @unchecked Sendable {
   /// Metal's API and shader validation settings (`MTL_DEBUG_LAYER*`,
   /// `MTL_SHADER_VALIDATION*`): validated pipelines are instrumented binaries, so
   /// they never share an archive with plain ones.
+  /// Whether Metal's GPU shader validation is on in `environment`
+  /// (`MTL_SHADER_VALIDATION` set and not "0"). Archives are then never written.
+  static func shaderValidation(_ environment: [String: String]) -> Bool {
+    environment["MTL_SHADER_VALIDATION"].map { $0 != "0" } ?? false
+  }
+
+  /// `shaderValidation` of this process (Metal reads the variable at launch).
+  static let shaderValidationEnabled = shaderValidation(ProcessInfo.processInfo.environment)
+
+  static let shaderValidationNote =
+    "save: off under MTL_SHADER_VALIDATION (Metal cannot load the instrumented binaries it would record)"
+
   static var validationIdentity: String {
     ProcessInfo.processInfo.environment
       .filter { $0.key.hasPrefix("MTL_DEBUG_LAYER") || $0.key.hasPrefix("MTL_SHADER_VALIDATION") }
