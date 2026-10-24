@@ -6,6 +6,11 @@ This pass started from the current `main` implementation and used measured CPU, 
 
 ## Changes merged to `main`
 
+The delegated performance commits are on `main` as `dbd76d2`, `15be010`,
+`38a0534`, `5de3359`, `1b24974`, `2d03f2b`, and `cadecae`. Their original
+agent branch tips remain available under the `archive/` tags after worktree
+cleanup.
+
 - `AudioMeter` computes peak decay once per audio chunk, skips disabled peak ballistics, and avoids building a true-peak envelope unless true peak or phase-based PPM needs it. The shared phase envelope dependency is preserved for PPM-only configurations.
 - Code-range scaling for supported 8–16-bit depths uses exact integer shifts instead of repeated `pow` calls, with the existing fallback for invalid depths.
 - Tiny navigator viewports now return an empty navigator and identity map instead of producing non-finite geometry.
