@@ -55,7 +55,7 @@ enum UIScopeChoice: String, CaseIterable, Identifiable, Sendable {
 }
 
 /// The waveform's and histogram's level axis and trace colours. Classic is the
-/// look of Ultracam's earlier scopes and the default (`ScopeSettings.ultracamLegacy`).
+/// look of Ultracam's earlier scopes and the default (`ScopeSettings.plainWaveform`).
 enum UIScopeLook: String, CaseIterable, Identifiable, Sendable {
   /// −10…110 IRE with the old channel colours.
   case classic
@@ -74,7 +74,7 @@ enum UIScopeLook: String, CaseIterable, Identifiable, Sendable {
   /// nil when the range and colours don't belong to one look.
   init?(_ settings: ScopeSettings) {
     switch (settings.levelRange, settings.display.palette) {
-    case (.minus10To110, .ultracamLegacy): self = .classic
+    case (.minus10To110, .plain): self = .classic
     case (.standard, .standard): self = .standard
     default: return nil
     }
@@ -87,7 +87,7 @@ enum UIScopeLook: String, CaseIterable, Identifiable, Sendable {
     switch self {
     case .classic:
       s.levelRange = .minus10To110
-      s.display.palette = .ultracamLegacy
+      s.display.palette = .plain
     case .standard:
       s.levelRange = .standard
       s.display.palette = .standard
@@ -103,8 +103,8 @@ enum UIScopeLook: String, CaseIterable, Identifiable, Sendable {
 /// settings or the shown signal change, never per frame.
 struct UIScopeDescription: Equatable, Sendable {
   /// The size of the scope image the surface draws (`MonitorScopeNSView`).
-  static let imageWidth = Double(ScopeSettings.ultracamLegacyImageWidth)
-  static let imageHeight = Double(ScopeSettings.ultracamLegacyImageHeight)
+  static let imageWidth = Double(ScopeSettings.plainWaveformImageWidth)
+  static let imageHeight = Double(ScopeSettings.plainWaveformImageHeight)
   static var imageAspectRatio: Double { imageWidth / imageHeight }
 
   let settings: ScopeSettings

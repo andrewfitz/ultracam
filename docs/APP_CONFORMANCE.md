@@ -61,7 +61,7 @@
 | 25 | ⋯ menu: Show Inspector, Cut (Program), Record/Stop, Pause/Resume, Load LUT…, Choose Folder…, Use Default, Copy Monitor Settings To ›, Rename… (locked with reason), Diagnostics…, Stop/Start Camera, Remove Camera… | OK | `UICameraColumn.swift:461–505` | – | – |
 | 26 | ⋯ "Remove Camera…" removes immediately, with no confirmation (the inspector asks first) | WRONG | `UICameraColumn.swift:502` sends `.removeCamera` directly | Route through the same confirmation (add `.removeCamera` to `UIAction.needsConfirmation`) | P2 |
 | 27 | "Copy Settings To" doesn't offer Program | MISSING | `UICameraColumn.swift:275, 484` list cameras only; old context menu included every target, Program included | Add a Program entry when `outputMode == .program` → `.copyMonitorSettings(from:to: "program")` | P3 |
-| 28 | Monitor tool split buttons + popovers (Guides, Zebra, False Color Off/Sony S-Log3/EL Zone, Focus, Scopes); Program limits | OK | `UIMonitorTools.swift`; `component-camera-column-*.png` | – | – |
+| 28 | Monitor tool split buttons + popovers (Guides, Zebra, False Color Off/Sony S-Log3/ARRI-style/ARRI LogC/Six band/Custom, Focus, Scopes); Program limits | OK | `UIMonitorTools.swift`; `component-camera-column-*.png` | – | – |
 | 29 | Picture zoom Fit/150/200/400 | OK | `UICameraColumn.swift:236` | – | – |
 | 30 | Picture signal Output/Source picker | OK | `UICameraColumn.swift:205` | – | – |
 | 31 | Detach to Window | OK | `UISupport.swift` → `MonitorDetachedWindows.open` (old AppKit window kept) | – | – |

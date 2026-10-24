@@ -115,14 +115,14 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     case .off: return state.pictureStage
     case .sixBand: return falseColor.stage
     case .custom: return falseColor.customBands.isEmpty ? state.pictureStage : falseColor.stage
-    case .sonySLog3, .arriStyleSLog3, .arriLogC, .elZone:
+    case .sonySLog3, .arriStyleSLog3, .arriLogC:
       return logFalseColor(falseColor.mode, reads: signal.encoding.log) ? .source : state.pictureStage
     }
   }
 
   /// Whether log false colour `mode` classifies `log`, as MonitorKit resolves it:
-  /// Sony's tables need S-Log3, the ARRI-style and EL Zone scales S-Log3 in
-  /// S-Gamut3 or S-Gamut3.Cine, ARRI's an ARRI LogC curve. Otherwise MonitorKit
+  /// Sony's tables need S-Log3, the ARRI-style scale S-Log3 in S-Gamut3 or
+  /// S-Gamut3.Cine, ARRI's an ARRI LogC curve. Otherwise MonitorKit
   /// reports it unavailable and the picture stage shows.
   private static func logFalseColor(_ mode: FalseColorMode, reads log: LogEncoding?) -> Bool {
     guard let log else { return false }
@@ -130,7 +130,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let sGamut = sony && (log.gamut == .sGamut3 || log.gamut == .sGamut3Cine)
     switch mode {
     case .sonySLog3: return sony
-    case .arriStyleSLog3, .elZone: return sGamut
+    case .arriStyleSLog3: return sGamut
     case .arriLogC: return FalseColorTable.arriProfile(for: log.curve) != nil
     case .off, .sixBand, .custom: return false
     }

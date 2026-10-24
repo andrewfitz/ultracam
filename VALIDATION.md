@@ -51,8 +51,9 @@ claim Sony sensor clipping or noise limits. Literal ARRI LogC3/LogC4 EI800
 profiles remain available. Freeze/Clean remain local to each surface; source
 and processed signals are independent settings. Recording receives untouched
 source frames before processing admission. Tools-off selected main/tray preview
-keeps its native path. Program source-focus/false color and continuous EL Zone
-remain unavailable; see [color evidence](docs/MONITOR_COLOR_REFERENCES.md).
+keeps its native path. Program source-focus/false color remain unavailable, and
+EL Zone false color was removed on 2026-10-24 (a saved selection reads as off);
+see [color evidence](docs/MONITOR_COLOR_REFERENCES.md).
 
 The pre-correction frozen `bash scripts/test.sh` run passed **316 app tests, zero failures**,
 34.681 seconds, and **112 package tests, zero failures** (44 Core including

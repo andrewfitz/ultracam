@@ -748,7 +748,7 @@ extension MonitorCoordinatorChecks {
     XCTAssertEqual(scope.metalLayer.maximumDrawableCount, 3)
     XCTAssertEqual(
       scope.metalLayer.drawableSize,
-      CGSize(width: ScopeSettings.ultracamLegacyImageWidth, height: ScopeSettings.ultracamLegacyImageHeight))
+      CGSize(width: ScopeSettings.plainWaveformImageWidth, height: ScopeSettings.plainWaveformImageHeight))
     XCTAssertEqual(scope.metalLayer.drawableSize, CGSize(width: 768, height: 256))
     portedOffer(host, 1, try monitorPixelBuffer(width: 64, height: 36))
     presenter.setClean(false)

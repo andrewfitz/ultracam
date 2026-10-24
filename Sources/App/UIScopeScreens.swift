@@ -108,8 +108,8 @@ import SwiftUI
     let classic = MonitorScopePreferences().settings
     check("the default is the classic RGB parade, −10…110 IRE",
       UIScopeChoice(classic) == .rgbParade && UIScopeLook(classic) == .classic
-        && classic.waveformColumns == ScopeSettings.ultracamLegacyImageWidth
-        && classic.waveformLevels == ScopeSettings.ultracamLegacyImageHeight)
+        && classic.waveformColumns == ScopeSettings.plainWaveformImageWidth
+        && classic.waveformLevels == ScopeSettings.plainWaveformImageHeight)
     for choice in UIScopeChoice.allCases {
       let changed = choice.applied(to: classic)
       var expected = classic

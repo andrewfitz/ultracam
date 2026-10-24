@@ -10,7 +10,7 @@ import SwiftUI
 /// Plain controls without a container, so a host can put them in a `Form` or in
 /// MonitorKit's tile toolbar popover. The host's own switch turns scopes on;
 /// these settings never do. Every change edits only the field it names, so the
-/// classic look (`ScopeSettings.ultracamLegacy`) survives a change of scope.
+/// classic look (`ScopeSettings.plainWaveform`) survives a change of scope.
 struct UIScopeSettingsView: View {
   @Binding var scopes: MonitorScopePreferences
   var isProgram: Bool

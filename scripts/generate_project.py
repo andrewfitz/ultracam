@@ -3,9 +3,15 @@
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# MonitorKit is a git submodule; a clone without it would generate a project
+# whose package reference points at an empty directory.
+if not (ROOT / "Packages/MonitorKit/Package.swift").is_file():
+    sys.exit("generate_project.py: Packages/MonitorKit/Package.swift is missing; "
+             "MonitorKit is a git submodule: run git submodule update --init")
 EXTERNAL_ROOT = Path("/Volumes/8TB/cinesomatic-director-work").resolve(strict=False)
 objects = {}
 

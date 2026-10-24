@@ -38,7 +38,8 @@ import SwiftUI
       check("false color: \(mode) needs a declared log", !UIFalseColorChoices.isAvailable(mode, profile: nil), "")
     }
     check("false color: Sony on S-Log3", UIFalseColorChoices.isAvailable(.sonySLog3, profile: sony), "")
-    check("false color: EL Zone on S-Log3", UIFalseColorChoices.isAvailable(.elZone, profile: sonyWide), "")
+    check("false color: ARRI-style on S-Gamut3 / S-Log3",
+      UIFalseColorChoices.isAvailable(.arriStyleSLog3, profile: sonyWide), "")
     check("false color: ARRI LogC on LogC3", UIFalseColorChoices.isAvailable(.arriLogC, profile: arri), "")
     check("false color: no Sony table on LogC3", !UIFalseColorChoices.isAvailable(.sonySLog3, profile: arri), "")
     check("false color: no ARRI table on S-Log3", !UIFalseColorChoices.isAvailable(.arriLogC, profile: sony), "")
@@ -131,8 +132,9 @@ import SwiftUI
     let toSony = UISignalDeclarationFields.declaring(sony, in: with(.arriLogC, arri))
     check("declaring S-Log3 switches ARRI false color to Sony's", toSony.state.falseColor.mode == .sonySLog3,
       "\(toSony.state.falseColor.mode)")
-    let kept = UISignalDeclarationFields.declaring(sonyWide, in: with(.elZone, sony))
-    check("declaring another S-Log3 keeps EL Zone", kept.state.falseColor.mode == .elZone, "\(kept.state.falseColor.mode)")
+    let kept = UISignalDeclarationFields.declaring(sonyWide, in: with(.arriStyleSLog3, sony))
+    check("declaring another S-Log3 keeps ARRI-style", kept.state.falseColor.mode == .arriStyleSLog3,
+      "\(kept.state.falseColor.mode)")
     let cleared = UISignalDeclarationFields.declaring(nil, in: with(.sonySLog3, sony))
     check("clearing the declaration leaves a log mode to explain itself",
       cleared.state.falseColor.mode == .sonySLog3 && cleared.signal.logProfileID == nil, "\(cleared.state.falseColor.mode)")

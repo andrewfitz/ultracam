@@ -6,7 +6,16 @@ Date: 2026-10-22. A read-only survey for two goals:
 
 It replaces the 2026-10-21 version, which predates the app's Metal 4 rewrite (`2270aca`).
 
-Related: [Monitor library plan](MONITOR_LIBRARY_PLAN.md), [GPU pipeline plan](GPU_PIPELINE_PLAN.md), [MonitorKit architecture](../Packages/MonitorKit/Docs/ARCHITECTURE.md), [MonitorKit progress](../Packages/MonitorKit/PROGRESS.md).
+> **MonitorKit 0.1.0 (2026-10-24).** MonitorKit is now the published library
+> [github.com/andrewfitz/MonitorKit](https://github.com/andrewfitz/MonitorKit), a git submodule at
+> `Packages/MonitorKit`. Against this map it renames `ScopeSettings.ultracamLegacy(mode:stage:)` to
+> `plainWaveform(mode:stage:)` (`ultracamLegacyImageWidth/Height` to `plainWaveformImageWidth/Height`,
+> palette `.ultracamLegacy` to `.plain`; the app reads a saved "ultracamLegacy" palette as `.plain`),
+> renames the six-band profile ID to `monitorkit-six-band-v1`, and removes EL Zone false colour
+> (`FalseColorMode.elZone`, `ELZoneProfile`, `ELZonePublicReference`, `ELZoneReferenceStatus`). The app
+> dropped EL Zone too: a saved EL Zone selection reads as off. EL Zone mentions below are history.
+
+Related: [Monitor library plan](MONITOR_LIBRARY_PLAN.md), [GPU pipeline plan](GPU_PIPELINE_PLAN.md), [MonitorKit architecture](../Packages/MonitorKit/Docs/ARCHITECTURE.md), [MonitorKit progress](monitorkit/PROGRESS.md).
 
 ## 0. Baseline
 
@@ -678,7 +687,7 @@ Status as of 2026-10-22, before W4 (W2 is `a1b652a`; the W3 gap work landed in t
   - **Done (W3 gap work).** New `MonitorUnavailableReason.requiresCameraSignal` (with `MonitorFrame.isProcessed`) and `.unsupportedGeometry` (on the new `MonitorTool.picture`); `MonitorStatus.isCodeValueView` and `codeValueViewNote`, with a `.picture` label such as "S-Log3 code values". The EI ≠ 800 and profileID/specVersion refusals have no equivalent by design.
   - An untagged buffer (no `kCVImageBufferTransferFunctionKey`, or one MonitorKit does not read, such as ST 428-1 or a plain gamma) is BT.709 under `signal(of:range:)`, and when `wrap`/`MonitorTextureCache.frame` get no `signal`. For MonitorTools' refusal ("unsupported transfer; showing code values"), the host passes `MonitorFrame.signal(of: pb, range: r, untaggedTransfer: .unknown)` as the frame's `signal` (12e6b11).
 - **R15** MonitorKitUI parity, or a decision that the app keeps its ports: the false-colour legends (Sony Pattern 2, EL Zone, ARRI), the scope scale labels (−10…110 IRE), the tile toolbar.
-  - **Done (W3 gap work).** `FalseColorLegendView(legend:style: .captioned, unavailable:)` with the captioned legend fields, `ScopeIREScale`/`ScopeIREScaleView` (−10…110 IRE), `MonitorTileToolbar` with `MonitorTileTool`, `MonitorFreezeState`, `MonitorMagnifyChoice`; `ScopeSettings.ultracamLegacy(mode:stage:)` for the old 768 × 256 scope look.
+  - **Done (W3 gap work).** `FalseColorLegendView(legend:style: .captioned, unavailable:)` with the captioned legend fields, `ScopeIREScale`/`ScopeIREScaleView` (−10…110 IRE), `MonitorTileToolbar` with `MonitorTileTool`, `MonitorFreezeState`, `MonitorMagnifyChoice`; `ScopeSettings.ultracamLegacy(mode:stage:)` (now `plainWaveform(mode:stage:)`) for the old 768 × 256 scope look.
   - Program tile glue: pass `falseColorModes: FalseColorMode.allCases.filter { !$0.needsLogSource }` to `MonitorTileToolbar` on Program, so six band and custom stay available (as `MonitorWorkspace.falseColorModeIsAvailable` does), and pass `layout:` (the shown frame's `PixelLayout`) so the ARRI legend's range matches the GPU (12e6b11).
 - **R16 (W6)** Per-stage decode, for a camera declared with another range than its format's (or a SMPTE 240M camera whose burn-in reads BT.709): the Source stage reads the declared range and tagged matrix, the Output and Monitor stages what Program, recording and the virtual camera get.
   - **Done (W6).** `SignalDescription.outputReading` (`SignalReading(range:matrix:)`), set in `MonitorFeedHost.interpret` to the pixel format's range and the matrix `LUTProcessor.parameters` decodes (BT.709 for any but BT.2020 and BT.601; an untouched frame keeps its tag), nil when equal. Every pass gets the same frame with both readings (`MonitorFeedHost.frame(_:in:core:)`, no per-stage relabelling); a Freeze's owned copy keeps both, so a held picture's tools read every stage as the live one. MonitorKit decodes the Output and Monitor stages a second time with that reading (exact at 940/64), and binds each stage's reading for focus and scopes (`MonitorFrame.parameters(for:)`). `UIScopeDescription` labels the stage it measures (`signal.signal(for: stage)`), as `ScopeAccumulator` does. The specialized pipeline compiles the second decode only when a drawn tool reads those stages (+7.4 % of a 4K picture with zebras and clip indicators there, nothing otherwise).

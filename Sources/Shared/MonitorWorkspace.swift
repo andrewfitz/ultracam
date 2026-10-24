@@ -132,7 +132,6 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     switch state.falseColor.mode {
     case .off: return false
     case .sonySLog3: return SonySLog3FalseColor.supports(sourceProfileID: profile)
-    case .elZone: return ELZoneProfile.supports(sourceProfileID: profile)
     case .arriStyleSLog3: return SonyARRIStyleFalseColor.supports(sourceProfileID: profile)
     case .arriLogC: return profile.flatMap(ARRIFalseColorProfile.init(rawValue:)) != nil
     case .sixBand, .custom: return true
@@ -153,13 +152,12 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
   }
 
   /// The mode a false-colour toggle turns on for `profile`: Sony's Pattern 2 on
-  /// S-Log3, ARRI's table on LogC, else EL Zone where it reads the source, else
-  /// the six display-IRE bands, which need no log source (always on Program).
+  /// S-Log3, ARRI's table on LogC, else the six display-IRE bands, which need no
+  /// log source (always on Program).
   static func suggestedFalseColorMode(profile: String?, isProgram: Bool = false) -> FalseColorMode {
     if isProgram { return .sixBand }
     if SonySLog3FalseColor.supports(sourceProfileID: profile) { return .sonySLog3 }
     if profile.flatMap(ARRIFalseColorProfile.init(rawValue:)) != nil { return .arriLogC }
-    if ELZoneProfile.supports(sourceProfileID: profile) { return .elZone }
     return .sixBand
   }
 
@@ -247,9 +245,6 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     case .sonySLog3:
       c.falseColor.mode = .sonySLog3
       c.falseColor.profileID = SonySLog3FalseColor.profileID
-    case .elZone:
-      c.falseColor.mode = .elZone
-      c.falseColor.profileID = ELZoneProfile.profileID
     case .arriLogC:
       c.falseColor.mode = .arri
       c.falseColor.profileID = signal.logProfileID.flatMap(ARRIFalseColorProfile.init(rawValue:))?.rawValue
@@ -332,9 +327,9 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
 
     if new.falseColor.mode != old.falseColor.mode || new.falseColor.profileID != old.falseColor.profileID {
       switch new.falseColor.mode {
-      case .off: state.falseColor.mode = .off
+      // EL Zone is gone (`normalized()` turns it off); its blob still reads.
+      case .off, .elZone: state.falseColor.mode = .off
       case .sonySLog3: state.falseColor.mode = .sonySLog3
-      case .elZone: state.falseColor.mode = .elZone
       case .arri:
         // `normalized()` kept a literal ARRI mode only for a matching LogC
         // source at EI 800; the profile is now the declared signal's.
@@ -468,9 +463,9 @@ struct MonitorScopePreferences: Codable, Equatable, Sendable {
   /// Scope redraws per second: 10, 15 or 30.
   var refreshHz = 15
   /// MonitorTools' look by default: an RGB parade of the output, 768 × 256, −10…110 IRE.
-  var settings = ScopeSettings.ultracamLegacy()
+  var settings = ScopeSettings.plainWaveform()
 
-  init(enabled: Bool = false, refreshHz: Int = 15, settings: ScopeSettings = .ultracamLegacy()) {
+  init(enabled: Bool = false, refreshHz: Int = 15, settings: ScopeSettings = .plainWaveform()) {
     self.enabled = enabled
     self.refreshHz = Self.refreshRates.contains(refreshHz) ? refreshHz : 15
     self.settings = settings
@@ -483,7 +478,18 @@ struct MonitorScopePreferences: Codable, Equatable, Sendable {
     enabled = ((try? c.decodeIfPresent(Bool.self, forKey: .enabled)) ?? nil) ?? false
     let rate = ((try? c.decodeIfPresent(Int.self, forKey: .refreshHz)) ?? nil) ?? 15
     refreshHz = Self.refreshRates.contains(rate) ? rate : 15
-    settings = ((try? c.decodeIfPresent(ScopeSettings.self, forKey: .settings)) ?? nil) ?? .ultracamLegacy()
+    settings = ((try? c.decodeIfPresent(ScopeSettings.self, forKey: .settings)) ?? nil) ?? .plainWaveform()
+    // MonitorKit 0.1.0 renamed the trace palette "ultracamLegacy" to "plain"
+    // and reads a name it does not know as standard; a scope saved by an older
+    // build keeps its plain colours (the Classic look). Saved again as "plain".
+    let saved = (try? c.decodeIfPresent(SavedScopePalette.self, forKey: .settings)) ?? nil
+    if saved?.display?.palette == "ultracamLegacy" { settings.display.palette = .plain }
+  }
+
+  /// Only the palette name of saved scope settings, as written.
+  private struct SavedScopePalette: Decodable {
+    struct Display: Decodable { var palette: String? }
+    var display: Display?
   }
 }
 
@@ -606,6 +612,8 @@ struct LegacyMonitorConfiguration: Codable, Equatable, Sendable {
   }
   enum CodeRange: String, Codable, Sendable { case full, legal }
   enum Stage: String, Codable, Sendable, CaseIterable { case source, processedOutput }
+  /// `elZone` stays so an old blob that chose it still reads (as off, see
+  /// `normalized()`) instead of failing and losing every other setting.
   enum FalseColorMode: String, Codable, Sendable, CaseIterable {
     case off, elZone, sonySLog3, arri
   }
@@ -801,17 +809,14 @@ struct LegacyMonitorConfiguration: Codable, Equatable, Sendable {
         value.falseColor.specificationVersion = SonySLog3FalseColor.specificationVersion
       }
     }
+    // Ultracam no longer has EL Zone false colour: a saved EL Zone selection
+    // (profile "ultracam-elzone-public-chart-v1" or the public chart's
+    // "elzone-panasonic-varicam-fw9-public-chart") reads as off, and the rest
+    // of the configuration is kept.
     if value.falseColor.mode == .elZone {
-      let profile = value.falseColor.profileID
-      if !ELZoneProfile.supports(sourceProfileID: sourceProfileID)
-        || (profile != nil && profile != ELZoneProfile.profileID
-          && profile != ELZonePublicReference.profileID)
-      {
-        value.falseColor.mode = .off
-      } else {
-        value.falseColor.profileID = ELZoneProfile.profileID
-        value.falseColor.specificationVersion = ELZoneProfile.specificationVersion
-      }
+      value.falseColor.mode = .off
+      value.falseColor.profileID = nil
+      value.falseColor.specificationVersion = nil
     }
     if value.falseColor.mode == .arri, let profile = value.falseColor.profileID {
       if profile == SonyARRIStyleFalseColor.profileID {

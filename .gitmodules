@@ -1,0 +1,3 @@
+[submodule "Packages/MonitorKit"]
+	path = Packages/MonitorKit
+	url = https://github.com/andrewfitz/MonitorKit.git

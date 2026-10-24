@@ -55,7 +55,8 @@ extension MonitorLifecycleChecks {
     XCTAssertEqual(Self.boundaryBlobs.count, Self.monitorToolsDecoded.count)
     for (blob, golden) in zip(Self.boundaryBlobs, Self.monitorToolsDecoded) {
       let legacy = try JSONDecoder().decode(LegacyMonitorConfiguration.self, from: Data(blob.utf8))
-      let toolsJSON = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(golden.utf8)) as? NSDictionary, blob)
+      let toolsJSON = Self.withoutELZone(
+        try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(golden.utf8)) as? NSDictionary, blob))
       let legacyJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? NSDictionary
       XCTAssertEqual(legacyJSON, toolsJSON, blob)
       let normalizedJSON =
@@ -64,6 +65,21 @@ extension MonitorLifecycleChecks {
       // MonitorTools' JSON reads back as the same configuration.
       XCTAssertEqual(try JSONDecoder().decode(LegacyMonitorConfiguration.self, from: Data(golden.utf8)), legacy, blob)
     }
+  }
+
+  /// `json` as Ultracam reads it now: the one departure from MonitorTools is
+  /// that EL Zone false colour is gone, so its selection (with its profile
+  /// "ultracam-elzone-public-chart-v1" and specification) reads as off.
+  private static func withoutELZone(_ json: NSDictionary) -> NSDictionary {
+    guard let falseColor = json["falseColor"] as? NSDictionary, falseColor["mode"] as? String == "elZone" else {
+      return json
+    }
+    let off = NSMutableDictionary(dictionary: falseColor)
+    off["mode"] = "off"
+    off.removeObjects(forKeys: ["profileID", "specificationVersion"])
+    let value = NSMutableDictionary(dictionary: json)
+    value["falseColor"] = off
+    return value
   }
 
   func testBoundaryConfigurationSurvivesThePreferences() throws {

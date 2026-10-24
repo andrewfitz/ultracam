@@ -68,7 +68,7 @@ extension MonitorLifecycleChecks {
     let blob = #"""
       {"toolsEnabled":false,"guides":{"enabled":true},"zebra":{"enabled":true},
        "focus":{"enabled":true},"scopes":{"enabled":true},
-       "falseColor":{"mode":"elZone"},"sourceProfileID":"sony-slog3-sgamut3cine"}
+       "falseColor":{"mode":"sonySLog3"},"sourceProfileID":"sony-slog3-sgamut3cine"}
       """#
     let off = try migrated(blob)
     XCTAssertFalse(off.toolsEnabled)
@@ -76,7 +76,7 @@ extension MonitorLifecycleChecks {
     XCTAssertTrue(off.state.zebras[0].enabled)
     XCTAssertTrue(off.state.focus.enabled)
     XCTAssertTrue(off.scopes.enabled)
-    XCTAssertEqual(off.state.falseColor.mode, .elZone)
+    XCTAssertEqual(off.state.falseColor.mode, .sonySLog3)
     XCTAssertFalse(off.state.clean, "The master switch is not Clean View")
     let hidden = off.surfaceState(isProgram: false)
     XCTAssertFalse(hidden.guides.enabled)
@@ -91,7 +91,7 @@ extension MonitorLifecycleChecks {
     XCTAssertTrue(on.toolsEnabled)
     XCTAssertTrue(shown.guides.enabled)
     XCTAssertTrue(shown.focus.enabled)
-    XCTAssertEqual(shown.falseColor.mode, .elZone)
+    XCTAssertEqual(shown.falseColor.mode, .sonySLog3)
     XCTAssertTrue(on.scopesShown)
   }
 
@@ -197,16 +197,103 @@ extension MonitorLifecycleChecks {
 
   // MARK: false colour
 
-  func testMigrationSonyAndELZoneModesCarryOver() throws {
+  func testMigrationSonyModeCarriesOverAndELZoneIsOff() throws {
     let source = #""sourceProfileID":"sony-slog3-sgamut3cine""#
     XCTAssertEqual(try migrated(#"{"falseColor":{"mode":"off"},"# + source + "}").state.falseColor.mode, .off)
     XCTAssertEqual(
       try migrated(#"{"falseColor":{"mode":"sonySLog3"},"# + source + "}").state.falseColor.mode, .sonySLog3)
-    XCTAssertEqual(
-      try migrated(#"{"falseColor":{"mode":"elZone"},"# + source + "}").state.falseColor.mode, .elZone)
+    // Ultracam no longer has EL Zone: with or without its source, it reads as off.
+    XCTAssertEqual(try migrated(#"{"falseColor":{"mode":"elZone"},"# + source + "}").state.falseColor.mode, .off)
     // As MonitorTools' normalization did: no supported log source, no false colour.
     XCTAssertEqual(try migrated(#"{"falseColor":{"mode":"sonySLog3"}}"#).state.falseColor.mode, .off)
     XCTAssertEqual(try migrated(#"{"falseColor":{"mode":"elZone"}}"#).state.falseColor.mode, .off)
+  }
+
+  /// An old blob that chose EL Zone (either profile ID MonitorTools or an older
+  /// Ultracam wrote) reads with false colour off and every other setting kept.
+  func testMigrationELZoneBecomesOffAndKeepsEverythingElse() throws {
+    for profile in ["ultracam-elzone-public-chart-v1", "elzone-panasonic-varicam-fw9-public-chart"] {
+      let blob = #"""
+        {"toolsEnabled":true,"guides":{"enabled":true,"thirds":false,"centerCross":true},
+         "zebra":{"enabled":true,"thresholdIRE":80},"focus":{"enabled":true,"color":"green"},
+         "scopes":{"enabled":true,"mode":"lumaWaveform","refreshHz":30},
+         "falseColor":{"mode":"elZone","profileID":"\#(profile)",
+           "specificationVersion":"Ultracam-PanasonicFW9-Midpoints-v1","referenceOffsetStops":0.5},
+         "sourceProfileID":"sony-slog3-sgamut3","sourceCodeRange":"full"}
+        """#
+      let feed = try migratedFeed(blob)
+      let value = feed.monitor
+      XCTAssertEqual(value.state.falseColor.mode, .off, profile)
+      XCTAssertTrue(value.toolsEnabled, profile)
+      XCTAssertTrue(value.state.guides.enabled, profile)
+      XCTAssertFalse(value.state.guides.thirds, profile)
+      XCTAssertTrue(value.state.guides.centerCross, profile)
+      XCTAssertTrue(value.state.zebras[0].enabled, profile)
+      XCTAssertEqual(value.state.zebras[0].level, 80, profile)
+      XCTAssertTrue(value.state.focus.enabled, profile)
+      XCTAssertEqual(value.state.focus.color, .green, profile)
+      XCTAssertTrue(value.scopes.enabled, profile)
+      XCTAssertEqual(value.scopes.refreshHz, 30, profile)
+      XCTAssertEqual(value.scopes.settings.waveformMode, .luma, profile)
+      XCTAssertEqual(value.signal.logProfileID, "sony-slog3-sgamut3", profile)
+      XCTAssertEqual(value.signal.range, .full, profile)
+      XCTAssertEqual(value.state.falseColor.referenceOffsetStops, 0.5, profile)
+      XCTAssertTrue(value.surfaceState(isProgram: false).zebras[0].enabled, "No false colour: zebra shows")
+      // Saved and read again: the same settings, and no EL Zone written.
+      let saved = try JSONEncoder().encode(feed)
+      let reread = try JSONDecoder().decode(FeedDescriptor.self, from: saved)
+      XCTAssertEqual(reread.monitor, value, profile)
+      XCTAssertEqual(reread.monitor.state.falseColor.referenceOffsetStops, 0.5, profile)
+      let monitor = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+      XCTAssertFalse(monitor.contains("elZone"), monitor)
+    }
+  }
+
+  /// MonitorKit preferences saved by an older build with EL Zone selected read
+  /// with false colour off and every other setting kept; saving writes no EL Zone.
+  func testSavedELZonePreferencesReadAsOff() throws {
+    var written = MonitorFeedPreferences(toolsEnabled: true)
+    written.state.falseColor.mode = .sixBand
+    written.state.falseColor.referenceOffsetStops = 0.5
+    written.state.zebras[0].enabled = true
+    written.state.zebras[0].level = 90
+    written.state.guides.enabled = true
+    written.state.guides.thirds = false
+    written.state.guides.centerCross = true
+    written.signal = MonitorSignalDeclaration(logProfileID: "sony-slog3-sgamut3", range: .full)
+    written.scopes.enabled = true
+    written.scopes.refreshHz = 30
+    // As an older build wrote it with EL Zone chosen.
+    let json = String(decoding: try JSONEncoder().encode(written), as: UTF8.self)
+      .replacingOccurrences(of: #""mode":"sixBand""#, with: #""mode":"elZone""#)
+    XCTAssertTrue(json.contains(#""mode":"elZone""#), json)
+    let value = try JSONDecoder().decode(MonitorFeedPreferences.self, from: Data(json.utf8))
+    XCTAssertEqual(value.state.falseColor.mode, .off)
+    XCTAssertTrue(value.toolsEnabled)
+    XCTAssertTrue(value.state.zebras[0].enabled)
+    XCTAssertEqual(value.state.zebras[0].level, 90)
+    XCTAssertTrue(value.state.guides.enabled)
+    XCTAssertFalse(value.state.guides.thirds)
+    XCTAssertTrue(value.state.guides.centerCross)
+    XCTAssertEqual(value.signal.logProfileID, "sony-slog3-sgamut3")
+    XCTAssertEqual(value.signal.range, .full)
+    XCTAssertTrue(value.scopes.enabled)
+    XCTAssertEqual(value.scopes.refreshHz, 30)
+    XCTAssertEqual(value.state.falseColor.referenceOffsetStops, 0.5)
+    XCTAssertTrue(value.surfaceState(isProgram: false).zebras[0].enabled, "No false colour: zebra shows")
+    let saved = try JSONEncoder().encode(value)
+    XCTAssertFalse(String(decoding: saved, as: UTF8.self).contains("elZone"))
+    XCTAssertEqual(try JSONDecoder().decode(MonitorFeedPreferences.self, from: saved), value)
+
+    // A six-band selection keeps showing whatever profile ID an older build
+    // put beside it (MonitorKit renamed "ultracam-six-band-v1").
+    for profile in ["ultracam-six-band-v1", SixBandFalseColor.profileID] {
+      let sixBand = String(decoding: try JSONEncoder().encode(written), as: UTF8.self)
+        .replacingOccurrences(of: #""mode":"sixBand""#, with: #""mode":"sixBand","profileID":""# + profile + #"""#)
+      XCTAssertTrue(sixBand.contains(profile), sixBand)
+      let read = try JSONDecoder().decode(MonitorFeedPreferences.self, from: Data(sixBand.utf8))
+      XCTAssertEqual(read, written, profile)
+    }
   }
 
   func testMigrationARRIStyleProfileBecomesSony() throws {
@@ -263,7 +350,7 @@ extension MonitorLifecycleChecks {
 
   func testMigrationNewFalseColorFieldsTakeDefaults() throws {
     let falseColor = try migrated(#"""
-      {"falseColor":{"mode":"elZone"},"sourceProfileID":"sony-slog3-sgamut3cine"}
+      {"falseColor":{"mode":"sonySLog3"},"sourceProfileID":"sony-slog3-sgamut3cine"}
       """#).state.falseColor
     XCTAssertEqual(falseColor.stage, .output)
     XCTAssertEqual(falseColor.customUnit, .ire)
@@ -313,14 +400,47 @@ extension MonitorLifecycleChecks {
     let parade = try migrated(#"{"scopes":{"mode":"rgbParade"}}"#).scopes.settings
     XCTAssertEqual(parade.kind, .waveform)
     XCTAssertEqual(parade.waveformMode, .rgbParade)
-    XCTAssertEqual(parade.waveformColumns, ScopeSettings.ultracamLegacyImageWidth)
-    XCTAssertEqual(parade.waveformLevels, ScopeSettings.ultracamLegacyImageHeight)
+    XCTAssertEqual(parade.waveformColumns, ScopeSettings.plainWaveformImageWidth)
+    XCTAssertEqual(parade.waveformLevels, ScopeSettings.plainWaveformImageHeight)
     XCTAssertEqual(parade.levelRange, .minus10To110)
-    XCTAssertEqual(parade.display.palette, .ultracamLegacy)
+    XCTAssertEqual(parade.display.palette, .plain)
     let luma = try migrated(#"{"scopes":{"mode":"lumaWaveform"}}"#).scopes.settings
     XCTAssertEqual(luma.kind, .waveform)
     XCTAssertEqual(luma.waveformMode, .luma)
     XCTAssertEqual(luma.levelRange, .minus10To110)
+  }
+
+  /// Scopes saved before MonitorKit 0.1.0 named the plain trace palette
+  /// "ultracamLegacy"; they keep the plain colours (the Classic look) and are
+  /// saved again as "plain". A name nobody wrote still reads as standard.
+  func testSavedUltracamLegacyScopePaletteReadsAsPlain() throws {
+    var classic = MonitorScopePreferences(enabled: true, refreshHz: 30)
+    classic.settings.waveformMode = .luma
+    classic.settings.display.gain = 2
+    XCTAssertEqual(classic.settings.display.palette, .plain)
+    let current = String(decoding: try JSONEncoder().encode(classic), as: UTF8.self)
+    XCTAssertTrue(current.contains(#""palette":"plain""#), current)
+    let old = current.replacingOccurrences(of: #""palette":"plain""#, with: #""palette":"ultracamLegacy""#)
+    let read = try JSONDecoder().decode(MonitorScopePreferences.self, from: Data(old.utf8))
+    XCTAssertEqual(read, classic)
+    XCTAssertEqual(read.settings.display.palette, .plain)
+    let resaved = String(decoding: try JSONEncoder().encode(read), as: UTF8.self)
+    XCTAssertTrue(resaved.contains(#""palette":"plain""#), resaved)
+    XCTAssertFalse(resaved.contains("ultracamLegacy"), resaved)
+    XCTAssertEqual(try JSONDecoder().decode(MonitorScopePreferences.self, from: Data(resaved.utf8)), classic)
+
+    let unknown = current.replacingOccurrences(of: #""palette":"plain""#, with: #""palette":"nonsense""#)
+    let standard = try JSONDecoder().decode(MonitorScopePreferences.self, from: Data(unknown.utf8))
+    XCTAssertEqual(standard.settings.display.palette, .standard)
+    XCTAssertEqual(standard.settings.waveformMode, .luma, "The rest is kept")
+    XCTAssertEqual(standard.settings.display.gain, 2)
+
+    // Inside a saved feed, too.
+    var preferences = MonitorFeedPreferences(toolsEnabled: true)
+    preferences.scopes = classic
+    let feed = String(decoding: try JSONEncoder().encode(preferences), as: UTF8.self)
+      .replacingOccurrences(of: #""palette":"plain""#, with: #""palette":"ultracamLegacy""#)
+    XCTAssertEqual(try JSONDecoder().decode(MonitorFeedPreferences.self, from: Data(feed.utf8)), preferences)
   }
 
   func testMigrationScopeGainAndGraticule() throws {

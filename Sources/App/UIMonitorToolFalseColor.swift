@@ -16,7 +16,7 @@ enum UIFalseColorChoices {
   ]
 
   /// The modes, in menu order.
-  static let modes: [FalseColorMode] = [.off, .sonySLog3, .arriStyleSLog3, .arriLogC, .elZone, .sixBand, .custom]
+  static let modes: [FalseColorMode] = [.off, .sonySLog3, .arriStyleSLog3, .arriLogC, .sixBand, .custom]
 
   /// `MonitorFeedPreferences.falseColorModeIsAvailable`: no log mode on Program.
   static func isAvailable(_ mode: FalseColorMode, profile: String?, isProgram: Bool = false) -> Bool {
@@ -119,7 +119,7 @@ struct UIFalseColorSettingsForm: View {
         }
         .pickerStyle(.segmented)
       }
-      if mode == .elZone || (mode == .custom && preferences.state.falseColor.customUnit == .stops) {
+      if mode == .custom && preferences.state.falseColor.customUnit == .stops {
         Stepper(value: fc.referenceOffsetStops, in: -6...6, step: 0.25) {
           Text("Exposure offset \(preferences.state.falseColor.referenceOffsetStops, specifier: "%+.2f") stops")
         }
@@ -159,10 +159,6 @@ struct UIFalseColorSettingsForm: View {
       return available
         ? "ARRI's published 10-bit code-value table for EI 800, on the declared LogC source."
         : "Declare the ARRI LogC3 or LogC4 profile that matches the camera."
-    case .elZone:
-      return available
-        ? "Public-chart mapping. Sony Monitor & Control match not tested."
-        : "EL Zone needs a supported Sony S-Log3 source."
     case .sixBand:
       return "Six bands on the chosen signal's display IRE. No log source needed."
     case .custom:

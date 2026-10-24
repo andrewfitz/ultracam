@@ -306,7 +306,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   }
 
   func testCopyFalseColorModeUsesItsProfileWhilePreservingDestinationCalibration() {
-    for mode in [FalseColorMode.sonySLog3, .elZone] {
+    for mode in [FalseColorMode.sonySLog3, .arriStyleSLog3] {
       let value = coordinator()
       var source = MonitorFeedPreferences()
       source.toolsEnabled = true
@@ -315,7 +315,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
       var destination = MonitorFeedPreferences()
       destination.signal = MonitorSignalDeclaration(
         logProfileID: "sony-slog3-sgamut3", range: .legal, transport: .fullRescaledToLegal)
-      destination.state.falseColor.mode = mode == .elZone ? .sonySLog3 : .elZone
+      destination.state.falseColor.mode = mode == .arriStyleSLog3 ? .sonySLog3 : .arriStyleSLog3
       destination.state.falseColor.referenceOffsetStops = 1.25
       value.setPreferences(source, for: alpha)
       value.setPreferences(destination, for: beta)
@@ -1183,13 +1183,11 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC3), .source, "ARRI's table on LogC3")
     XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC4), .source, "ARRI's table on LogC4")
     XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .output, "ARRI's table on S-Log3")
-    for mode in [FalseColorMode.arriStyleSLog3, .elZone] {
-      state.falseColor.mode = mode
-      XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .source, "\(mode) on S-Gamut3.Cine")
-      XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC3), .output, "\(mode) on LogC3")
-      XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: sLog3Rec2020), .output,
-        "\(mode) on S-Log3 outside S-Gamut3")
-    }
+    state.falseColor.mode = .arriStyleSLog3
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: log), .source, "ARRI-style on S-Gamut3.Cine")
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: logC3), .output, "ARRI-style on LogC3")
+    XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: sLog3Rec2020), .output,
+      "ARRI-style on S-Log3 outside S-Gamut3")
     state.falseColor.mode = .sixBand
     state.falseColor.stage = .monitor
     XCTAssertEqual(MonitorFeedHost.pictureReading(state, signal: display), .monitor, "Six bands classify their stage")

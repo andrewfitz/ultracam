@@ -107,8 +107,6 @@ extension MonitorLifecycleChecks {
       (FalseColorMode.sonySLog3, "sony-slog3-sgamut3cine", true),
       (.sonySLog3, "arri-logc3-ei800", false),
       (.sonySLog3, nil, false),
-      (.elZone, "sony-slog3-sgamut3", true),
-      (.elZone, nil, false),
       (.arriLogC, "arri-alexa35-logc4-ei800", true),
       (.arriLogC, "sony-slog3-sgamut3cine", false),
       (.arriStyleSLog3, "sony-slog3-sgamut3cine", true),

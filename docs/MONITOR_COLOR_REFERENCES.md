@@ -94,6 +94,11 @@ shader reference adaptation.
 
 ## EL Zone research and remaining qualification
 
+> **Removed 2026-10-24.** EL Zone false colour is no longer part of MonitorKit (0.1.0) or
+> Ultracam. A saved EL Zone selection reads as false colour off with every other setting
+> kept (`LegacyMonitorConfiguration.normalized()`, `MonitorState` decoding). The EL Zone
+> sections below are kept as the research record only.
+
 Actively examined these public primary sources:
 
 - [Creator's official homepage](https://www.elzonesystem.com/) and
@@ -251,6 +256,9 @@ incompatible source disables this preset. Physical camera/capture qualification
 remains separate from these scalar and shader reference checks.
 
 ## Operational EL Zone public-chart profile
+
+> **Removed 2026-10-24** with EL Zone itself (see above); `ELZoneProfile`,
+> `ELZonePublicReference` and `ELZoneReferenceStatus` no longer exist.
 
 `ELZoneProfile` now provides the selectable operational **EL Zone · Public chart**
 profile, ID `ultracam-elzone-public-chart-v1`, specification identity

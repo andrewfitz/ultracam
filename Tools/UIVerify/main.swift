@@ -955,6 +955,17 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   for screen in UIMonitorToolScreens.screens() {
     run.render(screen.name, screen.view, size: screen.size).forEach { $0.close() }
   }
+  // Custom bands in stops show the exposure-offset stepper; in IRE they do not.
+  let offsetShown = ["monitor-tool-false-color-customstops": true, "monitor-tool-false-color-custom": false]
+  for screen in UIMonitorToolScreens.screens() {
+    guard let expected = offsetShown[screen.name] else { continue }
+    let hosted = HostedView(screen.view, size: screen.size, dark: false)
+    let nodes = Accessibility.nodes(in: hosted.host)
+    hosted.close()
+    verifier.check("\(screen.name) \(expected ? "shows" : "hides") the exposure offset",
+      run.contains(nodes, "Exposure offset") == expected, run.names(nodes).prefix(16).joined(separator: "; "),
+      viewDependent: true)
+  }
   UIScopeScreens.run(verifier: verifier) { name, view, size in
     run.render(name, view, size: size).forEach { $0.close() }
   }

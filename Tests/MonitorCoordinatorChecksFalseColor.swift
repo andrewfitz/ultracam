@@ -237,11 +237,12 @@ extension MonitorCoordinatorChecks {
           XCTAssertEqual(other.declaringCameraLog(sonySource).state.falseColor.mode, mode, "\(mode) is untouched")
         }
       }
-      var elZone = MonitorFeedPreferences()
-      elZone.signal.logProfileID = sonySource
-      elZone.state.falseColor.mode = .elZone
+      var arriStyle = MonitorFeedPreferences()
+      arriStyle.signal.logProfileID = sonySource
+      arriStyle.state.falseColor.mode = .arriStyleSLog3
       let otherSony = Self.portedSonySources.first { $0 != sonySource }
-      XCTAssertEqual(elZone.declaringCameraLog(otherSony).state.falseColor.mode, .elZone, "Another S-Log3 keeps EL Zone")
+      XCTAssertEqual(arriStyle.declaringCameraLog(otherSony).state.falseColor.mode, .arriStyleSLog3,
+        "Another S-Log3 keeps ARRI-style")
     }
     // Program: no log mode is available and a toggle suggests six band.
     XCTAssertFalse(MonitorFeedPreferences.falseColorModeIsAvailable(.sonySLog3, profile: "sony-slog3-sgamut3",
@@ -268,74 +269,11 @@ extension MonitorCoordinatorChecks {
       XCTAssertTrue(legend.title.hasPrefix(name), legend.title)
       XCTAssertEqual(legend.unit, .code)
       XCTAssertFalse(SonySLog3FalseColor.supports(sourceProfileID: source))
-      XCTAssertFalse(ELZoneProfile.supports(sourceProfileID: source))
+      XCTAssertFalse(SonyARRIStyleFalseColor.supports(sourceProfileID: source))
     }
   }
 
   // MARK: SonyFalseColorUITests
-
-  /// SonyFalseColorUITests:8. EL Zone on a Sony camera is one complete
-  /// publication that keeps the exposure offset and the other tools; Program
-  /// cannot show it.
-  func testELZoneModeSelectionPublishesOneCompleteQualifiedConfiguration() throws {
-    for source in Self.portedSonySources {
-      var saved = MonitorFeedPreferences()
-      saved.signal = MonitorSignalDeclaration(logProfileID: source)
-      saved.toolsEnabled = true
-      saved.state.falseColor.mode = .sonySLog3
-      saved.state.falseColor.referenceOffsetStops = 1.25
-      saved.state.guides.enabled = true
-      saved.state.guides.centerCross = true
-      let value = portedFalseColorCoordinator(["alpha": saved])
-      var published: [MonitorFeedPreferences] = []
-      value.onConfigurationChange = { _, preferences in published.append(preferences) }
-      XCTAssertTrue(ELZoneProfile.supports(sourceProfileID: saved.signal.logProfileID))
-      XCTAssertEqual(saved.surfaceState(isProgram: true).falseColor.mode, .off, "EL Zone needs a camera's source")
-      portedExpectProgramZebra(portedSelecting(.elZone, in: saved))
-
-      value.setPreferences(portedSelecting(.elZone, in: saved), for: MonitorTargetID("alpha"))
-
-      XCTAssertEqual(published.count, 1, "The mode reaches the surfaces in one complete update")
-      let selected = try XCTUnwrap(published.first)
-      XCTAssertEqual(selected.state.falseColor.mode, .elZone)
-      XCTAssertEqual(selected.state.falseColor.referenceOffsetStops, 1.25)
-      XCTAssertTrue(selected.state.guides.centerCross)
-      XCTAssertEqual(selected.signal.logProfileID, source)
-      XCTAssertTrue(selected.falseColorDeclared)
-      XCTAssertEqual(value.preferences(for: MonitorTargetID("alpha")), selected)
-      let legend = try XCTUnwrap(try portedLegend(selected))
-      XCTAssertTrue(legend.isProvisional)
-      XCTAssertTrue(legend.showsSwatchesAsGrid)
-      XCTAssertTrue(legend.captions.contains { $0.contains("+1.25 stops") }, "\(legend.captions)")
-      XCTAssertNil(legend.unavailableNote)
-    }
-  }
-
-  /// SonyFalseColorUITests:44. A selected EL Zone shows once a Sony camera is
-  /// declared; each camera switch is one publication keeping offset and range.
-  func testSonySourceSelectionQualifiesELZoneBeforeCoordinatorNormalization() throws {
-    var start = MonitorFeedPreferences()
-    start = portedSelecting(.elZone, in: start)
-    start.state.falseColor.referenceOffsetStops = -0.75
-    start.signal.range = .full
-    let value = portedFalseColorCoordinator(["alpha": start])
-    var published: [MonitorFeedPreferences] = []
-    value.onConfigurationChange = { _, preferences in published.append(preferences) }
-    XCTAssertFalse(start.falseColorDeclared)
-    var selected = start
-    for source in Self.portedSonySources {
-      selected.signal.logProfileID = source
-      value.setPreferences(selected, for: MonitorTargetID("alpha"))
-
-      XCTAssertEqual(published.last?.signal.logProfileID, source)
-      XCTAssertEqual(published.last?.state.falseColor.mode, .elZone)
-      XCTAssertTrue(published.last?.falseColorDeclared == true)
-      let shown = value.preferences(for: MonitorTargetID("alpha"))
-      XCTAssertEqual(shown.state.falseColor.referenceOffsetStops, -0.75)
-      XCTAssertEqual(shown.signal.range, .full)
-    }
-    XCTAssertEqual(published.count, 2, "Each camera switch publishes one complete update")
-  }
 
   /// SonyFalseColorUITests:80. An unknown saved camera profile is kept as saved
   /// (shown, persisted and never rewritten) and offers no Sony mode until a Sony
@@ -355,7 +293,7 @@ extension MonitorCoordinatorChecks {
       let decoded = try JSONDecoder().decode(MonitorFeedPreferences.self, from: JSONEncoder().encode(saved))
       XCTAssertEqual(decoded.signal.logProfileID, source, "The saved input survives a save and load")
       XCTAssertFalse(SonySLog3FalseColor.supports(sourceProfileID: source))
-      XCTAssertFalse(ELZoneProfile.supports(sourceProfileID: source))
+      XCTAssertFalse(SonyARRIStyleFalseColor.supports(sourceProfileID: source))
       let sony = portedSelecting(.sonySLog3, in: saved)
       XCTAssertFalse(sony.falseColorDeclared)
       XCTAssertNotNil(try portedLegend(sony)?.unavailableNote, "A Sony mode on this input says it is unavailable")
@@ -364,7 +302,8 @@ extension MonitorCoordinatorChecks {
       chosen.signal.logProfileID = "sony-slog3-sgamut3cine"
       value.setPreferences(chosen, for: MonitorTargetID("alpha"))
       XCTAssertTrue(SonySLog3FalseColor.supports(sourceProfileID: value.preferences(for: MonitorTargetID("alpha")).signal.logProfileID))
-      XCTAssertTrue(ELZoneProfile.supports(sourceProfileID: value.preferences(for: MonitorTargetID("alpha")).signal.logProfileID))
+      XCTAssertTrue(SonyARRIStyleFalseColor.supports(
+        sourceProfileID: value.preferences(for: MonitorTargetID("alpha")).signal.logProfileID))
       XCTAssertEqual(writes, 1)
     }
     for source in Self.portedSonySources {

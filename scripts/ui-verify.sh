@@ -14,6 +14,9 @@ if ! mount | /usr/bin/grep -F ' on /Volumes/8TB ' >/dev/null; then
   echo 'External drive /Volumes/8TB is not mounted.' >&2
   exit 1
 fi
+# Before the inputs hash: it names the package's files, so a clone without the
+# submodule stops on its message, not on find's.
+source "$task_root/scripts/monitor-kit-package.sh"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 build_root="$external_root/agent-work/build/ultracam/ui-verify"
 # Skip when nothing the verifier compiles has changed since its last passing run.
@@ -31,7 +34,6 @@ mkdir -p "$test_root/modules" "$test_root/tmp"
 export TMPDIR="$test_root/tmp"
 export MACOSX_DEPLOYMENT_TARGET=26.0
 export ULTRACAM_SHADER="$task_root/Sources/App/LUTShaders.metal"
-source "$task_root/scripts/monitor-kit-package.sh"
 monitor_kit_package_build > "$test_root/package-build.log" 2>&1 || {
   cat "$test_root/package-build.log"
   exit 1

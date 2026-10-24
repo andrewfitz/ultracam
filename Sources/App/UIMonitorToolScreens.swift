@@ -49,7 +49,6 @@ import SwiftUI
     }
     return [
       ("sony", with(.sonySLog3, profile: "sony-slog3-sgamut3cine")),
-      ("elzone", with(.elZone, profile: "sony-slog3-sgamut3") { $0.state.falseColor.referenceOffsetStops = 0.5 }),
       ("arri", with(.arriLogC, profile: ARRIFalseColorProfile.logC3EI800.rawValue)),
       ("sixband", with(.sixBand, profile: nil)),
       ("custom", with(.custom, profile: nil) {
@@ -57,6 +56,16 @@ import SwiftUI
           FalseColorBand(lower: -.infinity, upper: 5, color: ColorRGB(r: 0.45, g: 0.2, b: 0.75)),
           FalseColorBand(lower: 40, upper: 50, color: ColorRGB(r: 0.2, g: 0.75, b: 0.3)),
           FalseColorBand(lower: 95, upper: .infinity, color: ColorRGB(r: 1, g: 0.15, b: 0.1)),
+        ]
+      }),
+      // Stops show the exposure-offset stepper; IRE bands (above) do not.
+      ("customstops", with(.custom, profile: nil) {
+        $0.state.falseColor.customUnit = .stops
+        $0.state.falseColor.referenceOffsetStops = 0.5
+        $0.state.falseColor.customBands = [
+          FalseColorBand(lower: -.infinity, upper: -4, color: ColorRGB(r: 0.45, g: 0.2, b: 0.75)),
+          FalseColorBand(lower: -0.5, upper: 0.5, color: ColorRGB(r: 0.2, g: 0.75, b: 0.3)),
+          FalseColorBand(lower: 4, upper: .infinity, color: ColorRGB(r: 1, g: 0.15, b: 0.1)),
         ]
       }),
       ("undeclared", with(.sonySLog3, profile: nil)),

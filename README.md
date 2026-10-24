@@ -157,12 +157,11 @@ source and presented rates, scope skips and GPU time.
 
 **Sony S-Log3** false color uses Sony Monitor & Control's published source IRE
 bands with Ultracam display colors. It supports S-Gamut3.Cine and S-Gamut3;
-camera EI does not shift these bands. **EL Zone** decodes Sony channels before
-source-gamut scene luminance and stops relative to 18% gray. It uses the published
-public-chart palette and Ultracam's versioned continuous-band convention. The
-manual monitor exposure offset adds stops; it does not infer camera EI. Sony M&C
-EL Zone matching is not tested. Neither mode claims Sony sensor clipping/noise
-limits. Historical Sony ARRI-style settings migrate to Sony S-Log3; legacy literal
+camera EI does not shift these bands, and they do not claim Sony sensor
+clipping/noise limits. The exposure offset of custom stop bands adds stops; it
+does not infer camera EI. A saved EL Zone selection from an earlier build reads
+as false color off, with every other setting kept. Historical Sony ARRI-style
+settings migrate to Sony S-Log3; legacy literal
 ARRI data remains readable as an unsupported saved choice. Select the matching source
 profile, input range and Log transport mapping; these declarations do not
 calibrate the capture device. Source Log pictures without a LUT are labeled as
@@ -241,9 +240,17 @@ Requirements: Apple silicon, Xcode, macOS 15 or later, Blackmagic Desktop Video
 with its camera extension enabled. The development target is macOS 27.0.1.
 
 ```sh
+git clone --recurse-submodules https://github.com/andrewfitz/blackmagic-lut-webcam.git
+# or, in an existing clone:
+git submodule update --init
 bash scripts/build.sh
 bash scripts/test.sh
 ```
+
+MonitorKit (`Packages/MonitorKit`) is a git submodule pinned to a tagged release
+of [github.com/andrewfitz/MonitorKit](https://github.com/andrewfitz/MonitorKit);
+run `git submodule update --init` after cloning or after a pull that moves it.
+Its development log is [docs/monitorkit/PROGRESS.md](docs/monitorkit/PROGRESS.md).
 
 These commands require the mounted `/Volumes/8TB` drive and keep all build
 products, test binaries, module caches and temporary files under

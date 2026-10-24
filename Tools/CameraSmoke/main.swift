@@ -437,7 +437,7 @@ final class MonitorComparison: MonitorGPUCompletion, @unchecked Sendable {
     let core = try context.core()
     try core.warmUp()
     let device = core.device
-    let scope = try core.scopeEngine.makeAccumulator(settings: .ultracamLegacy(mode: .rgbParade, stage: .output))
+    let scope = try core.scopeEngine.makeAccumulator(settings: .plainWaveform(mode: .rgbParade, stage: .output))
     func texture(_ width: Int, _ height: Int) throws -> MTLTexture {
       let descriptor = MTLTextureDescriptor.texture2DDescriptor(
         pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
@@ -450,7 +450,7 @@ final class MonitorComparison: MonitorGPUCompletion, @unchecked Sendable {
     }
     let targets = try (0..<3).map { _ in try texture(1920, 1080) }
     let scopeTargets = try (0..<3).map { _ in
-      try texture(ScopeSettings.ultracamLegacyImageWidth, ScopeSettings.ultracamLegacyImageHeight)
+      try texture(ScopeSettings.plainWaveformImageWidth, ScopeSettings.plainWaveformImageHeight)
     }
     let residency = MTLResidencySetDescriptor()
     residency.label = "CameraSmoke monitor targets"

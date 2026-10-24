@@ -1,5 +1,6 @@
 #!/bin/bash
-# Source this helper after setting task_root and a run-specific external test_root.
+# Source this helper after setting task_root; set a run-specific external test_root
+# before calling its functions.
 # Compile the MonitorKit package; consumers link a per-run copy of its real products and
 # use Bundle.module. Every name is monitor_kit_*, so it leaves a sourcing script's own
 # names alone.
@@ -7,6 +8,10 @@
 # retry policy against fixture logs and a stub xcrun.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then task_root="$(cd "$(dirname "$0")/.." && pwd)"; fi
 monitor_kit_package="$task_root/Packages/MonitorKit"
+if [[ ! -f "$monitor_kit_package/Package.swift" ]]; then
+  echo "Packages/MonitorKit/Package.swift is missing: MonitorKit is a git submodule; run git submodule update --init" >&2
+  exit 1
+fi
 # The release products build incrementally in one shared scratch. Each run copies them out
 # while it still holds the cache lock, so it compiles and links against exactly what it
 # built, whatever another run rebuilds afterwards.

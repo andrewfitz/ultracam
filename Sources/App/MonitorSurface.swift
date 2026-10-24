@@ -1034,7 +1034,7 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     metalLayer.framebufferOnly = true
     metalLayer.maximumDrawableCount = 3
     metalLayer.drawableSize = CGSize(
-      width: ScopeSettings.ultracamLegacyImageWidth, height: ScopeSettings.ultracamLegacyImageHeight)
+      width: ScopeSettings.plainWaveformImageWidth, height: ScopeSettings.plainWaveformImageHeight)
     metalLayer.contentsGravity = .resize
     metalLayer.isOpaque = false
     metalLayer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]

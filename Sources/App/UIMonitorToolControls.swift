@@ -101,7 +101,6 @@ enum UIMonitorToolText {
     case .sonySLog3: return "Sony S-Log3"
     case .arriStyleSLog3: return "ARRI-style (S-Log3)"
     case .arriLogC: return "ARRI LogC"
-    case .elZone: return "EL Zone"
     case .sixBand: return "Six band (display IRE)"
     case .custom: return "Custom bands"
     }
