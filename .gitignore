@@ -4,4 +4,5 @@ xcuserdata/
 build/
 .build/
 Tools/auto-switcher/target/
+__pycache__/
 Config/Signing.xcconfig
