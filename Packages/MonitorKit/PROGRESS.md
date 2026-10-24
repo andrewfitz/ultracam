@@ -9,6 +9,7 @@ The autonomous build log. The heartbeat (every 5 hours) reads this file to resum
 - [x] W2 HDR/display transforms + EDR; MonitorKitUI; a dedicated performance/optimization pass; audit round 2 of the W1 modules + fixes. Done 2026-10-22 (integration step: see "W2 result" below). Added beyond the plan: the Metal 4 encode path for every GPU object (bit-identical to classic), MonitorMultiview, white-point trim, scope HDR colours.
 - [x] W3 Two audit rounds of the W2 work + fixes; docs (README, FEATURES, API, INTEGRATION, MATH, LICENSE); final benchmarks. Done 2026-10-22: fd87db8 (final perf pass + the W3 library work: docs, CHANGELOG, NOTICE, ported tests, texture cache, warm-up, UI chrome), ff54124 (exact-quotient scope decode, checksummed statistics slots, stress-test hardening: 759 tests, 0 failures), 97fd185 (gate helper), then the W4-found library fixes 96fdeb6 and 12e6b11. See "W3 + W4 result" below.
 - [x] W4 Ultracam integration: LUT fused into LUTProcessor, monitor surfaces on MonitorKit, UI, then audits and regression tests; MonitorTools retired (74de953). Done 2026-10-23 at 1baddab; all gates green (see "W3 + W4 result" below).
+- [x] W6 Polish (user-approved list): per-stage decode, pipeline warm start, BT.2446 HLG → SDR, the 240 Hz integration check, audio metering off the DeckLink callback, Release size. Done 2026-10-23; then a fresh 20-agent bug audit (51d9e9d…68c74bd, f76affe) and final-verify at 5067386 (see "W6 result (final-verify)" below).
 - [ ] W5 Final verification and report. Offline verification done 2026-10-23 (final-verify at 1baddab, every gate run; see below). Still open: plan step 9, the hands-on check with the UltraStudio (needs `LIVE=1` or the installed app quit, so only with the user's go-ahead), and the final report to the user (report delivered 2026-10-23).
 
 ## Workflow runs
@@ -43,9 +44,9 @@ Full suite with the default scratch path: 621 tests, 619 passed, 2 skipped (the 
 Key numbers (M4 Max, min of N, shared GPU): picture pass 4K v210 → 1080p every tool 0.29 ms (budget 0.35), → 1600×900 0.33 (0.40); focus mask 4K 0.113 ms (0.24); four 4K feeds in one MonitorMultiview pass 1.56 ms (2.0); every output encoding within 10 % of SDR (tools off: PQ +9.0 %, HLG +9.6 %, SDR/linear +4–5 %); scope accumulation 4K 0.32–0.42 ms single, 0.62 / 0.78 ms fused group; Freeze 0.043 ms; CPU encode 7.6–8.8 µs debug / 6.5 µs release (classic), Metal 4 render 9.4 / 5.3 µs; audio 0.30 % of a core for 16 channels at 48 kHz.
 
 Open items carried into W3/W4:
-- Perf: LUT-stage focus mask 0.48 ms tetrahedral / 0.55 ms trilinear (33³) is over the old 0.4 ms target (guarded at 0.52 / 0.6); needs a decode-once threadgroup tile or a smaller analysis LUT format. Metal 4 render encode is 9.4 µs in debug (> 8 µs; release 5.3 µs). Display transforms cost +8 to +16 % over SDR (outside the 10 % bar). 2560×1440 (0.56 ms) and 4K 1:1 (0.70 ms) with every tool, and the compute picture's 16 × 16 threadgroup, are untuned. Scope PQ/HLG draw encode adds about 14 µs per 1024×512 draw.
-- Metal 4: pipelines are device-built, not MTL4Compiler-built, so no MTL4PipelineDataSetSerializer warm start yet. The first Metal 4 encode of each object allocates its argument table and ring (no warm-up API). Focus-mask barriers are queue-wide while a mask submission may run (MTLFence variant deferred). No Metal 4 scope test into a framebufferOnly drawable. Scopes copy `store`/`align256`/`makeArgumentTable` from MonitorKit (could be `package`). Optional: expose the scope draw's `waited` flag so MonitorRenderer issues one barrier per shared encoder.
-- Colour: HLG → SDR hard-clips above reference white (a BT.2446 soft-knee mode could be added). HDR-to-HDR LUTs are not modelled (any LUT makes the picture Rec.709).
+- Perf: LUT-stage focus mask 0.48 ms tetrahedral / 0.55 ms trilinear (33³) is over the old 0.4 ms target (guarded at 0.52 / 0.6); needs a decode-once threadgroup tile or a smaller analysis LUT format. Metal 4 render encode is 9.4 µs in debug (> 8 µs; release 5.3 µs). Display transforms cost +8 to +16 % over SDR (outside the 10 % bar; partly done in W6, e943328: HLG → SDR now about +9.5 %, PQ → SDR still +16 %). 2560×1440 (0.56 ms) and 4K 1:1 (0.70 ms) with every tool, and the compute picture's 16 × 16 threadgroup, are untuned. Scope PQ/HLG draw encode adds about 14 µs per 1024×512 draw.
+- Metal 4: DONE in W6 (42de2e6, ae6f592, e73f2da: `MonitorPipelineArchive`, MTL4Compiler-built pipelines warm-started from an `MTL4Archive`): pipelines are device-built, not MTL4Compiler-built, so no MTL4PipelineDataSetSerializer warm start yet. The first Metal 4 encode of each object allocates its argument table and ring (no warm-up API). Focus-mask barriers are queue-wide while a mask submission may run (MTLFence variant deferred). No Metal 4 scope test into a framebufferOnly drawable. Scopes copy `store`/`align256`/`makeArgumentTable` from MonitorKit (could be `package`). Optional: expose the scope draw's `waited` flag so MonitorRenderer issues one barrier per shared encoder.
+- Colour: DONE in W6 (e943328, 22b06f5: BT.2446-1 Method C): HLG → SDR hard-clips above reference white (a BT.2446 soft-knee mode could be added). HDR-to-HDR LUTs are not modelled (any LUT makes the picture Rec.709).
 - UI: iOS is compile-checked only (gestures, UIScreen headroom, background pausing never ran); the two display-link window tests are opt-in (MONITORKITUI_WINDOW_TESTS=1). Feeds and scope bins are not shared across renderers (two MonitorViews of one source analyse twice). A residual wait remains in the split picture/scope path under heavy contention. A `drawOffscreen` with a caller's command buffer can stay pinned while paused. Request still open: a threshold-aware `MonitorFeed.hasFocusMask` (today one feed per distinct analysis).
 - Audio: below 48 kHz the oversampled rate is under 192 kHz (readings not formally dBTP). `LoudnessMeter` has no `flush()`.
 - Map owner (docs/MONITORKIT_INTEGRATION_MAP.md, not edited here): cite `MonitorPass.uniformLength` 5120, `MonitorFeed.uniformLength` 1024, `ScopeAccumulator` 1280, `ScopeGroup` 2048, `ScopeRenderer` 768 + graticule 2304 instead of hand-computed struct sizes (GuideParameters is 2592 B, PassParameters 1456 B); recommend `MonitorMultiview` for multiview surfaces; wire `ScopeRenderer.colorPipeline = pass.colorPipeline` for scopes on HDR layers; call `AudioMeter.flush()` when a stream stops; show `programmeMaximumTruePeak` as R 128 Max TP; `MonitorFeed.monitorStageHasLUT(for:)` for layer tagging; `releaseRetired()` for idle classic hosts; the contiguous-completion watermark for MonitorSubmission.
@@ -150,7 +151,7 @@ Open after W4:
 - W5: plan step 9, hands-on with the UltraStudio (LIVE=1 or the installed app quit), needs the user. Then the final report.
 - Heartbeat 2026-10-23 05:21: no workflow running; W1–W4 complete (HEAD da5e0b8), W4 freeze released and ultracam-18 told, final report delivered. Only W5's hands-on UltraStudio check remains; it waits for the user's go-ahead, so nothing to resume.
 - Heartbeat 2026-10-23 10:22: idle; nothing to resume (W5 hands-on check waits for the user).
-- 2026-10-23: W6 started (user approved "yes" to the polish list). CURRENT RUN = wf_c4a7da30-d9e (task wvavfbmlp), script workflows/scripts/monitorkit-w6-wf_c4a7da30-d9e.js, base ea9ef25. Units, run in parallel where file ownership allows:
+- 2026-10-23: W6 started (user approved "yes" to the polish list). FINISHED (final-verify 2026-10-23 at 5067386): wf_c4a7da30-d9e (task wvavfbmlp), script workflows/scripts/monitorkit-w6-wf_c4a7da30-d9e.js, base ea9ef25. Units, run in parallel where file ownership allows:
   - per-stage decode (library, then app glue);
   - pipeline warm start (library, then app glue);
   - BT.2446 HLG→SDR and display-transform performance (after the per-stage decode);
@@ -173,3 +174,102 @@ Decisions and findings:
 - Display-rate checks (gate I): a source at the display's rate needs refreshes ≥ 0.9 × the display rate and GPU per picture < one refresh, and presented ≥ (2/3 + 3/4)/2 ≈ 0.71 × min(offered, refreshes) (fix-w6-round2: midway between a 1-in-3 drop and a correct presenter's worst phase, 3/4; 0.75 in fix-w6-all, 0.6 in 8ba4052), in one of 3 rounds. The 30 Hz scope floor is 0.85 × min(hz × elapsed, presented), not scaled by the picture link; the round-sensitive scope checks are re-measured, and a scope is drawn on at most one scope-link tick (`MonitorSurfaceStatistics.scopeRefreshes`). The render thread runs on a real-time schedule (`THREAD_TIME_CONSTRAINT_POLICY`, period one refresh of the fastest display, 1 ms computation within 4 ms), so other processes' load no longer preempts it for a source interval.
 - Release symbols: build.sh links `Ultracam.app.dSYM` beside the stable product (both non-symlink checks run before either link moves) and `scripts/archive-dsym.sh` keeps a copy per build under `symbols/<run id>/`, a link per UUID of every slice (`symbols/<uuid>` → run id) and only the newest 20 builds (fix-w6-round2; best effort: a failure warns after the product is linked); `prepare_local_build.py` copies the dSYM beside the staged local app (the stripped Release `--local-development` stage failed `validate_symbols` without it).
 
+
+## W6 result (final-verify, 2026-10-23, gates at f76affe; fixes fdc32a4, 5067386)
+
+W6 commits since ea9ef25 (33, then final-verify's 2):
+- The W6 units and fix-w6-all as listed above, then 7c7b886 (fix-w6-all plus the plan for a fresh audit).
+- The fresh 20-agent bug audit (docs/MONITORKIT_FRESH_BUG_AUDIT_REPORT.md): 51d9e9d, 6b4abd7, 2828847, 18a0a58, aac7a04, ebf036f, 5475c82, 54d0527, df1916c, dcf3325, 3071136, 19737f4, 7e7008a, 68c74bd, 75a3597, 5baf7d2.
+- f76affe (fix-w6-round2).
+- final-verify: fdc32a4 and 5067386.
+
+Gates (M4 Max; logs in /tmp/fv6):
+- T `ui-typecheck.sh`: OK.
+- U `test.sh`, first run at f76affe: 607 run, 2 failed. The fresh audit changed two behaviours on purpose but never ran test.sh, so two checks were stale:
+  - `testOutOfOrderCompletionCannotRollBackOrChangeTheSurfaceTarget`: an equal stamp is no longer accepted as a repeat (5475c82, 7e7008a).
+  - `testMigrationProgramConfigurationMovesToProgramMonitor`: Program keeps its zebra because it draws no log false colour (dcf3325). This refines W4 decision (1): false colour suppresses zebra only where it is drawn.
+  - fdc32a4 updates both checks to the new behaviour. Rerun: app 607/607, 0 failures; MonitorKit 846 run, 6 skipped, 0 failures, 0 FLAKY.
+  - Against the baseline of 592 (+ MonitorKit 796), the app gained 15 checks:
+    - 7 in DeckLinkChecksAudioMetering (new);
+    - 4 in MonitorCoordinatorChecks: both readings, held pictures, scope readings, the focus stage;
+    - 3 in MonitorFeedHostChecks: the Output-stage focus reading, the pipeline cache location, the warm start;
+    - 1 in DeckLinkChecks: video handed off before audio.
+  - No check was removed.
+- V `FORCE=1 ui-verify.sh`: 795 passed, 0 failed, 189 images. Baseline 791/189: +4 checks, no new images.
+  - AudioMeterTapVerify, reworked for the hand-off ring: 4 checks became 5.
+  - UIScopeScreens: 3 new per-stage reading checks. These are a Full-declared camera's Output-stage label, its Source-stage range and 240M, and the BT.709 of its Monitor-stage vectorscope.
+- I `monitor-app-integration.sh`: 36/36, passed on the first run. Baseline 32: the 4 new MonitorCoordinatorChecks GPU checks.
+  - The display-rate check passed in round 1. On the 240 Hz display (239.9 refreshes/s) it offered 239.89 fps and presented 237.89 fps; 720 of 720 frames were accepted, 6 superseded.
+  - The 30 and 60 Hz cases presented every frame with 0 superseded.
+  - 4K v210 → 1080p picture: GPU median 0.158 ms (min 0.132). With focus, zebra and guides: median 0.368 ms (min 0.301). The W4 figures were 0.211 and 0.474 ms.
+  - Heap allocations per frame are unchanged: slot 0, wrap 0, encode 2 or 3, the same as inline Metal calls.
+- K MonitorKit `swift test`: 846 run, 6 skipped, 0 failures. W4 had 796, so +50:
+  - MonitorKitTests 256 → 290;
+  - Scopes 152 → 158;
+  - Core 159 → 168;
+  - Audio 79 → 79;
+  - UI 150 → 151.
+  - The 6 skips are the 2 opt-in window tests, the 3 opt-in warm-start benchmarks and 1 test that runs only under shader validation.
+- `swift build -c release` of the package: clean, 0 warnings.
+- B `build.sh --debug`: built; `validate_bundle.py` passed ("no MonitorTools shipped").
+  - The first run rewrote the committed project's `LIBRARY_SEARCH_PATHS` with the checkout's absolute path. build.sh exports `AUTO_SWITCHER_LIB_DIR`, and 54d0527 had made the path relative only when that variable is unset.
+  - 5067386 writes the path under `$(SRCROOT)`. Rerun: the regenerated project matches the committed one.
+  - Install link before B: `…/runs/20261023T090215-58086/Build/Products/Release/Ultracam.app` (W4's Release build).
+  - After B: `…/runs/20261024T042732-83205/Build/Products/Debug/Ultracam.app`. There is no `Ultracam.app.dSYM` link (a Debug build).
+- S `SKIP_BUILD=1 app-self-test.sh` (non-live): 39 passed, 0 failed. Preferences were backed up to /tmp/ultracam-prefs-backup-w6.plist and restored; the restored file is byte-identical.
+
+Release app (`xcodebuild -configuration Release` into `runs/final-verify-w6-release-20261024T042522`; the install link is untouched):
+
+| Product | W4 (1baddab) | W6 | Change |
+| --- | --- | --- | --- |
+| `Contents/MacOS/Ultracam` | 25,017,704 B | 7,328,312 B | −17.69 MB; −12.97 MB against 1fab7f5's 20,301,696 B before MonitorKit, which was unstripped |
+| Camera extension | 345,096 B | 345,096 B | unchanged |
+| MonitorKit resource bundle | 88 KB | 96 KB | +8 KB of shaders |
+| MonitorKitScopes resource bundle | 52 KB | 52 KB | unchanged |
+| App bundle | 25.1 MB | 7.9 MB | −17.2 MB |
+| `Ultracam.app.dSYM` | — | 30.3 MB | beside the app, not shipped in it |
+
+- Code by module, measured with nm on the dSYM:
+  - `__text` 8.16 → 5.05 MB. Non-Swift code (the static libraries) is dead-stripped from 4,036 to 939 KB. The app module went from 2,779 to 2,782 KB.
+  - MonitorKit* 991 → 1,045 KB (+54 KB): MonitorKit 178 → 217 for the archive and the second decode, Core 198 → 203, Scopes 142 → 152, UI 414 → 415, Audio 60.
+  - So W4's +4.72 MB is gone. MonitorKit still costs about 1.0 MB of code, which is about 0.7 MB more than MonitorTools did.
+- Against 07c624a's 7,220,104 B, the later W6 work added 108 KB.
+
+Cold against warm pipeline start (`MONITORKIT_WARMSTART_BENCH=1`, min of 3, system shader cache warm, so "cold" means an empty archive directory):
+- Engine init + `warmUp()` (15 pipelines):
+  - plain MTL4Compiler with no cache: 0.2 + 2.7 ms;
+  - archive cold: 0.5 + 97.7 ms (it builds and records);
+  - archive warm: 2.8 + 2.6 ms, 0 misses;
+  - device-built: 0.2 + 2.9 ms.
+- With 1, 3 or 5 launches' files, the archive costs 5.9, 6.1 or 6.5 ms against 3.3 ms for the plain compiler. Only the newest of the 3 kept files is opened.
+- First specialized frame: 3.7 ms plain compiler, 4.5 ms archive cold, 6.7 ms archive warm, 4.1 ms device-built.
+- With a warm system cache the archive costs about 3 ms per launch, as fix-w6-all found. Its gain, a launch after the system shader cache was purged, cannot be measured here.
+
+Rechecked at HEAD:
+- No TODO/FIXME/XXX/HACK was added since ea9ef25.
+- No camera-extension file changed since ea9ef25 (no extension bump).
+- No `import MonitorTools` remains. The app has no trilinear path: the only mention is the `LUTGoldenChecks` rejection.
+- `/tmp/mk-*` scratch directories were removed (mk-agent05-build, mk-agent11-build and final-verify's own). The `/tmp/mk-*.log`/json files were left in place.
+
+Open after W6:
+- Someone else is editing in the tree right now (not final-verify's work, so not committed here):
+  - An uncommitted `Packages/MonitorKit/Sources/MonitorKitAudio/AudioMeter.swift` change appeared at 23:26 (hoist the per-chunk `exp()` decay out of the per-channel loop), with `/tmp/monitorkit-perf-audio-*` scratch.
+  - Gates T, U, V, I, K and R ran before it.
+  - The second B (the current Debug install link) compiled it.
+  - The Release build may or may not have included it.
+  - It needs its own gates and commit.
+- W5 plan step 9: the hands-on UltraStudio check (LIVE=1 or the installed app quit). It needs the user.
+- Library, unchanged by W6:
+  - The display transforms other than HLG → SDR are still over +10 % (PQ → SDR +16 %, PQ/HLG output encodings +12–14 %).
+  - A hue-preserving BT.709 gamut step is still open (BT.2407 Annex 5, measured +8–17 %).
+  - `toTarget`/`transformMatrix` could be baked as function constants.
+  - HDR-to-HDR LUTs are not modelled.
+  - MonitorKitUI on iOS is compile-checked only.
+  - Feeds and scope bins are not shared across renderers.
+  - Audio below 48 kHz is not formally dBTP.
+- Pipeline archives:
+  - Two processes sharing one cache directory are not covered.
+  - Under `MTL_SHADER_VALIDATION`, sessions build without a cache (68c74bd).
+- `Packages/MonitorTools/` still holds 512 MB of ignored build output from the retired package; remove it by hand.
+- Other agents' scratch in `/tmp` was left alone: `monitorkit-fresh-*`, `monitorkit-perf-*` (in use), `/tmp/fv`, `/tmp/fv6`.
+- The Metal validation run was not repeated here. The fresh audit ran it at 68c74bd: 0 failures.
