@@ -690,12 +690,19 @@ public final class MonitorRenderer {
       return
     }
     var next: [GroupState] = []
-    var pending: [(source: SourceState, lut: Bool, members: [OverlayState])] = []
+    // Scope cadence is a property of the accumulation, not just of the source
+    // and LUT.  Keeping different intervals in one fused group causes the
+    // group's single dispatch to advance a slow member whenever a fast member
+    // is due, so that member never observes its requested cadence.  Partition
+    // by interval as well; each group can then be advanced atomically.
+    var pending: [(source: SourceState, lut: Bool, interval: UInt64, members: [OverlayState])] = []
     for o in overlays {
-      if let k = pending.firstIndex(where: { $0.source === o.source && $0.lut == o.monitorLUTEnabled }) {
+      if let k = pending.firstIndex(where: {
+        $0.source === o.source && $0.lut == o.monitorLUTEnabled && $0.interval == o.interval
+      }) {
         pending[k].members.append(o)
       } else {
-        pending.append((o.source, o.monitorLUTEnabled, [o]))
+        pending.append((o.source, o.monitorLUTEnabled, o.interval, [o]))
       }
     }
     for p in pending {
