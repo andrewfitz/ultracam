@@ -140,17 +140,18 @@ import MonitorKit
     hosts[target]?.monitorLUTState ?? .none
   }
 
-  /// What the target's scope measures: the signal of a picture of it on screen as
-  /// the scope's stage reads it (`SignalDescription.signal(for:)`: the Output and
-  /// Monitor stages with the burn-in's reading, as `ScopeAccumulator` measures
-  /// them; nil before a frame) and whether a LUT is on the scope's stage
-  /// (`MonitorSurfacePresenter.scopeMeasuresLUT`).
+  /// What the target's scope measures: the signal of a picture of it on screen
+  /// with both its readings (nil before a frame), and whether a LUT is on the
+  /// scope's stage (`MonitorSurfacePresenter.scopeMeasuresLUT`). The signal is
+  /// not resolved to a stage here: the scope's description picks its own stage's
+  /// reading (`SignalDescription.signal(for:)`, as `ScopeAccumulator` does) from
+  /// the stage the settings form shows, which reaches this coordinator a change
+  /// later, and a resolved Output reading cannot be read back as the Source's.
   func scopeMeasurement(for target: MonitorTargetID) -> (signal: SignalDescription?, stageLUT: Bool) {
     let presenter = surfaces.values.first { $0.target == target && $0.presenter.shownSignal != nil }?.presenter
       ?? surfaces.values.first { $0.target == target }?.presenter
     guard let presenter else { return (nil, false) }
-    let tools = preferences(for: target)
-    return (presenter.shownSignal?.signal(for: tools.scopes.settings.stage), presenter.scopeMeasuresLUT(tools))
+    return (presenter.shownSignal, presenter.scopeMeasuresLUT(preferences(for: target)))
   }
 
   /// A target's tools, signal declaration and scopes.
