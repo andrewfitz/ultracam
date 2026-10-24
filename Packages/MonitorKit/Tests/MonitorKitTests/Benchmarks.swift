@@ -11,7 +11,9 @@ final class Benchmarks: XCTestCase {
   static let width = 3840, height = 2160
 
   /// A 4K v210 frame with detail everywhere (gradients plus noise), built word by word.
-  static func frame4K(_ gpu: TestGPU, seed: UInt64 = 1, linear: Bool = false) throws -> MonitorFrame {
+  /// `muted`: chroma within ±32 codes of neutral, colours a camera mostly records
+  /// (the default spreads chroma over the whole code range, far outside BT.709).
+  static func frame4K(_ gpu: TestGPU, seed: UInt64 = 1, linear: Bool = false, muted: Bool = false) throws -> MonitorFrame {
     let groups = (width + 5) / 6
     var words = [UInt32](repeating: 0, count: groups * 4 * height)
     var rng = SeededRandom(seed)
@@ -20,7 +22,7 @@ final class Benchmarks: XCTestCase {
         for g in 0..<groups {
           let base = UInt32(64 + (g * 6 + y) % 800)
           var v = [UInt32](repeating: 0, count: 12)
-          for i in 0..<12 { v[i] = base + UInt32(rng.next() % 64) }
+          for i in 0..<12 { v[i] = muted && i % 2 == 0 ? 480 + UInt32(rng.next() % 64) : base + UInt32(rng.next() % 64) }
           let o = (y * groups + g) * 4
           w[o] = v[0] | v[1] << 10 | v[2] << 20
           w[o + 1] = v[3] | v[4] << 10 | v[5] << 20
@@ -357,6 +359,9 @@ final class Benchmarks: XCTestCase {
       MonitorOutputColor(primaries: p, encoding: e, headroom: headroom)
     }
     let none = DisplayTransform.none
+    // The display transform cases draw from a feed without LUTs (a transform needs
+    // the camera's signal), so with tools on they are compared with the last case,
+    // the same baseline drawn from that feed.
     let cases: [(String, MonitorFrame, MonitorOutputColor, DisplayTransform)] = [
       ("signal-native SDR (baseline)", sdr, .signalNative, none),
       ("sdr BT.1886 BT.2020", sdr, output(.rec2020, .sdr(.bt1886)), none),
@@ -370,7 +375,9 @@ final class Benchmarks: XCTestCase {
       ("HLG → SDR", hlg, .signalNative, .hdrToSDR),
       ("PQ passthrough → extended linear", pq, output(.rec2020, .extendedLinear, headroom: 2), .hdrPassthrough),
       ("HLG → PQ", hlg, output(.rec2020, .pq), none),
+      ("signal-native SDR, no LUTs (transform baseline)", sdr, .signalNative, none),
     ]
+    let transformBaseline = cases.count - 1
     for (label, base) in [("tools off", MonitorState()), ("LUTs + zebras + peaking + guides", allTools(falseColor: false))] {
       let feed = gpu.engine.makeFeed(), plainFeed = gpu.engine.makeFeed()
       if base.focus.enabled {
@@ -390,7 +397,7 @@ final class Benchmarks: XCTestCase {
       for round in 0..<70 {
         for (i, c) in cases.enumerated() {
           let cb = gpu.queue.makeCommandBuffer()!
-          let f = c.3 == .none ? feed : plainFeed
+          let f = c.3 == .none && i != transformBaseline ? feed : plainFeed
           if base.focus.enabled {
             // Every round analyses, so subtracting one analysis is right for all.
             f.invalidateFocusMask()
@@ -403,31 +410,80 @@ final class Benchmarks: XCTestCase {
           if round >= 10 { times[i].append((cb.gpuEndTime - cb.gpuStartTime) * 1000) }
         }
       }
-      // Analysis costs the same in every case; measure it alone to subtract it.
-      var analysis = Double.infinity
-      if base.focus.enabled {
+      // Analysis costs the same in every case of a feed; measure it alone to subtract it.
+      func analysisTime(_ f: MonitorFeed) throws -> Double {
+        guard base.focus.enabled else { return 0 }
+        var best = Double.infinity
         for _ in 0..<40 {
           let cb = gpu.queue.makeCommandBuffer()!
-          feed.invalidateFocusMask()
-          try feed.analyze(sdr, focus: base.focus, into: cb)
+          f.invalidateFocusMask()
+          try f.analyze(sdr, focus: base.focus, into: cb)
           cb.commit()
           cb.waitUntilCompleted()
-          analysis = min(analysis, (cb.gpuEndTime - cb.gpuStartTime) * 1000)
+          best = min(best, (cb.gpuEndTime - cb.gpuStartTime) * 1000)
         }
-      } else {
-        analysis = 0
+        return best
       }
+      let analysis = try analysisTime(feed), plainAnalysis = try analysisTime(plainFeed)
       let baseline = times[0].min()! - analysis
+      let plainBaseline = times[transformBaseline].min()! - plainAnalysis
       for (i, c) in cases.enumerated() {
         XCTAssertTrue(passes[i].0.usesSpecializedPipeline, c.0)
-        let ms = times[i].min()! - analysis
+        let plain = c.3 != .none || i == transformBaseline
+        let ms = times[i].min()! - (plain ? plainAnalysis : analysis)
+        let reference = plain ? plainBaseline : baseline
         // Interpolated labels: `%@` with Swift strings garbled and dropped lines here.
-        print("BENCH 4K v210 -> 1080p f16 \(label), \(c.0): " + String(format: "%.3f ms (%+.1f%%)", ms, (ms / baseline - 1) * 100))
+        print("BENCH 4K v210 -> 1080p f16 \(label), \(c.0): " + String(format: "%.4f ms (%+.1f%%)", ms, (ms / reference - 1) * 100))
         // Every output encoding, PQ and HLG included, within 10% of the baseline (plus
         // 10 µs of timer noise): 5–14 µs on a bare picture (+5 to +14 % of its
         // 0.106 ms since the exact-quotient decode; +2 to +8 % before), less with tools.
         if i <= 6 { XCTAssertLessThanOrEqual(ms, baseline * 1.1 + 0.01, "\(label) \(c.0)") }
       }
+    }
+  }
+
+  /// HDR → SDR on colours a camera mostly records (chroma within ±32 codes of
+  /// neutral), where the BT.2407 projection is rarely needed, against the same
+  /// frame shown signal-native; interleaved, every case reading the same texture
+  /// (the main encoding benchmark's frame is far outside BT.709 everywhere).
+  func testHDRToSDROnMutedColoursGPUTime() throws {
+    let gpu = try requireGPU()
+    let muted = try Self.frame4K(gpu, muted: true)
+    try warmUp(gpu, muted)
+    func relabel(_ signal: SignalDescription) throws -> MonitorFrame {
+      try MonitorFrame(layout: .v210, width: Self.width, height: Self.height, packed: muted.packed, signal: signal)
+    }
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1920, height: 1080, mipmapped: false)
+    d.usage = .renderTarget
+    d.storageMode = .private
+    let target = gpu.device.makeTexture(descriptor: d)!
+    let cases: [(String, MonitorFrame, DisplayTransform)] = [
+      ("signal-native SDR (baseline)", muted, .none),
+      ("PQ → SDR", try relabel(SignalDescription(matrix: .bt2020, encoding: .display(.pq))), .hdrToSDR),
+      ("HLG → SDR", try relabel(SignalDescription(matrix: .bt2020, encoding: .display(.hlg))), .hdrToSDR),
+    ]
+    let feed = gpu.engine.makeFeed()
+    let passes = cases.map { c -> (MonitorPass, MonitorState) in
+      var state = MonitorState()
+      state.displayTransform.mode = c.2
+      return (gpu.engine.makePass(), state)
+    }
+    var times = [[Double]](repeating: [], count: cases.count)
+    for round in 0..<70 {
+      for (i, c) in cases.enumerated() {
+        let cb = gpu.queue.makeCommandBuffer()!
+        try passes[i].0.encode(frame: c.1, feed: feed, state: passes[i].1, target: target, into: cb)
+        cb.commit()
+        cb.waitUntilCompleted()
+        XCTAssertNil(cb.error)
+        if round >= 10 { times[i].append((cb.gpuEndTime - cb.gpuStartTime) * 1000) }
+      }
+    }
+    let baseline = times[0].min()!
+    for (i, c) in cases.enumerated() {
+      XCTAssertTrue(passes[i].0.usesSpecializedPipeline, c.0)
+      let ms = times[i].min()!
+      print("BENCH 4K v210 -> 1080p f16 muted colours, \(c.0): " + String(format: "%.4f ms (%+.1f%%)", ms, (ms / baseline - 1) * 100))
     }
   }
 

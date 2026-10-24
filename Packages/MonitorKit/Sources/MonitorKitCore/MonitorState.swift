@@ -421,10 +421,9 @@ public enum DisplayTransform: String, Codable, Sendable, CaseIterable {
   /// A log source (S-Log3/S-Gamut3(.Cine), LogC3/AWG3, LogC4/AWG4) to Rec.709 SDR:
   /// "MonitorKit display assist v1" (`DisplayAssist`).
   case logToRec709
-  /// PQ or HLG to Rec.709 SDR: PQ through the BT.2408 Annex 5 EETF (display
-  /// light); HLG by MonitorKit's SDR-camera scene-light convention, BT.2408
-  /// §5.1.4.1's scaling (75% HLG is graphics white) then the BT.709 OETF
-  /// (`HDRToSDR.hlg`). It does not invert BT.2408's scene-light up-mapping.
+  /// PQ or HLG to Rec.709 SDR by display light: PQ through the BT.2408 Annex 5
+  /// EETF, HLG through Report ITU-R BT.2446-1 Method C (`HDRToSDR.hlg`), each
+  /// then converted to BT.709 in linear light and clipped (Report ITU-R BT.2407 §2).
   case hdrToSDR
   /// PQ or HLG stays HDR on an HDR output, its highlights rolled off to what the
   /// output holds (the EDR headroom for extended linear).

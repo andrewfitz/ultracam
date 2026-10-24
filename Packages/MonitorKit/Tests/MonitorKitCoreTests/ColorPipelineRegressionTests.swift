@@ -79,8 +79,8 @@ final class ColorPipelineRegressionTests: XCTestCase {
     XCTAssertEqual(capped.rolloff(headroom: 1)?.targetPeak, 1000)
   }
 
-  func testHLGToSDRIsLabelledAsTheSDRCameraConvention() {
-    XCTAssertEqual(pipeline(.signalNative, signal: hlg, mode: .hdrToSDR).status, .active(label: "HLG → SDR · scene light, BT.709 OETF"))
+  func testHLGToSDRIsLabelledAsBT2446MethodC() {
+    XCTAssertEqual(pipeline(.signalNative, signal: hlg, mode: .hdrToSDR).status, .active(label: "HLG → SDR · BT.2446 Method C"))
   }
 
   // MARK: - Identity conversions

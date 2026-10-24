@@ -140,10 +140,6 @@ inline float3 mk_div(float3 x, float3 y) { return fast::divide(x, y); }
 inline float mk_div(float x, float y) { return fast::divide(x, y); }
 // sign(v)·|v|^e: the SDR curves mirrored about zero (Report ITU-R BT.2408-8 §5.3).
 inline float3 mk_mirrorPow(float3 v, float e) { return sign(v) * mk_powf(abs(v), float3(e)); }
-// ITU-R BT.709 OETF; 0 below zero.
-float3 mk_bt709OETF(float3 l) {
-  return select(1.099f * mk_powf(max(l, .018f), float3(.45f)) - .099f, 4.5f * max(l, 0.0f), l < .018f);
-}
 // SMPTE ST 2084 (BT.2100 Table 4): the EOTF in cd/m² (signal clipped to its 0…1
 // domain, so super-whites stop at 10 000 cd/m² and nothing is NaN), and its inverse.
 constant float MK_PQ_M1 = 2610.0f / 16384, MK_PQ_M2 = 2523.0f / 4096 * 128, MK_PQ_C1 = 3424.0f / 4096,
@@ -259,6 +255,8 @@ struct mk_PassParams {
   float4 whiteSignalGain;    // the same gains on the signal of a power-law picture (BT.1886, gamma 2.2, linear)
   float4 reciprocals;        // correctly rounded: x: 1 / luma span (levels.y), y: 1 / chroma span (levels.w), z: 1 / kg (matrix.y), w: 1 / zebra stripe period; 0: computed here
   float4 outputReading;      // w: 1 when the output and monitor stages decode with their own reading (mk_PassFrames.output), 0: the source's; xyz: its reciprocals as above
+  float4 hlgToSDR;           // BT.2446 Method C eq. (5) for the HLG decode peak L: x L / Y_HDR,ip, y k3, z k2·ln 2 / 100, w k4 / 100
+  float4 sourceWeights;      // rgb: luminance weights of the signal's primaries, w: k1·L / 100
 };
 
 // Mirrors MonitorKit.GuideParameters: guide strokes in viewport pixels, drawn
@@ -668,8 +666,18 @@ float3 mk_displayTransform(float3 c, constant mk_FrameParams& f, thread const mk
     return mk_powf(saturate(l), float3(1 / 2.4f));
   }
   if (MK_TRANSFORM == 3) {
-    // HLG by scene light: 75% HLG is 100% SDR, Rec.709, the BT.709 OETF.
-    return mk_bt709OETF(min(mk_rows(p.transformMatrix, mk_hlgInverseOETF3(c) * p.hlgSource.z), 1.0f));
+    // HLG by BT.2446 Method C: the EOTF for the decode peak L, eq. (5) on the
+    // luminance at constant chromaticity to 100 cd/m² = 1, Rec.709 (BT.2407 §2's
+    // matrix, clipped), BT.1886. With scene light E and Ys its luminance, display light is
+    // L·Ys^(γ-1)·E and Y_HDR = L·Ys^γ, so the SDR light E·Y_SDR/(100·Ys) is
+    // E·(k1·L/100)·Ys^(γ-1) on the linear segment.
+    float3 e = mk_hlgInverseOETF3(c);
+    float ys = dot(p.sourceWeights.rgb, e);
+    float lift = ys > 0 ? mk_powf(ys, p.hlgSource.y - 1) : 0.0f;   // Ys^(γ-1)
+    float ratio = ys * lift * p.hlgToSDR.x;                    // Y_HDR / Y_HDR,ip
+    float k = ratio < 1 ? p.sourceWeights.w * lift
+                        : mk_div(p.hlgToSDR.z * fast::log2(ratio - p.hlgToSDR.y) + p.hlgToSDR.w, ys);
+    return mk_powf(saturate(mk_rows(p.transformMatrix, e * k)), float3(1 / 2.4f));
   }
   return c;
 }

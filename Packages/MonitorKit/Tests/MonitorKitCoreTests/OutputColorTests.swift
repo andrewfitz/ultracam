@@ -213,22 +213,28 @@ final class OutputColorTests: XCTestCase {
 
   // MARK: - HDR to SDR
 
-  func testHLGToSDRPutsReferenceWhiteAtGraphicsWhiteAndGreyWhereBT709Does() {
-    // BT.2408 §5.1.4.1: 100% SDR ↔ 75% HLG scales by OETF⁻¹(0.75) = 0.265 (rounded there).
-    XCTAssertEqual(HDRToSDR.hlgReferenceWhiteScene, 0.265, accuracy: 5e-4)
+  func testHLGToSDRIsMethodCWithItsAnchors() {
+    // Report ITU-R BT.2446-1 §6.1: 50% HLG (skin, BT.2408 Annex 4) is 70% SDR, the
+    // knee 80% SDR, HDR Reference White (75% HLG) 96% SDR, for the 1000 cd/m²
+    // display with γ 1.2 into the 100 cd/m² SDR display.
     func sdr(_ v: Double) -> Double { HDRToSDR.hlg(ColorRGB(r: v, g: v, b: v), primaries: .rec2020).g }
-    XCTAssertEqual(sdr(0.75), 1, accuracy: 1e-12)
-    // 38% HLG (the grey card) is 0.1817 scene light, 41.1% after the BT.709 OETF (an
-    // SDR camera: 40.9% at 0.18).
-    let grey = 0.38 * 0.38 / 3 / HDRToSDR.hlgReferenceWhiteScene
-    XCTAssertEqual(sdr(0.38), 1.099 * pow(grey, 0.45) - 0.099, accuracy: 1e-12)
-    XCTAssertEqual(sdr(0.38), 0.4111, accuracy: 5e-4)
-    XCTAssertEqual(sdr(0.9), 1, "above reference white clips")
+    XCTAssertEqual(sdr(0.5), 0.70, accuracy: 5e-6)
+    XCTAssertEqual(sdr(0.75), 0.96, accuracy: 5e-6)
+    // 38% HLG (the grey card, 26.24 cd/m²) is on the linear segment: k1·26.24 = 21.99 cd/m², 53.2%.
+    let greyNits = 1000 * pow(0.38 * 0.38 / 3, 1.2)
+    XCTAssertEqual(sdr(0.38), pow(BT2446MethodC.k1 * greyNits / 100, 1 / 2.4), accuracy: 1e-12)
+    XCTAssertEqual(sdr(0.38), 0.532, accuracy: 5e-4)
     XCTAssertEqual(sdr(0), 0)
+    // SDR peak white from 334 cd/m² (about 83% HLG) up; eq. (5) continues to 118 cd/m²
+    // (109%) at 1000, which the SDR picture holds no more than the 100 cd/m² display.
+    XCTAssertLessThan(sdr(0.828), 1)
+    XCTAssertEqual(sdr(0.84), 1)
+    XCTAssertEqual(sdr(1), 1)
     var last = -1.0
     for i in 0...1023 {
       let v = sdr(Double(i) / 1023)
       XCTAssertGreaterThanOrEqual(v, last)
+      XCTAssertLessThanOrEqual(v, 1)
       last = v
     }
   }

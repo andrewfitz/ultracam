@@ -41,7 +41,8 @@ public struct PassParameters: Sendable {
   public var colorFlags = SIMD4<UInt32>.zero
   /// x: graphics white cd/m², y: its inverse, z: HLG output peak, w: its system gamma.
   public var colorLevels = SIMD4<Float>(203, 1 / 203, 1000, 1.2)
-  /// x: HLG decode peak, y: its system gamma, z: 1 / scene light of 75% HLG.
+  /// x: HLG decode peak, y: its system gamma, z: 1 / scene light of 75% HLG (set,
+  /// no longer read: the HLG to SDR transform is BT.2446 Method C, `hlgToSDR`).
   public var hlgSource = SIMD4<Float>(1000, 1.2, 1, 0)
   /// The BT.2408 Annex 5 EETF: x: PQ signal of the source peak, y: maxLum, z: knee start, w: identity.
   public var toneMap = SIMD4<Float>(1, 1, 1, 1)
@@ -85,8 +86,27 @@ public struct PassParameters: Sendable {
   /// compiles no second decode (`MK_LUTS` bit 2). xyz: that reading's correctly
   /// rounded reciprocals, as `reciprocals` (0: computed per pixel).
   public var outputReading = SIMD4<Float>.zero
+  /// HLG to SDR by Report ITU-R BT.2446-1 Method C (`BT2446MethodC`), eq. (5) for
+  /// the HLG decode peak L: x L / Y_HDR,ip, y k3, z k2·ln 2 / 100, w k4 / 100.
+  public var hlgToSDR = Self.methodC
+  /// rgb: the luminance weights of the signal's primaries (Method C's Y, the HLG
+  /// OOTF's); w: k1·L / 100, eq. (5)'s linear segment. BT.2100's by default.
+  public var sourceWeights = Self.sourceWeights(.rec2020)
 
   public init() {}
+
+  /// `hlgToSDR` for the 1000 cd/m² HLG decode.
+  static let methodC: SIMD4<Float> = {
+    typealias C = BT2446MethodC
+    return SIMD4(
+      Float(C.hdrPeak / C.inflection), Float(C.k3), Float(C.k2 * 0.693_147_180_559_945_3 / C.sdrPeak), Float(C.k4 / C.sdrPeak))
+  }()
+
+  /// `sourceWeights` for a signal with `primaries`.
+  static func sourceWeights(_ primaries: ColorPrimaries) -> SIMD4<Float> {
+    let w = primaries.luminanceCoefficients
+    return SIMD4(Float(w.r), Float(w.g), Float(w.b), Float(BT2446MethodC.k1 * BT2446MethodC.hdrPeak / BT2446MethodC.sdrPeak))
+  }
 
   /// `reciprocals` for `frame`'s parameters and the stripe period `zebra.w`.
   static func reciprocals(_ frame: FrameParameters, zebraPeriod: UInt32) -> SIMD4<Float> {

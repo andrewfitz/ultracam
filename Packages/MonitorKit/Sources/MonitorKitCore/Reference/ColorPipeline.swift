@@ -44,7 +44,8 @@ public enum DisplayAssist {
   }
 }
 
-/// HDR to SDR monitoring conversions (Report ITU-R BT.2408-8 §5.2, §5.1.4.1 and Annex 5).
+/// HDR to SDR monitoring conversions (Report ITU-R BT.2408-8 §5.2 and Annex 5,
+/// Report ITU-R BT.2446-1 §6, Report ITU-R BT.2407-0 §2).
 public enum HDRToSDR {
   /// The HLG scene light of HDR Reference White (75% HLG): BT.2100's inverse OETF
   /// of 0.75, 0.26496 (BT.2408 §5.1.4.1 prints it rounded, 0.265).
@@ -52,23 +53,24 @@ public enum HDRToSDR {
   /// The nominal peak an HLG signal is decoded for (BT.2408-8 §6.2's reference condition).
   public static let hlgReferencePeak = 1000.0
 
-  /// HLG to Rec.709 SDR by scene light, a MonitorKit convention ("SDR-camera scene
-  /// light"): BT.2408 §5.1.4.1's scaling, so 75% HLG is 100% SDR (graphics white),
-  /// then BT.2020 to BT.709 in linear light and the exact BT.709 OETF, as an SDR
-  /// camera encodes the scene. 18% grey (38% HLG) lands at 41.1%, where a BT.709
-  /// camera puts it. It is not the inverse of BT.2408's scene-light up-mapping,
-  /// which linearizes SDR with the approximation E = E'² (BT.2087): SDR up-mapped
-  /// that way comes back darker in the shadows (10% as 4.5%, 41% as 39.4%). Above
-  /// reference white the signal is clipped (§7.6.4's hard-clip down-mapping): this
-  /// shows what a scene-light SDR output keeps.
+  /// HLG to Rec.709 SDR by display light, Report ITU-R BT.2446-1 Method C
+  /// (`BT2446MethodC`): the BT.2100 EOTF for the 1000 cd/m² display (system gamma
+  /// 1.2), eq. (5)'s tone map of the luminance at constant chromaticity to the
+  /// 100 cd/m² SDR display, BT.2020 to BT.709 in linear light clipped to 0…1
+  /// (Report ITU-R BT.2407 §2, to which §6.1 refers), and the BT.1886 inverse
+  /// EOTF. 18% grey (38% HLG) lands at 53.2%, skin (50% HLG) at 70%, HDR
+  /// Reference White (75% HLG) at 96%; luminance reaches 100% SDR at 334 cd/m²
+  /// (about 83% HLG), and brighter light is the SDR peak, as on the 100 cd/m²
+  /// display.
   public static func hlg(_ v: ColorRGB, primaries: ColorPrimaries) -> ColorRGB {
-    let k = 1 / hlgReferenceWhiteScene
-    let e = ColorRGB(
-      r: ColorMath.hlgInverseOETF(max(v.r, 0)) * k, g: ColorMath.hlgInverseOETF(max(v.g, 0)) * k,
-      b: ColorMath.hlgInverseOETF(max(v.b, 0)) * k)
-    let c = primaries.conversion(to: .rec709).apply(e)
-    return ColorRGB(
-      r: ColorMath.bt709OETF(min(c.r, 1)), g: ColorMath.bt709OETF(min(c.g, 1)), b: ColorMath.bt709OETF(min(c.b, 1)))
+    let display = ColorMath.hlgEOTF(
+      ColorRGB(r: max(v.r, 0), g: max(v.g, 0), b: max(v.b, 0)), peak: BT2446MethodC.hdrPeak,
+      weights: primaries.luminanceCoefficients)
+    let sdr = BT2446MethodC.toneMap(display, primaries: primaries)
+    let k = 1 / BT2446MethodC.sdrPeak
+    let l = primaries.conversion(to: .rec709).apply(ColorRGB(r: sdr.r * k, g: sdr.g * k, b: sdr.b * k))
+    func encode(_ l: Double) -> Double { ColorMath.bt1886InverseEOTF(min(max(l, 0), 1)) }
+    return ColorRGB(r: encode(l.r), g: encode(l.g), b: encode(l.b))
   }
 
   /// PQ to Rec.709 SDR by display light (§5.2: preferred, it keeps the HDR look):
@@ -292,7 +294,7 @@ public struct MonitorColorPipeline: Equatable, Sendable {
         status = .active(label: "PQ → SDR · BT.2408 EETF")
       case .hlg?:
         transform = .hlgToSDR
-        status = .active(label: "HLG → SDR · scene light, BT.709 OETF")
+        status = .active(label: "HLG → SDR · BT.2446 Method C")
       default: status = .unavailable(.requiresHDRSource)
       }
     case .hdrPassthrough:

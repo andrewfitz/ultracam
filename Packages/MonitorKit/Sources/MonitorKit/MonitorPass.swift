@@ -829,6 +829,8 @@ public final class MonitorPass {
     p.hlgSource = SIMD4(
       Float(HDRToSDR.hlgReferencePeak), Float(ColorMath.hlgSystemGamma(peak: HDRToSDR.hlgReferencePeak)),
       Float(1 / HDRToSDR.hlgReferenceWhiteScene), 0)
+    p.hlgToSDR = PassParameters.methodC
+    p.sourceWeights = PassParameters.sourceWeights(o.sourcePrimaries)
     p.toneMap = toneMap(o.transform == .pqToSDR ? o.sdrToneMap : nil)
     p.assist = SIMD4(
       Float(DisplayAssist.kneeScene), Float(DisplayAssist.kneeSignal), Float(DisplayAssist.shoulderExponent),
