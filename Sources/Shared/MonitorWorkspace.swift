@@ -113,9 +113,11 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
     }
     // Suppress zebra only when false colour is actually drawn on this surface.
     // A Program cannot classify camera log encodings, so its log mode is turned
-    // off above and zebra must remain available there.
-    let suppressesZebra = value.falseColor.mode != .off &&
-      (value.falseColor.mode.needsLogSource ? falseColorDeclared : true)
+    // off above and zebra must remain available there. Custom false colour with
+    // no bands draws nothing (MonitorKit reports it unavailable), so it keeps zebra.
+    let drawsFalseColor = value.falseColor.mode == .custom ? !value.falseColor.customBands.isEmpty
+      : value.falseColor.mode.needsLogSource ? falseColorDeclared : true
+    let suppressesZebra = value.falseColor.mode != .off && drawsFalseColor
     if !toolsEnabled || suppressesZebra {
       for index in value.zebras.indices where value.zebras[index].enabled {
         value.zebras[index].enabled = false
