@@ -128,6 +128,7 @@ enum UIFixtures {
     inUse: Bool = false, signal: UISignal = .live(format: "2160p 59.94")) -> UICameraSnapshot {
     var camera = UICameraSnapshot(id: "camera-\(index)", name: "Camera \(index)")
     camera.inputName = inputs[(index - 1) % inputs.count].name
+    camera.inputID = inputs[(index - 1) % inputs.count].id
     camera.running = true
     camera.signal = signal
     camera.outputFormat = "1080p 29.97"
