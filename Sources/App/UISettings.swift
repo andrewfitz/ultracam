@@ -666,10 +666,10 @@ struct UISettingsAdvancedPane: View {
   var body: some View {
     Form {
       Section {
-        Toggle("Advertise HDR to cameras (HLG and PQ)", isOn: $model.advertiseHDRToCameras)
-          .help("Tells cameras on the UltraStudio HDMI inputs that HLG and PQ are welcome.")
+        Toggle("Advertise HLG to cameras", isOn: $model.advertiseHDRToCameras)
+          .help("Tells cameras on the UltraStudio HDMI inputs that HLG is welcome. SDR and PQ always are.")
       } header: { Text("Inputs") } footer: {
-        UISettingsFootnote("When on, cameras can send HLG or PQ video over HDMI instead of falling back to SDR. Changing this makes connected cameras renegotiate HDMI once, so their picture drops for a few seconds.")
+        UISettingsFootnote("SDR and PQ are always advertised. When on, cameras can also send HLG over HDMI instead of falling back to SDR. Changing this makes connected cameras renegotiate HDMI once, so their picture drops for a few seconds.")
       }
 
       Section {

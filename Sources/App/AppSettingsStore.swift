@@ -442,7 +442,7 @@ final class AppSettingsStore {
     set { defaults.set(newValue, forKey: Self.hideFromDockKey) }
   }
 
-  /// "Advertise HDR to cameras (HLG and PQ)". Off when never saved.
+  /// "Advertise HLG to cameras" (the driver default already has SDR and PQ). Off when never saved.
   var advertiseHDRToCameras: Bool {
     get { defaults.bool(forKey: Self.advertiseHDRKey) }
     set { defaults.set(newValue, forKey: Self.advertiseHDRKey) }
