@@ -708,7 +708,6 @@ final class AppModel {
     let id = feedCoordinator.add(name: name)
     syncRecordingFeeds()
     guard selectFeed(id) else { return nil }
-    takeAudio[id] = nil
     saveSettings()
     return id
   }
@@ -740,6 +739,7 @@ final class AppModel {
     let wasSelected = id == selectedFeedID
     saveSettings()
     guard feedCoordinator.remove(id) else { return false }
+    takeAudio[id] = nil
     monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(id.rawValue), nil)
     syncRecordingFeeds()
     if wasSelected {
