@@ -118,7 +118,7 @@ enum UIMonitorToolText {
   static func displayTransform(_ mode: DisplayTransform) -> String {
     switch mode {
     case .none: return "None"
-    case .logToRec709: return "Log to Rec.709 (display assist)"
+    case .logToRec709: return "Log to Rec.709"
     case .hdrToSDR: return "HDR to SDR"
     case .hdrPassthrough: return "HDR passthrough"
     }
