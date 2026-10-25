@@ -1,7 +1,11 @@
 import Dispatch
 import Foundation
 import MonitorKitAudio
+import OSLog
 import Synchronization
+
+/// Audio overs, logged by each capture's meter tap (rate-limited).
+let audioLog = Logger(subsystem: "org.ultracam.app", category: "audio")
 
 /// One capture's broadcast audio meters (MonitorKitAudio: sample and true peak,
 /// RMS, VU, PPM and EBU R 128 loudness), fed from the embedded audio the
@@ -60,8 +64,11 @@ final class AudioMeterTap: @unchecked Sendable {
   // confined to `meterQueue`. Everything else is atomic or under `sessions`.
 
   /// The capture's fixed embedded-audio format: 48 kHz, 2 channels, Int32.
+  /// Only what the meters show runs: true peak (and the sample peak behind
+  /// the clip count), R 128 loudness and phase correlation; no RMS, VU or PPM.
   static let configuration = AudioMeterConfiguration(
-    sampleRate: EmbeddedAudioFormat.sampleRate, channelCount: EmbeddedAudioFormat.channelCount)
+    sampleRate: EmbeddedAudioFormat.sampleRate, channelCount: EmbeddedAudioFormat.channelCount,
+    meters: [.samplePeak, .truePeak, .loudness, .correlation])
 
   /// Packets the hand-off holds before the meters coalesce: 4096 DeckLink
   /// callbacks, 68 s at 59.94p and 137 s at 29.97p. The slots are
@@ -118,6 +125,15 @@ final class AudioMeterTap: @unchecked Sendable {
   // session start on the main thread never releases a meter in use.
   private var consumerMeter: AudioMeter?
   private var consumerSession: UInt64 = 0
+
+  /// Meter queue only: what the over watch saw last.
+  private var overWatch = OverWatch()
+  /// Overs since the tap was made (see `OverWatch`).
+  private let overEvents = Atomic<UInt64>(0)
+  /// The camera and timecode the over log names; set by the views showing the meter.
+  private let logContext = Mutex(LogContext())
+  /// The take being measured, if any.
+  private let take = Mutex<TakeState?>(nil)
 
   private let metered = Atomic<UInt64>(0)
   private let rejected = Atomic<UInt64>(0)
@@ -232,6 +248,7 @@ final class AudioMeterTap: @unchecked Sendable {
             frameStride: stride)
         }
         metered.add(1, ordering: .relaxed)
+        watchForOvers(meter)
       } else {
         stale.add(1, ordering: .relaxed)
       }
@@ -256,6 +273,53 @@ final class AudioMeterTap: @unchecked Sendable {
     }
     consumerMeter = current.0
     consumerSession = current.1
+  }
+
+  /// Looks for a new over after each packet: a sample clipped, the true-peak
+  /// maximum rose to −1 dBTP or above, or the true-peak bar is there. Overs on
+  /// a channel less than a second (of audio) apart are one over. Each new one
+  /// counts in `overCount` and is logged, at most once a second. Meter queue only.
+  private func watchForOvers(_ meter: AudioMeter) {
+    let snapshot = meter.snapshot()
+    let id = ObjectIdentifier(meter)
+    if overWatch.meter != id { overWatch = OverWatch(meter: id) }
+    let n = min(snapshot.channelCount, OverWatch.channels)
+    var event: (channel: Int, level: Float, clips: UInt32)?
+    for c in 0..<n {
+      let levels = snapshot.channels[c]
+      // A peak reset lowers the maximum and clears the count: follow it.
+      if levels.truePeakMax < overWatch.lastMax[c] || levels.clipCount < overWatch.lastClips[c] {
+        overWatch.lastMax[c] = levels.truePeakMax
+        overWatch.lastClips[c] = levels.clipCount
+      }
+      let clipped = levels.clipCount > overWatch.lastClips[c]
+      let rose = levels.truePeakMax > overWatch.lastMax[c] && levels.truePeakMax >= -1
+      let over = clipped || rose || levels.truePeak >= -1
+      overWatch.lastMax[c] = levels.truePeakMax
+      overWatch.lastClips[c] = levels.clipCount
+      guard over else { continue }
+      let previous = overWatch.lastOverFrame[c]
+      overWatch.lastOverFrame[c] = snapshot.frameCount
+      let gap = UInt64(EmbeddedAudioFormat.sampleRate)
+      if previous == nil || snapshot.frameCount &- (previous ?? 0) > gap, event == nil {
+        event = (c, max(levels.truePeakMax, levels.truePeak), levels.clipCount)
+      }
+    }
+    guard let event else { return }
+    overEvents.add(1, ordering: .relaxed)
+    let now = DispatchTime.now().uptimeNanoseconds
+    guard overWatch.lastLog == nil || now &- (overWatch.lastLog ?? 0) >= 1_000_000_000 else {
+      overWatch.suppressed += 1
+      return
+    }
+    overWatch.lastLog = now
+    let suppressed = overWatch.suppressed
+    overWatch.suppressed = 0
+    let context = logContext.withLock { $0 }
+    let message = Self.overMessage(
+      camera: context.camera, channel: event.channel, channels: n, level: Double(event.level), clips: event.clips,
+      timecode: context.timecode, suppressed: suppressed)
+    audioLog.notice("\(message, privacy: .public)")
   }
 
   /// Waits until the meter queue has metered every packet handed over before
@@ -302,6 +366,48 @@ final class AudioMeterTap: @unchecked Sendable {
   }
 
   var isMetering: Bool { viewers.load(ordering: .relaxed) > 0 }
+
+  /// Overs seen since the tap was made, while metering (a second apart per channel).
+  var overCount: UInt64 { overEvents.load(ordering: .relaxed) }
+
+  /// The camera name and source timecode the over log names. Any thread.
+  func setLogContext(camera: String?, timecode: String?) {
+    logContext.withLock { $0 = LogContext(camera: camera, timecode: timecode) }
+  }
+
+  // MARK: Takes
+
+  /// A take started: meters through the take whether or not a view shows
+  /// them, and starts integrated loudness, the true-peak maxima and the over
+  /// latch over, so the take's numbers are its own. Main thread. A second
+  /// call during a take restarts it. The true-peak interpolator reads about
+  /// six samples behind, so audio in the instant before the start can still
+  /// reach the take's maximum.
+  func beginTake() {
+    let started = take.withLock { state -> Bool in
+      if state != nil { return false }
+      state = TakeState(oversAtStart: overCount)
+      return true
+    }
+    let meter = started ? attach() : self.meter
+    meter?.resetPeaks()
+    meter?.resetLoudness()
+    if !started { take.withLock { $0?.oversAtStart = overCount } }
+  }
+
+  /// The take ended: its integrated loudness, maximum true peak and overs,
+  /// and the metering it held stops. Nil when no take was running. Main thread.
+  func endTake() -> AudioTakeSummary? {
+    guard let state = take.withLock({ state -> TakeState? in
+      defer { state = nil }
+      return state
+    }) else { return nil }
+    let snapshot = meter?.snapshot() ?? AudioMeterSnapshot()
+    detach()
+    return AudioTakeSummary(
+      integrated: Double(snapshot.loudness.integrated), maximumTruePeak: Double(snapshot.programmeMaximumTruePeak),
+      overs: Int(clamping: overCount &- state.oversAtStart), duration: snapshot.loudness.duration)
+  }
 
   /// The current (or last) session's meter; nil before the first attach.
   var meter: AudioMeter? { sessions.withLock { $0.live } }
