@@ -233,6 +233,15 @@ final class CaptureController: @unchecked Sendable {
   private var realtimeActivity: NSObjectProtocol?
   private let logger = Logger(subsystem: "org.ultracam.app", category: "capture")
   private var lastLogged: Double = 0
+  // Capture queue: virtual camera output reporting. The first send after a
+  // connect, and full-queue windows: the first full send at once, then the
+  // counts at most every five seconds while it lasts.
+  private var cameraFirstSendPending = false
+  private var cameraWasStalled = false
+  private var cameraWindowStart: Double = 0
+  private var cameraWindowSent: UInt64 = 0
+  private var cameraWindowFull: UInt64 = 0
+  private var cameraLabel: String { activeFeed?.rawValue ?? "legacy" }
   // Program output consumes processed frames through FeedCoordinator. When it
   // is enabled, this controller keeps capture and GPU work alive without
   // opening a per-feed CMIO sink; the Program bridge owns that sink.
@@ -332,9 +341,13 @@ final class CaptureController: @unchecked Sendable {
         }
         try self.makeProcessor().load(lut)
         self.lock.withLock { self.loadedLUT = lut }
+        lutLog.notice("LUT \"\(lut.cube.title, privacy: .public)\" in the pipeline of \(self.cameraLabel, privacy: .public) (controller \(UInt(bitPattern: ObjectIdentifier(self).hashValue), format: .hex, privacy: .public)); burned in: \(self.pipelineEnabled && self.configuration.applyLUT, privacy: .public)")
         if self.pipelineEnabled && self.configuration.applyLUT { self.flushOwnedPreviews() }
         DispatchQueue.main.async { completion(.success(())) }
-      } catch { DispatchQueue.main.async { completion(.failure(error)) } }
+      } catch {
+        lutLog.error("LUT not loaded into \(self.cameraLabel, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        DispatchQueue.main.async { completion(.failure(error)) }
+      }
     }
   }
 
@@ -416,6 +429,11 @@ final class CaptureController: @unchecked Sendable {
         self.frameRateGate = FrameRateGate()
         self.resetSampleFormat()
         self.cameraConnected = false
+        self.cameraFirstSendPending = false
+        self.cameraWasStalled = false
+        self.cameraWindowStart = 0
+        self.cameraWindowSent = 0
+        self.cameraWindowFull = 0
         self.cameraMessage = "Waiting for detected input"
         // Connect and warm before enabling driver callbacks, so the first
         // frames find the camera and GPU ready. This connection waits for the
@@ -581,6 +599,9 @@ final class CaptureController: @unchecked Sendable {
     let token = lock.withLock { generation }
     queue.async {
       guard self.isAccepting(token) else { return }
+      let changes = Self.describeChanges(from: self.configuration, pipeline: self.pipelineEnabled,
+        to: configuration, pipeline: pipelineEnabled)
+      self.logger.notice("Reconfigure \(self.cameraLabel, privacy: .public): \(changes, privacy: .public)")
       self.configuration = configuration
       self.pipelineEnabled = pipelineEnabled
       self.publishBurnIn()
@@ -593,6 +614,22 @@ final class CaptureController: @unchecked Sendable {
       self.publishCurrent(token: token)
       // First new frame establishes the exact source-dependent output contract.
     }
+  }
+
+  /// "applyLUT off→on, downscale on→off", or "no change", for logs.
+  static func describeChanges(from old: PipelineConfiguration, pipeline oldPipeline: Bool,
+    to new: PipelineConfiguration, pipeline newPipeline: Bool) -> String {
+    func flag(_ value: Bool) -> String { value ? "on" : "off" }
+    var parts: [String] = []
+    if oldPipeline != newPipeline { parts.append("processing \(flag(oldPipeline))→\(flag(newPipeline))") }
+    if old.applyLUT != new.applyLUT { parts.append("applyLUT \(flag(old.applyLUT))→\(flag(new.applyLUT))") }
+    if old.downscale != new.downscale { parts.append("downscale \(flag(old.downscale))→\(flag(new.downscale))") }
+    if old.convertTo420 != new.convertTo420 { parts.append("4:2:0 \(flag(old.convertTo420))→\(flag(new.convertTo420))") }
+    if old.reduceFrameRate != new.reduceFrameRate {
+      parts.append("29.97 limit \(flag(old.reduceFrameRate))→\(flag(new.reduceFrameRate))")
+    }
+    if old.inputFast != new.inputFast { parts.append("input \(old.inputFast ? "59.94" : "29.97")→\(new.inputFast ? "59.94" : "29.97")") }
+    return parts.isEmpty ? "no change" : parts.joined(separator: ", ")
   }
 
   func setPreviewEnabled(_ enabled: Bool) {
@@ -840,6 +877,7 @@ final class CaptureController: @unchecked Sendable {
 
   private func establish(_ next: PipelineConfiguration, inputType: OSType, synchronous: Bool = false) {
     let prior = activeConfiguration
+    let priorType = activeInputType
     let sameContract = prior.map {
       $0.width == next.width && $0.height == next.height &&
         $0.pixelFormat == next.pixelFormat && $0.duration == next.duration &&
@@ -852,6 +890,12 @@ final class CaptureController: @unchecked Sendable {
       return
     }
     if prior?.duration != next.duration { frameRateGate = FrameRateGate() }
+    func describe(_ value: PipelineConfiguration?, _ type: OSType?) -> String {
+      guard let value else { return "none" }
+      return "\(value.width)×\(value.height) \(fourCC(value.untouched ? (type ?? 0) : value.pixelFormat)) " +
+        "\(value.duration.value)/\(value.duration.timescale) s\(value.untouched ? " untouched" : "")"
+    }
+    cameraOutputLog.notice("Camera contract: \(self.cameraLabel, privacy: .public) \(describe(prior, priorType), privacy: .public) → \(describe(next, inputType), privacy: .public)\(self.cameraOutputEnabled ? "" : " (camera output off)", privacy: .public)")
     resetSampleFormat()
     guard cameraOutputEnabled else {
       if cameraConnected || cameraConnecting { closeCamera() }
@@ -868,6 +912,7 @@ final class CaptureController: @unchecked Sendable {
       ProcessInfo.processInfo.systemUptime >= reconnectAfter,
       let next = activeConfiguration, let type = activeInputType else { return }
     if reconnectAttempts > 0 { reconnectAttempts -= 1 }
+    cameraOutputLog.notice("Camera reconnect: \(self.cameraLabel, privacy: .public) (\(self.reconnectRequested ? "requested" : "recovering", privacy: .public), \(self.reconnectAttempts, privacy: .public) recovery attempts left)")
     requestConnect(next, inputType: type, synchronous: false)
   }
 
@@ -875,6 +920,7 @@ final class CaptureController: @unchecked Sendable {
     guard cameraOutputEnabled, reconnectRequested || reconnectAttempts > 0 else { return }
     let token = lock.withLock { generation }
     let delay = max(0, reconnectAfter - ProcessInfo.processInfo.systemUptime)
+    cameraOutputLog.notice("Camera reconnect scheduled: \(self.cameraLabel, privacy: .public) in \(String(format: "%.1f", delay), privacy: .public) s")
     queue.asyncAfter(deadline: .now() + delay) { [weak self] in
       guard let self, self.isAccepting(token) else { return }
       self.reconnectIfDue()
@@ -921,8 +967,26 @@ final class CaptureController: @unchecked Sendable {
       scheduleReconnect()
     } else {
       cameraConnected = true
+      cameraFirstSendPending = true
       cameraMessage = "Ultracam camera connected. Choose it in your meeting app."
     }
+  }
+
+  /// Capture queue, per delivered frame: at most every five seconds while the
+  /// queue has been full in the window, the frames the camera took and refused.
+  private func reportCameraWindow() {
+    let now = ProcessInfo.processInfo.systemUptime
+    if cameraWindowStart == 0 { cameraWindowStart = now }
+    guard now - cameraWindowStart >= 5 else { return }
+    if cameraWindowFull > 0 {
+      cameraOutputLog.error("Camera queue full: \(self.cameraLabel, privacy: .public): \(self.cameraWindowFull, privacy: .public) frames refused, \(self.cameraWindowSent, privacy: .public) taken in the last \(String(format: "%.0f", now - self.cameraWindowStart), privacy: .public) s")
+    } else if cameraWasStalled {
+      cameraWasStalled = false
+      cameraOutputLog.notice("Camera queue flowing again: \(self.cameraLabel, privacy: .public), \(self.cameraWindowSent, privacy: .public) frames taken in the last \(String(format: "%.0f", now - self.cameraWindowStart), privacy: .public) s")
+    }
+    cameraWindowStart = now
+    cameraWindowSent = 0
+    cameraWindowFull = 0
   }
 
   private func beginCameraRecovery() {
@@ -1202,7 +1266,12 @@ final class CaptureController: @unchecked Sendable {
     inputMetadataChanged = false
     switch report.outcome {
     case .sent:
+      cameraWindowSent &+= 1
       if item.cameraAttempt == cameraAttempt {
+        if cameraFirstSendPending || cameraOutage {
+          cameraOutputLog.notice("Camera output \(self.cameraOutage ? "recovered" : "sending", privacy: .public): \(self.cameraLabel, privacy: .public), first frame accepted by the camera queue")
+          cameraFirstSendPending = false
+        }
         // An opened queue is not proof of recovery. Only a successful frame
         // send ends the outage and permits a fresh retry budget.
         cameraOutage = false
@@ -1211,8 +1280,14 @@ final class CaptureController: @unchecked Sendable {
     case .full:
       // The extension's queue is full: it has stalled. Counted and shown.
       cameraDrops &+= 1
+      cameraWindowFull &+= 1
+      if !cameraWasStalled {
+        cameraWasStalled = true
+        cameraOutputLog.error("Camera queue full: \(self.cameraLabel, privacy: .public); the camera extension is not taking frames")
+      }
     case .failed(let description):
       cameraDrops &+= 1
+      cameraOutputLog.error("Camera send failed: \(self.cameraLabel, privacy: .public): \(description, privacy: .public); closing and reconnecting")
       if item.cameraAttempt == cameraAttempt {
         closeCamera()
         beginCameraRecovery()
@@ -1224,6 +1299,7 @@ final class CaptureController: @unchecked Sendable {
       }
     case .notSent: break
     }
+    reportCameraWindow()
     frames &+= 1
     lastDeliveredSourceTime = item.pts
     processingMS = report.processingMS

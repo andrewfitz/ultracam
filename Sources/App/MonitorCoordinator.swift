@@ -274,7 +274,9 @@ import MonitorKit
       host.releaseRenderState()
     }
     preferences[target] = nil
-    burnInSources[target] = nil
+    if burnInSources.removeValue(forKey: target) != nil {
+      lutLog.notice("Monitor burn-in LUT source cleared: \(target.rawValue, privacy: .public) (camera removed)")
+    }
     assignedDevices[target] = nil
     previewEnabled[target] = nil
     diagnosticSnapshots[target] = nil
@@ -316,7 +318,12 @@ import MonitorKit
   /// `MonitorLUT` the camera burns in. Surfaces read it at each encode, so a LUT
   /// load or Apply LUT change shows on the next picture. Nil for Program.
   func setBurnInLUTSource(for target: MonitorTargetID, _ source: (@Sendable () -> MonitorLUT?)?) {
+    let wasSet = burnInSources[target] != nil
     burnInSources[target] = target.isProgram ? nil : source
+    let isSet = burnInSources[target] != nil
+    if wasSet != isSet || isSet {
+      lutLog.notice("Monitor burn-in LUT source \(isSet ? (wasSet ? "replaced" : "set") : "cleared", privacy: .public): \(target.rawValue, privacy: .public), \(self.surfaces.values.filter { $0.target == target }.count, privacy: .public) surfaces")
+    }
     for surface in surfaces.values where surface.target == target {
       surface.presenter.setBurnInLUTSource(burnInSources[target])
     }
