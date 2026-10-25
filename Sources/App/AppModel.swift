@@ -281,6 +281,13 @@ final class AppModel {
   private var autoSwitcherBridge: AutoSwitcherBridge?
   private var autoSwitcherTimeline: AutoSwitcherTimelineRecorder?
   private var recordingTimelines: [FeedID: AutoSwitcherTimelineRecorder] = [:]
+  /// The tap each running take measures its audio on: the one it started on,
+  /// so a capture replaced mid-take still gets its take ended (and its viewer released).
+  @ObservationIgnored private var takeTaps: [FeedID: AudioMeterTap] = [:]
+  /// Each camera's last finished take's audio: integrated loudness, Max TP, overs.
+  private(set) var takeAudio: [FeedID: AudioTakeSummary] = [:]
+  /// The running take's audio so far; nil without a take on a meter.
+  func takeAudioSoFar(_ id: FeedID) -> AudioTakeSummary? { takeTaps[id]?.takeSummarySoFar() }
   private var pendingAutoDecisionID: UUID?
   private var pendingAutoTargetFeedID: FeedID?
   private var programMonitorTap: ProgramMonitorTap?
@@ -401,6 +408,7 @@ final class AppModel {
     }
     recordingModel.onRecordingStarted = { [weak self] feedID, url in
       guard let self else { return }
+      self.beginTakeAudio(feedID)
       self.reconcileAutomaticFeed()
       guard let timeline = self.autoSwitcherTimeline else { return }
       self.recordingTimelines[feedID] = timeline
@@ -408,9 +416,13 @@ final class AppModel {
     }
     recordingModel.onRecordingFinished = { [weak self] feedID, url in
       guard let self else { return }
+      self.endTakeAudio(feedID)
       self.reconcileAutomaticFeed()
       guard let timeline = self.recordingTimelines.removeValue(forKey: feedID) else { return }
       timeline.recordingFinished(feedID: feedID, url: url, mediaEnd: self.update.mediaTime)
+    }
+    recordingModel.onRecordingPaused = { [weak self] feedID, paused in
+      self?.takeTaps[feedID]?.pauseTake(paused)
     }
     feedCoordinator.onProgramCutAbandoned = { [weak self] feedID, reason in
       self?.programCutAbandoned(feedID, reason: reason)
@@ -696,8 +708,28 @@ final class AppModel {
     let id = feedCoordinator.add(name: name)
     syncRecordingFeeds()
     guard selectFeed(id) else { return nil }
+    takeAudio[id] = nil
     saveSettings()
     return id
+  }
+
+  /// A take started recording: its audio is measured on the camera's tap
+  /// from here, on a meter of its own (see `AudioMeterTap.beginTake`).
+  private func beginTakeAudio(_ id: FeedID) {
+    takeAudio[id] = nil
+    // A take never ended (no finish callback) must not keep a viewer.
+    _ = takeTaps.removeValue(forKey: id)?.endTake()
+    guard let tap = audioMeterTap(for: id) else { return }
+    takeTaps[id] = tap
+    tap.beginTake()
+  }
+
+  /// A take finished (saved, failed or stopped while starting): keep its audio for the strip, and log it.
+  private func endTakeAudio(_ id: FeedID) {
+    guard let summary = takeTaps.removeValue(forKey: id)?.endTake() else { return }
+    takeAudio[id] = summary
+    let name = feedDescriptors.first { $0.id == id }?.name ?? id.rawValue
+    audioLog.notice("Take on \(name, privacy: .public): \(summary.note, privacy: .public), \(String(format: "%.1f", summary.duration), privacy: .public) s measured")
   }
 
   /// Removes an idle feed and selects the first remaining descriptor when the

@@ -79,6 +79,9 @@ struct UICameraRecording: Sendable, Equatable {
   var error: String?
   /// A note on the take that isn't an error, such as audio re-synced to the picture.
   var note: String?
+  /// The take's audio, measured from its start: so far while it records, then
+  /// the finished take's until the next one starts.
+  var audio: AudioTakeSummary?
   /// The most recent finished take, kept until the next take starts.
   var savedFileName: String?
   var savedURL: URL?
@@ -303,8 +306,12 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var automaticStartFailed: Bool
   /// The failed take ran out of disk space: the strip offers another folder.
   var diskFull = false
-  /// A note on the current or last take, such as audio re-synced after a signal drop.
+  /// A note on the current or last take that needs a look, such as audio
+  /// re-synced after a signal drop, or an audio over. Shown with a warning symbol.
   var recordingNote: String? = nil
+  /// The take's audio in full ("Audio −23.4 LUFS · max −2.1 dBTP · no overs"),
+  /// for a tooltip and VoiceOver: so far while recording, the last take's once saved.
+  var takeAudioHelp: String? = nil
 }
 
 /// One row of an Input picker: a listed device, and the other camera that already uses it.
@@ -631,6 +638,11 @@ enum UIPresentationBuilder {
     if let label = tally.label { labelParts.append(label) }
     if isRecording { labelParts.append(rec.status == .paused ? "recording paused at \(elapsedShort)" : "recording \(elapsedShort)") }
     if tile != .live { labelParts.append(statusBadge) }
+    // The take's audio warns only when it needs a look: an over, or a true peak at −1 dBTP or above.
+    let takeAudio = isRecording || strip == .saved ? rec.audio : nil
+    let audioNote = takeAudio.flatMap { $0.needsAttention ? $0.note : nil }
+    let recordingNote = [rec.note, audioNote].compactMap { $0 }.joined(separator: " · ")
+    if let audioNote { labelParts.append(audioNote) }
 
     return UICameraPresentation(
       id: camera.id, number: index + 1, name: camera.name,
@@ -663,7 +675,8 @@ enum UIPresentationBuilder {
       accessibilityLabel: labelParts.joined(separator: ", "),
       lutError: camera.lutError, automaticStartFailed: camera.automaticStartFailed,
       diskFull: diskFull(camera, in: session),
-      recordingNote: rec.note)
+      recordingNote: recordingNote.isEmpty ? nil : recordingNote,
+      takeAudioHelp: takeAudio.map { (isRecording ? "This take so far: " : "Last take: ") + $0.note })
   }
 
   static func stopMessage(camera: UICameraSnapshot, recording: Bool, onAir: Bool) -> String {

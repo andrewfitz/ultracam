@@ -602,7 +602,12 @@ struct UIChannelStripView: View {
       Divider()
       outputRow
       HStack(spacing: 8) {
-        gutterIcon("waveform").help("Embedded audio, true peak").accessibilityHidden(true)
+        // Red while a take measures the audio: the take started the maxima and OVER over.
+        gutterIcon("waveform", color: takeMeasuresAudio ? .red : .secondary)
+          .help(takeMeasuresAudio
+            ? "Embedded audio, true peak. The maxima, OVER and loudness started over with this take."
+            : "Embedded audio, true peak")
+          .accessibilityHidden(true)
         UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio)
       }
     }
@@ -802,9 +807,13 @@ struct UIChannelStripView: View {
         if isRecordingOrPaused {
           Text(camera.recordDetail).font(.uiClock)
             .foregroundStyle(camera.stripState == .paused ? .secondary : .primary)
+            .help(camera.takeAudioHelp ?? "")
         } else {
           Text(camera.recordDetail).font(.uiRow).lineLimit(1).truncationMode(.middle)
             .foregroundStyle(camera.stripState == .saved ? .primary : .secondary)
+            .help(camera.takeAudioHelp.map { "\(camera.recordDetail)\n\($0)" } ?? "")
+          // A saved take's note (an audio over, audio re-synced) stays until the next take.
+          if camera.stripState == .saved, let note = camera.recordingNote { noteLine(note) }
         }
       }
       .layoutPriority(1)
@@ -819,20 +828,28 @@ struct UIChannelStripView: View {
             }
             .font(.uiValue)
           }
-          if let note = camera.recordingNote {
-            HStack(spacing: 4) {
-              Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).imageScale(.small)
-              Text(note).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
-            }
-            .font(.uiValue)
-            .help(note)
-          }
+          if let note = camera.recordingNote { noteLine(note) }
         }
       }
       Spacer(minLength: 4)
       recordActions
     }
     .accessibilityElement(children: .contain)
+  }
+
+  /// A take's note that needs a look, with the orange warning symbol.
+  private func noteLine(_ note: String) -> some View {
+    HStack(spacing: 4) {
+      Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).imageScale(.small)
+      Text(note).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+    }
+    .font(.uiValue)
+    .help(note)
+  }
+
+  /// A take is measuring the audio: it started the meter's maxima, OVER latch and loudness over.
+  private var takeMeasuresAudio: Bool {
+    camera.stripState == .recording || camera.stripState == .recordingNoSignal || camera.stripState == .updating
   }
 
   @ViewBuilder private var recordActions: some View {

@@ -595,6 +595,8 @@ final class RecordingModel {
   var onOutputFolderChanged: ((URL?) -> Void)?
   var onRecordingStarted: ((FeedID, URL) -> Void)?
   var onRecordingFinished: ((FeedID, URL?) -> Void)?
+  /// A take paused (`true`) or resumed (`false`).
+  var onRecordingPaused: ((FeedID, Bool) -> Void)?
 
   private let driver: RecordingSessionDriver
   private var finishedCallbacks: [() -> Void] = []
@@ -788,6 +790,7 @@ final class RecordingModel {
       try driver.pauseRecording(feedID: feedID)
       feeds[index].status = .paused
       feeds[index].error = nil
+      onRecordingPaused?(feedID, true)
     } catch {
       feeds[index].error = error.localizedDescription
     }
@@ -799,6 +802,7 @@ final class RecordingModel {
       try driver.resumeRecording(feedID: feedID)
       feeds[index].status = .recording
       feeds[index].error = nil
+      onRecordingPaused?(feedID, false)
     } catch {
       feeds[index].error = error.localizedDescription
     }

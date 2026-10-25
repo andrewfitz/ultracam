@@ -81,6 +81,8 @@ import SystemExtensions
     case .recording:
       camera.recording.status = .recording
       camera.recording.elapsed = 751
+      // Clean audio: a tooltip, no warning line.
+      camera.recording.audio = AudioTakeSummary(integrated: -23.4, maximumTruePeak: -2.1, overs: 0, duration: 751)
     case .paused:
       camera.recording.status = .paused
       camera.recording.elapsed = 252
@@ -89,6 +91,8 @@ import SystemExtensions
       camera.recording.savedFileName = "Camera 1_2026-10-21_09-41-03_001.mov"
       camera.recording.savedURL = URL(fileURLWithPath: "/Volumes/8TB/Takes/Camera 1/Camera 1_2026-10-21_09-41-03_001.mov")
       camera.recording.savedDuration = 2292
+      // An over in the take: the saved row warns.
+      camera.recording.audio = AudioTakeSummary(integrated: -16.2, maximumTruePeak: 0.4, overs: 1, duration: 2292)
     case .noFolder: camera.recording.folderPath = nil
     case .failed: camera.recording.error = "The drive was disconnected. Saved up to 00:12:20."
     case .recordingNoSignal:
@@ -1272,6 +1276,9 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   UIMonitorToolVerify.run(verifier: verifier)
   MonitorWorkspaceVerify.run(verifier: verifier)
   AudioMeterTapVerify.run(verifier: verifier)
+  AudioMeterViewsVerify.run(verifier: verifier, recording: run.stripFixture(.recording), saved: run.stripFixture(.saved)) {
+    name, view, size in run.render(name, view, size: size).forEach { $0.close() }
+  }
   run.accessibility()
   run.interactions()
   do { try run.bridge() } catch { verifier.check("bridge tests threw", false, "\(error)") }

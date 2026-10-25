@@ -158,6 +158,8 @@ struct UISessionBridge {
       rec.megabitsPerSecond = stats?.videoMegabitsPerSecond ?? 0
       rec.droppedFrames = Int(clamping: stats?.droppedVideoFrames ?? 0)
       rec.note = stats?.warning
+      // The running take's audio so far, then the finished take's (cleared when the next starts).
+      rec.audio = model.takeAudioSoFar(id) ?? model.takeAudio[id]
       rec.failed = stats?.failed == true
       rec.error = state?.error ?? stats?.lastError
       rec.savedURL = state?.savedURL

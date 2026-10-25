@@ -304,6 +304,17 @@ struct UIStatusPopover: View {
               .foregroundStyle(.secondary)
           }
           .font(.subheadline.monospacedDigit())
+          // The take's audio: a warning line when it needs a look, the summary otherwise.
+          if let note = camera.recordingNote {
+            Label { Text(note).foregroundStyle(.secondary) } icon: {
+              Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).imageScale(.small)
+            }
+            .font(.subheadline.monospacedDigit())
+            .fixedSize(horizontal: false, vertical: true)
+          } else if let audio = camera.takeAudioHelp {
+            Text(audio).font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+              .fixedSize(horizontal: false, vertical: true)
+          }
         }
         .accessibilityElement(children: .combine)
       }
