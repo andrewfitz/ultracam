@@ -417,6 +417,7 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
 @MainActor
 final class AppSettingsStore {
   static let hideFromDockKey = "ultracam.hideFromDock"
+  static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
   static let v2Key = snapshotKey
@@ -425,11 +426,12 @@ final class AppSettingsStore {
   init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
   /// Removes every saved Ultracam preference: feeds, switcher, monitor tools,
-  /// Dock visibility, interface layout and recording-folder bookmarks.
+  /// Dock visibility, HDR advertisement, interface layout and recording-folder
+  /// bookmarks.
   /// Recordings and their recovery journals on disk are not touched.
   func resetAll() {
     let names = defaults.dictionaryRepresentation().keys.filter {
-      $0 == Self.hideFromDockKey || $0 == Self.key || $0 == Self.snapshotKey ||
+      $0 == Self.hideFromDockKey || $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
         $0.hasPrefix("ui.") || $0.hasPrefix("recordingFolderBookmark")
     }
     for name in names { defaults.removeObject(forKey: name) }
@@ -438,6 +440,12 @@ final class AppSettingsStore {
   var hideFromDock: Bool {
     get { defaults.bool(forKey: Self.hideFromDockKey) }
     set { defaults.set(newValue, forKey: Self.hideFromDockKey) }
+  }
+
+  /// "Advertise HDR to cameras (HLG and PQ)". Off when never saved.
+  var advertiseHDRToCameras: Bool {
+    get { defaults.bool(forKey: Self.advertiseHDRKey) }
+    set { defaults.set(newValue, forKey: Self.advertiseHDRKey) }
   }
 
   func load() -> AppSettings {

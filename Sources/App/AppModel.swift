@@ -34,6 +34,9 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   var driverWarning: () -> String?
   var observeDevices: (@escaping @MainActor @Sendable ([InputDevice]) -> Void) -> Any?
   var diagnostics: (String) -> UltracamDeviceDiagnostics?
+  /// "Advertise HDR to cameras": whether discovery writes the HDR EDID. Never
+  /// at a capture start (an EDID write makes the camera renegotiate HDMI).
+  var setAdvertisesHDR: (Bool) -> Void = { _ in }
 
   static let live = AppHardware(
     captureServices: { .live(feedID: $0) },
@@ -44,7 +47,8 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
         handler(list.map { InputDevice(id: $0.identifier, name: $0.name) })
       }
     },
-    diagnostics: { UltracamBackend.diagnostics(deviceID: $0) })
+    diagnostics: { UltracamBackend.diagnostics(deviceID: $0) },
+    setAdvertisesHDR: { UltracamBackend.setAdvertisesHDR($0) })
 
   /// No devices; starting a camera fails with an error and nothing is sent.
   static let offline = AppHardware(
@@ -65,6 +69,16 @@ final class AppModel {
       guard hideFromDock != oldValue else { return }
       settingsStore.hideFromDock = hideFromDock
       NSApplication.shared.setActivationPolicy(hideFromDock ? .accessory : .regular)
+    }
+  }
+  /// Lets cameras send HLG and PQ over HDMI: each UltraStudio's EDID advertises
+  /// them from discovery on. Off by default. Changing it makes connected
+  /// cameras renegotiate HDMI once; a camera start never does.
+  var advertiseHDRToCameras = false {
+    didSet {
+      guard advertiseHDRToCameras != oldValue else { return }
+      settingsStore.advertiseHDRToCameras = advertiseHDRToCameras
+      hardware.setAdvertisesHDR(advertiseHDRToCameras)
     }
   }
   var devices: [InputDevice] = [] { didSet { expireResolvedStartRefusals() } }
@@ -279,6 +293,11 @@ final class AppModel {
     self.settingsStore = store
     self.registryPublisher = registryPublisher ?? VirtualCameraRegistryPublisher()
     hideFromDock = store.hideFromDock
+    // Before discovery starts (observeDevices, below), so devices present at
+    // launch get the EDID the setting asks for, once, before any capture.
+    let advertiseHDR = store.advertiseHDRToCameras
+    advertiseHDRToCameras = advertiseHDR
+    hardware.setAdvertisesHDR(advertiseHDR)
     self.virtualCameraRegistryStore = registryStore ?? VirtualCameraRegistryStore()
     let snapshot = store.loadSnapshot()
     persistedSnapshot = snapshot

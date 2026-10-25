@@ -987,6 +987,40 @@ import SystemExtensions
 
   // MARK: Menu bar
 
+  /// "Advertise HDR to cameras": off by default, persisted, and applied to the
+  /// backend at launch (before discovery) and on every change; no hardware.
+  func hdrAdvertisement() {
+    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("HDR: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    final class Calls { var values: [Bool] = []; var discoveryStartedAfter: Int? }
+    let calls = Calls()
+    var hardware = AppHardware.offline
+    hardware.setAdvertisesHDR = { calls.values.append($0) }
+    hardware.observeDevices = { _ in calls.discoveryStartedAfter = calls.values.count; return nil }
+    let make = {
+      AppModel(settingsStore: AppSettingsStore(defaults: defaults), registryStore: VirtualCameraRegistryStore(defaults: defaults),
+        registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
+        installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    }
+    let model = make()
+    verifier.check("HDR: off by default", !model.advertiseHDRToCameras && calls.values == [false], "\(calls.values)")
+    verifier.check("HDR: the setting reaches the backend before discovery starts", calls.discoveryStartedAfter == 1,
+      "\(calls.discoveryStartedAfter.map(String.init) ?? "never")")
+    model.advertiseHDRToCameras = true
+    verifier.check("HDR: turning it on reaches the backend once", calls.values == [false, true], "\(calls.values)")
+    model.advertiseHDRToCameras = true
+    verifier.check("HDR: setting the same value again does nothing", calls.values == [false, true], "\(calls.values)")
+    verifier.check("HDR: the setting persists", AppSettingsStore(defaults: defaults).advertiseHDRToCameras)
+    calls.values = []
+    let relaunched = make()
+    verifier.check("HDR: a relaunch applies the saved setting", relaunched.advertiseHDRToCameras && calls.values == [true],
+      "\(calls.values)")
+    relaunched.advertiseHDRToCameras = false
+    verifier.check("HDR: turning it off reaches the backend", calls.values == [true, false] &&
+      !AppSettingsStore(defaults: defaults).advertiseHDRToCameras, "\(calls.values)")
+  }
+
   func menuItems(_ items: [NSMenuItem]) -> [NSMenuItem] {
     items.flatMap { item in [item] + menuItems(item.submenu?.items ?? []) }
   }
@@ -1123,6 +1157,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   do { try run.lutModel() } catch { verifier.check("LUT model tests threw", false, "\(error)") }
   do { try MonitorLUTVerify.run(verifier: verifier) } catch { verifier.check("monitor LUT tests threw", false, "\(error)") }
   run.discovery()
+  run.hdrAdvertisement()
   run.adoption()
   run.sharedInput()
   run.pictureMenus()
