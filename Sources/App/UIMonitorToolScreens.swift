@@ -1,3 +1,4 @@
+import AppKit
 import MonitorKitCore
 import MonitorKitScopes
 import SwiftUI
@@ -10,6 +11,18 @@ import SwiftUI
     let name: String
     let view: AnyView
     let size: CGSize
+    /// A settings popover's own size, sized to its content; nil for the bar.
+    var popover: CGSize?
+  }
+
+  /// The margin around a popover in its render.
+  static let margin: CGFloat = 12
+
+  /// The size `view` takes when nothing constrains it, as a popover sizes it.
+  static func fittingSize(_ view: some View) -> CGSize {
+    let host = NSHostingView(rootView: view)
+    host.layoutSubtreeIfNeeded()
+    return host.fittingSize
   }
 
   /// A camera declared as Sony S-Gamut3.Cine / S-Log3 with the tools on.
@@ -80,10 +93,17 @@ import SwiftUI
       target: String, title: String, program: Bool) {
       let provider = UIFixtureMonitorSettings(session: session)
       provider.setPreferences(preferences, for: target)
-      screens.append(Screen(name: "monitor-tool-\(label)",
-        view: AnyView(UIMonitorToolSettingsView(panel: panel, cameraID: target, cameraName: title, isProgram: program,
-          provider: provider)),
-        size: CGSize(width: 340 + 28, height: 680)))
+      let settings = UIMonitorToolSettingsView(panel: panel, cameraID: target, cameraName: title, isProgram: program,
+        provider: provider)
+      let size = fittingSize(settings)
+      // Drawn on a popover-like card so the render shows the popover's bounds.
+      let card = settings
+        .background(.background, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.separator))
+        .padding(margin)
+        .background(Color(nsColor: .underPageBackgroundColor))
+      screens.append(Screen(name: "monitor-tool-\(label)", view: AnyView(card),
+        size: CGSize(width: ceil(size.width) + margin * 2, height: ceil(size.height) + margin * 2), popover: size))
     }
     let camera = cameraPreferences()
     panel("guides", .tool(.guides), camera, target: cameraID, title: name, program: false)
@@ -114,6 +134,11 @@ import SwiftUI
       view: AnyView(UIMonitorToolButtons(targetID: cameraID, name: name, activeTools: tools, isProgram: false,
         toggle: { _ in }, monitor: provider).padding(8).background(Color.black)),
       size: CGSize(width: 360, height: 48)))
+    // A narrow picture's bar: one menu button (its Settings items open the popovers).
+    screens.append(Screen(name: "monitor-tool-bar-collapsed",
+      view: AnyView(UIMonitorToolButtons(targetID: cameraID, name: name, activeTools: tools, isProgram: false,
+        toggle: { _ in }, monitor: provider).frame(width: 120).padding(8).background(Color.black)),
+      size: CGSize(width: 136, height: 48)))
     return screens
   }
 }

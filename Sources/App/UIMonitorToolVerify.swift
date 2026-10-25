@@ -6,7 +6,7 @@ import SwiftUI
 /// false-color modes a declaration offers and what its toggle turns on, the
 /// clip-indicator and zebra master-switch rules, the declaration's mode remap,
 /// the temperature slider's return to D65, the Picture button's "adjusted"
-/// state and the signal each popover's header names.
+/// state, the signal each popover's header names and each popover's size.
 @MainActor enum UIMonitorToolVerify {
   static let sony = "sony-slog3-sgamut3cine"
   static let sonyWide = "sony-slog3-sgamut3"
@@ -19,6 +19,18 @@ import SwiftUI
     declaration(verifier)
     picture(verifier)
     subtitles(verifier)
+    sizes(verifier)
+  }
+
+  /// Every settings popover fits a normal display without scrolling: wide,
+  /// not tall, and sized to its content.
+  static func sizes(_ verifier: Verifier) {
+    for screen in UIMonitorToolScreens.screens() {
+      guard let size = screen.popover else { continue }
+      verifier.check("\(screen.name) fits without scrolling",
+        (480...740).contains(size.width) && size.height <= 560 && size.height >= 120,
+        "\(Int(size.width))×\(Int(size.height)) pt")
+    }
   }
 
   /// A binding's storage; the checks run on the main actor only.
