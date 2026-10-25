@@ -25,55 +25,70 @@ struct UIGuideSettingsForm: View {
 
   var body: some View {
     let g = preferences.state.guides
-    Section {
-      Toggle("Guides", isOn: UIMonitorToolBindings.enabling($preferences, \.state.guides.enabled))
-      Picker("Frame guide", selection: frameAspect) {
-        ForEach(Self.aspects(current: g.frameGuides.first?.aspect ?? 0), id: \.self) { aspect in
-          Text(aspect == 0 ? "None" : UIMonitorToolText.aspect(aspect)).tag(aspect)
-        }
-      }
-      if !g.frameGuides.isEmpty {
-        Picker("Frame style", selection: firstGuide(\.style, .lines)) {
-          ForEach(FrameGuideStyle.allCases, id: \.self) { Text(UIMonitorToolText.frameGuideStyle($0)).tag($0) }
-        }
-        .pickerStyle(.segmented)
-        if g.frameGuides[0].style != .lines {
-          UIMonitorSlider("Matte", percent: firstGuide(\.matteOpacity, 0.6))
-        }
-        Toggle("Grids follow the frame", isOn: guides.followsFrameGuide)
-      }
-      LabeledContent("Safe area") {
-        HStack(spacing: 4) {
-          ForEach(safeAreaChoices(g), id: \.self) { percent in
-            Toggle(UIMonitorToolText.percent(percent), isOn: safeArea(percent)).toggleStyle(.button)
-              .accessibilityLabel("Safe area \(UIMonitorToolText.percent(percent))")
+    UIToolColumns {
+      UIToolGroup("Frame") {
+        Picker("Frame guide", selection: frameAspect) {
+          ForEach(Self.aspects(current: g.frameGuides.first?.aspect ?? 0), id: \.self) { aspect in
+            Text(aspect == 0 ? "None" : UIMonitorToolText.aspect(aspect)).tag(aspect)
           }
         }
+        .fixedSize()
+        .uiToolRow("Frame guide")
+        if !g.frameGuides.isEmpty {
+          Picker("Frame style", selection: firstGuide(\.style, .lines)) {
+            ForEach(FrameGuideStyle.allCases, id: \.self) { Text(UIMonitorToolText.frameGuideStyle($0)).tag($0) }
+          }
+          .pickerStyle(.segmented)
+          .uiToolRow("Style")
+          if g.frameGuides[0].style != .lines {
+            UIMonitorSlider("Matte", percent: firstGuide(\.matteOpacity, 0.6))
+          }
+        }
+        LabeledContent("Safe area") {
+          HStack(spacing: 4) {
+            ForEach(safeAreaChoices(g), id: \.self) { percent in
+              Toggle(UIMonitorToolText.percent(percent), isOn: safeArea(percent)).toggleStyle(.button)
+                .accessibilityLabel("Safe area \(UIMonitorToolText.percent(percent))")
+            }
+          }
+        }
+        if !g.frameGuides.isEmpty {
+          Toggle("Grids follow the frame", isOn: guides.followsFrameGuide).uiToolInline()
+        }
       }
-    } header: {
-      Text("Frame")
-    }
-    Section {
-      Toggle("Rule of thirds", isOn: guides.thirds)
-      Toggle("Square grid", isOn: guides.squareGrid)
-      if g.squareGrid {
-        Stepper("Grid rows: \(g.squareGridRows)", value: guides.squareGridRows, in: 2...16)
+      UIToolGroup("Grids and center") {
+        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+          GridRow {
+            Toggle("Rule of thirds", isOn: guides.thirds)
+            Toggle("Center cross", isOn: guides.centerCross)
+          }
+          GridRow {
+            Toggle("Diagonals", isOn: guides.diagonals)
+            Toggle("Center dot", isOn: guides.centerDot)
+          }
+          GridRow {
+            Toggle("Square grid", isOn: guides.squareGrid)
+            if g.squareGrid {
+              Stepper("Rows: \(g.squareGridRows)", value: guides.squareGridRows, in: 2...16)
+                .accessibilityLabel("Grid rows")
+                .accessibilityValue("\(g.squareGridRows)")
+            }
+          }
+        }
+        .uiToolInline()
       }
-      Toggle("Diagonals", isOn: guides.diagonals)
-      Toggle("Center cross", isOn: guides.centerCross)
-      Toggle("Center dot", isOn: guides.centerDot)
-    } header: {
-      Text("Grids and center")
-    }
-    Section {
-      ColorPicker("Color", selection: color, supportsOpacity: false)
-      UIMonitorSlider("Opacity", percent: guides.opacity)
-      UIMonitorSlider("Contrast", percent: guides.contrast)
-      UIMonitorSlider("Line width", value: guides.lineWidth, in: 0.5...4, step: 0.5) { String(format: "%.1f pt", $0) }
-      UIMonitorToolCaption("Contrast adds a dark edge so lines stay visible on bright areas. Guides are drawn on the monitor only; output and recordings are unchanged.")
+    } trailing: {
+      UIToolGroup("Look") {
+        ColorPicker("Color", selection: color, supportsOpacity: false)
+          .uiToolRow("Color")
+        UIMonitorSlider("Opacity", percent: guides.opacity)
+        UIMonitorSlider("Contrast", percent: guides.contrast)
+        UIMonitorSlider("Line width", value: guides.lineWidth, in: 0.5...4, step: 0.5) { String(format: "%.1f pt", $0) }
+        UIMonitorToolCaption("Contrast adds a dark edge so lines stay visible on bright areas.")
+      }
+      UIMonitorToolCaption("Guides are drawn on the monitor only; output and recordings are unchanged.")
+        .padding(.horizontal, 4)
       UIMonitorStatusNote(cameraID: cameraID, tools: [.guides])
-    } header: {
-      Text("Look")
     }
   }
 
@@ -136,40 +151,49 @@ struct UIZebraSettingsForm: View {
   let isProgram: Bool
 
   var body: some View {
-    ForEach(0..<MonitorState.maximumZebraSets, id: \.self) { index in
-      let zebra = UIMonitorToolBindings.zebra($preferences, index)
-      Section {
-        Toggle("Zebra \(index + 1)", isOn: UIMonitorToolBindings.zebraEnabled($preferences, index))
-        Picker("Mode", selection: zebra.mode) {
-          Text("Above threshold").tag(ZebraMode.lowerLimit)
-          Text("Band").tag(ZebraMode.band)
-        }
-        UIMonitorSlider("Threshold", value: zebra.level, in: 0...109, step: 1) { "\(Int($0.rounded())) IRE" }
-        // The band's full width; MonitorKit keeps its half-width (`range`).
-        UIMonitorSlider("Width", value: Binding(get: { zebra.wrappedValue.range * 2 },
-          set: { zebra.wrappedValue.range = $0 / 2 }), in: 0...30, step: 1) { "\(Int($0.rounded())) IRE" }
-          .disabled(zebra.wrappedValue.mode != .band)
-        UIMonitorSlider("Opacity", percent: zebra.opacity)
-        if index == 0 {
-          LabeledContent("Signal", value: UIMonitorToolText.stage(preferences.state.pictureStage))
-            .help("Zebra 1 measures the picture shown. Change it with the picture's signal menu.")
-        } else {
-          Picker("Signal", selection: zebra.stage) {
-            Text("Source").tag(SignalStage.source).disabled(isProgram)
-            Text("Output (LUT)").tag(SignalStage.output)
-            if zebra.wrappedValue.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
-          }
-        }
-      } header: {
-        Text(index == 0 ? "Zebra 1 · picture" : "Zebra 2")
-      }
-    }
-    Section {
+    UIToolColumns {
+      zebraGroup(0)
+    } trailing: {
+      zebraGroup(1)
+    } footer: {
       UIMonitorToolCaption("Threshold 0–109 IRE. In Band mode, Width sets the band around the threshold.")
       if preferences.toolsEnabled && preferences.falseColorDeclared {
         UIMonitorToolCaption("Zebra is bypassed while false color is on.")
       }
       UIMonitorStatusNote(cameraID: cameraID, tools: [.zebra1, .zebra2])
+    }
+  }
+
+  private func zebraGroup(_ index: Int) -> some View {
+    let zebra = UIMonitorToolBindings.zebra($preferences, index)
+    return UIToolGroup(index == 0 ? "Zebra 1 · picture" : "Zebra 2") {
+      Picker("Mode", selection: zebra.mode) {
+        Text("Above threshold").tag(ZebraMode.lowerLimit)
+        Text("Band").tag(ZebraMode.band)
+      }
+      .pickerStyle(.segmented)
+      .uiToolRow("Mode")
+      UIMonitorSlider("Threshold", value: zebra.level, in: 0...109, step: 1) { "\(Int($0.rounded())) IRE" }
+      // The band's full width; MonitorKit keeps its half-width (`range`).
+      UIMonitorSlider("Width", value: Binding(get: { zebra.wrappedValue.range * 2 },
+        set: { zebra.wrappedValue.range = $0 / 2 }), in: 0...30, step: 1) { "\(Int($0.rounded())) IRE" }
+        .disabled(zebra.wrappedValue.mode != .band)
+      UIMonitorSlider("Opacity", percent: zebra.opacity)
+      if index == 0 {
+        LabeledContent("Signal", value: UIMonitorToolText.stage(preferences.state.pictureStage))
+          .help("Zebra 1 measures the picture shown. Change it with the picture's signal menu.")
+      } else {
+        Picker("Signal", selection: zebra.stage) {
+          Text("Source").tag(SignalStage.source).disabled(isProgram)
+          Text("Output (LUT)").tag(SignalStage.output)
+          if zebra.wrappedValue.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
+        }
+        .fixedSize()
+        .uiToolRow("Signal")
+      }
+    } accessory: {
+      Toggle("Zebra \(index + 1)", isOn: UIMonitorToolBindings.zebraEnabled($preferences, index))
+        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
     }
   }
 }
@@ -181,25 +205,33 @@ struct UIFocusSettingsForm: View {
 
   var body: some View {
     let focus = $preferences.state.focus
-    Section {
-      Toggle("Focus peaking", isOn: UIMonitorToolBindings.enabling($preferences, \.state.focus.enabled))
-      Picker("Style", selection: focus.style) {
-        Text("Colored edges").tag(PeakingStyle.coloredEdges)
-        Text("Peak").tag(PeakingStyle.peak)
-      }
-      .pickerStyle(.segmented)
-      Picker("Highlight", selection: focus.color) {
-        ForEach(PeakingColor.allCases, id: \.self) { color in
-          Label { Text(color.rawValue.capitalized) } icon: {
-            Image(systemName: "circle.fill").foregroundStyle(color.rgb.color)
-          }
-          .tag(color)
+    UIToolColumns {
+      UIToolGroup("Style") {
+        Picker("Style", selection: focus.style) {
+          Text("Colored edges").tag(PeakingStyle.coloredEdges)
+          Text("Peak").tag(PeakingStyle.peak)
         }
+        .pickerStyle(.segmented)
+        .uiToolRow("Style")
+        Picker("Highlight", selection: focus.color) {
+          ForEach(PeakingColor.allCases, id: \.self) { color in
+            Label { Text(color.rawValue.capitalized) } icon: {
+              Image(systemName: "circle.fill").foregroundStyle(color.rgb.color)
+            }
+            .tag(color)
+          }
+        }
+        .fixedSize()
+        .uiToolRow("Highlight")
+        .disabled(preferences.state.focus.style != .coloredEdges)
       }
-      .disabled(preferences.state.focus.style != .coloredEdges)
-      UIMonitorSlider("Sensitivity", percent: focus.sensitivity)
-      UIMonitorSlider("Noise rejection", percent: focus.noiseRejection)
-      UIMonitorSlider("Opacity", percent: focus.opacity)
+    } trailing: {
+      UIToolGroup("Detection") {
+        UIMonitorSlider("Sensitivity", percent: focus.sensitivity)
+        UIMonitorSlider("Noise rejection", percent: focus.noiseRejection)
+        UIMonitorSlider("Opacity", percent: focus.opacity)
+      }
+    } footer: {
       UIMonitorToolCaption(preferences.state.focus.style == .peak
         ? "Peak brightens edges, like traditional sharpness peaking. Edges are found on the camera's source picture at full resolution."
         : "Edges are found on the camera's source picture at full resolution.")
@@ -217,49 +249,52 @@ struct UIClipIndicatorSettingsForm: View {
   var body: some View {
     let clip = $preferences.state.clipIndicators
     let c = preferences.state.clipIndicators
-    Section {
-      Toggle("Clip indicators", isOn: UIMonitorToolBindings.enabling($preferences, \.state.clipIndicators.enabled))
-      Picker("Signal", selection: clip.stage) {
-        Text("Source").tag(SignalStage.source).disabled(isProgram)
-        Text("Output (LUT)").tag(SignalStage.output)
-        if c.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
-      }
-      LabeledContent("Channels") {
-        HStack(spacing: 4) {
-          Toggle("R", isOn: clip.red).toggleStyle(.button).accessibilityLabel("Red channel")
-          Toggle("G", isOn: clip.green).toggleStyle(.button).accessibilityLabel("Green channel")
-          Toggle("B", isOn: clip.blue).toggleStyle(.button).accessibilityLabel("Blue channel")
-          Toggle("Y", isOn: clip.luma).toggleStyle(.button).accessibilityLabel("Luma")
+    UIToolColumns {
+      UIToolGroup("Measure") {
+        Picker("Signal", selection: clip.stage) {
+          Text("Source").tag(SignalStage.source).disabled(isProgram)
+          Text("Output (LUT)").tag(SignalStage.output)
+          if c.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
+        }
+        .fixedSize()
+        .uiToolRow("Signal")
+        LabeledContent("Channels") {
+          HStack(spacing: 4) {
+            Toggle("R", isOn: clip.red).toggleStyle(.button).accessibilityLabel("Red channel")
+            Toggle("G", isOn: clip.green).toggleStyle(.button).accessibilityLabel("Green channel")
+            Toggle("B", isOn: clip.blue).toggleStyle(.button).accessibilityLabel("Blue channel")
+            Toggle("Y", isOn: clip.luma).toggleStyle(.button).accessibilityLabel("Luma")
+          }
         }
       }
-    }
-    Section {
-      Toggle("Over", isOn: clip.showsOver)
-      UIMonitorSlider("At or above", value: clip.high, in: 90...109, step: 0.5) { String(format: "%.1f%%", $0) }
-        .disabled(!c.showsOver)
-      Toggle("Under", isOn: clip.showsUnder)
-      UIMonitorSlider("At or below", value: clip.low, in: -7...10, step: 0.5) { String(format: "%.1f%%", $0) }
-        .disabled(!c.showsUnder)
-    } header: {
-      Text("Levels")
-    }
-    Section {
-      Picker("Colors", selection: clip.coloring) {
-        Text("Per channel").tag(ClipIndicatorColoring.perChannel)
-        Text("Uniform").tag(ClipIndicatorColoring.uniform)
+      UIToolGroup("Levels") {
+        Toggle("Over", isOn: clip.showsOver)
+        UIMonitorSlider("At or above", value: clip.high, in: 90...109, step: 0.5) { String(format: "%.1f%%", $0) }
+          .disabled(!c.showsOver)
+        Toggle("Under", isOn: clip.showsUnder)
+        UIMonitorSlider("At or below", value: clip.low, in: -7...10, step: 0.5) { String(format: "%.1f%%", $0) }
+          .disabled(!c.showsUnder)
       }
-      .pickerStyle(.segmented)
-      if c.coloring == .uniform {
-        ColorPicker("Over color", selection: color(\.overColor), supportsOpacity: false)
-        ColorPicker("Under color", selection: color(\.underColor), supportsOpacity: false)
+    } trailing: {
+      UIToolGroup("Look") {
+        Picker("Colors", selection: clip.coloring) {
+          Text("Per channel").tag(ClipIndicatorColoring.perChannel)
+          Text("Uniform").tag(ClipIndicatorColoring.uniform)
+        }
+        .pickerStyle(.segmented)
+        .uiToolRow("Colors")
+        if c.coloring == .uniform {
+          ColorPicker("Over color", selection: color(\.overColor), supportsOpacity: false)
+            .uiToolRow("Over color")
+          ColorPicker("Under color", selection: color(\.underColor), supportsOpacity: false)
+            .uiToolRow("Under color")
+        }
+        UIMonitorSlider("Opacity", percent: clip.opacity)
+        UIMonitorToolCaption(c.coloring == .perChannel
+          ? "Clipped channels show in their own colors and mix: all three clipped show white. Under-range shows the same mix at half level."
+          : "Any clipped channel shows in the over or under color.")
       }
-      UIMonitorSlider("Opacity", percent: clip.opacity)
-      UIMonitorToolCaption(c.coloring == .perChannel
-        ? "Clipped channels show in their own colors and mix: all three clipped show white. Under-range shows the same mix at half level."
-        : "Any clipped channel shows in the over or under color.")
       UIMonitorStatusNote(cameraID: cameraID, tools: [.clipIndicators])
-    } header: {
-      Text("Look")
     }
   }
 
@@ -279,10 +314,7 @@ struct UIScopeSettingsForm: View {
   var measurement: (signal: SignalDescription?, stageLUT: Bool) = (nil, false)
 
   var body: some View {
-    Section {
-      Toggle("Scope", isOn: UIMonitorToolBindings.enabling($preferences, \.scopes.enabled))
-      UIScopeSettingsView(scopes: $preferences.scopes, isProgram: isProgram, signal: measurement.signal,
-        stageLUT: measurement.stageLUT)
-    }
+    UIScopeSettingsView(scopes: $preferences.scopes, isProgram: isProgram, signal: measurement.signal,
+      stageLUT: measurement.stageLUT, layout: .columns)
   }
 }

@@ -40,70 +40,79 @@ struct UIPictureSettingsForm: View {
 
   var body: some View {
     let state = $preferences.state
-    Section {
-      Picker("Signal", selection: UIMonitorToolBindings.pictureStage($preferences)) {
-        Text("Source (camera signal)").tag(SignalStage.source).disabled(isProgram)
-        Text("Output (LUT)").tag(SignalStage.output)
-        Text("Monitor").tag(SignalStage.monitor)
+    let mode = preferences.state.displayTransform.mode
+    UIToolColumns {
+      UIToolGroup("Picture") {
+        Picker("Signal", selection: UIMonitorToolBindings.pictureStage($preferences)) {
+          Text("Source (camera signal)").tag(SignalStage.source).disabled(isProgram)
+          Text("Output (LUT)").tag(SignalStage.output)
+          Text("Monitor").tag(SignalStage.monitor)
+        }
+        .fixedSize()
+        .uiToolRow("Signal")
+        UIMonitorToolCaption(isProgram
+          ? "On Program the picture is Program Output; Source is unavailable."
+          : "Output (LUT) is the camera's source with the burn-in LUT, as published. Zebra 1 measures the picture shown.")
+        UIMonitorStatusNote(cameraID: cameraID, tools: [.picture, .burnInLUT, .monitorLUT], explainsCodeValues: true)
       }
-      UIMonitorToolCaption(isProgram
-        ? "On Program the picture is Program Output; Source is unavailable."
-        : "Output (LUT) is the camera's source with the burn-in LUT, as published. Zebra 1 measures the picture shown.")
-      UIMonitorStatusNote(cameraID: cameraID, tools: [.picture, .burnInLUT, .monitorLUT], explainsCodeValues: true)
-    } header: {
-      Text("Picture")
-    }
-    Section {
-      Picker("Transform", selection: state.displayTransform.mode) {
-        ForEach(DisplayTransform.allCases, id: \.self) { Text(UIMonitorToolText.displayTransform($0)).tag($0) }
-      }
-      let mode = preferences.state.displayTransform.mode
-      if mode == .hdrToSDR || mode == .hdrPassthrough {
-        Picker("PQ mastering peak", selection: state.displayTransform.pqSourcePeak) {
-          ForEach(Self.pqPeaks, id: \.self) { Text("\(Int($0)) cd/m²").tag($0) }
-          let peak = preferences.state.displayTransform.pqSourcePeak
-          if !Self.pqPeaks.contains(peak) { Text("\(Int(peak)) cd/m²").tag(peak) }
+      UIToolGroup("Display transform") {
+        Picker("Transform", selection: state.displayTransform.mode) {
+          ForEach(DisplayTransform.allCases, id: \.self) { Text(UIMonitorToolText.displayTransform($0)).tag($0) }
+        }
+        .uiToolRow("Transform")
+        if mode == .hdrToSDR || mode == .hdrPassthrough {
+          Picker("PQ mastering peak", selection: state.displayTransform.pqSourcePeak) {
+            ForEach(Self.pqPeaks, id: \.self) { Text("\(Int($0)) cd/m²").tag($0) }
+            let peak = preferences.state.displayTransform.pqSourcePeak
+            if !Self.pqPeaks.contains(peak) { Text("\(Int(peak)) cd/m²").tag(peak) }
+          }
+          .fixedSize()
+          .uiToolRow("PQ mastering peak")
+        }
+        UIMonitorToolCaption(Self.transformCaption(mode))
+        UIMonitorStatusNote(cameraID: cameraID, tools: [.displayTransform])
+        if mode == .logToRec709 && !isProgram {
+          Divider()
+          UISignalDeclarationFields(preferences: $preferences, isProgram: isProgram)
         }
       }
-      UIMonitorToolCaption(Self.transformCaption(mode))
-      UIMonitorStatusNote(cameraID: cameraID, tools: [.displayTransform])
-      if mode == .logToRec709 && !isProgram {
-        UISignalDeclarationFields(preferences: $preferences, isProgram: isProgram)
+    } trailing: {
+      UIToolGroup("Geometry") {
+        Picker("De-squeeze", selection: state.geometry.desqueeze) {
+          ForEach(desqueezeChoices, id: \.self) { Text(UIMonitorToolText.desqueeze($0)).tag($0) }
+        }
+        .fixedSize()
+        .uiToolRow("De-squeeze")
+        Picker("Flip", selection: state.geometry.flip) {
+          ForEach(FlipMode.allCases, id: \.self) { Text(UIMonitorToolText.flip($0)).tag($0) }
+        }
+        .fixedSize()
+        .uiToolRow("Flip")
+        UIMonitorToolCaption("Zoom is in the picture's zoom menu, for this view only.")
+        UIMonitorStatusNote(cameraID: cameraID, tools: [.desqueeze, .flip])
       }
-    } header: {
-      Text("Display transform")
-    }
-    Section {
-      Picker("De-squeeze", selection: state.geometry.desqueeze) {
-        ForEach(desqueezeChoices, id: \.self) { Text(UIMonitorToolText.desqueeze($0)).tag($0) }
+      UIToolGroup("Display") {
+        let display = state.display
+        UIMonitorSlider("Brightness", value: display.brightness, in: -1...1, step: 0.01) { String(format: "%+.0f%%", $0 * 100) }
+        UIMonitorSlider("Contrast", value: display.contrast, in: 0...2, step: 0.01) { String(format: "%.2f×", $0) }
+        UIMonitorSlider("Saturation", value: display.saturation, in: 0...2, step: 0.01) { String(format: "%.2f×", $0) }
+        UIMonitorSlider("Temperature", value: temperature, in: WhitePointTrim.temperatureRange, step: 50) {
+          String(format: "%.0f K", $0)
+        }
+        UIMonitorSlider("Tint", value: display.tint, in: WhitePointTrim.tintRange, step: 0.001) { String(format: "%+.3f", $0) }
+        Picker("Color", selection: display.monochrome) {
+          ForEach(MonochromeMode.allCases, id: \.self) { Text(UIMonitorToolText.monochrome($0)).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .uiToolRow("Color")
+        HStack(alignment: .firstTextBaseline) {
+          UIMonitorToolCaption("Display adjustments change this monitor's picture only, never tools, legends or output.")
+          Spacer(minLength: 8)
+          Button("Reset Display") { preferences.state.display = DisplayAdjustments() }
+            .disabled(preferences.state.display.isIdentity)
+        }
+        UIMonitorStatusNote(cameraID: cameraID, tools: [.displayAdjustments])
       }
-      Picker("Flip", selection: state.geometry.flip) {
-        ForEach(FlipMode.allCases, id: \.self) { Text(UIMonitorToolText.flip($0)).tag($0) }
-      }
-      UIMonitorToolCaption("Zoom is in the picture's zoom menu, for this view only.")
-      UIMonitorStatusNote(cameraID: cameraID, tools: [.desqueeze, .flip])
-    } header: {
-      Text("Geometry")
-    }
-    Section {
-      let display = state.display
-      UIMonitorSlider("Brightness", value: display.brightness, in: -1...1, step: 0.01) { String(format: "%+.0f%%", $0 * 100) }
-      UIMonitorSlider("Contrast", value: display.contrast, in: 0...2, step: 0.01) { String(format: "%.2f×", $0) }
-      UIMonitorSlider("Saturation", value: display.saturation, in: 0...2, step: 0.01) { String(format: "%.2f×", $0) }
-      Picker("Color", selection: display.monochrome) {
-        ForEach(MonochromeMode.allCases, id: \.self) { Text(UIMonitorToolText.monochrome($0)).tag($0) }
-      }
-      .pickerStyle(.segmented)
-      UIMonitorSlider("Temperature", value: temperature, in: WhitePointTrim.temperatureRange, step: 50) {
-        String(format: "%.0f K", $0)
-      }
-      UIMonitorSlider("Tint", value: display.tint, in: WhitePointTrim.tintRange, step: 0.001) { String(format: "%+.3f", $0) }
-      Button("Reset Display") { preferences.state.display = DisplayAdjustments() }
-        .disabled(preferences.state.display.isIdentity)
-      UIMonitorToolCaption("Display adjustments change this monitor's picture only, never tools, legends or output.")
-      UIMonitorStatusNote(cameraID: cameraID, tools: [.displayAdjustments])
-    } header: {
-      Text("Display")
     }
   }
 

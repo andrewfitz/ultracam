@@ -55,17 +55,20 @@ struct UISignalDeclarationFields: View {
         Text("Unsupported saved profile").tag(profile).disabled(true)
       }
     }
+    .uiToolRow("Camera log")
     .disabled(isProgram)
     Picker("Input code range", selection: $preferences.signal.range) {
       Text("Format native").tag(Optional<CodeRange>.none)
       Text("Legal (64…940 at 10-bit)").tag(Optional(CodeRange.legal))
       Text("Full (0…1023 at 10-bit)").tag(Optional(CodeRange.full))
     }
+    .uiToolRow("Input code range")
     .disabled(isProgram)
     Picker("Log transport", selection: $preferences.signal.transport) {
       Text("Native 10-bit codes").tag(LogTransport.native)
       Text("Full codes rescaled to legal").tag(LogTransport.fullRescaledToLegal)
     }
+    .uiToolRow("Log transport")
     .disabled(profile == nil || isProgram)
     UIMonitorToolCaption(isProgram
       ? "Program is not a camera signal, so it has no camera log to declare."
@@ -98,47 +101,56 @@ struct UIFalseColorSettingsForm: View {
     let profile = preferences.signal.logProfileID
     let mode = preferences.state.falseColor.mode
     let fc = $preferences.state.falseColor
-    Section {
-      Picker("Mode", selection: UIMonitorToolBindings.falseColorMode($preferences)) {
-        ForEach(UIFalseColorChoices.modes, id: \.self) { choice in
-          Text(UIMonitorToolText.falseColor(choice)).tag(choice)
-            .disabled(!UIFalseColorChoices.isAvailable(choice, profile: profile, isProgram: isProgram))
+    UIToolColumns {
+      UIToolGroup("Mode") {
+        Picker("Mode", selection: UIMonitorToolBindings.falseColorMode($preferences)) {
+          ForEach(UIFalseColorChoices.modes, id: \.self) { choice in
+            Text(UIMonitorToolText.falseColor(choice)).tag(choice)
+              .disabled(!UIFalseColorChoices.isAvailable(choice, profile: profile, isProgram: isProgram))
+          }
         }
-      }
-      if mode == .sixBand || mode == .custom {
-        Picker("Signal", selection: fc.stage) {
-          Text("Source").tag(SignalStage.source)
-          Text("Output (LUT)").tag(SignalStage.output)
-          if preferences.state.falseColor.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
+        .fixedSize()
+        .uiToolRow("Mode")
+        if mode == .sixBand || mode == .custom {
+          Picker("Signal", selection: fc.stage) {
+            Text("Source").tag(SignalStage.source)
+            Text("Output (LUT)").tag(SignalStage.output)
+            if preferences.state.falseColor.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
+          }
+          .fixedSize()
+          .uiToolRow("Signal")
         }
+        if mode == .custom {
+          Picker("Unit", selection: fc.customUnit) {
+            Text("IRE").tag(FalseColorUnit.ire)
+            Text("Stops").tag(FalseColorUnit.stops)
+          }
+          .pickerStyle(.segmented)
+          .fixedSize()
+          .uiToolRow("Unit")
+        }
+        if mode == .custom && preferences.state.falseColor.customUnit == .stops {
+          Stepper(value: fc.referenceOffsetStops, in: -6...6, step: 0.25) {
+            Text("Exposure offset \(preferences.state.falseColor.referenceOffsetStops, specifier: "%+.2f") stops")
+              .font(.callout)
+          }
+          .help("Adds stops to measured source exposure. Camera EI is independent.")
+          .uiToolInline()
+        }
+        UIMonitorToolCaption(isProgram && mode.needsLogSource
+          ? "Program is not a camera signal, so log false color is off. Six band and custom bands work on Program."
+          : Self.caption(mode, profile: profile))
+        UIMonitorStatusNote(cameraID: cameraID, tools: [.falseColor])
       }
+      UIToolGroup("Camera signal") {
+        UISignalDeclarationFields(preferences: $preferences, isProgram: isProgram)
+      }
+    } trailing: {
       if mode == .custom {
-        Picker("Unit", selection: fc.customUnit) {
-          Text("IRE").tag(FalseColorUnit.ire)
-          Text("Stops").tag(FalseColorUnit.stops)
-        }
-        .pickerStyle(.segmented)
+        UIFalseColorBandEditor(settings: fc)
       }
-      if mode == .custom && preferences.state.falseColor.customUnit == .stops {
-        Stepper(value: fc.referenceOffsetStops, in: -6...6, step: 0.25) {
-          Text("Exposure offset \(preferences.state.falseColor.referenceOffsetStops, specifier: "%+.2f") stops")
-        }
-        .help("Adds stops to measured source exposure. Camera EI is independent.")
-      }
-      UIMonitorToolCaption(isProgram && mode.needsLogSource
-        ? "Program is not a camera signal, so log false color is off. Six band and custom bands work on Program."
-        : Self.caption(mode, profile: profile))
-      UIMonitorStatusNote(cameraID: cameraID, tools: [.falseColor])
-    }
-    if mode == .custom {
-      UIFalseColorBandEditor(settings: fc)
-    }
-    UIFalseColorLegendSection(cameraID: cameraID, settings: preferences.state.falseColor,
-      declaration: preferences.signal)
-    Section {
-      UISignalDeclarationFields(preferences: $preferences, isProgram: isProgram)
-    } header: {
-      Text("Camera signal")
+      UIFalseColorLegendSection(cameraID: cameraID, settings: preferences.state.falseColor,
+        declaration: preferences.signal)
     }
   }
 
@@ -173,7 +185,7 @@ private struct UIFalseColorBandEditor: View {
 
   var body: some View {
     let unit = settings.customUnit == .ire ? "IRE" : "stops"
-    Section {
+    UIToolGroup("Bands") {
       ForEach(Array(settings.customBands.indices), id: \.self) { index in
         HStack(spacing: 6) {
           ColorPicker("Band \(index + 1) color", selection: color(index), supportsOpacity: false).labelsHidden()
@@ -203,8 +215,6 @@ private struct UIFalseColorBandEditor: View {
       if settings.customBands.isEmpty {
         UIMonitorToolCaption("No bands yet: false color shows nothing until you add one.")
       }
-    } header: {
-      Text("Bands")
     }
   }
 
@@ -246,10 +256,17 @@ struct UIFalseColorLegendSection: View {
   @ViewBuilder static func legend(settings: FalseColorSettings, signal: SignalDescription,
     unavailable: MonitorUnavailableReason?) -> some View {
     if let legend = FalseColorLegend(settings: settings, signal: signal) {
-      Section {
-        FalseColorLegendView(legend: legend, style: .captioned, unavailable: unavailable)
-      } header: {
-        Text("Legend")
+      UIToolGroup("Legend") {
+        UIFalseColorLegendGrid(legend: legend, unavailable: unavailable)
+      } accessory: {
+        Text(legend.unit.symbol).font(.uiMeta).foregroundStyle(.secondary)
+      }
+    } else {
+      // No table to show: off, an ARRI table without a LogC signal, or no custom bands.
+      UIToolGroup("Legend") {
+        UIMonitorToolCaption(settings.mode == .off
+          ? "Choose a mode to see its bands here."
+          : "No bands to show for this mode and signal.")
       }
     }
   }
@@ -263,5 +280,88 @@ struct UIFalseColorLegendSection: View {
         signal: declaration.applied(to: presenter.shownSignal ?? SignalDescription()),
         unavailable: presenter.shownStatus.reason(for: .falseColor))
     }
+  }
+}
+
+/// MonitorKit's captioned legend, laid out compactly: the headline and the
+/// reference's captions, the bands brightest first as a swatch grid (two
+/// columns when they fit without truncating), then the footnotes. Label colors and
+/// outlined swatches read in light and dark.
+struct UIFalseColorLegendGrid: View {
+  let legend: FalseColorLegend
+  /// The surface status's reason for `.falseColor`; it replaces the swatches.
+  let unavailable: MonitorUnavailableReason?
+
+  /// Why nothing is drawn: the surface's reason, else the legend's own check.
+  var unavailableText: String? { unavailable.map { "Unavailable: \($0.description)" } ?? legend.unavailableNote }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Text(legend.headline).font(.caption.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+      if let reason = unavailableText {
+        Label(reason, systemImage: "exclamationmark.triangle")
+          .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      } else {
+        ForEach(Array(legend.captions.enumerated()), id: \.offset) { _, line in
+          Text(line).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        swatches
+        ForEach(Array(legend.footnotes.enumerated()), id: \.offset) { _, line in
+          Text(line).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+      }
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("False color legend, \(legend.headline)")
+  }
+
+  /// Two columns when every name and range fits in them, else one.
+  @ViewBuilder private var swatches: some View {
+    if legend.entries.count > 3 {
+      ViewThatFits(in: .horizontal) {
+        grid(columns: 2)
+        grid(columns: 1)
+      }
+    } else {
+      grid(columns: 1)
+    }
+  }
+
+  /// Brightest first, down the first column and then the next. Each band is a
+  /// swatch, name and range in grid columns sized to their widest cell, so
+  /// nothing truncates: when two columns are too wide, one is used.
+  private func grid(columns: Int) -> some View {
+    let entries = legend.displayOrder
+    let rows = (entries.count + columns - 1) / columns
+    return Grid(alignment: .leading, horizontalSpacing: 6, verticalSpacing: 3) {
+      ForEach(0..<rows, id: \.self) { row in
+        GridRow {
+          ForEach(0..<columns, id: \.self) { column in
+            let index = column * rows + row
+            if index < entries.count {
+              swatch(entries[index]).padding(.leading, column > 0 ? 12 : 0)
+              Text(entries[index].name).lineLimit(1).accessibilityHidden(true)
+              Text(entries[index].range).monospacedDigit().foregroundStyle(.secondary).lineLimit(1)
+                .gridColumnAlignment(.trailing)
+                .accessibilityHidden(true)
+            }
+          }
+        }
+      }
+    }
+    .font(.caption)
+    .fixedSize()
+    .padding(.vertical, 2)
+  }
+
+  /// A band's color, outlined so white and black bands show in either appearance.
+  /// It carries the band's name and range for VoiceOver.
+  private func swatch(_ entry: FalseColorLegend.Entry) -> some View {
+    RoundedRectangle(cornerRadius: 2)
+      .fill(entry.color.color)
+      .frame(width: 12, height: 10)
+      .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.primary.opacity(0.25), lineWidth: 0.5))
+      .accessibilityElement()
+      .accessibilityLabel("\(entry.name), \(entry.range) \(legend.unit.symbol)")
   }
 }

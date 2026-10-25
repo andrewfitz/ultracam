@@ -7,11 +7,15 @@ import SwiftUI
 /// zoom, targets and skin tone line, the histogram's mode and counts, trace
 /// gain, graticule and the clip readout levels. (Scopes follow every video frame.)
 ///
-/// Plain controls without a container, so a host can put them in a `Form` or in
-/// MonitorKit's tile toolbar popover. The host's own switch turns scopes on;
-/// these settings never do. Every change edits only the field it names, so the
-/// classic look (`ScopeSettings.plainWaveform`) survives a change of scope.
+/// `.stacked` is plain controls without a container, so a host can put them in
+/// a `Form` or in MonitorKit's tile toolbar popover. `.columns` lays them out as
+/// the monitor tool popovers do: the scope and its signal beside its look and
+/// readout. The host's own switch turns scopes on; these settings never do.
+/// Every change edits only the field it names, so the classic look
+/// (`ScopeSettings.plainWaveform`) survives a change of scope.
 struct UIScopeSettingsView: View {
+  enum Layout { case stacked, columns }
+
   @Binding var scopes: MonitorScopePreferences
   var isProgram: Bool
   /// The picture's signal and whether a LUT is on the scope's stage
@@ -19,6 +23,7 @@ struct UIScopeSettingsView: View {
   /// signal the scope measures, and so which scales fit it.
   var signal: SignalDescription?
   var stageLUT: Bool
+  var layout: Layout = .stacked
 
   /// Whether the menus offer every MonitorKit scope and scale. The main
   /// window's scope strip draws and labels every scope (`UIScopeImage`) and
@@ -42,19 +47,66 @@ struct UIScopeSettingsView: View {
 
   var body: some View {
     let d = description
+    switch layout {
+    case .stacked:
+      row("Scope") { scopePicker(d) }
+      if d.settings.kind == .histogram { row("Channels") { channelsPicker } }
+      row("Signal") { signalPicker }
+      levelControls(d)
+      kindControls(d)
+      if d.usesMatrix { row("Matrix") { matrixPicker } }
+      traceControls
+      caption(d)
+    case .columns:
+      UIToolColumns {
+        UIToolGroup("Scope") {
+          row("Scope") { scopePicker(d) }
+          if d.settings.kind == .histogram { row("Channels") { channelsPicker } }
+          row("Signal") { signalPicker }
+          if d.usesMatrix { row("Matrix") { matrixPicker } }
+        }
+        if d.hasLevelAxis {
+          UIToolGroup("Levels") { levelControls(d) }
+        }
+      } trailing: {
+        UIToolGroup("Display") {
+          kindControls(d)
+          UIScopeSlider(title: "Trace gain", value: settings.display.gain, range: 0.25...4, format: "%.2f×")
+          Toggle("Graticule", isOn: settings.display.showsGraticule)
+        }
+        UIToolGroup("Clip readout") { clipControls }
+      } footer: {
+        caption(d)
+      }
+    }
+  }
+
+  /// A control as a row: inline as before when stacked, in the label column in columns.
+  @ViewBuilder private func row<Control: View>(_ title: String, @ViewBuilder _ control: () -> Control) -> some View {
+    switch layout {
+    case .stacked: control()
+    case .columns: control().fixedSize().uiToolRow(title)
+    }
+  }
+
+  private func scopePicker(_ d: UIScopeDescription) -> some View {
     Picker("Scope", selection: choice) {
       ForEach(UIScopeChoice.allCases.filter { Self.offersEveryScope || $0.isWaveform || $0 == d.choice }) {
         Text($0.title).tag($0)
       }
     }
     .accessibilityHint(Self.offersEveryScope ? "Waveform, parade, vectorscope or histogram" : "Waveform or parade")
-    if d.settings.kind == .histogram {
-      Picker("Channels", selection: settings.histogramMode) {
-        Text("Luma").tag(HistogramMode.luma)
-        Text("RGB overlay").tag(HistogramMode.rgbOverlay)
-        Text("RGB parade").tag(HistogramMode.rgbParade)
-      }
+  }
+
+  private var channelsPicker: some View {
+    Picker("Channels", selection: settings.histogramMode) {
+      Text("Luma").tag(HistogramMode.luma)
+      Text("RGB overlay").tag(HistogramMode.rgbOverlay)
+      Text("RGB parade").tag(HistogramMode.rgbParade)
     }
+  }
+
+  private var signalPicker: some View {
     Picker("Signal", selection: settings.stage) {
       Text("Source").tag(SignalStage.source).disabled(isProgram)
       Text(isProgram ? "Program Output" : "Output (LUT)").tag(SignalStage.output)
@@ -63,22 +115,43 @@ struct UIScopeSettingsView: View {
       }
     }
     .help("The stage the scope measures. Output (LUT) is the source with the burned-in LUT, as published.")
-    if d.hasLevelAxis {
-      Picker("Look", selection: look) {
-        ForEach(UIScopeLook.allCases) { Text($0.title).tag(Optional($0)) }
-        if UIScopeLook(scopes.settings) == nil {
-          Text("Custom").tag(Optional<UIScopeLook>.none).disabled(true)
-        }
+  }
+
+  private var matrixPicker: some View {
+    Picker("Matrix", selection: settings.colorimetry) {
+      Text("Automatic").tag(ScopeColorimetry.auto)
+      Text("BT.601").tag(ScopeColorimetry.bt601)
+      Text("BT.709").tag(ScopeColorimetry.bt709)
+      Text("BT.2020").tag(ScopeColorimetry.bt2020)
+      if scopes.settings.colorimetry == .smpte240m {
+        Text("SMPTE 240M").tag(ScopeColorimetry.smpte240m)
       }
-      .help("Classic is the earlier Ultracam scope: −10…110 IRE with its trace colours.")
-      if scales.count > 1 {
-        Picker("Scale", selection: settings.display.waveformScale) {
-          ForEach(scales, id: \.self) { scale in
-            Text(UIScopeDescription.scaleTitle(scale)).tag(scale)
-              .disabled(!d.offers(scale) && scopes.settings.display.waveformScale != scale)
+    }
+    .help("The Y'CbCr weights of the drawn luma and chroma. Automatic uses the camera's matrix for the source and BT.709 after a LUT.")
+  }
+
+  /// The look, the level scale and its note, for scopes with a level axis.
+  @ViewBuilder private func levelControls(_ d: UIScopeDescription) -> some View {
+    if d.hasLevelAxis {
+      row("Look") {
+        Picker("Look", selection: look) {
+          ForEach(UIScopeLook.allCases) { Text($0.title).tag(Optional($0)) }
+          if UIScopeLook(scopes.settings) == nil {
+            Text("Custom").tag(Optional<UIScopeLook>.none).disabled(true)
           }
         }
-        .help("Nits scales read light levels on PQ and HLG signals.")
+        .help("Classic is the earlier Ultracam scope: −10…110 IRE with its trace colours.")
+      }
+      if scales.count > 1 {
+        row("Scale") {
+          Picker("Scale", selection: settings.display.waveformScale) {
+            ForEach(scales, id: \.self) { scale in
+              Text(UIScopeDescription.scaleTitle(scale)).tag(scale)
+                .disabled(!d.offers(scale) && scopes.settings.display.waveformScale != scale)
+            }
+          }
+          .help("Nits scales read light levels on PQ and HLG signals.")
+        }
       }
       if let note = d.scaleNote, Self.offersEveryScope || scopes.settings.display.waveformScale != .percent {
         HStack(alignment: .firstTextBaseline) {
@@ -94,44 +167,53 @@ struct UIScopeSettingsView: View {
         }
       }
     }
+  }
+
+  /// The vectorscope's zoom, targets and skin tone line; the histogram's counts.
+  @ViewBuilder private func kindControls(_ d: UIScopeDescription) -> some View {
     switch d.settings.kind {
     case .vectorscope:
-      Picker("Zoom", selection: settings.vectorscopeZoom) {
-        ForEach(ScopeSettings.vectorscopeZooms, id: \.self) { Text("\($0)×").tag($0) }
+      row("Zoom") {
+        Picker("Zoom", selection: settings.vectorscopeZoom) {
+          ForEach(ScopeSettings.vectorscopeZooms, id: \.self) { Text("\($0)×").tag($0) }
+        }
       }
-      Picker("Targets", selection: settings.display.vectorscopeTargets) {
-        Text("None").tag(VectorscopeTargets.none)
-        Text("75%").tag(VectorscopeTargets.percent75)
-        Text("100%").tag(VectorscopeTargets.percent100)
-        Text("75% and 100%").tag(VectorscopeTargets.both)
+      row("Targets") {
+        Picker("Targets", selection: settings.display.vectorscopeTargets) {
+          Text("None").tag(VectorscopeTargets.none)
+          Text("75%").tag(VectorscopeTargets.percent75)
+          Text("100%").tag(VectorscopeTargets.percent100)
+          Text("75% and 100%").tag(VectorscopeTargets.both)
+        }
       }
       Toggle("Skin tone line", isOn: settings.display.showsSkinToneLine)
     case .histogram:
-      Picker("Counts", selection: settings.display.histogramScale) {
-        Text("Linear").tag(HistogramScale.linear)
-        Text("Logarithmic").tag(HistogramScale.logarithmic)
+      row("Counts") {
+        Picker("Counts", selection: settings.display.histogramScale) {
+          Text("Linear").tag(HistogramScale.linear)
+          Text("Logarithmic").tag(HistogramScale.logarithmic)
+        }
       }
     case .waveform:
       EmptyView()
     }
-    if d.usesMatrix {
-      Picker("Matrix", selection: settings.colorimetry) {
-        Text("Automatic").tag(ScopeColorimetry.auto)
-        Text("BT.601").tag(ScopeColorimetry.bt601)
-        Text("BT.709").tag(ScopeColorimetry.bt709)
-        Text("BT.2020").tag(ScopeColorimetry.bt2020)
-        if scopes.settings.colorimetry == .smpte240m {
-          Text("SMPTE 240M").tag(ScopeColorimetry.smpte240m)
-        }
-      }
-      .help("The Y'CbCr weights of the drawn luma and chroma. Automatic uses the camera's matrix for the source and BT.709 after a LUT.")
-    }
+  }
+
+  /// Trace gain, graticule and the clip readout's levels, as stacked.
+  @ViewBuilder private var traceControls: some View {
     UIScopeSlider(title: "Trace gain", value: settings.display.gain, range: 0.25...4, format: "%.2f×")
     Toggle("Graticule", isOn: settings.display.showsGraticule)
+    clipControls
+  }
+
+  @ViewBuilder private var clipControls: some View {
     UIScopeSlider(title: "Clip above", value: settings.clipHighPercent, range: 90...109, format: "%.0f%%", step: 1)
       .help("The clip readout counts pixels at or above this level, per R, G, B and luma.")
     UIScopeSlider(title: "Clip below", value: settings.clipLowPercent, range: -7...10, format: "%.0f%%", step: 1)
       .help("The clip readout counts pixels at or below this level, per R, G, B and luma.")
+  }
+
+  private func caption(_ d: UIScopeDescription) -> some View {
     Text("One scope per camera. \(d.caption).")
       .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
   }

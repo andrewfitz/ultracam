@@ -39,6 +39,8 @@ struct UIMonitorToolButtons: View {
   let toggle: @MainActor (UIMonitorTool) -> Void
   let monitor: any UIMonitorSettingsProviding
   @State private var openPanel: UIMonitorPanel?
+  /// The popover opened from the collapsed menu's Settings items.
+  @State private var menuPanel: UIMonitorPanel?
 
   /// A camera's tools; toggles go through the interface's actions.
   init(camera: UICameraPresentation, context: UIContext) {
@@ -91,6 +93,14 @@ struct UIMonitorToolButtons: View {
           .disabled(UIMonitorToolSettingsView.unavailableReason(tool, isProgram: isProgram) != nil)
       }
       Toggle(UIMonitorPanel.clipIndicators.title, isOn: Binding(get: { clipOn }, set: { _ in toggleClip() }))
+      Divider()
+      // A menu can't hold the settings, so these open the same popover the
+      // bar's chevrons do, from this button.
+      Menu("Settings") {
+        ForEach(Self.panels, id: \.self) { panel in
+          Button("\(panel.title)\u{2026}") { menuPanel = panel }
+        }
+      }
     } label: {
       Image(systemName: activeTitles.isEmpty ? "slider.horizontal.3" : "slider.horizontal.below.square.filled.and.square")
         .font(.callout.weight(.medium))
@@ -105,7 +115,14 @@ struct UIMonitorToolButtons: View {
     .uiPictureControls()
     .help(activeTitles.isEmpty ? "Monitor tools" : "Monitor tools: " + activeTitles.joined(separator: ", "))
     .accessibilityLabel("Monitor tools for \(name)")
+    .popover(isPresented: Binding(get: { menuPanel != nil }, set: { if !$0 { menuPanel = nil } }),
+      arrowEdge: .bottom) {
+      if let menuPanel { settings(menuPanel) }
+    }
   }
+
+  /// Every popover of the bar, in its order.
+  static let panels: [UIMonitorPanel] = UIMonitorTool.allCases.map { .tool($0) } + [.clipIndicators, .picture]
 
   private var bar: some View {
     HStack(spacing: 2) {
@@ -271,27 +288,55 @@ struct UIMonitorToolSettingsView: View {
     }
   }
 
+  /// The tool's own switch, in the header: one per tool that has a single one.
+  /// Zebra has a switch per set, false color its mode, the picture none.
+  private var headerSwitch: (label: String, isOn: Binding<Bool>)? {
+    switch panel {
+    case .tool(.guides): return ("Guides", UIMonitorToolBindings.enabling($preferences, \.state.guides.enabled))
+    case .tool(.focus): return ("Focus peaking", UIMonitorToolBindings.enabling($preferences, \.state.focus.enabled))
+    case .tool(.scopes): return ("Scope", UIMonitorToolBindings.enabling($preferences, \.scopes.enabled))
+    case .clipIndicators:
+      return ("Clip indicators", UIMonitorToolBindings.enabling($preferences, \.state.clipIndicators.enabled))
+    case .tool(.zebra), .tool(.falseColor), .picture: return nil
+    }
+  }
+
   var body: some View {
     let reason = Self.unavailableReason(panel, isProgram: isProgram)
-    VStack(alignment: .leading, spacing: 10) {
-      HStack {
-        Label(panel.title, systemImage: panel.symbol).font(.headline)
-        Spacer()
-        Text(subtitle).font(.uiMeta).foregroundStyle(.secondary).lineLimit(1)
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(alignment: .center, spacing: 10) {
+        Image(systemName: panel.symbol)
+          .font(.title3).foregroundStyle(.secondary).frame(width: 26)
+          .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 1) {
+          Text(panel.title).font(.headline).accessibilityAddTraits(.isHeader)
+          Text(subtitle).font(.uiMeta).foregroundStyle(.secondary).lineLimit(1)
+        }
+        Spacer(minLength: 12)
+        if let toggle = headerSwitch {
+          Toggle(toggle.label, isOn: toggle.isOn)
+            .toggleStyle(.switch).labelsHidden()
+            .disabled(reason != nil)
+            .help(toggle.isOn.wrappedValue ? "Turn off \(panel.title)" : "Turn on \(panel.title)")
+        }
       }
       if let reason {
-        Text(reason).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        Label(reason, systemImage: "info.circle")
+          .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
-      Form { settings }
-        .formStyle(.grouped)
-        .disabled(reason != nil)
-        // Long forms (guides, false color, picture) scroll inside the popover.
-        .frame(maxHeight: 560)
-        .fixedSize(horizontal: false, vertical: true)
+      // Sized to the settings; they scroll only on a screen too short for them.
+      ScrollView {
+        settings
+          .disabled(reason != nil)
+      }
+      .scrollBounceBehavior(.basedOnSize)
+      .frame(maxHeight: UIToolLayout.maximumSettingsHeight)
+      .fixedSize(horizontal: false, vertical: true)
     }
-    .padding(14)
-    .frame(width: 340)
+    .padding(UIToolLayout.padding)
+    .frame(width: UIToolLayout.panelWidth, alignment: .leading)
     .controlSize(.small)
+    .labeledContentStyle(UIToolLabeledContentStyle())
     .onChange(of: preferences) { _, value in provider.setPreferences(value, for: cameraID) }
   }
 
