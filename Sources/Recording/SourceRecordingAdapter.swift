@@ -19,6 +19,10 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   /// format or color tags changed).
   private let formatLock = RecordingLock()
   private var cachedFormat: CMVideoFormatDescription?
+  /// Puts the DeckLink audio packet clock on the video stream clock; see
+  /// ``callbacks``.
+  private let clockLock = RecordingLock()
+  private var audioClock = EmbeddedAudioClockAnchor()
 
   init(feedID: SourceRecordingFeedID, recorder: SourceRecorderCore) {
     self.feedID = feedID
@@ -130,19 +134,35 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   /// Returns the adapter's raw callback closures. They capture this adapter,
   /// preserving the per-feed routing while leaving callback callers free to
   /// pass them to a backend without any controller changes.
+  ///
+  /// The closures carry one DeckLink input callback each: its frame, then its
+  /// audio packet, on one thread. The frame's stream time and the packet's
+  /// packet time are separate device clocks whose origins can differ by a
+  /// large, device-dependent amount (0.44 s and 0.88 s were measured on two
+  /// UltraStudios opened together), so the raw packet time is moved onto the
+  /// video clock: a packet that follows a frame is that frame's audio. Audio
+  /// keeps its own sample-exact spacing; only its origin moves.
   var callbacks: Callbacks {
     Callbacks(
       video: { [weak self] pixelBuffer, presentationTime, duration, signalValid in
-        self?.appendRawVideo(pixelBuffer: pixelBuffer, presentationTime: presentationTime,
-          duration: duration, signalValid: signalValid) ?? false
+        guard let self else { return false }
+        if signalValid {
+          self.clockLock.withLock { self.audioClock.noteVideo(presentationTime, duration: duration) }
+        }
+        return self.appendRawVideo(pixelBuffer: pixelBuffer, presentationTime: presentationTime,
+          duration: duration, signalValid: signalValid)
       },
       audio: { [weak self] sample in self?.appendEmbeddedAudio(sample: sample) ?? false },
       rawAudio: { [weak self] sourcePCM32, sampleFrameCount, presentationTime, channelCount, bytesPerSample in
+        guard let self else { return false }
         guard bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample else {
-          return self?.reject(video: false) ?? false
+          return self.reject(video: false)
         }
-        return self?.appendEmbeddedAudio(sourcePCM32: sourcePCM32, sampleFrameCount: sampleFrameCount,
-          presentationTime: presentationTime, channelCount: channelCount) ?? false
+        let videoTime = self.clockLock.withLock {
+          self.audioClock.place(presentationTime, sampleFrameCount: sampleFrameCount)
+        }
+        return self.appendEmbeddedAudio(sourcePCM32: sourcePCM32, sampleFrameCount: sampleFrameCount,
+          presentationTime: videoTime, channelCount: channelCount)
       })
   }
 
@@ -191,5 +211,57 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   private func reject(video: Bool = true) -> Bool {
     recorder.recordDrop(.invalidSample, video: video)
     return false
+  }
+}
+
+/// Moves DeckLink audio packet times onto the video stream clock of the same
+/// input. A packet that follows a frame from the same input callback is that
+/// frame's audio, so each such pair measures the offset between the clocks.
+/// The first pair sets it; a later pair moves it only when it disagrees by
+/// more than half a frame (the device re-based a clock, for example across an
+/// HDMI re-lock). Ordinary pairs agree to a sample: a 59.94 frame is 800.8
+/// samples and its packets carry 800 or 801. Packets are never moved back
+/// over audio already placed, so every sample is kept.
+struct EmbeddedAudioClockAnchor {
+  /// The latest frame not yet paired with a packet, in 48 kHz samples.
+  private var pendingVideo: (start: Int64, duration: Int64)?
+  /// Samples subtracted from a packet time; nil before the first packet.
+  private(set) var offset: Int64?
+  /// Where a packet contiguous with the last one placed starts.
+  private var nextStart: Int64?
+
+  mutating func noteVideo(_ time: CMTime, duration: CMTime) {
+    guard time.isNumeric, time.epoch == 0, duration.isNumeric, duration.value > 0 else { return }
+    pendingVideo = (Self.samples(time), max(1, Self.samples(duration)))
+  }
+
+  /// The packet's start on the video clock. A packet time this contract
+  /// cannot read is returned unchanged for the recorder to reject.
+  mutating func place(_ packetTime: CMTime, sampleFrameCount: Int) -> CMTime {
+    guard packetTime.isNumeric, packetTime.epoch == 0,
+      packetTime.timescale == EmbeddedAudioFormat.sampleRateTimescale, sampleFrameCount > 0 else {
+      return packetTime
+    }
+    let raw = packetTime.value
+    if let video = pendingVideo {
+      pendingVideo = nil
+      let measured = raw - video.start
+      if offset.map({ abs(measured - $0) * 2 > video.duration }) ?? true {
+        var anchored = measured
+        if let nextStart, raw - anchored < nextStart { anchored = raw - nextStart }
+        offset = anchored
+      }
+    }
+    // Audio ahead of any frame keeps its own clock.
+    let applied = offset ?? 0
+    offset = applied
+    let start = raw - applied
+    nextStart = start + Int64(sampleFrameCount)
+    return CMTime(value: start, timescale: EmbeddedAudioFormat.sampleRateTimescale)
+  }
+
+  private static func samples(_ time: CMTime) -> Int64 {
+    CMTimeConvertScale(time, timescale: EmbeddedAudioFormat.sampleRateTimescale,
+      method: .roundHalfAwayFromZero).value
   }
 }

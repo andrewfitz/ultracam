@@ -296,6 +296,131 @@ private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecke
     try adapter.stop()
   }
 
+  /// The 2026-10-24 take: each DeckLink callback's audio packet time ran
+  /// 42 050 samples (0.876 s) ahead of its frame's stream time, and the audio
+  /// was written that far behind the picture for the whole take. A packet is
+  /// its frame's audio, so it must land on that frame's time, sample-exact,
+  /// with every packet contiguous and none dropped.
+  func testRawAudioLandsOnItsFramesVideoTime() throws {
+    for clockOffset: Int64 in [42_050, 21_132, 0, -9_600] {
+      let (writer, adapter) = try rawAudioAdapter("clock-\(clockOffset)")
+      let callbacks = adapter.callbacks
+      let frames = 120
+      let videoOrigin: Int64 = 600 * 1_001  // ten seconds of stream time
+      let audioOrigin = videoOrigin * 4 / 5 + 48_000 + clockOffset  // well clear of zero
+      for frame in 0..<frames {
+        XCTAssertTrue(sendCallback(callbacks, frame: frame, videoOrigin: videoOrigin, audioOrigin: audioOrigin))
+      }
+      XCTAssertTrue(waitForAudio(writer, count: frames))
+      try adapter.stop()
+      try assertAudioOnVideoClock(writer.audioSnapshot, firstFrame: 0, videoOrigin: videoOrigin)
+      XCTAssertEqual(adapter.telemetry.droppedAudio, 0)
+      XCTAssertEqual(adapter.telemetry.appendedAudio, UInt64(frames))
+    }
+  }
+
+  /// A take's first callback can carry no audio: the first packet then
+  /// belongs to the second frame, not the first.
+  func testRawAudioAnchorsToTheFrameOfItsOwnCallback() throws {
+    let (writer, adapter) = try rawAudioAdapter("first-without-audio")
+    let callbacks = adapter.callbacks
+    let videoOrigin: Int64 = 1_001 * 37
+    let audioOrigin: Int64 = 96_000 + 42_050
+    for frame in 0..<30 {
+      XCTAssertTrue(sendCallback(callbacks, frame: frame, videoOrigin: videoOrigin, audioOrigin: audioOrigin,
+        audio: frame > 0))
+    }
+    XCTAssertTrue(waitForAudio(writer, count: 29))
+    try adapter.stop()
+    try assertAudioOnVideoClock(writer.audioSnapshot, firstFrame: 1, videoOrigin: videoOrigin)
+  }
+
+  /// Should the device re-base one clock mid-take (an HDMI re-lock), the next
+  /// pair re-anchors. Moving later leaves a gap; moving earlier would overlap
+  /// written audio, so audio stays contiguous and no sample is dropped.
+  func testRawAudioReanchorsAfterAClockStepWithoutDroppingAudio() throws {
+    for step: Int64 in [129_600, -4_000] {
+      let (writer, adapter) = try rawAudioAdapter("step-\(step)")
+      let callbacks = adapter.callbacks
+      let videoOrigin: Int64 = 1_001 * 300
+      let audioOrigin: Int64 = 400_000
+      for frame in 0..<60 {
+        XCTAssertTrue(sendCallback(callbacks, frame: frame, videoOrigin: videoOrigin,
+          audioOrigin: audioOrigin + (frame >= 30 ? step : 0)))
+      }
+      XCTAssertTrue(waitForAudio(writer, count: 60))
+      try adapter.stop()
+      let audio = writer.audioSnapshot
+      XCTAssertEqual(adapter.telemetry.droppedAudio, 0)
+      try assertAudioOnVideoClock(Array(audio.prefix(30)), firstFrame: 0, videoOrigin: videoOrigin)
+      if step > 0 {
+        try assertAudioOnVideoClock(Array(audio.suffix(30)), firstFrame: 30, videoOrigin: videoOrigin)
+      } else {
+        for index in 1..<audio.count {
+          XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(audio[index]),
+            CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(audio[index - 1]),
+              CMSampleBufferGetDuration(audio[index - 1])), "packet \(index) must not overlap or gap")
+        }
+      }
+    }
+  }
+
+  /// The start of 59.94 frame `frame` in 48 kHz samples (800.8 per frame).
+  private func videoSamples(_ frame: Int, videoOrigin: Int64) -> Int64 {
+    CMTimeConvertScale(CMTime(value: videoOrigin + Int64(frame) * 1_001, timescale: 60_000),
+      timescale: 48_000, method: .roundHalfAwayFromZero).value
+  }
+
+  /// One DeckLink callback: the frame, then its packet. Packets carry 800 or
+  /// 801 samples and run contiguously on their own clock.
+  private func sendCallback(_ callbacks: SourceRecordingCallbackAdapter.Callbacks, frame: Int,
+    videoOrigin: Int64, audioOrigin: Int64, audio: Bool = true) -> Bool {
+    let duration = CMTime(value: 1_001, timescale: 60_000)
+    guard let image = try? image(width: 32, height: 32),
+      callbacks.video(image, CMTime(value: videoOrigin + Int64(frame) * 1_001, timescale: 60_000),
+        duration, true) else { return false }
+    guard audio else { return true }
+    let start = videoSamples(frame, videoOrigin: 0)
+    let count = Int(videoSamples(frame + 1, videoOrigin: 0) - start)
+    return callbacks.rawAudio(Data(count: count * 2 * 4), count,
+      CMTime(value: audioOrigin + start, timescale: 48_000), 2, 4)
+  }
+
+  private func assertAudioOnVideoClock(_ audio: [CMSampleBuffer], firstFrame: Int, videoOrigin: Int64,
+    file: StaticString = #filePath, line: UInt = #line) throws {
+    XCTAssertFalse(audio.isEmpty, file: file, line: line)
+    for (index, sample) in audio.enumerated() {
+      let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+      XCTAssertEqual(pts.timescale, 48_000, file: file, line: line)
+      let frameStart = videoSamples(firstFrame + index, videoOrigin: videoOrigin)
+      XCTAssertLessThanOrEqual(abs(pts.value - frameStart), 1,
+        "packet \(index) at \(pts.value), its frame at \(frameStart)", file: file, line: line)
+      if index > 0 {
+        let previous = audio[index - 1]
+        XCTAssertEqual(pts, CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(previous),
+          CMSampleBufferGetDuration(previous)), "packet \(index) must be contiguous", file: file, line: line)
+      }
+    }
+  }
+
+  private func rawAudioAdapter(_ name: String) throws -> (AdapterRecordingWriter, SourceRecordingCallbackAdapter) {
+    let writer = AdapterRecordingWriter()
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID(name),
+      outputURL: URL(fileURLWithPath: "/tmp/\(name).mov"), width: 32, height: 32)
+    let adapter = try SourceRecordingCallbackAdapter(configuration: config, writerFactory: { writer })
+    try adapter.start()
+    return (writer, adapter)
+  }
+
+  private func waitForAudio(_ writer: AdapterRecordingWriter, count: Int) -> Bool {
+    let deadline = Date().addingTimeInterval(5)
+    while writer.audioSnapshot.count < count {
+      guard Date() < deadline else { return false }
+      _ = writer.waitForAudio(timeout: 0.1)
+    }
+    return true
+  }
+
   private func image(width: Int, height: Int) throws -> CVPixelBuffer {
     var result: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, width, height,

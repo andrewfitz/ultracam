@@ -489,6 +489,77 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertEqual(box.frames, Double(frames), accuracy: 0.5, "Every frame must be in the file")
   }
 
+  /// The 2026-10-24 takes began their audio 0.876 s and 0.440 s after the
+  /// picture (an empty `elst` edit) and ran it that far past the last frame:
+  /// each DeckLink callback's audio packet time was ahead of its frame's
+  /// stream time by a device-dependent amount, and the movie was written on
+  /// the raw packet clock. The movie must start both tracks together and end
+  /// the audio with the video, whatever the two device clocks' origins are.
+  func testMovieKeepsDeckLinkAudioInSyncWhenItsClockOriginDiffers() throws {
+    for clockOffset: Int64 in [42_050, 0] {
+      let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-avsync-\(UUID().uuidString)")
+      defer { try? FileManager.default.removeItem(at: root) }
+      let url = root.appendingPathComponent("avsync.mov")
+      let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("avsync"), outputURL: url,
+        width: 1_920, height: 1_080, videoCodec: kCMVideoCodecType_AppleProRes422HQ)
+      let adapter = try SourceRecordingCallbackAdapter(configuration: config)
+      try adapter.start()
+      let callbacks = adapter.callbacks
+      let image = try v210Frame(width: 1_920, height: 1_080)
+      let duration = VideoContract.fastDuration
+      let frames = 60
+      // Stream time 2.1 s in, as after the first frame of a real open.
+      let videoOrigin = Int64(126) * duration.value
+      let audioOrigin = CMTimeConvertScale(CMTime(value: videoOrigin, timescale: duration.timescale),
+        timescale: 48_000, method: .roundHalfAwayFromZero).value + clockOffset
+      var audioSamples: Int64 = 0
+      for frame in 0..<frames {
+        let pts = CMTime(value: videoOrigin + Int64(frame) * duration.value, timescale: duration.timescale)
+        XCTAssertTrue(callbacks.video(image, pts, duration, true))
+        // 800.8 samples per frame: packets of 800 and 801, contiguous.
+        let end = (Int64(frame + 1) * 48_000 * duration.value + Int64(duration.timescale) / 2) /
+          Int64(duration.timescale)
+        let count = Int(end - audioSamples)
+        XCTAssertTrue(callbacks.rawAudio(Data(count: count * 2 * 4), count,
+          CMTime(value: audioOrigin + audioSamples, timescale: 48_000), 2, 4))
+        audioSamples = end
+        Thread.sleep(forTimeInterval: duration.seconds)
+      }
+      try adapter.stop()
+      let telemetry = adapter.telemetry
+      XCTAssertEqual(adapter.state, .finished, telemetry.lastError ?? "")
+      XCTAssertEqual(telemetry.totalDrops, 0)
+      XCTAssertEqual(telemetry.droppedAudio, 0)
+      XCTAssertEqual(telemetry.appendedAudio, UInt64(frames))
+
+      final class Ranges: @unchecked Sendable {
+        var video: CMTimeRange?, audio: CMTimeRange?, movie: CMTime?
+      }
+      let ranges = Ranges()
+      let asset = AVURLAsset(url: url)
+      let done = DispatchSemaphore(value: 0)
+      Task {
+        ranges.video = try? await asset.loadTracks(withMediaType: .video).first?.load(.timeRange)
+        ranges.audio = try? await asset.loadTracks(withMediaType: .audio).first?.load(.timeRange)
+        ranges.movie = try? await asset.load(.duration)
+        done.signal()
+      }
+      done.wait()
+      let video = try XCTUnwrap(ranges.video)
+      let audio = try XCTUnwrap(ranges.audio)
+      let movie = try XCTUnwrap(ranges.movie)
+      let onePacket = 801.0 / 48_000
+      XCTAssertEqual(audio.start.seconds, video.start.seconds, accuracy: 1.0 / 48_000,
+        "offset \(clockOffset): audio starts \(audio.start.seconds - video.start.seconds) s after the video")
+      XCTAssertEqual(audio.duration.seconds, Double(audioSamples) / 48_000, accuracy: 1.0 / 48_000,
+        "Every audio sample is in the movie")
+      XCTAssertEqual(audio.end.seconds, video.end.seconds, accuracy: onePacket,
+        "offset \(clockOffset): audio ends \(audio.end.seconds - video.end.seconds) s after the video")
+      XCTAssertEqual(movie.seconds, video.end.seconds, accuracy: onePacket,
+        "offset \(clockOffset): the movie runs on past its last frame")
+    }
+  }
+
   /// When the disk stays stalled past the memory bound the take fails
   /// visibly; it is never a silent drop. What was queued is still written.
   func testWriterOverflowFailsTheTakeVisiblyAndKeepsTheFile() throws {
