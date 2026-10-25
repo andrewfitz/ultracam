@@ -102,9 +102,10 @@ template <typename T> struct ComRef {
   void reset() { if (value) value->Release(); value = nullptr; }
 };
 
-// The HDMI EDID this session advertises: SDR plus both static HDR transfer
-// functions, so an FX3 in HLG keeps signalling HLG instead of falling back.
-// The driver default is SDR | PQ (DeckLinkAPI.h, bmdDeckLinkHDMIInputEDIDDynamicRange).
+// The HDMI EDID Ultracam advertises when "Advertise HDR to cameras" is on: SDR
+// plus both static HDR transfer functions, so an FX3 in HLG keeps signalling
+// HLG instead of falling back. The driver default is SDR | PQ (DeckLinkAPI.h,
+// bmdDeckLinkHDMIInputEDIDDynamicRange).
 static constexpr int64_t kAdvertisedDynamicRange =
   bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ | bmdDynamicRangeHDRStaticHLG;
 
@@ -115,50 +116,44 @@ static NSString *dynamicRangeList(int64_t value) {
   return [parts componentsJoinedByString:@" · "];
 }
 
+// Advertises kAdvertisedDynamicRange and returns the reference that keeps it:
+// releasing every IDeckLinkHDMIInputEDID reference restores the default EDID
+// (DeckLinkAPI.h). Writing the EDID is an HDMI hot-plug (the camera re-reads it
+// and drops its signal for seconds), so only the device registry calls this,
+// when a device is discovered or the setting is turned on; a capture start
+// never does. S_OK: written. S_FALSE: already advertised, held, not rewritten.
+static HRESULT advertiseHDR(IDeckLink *device, ComRef<IDeckLinkHDMIInputEDID> &held) {
+  ComRef<IDeckLinkHDMIInputEDID> candidate;
+  HRESULT status = device->QueryInterface(IID_IDeckLinkHDMIInputEDID, reinterpret_cast<void **>(candidate.out()));
+  if (status != S_OK || !candidate) return status == S_OK ? E_NOINTERFACE : status;
+  int64_t current = 0;
+  if (candidate->GetInt(bmdDeckLinkHDMIInputEDIDDynamicRange, &current) == S_OK &&
+      (current & kAdvertisedDynamicRange) == kAdvertisedDynamicRange) {
+    held.value = candidate.take();
+    return S_FALSE;
+  }
+  status = candidate->SetInt(bmdDeckLinkHDMIInputEDIDDynamicRange, kAdvertisedDynamicRange);
+  if (status == S_OK) status = candidate->WriteToEDID();
+  if (status != S_OK) return status;  // Releasing the candidate restores the default.
+  held.value = candidate.take();
+  return S_OK;
+}
+
 // Session-only HDMI selection. Never persist device preferences. Restore only
 // the value this session still owns, preserving a subsequent outside change.
+// The EDID is not the session's: see advertiseHDR.
 struct HDMILease {
   ComRef<IDeckLinkConfiguration> configuration;
   int64_t previous = bmdVideoConnectionHDMI;
   bool changed = false;
   bool started = false;
-  // Releasing every IDeckLinkHDMIInputEDID reference restores the default EDID
-  // (DeckLinkAPI.h). The session holds the one it wrote; a successful session
-  // also hands a reference to the device registry, which keeps the
-  // advertisement for as long as the device stays listed (see
-  // DeviceRegistry::holdAdvertisedEDID). Declared after configuration:
-  // released after the connector restore.
-  ComRef<IDeckLinkHDMIInputEDID> edid;
-  int64_t edidDynamicRange = -1;
-  // Before EnableVideoInput (manual 2.4.12.1). S_FALSE: already advertised.
-  HRESULT advertiseDynamicRange(IDeckLink *device) {
-    ComRef<IDeckLinkHDMIInputEDID> candidate;
-    HRESULT status = device->QueryInterface(IID_IDeckLinkHDMIInputEDID, reinterpret_cast<void **>(candidate.out()));
-    if (status != S_OK || !candidate) return status == S_OK ? E_NOINTERFACE : status;
-    int64_t current = 0;
-    if (candidate->GetInt(bmdDeckLinkHDMIInputEDIDDynamicRange, &current) == S_OK &&
-        (current & kAdvertisedDynamicRange) == kAdvertisedDynamicRange) {
-      edidDynamicRange = current;
-      return S_FALSE;
-    }
-    status = candidate->SetInt(bmdDeckLinkHDMIInputEDIDDynamicRange, kAdvertisedDynamicRange);
-    if (status == S_OK) status = candidate->WriteToEDID();
-    if (status != S_OK) return status;  // Releasing the candidate restores the default.
-    edidDynamicRange = kAdvertisedDynamicRange;
-    edid.value = candidate.take();
-    return S_OK;
-  }
   ~HDMILease() {
     if (started) restoreConnector();
   }
-  // A start that failed after select/advertise: put back the connector and
-  // the default EDID now, while the caller still holds the device's input,
-  // so a failed claim leaves the other app's HDMI setup as it found it.
-  void abandon() {
-    restoreConnector();
-    edid.reset();  // The last release restores the default EDID.
-    edidDynamicRange = -1;
-  }
+  // A start that failed after select: put back the connector now, while the
+  // caller still holds the device's input, so a failed claim leaves the other
+  // app's HDMI setup as it found it.
+  void abandon() { restoreConnector(); }
   void restoreConnector() {
     int64_t current = 0;
     if (changed && configuration && configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &current) == S_OK && current == bmdVideoConnectionHDMI)
@@ -398,14 +393,12 @@ struct SessionStats {
   std::atomic<bool> active{false};
   std::mutex textMutex;
   NSString *signal = nil;
-  NSString *dynamicRange = nil;
   void reset() {
     deviceDrops = 0; backlog = 0; maxBacklog = 0; hostOffsetValid = false; temperature = INT64_MIN;
     std::lock_guard<std::mutex> guard(textMutex);
-    signal = nil; dynamicRange = nil;
+    signal = nil;
   }
   void setSignal(NSString *value) { std::lock_guard<std::mutex> guard(textMutex); signal = [value copy]; }
-  void setDynamicRange(NSString *value) { std::lock_guard<std::mutex> guard(textMutex); dynamicRange = [value copy]; }
 };
 
 // MARK: Timecode
@@ -1257,19 +1250,15 @@ class DeviceRegistry {
     for (auto &entry : entries) if ([entry.description.identifier isEqualToString:identifier]) return true;
     return false;
   }
-  // The HLG EDID a successful session wrote outlives that session while the
-  // device stays listed, so a later start finds it in effect and writes
-  // nothing. Writing the EDID is an HDMI hot-plug: the camera re-reads it and
-  // drops its signal for seconds, which a start would show as one frame, then
-  // black, then the picture again. Released when the device departs.
-  void holdAdvertisedEDID(NSString *identifier, IDeckLinkHDMIInputEDID *edid) {
-    if (!edid) return;
-    std::lock_guard<std::mutex> guard(mutex);
-    for (auto &entry : entries) {
-      if (![entry.description.identifier isEqualToString:identifier]) continue;
-      if (!entry.edid) { edid->AddRef(); entry.edid = edid; }
-      return;
-    }
+  // "Advertise HDR to cameras". On: each listed device's EDID advertises SDR,
+  // PQ and HLG from its discovery until it departs or the setting goes off.
+  // Off: Ultracam never writes the EDID, and lets go of one it wrote, which
+  // restores the driver default. Either way that is one HDMI renegotiation per
+  // device, at discovery or when the setting changes; a capture start never
+  // writes the EDID.
+  void setAdvertiseHDR(bool enabled) {
+    advertisingHDR = enabled;
+    dispatch_async(queue, ^{ applyAdvertisement(); });
   }
   bool holdsAdvertisedEDID(NSString *identifier) {
     std::lock_guard<std::mutex> guard(mutex);
@@ -1328,7 +1317,7 @@ class DeviceRegistry {
     result.supportsHDMITimecode = found->capabilities.hdmiTimecode;
     result.supportsHighFrameRateTimecode = found->capabilities.highFrameRateTimecode;
     result.temperatureCelsius = NSNotFound;
-    result.hdmiDynamicRange = @"Driver default";
+    result.hdmiDynamicRange = found->edid ? dynamicRangeList(kAdvertisedDynamicRange) : @"Driver default";
     auto stats = statsByDevice.find(std::string(identifier.UTF8String ?: ""));
     if (stats != statsByDevice.end() && stats->second) {
       SessionStats &values = *stats->second;
@@ -1341,7 +1330,6 @@ class DeviceRegistry {
       result.hostTimeMapped = values.hostOffsetValid.load();
       std::lock_guard<std::mutex> text(values.textMutex);
       result.signal = values.signal;
-      if (values.dynamicRange) result.hdmiDynamicRange = values.dynamicRange;
     }
     return result;
   }
@@ -1351,7 +1339,7 @@ class DeviceRegistry {
     IDeckLink *device = nullptr;  // One owned reference.
     UltracamDevice *description = nil;
     DeviceCapabilities capabilities;
-    // The HLG advertisement a session wrote; one owned reference or null.
+    // The HDR advertisement (see setAdvertiseHDR); one owned reference or null.
     IDeckLinkHDMIInputEDID *edid = nullptr;
   };
   struct Session {
@@ -1386,7 +1374,79 @@ class DeviceRegistry {
       std::lock_guard<std::mutex> guard(mutex);
       entries.push_back(entry);
     }
+    // Before the device is published, so no capture can start first.
+    if (advertisingHDR) updateAdvertisement(device, description.identifier, description.name);
+    else os_log(backendLog(), "HDR advertisement is off: the HDMI EDID of %{public}@ (%{public}@) stays at the driver default",
+      description.name, description.identifier);
     publish();
+  }
+
+  // Registry queue only.
+  void applyAdvertisement() {
+    struct Listed { IDeckLink *device; NSString *identifier; NSString *name; };
+    std::vector<Listed> listed;
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      for (auto &entry : entries) {
+        entry.device->AddRef();
+        listed.push_back({entry.device, entry.description.identifier, entry.description.name});
+      }
+    }
+    for (auto &item : listed) {
+      updateAdvertisement(item.device, item.identifier, item.name);
+      item.device->Release();
+    }
+  }
+
+  // Registry queue only: brings one listed device's EDID in line with the setting.
+  void updateAdvertisement(IDeckLink *device, NSString *identifier, NSString *name) {
+    bool held = false, capturing = false;
+    IDeckLinkHDMIInputEDID *released = nullptr;
+    const bool enabled = advertisingHDR;
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      for (auto &entry : entries) {
+        if (entry.device != device) continue;
+        held = entry.edid != nullptr;
+        if (!enabled) { released = entry.edid; entry.edid = nullptr; }
+      }
+      for (auto &session : sessions) if ([session.identifier isEqualToString:identifier]) capturing = true;
+    }
+    if (!enabled) {
+      if (!released) return;
+      released->Release();
+      os_log(backendLog(), "HDR advertisement turned off: released the HDMI EDID of %{public}@ (%{public}@); the driver default returns",
+        name, identifier);
+      return;
+    }
+    if (held) return;
+    // Another app capturing: rewriting the EDID would renegotiate HDMI under it.
+    // Ultracam's own capture is renegotiated: the user changed the setting.
+    ComRef<IDeckLinkStatus> status;
+    int64_t busy = 0;
+    if (!capturing && device->QueryInterface(IID_IDeckLinkStatus, reinterpret_cast<void **>(status.out())) == S_OK &&
+        status && status->GetInt(bmdDeckLinkStatusBusy, &busy) == S_OK && (busy & bmdDeviceCaptureBusy)) {
+      os_log(backendLog(), "%{public}@ (%{public}@) is in use by another app: its HDMI EDID was left unchanged",
+        name, identifier);
+      return;
+    }
+    ComRef<IDeckLinkHDMIInputEDID> edid;
+    HRESULT result = advertiseHDR(device, edid);
+    if (result == S_OK)
+      os_log(backendLog(), "HDMI EDID of %{public}@ (%{public}@) now advertises SDR, PQ and HLG; held while the device is listed",
+        name, identifier);
+    else if (result == S_FALSE)
+      os_log(backendLog(), "HDMI EDID of %{public}@ (%{public}@) already advertises SDR, PQ and HLG; held, not rewritten",
+        name, identifier);
+    else
+      os_log(backendLog(), "HDMI EDID of %{public}@ (%{public}@) left at the driver default (0x%08x)",
+        name, identifier, (unsigned)result);
+    if (!edid) return;
+    std::lock_guard<std::mutex> guard(mutex);
+    for (auto &entry : entries) {
+      if (entry.device != device || entry.edid) continue;
+      entry.edid = edid.take();
+    }
   }
 
   // Registry queue only.
@@ -1414,7 +1474,6 @@ class DeviceRegistry {
       capture->reportFatal(@"UltraStudio disconnected. Reconnect it to resume capture.");
       capture->Release();
     }
-    // A session still running holds its own reference until it stops.
     if (edid) edid->Release();
     owned->Release();
     publish();
@@ -1440,6 +1499,8 @@ class DeviceRegistry {
   NSMutableDictionary<NSUUID *, id> *observerBlocks;
   std::once_flag discoveryOnce;
   std::atomic<bool> installed{false};
+  // Off until the app applies its setting: tools never write the EDID.
+  std::atomic<bool> advertisingHDR{false};
   IDeckLinkDiscovery *discovery = nullptr;
   DiscoveryCallback *callback = nullptr;
 };
@@ -1576,6 +1637,10 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 
 + (id)addDeviceListObserver:(void (^)(NSArray<UltracamDevice *> *))handler {
   return DeviceRegistry::shared().addObserver(handler);
+}
+
++ (void)setAdvertisesHDRToCameras:(BOOL)enabled {
+  DeviceRegistry::shared().setAdvertiseHDR(enabled);
 }
 
 + (void)removeDeviceListObserver:(id)token {
@@ -1760,24 +1825,20 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (autoFrameHandler && !capabilities.formatDetection)
     return fail(error, @"This Blackmagic device/driver does not support automatic HDMI format detection.");
   auto connection = std::make_unique<HDMILease>();
-  // Every failure from here on restores the connector and EDID it changed,
-  // while `input` is still held (this guard is destroyed before it).
+  // Every failure from here on restores the connector it changed, while
+  // `input` is still held (this guard is destroyed before it).
   struct AbandonOnFailure {
     HDMILease *lease;
     ~AbandonOnFailure() { if (lease) lease->abandon(); }
   } abandonOnFailure{connection.get()};
   HRESULT connectionStatus = connection->select(device.value);
   if (connectionStatus != S_OK) return fail(error, @"Cannot select the UltraStudio HDMI input. Close other capture apps, then restart.", connectionStatus);
-  // Advertise HLG as well as SDR and PQ before the input opens (manual 2.4.12.1),
-  // once per listed device: an earlier session's advertisement is still in
-  // effect (the registry holds it), and rewriting it would hot-plug HDMI.
-  HRESULT edidStatus = S_FALSE;
-  if (held && _registry->holdsAdvertisedEDID(deviceID)) connection->edidDynamicRange = kAdvertisedDynamicRange;
-  else edidStatus = connection->advertiseDynamicRange(device.value);
-  if (edidStatus == S_OK) os_log(backendLog(), "HDMI EDID advertises SDR, PQ and HLG (written now; kept while the device is listed)");
-  else if (edidStatus == S_FALSE) os_log(backendLog(), "HDMI EDID already advertises SDR, PQ and HLG; not rewritten");
-  else
-    os_log(backendLog(), "HDMI EDID dynamic range left at the driver default (0x%08x)", (unsigned)edidStatus);
+  // The EDID is never written here: rewriting it hot-plugs HDMI and the camera
+  // drops its signal for seconds. The registry advertises HDR at discovery
+  // when the setting is on (DeviceRegistry::setAdvertiseHDR).
+  os_log(backendLog(), "Capture start leaves the HDMI EDID unchanged: %{public}s",
+    held && _registry->holdsAdvertisedEDID(deviceID) ? "SDR, PQ and HLG (advertised at discovery)" :
+      "Ultracam advertises no HDR (driver default)");
   if (!capabilities.hdmiTimecode)
     os_log(backendLog(), "Device does not report HDMI timecode support; RP188 may be absent");
   os_log(backendLog(), "HDMI audio: device maximum %lld channels; capturing 2 at 32-bit",
@@ -1835,12 +1896,10 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   }
   connection->started = true;
   abandonOnFailure.lease = nullptr;
-  if (held) _registry->holdAdvertisedEDID(deviceID, connection->edid.value);
   _input = input.take(); _callback = callback; _connection = std::move(connection);
   _device = device.take(); _status = deviceStatus.take();
   if (_device->QueryInterface(IID_IDeckLinkStatistics, reinterpret_cast<void **>(&_statistics)) != S_OK)
     _statistics = nullptr;
-  _stats->setDynamicRange(_connection->edidDynamicRange >= 0 ? dynamicRangeList(_connection->edidDynamicRange) : nil);
   _stats->active = true;
   // A device discovery held but has since removed: report it now.
   if (!_registry->attachSession(deviceID, callback, _stats) && held)
@@ -2064,8 +2123,8 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   _notifications.reset();
   if (_input) {
     stopInput(_input, _callback);
-    // Restore the connector and release the EDID lease while this successful
-    // session still holds its input, never after release.
+    // Restore the connector while this successful session still holds its
+    // input, never after release. The EDID is the registry's and stays.
     _connection.reset();
     _input->Release(); _input = nullptr;
   } else {
@@ -2300,8 +2359,14 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   device->input.provideClock = true; device->input.clockOffsetMicros = 1000000;
   device->input.availableFrames = 3;
   device->configuration.connection = bmdVideoConnectionSDI;
+  // "Advertise HDR to cameras" on: the EDID is written at discovery, before
+  // the device is published, and never by a capture start.
+  registry->setAdvertiseHDR(true);
   registry->arrived(device);
   registry->drain();
+  if (device->edid.writes != 1 || device->edid.value != kAdvertisedDynamicRange || device->edid.references != 2 ||
+      ![registry->diagnostics(@"decklink:000000001234abcd").hdmiDynamicRange isEqualToString:@"SDR · PQ · HLG"])
+    return fail(error, @"Discovery did not advertise HDR in the HDMI EDID with the setting on.");
 
   __block BOOL started = NO;
   __block NSError *startError = nil;
@@ -2314,9 +2379,9 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (device->input.calls != std::vector<std::string>{"support", "enable", "callback", "start"} ||
       device->input.enabledMode != bmdMode4K2160p2997 || device->input.enabledAudioType != bmdAudioSampleType32bitInteger)
     return fail(error, @"Start did not open the detected 29.97 mode directly.");
-  if (device->edid.writes != 1 || device->edid.value != kAdvertisedDynamicRange || device->edid.references != 3 ||
+  if (device->edid.writes != 1 || device->edid.value != kAdvertisedDynamicRange || device->edid.references != 2 ||
       device->configuration.connection != bmdVideoConnectionHDMI || device->notification.subscriptions.size() != 2)
-    return fail(error, @"Start did not hold the HDMI, EDID and notification leases.");
+    return fail(error, @"Start wrote the EDID or did not hold the HDMI and notification leases.");
   if (![lastEvent() hasPrefix:@"Detected HDMI input: "] || ![lastEvent() containsString:@"29.97"] ||
       ![lastEvent() containsString:@"Rec.709 · SDR"])
     return fail(error, @"The directly opened mode was not announced with its colorimetry.");
@@ -2403,24 +2468,73 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
       fallback->input.enabledMode != bmdMode4K2160p5994 || events.count != eventCount)
     return fail(error, @"Unavailable detection status did not fall back to the 59.94 open.");
   [self stop];
-  // Stop, then Start again on the same listed device: the advertisement the
-  // first session wrote is still in effect, so nothing is written. Writing the
-  // EDID is an HDMI hot-plug: the camera drops its signal for seconds, so a
-  // start that rewrites it shows a frame, goes blank, then comes back.
+  // Stop, then Start again: the advertisement written at discovery is still in
+  // effect and nothing is written. Writing the EDID is an HDMI hot-plug: the
+  // camera drops its signal for seconds, so a start that rewrote it showed a
+  // frame, went blank, then came back.
   if (fallback->edid.writes != 1 || fallback->edid.value != kAdvertisedDynamicRange)
     return fail(error, @"Stopping a session restored the default EDID of a device that is still listed.");
-  [self onControlQueue:^{
-    started = [self startOnQueue:@"decklink:0000000000000077" inputFast:YES frameHandler:nil autoFrameHandler:frameBlock
-      mediaHandler:nil rawAudioHandler:rawBlock eventHandler:eventBlock error:&startError];
-  }];
-  if (!started || fallback->edid.writes != 1 || fallback->edid.value != kAdvertisedDynamicRange ||
+  auto startFallback = ^BOOL {
+    __block BOOL ok = NO;
+    __block NSError *startFailure = nil;
+    [self onControlQueue:^{
+      ok = [self startOnQueue:@"decklink:0000000000000077" inputFast:YES frameHandler:nil autoFrameHandler:frameBlock
+        mediaHandler:nil rawAudioHandler:rawBlock eventHandler:eventBlock error:&startFailure];
+    }];
+    return ok;
+  };
+  if (!startFallback() || fallback->edid.writes != 1 || fallback->edid.value != kAdvertisedDynamicRange ||
       ![registry->diagnostics(@"decklink:0000000000000077").hdmiDynamicRange isEqualToString:@"SDR · PQ · HLG"])
     return fail(error, @"A second start rewrote the HDMI EDID (an HDMI hot-plug at every start).");
+  // Turned off while capturing: the advertisement is released (the driver
+  // default returns) and nothing is written.
+  registry->setAdvertiseHDR(false);
+  registry->drain();
+  if (fallback->edid.writes != 1 || fallback->edid.value != (bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ) ||
+      fallback->edid.references != 1 ||
+      ![registry->diagnostics(@"decklink:0000000000000077").hdmiDynamicRange isEqualToString:@"Driver default"])
+    return fail(error, @"Turning HDR advertisement off did not release the EDID.");
+  // Turned on again: written once, now, though Ultracam itself is capturing.
+  registry->setAdvertiseHDR(true);
+  registry->drain();
+  registry->setAdvertiseHDR(true);
+  registry->drain();
+  if (fallback->edid.writes != 2 || fallback->edid.value != kAdvertisedDynamicRange || fallback->edid.references != 2)
+    return fail(error, @"Turning HDR advertisement on did not write the EDID of a listed device exactly once.");
+  [self stop];
+  // Off: a start writes nothing.
+  registry->setAdvertiseHDR(false);
+  registry->drain();
+  if (!startFallback() || fallback->edid.writes != 2 ||
+      fallback->edid.value != (bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ))
+    return fail(error, @"A start wrote the HDMI EDID with HDR advertisement off.");
   [self stop];
   registry->removed(fallback);
   registry->drain();
   if (fallback->edid.value != (bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ))
     return fail(error, @"Removing the device did not restore its default EDID.");
+
+  // Off at discovery: the EDID is never touched, at arrival or at start.
+  {
+    FakeDeckLink unadvertised;
+    unadvertised.attributes.persistentID = 0x88;
+    unadvertised.input.audioResult = S_OK;
+    registry->arrived(&unadvertised);
+    registry->drain();
+    __block BOOL offOk = NO;
+    __block NSError *offError = nil;
+    [self onControlQueue:^{
+      offOk = [self startOnQueue:@"decklink:0000000000000088" inputFast:YES frameHandler:nil autoFrameHandler:frameBlock
+        mediaHandler:nil rawAudioHandler:rawBlock eventHandler:eventBlock error:&offError];
+    }];
+    const BOOL offStarted = offOk;
+    const bool untouched = unadvertised.edid.writes == 0 && unadvertised.edid.references == 1;
+    [self stop];
+    registry->removed(&unadvertised);
+    registry->drain();
+    if (!offStarted || !untouched || !unadvertised.balanced())
+      return fail(error, @"With HDR advertisement off, discovery or a start touched the HDMI EDID.");
+  }
   return YES;
 }
 
@@ -2432,6 +2546,9 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   auto eventBlock = ^(NSString *) {};
   __block BOOL started = NO;
   __block NSError *startError = nil;
+  // Busy at discovery with the setting on: the EDID is left alone.
+  registry->setAdvertiseHDR(true);
+  registry->drain();
   busy->attributes.persistentID = 0x55;
   busy->status.busy = bmdDeviceCaptureBusy;
   busy->configuration.connection = bmdVideoConnectionSDI;
@@ -2448,6 +2565,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   registry->removed(busy);
   registry->drain();
 
+  // Discovered with the setting on: advertised then; the refused claim leaves it.
   denied->attributes.persistentID = 0x66;
   denied->input.enableResult = E_ACCESSDENIED;
   denied->configuration.connection = bmdVideoConnectionSDI;
@@ -2461,10 +2579,12 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (started || ![startError.localizedDescription containsString:@"in use by another app"] ||
       denied->edid.writes != 1 || denied->configuration.writes != 2 ||
       denied->configuration.connection != bmdVideoConnectionSDI ||
-      denied->edid.value != (bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ) || denied->edid.references != 1)
-    return fail(error, @"A refused claim left the connector on HDMI or the session EDID in place.");
+      denied->edid.value != kAdvertisedDynamicRange || denied->edid.references != 2)
+    return fail(error, @"A refused claim left the connector on HDMI or touched the discovery EDID.");
   registry->removed(denied);
   registry->drain();
+  if (denied->edid.value != (bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ))
+    return fail(error, @"Removing a device did not restore its default EDID.");
   return YES;
 }
 

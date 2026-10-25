@@ -1030,23 +1030,23 @@ static BOOL runFrameFeatureChecks(NSError **error) {
       if (!destroyed) return fail(error, @"Colorimetry fixture leaked its frame.");
     }
 
-    // EDID: advertise SDR | PQ | HLG for the session; the last release restores.
+    // EDID: advertise SDR | PQ | HLG; the held reference keeps it, the last release restores.
     {
       FakeDeckLink device;
       {
-        HDMILease lease;
-        if (lease.advertiseDynamicRange(&device) != S_OK || device.edid.writes != 1 ||
+        ComRef<IDeckLinkHDMIInputEDID> held;
+        if (advertiseHDR(&device, held) != S_OK || !held || device.edid.writes != 1 ||
             device.edid.value != kAdvertisedDynamicRange || device.edid.references != 2)
-          return fail(error, @"HLG was not written to the HDMI EDID for the session.");
-        HDMILease again;
-        if (again.advertiseDynamicRange(&device) != S_FALSE || device.edid.writes != 1 || device.edid.references != 2)
-          return fail(error, @"An EDID already advertising HLG was rewritten or retained.");
+          return fail(error, @"HLG was not written to the HDMI EDID.");
+        ComRef<IDeckLinkHDMIInputEDID> again;
+        if (advertiseHDR(&device, again) != S_FALSE || !again || device.edid.writes != 1 || device.edid.references != 3)
+          return fail(error, @"An EDID already advertising HLG was rewritten or not held.");
       }
       if (device.edid.value != (bmdDynamicRangeSDR | bmdDynamicRangeHDRStaticPQ) || !device.balanced())
-        return fail(error, @"Ending the session did not restore the default EDID.");
+        return fail(error, @"Releasing the advertisement did not restore the default EDID.");
       device.hasEDID = false;
-      HDMILease unsupported;
-      if (unsupported.advertiseDynamicRange(&device) != E_NOINTERFACE || unsupported.edid)
+      ComRef<IDeckLinkHDMIInputEDID> unsupported;
+      if (advertiseHDR(&device, unsupported) != E_NOINTERFACE || unsupported)
         return fail(error, @"A device without IDeckLinkHDMIInputEDID did not skip quietly.");
     }
 

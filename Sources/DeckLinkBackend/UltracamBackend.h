@@ -148,6 +148,11 @@ typedef void (^UltracamRawAudioHandler)(NSData *_Nullable samples, CMTime audioP
 - (void)stop;
 
 + (UltracamDriverInfo *)driverInfo;
+// "Advertise HDR to cameras": on, each discovered device's HDMI EDID advertises
+// SDR, PQ and HLG (written at discovery, or now for listed devices) and keeps
+// doing so while the device is listed; off, Ultracam never writes the EDID and
+// releases one it wrote. Capture starts never write it. Off until called.
++ (void)setAdvertisesHDRToCameras:(BOOL)enabled NS_SWIFT_NAME(setAdvertisesHDR(_:));
 // Hot-plug discovery (IDeckLinkDiscovery). Installs device notifications on
 // first use. The handler runs on the main queue with the complete device list
 // after every arrival or removal, and once soon after registering.
