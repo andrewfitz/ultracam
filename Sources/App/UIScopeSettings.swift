@@ -4,8 +4,8 @@ import SwiftUI
 
 /// One target's scope settings: which scope, the stage it measures, its look,
 /// level scale (with the nits scales on PQ and HLG stages), the vectorscope's
-/// zoom, targets and skin tone line, the histogram's mode and counts, the
-/// refresh rate, trace gain, graticule and the clip readout levels.
+/// zoom, targets and skin tone line, the histogram's mode and counts, trace
+/// gain, graticule and the clip readout levels. (Scopes follow every video frame.)
 ///
 /// Plain controls without a container, so a host can put them in a `Form` or in
 /// MonitorKit's tile toolbar popover. The host's own switch turns scopes on;
