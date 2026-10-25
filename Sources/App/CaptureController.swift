@@ -400,6 +400,8 @@ final class CaptureController: @unchecked Sendable {
         self.pipelineEnabled = pipelineEnabled
         self.publishBurnIn()
         self.previewEnabled = previewEnabled
+        let lutTitle = self.lock.withLock { self.loadedLUT?.cube.title }
+        self.logger.notice("Start \(self.cameraLabel, privacy: .public) on controller \(UInt(bitPattern: ObjectIdentifier(self).hashValue), format: .hex, privacy: .public): processing \(pipelineEnabled ? "on" : "off", privacy: .public), Apply LUT \(configuration.applyLUT ? "on" : "off", privacy: .public), LUT in memory: \(lutTitle ?? "none", privacy: .public), burned in: \(pipelineEnabled && configuration.applyLUT && lutTitle != nil, privacy: .public)")
         self.activeConfiguration = nil
         self.activeInputType = nil
         self.detected = nil

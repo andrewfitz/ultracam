@@ -174,6 +174,100 @@ import XCTest
     XCTAssertNil(shown(), "A removed feed's surfaces no longer read the old controller")
   }
 
+  /// The selected camera on automatic start, at launch: its saved LUT restores,
+  /// then a visible picture's demand starts it, and real frames flow from the
+  /// controller to a drawn picture. The picture's Output stage draws the LUT
+  /// (MonitorKit's own account of what it drew), as the camera's output does.
+  func testSelectedCameraRestoredBeforeAutomaticStartDrawsItsLUT() throws {
+    guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
+    let suiteName = "org.ultracam.monitor-app-integration.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("monitor-lut-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    var lattice = ["TITLE \"Integration LUT\"", "LUT_3D_SIZE 2"]
+    for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lattice.append("\(1 - Float(r)) \(1 - Float(g)) \(1 - Float(b))") } } }
+    let cube = folder.appendingPathComponent("integration.cube")
+    try lattice.joined(separator: "\n").write(to: cube, atomically: true, encoding: .utf8)
+    let settings = AppSettingsStore(defaults: defaults)
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: [
+      FeedDescriptor(id: alpha, name: "Integration Wide", selectedDevice: "integration-device-a",
+        applyLUT: false, automaticFeed: true),
+      FeedDescriptor(id: beta, name: "Integration Tight", selectedDevice: "integration-device-b",
+        applyLUT: false, automaticFeed: true),
+    ], selectedFeedID: alpha, outputMode: .separateCameras))
+    final class Frames: @unchecked Sendable {
+      let lock = NSLock()
+      var handlers: [String: (CVPixelBuffer, CMTime, CMTime, Bool) -> Void] = [:]
+    }
+    let frames = Frames()
+    var hardware = AppHardware.offline
+    hardware.devices = {
+      [InputDevice(id: "integration-device-a", name: "A"), InputDevice(id: "integration-device-b", name: "B")]
+    }
+    hardware.captureServices = { _ in
+      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+        send: { _ in true })
+      services.startAutomatic = { device, handler, _ in frames.lock.withLock { frames.handlers[device] = handler } }
+      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
+      return services
+    }
+    func makeModel() -> AppModel {
+      AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+        recordingFolderStore: RecordingFolderStore(defaults: defaults), hardware: hardware)
+    }
+    do {
+      let setup = makeModel()
+      setup.loadLUT(url: cube, feedID: alpha)
+      XCTAssertTrue(spinUntil(seconds: 10) { !setup.loading && setup.lutLoaded }, "The LUT is saved for Camera 1")
+      setup.loadLUT(url: cube, feedID: beta)
+      XCTAssertTrue(spinUntil(seconds: 10) { setup.descriptor(for: beta)?.applyLUT == true }, "The LUT is saved for Camera 2")
+    }
+    let model = makeModel()
+    let coordinator = model.monitorCoordinator
+    // Both pictures are on screen at launch: Camera 2 starts headless while
+    // the selected Camera 1 is still restoring its LUT, as in the app.
+    let (windowA, presenterA, idA) = pictureWindow(coordinator, target: MonitorTargetID(alpha.rawValue),
+      points: CGSize(width: 480, height: 270))
+    let (windowB, presenterB, idB) = pictureWindow(coordinator, target: MonitorTargetID(beta.rawValue),
+      points: CGSize(width: 480, height: 270))
+    defer {
+      coordinator.unregisterSurface(id: idA)
+      coordinator.unregisterSurface(id: idB)
+      windowA.close()
+      windowB.close()
+      model.stopCamera(beta)
+      model.stopCamera(alpha)
+    }
+    XCTAssertTrue(spinUntil(seconds: 10) {
+      model.isCameraRunning(alpha) && model.isCameraRunning(beta) &&
+        model.burnInLUT(for: alpha) != nil && model.burnInLUT(for: beta) != nil
+    }, "Both cameras start on demand with their LUTs burned in")
+    XCTAssertTrue(spinUntil(seconds: 5) {
+      frames.lock.withLock { frames.handlers["integration-device-a"] != nil && frames.handlers["integration-device-b"] != nil }
+    })
+    let buffers = try pool(4, width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10)
+    let handlers = frames.lock.withLock { [frames.handlers["integration-device-a"]!, frames.handlers["integration-device-b"]!] }
+    var index = 0
+    func drawsLUT(_ presenter: MonitorSurfacePresenter) -> Bool {
+      presenter.shownStatus.activeLabels.contains { $0.hasPrefix("LUT") }
+    }
+    let drawn = spinUntil(seconds: 10) {
+      index += 1
+      for handler in handlers {
+        handler(buffers[index % buffers.count], CMTimeMultiply(VideoContract.slowDuration, multiplier: Int32(index)),
+          VideoContract.slowDuration, true)
+      }
+      RunLoop.main.run(until: Date().addingTimeInterval(1 / 30))
+      return drawsLUT(presenterA) && drawsLUT(presenterB)
+    }
+    XCTAssertTrue(drawn)
+    XCTAssertTrue(drawsLUT(presenterA), "The selected camera's Output stage draws its LUT: \(presenterA.shownStatus.activeLabels)")
+    XCTAssertTrue(drawsLUT(presenterB), "Camera 2's Output stage draws its LUT: \(presenterB.shownStatus.activeLabels)")
+  }
+
   func testDetachedWindowCanClearAndRebindTheTargetUsedByItsChooser() throws {
     let alphaTarget = MonitorTargetID(alpha.rawValue)
     let betaTarget = MonitorTargetID(beta.rawValue)

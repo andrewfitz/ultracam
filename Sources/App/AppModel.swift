@@ -632,6 +632,9 @@ final class AppModel {
           self.lutBookmark = loaded.bookmark
           self.rememberedLUTEnabled = enable
           self.configuration.applyLUT = enable
+          if enable {
+            lutLog.notice("LUT applied: \(feedID.rawValue, privacy: .public), burned into its output and monitor (selected camera, \(self.running ? "running: reconfigured now" : "applied when it starts", privacy: .public))")
+          }
           self.lutTitle = "\(loaded.cube.title) · \(loaded.cube.sizeDescription)"
           self.lutFileName = loaded.fileName
           self.saveSettings()

@@ -1010,6 +1010,93 @@ import SystemExtensions
   /// Every running camera with Apply LUT on and a saved LUT burns it in, whatever
   /// the selection, start order or toggles. Scripted capture: starts succeed and
   /// deliver no frames; no hardware.
+  /// The selected camera on automatic start with a saved LUT, at launch: the
+  /// restore completes, then demand starts the camera. Its output and its
+  /// monitor's Output stage burn the LUT in. Then a camera already running when
+  /// it becomes selected (its restore completes after it started). Scripted
+  /// capture; no hardware.
+  func lutOnAutomaticSelectedCamera() throws {
+    let suiteName = "org.ultracam.ui-verify-lut-auto.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut auto: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-auto-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    var lattice = ["TITLE \"Auto LUT\"", "LUT_3D_SIZE 2"]
+    for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lattice.append("\(1 - Float(r)) \(1 - Float(g)) \(1 - Float(b))") } } }
+    let cube = folder.appendingPathComponent("auto.cube")
+    try lattice.joined(separator: "\n").write(to: cube, atomically: true, encoding: .utf8)
+    let settings = AppSettingsStore(defaults: defaults)
+    let alpha = FeedID(rawValue: "ui-verify-auto-alpha"), beta = FeedID(rawValue: "ui-verify-auto-beta")
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: [
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-a", applyLUT: false, automaticFeed: true),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-b", applyLUT: false, automaticFeed: true),
+    ], selectedFeedID: alpha, outputMode: .separateCameras))
+    var hardware = AppHardware.offline
+    hardware.devices = { [InputDevice(id: "dev-a", name: "UltraStudio A"), InputDevice(id: "dev-b", name: "UltraStudio B")] }
+    hardware.captureServices = { _ in
+      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+        send: { _ in true })
+      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
+      return services
+    }
+    func makeModel() -> AppModel {
+      AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+        recordingFolderStore: RecordingFolderStore(defaults: defaults),
+        installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    }
+    func settle(_ seconds: Double = 5, until condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(seconds)
+      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+    }
+    // Save both cameras' LUTs, as a previous session would have.
+    do {
+      let setup = makeModel()
+      setup.loadLUT(url: cube, feedID: alpha)
+      settle { !setup.loading && setup.lutLoaded }
+      setup.loadLUT(url: cube, feedID: beta)
+      settle { setup.descriptor(for: beta)?.applyLUT == true }
+    }
+    // Launch: a visible monitor of each camera is the demand that starts it.
+    let model = makeModel()
+    let surfaceA = UUID(), surfaceB = UUID()
+    model.monitorCoordinator.registerSurface(id: surfaceA, target: MonitorTargetID(alpha.rawValue), isVisible: true,
+      scopeVisible: false)
+    model.monitorCoordinator.registerSurface(id: surfaceB, target: MonitorTargetID(beta.rawValue), isVisible: true,
+      scopeVisible: false)
+    settle { model.isCameraRunning(alpha) && model.isCameraRunning(beta) &&
+      model.burnInLUT(for: alpha) != nil && model.burnInLUT(for: beta) != nil }
+    verifier.check("lut auto: both cameras start automatically", model.isCameraRunning(alpha) && model.isCameraRunning(beta))
+    verifier.check("lut auto: the selected camera's restored LUT burns in after an automatic start",
+      model.burnInLUT(for: alpha) != nil, "LUT loaded: \(model.lutLoaded), \(model.lutTitle)")
+    verifier.check("lut auto: the other camera's LUT burns in", model.burnInLUT(for: beta) != nil)
+    // The monitor's Output stage: what each surface's host hands its feed at encode.
+    func monitorBurnsIn(_ surface: UUID, _ id: FeedID) -> Bool {
+      let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
+      presenter.refreshBurnInLUT()
+      return presenter.host.burnInLUT != nil && presenter.host.burnInLUT === model.burnInLUT(for: id)
+    }
+    verifier.check("lut auto: the selected camera's monitor Output stage has its LUT", monitorBurnsIn(surfaceA, alpha))
+    verifier.check("lut auto: the other camera's monitor Output stage has its LUT", monitorBurnsIn(surfaceB, beta))
+    // Running when selected: its restore completes after it started.
+    model.selectFeed(beta)
+    settle { !model.loading }
+    settle(1) { false }
+    verifier.check("lut auto: selecting a running camera keeps its LUT burned in", model.burnInLUT(for: beta) != nil)
+    verifier.check("lut auto: the deselected camera keeps its LUT burned in", model.burnInLUT(for: alpha) != nil)
+    model.selectFeed(alpha)
+    settle { !model.loading }
+    settle(1) { false }
+    verifier.check("lut auto: selecting the first camera again keeps its LUT burned in", model.burnInLUT(for: alpha) != nil)
+    verifier.check("lut auto: after selection changes both monitors show their LUTs",
+      monitorBurnsIn(surfaceA, alpha) && monitorBurnsIn(surfaceB, beta))
+    model.monitorCoordinator.unregisterSurface(id: surfaceA)
+    model.monitorCoordinator.unregisterSurface(id: surfaceB)
+    model.stopCamera(beta)
+    model.stopCamera(alpha)
+  }
+
   func lutOnRunningCameras() throws {
     let suiteName = "org.ultracam.ui-verify-lut-run.\(UUID().uuidString)"
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut run: defaults suite", false); return }
@@ -1287,6 +1374,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.discovery()
   run.hdrAdvertisement()
   do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
+  do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }
   run.adoption()
   run.sharedInput()
   run.pictureMenus()

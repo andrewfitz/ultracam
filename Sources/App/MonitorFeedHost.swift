@@ -273,13 +273,25 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     get { lock.withLock { burnIn } }
     set {
       let value = isProgram ? nil : newValue
-      lock.withLock {
-        guard burnIn !== value else { return }
+      let report: (String, UInt64)? = lock.withLock {
+        guard burnIn !== value else { return nil }
         burnIn = value
         lutVersion &+= 1
+        // Set at every encode: report the first change, then at most every 5 s.
+        burnInChanges &+= 1
+        let now = clock()
+        guard now - lastBurnInReport >= 5 else { return nil }
+        lastBurnInReport = now
+        defer { burnInChanges = 0 }
+        return (value.map { "\"\($0.cube.title)\"" } ?? "none", burnInChanges)
+      }
+      if let (title, changes) = report {
+        lutLog.notice("Monitor burn-in LUT for \(self.target, privacy: .public): \(title, privacy: .public)\(changes > 1 ? " (\(changes) changes in the last 5 s)" : "", privacy: .public)")
       }
     }
   }
+  private var burnInChanges: UInt64 = 0
+  private var lastBurnInReport = -Double.infinity
 
   /// A monitor-only LUT, stacked on the burn-in LUT. Applied on the render thread.
   var monitorLUT: MonitorLUT? {
@@ -620,7 +632,13 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       let reason =
         (burn != nil && feed.burnInLUT == nil) || (monitor != nil && feed.monitorLUT == nil)
         ? "The LUT was made on another GPU than the monitor's." : nil
-      lock.withLock { mismatch = reason }
+      let previous = lock.withLock { () -> String? in
+        defer { mismatch = reason }
+        return mismatch
+      }
+      if let reason, previous != reason {
+        lutLog.error("Monitor LUT not applied for \(self.target, privacy: .public): \(reason, privacy: .public)")
+      }
     }
     return feed
   }

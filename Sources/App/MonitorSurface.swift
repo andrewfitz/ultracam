@@ -380,10 +380,15 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   /// MonitorKit's account of the drawn picture's tools, kept when it changes
   /// (rarely: the status is rebuilt only when the state, signal or feed change).
   func recordStatus(_ status: MonitorStatus) {
-    lock.withLock {
-      guard status != pictureStatus else { return }
+    let changed: [String]? = lock.withLock {
+      guard status != pictureStatus else { return nil }
       pictureStatus = status
       rendererStatus = Self.describe(status)
+      return rendererStatus
+    }
+    // Rare: the status is rebuilt only when the state, signal or feed change.
+    if let changed {
+      lutLog.notice("Monitor picture \(self.target.rawValue, privacy: .public): \(changed.isEmpty ? "no tools or LUTs" : changed.joined(separator: "; "), privacy: .public)")
     }
   }
 
