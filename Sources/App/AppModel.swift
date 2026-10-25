@@ -1,6 +1,7 @@
 import AppKit
 import CoreVideo
 import Observation
+import os
 import UniformTypeIdentifiers
 
 struct InputDevice: Identifiable {
@@ -90,6 +91,12 @@ final class AppModel {
   /// session still follows the established one-feed capture path.
   var feedDescriptors: [FeedDescriptor] { feedCoordinator.descriptors }
   /// A camera's broadcast audio meters; never creates a capture controller.
+  /// The LUT a camera burns into its output now (nil when none): what its
+  /// virtual camera, recording, Program and monitor Output stage get. Never
+  /// creates a capture controller.
+  func burnInLUT(for id: FeedID) -> MonitorLUT? {
+    feedCoordinator.capturePool.existingController(for: id)?.burnInLUT
+  }
   func audioMeterTap(for id: FeedID) -> AudioMeterTap? {
     feedCoordinator.capturePool.existingController(for: id)?.audioMeterTap
   }
@@ -446,7 +453,7 @@ final class AppModel {
     automaticFeedEnabled = savedFeed.automaticFeed
     lutBookmark = savedFeed.lutBookmark
     restoringSettings = false
-    publishVirtualCameraRegistry(snapshot)
+    publishVirtualCameraRegistry(snapshot, reason: "launch")
     capture.setPreviewEnabled(previewEnabled)
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
     feedCoordinator.setCameraOutputEnabled(feedID: initialFeedID,
@@ -543,6 +550,7 @@ final class AppModel {
     update.message = "Restoring saved LUT…"
     let feedID = selectedFeedID
     let loadGeneration = beginLUTLoad(feedID)
+    lutLog.notice("LUT restore started: \(feedID.rawValue, privacy: .public) (selected camera)")
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.restore(bookmark: bookmark)
@@ -582,10 +590,23 @@ final class AppModel {
         case .success:
           self.lutLoadingFeeds.remove(feedID)
           let enable = restoring ? self.descriptor(for: feedID)?.applyLUT == true : enable
+          lutLog.notice("LUT \(restoring ? "restored" : "loaded", privacy: .public): \(feedID.rawValue, privacy: .public), \"\(loaded.cube.title, privacy: .public)\" (\(loaded.fileName, privacy: .public)), Apply LUT \(enable ? "on" : "off", privacy: .public)\(feedID == self.selectedFeedID ? " (selected camera)" : "", privacy: .public)")
           guard feedID == self.selectedFeedID else {
             self.updateCamera(feedID) { descriptor in
               descriptor.lutBookmark = loaded.bookmark
               descriptor.applyLUT = enable
+            }
+            // The selection moved while it loaded. The LUT is in this camera's
+            // pipeline now; a running camera burns it in from here, whether or
+            // not the descriptor changed (an unchanged one reconfigures nothing).
+            if enable, self.feedCoordinator.isFeedRunning(feedID),
+              let descriptor = self.descriptor(for: feedID) {
+              var configuration = descriptor.configuration
+              if let detected = self.detectedInputCadence[feedID] { configuration.inputFast = detected }
+              configuration.applyLUT = true
+              lutLog.notice("LUT applied: \(feedID.rawValue, privacy: .public), loaded after the selection moved")
+              self.feedCoordinator.reconfigureCapture(feedID: feedID, configuration: configuration,
+                pipelineEnabled: descriptor.pipelineEnabled)
             }
             self.reconcileAutomaticFeed()
             return
@@ -611,6 +632,7 @@ final class AppModel {
     guard generation == lutLoadGenerations[feedID] else { return }
     lutLoadingFeeds.remove(feedID)
     let message = "\(restoring ? "Saved LUT could not be restored" : "LUT was not changed"): \(error.localizedDescription)"
+    lutLog.error("LUT \(restoring ? "restore" : "load", privacy: .public) failed: \(feedID.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
     guard feedID == selectedFeedID else {
       var cameraUpdate = cameraUpdates[feedID] ?? CaptureUpdate(message: message)
       cameraUpdate.message = message
@@ -636,7 +658,10 @@ final class AppModel {
   func selectFeed(_ id: FeedID) -> Bool {
     guard feedCoordinator.descriptors.contains(where: { $0.id == id }) else { return false }
     saveSettings()
+    let previous = selectedFeedID
+    let previousLUTLoaded = lutLoaded
     guard feedCoordinator.select(id) else { return false }
+    captureLog.notice("Selection: \(previous.rawValue, privacy: .public) → \(id.rawValue, privacy: .public)")
     capture.setLegacyPreviewOwnership(false)
     capture = feedCoordinator.capture(for: id)
     previewRenderer.bindSource(id.rawValue)
@@ -649,6 +674,12 @@ final class AppModel {
     settingsStore.saveSnapshot(persistedSnapshot)
     installCaptureUpdateHandler(for: id)
     installProcessedFrameHandler(for: id)
+    // The camera that was selected keeps running headless. If its saved LUT
+    // never loaded while it was selected, restore it the headless way now.
+    if previous != id, !previousLUTLoaded, feedCoordinator.isFeedRunning(previous),
+      let old = self.descriptor(for: previous), old.applyLUT, let bookmark = old.lutBookmark {
+      restoreHeadlessLUT(feedID: previous, bookmark: bookmark, pipelineEnabled: old.pipelineEnabled)
+    }
     return true
   }
 
@@ -688,7 +719,7 @@ final class AppModel {
     persistedSnapshot = feedCoordinator.snapshot
     settingsStore.saveSnapshot(persistedSnapshot)
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
-    publishVirtualCameraRegistry(persistedSnapshot)
+    publishVirtualCameraRegistry(persistedSnapshot, reason: "camera removed")
     monitorCoordinator.updateTargets(feeds: feedDescriptors, programAvailable: outputMode == .program)
     return true
   }
@@ -840,7 +871,7 @@ final class AppModel {
     persistedSnapshot = feedCoordinator.snapshot
     settingsStore.saveSnapshot(persistedSnapshot)
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
-    publishVirtualCameraRegistry(persistedSnapshot)
+    publishVirtualCameraRegistry(persistedSnapshot, reason: "settings saved")
     monitorCoordinator.updateTargets(feeds: feedDescriptors, programAvailable: outputMode == .program)
   }
 
@@ -876,14 +907,18 @@ final class AppModel {
   /// Publishes the complete feed topology in one transaction. The camera
   /// extension receives it through CMIO and retains existing devices until
   /// their clients release them during reconciliation.
-  private func publishVirtualCameraRegistry(_ snapshot: AppSettingsSnapshot) {
+  private func publishVirtualCameraRegistry(_ snapshot: AppSettingsSnapshot, reason: String) {
     let previous = virtualCameraRegistryStore.load()
     let candidate = VirtualCameraRegistrySnapshot.forFeeds(snapshot.feeds,
       outputMode: snapshot.outputMode, previous: previous)
     do {
       try virtualCameraRegistryStore.save(candidate)
+      if candidate != previous {
+        registryLog.notice("Registry publish: generation \(candidate.generation, privacy: .public), \(candidate.devices.filter(\.enabled).count, privacy: .public) cameras (\(snapshot.outputMode == .program ? "Program" : "separate cameras", privacy: .public)), reason: \(reason, privacy: .public)")
+      }
       registryPublisher.publish(candidate)
     } catch {
+      registryLog.error("Registry publish failed: \(error.localizedDescription, privacy: .public)")
       update.message = "Virtual cameras could not be updated: \(error.localizedDescription)"
     }
   }
@@ -926,6 +961,7 @@ final class AppModel {
   }
 
   func start() {
+    captureLog.notice("Start \(self.selectedFeedID.rawValue, privacy: .public): user (selected camera)")
     manuallyStoppedFeeds.remove(selectedFeedID)
     if automaticFeedEnabled { retryAutomaticFeed() } else { startFeed() }
     noteStartAttempt(selectedFeedID, started: running)
@@ -1019,6 +1055,7 @@ final class AppModel {
   }
 
   func stop() {
+    captureLog.notice("Stop \(self.selectedFeedID.rawValue, privacy: .public): user (selected camera)")
     manuallyStoppedFeeds.insert(selectedFeedID)
     refusedStarts.remove(selectedFeedID)
     running = false
@@ -1184,6 +1221,7 @@ final class AppModel {
         guard let self, self.feedDescriptors.contains(where: { $0.id == feedID }) else { return }
         self.cameraUpdates[feedID] = update
         if update.stopped {
+          captureLog.notice("Stopped \(feedID.rawValue, privacy: .public): \(update.message, privacy: .public)")
           self.cameraStateRevision &+= 1
           self.monitorCoordinator.sourceStateChanged(target: MonitorTargetID(feedID.rawValue), running: false, message: update.message)
           self.detectedInputCadence[feedID] = nil
@@ -1227,6 +1265,7 @@ final class AppModel {
   private func restoreHeadlessLUT(feedID: FeedID, bookmark: Data, pipelineEnabled: Bool) {
     let controller = feedCoordinator.capture(for: feedID)
     let generation = controller.generationToken
+    lutLog.notice("LUT restore started: \(feedID.rawValue, privacy: .public) (headless camera, generation \(generation, privacy: .public))")
     Task { [weak self, lutLoader] in
       let loaded: LoadedLUT
       let lut: MonitorLUT
@@ -1235,15 +1274,19 @@ final class AppModel {
         lut = try await Self.makeMonitorLUT(loaded.cube)
       } catch {
         await MainActor.run { [weak self] in
+          lutLog.error("LUT restore failed: \(feedID.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
           self?.headlessLUTRestoreFailed(error, feedID: feedID, bookmark: bookmark, generation: generation)
         }
         return
       }
       await MainActor.run { [weak self] in
-        guard let self, self.feedCoordinator.isFeedRunning(feedID),
-          controller.generationToken == generation,
-          let descriptor = self.feedCoordinator.descriptors.first(where: { $0.id == feedID }),
-          descriptor.lutBookmark == bookmark, descriptor.applyLUT else { return }
+        guard let self else { return }
+        if let reason = self.headlessLUTSkipReason(feedID: feedID, controller: controller, generation: generation,
+          bookmark: bookmark) {
+          lutLog.notice("LUT restore skipped: \(feedID.rawValue, privacy: .public): \(reason, privacy: .public)")
+          return
+        }
+        lutLog.notice("LUT restored: \(feedID.rawValue, privacy: .public), \"\(loaded.cube.title, privacy: .public)\" (\(loaded.fileName, privacy: .public))")
         controller.load(lut, expectedGeneration: generation) { [weak self] result in
           MainActor.assumeIsolated {
             guard let self else { return }
@@ -1251,19 +1294,35 @@ final class AppModel {
               self.headlessLUTRestoreFailed(error, feedID: feedID, bookmark: bookmark, generation: generation)
               return
             }
-            guard self.feedCoordinator.isFeedRunning(feedID),
-              controller.generationToken == generation,
-              let descriptor = self.feedCoordinator.descriptors.first(where: { $0.id == feedID }),
-              descriptor.lutBookmark == bookmark, descriptor.applyLUT else { return }
+            if let reason = self.headlessLUTSkipReason(feedID: feedID, controller: controller, generation: generation,
+              bookmark: bookmark) {
+              lutLog.notice("LUT not applied: \(feedID.rawValue, privacy: .public): \(reason, privacy: .public)")
+              return
+            }
+            guard let descriptor = self.feedCoordinator.descriptors.first(where: { $0.id == feedID }) else { return }
             var configuration = descriptor.configuration
             if let detected = self.detectedInputCadence[feedID] { configuration.inputFast = detected }
             configuration.applyLUT = true
+            lutLog.notice("LUT applied: \(feedID.rawValue, privacy: .public), burned into its output and monitor")
             self.feedCoordinator.reconfigureCapture(feedID: feedID,
               configuration: configuration, pipelineEnabled: descriptor.pipelineEnabled)
           }
         }
       }
     }
+  }
+
+  /// Why a headless camera's finished LUT restore no longer applies; nil when it does.
+  /// A skip is never final: the event that made it stale (a restart, a newer
+  /// toggle or bookmark) restores again.
+  private func headlessLUTSkipReason(feedID: FeedID, controller: CaptureController, generation: UInt64,
+                                     bookmark: Data) -> String? {
+    guard feedCoordinator.isFeedRunning(feedID) else { return "the camera is not running" }
+    guard controller.generationToken == generation else { return "the camera restarted (a newer restore follows)" }
+    guard let descriptor = feedCoordinator.descriptors.first(where: { $0.id == feedID }) else { return "the camera was removed" }
+    guard descriptor.lutBookmark == bookmark else { return "the camera's LUT changed (a newer restore follows)" }
+    guard descriptor.applyLUT else { return "Apply LUT is off" }
+    return nil
   }
 
   private func headlessLUTRestoreFailed(_ error: Error, feedID: FeedID, bookmark: Data, generation: UInt64) {
@@ -1369,8 +1428,12 @@ final class AppModel {
       let action = policy.action(ready: ready && (id != selectedFeedID || canStartFeed), running: isRunning)
       feedPolicies[id] = policy
       if id == selectedFeedID { automaticPolicy = policy }
+      let why = [camera ? "camera app" : nil, recording ? "recording" : nil,
+        outputMode == .program && programRequested ? "Program" : nil,
+        policy.previewRequested ? "preview" : nil].compactMap { $0 }.joined(separator: ", ")
       switch action {
       case .start:
+        captureLog.notice("Start \(id.rawValue, privacy: .public): automatic (\(why.isEmpty ? "demand" : why, privacy: .public))")
         demandStartedFeeds.insert(id)
         refusedStarts.remove(id)
         if id == selectedFeedID { startFeed() }
@@ -1390,6 +1453,7 @@ final class AppModel {
         }
       case .stop:
         guard demandStartedFeeds.contains(id), !recording else { continue }
+        captureLog.notice("Stop \(id.rawValue, privacy: .public): automatic (no camera app, preview or recording needs it)")
         demandStartedFeeds.remove(id)
         feedCoordinator.stopCapture(feedID: id)
         monitorCoordinator.sourceStateChanged(target: MonitorTargetID(id.rawValue), running: false, message: "Waiting for demand")
@@ -1516,6 +1580,7 @@ final class AppModel {
       return
     }
     noteStartAttempt(id, started: true)
+    captureLog.notice("Start \(id.rawValue, privacy: .public): user")
     manuallyStoppedFeeds.remove(id)
     installCaptureUpdateHandler(for: id)
     installProcessedFrameHandler(for: id)
@@ -1538,6 +1603,7 @@ final class AppModel {
     if id == selectedFeedID { stop(); return }
     refusedStarts.remove(id)
     guard feedCoordinator.isFeedRunning(id) else { return }
+    captureLog.notice("Stop \(id.rawValue, privacy: .public): user")
     manuallyStoppedFeeds.insert(id)
     demandStartedFeeds.remove(id)
     recordingModel.stop(feedID: id)
@@ -1585,6 +1651,9 @@ final class AppModel {
       }
     }
     guard descriptor != before else { return }
+    if descriptor.applyLUT != before.applyLUT {
+      lutLog.notice("Apply LUT \(descriptor.applyLUT ? "on" : "off", privacy: .public): \(id.rawValue, privacy: .public)\(id == self.selectedFeedID ? " (selected camera)" : "", privacy: .public), running: \(self.isCameraRunning(id), privacy: .public), saved LUT: \(descriptor.lutBookmark != nil, privacy: .public)")
+    }
     if id == selectedFeedID {
       if descriptor.applyLUT != before.applyLUT { rememberedLUTEnabled = descriptor.applyLUT }
       if descriptor.configuration.downscale != configuration.downscale ||
@@ -1607,13 +1676,19 @@ final class AppModel {
       if descriptor.automaticFeed != automaticFeedEnabled { automaticFeedEnabled = descriptor.automaticFeed }
       if descriptor.selectedDevice != selectedDevice { selectedDevice = descriptor.selectedDevice }
       if descriptor.applyLUT != before.applyLUT { saveSettings() }
+      // Turned on with its saved LUT not in memory (it could not be read when
+      // the camera was selected or the app launched): read it again now. It is
+      // applied when it loads, like any restore.
+      if descriptor.applyLUT, !before.applyLUT, !lutLoaded, let bookmark = lutBookmark, !loading {
+        restoreLUT(bookmark: bookmark)
+      }
       return
     }
     if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
     feedCoordinator.update(descriptor)
     persistedSnapshot = feedCoordinator.snapshot
     settingsStore.saveSnapshot(persistedSnapshot)
-    publishVirtualCameraRegistry(persistedSnapshot)
+    publishVirtualCameraRegistry(persistedSnapshot, reason: "camera settings changed")
     if descriptor.previewEnabled != before.previewEnabled {
       monitorCoordinator.setPreviewEnabled(descriptor.previewEnabled, for: MonitorTargetID(id.rawValue))
     }

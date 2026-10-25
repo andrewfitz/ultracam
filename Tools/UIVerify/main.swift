@@ -1003,6 +1003,111 @@ import SystemExtensions
 
   // MARK: Menu bar
 
+  /// Every running camera with Apply LUT on and a saved LUT burns it in, whatever
+  /// the selection, start order or toggles. Scripted capture: starts succeed and
+  /// deliver no frames; no hardware.
+  func lutOnRunningCameras() throws {
+    let suiteName = "org.ultracam.ui-verify-lut-run.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut run: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-run-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    var lattice = ["TITLE \"Run LUT\"", "LUT_3D_SIZE 2"]
+    for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lattice.append("\(1 - Float(r)) \(1 - Float(g)) \(1 - Float(b))") } } }
+    let cube = folder.appendingPathComponent("run.cube")
+    try lattice.joined(separator: "\n").write(to: cube, atomically: true, encoding: .utf8)
+    let settings = AppSettingsStore(defaults: defaults)
+    let alpha = FeedID(rawValue: "ui-verify-run-alpha"), beta = FeedID(rawValue: "ui-verify-run-beta")
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: [
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-a", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-b", applyLUT: false, automaticFeed: false),
+    ], selectedFeedID: alpha, outputMode: .separateCameras))
+    var hardware = AppHardware.offline
+    hardware.devices = { [InputDevice(id: "dev-a", name: "UltraStudio A"), InputDevice(id: "dev-b", name: "UltraStudio B")] }
+    hardware.captureServices = { _ in
+      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+        send: { _ in true })
+      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
+      return services
+    }
+    let model = AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+      registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    func settle(until condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(5)
+      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+    }
+    func burns(_ id: FeedID) -> Bool { model.burnInLUT(for: id) != nil }
+    func both(_ name: String) {
+      settle { burns(alpha) && burns(beta) }
+      verifier.check("lut run: \(name): Camera 1 burns its LUT in", burns(alpha))
+      verifier.check("lut run: \(name): Camera 2 burns its LUT in", burns(beta))
+    }
+    func toggle(_ id: FeedID) {
+      model.updateCamera(id) { $0.applyLUT = false }
+      settle { !burns(id) }
+      verifier.check("lut run: Apply LUT off stops \(id == alpha ? "Camera 1" : "Camera 2")'s LUT", !burns(id))
+      model.updateCamera(id) { $0.applyLUT = true }
+    }
+
+    model.loadLUT(url: cube, feedID: alpha)
+    settle { !model.loading && model.lutLoaded }
+    model.loadLUT(url: cube, feedID: beta)
+    settle { model.descriptor(for: beta)?.applyLUT == true }
+    model.startCamera(alpha)
+    model.startCamera(beta)
+    settle { model.isCameraRunning(alpha) && model.isCameraRunning(beta) }
+    verifier.check("lut run: both cameras run", model.isCameraRunning(alpha) && model.isCameraRunning(beta))
+    both("started")
+    model.selectFeed(beta)
+    settle { !model.loading }
+    both("after selecting Camera 2")
+    toggle(alpha)
+    both("after toggling Camera 1 while Camera 2 is selected")
+    toggle(beta)
+    both("after toggling the selected Camera 2")
+    model.selectFeed(alpha)
+    settle { !model.loading }
+    both("after selecting Camera 1 again")
+    toggle(beta)
+    both("after toggling Camera 2 while Camera 1 is selected")
+    toggle(alpha)
+    both("after toggling the selected Camera 1")
+    model.stopCamera(beta)
+    model.stopCamera(alpha)
+
+    // A saved LUT that could not be read at launch (a disk not mounted yet, a
+    // moved file put back): turning Apply LUT off and on again reads it again,
+    // on the selected camera and on another one.
+    let backup = folder.appendingPathComponent("run-backup.cube")
+    try FileManager.default.copyItem(at: cube, to: backup)
+    try FileManager.default.removeItem(at: cube)
+    let relaunched = AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+      registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    settle { !relaunched.loading }
+    verifier.check("lut run: a missing saved LUT is reported", relaunched.lutTitle == "Saved LUT unavailable",
+      relaunched.lutTitle)
+    relaunched.startCamera(alpha)
+    relaunched.startCamera(beta)
+    settle { relaunched.isCameraRunning(alpha) && relaunched.isCameraRunning(beta) }
+    try FileManager.default.copyItem(at: backup, to: cube)
+    for id in [alpha, beta] {
+      relaunched.updateCamera(id) { $0.applyLUT = false }
+      relaunched.updateCamera(id) { $0.applyLUT = true }
+    }
+    settle { relaunched.burnInLUT(for: alpha) != nil && relaunched.burnInLUT(for: beta) != nil }
+    verifier.check("lut run: Apply LUT on reads a returned LUT again (selected Camera 1)",
+      relaunched.burnInLUT(for: alpha) != nil, relaunched.lutTitle)
+    verifier.check("lut run: Apply LUT on reads a returned LUT again (Camera 2)",
+      relaunched.burnInLUT(for: beta) != nil)
+    relaunched.stopCamera(beta)
+    relaunched.stopCamera(alpha)
+  }
+
   /// "Advertise HDR to cameras": off by default, persisted, and applied to the
   /// backend at launch (before discovery) and on every change; no hardware.
   func hdrAdvertisement() {
@@ -1174,6 +1279,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   do { try MonitorLUTVerify.run(verifier: verifier) } catch { verifier.check("monitor LUT tests threw", false, "\(error)") }
   run.discovery()
   run.hdrAdvertisement()
+  do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
   run.adoption()
   run.sharedInput()
   run.pictureMenus()
