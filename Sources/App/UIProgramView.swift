@@ -11,8 +11,8 @@ struct UIProgramView: View {
 
   var body: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 12) {
-        HStack(alignment: .top, spacing: 12) {
+      VStack(alignment: .leading, spacing: UIPictureSpacing.gutter) {
+        HStack(alignment: .top, spacing: UIPictureSpacing.gutter) {
           programPicture
             .frame(maxWidth: .infinity)
           VStack(spacing: 10) {
@@ -30,7 +30,7 @@ struct UIProgramView: View {
       }
     }
     .scrollBounceBehavior(.basedOnSize)
-    .contentMargins(12, for: .scrollContent)
+    .contentMargins(UIPictureSpacing.margin, for: .scrollContent)
   }
 
   private var programPicture: some View {

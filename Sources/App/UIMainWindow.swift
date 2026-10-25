@@ -8,10 +8,11 @@ struct UIMainWindowView: View {
   /// really take (the strip's height changes with its contents and when it collapses).
   @State private var stripHeights: [String: CGFloat] = [:]
 
-  /// Space between a picture and its strip (`UICameraColumnView`) and between grid cells.
+  /// Space between a picture and its strip (`UICameraColumnView`), between grid cells,
+  /// and around the pictures (clear of the sidebar, inspector and window edges).
   private let columnSpacing: CGFloat = 10
-  private let cellSpacing: CGFloat = 12
-  private let margin: CGFloat = 12
+  private let cellSpacing = UIPictureSpacing.gutter
+  private let margin = UIPictureSpacing.margin
 
   var body: some View {
     NavigationSplitView(columnVisibility: columnVisibility) {

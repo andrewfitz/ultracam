@@ -52,6 +52,17 @@ extension Font {
   static let uiPlaceholderTitle = Font.title3.weight(.semibold)
 }
 
+/// Room around the camera pictures in the main window, in every layout.
+enum UIPictureSpacing {
+  /// From the sidebar, inspector, toolbar, status bar and window edges.
+  static let margin: CGFloat = 20
+  /// Between two cameras (side by side, four up, Program's sources).
+  static let gutter: CGFloat = 20
+  /// How far the selection ring sits outside its picture. It stays well inside the
+  /// margin and half the gutter, so it's never clipped and never touches a neighbour.
+  static let ringOutset: CGFloat = 4
+}
+
 extension View {
   /// Dark backing for text drawn over video, so it stays readable over bright pictures (≥ 4.5:1).
   /// A caller's own `.font` wins; the default is the overlay style.

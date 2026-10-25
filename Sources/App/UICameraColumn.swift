@@ -82,10 +82,16 @@ struct UICameraPictureView: View {
     }
     .overlay {
       // Selection only means something next to other pictures; alone, the ring just doubles the tally ring.
-      if camera.selected && !compact && context.presentation.layout != .single {
-        RoundedRectangle(cornerRadius: 17).strokeBorder(Color.accentColor, lineWidth: 2.5)
-          .padding(-4).allowsHitTesting(false)
-      }
+      // Always in the hierarchy and shown by opacity, without animation: selecting never inserts a
+      // view or animates anything, and an overlay never changes the picture's layout. It sits in
+      // the margin around the pictures (UIPictureSpacing), so it's never clipped.
+      let outset = UIPictureSpacing.ringOutset
+      RoundedRectangle(cornerRadius: (compact ? 10 : 14) + outset).strokeBorder(Color.accentColor, lineWidth: 2.5)
+        .padding(-outset)
+        .opacity(camera.selected && !compact && context.presentation.layout != .single ? 1 : 0)
+        .transaction { $0.animation = nil }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
     .contentShape(Rectangle())
     .onTapGesture { context.send(.select(cameraID: camera.id)) }
