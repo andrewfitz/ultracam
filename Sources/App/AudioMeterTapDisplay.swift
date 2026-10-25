@@ -7,28 +7,110 @@ import MonitorKitAudio
 // checks it (it compiles AudioMeterTap*.swift).
 
 extension AudioMeterTap {
-  /// The over watch's memory between packets. Meter queue only.
+  /// The over watch's memory between packets, for one meter. Meter queue only.
   struct OverWatch {
     static let channels = 16
-    /// The meter these readings came from; a new session's meter starts over.
-    var meter: ObjectIdentifier?
+    /// The meter (session or take number) these readings came from; a new one starts over.
+    var source: UInt64?
     var lastMax = [Float](repeating: -.infinity, count: channels)
     var lastClips = [UInt32](repeating: 0, count: channels)
     /// The meter's frame count at each channel's last over sample.
     var lastOverFrame = [UInt64?](repeating: nil, count: channels)
-    /// Uptime of the last log line, in nanoseconds.
-    var lastLog: UInt64?
-    /// Overs not logged since the last line (the rate limit).
-    var suppressed = 0
+
+    struct Event: Equatable {
+      var channel: Int
+      /// dBTP: the higher of the channel's maximum and its bar.
+      var level: Float
+      var clips: UInt32
+    }
+
+    /// Looks at the readings after a packet for a new over: a sample clipped,
+    /// the true-peak maximum rose to −1 dBTP or above, or the true-peak bar is
+    /// there. Overs on a channel less than a second of audio apart are one
+    /// over; overs on several channels at once are one, named by the first.
+    mutating func observe(_ snapshot: AudioMeterSnapshot, source: UInt64) -> Event? {
+      if self.source != source { self = OverWatch(source: source) }
+      let n = min(snapshot.channelCount, Self.channels)
+      var event: Event?
+      for c in 0..<n {
+        let levels = snapshot.channels[c]
+        // A peak reset lowers the maximum and clears the count: follow it.
+        if levels.truePeakMax < lastMax[c] || levels.clipCount < lastClips[c] {
+          lastMax[c] = levels.truePeakMax
+          lastClips[c] = levels.clipCount
+        }
+        let clipped = levels.clipCount > lastClips[c]
+        let rose = levels.truePeakMax > lastMax[c] && levels.truePeakMax >= -1
+        let over = clipped || rose || levels.truePeak >= -1
+        lastMax[c] = levels.truePeakMax
+        lastClips[c] = levels.clipCount
+        guard over else { continue }
+        let previous = lastOverFrame[c]
+        lastOverFrame[c] = snapshot.frameCount
+        let gap = UInt64(EmbeddedAudioFormat.sampleRate)
+        if event == nil, previous.map({ snapshot.frameCount &- $0 > gap }) ?? true {
+          event = Event(channel: c, level: max(levels.truePeakMax, levels.truePeak), clips: levels.clipCount)
+        }
+      }
+      return event
+    }
   }
 
-  struct LogContext: Sendable, Equatable {
-    var camera: String?
-    var timecode: String?
+  /// The over log's rate limit: one line a second. Overs held back are counted
+  /// in the next line, or flushed in a line of their own once their second is
+  /// up, so the log never loses one. Times are uptime nanoseconds. Meter queue only.
+  struct OverLogLimiter {
+    static let interval: UInt64 = 1_000_000_000
+    private(set) var lastLog: UInt64?
+    /// Overs held back since the last line.
+    private(set) var suppressed = 0
+    /// The source timecode of the last over held back.
+    private(set) var lastSuppressedTimecode: String?
+
+    /// An over: the count held back to report in its line (0 for none), or nil
+    /// when the over is held back.
+    mutating func offer(now: UInt64, timecode: String?) -> Int? {
+      if let lastLog, now &- lastLog < Self.interval {
+        suppressed += 1
+        lastSuppressedTimecode = timecode
+        return nil
+      }
+      lastLog = now
+      defer { suppressed = 0; lastSuppressedTimecode = nil }
+      return suppressed
+    }
+
+    /// The overs held back, once a second has passed since the last line; nil when there are none or it's too soon.
+    mutating func flush(now: UInt64) -> (count: Int, timecode: String?)? {
+      guard suppressed > 0, let lastLog, now &- lastLog >= Self.interval else { return nil }
+      self.lastLog = now
+      defer { suppressed = 0; lastSuppressedTimecode = nil }
+      return (suppressed, lastSuppressedTimecode)
+    }
+
+    func nanosecondsUntilFlush(now: UInt64) -> UInt64 {
+      guard let lastLog else { return 0 }
+      let elapsed = now &- lastLog
+      return elapsed >= Self.interval ? 0 : Self.interval - elapsed
+    }
   }
 
-  struct TakeState: Sendable {
-    var oversAtStart: UInt64
+  /// A running take: its own meter, and the overs its own watch counted.
+  struct TakeState {
+    let meter: AudioMeter
+    let number: UInt64
+    /// The first packet (ring position) the take meters.
+    let startPacket: Int
+    var paused = false
+    var overs = 0
+  }
+
+  /// The line for overs the rate limit held back: "Audio overs on Camera 1:
+  /// 3 more since the last report, the last at 01:02:03:04".
+  static func heldOversMessage(camera: String?, count: Int, lastTimecode: String?) -> String {
+    var text = "Audio overs on \(camera ?? "a camera"): \(count) more since the last report"
+    if let lastTimecode, !lastTimecode.isEmpty, lastTimecode != "—" { text += ", the last at \(lastTimecode)" }
+    return text
   }
 
   /// One log line for an over: "Audio over on Camera 1, L: +0.4 dBTP, 3 clipped samples, at 01:02:03:04

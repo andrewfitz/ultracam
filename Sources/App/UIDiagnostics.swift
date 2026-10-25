@@ -191,8 +191,6 @@ private struct UIDiagnosticsCameraTab: View {
   }
 }
 
-/// The capture device and driver: cached SDK attributes plus the last
-/// session's device-side counters. Reading never calls into the driver.
 /// The Embedded Audio section's meter: the camera's live strip meter and its
 /// loudness numbers (integrated, LRA, Max TP, PLR, phase correlation), read
 /// from the tap while shown; the status levels where the camera has no meter.
@@ -207,7 +205,7 @@ private struct UIDiagnosticsAudioMeter: View {
       UILiveAudioMeter(cameraID: cameraID, name: name ?? "Camera", audio: audio)
         .environment(\.uiAudioMeters, UIAudioMeterSource { [tap] _ in tap })
       if let tap {
-        UIDiagnosticsLoudness(tap: tap).id(ObjectIdentifier(tap))
+        UIDiagnosticsLoudness(tap: tap).id(tap.identity)
       }
     }
   }
@@ -235,6 +233,8 @@ private struct UIDiagnosticsLoudness: View {
   }
 }
 
+/// The capture device and driver: cached SDK attributes plus the last
+/// session's device-side counters. Reading never calls into the driver.
 private struct UIDiagnosticsDeviceSection: View {
   let device: UltracamDeviceDiagnostics?
   let driverWarning: String?

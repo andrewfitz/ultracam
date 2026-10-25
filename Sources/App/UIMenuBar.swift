@@ -582,7 +582,7 @@ struct UIMenuPreviewContent: View {
       .overlay(alignment: .bottomLeading) {
         HStack(spacing: 6) {
           Text(camera.timecode).font(.caption.monospacedDigit().weight(.semibold)).uiPictureOverlay()
-          UILiveAudioMeter(cameraID: camera.id, name: camera.name, timecode: camera.timecode, audio: camera.audio,
+          UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio,
             style: .compact)
             .uiPictureOverlay()
         }

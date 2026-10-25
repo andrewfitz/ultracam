@@ -36,7 +36,7 @@ struct UIAudioMeterPanel: View {
     Group {
       if let tap = source?.tap(cameraID) {
         // A new capture (camera removed and added again) is a new tap: a new view pairs attach and detach.
-        UIAudioMeterTapView(tap: tap, present: levels.present, name: name).id(ObjectIdentifier(tap))
+        UIAudioMeterTapView(tap: tap, present: levels.present, name: name).id(tap.identity)
       } else {
         LevelMeterView(snapshot: levels.meterSnapshot, style: .full, present: levels.present, name: name)
       }
@@ -58,11 +58,14 @@ private struct UIAudioMeterTapView: View {
       Group {
         if let meter { AudioMeterView(meter: meter, present: present, name: name) } else { Color.clear }
       }
-      Text("Click OVER to reset the peaks; right-click to reset loudness. Loudness is measured while shown or recording.")
+      Text("Click OVER to reset the peaks; right-click to reset loudness. Loudness is measured while shown or recording, and starts over with each take.")
         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
     .onAppear { meter = tap.attach() }
-    .onDisappear { tap.detach() }
+    .onDisappear {
+      tap.detach()
+      meter = nil
+    }
   }
 }
 
@@ -71,21 +74,20 @@ private struct UIAudioMeterTapView: View {
 /// broadcast scale, drawn at the display rate from the camera's live meter
 /// while one exists. The status levels, published a few times a second, say
 /// whether audio is present and stand in where there's no meter (fixtures,
-/// previews, a camera not capturing). Showing the meter names the camera and
-/// timecode in the tap's over log.
+/// previews, a camera not capturing).
 struct UILiveAudioMeter: View {
   let cameraID: String
   let name: String
-  var timecode: String? = nil
   let audio: UIAudioLevels
   var style: LevelMeterStyle = .strip
   @Environment(\.uiAudioMeters) private var source
 
   var body: some View {
     if let tap = source?.tap(cameraID) {
-      // A new capture is a new tap: a new view pairs attach and detach.
-      UILiveAudioMeterTapView(tap: tap, name: name, timecode: timecode, audio: audio, style: style)
-        .id(ObjectIdentifier(tap))
+      // A new capture is a new tap: a new view pairs attach and detach. Only
+      // `present` goes in, so the 4 Hz status peaks don't re-evaluate it.
+      UILiveAudioMeterTapView(tap: tap, name: name, present: audio.present, style: style)
+        .id(tap.identity)
     } else {
       LevelMeterView(snapshot: audio.meterSnapshot, style: style, present: audio.present, name: name)
     }
@@ -96,24 +98,21 @@ struct UILiveAudioMeter: View {
 private struct UILiveAudioMeterTapView: View {
   let tap: AudioMeterTap
   let name: String
-  let timecode: String?
-  let audio: UIAudioLevels
+  let present: Bool
   let style: LevelMeterStyle
   @State private var meter: AudioMeter?
+  private static let silence = AudioMeterTap.snapshot(statusPeaks: [0, 0])
 
   var body: some View {
     Group {
       if let meter {
-        LevelMeterView(meter: meter, style: style, present: audio.present, name: name)
+        LevelMeterView(meter: meter, style: style, present: present, name: name)
       } else {
-        LevelMeterView(snapshot: audio.meterSnapshot, style: style, present: audio.present, name: name)
+        // Before the first appearance: two silent channels, the live meter's layout.
+        LevelMeterView(snapshot: Self.silence, style: style, present: present, name: name)
       }
     }
-    .onAppear {
-      meter = tap.attach()
-      tap.setLogContext(camera: name, timecode: timecode)
-    }
-    .onChange(of: timecode) { tap.setLogContext(camera: name, timecode: timecode) }
+    .onAppear { meter = tap.attach() }
     .onDisappear {
       tap.detach()
       meter = nil

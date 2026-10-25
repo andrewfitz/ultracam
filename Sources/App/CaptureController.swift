@@ -272,6 +272,9 @@ final class CaptureController: @unchecked Sendable {
     previewRenderers = (previewRenderer.map { [$0] } ?? []) + additionalPreviewRenderers
     queue.setSpecific(key: queueKey, value: 1)
     controlQueue.setSpecific(key: controlKey, value: 1)
+    // The over log names the source timecode at the over, read from the
+    // capture (under its media lock, on the meter queue), not from a view.
+    audioMeterTap.setTimecodeSource { [media] in media.snapshot().timecode }
   }
 
   deinit {
@@ -420,6 +423,8 @@ final class CaptureController: @unchecked Sendable {
         self.latencyMS = 0
         self.media.reset()
         self.audioMeterCoalescedAtStart = self.audioMeterTap.counters.coalesced
+        // A new stream: its first packet does not follow the last one metered.
+        self.audioMeterTap.noteGap()
         self.processor?.resetInFlightPeak()
         self.videoRateStart = 0
         self.videoRateBytes = 0

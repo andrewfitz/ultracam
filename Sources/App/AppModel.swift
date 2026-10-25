@@ -97,8 +97,12 @@ final class AppModel {
   func burnInLUT(for id: FeedID) -> MonitorLUT? {
     feedCoordinator.capturePool.existingController(for: id)?.burnInLUT
   }
+  /// Names the camera in the tap's over log as it hands the tap out (a lock
+  /// and a compare when unchanged), so a rename reaches the log.
   func audioMeterTap(for id: FeedID) -> AudioMeterTap? {
-    feedCoordinator.capturePool.existingController(for: id)?.audioMeterTap
+    guard let tap = feedCoordinator.capturePool.existingController(for: id)?.audioMeterTap else { return nil }
+    tap.setCameraName(feedCoordinator.descriptors.first { $0.id == id }?.name)
+    return tap
   }
   var selectedFeedID: FeedID { feedCoordinator.selectedFeedID }
 

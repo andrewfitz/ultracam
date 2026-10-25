@@ -8,7 +8,7 @@ import Synchronization
 let audioLog = Logger(subsystem: "org.ultracam.app", category: "audio")
 
 /// One capture's broadcast audio meters (MonitorKitAudio: sample and true peak,
-/// RMS, VU, PPM and EBU R 128 loudness), fed from the embedded audio the
+/// EBU R 128 loudness and phase correlation), fed from the embedded audio the
 /// DeckLink driver thread hands `CaptureController.receiveRawAudio`.
 ///
 /// The meters run off the driver thread, on the tap's own serial queue. The
@@ -53,6 +53,11 @@ let audioLog = Logger(subsystem: "org.ultracam.app", category: "audio")
 /// that session's meter), and drops a packet of a session it has already moved
 /// past (`Counters.stale`), so a new session never starts on old audio.
 ///
+/// A take (`beginTake` / `endTake`) meters on a meter of its own, fed from the
+/// same packets on the meter queue. A view's reset (clicking OVER, Reset
+/// Loudness) never touches the take's numbers, and a paused take leaves the
+/// paused audio out of its loudness, Max TP and overs.
+///
 /// The ring takes one producer at a time. The capture's generation guard
 /// already rejects packets from a stopped stream; `producing` makes an overlap
 /// of two driver threads (a restart racing the old stream's last packet) skip
@@ -61,7 +66,7 @@ final class AudioMeterTap: @unchecked Sendable {
   // @unchecked: `slots` is shared through the ring's acquire/release protocol
   // (a slot belongs to the producer from `tail` to `head`, to the meter queue
   // from `head` back to `tail`), and `consumerMeter`/`consumerSession` are
-  // confined to `meterQueue`. Everything else is atomic or under `sessions`.
+  // confined to `meterQueue`. Everything else is atomic or under a Mutex.
 
   /// The capture's fixed embedded-audio format: 48 kHz, 2 channels, Int32.
   /// Only what the meters show runs: true peak (and the sample peak behind
@@ -69,6 +74,20 @@ final class AudioMeterTap: @unchecked Sendable {
   static let configuration = AudioMeterConfiguration(
     sampleRate: EmbeddedAudioFormat.sampleRate, channelCount: EmbeddedAudioFormat.channelCount,
     meters: [.samplePeak, .truePeak, .loudness, .correlation])
+
+  /// A take's own meter: what its summary reports (integrated loudness, Max
+  /// TP) and its over watch needs (true peak, and the sample peak's clip count).
+  static let takeConfiguration = AudioMeterConfiguration(
+    sampleRate: EmbeddedAudioFormat.sampleRate, channelCount: EmbeddedAudioFormat.channelCount,
+    meters: [.samplePeak, .truePeak, .loudness])
+
+  private static let identities = Atomic<UInt64>(0)
+
+  /// Unique to this tap for the life of the process. Views key on it: an
+  /// `ObjectIdentifier` can come back for a new tap at a freed one's address
+  /// (a camera removed and added again), which would keep a view attached to
+  /// the old tap.
+  let identity: UInt64 = AudioMeterTap.identities.add(1, ordering: .relaxed).newValue
 
   /// Packets the hand-off holds before the meters coalesce: 4096 DeckLink
   /// callbacks, 68 s at 59.94p and 137 s at 29.97p. The slots are
@@ -126,14 +145,27 @@ final class AudioMeterTap: @unchecked Sendable {
   private var consumerMeter: AudioMeter?
   private var consumerSession: UInt64 = 0
 
-  /// Meter queue only: what the over watch saw last.
+  /// Meter queue only: what the live meter's over watch saw last.
   private var overWatch = OverWatch()
+  /// Meter queue only: the over log's rate limit.
+  private var overLog = OverLogLimiter()
+  /// Meter queue only: a flush of held-back overs is scheduled.
+  private var overLogFlushScheduled = false
+  /// Meter queue only: the take meter's over watch, and the last packet the take metered.
+  private var takeWatch = OverWatch()
+  private var lastTakePacket: Int?
   /// Overs since the tap was made (see `OverWatch`).
   private let overEvents = Atomic<UInt64>(0)
-  /// The camera and timecode the over log names; set by the views showing the meter.
-  private let logContext = Mutex(LogContext())
+  /// The last over line logged (`lastOverReport`).
+  private let lastReport = Mutex<String?>(nil)
+  /// The camera the over log names (`setCameraName`).
+  private let cameraName = Mutex<String?>(nil)
+  /// The capture's latest source timecode, read when an over is logged.
+  private let timecodeSource = Mutex<(@Sendable () -> String?)?>(nil)
   /// The take being measured, if any.
   private let take = Mutex<TakeState?>(nil)
+  /// Numbers the takes, so the meter queue tells one take's meter from the next.
+  private let takeNumbers = Atomic<UInt64>(0)
 
   private let metered = Atomic<UInt64>(0)
   private let rejected = Atomic<UInt64>(0)
@@ -217,6 +249,11 @@ final class AudioMeterTap: @unchecked Sendable {
     var next = tail.load(ordering: .relaxed)
     // Acquiring: the producer's slot contents up to `end`.
     let end = head.load(ordering: .acquiring)
+    guard next != end else { return }
+    // Once per drain, not per packet: the take, if one is running and not paused.
+    let currentTake = take.withLock { state in
+      state.flatMap { $0.paused ? nil : (meter: $0.meter, number: $0.number, start: $0.startPacket) }
+    }
     while next != end {
       let slot = slots + (next & slotMask)
       let packetSession = slot.pointee.session
@@ -252,6 +289,25 @@ final class AudioMeterTap: @unchecked Sendable {
       } else {
         stale.add(1, ordering: .relaxed)
       }
+      // The take's own meter, from the packet the take started at.
+      if let currentTake, next >= currentTake.start, let samples = slot.pointee.samples {
+        let takeMeter = currentTake.meter
+        // A gap in the stream, or audio left out while the take was paused.
+        if slot.pointee.followsGap || (lastTakePacket.map { $0 != next &- 1 } ?? false) { takeMeter.noteDiscontinuity() }
+        let frames = slot.pointee.frames
+        let stride = slot.pointee.stride
+        samples.withUnsafeBytes { raw in
+          guard let base = raw.baseAddress else { return }
+          takeMeter.process(interleaved: base.assumingMemoryBound(to: Int32.self), frameCount: frames,
+            frameStride: stride)
+        }
+        lastTakePacket = next
+        if takeWatch.observe(takeMeter.snapshot(), source: currentTake.number) != nil {
+          take.withLock { state in
+            if state?.number == currentTake.number { state?.overs += 1 }
+          }
+        }
+      }
       // The packet is released here, never on the driver thread.
       slot.pointee.samples = nil
       next &+= 1
@@ -275,55 +331,56 @@ final class AudioMeterTap: @unchecked Sendable {
     consumerSession = current.1
   }
 
-  /// Looks for a new over after each packet: a sample clipped, the true-peak
-  /// maximum rose to −1 dBTP or above, or the true-peak bar is there. Overs on
-  /// a channel less than a second (of audio) apart are one over. Each new one
-  /// counts in `overCount` and is logged, at most once a second. Meter queue only.
+  /// Looks for a new over after each packet (`OverWatch.observe`): a sample
+  /// clipped, the true-peak maximum rose to −1 dBTP or above, or the true-peak
+  /// bar is there. Overs on a channel less than a second (of audio) apart are
+  /// one over. Each new one counts in `overCount` and is logged, at most one
+  /// line a second; overs held back are counted in the next line, or in a line
+  /// of their own a second after the last if no other over follows. Meter queue only.
   private func watchForOvers(_ meter: AudioMeter) {
     let snapshot = meter.snapshot()
-    let id = ObjectIdentifier(meter)
-    if overWatch.meter != id { overWatch = OverWatch(meter: id) }
-    let n = min(snapshot.channelCount, OverWatch.channels)
-    var event: (channel: Int, level: Float, clips: UInt32)?
-    for c in 0..<n {
-      let levels = snapshot.channels[c]
-      // A peak reset lowers the maximum and clears the count: follow it.
-      if levels.truePeakMax < overWatch.lastMax[c] || levels.clipCount < overWatch.lastClips[c] {
-        overWatch.lastMax[c] = levels.truePeakMax
-        overWatch.lastClips[c] = levels.clipCount
-      }
-      let clipped = levels.clipCount > overWatch.lastClips[c]
-      let rose = levels.truePeakMax > overWatch.lastMax[c] && levels.truePeakMax >= -1
-      let over = clipped || rose || levels.truePeak >= -1
-      overWatch.lastMax[c] = levels.truePeakMax
-      overWatch.lastClips[c] = levels.clipCount
-      guard over else { continue }
-      let previous = overWatch.lastOverFrame[c]
-      overWatch.lastOverFrame[c] = snapshot.frameCount
-      let gap = UInt64(EmbeddedAudioFormat.sampleRate)
-      if previous == nil || snapshot.frameCount &- (previous ?? 0) > gap, event == nil {
-        event = (c, max(levels.truePeakMax, levels.truePeak), levels.clipCount)
-      }
-    }
-    guard let event else { return }
+    guard let event = overWatch.observe(snapshot, source: consumerSession) else { return }
     overEvents.add(1, ordering: .relaxed)
     let now = DispatchTime.now().uptimeNanoseconds
-    guard overWatch.lastLog == nil || now &- (overWatch.lastLog ?? 0) >= 1_000_000_000 else {
-      overWatch.suppressed += 1
+    let timecode = timecodeSource.withLock { $0 }?()
+    guard let suppressed = overLog.offer(now: now, timecode: timecode) else {
+      scheduleOverLogFlush(now: now)
       return
     }
-    overWatch.lastLog = now
-    let suppressed = overWatch.suppressed
-    overWatch.suppressed = 0
-    let context = logContext.withLock { $0 }
     let message = Self.overMessage(
-      camera: context.camera, channel: event.channel, channels: n, level: Double(event.level), clips: event.clips,
-      timecode: context.timecode, suppressed: suppressed)
+      camera: cameraName.withLock { $0 }, channel: event.channel, channels: min(snapshot.channelCount, OverWatch.channels),
+      level: Double(event.level), clips: event.clips, timecode: timecode, suppressed: suppressed)
     audioLog.notice("\(message, privacy: .public)")
+    lastReport.withLock { $0 = message }
+  }
+
+  /// Logs the overs the rate limit held back once their second is up, so a
+  /// burst's last overs reach the log even when no over follows them, or the
+  /// metering stops. Meter queue only.
+  private func scheduleOverLogFlush(now: UInt64) {
+    guard !overLogFlushScheduled else { return }
+    overLogFlushScheduled = true
+    let wait = overLog.nanosecondsUntilFlush(now: now)
+    meterQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(clamping: wait))) { [weak self] in
+      self?.flushOverLog()
+    }
+  }
+
+  private func flushOverLog() {
+    overLogFlushScheduled = false
+    let now = DispatchTime.now().uptimeNanoseconds
+    if let held = overLog.flush(now: now) {
+      let message = Self.heldOversMessage(camera: cameraName.withLock { $0 }, count: held.count, lastTimecode: held.timecode)
+      audioLog.notice("\(message, privacy: .public)")
+      lastReport.withLock { $0 = message }
+    } else if overLog.suppressed > 0 {
+      scheduleOverLogFlush(now: now)
+    }
   }
 
   /// Waits until the meter queue has metered every packet handed over before
-  /// this call. For tests and verification; never from the driver thread.
+  /// this call. For tests, verification and the end of a take; never from the
+  /// driver thread.
   func waitUntilMetered() {
     meterQueue.sync { drainRing() }
   }
@@ -367,46 +424,97 @@ final class AudioMeterTap: @unchecked Sendable {
 
   var isMetering: Bool { viewers.load(ordering: .relaxed) > 0 }
 
+  /// Views (and a take) holding the meters; for checks that views pair attach and detach.
+  var viewerCount: Int { viewers.load(ordering: .relaxed) }
+
   /// Overs seen since the tap was made, while metering (a second apart per channel).
   var overCount: UInt64 { overEvents.load(ordering: .relaxed) }
 
-  /// The camera name and source timecode the over log names. Any thread.
-  func setLogContext(camera: String?, timecode: String?) {
-    logContext.withLock { $0 = LogContext(camera: camera, timecode: timecode) }
+  /// The last line the over log wrote; nil before the first over. Any thread.
+  var lastOverReport: String? { lastReport.withLock { $0 } }
+
+  /// The camera the over log names. Any thread; cheap when unchanged.
+  func setCameraName(_ name: String?) {
+    cameraName.withLock { if $0 != name { $0 = name } }
+  }
+
+  /// Where the over log reads the source timecode: the capture's latest
+  /// RP188 label, read on the meter queue when an over is logged (never on
+  /// the driver thread). Set once by the capture.
+  func setTimecodeSource(_ source: @escaping @Sendable () -> String?) {
+    timecodeSource.withLock { $0 = source }
+  }
+
+  /// The audio the next packet brings does not follow the last one (the
+  /// capture restarted): the meters prime their filters there instead of
+  /// interpolating across the gap. Any thread.
+  func noteGap() {
+    gapPending.store(true, ordering: .relaxed)
   }
 
   // MARK: Takes
 
-  /// A take started: meters through the take whether or not a view shows
-  /// them, and starts integrated loudness, the true-peak maxima and the over
-  /// latch over, so the take's numbers are its own. Main thread. A second
-  /// call during a take restarts it. The true-peak interpolator reads about
-  /// six samples behind, so audio in the instant before the start can still
-  /// reach the take's maximum.
+  /// A take started. It meters on a meter of its own from the next packet
+  /// handed over, whether or not a view shows the meters, so its loudness,
+  /// Max TP and overs are its own: no view's reset changes them. The views'
+  /// meters start their peaks, over latch and loudness over too, so what they
+  /// show from here is the take. Main thread. A second call during a take
+  /// starts it over.
   func beginTake() {
-    let started = take.withLock { state -> Bool in
-      if state != nil { return false }
-      state = TakeState(oversAtStart: overCount)
-      return true
+    let meter: AudioMeter
+    do {
+      meter = try AudioMeter(configuration: Self.takeConfiguration)
+    } catch {
+      preconditionFailure("The take meter configuration is invalid: \(error)")
     }
-    let meter = started ? attach() : self.meter
-    meter?.resetPeaks()
-    meter?.resetLoudness()
-    if !started { take.withLock { $0?.oversAtStart = overCount } }
+    let start = head.load(ordering: .acquiring)
+    let number = takeNumbers.add(1, ordering: .relaxed).newValue
+    let restarted = take.withLock { state -> Bool in
+      let running = state != nil
+      state = TakeState(meter: meter, number: number, startPacket: start)
+      return running
+    }
+    // The take keeps the stream metered; a restart already holds its viewer.
+    let live = restarted ? self.meter : attach()
+    live?.resetPeaks()
+    live?.resetLoudness()
+  }
+
+  /// Leaves the audio out of the take while it is paused (`true`) and takes it
+  /// in again on resume. Main thread; a no-op without a take.
+  func pauseTake(_ paused: Bool) {
+    take.withLock { $0?.paused = paused }
+  }
+
+  /// The running take's numbers so far; nil without a take. Any thread.
+  func takeSummarySoFar() -> AudioTakeSummary? {
+    take.withLock { $0 }.map(Self.summary)
   }
 
   /// The take ended: its integrated loudness, maximum true peak and overs,
-  /// and the metering it held stops. Nil when no take was running. Main thread.
+  /// after the audio already handed over is metered. The metering it held
+  /// stops. Nil when no take was running. Main thread.
   func endTake() -> AudioTakeSummary? {
+    guard take.withLock({ $0 != nil }) else { return nil }
+    // Normally the ring is empty and this is a few microseconds. `flush`
+    // publishes the take meter's last few milliseconds; producer (meter queue) only.
+    meterQueue.sync {
+      drainRing()
+      take.withLock { $0?.meter }?.flush()
+    }
     guard let state = take.withLock({ state -> TakeState? in
       defer { state = nil }
       return state
     }) else { return nil }
-    let snapshot = meter?.snapshot() ?? AudioMeterSnapshot()
     detach()
+    return Self.summary(state)
+  }
+
+  private static func summary(_ state: TakeState) -> AudioTakeSummary {
+    let snapshot = state.meter.snapshot()
     return AudioTakeSummary(
       integrated: Double(snapshot.loudness.integrated), maximumTruePeak: Double(snapshot.programmeMaximumTruePeak),
-      overs: Int(clamping: overCount &- state.oversAtStart), duration: snapshot.loudness.duration)
+      overs: state.overs, duration: snapshot.loudness.duration)
   }
 
   /// The current (or last) session's meter; nil before the first attach.
