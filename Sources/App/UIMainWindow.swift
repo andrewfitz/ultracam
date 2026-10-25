@@ -7,6 +7,8 @@ struct UIMainWindowView: View {
   /// Measured channel-strip height per camera, so the pictures are fitted to what the strips
   /// really take (the strip's height changes with its contents and when it collapses).
   @State private var stripHeights: [String: CGFloat] = [:]
+  /// What the side columns' bindings read (see `columnVisibility`).
+  @State private var columns = UIColumnState()
 
   /// Space between a picture and its strip (`UICameraColumnView`), between grid cells,
   /// and around the pictures (clear of the sidebar, inspector and window edges).
@@ -15,6 +17,7 @@ struct UIMainWindowView: View {
   private let margin = UIPictureSpacing.margin
 
   var body: some View {
+    let _ = columns.update(from: context.session)
     NavigationSplitView(columnVisibility: columnVisibility) {
       UISessionSidebarView(context: context)
         .navigationSplitViewColumnWidth(min: 200, ideal: 236, max: 300)
@@ -155,17 +158,27 @@ struct UIMainWindowView: View {
 
   private var columnVisibility: Binding<NavigationSplitViewVisibility> {
     // Showing the sidebar is always the user's choice, whatever the window width.
-    // The split view keeps the first binding it gets, so read the live state, not this view's copy.
-    Binding(
-      get: { context.current.session.sidebarVisible ? .all : .detailOnly },
-      set: { context.send(.setSidebarVisible($0 != .detailOnly)) })
+    // The split view keeps the first binding it gets, so it reads the live state in `columns`,
+    // not this view's copy. The split view and inspector read these on every frame of their
+    // animations, so they must be cheap: `context.current` rebuilt the whole session each time.
+    let columns = columns
+    return Binding(
+      get: { columns.sidebarVisible ? .all : .detailOnly },
+      set: { value in
+        columns.sidebarVisible = value != .detailOnly
+        context.send(.setSidebarVisible(value != .detailOnly))
+      })
   }
 
   private var inspectorBinding: Binding<Bool> {
-    Binding(
-      get: { context.current.session.inspectorOpen },
+    let columns = columns
+    return Binding(
+      get: { columns.inspectorOpen },
       // Set, never toggle: SwiftUI may echo the current value back through the binding.
-      set: { context.send(.setInspectorOpen($0)) })
+      set: { open in
+        columns.inspectorOpen = open
+        context.send(.setInspectorOpen(open))
+      })
   }
 
   private var confirmationBinding: Binding<Bool> {
@@ -198,5 +211,21 @@ struct UIMainWindowView: View {
     case .resetAllSettings: return "Reset and Quit"
     default: return "Continue"
     }
+  }
+}
+
+/// The side columns' visibility for their bindings: set at once by the bindings, and taken
+/// from the session whenever the session's value changes, so a getter that runs before the
+/// next update (or on every animation frame) reads the current value without rebuilding the
+/// session. A body update with an older session (from this view's own state) changes nothing.
+@MainActor private final class UIColumnState {
+  var sidebarVisible = true
+  var inspectorOpen = false
+  private var seen: (sidebar: Bool, inspector: Bool)?
+
+  func update(from session: UISessionSnapshot) {
+    if seen?.sidebar != session.sidebarVisible { sidebarVisible = session.sidebarVisible }
+    if seen?.inspector != session.inspectorOpen { inspectorOpen = session.inspectorOpen }
+    seen = (session.sidebarVisible, session.inspectorOpen)
   }
 }

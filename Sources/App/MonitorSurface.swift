@@ -954,7 +954,11 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     metalLayer.maximumDrawableCount = 3
     metalLayer.device = presenter.gpu.layerDevice
     metalLayer.isOpaque = true
-    metalLayer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]
+    // While a resize settles, the compositor scales the drawables to the layer (see layout).
+    metalLayer.contentsGravity = .resize
+    metalLayer.actions = [
+      "bounds": NSNull(), "position": NSNull(), "frame": NSNull(), "contents": NSNull(), "drawableSize": NSNull(),
+    ]
     layer?.addSublayer(metalLayer)
     aspectObservation = presenter.$pictureAspectRatio.sink { [weak self] _ in
       MainActor.assumeIsolated { self?.needsLayout = true }
@@ -962,8 +966,23 @@ private final class MonitorWindowObservations: @unchecked Sendable {
   }
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+  /// How long the picture's size must hold still before the drawables follow it.
+  static let drawableSettleDelay: TimeInterval = 0.12
+  /// Drawable sizes committed so far (tests and diagnostics).
+  private(set) var drawableResizes = 0
+  private var drawableResizePending = false
+
   /// The layer is the picture's aspect-fit rectangle, so the drawable holds only
   /// picture pixels.
+  ///
+  /// The layer's frame follows every layout pass, but its drawable size doesn't:
+  /// while the picture is resizing (a side column or strip animating, a window
+  /// live-resizing) the compositor scales the last drawables to the new frame
+  /// (`contentsGravity` resize, same aspect), and the drawables are resized once,
+  /// when the size settles. Changing `drawableSize` makes Core Animation allocate a
+  /// new set of drawables, so following it on every animation frame reallocated
+  /// full-size surfaces at the display rate and hitched the animation. Every
+  /// camera frame is still drawn and presented meanwhile, only at the old size.
   override func layout() {
     super.layout()
     let aspect = presenter?.pictureAspectRatio ?? 16.0 / 9.0
@@ -974,12 +993,54 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     metalLayer.frame = frame.integral
-    if metalLayer.contentsScale != scale { metalLayer.contentsScale = scale }
-    let size = CGSize(
+    let scaleChanged = metalLayer.contentsScale != scale
+    if scaleChanged { metalLayer.contentsScale = scale }
+    CATransaction.commit()
+    // The first real size (a view that just appeared, or one laid out at zero size first) and
+    // a new display's scale apply at once; any other change waits to settle.
+    let degenerate = metalLayer.drawableSize.width <= 1 || metalLayer.drawableSize.height <= 1
+    if scaleChanged || degenerate {
+      commitDrawableSize()
+    } else if metalLayer.drawableSize != targetDrawableSize {
+      scheduleDrawableSize()
+    }
+  }
+
+  private var targetDrawableSize: CGSize {
+    let scale = metalLayer.contentsScale
+    return CGSize(
       width: max(1, (metalLayer.frame.width * scale).rounded()),
       height: max(1, (metalLayer.frame.height * scale).rounded()))
-    if metalLayer.drawableSize != size { metalLayer.drawableSize = size }
+  }
+
+  /// Restarts the settle delay on every change, so a resize in progress never reallocates.
+  private func scheduleDrawableSize() {
+    NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(drawableSizeSettled), object: nil)
+    drawableResizePending = true
+    perform(#selector(drawableSizeSettled), with: nil, afterDelay: Self.drawableSettleDelay)
+  }
+
+  @objc private func drawableSizeSettled() {
+    // A window live resize pauses between drags; it commits when the resize ends instead.
+    if inLiveResize { return }
+    commitDrawableSize()
+  }
+
+  private func commitDrawableSize() {
+    NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(drawableSizeSettled), object: nil)
+    drawableResizePending = false
+    let size = targetDrawableSize
+    guard metalLayer.drawableSize != size else { return }
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    metalLayer.drawableSize = size
     CATransaction.commit()
+    drawableResizes += 1
+  }
+
+  override func viewDidEndLiveResize() {
+    super.viewDidEndLiveResize()
+    if drawableResizePending || metalLayer.drawableSize != targetDrawableSize { commitDrawableSize() }
   }
 
   /// Moving between a 1x and a 2x display changes the backing scale: resize the
@@ -998,6 +1059,8 @@ private final class MonitorWindowObservations: @unchecked Sendable {
       renderLoop.start(paused: !isDrawable)
     } else {
       renderLoop.stop()
+      NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(drawableSizeSettled), object: nil)
+      drawableResizePending = false
     }
   }
 
