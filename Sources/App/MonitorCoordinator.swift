@@ -121,7 +121,8 @@ import MonitorKit
   func diagnostics(for target: MonitorTargetID) -> MonitorDiagnostics {
     var snapshot = diagnosticSnapshots[target] ?? MonitorDiagnostics()
     snapshot.requestedPictureHz = hosts[target]?.observedSourceFrameHz ?? 0
-    snapshot.requestedScopeHz = preferences(for: target).scopes.refreshHz
+    // Scopes follow the video: one per source frame (the saved refresh rate is ignored).
+    snapshot.requestedScopeHz = Int(snapshot.requestedPictureHz.rounded())
     let registered = surfaces.values.filter { $0.target == target }
     if !registered.isEmpty
       && (!isPreviewEnabled(for: target)

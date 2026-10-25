@@ -126,9 +126,6 @@ struct UIScopeSettingsView: View {
       }
       .help("The Y'CbCr weights of the drawn luma and chroma. Automatic uses the camera's matrix for the source and BT.709 after a LUT.")
     }
-    Picker("Refresh", selection: $scopes.refreshHz) {
-      ForEach(MonitorScopePreferences.refreshRates, id: \.self) { Text("\($0) Hz").tag($0) }
-    }
     UIScopeSlider(title: "Trace gain", value: settings.display.gain, range: 0.25...4, format: "%.2f×")
     Toggle("Graticule", isOn: settings.display.showsGraticule)
     UIScopeSlider(title: "Clip above", value: settings.clipHighPercent, range: 90...109, format: "%.0f%%", step: 1)
