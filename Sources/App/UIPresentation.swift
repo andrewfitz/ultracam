@@ -77,6 +77,8 @@ struct UICameraRecording: Sendable, Equatable {
   var droppedFrames = 0
   var failed = false
   var error: String?
+  /// A note on the take that isn't an error, such as audio re-synced to the picture.
+  var note: String?
   /// The most recent finished take, kept until the next take starts.
   var savedFileName: String?
   var savedURL: URL?
@@ -301,6 +303,8 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var automaticStartFailed: Bool
   /// The failed take ran out of disk space: the strip offers another folder.
   var diskFull = false
+  /// A note on the current or last take, such as audio re-synced after a signal drop.
+  var recordingNote: String? = nil
 }
 
 /// One row of an Input picker: a listed device, and the other camera that already uses it.
@@ -658,7 +662,8 @@ enum UIPresentationBuilder {
       activeTools: UIMonitorTool.allCases.filter { camera.activeTools.contains($0) },
       accessibilityLabel: labelParts.joined(separator: ", "),
       lutError: camera.lutError, automaticStartFailed: camera.automaticStartFailed,
-      diskFull: diskFull(camera, in: session))
+      diskFull: diskFull(camera, in: session),
+      recordingNote: rec.note)
   }
 
   static func stopMessage(camera: UICameraSnapshot, recording: Bool, onAir: Bool) -> String {

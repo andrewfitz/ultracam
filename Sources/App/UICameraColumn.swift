@@ -819,6 +819,14 @@ struct UIChannelStripView: View {
             }
             .font(.uiValue)
           }
+          if let note = camera.recordingNote {
+            HStack(spacing: 4) {
+              Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).imageScale(.small)
+              Text(note).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            }
+            .font(.uiValue)
+            .help(note)
+          }
         }
       }
       Spacer(minLength: 4)

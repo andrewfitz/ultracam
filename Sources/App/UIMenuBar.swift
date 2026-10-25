@@ -476,6 +476,8 @@ struct UIMenuPreviewCard: View {
       UIMenuPreviewContent(presentation: UIPresentationBuilder.session(session), session: session,
         pictures: UIAppPictures(model: model), showLive: showLive, width: width)
     }
+    // The meter bars read the camera's tap every refresh, not this 1 s snapshot.
+    .environment(\.uiAudioMeters, UIAudioMeterSource { [model] in model.audioMeterTap(for: FeedID(rawValue: $0)) })
   }
 }
 

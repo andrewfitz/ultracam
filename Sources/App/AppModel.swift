@@ -227,6 +227,10 @@ final class AppModel {
   private var routeDemand: [String: Bool] = [:]
   private var demandStartedFeeds: Set<FeedID> = []
   private var manuallyStoppedFeeds: Set<FeedID> = []
+  /// Each camera's virtual-camera route ID. It depends only on the feed ID, and
+  /// building a descriptor hex-encodes four identities, which the interface
+  /// snapshot did on every animation frame.
+  @ObservationIgnored private var feedRouteIDs: [FeedID: String] = [:]
   private var refusedStarts: Set<FeedID> = []
   /// Cameras whose input is None by choice. Discovery never fills them (`applyDevices`).
   @ObservationIgnored private var inputsClearedByChoice: Set<FeedID> = []
@@ -1301,7 +1305,7 @@ final class AppModel {
     if feedCoordinator.outputMode == .program {
       return VirtualCameraDescriptor.program().id
     }
-    return VirtualCameraDescriptor.feed(feedID: selectedFeedID.rawValue).id
+    return feedRouteID(selectedFeedID)
   }
 
   var automaticFeedStatus: String {
@@ -1352,7 +1356,7 @@ final class AppModel {
         $0.id == id && ($0.status == .recording || $0.status == .paused)
       }
       var policy = feedPolicies[id] ?? AutomaticFeedPolicy()
-      let camera = routeDemand[VirtualCameraDescriptor.feed(feedID: id.rawValue).id] == true
+      let camera = routeDemand[feedRouteID(id)] == true
       policy.demand(camera || (outputMode == .program && programRequested) || recording)
       let legacyVisible = id == selectedFeedID && descriptor.previewEnabled &&
         (previewRenderer.isPresented || miniPreviewRenderer.isPresented)
@@ -1489,9 +1493,16 @@ final class AppModel {
   /// Program mode: the "Ultracam · Program" virtual camera has at least one client.
   var programInUse: Bool { routeDemand[VirtualCameraDescriptor.program().id] == true }
 
+  private func feedRouteID(_ id: FeedID) -> String {
+    if let cached = feedRouteIDs[id] { return cached }
+    let routeID = VirtualCameraDescriptor.feed(feedID: id.rawValue).id
+    feedRouteIDs[id] = routeID
+    return routeID
+  }
+
   /// Separate mode: this camera's virtual camera has at least one client.
   func cameraInUse(_ id: FeedID) -> Bool {
-    routeDemand[VirtualCameraDescriptor.feed(feedID: id.rawValue).id] == true
+    routeDemand[feedRouteID(id)] == true
   }
 
   /// Starts one camera without changing the selection. The selected camera

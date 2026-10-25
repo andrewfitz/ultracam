@@ -157,6 +157,7 @@ struct UISessionBridge {
       rec.fileBytes = Int64(stats?.fileBytes ?? 0)
       rec.megabitsPerSecond = stats?.videoMegabitsPerSecond ?? 0
       rec.droppedFrames = Int(clamping: stats?.droppedVideoFrames ?? 0)
+      rec.note = stats?.warning
       rec.failed = stats?.failed == true
       rec.error = state?.error ?? stats?.lastError
       rec.savedURL = state?.savedURL

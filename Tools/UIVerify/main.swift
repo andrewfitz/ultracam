@@ -259,6 +259,22 @@ import SystemExtensions
     let context = UIContext.fixture(session) { log.append($0) }
     let presentation = context.presentation
 
+    // A sidebar row that names a camera is one button that shows it in the inspector. (A List's
+    // rows expose no text offscreen, so the row is hosted on its own.)
+    let outputRow = HostedView(UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · Camera 2", detail: "Not in use")
+      .uiSidebarInspectButton(cameraName: "Camera 2") { log.append(.showInspector(cameraID: "camera-2")) },
+      size: CGSize(width: 260, height: 44), dark: false)
+    if let row = Accessibility.nodes(in: outputRow.host).first(where: { $0.text.contains("Camera 2") && $0.enabled }) {
+      log.clear()
+      _ = Accessibility.press(row)
+      verifier.check("a sidebar output row shows its camera in the inspector",
+        log.actions.contains(.showInspector(cameraID: "camera-2")), "\(log.actions)", viewDependent: true)
+    } else {
+      verifier.check("a sidebar output row is a button", false, names(Accessibility.nodes(in: outputRow.host)).joined(separator: "; "),
+        viewDependent: true)
+    }
+    outputRow.close()
+
     // Picture press selects and never cuts (D1).
     for camera in presentation.cameras {
       let hosted = HostedView(UICameraPictureView(camera: camera, context: context), size: CGSize(width: 520, height: 292), dark: false)
