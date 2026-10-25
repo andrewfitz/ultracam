@@ -1,4 +1,5 @@
 import AppKit
+import MonitorKitAudio
 import SwiftUI
 
 /// Diagnostics window: per-camera capture, drops, audio, encoder and
@@ -144,8 +145,11 @@ private struct UIDiagnosticsCameraTab: View {
           // Meters only: recording and video still get every packet.
           UIDiagnosticsRow("Meter packets coalesced", UIDiagnosticsFormat.count(update.audioMeterCoalesced),
             warning: update.audioMeterCoalesced > 0)
-          UIAudioMeter(audio: UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
-            peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight))
+          // The camera's live meter (true peak, R 128 loudness), not the 4 Hz status levels.
+          UIDiagnosticsAudioMeter(cameraID: cameraID.rawValue, name: model.feedDescriptors.first { $0.id == cameraID }?.name,
+            audio: UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
+              peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight),
+            tap: model.audioMeterTap(for: cameraID))
         }
       }
       UIDiagnosticsDeviceSection(device: model.deviceDiagnostics(cameraID), driverWarning: model.driverWarning)
@@ -189,6 +193,48 @@ private struct UIDiagnosticsCameraTab: View {
 
 /// The capture device and driver: cached SDK attributes plus the last
 /// session's device-side counters. Reading never calls into the driver.
+/// The Embedded Audio section's meter: the camera's live strip meter and its
+/// loudness numbers (integrated, LRA, Max TP, PLR, phase correlation), read
+/// from the tap while shown; the status levels where the camera has no meter.
+private struct UIDiagnosticsAudioMeter: View {
+  let cameraID: String
+  let name: String?
+  let audio: UIAudioLevels
+  let tap: AudioMeterTap?
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      UILiveAudioMeter(cameraID: cameraID, name: name ?? "Camera", audio: audio)
+        .environment(\.uiAudioMeters, UIAudioMeterSource { [tap] _ in tap })
+      if let tap {
+        UIDiagnosticsLoudness(tap: tap).id(ObjectIdentifier(tap))
+      }
+    }
+  }
+}
+
+/// Twice a second: the live meter's R 128 numbers and correlation.
+private struct UIDiagnosticsLoudness: View {
+  let tap: AudioMeterTap
+
+  var body: some View {
+    TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+      let s = tap.meter?.snapshot()
+      let loudness = s.map { Double($0.loudness.integrated) } ?? -.infinity
+      let peak = s.map { Double($0.programmeMaximumTruePeak) } ?? -.infinity
+      Text([
+        "I " + (loudness.isFinite ? MeterText.level(loudness) + " LUFS" : "—"),
+        "LRA " + (s.map { MeterText.amount(Double($0.loudness.loudnessRange)) + " LU" } ?? "—"),
+        "Max TP " + (peak.isFinite ? MeterText.level(peak) + " dBTP" : "—"),
+        "PLR " + MeterText.amount(s?.peakToLoudnessRatio),
+        "Phase " + MeterText.correlation(s.map { Double($0.correlation) } ?? .nan),
+        "Overs \(tap.overCount)",
+      ].joined(separator: " · "))
+      .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+    }
+  }
+}
+
 private struct UIDiagnosticsDeviceSection: View {
   let device: UltracamDeviceDiagnostics?
   let driverWarning: String?

@@ -602,8 +602,8 @@ struct UIChannelStripView: View {
       Divider()
       outputRow
       HStack(spacing: 8) {
-        gutterIcon("waveform").help("Embedded audio").accessibilityHidden(true)
-        UILiveAudioMeter(cameraID: camera.id, audio: camera.audio)
+        gutterIcon("waveform").help("Embedded audio, true peak").accessibilityHidden(true)
+        UILiveAudioMeter(cameraID: camera.id, name: camera.name, timecode: camera.timecode, audio: camera.audio)
       }
     }
   }
@@ -1009,9 +1009,11 @@ struct UIChannelStripView: View {
       ViewThatFits(in: .horizontal) {
         HStack(spacing: 6) {
           effectChips
-          UILiveAudioMeter(cameraID: camera.id, audio: camera.audio, compact: true)
+          UILiveAudioMeter(cameraID: camera.id, name: camera.name, timecode: camera.timecode, audio: camera.audio,
+            style: .compact)
         }
-        UILiveAudioMeter(cameraID: camera.id, audio: camera.audio, compact: true)
+        UILiveAudioMeter(cameraID: camera.id, name: camera.name, timecode: camera.timecode, audio: camera.audio,
+          style: .compact)
         EmptyView()
       }
       if camera.stripState == .finishing {

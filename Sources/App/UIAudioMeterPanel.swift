@@ -20,23 +20,28 @@ extension EnvironmentValues {
   }
 }
 
-/// A camera's embedded audio on broadcast meters: per-channel bars (true peak by
-/// default; sample peak, RMS, VU or PPM on request) and the EBU R 128 loudness
-/// panel (M, S, I, LRA, Max TP). Falls back to the plain peak/RMS meter where no
-/// meters are available.
+/// A camera's embedded audio on MonitorKit's full broadcast panel: true-peak
+/// bars with each channel's maximum and the over latch, the EBU R 128 panel
+/// in LUFS (M, S, I, LRA, Max TP, PLR) and phase correlation. One standard
+/// meter, no meter-type picker. Without a live meter (fixtures, previews) the
+/// camera's status peaks stand in on the same scale.
 struct UIAudioMeterPanel: View {
   let cameraID: String
-  /// The camera's status levels: whether audio is present, and the fallback meter.
+  var name: String? = nil
+  /// The camera's status levels: whether audio is present, and the fallback readings.
   let levels: UIAudioLevels
   @Environment(\.uiAudioMeters) private var source
 
   var body: some View {
-    if let tap = source?.tap(cameraID) {
-      // A new capture (camera removed and added again) is a new tap: a new view pairs attach and detach.
-      UIAudioMeterTapView(tap: tap, present: levels.present).id(ObjectIdentifier(tap))
-    } else {
-      UIAudioMeter(audio: levels)
+    Group {
+      if let tap = source?.tap(cameraID) {
+        // A new capture (camera removed and added again) is a new tap: a new view pairs attach and detach.
+        UIAudioMeterTapView(tap: tap, present: levels.present, name: name).id(ObjectIdentifier(tap))
+      } else {
+        LevelMeterView(snapshot: levels.meterSnapshot, style: .full, present: levels.present, name: name)
+      }
     }
+    .frame(height: 210)
   }
 }
 
@@ -45,54 +50,44 @@ struct UIAudioMeterPanel: View {
 private struct UIAudioMeterTapView: View {
   let tap: AudioMeterTap
   let present: Bool
-  @State private var kind: AudioMeterBarKind = .truePeak
+  let name: String?
   @State private var meter: AudioMeter?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
-      Picker("Meter", selection: $kind) {
-        ForEach(AudioMeterBarKind.allCases, id: \.self) { Text($0.title).tag($0) }
-      }
-      .pickerStyle(.segmented)
-      .labelsHidden()
-      .help("Meter scale for the channel bars. Loudness is EBU R 128 (−23 LUFS target).")
       Group {
-        if let meter { AudioMeterView(meter: meter, kind: kind) } else { Color.clear }
+        if let meter { AudioMeterView(meter: meter, present: present, name: name) } else { Color.clear }
       }
-      .frame(height: 160)
-      .opacity(present ? 1 : 0.4)
-      .overlay {
-        if !present {
-          Text("No embedded audio").font(.callout).foregroundStyle(.secondary)
-            .padding(.horizontal, 8).padding(.vertical, 4)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
-        }
-      }
-      Text("Click the bars to reset peaks; right-click to reset loudness. Loudness is measured while shown.")
-        .font(.caption).foregroundStyle(.secondary)
+      Text("Click OVER to reset the peaks; right-click to reset loudness. Loudness is measured while shown or recording.")
+        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
     .onAppear { meter = tap.attach() }
     .onDisappear { tap.detach() }
   }
 }
 
-/// A camera's level meter (the strip's, the collapsed strip's, the menu bar's) at the
-/// display rate: it shows the camera's live meter while one exists and draws it on every
-/// display refresh, reading the meter's lock-free latest readings. The status levels,
-/// published a few times a second, only say whether audio is present (and stand in
-/// where there's no meter: fixtures, previews, a camera not capturing).
+/// A camera's level meter (the expanded strip's, the collapsed strip's, the
+/// menu bar card's) on MonitorKit's `LevelMeterView`: true peak on the
+/// broadcast scale, drawn at the display rate from the camera's live meter
+/// while one exists. The status levels, published a few times a second, say
+/// whether audio is present and stand in where there's no meter (fixtures,
+/// previews, a camera not capturing). Showing the meter names the camera and
+/// timecode in the tap's over log.
 struct UILiveAudioMeter: View {
   let cameraID: String
+  let name: String
+  var timecode: String? = nil
   let audio: UIAudioLevels
-  var compact = false
+  var style: LevelMeterStyle = .strip
   @Environment(\.uiAudioMeters) private var source
 
   var body: some View {
     if let tap = source?.tap(cameraID) {
       // A new capture is a new tap: a new view pairs attach and detach.
-      UILiveAudioMeterTapView(tap: tap, audio: audio, compact: compact).id(ObjectIdentifier(tap))
+      UILiveAudioMeterTapView(tap: tap, name: name, timecode: timecode, audio: audio, style: style)
+        .id(ObjectIdentifier(tap))
     } else {
-      UIAudioMeter(audio: audio, compact: compact)
+      LevelMeterView(snapshot: audio.meterSnapshot, style: style, present: audio.present, name: name)
     }
   }
 }
@@ -100,16 +95,33 @@ struct UILiveAudioMeter: View {
 /// Meters one tap while shown; the tap meters off the capture thread only while a view attaches.
 private struct UILiveAudioMeterTapView: View {
   let tap: AudioMeterTap
+  let name: String
+  let timecode: String?
   let audio: UIAudioLevels
-  let compact: Bool
+  let style: LevelMeterStyle
   @State private var meter: AudioMeter?
 
   var body: some View {
-    UIAudioMeter(audio: audio, compact: compact, meter: meter)
-      .onAppear { meter = tap.attach() }
-      .onDisappear {
-        tap.detach()
-        meter = nil
+    Group {
+      if let meter {
+        LevelMeterView(meter: meter, style: style, present: audio.present, name: name)
+      } else {
+        LevelMeterView(snapshot: audio.meterSnapshot, style: style, present: audio.present, name: name)
       }
+    }
+    .onAppear {
+      meter = tap.attach()
+      tap.setLogContext(camera: name, timecode: timecode)
+    }
+    .onChange(of: timecode) { tap.setLogContext(camera: name, timecode: timecode) }
+    .onDisappear {
+      tap.detach()
+      meter = nil
+    }
   }
+}
+
+extension UIAudioLevels {
+  /// The status peaks as meter readings, for a camera without a live meter.
+  var meterSnapshot: AudioMeterSnapshot { AudioMeterTap.snapshot(statusPeaks: [peakLeft, peakRight]) }
 }
