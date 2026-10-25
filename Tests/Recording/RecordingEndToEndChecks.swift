@@ -560,6 +560,90 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     }
   }
 
+  /// Mid-take clock jumps, in a real movie. `audioOnly`: ten callbacks bring
+  /// audio while the video clock stands still, so the audio re-anchors
+  /// earlier and the overlap is left out. `skipped`: ten callbacks never
+  /// arrive, so a hole is filled with silence (AVAssetWriter would otherwise
+  /// close it up and pull every later sample early). Either way the audio
+  /// must end with the video, and the movie must not outlast its frames.
+  func testMovieStaysInSyncAcrossAMidTakeClockJump() throws {
+    for scenario in ["audioOnly", "skipped"] {
+      let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-avjump-\(UUID().uuidString)")
+      defer { try? FileManager.default.removeItem(at: root) }
+      let url = root.appendingPathComponent("avjump.mov")
+      let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("avjump"), outputURL: url,
+        width: 1_920, height: 1_080, videoCodec: kCMVideoCodecType_AppleProRes422HQ)
+      let adapter = try SourceRecordingCallbackAdapter(configuration: config)
+      try adapter.start()
+      let callbacks = adapter.callbacks
+      let image = try v210Frame(width: 1_920, height: 1_080)
+      let duration = VideoContract.fastDuration
+      let videoOrigin = Int64(126) * duration.value
+      var audioClock: Int64 = 300_000 + 42_050
+      var videoFrame: Int64 = 0
+      var sent: Int64 = 0
+      var gap: Int64 = 0
+      func packet(_ index: Int64) -> Int { Int(((index + 1) * 8_008 + 5) / 10 - (index * 8_008 + 5) / 10) }
+      for index: Int64 in 0..<70 {
+        let count = packet(index)
+        let inGap = (30..<40).contains(index)
+        if inGap, scenario == "skipped" {
+          videoFrame += 1
+          audioClock += Int64(count)
+          gap += Int64(count)
+          continue
+        }
+        if !inGap {
+          XCTAssertTrue(callbacks.video(image, CMTime(value: videoOrigin + videoFrame * duration.value,
+            timescale: duration.timescale), duration, true))
+          videoFrame += 1
+        } else {
+          gap += Int64(count)
+        }
+        XCTAssertTrue(callbacks.rawAudio(Data(count: count * 2 * 4), count,
+          CMTime(value: audioClock, timescale: 48_000), 2, 4))
+        audioClock += Int64(count)
+        sent += Int64(count)
+        Thread.sleep(forTimeInterval: duration.seconds)
+      }
+      try adapter.stop()
+      let telemetry = adapter.telemetry
+      XCTAssertEqual(adapter.state, .finished, telemetry.lastError ?? "")
+      XCTAssertEqual(telemetry.droppedAudio, 0)
+      if scenario == "audioOnly" {
+        XCTAssertEqual(telemetry.audioBackwardResyncs, 1)
+        XCTAssertEqual(telemetry.audioResyncTrimmedFrames, UInt64(gap))
+      } else {
+        XCTAssertEqual(telemetry.audioSilenceFilledFrames, UInt64(gap))
+      }
+      let expectedAudio = scenario == "audioOnly" ? sent - gap : sent + gap
+
+      final class Ranges: @unchecked Sendable {
+        var video: CMTimeRange?, audio: CMTimeRange?, movie: CMTime?
+      }
+      let ranges = Ranges()
+      let asset = AVURLAsset(url: url)
+      let done = DispatchSemaphore(value: 0)
+      Task {
+        ranges.video = try? await asset.loadTracks(withMediaType: .video).first?.load(.timeRange)
+        ranges.audio = try? await asset.loadTracks(withMediaType: .audio).first?.load(.timeRange)
+        ranges.movie = try? await asset.load(.duration)
+        done.signal()
+      }
+      done.wait()
+      let video = try XCTUnwrap(ranges.video)
+      let audio = try XCTUnwrap(ranges.audio)
+      let movie = try XCTUnwrap(ranges.movie)
+      let onePacket = 801.0 / 48_000
+      XCTAssertEqual(audio.duration.seconds, Double(expectedAudio) / 48_000, accuracy: 1.0 / 48_000,
+        "\(scenario): only the overlap is left out, only the hole is added")
+      XCTAssertEqual(audio.end.seconds, video.end.seconds, accuracy: onePacket,
+        "\(scenario): audio ends \(audio.end.seconds - video.end.seconds) s after the video")
+      XCTAssertEqual(movie.seconds, video.end.seconds, accuracy: onePacket,
+        "\(scenario): the movie runs on past its last frame")
+    }
+  }
+
   /// When the disk stays stalled past the memory bound the take fails
   /// visibly; it is never a silent drop. What was queued is still written.
   func testWriterOverflowFailsTheTakeVisiblyAndKeepsTheFile() throws {

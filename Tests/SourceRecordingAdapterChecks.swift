@@ -335,10 +335,10 @@ private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecke
     try assertAudioOnVideoClock(writer.audioSnapshot, firstFrame: 1, videoOrigin: videoOrigin)
   }
 
-  /// Should the device re-base one clock mid-take (an HDMI re-lock), the next
-  /// pair re-anchors. Moving later leaves a gap; moving earlier would overlap
-  /// written audio, so audio stays contiguous and no sample is dropped.
-  func testRawAudioReanchorsAfterAClockStepWithoutDroppingAudio() throws {
+  /// Should the device re-base only its audio clock mid-take, the next pair
+  /// re-anchors and the audio lands back on its frames: nothing overlaps,
+  /// nothing is left out, no silence is needed.
+  func testRawAudioReanchorsAfterItsClockSteps() throws {
     for step: Int64 in [129_600, -4_000] {
       let (writer, adapter) = try rawAudioAdapter("step-\(step)")
       let callbacks = adapter.callbacks
@@ -350,19 +350,207 @@ private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecke
       }
       XCTAssertTrue(waitForAudio(writer, count: 60))
       try adapter.stop()
-      let audio = writer.audioSnapshot
-      XCTAssertEqual(adapter.telemetry.droppedAudio, 0)
-      try assertAudioOnVideoClock(Array(audio.prefix(30)), firstFrame: 0, videoOrigin: videoOrigin)
-      if step > 0 {
-        try assertAudioOnVideoClock(Array(audio.suffix(30)), firstFrame: 30, videoOrigin: videoOrigin)
-      } else {
-        for index in 1..<audio.count {
-          XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(audio[index]),
-            CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(audio[index - 1]),
-              CMSampleBufferGetDuration(audio[index - 1])), "packet \(index) must not overlap or gap")
+      try assertAudioOnVideoClock(writer.audioSnapshot, firstFrame: 0, videoOrigin: videoOrigin)
+      let telemetry = adapter.telemetry
+      XCTAssertEqual(telemetry.droppedAudio, 0)
+      XCTAssertEqual(telemetry.audioReanchors, 1)
+      XCTAssertEqual(telemetry.audioBackwardResyncs, 0)
+      XCTAssertEqual(telemetry.audioResyncTrimmedFrames, 0)
+      XCTAssertEqual(telemetry.audioSilenceFilledFrames, 0)
+      XCTAssertNil(telemetry.warning)
+    }
+  }
+
+  /// The backup for a backward jump: the input delivered audio while its
+  /// video clock stood still (ten audio-only callbacks during a re-lock), so
+  /// the next pair re-anchors that much earlier. The new audio lands on its
+  /// frames, exactly the overlapping frames are left out, and the cut is
+  /// crossfaded from what the recorded audio would have continued with.
+  func testBackwardResyncLeavesOutOnlyTheOverlapAndCrossfadesTheCut() throws {
+    let (writer, adapter) = try rawAudioAdapter("backward-resync")
+    var feed = DeckLinkFeed(videoOrigin: 1_001 * 300, audioOrigin: 500_000)
+    let callbacks = adapter.callbacks
+    for _ in 0..<30 { XCTAssertTrue(feed.callback(callbacks)) }
+    let cut = feed.content
+    for _ in 0..<10 { XCTAssertTrue(feed.callback(callbacks, video: false)) }
+    let overlap = feed.content - cut
+    for _ in 0..<40 { XCTAssertTrue(feed.callback(callbacks)) }
+    // Ten packets wholly inside the overlap leave nothing to queue.
+    XCTAssertTrue(waitForAudio(writer, count: 70))
+    try adapter.stop()
+
+    let telemetry = adapter.telemetry
+    XCTAssertEqual(telemetry.audioReanchors, 1)
+    XCTAssertEqual(telemetry.audioBackwardResyncs, 1)
+    XCTAssertEqual(telemetry.audioResyncTrimmedFrames, UInt64(overlap))
+    XCTAssertEqual(telemetry.audioSilenceFilledFrames, 0)
+    XCTAssertEqual(telemetry.droppedAudio, 0)
+    XCTAssertEqual(telemetry.totalDrops, 0)
+    XCTAssertTrue(telemetry.warning?.contains("re-synced") == true, telemetry.warning ?? "no note")
+
+    let audio = writer.audioSnapshot
+    let output = try contiguousFrames(audio)
+    XCTAssertEqual(output.count, (feed.content - overlap) * 2, "Only the overlap is left out")
+    // After the overlap every packet sits on its own frame again.
+    let resumed = audio.drop(while: { CMSampleBufferGetPresentationTimeStamp($0).value < feed.videoStart(40) })
+    XCTAssertFalse(resumed.isEmpty)
+    for sample in resumed {
+      let pts = CMSampleBufferGetPresentationTimeStamp(sample).value
+      let frame = feed.frameIndex(at: pts)
+      XCTAssertLessThanOrEqual(abs(pts - feed.videoStart(frame)), 1, "packet at \(pts)")
+    }
+    // Recorded audio is the source, sample-exact, except the overlap left
+    // out and the crossfade.
+    let fade = EmbeddedAudioClockAnchor.crossfadeFrames
+    let joint = cut + overlap  // output frame where the kept audio starts
+    var mismatches = 0
+    for frame in 0..<output.count / 2 where frame < joint || frame >= joint + fade {
+      let source = frame < joint ? frame : frame + overlap
+      for channel in 0..<2 where output[frame * 2 + channel] != feed.recorded(source, channel: channel) {
+        mismatches += 1
+      }
+    }
+    XCTAssertEqual(mismatches, 0, "recorded samples differ from the source outside the crossfade")
+    XCTAssertEqual(output[(output.count / 2 - 1) * 2], feed.recorded(feed.content - 1, channel: 0))
+    // No click: across the cut no step is larger than the tone's own (0.029
+    // of full scale) plus the fade's share; a plain cut would step 0.44.
+    let fullScale = Double(1 << 23)
+    let plainStep = abs(Double(feed.recorded(joint - 1, channel: 0) - feed.recorded(joint + overlap, channel: 0)))
+    XCTAssertGreaterThan(plainStep / fullScale, 0.3, "the test tone must make a plain cut audible")
+    var largest = 0.0
+    for frame in (joint - 8)..<(joint + fade + 8) {
+      for channel in 0..<2 {
+        largest = max(largest, abs(Double(output[(frame + 1) * 2 + channel] - output[frame * 2 + channel])))
+      }
+    }
+    XCTAssertLessThan(largest / fullScale, 0.04, "the crossfade must not click")
+  }
+
+  /// The device skipped ten callbacks (no frames, no audio; both clocks ran
+  /// on). The movie's LPCM track has no gaps, so the hole is filled with
+  /// silence of exactly its length and the audio after it stays on its frames.
+  func testAudioHoleIsFilledWithExactSilence() throws {
+    let (writer, adapter) = try rawAudioAdapter("silence-fill")
+    var feed = DeckLinkFeed(videoOrigin: 1_001 * 300, audioOrigin: 500_000)
+    let callbacks = adapter.callbacks
+    for _ in 0..<30 { XCTAssertTrue(feed.callback(callbacks)) }
+    let hole = feed.skip(10)
+    for _ in 0..<30 { XCTAssertTrue(feed.callback(callbacks)) }
+    XCTAssertTrue(waitForAudio(writer, count: 61))
+    try adapter.stop()
+
+    let telemetry = adapter.telemetry
+    XCTAssertEqual(telemetry.audioSilenceFilledFrames, UInt64(hole))
+    XCTAssertEqual(telemetry.audioReanchors, 0)
+    XCTAssertEqual(telemetry.audioResyncTrimmedFrames, 0)
+    XCTAssertEqual(telemetry.droppedAudio, 0)
+    XCTAssertEqual(telemetry.deviceSkippedFrames, 10)
+    XCTAssertFalse(telemetry.warning?.contains("re-synced") == true, telemetry.warning ?? "")
+    let audio = writer.audioSnapshot
+    let output = try contiguousFrames(audio)
+    XCTAssertEqual(output.count, (feed.content + hole) * 2, "Every sample plus exactly the hole")
+    let holeStart = feed.contentBefore(skip: 30)
+    XCTAssertTrue(output[(holeStart * 2)..<((holeStart + hole) * 2)].allSatisfy { $0 == 0 })
+    XCTAssertEqual(output[(holeStart - 1) * 2], feed.recorded(holeStart - 1, channel: 0))
+    XCTAssertEqual(output[(holeStart + hole) * 2], feed.recorded(holeStart, channel: 0))
+    for sample in audio.suffix(30) {
+      let pts = CMSampleBufferGetPresentationTimeStamp(sample).value
+      XCTAssertLessThanOrEqual(abs(pts - feed.videoStart(feed.frameIndex(at: pts))), 1, "packet at \(pts)")
+    }
+  }
+
+  /// One input's callbacks: 59.94 frames on the stream clock, and their
+  /// 800/801-sample packets of a 440 Hz tone on a separate packet clock.
+  private struct DeckLinkFeed {
+    let videoOrigin: Int64
+    var audioClock: Int64
+    var callbackIndex = 0
+    var videoFrame = 0
+    /// Source frames delivered so far.
+    var content = 0
+    private var skippedAt: [Int: Int] = [:]
+
+    init(videoOrigin: Int64, audioOrigin: Int64) {
+      self.videoOrigin = videoOrigin
+      audioClock = audioOrigin
+    }
+
+    static func rounded(_ frame: Int) -> Int64 { (Int64(frame) * 8_008 + 5) / 10 }
+    func packetFrames(_ index: Int) -> Int { Int(Self.rounded(index + 1) - Self.rounded(index)) }
+    func videoStart(_ frame: Int) -> Int64 {
+      CMTimeConvertScale(CMTime(value: videoOrigin + Int64(frame) * 1_001, timescale: 60_000),
+        timescale: 48_000, method: .roundHalfAwayFromZero).value
+    }
+    func frameIndex(at sample: Int64) -> Int {
+      Int(((Double(sample - videoStart(0)) / 800.8)).rounded())
+    }
+
+    /// A source sample as 32-bit PCM whose low byte is zero, so it survives
+    /// the 24-bit recording exactly.
+    func source(_ frame: Int, channel: Int) -> Int32 {
+      let value = sin(2 * Double.pi * 440 * Double(frame) / 48_000) * (channel == 0 ? 0.5 : -0.25)
+      return Int32(value * Double(Int32.max)) & ~0xff
+    }
+    /// The same sample as the movie holds it (24-bit).
+    func recorded(_ frame: Int, channel: Int) -> Int32 { source(frame, channel: channel) >> 8 }
+
+    mutating func callback(_ callbacks: SourceRecordingCallbackAdapter.Callbacks, video: Bool = true) -> Bool {
+      let duration = CMTime(value: 1_001, timescale: 60_000)
+      if video {
+        var buffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(nil, 32, 32, kCVPixelFormatType_422YpCbCr10, nil, &buffer) == kCVReturnSuccess,
+          let buffer, callbacks.video(buffer, CMTime(value: videoOrigin + Int64(videoFrame) * 1_001,
+            timescale: 60_000), duration, true) else { return false }
+        videoFrame += 1
+      }
+      let count = packetFrames(callbackIndex)
+      var samples = [Int32](repeating: 0, count: count * 2)
+      for frame in 0..<count {
+        samples[frame * 2] = source(content + frame, channel: 0)
+        samples[frame * 2 + 1] = source(content + frame, channel: 1)
+      }
+      let data = samples.withUnsafeBytes { Data($0) }
+      let accepted = callbacks.rawAudio(data, count, CMTime(value: audioClock, timescale: 48_000), 2, 4)
+      audioClock += Int64(count)
+      content += count
+      callbackIndex += 1
+      return accepted
+    }
+
+    /// Callbacks the device never delivered: both clocks run on, no source.
+    mutating func skip(_ callbacks: Int) -> Int {
+      skippedAt[videoFrame] = content
+      var frames = 0
+      for _ in 0..<callbacks {
+        frames += packetFrames(callbackIndex)
+        callbackIndex += 1
+        videoFrame += 1
+      }
+      audioClock += Int64(frames)
+      return frames
+    }
+    func contentBefore(skip frame: Int) -> Int { skippedAt[frame] ?? 0 }
+  }
+
+  /// The queued audio as one run of interleaved 24-bit samples, checking
+  /// that each packet starts where the last one ended.
+  private func contiguousFrames(_ audio: [CMSampleBuffer]) throws -> [Int32] {
+    var result: [Int32] = []
+    var expected: CMTime?
+    for sample in audio {
+      let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+      if let expected { XCTAssertEqual(pts, expected, "packets must be contiguous") }
+      expected = CMTimeAdd(pts, CMTime(value: Int64(CMSampleBufferGetNumSamples(sample)), timescale: 48_000))
+      let bytes = try blockBytes(sample)
+      XCTAssertEqual(bytes.count, CMSampleBufferGetNumSamples(sample) * 6)
+      bytes.withUnsafeBytes { raw in
+        for index in 0..<(bytes.count / 3) {
+          let value = Int32(raw[index * 3]) | Int32(raw[index * 3 + 1]) << 8 | Int32(raw[index * 3 + 2]) << 16
+          result.append((value << 8) >> 8)
         }
       }
     }
+    return result
   }
 
   /// The start of 59.94 frame `frame` in 48 kHz samples (800.8 per frame).
@@ -405,8 +593,11 @@ private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecke
 
   private func rawAudioAdapter(_ name: String) throws -> (AdapterRecordingWriter, SourceRecordingCallbackAdapter) {
     let writer = AdapterRecordingWriter()
+    // Room for every callback a check sends at once: the queue bound is
+    // not under test here, and a busy machine must not fail the take.
     let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID(name),
-      outputURL: URL(fileURLWithPath: "/tmp/\(name).mov"), width: 32, height: 32)
+      outputURL: URL(fileURLWithPath: "/tmp/\(name).mov"), width: 32, height: 32,
+      queueCapacity: 256, audioQueueCapacity: 256)
     let adapter = try SourceRecordingCallbackAdapter(configuration: config, writerFactory: { writer })
     try adapter.start()
     return (writer, adapter)

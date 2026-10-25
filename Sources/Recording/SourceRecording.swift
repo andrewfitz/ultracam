@@ -282,6 +282,16 @@ struct SourceRecordingTelemetry: Equatable, Sendable {
   /// Frames missing between consecutive capture timestamps during the take:
   /// the device skipped them (counted in `droppedVideo` too).
   fileprivate(set) var deviceSkippedFrames: UInt64 = 0
+  /// Times the embedded audio was re-anchored to the video clock mid-take,
+  /// and how many of those moved it earlier (a backward re-sync).
+  fileprivate(set) var audioReanchors: UInt64 = 0
+  fileprivate(set) var audioBackwardResyncs: UInt64 = 0
+  /// Audio sample frames left out because audio already recorded covered
+  /// their instants, and frames of silence that filled holes in the audio.
+  fileprivate(set) var audioResyncTrimmedFrames: UInt64 = 0
+  fileprivate(set) var audioSilenceFilledFrames: UInt64 = 0
+  /// A short note when audio was re-synced backward; joins `warning`.
+  fileprivate(set) var audioSyncNote: String?
   /// The take is still healthy but something deserves attention, such as
   /// VideoToolbox converting frames on the CPU. Never a failure.
   fileprivate(set) var warning: String?
@@ -485,6 +495,9 @@ final class SourceRecorderCore: @unchecked Sendable {
       snapshot.queueCapacity = configuration.queueCapacity
       snapshot.queuedAudio = pendingAudio
       if snapshot.warning == nil { snapshot.warning = writerSnapshot.warning }
+      if let note = snapshot.audioSyncNote {
+        snapshot.warning = snapshot.warning.map { "\($0) \(note)" } ?? note
+      }
       if snapshot.lastError == nil { snapshot.lastError = writerSnapshot.lastError }
       return snapshot
     }
@@ -883,6 +896,26 @@ final class SourceRecorderCore: @unchecked Sendable {
 
   /// Records a rejection made before a CMSampleBuffer exists, such as an invalid
   /// Blackmagic signal flag or packet metadata.
+  /// The callback adapter re-placed this take's audio on the video clock: a
+  /// re-anchor (`backward` when it reached into audio already recorded),
+  /// frames left out because recorded audio already covered them, or a hole
+  /// filled with silence. Counted on the take; left-out audio leaves a note.
+  func noteAudioResync(reanchored: Bool, backward: Bool, trimmedFrames: Int, silenceFrames: Int) {
+    stateLock.withLock {
+      if reanchored { telemetryValue.audioReanchors &+= 1 }
+      if backward { telemetryValue.audioBackwardResyncs &+= 1 }
+      telemetryValue.audioResyncTrimmedFrames &+= UInt64(max(0, trimmedFrames))
+      telemetryValue.audioSilenceFilledFrames &+= UInt64(max(0, silenceFrames))
+      let trimmed = telemetryValue.audioResyncTrimmedFrames
+      guard trimmed > 0 else { return }
+      let times = telemetryValue.audioBackwardResyncs
+      let ms = String(format: "%.0f", Double(trimmed) / 48)
+      telemetryValue.audioSyncNote = times > 1
+        ? "Audio was re-synced to the picture \(times) times; \(ms) ms of overlapping audio was left out."
+        : "Audio was re-synced to the picture; \(ms) ms of overlapping audio was left out."
+    }
+  }
+
   func recordDrop(_ reason: SourceRecordingDropReason, video: Bool = true) {
     stateLock.withLock {
       // Paused/stopped callbacks are intentionally ignored, not lost frames.

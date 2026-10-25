@@ -264,6 +264,77 @@ public enum EmbeddedAudioRecording {
     }
   }
 
+  /// Builds a sample buffer from the frames of a Blackmagic packet after its
+  /// first `skippingFrames`, which overlapped audio already recorded. With a
+  /// `continuation` (the interleaved 32-bit frames the recorded audio would
+  /// have continued with), the first kept frames are crossfaded in from it,
+  /// sample by sample, so the cut has no step. The conversion writes straight
+  /// into the Core Media block; nothing is copied beyond it.
+  static func makeSampleBuffer(sourcePCM32: Data, skippingFrames: Int, sampleFrameCount: Int,
+    presentationTime: CMTime, channelCount: Int = EmbeddedAudioFormat.channelCount,
+    crossfadingFrom continuation: UnsafeBufferPointer<Int32>?) throws -> CMSampleBuffer {
+    guard sampleFrameCount > 0, skippingFrames >= 0 else { throw EmbeddedAudioError.invalidSampleFrameCount }
+    guard channelCount == EmbeddedAudioFormat.channelCount else {
+      throw EmbeddedAudioError.invalidChannelCount
+    }
+    guard presentationTime.isNumeric,
+      presentationTime.timescale == EmbeddedAudioFormat.sampleRateTimescale,
+      presentationTime.epoch == 0,
+      presentationTime.value >= 0 else {
+      throw EmbeddedAudioError.invalidPresentationTime
+    }
+    let sourceBytesPerFrame = channelCount * EmbeddedAudioFormat.sourceBytesPerSample
+    let (frames, overflow) = skippingFrames.addingReportingOverflow(sampleFrameCount)
+    guard !overflow, frames <= Int.max / sourceBytesPerFrame else {
+      throw EmbeddedAudioError.invalidSampleFrameCount
+    }
+    guard sourcePCM32.count == frames * sourceBytesPerFrame else {
+      throw EmbeddedAudioError.byteCountMismatch(expected: frames * sourceBytesPerFrame, actual: sourcePCM32.count)
+    }
+    return try makeSampleBuffer(sampleFrameCount: sampleFrameCount,
+      presentationTime: presentationTime) { destination in
+      sourcePCM32.withUnsafeBytes { sourceBytes in
+        guard let base = sourceBytes.baseAddress else { return }
+        let kept = base + skippingFrames * sourceBytesPerFrame
+        BlackmagicAudioConverter.packSignificant24Bits(from: kept, to: destination,
+          sampleCount: sampleFrameCount * channelCount)
+        guard let continuation, !continuation.isEmpty else { return }
+        let fadeFrames = min(continuation.count / channelCount, sampleFrameCount)
+        for frame in 0..<fadeFrames {
+          // Rises from just above 0 to just below 1: the first frame is
+          // almost all continuation, the frame after the fade all kept audio.
+          let weight = Double(frame + 1) / Double(fadeFrames + 1)
+          for channel in 0..<channelCount {
+            let index = frame * channelCount + channel
+            let from = Double(continuation[index])
+            let to = Double(kept.loadUnaligned(fromByteOffset: index * 4, as: Int32.self))
+            let mixed = Int32(clamping: Int64((from + (to - from) * weight).rounded()))
+            let packed = UInt32(bitPattern: mixed >> 8)
+            destination.storeBytes(of: UInt8(truncatingIfNeeded: packed), toByteOffset: index * 3, as: UInt8.self)
+            destination.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 8), toByteOffset: index * 3 + 1, as: UInt8.self)
+            destination.storeBytes(of: UInt8(truncatingIfNeeded: packed >> 16), toByteOffset: index * 3 + 2, as: UInt8.self)
+          }
+        }
+      }
+    }
+  }
+
+  /// Digital silence on the embedded-audio contract: fills a hole in a take's
+  /// audio so the audio after it stays on its frames.
+  static func makeSilenceSampleBuffer(sampleFrameCount: Int, presentationTime: CMTime) throws -> CMSampleBuffer {
+    guard sampleFrameCount > 0 else { throw EmbeddedAudioError.invalidSampleFrameCount }
+    guard presentationTime.isNumeric,
+      presentationTime.timescale == EmbeddedAudioFormat.sampleRateTimescale,
+      presentationTime.epoch == 0,
+      presentationTime.value >= 0 else {
+      throw EmbeddedAudioError.invalidPresentationTime
+    }
+    return try makeSampleBuffer(sampleFrameCount: sampleFrameCount, presentationTime: presentationTime) {
+      $0.initializeMemory(as: UInt8.self, repeating: 0,
+        count: sampleFrameCount * EmbeddedAudioFormat.recordingBytesPerFrame)
+    }
+  }
+
   /// Builds the shared format description now, so the first packet on the
   /// capture thread does not pay for Core Audio's first-use setup.
   public static func prepareFormat() { _ = cachedFormat }
