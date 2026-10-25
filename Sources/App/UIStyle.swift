@@ -1,3 +1,4 @@
+import MonitorKitAudio
 import SwiftUI
 
 // Shared visual language for the new interface. System colors and materials
@@ -243,16 +244,24 @@ struct UILevelBar: View {
 }
 
 /// Two-channel meter with a dB readout of the louder peak.
+///
+/// With a live `meter` (a camera's MonitorKit meter, from `UILiveAudioMeter`) the bars
+/// are redrawn on every display refresh from the meter's lock-free latest readings, and
+/// only the bars: the readout changes ten times a second, where it can be read. The
+/// ballistics and the peak hold are the meter's own, timed by the audio, not by redraws.
+/// Without one, it draws `audio`, the camera's status levels.
 struct UIAudioMeter: View {
   let audio: UIAudioLevels
   var compact = false
+  var meter: AudioMeter? = nil
+
   var body: some View {
     if compact {
       Group {
         if audio.present {
           VStack(spacing: 2) {
-            UILevelBar(rms: audio.rmsLeft, peak: audio.peakLeft).frame(height: 3)
-            UILevelBar(rms: audio.rmsRight, peak: audio.peakRight).frame(height: 3)
+            bar(0).frame(height: 3)
+            bar(1).frame(height: 3)
           }
         } else {
           Image(systemName: "speaker.slash").imageScale(.small).foregroundStyle(.tertiary)
@@ -266,10 +275,10 @@ struct UIAudioMeter: View {
     } else {
       HStack(spacing: 8) {
         Text("L").font(.uiBadge).foregroundStyle(.secondary)
-        UILevelBar(rms: audio.rmsLeft, peak: audio.peakLeft).frame(height: 6)
+        bar(0).frame(height: 6)
         Text("R").font(.uiBadge).foregroundStyle(.secondary)
-        UILevelBar(rms: audio.rmsRight, peak: audio.peakRight).frame(height: 6)
-        Text(audio.present ? UIAudioMath.decibels(max(audio.peakLeft, audio.peakRight)) : "No audio")
+        bar(1).frame(height: 6)
+        readout
           .font(.uiMeta.monospacedDigit()).foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
       }
       .accessibilityElement(children: .ignore)
@@ -278,5 +287,52 @@ struct UIAudioMeter: View {
         ? "Left peak \(UIAudioMath.decibels(audio.peakLeft)), right peak \(UIAudioMath.decibels(audio.peakRight))"
         : "No embedded audio")
     }
+  }
+
+  /// One channel's bar: live at the display rate, or the status levels.
+  @ViewBuilder private func bar(_ channel: Int) -> some View {
+    if let meter {
+      // Paused without audio: a silent camera costs no redraws.
+      TimelineView(.animation(paused: !audio.present)) { _ in
+        let levels = UILiveLevels(meter.snapshot(), channel: channel)
+        UILevelBar(rms: levels.rms, peak: levels.peakHold)
+      }
+    } else {
+      UILevelBar(rms: channel == 0 ? audio.rmsLeft : audio.rmsRight, peak: channel == 0 ? audio.peakLeft : audio.peakRight)
+    }
+  }
+
+  @ViewBuilder private var readout: some View {
+    if !audio.present {
+      Text("No audio")
+    } else if let meter {
+      TimelineView(.periodic(from: .now, by: 0.1)) { _ in
+        let snapshot = meter.snapshot()
+        let peak = max(UILiveLevels(snapshot, channel: 0).peak, UILiveLevels(snapshot, channel: 1).peak)
+        Text(UIAudioMath.decibels(peak))
+      }
+    } else {
+      Text(UIAudioMath.decibels(max(audio.peakLeft, audio.peakRight)))
+    }
+  }
+}
+
+/// One channel of a live meter's readings, as the linear levels `UILevelBar` draws.
+struct UILiveLevels {
+  var rms = 0.0
+  var peak = 0.0
+  var peakHold = 0.0
+
+  init(_ snapshot: AudioMeterSnapshot, channel: Int) {
+    guard channel < snapshot.channelCount, channel < snapshot.channels.count else { return }
+    let levels = snapshot.channels[channel]
+    rms = Self.linear(levels.rms)
+    peak = Self.linear(levels.samplePeak)
+    peakHold = Self.linear(levels.samplePeakHold)
+  }
+
+  /// dBFS to a 0…1 amplitude; silence (−∞) is 0.
+  static func linear(_ decibels: Float) -> Double {
+    decibels.isFinite ? min(1, pow(10, Double(decibels) / 20)) : 0
   }
 }

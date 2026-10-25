@@ -75,3 +75,41 @@ private struct UIAudioMeterTapView: View {
     .onDisappear { tap.detach() }
   }
 }
+
+/// A camera's level meter (the strip's, the collapsed strip's, the menu bar's) at the
+/// display rate: it shows the camera's live meter while one exists and draws it on every
+/// display refresh, reading the meter's lock-free latest readings. The status levels,
+/// published a few times a second, only say whether audio is present (and stand in
+/// where there's no meter: fixtures, previews, a camera not capturing).
+struct UILiveAudioMeter: View {
+  let cameraID: String
+  let audio: UIAudioLevels
+  var compact = false
+  @Environment(\.uiAudioMeters) private var source
+
+  var body: some View {
+    if let tap = source?.tap(cameraID) {
+      // A new capture is a new tap: a new view pairs attach and detach.
+      UILiveAudioMeterTapView(tap: tap, audio: audio, compact: compact).id(ObjectIdentifier(tap))
+    } else {
+      UIAudioMeter(audio: audio, compact: compact)
+    }
+  }
+}
+
+/// Meters one tap while shown; the tap meters off the capture thread only while a view attaches.
+private struct UILiveAudioMeterTapView: View {
+  let tap: AudioMeterTap
+  let audio: UIAudioLevels
+  let compact: Bool
+  @State private var meter: AudioMeter?
+
+  var body: some View {
+    UIAudioMeter(audio: audio, compact: compact, meter: meter)
+      .onAppear { meter = tap.attach() }
+      .onDisappear {
+        tap.detach()
+        meter = nil
+      }
+  }
+}
