@@ -838,6 +838,21 @@ import SystemExtensions
     model.startCamera(gamma)
     verifier.check("discovery: with no inputs, the selected camera's Start asks for the UltraStudio",
       model.startRefusal(gamma) == "Connect the UltraStudio.", model.startRefusal(gamma) ?? "nil")
+
+    // Stop is a choice, not a failure: a camera stopped while its preview is on
+    // screen (so automatic start still wants it) reads Stopped, not Couldn't start.
+    publish([x, y])
+    model.updateCamera(alpha) { $0.selectedDevice = "dev-y"; $0.automaticFeed = true }
+    _ = model.selectFeed(alpha)
+    let surface = UUID()
+    model.monitorCoordinator.registerSurface(id: surface, target: MonitorTargetID(alpha.rawValue), isVisible: true,
+      scopeVisible: false)
+    model.stop()
+    verifier.check("discovery: a stopped camera isn't a failed start", !model.automaticStartFailed(alpha),
+      model.automaticFeedStatus)
+    verifier.check("discovery: a stopped camera's status says it stays off",
+      model.automaticFeedStatus == "Camera stopped. It stays off until you start it.", model.automaticFeedStatus)
+    model.monitorCoordinator.unregisterSurface(id: surface)
   }
 
   // MARK: Menu bar

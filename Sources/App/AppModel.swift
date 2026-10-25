@@ -1246,6 +1246,7 @@ final class AppModel {
         ? "Camera in use. Hide preview without interrupting camera output."
         : "Preview is live. Hide it to stop capture until a camera app needs it."
     }
+    if manuallyStoppedFeeds.contains(selectedFeedID) { return "Camera stopped. It stays off until you start it." }
     if let cameraDemandError { return cameraDemandError }
     if !automaticCaptureRequested { return "Waiting for a camera app or visible preview. Capture and video processing are off." }
     if loading { return "Restoring your LUT…" }
@@ -1400,9 +1401,11 @@ final class AppModel {
 
   /// Automatic mode asked this camera to run and it isn't running: its start failed.
   /// The interface offers Retry (one attempt per camera session, no background loop).
+  /// A camera the user stopped hasn't failed; it stays off until Start.
   func automaticStartFailed(_ id: FeedID) -> Bool {
     if startRefusal(id) != nil { return true }
-    guard let descriptor = descriptor(for: id), descriptor.automaticFeed, !feedCoordinator.isFeedRunning(id) else { return false }
+    guard let descriptor = descriptor(for: id), descriptor.automaticFeed, !feedCoordinator.isFeedRunning(id),
+      !manuallyStoppedFeeds.contains(id) else { return false }
     return feedPolicies[id]?.captureRequested == true || (id == selectedFeedID && automaticCaptureRequested && !running)
   }
 
