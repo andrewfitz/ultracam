@@ -142,10 +142,23 @@ struct CameraSinkRoute: Equatable, Sendable {
 /// Pairs a virtual camera's source and input streams without treating a
 /// display name that merely contains "input" as the sink.
 enum CameraStreamNames {
+  /// `kCMIOStreamPropertyDirection` as the CMIO DAL reports it to clients:
+  /// 1 is an input stream (input to this Mac: a camera's source, which a
+  /// client captures from) and 0 is an output stream (this Mac sends into it:
+  /// the camera's sink). This is NOT the extension-side
+  /// `CMIOExtensionStream.Direction`, where `.sink` is 1. The installed
+  /// extension publishes "Ultracam · Camera 1" with direction 1 and
+  /// "Ultracam · Camera 1 Input" with direction 0. Treating 1 as the sink made
+  /// the app start each camera's source as a viewer and enqueue into that
+  /// viewer's receive queue, so the real sink was never consumed and camera
+  /// apps only ever saw standby black.
+  static let sinkDirection: UInt32 = 0
+  static let sourceDirection: UInt32 = 1
+
   static func pair(_ streams: [(id: UInt32, name: String, direction: UInt32?)],
     sinkName: String, sourceName: String) -> (sink: UInt32, source: UInt32)? {
-    let sinkByDirection = streams.first { $0.direction == 1 }?.id
-    let sourceByDirection = streams.first { $0.direction == 0 && $0.id != sinkByDirection }?.id
+    let sinkByDirection = streams.first { $0.direction == sinkDirection }?.id
+    let sourceByDirection = streams.first { $0.direction == sourceDirection && $0.id != sinkByDirection }?.id
     if let sinkByDirection, let sourceByDirection { return (sinkByDirection, sourceByDirection) }
     if let sink = streams.first(where: { $0.name == sinkName })?.id,
       let source = streams.first(where: { $0.name == sourceName && $0.id != sink })?.id {

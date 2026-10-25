@@ -51,12 +51,37 @@ import XCTest
     XCTAssertEqual(paired?.sink, 2)
     XCTAssertEqual(paired?.source, 1)
     XCTAssertEqual(CameraDemandMonitor.sourceStream([(1, "Input Cam"), (2, "Input Cam Input")], named: "Renamed"), 1)
+    // DAL direction 0 is an output stream (the sink), 1 an input stream (the source).
     let directed = CameraStreamNames.pair([
-      (4, "Whatever Input", 0),
-      (3, "Not the sink", 1),
+      (3, "Not the source", 1),
+      (4, "Whatever", 0),
     ], sinkName: "missing", sourceName: "missing")
-    XCTAssertEqual(directed?.sink, 3)
-    XCTAssertEqual(directed?.source, 4)
+    XCTAssertEqual(directed?.sink, 4)
+    XCTAssertEqual(directed?.source, 3)
+  }
+
+  /// The layout the installed extension publishes, read from the live CMIO DAL:
+  /// each camera's source reports kCMIOStreamPropertyDirection 1 and its
+  /// "… Input" sink reports 0. The expected names deliberately don't match, so
+  /// only direction decides. Pairing these the other way round started the
+  /// source stream as a viewer and filled its receive queue: every camera frame
+  /// was refused as "queue full" and camera apps saw standby black.
+  @MainActor func testPublishedDirectionsPairTheInputStreamAsTheSink() {
+    let published: [(id: UInt32, name: String, direction: UInt32?)] = [
+      (45, "Ultracam · Camera 1", 1),
+      (46, "Ultracam · Camera 1 Input", 0),
+    ]
+    let paired = CameraStreamNames.pair(published, sinkName: "Renamed Input", sourceName: "Renamed")
+    XCTAssertEqual(paired?.sink, 46)
+    XCTAssertEqual(paired?.source, 45)
+    let named = CameraStreamNames.pair(published,
+      sinkName: "Ultracam · Camera 1 Input", sourceName: "Ultracam · Camera 1")
+    XCTAssertEqual(named?.sink, 46)
+    XCTAssertEqual(named?.source, 45)
+    // The DAL values are the opposite of the extension's own enum; pin both.
+    XCTAssertEqual(CMIOExtensionStream.Direction.sink.rawValue, 1)
+    XCTAssertEqual(CameraStreamNames.sinkDirection, 0)
+    XCTAssertEqual(CameraStreamNames.sourceDirection, 1)
   }
 
   func testLegacyRoutePreservesOriginalSingleCameraIdentity() {
