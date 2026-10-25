@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import CoreMediaIO
 import MonitorKitCore
+import os
 
 /// Recording destinations: free space, time left and recent takes.
 enum UIRecordingLibrary {
@@ -37,8 +38,18 @@ enum UIRecordingLibrary {
     for case let folder? in folders {
       let name = volumeName(for: folder)
       guard seen[name] == nil else { continue }
-      let values = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
-        .volumeAvailableCapacityKey, .volumeTotalCapacityKey])
+      // The folder comes from a security-scoped bookmark: a sandboxed read of its
+      // volume's capacity needs the grant held, or it fails and the drive read as empty.
+      let accessed = folder.startAccessingSecurityScopedResource()
+      defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
+      let values: URLResourceValues?
+      do {
+        values = try folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
+          .volumeAvailableCapacityKey, .volumeTotalCapacityKey])
+      } catch {
+        values = nil
+        Self.logUnreadable(name, error)
+      }
       // Some volumes (network, non-APFS) don't report the "important usage" figure; a missing
       // value must not read as a full drive.
       let reported = values?.volumeAvailableCapacityForImportantUsage ?? values?.volumeAvailableCapacity.map(Int64.init)
@@ -52,6 +63,15 @@ enum UIRecordingLibrary {
       order.append(name)
     }
     return order.compactMap { seen[$0] }
+  }
+
+  private static let driveLog = Logger(subsystem: "org.ultracam.app", category: "recording")
+  nonisolated(unsafe) private static var unreadableLogged = Set<String>()
+
+  /// Once per volume per run: why its free space couldn't be read.
+  private static func logUnreadable(_ name: String, _ error: Error) {
+    guard unreadableLogged.insert(name).inserted else { return }
+    driveLog.error("Free space of \(name, privacy: .public) unreadable: \(error.localizedDescription, privacy: .public)")
   }
 
   /// Finished movies in the recording folders (and one level of camera

@@ -291,7 +291,7 @@ struct UIDriveRow: View {
         Image(systemName: low ? "exclamationmark.triangle.fill" : "externaldrive").foregroundStyle(low ? Color.orange : .secondary)
         Text(drive.name).lineLimit(1)
         Spacer()
-        Text(drive.secondsLeft.map { "\(UIFormat.duration($0)) left" } ?? "\(UIFormat.bytes(drive.availableBytes)) free")
+        Text(Self.freeText(drive))
           .font(.subheadline.monospacedDigit())
           .foregroundStyle(low ? .primary : .secondary)
       }
@@ -301,8 +301,17 @@ struct UIDriveRow: View {
     }
     .accessibilityElement(children: .ignore)
     .accessibilityLabel("Drive \(drive.name)")
-    .accessibilityValue(drive.secondsLeft.map { "\(UIFormat.duration($0)) of recording left" } ?? "\(UIFormat.bytes(drive.availableBytes)) free")
-    .help("\(UIFormat.bytes(drive.availableBytes)) free. Time left is estimated from the bitrate of the takes recording to this drive.")
+    .accessibilityValue(drive.secondsLeft.map { "\(UIFormat.duration($0)) of recording left" } ?? Self.freeText(drive))
+    .help(Self.unknown(drive) ? "Ultracam couldn't read this drive's free space."
+      : "\(UIFormat.bytes(drive.availableBytes)) free. Time left is estimated from the bitrate of the takes recording to this drive.")
+  }
+
+  /// An unreadable volume reports no size at all; that is unknown, not a full drive.
+  private static func unknown(_ drive: UIDrive) -> Bool { drive.totalBytes == 0 && drive.availableBytes == 0 }
+
+  private static func freeText(_ drive: UIDrive) -> String {
+    if let seconds = drive.secondsLeft { return "\(UIFormat.duration(seconds)) left" }
+    return unknown(drive) ? "Free space unknown" : "\(UIFormat.bytes(drive.availableBytes)) free"
   }
 }
 
