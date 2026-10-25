@@ -76,6 +76,14 @@ import SwiftUI
     window.contentView = hosting
     window.setContentSize(size)
     window.setFrameOrigin(NSPoint(x: -30_000, y: -30_000))
+    // Renders come from cacheDisplay, not the screen, so the window is transparent,
+    // click-through and never animated in: a titled window can be pulled back onto
+    // the screen, and these runs must never flash over the user's work.
+    window.alphaValue = 0
+    window.ignoresMouseEvents = true
+    window.hasShadow = false
+    window.animationBehavior = .none
+    window.collectionBehavior = [.transient, .ignoresCycle]
     window.orderFrontRegardless()
     // Split views lay out their columns over several passes; give titled windows longer.
     settle(titled ? 0.8 : 0.25)

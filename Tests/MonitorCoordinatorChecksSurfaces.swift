@@ -101,7 +101,7 @@ extension MonitorCoordinatorChecks {
     window.isReleasedWhenClosed = false
     window.title = "Synthetic monitor surface fixture"
     window.contentView = view
-    window.orderFrontRegardless()
+    window.orderInvisiblyForTesting()
     return window
   }
 

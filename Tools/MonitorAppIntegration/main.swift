@@ -235,7 +235,13 @@ import XCTest
         MonitorNativePicture(presenter: presenter).frame(width: points.width, height: points.height)
         if scope { MonitorNativeScope(presenter: presenter).frame(width: points.width, height: scopeHeight) }
       })
-    window.makeKeyAndOrderFront(nil)
+    // Invisible and never key: these runs must not flash windows or take focus.
+    window.alphaValue = 0
+    window.ignoresMouseEvents = true
+    window.hasShadow = false
+    window.animationBehavior = .none
+    window.collectionBehavior = [.transient, .ignoresCycle]
+    window.orderFrontRegardless()
     coordinator.registerSurface(id: id, target: target, isVisible: true, scopeVisible: scope)
     return (window, presenter, id)
   }

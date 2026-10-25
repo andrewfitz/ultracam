@@ -63,7 +63,7 @@ private final class PreviewTestCounters: @unchecked Sendable {
     window.title = "Synthetic video preview check"
     window.isReleasedWhenClosed = false
     window.contentView = renderer.makeView()
-    window.orderFrontRegardless()
+    window.orderInvisiblyForTesting()
     window.contentView?.layoutSubtreeIfNeeded()
     RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
     print("PREVIEW HOST windowVisible=\(window.isVisible) occlusion=\(window.occlusionState.rawValue) viewBounds=\(window.contentView?.bounds ?? .zero) viewVisibleRect=\(window.contentView?.visibleRect ?? .zero) appActive=\(NSApplication.shared.isActive)")
