@@ -16,7 +16,8 @@ struct UISessionSidebarViewContent: View {
   private var presentation: UISessionPresentation { context.presentation }
 
   var body: some View {
-    // Only the camera rows (shown with three or more cameras) are tagged, so only they select.
+    // Only the camera rows (shown with three or more cameras) are tagged, so only they select
+    // through the list; other rows that name a camera are buttons that do the same.
     List(selection: selection) {
       if let banner = UIExtensionBanner.state(session.install) {
         Section { UIExtensionBannerView(state: banner, context: context) }
@@ -34,8 +35,16 @@ struct UISessionSidebarViewContent: View {
 
   private var selection: Binding<String?> {
     Binding(
-      get: { context.current.presentation.selected?.id },
-      set: { if let id = $0 { context.send(.select(cameraID: id)) } })
+      // The context is already the refreshed one (UISessionSidebarView builds it).
+      get: { context.presentation.selected?.id },
+      set: { if let id = $0 { inspect(id) } })
+  }
+
+  /// A click on a row that names a camera selects it and shows it in the inspector.
+  /// (The bridge ignores selecting the camera that's already selected.)
+  private func inspect(_ cameraID: String) {
+    context.send(.select(cameraID: cameraID))
+    context.send(.showInspector(cameraID: cameraID))
   }
 
   // MARK: Cameras
@@ -59,6 +68,7 @@ struct UISessionSidebarViewContent: View {
           .tag(camera.id)
           .accessibilityElement(children: .combine)
           .accessibilityLabel(camera.accessibilityLabel)
+          .accessibilityHint("Shows \(camera.name) in the inspector")
         }
       }
     } header: {
@@ -91,9 +101,11 @@ struct UISessionSidebarViewContent: View {
           UIShotTimerView(shot: session.shot, onAirName: presentation.cameras.first { $0.id == session.onAirID }?.name)
         }
       case .separate:
+        // Each output is its camera: a click selects the camera and shows it in the inspector.
         ForEach(session.cameras) { camera in
           UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · \(camera.name)",
             detail: camera.inUse ? "In use" : "Not in use", positive: camera.inUse)
+            .uiSidebarInspectButton(cameraName: camera.name) { inspect(camera.id) }
             .selectionDisabled()
         }
       }
@@ -187,6 +199,13 @@ struct UISessionSidebarViewContent: View {
 
   // MARK: Automation
 
+  private var automationCamera: UICameraSnapshot? {
+    let automatic = session.cameras.filter(\.automaticStart)
+    let selected = session.cameras.first { $0.id == session.selectedID }
+    if let selected, automatic.isEmpty || selected.automaticStart { return selected }
+    return automatic.first ?? session.cameras.first
+  }
+
   private var automationSection: some View {
     Section("Automation") {
       let automatic = session.cameras.filter(\.automaticStart).map(\.name)
@@ -203,6 +222,9 @@ struct UISessionSidebarViewContent: View {
       }
       .accessibilityElement(children: .combine)
       .help("A camera starts when a meeting app opens its Ultracam camera and stops when the last app closes. Set it per camera in the inspector.")
+      // The setting is per camera in the inspector: open the selected camera if it's one of
+      // those named (or none is), otherwise the first one named.
+      .modifier(UISidebarAutomationButton(camera: automationCamera, inspect: inspect))
       VStack(alignment: .leading, spacing: 1) {
         Text("Backup recording")
         Text("Coming later").font(.subheadline)
@@ -215,6 +237,31 @@ struct UISessionSidebarViewContent: View {
 }
 
 // MARK: - Pieces
+
+extension View {
+  /// Makes a whole sidebar row (its empty space too) one button that shows a camera in the inspector.
+  func uiSidebarInspectButton(cameraName: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help("Show \(cameraName) in the inspector")
+    .accessibilityHint("Shows \(cameraName) in the inspector")
+  }
+}
+
+/// The Automation row opens its camera's inspector, where the setting lives.
+private struct UISidebarAutomationButton: ViewModifier {
+  let camera: UICameraSnapshot?
+  let inspect: (String) -> Void
+  func body(content: Content) -> some View {
+    if let camera {
+      content.uiSidebarInspectButton(cameraName: camera.name) { inspect(camera.id) }
+    } else {
+      content
+    }
+  }
+}
 
 struct UISidebarRow: View {
   let symbol: String
