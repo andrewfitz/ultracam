@@ -93,13 +93,16 @@ struct UISessionBridge {
     _ = model.running
     _ = model.cameraUpdates
     let recording = model.recordingModel
-    let drives = UIRecordingLibrary.drives(for: model.feedDescriptors.map { recording.outputFolder(for: $0.id) },
-      recordingRates: model.feedDescriptors.compactMap { descriptor -> (URL, Double)? in
-        guard let folder = recording.outputFolder(for: descriptor.id),
-          let state = recording.feeds.first(where: { $0.id == descriptor.id }),
-          state.status == .recording || state.status == .paused else { return nil }
-        return (folder, state.statistics?.videoMegabitsPerSecond ?? UIRecordingLibrary.nominalMegabits(codec: recording.codec, fast: true))
-      })
+    let folders = model.feedDescriptors.map { recording.outputFolder(for: $0.id) }
+    let drives = Self.cachedDrives(for: folders) {
+      UIRecordingLibrary.drives(for: folders,
+        recordingRates: model.feedDescriptors.compactMap { descriptor -> (URL, Double)? in
+          guard let folder = recording.outputFolder(for: descriptor.id),
+            let state = recording.feeds.first(where: { $0.id == descriptor.id }),
+            state.status == .recording || state.status == .paused else { return nil }
+          return (folder, state.statistics?.videoMegabitsPerSecond ?? UIRecordingLibrary.nominalMegabits(codec: recording.codec, fast: true))
+        })
+    }
     var cameras: [UICameraSnapshot] = []
     for descriptor in model.feedDescriptors {
       let id = descriptor.id
@@ -208,6 +211,20 @@ struct UISessionBridge {
   }
 
   func presentation() -> UISessionPresentation { UIPresentationBuilder.session(snapshot()) }
+
+  /// Free space takes about 10 ms per volume to read, and every view that rebuilds the
+  /// context (window, sidebar, inspector, their bindings) read it on each capture update,
+  /// 4 Hz per running camera: main-thread time taken from scrolling. The figures are
+  /// reused for two seconds.
+  private static var driveCache: (folders: [String?], date: Date, drives: [UIDrive])?
+
+  private static func cachedDrives(for folders: [URL?], read: () -> [UIDrive]) -> [UIDrive] {
+    let key = folders.map { $0?.path }
+    if let cache = driveCache, cache.folders == key, Date().timeIntervalSince(cache.date) < 2 { return cache.drives }
+    let drives = read()
+    driveCache = (key, Date(), drives)
+    return drives
+  }
 
   private func feedID(_ raw: String) -> FeedID { FeedID(rawValue: raw) }
 

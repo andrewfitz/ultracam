@@ -49,6 +49,8 @@ struct UIInspectorViewContent: View {
     .formStyle(.grouped)
     // Even margins wide enough for the scroller, so it runs beside the sections and never over their controls.
     .contentMargins(.horizontal, 16, for: .scrollContent)
+    // Like the app's other scroll views: no rubber band when everything fits.
+    .scrollBounceBehavior(.basedOnSize)
   }
 
   /// The camera's name and state, in place of a "Camera" row. The Input picker
@@ -100,9 +102,9 @@ struct UIInspectorViewContent: View {
       .accessibilityElement(children: .ignore)
       .accessibilityLabel("Signal")
       .accessibilityValue(signalText(snapshot))
-      if snapshot.running {
-        LabeledContent("Timecode") { Text(camera.timecode).monospacedDigit().textSelection(.enabled) }
-      }
+      // Always present ("—" while stopped): a row that comes and goes with Start and Stop
+      // moved everything below it under the pointer.
+      LabeledContent("Timecode") { Text(camera.timecode).monospacedDigit().textSelection(.enabled) }
       Toggle("Video preview", isOn: Binding(get: { snapshot.previewEnabled },
         set: { context.send(.setPreviewEnabled(cameraID: camera.id, $0)) }))
         .help("Hidden previews do no rendering work. Camera output continues.")
