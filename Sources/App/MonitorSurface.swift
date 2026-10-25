@@ -132,9 +132,16 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   /// Whether the surface holds a picture (frozen) instead of taking live frames.
   var holdsFreeze: Bool { lock.withLock { frozen != nil } }
 
-  /// A snapshot of this surface's counters.
+  /// How long a failure is reported after it happened (the tile, and the
+  /// coordinator's diagnostics through `statistics.lastFailure`); `failures` keeps the count.
+  static let failureShownFor = 1.0
+
+  /// A snapshot of this surface's counters. `lastFailure` is the last failure only
+  /// within `failureShownFor` of it, so one transient error does not mark the
+  /// surface degraded for good.
   var statistics: MonitorSurfaceStatistics {
-    lock.withLock {
+    let now = ProcessInfo.processInfo.systemUptime
+    return lock.withLock {
       var value = published
       value.refreshes = counters.refreshes
       value.scopeRefreshes = counters.scopeRefreshes
@@ -147,7 +154,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       value.failures = counters.failures
       value.lastPresented = counters.lastPresented
       value.lastScope = counters.lastScope
-      value.lastFailure = counters.lastFailure
+      value.lastFailure = now - lastFailureTime < Self.failureShownFor ? counters.lastFailure : nil
       return value
     }
   }
@@ -768,7 +775,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       window = (now, counters.acceptedFrames, counters.presentedFrames, counters.scopeUpdates)
     }
     let lastScope = counters.lastScope
-    let failure = now - lastFailureTime < 1 ? counters.lastFailure : nil
+    let failure = now - lastFailureTime < Self.failureShownFor ? counters.lastFailure : nil
     lock.unlock()
     let frozenNow = frozenValue != nil
     if isFrozen != frozenNow { isFrozen = frozenNow }

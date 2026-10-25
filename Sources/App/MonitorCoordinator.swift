@@ -83,8 +83,9 @@ import MonitorKit
   }
 
   /// Once a second: source rate from the feed host, presented rate and GPU time
-  /// from the busiest live surface of each target.
-  private func refreshDiagnostics() {
+  /// from the busiest live surface of each target. A surface is degraded only by
+  /// a recent failure (`MonitorSurfacePresenter.failureShownFor`). Internal for tests.
+  func refreshDiagnostics() {
     var next: [MonitorTargetID: MonitorDiagnostics] = [:]
     let now = ProcessInfo.processInfo.systemUptime
     for (target, host) in hosts {

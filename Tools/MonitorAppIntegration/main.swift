@@ -340,9 +340,12 @@ import XCTest
     return (window, presenter, id)
   }
 
-  /// Scopes beside the picture draw at their own rate (10, 15 or 30 Hz, at most
-  /// the source's), with MonitorKit's legacy-look scope in a framebufferOnly
-  /// layer, never more than two on the GPU, and the picture keeps every frame.
+  /// Scopes beside the picture follow the video: every frame the picture draws
+  /// has its scope drawn on the scope link's next refresh, so a 30 Hz source
+  /// makes 30 scope updates a second whatever refresh rate older settings saved
+  /// (it is ignored). MonitorKit's legacy-look scope is drawn in a framebufferOnly
+  /// layer, never more than two on the GPU, and the picture keeps every frame:
+  /// scopes never hold it back.
   func testScopesDrawAtTheirRateBesideThePicture() throws {
     guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
     let coordinator = MonitorCoordinator()
@@ -365,6 +368,7 @@ import XCTest
     source.start()
     defer { source.stop() }
     let displayHz = Double(window.screen?.maximumFramesPerSecond ?? 60)
+    // Every saved rate (older settings) gives the same video-rate scopes.
     for hz in MonitorScopePreferences.refreshRates {
       tools.scopes.refreshHz = hz
       coordinator.setPreferences(tools, for: target)
@@ -389,63 +393,49 @@ import XCTest
         let skipped = (end.scopeSkippedBusy - start.scopeSkippedBusy, end.scopeSkippedNoDrawable - start.scopeSkippedNoDrawable)
         print(
           String(
-            format: "MONITOR_SURFACE_MEASURE scopes at %d Hz beside a %.0f Hz picture, round %d (%.1f refreshes/s on a %.0f Hz display, scope link %.1f ticks/s): drawn %.2f fps, picture %.2f fps, skipped busy %llu no drawable %llu, GPU per scope %@",
+            format: "MONITOR_SURFACE_MEASURE scopes (saved rate %d Hz, ignored) beside a %.0f Hz picture, round %d (%.1f refreshes/s on a %.0f Hz display, scope link %.1f ticks/s): drawn %.2f fps, picture %.2f fps, skipped busy %llu no drawable %llu, GPU per scope %@",
             hz, pictureHz, round, refreshesFPS, displayHz, scopeTicks / elapsed, scopeFPS, presentedFPS, skipped.0,
             skipped.1, end.scopeGPUMilliseconds.map { String(format: "%.3f ms", $0) } ?? "n/a"))
         // A scope is drawn only on a callback of the scope's own display link
         // (`MonitorSurfaceStatistics.scopeRefreshes`), at most one per callback.
         XCTAssertLessThanOrEqual(scopes, scopeTicks + 2, "A scope is drawn on at most one scope-link tick each")
-        // A scope draws at most once per slot of its rate and once per new picture
-        // (a scope of a picture already scoped is never redrawn): the physical
-        // ceiling. The tolerance is the window's edges: a scope pending at its
-        // start, the scope link's 2 ms slack and the picture count's own edge.
-        XCTAssertLessThanOrEqual(scopes, min(Double(hz) * elapsed, presented) + 3,
-          "Scopes never draw faster than their rate or than new pictures arrive")
+        // At most one scope per drawn picture (a picture already scoped is never
+        // redrawn): the physical ceiling. The tolerance is the window's edges: a
+        // scope pending at its start and the picture count's own edge.
+        XCTAssertLessThanOrEqual(scopes, presented + 3, "Scopes never draw faster than new pictures arrive")
         XCTAssertEqual(end.failures, 0)
         // The rate checks below depend on the render thread getting its display
         // links' callbacks, which a loaded machine delays (both links run on that
         // one thread), so a round that misses any of them is re-measured, up to
         // three rounds, and they are asserted together once a round meets them all
         // or on the last. The ceiling and the failure count above hold in every round.
-        let scopeRateMet: Bool
-        let scopeFloor: Double
-        if Double(hz) * 2 <= pictureHz {
-          // Two or more new pictures per scope slot: every slot finds one whatever
-          // the phase, so the chosen rate is met exactly.
-          scopeFloor = 0
-          scopeRateMet = abs(scopeFPS - Double(hz)) <= max(1.5, Double(hz) * 0.15)
-        } else {
-          // A scope rate at the picture's rate: a slot finds a new picture unless
-          // presentation jitter straddles the scope link's tick (one slot then finds
-          // none and the next finds two, the older never scoped). Both links tick on
-          // the display's own refresh grid, so this is rare: an idle machine fills
-          // 93-100% of the slots there were (the chosen rate, and no more than the
-          // pictures presented). The floor is the chosen rate's 15% tolerance, which
-          // a scope that drew two slots in three (67%) or every other slot (50%) misses.
-          scopeFloor = 0.85 * min(Double(hz) * elapsed, presented)
-          scopeRateMet = scopes >= scopeFloor
-        }
+        //
+        // Scopes follow the video: each drawn picture's scope is drawn on the scope
+        // link's next refresh, and is lost only if the next picture is drawn first
+        // (both links tick on the display's refresh grid, at least twice per 30 Hz
+        // picture on a 60 Hz display, so an idle machine scopes 93-100% of them).
+        // The floor is 85% of the pictures drawn, which a scope held to a 10 or
+        // 15 Hz rate (a third or half of them) misses by far.
+        let scopeFloor = 0.85 * presented
+        let scopeRateMet = scopes >= scopeFloor
         let skipsMet = skipped.0 + skipped.1 <= 2
-        // Strict: a 30 Hz picture has every frame presented. A frame goes
-        // unpresented only if the display link delivered no refresh for a whole
-        // picture interval, at least displayHz / pictureHz - 1 refreshes in a row
-        // (the render thread starved). So a picture miss is re-measured only when
-        // the refreshes the link failed to deliver account for every unpresented
-        // frame; otherwise it fails at once.
+        // Strict: a 30 Hz picture has every frame presented while scopes draw. A
+        // frame goes unpresented only if the display link delivered no refresh for
+        // a whole picture interval, at least displayHz / pictureHz - 1 refreshes in
+        // a row (the render thread starved). So a picture miss is re-measured only
+        // when the refreshes the link failed to deliver account for every
+        // unpresented frame; otherwise it fails at once.
         let pictureMet = presentedFPS > 28
         let missedRefreshes = max(0, displayHz * elapsed - refreshesFPS * elapsed)
         let starved = max(0, offered - presented) * (displayHz / pictureHz - 1) <= missedRefreshes
         if (pictureMet && scopeRateMet && skipsMet) || (!pictureMet && !starved) || round == rounds {
-          if Double(hz) * 2 <= pictureHz {
-            XCTAssertEqual(scopeFPS, Double(hz), accuracy: max(1.5, Double(hz) * 0.15),
-              "Scopes keep the chosen rate in one of \(rounds) rounds (the last shown)")
-          } else {
-            XCTAssertGreaterThanOrEqual(scopes, scopeFloor,
-              "Scopes at the picture's rate fill the slots a new picture reached in one of \(rounds) rounds (the last shown)")
-          }
+          XCTAssertGreaterThanOrEqual(scopes, scopeFloor,
+            "Every drawn picture has its scope (saved rate \(hz) Hz ignored) in one of \(rounds) rounds (the last shown)")
+          XCTAssertGreaterThan(scopeFPS, 0.85 * pictureHz,
+            "Scopes update at the video's rate, not a chosen 10/15 Hz, in one of \(rounds) rounds (the last shown)")
           XCTAssertLessThanOrEqual(skipped.0 + skipped.1, 2,
             "Scopes are rarely skipped in one of \(rounds) rounds (the last shown)")
-          XCTAssertGreaterThan(presentedFPS, 28, "The picture keeps every frame while scopes draw")
+          XCTAssertGreaterThan(presentedFPS, 28, "The picture keeps every frame while scopes draw: scopes never hold it back")
           settled = true
         }
       }
