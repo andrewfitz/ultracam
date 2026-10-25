@@ -872,4 +872,31 @@ import XCTest
     session.cameras[0].automaticStartFailed = true
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: couldn't start")
   }
+
+  func testInputLabelsTellTwoUnitsOfOneModelApart() {
+    let inputs: [(id: String, name: String)] = [("decklink:00000000a1850ab8", "UltraStudio Mini Recorder 12G"),
+      ("decklink:00000000a29246b8", "UltraStudio Mini Recorder 12G"), ("decklink:00000000c0ffee01", "UltraStudio 4K Mini")]
+    XCTAssertEqual(UIInputLabels.suffix("decklink:00000000a1850ab8"), "0AB8")
+    XCTAssertEqual(UIInputLabels.label(id: inputs[0].id, name: inputs[0].name, among: inputs), "UltraStudio Mini Recorder 12G · 0AB8")
+    XCTAssertEqual(UIInputLabels.label(id: inputs[1].id, name: inputs[1].name, among: inputs), "UltraStudio Mini Recorder 12G · 46B8")
+    XCTAssertEqual(UIInputLabels.label(id: inputs[2].id, name: inputs[2].name, among: inputs), "UltraStudio 4K Mini",
+      "A name no other input has stays as the driver gives it")
+    XCTAssertEqual(UIInputLabels.label(id: inputs[0].id, name: inputs[0].name, among: [inputs[0]]), "UltraStudio Mini Recorder 12G",
+      "With its twin unplugged there is nothing to tell apart")
+    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: inputs[1].name), "UltraStudio Mini Recorder 12G · 46B8")
+    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: nil), "Blackmagic input · 46B8")
+  }
+
+  func testInputOptionsNameTheCameraThatHasAnInput() {
+    var first = camera(1), second = camera(2), third = camera(3)
+    first.inputID = "a"
+    second.inputID = "b"
+    third.inputID = nil
+    let cameras = [first, second, third]
+    let inputs: [(id: String, name: String)] = [("a", "UltraStudio A"), ("b", "UltraStudio B"), ("c", "UltraStudio C")]
+    let forFirst = UIInputLabels.options(inputs, cameras: cameras, for: "camera-1")
+    XCTAssertEqual(forFirst.map(\.usedBy), [nil, "Camera 2", nil], "A camera's own input isn't taken from it")
+    let forThird = UIInputLabels.options(inputs, cameras: cameras, for: "camera-3")
+    XCTAssertEqual(forThird.map(\.usedBy), ["Camera 1", "Camera 2", nil])
+  }
 }

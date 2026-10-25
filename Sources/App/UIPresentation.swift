@@ -90,6 +90,9 @@ struct UICameraRecording: Sendable, Equatable {
 struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var id: String
   var name: String
+  /// The assigned input's ID, listed or not; nil when the camera has none (None).
+  var inputID: String?
+  /// The assigned input's label (`UIInputLabels.label`), also while it's unplugged; nil with none.
   var inputName: String?
   var deviceAvailable = true
   var running = false
@@ -298,6 +301,43 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var automaticStartFailed: Bool
   /// The failed take ran out of disk space: the strip offers another folder.
   var diskFull = false
+}
+
+/// One row of an Input picker: a listed device, and the other camera that already uses it.
+struct UIInputOption: Sendable, Equatable, Identifiable {
+  var id: String
+  var label: String
+  /// Another camera assigned this input; the row is disabled for this camera.
+  var usedBy: String?
+}
+
+/// Device labels that stay apart when two units share a model name. The driver's own
+/// "(1)"/"(2)" follow enumeration order, so they can name a different unit next launch.
+enum UIInputLabels {
+  /// The last four hex digits of the persistent ID: "0AB8" for decklink:00000000a1850ab8.
+  static func suffix(_ id: String) -> String {
+    let digits = id.split(separator: ":").last.map(String.init) ?? id
+    return String(digits.filter { $0.isLetter || $0.isNumber }.suffix(4)).uppercased()
+  }
+
+  /// The name, with the ID's last four digits when another input in `inputs` has the same name.
+  static func label(id: String, name: String, among inputs: [(id: String, name: String)]) -> String {
+    inputs.contains { $0.id != id && $0.name == name } ? "\(name) · \(suffix(id))" : name
+  }
+
+  /// An assigned input that isn't listed. The last name seen this session when there is one.
+  static func missingLabel(id: String, lastName: String?) -> String {
+    "\(lastName ?? "Blackmagic input") · \(suffix(id))"
+  }
+
+  /// The picker rows for one camera: every listed input, labelled, with the camera that holds it.
+  static func options(_ inputs: [(id: String, name: String)], cameras: [UICameraSnapshot],
+    for cameraID: String) -> [UIInputOption] {
+    inputs.map { input in
+      UIInputOption(id: input.id, label: label(id: input.id, name: input.name, among: inputs),
+        usedBy: cameras.first { $0.id != cameraID && $0.inputID == input.id }?.name)
+    }
+  }
 }
 
 enum UIRecordControl: Sendable, Equatable {

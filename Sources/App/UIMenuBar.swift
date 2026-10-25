@@ -420,12 +420,22 @@ final class UIMenuCommandBox: NSObject {
     submenu.addItem(row("Load LUT…", action(.chooseLUT(cameraID: camera.id)), symbol: "cube", target: target))
     let inputMenu = NSMenu(title: "Input")
     inputMenu.autoenablesItems = false
-    let running = session.cameras.first { $0.id == camera.id }?.running == true
-    for input in inputs {
-      inputMenu.addItem(row(input.name, action(.setInput(cameraID: camera.id, deviceID: input.id)),
-        checked: input.name == camera.inputName, enabled: !running, target: target))
+    let cameraSnapshot = session.cameras.first { $0.id == camera.id }
+    let running = cameraSnapshot?.running == true
+    let inputID = cameraSnapshot?.inputID
+    // By ID, as in the inspector: an input another camera has is disabled and says which.
+    inputMenu.addItem(row("None", action(.setInput(cameraID: camera.id, deviceID: "")),
+      checked: inputID == nil, enabled: !running, target: target))
+    inputMenu.addItem(.separator())
+    let options = UIInputLabels.options(inputs.map { ($0.id, $0.name) }, cameras: session.cameras, for: camera.id)
+    for option in options {
+      inputMenu.addItem(row(option.label, action(.setInput(cameraID: camera.id, deviceID: option.id)),
+        checked: option.id == inputID, enabled: !running && (option.usedBy == nil || option.id == inputID),
+        subtitle: option.usedBy.map { "Used by \($0)" }, target: target))
     }
-    if inputs.isEmpty {
+    if let inputID, !options.contains(where: { $0.id == inputID }) {
+      inputMenu.addItem(row(camera.inputName, [], checked: true, enabled: false, subtitle: "Disconnected", target: target))
+    } else if inputs.isEmpty {
       let none = NSMenuItem(title: "No inputs detected", action: nil, keyEquivalent: "")
       none.isEnabled = false
       inputMenu.addItem(none)

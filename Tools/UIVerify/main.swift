@@ -817,14 +817,17 @@ import SystemExtensions
     model.startCamera(gamma)
     verifier.check("discovery: Start with no input chosen says to choose one",
       model.startRefusal(gamma) == "Choose an input for this camera.", model.startRefusal(gamma) ?? "nil")
+    // Saved with no input beside cameras that have one: that's None by choice, and an
+    // arriving input doesn't fill it (only a fresh setup is filled; see adoption()).
     _ = model.selectFeed(gamma)
     publish([x])
-    verifier.check("discovery: an empty assignment takes the arriving input",
-      model.descriptor(for: gamma)?.selectedDevice == "dev-x", model.descriptor(for: gamma)?.selectedDevice ?? "nil")
-    verifier.check("discovery: the adopted input clears the selected camera's refusal",
+    verifier.check("discovery: a camera saved with None keeps None when an input arrives",
+      model.descriptor(for: gamma)?.selectedDevice == "", model.descriptor(for: gamma)?.selectedDevice ?? "nil")
+    model.updateCamera(gamma) { $0.selectedDevice = "dev-x" }
+    verifier.check("discovery: choosing an input clears the selected camera's refusal",
       model.startRefusal(gamma) == nil, model.startRefusal(gamma) ?? "")
     publish([])
-    verifier.check("discovery: unplugging the adopted input revives no old refusal",
+    verifier.check("discovery: unplugging the chosen input revives no old refusal",
       model.startRefusal(gamma) == nil, model.startRefusal(gamma) ?? "")
 
     // No input listed at all: there is none to choose, so a camera without one
@@ -839,9 +842,12 @@ import SystemExtensions
     verifier.check("discovery: with no inputs, the selected camera's Start asks for the UltraStudio",
       model.startRefusal(gamma) == "Connect the UltraStudio.", model.startRefusal(gamma) ?? "nil")
 
+    publish([x, y])
+    verifier.check("discovery: None set in the inspector stays None when inputs arrive",
+      model.selectedDevice == "" && model.descriptor(for: gamma)?.selectedDevice == "", model.selectedDevice)
+
     // Stop is a choice, not a failure: a camera stopped while its preview is on
     // screen (so automatic start still wants it) reads Stopped, not Couldn't start.
-    publish([x, y])
     model.updateCamera(alpha) { $0.selectedDevice = "dev-y"; $0.automaticFeed = true }
     _ = model.selectFeed(alpha)
     let surface = UUID()
@@ -853,6 +859,130 @@ import SystemExtensions
     verifier.check("discovery: a stopped camera's status says it stays off",
       model.automaticFeedStatus == "Camera stopped. It stays off until you start it.", model.automaticFeedStatus)
     model.monitorCoordinator.unregisterSurface(id: surface)
+  }
+
+  /// A model on a scripted device list whose `devices()` and discovery both follow `list`.
+  final class ScriptedInputs {
+    var list: [InputDevice] = []
+    var handler: (@MainActor @Sendable ([InputDevice]) -> Void)?
+    @MainActor func publish(_ next: [InputDevice]) { list = next; handler?(next) }
+  }
+
+  func scriptedModel(_ feeds: [FeedDescriptor], inputs: ScriptedInputs, defaults: UserDefaults) -> AppModel {
+    let settings = AppSettingsStore(defaults: defaults)
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: feeds, selectedFeedID: feeds[0].id, outputMode: .separateCameras))
+    var hardware = AppHardware.offline
+    hardware.devices = { inputs.list }
+    hardware.observeDevices = { handler in inputs.handler = handler; return nil }
+    return AppModel(settingsStore: settings, registryStore: VirtualCameraRegistryStore(defaults: defaults),
+      registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+  }
+
+  /// Two units of one model, one input per camera, and which camera an arriving input fills.
+  func adoption() {
+    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("adoption: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let alpha = FeedID(rawValue: "ui-verify-alpha"), beta = FeedID(rawValue: "ui-verify-beta")
+    // The user's two Mini Recorders: same name, persistent IDs differ.
+    let a = InputDevice(id: "decklink:00000000a1850ab8", name: "UltraStudio Mini Recorder 12G")
+    let b = InputDevice(id: "decklink:00000000a29246b8", name: "UltraStudio Mini Recorder 12G")
+    let c = InputDevice(id: "decklink:00000000c0ffee01", name: "UltraStudio 4K Mini")
+    let inputs = ScriptedInputs()
+    // A fresh setup: no camera has an input yet.
+    let model = scriptedModel([FeedDescriptor(id: alpha, name: "Camera 1", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", applyLUT: false, automaticFeed: false)], inputs: inputs, defaults: defaults)
+    let bridge = UISessionBridge(model: model, interface: UIInterfaceState(defaults: defaults))
+    func device(_ id: FeedID) -> String { model.descriptor(for: id)?.selectedDevice ?? "nil" }
+
+    inputs.publish([a])
+    verifier.check("adoption: a fresh setup takes the arriving input", device(alpha) == a.id, device(alpha))
+    inputs.publish([a, b, c])
+    verifier.check("adoption: two inputs with one name get their ID digits",
+      model.inputLabel(a.id) == "UltraStudio Mini Recorder 12G · 0AB8" &&
+        model.inputLabel(b.id) == "UltraStudio Mini Recorder 12G · 46B8", model.inputLabel(a.id) ?? "nil")
+    verifier.check("adoption: a unique name has no suffix", model.inputLabel(c.id) == c.name, model.inputLabel(c.id) ?? "nil")
+    verifier.check("adoption: the camera's input name is its label",
+      bridge.snapshot().cameras.first { $0.id == alpha.rawValue }?.inputName == "UltraStudio Mini Recorder 12G · 0AB8",
+      bridge.snapshot().cameras.first { $0.id == alpha.rawValue }?.inputName ?? "nil")
+
+    // Camera 2 is new and empty: it takes the first input no camera has.
+    _ = model.selectFeed(beta)
+    inputs.publish([])
+    inputs.publish([a])
+    verifier.check("adoption: an arriving input another camera has isn't taken", device(beta) == "", device(beta))
+    inputs.publish([a, b])
+    verifier.check("adoption: the first free input is taken", device(beta) == b.id, device(beta))
+
+    // One input per camera, in the model and in both pickers.
+    bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: a.id))
+    verifier.check("adoption: choosing an input another camera has is refused", device(beta) == b.id, device(beta))
+    model.updateCamera(alpha) { $0.selectedDevice = b.id }
+    verifier.check("adoption: refused for a camera that isn't selected too", device(alpha) == a.id, device(alpha))
+    let session = bridge.snapshot()
+    let options = UIInputLabels.options(model.devices.map { ($0.id, $0.name) }, cameras: session.cameras, for: beta.rawValue)
+    verifier.check("adoption: the inspector names the camera that has an input",
+      options.first { $0.id == a.id }?.usedBy == "Camera 1" && options.first { $0.id == b.id }?.usedBy == nil,
+      "\(options)")
+    let menu = UIMenuBarController.buildItems(presentation: UIPresentationBuilder.session(session), session: session,
+      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name) }, stats: nil, target: nil, previewItem: nil)
+    let camera2Inputs = menuItems(menu).first { $0.title == "Camera 2" }?.submenu?.items.first { $0.title == "Input" }?.submenu?.items ?? []
+    let taken = camera2Inputs.first { $0.title == "UltraStudio Mini Recorder 12G · 0AB8" }
+    let own = camera2Inputs.first { $0.title == "UltraStudio Mini Recorder 12G · 46B8" }
+    verifier.check("adoption: the menu bar disables an input another camera has",
+      taken?.isEnabled == false && taken?.subtitle == "Used by Camera 1" && own?.isEnabled == true && own?.state == .on,
+      camera2Inputs.map { "\($0.title) \($0.isEnabled) \($0.subtitle ?? "")" }.joined(separator: " | "))
+    verifier.check("adoption: the menu bar offers None",
+      camera2Inputs.first?.title == "None" && camera2Inputs.first?.state == .off,
+      camera2Inputs.map(\.title).joined(separator: " | "))
+
+    // None frees the input and sticks: neither an arrival nor Refresh fills it again.
+    bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: ""))
+    verifier.check("adoption: None clears the camera's input", device(beta) == "", device(beta))
+    inputs.publish([a])
+    inputs.publish([a, b, c])
+    model.refresh()
+    verifier.check("adoption: None stays None across a hot-plug and Refresh", device(beta) == "", device(beta))
+    bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: a.id))
+    verifier.check("adoption: an input Camera 1 has is still refused after None", device(beta) == "", device(beta))
+    bridge.perform(.setInput(cameraID: alpha.rawValue, deviceID: ""))
+    bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: a.id))
+    verifier.check("adoption: an input freed with None can move to another camera",
+      device(beta) == a.id && device(alpha) == "", "\(device(alpha)) \(device(beta))")
+
+    // Unplugged, the input stays the camera's and keeps its name.
+    inputs.publish([c])
+    verifier.check("adoption: an unplugged input stays assigned", device(beta) == a.id, device(beta))
+    verifier.check("adoption: an unplugged input keeps its label",
+      bridge.snapshot().cameras.first { $0.id == beta.rawValue }?.inputName == "UltraStudio Mini Recorder 12G · 0AB8",
+      bridge.snapshot().cameras.first { $0.id == beta.rawValue }?.inputName ?? "nil")
+    _ = model.selectFeed(alpha)
+    model.refresh()
+    verifier.check("adoption: a selected camera with None isn't filled by Refresh", device(alpha) == "", device(alpha))
+  }
+
+  /// Settings saved before inputs were exclusive can give two cameras one input:
+  /// the first to start keeps it, and the other's Start is refused with the reason.
+  func sharedInput() {
+    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("shared input: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let alpha = FeedID(rawValue: "ui-verify-alpha"), beta = FeedID(rawValue: "ui-verify-beta")
+    let inputs = ScriptedInputs()
+    inputs.list = [InputDevice(id: "dev-q", name: "UltraStudio Q")]
+    let model = scriptedModel([FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-q", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-q", applyLUT: false, automaticFeed: false)],
+      inputs: inputs, defaults: defaults)
+    model.startCamera(beta)
+    verifier.check("shared input: the first camera starts", model.isCameraRunning(beta))
+    model.startCamera(alpha)
+    verifier.check("shared input: Start on a camera whose input is in use is refused",
+      !model.isCameraRunning(alpha) && model.startRefusal(alpha) == "Camera 2 is using this input. Choose another input.",
+      model.startRefusal(alpha) ?? "nil")
+    model.stopCamera(beta)
+    verifier.check("shared input: the refusal clears when the other camera stops", model.startRefusal(alpha) == nil,
+      model.startRefusal(alpha) ?? "")
   }
 
   // MARK: Menu bar
@@ -993,6 +1123,8 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   do { try run.lutModel() } catch { verifier.check("LUT model tests threw", false, "\(error)") }
   do { try MonitorLUTVerify.run(verifier: verifier) } catch { verifier.check("monitor LUT tests threw", false, "\(error)") }
   run.discovery()
+  run.adoption()
+  run.sharedInput()
   run.pictureMenus()
   run.menuBar()
   Images.waitForWrites()

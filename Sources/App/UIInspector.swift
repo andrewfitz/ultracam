@@ -66,16 +66,28 @@ struct UIInspectorViewContent: View {
 
   private func sourceSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
+      // Selected by ID: two units of one model share a name. An input another camera
+      // has is shown but disabled; None frees this camera's input for another.
+      let options = UIInputLabels.options(context.inputs.map { ($0.id, $0.name) }, cameras: context.session.cameras,
+        for: camera.id)
+      let missingID = snapshot.inputID.flatMap { id in options.contains { $0.id == id } ? nil : id }
       Picker("Input", selection: Binding(
-        get: { context.inputs.first { $0.name == snapshot.inputName }?.id ?? "" },
+        get: { snapshot.inputID ?? "" },
         set: { context.send(.setInput(cameraID: camera.id, deviceID: $0)) })) {
-        if snapshot.inputName == nil { Text("No input").tag("") }
-        ForEach(context.inputs) { Text($0.name).lineLimit(1).truncationMode(.middle).tag($0.id) }
+        Text("None").tag("")
+        Divider()
+        ForEach(options) { option in
+          Text(option.usedBy.map { "\(option.label) (used by \($0))" } ?? option.label)
+            .lineLimit(1).truncationMode(.middle).tag(option.id)
+            .disabled(option.usedBy != nil && option.id != snapshot.inputID)
+        }
+        if let missingID { Text("\(snapshot.inputName ?? missingID) (disconnected)").tag(missingID) }
       }
       // One row: a long device name truncates instead of widening the inspector.
       .lineLimit(1)
       .disabled(snapshot.running)
-      .help(snapshot.running ? "Stop the camera to change its input." : "Choose the Blackmagic capture device.")
+      .help(snapshot.running ? "Stop the camera to change its input."
+        : "Choose the Blackmagic capture device. Each input serves one camera.")
       LabeledContent("Signal") {
         // The tone goes on the symbol; small orange text is hard to read in light mode.
         HStack(spacing: 4) {

@@ -111,7 +111,8 @@ struct UISessionBridge {
       let stats = state?.statistics
       let folder = recording.outputFolder(for: id)
       var camera = UICameraSnapshot(id: id.rawValue, name: descriptor.name)
-      camera.inputName = model.devices.first { $0.id == descriptor.selectedDevice }?.name
+      camera.inputID = descriptor.selectedDevice.isEmpty ? nil : descriptor.selectedDevice
+      camera.inputName = model.inputLabel(descriptor.selectedDevice)
       camera.deviceAvailable = deviceAvailable
       camera.running = running
       camera.signal = UIFormatLabels.signal(running: running, deviceAvailable: deviceAvailable, update: update)

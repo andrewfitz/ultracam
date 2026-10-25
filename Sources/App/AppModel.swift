@@ -5,7 +5,16 @@ import UniformTypeIdentifiers
 
 struct InputDevice: Identifiable {
   let id: String
+  /// The driver's model name, unchanged. Two units of one model share it; show `label`.
   let name: String
+}
+
+extension Array where Element == InputDevice {
+  /// The device's label in this list (`UIInputLabels.label`); nil when it isn't listed.
+  func label(for id: String) -> String? {
+    guard let device = first(where: { $0.id == id }) else { return nil }
+    return UIInputLabels.label(id: id, name: device.name, among: map { ($0.id, $0.name) })
+  }
 }
 
 @MainActor protocol AppVirtualCameraRegistryPublishing {
@@ -205,6 +214,10 @@ final class AppModel {
   private var demandStartedFeeds: Set<FeedID> = []
   private var manuallyStoppedFeeds: Set<FeedID> = []
   private var refusedStarts: Set<FeedID> = []
+  /// Cameras whose input is None by choice. Discovery never fills them (`applyDevices`).
+  @ObservationIgnored private var inputsClearedByChoice: Set<FeedID> = []
+  /// The name of every input seen this session, so an unplugged one keeps its name.
+  @ObservationIgnored private var lastInputNames: [String: String] = [:]
   private var programTransportRequired = false
   private var programTransportConfiguration: PipelineConfiguration?
   private var detectedInputCadence: [FeedID: Bool] = [:]
@@ -269,6 +282,11 @@ final class AppModel {
     self.virtualCameraRegistryStore = registryStore ?? VirtualCameraRegistryStore()
     let snapshot = store.loadSnapshot()
     persistedSnapshot = snapshot
+    // Saved without an input beside cameras that have one: that camera was set to None.
+    // Only a fresh setup, where no camera has an input yet, is filled in on its own.
+    if snapshot.feeds.contains(where: { !$0.selectedDevice.isEmpty }) {
+      inputsClearedByChoice = Set(snapshot.feeds.filter { $0.selectedDevice.isEmpty }.map(\.id))
+    }
     monitorCoordinator = MonitorCoordinator(feeds: snapshot.feeds, program: snapshot.programMonitor,
       workspace: snapshot.monitorWorkspacePreferences)
 
@@ -450,13 +468,15 @@ final class AppModel {
   private func applyDevices(_ next: [InputDevice], fromDiscovery: Bool) {
     // Discovery reports every arrival, including devices already listed.
     if fromDiscovery, next.map(\.id) == devices.map(\.id), next.map(\.name) == devices.map(\.name) { return }
+    for device in next { lastInputNames[device.id] = device.name }
     devices = next
-    // Discovery publishes after each arrival or removal, so its list can be
-    // partial; it only fills an empty assignment and never moves one.
-    if !running, !capture.hasActiveFeed, let first = devices.first,
-      !fromDiscovery || selectedDevice.isEmpty,
-      !devices.contains(where: { $0.id == selectedDevice }) {
-      selectedDevice = first.id
+    // Lists can be partial (discovery publishes after each arrival), and a saved
+    // input names one unit, so an assignment is never moved: an unplugged input
+    // stays the camera's until the user picks another. Only a camera that never
+    // had an input takes the first free one; None by choice stays None.
+    if !running, !capture.hasActiveFeed, selectedDevice.isEmpty, !inputsClearedByChoice.contains(selectedFeedID),
+      let free = devices.first(where: { inputHolder($0.id, excluding: selectedFeedID) == nil }) {
+      selectedDevice = free.id
     }
     if feedDescriptors.contains(where: \.automaticFeed), !restoringSettings {
       demandMonitor.refresh()
@@ -859,7 +879,27 @@ final class AppModel {
   }
 
   var canStartFeed: Bool {
-    !running && !loading && devices.contains { $0.id == selectedDevice }
+    !running && !loading && devices.contains { $0.id == selectedDevice } && inputInUse(by: selectedFeedID) == nil
+  }
+
+  /// What the interface calls an input: its label while listed (`UIInputLabels`),
+  /// its last name seen and ID digits while unplugged, nil for none.
+  func inputLabel(_ device: String) -> String? {
+    guard !device.isEmpty else { return nil }
+    return devices.label(for: device) ?? UIInputLabels.missingLabel(id: device, lastName: lastInputNames[device])
+  }
+
+  /// Another camera assigned `device`. One input serves one camera.
+  func inputHolder(_ device: String, excluding id: FeedID) -> FeedDescriptor? {
+    guard !device.isEmpty else { return nil }
+    return feedDescriptors.first { $0.id != id && $0.selectedDevice == device }
+  }
+
+  /// A running camera on this camera's input. Settings saved before inputs were
+  /// exclusive can give two cameras one input; the first to start keeps it.
+  private func inputInUse(by id: FeedID) -> FeedDescriptor? {
+    guard let device = descriptor(for: id)?.selectedDevice, !device.isEmpty else { return nil }
+    return feedDescriptors.first { $0.id != id && $0.selectedDevice == device && feedCoordinator.isFeedRunning($0.id) }
   }
 
   func start() {
@@ -893,14 +933,15 @@ final class AppModel {
     guard refusedStarts.contains(id), let descriptor = descriptor(for: id), !feedCoordinator.isFeedRunning(id) else { return nil }
     if id == selectedFeedID && automaticFeedEnabled { return automaticFeedStatus }
     if id == selectedFeedID && loading { return "Its LUT is still loading. Start it again in a moment." }
-    return inputUnavailableReason(descriptor.selectedDevice)
+    return inputUnavailableReason(descriptor.selectedDevice, for: id)
   }
 
-  /// Why a camera on input `device` can't start, nil while that input is listed.
+  /// Why camera `id` on input `device` can't start, nil while that input is listed and free.
   /// With no input listed there is none to choose: the UltraStudio is missing.
-  private func inputUnavailableReason(_ device: String) -> String? {
+  private func inputUnavailableReason(_ device: String, for id: FeedID) -> String? {
     if device.isEmpty && !devices.isEmpty { return driverWarning ?? "Choose an input for this camera." }
     if !devices.contains(where: { $0.id == device }) { return driverWarning ?? "Connect the UltraStudio." }
+    if let holder = inputInUse(by: id) { return "\(holder.name) is using this input. Choose another input." }
     return nil
   }
 
@@ -910,8 +951,11 @@ final class AppModel {
       // Start every configured source that has a device assignment. The
       // selected feed keeps the existing preview controller; additional
       // sources run headless and publish only into the Program route.
+      // A source sharing an input with one already started (or with the selected
+      // camera, which starts last) is skipped: one input serves one camera.
       for descriptor in feedCoordinator.descriptors where descriptor.enabled &&
         descriptor.id != selectedFeedID && !descriptor.selectedDevice.isEmpty &&
+        descriptor.selectedDevice != selectedDevice && inputInUse(by: descriptor.id) == nil &&
         !manuallyStoppedFeeds.contains(descriptor.id) &&
         (!automaticFeedEnabled || descriptor.automaticFeed) {
         if automaticFeedEnabled { demandStartedFeeds.insert(descriptor.id) }
@@ -961,6 +1005,8 @@ final class AppModel {
     recordingModel.stop(feedID: selectedFeedID)
     reconcileProgramTransportDemand()
     stopAutoSwitcher()
+    // A Start refused because this camera had the input is no longer refused.
+    expireResolvedStartRefusals()
   }
 
   private func reconcileAutoSwitcher() {
@@ -1250,7 +1296,7 @@ final class AppModel {
     if let cameraDemandError { return cameraDemandError }
     if !automaticCaptureRequested { return "Waiting for a camera app or visible preview. Capture and video processing are off." }
     if loading { return "Restoring your LUT…" }
-    if let reason = inputUnavailableReason(selectedDevice) { return reason }
+    if let reason = inputUnavailableReason(selectedDevice, for: selectedFeedID) { return reason }
     return "Camera stopped. Retry to resume preview or camera output."
   }
 
@@ -1295,7 +1341,7 @@ final class AppModel {
       let isRunning = feedCoordinator.isFeedRunning(id)
       let ready = FeedLifecycleDemandPolicy.canStartSource(automaticEnabled: descriptor.automaticFeed,
         manuallyStopped: manuallyStoppedFeeds.contains(id),
-        deviceAvailable: devices.contains { $0.id == descriptor.selectedDevice },
+        deviceAvailable: devices.contains { $0.id == descriptor.selectedDevice } && inputInUse(by: id) == nil,
         loading: id == selectedFeedID && loading)
       let action = policy.action(ready: ready && (id != selectedFeedID || canStartFeed), running: isRunning)
       feedPolicies[id] = policy
@@ -1435,7 +1481,7 @@ final class AppModel {
     guard let descriptor = descriptor(for: id), descriptor.enabled else { return }
     if id == selectedFeedID { start(); return }
     guard !feedCoordinator.isFeedRunning(id) else { return }
-    guard devices.contains(where: { $0.id == descriptor.selectedDevice }) else {
+    guard devices.contains(where: { $0.id == descriptor.selectedDevice }), inputInUse(by: id) == nil else {
       noteStartAttempt(id, started: false)
       return
     }
@@ -1471,6 +1517,7 @@ final class AppModel {
     cameraUpdates[id] = nil
     cameraStateRevision &+= 1
     reconcileProgramTransportDemand()
+    expireResolvedStartRefusals()
   }
 
   func startAllCameras() {
@@ -1495,6 +1542,18 @@ final class AppModel {
     guard var descriptor = descriptor(for: id) else { return }
     let before = descriptor
     mutate(&descriptor)
+    // One input serves one camera: an input another camera has is refused, and a
+    // running camera keeps its input. None is remembered so discovery leaves it.
+    if descriptor.selectedDevice != before.selectedDevice {
+      if inputHolder(descriptor.selectedDevice, excluding: id) != nil || isCameraRunning(id) ||
+        (id == selectedFeedID && running) {
+        descriptor.selectedDevice = before.selectedDevice
+      } else if descriptor.selectedDevice.isEmpty {
+        inputsClearedByChoice.insert(id)
+      } else {
+        inputsClearedByChoice.remove(id)
+      }
+    }
     guard descriptor != before else { return }
     if id == selectedFeedID {
       if descriptor.applyLUT != before.applyLUT { rememberedLUTEnabled = descriptor.applyLUT }
@@ -1516,12 +1575,9 @@ final class AppModel {
       if descriptor.gamut != gamut { gamut = descriptor.gamut }
       if descriptor.previewEnabled != previewEnabled { previewEnabled = descriptor.previewEnabled }
       if descriptor.automaticFeed != automaticFeedEnabled { automaticFeedEnabled = descriptor.automaticFeed }
-      if descriptor.selectedDevice != selectedDevice, !running { selectedDevice = descriptor.selectedDevice }
+      if descriptor.selectedDevice != selectedDevice { selectedDevice = descriptor.selectedDevice }
       if descriptor.applyLUT != before.applyLUT { saveSettings() }
       return
-    }
-    if feedCoordinator.isFeedRunning(id) && descriptor.selectedDevice != before.selectedDevice {
-      descriptor.selectedDevice = before.selectedDevice
     }
     if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
     feedCoordinator.update(descriptor)
