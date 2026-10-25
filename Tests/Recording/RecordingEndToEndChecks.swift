@@ -549,8 +549,8 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
       let audio = try XCTUnwrap(ranges.audio)
       let movie = try XCTUnwrap(ranges.movie)
       let onePacket = 801.0 / 48_000
-      XCTAssertEqual(audio.start.seconds, video.start.seconds, accuracy: 1.0 / 48_000,
-        "offset \(clockOffset): audio starts \(audio.start.seconds - video.start.seconds) s after the video")
+      // A track's time range includes a leading empty edit, so a late start
+      // shows as a longer audio track that ends after the video.
       XCTAssertEqual(audio.duration.seconds, Double(audioSamples) / 48_000, accuracy: 1.0 / 48_000,
         "Every audio sample is in the movie")
       XCTAssertEqual(audio.end.seconds, video.end.seconds, accuracy: onePacket,
