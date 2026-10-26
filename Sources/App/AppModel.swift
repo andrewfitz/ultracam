@@ -328,8 +328,8 @@ final class AppModel {
     let coordinator = feedCoordinator
     recordingModel = RecordingModel(
       feeds: feedCoordinator.descriptors.map { RecordingFeedDescriptor(id: $0.id, name: $0.name) },
-      driver: NativeRecordingSessionDriver(capture: coordinator.capture(for: coordinator.selectedFeedID),
-        rawAudioCallbackAvailable: true, captureForFeed: { id in coordinator.capture(for: id) }),
+      driver: NativeRecordingSessionDriver(captureForFeed: { id in coordinator.capture(for: id) },
+        rawAudioCallbackAvailable: true),
       folderStore: recordingFolderStore ?? RecordingFolderStore())
     self.lutLoader = lutLoader
     monitorCoordinator.onConfigurationChange = { [weak self] target, configuration in

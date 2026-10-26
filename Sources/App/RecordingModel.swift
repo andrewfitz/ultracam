@@ -239,10 +239,9 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
   private var finishedOutputs: [FeedID: URL] = [:]
   private var outputManagers: [String: RecordingOutputManager] = [:]
 
-  init(capture: CaptureController, rawAudioCallbackAvailable: Bool = false,
-    captureForFeed: ((FeedID) -> CaptureController)? = nil,
+  init(captureForFeed: @escaping (FeedID) -> CaptureController, rawAudioCallbackAvailable: Bool = false,
     recorderFactory: @escaping RecorderFactory = { try SourceRecorderCore(configuration: $0) }) {
-    self.captureForFeed = captureForFeed ?? { _ in capture }
+    self.captureForFeed = captureForFeed
     self.rawAudioCallbackAvailable = rawAudioCallbackAvailable
     self.recorderFactory = recorderFactory
     // The first take would otherwise compile the GPU repack kernel at start.

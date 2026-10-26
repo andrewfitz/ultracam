@@ -355,7 +355,7 @@ import XCTest
     let capture = CaptureController(services: CaptureServices(
       start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
     var configurations: [SourceRecordingConfiguration] = []
-    let driver = NativeRecordingSessionDriver(capture: capture,
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture },
       recorderFactory: { configuration in
         configurations.append(configuration)
         return try SourceRecorderCore(configuration: configuration, writerFactory: { Writer() })
@@ -396,7 +396,7 @@ import XCTest
       start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
     let idsLock = NSLock()
     var sourceIDs: [String] = []
-    let driver = NativeRecordingSessionDriver(capture: capture, rawAudioCallbackAvailable: true,
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, rawAudioCallbackAvailable: true,
       recorderFactory: { configuration in
         idsLock.withLock { sourceIDs.append(configuration.feedID.rawValue) }
         return try SourceRecorderCore(configuration: configuration, writerFactory: { Writer() })
@@ -429,7 +429,7 @@ import XCTest
       let capture = CaptureController(services: CaptureServices(
         start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
       let writer = SlowFinishingWriter(fail: fail)
-      let driver = NativeRecordingSessionDriver(capture: capture, rawAudioCallbackAvailable: true,
+      let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, rawAudioCallbackAvailable: true,
         recorderFactory: { configuration in
           try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
         })
@@ -474,7 +474,7 @@ import XCTest
     let writer = SlowFinishingWriter(fail: true)
     writer.release.signal()
     let media = Data([10, 20, 30])
-    let driver = NativeRecordingSessionDriver(capture: capture, recorderFactory: { configuration in
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, recorderFactory: { configuration in
       try media.write(to: configuration.outputURL)
       return try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
     })
@@ -567,7 +567,7 @@ import XCTest
     let capture = CaptureController(services: CaptureServices(
       start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
     let writer = SlowStartingWriter()
-    let driver = NativeRecordingSessionDriver(capture: capture, rawAudioCallbackAvailable: true,
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, rawAudioCallbackAvailable: true,
       recorderFactory: { configuration in
         try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
       })
@@ -600,7 +600,7 @@ import XCTest
 
     // Stop while the take is still starting: it finishes once the take exists.
     let second = SlowStartingWriter()
-    let stopDriver = NativeRecordingSessionDriver(capture: capture, rawAudioCallbackAvailable: true,
+    let stopDriver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, rawAudioCallbackAvailable: true,
       recorderFactory: { configuration in
         try SourceRecorderCore(configuration: configuration, writerFactory: { second })
       })
