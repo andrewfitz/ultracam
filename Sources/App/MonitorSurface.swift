@@ -79,14 +79,20 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   private weak var scopeLayer: CAMetalLayer?
   private var lastStatusUpdate = 0.0
 
+  /// Published only when it changes: the picture views observe this presenter.
   @MainActor @Published private(set) var status = "No Signal"
-  @MainActor @Published private(set) var detail = ""
+  /// The picture's timing ("Picture PTS … · 0.0 s old"), which changes with every refresh
+  /// (2 Hz): published by `readout`, which only the monitor windows' text observes, so the
+  /// main window's pictures aren't re-evaluated twice a second each.
+  @MainActor var detail: String { readout.detail }
+  @MainActor let readout = MonitorSurfaceReadout()
   @MainActor @Published private(set) var isFrozen = false
   @MainActor @Published private(set) var isFreezePending = false
   @MainActor @Published private(set) var isClean = false
   @MainActor @Published private(set) var zoom = Magnification()
   @MainActor @Published private(set) var pictureInterpretation = "Range / transfer interpretation unavailable"
-  @MainActor @Published private(set) var scopeTiming = "No scope signal"
+  /// The scope's timing, with every refresh; published by `readout` (see `detail`).
+  @MainActor var scopeTiming: String { readout.scopeTiming }
   @MainActor @Published private(set) var scopeInterpretation = "Range / transfer interpretation unavailable"
   @MainActor @Published private(set) var pictureAspectRatio = 16.0 / 9.0
   /// The tools of the picture on screen: the frozen ones while frozen.
@@ -617,7 +623,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     if let copyToken { scheduleFreezeCopy(token: copyToken) }
     if let retired { retire(retired) }
     refresh(force: true)
-    if let message { detail = message }
+    if let message { readout.setDetail(message) }
   }
 
   /// Ends any freeze; returns a hold whose copy the caller retires.
@@ -786,28 +792,28 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     if shownStatus != drawnStatus { shownStatus = drawnStatus }
     let occluded = !frozenNow && visibilityReported && !visibility.drawable
     if pending {
-      status = "Waiting to freeze next picture"
-      detail = status
+      setStatus("Waiting to freeze next picture")
+      readout.setDetail(status)
       return
     }
     let stamp = shown?.stamp ?? live?.stamp
     guard let stamp else {
-      scopeTiming = "No scope signal"
-      status = occluded ? (visibility.presented ? "Occluded" : "Paused / hidden") : unavailable
-      detail = status
+      readout.setScopeTiming("No scope signal")
+      setStatus(occluded ? (visibility.presented ? "Occluded" : "Paused / hidden") : unavailable)
+      readout.setDetail(status)
       return
     }
     if occluded {
-      status = visibility.presented ? "Occluded" : "Paused / hidden"
-      detail = status
+      setStatus(visibility.presented ? "Occluded" : "Paused / hidden")
+      readout.setDetail(status)
       return
     }
     guard force || now - lastStatusUpdate >= 0.5 else { return }
     lastStatusUpdate = now
     // A picture that fails to draw is reported on the tile, never shown as Live.
     if let reason = gpu.unavailableReason ?? failure, !frozenNow {
-      status = "Monitor error"
-      detail = reason
+      setStatus("Monitor error")
+      readout.setDetail(reason)
       return
     }
     let signal = shown?.signal ?? live?.signal
@@ -827,22 +833,22 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       if aspect.isFinite, aspect > 0, abs(aspect - pictureAspectRatio) > 0.0001 { pictureAspectRatio = aspect }
     }
     let age = max(0, now - stamp.hostTime)
-    status = frozenNow ? "Frozen" : age > 0.25 ? "Stale" : "Live"
+    setStatus(frozenNow ? "Frozen" : age > 0.25 ? "Stale" : "Live")
     var text = "Picture PTS \(String(format: "%.3f", stamp.sourcePTS)) · \(String(format: "%.1f", age)) s old"
     if shownTools.scopesShown, let lastScope {
       let scopeAge = max(0, now - lastScope.hostTime)
       let scopeState =
         frozenNow ? "Frozen" : scopeAge > 0.25 ? "Stale" : "Live"
-      scopeTiming =
-        "\(scopeState) · Scope PTS \(String(format: "%.3f", lastScope.sourcePTS)) · \(String(format: "%.1f", scopeAge)) s old"
+      readout.setScopeTiming(
+        "\(scopeState) · Scope PTS \(String(format: "%.3f", lastScope.sourcePTS)) · \(String(format: "%.1f", scopeAge)) s old")
       text += " · Scope PTS \(String(format: "%.3f", lastScope.sourcePTS))"
     } else {
-      scopeTiming = "No scope signal"
+      readout.setScopeTiming("No scope signal")
     }
     if let reason = gpu.unavailableReason { text += " · " + reason }
     if let lut = host.lutMismatch { text += " · " + lut }
     if !statuses.isEmpty { text += " · " + statuses.joined(separator: " · ") }
-    detail = text
+    readout.setDetail(text)
   }
 }
 
@@ -1004,7 +1010,8 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     let scale = window?.backingScaleFactor ?? 2
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    metalLayer.frame = frame.integral
+    // Only a real change: an unchanged frame still re-sent the layer in every commit.
+    if metalLayer.frame != frame.integral { metalLayer.frame = frame.integral }
     let scaleChanged = metalLayer.contentsScale != scale
     if scaleChanged { metalLayer.contentsScale = scale }
     CATransaction.commit()
@@ -1121,7 +1128,7 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     super.layout()
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    metalLayer.frame = bounds
+    if metalLayer.frame != bounds { metalLayer.frame = bounds }
     CATransaction.commit()
   }
   override func viewDidMoveToWindow() {
@@ -1627,4 +1634,20 @@ struct MonitorSurfaceVisibility: NSViewRepresentable {
   let presenter: MonitorSurfacePresenter
   func makeNSView(context: Context) -> NSView { presenter.makeVisibilityView() }
   func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+extension MonitorSurfacePresenter {
+  /// Sets the status only when it changes, so its observers aren't told of every refresh.
+  @MainActor fileprivate func setStatus(_ value: String) { if status != value { status = value } }
+}
+
+/// A surface's timing texts, which change with every refresh: observed by the monitor
+/// windows that print them, not by every view of the picture.
+@MainActor final class MonitorSurfaceReadout: ObservableObject {
+  @Published private(set) var detail = ""
+  @Published private(set) var scopeTiming = "No scope signal"
+  /// Made with its presenter, off the main actor.
+  nonisolated init() {}
+  func setDetail(_ value: String) { if detail != value { detail = value } }
+  func setScopeTiming(_ value: String) { if scopeTiming != value { scopeTiming = value } }
 }

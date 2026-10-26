@@ -9,6 +9,8 @@ struct UIMainWindowView: View {
   @State private var stripHeights: [String: CGFloat] = [:]
   /// What the side columns' bindings read (see `columnVisibility`).
   @State private var columns = UIColumnState()
+  /// The detail's size once it stops changing (see `UISettledSize`).
+  @State private var settled = UISettledSize()
 
   /// Space between a picture and its strip (`UICameraColumnView`), between grid cells,
   /// and around the pictures (clear of the sidebar, inspector and window edges).
@@ -40,7 +42,10 @@ struct UIMainWindowView: View {
     .navigationTitle(context.presentation.title)
     .navigationSubtitle(context.presentation.subtitle)
     .inspector(isPresented: inspectorBinding) {
-      UIInspectorView(context: context)
+      // Laid out at least at the column's minimum width: while the column opens or closes the
+      // form keeps that layout and is revealed, instead of laying out every row at every frame.
+      UIMinimumWidthLayout(minimum: 280) { UIInspectorView(context: context) }
+        .clipped()
         .inspectorColumnWidth(min: 280, ideal: 320, max: 460)
     }
     .confirmationDialog(confirmationTitle, isPresented: confirmationBinding, titleVisibility: .visible) {
@@ -75,54 +80,43 @@ struct UIMainWindowView: View {
       case .single:
         if let camera = context.presentation.selected ?? cameras.first {
           // Size the picture so the picture and its strip fit the window height.
-          GeometryReader { proxy in
-            let fitted = (proxy.size.height - stripHeight(camera) - columnSpacing - margin * 2) * 16 / 9
-            // Never wider than the column; a short window scrolls rather than shrinking it below 420 pt.
-            let width = min(proxy.size.width - margin * 2, max(420, fitted))
-            ScrollView {
-              column(camera)
-                .frame(width: width)
-                .frame(maxWidth: .infinity)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-            .contentMargins(margin, for: .scrollContent)
-          }
+          cells(singleFit(camera)) { width in column(camera).frame(width: width) }
         }
       case .sideBySide, .fourUp:
         // Fit the cells to the height as well as the width, so every picture and its strip
         // (collapsed in Four Up) is on screen at the default window size.
-        GeometryReader { proxy in
-          let width = cellWidth(in: proxy.size, cameras: cameras)
-          ScrollView {
-            Group {
-              if cameras.count <= 2 && context.presentation.layout == .sideBySide {
-                HStack(alignment: .top, spacing: cellSpacing) {
-                  ForEach(cameras) { camera in
-                    column(camera).frame(width: width)
-                  }
-                }
-              } else {
-                Grid(horizontalSpacing: cellSpacing, verticalSpacing: cellSpacing) {
-                  ForEach(Array(stride(from: 0, to: cameras.count, by: 2)), id: \.self) { start in
-                    GridRow(alignment: .top) {
-                      column(cameras[start]).frame(width: width)
-                      if start + 1 < cameras.count {
-                        column(cameras[start + 1]).frame(width: width)
-                      } else {
-                        Color.clear.frame(width: width, height: 1)
-                      }
-                    }
-                  }
-                }
-              }
+        cells(gridFit(cameras)) { width in
+          // Two cells to a row, top-aligned (Side by Side is one row of two).
+          UICellRowsLayout(spacing: cellSpacing) {
+            ForEach(cameras) { camera in
+              column(camera).frame(width: width)
             }
-            .frame(maxWidth: .infinity)
           }
-          .scrollBounceBehavior(.basedOnSize)
-          .contentMargins(margin, for: .scrollContent)
         }
       }
     }
+  }
+
+  /// The cells at the width `fit` gives the detail's settled size, centered in a scroll view.
+  /// While the detail's size changes (a side column animating, a live resize) they keep that
+  /// layout and scale to the width `fit` gives the live size, in the render pass alone: no body
+  /// is evaluated and nothing is laid out again until the size settles (`UISettledSize`).
+  private func cells(_ fit: UIDetailFit, @ViewBuilder content: (CGFloat) -> some View) -> some View {
+    let width = fit.width(in: settled.size)
+    // In an overlay, so the cells' width never becomes the detail's ideal size (the split view
+    // turns that into constraints, and changing it from its own size loops).
+    return Color.clear.overlay { ScrollView {
+      content(width)
+        .visualEffect { content, proxy in
+          let live = proxy.bounds(of: .scrollView)?.size ?? proxy.size
+          return content.scaleEffect(fit.scale(laidOut: width, live: live), anchor: .top)
+        }
+        .frame(maxWidth: .infinity)
+    }
+    .scrollBounceBehavior(.basedOnSize)
+    .contentMargins(margin, for: .scrollContent)
+    }
+    .onGeometryChange(for: CGSize.self) { $0.size } action: { settled.changed(to: $0) }
   }
 
   // MARK: Fitting
@@ -137,22 +131,24 @@ struct UIMainWindowView: View {
       }
   }
 
-  /// The measured strip height, or an estimate until the first layout pass.
-  private func stripHeight(_ camera: UICameraPresentation) -> CGFloat {
-    stripHeights[camera.id] ?? (camera.collapsed ? 56 : 190)
+  /// The single layout: the picture and its strip fit the window height.
+  private func singleFit(_ camera: UICameraPresentation) -> UIDetailFit {
+    UIDetailFit(columns: 1, rows: 1, strip: stripHeight(camera), narrowest: 420, margin: margin, cellSpacing: cellSpacing,
+      columnSpacing: columnSpacing)
   }
 
   /// The widest cell that fits two columns across and every row (picture and strip) down.
-  private func cellWidth(in size: CGSize, cameras: [UICameraPresentation]) -> CGFloat {
-    let rows = CGFloat((cameras.count + 1) / 2)
-    let strip = cameras.map(stripHeight).max() ?? 0
-    let byWidth = (size.width - margin * 2 - cellSpacing) / 2
-    let rowHeight = (size.height - margin * 2 - cellSpacing * (rows - 1)) / rows
-    let byHeight = (rowHeight - strip - columnSpacing) * 16 / 9
+  private func gridFit(_ cameras: [UICameraPresentation]) -> UIDetailFit {
     // A short window scrolls rather than shrinking cells below what their strips need
     // (an expanded strip's controls don't fit under about 400 pt and would spill out of the cell).
-    let narrowest: CGFloat = cameras.contains { !$0.collapsed } ? 400 : 260
-    return max(0, min(byWidth, max(narrowest, byHeight))).rounded(.down)
+    UIDetailFit(columns: 2, rows: (cameras.count + 1) / 2, strip: cameras.map(stripHeight).max() ?? 0,
+      narrowest: cameras.contains { !$0.collapsed } ? 400 : 260, margin: margin, cellSpacing: cellSpacing,
+      columnSpacing: columnSpacing)
+  }
+
+  /// The measured strip height, or an estimate until the first layout pass.
+  private func stripHeight(_ camera: UICameraPresentation) -> CGFloat {
+    stripHeights[camera.id] ?? (camera.collapsed ? 56 : 190)
   }
 
   // MARK: Bindings
@@ -229,4 +225,121 @@ struct UIMainWindowView: View {
     if seen?.inspector != session.inspectorOpen { inspectorOpen = session.inspectorOpen }
     seen = (session.sidebarVisible, session.inspectorOpen)
   }
+}
+
+/// The detail's size, adopted once it has stopped changing for a moment. Every frame of a side
+/// column's animation (or a live window resize) changed the cells' widths, and laying out every
+/// picture, strip and control again took longer than a frame. Until the size settles the cells
+/// keep their layout and scale (`cells(_:content:)`), as the Metal pictures keep their drawables.
+@MainActor @Observable final class UISettledSize {
+  private(set) var value: CGSize?
+  @ObservationIgnored private var pending: DispatchWorkItem?
+  /// How long the size must hold still: a little more than a frame of a live resize's gaps.
+  private static let delay = 0.12
+
+  /// The size to lay out at: the settled one, or a typical one before the first.
+  var size: CGSize { value ?? CGSize(width: 1000, height: 700) }
+
+  func changed(to size: CGSize) {
+    pending?.cancel()
+    // The first size is adopted at once, so the first layout is the real one.
+    guard value != nil else { value = size; return }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, self.value != size else { return }
+      self.value = size
+    }
+    pending = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.delay, execute: work)
+  }
+}
+
+/// How wide the detail's cells are for a size: as wide as the columns allow, and no taller than
+/// the rows allow, but never under `narrowest` (a short window scrolls instead).
+struct UIDetailFit: Sendable {
+  var columns: Int
+  var rows: Int
+  var strip: CGFloat
+  var narrowest: CGFloat
+  var margin: CGFloat
+  var cellSpacing: CGFloat
+  var columnSpacing: CGFloat
+
+  func width(in size: CGSize) -> CGFloat {
+    let columns = CGFloat(max(1, columns)), rows = CGFloat(max(1, rows))
+    let byWidth = (size.width - margin * 2 - cellSpacing * (columns - 1)) / columns
+    let rowHeight = (size.height - margin * 2 - cellSpacing * (rows - 1)) / rows
+    let byHeight = (rowHeight - strip - columnSpacing) * 16 / 9
+    return max(1, min(byWidth, max(narrowest, byHeight)).rounded(.down))
+  }
+
+  /// The scale that fits cells laid out `laidOut` wide to the live size: under 1 while the
+  /// detail is narrower than its settled size, 1 otherwise (a wider detail centers them).
+  func scale(laidOut: CGFloat, live: CGSize) -> CGFloat {
+    guard laidOut > 0, live.width > 0, live.height > 0 else { return 1 }
+    return min(1, max(0.05, width(in: live) / laidOut))
+  }
+}
+
+/// Lays its content out at least `minimum` wide, leading-aligned, whatever narrower width it is
+/// offered (a column opening or closing); it still takes only the width it's offered.
+struct UIMinimumWidthLayout: Layout {
+  let minimum: CGFloat
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    let width = proposal.width ?? minimum
+    let height = subviews.first?.sizeThatFits(ProposedViewSize(width: max(width, minimum), height: proposal.height)).height ?? 0
+    return CGSize(width: width, height: proposal.height ?? height)
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    for subview in subviews {
+      subview.place(at: bounds.origin, proposal: ProposedViewSize(width: max(bounds.width, minimum), height: bounds.height))
+    }
+  }
+
+  func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+  func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+}
+
+/// Cells two to a row, each row as tall as its tallest cell, the cells at their own (fixed)
+/// widths and top-aligned. Unlike an HStack or Grid row aligned `.top`, it asks no cell for
+/// alignment guides: those queries walked every picture and strip in every layout pass.
+struct UICellRowsLayout: Layout {
+  var spacing: CGFloat
+  var perRow = 2
+
+  private func rows(_ subviews: Subviews) -> [(cells: [(index: Int, size: CGSize)], height: CGFloat)] {
+    stride(from: 0, to: subviews.count, by: perRow).map { start in
+      let cells = (start..<min(start + perRow, subviews.count)).map { ($0, subviews[$0].sizeThatFits(.unspecified)) }
+      return (cells, cells.map(\.1.height).max() ?? 0)
+    }
+  }
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    let rows = rows(subviews)
+    let width = rows.map { row in row.cells.map(\.size.width).reduce(0, +) + spacing * CGFloat(max(0, row.cells.count - 1)) }.max() ?? 0
+    let height = rows.map(\.height).reduce(0, +) + spacing * CGFloat(max(0, rows.count - 1))
+    return CGSize(width: width, height: height)
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    var y = bounds.minY
+    for row in rows(subviews) {
+      var x = bounds.minX
+      for cell in row.cells {
+        subviews[cell.index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(cell.size))
+        x += cell.size.width + spacing
+      }
+      y += row.height + spacing
+    }
+  }
+
+  func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+  func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
 }

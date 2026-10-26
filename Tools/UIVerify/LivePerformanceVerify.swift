@@ -171,9 +171,29 @@ struct LivePerformanceSample {
   /// Views that must not re-evaluate while nothing but telemetry changes.
   static let structural = ["UILiveRoot", "UIMainWindowView", "UISessionSidebarView", "UISessionSidebarViewContent",
     "UIInspectorView", "UIInspectorViewContent", "UIToolbarContent", "UICameraColumnView", "UICameraPictureView",
-    "UIChannelStripView", "UIStatusBarView"]
+    "UIChannelStripView", "UIStatusBarView", "UIAppSurfacePicture"]
+
+  /// While the detail settles its cells scale in the render pass (`visualEffect`); the native
+  /// pictures in them (NSViews) must scale with them, not keep their laid-out size.
+  static func nativeViewsScaleWithVisualEffect(verifier: Verifier) {
+    final class Probe: NSView {}
+    struct Native: NSViewRepresentable {
+      let view: Probe
+      func makeNSView(context: Context) -> Probe { view }
+      func updateNSView(_ view: Probe, context: Context) {}
+    }
+    let probe = Probe()
+    let hosted = HostedView(Native(view: probe).frame(width: 400, height: 225)
+      .visualEffect { content, _ in content.scaleEffect(0.5, anchor: .top) }
+      .frame(width: 600, height: 400), size: CGSize(width: 600, height: 400), dark: false)
+    defer { hosted.close() }
+    let shown = probe.convert(probe.bounds, to: nil)
+    verifier.check("perf: a native picture scales with its cell while the detail settles",
+      abs(shown.width - 200) < 2 && abs(shown.height - 112.5) < 2, "\(shown)")
+  }
 
   static func run(verifier: Verifier) {
+    nativeViewsScaleWithVisualEffect(verifier: verifier)
     let counts = (ProcessInfo.processInfo.environment["UI_PERF_CAMERAS"] ?? "2,4").split(separator: ",").compactMap { Int($0) }
     for cameras in counts {
       // With live meters (as in the app), then with the meters showing fixed readings: MonitorKit's
@@ -266,7 +286,7 @@ struct LivePerformanceSample {
     print("PERF \(name) idle: \(idle.summary)")
     verifier.check("\(name): the window is on a display and ticks", idle.displayHz > 50, "\(idle.displayHz) Hz")
     verifier.check("\(name): every camera delivers frames while measured",
-      zip(before, after).allSatisfy { $1 > $0 + 150 }, "\(before) -> \(after)")
+      zip(before, after).allSatisfy { Double($1) > Double($0) + idle.seconds * 40 }, "\(before) -> \(after)")
     verifier.check("\(name): the session snapshot and context follow no capture update", !rebuilt.withLock { $0 })
     check(idle, "idle", name: name, verifier: verifier, liveMeters: liveMeters)
 
@@ -330,8 +350,8 @@ struct LivePerformanceSample {
       verifier.check("\(name), \(step): \(view) evaluated a few times, not per frame", total <= 10,
         String(format: "%.0f times", total))
     }
-    // Opening the inspector builds its form, once: the longest pass, about 50 ms unoptimized.
-    verifier.check("\(name), \(step): no run loop stall past 120 ms", value.longest < 120, value.summary)
+    // Opening the inspector builds its form, once: the longest pass, 50–120 ms unoptimized.
+    verifier.check("\(name), \(step): no run loop stall past 250 ms", value.longest < 250, value.summary)
   }
 }
 

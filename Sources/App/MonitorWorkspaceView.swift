@@ -52,12 +52,15 @@ private struct MonitorBoundTile: View {
   @State private var scopesVisible = true
   @State private var zoom = 1.0
   @State private var cleanBeforeHold: Bool?
+  /// The presenter's timing texts change twice a second (`MonitorSurfacePresenter.readout`).
+  @State private var readoutRevision = 0
   private var displayed: MonitorFeedPreferences {
     presenter.isFrozen ? presenter.shownPreferences : preferences.wrappedValue
   }
   private var previewEnabled: Bool { coordinator.isPreviewEnabled(for: target) }
   private var status: String { previewEnabled ? presenter.status : "Preview hidden" }
   var body: some View {
+    let _ = readoutRevision
     MonitorDetachedChrome(
       target: targetBinding, preferences: preferences, choices: coordinator.targets, status: status,
       detail: presenter.detail + " · " + presenter.pictureInterpretation, compact: compact,
@@ -160,6 +163,7 @@ private struct MonitorBoundTile: View {
     .onChange(of: presenter.isFrozen) { _, _ in register() }
     .onChange(of: scopesVisible) { _, _ in register() }
     .onChange(of: preferences.wrappedValue.scopesShown) { _, _ in register() }
+    .onReceive(presenter.readout.objectWillChange) { _ in readoutRevision &+= 1 }
   }
   /// What the shown scope measures: the frozen settings while frozen.
   private var scopeDescription: UIScopeDescription {

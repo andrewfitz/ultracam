@@ -93,6 +93,7 @@ private struct UIAppSurfacePicture: View {
   private var scopesShown: Bool { previewEnabled && displayed.scopesShown }
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIAppSurfacePicture")
     ZStack {
       Color.black
       if !previewEnabled {
