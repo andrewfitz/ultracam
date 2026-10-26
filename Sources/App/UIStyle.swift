@@ -210,3 +210,48 @@ struct UIChipToggle: View {
 }
 
 // The level meters live in UIAudioMeterPanel.swift, on MonitorKitUI's LevelMeterView and AudioMeterView.
+
+/// The first of its candidates whose ideal width fits the row, like `ViewThatFits(in: .horizontal)`,
+/// for rows that span their container. ViewThatFits measures every candidate at the offered width
+/// in every layout pass, so a side column animating beside the row re-measured every candidate at
+/// every frame. This measures each candidate once at its ideal width (a proposal that doesn't
+/// change with the row's width, so it's laid out from cache) and changes its choice only when the
+/// row crosses a candidate's width.
+struct UIFirstFitting<Content: View>: View {
+  @ViewBuilder let content: Content
+  @State private var ideal: [Int: CGFloat] = [:]
+  @State private var chosen = 0
+
+  var body: some View {
+    Group(subviews: content) { candidates in
+      let index = min(chosen, max(0, candidates.count - 1))
+      if !candidates.isEmpty {
+        candidates[index]
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(alignment: .topLeading) {
+            ZStack(alignment: .topLeading) {
+              ForEach(candidates.indices, id: \.self) { candidate in
+                candidates[candidate].fixedSize().hidden()
+                  .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { ideal[candidate] = $0 }
+              }
+            }
+            .frame(width: 0, height: 0, alignment: .topLeading)
+            .accessibilityHidden(true)
+            .allowsHitTesting(false)
+          }
+          .onGeometryChange(for: Int.self) { [ideal, count = candidates.count] proxy in
+            UIFitting.choice(ideal, count: count, width: proxy.size.width)
+          } action: { chosen = $0 }
+      }
+    }
+  }
+
+}
+
+enum UIFitting {
+  /// The first candidate that fits `width` (the last when none does, or before any is measured, the first).
+  nonisolated static func choice(_ ideal: [Int: CGFloat], count: Int, width: CGFloat) -> Int {
+    guard count > 0, ideal.count == count else { return 0 }
+    return (0..<count).first { (ideal[$0] ?? .infinity) <= width + 0.5 } ?? count - 1
+  }
+}

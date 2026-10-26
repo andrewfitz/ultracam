@@ -245,8 +245,12 @@ final class AppModel {
     var configuration: PipelineConfiguration
     var pipelineEnabled: Bool
   }
-  /// The latest status from every camera.
+  /// The latest status from every camera. Observers are told only when its state changes
+  /// (`CaptureUpdateState`); the values that change with every update are telemetry
+  /// (`telemetry`, `liveCameraUpdate`), so the window isn't rebuilt 4 times a second per camera.
   private(set) var cameraUpdates: [FeedID: CaptureUpdate] = [:]
+  /// Fast-changing camera and take values, for the views that show them (see UILiveTelemetry.swift).
+  var telemetry: UITelemetryStore { recordingModel.telemetry }
   /// Program cuts applied this session, newest first (bounded).
   private(set) var recentCuts: [UICutRecord] = []
   /// When the camera now on Program went on air.
@@ -1060,7 +1064,13 @@ final class AppModel {
   /// work drains, so updates for a removed camera are ignored.
   private func cameraDidUpdate(_ feedID: FeedID, _ update: CaptureUpdate) {
     guard descriptor(for: feedID) != nil else { return }
-    cameraUpdates[feedID] = update
+    if let previous = _cameraUpdates[feedID], CaptureUpdateState(previous) == CaptureUpdateState(update) {
+      // Only telemetry changed: stored without telling the observers of `cameraUpdates`.
+      _cameraUpdates[feedID] = update
+    } else {
+      cameraUpdates[feedID] = update
+    }
+    telemetry.captureChanged(feedID)
     if update.stopped {
       captureLog.notice("Stopped \(feedID.rawValue, privacy: .public): \(update.message, privacy: .public)")
       cameraStateRevision &+= 1
@@ -1373,8 +1383,15 @@ final class AppModel {
     return hardware.diagnostics(deviceID)
   }
 
-  /// The latest status for any camera.
+  /// The latest status for any camera. A view reading it follows its state only; one that
+  /// shows its running values (timecode, levels, counters) reads `liveCameraUpdate`.
   func cameraUpdate(_ id: FeedID) -> CaptureUpdate? { cameraUpdates[id] }
+
+  /// The latest status, followed with every update (4 Hz while capturing).
+  func liveCameraUpdate(_ id: FeedID) -> CaptureUpdate? {
+    _ = telemetry.camera(id).capture
+    return cameraUpdates[id]
+  }
 
   /// Program mode: the "Ultracam · Program" virtual camera has at least one client.
   var programInUse: Bool { routeDemand[VirtualCameraDescriptor.program().id] == true }

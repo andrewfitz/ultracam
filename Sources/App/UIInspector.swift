@@ -108,7 +108,12 @@ struct UIInspectorViewContent: View {
       .accessibilityValue(signalText(snapshot))
       // Always present ("—" while stopped): a row that comes and goes with Start and Stop
       // moved everything below it under the pointer.
-      LabeledContent("Timecode") { Text(camera.timecode).monospacedDigit().textSelection(.enabled) }
+      LabeledContent("Timecode") {
+        // Follows the camera's updates here, not in the inspector.
+        UILiveCamera(camera: camera, context: context, follows: .capture) { live in
+          Text(live.camera.timecode).monospacedDigit().textSelection(.enabled)
+        }
+      }
       Toggle("Video preview", isOn: Binding(get: { snapshot.previewEnabled },
         set: { context.send(.setPreviewEnabled(cameraID: camera.id, $0)) }))
         .help("Hidden previews do no rendering work. Camera output continues.")
@@ -216,7 +221,9 @@ struct UIInspectorViewContent: View {
           : folder.folderIsCustom ? "This camera's folder" : "Default folder")
       }
       .help(folder.folderPath ?? "")
-      if let left = camera.timeLeftLine { LabeledContent("Time left", value: left) }
+      UILiveCamera(camera: camera, context: context, follows: .take, refresh: 5) { live in
+        if let left = live.camera.timeLeftLine { LabeledContent("Time left", value: left) }
+      }
     } header: {
       Text("Recording")
     } footer: {

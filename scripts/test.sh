@@ -70,7 +70,7 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-pat
   "$task_root/Sources/App/ProgramNormalizer.swift" \
   "$task_root/Sources/App/AppSettingsStore.swift" \
   "$task_root/Sources/App/VirtualCameraRegistryPublishing.swift" \
-  "$task_root/Sources/App/RecordingModel.swift" \
+  "$task_root/Sources/App/RecordingModel.swift" "$task_root/Sources/App/LiveTelemetry.swift" \
   "$task_root/Sources/App/AutomaticFeedPolicy.swift" \
   "$task_root/Sources/App/CameraDemandMonitor.swift" \
   "$task_root/Sources/App/ExtensionInstaller.swift" \

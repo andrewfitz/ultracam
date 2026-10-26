@@ -3,6 +3,7 @@ import CoreMedia
 import CoreVideo
 import Darwin
 import SwiftUI
+import Synchronization
 
 // The live main window's main-thread cost, measured offscreen: the real view tree
 // (UILiveRoot, UIMainWindowView, toolbar) over a real AppModel whose cameras run on
@@ -133,17 +134,16 @@ final class ScriptedLiveCapture: @unchecked Sendable {
     stretches = []
   }
 
-  /// User plus system CPU time of the main thread, in seconds.
+  /// CPU time of the calling (main) thread, in seconds.
   static func mainThreadCPU() -> Double {
-    var info = thread_basic_info()
-    var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<integer_t>.size)
-    let port = pthread_mach_thread_np(pthread_self())
-    let result = withUnsafeMutablePointer(to: &info) {
-      $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { thread_info(port, thread_flavor_t(THREAD_BASIC_INFO), $0, &count) }
-    }
-    guard result == KERN_SUCCESS else { return 0 }
-    return Double(info.user_time.seconds + info.system_time.seconds)
-      + Double(info.user_time.microseconds + info.system_time.microseconds) / 1e6
+    Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)) / 1e9
+  }
+
+  /// CPU time of the whole process, in seconds.
+  static func processCPU() -> Double {
+    var usage = rusage()
+    getrusage(RUSAGE_SELF, &usage)
+    return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6
   }
 }
 
@@ -151,6 +151,7 @@ final class ScriptedLiveCapture: @unchecked Sendable {
 struct LivePerformanceSample {
   var seconds: Double
   var busy: Double
+  var process: Double
   var bodies: [String: Double]
   var displayHz: Double
   var hitches8: Int
@@ -161,7 +162,7 @@ struct LivePerformanceSample {
 
   var summary: String {
     let views = bodies.sorted { $0.key < $1.key }.map { "\($0.key)=\(String(format: "%.1f", $0.value))" }.joined(separator: " ")
-    return String(format: "busy %.1f%% display %.0f Hz hitches>8ms %d >16ms %d longest %.1f ms | bodies/s ", busy * 100,
+    return String(format: "main %.1f%% process %.0f%% display %.0f Hz hitches>8ms %d >16ms %d longest %.1f ms | bodies/s ", busy * 100, process * 100,
       displayHz, hitches8, hitches16, longest) + views
   }
 }
@@ -174,10 +175,18 @@ struct LivePerformanceSample {
 
   static func run(verifier: Verifier) {
     let counts = (ProcessInfo.processInfo.environment["UI_PERF_CAMERAS"] ?? "2,4").split(separator: ",").compactMap { Int($0) }
-    for cameras in counts { measure(cameras: cameras, verifier: verifier) }
+    for cameras in counts {
+      // With live meters (as in the app), then with the meters showing fixed readings: MonitorKit's
+      // LevelMeterView redraws at the display rate in a TimelineView, and each of its frames lays out,
+      // renders and commits the whole window's SwiftUI graph, so the second run measures the rest.
+      let meters = ProcessInfo.processInfo.environment["UI_PERF_METERS"] ?? "live,fixed"
+      if meters.contains("live") { measure(cameras: cameras, liveMeters: true, verifier: verifier) }
+      if meters.contains("fixed") { measure(cameras: cameras, liveMeters: false, verifier: verifier) }
+    }
   }
 
-  static func measure(cameras: Int, verifier: Verifier) {
+  static func measure(cameras: Int, liveMeters: Bool, verifier: Verifier) {
+    let name = "perf \(cameras) cameras\(liveMeters ? "" : ", fixed meters")"
     let suiteName = "org.ultracam.ui-verify-perf.\(UUID().uuidString)"
     guard let defaults = UserDefaults(suiteName: suiteName) else { return verifier.check("perf: defaults suite", false) }
     defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -211,11 +220,13 @@ struct LivePerformanceSample {
     let live = { ids.allSatisfy { (model.cameraUpdate($0)?.frames ?? 0) > 30 && model.cameraUpdate($0)?.timecode != nil } }
     let deadline = Date().addingTimeInterval(8)
     while !live() && Date() < deadline { MainLoop.run(seconds: 0.05) }
-    verifier.check("perf \(cameras) cameras: scripted capture goes live", live(),
+    verifier.check("\(name): scripted capture goes live", live(),
       ids.map { model.cameraUpdate($0)?.input ?? "nil" }.joined(separator: ", "))
 
     let window = PerfWindow(UILiveRoot(model: model, interface: interface) { context in
       UIMainWindowView(context: context).toolbar { UIToolbarContent(context: context) }
+        // Without a tap source the meters draw the status peaks as fixed readings.
+        .environment(\.uiAudioMeters, liveMeters ? UIAudioMeterSource { model.audioMeterTap(for: FeedID(rawValue: $0)) } : nil)
     }, size: CGSize(width: 1320, height: 860))
     defer { window.close() }
     let meter = MainThreadMeter(view: window.host)
@@ -226,47 +237,101 @@ struct LivePerformanceSample {
       UIRenderProbe.reset()
       meter.reset()
       let cpu = MainThreadMeter.mainThreadCPU()
+      let processCPU = MainThreadMeter.processCPU()
       let start = Date()
       action()
       let end = start.addingTimeInterval(seconds)
       while Date() < end { MainLoop.run(seconds: min(0.05, max(0.001, end.timeIntervalSinceNow))) }
       let elapsed = Date().timeIntervalSince(start)
       let busy = (MainThreadMeter.mainThreadCPU() - cpu) / elapsed
-      return LivePerformanceSample(seconds: elapsed, busy: busy,
+      return LivePerformanceSample(seconds: elapsed, busy: busy, process: (MainThreadMeter.processCPU() - processCPU) / elapsed,
         bodies: UIRenderProbe.counts.mapValues { Double($0) / elapsed }, displayHz: Double(meter.displayTicks) / elapsed,
         hitches8: meter.stretches.filter { $0 > 1000.0 / 120 }.count, hitches16: meter.stretches.filter { $0 > 1000.0 / 60 }.count,
         longest: meter.stretches.max() ?? 0)
     }
 
+    // Nothing that builds the session (the window's root, its columns, the menus, the menu bar
+    // icon) depends on telemetry: capture updates and meters run without telling it.
+    let bridge = UISessionBridge.live(model: model, interface: interface)
+    let rebuilt = Mutex(false)
+    withObservationTracking {
+      _ = bridge.snapshot()
+      _ = bridge.context()
+    } onChange: { rebuilt.withLock { $0 = true } }
+
     let before = ids.map { model.cameraUpdate($0)?.frames ?? 0 }
-    let idle = sample(4)
-    print("PERF \(cameras) cameras idle: \(idle.summary)")
+    // UI_PERF_IDLE stretches the idle interval, e.g. to attach Instruments to this process.
+    let idle = sample(Double(ProcessInfo.processInfo.environment["UI_PERF_IDLE"] ?? "") ?? 4)
     let after = ids.map { model.cameraUpdate($0)?.frames ?? 0 }
-    print("PERF \(cameras) cameras frames \(before) -> \(after), timecode \(ids.map { model.cameraUpdate($0)?.timecode ?? "nil" }), message \(ids.map { model.cameraUpdate($0)?.message ?? "" })")
-    verifier.check("perf \(cameras) cameras: the window is on a display and ticks", idle.displayHz > 50, "\(idle.displayHz) Hz")
+    print("PERF \(name) idle: \(idle.summary)")
+    verifier.check("\(name): the window is on a display and ticks", idle.displayHz > 50, "\(idle.displayHz) Hz")
+    verifier.check("\(name): every camera delivers frames while measured",
+      zip(before, after).allSatisfy { $1 > $0 + 150 }, "\(before) -> \(after)")
+    verifier.check("\(name): the session snapshot and context follow no capture update", !rebuilt.withLock { $0 })
+    check(idle, "idle", name: name, verifier: verifier, liveMeters: liveMeters)
 
     // The split view's own sidebar animation, as the toolbar's sidebar button runs it.
-    var toggles: [LivePerformanceSample] = []
     if let split = window.splitViewController {
-      toggles.append(sample(1.2) { split.toggleSidebar(nil) })
-      toggles.append(sample(1.2) { split.toggleSidebar(nil) })
-      print("PERF \(cameras) cameras sidebar hide: \(toggles[0].summary)")
-      print("PERF \(cameras) cameras sidebar show: \(toggles[1].summary)")
+      let hide = sample(1.2) { split.toggleSidebar(nil) }
+      let show = sample(1.2) { split.toggleSidebar(nil) }
+      print("PERF \(name) sidebar hide: \(hide.summary)")
+      print("PERF \(name) sidebar show: \(show.summary)")
+      for (step, value) in [("sidebar hide", hide), ("sidebar show", show)] {
+        checkToggle(value, step, name: name, verifier: verifier, liveMeters: liveMeters)
+      }
     } else {
-      verifier.check("perf \(cameras) cameras: the main window has a split view controller", false)
+      verifier.check("\(name): the main window has a split view controller", false)
     }
-    // The inspector, as the toolbar's Inspector button opens and closes it.
-    let bridge = UISessionBridge.live(model: model, interface: interface)
-    if ProcessInfo.processInfo.environment["UI_PERF_INSPECTOR"] != "0" {
-      let open = sample(1.2) { bridge.send(.toggleInspector) }
-      let close = sample(1.2) { bridge.send(.toggleInspector) }
-      print("PERF \(cameras) cameras inspector open: \(open.summary)")
-      print("PERF \(cameras) cameras inspector close: \(close.summary)")
-      toggles += [open, close]
+    // UI_PERF_PROFILE_INSPECTOR=n toggles the inspector n times first, to profile its animation.
+    for _ in 0..<(Int(ProcessInfo.processInfo.environment["UI_PERF_PROFILE_INSPECTOR"] ?? "") ?? 0) {
+      _ = sample(0.8) { bridge.send(.toggleInspector) }
     }
+    // The inspector, as the toolbar's Inspector button opens and closes it; and live with it open.
+    let open = sample(1.2) { bridge.send(.toggleInspector) }
+    print("PERF \(name) inspector open: \(open.summary)")
+    checkToggle(open, "inspector open", name: name, verifier: verifier, liveMeters: liveMeters)
+    let inspecting = sample(3)
+    print("PERF \(name) idle with the inspector open: \(inspecting.summary)")
+    check(inspecting, "idle with the inspector open", name: name, verifier: verifier, liveMeters: liveMeters)
+    // The leaves still follow: the inspector's timecode with the selected camera's updates (4 Hz).
+    verifier.check("\(name): the inspector's timecode follows capture updates",
+      inspecting.rate("UILiveCamera(capture)") >= 3, inspecting.summary)
+    let close = sample(1.2) { bridge.send(.toggleInspector) }
+    print("PERF \(name) inspector close: \(close.summary)")
+    checkToggle(close, "inspector close", name: name, verifier: verifier, liveMeters: liveMeters)
     let afterToggles = sample(3)
-    print("PERF \(cameras) cameras idle after toggles: \(afterToggles.summary)")
-    _ = toggles
+    print("PERF \(name) idle after toggles: \(afterToggles.summary)")
+    check(afterToggles, "idle after toggles", name: name, verifier: verifier, liveMeters: liveMeters)
+  }
+
+
+  /// Budgets while only telemetry changes: no structural view re-evaluates, the run loop never
+  /// stalls as the whole-window rebuilds did, and without live meters the main thread stays
+  /// nearly idle (an unoptimized build).
+  static func check(_ value: LivePerformanceSample, _ step: String, name: String, verifier: Verifier, liveMeters: Bool) {
+    for view in structural {
+      verifier.check("\(name), \(step): \(view) is not re-evaluated", value.rate(view) * value.seconds < 1,
+        String(format: "%.1f per second", value.rate(view)))
+    }
+    // The rebuilds on every capture update stalled it 40–100 ms several times a second. Shorter
+    // stalls are reported, not budgeted: they depend on the machine and what else runs on it.
+    verifier.check("\(name), \(step): no run loop stall past 50 ms", value.longest < 50, value.summary)
+    if !liveMeters {
+      verifier.check("\(name), \(step): main thread under 25% busy", value.busy < 0.25, value.summary)
+    }
+  }
+
+  /// Budgets while a side column opens or closes: the window re-evaluates a few times for the
+  /// change (the column's state, the strips' measured heights), never once per frame of the
+  /// animation, and no frame stalls as the 50 ms rebuilds on every capture update did.
+  static func checkToggle(_ value: LivePerformanceSample, _ step: String, name: String, verifier: Verifier, liveMeters: Bool) {
+    for view in ["UILiveRoot", "UIMainWindowView", "UISessionSidebarViewContent", "UIInspectorViewContent", "UIChannelStripView"] {
+      let total = value.rate(view) * value.seconds
+      verifier.check("\(name), \(step): \(view) evaluated a few times, not per frame", total <= 10,
+        String(format: "%.0f times", total))
+    }
+    // Opening the inspector builds its form, once: the longest pass, about 50 ms unoptimized.
+    verifier.check("\(name), \(step): no run loop stall past 120 ms", value.longest < 120, value.summary)
   }
 }
 

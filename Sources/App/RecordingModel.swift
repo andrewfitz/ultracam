@@ -589,7 +589,11 @@ final class RecordingModel {
   private var loadedFolderFeedIDs = Set<FeedID>()
   private var interruptedRecordingRoots: [URL: URL] = [:]
   var timecodeMode: RecordingTimecodeMode = .wallClock
+  /// Observers are told when a take's state changes; its running statistics (2 Hz) are
+  /// stored without telling them (`RecordingStatisticsState`) and published as telemetry.
   private(set) var feeds: [RecordingFeedState] = []
+  /// The takes' running statistics, for the views that show them (`liveStatistics`).
+  @ObservationIgnored let telemetry = UITelemetryStore()
 
   var onOutputFolderChanged: ((URL?) -> Void)?
   var onRecordingStarted: ((FeedID, URL) -> Void)?
@@ -849,7 +853,15 @@ final class RecordingModel {
     let snapshots = await source.recordingStatistics()
     for (id, snapshot) in snapshots {
       guard generations[id] == recordingGenerations[id], let index = index(of: id) else { continue }
-      feeds[index].statistics = snapshot
+      let previous = _feeds[index].statistics
+      guard previous != snapshot else { continue }
+      if RecordingStatisticsState(previous) == RecordingStatisticsState(snapshot) {
+        // Only the clock, size or rate moved: stored without telling the observers of `feeds`.
+        _feeds[index].statistics = snapshot
+      } else {
+        feeds[index].statistics = snapshot
+      }
+      telemetry.statisticsChanged(id)
     }
   }
 
@@ -890,5 +902,11 @@ final class RecordingModel {
 
   private func index(of id: FeedID) -> Int? {
     feeds.firstIndex { $0.id == id }
+  }
+
+  /// A take's statistics, followed with every refresh (2 Hz while recording).
+  func liveStatistics(_ id: FeedID) -> RecordingStatistics? {
+    _ = telemetry.camera(id).statistics
+    return feeds.first { $0.id == id }?.statistics
   }
 }

@@ -6,7 +6,9 @@ struct UIStatusBarView: View {
   let context: UIContext
   @State private var open: UIStatusSegment.Kind?
   @State private var resourcesOpen = false
-  @State private var usage = AppResourceUsage()
+  /// The resource readout's figures: read by the readout alone, so a sample (1 Hz) doesn't
+  /// re-evaluate the bar and every density ViewThatFits tries.
+  @State private var resources = UIResourceMonitor()
 
   var body: some View {
     let _ = UIRenderProbe.count("UIStatusBarView")
@@ -14,7 +16,7 @@ struct UIStatusBarView: View {
     // resource readout when there is room, then a shorter readout, no readout, short
     // segment text, and finally only output, recording and warning. The bar sits in the
     // detail column, so its width depends on the side columns, not just the window.
-    ViewThatFits(in: .horizontal) {
+    UIFirstFitting {
       bar(compact: false, readout: .full)
       bar(compact: false, readout: .short)
       bar(compact: false, readout: nil)
@@ -33,7 +35,7 @@ struct UIStatusBarView: View {
       // Sampled here rather than in the readout, which ViewThatFits may swap for another variant.
       var sampler = AppResourceSampler()
       while !Task.isCancelled {
-        usage = sampler.sample()
+        resources.publish(sampler.sample())
         do { try await Task.sleep(for: .seconds(1)) } catch { break }
       }
     }
@@ -45,7 +47,7 @@ struct UIStatusBarView: View {
         .layoutPriority(1)
       Spacer(minLength: 8)
       if let readout {
-        UIResourceReadout(open: $resourcesOpen, usage: usage, density: readout, context: context)
+        UIResourceReadout(open: $resourcesOpen, resources: resources, density: readout, context: context)
       }
     }
   }
@@ -54,7 +56,7 @@ struct UIStatusBarView: View {
     HStack(spacing: 2) {
       ForEach(Array(visibleSegments(essentialOnly: essentialOnly).enumerated()), id: \.element.id) { index, segment in
         if index > 0 { Divider().frame(height: 14) }
-        segmentButton(segment, compact: compact)
+        liveSegmentButton(segment, compact: compact)
           .layoutPriority(priority(segment.kind))
       }
     }
@@ -74,6 +76,18 @@ struct UIStatusBarView: View {
     let segments = context.presentation.statusSegments
     guard essentialOnly else { return segments }
     return segments.filter { $0.kind == .output || $0.kind == .recording || $0.kind == .warning }
+  }
+
+  /// The recording segment's clock and the drives' free space (in it and in a low-space
+  /// warning) follow the takes here, not in the bar.
+  @ViewBuilder private func liveSegmentButton(_ segment: UIStatusSegment, compact: Bool) -> some View {
+    if segment.kind == .recording || segment.kind == .warning {
+      UILiveSession(context: context, refresh: 5, probe: "UILiveSession(status)") { _, presentation in
+        segmentButton(presentation.statusSegments.first { $0.kind == segment.kind } ?? segment, compact: compact)
+      }
+    } else {
+      segmentButton(segment, compact: compact)
+    }
   }
 
   private func segmentButton(_ segment: UIStatusSegment, compact: Bool) -> some View {
@@ -154,7 +168,7 @@ struct UIResourceReadout: View {
   enum Density { case full, short }
 
   @Binding var open: Bool
-  let usage: AppResourceUsage
+  let resources: UIResourceMonitor
   var density: Density = .full
   let context: UIContext
 
@@ -194,6 +208,7 @@ struct UIResourceReadout: View {
     }
   }
 
+  private var usage: AppResourceUsage { resources.usage }
   private var cpu: String { usage.cpuPercent.map { String(format: "%.1f%%", $0) } ?? "—" }
   private var memory: String {
     usage.memoryBytes.map { ByteCountFormatter.string(fromByteCount: Int64(clamping: $0), countStyle: .memory) } ?? "—"
@@ -284,10 +299,15 @@ struct UIStatusPopover: View {
     }
   }
 
+  /// The takes' clocks, sizes and the drives follow their statistics while the popover is open.
   private var recording: some View {
+    UILiveSession(context: context, refresh: 2) { session, presentation in recording(session, presentation) }
+  }
+
+  private func recording(_ session: UISessionSnapshot, _ presentation: UISessionPresentation) -> some View {
     Group {
       Text("Recording").font(.headline)
-      let takes = context.presentation.cameras.filter { $0.sizeLine != nil }
+      let takes = presentation.cameras.filter { $0.sizeLine != nil }
       if takes.isEmpty {
         Text("Not recording").foregroundStyle(.secondary)
       }
@@ -320,7 +340,7 @@ struct UIStatusPopover: View {
         }
         .accessibilityElement(children: .combine)
       }
-      ForEach(context.session.drives) { UIDriveRow(drive: $0) }
+      ForEach(session.drives) { UIDriveRow(drive: $0) }
       HStack {
         Button("Show in Finder") { context.send(.revealRecordings) }
           .disabled(!context.presentation.canRevealRecordings)
@@ -349,4 +369,10 @@ struct UIStatusPopover: View {
         .font(.subheadline).foregroundStyle(.secondary)
     }
   }
+}
+
+/// The status bar's latest resource figures, observed by the readouts alone.
+@MainActor @Observable final class UIResourceMonitor {
+  private(set) var usage = AppResourceUsage()
+  func publish(_ usage: AppResourceUsage) { if usage != self.usage { self.usage = usage } }
 }

@@ -93,16 +93,7 @@ struct UISessionBridge {
     _ = model.cameraUpdates
     _ = model.cameraLUTs
     let recording = model.recordingModel
-    let folders = model.feedDescriptors.map { recording.outputFolder(for: $0.id) }
-    let drives = Self.cachedDrives(for: folders) {
-      UIRecordingLibrary.drives(for: folders,
-        recordingRates: model.feedDescriptors.compactMap { descriptor -> (URL, Double)? in
-          guard let folder = recording.outputFolder(for: descriptor.id),
-            let state = recording.feeds.first(where: { $0.id == descriptor.id }),
-            state.status == .recording || state.status == .paused else { return nil }
-          return (folder, state.statistics?.videoMegabitsPerSecond ?? UIRecordingLibrary.nominalMegabits(codec: recording.codec, fast: true))
-        })
-    }
+    let drives = currentDrives()
     var cameras: [UICameraSnapshot] = []
     for descriptor in model.feedDescriptors {
       let id = descriptor.id
@@ -134,11 +125,7 @@ struct UISessionBridge {
       // A refused Start says why; otherwise an automatic camera's status.
       camera.automaticStatus = model.startRefusal(id) ?? (descriptor.automaticFeed ? model.automaticStatus(id) : nil)
       camera.automaticStartFailed = model.automaticStartFailed(id)
-      camera.timecode = update?.timecode
-      if let update {
-        camera.audio = UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
-          peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight)
-      }
+      Self.applyCapture(update, to: &camera)
       let monitor = model.monitorCoordinator.preferences(for: MonitorTargetID(id.rawValue))
       camera.activeTools = UIMonitorBridge.activeTools(monitor)
       camera.message = update?.message ?? ""
@@ -149,21 +136,14 @@ struct UISessionBridge {
       case .paused: rec.status = .paused
       case .finishing: rec.status = .finishing
       }
-      rec.elapsed = stats?.elapsed ?? 0
-      rec.fileBytes = Int64(stats?.fileBytes ?? 0)
-      rec.megabitsPerSecond = stats?.videoMegabitsPerSecond ?? 0
-      rec.droppedFrames = Int(clamping: stats?.droppedVideoFrames ?? 0)
       rec.note = stats?.warning
-      // The running take's audio so far, then the finished take's (cleared when the next starts).
-      rec.audio = model.takeAudioSoFar(id) ?? model.takeAudio[id]
       rec.failed = stats?.failed == true
       rec.error = state?.error ?? stats?.lastError
       rec.savedURL = state?.savedURL
       rec.savedFileName = state?.savedURL?.lastPathComponent
-      rec.savedDuration = state?.savedURL != nil ? stats?.elapsed : nil
       rec.folderPath = folder?.path
       rec.folderIsCustom = recording.customOutputFolder(for: id) != nil
-      rec.secondsLeft = folder.flatMap { url in drives.first { $0.name == UIRecordingLibrary.volumeName(for: url) }?.secondsLeft }
+      applyTake(id, statistics: stats, drives: drives, to: &rec)
       camera.recording = rec
       cameras.append(camera)
     }
@@ -217,11 +197,12 @@ struct UISessionBridge {
   /// reused for two seconds.
   private static var driveCache: (folders: [String?], date: Date, drives: [UIDrive])?
 
-  private static func cachedDrives(for folders: [URL?], read: () -> [UIDrive]) -> [UIDrive] {
+  static func cachedDrives(for folders: [URL?], read: () -> [UIDrive]) -> [UIDrive] {
     let key = folders.map { $0?.path }
     if let cache = driveCache, cache.folders == key, Date().timeIntervalSince(cache.date) < 2 { return cache.drives }
     let drives = read()
     driveCache = (key, Date(), drives)
+    UIDriveLevels.shared.update(drives)
     return drives
   }
 

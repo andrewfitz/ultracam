@@ -138,7 +138,7 @@ private struct MonitorBoundTile: View {
             }
           }
         }
-      MonitorDiagnosticsDisclosure(snapshot: coordinator.diagnostics(for: target), surfaceScopeTiming: presenter.scopeTiming)
+      MonitorLiveDiagnostics(coordinator: coordinator, target: target) { MonitorDiagnosticsDisclosure(snapshot: $0, surfaceScopeTiming: presenter.scopeTiming) }
     } scopes: {
       if previewEnabled {
         UIScopePanel(

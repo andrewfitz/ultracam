@@ -149,7 +149,7 @@ struct UISessionSidebarViewContent: View {
         }
       }
       .accessibilityElement(children: .combine)
-      ForEach(session.drives) { drive in UIDriveRow(drive: drive).selectionDisabled() }
+      ForEach(session.drives) { drive in UILiveDriveRow(drive: drive, context: context).selectionDisabled() }
       HStack(spacing: 8) {
         Image(systemName: "folder").foregroundStyle(.secondary)
         // The folder's name, and where it is underneath: a whole path doesn't fit the sidebar.
@@ -348,7 +348,8 @@ struct UIShotTimerView: View {
   init(shot: UIShotTiming, onAirName: String?) {
     self.shot = shot
     self.onAirName = onAirName
-    anchor = shot.currentShot.map { Date().addingTimeInterval(-$0) }
+    // From the model's start: the snapshot may be older than this view.
+    anchor = shot.anchor
   }
 
   var body: some View {

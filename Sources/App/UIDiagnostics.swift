@@ -95,8 +95,10 @@ private struct UIDiagnosticsCameraTab: View {
   let cameraID: FeedID
 
   var body: some View {
-    let update = model.cameraUpdate(cameraID)
+    // Diagnostics show the running counters: follow every update and take refresh.
+    let update = model.liveCameraUpdate(cameraID)
     let running = model.isCameraRunning(cameraID)
+    let _ = model.recordingModel.liveStatistics(cameraID)
     let state = model.recordingModel.feeds.first { $0.id == cameraID }
     let target = MonitorTargetID(cameraID.rawValue)
     Form {

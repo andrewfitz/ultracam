@@ -9,12 +9,15 @@ struct UILiveRoot<Content: View>: View {
   @Environment(\.openWindow) private var openWindow
   @Environment(\.openSettings) private var openSettings
   @ObservedObject private var monitor: MonitorCoordinator
+  /// Running values for the views that show them (see UILiveTelemetry.swift); one for the window's life.
+  @State private var live: UILiveSource
 
   init(model: AppModel, interface: UIInterfaceState, @ViewBuilder content: @escaping (UIContext) -> Content) {
     self.model = model
     self.interface = interface
     self.content = content
     _monitor = ObservedObject(wrappedValue: model.monitorCoordinator)
+    _live = State(initialValue: UILiveSource(model: model, interface: interface))
   }
 
   var body: some View {
@@ -23,6 +26,7 @@ struct UILiveRoot<Content: View>: View {
       openSettings: { openSettings() })
     content(bridge.context())
       .environment(\.uiAudioMeters, UIAudioMeterSource { [model] in model.audioMeterTap(for: FeedID(rawValue: $0)) })
+      .environment(\.uiLive, live)
   }
 }
 

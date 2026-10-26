@@ -32,7 +32,13 @@ import MonitorKit
   var onWorkspaceChange: ((MonitorWorkspacePreferences) -> Void)?
   var onDemandChange: ((Set<MonitorTargetID>) -> Void)?
   var onPreviewEnabledChange: ((MonitorTargetID, Bool) -> Void)?
-  @Published private var diagnosticSnapshots: [MonitorTargetID: MonitorDiagnostics] = [:]
+  /// Refreshed once a second. Not published by the coordinator: its rates and ages change
+  /// every second while a camera runs, and the main window observes the coordinator for
+  /// tool changes. Views that show diagnostics observe `diagnosticsPublisher`; a change of a
+  /// monitor LUT's state (which the camera's LUT menu shows) is published by both.
+  private var diagnosticSnapshots: [MonitorTargetID: MonitorDiagnostics] = [:]
+  /// Tells the views that show diagnostics (`diagnostics(for:)`) when they change.
+  let diagnosticsPublisher = ObservableObjectPublisher()
   /// The shared GPU context every surface encodes through.
   let gpu: MonitorGPUContext
   /// The process's monitor GPU context: one device, queue, engine and render
@@ -116,7 +122,10 @@ import MonitorKit
       value.monitorLUT = host.monitorLUTState
       next[target] = value
     }
-    if next != diagnosticSnapshots { diagnosticSnapshots = next }
+    guard next != diagnosticSnapshots else { return }
+    if next.mapValues(\.monitorLUT) != diagnosticSnapshots.mapValues(\.monitorLUT) { objectWillChange.send() }
+    diagnosticsPublisher.send()
+    diagnosticSnapshots = next
   }
 
   func diagnostics(for target: MonitorTargetID) -> MonitorDiagnostics {

@@ -31,6 +31,15 @@ struct UIColumnPictureLayout: Layout {
   func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
     for subview in subviews { subview.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size)) }
   }
+
+  // No guides of its own: the stacks and grid rows that align columns use its edges. The
+  // default asks every view on the picture for its guides, in every layout pass (each frame
+  // while a side column animates).
+  func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+  func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
 }
 
 // MARK: - Picture
@@ -65,7 +74,7 @@ struct UICameraPictureView: View {
     ZStack {
       context.pictures.picture(cameraID: camera.id, compact: compact, zoom: zoom)
         .accessibilityElement()
-        .accessibilityLabel(camera.accessibilityLabel)
+        .modifier(UILiveCameraAccessibilityLabel(camera: camera, context: context))
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { context.send(.select(cameraID: camera.id)) }
         .accessibilityAction(named: "Select \(camera.name)") { context.send(.select(cameraID: camera.id)) }
@@ -206,8 +215,11 @@ struct UICameraPictureView: View {
       Spacer(minLength: 0)
       HStack(alignment: .center, spacing: 6) {
         if revealed {
-          Text(camera.timecode).font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
-            .accessibilityLabel("Timecode \(camera.timecode)")
+          // The timecode alone follows the camera's updates (4 Hz), not the picture.
+          UILiveCamera(camera: camera, context: context, follows: .capture) { live in
+            Text(live.camera.timecode).font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
+              .accessibilityLabel("Timecode \(live.camera.timecode)")
+          }
           signalMenu
         }
         Spacer(minLength: 4)
@@ -220,7 +232,12 @@ struct UICameraPictureView: View {
     .animation(.easeOut(duration: 0.15), value: revealed)
   }
 
-  @ViewBuilder private var recordingPill: some View {
+  /// The take's clock follows its statistics here, not in the picture.
+  private var recordingPill: some View {
+    UILiveCamera(camera: camera, context: context, follows: .take) { live in recordingPill(live.snapshot) }
+  }
+
+  @ViewBuilder private func recordingPill(_ snapshot: UICameraSnapshot?) -> some View {
     let elapsed = UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0)
     switch camera.stripState {
     case .recording, .updating:
@@ -558,6 +575,10 @@ struct UIChannelStripView: View {
 
   /// Width of the leading glyph column in every row.
   private static let gutter: CGFloat = 28
+  /// MonitorKit's compact level meter is 56 pt wide.
+  nonisolated private static let compactMeterWidth: CGFloat = 56
+  /// Whether the collapsed strip has room for its meter (set only when that changes).
+  @State private var compactMeterFits = true
 
   private var snapshot: UICameraSnapshot? { context.snapshot(camera.id) }
   private var isRecordingOrPaused: Bool { camera.pauseTitle != nil }
@@ -655,7 +676,15 @@ struct UIChannelStripView: View {
     }
   }
 
+  /// The camera button names its action while the whole row fits, and shortens otherwise.
   private var header: some View {
+    UIFirstFitting {
+      header(compact: false)
+      header(compact: true)
+    }
+  }
+
+  private func header(compact: Bool) -> some View {
     HStack(spacing: 8) {
       chevron
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
@@ -663,10 +692,7 @@ struct UIChannelStripView: View {
       UIBadge(text: camera.statusBadge, tone: camera.statusTone)
       tallyBadge
       Spacer(minLength: 4)
-      ViewThatFits(in: .horizontal) {
-        cameraButton(compact: false)
-        cameraButton(compact: true)
-      }
+      cameraButton(compact: compact)
       overflowMenu
     }
   }
@@ -803,7 +829,12 @@ struct UIChannelStripView: View {
     }
   }
 
+  /// The take's clock, size and drops follow its statistics in this row alone.
   private var recordRow: some View {
+    UILiveCamera(camera: camera, context: context, follows: .take) { live in recordRow(live.camera) }
+  }
+
+  private func recordRow(_ camera: UICameraPresentation) -> some View {
     HStack(spacing: 8) {
       Group {
         if camera.stripState == .finishing { ProgressView().controlSize(.small) } else { recordButton }
@@ -908,14 +939,17 @@ struct UIChannelStripView: View {
     }
   }
 
+  /// The time left on the drive follows the take, and free space every few seconds.
   private var folderRow: some View {
-    ViewThatFits(in: .horizontal) {
-      folderContent(footnote: true)
-      folderContent(footnote: false)
+    UILiveCamera(camera: camera, context: context, follows: .take, refresh: 5) { live in
+      UIFirstFitting {
+        folderContent(live.camera, footnote: true)
+        folderContent(live.camera, footnote: false)
+      }
     }
   }
 
-  private func folderContent(footnote: Bool) -> some View {
+  private func folderContent(_ camera: UICameraPresentation, footnote: Bool) -> some View {
     HStack(spacing: 8) {
       gutterIcon("folder")
       HStack(spacing: 4) {
@@ -936,7 +970,7 @@ struct UIChannelStripView: View {
   }
 
   private var outputRow: some View {
-    ViewThatFits(in: .horizontal) {
+    UIFirstFitting {
       outputContent(full: true)
       outputContent(full: false)
       // Narrow cells: icon-only output state and an unlabeled Processing switch, so the
@@ -1027,7 +1061,7 @@ struct UIChannelStripView: View {
       chevron
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
       tallyBadge
-      collapsedState
+      UILiveCamera(camera: camera, context: context, follows: .take) { live in collapsedState(live.snapshot) }
       if camera.automaticStartFailed {
         Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }.controlSize(.small)
           .help(retryHelp)
@@ -1038,15 +1072,21 @@ struct UIChannelStripView: View {
           .accessibilityLabel("LUT unavailable")
       }
       Spacer(minLength: 4)
+      // One meter, outside ViewThatFits: each candidate would run its own display-rate
+      // meter, and a swap between candidates (a column animating) restarted its ballistics.
       ViewThatFits(in: .horizontal) {
         HStack(spacing: 6) {
           effectChips
-          UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio,
-            style: .compact)
+          Color.clear.frame(width: Self.compactMeterWidth, height: 1)
         }
-        UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio,
-          style: .compact)
+        Color.clear.frame(width: Self.compactMeterWidth, height: 1)
         EmptyView()
+      }
+      .onGeometryChange(for: Bool.self) { $0.size.width >= Self.compactMeterWidth } action: { compactMeterFits = $0 }
+      .overlay(alignment: .trailing) {
+        if compactMeterFits {
+          UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, style: .compact)
+        }
       }
       if camera.stripState == .finishing {
         ProgressView().controlSize(.mini).frame(width: 24, height: 24)
@@ -1069,7 +1109,7 @@ struct UIChannelStripView: View {
     .font(value ? .uiValue : .uiRow)
   }
 
-  @ViewBuilder private var collapsedState: some View {
+  @ViewBuilder private func collapsedState(_ snapshot: UICameraSnapshot?) -> some View {
     let elapsed = UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0)
     switch camera.stripState {
     case .recording, .updating:

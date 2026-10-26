@@ -180,7 +180,11 @@ struct UIToolbarRecordControl: View {
 
   var body: some View {
     let _ = UIRenderProbe.count("UIToolbarRecordControl")
-    let control = context.presentation.recordControl
+    // The takes' clock follows their statistics in this control alone.
+    UILiveSession(context: context, probe: "UILiveSession(record)") { _, presentation in control(presentation.recordControl) }
+  }
+
+  @ViewBuilder private func control(_ control: UIRecordControl) -> some View {
     switch control {
     case .record(let all, let enabled):
       Button {
