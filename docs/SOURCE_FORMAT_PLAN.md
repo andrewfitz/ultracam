@@ -420,8 +420,7 @@ changes their output.
   mapping unknown values to the default and keeping the rest of the record.
 - **New stored settings** from this plan:
   - "Allow CPU conversion (compatibility)", global;
-  - the per-camera VFR compatibility setting, if recommendation 1 is
-    confirmed;
+  - the per-camera VFR compatibility setting;
   - the per-camera aspect mode;
   - per-device DeckLink settings: EDID HDR and the connector.
 
@@ -526,7 +525,7 @@ B1 (the standby frame and recording's fallback change), B2, B3, B5 and B6.
   - Extension `validFrameDurations` and new `FrameRateTarget` cases.
   - DeckLink accepts every rate it detects (23.976 to 60, plus 100/119.88/120
     where the hardware supports them).
-  - VFR recording per recommendation 1, once confirmed.
+  - VFR recording per decision 1 below.
 - **B4. Colour.**
   - `Colorimetry` from the plugin, and one CV-attachment writer.
   - LUT input and output spaces.
@@ -585,8 +584,9 @@ its types.
   count and badge.
 - **Recordings** are checked for:
   - their timescale;
-  - per-frame duration: exact for constant-rate sources; for VFR, per
-    recommendation 1 once confirmed;
+  - per-frame duration: exact for constant-rate sources; for VFR, the source's own
+    timestamps, or a constant rate with counted repeats and skips when the
+    per-camera option is on;
   - `tmcd` drop-frame;
   - colour tags;
   - audio channel layout.
@@ -626,9 +626,9 @@ already covers each one:
   - Interlaced and PsF signals are refused at admission with a clear message.
   - The plugin reports scan type, so the refusal names the signal.
 
-## Recommendations to confirm
+## Also decided on 2026-10-26 (confirmed by Andrew)
 
-My recommendations, with NDI and webcams in mind:
+Chosen with NDI and webcams in mind:
 
 1. **Variable-frame-rate recording.**
    - **Default:** record every frame with the source's own timestamps (a VFR

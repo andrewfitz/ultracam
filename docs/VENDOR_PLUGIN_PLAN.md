@@ -709,7 +709,7 @@ Decided on 2026-10-26:
 Part B's other decisions are in [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md):
 VFR, Program rate conversion, aspect and audio-only takes.
 
-### Recommendations to confirm
+### Decided on 2026-10-26 (confirmed by Andrew)
 
 1. **Isolation: one module plus a boundary-check script.**
    - It works with today's build, where `test.sh` and `ui-verify.sh` compile
