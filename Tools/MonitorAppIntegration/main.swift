@@ -16,6 +16,12 @@ import XCTest
   private let alpha = FeedID(rawValue: "monitor-integration-alpha")
   private let beta = FeedID(rawValue: "monitor-integration-beta")
 
+  /// One camera's controller, through the model's private coordinator.
+  private func controller(_ model: AppModel, _ id: FeedID) throws -> CaptureController {
+    let coordinator = try XCTUnwrap(Mirror(reflecting: model).children.lazy.compactMap { $0.value as? FeedCoordinator }.first)
+    return try XCTUnwrap(coordinator.capturePool.existingController(for: id))
+  }
+
   func testRemovingIdleFeedRefreshesMonitorAndRegistryProjections() throws {
     for removeSelected in [false, true] {
       let suiteName = "org.ultracam.monitor-app-integration.\(UUID().uuidString)"
@@ -42,11 +48,11 @@ import XCTest
       let model = AppModel(settingsStore: settings, registryStore: registry,
         registryPublisher: publisher, recordingFolderStore: RecordingFolderStore(defaults: defaults),
         hardware: .offline)
-      let selectedControllers = Mirror(reflecting: model).children.compactMap {
-        $0.value as? CaptureController
+      // Every camera is wired at launch, selected or not.
+      for id in [alpha, beta] {
+        XCTAssertNotNil(try controller(model, id).onUpdate, "\(id.rawValue) is wired at launch")
       }
-      XCTAssertEqual(selectedControllers.count, 1)
-      let oldSelectedUpdate = try XCTUnwrap(selectedControllers.first?.onUpdate)
+      let removedUpdate = try XCTUnwrap(try controller(model, removed).onUpdate)
       let coordinator = model.monitorCoordinator
       let removedID = UUID()
       let retainedID = UUID()
@@ -92,8 +98,9 @@ import XCTest
         "AppModel must publish its new topology to the camera transport boundary")
       XCTAssertGreaterThan(publishedAfter.generation, publishedBefore.generation)
       XCTAssertEqual(registry.load()?.devices, publishedAfter.devices)
-      if removeSelected {
-        oldSelectedUpdate(CaptureUpdate(message: "Late stop from removed feed", stopped: true))
+      do {
+        // Selected or not, a removed camera's late stop changes nothing.
+        removedUpdate(CaptureUpdate(message: "Late stop from removed feed", stopped: true))
         XCTAssertEqual(removedPresenter.status, "Missing feed",
           "A queued stop from a removed controller must not overwrite the missing target")
         XCTAssertEqual(demand, [retainedTarget])
@@ -126,7 +133,7 @@ import XCTest
     let model = AppModel(settingsStore: settings, registryStore: VirtualCameraRegistryStore(defaults: defaults),
       registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
       hardware: .offline)
-    let controller = try XCTUnwrap(Mirror(reflecting: model).children.compactMap { $0.value as? CaptureController }.first)
+    let controller = try controller(model, alpha)
     defer { controller.stop() }
     let coordinator = model.monitorCoordinator
     let target = MonitorTargetID(alpha.rawValue)
@@ -174,11 +181,11 @@ import XCTest
     XCTAssertNil(shown(), "A removed feed's surfaces no longer read the old controller")
   }
 
-  /// The selected camera on automatic start, at launch: its saved LUT restores,
-  /// then a visible picture's demand starts it, and real frames flow from the
-  /// controller to a drawn picture. The picture's Output stage draws the LUT
-  /// (MonitorKit's own account of what it drew), as the camera's output does.
-  func testSelectedCameraRestoredBeforeAutomaticStartDrawsItsLUT() throws {
+  /// Every camera on automatic start, at launch, whichever is selected: its saved
+  /// LUT restores, then a visible picture's demand starts it, and real frames flow
+  /// from the controller to a drawn picture. The picture's Output stage draws the
+  /// LUT (MonitorKit's own account of what it drew), as the camera's output does.
+  func testEveryCameraRestoredBeforeAutomaticStartDrawsItsLUT() throws {
     guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
     let suiteName = "org.ultracam.monitor-app-integration.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -221,51 +228,61 @@ import XCTest
     do {
       let setup = makeModel()
       setup.loadLUT(url: cube, feedID: alpha)
-      XCTAssertTrue(spinUntil(seconds: 10) { !setup.loading && setup.lutLoaded }, "The LUT is saved for Camera 1")
+      XCTAssertTrue(spinUntil(seconds: 10) { setup.lutState(alpha).loaded }, "The LUT is saved for Camera 1")
       setup.loadLUT(url: cube, feedID: beta)
       XCTAssertTrue(spinUntil(seconds: 10) { setup.descriptor(for: beta)?.applyLUT == true }, "The LUT is saved for Camera 2")
     }
-    let model = makeModel()
-    let coordinator = model.monitorCoordinator
-    // Both pictures are on screen at launch: Camera 2 starts headless while
-    // the selected Camera 1 is still restoring its LUT, as in the app.
-    let (windowA, presenterA, idA) = pictureWindow(coordinator, target: MonitorTargetID(alpha.rawValue),
-      points: CGSize(width: 480, height: 270))
-    let (windowB, presenterB, idB) = pictureWindow(coordinator, target: MonitorTargetID(beta.rawValue),
-      points: CGSize(width: 480, height: 270))
-    defer {
-      coordinator.unregisterSurface(id: idA)
-      coordinator.unregisterSurface(id: idB)
-      windowA.close()
-      windowB.close()
-      model.stopCamera(beta)
-      model.stopCamera(alpha)
-    }
-    XCTAssertTrue(spinUntil(seconds: 10) {
-      model.isCameraRunning(alpha) && model.isCameraRunning(beta) &&
-        model.burnInLUT(for: alpha) != nil && model.burnInLUT(for: beta) != nil
-    }, "Both cameras start on demand with their LUTs burned in")
-    XCTAssertTrue(spinUntil(seconds: 5) {
-      frames.lock.withLock { frames.handlers["integration-device-a"] != nil && frames.handlers["integration-device-b"] != nil }
-    })
-    let buffers = try pool(4, width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10)
-    let handlers = frames.lock.withLock { [frames.handlers["integration-device-a"]!, frames.handlers["integration-device-b"]!] }
-    var index = 0
-    func drawsLUT(_ presenter: MonitorSurfacePresenter) -> Bool {
-      presenter.shownStatus.activeLabels.contains { $0.hasPrefix("LUT") }
-    }
-    let drawn = spinUntil(seconds: 10) {
-      index += 1
-      for handler in handlers {
-        handler(buffers[index % buffers.count], CMTimeMultiply(VideoContract.slowDuration, multiplier: Int32(index)),
-          VideoContract.slowDuration, true)
+    // The same for either selection: selection never changes a camera's pipeline.
+    for selected in [alpha, beta] {
+      let label = selected == alpha ? "Camera 1 selected" : "Camera 2 selected"
+      var snapshot = settings.loadSnapshot()
+      snapshot.selectedFeedID = selected
+      settings.saveSnapshot(snapshot)
+      frames.lock.withLock { frames.handlers = [:] }
+      let model = makeModel()
+      let coordinator = model.monitorCoordinator
+      // Both pictures are on screen at launch while both cameras restore their LUTs.
+      let (windowA, presenterA, idA) = pictureWindow(coordinator, target: MonitorTargetID(alpha.rawValue),
+        points: CGSize(width: 480, height: 270))
+      let (windowB, presenterB, idB) = pictureWindow(coordinator, target: MonitorTargetID(beta.rawValue),
+        points: CGSize(width: 480, height: 270))
+      defer {
+        coordinator.unregisterSurface(id: idA)
+        coordinator.unregisterSurface(id: idB)
+        windowA.close()
+        windowB.close()
+        model.stopCamera(beta)
+        model.stopCamera(alpha)
       }
-      RunLoop.main.run(until: Date().addingTimeInterval(1 / 30))
-      return drawsLUT(presenterA) && drawsLUT(presenterB)
+      XCTAssertTrue(spinUntil(seconds: 10) {
+        model.isCameraRunning(alpha) && model.isCameraRunning(beta) &&
+          model.burnInLUT(for: alpha) != nil && model.burnInLUT(for: beta) != nil
+      }, "Both cameras start on demand with their LUTs burned in (\(label))")
+      XCTAssertTrue(spinUntil(seconds: 5) {
+        frames.lock.withLock { frames.handlers["integration-device-a"] != nil && frames.handlers["integration-device-b"] != nil }
+      })
+      let buffers = try pool(4, width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10)
+      let handlers = frames.lock.withLock { [frames.handlers["integration-device-a"]!, frames.handlers["integration-device-b"]!] }
+      var index = 0
+      func drawsLUT(_ presenter: MonitorSurfacePresenter) -> Bool {
+        presenter.shownStatus.activeLabels.contains { $0.hasPrefix("LUT") }
+      }
+      let drawn = spinUntil(seconds: 10) {
+        index += 1
+        for handler in handlers {
+          handler(buffers[index % buffers.count], CMTimeMultiply(VideoContract.slowDuration, multiplier: Int32(index)),
+            VideoContract.slowDuration, true)
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(1 / 30))
+        return drawsLUT(presenterA) && drawsLUT(presenterB)
+      }
+      XCTAssertTrue(drawn)
+      XCTAssertTrue(drawsLUT(presenterA), "Camera 1's Output stage draws its LUT (\(label)): \(presenterA.shownStatus.activeLabels)")
+      XCTAssertTrue(drawsLUT(presenterB), "Camera 2's Output stage draws its LUT (\(label)): \(presenterB.shownStatus.activeLabels)")
+      for id in [alpha, beta] {
+        XCTAssertEqual(coordinator.preferences(for: MonitorTargetID(id.rawValue)).state.pictureStage, .output)
+      }
     }
-    XCTAssertTrue(drawn)
-    XCTAssertTrue(drawsLUT(presenterA), "The selected camera's Output stage draws its LUT: \(presenterA.shownStatus.activeLabels)")
-    XCTAssertTrue(drawsLUT(presenterB), "Camera 2's Output stage draws its LUT: \(presenterB.shownStatus.activeLabels)")
   }
 
   func testDetachedWindowCanClearAndRebindTheTargetUsedByItsChooser() throws {

@@ -90,8 +90,8 @@ struct UISessionBridge {
     // Register the observable camera state up front. Whether a camera runs is read
     // from the capture coordinator, which SwiftUI can't observe on its own.
     _ = model.cameraStateRevision
-    _ = model.running
     _ = model.cameraUpdates
+    _ = model.cameraLUTs
     let recording = model.recordingModel
     let folders = model.feedDescriptors.map { recording.outputFolder(for: $0.id) }
     let drives = Self.cachedDrives(for: folders) {
@@ -109,7 +109,7 @@ struct UISessionBridge {
       let running = model.isCameraRunning(id)
       let update = running ? model.cameraUpdate(id) : nil
       let deviceAvailable = model.devices.contains { $0.id == descriptor.selectedDevice }
-      let selected = id == model.selectedFeedID
+      let lut = model.lutState(id)
       let state = recording.feeds.first { $0.id == id }
       let stats = state?.statistics
       let folder = recording.outputFolder(for: id)
@@ -123,20 +123,17 @@ struct UISessionBridge {
       camera.applying = running && update != nil && update?.pipelineEnabledApplied == nil &&
         UIFormatLabels.shortFormat(update?.input ?? "") != nil
       camera.inUse = model.outputMode == .separateCameras && running && (model.cameraInUse(id) || update?.cameraOutputActive == true)
-      camera.processing = selected ? model.pipelineEnabled : descriptor.pipelineEnabled
-      let configuration = selected ? model.configuration : descriptor.configuration
-      camera.effects = [selected ? (model.configuration.applyLUT || (!model.lutLoaded && descriptor.applyLUT)) : descriptor.applyLUT,
-        configuration.downscale, configuration.convertTo420, configuration.reduceFrameRate]
-      camera.lutName = selected ? (model.lutLoaded ? model.lutFileName ?? model.lutTitle : nil)
-        : (descriptor.lutBookmark != nil ? "Saved LUT" : nil)
-      camera.lutLoading = selected && model.loading
-      camera.lutError = selected ? model.lutError : nil
-      camera.gamut = selected ? model.gamut : descriptor.gamut
+      camera.processing = descriptor.pipelineEnabled
+      camera.effects = [descriptor.applyLUT, descriptor.downscale, descriptor.convertTo420, descriptor.reduceFrameRate]
+      camera.lutName = lut.loaded ? lut.fileName ?? lut.displayTitle : nil
+      camera.lutLoading = model.isLUTLoading(id)
+      camera.lutError = lut.error
+      camera.gamut = descriptor.gamut
       camera.previewEnabled = descriptor.previewEnabled
       camera.previewError = update?.previewError
       camera.automaticStart = descriptor.automaticFeed
-      // A refused Start says why, on any camera; otherwise the selected automatic camera's status.
-      camera.automaticStatus = model.startRefusal(id) ?? (selected && descriptor.automaticFeed ? model.automaticFeedStatus : nil)
+      // A refused Start says why; otherwise an automatic camera's status.
+      camera.automaticStatus = model.startRefusal(id) ?? (descriptor.automaticFeed ? model.automaticStatus(id) : nil)
       camera.automaticStartFailed = model.automaticStartFailed(id)
       camera.timecode = update?.timecode
       if let update {
@@ -231,8 +228,8 @@ struct UISessionBridge {
 
   private func feedID(_ raw: String) -> FeedID { FeedID(rawValue: raw) }
 
-  /// Selecting reloads the camera's LUT and processing, so a tap on the camera
-  /// that's already selected (its picture, its tools, Show Inspector) must not select it again.
+  /// A tap on the camera that's already selected (its picture, its tools, Show
+  /// Inspector) leaves the selection, and its saved state, as they are.
   private func select(_ id: FeedID) {
     if id != model.selectedFeedID { _ = model.selectFeed(id) }
   }
@@ -330,7 +327,6 @@ struct UISessionBridge {
     case .retryAutomaticStart(let id):
       // A refused Start retries as Start; a failed automatic start retries the automatic start.
       if model.startRefusal(feedID(id)) != nil { model.startCamera(feedID(id)) } else { model.retryAutomaticFeed(feedID: feedID(id)) }
-    case .retryPreview: model.resetPreview()
     case .addCamera:
       if let id = model.addFeed(), interface.defaultCollapsed { interface.collapsed.insert(id.rawValue) }
     case .removeCamera(let id): _ = model.removeFeed(feedID(id))
@@ -392,7 +388,7 @@ struct UISessionBridge {
       }
     case .recover(let id): if let take = recording.interruptedRecordings.first(where: { $0.id.path == id }) { recording.recover(take) }
     case .toggleTool(let id, let tool):
-      let gamut = model.descriptor(for: feedID(id))?.gamut ?? model.gamut
+      let gamut = model.descriptor(for: feedID(id))?.gamut ?? FeedDescriptor().gamut
       UIMonitorBridge.toggle(tool, for: id, coordinator: model.monitorCoordinator,
         defaultSourceProfile: UIMonitorBridge.sourceProfile(forGamut: gamut))
     case .freeze, .toggleClean, .detachMonitor: UIMonitorBridge.perform(action, coordinator: model.monitorCoordinator)

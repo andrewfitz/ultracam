@@ -23,6 +23,159 @@ import SystemExtensions
   }
 }
 
+/// Every camera runs one pipeline: for each camera, selected or not, the LUT
+/// restore at launch, Apply LUT toggles, a LUT loaded before or after start
+/// and a selection change mid-load all end with that camera's LUT burned into
+/// its output and shown by its monitor's Output stage. Scripted capture
+/// (starts succeed, no frames); no hardware.
+extension UIVerify {
+  func cameraSymmetry() throws {
+    let suiteName = "org.ultracam.ui-verify-symmetry.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("symmetry: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-symmetry-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    func cube(_ title: String) throws -> URL {
+      var lattice = ["TITLE \"\(title)\"", "LUT_3D_SIZE 2"]
+      for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lattice.append("\(1 - Float(r)) \(1 - Float(g)) \(1 - Float(b))") } } }
+      let url = folder.appendingPathComponent("\(title).cube")
+      try lattice.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+      return url
+    }
+    let first = try cube("First"), second = try cube("Second")
+    let ids = [1, 2, 3].map { FeedID(rawValue: "ui-verify-symmetry-\($0)") }
+    let settings = AppSettingsStore(defaults: defaults)
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: ids.enumerated().map { index, id in
+      FeedDescriptor(id: id, name: "Camera \(index + 1)", selectedDevice: "dev-\(index + 1)", applyLUT: false,
+        automaticFeed: false)
+    }, selectedFeedID: ids[0], outputMode: .separateCameras))
+    var hardware = AppHardware.offline
+    hardware.devices = { (1...3).map { InputDevice(id: "dev-\($0)", name: "UltraStudio \($0)") } }
+    hardware.captureServices = { _ in
+      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+        send: { _ in true })
+      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
+      return services
+    }
+    func makeModel() -> AppModel {
+      AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+        recordingFolderStore: RecordingFolderStore(defaults: defaults),
+        installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    }
+    func settle(_ seconds: Double = 5, until condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(seconds)
+      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+    }
+    func name(_ id: FeedID) -> String { "Camera \((ids.firstIndex(of: id) ?? 0) + 1)" }
+
+    // Every camera's monitor defaults to the Output stage, a camera added later too.
+    do {
+      let model = makeModel()
+      for id in ids {
+        verifier.check("symmetry: \(name(id))'s monitor defaults to the Output stage",
+          model.monitorCoordinator.preferences(for: MonitorTargetID(id.rawValue)).state.pictureStage == .output)
+      }
+      if let added = model.addFeed() {
+        verifier.check("symmetry: an added camera's monitor defaults to the Output stage",
+          model.monitorCoordinator.preferences(for: MonitorTargetID(added.rawValue)).state.pictureStage == .output)
+        _ = model.removeFeed(added)
+      }
+      _ = model.selectFeed(ids[0])
+      // Save each camera's LUT, as a previous session would have.
+      for id in ids { model.loadLUT(url: first, feedID: id) }
+      settle { ids.allSatisfy { model.lutState($0).loaded && model.descriptor(for: $0)?.applyLUT == true } }
+      verifier.check("symmetry: every camera saves its LUT", ids.allSatisfy { model.descriptor(for: $0)?.lutBookmark != nil })
+    }
+
+    for selected in ids {
+      let label = "\(name(selected)) selected"
+      // Saved with this selection; the relaunch restores every camera's LUT.
+      settings.saveSnapshot({ var snapshot = settings.loadSnapshot(); snapshot.selectedFeedID = selected; return snapshot }())
+      let model = makeModel()
+      verifier.check("symmetry (\(label)): the launch selection", model.selectedFeedID == selected)
+      var surfaces: [FeedID: UUID] = [:]
+      for id in ids {
+        let surface = UUID()
+        surfaces[id] = surface
+        model.monitorCoordinator.registerSurface(id: surface, target: MonitorTargetID(id.rawValue), isVisible: true,
+          scopeVisible: false)
+      }
+      defer {
+        for surface in surfaces.values { model.monitorCoordinator.unregisterSurface(id: surface) }
+        for id in ids { model.stopCamera(id) }
+      }
+      func burns(_ id: FeedID) -> Bool {
+        guard let lut = model.burnInLUT(for: id), let surface = surfaces[id] else { return false }
+        let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
+        presenter.refreshBurnInLUT()
+        return presenter.host.burnInLUT === lut &&
+          model.monitorCoordinator.preferences(for: MonitorTargetID(id.rawValue)).state.pictureStage == .output
+      }
+      func check(_ step: String, title: String) {
+        settle { ids.allSatisfy { burns($0) && model.lutState($0).displayTitle.hasPrefix(title) } }
+        for id in ids {
+          verifier.check("symmetry (\(label)): \(step): \(name(id)) burns its LUT into its output and Output monitor",
+            burns(id) && model.lutState(id).displayTitle.hasPrefix(title), model.lutState(id).displayTitle)
+        }
+        // One path: the same settings give the same pipeline on every camera.
+        let configurations = ids.map { model.effectiveConfiguration(for: $0) }
+        verifier.check("symmetry (\(label)): \(step): every camera's pipeline is identical",
+          configurations.allSatisfy { $0 == configurations[0] }, "\(configurations)")
+      }
+
+      settle { ids.allSatisfy { model.lutState($0).loaded } }
+      verifier.check("symmetry (\(label)): launch restores every camera's LUT",
+        ids.allSatisfy { model.lutState($0).displayTitle.hasPrefix("First") && model.lutState($0).error == nil })
+      for id in ids { model.startCamera(id) }
+      settle { ids.allSatisfy { model.isCameraRunning($0) } }
+      verifier.check("symmetry (\(label)): every camera starts", ids.allSatisfy { model.isCameraRunning($0) })
+      check("restored before start", title: "First")
+
+      for id in ids {
+        model.updateCamera(id) { $0.applyLUT = false }
+        settle { !burns(id) }
+        verifier.check("symmetry (\(label)): Apply LUT off stops \(name(id))'s LUT, and only its",
+          !burns(id) && ids.filter { $0 != id }.allSatisfy { model.burnInLUT(for: $0) != nil })
+        model.updateCamera(id) { $0.applyLUT = true }
+      }
+      check("after toggles", title: "First")
+
+      // A LUT loaded into a running camera, then the selection moving while it loads.
+      for id in ids {
+        model.loadLUT(url: second, feedID: id)
+        _ = model.selectFeed(ids.first { $0 != model.selectedFeedID } ?? id)
+      }
+      check("loaded after start, selection moved mid-load", title: "Second")
+      _ = model.selectFeed(selected)
+
+      // Restarted cameras keep their LUT: it stays in each camera's pipeline.
+      for id in ids { model.stopCamera(id) }
+      for id in ids { model.startCamera(id) }
+      settle { ids.allSatisfy { model.isCameraRunning($0) } }
+      check("restarted", title: "Second")
+      // Back to the first LUT for the next relaunch.
+      for id in ids { model.loadLUT(url: first, feedID: id) }
+      settle { ids.allSatisfy { model.lutState($0).displayTitle.hasPrefix("First") } }
+    }
+
+    // A launch whose selection changes while every restore is in flight.
+    do {
+      let model = makeModel()
+      for id in ids.reversed() { _ = model.selectFeed(id) }
+      settle { ids.allSatisfy { model.lutState($0).loaded } }
+      for id in ids { model.startCamera(id) }
+      settle { ids.allSatisfy { model.burnInLUT(for: $0) != nil } }
+      for id in ids {
+        verifier.check("symmetry: selection moved during launch restores: \(name(id)) burns its LUT",
+          model.burnInLUT(for: id) != nil, model.lutState(id).displayTitle)
+      }
+      for id in ids { model.stopCamera(id) }
+    }
+  }
+}
+
 @MainActor private struct UIVerify {
   let verifier: Verifier
 
@@ -221,7 +374,7 @@ import SystemExtensions
     let problemNodes = Accessibility.nodes(in: problems.host)
     try? problemNodes.map { "\($0.role)\t\($0.text)" }.joined(separator: "\n")
       .write(to: verifier.pngDirectory.deletingLastPathComponent().appendingPathComponent("accessibility-problems.tsv"), atomically: true, encoding: .utf8)
-    for label in ["Retry Preview", "Locate…"] {
+    for label in ["Locate…"] {
       verifier.check("problems window offers \"\(label)\"", contains(problemNodes, label), "", viewDependent: true)
     }
     // Sidebar List rows aren't exposed to accessibility offscreen (the render
@@ -246,15 +399,8 @@ import SystemExtensions
       verifier.check("pressing Install Camera sends its action", log.actions.contains(.installCameraExtension), "\(log.actions)",
         viewDependent: true)
     }
-    verifier.check("problems window offers Retry for the failed start", problemNodes.contains { $0.text.hasPrefix("Retry") && $0.text != "Retry Preview" },
+    verifier.check("problems window offers Retry for the failed start", problemNodes.contains { $0.text.hasPrefix("Retry") },
       "", viewDependent: true)
-    for (label, expected) in [("Retry Preview", UIAction.retryPreview)] {
-      if let node = problemNodes.first(where: { $0.text == label && $0.enabled }) {
-        log.clear()
-        _ = Accessibility.press(node)
-        verifier.check("pressing \(label) sends its action", log.actions.contains(expected), "\(log.actions)", viewDependent: true)
-      }
-    }
   }
 
   func interactions() {
@@ -435,51 +581,76 @@ import SystemExtensions
     }
     func bookmark(_ id: FeedID) -> Data? { settings.loadSnapshot().feeds.first { $0.id == id }?.lutBookmark }
 
+    func lut(_ id: FeedID) -> CameraLUTState { model.lutState(id) }
+    func idle(_ id: FeedID) -> Bool { !model.isLUTLoading(id) }
+
     model.loadLUT(url: cube3D, feedID: alpha)
-    settle { !model.loading && (model.lutLoaded || model.lutError != nil) }
-    verifier.check("lut: a 3D cube loads", model.lutLoaded && model.lutError == nil, model.lutError ?? "")
-    verifier.check("lut: a 3D cube's title", model.lutTitle == "Check LUT · 2³", model.lutTitle)
-    verifier.check("lut: loading turns Apply LUT on", model.configuration.applyLUT)
+    settle { idle(alpha) && (lut(alpha).loaded || lut(alpha).error != nil) }
+    verifier.check("lut: a 3D cube loads", lut(alpha).loaded && lut(alpha).error == nil, lut(alpha).error ?? "")
+    verifier.check("lut: a 3D cube's title", lut(alpha).displayTitle == "Check LUT · 2³", lut(alpha).displayTitle)
+    verifier.check("lut: loading turns Apply LUT on", model.effectiveConfiguration(for: alpha).applyLUT)
     verifier.check("lut: a load saves its bookmark", bookmark(alpha) != nil)
 
     model.loadLUT(url: cube1D, feedID: alpha)
-    settle { !model.loading && model.lutTitle != "Check LUT · 2³" }
-    verifier.check("lut: a 1D cube's title", model.lutTitle == "Shaper · 1D 2", model.lutTitle)
+    settle { idle(alpha) && lut(alpha).displayTitle != "Check LUT · 2³" }
+    verifier.check("lut: a 1D cube's title", lut(alpha).displayTitle == "Shaper · 1D 2", lut(alpha).displayTitle)
 
     model.loadLUT(url: broken, feedID: alpha)
-    settle { !model.loading && model.lutError != nil }
+    settle { idle(alpha) && lut(alpha).error != nil }
     verifier.check("lut: a file that does not parse says so",
-      model.lutError?.hasPrefix("LUT was not changed") == true, model.lutError ?? "no error")
+      lut(alpha).error?.hasPrefix("LUT was not changed") == true, lut(alpha).error ?? "no error")
     verifier.check("lut: a failed load keeps the loaded LUT",
-      model.lutLoaded && model.lutTitle == "Shaper · 1D 2", model.lutTitle)
+      lut(alpha).loaded && lut(alpha).displayTitle == "Shaper · 1D 2", lut(alpha).displayTitle)
 
     model.loadLUT(url: cube3D, feedID: alpha)
-    settle { !model.loading && model.lutTitle == "Check LUT · 2³" }
-    model.selectFeed(beta)
-    settle { !model.loading }
+    settle { idle(alpha) && lut(alpha).displayTitle == "Check LUT · 2³" }
     verifier.check("lut: another camera has its own (no) LUT",
-      !model.lutLoaded && model.lutTitle == "No LUT loaded", model.lutTitle)
-    model.selectFeed(alpha)
-    verifier.check("lut: selecting a camera restores its LUT", model.loading)
-    settle { !model.loading }
-    verifier.check("lut: the restore loads", model.lutLoaded && model.lutError == nil, model.lutError ?? "")
-    verifier.check("lut: the restore's title", model.lutTitle == "Check LUT · 2³", model.lutTitle)
-    verifier.check("lut: the restore keeps Apply LUT on", model.configuration.applyLUT)
-
-    model.loadLUT(url: cube1D, feedID: beta)
-    settle { !model.loading && bookmark(beta) != nil }
-    try FileManager.default.removeItem(at: cube1D)
+      !lut(beta).loaded && lut(beta).displayTitle == "No LUT loaded", lut(beta).displayTitle)
+    // Selection is UI state: it neither reloads nor drops a camera's LUT.
     model.selectFeed(beta)
-    settle { !model.loading }
-    verifier.check("lut: a missing file on restore is unavailable", model.lutTitle == "Saved LUT unavailable", model.lutTitle)
-    verifier.check("lut: a missing file on restore says so",
-      model.lutError?.hasPrefix("Saved LUT could not be restored") == true, model.lutError ?? "no error")
-
+    verifier.check("lut: selecting another camera loads nothing", idle(alpha) && idle(beta))
+    verifier.check("lut: the deselected camera keeps its LUT",
+      lut(alpha).displayTitle == "Check LUT · 2³" && model.effectiveConfiguration(for: alpha).applyLUT, lut(alpha).displayTitle)
     model.selectFeed(alpha)
-    settle { !model.loading }
+
+    // A relaunch restores every camera's saved LUT, selected or not.
+    model.loadLUT(url: cube1D, feedID: beta)
+    settle { idle(beta) && bookmark(beta) != nil }
+    for selected in [alpha, beta] {
+      model.selectFeed(selected)
+      let relaunched = AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+        recordingFolderStore: RecordingFolderStore(defaults: defaults),
+        installer: ExtensionInstaller(services: installerServices.services()), hardware: .offline)
+      settle { !relaunched.isLUTLoading(alpha) && !relaunched.isLUTLoading(beta) }
+      let name = selected == alpha ? "Camera 1 selected" : "Camera 2 selected"
+      verifier.check("lut: launch restores Camera 1's LUT (\(name))",
+        relaunched.lutState(alpha).displayTitle == "Check LUT · 2³" && relaunched.effectiveConfiguration(for: alpha).applyLUT,
+        relaunched.lutState(alpha).displayTitle)
+      verifier.check("lut: launch restores Camera 2's LUT (\(name))",
+        relaunched.lutState(beta).displayTitle == "Shaper · 1D 2" && relaunched.effectiveConfiguration(for: beta).applyLUT,
+        relaunched.lutState(beta).displayTitle)
+    }
+    model.selectFeed(alpha)
+
+    try FileManager.default.removeItem(at: cube1D)
+    let missing = AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+      registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      installer: ExtensionInstaller(services: installerServices.services()), hardware: .offline)
+    settle { !missing.isLUTLoading(beta) }
+    verifier.check("lut: a missing file on restore is unavailable",
+      missing.lutState(beta).displayTitle == "Saved LUT unavailable", missing.lutState(beta).displayTitle)
+    verifier.check("lut: a missing file on restore says so",
+      missing.lutState(beta).error?.hasPrefix("Saved LUT could not be restored") == true, missing.lutState(beta).error ?? "no error")
+    verifier.check("lut: a missing file on restore keeps the saved choice",
+      missing.descriptor(for: beta)?.lutBookmark != nil && missing.descriptor(for: beta)?.applyLUT == true
+        && !missing.effectiveConfiguration(for: beta).applyLUT)
+
     model.forgetLUT(alpha)
     verifier.check("lut: Forget LUT clears it",
-      !model.lutLoaded && model.lutTitle == "No LUT loaded" && !model.configuration.applyLUT, model.lutTitle)
+      !lut(alpha).loaded && lut(alpha).displayTitle == "No LUT loaded" && !model.effectiveConfiguration(for: alpha).applyLUT,
+      lut(alpha).displayTitle)
     verifier.check("lut: Forget LUT persists", bookmark(alpha) == nil)
   }
 
@@ -554,7 +725,7 @@ import SystemExtensions
     verifier.check("bridge: automatic start persists", model.descriptor(for: beta)?.automaticFeed == true)
     bridge.perform(.setAutomaticStart(cameraID: beta.rawValue, false))
     bridge.perform(.setEffect(cameraID: alpha.rawValue, index: 2, false))
-    verifier.check("bridge: effect on selected camera", model.configuration.convertTo420 == false && bridge.snapshot().cameras[0].effects[2] == false)
+    verifier.check("bridge: effect on selected camera", model.descriptor(for: alpha)?.convertTo420 == false && bridge.snapshot().cameras[0].effects[2] == false)
     bridge.perform(.setGamut(cameraID: beta.rawValue, "S-Gamut3 / S-Log3"))
     verifier.check("bridge: gamut", model.descriptor(for: beta)?.gamut == "S-Gamut3 / S-Log3")
 
@@ -562,7 +733,7 @@ import SystemExtensions
     bridge.perform(.stopCamera(cameraID: beta.rawValue))
     bridge.perform(.stopCamera(cameraID: alpha.rawValue))
     bridge.perform(.stopAllCameras)
-    verifier.check("bridge: stop on stopped cameras is a no-op", !model.running && !model.isCameraRunning(beta))
+    verifier.check("bridge: stop on stopped cameras is a no-op", !model.running && !model.isCameraRunning(alpha) && !model.isCameraRunning(beta))
     bridge.send(.stopCamera(cameraID: beta.rawValue))
     verifier.check("bridge: no confirmation for an idle camera", interface.confirmation == nil)
 
@@ -570,9 +741,10 @@ import SystemExtensions
     // offline hardware (no inputs), so both cameras point at missing inputs.
     bridge.perform(.setInput(cameraID: alpha.rawValue, deviceID: "ui-verify-device-a"))
     bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: "ui-verify-device-b"))
-    let missingInputs = model.selectedDevice == "ui-verify-device-a" && model.descriptor(for: beta)?.selectedDevice == "ui-verify-device-b"
+    let missingInputs = model.descriptor(for: alpha)?.selectedDevice == "ui-verify-device-a"
+      && model.descriptor(for: beta)?.selectedDevice == "ui-verify-device-b"
       && !model.devices.contains { $0.id.hasPrefix("ui-verify-device-") }
-    verifier.check("bridge: cameras point at missing inputs", missingInputs, model.selectedDevice)
+    verifier.check("bridge: cameras point at missing inputs", missingInputs, model.descriptor(for: alpha)?.selectedDevice ?? "nil")
     if missingInputs {
       bridge.perform(.startCamera(cameraID: beta.rawValue))
       let refused = bridge.snapshot().cameras[1]
@@ -580,7 +752,7 @@ import SystemExtensions
         && refused.automaticStatus?.isEmpty == false && model.selectedFeedID == alpha, refused.automaticStatus ?? "no status")
       bridge.perform(.startCamera(cameraID: alpha.rawValue))
       let refusedSelected = bridge.snapshot().cameras[0]
-      verifier.check("bridge: a refused Start on the selected camera says why", !model.running && refusedSelected.automaticStartFailed
+      verifier.check("bridge: a refused Start on the selected camera says why", !model.isCameraRunning(alpha) && refusedSelected.automaticStartFailed
         && refusedSelected.automaticStatus?.isEmpty == false, refusedSelected.automaticStatus ?? "no status")
       verifier.check("bridge: a refused Start shows in the status bar",
         UIPresentationBuilder.warning(bridge.snapshot())?.contains("couldn't start") == true, UIPresentationBuilder.warning(bridge.snapshot()) ?? "none")
@@ -590,8 +762,8 @@ import SystemExtensions
 
       // LUT loads are per camera: one camera's load neither blocks nor cancels another's.
       model.updateCamera(beta) { $0.lutBookmark = Data([1, 2, 3]) }
-      bridge.perform(.select(cameraID: beta.rawValue))
-      verifier.check("bridge: selecting a camera restores its LUT", model.loading)
+      verifier.check("bridge: a camera's new saved LUT is read at once, unselected", model.isLUTLoading(beta)
+        && model.selectedFeedID == alpha)
       bridge.perform(.startCamera(cameraID: beta.rawValue))
       verifier.check("bridge: Start while the LUT loads says so",
         bridge.snapshot().cameras[1].automaticStatus?.contains("LUT") == true, bridge.snapshot().cameras[1].automaticStatus ?? "no status")
@@ -599,15 +771,20 @@ import SystemExtensions
       model.loadLUT(url: missingCube, feedID: alpha)
       let lutDeadline = Date().addingTimeInterval(5)
       // Both loads fail (a bogus bookmark, a missing file); wait for both.
-      while (model.lutError == nil || !model.canEditFeedTopology) && Date() < lutDeadline { MainLoop.run(seconds: 0.01) }
-      verifier.check("bridge: another camera's LUT load doesn't drop the selected camera's restore",
-        model.lutError?.contains("Saved LUT could not be restored") == true && model.canEditFeedTopology, model.lutError ?? "no error")
-      // A failed restore keeps the bookmark, so selecting the camera again restores it again.
-      bridge.perform(.select(cameraID: alpha.rawValue))
+      while (model.lutState(alpha).error == nil || model.lutState(beta).error == nil || !model.canEditFeedTopology)
+        && Date() < lutDeadline { MainLoop.run(seconds: 0.01) }
+      verifier.check("bridge: another camera's LUT load doesn't drop this camera's restore",
+        model.lutState(beta).error?.contains("Saved LUT could not be restored") == true && model.canEditFeedTopology,
+        model.lutState(beta).error ?? "no error")
+      verifier.check("bridge: a failed load names its own camera",
+        model.lutState(alpha).error?.hasPrefix("LUT was not changed") == true
+          && bridge.snapshot().cameras[0].lutError == model.lutState(alpha).error
+          && bridge.snapshot().cameras[1].lutError == model.lutState(beta).error, model.lutState(alpha).error ?? "no error")
+      // Selection is UI state: it starts no load on either camera.
       bridge.perform(.select(cameraID: beta.rawValue))
       bridge.perform(.select(cameraID: alpha.rawValue))
-      verifier.check("bridge: a camera without a LUT isn't blocked by another camera's load",
-        !model.loading && !bridge.snapshot().cameras[0].lutLoading)
+      verifier.check("bridge: selecting cameras loads no LUT",
+        !model.isLUTLoading(alpha) && !model.isLUTLoading(beta) && !bridge.snapshot().cameras[0].lutLoading)
       // Forgetting the LUT also drops its restore still in flight.
       bridge.perform(.forgetLUT(cameraID: beta.rawValue))
       bridge.perform(.stopCamera(cameraID: beta.rawValue))
@@ -800,11 +977,12 @@ import SystemExtensions
       installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
     let publish = { (list: [InputDevice]) in publisher.handler?(list) }
 
-    verifier.check("discovery: launch keeps the saved input", model.selectedDevice == "dev-y", model.selectedDevice)
+    verifier.check("discovery: launch keeps the saved input", model.descriptor(for: alpha)?.selectedDevice == "dev-y",
+      model.descriptor(for: alpha)?.selectedDevice ?? "nil")
     // Discovery publishes once per arrival, so the first list can be partial.
     publish([x])
-    verifier.check("discovery: a partial list doesn't move the camera's input", model.selectedDevice == "dev-y",
-      model.selectedDevice)
+    verifier.check("discovery: a partial list doesn't move the camera's input",
+      model.descriptor(for: alpha)?.selectedDevice == "dev-y", model.descriptor(for: alpha)?.selectedDevice ?? "nil")
     publish([x, y])
 
     model.startCamera(beta)
@@ -864,7 +1042,7 @@ import SystemExtensions
 
     publish([x, y])
     verifier.check("discovery: None set in the inspector stays None when inputs arrive",
-      model.selectedDevice == "" && model.descriptor(for: gamma)?.selectedDevice == "", model.selectedDevice)
+      model.descriptor(for: gamma)?.selectedDevice == "", model.descriptor(for: gamma)?.selectedDevice ?? "nil")
 
     // Stop is a choice, not a failure: a camera stopped while its preview is on
     // screen (so automatic start still wants it) reads Stopped, not Couldn't start.
@@ -873,11 +1051,11 @@ import SystemExtensions
     let surface = UUID()
     model.monitorCoordinator.registerSurface(id: surface, target: MonitorTargetID(alpha.rawValue), isVisible: true,
       scopeVisible: false)
-    model.stop()
+    model.stopCamera(alpha)
     verifier.check("discovery: a stopped camera isn't a failed start", !model.automaticStartFailed(alpha),
-      model.automaticFeedStatus)
+      model.automaticStatus(alpha))
     verifier.check("discovery: a stopped camera's status says it stays off",
-      model.automaticFeedStatus == "Camera stopped. It stays off until you start it.", model.automaticFeedStatus)
+      model.automaticStatus(alpha) == "Camera stopped. It stays off until you start it.", model.automaticStatus(alpha))
     model.monitorCoordinator.unregisterSurface(id: surface)
   }
 
@@ -918,7 +1096,10 @@ import SystemExtensions
 
     inputs.publish([a])
     verifier.check("adoption: a fresh setup takes the arriving input", device(alpha) == a.id, device(alpha))
+    verifier.check("adoption: an arriving input another camera has isn't taken", device(beta) == "", device(beta))
     inputs.publish([a, b, c])
+    verifier.check("adoption: every empty camera takes the first free input, selected or not",
+      device(beta) == b.id && model.selectedFeedID == alpha, device(beta))
     verifier.check("adoption: two inputs with one name get their ID digits",
       model.inputLabel(a.id) == "UltraStudio Mini Recorder 12G · 0AB8" &&
         model.inputLabel(b.id) == "UltraStudio Mini Recorder 12G · 46B8", model.inputLabel(a.id) ?? "nil")
@@ -927,13 +1108,7 @@ import SystemExtensions
       bridge.snapshot().cameras.first { $0.id == alpha.rawValue }?.inputName == "UltraStudio Mini Recorder 12G · 0AB8",
       bridge.snapshot().cameras.first { $0.id == alpha.rawValue }?.inputName ?? "nil")
 
-    // Camera 2 is new and empty: it takes the first input no camera has.
     _ = model.selectFeed(beta)
-    inputs.publish([])
-    inputs.publish([a])
-    verifier.check("adoption: an arriving input another camera has isn't taken", device(beta) == "", device(beta))
-    inputs.publish([a, b])
-    verifier.check("adoption: the first free input is taken", device(beta) == b.id, device(beta))
 
     // One input per camera, in the model and in both pickers.
     bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: a.id))
@@ -1054,7 +1229,7 @@ import SystemExtensions
     do {
       let setup = makeModel()
       setup.loadLUT(url: cube, feedID: alpha)
-      settle { !setup.loading && setup.lutLoaded }
+      settle { setup.lutState(alpha).loaded }
       setup.loadLUT(url: cube, feedID: beta)
       settle { setup.descriptor(for: beta)?.applyLUT == true }
     }
@@ -1069,7 +1244,7 @@ import SystemExtensions
       model.burnInLUT(for: alpha) != nil && model.burnInLUT(for: beta) != nil }
     verifier.check("lut auto: both cameras start automatically", model.isCameraRunning(alpha) && model.isCameraRunning(beta))
     verifier.check("lut auto: the selected camera's restored LUT burns in after an automatic start",
-      model.burnInLUT(for: alpha) != nil, "LUT loaded: \(model.lutLoaded), \(model.lutTitle)")
+      model.burnInLUT(for: alpha) != nil, model.lutState(alpha).displayTitle)
     verifier.check("lut auto: the other camera's LUT burns in", model.burnInLUT(for: beta) != nil)
     // The monitor's Output stage: what each surface's host hands its feed at encode.
     func monitorBurnsIn(_ surface: UUID, _ id: FeedID) -> Bool {
@@ -1081,12 +1256,12 @@ import SystemExtensions
     verifier.check("lut auto: the other camera's monitor Output stage has its LUT", monitorBurnsIn(surfaceB, beta))
     // Running when selected: its restore completes after it started.
     model.selectFeed(beta)
-    settle { !model.loading }
+    settle { !model.isLUTLoading(alpha) && !model.isLUTLoading(beta) }
     settle(1) { false }
     verifier.check("lut auto: selecting a running camera keeps its LUT burned in", model.burnInLUT(for: beta) != nil)
     verifier.check("lut auto: the deselected camera keeps its LUT burned in", model.burnInLUT(for: alpha) != nil)
     model.selectFeed(alpha)
-    settle { !model.loading }
+    settle { !model.isLUTLoading(alpha) && !model.isLUTLoading(beta) }
     settle(1) { false }
     verifier.check("lut auto: selecting the first camera again keeps its LUT burned in", model.burnInLUT(for: alpha) != nil)
     verifier.check("lut auto: after selection changes both monitors show their LUTs",
@@ -1144,7 +1319,7 @@ import SystemExtensions
     }
 
     model.loadLUT(url: cube, feedID: alpha)
-    settle { !model.loading && model.lutLoaded }
+    settle { model.lutState(alpha).loaded }
     model.loadLUT(url: cube, feedID: beta)
     settle { model.descriptor(for: beta)?.applyLUT == true }
     model.startCamera(alpha)
@@ -1153,14 +1328,14 @@ import SystemExtensions
     verifier.check("lut run: both cameras run", model.isCameraRunning(alpha) && model.isCameraRunning(beta))
     both("started")
     model.selectFeed(beta)
-    settle { !model.loading }
+    settle { !model.isLUTLoading(alpha) && !model.isLUTLoading(beta) }
     both("after selecting Camera 2")
     toggle(alpha)
     both("after toggling Camera 1 while Camera 2 is selected")
     toggle(beta)
     both("after toggling the selected Camera 2")
     model.selectFeed(alpha)
-    settle { !model.loading }
+    settle { !model.isLUTLoading(alpha) && !model.isLUTLoading(beta) }
     both("after selecting Camera 1 again")
     toggle(beta)
     both("after toggling Camera 2 while Camera 1 is selected")
@@ -1179,9 +1354,10 @@ import SystemExtensions
       registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
       recordingFolderStore: RecordingFolderStore(defaults: defaults),
       installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
-    settle { !relaunched.loading }
-    verifier.check("lut run: a missing saved LUT is reported", relaunched.lutTitle == "Saved LUT unavailable",
-      relaunched.lutTitle)
+    settle { !relaunched.isLUTLoading(alpha) && !relaunched.isLUTLoading(beta) }
+    verifier.check("lut run: a missing saved LUT is reported on every camera",
+      relaunched.lutState(alpha).displayTitle == "Saved LUT unavailable" && relaunched.lutState(beta).displayTitle == "Saved LUT unavailable",
+      relaunched.lutState(alpha).displayTitle)
     relaunched.startCamera(alpha)
     relaunched.startCamera(beta)
     settle { relaunched.isCameraRunning(alpha) && relaunched.isCameraRunning(beta) }
@@ -1192,7 +1368,7 @@ import SystemExtensions
     }
     settle { relaunched.burnInLUT(for: alpha) != nil && relaunched.burnInLUT(for: beta) != nil }
     verifier.check("lut run: Apply LUT on reads a returned LUT again (selected Camera 1)",
-      relaunched.burnInLUT(for: alpha) != nil, relaunched.lutTitle)
+      relaunched.burnInLUT(for: alpha) != nil, relaunched.lutState(alpha).displayTitle)
     verifier.check("lut run: Apply LUT on reads a returned LUT again (Camera 2)",
       relaunched.burnInLUT(for: beta) != nil)
     relaunched.stopCamera(beta)
@@ -1375,6 +1551,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.hdrAdvertisement()
   do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
   do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }
+  do { try run.cameraSymmetry() } catch { verifier.check("camera symmetry tests threw", false, "\(error)") }
   run.adoption()
   run.sharedInput()
   run.pictureMenus()

@@ -69,7 +69,6 @@ struct UICameraPictureView: View {
         .accessibilityAction(named: "Select \(camera.name)") { context.send(.select(cameraID: camera.id)) }
         .modifier(UICutAccessibilityAction(camera: camera, context: context))
       placeholder
-      previewErrorNotice
       overlays
     }
     .aspectRatio(16 / 9, contentMode: .fit)
@@ -169,26 +168,6 @@ struct UICameraPictureView: View {
     }
     guard let first = status.first else { return nil }
     return first.uppercased() + status.dropFirst()
-  }
-
-  /// Preview rendering failed; camera output is unaffected and keeps running.
-  @ViewBuilder private var previewErrorNotice: some View {
-    if !compact, let error = snapshot?.previewError, !error.isEmpty {
-      VStack(spacing: 6) {
-        Label("Preview error — camera output continues", systemImage: "exclamationmark.triangle.fill")
-          .font(.uiOverlay).foregroundStyle(.orange)
-        Text(error).font(.uiMeta).foregroundStyle(.white.opacity(0.7)).lineLimit(2).multilineTextAlignment(.center)
-        Button("Retry Preview") { context.send(.retryPreview) }
-          .controlSize(.small)
-          .help("Restart preview rendering. Camera output keeps running.")
-      }
-      .padding(10)
-      .frame(maxWidth: 360)
-      .background(Color.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 10))
-      .environment(\.colorScheme, .dark)
-      .accessibilityElement(children: .contain)
-      .accessibilityLabel("Preview error")
-    }
   }
 
   // MARK: Overlays

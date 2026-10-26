@@ -207,12 +207,11 @@ enum UIFixtures {
     return session
   }
 
-  /// Problems: a preview error on Camera 1, a LUT that couldn't be restored and a
-  /// failed automatic start on Camera 2, and the camera extension not installed.
+  /// Problems: a LUT that couldn't be restored and a failed automatic start on
+  /// Camera 2, and the camera extension not installed.
   static func problems() -> UISessionSnapshot {
     var session = baseSession()
-    var one = camera(1, recording: .idle)
-    one.previewError = "The preview stopped responding."
+    let one = camera(1, recording: .idle)
     var two = camera(2, recording: .idle)
     two.running = false
     two.signal = .none
