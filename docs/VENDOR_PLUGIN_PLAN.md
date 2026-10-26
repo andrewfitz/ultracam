@@ -275,9 +275,15 @@ them acceptance criteria:
   without a copy. The plugin owns the allocation:
   - DeckLink's default allocator already does this;
   - an AJA plugin would DMA into IOSurface-backed buffers it allocates;
-  - AVFoundation buffers are already IOSurface-backed.
-- **No CPU pixel conversion.** A format the pipeline can't take gets a shader
-  path (Part B), never a CPU conversion.
+  - AVFoundation buffers are already IOSurface-backed;
+  - an SDK that returns frames in ordinary memory (NDI) is read in place by
+    the GPU through a no-copy `MTLBuffer`, and its unpack kernel writes the
+    IOSurface pool.
+- **No CPU pixel path at all.** Every Mac Ultracam runs on is Apple Silicon
+  (arm64 only, macOS 26), with a GPU and unified memory. So there is no CPU
+  fallback, not even a counted one. A format without a GPU route is refused
+  at admission, and a check script fails on any CPU pixel access. See "GPU
+  only, with no CPU fallback" in [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md).
 - **Timing comes from the source.** Presentation time and duration come from
   the device clock, never a user-chosen rate. The host-time attachment marks
   when the frame *finished* arriving (`UltracamBackend.h:65-68`). A plugin
@@ -570,7 +576,7 @@ before anyone outside builds on the API.
 
 Decided on 2026-10-26: Part B is in scope and covers every hard-coded
 assumption. Part B's own decisions (VFR, Program rate conversion, aspect,
-CPU-memory sources, interlaced, audio-only takes) are in
+interlaced, audio-only takes) are in
 [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md).
 
 1. **Isolation:** one module with a boundary-check script (recommended now),

@@ -38,6 +38,41 @@ stage compares a frame against a constant. Each one compares against the
 format its source declared, and an unsupported format is refused with a clear
 message naming the stage.
 
+### GPU only, with no CPU fallback
+
+Ultracam builds for arm64 only (`generate_project.py`, `ARCHS="arm64"`) and
+targets macOS 26. So every Mac it runs on is Apple Silicon, with a GPU and
+unified memory. That allows a stricter rule than "zero CPU copies on the
+normal path":
+
+- **No CPU pixel path exists anywhere**: not as a fallback, and not as a
+  counted degraded mode. Every format conversion, scale, colour conversion,
+  fill and repack is a GPU kernel.
+- **A format with no GPU route is refused at admission** (or before a take
+  starts), with a message naming the format and the stage. It is never
+  converted on the CPU.
+- **GPU failures are reported, not hidden.** If a GPU command fails on one
+  frame (a pool exhausted, a command buffer error), that frame is a counted,
+  visible error for that consumer, never handed to a CPU path.
+- **CPU-memory sources need no CPU copy either.** Some SDKs return frames in
+  ordinary memory: NDI, software decoders. Unified memory lets the GPU read
+  that memory directly:
+  - wrap the frame's pages in an `MTLBuffer` with
+    `makeBuffer(bytesNoCopy:length:options:deallocator:)`. The range is
+    page-aligned: round the start down and the length up;
+  - unpack it with the format's GPU kernel straight into an IOSurface pool.
+
+  That GPU write is the same format conversion any non-native format gets.
+  The plugin keeps the vendor frame alive until the command buffer completes.
+  Where the SDK lets us supply the allocator, the plugin gives it
+  IOSurface-backed, page-aligned memory, and the GPU reads the frame in place.
+- **Enforcement:** a check script fails if `CVPixelBufferLockBaseAddress`,
+  `CVPixelBufferGetBaseAddress*` or `MTLTexture.getBytes`/`replace(region:)`
+  appears in `Sources/` or `Vendors/` outside an allowlist. Today the
+  allowlist is one entry: the 2×2×2 identity LUT upload
+  (`LUTProcessor.swift:343`), which is LUT data, not video. The only current
+  violations are the two in "Fix now". Tests are exempt.
+
 ### The contract types
 
 These live in `Sources/Shared`, so the extension compiles them too.
@@ -111,6 +146,8 @@ These are bugs in today's code, separate from the refactor:
 | `VideoContract.swift:190` | `untouched` treats `resizeTarget == .uhd4K` as "no resize". With a 1080p source, the sink would negotiate 3840×2160 (`CameraSink.swift:211`) and refuse every frame (`:328`). | No (4K only). |
 | `SourceRecording.swift:234` | Drop-frame timecode is chosen when `frameRate == .fps2997 \|\| .fps5994`, which is always true, so a 25p take gets a drop-frame `tmcd` track. | No (4K 29.97/59.94 only). |
 | `VideoContract.swift:166` | `Int32(title)!` crashes if a rate with a fractional title (119.88, 47.952) is added without an explicit duration. | No. It's a trap for B3. |
+| `AVAssetSourceRecordingWriter.swift:65-66`, `:417`, `:480-484`, `:496-497` | Recording's CPU routes: `videoToolboxConverts` when no GPU route exists, a capture buffer that isn't IOSurface-backed, and a failed GPU repack ("Never lose the frame: let VideoToolbox convert it") all hand the frame to VideoToolbox's CPU conversion. | **Yes**, though unused with today's single format. Remove the route: no GPU route means the take refuses to start, and a GPU failure is a counted lost recording frame. |
+| `CameraProvider.swift:413-446` [EXT] | The standby black frame is filled on the CPU (`CVPixelBufferLockBaseAddress` plus `memset`, and a v210 word pattern), tagged 709. | **Yes**. Clear it on the GPU (Metal in the extension) from the format table's black values, with tags from the published format. |
 | `RecordingModel.swift` vs `UISupport.swift:9-14` | The recorder's space guard (`SourceRecording.swift:94-99`, bytes per pixel) and the UI's time-left estimate (`707`/`354` Mb/s, `fallbackMegabits: 707` at `:36`) disagree by about 2.5× at 59.94. | **Yes**. One estimator (B9). |
 
 ## Inventory
@@ -164,7 +201,7 @@ Each gate compares against constants. Each must compare against the declared
 | `VideoContract.swift:139-152` [P][EXT][CLIENT] | `ColorTarget` has only four video-range YUV formats | append (indices are a contract); add full range and 4:4:4 if wanted |
 | `VideoContract.swift:49` [EXT][CLIENT] | `formatDescription` limited to `tenBit422 ∪ ColorTarget` | the format table |
 | `RecordingPixelConverter.swift:54`, `:208`; `SourceRecording.swift:73`, `:79` | in: v210 only; out: x422 pool only | a repack kernel per (source, encoder) pair, from the table |
-| `AVAssetSourceRecordingWriter.swift:65-66`, `:480-481`, `:496-497` | `videoToolboxConverts`: when no GPU route exists, VideoToolbox converts on the **CPU**. Counted, but any new format would land here by default | a new format must bring its GPU repack; this path stays only as a counted, visible error, never a designed route |
+| `AVAssetSourceRecordingWriter.swift:65-66`, `:480-481`, `:496-497` | `videoToolboxConverts`: when no GPU route exists, VideoToolbox converts on the **CPU** | removed in B0 (see "Fix now"); a new format must bring its GPU repack, or recording refuses it |
 | `MonitorFeedHost.swift:476`; MonitorKit `Signal.swift:263` | range falls back to `.legal` | take the range from the format; full-range webcams send `420f` |
 
 MonitorKit's `PixelLayout` (`Signal.swift:13-33`) already handles v210, uyvy,
@@ -265,7 +302,7 @@ nv12, p010 and RGB. It is the model for the table.
 | `CameraProvider.swift:132-138` [EXT][CLIENT] | "keep the original eight indices stable"; one format list for every device | append only |
 | `VirtualCameraRegistry.swift:151`, `:183` [EXT] | schema version 1, checked for exact equality, with no format fields | bump to 2 with per-device formats, shipped in the app and the extension together; old extensions must keep working until reinstalled |
 | `CameraProvider.swift:381`, `:839` [EXT] | standby black after 0.5 s without frames; checks for frames at a quarter of the frame interval | in time, from the published rate; a VFR or paused source (NDI) shouldn't flash black at 0.5 s |
-| `CameraProvider.swift:414-444` [EXT] | the standby fill runs on the CPU per format family, assuming video range and 709 | one fill per table entry (a fill of a small black frame is not a pixel copy of video, so the rule holds) |
+| `CameraProvider.swift:413-446` [EXT] | the standby fill runs on the CPU per format family, assuming video range and 709 | a GPU clear from the format table (B0) |
 | `CameraProvider.swift:656` [CLIENT] | the device model is `"FX3 LUT camera"` | "Ultracam camera" |
 | `VideoContract.swift:24`, `:28`, `:32`; `maxFramesInFlight = 3`; `LUTProcessor.swift:697`; `ProgramNormalizer.swift:393` [EXT] | pools of 9 / limit 64 / sink queue 8 / Program 4 count frames, not bytes (64 frames of 8K 4:2:2 10-bit is about 8 GB) | budget in bytes, keeping minimum counts |
 
@@ -278,7 +315,7 @@ nv12, p010 and RGB. It is the model for the table.
 | `UltracamBackend.mm:1821-1823`; `AppModel.swift:1228`, `:1235` | a device is exclusive; one feed per input | the plugin declares whether a source can be shared (NDI can) |
 | `CaptureController.swift:530-558` | the 2-second no-signal watchdog | the plugin declares whether a source may legitimately pause (NDI, a webcam with its shutter closed) and its own timeout |
 | `UICameraColumn.swift:130`, `:133` | "2160p 29.97 or 59.94, 10-bit 4:2:2, RAW off" | the plugin's supported-modes text |
-| CPU-memory sources (NDI, software) | an IOSurface is required at `LUTProcessor.swift:578`, `:690`, `CameraSink.swift:84`, `ProgramNormalizer.swift:221`, `MonitorFeedHost.swift:685` | the plugin writes each frame **once** into an IOSurface pool it owns at ingest (decision 4); zero copies from there on |
+| CPU-memory sources (NDI, software) | an IOSurface is required at `LUTProcessor.swift:578`, `:690`, `CameraSink.swift:84`, `ProgramNormalizer.swift:221`, `MonitorFeedHost.swift:685` | the GPU reads the vendor's memory in place through a no-copy `MTLBuffer`, and its unpack kernel writes the IOSurface pool (see "GPU only, with no CPU fallback"); downstream stays IOSurface-only |
 
 ### 12. Limits counted in frames
 
@@ -403,8 +440,11 @@ FX3 4K59.94 path identical. Andrew checks it live after B2, B3, B5 and B6.
     monitor;
   - conformance tests.
 
+  A format missing any of those GPU routes is refused at admission, not
+  shipped half-done.
+
   Order: 12-bit 4:2:2, then `420v`/`420f`, then `2vuy`/`yuvs`, then 4:4:4 and
-  RGB. The recording profile matrix and the CPU-route policy also land here.
+  RGB. The recording profile matrix also lands here.
 - **B6. Audio.**
   - `SourceAudioFormat` end to end: other rates, channels and sample types;
     the channel layout in files; N-channel meters; the auto-switcher input;
@@ -414,7 +454,7 @@ FX3 4K59.94 path identical. Andrew checks it live after B2, B3, B5 and B6.
   - DeckLink enables all embedded channels.
 - **B7. Interface and device.** The connector setting, the per-device EDID
   setting, shared versus exclusive sources, pause-tolerant sources, and
-  CPU-memory ingest.
+  GPU ingest for CPU-memory sources.
 - **B8. Wording and stored text.** Section 14, the structured format display,
   the usage strings, the README, and supported-modes text.
 - **B9. Estimates and cleanup.** One recording estimator, and remove or tie
@@ -438,8 +478,10 @@ its types.
   for each table entry, size and rate: 720p25, 1080p23.976, 1080p50, 4K59.94
   v210, 4K 12-bit, 1080p 4:2:0 full range, `2vuy`, 4:4:4, and VFR. Each runs
   through the end-to-end checks.
-- **The four counts.** Each mode must show zero lost frames to preview,
-  extension, recording, monitor and Program, and zero CPU-routed frames.
+- **The counts.** Each mode must show zero lost frames to preview, extension,
+  recording, monitor and Program.
+- **The CPU-pixel check** passes on every commit. There is no CPU route left
+  to count.
 - **Recordings** are checked for:
   - their timescale;
   - per-frame duration (exact, no "VFR" in editors);
@@ -461,10 +503,6 @@ its types.
    rate.
 3. **Aspect:** letterbox or pillarbox (recommended), crop, or stretch, when a
    source's aspect differs from the output's.
-4. **CPU-memory sources (NDI and similar):** allow exactly one ingest write
-   into an IOSurface pool the plugin owns, counted in diagnostics, as the only
-   exception to "zero CPU pixel copies". The alternative is not supporting
-   them.
-5. **Interlaced SDI (1080i):** refuse it in v1 (recommended), or add a GPU
+4. **Interlaced SDI (1080i):** refuse it in v1 (recommended), or add a GPU
    deinterlacer.
-6. **Audio-only takes:** allow, or keep "video must start the file".
+5. **Audio-only takes:** allow, or keep "video must start the file".
