@@ -171,6 +171,8 @@ struct UIInstallState: Sendable, Equatable {
   var unavailableReason: String?
   /// True when an Ultracam camera device is present in the system.
   var installed = true
+  /// What macOS says about the extension (versions, enabled, approval); nil until it answers.
+  var system: ExtensionSystemState?
   var needsApproval: Bool { status.localizedCaseInsensitiveContains("approve") }
 }
 

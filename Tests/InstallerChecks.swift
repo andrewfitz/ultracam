@@ -275,4 +275,78 @@ import XCTest
     XCTAssertTrue(installer.pending)
     XCTAssertEqual(harness.submitted.count, 2)
   }
+
+  // MARK: What macOS says about the extension
+
+  private func record(_ version: String, enabled: Bool = true, approval: Bool = false,
+    uninstalling: Bool = false) -> ExtensionSystemRecord {
+    ExtensionSystemRecord(bundleVersion: version, enabled: enabled, awaitingApproval: approval, uninstalling: uninstalling)
+  }
+
+  /// After an update from 7 to 8, macOS lists 8 enabled and 7 waiting to go at the next restart.
+  func testSystemStateAfterAnUpdateIsEnabledNotOutdated() {
+    let state = ExtensionSystemState(records: [record("7", uninstalling: true), record("8")], bundledVersion: "8")
+    XCTAssertEqual(state.enabledVersion, "8")
+    XCTAssertTrue(state.enabled)
+    XCTAssertTrue(state.replacing)
+    XCTAssertFalse(state.outdated)
+    XCTAssertFalse(state.awaitingApproval)
+  }
+
+  func testSystemStateComparesVersionsNumerically() {
+    XCTAssertTrue(ExtensionSystemState(records: [record("9")], bundledVersion: "10").outdated)
+    XCTAssertFalse(ExtensionSystemState(records: [record("10")], bundledVersion: "9").outdated)
+    XCTAssertEqual(ExtensionSystemState(records: [record("9"), record("10")], bundledVersion: nil).enabledVersion, "10")
+    XCTAssertFalse(ExtensionSystemState(records: [record("9")], bundledVersion: nil).outdated)
+  }
+
+  func testSystemStateIgnoresVersionsOnTheirWayOut() {
+    let state = ExtensionSystemState(records: [record("7", uninstalling: true)], bundledVersion: "8")
+    XCTAssertNil(state.enabledVersion)
+    XCTAssertFalse(state.enabled)
+    XCTAssertFalse(state.outdated)
+    let approval = ExtensionSystemState(records: [record("8", enabled: false, approval: true)], bundledVersion: "8")
+    XCTAssertTrue(approval.awaitingApproval)
+    XCTAssertFalse(approval.enabled)
+  }
+
+  /// The installer asks at launch and again after each request, and never when it can't request changes.
+  func testInstallerAsksMacOSAtLaunchAndAfterEachRequest() throws {
+    let harness = InstallerHarness()
+    var services = harness.services()
+    var queries = 0
+    services.queryProperties = { reply in
+      queries += 1
+      reply([ExtensionSystemRecord(bundleVersion: "8", enabled: true, awaitingApproval: false, uninstalling: false)])
+    }
+    services.bundledVersion = { "8" }
+    let installer = ExtensionInstaller(services: services)
+    callbacks()
+    XCTAssertEqual(queries, 1)
+    XCTAssertEqual(installer.system?.enabledVersion, "8")
+    installer.install()
+    let request = try XCTUnwrap(harness.submitted.first)
+    installer.request(request, didFinishWithResult: .completed)
+    callbacks()
+    XCTAssertEqual(queries, 2)
+
+    harness.signing = ExtensionInstallPreflight(developerSigned: false, hasInstallEntitlement: false)
+    var unsigned = harness.services()
+    var unsignedQueries = 0
+    unsigned.queryProperties = { _ in unsignedQueries += 1 }
+    let refused = ExtensionInstaller(services: unsigned)
+    callbacks()
+    XCTAssertEqual(unsignedQueries, 0)
+    XCTAssertNil(refused.system)
+  }
+
+  /// No answer (the request failed) keeps what was known rather than claiming "not installed".
+  func testNoAnswerLeavesTheStateUnknown() {
+    let harness = InstallerHarness()
+    var services = harness.services()
+    services.queryProperties = { reply in reply(nil) }
+    let installer = ExtensionInstaller(services: services)
+    callbacks()
+    XCTAssertNil(installer.system)
+  }
 }

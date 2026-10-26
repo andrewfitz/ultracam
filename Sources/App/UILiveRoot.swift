@@ -35,7 +35,9 @@ extension UISessionBridge {
   }
 
   func context() -> UIContext {
-    let session = snapshot()
+    var session = snapshot()
+    // Its cameras alone can't tell "not installed" from "enabled, not started yet".
+    session.install.system = model.installer.system
     let interface = self.interface
     let bridge = self
     return UIContext(session: session, presentation: UIPresentationBuilder.session(session),

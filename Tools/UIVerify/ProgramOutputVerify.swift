@@ -12,6 +12,44 @@ import SwiftUI
     pendingSwitch(verifier)
     menuBar(verifier)
     views(verifier, render: render)
+    extensionBanner(verifier, render: render)
+  }
+
+  // MARK: Camera extension banner
+
+  /// After an update macOS has the new version enabled but hasn't started it, so no
+  /// Ultracam cameras exist yet: that's a restart, not a missing install.
+  static func extensionBanner(_ verifier: Verifier, render: (String, AnyView, CGSize, Bool) -> Void) {
+    func record(_ version: String, enabled: Bool = true, approval: Bool = false, uninstalling: Bool = false) -> ExtensionSystemRecord {
+      ExtensionSystemRecord(bundleVersion: version, enabled: enabled, awaitingApproval: approval, uninstalling: uninstalling)
+    }
+    func install(_ records: [ExtensionSystemRecord]?, installed: Bool, bundled: String = "8") -> UIInstallState {
+      var state = UIInstallState(canRequestChanges: true, pending: false, status: "", unavailableReason: nil, installed: installed)
+      state.system = records.map { ExtensionSystemState(records: $0, bundledVersion: bundled) }
+      return state
+    }
+    let updated = [record("7", uninstalling: true), record("8")]
+    verifier.check("extension banner: enabled, no cameras yet → restart, no Install",
+      UIExtensionBanner.state(install(updated, installed: false)) == .needsRestart)
+    verifier.check("extension banner: enabled with cameras → none", UIExtensionBanner.state(install(updated, installed: true)) == nil)
+    verifier.check("extension banner: older enabled version → Update",
+      UIExtensionBanner.state(install([record("7")], installed: true)) == .outdated(installed: "7", bundled: "8"))
+    verifier.check("extension banner: older and not started → Update first",
+      UIExtensionBanner.state(install([record("7")], installed: false)) == .outdated(installed: "7", bundled: "8"))
+    verifier.check("extension banner: only a version on its way out → Install",
+      UIExtensionBanner.state(install([record("7", uninstalling: true)], installed: false)) == .notInstalled)
+    verifier.check("extension banner: macOS unknown and no cameras → Install",
+      UIExtensionBanner.state(install(nil, installed: false)) == .notInstalled)
+    verifier.check("extension banner: awaiting approval → approve",
+      UIExtensionBanner.state(install([record("8", enabled: false, approval: true)], installed: false))
+        == .needsApproval(UIExtensionBanner.approvalText))
+
+    for (name, state) in [("restart", install(updated, installed: false)), ("update", install([record("7")], installed: true))] {
+      var session = UIFixtures.standalone()
+      session.install = state
+      render("component-sidebar-extension-\(name)", AnyView(UISessionSidebarView(context: .fixture(session))),
+        CGSize(width: 260, height: 520), false)
+    }
   }
 
   // MARK: Fixtures

@@ -295,7 +295,7 @@ struct UISettingsCameraPane: View {
         LabeledContent {
           HStack {
             if installer.pending { ProgressView().controlSize(.small) }
-            Button("Install Camera Extension…") { installer.install() }
+            Button(installer.system?.outdated == true ? "Update Camera Extension…" : "Install Camera Extension…") { installer.install() }
             Button("Remove Camera Extension…") { installer.uninstall() }
           }
           .disabled(!installer.canRequestChanges || installer.pending || model.running)
@@ -358,8 +358,16 @@ struct UISettingsCameraPane: View {
     let installer = model.installer
     if installer.unavailableReason != nil { return "Needs a signed build" }
     if installer.pending { return "Waiting for macOS…" }
-    if needsApproval { return "Needs approval" }
-    return UIExtensionDetector.isInstalled() ? "Installed" : "Not installed"
+    if needsApproval || (installer.system?.awaitingApproval == true && installer.system?.enabled == false) { return "Needs approval" }
+    let published = UIExtensionDetector.isInstalled()
+    if let system = installer.system, system.enabled {
+      // Enabled but not started (after an update, until a restart): installing again wouldn't help.
+      if system.outdated, let installed = system.enabledVersion, let bundled = system.bundledVersion {
+        return "Version \(installed) installed · \(bundled) available"
+      }
+      return published ? "Installed" : "Restart your Mac to finish installing"
+    }
+    return published ? "Installed" : "Not installed"
   }
 
   private func extensionFooter(needsApproval: Bool) -> String {

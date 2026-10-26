@@ -394,11 +394,27 @@ enum UIExtensionBanner: Equatable {
   case pending(String)
   case needsApproval(String)
   case notInstalled
+  /// macOS has the extension enabled but hasn't started it, so it has no cameras yet
+  /// (after an update, until the Mac restarts). Installing again wouldn't help.
+  case needsRestart
+  /// The enabled extension is older than the one in this app.
+  case outdated(installed: String, bundled: String)
+
+  static let approvalText = "Approve Ultracam in System Settings › General › Login Items & Extensions › Camera Extensions."
 
   static func state(_ install: UIInstallState) -> UIExtensionBanner? {
     if install.needsApproval { return .needsApproval(install.status) }
     if install.pending { return .pending(install.status.isEmpty ? "Requesting camera activation…" : install.status) }
     if let reason = install.unavailableReason, !install.canRequestChanges { return .unavailable(reason) }
+    if let system = install.system {
+      if system.awaitingApproval && !system.enabled { return .needsApproval(approvalText) }
+      if system.enabled {
+        if system.outdated, install.canRequestChanges, let installed = system.enabledVersion, let bundled = system.bundledVersion {
+          return .outdated(installed: installed, bundled: bundled)
+        }
+        return install.installed ? nil : .needsRestart
+      }
+    }
     if install.canRequestChanges && !install.installed { return .notInstalled }
     return nil
   }
@@ -427,6 +443,18 @@ struct UIExtensionBannerView: View {
         Button("Install Camera") { context.send(.installCameraExtension) }
           .controlSize(.small)
           .help("Request installation of the Ultracam camera extension.")
+      case .needsRestart:
+        Label("Finish installing the camera", systemImage: "arrow.clockwise.circle").font(.body.weight(.semibold)).lineLimit(2)
+        Text("Restart your Mac to start the Ultracam camera.")
+          .font(.subheadline).foregroundStyle(.secondary).lineLimit(4)
+          .help("macOS has the camera extension enabled but hasn't started it yet, which usually happens after an update. Capture, preview and recording work meanwhile.")
+      case .outdated(let installed, let bundled):
+        Label("Update the Ultracam camera", systemImage: "arrow.down.circle").font(.body.weight(.semibold)).lineLimit(2)
+        Text("Version \(installed) is installed; this app has \(bundled).")
+          .font(.subheadline).foregroundStyle(.secondary).lineLimit(4)
+        Button("Update Camera") { context.send(.installCameraExtension) }
+          .controlSize(.small)
+          .help("Replace the installed camera extension with this app's version. macOS may ask you to restart.")
       case .needsApproval(let status):
         Label {
           Text("Approve the Ultracam camera")

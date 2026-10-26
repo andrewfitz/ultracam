@@ -72,6 +72,88 @@ struct ExtensionInstallPreflight: Sendable {
   }
 }
 
+/// One version of the camera extension as macOS reports it (`OSSystemExtensionProperties`).
+struct ExtensionSystemRecord: Equatable, Sendable {
+  var bundleVersion: String
+  var enabled: Bool
+  var awaitingApproval: Bool
+  var uninstalling: Bool
+}
+
+/// What macOS says about the camera extension, against the version this app carries.
+/// A replaced version stays listed (uninstalling) until the Mac restarts, and a newly
+/// enabled one may not have published its cameras yet.
+struct ExtensionSystemState: Equatable, Sendable {
+  /// The newest enabled version that isn't on its way out.
+  var enabledVersion: String?
+  var awaitingApproval: Bool
+  /// A replaced version is waiting to be removed at the next restart.
+  var replacing: Bool
+  /// The version inside this app (CFBundleVersion), if known.
+  var bundledVersion: String?
+
+  init(records: [ExtensionSystemRecord], bundledVersion: String?) {
+    let live = records.filter { $0.enabled && !$0.uninstalling }
+    enabledVersion = live.map(\.bundleVersion).max { $0.compare($1, options: .numeric) == .orderedAscending }
+    awaitingApproval = records.contains { $0.awaitingApproval && !$0.uninstalling }
+    replacing = records.contains(where: \.uninstalling)
+    self.bundledVersion = bundledVersion
+  }
+
+  var enabled: Bool { enabledVersion != nil }
+
+  /// The enabled extension is older than the one this app would install.
+  var outdated: Bool {
+    guard let enabledVersion, let bundledVersion else { return false }
+    return bundledVersion.compare(enabledVersion, options: .numeric) == .orderedDescending
+  }
+
+  /// CFBundleVersion of the extension inside this app.
+  static func bundledVersion(in bundle: Bundle = .main) -> String? {
+    let url = bundle.bundleURL.appendingPathComponent("Contents/Library/SystemExtensions/\(VideoContract.extensionID).systemextension")
+    return Bundle(url: url)?.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+  }
+}
+
+/// Asks macOS for the camera extension's properties. Keeps itself alive until the answer comes.
+private final class ExtensionPropertiesQuery: NSObject, OSSystemExtensionRequestDelegate, @unchecked Sendable {
+  private let completion: @Sendable ([ExtensionSystemRecord]?) -> Void
+  private let lock = NSLock()
+  private var retained: ExtensionPropertiesQuery?
+
+  init(completion: @escaping @Sendable ([ExtensionSystemRecord]?) -> Void) {
+    self.completion = completion
+    super.init()
+    retained = self
+  }
+
+  static func run(completion: @escaping @Sendable ([ExtensionSystemRecord]?) -> Void) {
+    let query = ExtensionPropertiesQuery(completion: completion)
+    let request = OSSystemExtensionRequest.propertiesRequest(forExtensionWithIdentifier: VideoContract.extensionID, queue: .main)
+    request.delegate = query
+    OSSystemExtensionManager.shared.submitRequest(request)
+  }
+
+  private func answer(_ records: [ExtensionSystemRecord]?) {
+    guard let query = lock.withLock({ () -> ExtensionPropertiesQuery? in defer { retained = nil }; return retained }) else { return }
+    query.completion(records)
+  }
+
+  func request(_ request: OSSystemExtensionRequest, foundProperties properties: [OSSystemExtensionProperties]) {
+    answer(properties.map { ExtensionSystemRecord(bundleVersion: $0.bundleVersion, enabled: $0.isEnabled,
+      awaitingApproval: $0.isAwaitingUserApproval, uninstalling: $0.isUninstalling) })
+  }
+
+  func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {
+    answer(nil)
+  }
+
+  func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) { answer(nil) }
+  func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {}
+  func request(_ request: OSSystemExtensionRequest, actionForReplacingExtension existing: OSSystemExtensionProperties,
+    withExtension replacement: OSSystemExtensionProperties) -> OSSystemExtensionRequest.ReplacementAction { .cancel }
+}
+
 /// The request in flight, readable from the delegate's nonisolated callbacks.
 /// Requests are compared by reference, not by address: a request that has
 /// finished can be freed, and a newer one allocated at the same address.
@@ -101,6 +183,9 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     var preflight: () -> ExtensionInstallPreflight
     var makeRequest: (Change) -> OSSystemExtensionRequest
     var submit: (OSSystemExtensionRequest) -> Void
+    /// Asks macOS which versions of the extension it knows (nil when it couldn't say).
+    var queryProperties: (@escaping @Sendable ([ExtensionSystemRecord]?) -> Void) -> Void = { _ in }
+    var bundledVersion: () -> String? = { nil }
 
     static func live() -> Self {
       Self(preflight: { ExtensionInstallPreflight.current() }, makeRequest: { change in
@@ -110,7 +195,9 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
         case .remove:
           return .deactivationRequest(forExtensionWithIdentifier: VideoContract.extensionID, queue: .main)
         }
-      }, submit: { OSSystemExtensionManager.shared.submitRequest($0) })
+      }, submit: { OSSystemExtensionManager.shared.submitRequest($0) },
+      queryProperties: { ExtensionPropertiesQuery.run(completion: $0) },
+      bundledVersion: { ExtensionSystemState.bundledVersion() })
     }
   }
 
@@ -118,6 +205,8 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   private(set) var pending = false
   private(set) var unavailableReason: String?
   var canRequestChanges: Bool { unavailableReason == nil }
+  /// What macOS last said about the extension; nil until it answers (or when it can't be asked).
+  private(set) var system: ExtensionSystemState?
 
   @ObservationIgnored private let services: Services
   @ObservationIgnored private var activeRequest: OSSystemExtensionRequest?
@@ -132,6 +221,18 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     unavailableReason = preflight.unavailableReason
     status = preflight.readyStatus
     super.init()
+    refreshSystemState()
+  }
+
+  /// Asks macOS about the extension again: at launch and after each install or removal.
+  /// Its cameras alone can't tell "not installed" from "enabled, not started yet".
+  func refreshSystemState() {
+    guard canRequestChanges else { return }
+    let bundled = services.bundledVersion()
+    services.queryProperties { [weak self] records in
+      guard let records else { return }
+      Task { @MainActor [weak self] in self?.system = ExtensionSystemState(records: records, bundledVersion: bundled) }
+    }
   }
 
   func install() { requestChange(.install) }
@@ -167,6 +268,7 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     activeChange = nil
     pending = false
     status = message
+    refreshSystemState()
   }
 
   /// Drops the identity token while leaving the in-flight request pending.
