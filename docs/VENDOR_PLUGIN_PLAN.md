@@ -65,34 +65,24 @@ Not covered by this plan:
 
 ### The single input format
 
-The whole capture path accepts exactly one format: 3840×2160, 10-bit 4:2:2
-(v210 or 10-bit 4:2:2 biplanar), at 29.97 or 59.94 fps. These gates enforce
-it:
+The whole app assumes one source: 3840×2160 10-bit 4:2:2 (v210 or 10-bit
+4:2:2 biplanar) at 29.97 or 59.94 fps, Rec.709, with 48 kHz 32-bit stereo
+audio paired with each frame, over HDMI.
 
-- `UltracamBackend.mm:851`: the DeckLink backend refuses any other frame.
-- `CaptureController.swift:1048-1056`: the controller fails any other size,
-  format or frame duration.
-- `CaptureController.swift:971-976`: recording admission has the same limits.
-- `LUTProcessor.swift:533-538`: the processor validates the input. The warm
-  buffer at `:422` is fixed to 4K v210.
-- `VideoContract.swift:180-181` and `VideoBufferLayout.swift:30-32`: the
-  layout and format checks are shared with the camera extension, whose format
-  list is `CameraProvider.swift:133-136`.
-- `VideoContract.swift:67-69`: the format description is hard-coded to
-  BT.709.
-- Recording:
-  - `RecordingPixelConverter.swift:208` (v210 only);
-  - `SourceRecording.swift:73`;
-  - `ProResRecordingConfiguration.swift:123-125`.
-- `ProgramNormalizer.swift:516-525`.
+That assumption is enforced at about a dozen gates, starting with
+`UltracamBackend.mm:851`, `CaptureController.swift:1048-1056` and
+`LUTProcessor.swift:533-538`. Below the gates it is baked in as constants:
+- shader maths, buffer sizes and timescales;
+- recording settings, the extension's format list, and stored settings;
+- UI text.
 
-`LUTProcessor.swift:863-874` lists copy-texture layouts for 8-bit and 4:2:0
-formats. That is not an input contract: those paths can't be reached, because
-the checks above run first. Of all the stages, only MonitorKit takes `2vuy`
-today.
+`LUTProcessor.swift:863-874` lists 8-bit and 4:2:0 copy layouts, but nothing
+can reach them, because the gates run first.
 
-The limit also hits Blackmagic users: a 1080p camera on an UltraStudio is
-refused. Part B is worth doing for DeckLink alone.
+The full inventory, about 150 items, is in
+[SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md) (Part B). The limit also
+refuses a 1080p camera on an UltraStudio, so Part B is worth doing for DeckLink
+alone.
 
 ### Audio
 
@@ -154,7 +144,7 @@ protocol CaptureSession: AnyObject, Sendable {
   /// The format this session will deliver, known before the first frame,
   /// so the controller can warm the GPU and connect the camera sink
   /// (today's `capturePixelFormat`, `CaptureController.swift:414-417`).
-  var nativeFormat: CaptureFormat { get }
+  var nativeFormat: SourceFormat { get }
   func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws
   func stop()
   var counters: CaptureCounters { get }              // device drops, backlog, max backlog
@@ -169,7 +159,7 @@ struct CaptureHandlers: Sendable {
 
 enum CaptureEvent: Sendable {
   case waitingForSignal, signalLost(reason: String), unsupportedInput(String),
-       formatChanged(CaptureFormat), fatal(String), info(String)
+       formatChanged(SourceFormat), fatal(String), info(String)
 }
 ```
 
@@ -177,12 +167,15 @@ enum CaptureEvent: Sendable {
 - `CaptureFrameInfo` carries a `Timecode` struct: hours, minutes, seconds,
   frames, a drop-frame flag, and the rate. It is tied to its frame and
   replaces the string.
-- `CaptureFormat` gives size, pixel format, nominal frame duration, colour
-  primaries, transfer function, matrix and range.
-- `CaptureAudioPacket` gives interleaved PCM, sample rate, channel count,
-  bytes per sample, and packet time on the plugin's own audio clock.
+- `SourceFormat`, `FrameRate`, `Colorimetry`, `SourceAudioFormat` and
+  `Timecode` are defined in [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md):
+  size, scan, pixel format, colour, exact rate and audio format with its
+  clock domain.
+- `CaptureAudioPacket` gives interleaved PCM, its `SourceAudioFormat`, and the
+  packet time in that format's clock domain.
 - `CaptureTiming` is `.automatic` (follow the source's mode) or
-  `.fixed(inputFast:)`.
+  `.fixed(SourceFormat)`. Until B3, the DeckLink plugin maps `.fixed` onto
+  today's `inputFast` flag.
 
 **Event wording:** the core turns events into user text, worded neutrally
 ("Waiting for signal…"). Plugins add vendor hints through
@@ -296,51 +289,19 @@ them acceptance criteria:
 
 ## Part B: opening the input contract
 
-Part A leaves the pipeline's single-format limit alone. Part B makes it a
-per-source contract, still entirely on the GPU. In order:
+Decided on 2026-10-26: Part B is in scope and covers every hard-coded source
+assumption. It is planned in [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md):
+- the `SourceFormat`, `FrameRate`, `Colorimetry`, `SourceAudioFormat` and
+  `Timecode` types;
+- one pixel-format table shared with the extension;
+- the full inventory in 15 categories;
+- bugs to fix now;
+- steps B0-B9, verification, and its own decisions.
 
-1. **One `CaptureFormat` per session.**
-   - The controller's gate (`CaptureController.swift:1048-1056`) and recording
-     admission (`:971-976`) compare frames against the session's declared and
-     detected format, not against constants.
-   - `VideoContract` stops hard-coding 3840 and BT.709.
-2. **Size.**
-   - Sizing in `LUTProcessor`, the warm buffer (`:422`), the camera sink and
-     the extension format list (`CameraProvider.swift:133-136`) all follow the
-     source. Only append to that list: its indices are part of the stream
-     contract.
-   - The existing "Resize to" target (`UIInspector.swift:160`) is what keeps
-     the virtual camera output fixed when the input changes.
-3. **Pixel formats, highest value first:**
-   - 1080p and 4K v210 from DeckLink, which needs only items 1-2;
-   - 8-bit 4:2:0 biplanar (`420v`/`420f`, which webcams can deliver);
-   - packed 8-bit 4:2:2 (`2vuy`).
-
-   Each format needs, on the GPU:
-   - `VideoBufferLayout.validate` (shared with the extension);
-   - a `LUTProcessor` input kernel;
-   - `ProgramNormalizer` (`:516-525`);
-   - `RecordingPixelConverter` (`:208` is v210 only);
-   - `SourceRecording` (`:73`);
-   - the ProRes configuration (`ProResRecordingConfiguration.swift:123-125`).
-
-   MonitorKit already takes all three.
-4. **Frame rates.**
-   - Any constant rate the source declares. For DeckLink, the set it already
-     detects.
-   - **Variable frame rate** (webcams): decide whether recording conforms it
-     to a constant rate (dropping or repeating whole frames at the recorder,
-     shown as counted events) or refuses it, as now (`:973`). Today a change
-     in duration also resets drop counting on every frame (`:946-949`).
-5. **Audio.** Accept other rates and sample sizes in
-   `EmbeddedAudioClockAnchor` and the recorder. Add host-time placement for
-   audio that arrives without a paired frame, such as a UVC camera's separate
-   Core Audio device.
-
-Part B touches the hottest code in the app (capture, LUT, recording,
-extension), so each format lands with:
-- the existing GPU checks (`GPUExtendedChecks`, `EndToEndChecks`);
-- a live test by Andrew on the FX3 at 4K59.94 to confirm nothing regressed.
+The plugin API above carries these types: `CaptureSession.nativeFormat` is a
+`SourceFormat`, and `CaptureAudioPacket` carries a `SourceAudioFormat`. A
+plugin written against Part A doesn't change when Part B lands, and Part B
+only widens which formats it may declare.
 
 ## Folder layout and SDKs
 
@@ -527,8 +488,8 @@ whatever happens to plugins:
   manufacturer is "Ultracam" (`CameraProvider.swift:208`). It should hide
   other virtual cameras (OBS, Continuity Camera) by default too.
 - **Webcam timing** is variable-rate and stamps the start of the frame (see
-  Part B, item 4, and the host-time rule).
-- **Separate audio devices** have no frame to pair with (Part B, item 5).
+  SOURCE_FORMAT_PLAN.md section 4, and the host-time rule).
+- **Separate audio devices** have no frame to pair with (SOURCE_FORMAT_PLAN.md section 7, clock domains).
 - **Devices shared with other apps.** A webcam in use by another app may
   refuse to start or change format underneath us. That should surface as
   `unsupportedInput` or `signalLost`, not as a fatal error.
@@ -590,30 +551,35 @@ and again after each Part B format.
    - SDK policy and the conformance suite;
    - what Part B does and doesn't support yet.
 
-That completes Part A. Part B's items follow, in order. Then comes the first
-new vendor:
+That completes Part A. Part B ([SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md))
+fits around it:
+- B0 (fix now) can land at any time, even before step 1;
+- B1 starts after step 1, once DeviceAPI exists;
+- B2-B9 can overlap Part A steps 3-6, as long as each step owns its files.
+
+Then comes the first new vendor:
 - **AJA** fits today's single 4K 10-bit format, so it would prove the capture
   API without waiting on Part B. It needs AJA hardware.
-- **UVC** needs no SDK and no special hardware, but it needs Part B items 1-5
-  first.
+- **UVC** needs no SDK and no special hardware, but it needs B1-B6 first:
+  size, rate, colour, the `420v`/`2vuy` formats, and separate-device audio.
 
 Whichever comes first, expect it to force small API fixes, and make them
 before anyone outside builds on the API.
 
 ## Open decisions
 
-1. **Input scope:** do Part B (recommended, since it also lets 1080p
-   Blackmagic sources in), or declare v1 plugins limited to 4K 10-bit 4:2:2 at
-   29.97/59.94.
-2. **Isolation:** one module with a boundary-check script (recommended now),
+Decided on 2026-10-26: Part B is in scope and covers every hard-coded
+assumption. Part B's own decisions (VFR, Program rate conversion, aspect,
+CPU-memory sources, interlaced, audio-only takes) are in
+[SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md).
+
+1. **Isolation:** one module with a boundary-check script (recommended now),
    or a Swift package per plugin. Packages are enforced by the compiler, but
    they rework `test.sh` and `ui-verify.sh`, and Sony's dylibs would have to
    be wrapped as an xcframework.
-3. **Folder location:** top-level `Vendors/` (recommended, because the SDKs
+2. **Folder location:** top-level `Vendors/` (recommended, because the SDKs
    sit next to the code) or `Sources/Vendors/`.
-4. **Release builds without the Sony SDK:** ship with Sony control shown as
+3. **Release builds without the Sony SDK:** ship with Sony control shown as
    unavailable (as now), or have `build.sh` refuse a release build that is
    missing a plugin's SDK.
-5. **Variable-frame-rate sources:** conform them at the recorder, or refuse
-   them.
-6. **Going public:** choose a license, and make the build root configurable.
+4. **Going public:** choose a license, and make the build root configurable.
