@@ -564,7 +564,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
 
   func testCaptureMediaStatsExposeLevelsTimecodeRatesAndDropAccounting() throws {
     let harness = CaptureHarness()
-    let controller = CaptureController(services: harness.services(), previewRenderer: nil)
+    let controller = CaptureController(services: harness.services())
     let statuses = CaptureStatusRecorder()
     controller.onUpdate = { statuses.record($0) }
     defer { controller.onUpdate = nil; controller.stop() }
@@ -596,7 +596,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
 
   func testAudioDropAccountingUsesFixedDeckLink48KHzClock() throws {
     let harness = CaptureHarness()
-    let controller = CaptureController(services: harness.services(), previewRenderer: nil)
+    let controller = CaptureController(services: harness.services())
     let statuses = CaptureStatusRecorder()
     controller.onUpdate = { statuses.record($0) }
     defer { controller.onUpdate = nil; controller.stop() }
@@ -629,7 +629,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let entered = expectation(description: "Capture queue held inside native start")
     let gate = DispatchSemaphore(value: 0)
     let harness = CaptureHarness(startGate: gate, started: entered)
-    let controller = CaptureController(services: harness.services(), previewRenderer: nil)
+    let controller = CaptureController(services: harness.services())
     let statuses = CaptureStatusRecorder()
     controller.onUpdate = { statuses.record($0) }
     defer {
@@ -965,7 +965,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(harness.previewed, burst)
     awaitCondition("The backlog must be visible in status") { (statuses.last?.maxCaptureBacklog ?? 0) >= burst }
     XCTAssertEqual(statuses.drops, 0)
-    XCTAssertEqual(statuses.last?.captureDrops, 0)
+    XCTAssertEqual(statuses.last?.sourceDrops, 0)
     XCTAssertEqual(statuses.last?.poolDrops, 0)
     XCTAssertEqual(statuses.last?.cameraDrops, 0)
     XCTAssertGreaterThan(statuses.last?.lateFrames ?? 0, 0, "Frames processed long after capture are counted late")

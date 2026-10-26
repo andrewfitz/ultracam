@@ -50,7 +50,6 @@ import MonitorKit
     var scopeVisible = false
     var presented: Bool?
     var drawable: Bool?
-    var usesNativePreview = false
   }
   private var surfaces: [UUID: Surface] = [:]
   private var lastDemand: Set<MonitorTargetID> = []
@@ -345,18 +344,11 @@ import MonitorKit
     return presenter
   }
 
-  /// `usesNativePreview` marks a surface whose picture comes from elsewhere; it
-  /// takes no monitor frames. `presentationScopeVisible` is accepted for source
-  /// compatibility and no longer used.
-  func registerSurface(
-    id: UUID, target: MonitorTargetID, isVisible: Bool, scopeVisible: Bool,
-    usesNativePreview: Bool = false, presentationScopeVisible: Bool? = nil
-  ) {
+  func registerSurface(id: UUID, target: MonitorTargetID, isVisible: Bool, scopeVisible: Bool) {
     let presenter = surface(id: id, target: target)
     var value = surfaces[id] ?? Surface(target: target, presenter: presenter)
     value.visible = isVisible
     value.scopeVisible = scopeVisible
-    value.usesNativePreview = usesNativePreview
     surfaces[id] = value
     refreshHost(target)
     refreshDemand()
@@ -382,7 +374,7 @@ import MonitorKit
     host.setMonitorLUT(value.monitorLUT)
     let available = targets.contains { $0.id == target && $0.isAvailable }
     let live = all.filter {
-      $0.visible && !$0.presenter.holdsFreeze && !$0.usesNativePreview && available
+      $0.visible && !$0.presenter.holdsFreeze && available
         && isPreviewEnabled(for: target) && ($0.presented ?? true) && ($0.drawable ?? true)
     }
     host.setConsumers(live.map(\.presenter))

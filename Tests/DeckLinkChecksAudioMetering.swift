@@ -193,7 +193,7 @@ extension DeckLinkChecks {
   @objc func testRecordingGetsEveryPacketAndFrameWhileTheMetersStall() throws {
     let image = try syntheticRamp()
     let harness = DriverHarness()
-    let controller = CaptureController(services: harness.services, previewRenderer: nil)
+    let controller = CaptureController(services: harness.services)
     defer {
       controller.onUpdate = nil
       controller.stop()
@@ -301,7 +301,7 @@ extension DeckLinkChecks {
   /// stall never leaves a warning on later captures.
   @objc func testCoalescedMeterPacketsArePerCaptureAndZeroWhenStopped() throws {
     let harness = DriverHarness()
-    let controller = CaptureController(services: harness.services, previewRenderer: nil)
+    let controller = CaptureController(services: harness.services)
     defer {
       controller.onUpdate = nil
       controller.stop()
@@ -347,7 +347,7 @@ extension DeckLinkChecks {
     let image = try syntheticRamp()
     let harness = DriverHarness()
     let other = DriverHarness()
-    let controller = CaptureController(services: harness.services, previewRenderer: nil)
+    let controller = CaptureController(services: harness.services)
     defer {
       controller.onUpdate = nil
       controller.stop()

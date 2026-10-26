@@ -114,7 +114,6 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var lutError: String?
   var gamut = "S-Gamut3.Cine / S-Log3"
   var previewEnabled = true
-  var previewError: String?
   var automaticStart = false
   var automaticStatus: String?
   /// Automatic mode tried to start this camera and failed; Retry is available.

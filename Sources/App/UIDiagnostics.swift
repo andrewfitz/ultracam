@@ -129,11 +129,8 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Late processing", UIDiagnosticsFormat.count(update.lateFrames), warning: update.lateFrames > 0)
           UIDiagnosticsRow("Output stalls", UIDiagnosticsFormat.count(update.poolDrops), warning: update.poolDrops > 0)
           UIDiagnosticsRow("Camera stalls", UIDiagnosticsFormat.count(update.cameraDrops), warning: update.cameraDrops > 0)
-          UIDiagnosticsRow("Preview", UIDiagnosticsFormat.count(update.previewDrops), warning: update.previewDrops > 0)
-          UIDiagnosticsRow("Preview replaced before display", UIDiagnosticsFormat.count(update.previewLateFrames),
-            warning: update.previewLateFrames > 0)
         } header: { Text("Drops by Stage") } footer: {
-          Text("Capture keeps every frame; a stage that can't keep up is counted as a stall. Late processing counts frames started over two frame intervals after capture. Preview includes frames a newer one replaced before the display took them (the preview never queues); the camera, Program and recordings still get those frames. Native renderer totals include prior runs. Intentional frame-rate reduction is excluded.")
+          Text("Capture keeps every frame; a stage that can't keep up is counted as a stall. Late processing counts frames started over two frame intervals after capture. Monitor pictures report their own counts below. Intentional frame-rate reduction is excluded.")
             .font(.caption).foregroundStyle(.secondary)
         }
         Section("Embedded Audio") {
@@ -183,7 +180,6 @@ private struct UIDiagnosticsCameraTab: View {
         Section("Messages") {
           UIDiagnosticsRow("Capture", update.message)
           UIDiagnosticsRow("Camera", update.cameraMessage)
-          UIDiagnosticsRow("Preview", update.previewError ?? "No preview error", warning: update.previewError != nil)
         }
       }
     }

@@ -172,27 +172,23 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
       "Late teardown/visibility from the old target must not remove its replacement")
   }
 
-  func testNativeToolsAndHiddenPreviewTransitionsPreserveIndependentDemand() {
+  func testToolsAndHiddenPreviewTransitionsPreserveIndependentDemand() {
     let value = coordinator()
     let a = UUID()
     let b = UUID()
     var demand: Set<MonitorTargetID> = []
     value.onDemandChange = { demand = $0 }
-    value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false, usesNativePreview: true)
+    value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false)
     value.registerSurface(id: b, target: beta, isVisible: true, scopeVisible: false)
     XCTAssertEqual(demand, [alpha, beta])
-    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers, "A native picture takes no monitor frames")
     var preferences = value.preferences(for: alpha)
     preferences.toolsEnabled = true
     preferences.state.zebras[0].enabled = true
     value.setPreferences(preferences, for: alpha)
-    value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false)
     XCTAssertTrue(value.captureSink(for: alpha).hasConsumers)
     preferences.toolsEnabled = false
     value.setPreferences(preferences, for: alpha)
     XCTAssertTrue(value.captureSink(for: alpha).hasConsumers, "Every monitor picture takes every frame, tools or not")
-    value.registerSurface(id: a, target: alpha, isVisible: true, scopeVisible: false, usesNativePreview: true)
-    XCTAssertFalse(value.captureSink(for: alpha).hasConsumers)
     XCTAssertEqual(demand, [alpha, beta])
     value.setPreviewEnabled(false, for: alpha)
     XCTAssertEqual(demand, [beta])
@@ -357,24 +353,6 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertEqual(value.preferences(for: alpha), MonitorFeedPreferences())
     XCTAssertEqual(reported, 0, "The owner already saved them")
   }
-
-  #if CAPTURE_LIFECYCLE_TESTS
-    func testNativePreviewRejectsLateFramesAfterSourceRebinding() throws {
-      let renderer = VideoPreviewRenderer(renderWhenUnattached: true)
-      let image = try monitorPixelBuffer(format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
-      let sample = try VideoContract.sample(image, at: .zero, duration: VideoContract.fastDuration)
-      renderer.bindSource("alpha")
-      renderer.enqueue(sample, sourceID: "alpha")
-      XCTAssertEqual(renderer.diagnosticsSnapshot().received, 1)
-      renderer.bindSource("beta")
-      renderer.enqueue(sample, sourceID: "alpha")
-      XCTAssertEqual(
-        renderer.diagnosticsSnapshot().received, 0,
-        "Already executing old-source processing must not cross the new native binding")
-      renderer.enqueue(sample, sourceID: "beta")
-      XCTAssertEqual(renderer.diagnosticsSnapshot().received, 1)
-    }
-  #endif
 
   /// Program's monitor gets the selected camera's processed frames, restarting
   /// at each cut, and its feed never takes a burn-in LUT: its frames are the

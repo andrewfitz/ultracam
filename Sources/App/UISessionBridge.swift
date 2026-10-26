@@ -130,7 +130,6 @@ struct UISessionBridge {
       camera.lutError = lut.error
       camera.gamut = descriptor.gamut
       camera.previewEnabled = descriptor.previewEnabled
-      camera.previewError = update?.previewError
       camera.automaticStart = descriptor.automaticFeed
       // A refused Start says why; otherwise an automatic camera's status.
       camera.automaticStatus = model.startRefusal(id) ?? (descriptor.automaticFeed ? model.automaticStatus(id) : nil)

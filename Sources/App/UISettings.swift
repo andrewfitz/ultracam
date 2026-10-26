@@ -768,11 +768,10 @@ enum UIDiagnosticsText {
         lines.append("Input: \(update.input)")
         lines.append("Output: \(update.output.isEmpty ? "—" : update.output)")
         lines.append(String(format: "Delivered: %.2f fps · processing %.2f ms · video %.2f Mb/s", update.outputFPS, update.processingMS, update.videoBitrateMbps))
-        lines.append("Drops: source \(update.sourceDrops), capture \(update.captureDrops), buffers \(update.poolDrops), camera \(update.cameraDrops), preview \(update.previewDrops)")
+        lines.append("Drops: source \(update.sourceDrops), buffers \(update.poolDrops), camera \(update.cameraDrops)")
         lines.append("Audio: \(update.audioPresent ? "\(update.audioChannels) ch \(update.audioSampleRate) Hz" : "none") · drops \(update.audioDrops)")
         lines.append("Message: \(update.message)")
         lines.append("Camera: \(update.cameraMessage)")
-        if let error = update.previewError { lines.append("Preview: \(error)") }
       }
       if let state = model.recordingModel.feeds.first(where: { $0.id == descriptor.id }) {
         lines.append("Recording: \(state.displayStatus)")

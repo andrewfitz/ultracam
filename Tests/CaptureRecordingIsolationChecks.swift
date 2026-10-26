@@ -49,7 +49,7 @@ import XCTest
     let image = try syntheticRamp()
     let entered = expectation(description: "Preview worker stalled")
     let harness = Harness(entered: entered)
-    let controller = CaptureController(services: harness.services, previewRenderer: nil)
+    let controller = CaptureController(services: harness.services)
     defer {
       harness.release.signal()
       controller.onUpdate = nil
@@ -120,7 +120,7 @@ import XCTest
     let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
     var services = harness.services
     services.preview = nil
-    let controller = CaptureController(services: services, previewRenderer: nil)
+    let controller = CaptureController(services: services)
     let target = MonitorTargetID("capture-tap-integration")
     // The monitor's endpoint and one surface, without a GPU: offers stop at its slot.
     let gpu = MonitorGPUContext(device: { nil })
@@ -329,7 +329,7 @@ import XCTest
         camera.append($0)
         return true
       }
-      let controller = CaptureController(services: services, previewRenderer: nil)
+      let controller = CaptureController(services: services)
       let target = MonitorTargetID("paced-combined-\(enabled)")
       let gpu = MonitorCoordinator.sharedGPU
       let sink = MonitorFeedHost(target: target.rawValue, gpu: gpu)
@@ -484,7 +484,7 @@ import XCTest
         }
       },
       stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true })
-    let controller = CaptureController(services: services, previewRenderer: nil)
+    let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop(); release.signal() }
     let feed = FeedID(rawValue: "callback-after-stop")
     let configuration = PipelineConfiguration(downscale: false, convertTo420: false)
@@ -619,7 +619,7 @@ import XCTest
       disconnect: {}, send: { _ in true })
     services.startAutomatic = { _, frames, _ in harness.lock.withLock { harness.handler = frames } }
     services.cameraRetryInterval = 0
-    let controller = CaptureController(services: services, previewRenderer: nil)
+    let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop() }
     let started = expectation(description: "automatic capture ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
@@ -648,7 +648,7 @@ import XCTest
     let services = CaptureServices(
       start: { _, _, _, _ in }, stop: {},
       connect: { _, _ in }, disconnect: {}, send: { _ in true })
-    let controller = CaptureController(services: services, previewRenderer: nil)
+    let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop() }
     var sawConnected = false
     controller.onUpdate = { update in
@@ -722,7 +722,7 @@ import XCTest
     let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
     var services = harness.services
     services.preview = nil
-    let controller = CaptureController(services: services, previewRenderer: nil)
+    let controller = CaptureController(services: services)
     let sink = SourceOfferLog()
     controller.setCameraOutputEnabled(false)
     controller.setMonitorSink(sink)

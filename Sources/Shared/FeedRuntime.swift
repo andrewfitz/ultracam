@@ -1071,11 +1071,10 @@ final class FeedCoordinator {
   /// its update stream, matching the established single-feed behavior.
   @discardableResult
   func startCapture(feedID: FeedID, deviceID: String, configuration: PipelineConfiguration,
-                    pipelineEnabled: Bool = true, previewEnabled: Bool = true) -> Bool {
+                    pipelineEnabled: Bool = true) -> Bool {
     guard start(feedID) else { return false }
     capture(for: feedID).start(feedID: feedID, deviceID: deviceID,
-      configuration: configuration, pipelineEnabled: pipelineEnabled,
-      previewEnabled: previewEnabled)
+      configuration: configuration, pipelineEnabled: pipelineEnabled)
     return true
   }
 
@@ -1096,10 +1095,6 @@ final class FeedCoordinator {
   func reconfigureCapture(feedID: FeedID, configuration: PipelineConfiguration,
                           pipelineEnabled: Bool) {
     capture(for: feedID).reconfigure(configuration: configuration, pipelineEnabled: pipelineEnabled)
-  }
-
-  func setPreviewEnabled(feedID: FeedID, enabled: Bool) {
-    capture(for: feedID).setPreviewEnabled(enabled)
   }
 
   func setRecordingCallbacks(feedID: FeedID,

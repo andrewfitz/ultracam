@@ -19,25 +19,12 @@ struct CaptureUpdate: @unchecked Sendable {
   var sourceDrops: UInt64 = 0
   /// Frames the capture device itself reported dropped (DeckLink).
   var deviceDrops: UInt64 = 0
-  /// Always zero: capture admits every frame. Kept for existing readers.
-  var captureDrops: UInt64 = 0
   /// Output stalls: frames that could not get an output buffer because a
   /// consumer held every one (`VideoContract.outputBufferLimit`).
   var poolDrops: UInt64 = 0
   /// Camera stalls and failures: the CMIO queue was full or the send failed.
   var cameraDrops: UInt64 = 0
-  /// Preview losses, including `previewLateFrames`.
-  var previewDrops: UInt64 = 0
-  var previewFrames: UInt64 = 0
-  /// Preview frames superseded by a newer one before the display took them
-  /// (the preview shows the newest frame and never queues behind the
-  /// display). A preview loss only: camera, Program and recording still get
-  /// every frame.
-  var previewLateFrames: UInt64 = 0
   var outputFPS: Double = 0
-  var displayedFrames: UInt64 = 0
-  var rendererDrops: UInt64 = 0
-  var previewError: String?
   /// Frames committed to the GPU and not yet complete, now and at most.
   var framesInFlight = 0
   var maxFramesInFlight = 0
@@ -110,7 +97,6 @@ struct CaptureRawAudio: @unchecked Sendable {
 //   camera connect can't delay it.
 // Every frame the driver delivers is processed; nothing is dropped for being
 // busy. A stage that can't keep up shows up as a counted, visible stall.
-// Preview visibility never controls camera processing.
 final class CaptureController: @unchecked Sendable {
   private let queue = DispatchQueue(label: "org.ultracam.capture", qos: .userInteractive)
   private let deliveryQueue = DispatchQueue(label: "org.ultracam.capture.delivery", qos: .userInteractive)
@@ -163,20 +149,11 @@ final class CaptureController: @unchecked Sendable {
   private let media = MediaState()
   private let camera = CameraLink()
   private let services: CaptureServices
-  private let previewRenderers: [VideoPreviewRenderer]
-  private var legacyPreviewOwner = true
   private var monitorSink: (any MonitorFrameSink)?
   private var monitorLifecycleSink: (any MonitorFrameSink)?
   private var monitorSequence: UInt64 = 0
-  private var ownedPreviewRenderers: [VideoPreviewRenderer] { legacyPreviewOwner ? previewRenderers : [] }
-  // Capture queue: bumped by every preview flush and frozen into each frame,
-  // so frames still on the GPU at a flush can't reach the preview after it.
-  private var previewEpoch: UInt64 = 0
   // Delivery-queue owned.
   private let sampleFactory = VideoSampleFactory()
-  // Boxed so the flush that deinit's teardown queues doesn't retain self.
-  private final class EpochFloor: @unchecked Sendable { var value: UInt64 = 0 }
-  private let previewEpochFloor = EpochFloor()
   private var processor: LUTProcessor?
   private var configuration = PipelineConfiguration()
   private var pipelineEnabled = true
@@ -266,10 +243,8 @@ final class CaptureController: @unchecked Sendable {
   /// stop the native controller more than once during one session teardown.
   var generationToken: UInt64 { lock.withLock { generation } }
 
-  init(services: CaptureServices = .live(), previewRenderer: VideoPreviewRenderer? = nil,
-    additionalPreviewRenderers: [VideoPreviewRenderer] = []) {
+  init(services: CaptureServices = .live()) {
     self.services = services
-    previewRenderers = (previewRenderer.map { [$0] } ?? []) + additionalPreviewRenderers
     queue.setSpecific(key: queueKey, value: 1)
     controlQueue.setSpecific(key: controlKey, value: 1)
     // The over log names the source timecode at the over, read from the
@@ -345,7 +320,6 @@ final class CaptureController: @unchecked Sendable {
         try self.makeProcessor().load(lut)
         self.lock.withLock { self.loadedLUT = lut }
         lutLog.notice("LUT \"\(lut.cube.title, privacy: .public)\" in the pipeline of \(self.cameraLabel, privacy: .public) (controller \(UInt(bitPattern: ObjectIdentifier(self).hashValue), format: .hex, privacy: .public)); burned in: \(self.pipelineEnabled && self.configuration.applyLUT, privacy: .public)")
-        if self.pipelineEnabled && self.configuration.applyLUT { self.flushOwnedPreviews() }
         DispatchQueue.main.async { completion(.success(())) }
       } catch {
         lutLog.error("LUT not loaded into \(self.cameraLabel, privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -458,8 +432,7 @@ final class CaptureController: @unchecked Sendable {
           self.stopResources(preserveRecordingCallbacks: true)
           return
         }
-        let hasPreview = previewEnabled &&
-          (self.ownedPreviewRenderers.contains { $0.isVisible } || self.services.preview != nil)
+        let hasPreview = previewEnabled && self.services.preview != nil
         // Every consumer that makes the first frame do GPU work, including a
         // headless Program source. The monitor is not one: it shows the source
         // (and the burn-in LUT in its own shader), so it never forces processing.
@@ -616,7 +589,6 @@ final class CaptureController: @unchecked Sendable {
       self.applied = nil
       self.outputLabel = ""
       self.resetSampleFormat()
-      self.flushOwnedPreviews()
       self.message = self.detected == nil ? "Waiting for UltraStudio signal…" : "Updating output…"
       self.publishCurrent(token: token)
       // First new frame establishes the exact source-dependent output contract.
@@ -644,13 +616,8 @@ final class CaptureController: @unchecked Sendable {
     queue.async {
       guard self.isAccepting(token) else { return }
       self.previewEnabled = enabled
-      if !enabled { self.flushOwnedPreviews() }
       self.publishCurrent(token: token)
     }
-  }
-
-  func setLegacyPreviewOwnership(_ enabled: Bool) {
-    queue.async { self.legacyPreviewOwner = enabled }
   }
 
   /// The monitor's endpoint for this camera: every frame's source buffer, in
@@ -773,10 +740,9 @@ final class CaptureController: @unchecked Sendable {
     activeConfiguration = nil
     activeInputType = nil
     // Every completion is now queued for delivery, where the stale generation
-    // is discarded, ahead of the preview flush below.
+    // is discarded.
     processor?.releaseIdleResources()
     preparedConfiguration = nil
-    flushPreviewsIfEnabled()
     if !preserveRecordingCallbacks {
       lock.withLock {
         // Callbacks installed after this stop began belong to the next take.
@@ -799,30 +765,6 @@ final class CaptureController: @unchecked Sendable {
     controlQueue.async { services.disconnect() }
   }
 
-  /// Headless Program controllers share no UI renderer. Flushing a renderer
-  /// they do not own clears the window that belongs to the selected feed.
-  private func flushPreviewsIfEnabled() {
-    guard previewEnabled else { return }
-    flushOwnedPreviews()
-  }
-
-  /// Ordered on the delivery queue, behind every frame already handed to it.
-  /// Frames still on the GPU (up to `maxFramesInFlight`) carry the previous
-  /// epoch and skip the preview when they complete, so no frame encoded
-  /// before the flush reaches the display after it. The capture thread never
-  /// waits for the GPU here.
-  private func flushOwnedPreviews() {
-    let renderers = ownedPreviewRenderers
-    guard !renderers.isEmpty else { return }
-    previewEpoch &+= 1
-    let floor = previewEpoch
-    let epochFloor = previewEpochFloor
-    deliveryQueue.async {
-      epochFloor.value = floor
-      renderers.forEach { $0.flush() }
-    }
-  }
-
   private func resetSampleFormat() {
     deliveryQueue.async { self.sampleFactory.reset() }
   }
@@ -836,7 +778,6 @@ final class CaptureController: @unchecked Sendable {
     outputFPS = 0
     firstSourceTime = nil
     frameRateGate = FrameRateGate()
-    flushPreviewsIfEnabled()
   }
 
   private func fail(_ value: String, token: UInt64) {
@@ -1112,7 +1053,6 @@ final class CaptureController: @unchecked Sendable {
       type: CVPixelBufferGetPixelFormatType(input), duration: frame.duration)
     let metadataChanged = detected != actual
     if detected != actual {
-      if detected != nil { flushPreviewsIfEnabled() }
       if detected?.duration != actual.duration { firstSourceTime = nil; frameRateGate = FrameRateGate() }
       detected = actual
       inputLabel = actual.label
@@ -1138,10 +1078,8 @@ final class CaptureController: @unchecked Sendable {
       // that skip the GPU, ordered behind the frames still on it). The
       // monitor never keeps processing alive on its own.
       let sink = monitorSink
-      let hasVisiblePreview = previewEnabled && ownedPreviewRenderers.contains { $0.isVisible }
-      let hasPreview = hasVisiblePreview || (previewEnabled && services.preview != nil)
-      // One lock for the handler and the preview source ID.
-      let (processedHandler, feedID) = lock.withLock { (processedFrameHandler, activeFeedID?.rawValue) }
+      let hasPreview = previewEnabled && services.preview != nil
+      let processedHandler = lock.withLock { processedFrameHandler }
       // No downstream demand: keep metadata/detection alive without allocating,
       // submitting GPU work or staging raw buffers that nobody can consume.
       guard cameraConnected || cameraConnecting || hasPreview || processedHandler != nil else {
@@ -1167,14 +1105,11 @@ final class CaptureController: @unchecked Sendable {
       // Created on first demand; a complete bypass still uses it for the owned GPU copy.
       let processor = try makeProcessor()
       try ensurePrepared(effective, wait: false)
-      // The stored renderer array (no per-frame copy); each renderer's own
-      // visibility check drops frames for a hidden one.
       let item = DeliveryItem(token: token, sequence: frame.sequence, source: sink == nil ? nil : input,
         pts: frame.pts, hostTime: hostTime(for: frame.pts, duration: effective.duration, image: input),
         duration: effective.duration, receivedAt: frame.receivedAt, encodeStart: entryTime,
         pipelineEnabled: pipelineEnabled, applyLUT: effective.applyLUT,
-        renderers: hasVisiblePreview ? ownedPreviewRenderers : [], preview: previewEnabled ? services.preview : nil,
-        sourceID: hasVisiblePreview ? feedID : nil, previewEpoch: previewEpoch,
+        preview: previewEnabled ? services.preview : nil,
         cameraAttempt: cameraAttempt, monitorSink: sink, untouched: effective.untouched,
         processedHandler: processedHandler)
       let completion: LUTProcessor.Completion = { [self] completed in
@@ -1246,11 +1181,7 @@ final class CaptureController: @unchecked Sendable {
       queue.async { self.fail(error.localizedDescription, token: item.token) }
       return
     }
-    // Encoded before the latest preview flush: the old look or format.
-    if item.previewEpoch >= previewEpochFloor.value {
-      for renderer in item.renderers { renderer.enqueue(sample, sourceID: item.sourceID) }
-      item.preview?(sample)
-    }
+    item.preview?(sample)
     let outcome = camera.send(sample, attempt: item.cameraAttempt, using: services.send)
     if let handler = item.processedHandler {
       let metadata = ProcessedFrameMetadata(
@@ -1373,9 +1304,6 @@ final class CaptureController: @unchecked Sendable {
     }
     media.updateRates(now: now)
     lastPublished = now
-    for renderer in ownedPreviewRenderers where previewEnabled && renderer.isVisible {
-      renderer.refreshPerformanceMetrics()
-    }
     if now - lastLogged >= 5 {
       lastLogged = now
       let peak = processor?.inFlight.peak ?? 0
@@ -1393,25 +1321,15 @@ final class CaptureController: @unchecked Sendable {
     }
     let deviceDrops = services.deviceDroppedFrames()
     let audio = media.snapshot()
-    let diagnostics = ownedPreviewRenderers.map { $0.diagnosticsSnapshot() }
-    // Frames replaced in the newest-frame slot before the display took them
-    // are preview losses too (shown, with a warning, in diagnostics).
-    let previewLosses = diagnostics.reduce(UInt64(0)) {
-      $0 + $1.stagingDrops + $1.failed + $1.rendererDropped + $1.rendererCorrupted + $1.late
-    }
-    let visiblePreview = previewEnabled && (ownedPreviewRenderers.contains { $0.isVisible } || services.preview != nil)
+    let visiblePreview = previewEnabled && services.preview != nil
     let videoLosses = depth.sourceDrops + deviceDrops + poolDrops + cameraDrops
     let update = CaptureUpdate(message: message, input: inputLabel, output: outputLabel,
       inputFast: detected.map { $0.duration == VideoContract.fastDuration }, sourceDuration: detected?.duration,
       mediaTime: stopped ? nil : lastDeliveredSourceTime,
       pipelineEnabledApplied: applied, frames: frames, dropped: videoLosses,
       processingMS: processingMS, previewDelivered: visiblePreview && !outputLabel.isEmpty && !stopped,
-      sourceDrops: depth.sourceDrops, deviceDrops: deviceDrops, captureDrops: 0, poolDrops: poolDrops, cameraDrops: cameraDrops,
-      previewDrops: previewLosses, previewFrames: diagnostics.reduce(0) { $0 + $1.enqueued },
-      previewLateFrames: diagnostics.reduce(0) { $0 + $1.late },
-      outputFPS: outputFPS, displayedFrames: diagnostics.reduce(0) { $0 + $1.rendererFrames },
-      rendererDrops: diagnostics.reduce(0) { $0 + $1.rendererDropped },
-      previewError: diagnostics.compactMap(\.lastError).first,
+      sourceDrops: depth.sourceDrops, deviceDrops: deviceDrops, poolDrops: poolDrops, cameraDrops: cameraDrops,
+      outputFPS: outputFPS,
       framesInFlight: depth.inFlight, maxFramesInFlight: depth.maxInFlight,
       captureBacklog: depth.backlog, maxCaptureBacklog: depth.maxBacklog, lateFrames: lateFrames,
       gpuMS: gpuMS, captureCPUMS: captureCPUMS, latencyMS: latencyMS,
@@ -1455,10 +1373,7 @@ private struct DeliveryItem: @unchecked Sendable {
   let encodeStart: Double
   let pipelineEnabled: Bool
   let applyLUT: Bool
-  let renderers: [VideoPreviewRenderer]
   let preview: ((CMSampleBuffer) -> Void)?
-  let sourceID: String?
-  let previewEpoch: UInt64
   let cameraAttempt: UInt64
   let monitorSink: (any MonitorFrameSink)?
   /// Published as captured (the passthrough copy): the monitor's offer says so.
@@ -1635,11 +1550,9 @@ private struct InputFormat: Equatable {
 
 /// Owns one capture controller per configured feed.  A controller is created
 /// lazily, so idle feeds allocate no Metal, CMIO, or DeckLink resources.  The
-/// default factory calls `CaptureController()` for each feed; that in turn
-/// creates an independent `CaptureServices.live()` value and therefore an
-/// independent UltracamBackend control queue, DeckLink input lease, and camera
-/// sink.  The initial map lets the legacy primary UI keep its existing
-/// preview-renderer-backed controller while joining the same ownership model.
+/// default factory makes a controller with its own `CaptureServices.live(feedID:)`
+/// value and therefore an independent UltracamBackend control queue, DeckLink
+/// input lease, and camera sink.
 final class FeedCapturePool: @unchecked Sendable {
   typealias Factory = (FeedID) -> CaptureController
 
@@ -1647,10 +1560,10 @@ final class FeedCapturePool: @unchecked Sendable {
   private let factory: Factory
   private var controllers: [FeedID: CaptureController]
 
-  init(initial: [FeedID: CaptureController] = [:], factory: @escaping Factory = { feedID in
+  init(factory: @escaping Factory = { feedID in
     CaptureController(services: .live(feedID: feedID))
   }) {
-    controllers = initial
+    controllers = [:]
     self.factory = factory
   }
 

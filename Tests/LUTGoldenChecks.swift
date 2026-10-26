@@ -431,7 +431,7 @@ import simd
   func testBurnInLUTFollowsTheEffectiveApplyLUT() throws {
     let services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
       send: { _ in true })
-    let controller = CaptureController(services: services, previewRenderer: nil)
+    let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop() }
     let started = expectation(description: "Capture start completed")
     started.assertForOverFulfill = false

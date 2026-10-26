@@ -1107,8 +1107,7 @@ final class AppModel {
     feedCoordinator.setCameraOutputEnabled(feedID: id, enabled: outputMode != .program)
     detectedInputCadence[id] = nil
     guard feedCoordinator.startCapture(feedID: id, deviceID: descriptor.selectedDevice,
-      configuration: effectiveConfiguration(for: id), pipelineEnabled: descriptor.pipelineEnabled,
-      previewEnabled: descriptor.previewEnabled) else { return }
+      configuration: effectiveConfiguration(for: id), pipelineEnabled: descriptor.pipelineEnabled) else { return }
     appliedPipelines[id] = pipeline(for: id)
     cameraUpdates[id] = CaptureUpdate(message: "Opening UltraStudio…")
     cameraStateRevision &+= 1
@@ -1478,7 +1477,6 @@ final class AppModel {
     if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
     if descriptor.previewEnabled != before.previewEnabled {
       monitorCoordinator.setPreviewEnabled(descriptor.previewEnabled, for: MonitorTargetID(id.rawValue))
-      feedCoordinator.setPreviewEnabled(feedID: id, enabled: descriptor.previewEnabled)
     }
     // The saved LUT changed to another file than the one in this camera's
     // pipeline, or a load in flight is superseded: read it. A bookmark for the
