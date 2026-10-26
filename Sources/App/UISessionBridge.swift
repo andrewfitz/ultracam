@@ -354,8 +354,8 @@ struct UISessionBridge {
     case .setEmphasis(let id): model.naturalEmphasisFeedID = id.map(feedID)
     case .forgetLUT(let id): model.forgetLUT(feedID(id))
     case .resetAllSettings:
+      // The store clears every saved preference, the interface's `ui.*` keys included.
       guard model.resetAllSettings() else { return }
-      for key in ["ui.layout", "ui.collapsed", "ui.sidebar", "ui.order", "ui.collapsed.default"] { UserDefaults.standard.removeObject(forKey: key) }
       NSApplication.shared.terminate(nil)
     case .toggleRecording(let id):
       let fid = feedID(id)
