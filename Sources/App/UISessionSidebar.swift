@@ -6,7 +6,10 @@ import SwiftUI
 /// Rebuilds the context inside its own body so this column refreshes with the models.
 struct UISessionSidebarView: View {
   let context: UIContext
-  var body: some View { UISessionSidebarViewContent(context: context.current) }
+  var body: some View {
+    let _ = UIRenderProbe.count("UISessionSidebarView")
+    UISessionSidebarViewContent(context: context.current)
+  }
 }
 
 struct UISessionSidebarViewContent: View {
@@ -16,6 +19,7 @@ struct UISessionSidebarViewContent: View {
   private var presentation: UISessionPresentation { context.presentation }
 
   var body: some View {
+    let _ = UIRenderProbe.count("UISessionSidebarViewContent")
     // Only the camera rows (shown with three or more cameras) are tagged, so only they select
     // through the list; other rows that name a camera are buttons that do the same.
     List(selection: selection) {

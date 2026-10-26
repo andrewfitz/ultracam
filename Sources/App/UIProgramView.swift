@@ -10,6 +10,7 @@ struct UIProgramView: View {
   private var onAir: UICameraSnapshot? { session.cameras.first { $0.id == session.onAirID } }
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIProgramView")
     ScrollView {
       VStack(alignment: .leading, spacing: UIPictureSpacing.gutter) {
         HStack(alignment: .top, spacing: UIPictureSpacing.gutter) {

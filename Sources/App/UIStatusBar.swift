@@ -9,6 +9,7 @@ struct UIStatusBarView: View {
   @State private var usage = AppResourceUsage()
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIStatusBarView")
     // What fits decides the density, so the bar is never empty: full text with the full
     // resource readout when there is room, then a shorter readout, no readout, short
     // segment text, and finally only output, recording and warning. The bar sits in the
@@ -158,6 +159,7 @@ struct UIResourceReadout: View {
   let context: UIContext
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIResourceReadout")
     Button { open = true } label: {
       Text(density == .full ? fullText : shortText)
         .font(.subheadline.monospacedDigit())

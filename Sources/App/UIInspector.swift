@@ -4,7 +4,10 @@ import SwiftUI
 /// Rebuilds the context inside its own body so this column refreshes with the models.
 struct UIInspectorView: View {
   let context: UIContext
-  var body: some View { UIInspectorViewContent(context: context.current) }
+  var body: some View {
+    let _ = UIRenderProbe.count("UIInspectorView")
+    UIInspectorViewContent(context: context.current)
+  }
 }
 
 struct UIInspectorViewContent: View {
@@ -13,6 +16,7 @@ struct UIInspectorViewContent: View {
   private static let gamuts = ["S-Gamut3.Cine / S-Log3", "S-Gamut3 / S-Log3"]
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIInspectorViewContent")
     if let camera = context.presentation.selected, let snapshot = context.snapshot(camera.id) {
       form(camera: camera, snapshot: snapshot)
     } else {

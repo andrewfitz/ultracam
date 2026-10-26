@@ -9,6 +9,7 @@ struct UICameraColumnView: View {
   let context: UIContext
 
   var body: some View {
+    let _ = UIRenderProbe.count("UICameraColumnView")
     VStack(alignment: .leading, spacing: 10) {
       UIColumnPictureLayout {
         UICameraPictureView(camera: camera, context: context)
@@ -60,6 +61,7 @@ struct UICameraPictureView: View {
   private var isClean: Bool { !compact && UICleanViewState.shared.clean.contains(camera.id) }
 
   var body: some View {
+    let _ = UIRenderProbe.count("UICameraPictureView")
     ZStack {
       context.pictures.picture(cameraID: camera.id, compact: compact, zoom: zoom)
         .accessibilityElement()
@@ -567,6 +569,7 @@ struct UIChannelStripView: View {
   }
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIChannelStripView")
     Group {
       if camera.collapsed { collapsed } else { expanded }
     }

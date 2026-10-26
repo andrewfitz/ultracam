@@ -1647,6 +1647,13 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   let verifier = Verifier(output: URL(fileURLWithPath: outputPath, isDirectory: true), strict: strict)
   let run = UIVerify(verifier: verifier)
   let started = Date()
+  // First, before other windows: closed windows keep some content ticking.
+  LivePerformanceVerify.run(verifier: verifier)
+  if ProcessInfo.processInfo.environment["UI_PERF_ONLY"] == "1" {
+    print("\nUI verify (performance only): \(verifier.passed) passed, \(verifier.failed) failed")
+    for failure in verifier.failures { print("  FAIL \(failure)") }
+    return verifier.failed == 0 ? 0 : 1
+  }
   run.screens()
   // The monitor tool popovers and the scope pane, with their own fixtures.
   for screen in UIMonitorToolScreens.screens() {

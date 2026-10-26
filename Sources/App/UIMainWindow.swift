@@ -17,6 +17,7 @@ struct UIMainWindowView: View {
   private let margin = UIPictureSpacing.margin
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIMainWindowView")
     let _ = columns.update(from: context.session)
     NavigationSplitView(columnVisibility: columnVisibility) {
       UISessionSidebarView(context: context)

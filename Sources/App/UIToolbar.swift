@@ -8,6 +8,7 @@ struct UIToolbarContent: ToolbarContent {
   private var presentation: UISessionPresentation { context.presentation }
 
   var body: some ToolbarContent {
+    let _ = UIRenderProbe.count("UIToolbarContent")
     if presentation.outputMode == .program && !presentation.cutButtons.isEmpty {
       ToolbarItem(placement: .principal) {
         UIToolbarCutGroup(context: context)
@@ -178,6 +179,7 @@ struct UIToolbarRecordControl: View {
   let context: UIContext
 
   var body: some View {
+    let _ = UIRenderProbe.count("UIToolbarRecordControl")
     let control = context.presentation.recordControl
     switch control {
     case .record(let all, let enabled):

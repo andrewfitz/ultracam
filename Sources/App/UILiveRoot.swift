@@ -18,6 +18,7 @@ struct UILiveRoot<Content: View>: View {
   }
 
   var body: some View {
+    let _ = UIRenderProbe.count("UILiveRoot")
     let bridge = UISessionBridge.live(model: model, interface: interface, openWindow: { openWindow(id: $0) },
       openSettings: { openSettings() })
     content(bridge.context())
