@@ -20,13 +20,13 @@ import XCTest
     let suiteName = "org.ultracam.tests.settings.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
-    let saved = AppSettings(selectedDevice: "synthetic-device", applyLUT: true,
+    let saved = AppSettingsSnapshot(feeds: [FeedDescriptor(selectedDevice: "synthetic-device", applyLUT: true,
       downscale: false, convertTo420: false, reduceFrameRate: true,
       gamut: "S-Gamut3 / S-Log3", pipelineEnabled: false, previewEnabled: false,
-      lutBookmark: Data([1, 2, 3]), automaticFeed: true)
-    AppSettingsStore(defaults: defaults).save(saved)
-    XCTAssertEqual(AppSettingsStore(defaults: defaults).load(), saved)
-    let text = String(data: try XCTUnwrap(defaults.data(forKey: AppSettingsStore.key)), encoding: .utf8)!
+      lutBookmark: Data([1, 2, 3]), automaticFeed: true)])
+    AppSettingsStore(defaults: defaults).saveSnapshot(saved)
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot().feeds, saved.feeds)
+    let text = String(data: try XCTUnwrap(defaults.data(forKey: AppSettingsStore.snapshotKey)), encoding: .utf8)!
     XCTAssertFalse(text.contains("inputFast"), "Source rate must be detected each run")
     XCTAssertFalse(text.contains("running"), "Transient running state must not be persisted")
     XCTAssertFalse(text.contains("rgba"), "LUT payload must not become a preference")
@@ -162,11 +162,11 @@ import XCTest
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
     defaults.set(Data("invalid JSON".utf8), forKey: AppSettingsStore.key)
-    XCTAssertEqual(AppSettingsStore(defaults: defaults).load(), AppSettings())
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot(), AppSettingsSnapshot())
     var unsupported = AppSettings()
     unsupported.version = 9
-    AppSettingsStore(defaults: defaults).save(unsupported)
-    XCTAssertEqual(AppSettingsStore(defaults: defaults).load(), AppSettings())
+    defaults.set(try JSONEncoder().encode(unsupported), forKey: AppSettingsStore.key)
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot(), AppSettingsSnapshot())
   }
 
   func testBookmarkRestoreAndMissingFileRecovery() throws {

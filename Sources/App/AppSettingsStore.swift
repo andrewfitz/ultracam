@@ -194,6 +194,8 @@ struct SwitcherSettings: Codable, Equatable, Sendable {
   }
 }
 
+/// The original one-camera record (key `ultracam.settings.v1`). Only read, to
+/// migrate it into the first camera; nothing writes it any more.
 struct AppSettings: Codable, Equatable, Sendable {
   var version = 1
   var selectedDevice = ""
@@ -207,15 +209,9 @@ struct AppSettings: Codable, Equatable, Sendable {
   var lutBookmark: Data?
   // Optional on disk to migrate v1 preferences without losing the saved LUT.
   var automaticFeed: Bool?
-
-  var configuration: PipelineConfiguration {
-    PipelineConfiguration(applyLUT: applyLUT, downscale: downscale,
-      convertTo420: convertTo420, reduceFrameRate: reduceFrameRate)
-  }
 }
 
-/// Persisted settings for one feed. This is deliberately independent from
-/// `AppModel`, which still owns the one-feed runtime path for now.
+/// Persisted settings for one camera.
 struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   var version = 1
   var id: FeedID
@@ -287,23 +283,6 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
       convertTo420: convertTo420, reduceFrameRate: reduceFrameRate)
   }
 
-  var displayName: String {
-    get { name }
-    set { name = newValue }
-  }
-
-  var deviceID: String {
-    get { selectedDevice }
-    set { selectedDevice = newValue }
-  }
-
-  var appSettings: AppSettings {
-    AppSettings(selectedDevice: selectedDevice, applyLUT: applyLUT, downscale: downscale,
-      convertTo420: convertTo420, reduceFrameRate: reduceFrameRate, gamut: gamut,
-      pipelineEnabled: pipelineEnabled, previewEnabled: previewEnabled,
-      lutBookmark: lutBookmark, automaticFeed: automaticFeed)
-  }
-
   private enum CodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, pipelineEnabled, previewEnabled, lutBookmark,
@@ -370,10 +349,6 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
     self.monitorWorkspacePreferences = monitorWorkspace
   }
 
-  var selectedFeed: FeedDescriptor? {
-    feeds.first(where: { $0.id == selectedFeedID }) ?? feeds.first
-  }
-
   /// Returns a complete, safe snapshot while preserving descriptor ordering.
   /// Invalid IDs or an empty collection indicate corrupt v2 data and are
   /// rejected so the store can fall back to the v1 migration path.
@@ -420,7 +395,6 @@ final class AppSettingsStore {
   static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
-  static let v2Key = snapshotKey
   private let defaults: UserDefaults
 
   init(defaults: UserDefaults = .standard) { self.defaults = defaults }
@@ -448,13 +422,6 @@ final class AppSettingsStore {
     set { defaults.set(newValue, forKey: Self.advertiseHDRKey) }
   }
 
-  func load() -> AppSettings {
-    if let snapshot = loadV2() { return snapshot.selectedFeed?.appSettings ?? AppSettings() }
-    guard let legacy = loadLegacy() else { return AppSettings() }
-    saveSnapshot(AppSettingsSnapshot(feeds: [FeedDescriptor(legacy: legacy)], selectedFeedID: .primary))
-    return legacy
-  }
-
   /// Loads the v2 collection and migrates the original one-feed record on the
   /// first read. The v1 value is intentionally retained until a v2 snapshot is
   /// successfully encoded and stored, allowing recovery after a failed write.
@@ -464,11 +431,6 @@ final class AppSettingsStore {
     let migrated = AppSettingsSnapshot(feeds: [FeedDescriptor(legacy: legacy)], selectedFeedID: .primary)
     saveSnapshot(migrated)
     return migrated
-  }
-
-  func save(_ settings: AppSettings) {
-    guard let data = try? JSONEncoder().encode(settings) else { return }
-    defaults.set(data, forKey: Self.key)
   }
 
   func saveSnapshot(_ snapshot: AppSettingsSnapshot) {
