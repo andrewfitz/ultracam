@@ -427,7 +427,10 @@ FX3 4K59.94 path identical. Andrew checks it live after B2, B3, B5 and B6.
   - Extension `validFrameDurations` and new `FrameRateTarget` cases.
   - DeckLink accepts every rate it detects (23.976 to 60, plus 100/119.88/120
     where the hardware supports them).
-  - VFR as decided.
+  - VFR recording as decided below:
+    - native timing by default;
+    - a per-camera "Constant frame rate (compatibility)" setting, off by
+      default, which conforms takes for editors.
 - **B4. Colour.**
   - `Colorimetry` from the plugin, and one CV-attachment writer.
   - LUT input and output spaces.
@@ -484,7 +487,9 @@ its types.
   to count.
 - **Recordings** are checked for:
   - their timescale;
-  - per-frame duration (exact, no "VFR" in editors);
+  - per-frame duration: exact for constant-rate sources; for VFR, the source's
+    own timestamps by default, or a constant rate with counted
+    repeats and skips when the compatibility setting is on;
   - `tmcd` drop-frame;
   - colour tags;
   - audio channel layout.
@@ -493,16 +498,29 @@ its types.
 - **Live:** after each of B2, B3, B5 and B6, Andrew checks the FX3 at 4K59.94
   with the full chain (LUT, monitor, record, Program).
 
+## Decided
+
+- **Variable-frame-rate recording (2026-10-26).**
+  - **Default:** a VFR source records every frame with its own timestamps, so
+    the file is VFR. Nothing is repeated or skipped, which keeps the
+    every-frame rule.
+  - **Compatibility setting:** a per-camera "Constant frame rate
+    (compatibility)" setting, **off by default** and persisted [P], conforms
+    the take to the source's nominal rate for editors that mishandle VFR. It
+    repeats or skips whole frames, never blends, and counts each one in
+    recording telemetry and the take's sidecar.
+  - **Where it shows:** only when the camera's source declares
+    `FrameRate.isVariable`. Constant-rate sources are unaffected.
+- **No CPU pixel path** (2026-10-26): see "GPU only, with no CPU fallback".
+
 ## Decisions needed
 
-1. **Variable frame rate:** conform at the recorder (repeat or skip whole
-   frames, counted), or refuse VFR recording.
-2. **Program rate conversion:** repeating or skipping frames when a source's
+1. **Program rate conversion:** repeating or skipping frames when a source's
    rate differs from Program's is rate conversion, not drop-when-busy. Accept
    that it is counted and shown, or require every source to match Program's
    rate.
-3. **Aspect:** letterbox or pillarbox (recommended), crop, or stretch, when a
+2. **Aspect:** letterbox or pillarbox (recommended), crop, or stretch, when a
    source's aspect differs from the output's.
-4. **Interlaced SDI (1080i):** refuse it in v1 (recommended), or add a GPU
+3. **Interlaced SDI (1080i):** refuse it in v1 (recommended), or add a GPU
    deinterlacer.
-5. **Audio-only takes:** allow, or keep "video must start the file".
+4. **Audio-only takes:** allow, or keep "video must start the file".
