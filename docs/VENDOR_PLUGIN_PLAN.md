@@ -410,8 +410,10 @@ Two licenses need checking before anyone relies on them:
   it under `SDK/`.
 
 Because the Sony SDK can't go in a public repo, "bundled with its SDK" means
-two things. The built app embeds Sony's dylibs. The source tree holds Sony's
-installer, not Sony's files.
+two things:
+- Ultracam's released app embeds Sony's dylibs, and release builds require
+  them (recommendation 3).
+- The source tree holds Sony's installer, not Sony's files.
 
 ## Build system
 
@@ -719,12 +721,20 @@ VFR, Program rate conversion, aspect and audio-only takes.
      surface.
 2. **Folder: top-level `Vendors/<Vendor>/`.** The SDK, code, tests and README
    live together, so an SDK update or a new vendor touches one folder.
-3. **Release builds without the Sony SDK: ship with Sony control shown as
-   unavailable.**
-   - Outside developers can't get Sony's SDK from the repo.
-   - `build.sh` prints each plugin's status.
-   - `validate_bundle.py` fails only if a plugin that claims to be available
-     is missing its libraries.
+3. **Sony in releases.**
+   - **Official releases ship with Sony control.** The signed app embeds
+     Sony's libraries, as it does today.
+   - **A release can't be built without it.** A signed release build
+     (`build.sh` in release mode) refuses to run if any first-party plugin's
+     SDK is missing. `validate_bundle.py` fails if the Sony libraries are
+     absent from a release bundle.
+   - **Source builds by others still work.** Without the SDK installed, Sony
+     control shows as unavailable with the reason, because the public repo
+     can't contain Sony's SDK files.
+   - **Before the first public release**, confirm that Sony's SDK licence
+     allows including its runtime libraries in a downloadable app. Nothing in
+     the repo records those terms.
+   - `build.sh` prints each plugin's status in every build.
 4. **Licence: Apache-2.0** (MIT is the simpler alternative).
    - The app links vendor SDKs that aren't open source: Sony, and later NDI
      and possibly AJA.
