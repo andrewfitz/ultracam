@@ -31,9 +31,16 @@ import XCTest
       lock.withLock { (accepted, forwarded, refusals, connects) }
     }
 
-    func emit(_ image: CVPixelBuffer, at time: CMTime, duration: CMTime) {
-      let handler = lock.withLock { self.handler }
-      handler?(image, time, duration, true)
+    /// The driver has started: it delivers frames from here on, as a real one does.
+    var driverStarted: Bool { lock.withLock { handler != nil } }
+
+    /// Delivers one frame; false when the driver isn't started (a frame no
+    /// real driver could deliver).
+    @discardableResult
+    func emit(_ image: CVPixelBuffer, at time: CMTime, duration: CMTime) -> Bool {
+      guard let handler = lock.withLock({ self.handler }) else { return false }
+      handler(image, time, duration, true)
+      return true
     }
 
     func services() -> CaptureServices {
@@ -95,13 +102,18 @@ import XCTest
     wait(for: [loaded], timeout: 10)
     controller.start(feedID: FeedID(rawValue: "camera-output-path"), deviceID: "synthetic",
       configuration: configuration, pipelineEnabled: true, previewEnabled: false)
+    // Frames flow once the driver is started, after the controller has warmed
+    // up and connected the camera. The burn-in decision is published earlier.
     let deadline = Date().addingTimeInterval(10)
-    while controller.burnInLUT == nil && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+    while !(controller.burnInLUT != nil && path.driverStarted) && Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
     XCTAssertNotNil(controller.burnInLUT, "\(label): the LUT is burned in")
+    XCTAssertTrue(path.driverStarted, "\(label): the driver starts")
     let source = try v210Source()
     for index in 0..<frames {
-      path.emit(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: Int32(index + 1)),
-        duration: VideoContract.fastDuration)
+      XCTAssertTrue(path.emit(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: Int32(index + 1)),
+        duration: VideoContract.fastDuration), "\(label): frame \(index) delivered by the driver")
       // The driver's cadence, compressed: the pipeline never sees a burst.
       Thread.sleep(forTimeInterval: 0.004)
     }
