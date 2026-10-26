@@ -9,8 +9,6 @@ import XCTest
     XCTAssertFalse(snapshot.feeds[0].monitor.toolsEnabled)
     XCTAssertFalse(snapshot.programMonitor.toolsEnabled)
     XCTAssertEqual(snapshot.feeds[0].monitor, MonitorFeedPreferences())
-    XCTAssertNil(snapshot.feeds[0].legacyMonitorConfiguration)
-    XCTAssertNil(snapshot.legacyProgramMonitorConfiguration)
     XCTAssertEqual(snapshot.monitorWorkspacePreferences.layout, .single)
   }
 

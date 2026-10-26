@@ -541,7 +541,6 @@ extension MonitorLifecycleChecks {
     let snapshot = try JSONDecoder().decode(AppSettingsSnapshot.self, from: Data(json.utf8))
     XCTAssertTrue(snapshot.programMonitor.toolsEnabled)
     XCTAssertEqual(snapshot.programMonitor.state.zebras[0].level, 90)
-    XCTAssertNotNil(snapshot.legacyProgramMonitorConfiguration)
     let shown = snapshot.programMonitor.surfaceState(isProgram: true)
     XCTAssertFalse(shown.focus.enabled, "No peaking on Program")
     XCTAssertEqual(shown.falseColor.mode, .off, "No log false colour on Program")
@@ -573,7 +572,7 @@ extension MonitorLifecycleChecks {
 
   // MARK: persistence rules (map §5.2)
 
-  func testMigrationLegacyKeysRoundTripUntouched() throws {
+  func testMigrationLegacyKeysAreReadOnceAndNotWrittenBack() throws {
     let blob = #"""
       {"schemaVersion":1,"toolsEnabled":true,"zebra":{"enabled":true,"thresholdIRE":95,"widthIRE":7.5},
        "falseColor":{"mode":"arri","profileID":null,"exposureIndex":800,"referenceOffsetStops":-8.25},
@@ -581,8 +580,6 @@ extension MonitorLifecycleChecks {
       """#
     let json = #"{"version":2,"selectedFeedID":"a","feeds":[{"version":1,"id":"a","name":"A","monitorConfiguration":"#
       + blob + #"}],"programMonitorConfiguration":"# + blob + "}"
-    let original = try jsonObject(Data(json.utf8))
-    let originalBlob = try XCTUnwrap((original["feeds"] as? [NSDictionary])?.first?["monitorConfiguration"])
     var snapshot = try JSONDecoder().decode(AppSettingsSnapshot.self, from: Data(json.utf8))
     // A change through the MonitorTools UI updates only the new key.
     var changed = snapshot.feeds[0].monitor.legacyConfiguration
@@ -591,19 +588,15 @@ extension MonitorLifecycleChecks {
     XCTAssertEqual(snapshot.feeds[0].monitor.state.zebras[0].level, 80)
     let written = try jsonObject(JSONEncoder().encode(snapshot))
     let feed = try XCTUnwrap((written["feeds"] as? [NSDictionary])?.first)
-    XCTAssertEqual(feed["monitorConfiguration"] as? NSDictionary, originalBlob as? NSDictionary)
-    XCTAssertEqual(written["programMonitorConfiguration"] as? NSDictionary,
-      original["programMonitorConfiguration"] as? NSDictionary)
+    XCTAssertNil(feed["monitorConfiguration"], "The migrated blob is not written back")
+    XCTAssertNil(written["programMonitorConfiguration"])
     XCTAssertNotNil(feed["monitor"])
     XCTAssertNotNil(written["programMonitor"])
-    // Read again, the new keys win and the old ones are still carried.
+    // Read again, the new keys carry everything the old ones held.
     let reread = try JSONDecoder().decode(AppSettingsSnapshot.self, from: JSONEncoder().encode(snapshot))
     XCTAssertEqual(reread, snapshot)
     XCTAssertEqual(reread.feeds[0].monitor.state.zebras[0].level, 80)
-    // Booleans stay booleans and integers integers (JSONSerialization conflates them).
-    XCTAssertEqual(
-      try JSONDecoder().decode(PreservedJSON.self, from: Data(#"[1,0,true,false,2.5,null]"#.utf8)),
-      .array([.integer(1), .integer(0), .bool(true), .bool(false), .number(2.5), .null]))
+    XCTAssertTrue(reread.programMonitor.toolsEnabled)
     // A fresh install writes no legacy keys.
     let fresh = try jsonObject(JSONEncoder().encode(AppSettingsSnapshot()))
     XCTAssertNil(fresh["programMonitorConfiguration"])
@@ -618,7 +611,6 @@ extension MonitorLifecycleChecks {
       + #","monitorConfiguration":{"toolsEnabled":false,"focus":{"enabled":false}}}"#
     let feed = try JSONDecoder().decode(FeedDescriptor.self, from: Data(json.utf8))
     XCTAssertEqual(feed.monitor, saved)
-    XCTAssertNotNil(feed.legacyMonitorConfiguration)
   }
 
   func testMigrationFeedDescriptorVersionStaysOne() throws {

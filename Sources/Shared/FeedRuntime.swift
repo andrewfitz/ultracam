@@ -767,8 +767,6 @@ final class FeedCoordinator {
   private(set) var virtualCameraRegistrySnapshot: VirtualCameraRegistrySnapshot
   private let registryStore: VirtualCameraRegistryStore?
   var programMonitor: MonitorFeedPreferences
-  /// Program's MonitorTools blob from an earlier build, passed through untouched.
-  private let legacyProgramMonitorConfiguration: PreservedJSON?
   var monitorWorkspace: MonitorWorkspacePreferences
   private var sessions: [FeedID: FeedSession] = [:]
   let capturePool: FeedCapturePool
@@ -788,7 +786,6 @@ final class FeedCoordinator {
        registryStore: VirtualCameraRegistryStore? = nil) {
     let safe = snapshot.validated() ?? AppSettingsSnapshot()
     programMonitor = safe.programMonitor
-    legacyProgramMonitorConfiguration = safe.legacyProgramMonitorConfiguration
     monitorWorkspace = safe.monitorWorkspacePreferences
     descriptors = safe.feeds
     // A persisted selection can point at a disabled descriptor. Keep the
@@ -1235,7 +1232,6 @@ final class FeedCoordinator {
       outputMode: outputMode, switcher: switcher,
       virtualCameraRegistryVersion: virtualCameraRegistryVersion,
       programMonitor: programMonitor,
-      legacyProgramMonitorConfiguration: legacyProgramMonitorConfiguration,
       monitorWorkspace: monitorWorkspace)
   }
 

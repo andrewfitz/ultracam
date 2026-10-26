@@ -219,8 +219,8 @@ struct MonitorFeedPreferences: Codable, Equatable, Sendable {
   /// Whether a surface of this target shows scopes.
   var scopesShown: Bool { toolsEnabled && scopes.enabled }
 
-  /// These preferences as an old MonitorTools configuration (the shape the
-  /// coordinator's legacy callbacks and the migration checks use). Normalized,
+  /// These preferences as an old MonitorTools configuration: what `merge`
+  /// compares a migrated configuration with, field by field. Normalized,
   /// except that a false-colour mode the declared signal cannot show stays
   /// selected, as it did in MonitorTools' session configuration after a camera
   /// change: its renderer normalized it away, and declaring the source again
@@ -547,43 +547,6 @@ struct MonitorWorkspacePreferences: Codable, Equatable, Sendable {
   }
 }
 
-/// A JSON value kept exactly as it was read, so a blob this version no longer
-/// interprets (the MonitorTools `monitorConfiguration`) is written back
-/// unchanged and an older build still finds it.
-enum PreservedJSON: Codable, Equatable, Sendable {
-  case null
-  case bool(Bool)
-  case integer(Int64)
-  case number(Double)
-  case string(String)
-  case array([PreservedJSON])
-  case object([String: PreservedJSON])
-
-  init(from decoder: Decoder) throws {
-    let c = try decoder.singleValueContainer()
-    if c.decodeNil() { self = .null }
-    else if let value = try? c.decode(Bool.self) { self = .bool(value) }
-    else if let value = try? c.decode(Int64.self) { self = .integer(value) }
-    else if let value = try? c.decode(Double.self) { self = .number(value) }
-    else if let value = try? c.decode(String.self) { self = .string(value) }
-    else if let value = try? c.decode([PreservedJSON].self) { self = .array(value) }
-    else { self = .object(try c.decode([String: PreservedJSON].self)) }
-  }
-
-  func encode(to encoder: Encoder) throws {
-    var c = encoder.singleValueContainer()
-    switch self {
-    case .null: try c.encodeNil()
-    case .bool(let value): try c.encode(value)
-    case .integer(let value): try c.encode(value)
-    case .number(let value): try c.encode(value)
-    case .string(let value): try c.encode(value)
-    case .array(let value): try c.encode(value)
-    case .object(let value): try c.encode(value)
-    }
-  }
-}
-
 extension KeyedDecodingContainer {
   /// The preferences under `key`; else those migrated from the MonitorTools
   /// configuration under `legacyKey`; else the defaults. Never throws, and
@@ -594,14 +557,6 @@ extension KeyedDecodingContainer {
       return MonitorFeedPreferences(migrating: legacy)
     }
     return MonitorFeedPreferences()
-  }
-
-  /// The JSON under `key` as it was, or nil.
-  func preservedJSON(_ key: Key) -> PreservedJSON? {
-    guard contains(key), let value = try? decode(PreservedJSON.self, forKey: key), value != .null else {
-      return nil
-    }
-    return value
   }
 }
 
