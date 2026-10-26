@@ -42,12 +42,13 @@ enum UIRecordingLibrary {
       // volume's capacity needs the grant held, or it fails and the drive read as empty.
       let accessed = folder.startAccessingSecurityScopedResource()
       defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
-      let reported: Int64?
-      let values: URLResourceValues?
+      var reported: Int64?
+      var values: URLResourceValues?
       do {
         reported = try VolumeFreeSpace.bytes(at: folder)
         values = try folder.resourceValues(forKeys: [.volumeTotalCapacityKey])
       } catch {
+        // Either read failing leaves the drive unknown, not full.
         reported = nil
         values = nil
         Self.logUnreadable(name, error)
