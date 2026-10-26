@@ -2,6 +2,7 @@ import AppKit
 import CoreMedia
 import CoreVideo
 import Darwin
+import MonitorKitUI
 import SwiftUI
 import Synchronization
 
@@ -196,9 +197,8 @@ struct LivePerformanceSample {
     nativeViewsScaleWithVisualEffect(verifier: verifier)
     let counts = (ProcessInfo.processInfo.environment["UI_PERF_CAMERAS"] ?? "2,4").split(separator: ",").compactMap { Int($0) }
     for cameras in counts {
-      // With live meters (as in the app), then with the meters showing fixed readings: MonitorKit's
-      // LevelMeterView redraws at the display rate in a TimelineView, and each of its frames lays out,
-      // renders and commits the whole window's SwiftUI graph, so the second run measures the rest.
+      // With live meters (as in the app), then with the meters showing fixed readings, which never
+      // tick: the difference is what the meters' display-rate drawing costs the window.
       let meters = ProcessInfo.processInfo.environment["UI_PERF_METERS"] ?? "live,fixed"
       if meters.contains("live") { measure(cameras: cameras, liveMeters: true, verifier: verifier) }
       if meters.contains("fixed") { measure(cameras: cameras, liveMeters: false, verifier: verifier) }
@@ -281,9 +281,18 @@ struct LivePerformanceSample {
 
     let before = ids.map { model.cameraUpdate($0)?.frames ?? 0 }
     // UI_PERF_IDLE stretches the idle interval, e.g. to attach Instruments to this process.
+    let meterTicks = MeterDiagnostics.displayTicks
     let idle = sample(Double(ProcessInfo.processInfo.environment["UI_PERF_IDLE"] ?? "") ?? 4)
     let after = ids.map { model.cameraUpdate($0)?.frames ?? 0 }
-    print("PERF \(name) idle: \(idle.summary)")
+    let meterHz = Double(MeterDiagnostics.displayTicks - meterTicks) / idle.seconds
+    print("PERF \(name) idle: \(idle.summary) | meter frames/s \(Int(meterHz))")
+    // Each camera's strip meter draws on every display frame, without SwiftUI.
+    if liveMeters {
+      verifier.check("\(name): the live meters draw at the display rate",
+        meterHz > Double(cameras) * idle.displayHz * 0.8, "\(Int(meterHz)) meter frames/s at \(Int(idle.displayHz)) Hz")
+    } else {
+      verifier.check("\(name): fixed meters never tick", meterHz == 0, "\(meterHz)")
+    }
     verifier.check("\(name): the window is on a display and ticks", idle.displayHz > 50, "\(idle.displayHz) Hz")
     verifier.check("\(name): every camera delivers frames while measured",
       zip(before, after).allSatisfy { Double($1) > Double($0) + idle.seconds * 40 }, "\(before) -> \(after)")
@@ -326,8 +335,8 @@ struct LivePerformanceSample {
 
 
   /// Budgets while only telemetry changes: no structural view re-evaluates, the run loop never
-  /// stalls as the whole-window rebuilds did, and without live meters the main thread stays
-  /// nearly idle (an unoptimized build).
+  /// stalls as the whole-window rebuilds did, and the main thread stays nearly idle, live
+  /// meters or not (an unoptimized build).
   static func check(_ value: LivePerformanceSample, _ step: String, name: String, verifier: Verifier, liveMeters: Bool) {
     for view in structural {
       verifier.check("\(name), \(step): \(view) is not re-evaluated", value.rate(view) * value.seconds < 1,
@@ -336,9 +345,8 @@ struct LivePerformanceSample {
     // The rebuilds on every capture update stalled it 40–100 ms several times a second. Shorter
     // stalls are reported, not budgeted: they depend on the machine and what else runs on it.
     verifier.check("\(name), \(step): no run loop stall past 50 ms", value.longest < 50, value.summary)
-    if !liveMeters {
-      verifier.check("\(name), \(step): main thread under 25% busy", value.busy < 0.25, value.summary)
-    }
+    // Live meters included: they move layers on their own display link and re-evaluate nothing.
+    verifier.check("\(name), \(step): main thread under 25% busy", value.busy < 0.25, value.summary)
   }
 
   /// Budgets while a side column opens or closes: the window re-evaluates a few times for the
