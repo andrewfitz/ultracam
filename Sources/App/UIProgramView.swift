@@ -122,9 +122,10 @@ struct UIProgramCutBar: View {
           .help(context.presentation.canAutoSwitch
             ? "Automatic switching (⌃⌥A)" : "Choose a switching strategy first.")
         Picker("Strategy", selection: strategyBinding) {
-          ForEach([SwitcherStrategy.manual, .fixedInterval, .naturalTalkingHead, .dynamicAnalysis], id: \.self) { strategy in
+          // The same strategies as the sidebar and Program menu: Dynamic analysis isn't built, and
+          // choosing it would offer Auto with no director behind it.
+          ForEach(UIOutputModeControl.strategies, id: \.self) { strategy in
             Text(UIStrategy.title(strategy)).tag(strategy)
-              .selectionDisabled(strategy == .dynamicAnalysis)
           }
         }
         .labelsHidden()
@@ -168,17 +169,8 @@ struct UIProgramCutBar: View {
     Binding(get: { session.strategy }, set: { context.send(.setStrategy($0)) })
   }
 
-  private func strategy(from title: String) -> SwitcherStrategy {
-    [SwitcherStrategy.manual, .fixedInterval, .naturalTalkingHead, .dynamicAnalysis]
-      .first { UIStrategy.title($0) == title } ?? .manual
-  }
-
   @ViewBuilder private func cutButton(_ button: UICutButton) -> some View {
-    let label = HStack(spacing: 4) {
-      Text("\(button.number)").monospacedDigit().fontWeight(.bold)
-      Text(button.name)
-      if button.pending { Text("Next").font(.subheadline).foregroundStyle(.secondary) }
-    }
+    let label = UICutButtonLabel(button: button, showsNext: true)
     if button.onAir {
       Button { context.send(.cut(cameraID: button.id)) } label: { label }
         .buttonStyle(.borderedProminent).tint(.red)

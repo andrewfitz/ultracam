@@ -86,16 +86,35 @@ struct UISessionSidebarViewContent: View {
 
   // MARK: Output
 
+  /// The output mode (Separate (ISO) or Program), the cameras it publishes and, in Program,
+  /// the switching controls: Auto, its strategy, Hold and the shot timer. Cuts are in the toolbar.
   private var outputSection: some View {
     Section("Output") {
+      UIOutputModeControlView(context: context)
       switch session.outputMode {
       case .program:
         UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · Program",
           detail: session.programInUse ? "In use" : "Not in use", positive: session.programInUse)
-        LabeledContent("Switching") {
-          Text(presentation.autoSwitching
-            ? (presentation.canHoldShot && session.autoHold ? "Auto · holding shot" : "Auto · \(session.strategyTitle)") : "Manual")
-            .foregroundStyle(.secondary)
+          .help("One switched camera for meeting apps. Cut with the toolbar buttons or ⌃1–⌃\(min(4, max(1, presentation.cameras.count))).")
+        Toggle("Auto switching", isOn: Binding(get: { presentation.autoSwitching }, set: { context.send(.setAutoSwitching($0)) }))
+          .toggleStyle(.switch)
+          .controlSize(.small)
+          .disabled(!presentation.canAutoSwitch)
+          .help(presentation.canAutoSwitch ? "Cut automatically using the strategy below (⌃⌥A)."
+            : "Choose a strategy below to switch automatically.")
+        Picker("Strategy", selection: Binding(get: { session.strategy }, set: { context.send(.setStrategy($0)) })) {
+          ForEach(UIOutputModeControl.strategies, id: \.self) { strategy in
+            Text(UIStrategy.title(strategy)).tag(strategy)
+          }
+        }
+        .pickerStyle(.menu)
+        .controlSize(.small)
+        .help("How Auto chooses the next camera. Manual only cuts when you do.")
+        if presentation.canHoldShot {
+          Toggle("Hold current shot", isOn: Binding(get: { session.autoHold }, set: { context.send(.setAutoHold($0)) }))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .help("Auto stays on but makes no cuts.")
         }
         if presentation.autoSwitching {
           UIShotTimerView(shot: session.shot, onAirName: presentation.cameras.first { $0.id == session.onAirID }?.name)
@@ -426,5 +445,137 @@ struct UIExtensionBannerView: View {
     }
     .padding(.vertical, 2)
     .accessibilityElement(children: .contain)
+  }
+}
+
+// MARK: - Output mode
+
+/// When the output mode can change, and what to offer when it can't. The model's rule
+/// (`canEditTopology`: no camera running or stopping, nothing recording, no LUT loading)
+/// decides; this only says why and whether one click can clear the way safely.
+enum UIOutputModeControl {
+  enum Availability: Equatable {
+    case available
+    /// Only running cameras are in the way: nothing records and no meeting app shows Ultracam,
+    /// so stopping them asks nothing and ends nothing.
+    case stopCamerasFirst
+    /// Something the user has to finish first; the text says what.
+    case blocked(String)
+  }
+
+  /// The strategies the switching controls offer (Dynamic analysis isn't built yet).
+  static let strategies: [SwitcherStrategy] = [.manual, .fixedInterval, .naturalTalkingHead]
+
+  static func title(_ mode: UIOutputMode) -> String { mode == .program ? "Program" : "Separate (ISO)" }
+
+  static func availability(_ session: UISessionSnapshot) -> Availability {
+    if session.canEditTopology { return .available }
+    if session.cameras.contains(where: { $0.recording.status != .idle }) {
+      return .blocked("Stop recording, then stop the cameras, to change the output.")
+    }
+    let running = session.cameras.contains(where: \.running)
+    let inUse = session.outputMode == .program ? session.programInUse : session.cameras.contains { $0.running && $0.inUse }
+    if running && inUse { return .blocked("A meeting app is showing Ultracam. Stop the cameras to change the output.") }
+    if running { return .stopCamerasFirst }
+    return .blocked("Change the output once the cameras have stopped and the LUT has loaded.")
+  }
+
+  static func help(_ session: UISessionSnapshot) -> String {
+    let modes = "Separate (ISO) publishes an Ultracam camera for each camera. Program publishes one switched camera, Ultracam · Program."
+    switch availability(session) {
+    case .available: return "\(modes) Choose the new camera in your meeting app after changing."
+    case .stopCamerasFirst: return "Stop the cameras to change the output. \(modes)"
+    case .blocked(let reason): return "\(reason) \(modes)"
+    }
+  }
+}
+
+/// Stops every camera, then changes the output once they have stopped. A stopping camera
+/// holds the topology for a moment, so the two actions can't be sent back to back; this
+/// waits (briefly) for the model to allow the change and gives up if a camera keeps running.
+@MainActor @Observable final class UIOutputModeSwitch {
+  static let shared = UIOutputModeSwitch()
+
+  /// The mode being switched to while the cameras stop.
+  private(set) var pending: UIOutputMode?
+  @ObservationIgnored private var task: Task<Void, Never>?
+
+  func stopCamerasAndSwitch(to mode: UIOutputMode, send: @escaping @MainActor (UIAction) -> Void,
+    session: @escaping @MainActor () -> UISessionSnapshot, timeout: Duration = .seconds(8),
+    stillRunningAfter: Duration = .seconds(2), poll: Duration = .milliseconds(100)) {
+    // Only when nothing records and nothing is on air, so Stop asks no question.
+    guard UIOutputModeControl.availability(session()) == .stopCamerasFirst else { return }
+    task?.cancel()
+    pending = mode
+    send(.stopAllCameras)
+    task = Task { @MainActor [weak self] in
+      let clock = ContinuousClock()
+      let start = clock.now
+      while !Task.isCancelled, clock.now - start < timeout {
+        let current = session()
+        if current.outputMode == mode { break }
+        if current.canEditTopology {
+          send(.setOutputMode(mode))
+          break
+        }
+        // The stop didn't happen (or a camera started again): don't switch later by surprise.
+        if clock.now - start > stillRunningAfter, current.cameras.contains(where: \.running) { break }
+        try? await Task.sleep(for: poll)
+      }
+      guard !Task.isCancelled else { return }
+      self?.pending = nil
+    }
+  }
+}
+
+/// The Separate (ISO) / Program control, with the reason it's locked and, when that's
+/// safe, one click that stops the cameras and switches.
+struct UIOutputModeControlView: View {
+  let context: UIContext
+
+  var body: some View {
+    let session = context.session
+    let availability = UIOutputModeControl.availability(session)
+    let pending = UIOutputModeSwitch.shared.pending
+    let other: UIOutputMode = session.outputMode == .program ? .separate : .program
+    VStack(alignment: .leading, spacing: 6) {
+      Picker("Output", selection: Binding(get: { pending ?? session.outputMode },
+        set: { if $0 != session.outputMode { context.send(.setOutputMode($0)) } })) {
+        Text(UIOutputModeControl.title(.separate)).tag(UIOutputMode.separate)
+        Text(UIOutputModeControl.title(.program)).tag(UIOutputMode.program)
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      .disabled(availability != .available)
+      .help(UIOutputModeControl.help(session))
+      switch availability {
+      case .available:
+        EmptyView()
+      case .stopCamerasFirst:
+        if pending != nil {
+          HStack(spacing: 6) {
+            ProgressView().controlSize(.small)
+            Text("Stopping cameras…").font(.subheadline).foregroundStyle(.secondary)
+          }
+        } else {
+          Text("Stop the cameras to change the output.")
+            .font(.subheadline).foregroundStyle(.secondary)
+            .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+          Button("Stop Cameras and Switch") {
+            let refreshed = context
+            UIOutputModeSwitch.shared.stopCamerasAndSwitch(to: other, send: context.send,
+              session: { refreshed.current.session })
+          }
+          .controlSize(.small)
+          .help("Stop every camera, then switch to \(UIOutputModeControl.title(other)). Nothing is recording or on air.")
+        }
+      case .blocked(let reason):
+        // Sidebar rows are one line unless told otherwise.
+        Text(reason)
+          .font(.subheadline).foregroundStyle(.secondary)
+          .lineLimit(4).fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    .padding(.vertical, 2)
   }
 }

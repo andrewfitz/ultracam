@@ -170,6 +170,8 @@ enum UIFixtures {
     session.programInUse = true
     session.onAirID = "camera-1"
     session.autoSwitching = true
+    // Auto only shows as on with a strategy that switches on its own.
+    session.strategy = .naturalTalkingHead
     session.strategyTitle = "Natural talking head"
     session.shot = UIShotTiming(currentShot: 8.2)
     session.recentCuts = [UICutRecord(at: Date(timeIntervalSince1970: 1_792_405_343), cameraID: "camera-1", cameraName: "Camera 1", automatic: true),

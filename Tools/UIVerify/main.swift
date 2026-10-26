@@ -1579,6 +1579,9 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.sharedInput()
   run.pictureMenus()
   run.menuBar()
+  ProgramOutputVerify.run(verifier: verifier) { name, view, size, titled in
+    run.render(name, view, size: size, titled: titled).forEach { $0.close() }
+  }
   Images.waitForWrites()
   print("""
 

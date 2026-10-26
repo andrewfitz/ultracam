@@ -107,18 +107,31 @@ struct UIToolbarCutGroup: View {
         cutButton(button)
       }
       Divider().frame(height: 18)
-      Toggle(isOn: Binding(get: { context.presentation.autoSwitching }, set: { context.send(.setAutoSwitching($0)) })) {
-        Label("Auto", systemImage: "wand.and.sparkles")
+      if context.presentation.canAutoSwitch {
+        Toggle(isOn: Binding(get: { context.presentation.autoSwitching }, set: { context.send(.setAutoSwitching($0)) })) {
+          Label("Auto", systemImage: "wand.and.sparkles")
+        }
+        .toggleStyle(.button)
+        .help("Automatic switching with \(context.session.strategyTitle) (⌃⌥A)")
+      } else {
+        // Manual never cuts on its own: Auto asks how to switch, then turns on with that strategy.
+        Menu {
+          ForEach(UIOutputModeControl.strategies.filter { $0 != .manual }, id: \.self) { strategy in
+            Button(UIStrategy.title(strategy)) {
+              context.send(.setStrategy(strategy))
+              context.send(.setAutoSwitching(true))
+            }
+          }
+        } label: {
+          Label("Auto", systemImage: "wand.and.sparkles")
+        }
+        .help("Switch automatically: choose a strategy and Auto turns on.")
       }
-      .toggleStyle(.button)
-      .disabled(!context.presentation.canAutoSwitch)
-      .help(context.presentation.canAutoSwitch
-        ? "Automatic switching (⌃⌥A)" : "Choose a switching strategy in Program › Strategy first.")
     }
   }
 
   @ViewBuilder private func cutButton(_ button: UICutButton) -> some View {
-    let title = HStack(spacing: 4) { Text("\(button.number)").monospacedDigit().fontWeight(.bold); Text(button.name) }
+    let title = UICutButtonLabel(button: button)
     if button.onAir {
       Button { context.send(.cut(cameraID: button.id)) } label: { title }
         .buttonStyle(.borderedProminent)
@@ -134,6 +147,28 @@ struct UIToolbarCutGroup: View {
         .disabled(!button.enabled)
         .help(button.pending ? "Cut to \(button.name) is pending" : "Cut to \(button.name) (⌃\(button.number))")
         .accessibilityLabel(button.pending ? "\(button.name), cut pending" : "Cut to \(button.name)")
+    }
+  }
+}
+
+/// A cut button's number and name, with a tally dot: red on air, green while a cut is pending.
+/// The button's red fill alone isn't a tally: macOS draws prominent buttons grey whenever the
+/// window isn't key, which is most of a meeting.
+struct UICutButtonLabel: View {
+  let button: UICutButton
+  var showsNext = false
+
+  var body: some View {
+    HStack(spacing: 4) {
+      if button.onAir || button.pending {
+        Circle().fill(button.onAir ? Color.red : .green)
+          .overlay(Circle().strokeBorder(.white.opacity(button.onAir ? 0.8 : 0), lineWidth: 1))
+          .frame(width: 7, height: 7)
+          .accessibilityHidden(true)
+      }
+      Text("\(button.number)").monospacedDigit().fontWeight(.bold)
+      Text(button.name)
+      if showsNext && button.pending { Text("Next").font(.subheadline).foregroundStyle(.secondary) }
     }
   }
 }

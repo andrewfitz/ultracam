@@ -26,6 +26,8 @@ enum UIMenuCommand: Equatable {
   case action(UIAction)
   /// Automatic waiting state: render the live preview on request (a visible preview counts as demand).
   case showLivePreview
+  /// Stops every camera, then changes the output mode once they have stopped (`UIOutputModeSwitch`).
+  case stopCamerasAndSwitch(UIOutputMode)
 }
 
 final class UIMenuCommandBox: NSObject {
@@ -47,6 +49,8 @@ final class UIMenuCommandBox: NSObject {
   private var showLivePreview = false
   private var previewWidth = UIMenuPreviewContent.minimumWidth
   private var menuOpen = false
+  /// Refreshes the open menu's rows each second (see `refreshOpenMenu`).
+  private var refreshTimer: Timer?
   private var sampler = AppResourceSampler()
   private var lastIcon: UIMenuBarIcon?
   private var iconUpdateScheduled = false
@@ -164,10 +168,21 @@ final class UIMenuCommandBox: NSObject {
 
   func menuWillOpen(_ menu: NSMenu) {
     menuOpen = true
+    // NSMenu doesn't rebuild its rows while open, but the preview card does: an automatic
+    // cut left the card showing one camera on air and the rows checking another. Common
+    // modes, so the timer also fires while the menu tracks the mouse.
+    refreshTimer?.invalidate()
+    let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.refreshOpenMenu() }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    refreshTimer = timer
   }
 
   func menuDidClose(_ menu: NSMenu) {
     menuOpen = false
+    refreshTimer?.invalidate()
+    refreshTimer = nil
     showLivePreview = false
     // Tear down the preview so nothing renders while the menu is closed.
     previewItem?.view = nil
@@ -196,6 +211,59 @@ final class UIMenuCommandBox: NSObject {
     if previewWidth > host.frame.width {
       host.rootView = card(width: previewWidth)
       host.frame.size = host.fittingSize
+    }
+  }
+
+  /// Brings the open menu's rows up to date: in place when only their state changed, so the
+  /// menu neither jumps nor closes a submenu; rebuilt when rows came or went.
+  private func refreshOpenMenu() {
+    guard menuOpen, let previewItem else { return }
+    let session = bridge().snapshot()
+    let fresh = Self.buildItems(presentation: UIPresentationBuilder.session(session), session: session,
+      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name) },
+      stats: statsLine(session: session), target: self, previewItem: previewItem, showLivePreview: showLivePreview)
+    guard !Self.refresh(menu.items, with: fresh) else { return }
+    menu.removeAllItems()
+    for item in fresh { menu.addItem(item) }
+  }
+
+  /// Copies `fresh` rows onto `existing` ones when both have the same shape (the same rows,
+  /// separators, headers and submenus, recursively). Returns false, changing nothing, otherwise.
+  @discardableResult
+  static func refresh(_ existing: [NSMenuItem], with fresh: [NSMenuItem]) -> Bool {
+    guard sameShape(existing, fresh) else { return false }
+    copy(existing, fresh)
+    return true
+  }
+
+  private static func sameShape(_ existing: [NSMenuItem], _ fresh: [NSMenuItem]) -> Bool {
+    guard existing.count == fresh.count else { return false }
+    for (old, new) in zip(existing, fresh) where old !== new {
+      guard old.isSeparatorItem == new.isSeparatorItem, old.isSectionHeader == new.isSectionHeader,
+        old.view == nil, new.view == nil, (old.submenu == nil) == (new.submenu == nil) else { return false }
+      if let oldMenu = old.submenu, let newMenu = new.submenu, !sameShape(oldMenu.items, newMenu.items) { return false }
+    }
+    return true
+  }
+
+  private static func copy(_ existing: [NSMenuItem], _ fresh: [NSMenuItem]) {
+    for (old, new) in zip(existing, fresh) where old !== new && !old.isSeparatorItem {
+      // Only what changed, so an unchanged row isn't redrawn.
+      if old.title != new.title { old.title = new.title }
+      if old.attributedTitle != new.attributedTitle { old.attributedTitle = new.attributedTitle }
+      if old.subtitle != new.subtitle { old.subtitle = new.subtitle }
+      if old.state != new.state { old.state = new.state }
+      if old.isEnabled != new.isEnabled { old.isEnabled = new.isEnabled }
+      if old.toolTip != new.toolTip { old.toolTip = new.toolTip }
+      if old.keyEquivalent != new.keyEquivalent { old.keyEquivalent = new.keyEquivalent }
+      if old.keyEquivalentModifierMask != new.keyEquivalentModifierMask {
+        old.keyEquivalentModifierMask = new.keyEquivalentModifierMask
+      }
+      if old.image?.name() != new.image?.name() || (old.image == nil) != (new.image == nil) { old.image = new.image }
+      old.action = new.action
+      old.target = new.target
+      old.representedObject = new.representedObject
+      if let oldMenu = old.submenu, let newMenu = new.submenu { copy(oldMenu.items, newMenu.items) }
     }
   }
 
@@ -230,6 +298,9 @@ final class UIMenuCommandBox: NSObject {
         previewHost?.rootView = card(width: previewWidth)
       case .action(let action):
         run(action)
+      case .stopCamerasAndSwitch(let mode):
+        let bridge = bridge()
+        UIOutputModeSwitch.shared.stopCamerasAndSwitch(to: mode, send: { bridge.send($0) }, session: { bridge.snapshot() })
       }
     }
   }
@@ -315,6 +386,10 @@ final class UIMenuCommandBox: NSObject {
         modifiers: [.command, .option], symbol: "stop.circle", subtitle: elapsed, target: target))
     }
 
+    // Output: which Ultracam cameras meeting apps see, and switching between them.
+    items.append(.separator())
+    items.append(outputItem(session: session, target: target))
+
     // Program: cut rows (thumbnails never cut), automatic switching, hold.
     if presentation.outputMode == .program {
       items.append(.separator())
@@ -328,10 +403,21 @@ final class UIMenuCommandBox: NSObject {
       let auto = row("Automatic Switching", action(.setAutoSwitching(!presentation.autoSwitching)), key: "a",
         modifiers: [.control, .option], checked: presentation.autoSwitching, enabled: presentation.canAutoSwitch,
         symbol: "wand.and.stars", target: target)
-      if !presentation.canAutoSwitch { auto.toolTip = "Choose a switching strategy in Program › Strategy first." }
+      if !presentation.canAutoSwitch { auto.toolTip = "Choose a strategy below to switch automatically." }
       items.append(auto)
       items.append(row("Hold Current Shot", action(.setAutoHold(!session.autoHold)), checked: session.autoHold,
         enabled: presentation.canHoldShot, target: target))
+      // The strategy lives here too, so a disabled Automatic Switching isn't a dead end.
+      let strategies = NSMenu(title: "Strategy")
+      strategies.autoenablesItems = false
+      for strategy in UIOutputModeControl.strategies {
+        strategies.addItem(row(UIStrategy.title(strategy), action(.setStrategy(strategy)),
+          checked: session.strategy == strategy, target: target))
+      }
+      let strategyItem = NSMenuItem(title: "Strategy", action: nil, keyEquivalent: "")
+      strategyItem.subtitle = UIStrategy.title(session.strategy)
+      strategyItem.submenu = strategies
+      items.append(strategyItem)
     }
 
     // Cameras: processing and preview for the selected camera, then one submenu per camera.
@@ -373,6 +459,38 @@ final class UIMenuCommandBox: NSObject {
     return items
   }
 
+  /// "Output" with the mode as its subtitle; the submenu switches when the cameras are stopped,
+  /// offers to stop them when that's safe, and otherwise says what's in the way.
+  private static func outputItem(session: UISessionSnapshot, target: AnyObject?) -> NSMenuItem {
+    let availability = UIOutputModeControl.availability(session)
+    let submenu = NSMenu(title: "Output")
+    submenu.autoenablesItems = false
+    for mode in [UIOutputMode.separate, .program] {
+      submenu.addItem(row(UIOutputModeControl.title(mode), session.outputMode == mode ? [] : action(.setOutputMode(mode)),
+        checked: session.outputMode == mode, enabled: availability == .available || session.outputMode == mode,
+        subtitle: mode == .program ? "Ultracam · Program" : "Ultracam · each camera", target: target))
+    }
+    let other: UIOutputMode = session.outputMode == .program ? .separate : .program
+    switch availability {
+    case .available:
+      break
+    case .stopCamerasFirst:
+      submenu.addItem(.separator())
+      submenu.addItem(row("Stop Cameras and Switch to \(UIOutputModeControl.title(other))", [.stopCamerasAndSwitch(other)],
+        symbol: "stop.fill", target: target))
+    case .blocked(let reason):
+      submenu.addItem(.separator())
+      let note = NSMenuItem(title: reason, action: nil, keyEquivalent: "")
+      note.isEnabled = false
+      submenu.addItem(note)
+    }
+    let item = NSMenuItem(title: "Output", action: nil, keyEquivalent: "")
+    item.subtitle = UIOutputModeControl.title(session.outputMode)
+    item.image = NSImage(systemSymbolName: "video.badge.checkmark", accessibilityDescription: nil)
+    item.submenu = submenu
+    return item
+  }
+
   private static func cameraItem(_ camera: UICameraPresentation, presentation: UISessionPresentation,
     session: UISessionSnapshot, inputs: [UIInput], target: AnyObject?) -> NSMenuItem {
     var status: [String] = []
@@ -399,9 +517,12 @@ final class UIMenuCommandBox: NSObject {
       submenu.addItem(row(pause == "Pause" ? "Pause Recording" : "Resume Recording",
         action(.pauseOrResume(cameraID: camera.id)), symbol: pause == "Pause" ? "pause" : "play", target: target))
     }
-    if presentation.outputMode == .program && camera.showsCut {
+    // Always there in Program (checked while on air), so an automatic cut changes the row's
+    // state, not the submenu's rows, and the open menu updates in place.
+    if presentation.outputMode == .program {
+      let onAir = session.onAirID == camera.id
       submenu.addItem(row("Cut to \(camera.name)", action(.cut(cameraID: camera.id)), key: "",
-        modifiers: .control, enabled: camera.cutEnabled, symbol: "tv", target: target))
+        modifiers: .control, checked: onAir, enabled: camera.cutEnabled && !onAir, symbol: "tv", target: target))
     }
     submenu.addItem(.separator())
     submenu.addItem(row("Processing", action(.setProcessing(cameraID: camera.id, !camera.processing)),
@@ -562,7 +683,9 @@ struct UIMenuPreviewContent: View {
 
   private var programPicture: some View {
     // Sized from the card's width, so the picture fills it at 16:9 whatever the native preview's own size.
-    UIColumnPictureLayout { pictures.programPicture() }
+    // Compact, as the camera thumbnails: the window's Program picture brings its monitor tool
+    // bar (which covered the tally badge here) and its scopes, and shares Clean View state.
+    UIColumnPictureLayout { pictures.picture(cameraID: MonitorFeedHost.programTarget, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 10))
       .overlay(alignment: .topLeading) { Label("Ultracam · Program", systemImage: "tv").font(.caption.weight(.semibold)).uiPictureOverlay().padding(7) }
       .overlay(alignment: .topTrailing) { UITallyBadge(tally: session.programInUse ? .onAir : .program).padding(7) }
