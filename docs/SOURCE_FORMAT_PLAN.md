@@ -214,20 +214,20 @@ format table or the compatibility setting.
 Each gate compares against constants. Each must compare against the declared
 `SourceFormat` and the format table instead.
 
-| Where | Assumes |
-|---|---|
-| `UltracamBackend.mm:851` | `GetWidth() != 3840 \|\| GetHeight() != 2160 \|\| != bmdFormat10BitYUV` is fatal |
-| `UltracamBackend.mm:866-868` | `rowBytes < 10240`, "3840 × 2160 v210 needs …". 1080p v210 is 5120 bytes, so 1080p fails here even after `:851` is fixed |
-| `UltracamBackend.mm:886` | accepts v210 only |
-| `UltracamBackend.mm:220-229`, `:812`, `:856` | `supportedFrameDuration` allows only 1001/30000 and 1001/60000; anything else is "UltraStudio supplied an invalid frame timestamp" |
-| `UltracamBackend.mm:554`, `:201`, `:560-562` | the mode list is `bmdMode4K2160p2997/5994` only; format detection requires YCbCr422 at 10 or 12 bit and rejects RGB 4:4:4 and 8-bit |
-| `CaptureController.swift:1048-1056` | width 3840, height 2160, `tenBit422`, duration fast/slow |
-| `CaptureController.swift:971-976` | recording admission: the same four |
-| `LUTProcessor.swift:533-538` | 3840×2160 and `tenBit422` |
-| `AVAssetSourceRecordingWriter.swift:368`, `:379` | v210 only; size must equal the configured 3840×2160 |
-| `CameraSink.swift:83`, `:315-319`, `:328`; extension admit `CameraProvider.swift:219`, `:306`, `:315` [EXT] | `VideoBufferLayout` formats only; the sink compares size and duration exactly (`!=`); the extension allows 1 µs on duration |
-| `ProgramOutputBridge.swift:355` | drops frames whose duration differs from the negotiated one |
-| `ProgramTimestampMapper.swift:112-115` | rejects a source whose timescale changes |
+| Where | Assumes | Generalize |
+|---|---|---|
+| `UltracamBackend.mm:851` | `GetWidth() != 3840 \|\| GetHeight() != 2160 \|\| != bmdFormat10BitYUV` is fatal | compare against the declared `SourceFormat` and the table |
+| `UltracamBackend.mm:866-868` | `rowBytes < 10240`, "3840 × 2160 v210 needs …". 1080p v210 is 5120 bytes, so 1080p fails here even after `:851` is fixed | compare against the declared `SourceFormat` and the table |
+| `UltracamBackend.mm:886` | accepts v210 only | compare against the declared `SourceFormat` and the table |
+| `UltracamBackend.mm:220-229`, `:812`, `:856` | `supportedFrameDuration` allows only 1001/30000 and 1001/60000; anything else is "UltraStudio supplied an invalid frame timestamp" | compare against the declared `SourceFormat` and the table |
+| `UltracamBackend.mm:554`, `:201`, `:560-562` | the mode list is `bmdMode4K2160p2997/5994` only; format detection requires YCbCr422 at 10 or 12 bit and rejects RGB 4:4:4 and 8-bit | compare against the declared `SourceFormat` and the table |
+| `CaptureController.swift:1048-1056` | width 3840, height 2160, `tenBit422`, duration fast/slow | compare against the declared `SourceFormat` and the table |
+| `CaptureController.swift:971-976` | recording admission: the same four | compare against the declared `SourceFormat` and the table |
+| `LUTProcessor.swift:533-538` | 3840×2160 and `tenBit422` | compare against the declared `SourceFormat` and the table |
+| `AVAssetSourceRecordingWriter.swift:368`, `:379` | v210 only; size must equal the configured 3840×2160 | compare against the declared `SourceFormat` and the table |
+| `CameraSink.swift:83`, `:315-319`, `:328`; extension admit `CameraProvider.swift:219`, `:306`, `:315` [EXT] | `VideoBufferLayout` formats only; the sink compares size and duration exactly (`!=`); the extension allows 1 µs on duration | compare against the declared `SourceFormat` and the table |
+| `ProgramOutputBridge.swift:355` | drops frames whose duration differs from the negotiated one | compare against the declared `SourceFormat` and the table |
+| `ProgramTimestampMapper.swift:112-115` | rejects a source whose timescale changes | compare against the declared `SourceFormat` and the table |
 | `UltracamBackend.mm:201` | only the 2160p mode filter keeps interlaced modes out today; nothing reads field count or dominance | refuse interlaced and PsF at admission from `SourceFormat.scan`, with a clear message (decided: no interlaced support) |
 | `UltracamBackend.mm:2008` | refusal text "Unsupported HDMI input … 4K YUV 4:2:2 at 29.97 or 59.94" | the plugin's supported-modes text |
 
@@ -489,7 +489,7 @@ Dependencies:
   - the fake plugin exists for verification (vendor step 1).
 
 Each step keeps the FX3 4K59.94 path identical. Andrew checks it live after
-B2, B3, B5 and B6.
+B1 (the standby frame and recording's fallback change), B2, B3, B5 and B6.
 
 - **B0. Pure fixes.** The rows marked B0 in "Fix now":
   - the false-colour S-Log3 bug;

@@ -583,11 +583,13 @@ whatever happens to plugins:
   - `AllowScreenCaptureDevices` is turned on process-wide in three places:
     `CameraSink.swift:203`, `CameraDemandMonitor.swift:96` and
     `VirtualCameraRegistryTransport.swift:66`.
-  - So AVFoundation lists Ultracam's own virtual cameras. Capturing one would loop Program back into
-  itself. The UVC plugin must drop devices whose unique ID starts with
-  `org.ultracam.camera.device` (`VirtualCameraRegistry.swift:51-57`) or whose
-  manufacturer is "Ultracam" (`CameraProvider.swift:208`). It should hide
-  other virtual cameras (OBS, Continuity Camera) by default too.
+  - So AVFoundation lists Ultracam's own virtual cameras, and capturing one
+    would loop Program back into itself.
+  - The UVC plugin must drop devices whose unique ID starts with
+    `org.ultracam.camera.device` (`VirtualCameraRegistry.swift:51-57`) or
+    whose manufacturer is "Ultracam" (`CameraProvider.swift:208`).
+  - It should hide other virtual cameras (OBS, Continuity Camera) by default
+    too.
 - **Webcam timing** is variable-rate and stamps the start of the frame (see
   SOURCE_FORMAT_PLAN.md section 4, and the host-time rule).
 - **Separate audio devices** have no frame to pair with (SOURCE_FORMAT_PLAN.md section 7, clock domains).
