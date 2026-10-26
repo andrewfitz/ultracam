@@ -470,7 +470,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     controller.onUpdate = { update in
       if update.message.hasPrefix("Waiting") { started.fulfill() }
     }
-    controller.start(deviceID: "synthetic", configuration: configuration,
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: configuration,
       pipelineEnabled: pipelineEnabled, previewEnabled: previewEnabled)
     wait(for: [started], timeout: 5)
     XCTAssertEqual(harness.starts, 1)
@@ -568,7 +568,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let statuses = CaptureStatusRecorder()
     controller.onUpdate = { statuses.record($0) }
     defer { controller.onUpdate = nil; controller.stop() }
-    controller.start(deviceID: "synthetic", configuration: config, pipelineEnabled: false, previewEnabled: false)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config, pipelineEnabled: false, previewEnabled: false)
     awaitCondition("Synthetic media capture must start") { harness.active }
     let first = CaptureMediaStats(timecode: "01:02:03:04", audioPacketTime: .zero,
       audioSampleFrames: 160, audioChannels: 2, leftPeak: 0.75, rightPeak: 0.5,
@@ -600,7 +600,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let statuses = CaptureStatusRecorder()
     controller.onUpdate = { statuses.record($0) }
     defer { controller.onUpdate = nil; controller.stop() }
-    controller.start(deviceID: "synthetic", configuration: config,
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config,
       pipelineEnabled: false, previewEnabled: false)
     awaitCondition("Synthetic media capture must start") { harness.active }
 
@@ -637,7 +637,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       controller.stop()
       gate.signal()
     }
-    controller.start(deviceID: "synthetic", configuration: config,
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config,
       pipelineEnabled: false, previewEnabled: false)
     wait(for: [entered], timeout: 5)
     let packet = CaptureMediaStats(timecode: nil, audioPacketTime: .zero,
@@ -903,7 +903,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     controller.onUpdate = { statuses.record($0) }
     defer { release.signal(); controller.onUpdate = nil; controller.stop() }
     // Bypass isolates the cold transport ordering without requiring a LUT.
-    controller.start(deviceID: "synthetic", configuration: config,
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config,
       pipelineEnabled: false, previewEnabled: false)
     wait(for: [entered], timeout: 5)
     XCTAssertEqual(harness.starts, 0, "Driver callbacks must not race a cold camera connection")
@@ -932,7 +932,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     defer { controller.onUpdate = nil; controller.stop() }
     var missingLUT = config
     missingLUT.applyLUT = true
-    controller.start(deviceID: "synthetic", configuration: missingLUT, previewEnabled: false)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: missingLUT, previewEnabled: false)
     wait(for: [stopped], timeout: 5)
     XCTAssertEqual(harness.negotiated.count, 1)
     XCTAssertEqual(harness.starts, 0,
@@ -951,7 +951,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let statuses = CaptureStatusRecorder()
     defer { controller.onUpdate = nil; controller.stop(); gate.signal() }
     controller.onUpdate = { statuses.record($0) }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [entered], timeout: 5)
     let source = try EndToEndChecks.source()
     // Half a second of 59.94 video arrives while the capture queue is held.
@@ -987,7 +987,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let controller = CaptureController(services: harness.services())
     defer { controller.onUpdate = nil; controller.stop(); gate.signal() }
     controller.onUpdate = { if $0.stopped { stopped.fulfill() } }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [entered], timeout: 5)
     let initialConnections = harness.negotiated.count
     controller.reconfigure(configuration: config, pipelineEnabled: false)
@@ -1016,7 +1016,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       if update.stopped { stopped.fulfill() }
       if update.frames > 0 { unexpectedLive.fulfill() }
     }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [started], timeout: 3)
     controller.stop()
     gate.signal()
@@ -1050,7 +1050,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     controller.onUpdate = { update in
       if update.message.hasPrefix("Waiting") { firstStart.fulfill() }
     }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [firstStart], timeout: 3)
     let stopped = expectation(description: "First stop completed")
     controller.onUpdate = { if $0.stopped { stopped.fulfill() } }
@@ -1060,7 +1060,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     controller.onUpdate = { update in
       if update.message.hasPrefix("Waiting") { secondStart.fulfill() }
     }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [secondStart], timeout: 3)
     let delivered = expectation(description: "New generation frame processed")
     controller.onUpdate = { update in
@@ -1101,7 +1101,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       }
       if update.frames > 0 { unexpectedLive.fulfill() }
     }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [started], timeout: 5)
     var malformed: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 64, 64,
@@ -1127,7 +1127,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let controller = CaptureController(services: harness.services())
     defer { controller.onUpdate = nil; controller.stop(); gate.signal() }
     controller.onUpdate = { statuses.record($0) }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [started], timeout: 5)
     var malformed: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 64, 64,
@@ -1155,7 +1155,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       if update.message.hasPrefix("Waiting") { ready.fulfill() }
       XCTAssertFalse(update.stopped, "Backpressure must not be a fatal capture error")
     }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [ready], timeout: 3)
     let source = try EndToEndChecks.source()
     var frame = 0
@@ -1201,7 +1201,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     defer { controller.onUpdate = nil; controller.stop() }
     let ready = expectation(description: "Start ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { ready.fulfill() } }
-    controller.start(deviceID: "synthetic", configuration: config)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [ready], timeout: 3)
     let firstPreview = expectation(description: "Preview survives consumer disconnect")
     controller.onUpdate = { update in
@@ -1414,7 +1414,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       }
       let config = PipelineConfiguration(applyLUT: true, downscale: true,
         convertTo420: true, reduceFrameRate: reduce, inputFast: true)
-      controller.start(deviceID: "synthetic:v210", configuration: config)
+      controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic:v210", configuration: config)
       wait(for: [ready], timeout: 5)
       let produced = expectation(description: "180 source frames at 59.94 fps")
       let producerMetrics = PacedDriverMetrics()

@@ -84,15 +84,13 @@ import XCTest
     XCTAssertEqual(CameraStreamNames.sourceDirection, 1)
   }
 
-  func testLegacyRoutePreservesOriginalSingleCameraIdentity() {
-    let legacy = CameraSinkRoute(feedID: nil)
-    let defaultID = CameraSinkRoute(feedID: FeedID(rawValue: "default"))
-
-    XCTAssertEqual(legacy, .legacy)
-    XCTAssertEqual(defaultID, .legacy)
-    XCTAssertEqual(legacy.deviceUID, VideoContract.deviceUID)
-    XCTAssertEqual(legacy.sinkStreamName, VideoContract.sinkName)
-    XCTAssertEqual(legacy.sourceStreamName, VideoContract.cameraName)
+  /// The camera extension starts with one "default" device until the app
+  /// publishes its registry; that device keeps the original identity.
+  func testBootstrapDeviceRouteKeepsTheOriginalSingleCameraIdentity() {
+    let bootstrap = CameraSinkRoute(descriptor: .feed(feedID: "default", displayName: VideoContract.cameraName))
+    XCTAssertEqual(bootstrap.deviceUID, VideoContract.deviceUID)
+    XCTAssertEqual(bootstrap.sinkStreamName, VideoContract.sinkName)
+    XCTAssertEqual(bootstrap.sourceStreamName, VideoContract.cameraName)
   }
 
   func testPerFeedQueuesRemainIndependentWhenOneSinkStops() throws {

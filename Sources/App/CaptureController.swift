@@ -218,7 +218,7 @@ final class CaptureController: @unchecked Sendable {
   private var cameraWindowStart: Double = 0
   private var cameraWindowSent: UInt64 = 0
   private var cameraWindowFull: UInt64 = 0
-  private var cameraLabel: String { activeFeed?.rawValue ?? "legacy" }
+  private var cameraLabel: String { activeFeed?.rawValue ?? "an idle controller" }
   // Program output consumes processed frames through FeedCoordinator. When it
   // is enabled, this controller keeps capture and GPU work alive without
   // opening a per-feed CMIO sink; the Program bridge owns that sink.
@@ -243,7 +243,7 @@ final class CaptureController: @unchecked Sendable {
   /// stop the native controller more than once during one session teardown.
   var generationToken: UInt64 { lock.withLock { generation } }
 
-  init(services: CaptureServices = .live()) {
+  init(services: CaptureServices) {
     self.services = services
     queue.setSpecific(key: queueKey, value: 1)
     controlQueue.setSpecific(key: controlKey, value: 1)
@@ -339,20 +339,8 @@ final class CaptureController: @unchecked Sendable {
     load(lut, expectedGeneration: expectedGeneration, completion: completion)
   }
 
-  func start(deviceID: String, configuration: PipelineConfiguration,
-    pipelineEnabled: Bool = true, previewEnabled: Bool = true) {
-    start(feedID: nil, deviceID: deviceID, configuration: configuration,
-      pipelineEnabled: pipelineEnabled, previewEnabled: previewEnabled)
-  }
-
   func start(feedID: FeedID, deviceID: String, configuration: PipelineConfiguration,
     pipelineEnabled: Bool = true, previewEnabled: Bool = true) {
-    start(feedID: Optional(feedID), deviceID: deviceID, configuration: configuration,
-      pipelineEnabled: pipelineEnabled, previewEnabled: previewEnabled)
-  }
-
-  private func start(feedID: FeedID?, deviceID: String, configuration: PipelineConfiguration,
-    pipelineEnabled: Bool, previewEnabled: Bool) {
     let token = lock.withLock { () -> UInt64? in
       if retiredFromPool { return nil }
       generation &+= 1
@@ -1656,7 +1644,7 @@ struct CaptureServices: @unchecked Sendable {
   var deviceDroppedFrames: () -> UInt64 = { 0 }
   var cameraRetryInterval: TimeInterval = 2
 
-  static func live(feedID: FeedID? = nil) -> CaptureServices {
+  static func live(feedID: FeedID) -> CaptureServices {
     let backend = UltracamBackend()
     let sink = CameraSink(feedID: feedID)
     var services = CaptureServices(

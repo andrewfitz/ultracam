@@ -201,7 +201,7 @@ final class SourceQueue {
   private var closed = false
   private var closeStatus: OSStatus = noErr
 
-  init(route: CameraSinkRoute = .legacy, arrivals: SourceArrivals? = nil) throws {
+  init(route: CameraSinkRoute, arrivals: SourceArrivals? = nil) throws {
     self.arrivals = arrivals
     guard let device = try ids(CMIOObjectID(kCMIOObjectSystemObject), kCMIOHardwarePropertyDevices)
       .first(where: { try string($0, kCMIODevicePropertyDeviceUID) == route.deviceUID }),
@@ -847,7 +847,7 @@ func smoke() throws {
 
 @discardableResult
 func runCase(fast: Bool, pool: CVPixelBufferPool, mode: SyntheticMode,
-  route: CameraSinkRoute = .legacy, monitorEnabled: Bool = false, frameCount: Int = 60,
+  route: CameraSinkRoute, monitorEnabled: Bool = false, frameCount: Int = 60,
   pairedMonitor: Bool = false) throws -> CameraReceipt {
   let duration = fast ? VideoContract.fastDuration : VideoContract.slowDuration
   log("CMIO_SMOKE case requested=\(mode.summary(duration: duration))")

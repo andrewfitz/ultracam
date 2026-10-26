@@ -440,7 +440,7 @@ import simd
     off.inputFast = true
     var on = off
     on.applyLUT = true
-    controller.start(deviceID: "synthetic", configuration: off)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: off)
     wait(for: [started], timeout: 5)
     XCTAssertNil(controller.burnInLUT, "nothing loaded")
     let lut = try LUTProcessor.makeLUT(CubeLUT(text: cubeText(size: 17, transform: { $0 * $0 })))

@@ -23,11 +23,6 @@ struct CameraDemandRoute: Equatable, Hashable, Identifiable, Sendable {
     sourceStreamName = descriptor.displayName
     displayName = descriptor.displayName
   }
-
-  /// The migrated route remains the default when callers have not published
-  /// a registry yet, preserving existing single-camera behavior.
-  static let legacy = CameraDemandRoute(
-    descriptor: .feed(feedID: "default", displayName: VideoContract.cameraName))
 }
 
 /// One route-scoped demand update. `requested == nil` means the route could
@@ -63,7 +58,7 @@ final class CameraDemandMonitor {
 
   private var topology: Listener?
   private var demand: [String: Listener] = [:]
-  private var routesByID: [String: CameraDemandRoute] = [CameraDemandRoute.legacy.id: .legacy]
+  private var routesByID: [String: CameraDemandRoute] = [:]
   private var states: [String: State] = [:]
   private var enabled = false
 
@@ -71,14 +66,13 @@ final class CameraDemandMonitor {
 
   var routes: [CameraDemandRoute] { Array(routesByID.values).sorted { $0.id < $1.id } }
 
-  init(routes: [CameraDemandRoute] = [.legacy]) { setRoutes(routes) }
+  init(routes: [CameraDemandRoute] = []) { setRoutes(routes) }
 
   /// Replaces monitored topology without toggling the monitor. Duplicate route
   /// IDs collapse deterministically, and removed listeners are released first.
   func setRoutes(_ routes: [CameraDemandRoute]) {
     var next: [String: CameraDemandRoute] = [:]
     for route in routes where next[route.id] == nil { next[route.id] = route }
-    if next.isEmpty { next[CameraDemandRoute.legacy.id] = .legacy }
     let removed = Set(routesByID.keys).subtracting(next.keys)
     for id in removed {
       demand[id] = nil

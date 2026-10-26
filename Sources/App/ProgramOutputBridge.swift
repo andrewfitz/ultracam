@@ -83,7 +83,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
 
   /// The production bridge uses the dedicated Program CMIO destination.
   convenience init(route: FrameRoute<CVPixelBuffer>, queueLabel: String = "org.ultracam.program-output-bridge") {
-    let sink = CameraSink(program: true)
+    let sink = CameraSink(route: CameraSinkRoute(descriptor: .program()))
     self.init(route: route, connect: { configuration, passthroughFormat in
       try sink.connect(configuration: configuration, passthroughFormat: passthroughFormat)
     }, disconnect: { sink.disconnect() }, send: { sample in

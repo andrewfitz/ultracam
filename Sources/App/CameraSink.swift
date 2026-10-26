@@ -92,31 +92,15 @@ final class CameraFrameStager {
 ///
 /// The extension derives the same UID and stream names from
 /// `VirtualCameraDescriptor`, so an app-side capture controller never has to
-/// guess which virtual camera a frame belongs to. The legacy route intentionally
-/// retains the original UID and names for existing single-camera installations.
+/// guess which virtual camera a frame belongs to.
 struct CameraSinkRoute: Equatable, Sendable {
   let feedID: String?
   let deviceUID: String
   let sinkStreamName: String
   let sourceStreamName: String
 
-  static let legacy = CameraSinkRoute(
-    feedID: nil,
-    deviceUID: VideoContract.deviceUID,
-    sinkStreamName: VideoContract.sinkName,
-    sourceStreamName: VideoContract.cameraName)
-
-  init(feedID: FeedID?) {
-    guard let feedID else {
-      self = .legacy
-      return
-    }
-    let normalized = feedID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !normalized.isEmpty, normalized != "default" else {
-      self = .legacy
-      return
-    }
-    self.init(descriptor: .feed(feedID: normalized))
+  init(feedID: FeedID) {
+    self.init(descriptor: .feed(feedID: feedID.rawValue))
   }
 
   init(descriptor: VirtualCameraDescriptor) {
@@ -129,13 +113,6 @@ struct CameraSinkRoute: Equatable, Sendable {
       ? VideoContract.sinkName
       : "\(descriptor.displayName) Input"
     self.sourceStreamName = descriptor.displayName
-  }
-
-  private init(feedID: String?, deviceUID: String, sinkStreamName: String, sourceStreamName: String) {
-    self.feedID = feedID
-    self.deviceUID = deviceUID
-    self.sinkStreamName = sinkStreamName
-    self.sourceStreamName = sourceStreamName
   }
 }
 
@@ -187,34 +164,29 @@ final class CameraSink {
   private let registrySnapshot: () -> VirtualCameraRegistrySnapshot?
   let route: CameraSinkRoute
 
-  init(bufferQueue: CameraBufferQueue? = nil, route: CameraSinkRoute = .legacy,
+  init(bufferQueue: CameraBufferQueue? = nil, route: CameraSinkRoute,
     registrySnapshot: @escaping () -> VirtualCameraRegistrySnapshot? = { VirtualCameraRegistryStore().load() }) {
     queue = bufferQueue
     self.route = route
     self.registrySnapshot = registrySnapshot
   }
 
-  convenience init(bufferQueue: CameraBufferQueue? = nil, feedID: FeedID?) {
+  convenience init(bufferQueue: CameraBufferQueue? = nil, feedID: FeedID) {
     self.init(bufferQueue: bufferQueue, route: CameraSinkRoute(feedID: feedID))
-  }
-
-  convenience init(bufferQueue: CameraBufferQueue? = nil, program: Bool) {
-    self.init(bufferQueue: bufferQueue,
-      route: program ? CameraSinkRoute(descriptor: .program()) : .legacy)
   }
   deinit { disconnect() }
 
   func connect(configuration: PipelineConfiguration, passthroughFormat: OSType) throws {
     let pixelFormat = configuration.untouched ? passthroughFormat : configuration.pixelFormat
     cameraOutputLog.notice("""
-      Camera connect: \(self.route.feedID ?? "legacy", privacy: .public) → \(self.route.deviceUID, privacy: .public), \
+      Camera connect: \(self.route.feedID ?? "Program", privacy: .public) → \(self.route.deviceUID, privacy: .public), \
       \(configuration.width, privacy: .public)×\(configuration.height, privacy: .public) \
       \(fourCC(pixelFormat), privacy: .public), frame \(configuration.duration.value, privacy: .public)/\
       \(configuration.duration.timescale, privacy: .public) s
       """)
     do { try connectOnce(configuration: configuration, passthroughFormat: passthroughFormat) } catch {
       cameraOutputLog.error("""
-        Camera connect failed: \(self.route.feedID ?? "legacy", privacy: .public) → \(self.route.deviceUID, privacy: .public): \
+        Camera connect failed: \(self.route.feedID ?? "Program", privacy: .public) → \(self.route.deviceUID, privacy: .public): \
         \(error.localizedDescription, privacy: .public)
         """)
       throw error
@@ -247,7 +219,7 @@ final class CameraSink {
       // stream whose direction is into the device.
       guard let paired = CameraStreamNames.pair(namedStreams, sinkName: route.sinkStreamName,
         sourceName: route.sourceStreamName) else {
-        throw VideoError.message("The virtual camera for \(route.feedID ?? "legacy") does not publish its source and input streams.")
+        throw VideoError.message("The virtual camera for \(route.feedID ?? "Program") does not publish its source and input streams.")
       }
       // AVFoundation clients such as Zoom claim device control before starting
       // the source. In automatic mode the producer necessarily arrives later.
@@ -284,7 +256,7 @@ final class CameraSink {
       catch { disconnect(); throw error }
       let size = CMVideoFormatDescriptionGetDimensions(format)
       cameraOutputLog.notice("""
-        Camera connected: \(self.route.feedID ?? "legacy", privacy: .public), negotiated \(size.width, privacy: .public)×\
+        Camera connected: \(self.route.feedID ?? "Program", privacy: .public), negotiated \(size.width, privacy: .public)×\
         \(size.height, privacy: .public) \(fourCC(CMFormatDescriptionGetMediaSubType(format)), privacy: .public), \
         frame \(configuration.duration.value, privacy: .public)/\(configuration.duration.timescale, privacy: .public) s, \
         queue capacity \(self.queue.map { CMSimpleQueueGetCapacity($0.queue) } ?? 0, privacy: .public)\
@@ -323,7 +295,7 @@ final class CameraSink {
     if let negotiatedFormat, let negotiatedDuration,
       let mismatch = Self.mismatch(sample, format: negotiatedFormat, duration: negotiatedDuration) {
       // A failed send closes the connection, so this is at most once per connect.
-      cameraOutputLog.error("Camera frame refused before sending (\(self.route.feedID ?? "legacy", privacy: .public)): \(mismatch, privacy: .public)")
+      cameraOutputLog.error("Camera frame refused before sending (\(self.route.feedID ?? "Program", privacy: .public)): \(mismatch, privacy: .public)")
       throw VideoError.message("Frame does not match the virtual camera's negotiated format and timing (\(mismatch)).")
     }
     return try queue.send(try stager.stage(sample))

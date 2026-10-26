@@ -162,17 +162,17 @@ import XCTest
     var on = off
     on.applyLUT = true
 
-    controller.start(deviceID: "monitor-integration-offline", configuration: on)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "monitor-integration-offline", configuration: on)
     XCTAssertTrue(spinUntil { controller.burnInLUT === lut }, "Apply LUT on burns the loaded LUT in")
     let withLUT = shown()
     XCTAssertNotNil(withLUT, "Apply LUT on: the feed host has the burn-in LUT")
     XCTAssertTrue(withLUT === controller.burnInLUT, "The feed host shows the very LUT the camera burns in")
 
-    controller.start(deviceID: "monitor-integration-offline", configuration: off)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "monitor-integration-offline", configuration: off)
     XCTAssertTrue(spinUntil { controller.burnInLUT == nil }, "Apply LUT off burns nothing in")
     XCTAssertNil(shown(), "Apply LUT off: the feed host has no burn-in LUT")
 
-    controller.start(deviceID: "monitor-integration-offline", configuration: on)
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "monitor-integration-offline", configuration: on)
     XCTAssertTrue(spinUntil { controller.burnInLUT === lut })
     XCTAssertTrue(shown() === lut)
     XCTAssertFalse(model.running)

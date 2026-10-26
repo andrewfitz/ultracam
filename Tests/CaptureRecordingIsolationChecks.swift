@@ -542,7 +542,7 @@ import XCTest
     let second = pool.controller(for: feed)
     XCTAssertFalse(first === second)
     XCTAssertEqual(counters.lock.withLock { counters.created }, 2)
-    first.start(deviceID: "synthetic", configuration: PipelineConfiguration())
+    first.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: PipelineConfiguration())
     let ignored = expectation(description: "discarded start had time to run")
     DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { ignored.fulfill() }
     wait(for: [ignored], timeout: 2)
@@ -586,7 +586,7 @@ import XCTest
       removed.fulfill()
     }
     wait(for: [entered], timeout: 3)
-    controller.start(deviceID: "synthetic",
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic",
       configuration: PipelineConfiguration(downscale: false, convertTo420: false),
       pipelineEnabled: false, previewEnabled: false)
     release.signal()
@@ -623,7 +623,7 @@ import XCTest
     defer { controller.onUpdate = nil; controller.stop() }
     let started = expectation(description: "automatic capture ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
-    controller.start(deviceID: "synthetic",
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic",
       configuration: PipelineConfiguration(downscale: false, convertTo420: false),
       pipelineEnabled: false, previewEnabled: false)
     wait(for: [started], timeout: 3)
@@ -657,7 +657,7 @@ import XCTest
       }
       if update.message.hasPrefix("Waiting") { started.fulfill() }
     }
-    controller.start(deviceID: "synthetic",
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic",
       configuration: PipelineConfiguration(downscale: false, convertTo420: false),
       pipelineEnabled: false, previewEnabled: false)
     wait(for: [started], timeout: 3)

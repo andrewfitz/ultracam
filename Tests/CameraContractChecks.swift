@@ -4,6 +4,9 @@ import CoreVideo
 import XCTest
 
 @objcMembers final class CameraContractChecks: XCTestCase {
+  /// The extension's bootstrap device, which a provider without a registry publishes.
+  static let bootstrapRoute = CameraSinkRoute(descriptor: .feed(feedID: "default", displayName: VideoContract.cameraName))
+
   func testAuthorizedProducerCanNegotiateAfterConsumerStarts() throws {
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false)
     try camera.queue.sync {
@@ -227,7 +230,7 @@ import XCTest
     }
     let frame = try VideoContract.sample(image, at: CMTime(value: 1, timescale: 1), duration: VideoContract.fastDuration)
     XCTAssertThrowsError(try CameraFrameStager().stage(frame))
-    let sink = CameraSink(bufferQueue: try bufferQueue())
+    let sink = CameraSink(bufferQueue: try bufferQueue(), route: Self.bootstrapRoute)
     XCTAssertThrowsError(try sink.send(frame))
     var emitted = 0
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, output: { _, _, _ in emitted += 1 })
@@ -452,7 +455,7 @@ import XCTest
     }
     XCTAssertNil(firstWeak, "Native consumer releases the enqueue retain exactly once after use")
     XCTAssertEqual(CMSimpleQueueGetCount(queue.queue), 0)
-    let sink = CameraSink(bufferQueue: queue)
+    let sink = CameraSink(bufferQueue: queue, route: Self.bootstrapRoute)
     var remaining: CMSampleBuffer? = try sample()
     weak let remainingWeak = remaining
     XCTAssertTrue(try sink.send(XCTUnwrap(remaining)))
