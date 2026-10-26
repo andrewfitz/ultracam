@@ -499,6 +499,9 @@ struct LoadedLUT: Sendable {
   let cube: CubeLUT
   let bookmark: Data
   let fileName: String
+  /// The file the bookmark resolved to, symlinks resolved: two bookmarks with
+  /// different bytes (a refreshed one, another camera's) name the same LUT.
+  let path: String
 }
 
 // File access and cube parsing run off the main actor. Every security-scope
@@ -514,7 +517,8 @@ actor LUTFileLoader {
     let bookmark = try url.bookmarkData(options: scopedBookmarks
       ? [.withSecurityScope, .securityScopeAllowOnlyReadAccess] : [.minimalBookmark],
       includingResourceValuesForKeys: nil, relativeTo: nil)
-    return LoadedLUT(cube: try read(url), bookmark: bookmark, fileName: url.lastPathComponent)
+    return LoadedLUT(cube: try read(url), bookmark: bookmark, fileName: url.lastPathComponent,
+      path: url.resolvingSymlinksInPath().path)
   }
 
   func restore(bookmark: Data) throws -> LoadedLUT {
@@ -528,7 +532,8 @@ actor LUTFileLoader {
     let refreshed = stale ? try url.bookmarkData(options: scopedBookmarks
       ? [.withSecurityScope, .securityScopeAllowOnlyReadAccess] : [.minimalBookmark],
       includingResourceValuesForKeys: nil, relativeTo: nil) : bookmark
-    return LoadedLUT(cube: cube, bookmark: refreshed, fileName: url.lastPathComponent)
+    return LoadedLUT(cube: cube, bookmark: refreshed, fileName: url.lastPathComponent,
+      path: url.resolvingSymlinksInPath().path)
   }
 
   private func read(_ url: URL) throws -> CubeLUT {

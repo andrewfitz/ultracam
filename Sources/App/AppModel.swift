@@ -198,6 +198,21 @@ final class AppModel {
   func lutState(_ id: FeedID) -> CameraLUTState { cameraLUTs[id] ?? CameraLUTState() }
   /// The camera's LUT is loading. One camera's load never blocks another's.
   func isLUTLoading(_ id: FeedID) -> Bool { lutLoadingFeeds.contains(id) }
+  /// LUT file reads (loads and restores) per camera since launch, logged with
+  /// each read: an edit reads each affected camera's file once, and nothing
+  /// reads while the user does nothing.
+  private(set) var lutReads: [FeedID: Int] = [:]
+  /// The file each bookmark seen this session resolved to, so bookmarks with
+  /// different bytes for one file count as the same saved LUT.
+  @ObservationIgnored private var lutFiles: [Data: String] = [:]
+
+  /// Whether two saved bookmarks name the same LUT file.
+  private func sameLUTFile(_ a: Data?, _ b: Data?) -> Bool {
+    guard let a, let b else { return a == b }
+    if a == b { return true }
+    guard let fileA = lutFiles[a], let fileB = lutFiles[b] else { return false }
+    return fileA == fileB
+  }
   let installer: ExtensionInstaller
   let monitorCoordinator: MonitorCoordinator
   private var monitorDemand: Set<MonitorTargetID> = []
@@ -489,12 +504,12 @@ final class AppModel {
     guard descriptor(for: feedID) != nil else { return }
     cameraLUTs[feedID, default: CameraLUTState()].error = nil
     let generation = beginLUTLoad(feedID)
-    lutLog.notice("LUT load started: \(feedID.rawValue, privacy: .public)")
+    lutLog.notice("LUT load started: \(feedID.rawValue, privacy: .public) (read \(self.lutReads[feedID] ?? 0, privacy: .public))")
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.load(url: url)
         let lut = try await Self.makeMonitorLUT(loaded.cube)
-        self?.installLUT(loaded, lut: lut, restoring: false, generation: generation, feedID: feedID)
+        self?.installLUT(loaded, lut: lut, requested: nil, generation: generation, feedID: feedID)
       } catch { self?.lutLoadFailed(error, restoring: false, generation: generation, feedID: feedID) }
     }
   }
@@ -506,12 +521,12 @@ final class AppModel {
     guard let bookmark = descriptor(for: feedID)?.lutBookmark else { return }
     cameraLUTs[feedID, default: CameraLUTState()].error = nil
     let generation = beginLUTLoad(feedID)
-    lutLog.notice("LUT restore started: \(feedID.rawValue, privacy: .public)")
+    lutLog.notice("LUT restore started: \(feedID.rawValue, privacy: .public) (read \(self.lutReads[feedID] ?? 0, privacy: .public))")
     Task { [weak self, lutLoader] in
       do {
         let loaded = try await lutLoader.restore(bookmark: bookmark)
         let lut = try await Self.makeMonitorLUT(loaded.cube)
-        self?.installLUT(loaded, lut: lut, restoring: true, generation: generation, feedID: feedID)
+        self?.installLUT(loaded, lut: lut, requested: bookmark, generation: generation, feedID: feedID)
       } catch { self?.lutLoadFailed(error, restoring: true, generation: generation, feedID: feedID) }
     }
   }
@@ -526,6 +541,7 @@ final class AppModel {
   /// Starts a LUT load for one camera and returns its generation. A newer load
   /// for the same camera supersedes it; other cameras' loads are unaffected.
   private func beginLUTLoad(_ feedID: FeedID) -> UInt64 {
+    lutReads[feedID, default: 0] += 1
     let generation = (lutLoadGenerations[feedID] ?? 0) &+ 1
     lutLoadGenerations[feedID] = generation
     lutLoadingFeeds.insert(feedID)
@@ -540,29 +556,44 @@ final class AppModel {
 
   /// Puts a read LUT into the camera's own controller. It stays there across
   /// stops and starts; Apply LUT decides whether frames burn it in.
-  private func installLUT(_ loaded: LoadedLUT, lut: MonitorLUT, restoring: Bool, generation: UInt64,
+  /// `requested` is the saved bookmark a restore read; nil for a chosen file.
+  private func installLUT(_ loaded: LoadedLUT, lut: MonitorLUT, requested: Data?, generation: UInt64,
                           feedID: FeedID) {
     guard generation == lutLoadGenerations[feedID], descriptor(for: feedID) != nil else { return }
+    lutFiles[loaded.bookmark] = loaded.path
+    if let requested { lutFiles[requested] = loaded.path }
+    let restoring = requested != nil
     feedCoordinator.capture(for: feedID).load(lut) { [weak self] result in
       MainActor.assumeIsolated {
         guard let self, generation == self.lutLoadGenerations[feedID] else { return }
         switch result {
-        case .success: self.lutInstalled(loaded, restoring: restoring, feedID: feedID)
+        case .success: self.lutInstalled(loaded, requested: requested, feedID: feedID)
         case .failure(let error): self.lutLoadFailed(error, restoring: restoring, generation: generation, feedID: feedID)
         }
       }
     }
   }
 
-  private func lutInstalled(_ loaded: LoadedLUT, restoring: Bool, feedID: FeedID) {
+  private func lutInstalled(_ loaded: LoadedLUT, requested: Data?, feedID: FeedID) {
+    let restoring = requested != nil
     lutLoadingFeeds.remove(feedID)
     cameraLUTs[feedID] = CameraLUTState(title: "\(loaded.cube.title) · \(loaded.cube.sizeDescription)",
       fileName: loaded.fileName, bookmark: loaded.bookmark)
-    // A chosen file becomes the camera's saved LUT and turns Apply LUT on; a
-    // restore keeps the saved choice (and saves a refreshed bookmark).
-    updateCamera(feedID) { descriptor in
-      descriptor.lutBookmark = loaded.bookmark
-      if !restoring { descriptor.applyLUT = true }
+    if restoring {
+      // A restore keeps the saved choice. A refreshed bookmark for the same
+      // file is saved quietly: it is no edit, so it reads nothing anywhere.
+      if var descriptor = descriptor(for: feedID), descriptor.lutBookmark != loaded.bookmark,
+        sameLUTFile(descriptor.lutBookmark, loaded.bookmark) {
+        descriptor.lutBookmark = loaded.bookmark
+        feedCoordinator.update(descriptor)
+        saveSettings(reason: "LUT bookmark refreshed")
+      }
+    } else {
+      // A chosen file becomes the camera's saved LUT and turns Apply LUT on.
+      updateCamera(feedID) { descriptor in
+        descriptor.lutBookmark = loaded.bookmark
+        descriptor.applyLUT = true
+      }
     }
     let apply = descriptor(for: feedID)?.applyLUT == true
     lutLog.notice("LUT \(restoring ? "restored" : "loaded", privacy: .public): \(feedID.rawValue, privacy: .public), \"\(loaded.cube.title, privacy: .public)\" (\(loaded.fileName, privacy: .public)), Apply LUT \(apply ? "on" : "off", privacy: .public)")
@@ -1449,8 +1480,11 @@ final class AppModel {
       monitorCoordinator.setPreviewEnabled(descriptor.previewEnabled, for: MonitorTargetID(id.rawValue))
       feedCoordinator.setPreviewEnabled(feedID: id, enabled: descriptor.previewEnabled)
     }
-    // The saved LUT changed to one not in this camera's pipeline: read it.
-    if descriptor.lutBookmark != before.lutBookmark, descriptor.lutBookmark != lutState(id).bookmark {
+    // The saved LUT changed to another file than the one in this camera's
+    // pipeline, or a load in flight is superseded: read it. A bookmark for the
+    // same file reads nothing.
+    if descriptor.lutBookmark != before.lutBookmark,
+      lutLoadingFeeds.contains(id) || !sameLUTFile(descriptor.lutBookmark, lutState(id).bookmark) {
       cancelLUTLoad(id)
       cameraLUTs[id] = nil
       if descriptor.lutBookmark != nil { restoreLUT(id) }

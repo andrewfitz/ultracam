@@ -24,6 +24,113 @@ import SystemExtensions
   }
 }
 
+/// LUT files are read only when an edit needs them: once per camera at launch
+/// and per new file, never for a bookmark that names the file already loaded,
+/// and never while nothing happens. Scripted capture; no hardware.
+extension UIVerify {
+  func lutReadsAreBounded() throws {
+    let suiteName = "org.ultracam.ui-verify-lut-reads.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut reads: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-reads-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    func cube(_ title: String) throws -> URL {
+      var lattice = ["TITLE \"\(title)\"", "LUT_3D_SIZE 2"]
+      for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lattice.append("\(1 - Float(r)) \(1 - Float(g)) \(1 - Float(b))") } } }
+      let url = folder.appendingPathComponent("\(title).cube")
+      try lattice.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+      return url
+    }
+    let shared = try cube("Shared"), other = try cube("Other")
+    // Another path to the same file: its bookmark has other bytes.
+    let alias = folder.appendingPathComponent("alias.cube")
+    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: shared)
+    let alpha = FeedID(rawValue: "ui-verify-reads-alpha"), beta = FeedID(rawValue: "ui-verify-reads-beta")
+    let settings = AppSettingsStore(defaults: defaults)
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: [
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-a", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-b", applyLUT: false, automaticFeed: false),
+    ], selectedFeedID: alpha, outputMode: .separateCameras))
+    var hardware = AppHardware.offline
+    hardware.devices = { [InputDevice(id: "dev-a", name: "UltraStudio A"), InputDevice(id: "dev-b", name: "UltraStudio B")] }
+    hardware.captureServices = { _ in
+      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+        send: { _ in true })
+      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
+      return services
+    }
+    func makeModel() -> AppModel {
+      AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+        recordingFolderStore: RecordingFolderStore(defaults: defaults),
+        installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    }
+    func settle(_ seconds: Double = 5, until condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(seconds)
+      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+    }
+    do {
+      let setup = makeModel()
+      setup.loadLUT(url: alias, feedID: alpha)
+      setup.loadLUT(url: shared, feedID: beta)
+      settle { setup.lutState(alpha).loaded && setup.lutState(beta).loaded }
+    }
+    let model = makeModel()
+    func reads(_ id: FeedID) -> Int { model.lutReads[id] ?? 0 }
+    func idle() -> Bool { !model.isLUTLoading(alpha) && !model.isLUTLoading(beta) }
+    let surfaces = [alpha, beta].map { id -> (FeedID, UUID) in
+      let surface = UUID()
+      model.monitorCoordinator.registerSurface(id: surface, target: MonitorTargetID(id.rawValue), isVisible: true,
+        scopeVisible: false)
+      return (id, surface)
+    }
+    defer {
+      for (_, surface) in surfaces { model.monitorCoordinator.unregisterSurface(id: surface) }
+      model.stopCamera(alpha)
+      model.stopCamera(beta)
+    }
+    func monitorsBurnIn() -> Bool {
+      surfaces.allSatisfy { id, surface in
+        let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
+        presenter.refreshBurnInLUT()
+        return model.burnInLUT(for: id) != nil && presenter.host.burnInLUT === model.burnInLUT(for: id)
+      }
+    }
+    settle { idle() && model.lutState(alpha).loaded && model.lutState(beta).loaded }
+    model.startCamera(alpha)
+    model.startCamera(beta)
+    settle { monitorsBurnIn() }
+    verifier.check("lut reads: launch reads each camera's file once", reads(alpha) == 1 && reads(beta) == 1,
+      "\(reads(alpha)), \(reads(beta))")
+    verifier.check("lut reads: both monitors burn their LUT in after launch", monitorsBurnIn())
+
+    // Another camera's bookmark for the same file is the LUT already loaded.
+    let alphaBookmark = model.descriptor(for: alpha)?.lutBookmark
+    verifier.check("lut reads: the two bookmarks differ", alphaBookmark != model.descriptor(for: beta)?.lutBookmark)
+    model.updateCamera(beta) { $0.lutBookmark = alphaBookmark }
+    settle(1) { !idle() }
+    verifier.check("lut reads: a bookmark for the loaded file reads nothing", reads(beta) == 1 && monitorsBurnIn(),
+      "\(reads(beta))")
+
+    for id in [alpha, beta] {
+      model.updateCamera(id) { $0.applyLUT = false }
+      model.updateCamera(id) { $0.applyLUT = true }
+    }
+    settle { monitorsBurnIn() }
+    verifier.check("lut reads: Apply LUT toggles read nothing", reads(alpha) == 1 && reads(beta) == 1 && monitorsBurnIn(),
+      "\(reads(alpha)), \(reads(beta))")
+
+    model.loadLUT(url: other, feedID: alpha)
+    settle { idle() && model.lutState(alpha).displayTitle.hasPrefix("Other") }
+    verifier.check("lut reads: a new file reads only its camera, once", reads(alpha) == 2 && reads(beta) == 1,
+      "\(reads(alpha)), \(reads(beta))")
+    settle(3) { false }
+    verifier.check("lut reads: nothing reads while idle", reads(alpha) == 2 && reads(beta) == 1 && monitorsBurnIn(),
+      "\(reads(alpha)), \(reads(beta))")
+  }
+}
+
 /// Every camera runs one pipeline: for each camera, selected or not, the LUT
 /// restore at launch, Apply LUT toggles, a LUT loaded before or after start
 /// and a selection change mid-load all end with that camera's LUT burned into
@@ -1575,6 +1682,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
   do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }
   do { try run.cameraSymmetry() } catch { verifier.check("camera symmetry tests threw", false, "\(error)") }
+  do { try run.lutReadsAreBounded() } catch { verifier.check("LUT read tests threw", false, "\(error)") }
   run.adoption()
   run.sharedInput()
   run.pictureMenus()
