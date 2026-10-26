@@ -574,20 +574,47 @@ Then comes the first new vendor:
 Whichever comes first, expect it to force small API fixes, and make them
 before anyone outside builds on the API.
 
-## Open decisions
+## Decisions
 
-Decided on 2026-10-26: Part B is in scope and covers every hard-coded
-assumption. Part B's own decisions (VFR, Program rate conversion, aspect,
-interlaced, audio-only takes) are in
-[SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md).
+Decided on 2026-10-26:
+- Part B is in scope and covers every hard-coded assumption.
+- CPU conversion is an opt-in compatibility setting, off by default.
+- Interlaced signals are not supported.
 
-1. **Isolation:** one module with a boundary-check script (recommended now),
-   or a Swift package per plugin. Packages are enforced by the compiler, but
-   they rework `test.sh` and `ui-verify.sh`, and Sony's dylibs would have to
-   be wrapped as an xcframework.
-2. **Folder location:** top-level `Vendors/` (recommended, because the SDKs
-   sit next to the code) or `Sources/Vendors/`.
-3. **Release builds without the Sony SDK:** ship with Sony control shown as
-   unavailable (as now), or have `build.sh` refuse a release build that is
-   missing a plugin's SDK.
-4. **Going public:** choose a license, and make the build root configurable.
+Part B's other decisions are in [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md):
+VFR, Program rate conversion, aspect and audio-only takes.
+
+### Recommendations to confirm
+
+1. **Isolation: one module plus a boundary-check script.**
+   - It works with today's build, where `test.sh` and `ui-verify.sh` compile
+     everything in one `swiftc` call.
+   - The check fails on app code naming a plugin type, on plugin code reaching
+     past DeviceAPI, and on vendor names outside `Vendors/`.
+   - Swift packages per plugin can come later, once the API has settled.
+     Moving then is mechanical, because DeviceAPI is already the only shared
+     surface.
+2. **Folder: top-level `Vendors/<Vendor>/`.** The SDK, code, tests and README
+   live together, so an SDK update or a new vendor touches one folder.
+3. **Release builds without the Sony SDK: ship with Sony control shown as
+   unavailable.**
+   - Outside developers can't get Sony's SDK from the repo.
+   - `build.sh` prints each plugin's status.
+   - `validate_bundle.py` fails only if a plugin that claims to be available
+     is missing its libraries.
+4. **Licence: Apache-2.0** (MIT is the simpler alternative).
+   - The app links vendor SDKs that aren't open source: Sony, and later NDI
+     and possibly AJA.
+   - Under GPL, distributing those builds would need a linking exception.
+   - Apache-2.0 adds a patent grant, which suits a codebase that others
+     extend with plugins.
+5. **Build location: one `ULTRACAM_WORK_ROOT` environment variable.**
+   - It defaults to `.build/` inside the checkout.
+   - It replaces `/Volumes/8TB` in the 15 shell scripts and
+     `generate_project.py`.
+   - On this Mac, set it to the external drive to keep today's behaviour.
+6. **First new vendor: UVC, after B1-B6.**
+   - Anyone can test it with any webcam, and it needs no SDK.
+   - It exercises the parts of the API that DeckLink can't: a different
+     format and clock, separate-device audio, and VFR.
+   - AJA comes when there's hardware to test on.

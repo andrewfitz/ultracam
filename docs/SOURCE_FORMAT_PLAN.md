@@ -303,7 +303,7 @@ nv12, p010 and RGB. It is the model for the table.
 | `ProgramNormalizer.swift:14-15`, `:247` | "every format in the pipeline is BT.709 video range"; only `xf22` full range is handled | convert every source on the GPU to Program's colour |
 | behaviour of `FeedRuntime` and `ProgramNormalizer` [CLIENT] | a cut from a 709 camera to a 2020/PQ camera flips the Program tags mid-stream | the Program colour stays fixed; sources convert into it |
 | `FeedRuntime.swift:484` | at most 4 repeats | see section 4 |
-| Program rate conversion | today all sources share a cadence | a 25p source into a 59.94 Program repeats frames in a 2:3-like pattern, and a 59.94 source into 25p must skip frames. That skip is rate conversion, not drop-when-busy, but it has to be stated and counted (decision 2) |
+| Program rate conversion | today all sources share a cadence | a 25p source into a 59.94 Program repeats frames in a 2:3-like pattern, and a 59.94 source into 25p must skip frames. That skip is rate conversion, not drop-when-busy, but it has to be stated and counted (recommendation 2) |
 
 ### 9. Recording
 
@@ -449,7 +449,7 @@ FX3 4K59.94 path identical. Andrew checks it live after B2, B3, B5 and B6.
   - Extension `validFrameDurations` and new `FrameRateTarget` cases.
   - DeckLink accepts every rate it detects (23.976 to 60, plus 100/119.88/120
     where the hardware supports them).
-  - VFR recording as decided (decision 1).
+  - VFR recording per recommendation 1, once confirmed.
 - **B4. Colour.**
   - `Colorimetry` from the plugin, and one CV-attachment writer.
   - LUT input and output spaces.
@@ -518,28 +518,70 @@ its types.
 - **Live:** after each of B2, B3, B5 and B6, Andrew checks the FX3 at 4K59.94
   with the full chain (LUT, monitor, record, Program).
 
+## NDI readiness
+
+NDI isn't planned yet, but the contract should take it without another
+redesign. NDI differs from today's sources in these ways, and the plan
+already covers each one:
+
+| NDI trait | Covered by |
+|---|---|
+| **Its own clock.** The sender runs on another computer's clock, so it drifts against Program even at the same nominal rate | Program rate conversion (recommendation 2); `AudioClockDomain.own` for its audio |
+| **Frames in ordinary memory.** NDI's SDK decodes its full-bandwidth stream on the CPU inside its library, which we can't move | the GPU reads the frame in place through a no-copy `MTLBuffer`; if that memory can't be wrapped, the CPU compatibility setting allows one counted copy |
+| **NDI HX** (compressed H.264/HEVC) | probably decodable by the hardware decoder to IOSurface-backed buffers; confirm against the NDI SDK when NDI is planned |
+| **Formats with alpha and 16-bit formats:** `UYVA`, `P216`/`PA16`, plus `NV12`, `I420`, `BGRA` | format table entries (B5); alpha ignored in v1 |
+| **Any size and orientation**, including portrait phone sources | Fit by default (recommendation 3) |
+| **Timestamps with jitter around a declared rate** | constant-rate with jitter: a small duration change is not a mode change (section 4) |
+| **Planar float audio** at any rate and channel count, not paired with frames | `SourceAudioFormat` and its clock domains (B6) |
+| **Sources that pause, and sources shared by several cameras** | pause-tolerant and shareable source flags (B7) |
+| **Network discovery** | `NSBonjourServices` with `_ndi._tcp`, and the local-network usage string (section 14) |
+| **The NDI SDK licence** | check its runtime redistribution and trademark terms before vendoring, as for AJA |
+| **NDI output** (sending Program as NDI) | a future output plugin kind, out of scope here |
+
 ## Decided
 
-- **CPU conversion** (2026-10-26): GPU only by default; CPU conversion only
-  behind "Allow CPU conversion (compatibility)", off by default. See "GPU by
-  default".
+- **CPU conversion** (2026-10-26):
+  - GPU only by default;
+  - CPU conversion only behind "Allow CPU conversion (compatibility)", off by
+    default;
+  - see "GPU by default".
+- **Interlaced** (2026-10-26): no interlaced support.
+  - Interlaced and PsF signals are refused at admission with a clear message.
+  - The plugin reports scan type, so the refusal names the signal.
 
-## Decisions needed
+## Recommendations to confirm
 
-1. **Variable-frame-rate recording.** Recommendation:
+My recommendations, with NDI and webcams in mind:
+
+1. **Variable-frame-rate recording.**
    - **Default:** record every frame with the source's own timestamps (a VFR
      file). Nothing is repeated or skipped.
-   - **Optional:** a per-camera "Constant frame rate (compatibility)" setting,
+   - **Option:** a per-camera "Constant frame rate (compatibility)" setting,
      off by default, shown only for sources that declare
      `FrameRate.isVariable`. It conforms the take to the nominal rate for
      editors that mishandle VFR, repeating or skipping whole frames (never
      blending) and counting each one.
-2. **Program rate conversion:** repeating or skipping frames when a source's
-   rate differs from Program's is rate conversion, not drop-when-busy. Accept
-   that it is counted and shown, or require every source to match Program's
-   rate.
-3. **Aspect:** letterbox or pillarbox (recommended), crop, or stretch, when a
-   source's aspect differs from the output's.
-4. **Interlaced SDI (1080i):** refuse it in v1 (recommended), or add a GPU
-   deinterlacer.
-5. **Audio-only takes:** allow, or keep "video must start the file".
+2. **Program rate conversion: accept it.**
+   - **What happens:** Program runs on its own clock. When a source's rate or
+     clock differs, Program repeats or skips whole source frames to stay on
+     its grid. Each one is counted per source and shown in diagnostics.
+   - **Why:** any source on its own clock (NDI, a webcam, or two FX3s without
+     shared sync) drifts. So "every source must match Program's rate" can't
+     hold even when the rates are equal.
+   - **The every-frame rule still holds:** this is clock matching on the
+     Program route only, not dropping under load. Every frame still reaches
+     preview, recording, the monitor and the camera's own virtual camera.
+   - **Repeat cap:** the 4× limit (`FeedRuntime.swift:484`) goes away.
+3. **Aspect: fit by default.**
+   - Letterbox or pillarbox in the scaling kernel, with a per-camera
+     "Fill (crop)" option. Never stretch.
+   - Pixel aspect comes from `SourceFormat.pixelAspect`.
+   - Portrait sources (NDI phone apps, 1080×1920) fit with pillarbox.
+4. **Audio-only takes: no; video starts the file.**
+   - Audio that arrives before the first frame is held for a bounded few
+     seconds and lined up when video starts.
+   - Stopping before any video arrives makes no file and shows "No video
+     arrived, so nothing was recorded" rather than an error.
+   - True audio-only recording waits for an audio-source plugin kind.
+   - The recorder and recovery code (`RecordingRecovery.swift:158-175`)
+     assume a video track, and that's the right default for a camera app.
