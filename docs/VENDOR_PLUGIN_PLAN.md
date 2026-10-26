@@ -279,11 +279,13 @@ them acceptance criteria:
   - an SDK that returns frames in ordinary memory (NDI) is read in place by
     the GPU through a no-copy `MTLBuffer`, and its unpack kernel writes the
     IOSurface pool.
-- **No CPU pixel path at all.** Every Mac Ultracam runs on is Apple Silicon
-  (arm64 only, macOS 26), with a GPU and unified memory. So there is no CPU
-  fallback, not even a counted one. A format without a GPU route is refused
-  at admission, and a check script fails on any CPU pixel access. See "GPU
-  only, with no CPU fallback" in [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md).
+- **GPU by default; CPU only by opt-in.** Every Mac Ultracam runs on is Apple
+  Silicon (arm64 only, macOS 26), with a GPU and unified memory, so every
+  designed route is a GPU route. A format without one is refused, unless the
+  user turns on "Allow CPU conversion (compatibility)", which is off by
+  default. That setting allows a counted, badged CPU conversion in one
+  allowlisted type. A check script fails on CPU pixel access anywhere else.
+  See "GPU by default" in [SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md).
 - **Timing comes from the source.** Presentation time and duration come from
   the device clock, never a user-chosen rate. The host-time attachment marks
   when the frame *finished* arriving (`UltracamBackend.h:65-68`). A plugin

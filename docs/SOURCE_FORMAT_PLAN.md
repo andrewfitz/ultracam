@@ -38,22 +38,40 @@ stage compares a frame against a constant. Each one compares against the
 format its source declared, and an unsupported format is refused with a clear
 message naming the stage.
 
-### GPU only, with no CPU fallback
+### GPU by default; CPU conversion only as an opt-in compatibility setting
 
 Ultracam builds for arm64 only (`generate_project.py`, `ARCHS="arm64"`) and
 targets macOS 26. So every Mac it runs on is Apple Silicon, with a GPU and
-unified memory. That allows a stricter rule than "zero CPU copies on the
-normal path":
+unified memory, and every route the app designs is a GPU route.
 
-- **No CPU pixel path exists anywhere**: not as a fallback, and not as a
-  counted degraded mode. Every format conversion, scale, colour conversion,
-  fill and repack is a GPU kernel.
-- **A format with no GPU route is refused at admission** (or before a take
-  starts), with a message naming the format and the stage. It is never
-  converted on the CPU.
-- **GPU failures are reported, not hidden.** If a GPU command fails on one
-  frame (a pool exhausted, a command buffer error), that frame is a counted,
-  visible error for that consumer, never handed to a CPU path.
+Decided on 2026-10-26: CPU conversion survives only behind one setting.
+
+**The setting.** Settings gets "Allow CPU conversion (compatibility)". It is
+global, persisted [P], and **off by default**.
+
+**With it off (the default), no CPU pixel path runs:**
+- Every format conversion, scale, colour conversion, fill and repack is a GPU
+  kernel.
+- A format with no GPU route is refused at admission (or before a take
+  starts), with a message naming the format and the stage. The message also
+  says that the compatibility setting would allow it.
+- If a GPU command fails on one frame (a pool exhausted, a command buffer
+  error), that frame is a counted, visible error for that consumer.
+
+**With it on:**
+- A stage with no GPU route for a format may hand the frame to the system's
+  CPU conversion: VideoToolbox in recording, and a CPU copy into an IOSurface
+  for an ingest buffer the GPU can't wrap.
+- The same applies to a frame whose GPU command failed.
+- Every CPU-handled frame is counted per camera and per stage. The camera
+  shows a "CPU conversion" badge while any are happening, and diagnostics and
+  the take's sidecar record the count.
+- It never changes a route that has a GPU path. It only replaces "refused"
+  with "converted on the CPU, and shown".
+
+**Why keep it:** a source we haven't written a kernel for yet works
+immediately (a new NDI format, an unusual webcam fourCC), while the GPU route
+is built.
 - **CPU-memory sources need no CPU copy either.** Some SDKs return frames in
   ordinary memory: NDI, software decoders. Unified memory lets the GPU read
   that memory directly:
@@ -68,10 +86,14 @@ normal path":
   IOSurface-backed, page-aligned memory, and the GPU reads the frame in place.
 - **Enforcement:** a check script fails if `CVPixelBufferLockBaseAddress`,
   `CVPixelBufferGetBaseAddress*` or `MTLTexture.getBytes`/`replace(region:)`
-  appears in `Sources/` or `Vendors/` outside an allowlist. Today the
-  allowlist is one entry: the 2×2×2 identity LUT upload
-  (`LUTProcessor.swift:343`), which is LUT data, not video. The only current
-  violations are the two in "Fix now". Tests are exempt.
+  appears in `Sources/` or `Vendors/` outside an allowlist. Tests are exempt.
+  The allowlist has two entries:
+  - the 2×2×2 identity LUT upload (`LUTProcessor.swift:343`), which is LUT
+    data, not video;
+  - one `CPUCompatibilityConverter` type, which is the only code that may
+    touch pixels on the CPU, and runs only when the setting is on.
+
+  The extension's standby fill is the one current violation ("Fix now").
 
 ### The contract types
 
@@ -146,7 +168,7 @@ These are bugs in today's code, separate from the refactor:
 | `VideoContract.swift:190` | `untouched` treats `resizeTarget == .uhd4K` as "no resize". With a 1080p source, the sink would negotiate 3840×2160 (`CameraSink.swift:211`) and refuse every frame (`:328`). | No (4K only). |
 | `SourceRecording.swift:234` | Drop-frame timecode is chosen when `frameRate == .fps2997 \|\| .fps5994`, which is always true, so a 25p take gets a drop-frame `tmcd` track. | No (4K 29.97/59.94 only). |
 | `VideoContract.swift:166` | `Int32(title)!` crashes if a rate with a fractional title (119.88, 47.952) is added without an explicit duration. | No. It's a trap for B3. |
-| `AVAssetSourceRecordingWriter.swift:65-66`, `:417`, `:480-484`, `:496-497` | Recording's CPU routes: `videoToolboxConverts` when no GPU route exists, a capture buffer that isn't IOSurface-backed, and a failed GPU repack ("Never lose the frame: let VideoToolbox convert it") all hand the frame to VideoToolbox's CPU conversion. | **Yes**, though unused with today's single format. Remove the route: no GPU route means the take refuses to start, and a GPU failure is a counted lost recording frame. |
+| `AVAssetSourceRecordingWriter.swift:65-66`, `:417`, `:480-484`, `:496-497` | Recording's CPU routes: `videoToolboxConverts` when no GPU route exists, a capture buffer that isn't IOSurface-backed, and a failed GPU repack ("Never lose the frame: let VideoToolbox convert it") all hand the frame to VideoToolbox's CPU conversion. | **Yes**, though unused with today's single format. Put all three behind the compatibility setting (one `CPUCompatibilityConverter`). Off: no GPU route means the take refuses to start, and a GPU failure is a counted lost recording frame. On: they convert on the CPU, counted and badged. |
 | `CameraProvider.swift:413-446` [EXT] | The standby black frame is filled on the CPU (`CVPixelBufferLockBaseAddress` plus `memset`, and a v210 word pattern), tagged 709. | **Yes**. Clear it on the GPU (Metal in the extension) from the format table's black values, with tags from the published format. |
 | `RecordingModel.swift` vs `UISupport.swift:9-14` | The recorder's space guard (`SourceRecording.swift:94-99`, bytes per pixel) and the UI's time-left estimate (`707`/`354` Mb/s, `fallbackMegabits: 707` at `:36`) disagree by about 2.5× at 59.94. | **Yes**. One estimator (B9). |
 
@@ -201,7 +223,7 @@ Each gate compares against constants. Each must compare against the declared
 | `VideoContract.swift:139-152` [P][EXT][CLIENT] | `ColorTarget` has only four video-range YUV formats | append (indices are a contract); add full range and 4:4:4 if wanted |
 | `VideoContract.swift:49` [EXT][CLIENT] | `formatDescription` limited to `tenBit422 ∪ ColorTarget` | the format table |
 | `RecordingPixelConverter.swift:54`, `:208`; `SourceRecording.swift:73`, `:79` | in: v210 only; out: x422 pool only | a repack kernel per (source, encoder) pair, from the table |
-| `AVAssetSourceRecordingWriter.swift:65-66`, `:480-481`, `:496-497` | `videoToolboxConverts`: when no GPU route exists, VideoToolbox converts on the **CPU** | removed in B0 (see "Fix now"); a new format must bring its GPU repack, or recording refuses it |
+| `AVAssetSourceRecordingWriter.swift:65-66`, `:480-481`, `:496-497` | `videoToolboxConverts`: when no GPU route exists, VideoToolbox converts on the **CPU** | behind the compatibility setting from B0 (see "Fix now"); a new format still brings its GPU repack, and without one recording refuses it unless the setting is on |
 | `MonitorFeedHost.swift:476`; MonitorKit `Signal.swift:263` | range falls back to `.legal` | take the range from the format; full-range webcams send `420f` |
 
 MonitorKit's `PixelLayout` (`Signal.swift:13-33`) already handles v210, uyvy,
@@ -315,7 +337,7 @@ nv12, p010 and RGB. It is the model for the table.
 | `UltracamBackend.mm:1821-1823`; `AppModel.swift:1228`, `:1235` | a device is exclusive; one feed per input | the plugin declares whether a source can be shared (NDI can) |
 | `CaptureController.swift:530-558` | the 2-second no-signal watchdog | the plugin declares whether a source may legitimately pause (NDI, a webcam with its shutter closed) and its own timeout |
 | `UICameraColumn.swift:130`, `:133` | "2160p 29.97 or 59.94, 10-bit 4:2:2, RAW off" | the plugin's supported-modes text |
-| CPU-memory sources (NDI, software) | an IOSurface is required at `LUTProcessor.swift:578`, `:690`, `CameraSink.swift:84`, `ProgramNormalizer.swift:221`, `MonitorFeedHost.swift:685` | the GPU reads the vendor's memory in place through a no-copy `MTLBuffer`, and its unpack kernel writes the IOSurface pool (see "GPU only, with no CPU fallback"); downstream stays IOSurface-only |
+| CPU-memory sources (NDI, software) | an IOSurface is required at `LUTProcessor.swift:578`, `:690`, `CameraSink.swift:84`, `ProgramNormalizer.swift:221`, `MonitorFeedHost.swift:685` | the GPU reads the vendor's memory in place through a no-copy `MTLBuffer`, and its unpack kernel writes the IOSurface pool (see "GPU by default"; if the memory can't be wrapped, the compatibility setting allows one counted CPU copy); downstream stays IOSurface-only |
 
 ### 12. Limits counted in frames
 
@@ -427,10 +449,7 @@ FX3 4K59.94 path identical. Andrew checks it live after B2, B3, B5 and B6.
   - Extension `validFrameDurations` and new `FrameRateTarget` cases.
   - DeckLink accepts every rate it detects (23.976 to 60, plus 100/119.88/120
     where the hardware supports them).
-  - VFR recording as decided below:
-    - native timing by default;
-    - a per-camera "Constant frame rate (compatibility)" setting, off by
-      default, which conforms takes for editors.
+  - VFR recording as decided (decision 1).
 - **B4. Colour.**
   - `Colorimetry` from the plugin, and one CV-attachment writer.
   - LUT input and output spaces.
@@ -483,13 +502,14 @@ its types.
   through the end-to-end checks.
 - **The counts.** Each mode must show zero lost frames to preview, extension,
   recording, monitor and Program.
-- **The CPU-pixel check** passes on every commit. There is no CPU route left
-  to count.
+- **The CPU-pixel check** passes on every commit.
+- **CPU conversion count:** zero CPU-converted frames with the compatibility
+  setting off. With it on, a format that has no GPU route yet shows its CPU
+  count and badge.
 - **Recordings** are checked for:
   - their timescale;
-  - per-frame duration: exact for constant-rate sources; for VFR, the source's
-    own timestamps by default, or a constant rate with counted
-    repeats and skips when the compatibility setting is on;
+  - per-frame duration: exact for constant-rate sources; for VFR, as decision
+    1 settles;
   - `tmcd` drop-frame;
   - colour tags;
   - audio channel layout.
@@ -500,27 +520,26 @@ its types.
 
 ## Decided
 
-- **Variable-frame-rate recording (2026-10-26).**
-  - **Default:** a VFR source records every frame with its own timestamps, so
-    the file is VFR. Nothing is repeated or skipped, which keeps the
-    every-frame rule.
-  - **Compatibility setting:** a per-camera "Constant frame rate
-    (compatibility)" setting, **off by default** and persisted [P], conforms
-    the take to the source's nominal rate for editors that mishandle VFR. It
-    repeats or skips whole frames, never blends, and counts each one in
-    recording telemetry and the take's sidecar.
-  - **Where it shows:** only when the camera's source declares
-    `FrameRate.isVariable`. Constant-rate sources are unaffected.
-- **No CPU pixel path** (2026-10-26): see "GPU only, with no CPU fallback".
+- **CPU conversion** (2026-10-26): GPU only by default; CPU conversion only
+  behind "Allow CPU conversion (compatibility)", off by default. See "GPU by
+  default".
 
 ## Decisions needed
 
-1. **Program rate conversion:** repeating or skipping frames when a source's
+1. **Variable-frame-rate recording.** Recommendation:
+   - **Default:** record every frame with the source's own timestamps (a VFR
+     file). Nothing is repeated or skipped.
+   - **Optional:** a per-camera "Constant frame rate (compatibility)" setting,
+     off by default, shown only for sources that declare
+     `FrameRate.isVariable`. It conforms the take to the nominal rate for
+     editors that mishandle VFR, repeating or skipping whole frames (never
+     blending) and counting each one.
+2. **Program rate conversion:** repeating or skipping frames when a source's
    rate differs from Program's is rate conversion, not drop-when-busy. Accept
    that it is counted and shown, or require every source to match Program's
    rate.
-2. **Aspect:** letterbox or pillarbox (recommended), crop, or stretch, when a
+3. **Aspect:** letterbox or pillarbox (recommended), crop, or stretch, when a
    source's aspect differs from the output's.
-3. **Interlaced SDI (1080i):** refuse it in v1 (recommended), or add a GPU
+4. **Interlaced SDI (1080i):** refuse it in v1 (recommended), or add a GPU
    deinterlacer.
-4. **Audio-only takes:** allow, or keep "video must start the file".
+5. **Audio-only takes:** allow, or keep "video must start the file".
