@@ -111,7 +111,13 @@ is built.
   - one `CPUCompatibilityConverter` type, which is the only code that may
     touch pixels on the CPU, and runs only when the setting is on.
 
-  The extension's standby fill is the one current violation ("Fix now").
+  - **Exempt from the grep:** comments, test-support fakes
+    (`Sources/DeviceAPI/Fake*.swift` write CPU test patterns), and
+    `EmbeddedAudioRecording.swift`, whose `vImage` call (`:102-108`) shuffles
+    PCM bytes, not video.
+  - **The one current video violation** is the extension's standby fill
+    ("Fix now"). The `VTPixelTransferSession` hit at
+    `RecordingPixelConverter.swift:12` is a comment.
 
 ### The contract types
 
@@ -204,7 +210,7 @@ format table or the compatibility setting.
 | `SourceRecording.swift:234` | Drop-frame timecode is chosen when `frameRate == .fps2997 \|\| .fps5994`, which is always true, so a 25p take gets a drop-frame `tmcd` track. | No (4K 29.97/59.94 only). |
 | `VideoContract.swift:166` | `Int32(title)!` crashes if a rate with a fractional title (119.88, 47.952) is added without an explicit duration. | No. It's a trap for B3. |
 | `AVAssetSourceRecordingWriter.swift:65-66`, `:417`, `:480-484`, `:496-497` | Recording's CPU routes: `videoToolboxConverts` when no GPU route exists, a capture buffer that isn't IOSurface-backed, and a failed GPU repack ("Never lose the frame: let VideoToolbox convert it") all hand the frame to VideoToolbox's CPU conversion. | **Yes**, though unused with today's single format. B1: put all three behind the compatibility setting (one `CPUCompatibilityConverter`). Off: no GPU route means the take refuses to start, and a GPU failure is a counted lost recording frame. On: they convert on the CPU, counted and badged. |
-| `CameraProvider.swift:413-446` [EXT] | The standby black frame is filled on the CPU (`CVPixelBufferLockBaseAddress` plus `memset`, and a v210 word pattern), tagged 709. | **Yes**, B1. Clear it on the GPU (Metal in the extension) from the format table's black values, with tags from the published format. |
+| `CameraProvider.swift:413-446` [EXT] | The standby black frame is filled on the CPU (`CVPixelBufferLockBaseAddress` plus `memset`, and a v210 word pattern), tagged 709. Built once per format (`:384`). | **Yes**, B1. The extension has no Metal today and no shader library. Use a clear-load render pass, with no shaders, into IOSurface-backed texture views of each plane: Y and CbCr planes cleared to their black codes, and v210 viewed as `rg32Uint` cleared to its two alternating black words. Verify the v210 view on hardware. Tags come from the published format. |
 | `RecordingModel.swift` vs `UISupport.swift:9-14` | The recorder's space guard (`SourceRecording.swift:94-99`, bytes per pixel) and the UI's time-left estimate (`707`/`354` Mb/s, `fallbackMegabits: 707` at `:36`) disagree by about 2.5× at 59.94. | **Yes**. One estimator, in B9. |
 
 ## Inventory
@@ -243,7 +249,7 @@ Each gate compares against constants. Each must compare against the declared
 | `ProgramNormalizer.swift:562-578` | box filter for integer ratios up to 4, else 2-tap bilinear; aliases at large ratios such as 8K→720p | multi-tap or two-pass |
 | `VideoBufferLayout.swift:22`, `:50` [EXT] | row stride only has to be a multiple of 4 or the component size | check Metal's linear-texture alignment, so third-party buffers map |
 | pixel aspect | `kCVImageBufferPixelAspectRatioKey` is only copied (`AVAssetSourceRecordingWriter.swift:56`); no scaler reads it, and `LUTProcessor.swift:974-975` strips the display dimensions on downscale | scale from `SourceFormat.pixelAspect`; tag outputs square |
-| `CameraProvider.swift:135-136` [EXT][CLIENT] | the extension publishes only 1280×720, 1920×1080 and 3840×2160, so "Source size" and DCI 4096 have no CMIO format | append formats for the new targets (append only, section 10) |
+| `CameraProvider.swift:118-141` [EXT][CLIENT] | the extension publishes only 1280×720, 1920×1080 and 3840×2160, built once when the stream is created. Apple's header says a stream's `formats` "should not change during the life cycle of the associated stream" (`CMIOExtensionStream.h`) | enumerate the **full superset** at creation: every output size the app can produce (720p, 1080p, UHD, DCI 4096, and portrait sizes if wanted) × every `ColorTarget` × every rate, appended after today's indices. "Source size" picks the nearest pre-enumerated entry, never a new one. A size outside the superset needs an app update that ships a new extension; it is never added to a live stream |
 | `MonitorSurface.swift:99` | starts at 16:9 until the first frame | use the declared aspect (cosmetic) |
 | `UISessionBridge.swift:55-74` | splits the format *string* `"3840 × 2160 · v210 · …"` and forces `"\(height)p"` | use the structured `SourceFormat` |
 
@@ -284,7 +290,7 @@ nv12, p010 and RGB. It is the model for the table.
 | `MonitorFeedHost.swift:509` | the source rate is estimated from one timestamp gap | use `FrameRate`; smooth it for VFR |
 | `MonitorCoordinator.swift:133-135` | scopes run once per source frame, so 120 Hz scopes at 120 fps | cap the scope rate in time |
 | `MonitorWorkspace.swift:463` [P] | `refreshRates = [10, 15, 30]` is stored but ignored | wire it up or remove it |
-| `AVAssetSourceRecordingWriter.swift:1121-1122` [F] | movie and video timescale 30000 or 60000 | constant-rate takes: the source duration's own timescale (keeps 23.976 exact). VFR takes: 240000 |
+| `AVAssetSourceRecordingWriter.swift:1121-1122`; `RecordingTimecode.swift:11-46` [F] | the writer already uses `rate.frameDuration.timescale`, but the rate can only be one of `RecordingTimecode`'s two cases | pass the source's `FrameRate`: constant-rate takes use their own timescale (23.976 stays exact); VFR takes use 240000 |
 | `AVAssetSourceRecordingWriter.swift:291-297`; `SourceRecording.swift:176`; `RecordingModel.swift:368-376` [F] | `matchingFrameRate` falls back to the configured rate; the default is `.fps5994`, and the model never passes a rate. **A 25p take is silently labelled 59.94** | pass `FrameRate`; refuse a mismatch |
 | `SourceRecording.swift:740-758`; `AVAssetSourceRecordingWriter.swift:1282-1284` | the 60000 frame key; skip detection uses the previous frame's duration, so VFR reports false skips | skip detection only for constant-rate sources |
 | `SourceRecording.swift:175` [F] | `maxKeyFrameInterval: 60` counts frames (0.5 s at 120p, 2.4 s at 25p) | `maxKeyFrameIntervalDuration` in seconds |
@@ -343,7 +349,7 @@ nv12, p010 and RGB. It is the model for the table.
 | `ProgramNormalizer.swift:14-15`, `:247` | "every format in the pipeline is BT.709 video range"; only `xf22` full range is handled | convert every source on the GPU to Program's colour |
 | behaviour of `FeedRuntime` and `ProgramNormalizer` [CLIENT] | a cut from a 709 camera to a 2020/PQ camera flips the Program tags mid-stream | the Program colour stays fixed; sources convert into it |
 | `FeedRuntime.swift:484` | at most 4 repeats | see section 4 |
-| Program rate conversion | `ProgramOutputRoute` **already** repeats frames to put 29.97 sources on the 59.94 grid, and skips the odd frames of a faster source, counted in `cadenceSkipped` (`FeedRuntime.swift:98`, `:141-147`, `:510`), within the two-cadence world | generalize it to any rate and to clock drift (recommendation 2), and drop the 4× repeat cap |
+| Program rate conversion | `ProgramOutputRoute` **already** repeats frames to put 29.97 sources on the 59.94 grid, and skips the odd frames of a faster source, counted in `cadenceSkipped` (`FeedRuntime.swift:98`, `:141-147`, `:510`), within the two-cadence world | generalize it to any rate and to clock drift (decision 2), and drop the 4× repeat cap |
 
 ### 9. Recording
 
@@ -362,9 +368,9 @@ nv12, p010 and RGB. It is the model for the table.
 | Where | Assumes | Generalize |
 |---|---|---|
 | `CameraProvider.swift:132-138` [EXT][CLIENT] | "keep the original eight indices stable"; one format list for every device | append only |
-| `VirtualCameraRegistry.swift:151`, `:183`, `:322-327` [EXT] | schema version 1, checked for exact equality, with no format fields | **keep version 1** and add optional per-device format fields: Codable ignores unknown keys, so old extensions keep working. A bump to 2 would make an old extension's `validate()` reject the snapshot (no cameras), and `save()` with `current == nil` deletes the backup. A later breaking change should accept `<= current`, not `==` |
+| `VirtualCameraRegistry.swift:151`, `:183`, `:322-327` [EXT] | schema version 1, checked for exact equality, with no format fields | **keep version 1, and don't add per-device formats**. Formats are the fixed superset above, so the registry needs no format data. If it ever does, add optional fields (Codable ignores unknown keys). A bump to 2 would make an old extension's `validate()` reject the snapshot (no cameras), and `save()` with `current == nil` deletes the backup. A later breaking change should accept `<= current`, not `==` |
 | `CameraProvider.swift:381`, `:839` [EXT] | standby black after 0.5 s without frames; checks for frames at a quarter of the frame interval | in time, from the published rate; a VFR or paused source (NDI) shouldn't flash black at 0.5 s |
-| `CameraProvider.swift:413-446` [EXT] | the standby fill runs on the CPU per format family, assuming video range and 709 | a GPU clear from the format table (B0) |
+| `CameraProvider.swift:413-446` [EXT] | the standby fill runs on the CPU per format family, assuming video range and 709 | a GPU clear (B1; see "Fix now") |
 | `CameraProvider.swift:656` [CLIENT] | the device model is `"FX3 LUT camera"` | "Ultracam camera" |
 | `VideoContract.swift:24`, `:28`, `:32`; `maxFramesInFlight = 3`; `LUTProcessor.swift:697`; `ProgramNormalizer.swift:393` [EXT] | pools of 9 / limit 64 / sink queue 8 / Program 4 count frames, not bytes (64 frames of 8K 4:2:2 10-bit is about 8 GB) | budget in bytes, keeping minimum counts |
 
@@ -373,7 +379,7 @@ nv12, p010 and RGB. It is the model for the table.
 | Where | Assumes | Generalize |
 |---|---|---|
 | `UltracamBackend.mm:142-172`, `:2048-2060`; `DoesSupportVideoMode` at `:205, 1856, 1862, 1866, 2016` | `HDMILease` forces `bmdVideoConnectionHDMI`, and forces it again when Desktop Video preferences change, so SDI is never used | the connector is a per-device plugin setting (HDMI, SDI, optical), and the lease applies only when HDMI is chosen |
-| `UltracamBackend.mm:105-136`, `:1253-1258`; `AppSettingsStore.swift:418`, `:445` [P]; `UISettings.swift:682-685` | EDID HDR advertisement is one global Bool | an HDMI-sink capability owned by the plugin, per device (migrate the global value onto each DeckLink device) |
+| `UltracamBackend.mm:105-136`, `:1253-1258`; `AppSettingsStore.swift:418`, `:445` [P]; `UISettings.swift:682-685` | EDID HDR advertisement is one global Bool | an HDMI-sink capability owned by the plugin, per device (migrate the global value onto each DeckLink device), done in vendor step 5 |
 | `UltracamBackend.mm:1821-1823`; `AppModel.swift:1228`, `:1235` | a device is exclusive; one feed per input | the plugin declares whether a source can be shared (NDI can) |
 | `CaptureController.swift:530-558` | the 2-second no-signal watchdog | the plugin declares whether a source may legitimately pause (NDI, a webcam with its shutter closed) and its own timeout |
 | `UICameraColumn.swift:130`, `:133` | "2160p 29.97 or 59.94, 10-bit 4:2:2, RAW off" | the plugin's supported-modes text |
@@ -407,7 +413,8 @@ changes their output.
 - **The `gamut` display strings** become stable IDs (section 6).
 - **`ResizeTarget`, `ColorTarget` and `FrameRateTarget` raw values** are
   append only.
-- **`advertiseHDRToCameras`** becomes a per-device DeckLink setting.
+- **`advertiseHDRToCameras`** becomes a per-device DeckLink setting (vendor
+  step 5, leak 2).
 - **Recording codec and timecode mode** aren't stored today, so they need no
   migration.
 - **`selectedDevice` (`AppSettingsStore.swift:201`, `:222`)** and the
@@ -482,9 +489,11 @@ to the production path; don't generalize them:
 
 Dependencies:
 - **B0** can land at any time.
-- **B1** starts after vendor-plan step 4:
-  - the value types already exist (they land in vendor step 1);
-  - the backend has its final name and path (the move is vendor step 4);
+- **B1** starts after vendor-plan step 5:
+  - the value types already exist (vendor step 1);
+  - the backend has its final name and path (vendor step 4);
+  - `CaptureController` consumes typed events and the declared format, not
+    the eight legacy closures (vendor step 5);
   - the fake plugin exists for verification (vendor step 1).
 
 Each step keeps the FX3 4K59.94 path identical. Andrew checks it live after
@@ -496,30 +505,37 @@ B1 (the standby frame and recording's fallback change), B2, B3, B5 and B6.
   - the three wording fixes.
 
   These need nothing else.
-- **B1. Contract in force, no behaviour change.**
-  - DeckLink fills the `SourceFormat`. Every gate in section 1 compares
-    against the declared format and the table, which still holds only today's
-    entries.
-  - Add the CPU compatibility setting (stored, with its badge and sidecar
-    counts) and `CPUCompatibilityConverter`, and put recording's three
-    VideoToolbox CPU routes behind it.
-  - The extension's standby black is drawn by a GPU clear using the table's
-    black values.
-  - Add the two CPU-pixel checks (the grep and the recorder test), run by
-    `test.sh`.
-  - Convert section 12 to time and bytes.
-  - Write explicit settings values (section 13) and migrate gamut strings to
-    IDs.
+- **B1. Contract in force, no behaviour change.** Four commits, each building
+  and passing `test.sh`:
+  - **B1a. Gates:** DeckLink fills the `SourceFormat`. Every gate in section 1
+    compares against the declared format and the table, which still holds
+    only today's entries.
+  - **B1b. CPU rule:**
+    - add the CPU compatibility setting (stored, with its badge and sidecar
+      counts) and `CPUCompatibilityConverter`;
+    - put recording's three VideoToolbox CPU routes behind it;
+    - replace the extension's standby fill with the GPU clear;
+    - add the two CPU-pixel checks (the grep and the recorder test), run by
+      `test.sh`.
+  - **B1c. Limits:** convert section 12 to time and bytes.
+  - **B1d. Settings:** write explicit settings values, add lenient decoding,
+    and migrate gamut strings to IDs (section 13).
 - **B2. Size and aspect.**
   - Section 2, plus the row-bytes gate.
-  - The Lanczos upscale fix, the `untouched` fix, and a "Source size" target.
+  - The Lanczos upscale fix, the `untouched` fix, and a "Source size" target
+    that maps onto the extension's pre-enumerated sizes.
+  - The extension's format superset is appended in this step, once. It
+    changes the extension, so a running Zoom keeps its stream until the
+    extension is updated.
   - Pools sized by bytes.
   - DeckLink offers its HDMI modes at every resolution.
   - First new capability: 1080p and 720p from an UltraStudio.
 - **B3. Rate and time.**
   - `FrameRate` replaces `inputFast` everywhere.
   - Native timescales for capture, Program, recording and the timeline (schema
-    bump).
+    bump). The timeline change includes the Rust side (`Tools/auto-switcher`
+    `model.rs:341`) and its tests. `test.sh` already rebuilds
+    `libauto_switcher` with cargo before linking (`:31-33`, `:81`).
   - The `Timecode` struct, rate-correct drop-frame, and keyframe intervals in
     seconds.
   - Extension `validFrameDurations` and new `FrameRateTarget` cases.
@@ -550,8 +566,8 @@ B1 (the standby frame and recording's fallback change), B2, B3, B5 and B6.
   - Clock domains, with host-time placement for unpaired audio.
   - Takes without audio, and the audio-only decision.
   - DeckLink enables all embedded channels.
-- **B7. Interface and device.** The connector setting, the per-device EDID
-  setting, shared versus exclusive sources, pause-tolerant sources, and
+- **B7. Interface and device.** The connector setting (the per-device EDID
+  setting is vendor step 5's), shared versus exclusive sources, pause-tolerant sources, and
   GPU ingest for CPU-memory sources.
 - **B8. Wording and stored text.** Section 14, the structured format display,
   the usage strings, the README, and supported-modes text.
@@ -592,7 +608,7 @@ its types.
   - audio channel layout.
 - **Extension:** an old client (an already-running Zoom) keeps working across
   the format-list and registry changes.
-- **Live:** after each of B2, B3, B5 and B6, Andrew checks the FX3 at 4K59.94
+- **Live:** after each of B1, B2, B3, B5 and B6, Andrew checks the FX3 at 4K59.94
   with the full chain (LUT, monitor, record, Program).
 
 ## NDI readiness
@@ -603,11 +619,11 @@ already covers each one:
 
 | NDI trait | Covered by |
 |---|---|
-| **Its own clock.** The sender runs on another computer's clock, so it drifts against Program even at the same nominal rate | Program rate conversion (recommendation 2); `AudioClockDomain.own` for its audio |
+| **Its own clock.** The sender runs on another computer's clock, so it drifts against Program even at the same nominal rate | Program rate conversion (decision 2); `AudioClockDomain.own` for its audio |
 | **Frames in ordinary memory.** NDI's SDK decodes its full-bandwidth stream on the CPU inside its library, which we can't move | the GPU reads the frame in place through a no-copy `MTLBuffer`; if that memory can't be wrapped, the CPU compatibility setting allows one counted copy |
 | **NDI HX** (compressed H.264/HEVC) | probably decodable by the hardware decoder to IOSurface-backed buffers; confirm against the NDI SDK when NDI is planned |
 | **Formats with alpha and 16-bit formats:** `UYVA`, `P216`/`PA16`, plus `NV12`, `I420`, `BGRA` | format table entries (B5); alpha ignored in v1 |
-| **Any size and orientation**, including portrait phone sources | Fit by default (recommendation 3) |
+| **Any size and orientation**, including portrait phone sources | Fit by default (decision 3) |
 | **Timestamps with jitter around a declared rate** | constant-rate with jitter: a small duration change is not a mode change (section 4) |
 | **Planar float audio** at any rate and channel count, not paired with frames | `SourceAudioFormat` and its clock domains (B6) |
 | **Sources that pause, and sources shared by several cameras** | pause-tolerant and shareable source flags (B7) |

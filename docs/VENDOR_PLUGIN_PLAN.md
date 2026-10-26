@@ -45,6 +45,9 @@ Not covered by this plan:
 
 ## Where the code stands
 
+Line numbers are as of 2026-10-26. Other sessions edit these files, so they
+drift: search for the quoted code.
+
 ### Seams that already exist
 
 - `CaptureServices` (`CaptureController.swift:1614`) is a closure-based
@@ -88,11 +91,11 @@ alone.
 
 - **Format:** embedded audio is 48 kHz signed 32-bit throughout:
   - `CaptureController.swift:1016` rejects any other sample size;
-  - `:1494-1497` hard-codes the rate;
+  - the rate comes from `EmbeddedAudioFormat.sampleRate` (`:1501-1506`);
   - `EmbeddedAudioClockAnchor.place()` rejects any other timescale.
 - **Clock:** packet times are on the device's audio clock, not the video
   clock. The app maps them itself. `EmbeddedAudioClockAnchor`
-  (`SourceRecordingAdapter.swift:343-430`) pairs each packet with the frame
+  (`SourceRecordingAdapter.swift:358-445`) pairs each packet with the frame
   delivered in the same callback, which is why frame-then-audio order is part
   of the contract.
 - **Metering:** live capture uses the source-audio path. On it, peak and RMS
@@ -412,7 +415,7 @@ Two licenses need checking before anyone relies on them:
 Because the Sony SDK can't go in a public repo, "bundled with its SDK" means
 two things:
 - Ultracam's released app embeds Sony's dylibs, and release builds require
-  them (recommendation 3).
+  them (decision 3).
 - The source tree holds Sony's installer, not Sony's files.
 
 ## Build system
@@ -483,10 +486,13 @@ compile everything in one `swiftc` call. For now, a check script enforces the
 boundary instead. It fails if:
 - app code names a plugin type;
 - plugin code reaches past DeviceAPI and Shared;
-- a source file outside `Vendors/` contains a vendor or product name
-  (Blackmagic, UltraStudio, DeckLink, Sony, FX3).
+- a Swift, ObjC or Metal file under `Sources/`, or a file under `Config/`,
+  contains a vendor or product name (Blackmagic, UltraStudio, DeckLink, Sony,
+  FX3). Scripts, docs and the README are out of scope.
 
 Its allowlist:
+- `Config/App-Info.plist` and `App.entitlements`, until B8 rewords the usage
+  strings and the plugins own their keys;
 - `VendorRegistry.swift`;
 - the colour-science presets;
 - preview fixtures (`UIContext.swift:114-127`);
@@ -503,8 +509,8 @@ step.
 
 **Outside developers:** before the repo goes public, two things block them,
 whatever happens to plugins:
-- `/Volumes/8TB` is hard-coded in 15 shell scripts and in `generate_project.py`.
-  Make the build root an environment variable (recommendation 5).
+- `/Volumes/8TB` is hard-coded in 20 files under `scripts/` and `Tools/`.
+  Make the build root an environment variable (decision 5).
 - There is no `LICENSE` file. Choose a license.
 
 ## Leaks to close in the app
@@ -615,7 +621,7 @@ whatever happens to plugins:
   parallel.
 
 0. **Gate on the work in flight.**
-   - The tree has 64 uncommitted or untracked paths from other sessions, Grok
+   - The tree has 85 uncommitted or untracked paths from other sessions, Grok
      included.
    - They include all of the Sony control code, and changes to
      `CaptureController`, `LUTProcessor`, `VideoContract`,
@@ -627,9 +633,16 @@ whatever happens to plugins:
      table holding today's single format) and `Sources/DeviceAPI/`
      (protocols, `VendorRegistry`, `DeviceAPI.h`).
    - Add both to `generate_project.py` (app glob and the extension's list),
-     `test.sh`, `ui-verify.sh` and `ui-typecheck.sh`.
-   - Wrap `UltracamBackend` in `DeckLinkCapturePlugin` (Swift, compiled with
-     the app sources).
+     `test.sh`, `ui-verify.sh`, `ui-typecheck.sh` and
+     `monitor-app-integration.sh`.
+   - `DeviceAPI.h` defines `static NSString *const
+     UltracamCaptureHostTimeAttachmentKey = @"UltracamCaptureHostTime";` in
+     the header, replacing the definition at `UltracamBackend.mm:80`. That
+     way no new `.m` file is needed in any build.
+   - Wrap `UltracamBackend` in `DeckLinkCapturePlugin.swift`. Until step 4 it
+     lives in `Sources/App/`, the only folder every build already picks up
+     (`generate_project.py:37` takes only `.h/.mm/.inc` from
+     `Sources/DeckLinkBackend`).
    - Build `CaptureServices.live` and `AppHardware.live` from the registry,
      with routing by device ID.
    - The adapter fans out to the existing closures, and maps events back to
@@ -637,7 +650,8 @@ whatever happens to plugins:
    - `DeviceDiagnostics` replaces the ObjC type.
    - `FakeCapturePlugin` and `FakeControlPlugin` replace `AppHardware.offline`
      (UIVerify and MonitorAppIntegration move to them).
-   - Behaviour doesn't change.
+   - Behaviour doesn't change. It touches UIVerify, so run
+     `STRICT=1 bash scripts/ui-verify.sh` too.
 2. **Strict concurrency in `test.sh`.**
    - Add `-strict-concurrency=complete -warnings-as-errors`, and fix what it
      finds in `Tests/` and the shared sources.
@@ -662,9 +676,17 @@ whatever happens to plugins:
 5. **Typed events, and closing the leaks.**
    - `CaptureController` consumes `CaptureEvent` directly.
    - `CaptureServices` collapses to one `start`.
-   - Fix leaks 1-7.
-   - The UI work (leaks 3, 4, 7) and the controller work (leaks 5, 6) can run
-     as parallel subagents.
+   - Fix leaks 2-7. Leak 1 is done in step 1, and Sony's typed events arrive
+     with step 3's `CameraControlStore`.
+   - Two parallel subagents, with disjoint files:
+     - **UI and settings:** leaks 2, 3, 7, and leak 4 outside the controller.
+       Owns `UI*.swift`, `AppModel.swift`, `AppSettingsStore.swift` and
+       `SonyCameraStore.swift`.
+     - **Controller and recording:** leaks 5 and 6, and leak 4's
+       `CaptureController.swift` strings. Owns `CaptureController.swift` and
+       `SourceRecordingAdapter.swift`.
+   - Leak 2 (per-device EDID HDR and its migration) is owned here, not in Part
+     B.
 6. **SDK tooling and bundle checks.**
    - `scripts/vendor-sdk.py install|verify|status` replaces
      `fetch-decklink-sdk.sh` and `install-sony-sdk.py`, with thin wrappers
@@ -684,13 +706,15 @@ whatever happens to plugins:
 That completes Part A. Part B ([SOURCE_FORMAT_PLAN.md](SOURCE_FORMAT_PLAN.md))
 fits around it:
 - **B0** (pure bug fixes) can land at any time, even before step 1.
-- **B1** starts after step 4. Part B edits the backend, controller and GPU
-  files heavily, so it should land on their final paths and names, not before
-  the move.
-- **Steps 5-7 and B1-B9** may interleave. Only one step at a time owns
+- **B1** starts after step 5:
+  - it needs the backend on its final path and name (step 4);
+  - it needs `CaptureController` consuming `CaptureEvent` and the format
+    directly (step 5). Before that, the adapter still maps everything back
+    onto today's eight closures and strings, which carry no `SourceFormat`.
+- **Steps 6-7 and B1-B9** may interleave. Only one step at a time owns
   `CaptureController.swift` and `DeckLinkBackend.mm`.
 
-Then comes the first new vendor: UVC, after B1-B6 (recommendation 6).
+Then comes the first new vendor: UVC, after B1-B6 (decision 6).
 - **AJA** fits today's single 4K 10-bit format, so it could prove the capture
   API earlier. It needs AJA hardware.
 - **UVC** needs no SDK and no special hardware, but needs B1-B6: size, rate,
@@ -736,6 +760,9 @@ VFR, Program rate conversion, aspect and audio-only takes.
      the repo records those terms.
    - `build.sh` prints each plugin's status in every build.
 4. **Licence: Apache-2.0** (MIT is the simpler alternative).
+   - Add a `NOTICE` and `THIRD_PARTY_LICENSES.md` naming the committed
+     DeckLink headers (with their licence blocks) and the SDKs a release
+     embeds.
    - The app links vendor SDKs that aren't open source: Sony, and later NDI
      and possibly AJA.
    - Under GPL, distributing those builds would need a linking exception.
@@ -743,8 +770,8 @@ VFR, Program rate conversion, aspect and audio-only takes.
      extend with plugins.
 5. **Build location: one `ULTRACAM_WORK_ROOT` environment variable.**
    - It defaults to `.build/` inside the checkout.
-   - It replaces `/Volumes/8TB` in the 15 shell scripts and
-     `generate_project.py`.
+   - It replaces `/Volumes/8TB` in the 20 files under `scripts/` and
+     `Tools/`.
    - On this Mac, set it to the external drive to keep today's behaviour.
 6. **First new vendor: UVC, after B1-B6.**
    - Anyone can test it with any webcam, and it needs no SDK.
