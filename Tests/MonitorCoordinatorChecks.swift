@@ -339,11 +339,11 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     var copies: [(MonitorTargetID, MonitorTargetID)] = []
     value.onResetSettings = { target in
       resets.append(target)
-      return LegacyMonitorConfiguration()
+      return true
     }
     value.onCopySettings = { source, destination in
       copies.append((source, destination))
-      return LegacyMonitorConfiguration()
+      return true
     }
     value.copySettings(from: alpha, to: beta)
     XCTAssertEqual(copies.map(\.0), [alpha])

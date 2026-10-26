@@ -24,10 +24,11 @@ import MonitorKit
   /// replace the saved ones.
   var onConfigurationChange: ((MonitorTargetID, MonitorFeedPreferences) -> Void)?
   /// Reset and copy: the owner applies them to its saved preferences (the
-  /// coordinator applies the same change to its own); nil for a target it does not
-  /// know. Without an owner the change is reported through `onConfigurationChange`.
-  var onResetSettings: ((MonitorTargetID) -> LegacyMonitorConfiguration?)?
-  var onCopySettings: ((_ source: MonitorTargetID, _ destination: MonitorTargetID) -> LegacyMonitorConfiguration?)?
+  /// coordinator applies the same change to its own) and returns true; false
+  /// for a target it does not know. Without an owner the change is reported
+  /// through `onConfigurationChange`.
+  var onResetSettings: ((MonitorTargetID) -> Bool)?
+  var onCopySettings: ((_ source: MonitorTargetID, _ destination: MonitorTargetID) -> Bool)?
   var onWorkspaceChange: ((MonitorWorkspacePreferences) -> Void)?
   var onDemandChange: ((Set<MonitorTargetID>) -> Void)?
   var onPreviewEnabledChange: ((MonitorTargetID, Bool) -> Void)?
@@ -179,8 +180,8 @@ import MonitorKit
     var value = preferences(for: target)
     value.resetTools()
     guard let onResetSettings else { return setPreferences(value, for: target) }
-    // The owner resets its saved preferences the same way (nil: not its target).
-    guard onResetSettings(target) != nil else { return setPreferences(value, for: target) }
+    // The owner resets its saved preferences the same way (false: not its target).
+    guard onResetSettings(target) else { return setPreferences(value, for: target) }
     show(value, for: target)
   }
 
@@ -189,7 +190,7 @@ import MonitorKit
   func copySettings(from source: MonitorTargetID, to destination: MonitorTargetID) {
     var value = preferences(for: destination)
     value.copyTools(from: preferences(for: source))
-    if let onCopySettings, onCopySettings(source, destination) != nil {
+    if let onCopySettings, onCopySettings(source, destination) {
       return show(value, for: destination)
     }
     setPreferences(value, for: destination)

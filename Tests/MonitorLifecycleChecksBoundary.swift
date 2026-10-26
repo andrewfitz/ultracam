@@ -183,13 +183,13 @@ extension MonitorLifecycleChecks {
       var merges = 0
       coordinator.onConfigurationChange = { _, _ in merges += 1 }
       coordinator.onCopySettings = { source, destination in
-        guard let tools = owned[source.rawValue], owned[destination.rawValue] != nil else { return nil }
+        guard let tools = owned[source.rawValue], owned[destination.rawValue] != nil else { return false }
         owned[destination.rawValue]?.copyTools(from: tools)
-        return owned[destination.rawValue]?.legacyConfiguration
+        return true
       }
       coordinator.onResetSettings = { target in
         owned[target.rawValue]?.resetTools()
-        return owned[target.rawValue]?.legacyConfiguration
+        return owned[target.rawValue] != nil
       }
 
       coordinator.copySettings(from: MonitorTargetID("alpha"), to: MonitorTargetID("beta"))

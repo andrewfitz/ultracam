@@ -344,10 +344,10 @@ final class AppModel {
       self.saveSettings()
     }
     monitorCoordinator.onResetSettings = { [weak self] target in
-      self?.replaceMonitorPreferences(of: target) { $0.resetTools() }
+      self?.replaceMonitorPreferences(of: target) { $0.resetTools() } ?? false
     }
     monitorCoordinator.onCopySettings = { [weak self] source, destination in
-      guard let self, let tools = self.monitorPreferences(of: source) else { return nil }
+      guard let self, let tools = self.monitorPreferences(of: source) else { return false }
       return self.replaceMonitorPreferences(of: destination) { $0.copyTools(from: tools) }
     }
     monitorCoordinator.onWorkspaceChange = { [weak self] workspace in
@@ -959,21 +959,21 @@ final class AppModel {
     return feedDescriptors.first(where: { $0.id.rawValue == target.rawValue })?.monitor
   }
 
-  /// Changes a target's whole monitor preferences (reset, copy), saves them and
-  /// returns what its monitors now show; nil for an unknown target.
+  /// Changes a target's whole monitor preferences (reset, copy) and saves them;
+  /// false for an unknown target.
   private func replaceMonitorPreferences(
     of target: MonitorTargetID, _ change: (inout MonitorFeedPreferences) -> Void
-  ) -> LegacyMonitorConfiguration? {
+  ) -> Bool {
     if target.rawValue == "program" {
       change(&feedCoordinator.programMonitor)
     } else if var descriptor = feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
       change(&descriptor.monitor)
       feedCoordinator.update(descriptor)
     } else {
-      return nil
+      return false
     }
     saveSettings()
-    return monitorPreferences(of: target)?.legacyConfiguration
+    return true
   }
 
   private func syncRecordingFeeds() {
