@@ -495,6 +495,49 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
   /// stream time by a device-dependent amount, and the movie was written on
   /// the raw packet clock. The movie must start both tracks together and end
   /// the audio with the video, whatever the two device clocks' origins are.
+  /// Editors read a take's rate from its video track. A 1/600 s timebase can't
+  /// hold a 1001/60000 s frame, so 59.94 takes were stamped at exactly 1/60 s
+  /// and read as 60 fps or variable rate. Each rate gets its own timescale.
+  func testTakesAreStampedAtTheirBroadcastRate() throws {
+    for duration in [VideoContract.fastDuration, VideoContract.slowDuration] {
+      let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-rate-\(UUID().uuidString)")
+      defer { try? FileManager.default.removeItem(at: root) }
+      let url = root.appendingPathComponent("rate.mov")
+      let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("rate"), outputURL: url,
+        width: 1_920, height: 1_080, videoCodec: kCMVideoCodecType_AppleProRes422HQ)
+      let adapter = try SourceRecordingCallbackAdapter(configuration: config)
+      try adapter.start()
+      let image = try v210Frame(width: 1_920, height: 1_080)
+      let frames = 30
+      for frame in 0..<frames {
+        let pts = CMTime(value: Int64(frame) * duration.value, timescale: duration.timescale)
+        XCTAssertTrue(adapter.callbacks.video(image, pts, duration, true))
+        Thread.sleep(forTimeInterval: duration.seconds)
+      }
+      try adapter.stop()
+      XCTAssertEqual(adapter.state, .finished, adapter.telemetry.lastError ?? "")
+
+      final class Track: @unchecked Sendable {
+        var timescale: CMTimeScale = 0, minFrame: CMTime = .invalid, rate: Float = 0
+      }
+      let track = Track()
+      let asset = AVURLAsset(url: url)
+      let done = DispatchSemaphore(value: 0)
+      Task {
+        if let video = try? await asset.loadTracks(withMediaType: .video).first {
+          track.timescale = (try? await video.load(.naturalTimeScale)) ?? 0
+          track.minFrame = (try? await video.load(.minFrameDuration)) ?? .invalid
+          track.rate = (try? await video.load(.nominalFrameRate)) ?? 0
+        }
+        done.signal()
+      }
+      done.wait()
+      XCTAssertEqual(track.timescale, duration.timescale, "the video track is timed in \(duration.timescale)ths")
+      XCTAssertEqual(track.minFrame, duration, "every frame lasts exactly \(duration.value)/\(duration.timescale) s")
+      XCTAssertEqual(Double(track.rate), Double(duration.timescale) / Double(duration.value), accuracy: 0.001)
+    }
+  }
+
   func testMovieKeepsDeckLinkAudioInSyncWhenItsClockOriginDiffers() throws {
     for clockOffset: Int64 in [42_050, 0] {
       let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-avsync-\(UUID().uuidString)")

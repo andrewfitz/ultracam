@@ -1114,6 +1114,12 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     let audio = AVAssetWriterInput(mediaType: .audio,
       outputSettings: EmbeddedAudioFormat.assetWriterSettings)
     let rate = adoptedFrameRate ?? configuration.frameRate
+    // The default 1/600 s timebase can't hold a 1001/60000 s frame, so every
+    // 59.94 frame was rounded to 1/60 s and editors read the take as 60 fps
+    // or variable rate. Use the rate's own timescale for the video track and
+    // the movie, so each frame lasts exactly 1001/30000 or 1001/60000 s.
+    video.mediaTimeScale = rate.frameDuration.timescale
+    writer.movieTimeScale = rate.frameDuration.timescale
     let generatedTimecodeTrack = try Self.makeTimecodeTrack(for: configuration, frameRate: rate)
     let timecode = generatedTimecodeTrack?.makeInput()
     video.setValue(NSNumber(value: configuration.realTimeEncoding), forKey: "expectsMediaDataInRealTime")
