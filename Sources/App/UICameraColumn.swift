@@ -193,6 +193,7 @@ struct UICameraPictureView: View {
             // The name keeps its room; a narrow picture folds the tool bar into a menu instead.
             .layoutPriority(1)
           UITallyBadge(tally: camera.tally)
+          stageNotice
         }
         Spacer(minLength: 4)
         // The tools stay on the picture so they can be found; Clean View hides them until hover.
@@ -276,6 +277,38 @@ struct UICameraPictureView: View {
     .help("Choose what this picture shows")
     .accessibilityLabel("Picture signal")
     .accessibilityValue(Self.stageTitle(stage))
+  }
+
+  /// What the picture shows when it isn't the Output stage, always on the
+  /// picture (not only on hover), so a picture without the camera's LUT
+  /// explains itself. The stage menu below changes it.
+  @ViewBuilder private var stageNotice: some View {
+    let stage = context.monitor.preferences(for: camera.id).state.pictureStage
+    if let notice = Self.stageNotice(stage) {
+      Text(notice)
+        .font(.uiOverlay)
+        .lineLimit(1).truncationMode(.tail)
+        .uiPictureOverlay()
+        .help(Self.stageNoticeHelp(stage))
+        .accessibilityLabel("Picture shows \(notice)")
+    }
+  }
+
+  /// The picture's stage when it isn't Output (the default, the camera's output), nil at Output.
+  static func stageNotice(_ stage: SignalStage) -> String? {
+    switch stage {
+    case .output: return nil
+    case .source: return "Source · before LUT"
+    case .monitor: return "Monitor"
+    }
+  }
+
+  static func stageNoticeHelp(_ stage: SignalStage) -> String {
+    switch stage {
+    case .output: return ""
+    case .source: return "This picture shows the camera signal before its LUT. Choose Output to see what the camera outputs."
+    case .monitor: return "This picture shows the Monitor stage: the output with this camera's monitor-only LUT."
+    }
   }
 
   static func stageTitle(_ stage: SignalStage) -> String {

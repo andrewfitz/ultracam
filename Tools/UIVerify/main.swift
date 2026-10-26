@@ -1,4 +1,5 @@
 import AppKit
+import MonitorKitCore
 import SwiftUI
 import SystemExtensions
 
@@ -376,6 +377,28 @@ extension UIVerify {
       .write(to: verifier.pngDirectory.deletingLastPathComponent().appendingPathComponent("accessibility-problems.tsv"), atomically: true, encoding: .utf8)
     for label in ["Locate…"] {
       verifier.check("problems window offers \"\(label)\"", contains(problemNodes, label), "", viewDependent: true)
+    }
+    // A picture that isn't at the Output stage says so on the picture, without hover.
+    do {
+      var session = UIFixtures.fourUp()
+      session.cameras = Array(session.cameras.prefix(3))
+      let context = UIContext.fixture(session) { _ in }
+      for (camera, stage) in zip(session.cameras, [SignalStage.source, .output, .monitor]) {
+        var preferences = context.monitor.preferences(for: camera.id)
+        preferences.setPictureStage(stage)
+        context.monitor.setPreferences(preferences, for: camera.id)
+      }
+      let staged = HostedView(mainWindow(context), size: CGSize(width: 1320, height: 860), dark: false, titled: true)
+      defer { staged.close() }
+      let nodes = Accessibility.nodes(in: staged.host)
+      verifier.check("picture: a Source-stage camera shows \"Source · before LUT\" without hover",
+        contains(nodes, "Picture shows Source · before LUT"), "", viewDependent: true)
+      verifier.check("picture: a Monitor-stage camera shows its stage", contains(nodes, "Picture shows Monitor"), "",
+        viewDependent: true)
+      verifier.check("picture: an Output-stage camera shows no stage label",
+        !contains(nodes, "Picture shows Output") && !contains(nodes, "Picture shows Source (camera"), "", viewDependent: true)
+      verifier.check("picture: the stage label names Output as nothing to explain",
+        UICameraPictureView.stageNotice(.output) == nil && UICameraPictureView.stageNotice(.source) == "Source · before LUT")
     }
     // Sidebar List rows aren't exposed to accessibility offscreen (the render
     // component-sidebar-problems shows the banner), so check the banner's state and its view directly.
