@@ -14,6 +14,16 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
 }
 
 @objcMembers final class RecordingOutputChecks: XCTestCase {
+  /// External volumes can report 0 "available for important usage" while their
+  /// plain available capacity is terabytes; that drive must not read as full.
+  func testFreeSpaceUsesTheLargerVolumeFigure() {
+    XCTAssertEqual(VolumeFreeSpace.bytes(important: 0, available: 2_213_248_704_512), 2_213_248_704_512)
+    XCTAssertEqual(VolumeFreeSpace.bytes(important: 900, available: 500), 900)
+    XCTAssertEqual(VolumeFreeSpace.bytes(important: nil, available: 500), 500)
+    XCTAssertEqual(VolumeFreeSpace.bytes(important: 500, available: nil), 500)
+    XCTAssertNil(VolumeFreeSpace.bytes(important: nil, available: nil))
+  }
+
   private func makeRoot() throws -> URL {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("ultracam-recording-output-\(UUID().uuidString)", isDirectory: true)

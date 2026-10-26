@@ -42,17 +42,16 @@ enum UIRecordingLibrary {
       // volume's capacity needs the grant held, or it fails and the drive read as empty.
       let accessed = folder.startAccessingSecurityScopedResource()
       defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
+      let reported: Int64?
       let values: URLResourceValues?
       do {
-        values = try folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
-          .volumeAvailableCapacityKey, .volumeTotalCapacityKey])
+        reported = try VolumeFreeSpace.bytes(at: folder)
+        values = try folder.resourceValues(forKeys: [.volumeTotalCapacityKey])
       } catch {
+        reported = nil
         values = nil
         Self.logUnreadable(name, error)
       }
-      // Some volumes (network, non-APFS) don't report the "important usage" figure; a missing
-      // value must not read as a full drive.
-      let reported = values?.volumeAvailableCapacityForImportantUsage ?? values?.volumeAvailableCapacity.map(Int64.init)
       let available = reported ?? 0
       // An unreadable free figure leaves the size unknown too, so the drive isn't shown as full.
       let total = reported == nil ? 0 : Int64(values?.volumeTotalCapacity ?? 0)

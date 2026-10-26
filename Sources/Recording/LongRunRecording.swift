@@ -271,8 +271,7 @@ public struct FileManagerRecordingDiskSpaceProvider: RecordingDiskSpaceProvider 
   public init() {}
 
   public func availableBytes(at directory: URL) throws -> Int64 {
-    let values = try directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-    guard let available = values.volumeAvailableCapacityForImportantUsage, available >= 0 else {
+    guard let available = try VolumeFreeSpace.bytes(at: directory), available >= 0 else {
       throw RecordingError.diskSpaceUnavailable
     }
     return available

@@ -33,6 +33,27 @@ public protocol RecordingOutputDiskSpaceProviding: Sendable {
   func availableBytes(at directory: URL) throws -> UInt64
 }
 
+/// A volume's free space for recording. External volumes can report 0 for
+/// "available for important usage" while their plain available capacity is
+/// terabytes, so the larger of the two is used. Nil when the volume reports neither.
+public enum VolumeFreeSpace {
+  public static func bytes(at directory: URL) throws -> Int64? {
+    var fresh = URL(fileURLWithPath: directory.path, isDirectory: true)
+    fresh.removeAllCachedResourceValues()
+    let values = try fresh.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+    return bytes(important: values.volumeAvailableCapacityForImportantUsage, available: values.volumeAvailableCapacity.map(Int64.init))
+  }
+
+  static func bytes(important: Int64?, available: Int64?) -> Int64? {
+    switch (important, available) {
+    case (nil, nil): return nil
+    case let (important?, available?): return max(important, available)
+    case let (important?, nil): return important
+    case let (nil, available?): return available
+    }
+  }
+}
+
 public struct FileManagerRecordingOutputDiskSpaceProvider: RecordingOutputDiskSpaceProviding {
   public init() {}
 
@@ -40,10 +61,7 @@ public struct FileManagerRecordingOutputDiskSpaceProvider: RecordingOutputDiskSp
   /// lifetime, so reusing the stored root URL kept returning the free space
   /// from the take's start and never noticed a filling drive.
   public func availableBytes(at directory: URL) throws -> UInt64 {
-    var fresh = URL(fileURLWithPath: directory.path, isDirectory: true)
-    fresh.removeAllCachedResourceValues()
-    let values = try fresh.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-    guard let value = values.volumeAvailableCapacityForImportantUsage, value >= 0 else {
+    guard let value = try VolumeFreeSpace.bytes(at: directory), value >= 0 else {
       throw RecordingOutputError.diskSpaceUnavailable
     }
     return UInt64(value)
