@@ -3,11 +3,6 @@ import Foundation
 
 typealias CameraID = String
 
-enum CameraRole: Equatable {
-  case anchor
-  case emphasis
-}
-
 enum CueKind: String, Equatable {
   case phraseEnd
   case sentenceEnd

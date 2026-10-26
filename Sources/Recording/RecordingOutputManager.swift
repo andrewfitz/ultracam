@@ -243,8 +243,6 @@ public final class RecordingOutputManager: @unchecked Sendable {
     }
   }
 
-  public var outputRoot: URL { configuration.rootDirectory }
-
   fileprivate var minimumFreeBytes: UInt64 { configuration.minimumFreeBytes }
   fileprivate var fileExtension: String { configuration.fileExtension }
   fileprivate var fileManagerRef: FileManager { fileManager }

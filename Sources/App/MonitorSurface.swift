@@ -1458,11 +1458,6 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     work.preferences.scopesShown && !work.state.clean
   }
 
-  /// A held picture, a new scope view or changed scope settings draw at once.
-  private func isImmediate(_ key: ScopeKey) -> Bool {
-    key.frozenToken != nil || scopedKey?.layer != key.layer || scopedKey?.scopes != key.scopes
-      || scopedKey?.monitorLUT != key.monitorLUT
-  }
 
   /// Follows the presenter's scope layer: one scope display link per layer.
   private func setScopeLayer(_ scopeLayer: CAMetalLayer?) {
@@ -1592,10 +1587,6 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
 // MARK: - SwiftUI
 
 extension MonitorScopePreferences {
-  /// The IRE labels beside this scope's trace, on its level axis and bins.
-  var ireScale: ScopeIREScale {
-    ScopeIREScale(axis: settings.levelRange.low...settings.levelRange.high, bins: settings.waveformLevels)
-  }
 
   /// "RGB parade", "Luma waveform", …
   var title: String {

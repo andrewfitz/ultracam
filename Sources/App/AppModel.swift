@@ -924,19 +924,6 @@ final class AppModel {
     }
   }
 
-  /// Delivers a timestamped ASR boundary to the active transcript-assisted
-  /// director.  The app currently has no built-in speech recognizer, so an
-  /// ASR adapter can call this entry point from its own callback pipeline.
-  /// Validation and queue handoff are owned by `AutoSwitcherBridge`.
-  @MainActor
-  func ingestAutoSwitcherTranscript(segmentID: String, revision: UInt32,
-                                    start: CMTime, end: CMTime, kind: String,
-                                    confidence: Float, isFinal: Bool) {
-    guard feedCoordinator.outputMode == .program, let bridge = autoSwitcherBridge else { return }
-    bridge.ingestTranscript(segmentID: segmentID, revision: revision, start: start,
-      end: end, kind: kind, confidence: confidence, isFinal: isFinal)
-  }
-
   /// Shows an app-level message in the status of the camera the user is
   /// looking at (the selection). Display only.
   private func showStatus(_ message: String) {

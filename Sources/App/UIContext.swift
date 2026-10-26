@@ -72,17 +72,6 @@ struct UIContext {
   }
 }
 
-private struct UIContextKey: EnvironmentKey {
-  static let defaultValue: UIContext? = nil
-}
-
-extension EnvironmentValues {
-  var uiContext: UIContext? {
-    get { self[UIContextKey.self] }
-    set { self[UIContextKey.self] = newValue }
-  }
-}
-
 // MARK: - Fixtures
 
 /// A stand-in picture: a soft gradient with the camera's name, never a real frame.

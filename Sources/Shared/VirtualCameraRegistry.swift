@@ -21,11 +21,6 @@ struct VirtualCameraDescriptor: Codable, Equatable, Sendable, Identifiable {
   var displayName: String
   var enabled: Bool
 
-  var stableID: String {
-    get { id }
-    set { id = newValue }
-  }
-
   init(kind: VirtualCameraDeviceKind, feedID: String? = nil,
     displayName: String? = nil, enabled: Bool = true) {
     let normalizedFeedID = Self.normalizedFeedID(feedID)
@@ -166,17 +161,6 @@ struct VirtualCameraRegistrySnapshot: Codable, Equatable, Sendable {
   var generation: UInt64
   var appGroupIdentifier: String
   var devices: [VirtualCameraDescriptor]
-
-  var descriptors: [VirtualCameraDescriptor] {
-    get { devices }
-    set { devices = newValue }
-  }
-
-  /// Compatibility spelling for callers that use `version` for schema data.
-  var version: Int {
-    get { schemaVersion }
-    set { schemaVersion = newValue }
-  }
 
   init(schemaVersion: Int = Self.currentSchemaVersion, generation: UInt64 = 0,
     appGroupIdentifier: String = Self.defaultAppGroupIdentifier,

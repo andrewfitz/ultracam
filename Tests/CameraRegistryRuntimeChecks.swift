@@ -202,7 +202,7 @@ import XCTest
     } else {
       XCTFail("The on-air source must keep flowing while the cut is pending")
     }
-    if case let .cutApplied(mapped, _) = switcher.ingest(ProgramSourceFrame(sourceID: beta,
+    if case let .cutApplied(mapped) = switcher.ingest(ProgramSourceFrame(sourceID: beta,
       sourceTime: firstTime, duration: duration)) {
       XCTAssertEqual(mapped.programTime, CMTime(value: 2_002, timescale: 60_000))
       XCTAssertTrue(programRuntime.receive(try sample(luma: 208, at: mapped.programTime),

@@ -67,10 +67,6 @@ final class CameraDemandMonitor {
   private var states: [String: State] = [:]
   private var enabled = false
 
-  /// Compatibility callback for the original single-route monitor. It is
-  /// emitted only for the legacy/default route; new code should use
-  /// `onRouteChange` so each feed and Program route stays independent.
-  var onChange: ((Bool?, String?) -> Void)?
   var onRouteChange: ((CameraDemandChange) -> Void)?
 
   var routes: [CameraDemandRoute] { Array(routesByID.values).sorted { $0.id < $1.id } }
@@ -130,7 +126,7 @@ final class CameraDemandMonitor {
   func refresh() {
     if enabled {
       discover()
-    } else if onChange != nil || onRouteChange != nil {
+    } else if onRouteChange != nil {
       // `start()` can fail before it installs the topology listener. Retry
       // must be able to rebuild that registration.
       start()
@@ -203,7 +199,6 @@ final class CameraDemandMonitor {
     guard states[change.route.id] != next else { return }
     states[change.route.id] = next
     onRouteChange?(change)
-    if change.route.id == CameraDemandRoute.legacy.id { onChange?(change.requested, change.error) }
   }
 
   private func listen(_ object: CMIOObjectID, _ selector: Int, changed: @escaping () -> Void) throws -> Listener {

@@ -10,12 +10,6 @@ enum DemandRoute: String, Hashable, Codable, Sendable {
   case manualOutput
   case preview
 
-  /// Compatibility spellings for callers that use the route's UI vocabulary.
-  static let programSelected = DemandRoute.program
-  static let manual = DemandRoute.manualOutput
-  static let manualRoute = DemandRoute.manualOutput
-  static let previewOnly = DemandRoute.preview
-
   var contributesToSourceDemand: Bool {
     switch self {
     case .dedicatedCamera, .program, .manualOutput:
@@ -39,8 +33,6 @@ struct RouteDemandLease: Hashable, Identifiable, Sendable {
   var isPreviewOnly: Bool { route == .preview }
 }
 
-typealias DemandLease = RouteDemandLease
-
 /// Lifecycle work requested after source demand has remained stable for the
 /// configured debounce interval.
 enum SourceDemandTransition: Equatable, Sendable {
@@ -52,14 +44,7 @@ enum SourceDemandTransition: Equatable, Sendable {
     case .start(let feedID), .stop(let feedID): return feedID
     }
   }
-
-  var startsCapture: Bool {
-    if case .start = self { return true }
-    return false
-  }
 }
-
-typealias SourceDemandAction = SourceDemandTransition
 
 /// The route truth table for one feed. `previewOnly` is exposed separately so
 /// UI and diagnostics can explain why a preview is visible while capture is
@@ -73,10 +58,6 @@ struct FeedDemandSnapshot: Equatable, Sendable {
 
   var sourceDemand: Bool {
     dedicatedCamera || program || manualOutput
-  }
-
-  var hasAnyRoute: Bool {
-    dedicatedCamera || program || manualOutput || previewOnly
   }
 
   var isPreviewOnly: Bool {
@@ -193,16 +174,6 @@ struct RouteDemandCoordinator: Sendable {
   }
 
   @discardableResult
-  mutating func acquireProgram(feedID: String, at time: TimeInterval? = nil) -> RouteDemandLease {
-    acquire(feedID: feedID, route: .program, at: time)
-  }
-
-  @discardableResult
-  mutating func acquireManualOutput(feedID: String, at time: TimeInterval? = nil) -> RouteDemandLease {
-    acquire(feedID: feedID, route: .manualOutput, at: time)
-  }
-
-  @discardableResult
   mutating func acquirePreview(feedID: String, at time: TimeInterval? = nil) -> RouteDemandLease {
     acquire(feedID: feedID, route: .preview, at: time)
   }
@@ -252,10 +223,6 @@ struct RouteDemandCoordinator: Sendable {
     }
   }
 
-  mutating func setProgramSelectedFeed(_ feedID: String?, at time: TimeInterval? = nil) {
-    selectProgram(feedID: feedID, at: time)
-  }
-
   /// Keep only one selected explicit manual output feed.
   mutating func selectManualOutput(feedID: String?, at time: TimeInterval? = nil) {
     let timestamp = recordTime(time)
@@ -266,10 +233,6 @@ struct RouteDemandCoordinator: Sendable {
     if let feedID {
       _ = acquire(feedID: feedID, route: .manualOutput, at: timestamp)
     }
-  }
-
-  mutating func setManualOutputFeed(_ feedID: String?, at time: TimeInterval? = nil) {
-    selectManualOutput(feedID: feedID, at: time)
   }
 
   /// Advance the injected monotonic clock and return lifecycle work whose
@@ -301,8 +264,6 @@ struct RouteDemandCoordinator: Sendable {
     defer { transitions.removeAll(keepingCapacity: true) }
     return transitions
   }
-
-  var pendingTransitions: [SourceDemandTransition] { transitions }
 
   func snapshot(for feedID: String) -> FeedDemandSnapshot {
     var dedicated = false

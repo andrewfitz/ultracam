@@ -23,9 +23,8 @@ import XCTest
       return XCTFail("manual cut should queue")
     }
     XCTAssertEqual(coordinator.selectedFeedID, a)
-    if case let .cutApplied(mapped, flush) = coordinator.ingest(frame(b, 0)) {
+    if case let .cutApplied(mapped) = coordinator.ingest(frame(b, 0)) {
       XCTAssertEqual(mapped.sourceID, b)
-      XCTAssertFalse(flush, "Frames already on air before the cut are never flushed")
     } else {
       XCTFail("target frame should apply the queued cut")
     }

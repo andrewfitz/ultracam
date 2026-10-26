@@ -85,11 +85,6 @@ struct ProgramOutput<SourceID: Hashable> {
     scheduler.ingest(frame)
   }
 
-  mutating func ingestFrame(_ frame: ProgramSourceFrame<SourceID>)
-    -> ProgramFrameDecision<SourceID> {
-    ingest(frame)
-  }
-
   mutating func reset(selectedSource: SourceID? = nil) {
     let timeout = scheduler.pendingCutTimeout
     let startingTimeout = scheduler.startingCutTimeout
@@ -104,9 +99,6 @@ struct ProgramOutput<SourceID: Hashable> {
     scheduler.carryTimeline(from: previous.scheduler, keeping: sources)
   }
 }
-
-/// Compatibility spelling for call sites that use the coordinator name.
-typealias ProgramOutputCoordinator<SourceID: Hashable> = ProgramOutput<SourceID>
 
 /// Coordinates persisted switcher settings with the frame-boundary Program
 /// route. This type is deliberately independent from capture and CMIO.
@@ -167,7 +159,6 @@ struct SwitcherCoordinator {
   var pendingCut: FeedID? { programOutput.pendingCut }
   var pendingCutTime: CMTime? { programOutput.pendingCutTime }
   var hasPendingCut: Bool { programOutput.hasPendingCut }
-  var pendingDirectorCut: CutDecision? { pendingDirectorDecision }
   var isOnAir: Bool { programOutput.isOnAir }
   var isAutomaticRequestPending: Bool { automaticRequestPending }
   func readiness(of feedID: FeedID) -> ProgramSourceReadiness { programOutput.readiness(of: feedID) }
@@ -292,11 +283,6 @@ struct SwitcherCoordinator {
   }
 
   @discardableResult
-  mutating func manualCut(to feedID: FeedID) -> ProgramCutRequestResult<FeedID> {
-    requestManualCut(to: feedID)
-  }
-
-  @discardableResult
   mutating func manualOverride(to feedID: FeedID, at time: CMTime)
     -> ProgramCutRequestResult<FeedID> {
     let result = requestManualCut(to: feedID, at: time)
@@ -410,17 +396,12 @@ struct SwitcherCoordinator {
     }
   }
 
-  mutating func evaluateNatural(_ input: NaturalTalkingHeadDirectorInput)
-    -> CutDecision? {
-    evaluateDirector(input)
-  }
-
   /// Forward one source frame to the Program scheduler. A cut is applied only
   /// when the target source presents a valid frame boundary.
   mutating func ingest(_ frame: ProgramSourceFrame<FeedID>)
     -> ProgramFrameDecision<FeedID> {
     let decision = programOutput.ingest(frame)
-    if case let .cutApplied(mapped, _) = decision {
+    if case let .cutApplied(mapped) = decision {
       selectedFeedID = mapped.sourceID
       settings.selectedFeedID = mapped.sourceID
       automaticRequestPending = false

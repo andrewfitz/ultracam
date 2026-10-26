@@ -185,10 +185,9 @@ public enum ProgramFrameSkipReason: Equatable {
 
 public enum ProgramFrameDecision<SourceID: Hashable> {
   case accepted(ProgramMappedFrame<SourceID>)
-  /// `flushStaleFrames` is kept for source compatibility and is always false:
-  /// frames the old source already put on air precede the cut on the Program
-  /// clock and must still be delivered, in order.
-  case cutApplied(ProgramMappedFrame<SourceID>, flushStaleFrames: Bool)
+  /// The cut's first frame. Frames the old source already put on air precede
+  /// it on the Program clock and are still delivered, in order.
+  case cutApplied(ProgramMappedFrame<SourceID>)
   case skipped(ProgramFrameSkipReason)
 }
 
@@ -473,7 +472,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
         mapper = candidateMapper
         selectedSource = pendingCut
         clearPendingCut()
-        return .cutApplied(mapped, flushStaleFrames: false)
+        return .cutApplied(mapped)
       case let .failure(error):
         return .skipped(.invalidTimestamp(error))
       }

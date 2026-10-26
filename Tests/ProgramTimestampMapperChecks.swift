@@ -79,10 +79,9 @@ import XCTest
     guard case let .accepted(onAir) = scheduler.ingest(frame("A", 0)) else {
       return XCTFail("The on-air source must not freeze while a cut is pending")
     }
-    guard case let .cutApplied(mapped, flushStaleFrames) = scheduler.ingest(frame("B", 0)) else {
+    guard case let .cutApplied(mapped) = scheduler.ingest(frame("B", 0)) else {
       return XCTFail("Target frame should apply the pending cut")
     }
-    XCTAssertFalse(flushStaleFrames, "Frames already on air precede the cut and are kept")
     XCTAssertEqual(mapped.sourceID, "B")
     XCTAssertEqual(mapped.programTime, CMTimeAdd(onAir.programTime, onAir.programDuration))
     XCTAssertFalse(scheduler.hasPendingCut)
@@ -136,7 +135,7 @@ import XCTest
     }
     XCTAssertEqual(scheduler.pendingCut, "B", "Opening can take far longer than the live timeout")
     XCTAssertNil(scheduler.takeAbandonedCut())
-    guard case let .cutApplied(mapped, _) = scheduler.ingest(frame("B", 0)) else {
+    guard case let .cutApplied(mapped) = scheduler.ingest(frame("B", 0)) else {
       return XCTFail("The target's first frame lands the cut")
     }
     XCTAssertEqual(mapped.sourceID, "B")
@@ -227,7 +226,7 @@ import XCTest
       scheduler.ingest(frame("A", 2_002, duration: 1_001)) else {
       return XCTFail("A duplicate timestamp is not a restart and stays a counted skip")
     }
-    guard case let .cutApplied(cut, _) = scheduler.ingest(frame("B", 0, duration: 1_001)) else {
+    guard case let .cutApplied(cut) = scheduler.ingest(frame("B", 0, duration: 1_001)) else {
       return XCTFail("The pending cut still lands")
     }
     XCTAssertEqual(cut.programTime, CMTimeAdd(times[2], time(1_001)))
@@ -249,7 +248,7 @@ import XCTest
     XCTAssertNil(rebuilt.takeAbandonedCut())
     now = 1.9
     XCTAssertFalse(rebuilt.expirePendingCutIfNeeded(), "The carried cut keeps its own expiry clock")
-    guard case let .cutApplied(cut, _) = rebuilt.ingest(frame("B", 0, duration: 1_001)) else {
+    guard case let .cutApplied(cut) = rebuilt.ingest(frame("B", 0, duration: 1_001)) else {
       return XCTFail("The carried cut lands")
     }
     XCTAssertEqual(cut.programTime, time(1_001))
@@ -294,7 +293,7 @@ import XCTest
     if case .skipped(.nonSelectedSource) = scheduler.ingest(frame("B", 0)) {} else {
       XCTFail("An intermediate rapid-cut target must not be emitted")
     }
-    guard case let .cutApplied(mapped, _) = scheduler.ingest(frame("C", 0)) else {
+    guard case let .cutApplied(mapped) = scheduler.ingest(frame("C", 0)) else {
       return XCTFail("Latest rapid-cut target should be selected")
     }
     XCTAssertEqual(mapped.sourceID, "C")

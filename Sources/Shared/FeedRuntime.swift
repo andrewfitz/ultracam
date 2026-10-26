@@ -405,7 +405,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
     var report = FrameFanOutSummary()
     var published = false
     switch decision {
-    case let .accepted(mapped), let .cutApplied(mapped, _):
+    case let .accepted(mapped), let .cutApplied(mapped):
       let cut: Bool
       if case .cutApplied = decision { cut = true } else { cut = false }
       onAirSkips = 0
@@ -748,10 +748,6 @@ final class FeedSession: Identifiable {
                 policy: FrameQueueOverflowPolicy) throws -> FrameRoute<CVPixelBuffer> {
     try frameFanOut.addRoute(id: id, capacity: capacity, policy: policy)
   }
-
-  func removeRoute(_ route: FrameRoute<CVPixelBuffer>) {
-    route.cancel()
-  }
 }
 
 /// Main-actor collection of stable feed descriptors, runtime sessions, and
@@ -897,14 +893,6 @@ final class FeedCoordinator {
     programNormalizer.warm()
   }
 
-  /// Synchronous variant for tests; the app uses `requestProgramOutputDemand`.
-  func setProgramOutputDemand(_ active: Bool, configuration: PipelineConfiguration,
-                              passthroughFormat: OSType) throws {
-    try prepareProgramOutputBridge()
-    try programBridge?.setDemand(active, configuration: configuration,
-      passthroughFormat: passthroughFormat)
-  }
-
   /// Connects or closes the Program camera on the bridge's control queue so
   /// CMIO discovery (up to 3 s) never blocks the main actor. `completion`
   /// runs on the main actor.
@@ -917,8 +905,6 @@ final class FeedCoordinator {
       Task { @MainActor in completion(error) }
     }
   }
-
-  func pumpProgramOutput() { programBridge?.schedulePump() }
 
   var programOutputStatistics: ProgramOutputBridge.Statistics {
     programBridge?.currentStatistics ?? .init()
@@ -942,10 +928,6 @@ final class FeedCoordinator {
         controller.generationToken == generation else { return }
       route.ingest(fromCapture: feedID, frame: frame)
     }
-  }
-
-  func removeProgramFrameDelivery(feedID: FeedID) {
-    capture(for: feedID).onProcessedFrame = nil
   }
 
   func setCameraOutputEnabled(feedID: FeedID, enabled: Bool) {
@@ -1235,11 +1217,6 @@ final class FeedCoordinator {
         ownerID: ownerID, at: time)
     }
     return demandCoordinator.drainTransitions()
-  }
-
-  @discardableResult
-  func advanceDemand(to time: TimeInterval) -> [SourceDemandTransition] {
-    demandCoordinator.advance(to: time)
   }
 
   /// Feed IDs that currently keep a source capture demanded. Preview-only
