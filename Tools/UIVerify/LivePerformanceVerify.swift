@@ -301,15 +301,33 @@ struct LivePerformanceSample {
 
     // The split view's own sidebar animation, as the toolbar's sidebar button runs it.
     if let split = window.splitViewController {
+      // UI_PERF_PROFILE_SIDEBAR=n toggles the sidebar n times first, to profile its animation,
+      // and reports the main thread's CPU time per toggle (steadier than stalls on a busy machine).
+      let profileToggles = Int(ProcessInfo.processInfo.environment["UI_PERF_PROFILE_SIDEBAR"] ?? "") ?? 0
+      let profileCPU = MainThreadMeter.mainThreadCPU()
+      for _ in 0..<profileToggles { _ = sample(0.6) { split.toggleSidebar(nil) } }
+      if profileToggles > 0 {
+        print(String(format: "PERF \(name) sidebar toggle: main CPU %.1f ms per toggle",
+          (MainThreadMeter.mainThreadCPU() - profileCPU) * 1000 / Double(profileToggles)))
+      }
       let hide = sample(1.2) { split.toggleSidebar(nil) }
+      let grew = UIRenderProbe.samples.withLock { $0["cells scale"] ?? [] }
       let show = sample(1.2) { split.toggleSidebar(nil) }
+      let shrank = UIRenderProbe.samples.withLock { $0["cells scale"] ?? [] }
       print("PERF \(name) sidebar hide: \(hide.summary)")
       print("PERF \(name) sidebar show: \(show.summary)")
       for (step, value) in [("sidebar hide", hide), ("sidebar show", show)] {
         checkToggle(value, step, name: name, verifier: verifier, liveMeters: liveMeters)
       }
+      // The pictures follow the detail through the animation, scaled, rather than standing still
+      // until it ends: on macOS 26 the sidebar floats over the detail and animates its safe area.
+      // At least two sizes in between (a loaded machine draws few frames), then laid out at 1.
+      verifier.check("\(name): the pictures grow with the detail as the sidebar hides",
+        Set(grew.filter { $0 > 1.01 }).count >= 2 && grew.last == 1, grew.map { String(format: "%.2f", $0) }.joined(separator: " "))
+      verifier.check("\(name): the pictures shrink with the detail as the sidebar shows",
+        Set(shrank.filter { $0 < 0.99 }).count >= 2 && shrank.last == 1, shrank.map { String(format: "%.2f", $0) }.joined(separator: " "))
     } else {
-      verifier.check("\(name): the main window has a split view controller", false)
+      verifier.check("\(name): the main window has a split view controller with a sidebar", false)
     }
     // UI_PERF_PROFILE_INSPECTOR=n toggles the inspector n times first, to profile its animation.
     for _ in 0..<(Int(ProcessInfo.processInfo.environment["UI_PERF_PROFILE_INSPECTOR"] ?? "") ?? 0) {
@@ -387,14 +405,16 @@ struct LivePerformanceSample {
   }
 
   /// The NavigationSplitView's controller (the split view's delegate).
+  /// The split view controller with the sidebar: the NavigationSplitView's. The window's
+  /// outermost split is the inspector's (the content and the inspector), which has none.
   var splitViewController: NSSplitViewController? {
-    func find(_ view: NSView) -> NSSplitView? {
-      if let split = view as? NSSplitView { return split }
+    func find(_ view: NSView) -> NSSplitViewController? {
+      if let split = view as? NSSplitView, let controller = split.delegate as? NSSplitViewController,
+        controller.splitViewItems.contains(where: { $0.behavior == .sidebar }) { return controller }
       for child in view.subviews { if let found = find(child) { return found } }
       return nil
     }
-    guard let root = window.contentView, let split = find(root) else { return nil }
-    return split.delegate as? NSSplitViewController
+    return window.contentView.flatMap(find)
   }
 
   func close() {

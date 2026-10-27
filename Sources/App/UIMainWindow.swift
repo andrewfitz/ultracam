@@ -99,22 +99,31 @@ struct UIMainWindowView: View {
 
   /// The cells at the width `fit` gives the detail's settled size, centered in a scroll view.
   /// While the detail's size changes (a side column animating, a live resize) they keep that
-  /// layout and scale to the width `fit` gives the live size, in the render pass alone: no body
-  /// is evaluated and nothing is laid out again until the size settles (`UISettledSize`).
+  /// layout and the scroll view scales, larger or smaller, so the cells are as wide as `fit`
+  /// gives the live size: in the render pass alone, so no body is evaluated and nothing is laid
+  /// out again until the size settles (`UISettledSize`), and then at the size they were shown at.
   private func cells(_ fit: UIDetailFit, @ViewBuilder content: (CGFloat) -> some View) -> some View {
     let width = fit.width(in: settled.size)
     // In an overlay, so the cells' width never becomes the detail's ideal size (the split view
     // turns that into constraints, and changing it from its own size loops).
-    return Color.clear.overlay { ScrollView {
-      content(width)
-        .visualEffect { content, proxy in
-          let live = proxy.bounds(of: .scrollView)?.size ?? proxy.size
-          return content.scaleEffect(fit.scale(laidOut: width, live: live), anchor: .top)
-        }
-        .frame(maxWidth: .infinity)
-    }
-    .scrollBounceBehavior(.basedOnSize)
-    .contentMargins(margin, for: .scrollContent)
+    return Color.clear.overlay {
+      ScrollView {
+        content(width)
+          .frame(maxWidth: .infinity)
+      }
+      .scrollBounceBehavior(.basedOnSize)
+      .contentMargins(margin, for: .scrollContent)
+      // A vertical scroll view is never narrower than its content, so while the detail narrows
+      // (the sidebar opening) it keeps the settled width and overhangs, centered. This frame takes
+      // the detail's live size on every frame of the animation (on macOS 26 the sidebar floats
+      // over the detail and animates its safe area), and the scale reads it there. Scaling the
+      // cells inside instead cost more: the scroll view's visible bounds lag the animation.
+      .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+      .visualEffect { content, proxy in
+        let scale = fit.scale(laidOut: width, live: proxy.size)
+        UIRenderProbe.sample("cells scale", scale)
+        return content.scaleEffect(scale, anchor: .top)
+      }
     }
     .onGeometryChange(for: CGSize.self) { $0.size } action: { settled.changed(to: $0) }
   }
@@ -272,11 +281,12 @@ struct UIDetailFit: Sendable {
     return max(1, min(byWidth, max(narrowest, byHeight)).rounded(.down))
   }
 
-  /// The scale that fits cells laid out `laidOut` wide to the live size: under 1 while the
-  /// detail is narrower than its settled size, 1 otherwise (a wider detail centers them).
+  /// The scale that makes cells laid out `laidOut` wide as wide as `width(in:)` gives the live
+  /// size: under 1 while the detail is smaller than its settled size, over 1 while larger, and
+  /// exactly 1 at the settled size, so adopting it lays the cells out where they already were.
   func scale(laidOut: CGFloat, live: CGSize) -> CGFloat {
     guard laidOut > 0, live.width > 0, live.height > 0 else { return 1 }
-    return min(1, max(0.05, width(in: live) / laidOut))
+    return min(4, max(0.05, width(in: live) / laidOut))
   }
 }
 
