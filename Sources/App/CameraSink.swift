@@ -160,7 +160,7 @@ final class CMIODeviceListWatcher {
   private let block: CMIOObjectPropertyListenerBlock
   private let registered: Bool
 
-  init(changed: @escaping @MainActor () -> Void) {
+  init(changed: @escaping @MainActor @Sendable () -> Void) {
     let system = CMIOObjectID(kCMIOObjectSystemObject)
     // A process sees software cameras, and hears of them, only after opting in.
     var visibility = Self.address(kCMIOHardwarePropertyAllowScreenCaptureDevices)

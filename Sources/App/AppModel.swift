@@ -36,7 +36,7 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   var observeDevices: (@escaping @MainActor @Sendable ([InputDevice]) -> Void) -> Any?
   /// Calls the handler whenever CMIO's device list changes (the camera extension starting,
   /// its cameras appearing). Holds the observation until the returned value is released.
-  var observeVirtualCameras: (@escaping @MainActor () -> Void) -> Any? = { _ in nil }
+  var observeVirtualCameras: (@escaping @MainActor @Sendable () -> Void) -> Any? = { _ in nil }
   var diagnostics: (String) -> UltracamDeviceDiagnostics?
   /// "Advertise HDR to cameras": whether discovery writes the HDR EDID. Never
   /// at a capture start (an EDID write makes the camera renegotiate HDMI).
