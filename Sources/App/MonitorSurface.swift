@@ -89,6 +89,8 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   @MainActor @Published private(set) var isFrozen = false
   @MainActor @Published private(set) var isFreezePending = false
   @MainActor @Published private(set) var isClean = false
+  /// Native visibility, including window occlusion, for monitor-only overlays.
+  @MainActor @Published private(set) var isDrawable = false
   @MainActor @Published private(set) var zoom = Magnification()
   @MainActor @Published private(set) var pictureInterpretation = "Range / transfer interpretation unavailable"
   /// The scope's timing, with every refresh; published by `readout` (see `detail`).
@@ -167,6 +169,17 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
 
   /// The state the next live frame is drawn with (tests).
   var currentEncodeState: MonitorState { lock.withLock { encodeState } }
+
+  /// Geometry for a live monitor overlay, without retaining a video buffer.
+  /// Camera metadata must never move over a held, hidden or stale picture.
+  @MainActor func liveOverlayGeometry() -> (frame: MonitorFrameGeometry, state: MonitorState)? {
+    let now = ProcessInfo.processInfo.systemUptime
+    return lock.withLock {
+      guard !hidden, !clean, !signalLost, !pendingFreeze, frozen == nil,
+        let live = latest, now - live.stamp.hostTime <= 0.25 else { return nil }
+      return (live.geometry, encodeState)
+    }
+  }
 
   // MARK: Ingest (the delivery thread, under the host's lock)
 
@@ -315,7 +328,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let core: MonitorGPUContext.Core
     let context: MonitorGPUContext.EncodeContext
     do {
-      core = try gpu.core()
+      core = try gpu.core(nonblocking: true)
       context = try core.begin()
     } catch {
       recordFailure(error)
@@ -517,6 +530,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     guard first || visibility.presented != presented || visibility.drawable != drawable else { return }
     visibilityReported = true
     visibility = (presented, drawable)
+    if isDrawable != drawable { isDrawable = drawable }
     // A first "not presented" report arrives before the view reaches its window.
     // Passing it on drops monitor demand, which stops and restarts automatic capture.
     let beforeWindow = first && !presented && !drawable
@@ -855,6 +869,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
 extension MonitorSurfacePresenter: MonitorGPUCompletion {
   /// A freeze copy's completion: a failed copy is a counted surface failure.
   func gpuCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) {
+    if failed { gpu.invalidate() }
     recordGPU(kind: kind, milliseconds: (gpuEnd - gpuStart) * 1000, failed: failed)
   }
 }
@@ -1283,7 +1298,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     guard let work = presenter.renderWork(after: versions, force: resized) else { return }
     let core: MonitorGPUContext.Core
     do {
-      core = try gpu.core()
+      core = try gpu.core(nonblocking: true)
     } catch {
       presenter.recordFailure(error)
       return
@@ -1536,7 +1551,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let core: MonitorGPUContext.Core
     let context: MonitorGPUContext.EncodeContext
     do {
-      core = try gpu.core()
+      core = try gpu.core(nonblocking: true)
       context = try core.begin()
     } catch {
       presenter.cancelScope()
@@ -1587,6 +1602,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   }
 
   func gpuCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) {
+    if failed { gpu.invalidate() }
     presenter?.recordGPU(kind: kind, milliseconds: (gpuEnd - gpuStart) * 1000, failed: failed)
   }
 }

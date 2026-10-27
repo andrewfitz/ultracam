@@ -7,7 +7,10 @@ import SwiftUI
 
 @MainActor enum UIToolLayout {
   /// One column of groups.
-  static let columnWidth: CGFloat = 320
+  // Keep enough room for the slider track and its readout while dragging.
+  // The old width let SwiftUI renegotiate the popover on every value change,
+  // which made the zebra form visibly jump and could reflow the surrounding UI.
+  static let columnWidth: CGFloat = 356
   static let columnSpacing: CGFloat = 12
   /// The label column of a settings row.
   static let labelWidth: CGFloat = 104

@@ -57,6 +57,7 @@ struct UIContext {
   /// (inspector, sidebar) call this inside `body` so Observation tracks the models
   /// there too. Fixtures leave it nil.
   var refreshed: (@MainActor () -> UIContext)? = nil
+  var sonyCameras: SonyCameraStore? = nil
 
   /// The freshest context available: rebuilt from the models in the app, unchanged in fixtures.
   var current: UIContext { refreshed?() ?? self }

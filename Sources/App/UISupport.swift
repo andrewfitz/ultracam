@@ -128,8 +128,12 @@ enum UIMonitorBridge {
 
   /// Source profile for a camera's declared LUT input, used when false color is
   /// turned on before a source profile was chosen.
-  static func sourceProfile(forGamut gamut: String) -> String {
-    gamut.contains("Cine") ? "sony-slog3-sgamut3cine" : "sony-slog3-sgamut3"
+  static func sourceProfile(forGamut gamut: String) -> String? {
+    switch gamut {
+    case "S-Gamut3.Cine / S-Log3": return "sony-slog3-sgamut3cine"
+    case "S-Gamut3 / S-Log3": return "sony-slog3-sgamut3"
+    default: return nil
+    }
   }
 
   /// Turns one tool on or off. The master switch follows the tools: it is on

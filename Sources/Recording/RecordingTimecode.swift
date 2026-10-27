@@ -126,6 +126,12 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
     frameRate: RecordingFrameRate,
     dropFrame: Bool
   ) {
+    // All three separators are part of the fixed SMPTE shape. Check them
+    // before normalizing so malformed mixed-separator labels are rejected.
+    let chars = Array(string)
+    let expectedSeparator: Character = dropFrame ? ";" : ":"
+    guard chars.count == 11, chars[2] == expectedSeparator,
+      chars[5] == expectedSeparator, chars[8] == expectedSeparator else { return nil }
     let normalized = string.replacingOccurrences(of: ";", with: ":")
     let fields = normalized.split(separator: ":", omittingEmptySubsequences: false)
     guard fields.count == 4,
@@ -133,9 +139,7 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
       let seconds = Int(fields[2]), let frames = Int(fields[3]),
       (0..<24).contains(hours), (0..<60).contains(minutes),
       (0..<60).contains(seconds), (0..<Int(frameRate.nominalFramesPerSecond)).contains(frames),
-      string.count == 11,
-      (dropFrame ? string[string.index(string.startIndex, offsetBy: 8)] == ";"
-        : string[string.index(string.startIndex, offsetBy: 8)] == ":") else {
+      string.count == 11 else {
       return nil
     }
     if dropFrame && minutes % 10 != 0 && seconds == 0 && frames < Int(frameRate.dropFramesPerMinute) {

@@ -25,8 +25,9 @@ enum VideoBufferLayout {
       }
       return
     }
-    let is420 = type == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-    guard is420 || type == kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange ||
+    let color = ColorTarget.allCases.first { $0.pixelFormat == type }
+    let is420 = color?.is420 == true
+    guard color != nil || type == kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange ||
       type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange else {
       throw VideoError.message("Unsupported video pixel format.")
     }
@@ -34,7 +35,7 @@ enum VideoBufferLayout {
       CVPixelBufferIsPlanar(image), CVPixelBufferGetPlaneCount(image) == 2 else {
       throw VideoError.message("Invalid bi-planar video layout.")
     }
-    let bytesPerComponent = is420 ? 1 : 2
+    let bytesPerComponent = color?.isEightBit == true ? 1 : 2
     let (minimumStride, strideOverflow) = width.multipliedReportingOverflow(by: bytesPerComponent)
     guard !strideOverflow else { throw VideoError.message("Invalid video row stride.") }
     for plane in 0..<2 {

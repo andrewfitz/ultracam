@@ -30,6 +30,10 @@ enum UIAction: Sendable, Equatable {
   case stopAllCameras
   case setProcessing(cameraID: String, Bool)
   case setEffect(cameraID: String, index: Int, Bool)
+  case setResizeTarget(cameraID: String, ResizeTarget)
+  case setColorTarget(cameraID: String, ColorTarget)
+  case setFrameRateTarget(cameraID: String, FrameRateTarget)
+  case setSyncCameras(Bool)
   case chooseLUT(cameraID: String)
   case setGamut(cameraID: String, String)
   case setInput(cameraID: String, deviceID: String)

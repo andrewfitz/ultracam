@@ -88,10 +88,17 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 -module-cache-pat
   cat "$test_log"
   exit 1
 }
-# MonitorKit's XCTest bundles, one "Executed" summary each after the run.
+# MonitorKit's XCTest bundles, one "Executed" summary each after the run. A
+# skipped case is a successful platform-qualified outcome, but it is not
+# coverage; keep it visible instead of claiming that every case ran.
 monitor_kit_tests="$(awk "/Test Suite 'All tests' (passed|failed)/ { getline; print }" "$monitor_kit_test_log" \
   | awk '{ tests += $2 } END { print tests + 0 }')"
-echo "MonitorKit package: $monitor_kit_tests tests run, all passed ($monitor_kit_test_log)"
+monitor_kit_skipped="$(monitor_kit_skipped_cases "$monitor_kit_test_log" | awk 'NF { count++ } END { print count + 0 }')"
+if [[ "$monitor_kit_skipped" -gt 0 ]]; then
+  echo "MonitorKit package: $monitor_kit_tests tests completed, $monitor_kit_skipped skipped (platform-qualified; coverage is incomplete) ($monitor_kit_test_log)"
+else
+  echo "MonitorKit package: $monitor_kit_tests tests completed, none skipped ($monitor_kit_test_log)"
+fi
 # Timing budgets that passed only on their retry: report them, they are not silent.
 if /usr/bin/grep -q '^FLAKY (passed on retry)' "$monitor_kit_test_log"; then
   echo 'WARNING: MonitorKit timing budgets missed on the first run, passed on retry:'

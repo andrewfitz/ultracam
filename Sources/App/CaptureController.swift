@@ -272,6 +272,7 @@ final class CaptureController: @unchecked Sendable {
   func setCameraOutputEnabled(_ enabled: Bool) {
     let token = lock.withLock { generation }
     syncOnQueue {
+      guard isCurrent(token) else { return }
       cameraOutputEnabled = enabled
       if enabled {
         reconnectRequested = true
@@ -312,12 +313,16 @@ final class CaptureController: @unchecked Sendable {
   /// interpolation).
   func load(_ lut: MonitorLUT, expectedGeneration: UInt64? = nil,
     completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+    let token = expectedGeneration ?? generationToken
     queue.async {
       do {
-        if let expectedGeneration, !self.isCurrent(expectedGeneration) {
+        if !self.isCurrent(token) {
           throw VideoError.message("Camera changed before its LUT finished loading.")
         }
         try self.makeProcessor().load(lut)
+        guard self.isCurrent(token) else {
+          throw VideoError.message("Camera changed before its LUT finished loading.")
+        }
         self.lock.withLock { self.loadedLUT = lut }
         lutLog.notice("LUT \"\(lut.cube.title, privacy: .public)\" in the pipeline of \(self.cameraLabel, privacy: .public) (controller \(UInt(bitPattern: ObjectIdentifier(self).hashValue), format: .hex, privacy: .public)); burned in: \(self.pipelineEnabled && self.configuration.applyLUT, privacy: .public)")
         DispatchQueue.main.async { completion(.success(())) }
@@ -772,6 +777,8 @@ final class CaptureController: @unchecked Sendable {
     guard isCurrent(token), !stopNotified else { return }
     stopNotified = true
     lock.withLock { accepting = false }
+    let sink = lock.withLock { monitorLifecycleSink }
+    sink?.invalidate(rejectingCaptureGeneration: token)
     stopResources()
     applied = nil
     outputLabel = ""
@@ -803,7 +810,7 @@ final class CaptureController: @unchecked Sendable {
   /// committed ahead of the frame and the capture thread does not wait.
   private func ensurePrepared(_ next: PipelineConfiguration, wait: Bool) throws {
     if preparedConfiguration?.applyLUT != next.applyLUT || preparedConfiguration?.downscale != next.downscale ||
-      preparedConfiguration?.convertTo420 != next.convertTo420 {
+      preparedConfiguration?.pixelFormat != next.pixelFormat || preparedConfiguration?.width != next.width {
       try processor?.prepare(configuration: next, wait: wait)
       preparedConfiguration = next
     }

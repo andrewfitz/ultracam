@@ -109,7 +109,10 @@ public struct RecordingDropSummary: Equatable, Sendable {
   }
 
   public var total: UInt64 {
-    queueFull &+ paused &+ notRecording &+ invalidSample &+ writerNotReady &+ appendFailure
+    // Saturate rather than wrap: wrapping to zero would incorrectly report an
+    // overflowing set of drops as lossless.
+    [queueFull, paused, notRecording, invalidSample, writerNotReady, appendFailure]
+      .reduce(UInt64.zero) { total, value in total > UInt64.max - value ? UInt64.max : total + value }
   }
 
   public var isLossless: Bool { total == 0 }

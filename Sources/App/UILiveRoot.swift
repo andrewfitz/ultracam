@@ -54,6 +54,6 @@ extension UISessionBridge {
         if let pending = interface.confirmation { interface.confirmation = nil; bridge.send(pending.action, confirmed: true) }
       },
       cancelConfirmation: { interface.confirmation = nil },
-      refreshed: { bridge.context() })
+      refreshed: { bridge.context() }, sonyCameras: model.sonyCameras)
   }
 }

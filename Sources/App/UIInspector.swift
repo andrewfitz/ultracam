@@ -13,7 +13,7 @@ struct UIInspectorView: View {
 struct UIInspectorViewContent: View {
   let context: UIContext
 
-  private static let gamuts = ["S-Gamut3.Cine / S-Log3", "S-Gamut3 / S-Log3"]
+  private static let gamuts = ["Unspecified / custom LUT", "Rec.709", "S-Gamut3.Cine / S-Log3", "S-Gamut3 / S-Log3", "Canon Cinema Gamut / C-Log2", "Canon Cinema Gamut / C-Log3", "Panasonic V-Gamut / V-Log", "Blackmagic Wide Gamut / Film Gen 5", "ARRI Wide Gamut 3 / LogC3", "ARRI Wide Gamut 4 / LogC4", "REDWideGamutRGB / Log3G10", "Rec.2020 / HLG", "Rec.2020 / PQ"]
 
   var body: some View {
     let _ = UIRenderProbe.count("UIInspectorViewContent")
@@ -31,6 +31,15 @@ struct UIInspectorViewContent: View {
         header(camera: camera, snapshot: snapshot)
       }
       sourceSection(camera: camera, snapshot: snapshot)
+      if let store = context.sonyCameras {
+        Section("Sony Wi-Fi Control") {
+          UISonyCameraButton(feedID: camera.id, name: camera.name, store: store)
+          if let assignment = store.assignment(for: camera.id) {
+            Text("\(assignment.camera.model) · \(store.state(for: camera.id).cacheStatus)")
+              .font(.caption).foregroundStyle(.secondary)
+          }
+        }
+      }
       processingSection(camera: camera, snapshot: snapshot)
       lutSection(camera: camera, snapshot: snapshot)
       recordingSection(camera: camera, snapshot: snapshot)
@@ -132,6 +141,9 @@ struct UIInspectorViewContent: View {
 
   private func processingSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
+      Toggle("Sync cameras", isOn: Binding(get: { context.session.syncCameras },
+        set: { context.send(.setSyncCameras($0)) }))
+        .help("Copies this camera’s processing and monitor effects to enabled cameras, then keeps edits in sync. Input devices and recording folders stay separate.")
       Toggle("Processing", isOn: Binding(get: { snapshot.processing }, set: { context.send(.setProcessing(cameraID: camera.id, $0)) }))
         .help("Off is a complete bypass: original resolution, color, pixels and frame rate. Your effect choices stay saved. ⇧⌘B")
       ForEach(camera.chips) { chip in
@@ -145,6 +157,20 @@ struct UIInspectorViewContent: View {
         .disabled(!chip.enabled || !snapshot.processing)
         .help(chip.help)
       }
+      Picker("Resize to", selection: Binding(get: { snapshot.resizeTarget },
+        set: { context.send(.setResizeTarget(cameraID: camera.id, $0)) })) {
+        ForEach(ResizeTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+      }
+      Picker("Color format", selection: Binding(get: { snapshot.colorTarget },
+        set: { context.send(.setColorTarget(cameraID: camera.id, $0)) })) {
+        ForEach(ColorTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+      }
+      Picker("Frame-rate cap", selection: Binding(get: { snapshot.frameRateTarget },
+        set: { context.send(.setFrameRateTarget(cameraID: camera.id, $0)) })) {
+        ForEach(FrameRateTarget.allCases, id: \.self) { Text($0.title + " fps").tag($0) }
+      }
+      Text("Caps never exceed the detected source rate. Turn off an effect above to keep the source setting.")
+        .font(.caption).foregroundStyle(.secondary)
     } header: {
       Text("Effects")
     } footer: {

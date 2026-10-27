@@ -2,10 +2,12 @@ import CoreMedia
 
 struct FrameRateGate {
   private var last: CMTime = .invalid
+  private var next: CMTime = .invalid
   private var lastDuration: CMTime = .invalid
 
   mutating func reset() {
     last = .invalid
+    next = .invalid
     lastDuration = .invalid
   }
 
@@ -35,13 +37,28 @@ struct FrameRateGate {
         // A valid CMTime subtraction can still overflow for extreme values.
         // Refuse to publish when the cadence cannot be represented reliably.
         guard delta.isValid, delta.isNumeric, delta.epoch == 0 else { return false }
-        // Allow source-clock jitter while selecting every second 59.94 frame.
-        let deltaSeconds = delta.seconds
-        guard deltaSeconds.isFinite else { return false }
-        if deltaSeconds < durationSeconds * 0.9 { return false }
+        guard delta.seconds.isFinite else { return false }
+        // Keep a target-clock phase instead of restarting the interval at each
+        // selected source frame. Ratios such as 59.94 → 24 need alternating
+        // source-frame intervals; restarting would incorrectly yield 19.98.
+        let tolerance = durationSeconds * 0.1
+        guard next.isNumeric, next.seconds.isFinite else { return false }
+        let lateness = CMTimeSubtract(pts, next)
+        guard lateness.isNumeric, lateness.seconds.isFinite else { return false }
+        if lateness.seconds < -tolerance { return false }
+        let steps = max(1, floor((lateness.seconds + tolerance) / durationSeconds) + 1)
+        if steps < Double(Int32.max) {
+          next = CMTimeAdd(next, CMTimeMultiply(duration, multiplier: Int32(steps)))
+        } else {
+          next = CMTimeAdd(pts, duration)
+        }
+        last = pts
+        lastDuration = duration
+        return true
       }
       // A backwards source clock re-anchors the gate at the new generation.
     }
+    next = CMTimeAdd(pts, duration)
     last = pts
     lastDuration = duration
     return true

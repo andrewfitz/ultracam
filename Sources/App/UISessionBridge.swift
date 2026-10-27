@@ -35,11 +35,15 @@ final class UIInterfaceState {
     collapsed = Set(defaults.stringArray(forKey: "ui.collapsed") ?? [])
     sidebarVisible = defaults.object(forKey: "ui.sidebar") as? Bool ?? true
     order = defaults.stringArray(forKey: "ui.order") ?? []
-    defaultCollapsed = defaults.string(forKey: "ui.collapsed.default") == "collapsed"
   }
 
   /// Settings › General › Channel strips: new cameras start collapsed.
-  let defaultCollapsed: Bool
+  /// Reads the preference at the time a camera is added. Settings can be
+  /// changed while the app is running, so caching this at interface-state
+  /// initialization would leave newly added strips using the old density.
+  var defaultCollapsed: Bool {
+    defaults.string(forKey: "ui.collapsed.default") == "collapsed"
+  }
 
   /// Sorts cameras into the display order.
   func ordered<T>(_ items: [T], id: (T) -> String) -> [T] {
@@ -87,6 +91,13 @@ struct UISessionBridge {
   var openSettings: () -> Void = {}
 
   func snapshot() -> UISessionSnapshot {
+    // Drop preferences for cameras that no longer exist. Older builds could
+    // leave these IDs behind after a camera was removed.
+    let liveIDs = Set(model.feedDescriptors.map { $0.id.rawValue })
+    let validCollapsed = interface.collapsed.intersection(liveIDs)
+    if validCollapsed != interface.collapsed { interface.collapsed = validCollapsed }
+    let validOrder = interface.order.filter { liveIDs.contains($0) }
+    if validOrder != interface.order { interface.order = validOrder }
     // Register the observable camera state up front. Whether a camera runs is read
     // from the capture coordinator, which SwiftUI can't observe on its own.
     _ = model.cameraStateRevision
@@ -115,6 +126,9 @@ struct UISessionBridge {
         UIFormatLabels.shortFormat(update?.input ?? "") != nil
       camera.inUse = model.outputMode == .separateCameras && running && (model.cameraInUse(id) || update?.cameraOutputActive == true)
       camera.processing = descriptor.pipelineEnabled
+      camera.resizeTarget = descriptor.configuration.resizeTarget
+      camera.colorTarget = descriptor.configuration.colorTarget
+      camera.frameRateTarget = descriptor.configuration.frameRateTarget
       camera.effects = [descriptor.applyLUT, descriptor.downscale, descriptor.convertTo420, descriptor.reduceFrameRate]
       camera.lutName = lut.loaded ? lut.fileName ?? lut.displayTitle : nil
       camera.lutLoading = model.isLUTLoading(id)
@@ -148,6 +162,7 @@ struct UISessionBridge {
       cameras.append(camera)
     }
     var session = UISessionSnapshot()
+    session.syncCameras = model.syncCameras
     session.outputMode = model.outputMode == .program ? .program : .separate
     session.cameras = interface.ordered(cameras, id: \.id)
     session.selectedID = model.selectedFeedID.rawValue
@@ -297,6 +312,10 @@ struct UISessionBridge {
         default: break
         }
       }
+    case .setSyncCameras(let enabled): model.setSyncCameras(enabled)
+    case .setResizeTarget(let id, let target): model.updateCamera(feedID(id)) { $0.resizeTarget = target; $0.downscale = true }
+    case .setColorTarget(let id, let target): model.updateCamera(feedID(id)) { $0.colorTarget = target; $0.convertTo420 = true }
+    case .setFrameRateTarget(let id, let target): model.updateCamera(feedID(id)) { $0.frameRateTarget = target; $0.reduceFrameRate = true }
     case .chooseLUT(let id):
       model.chooseLUT(feedID: feedID(id))
     case .setGamut(let id, let gamut): model.updateCamera(feedID(id)) { $0.gamut = gamut }
@@ -309,7 +328,10 @@ struct UISessionBridge {
       if model.startRefusal(feedID(id)) != nil { model.startCamera(feedID(id)) } else { model.retryAutomaticFeed(feedID: feedID(id)) }
     case .addCamera:
       if let id = model.addFeed(), interface.defaultCollapsed { interface.collapsed.insert(id.rawValue) }
-    case .removeCamera(let id): _ = model.removeFeed(feedID(id))
+    case .removeCamera(let id):
+      _ = model.removeFeed(feedID(id))
+      interface.collapsed.remove(id)
+      interface.order.removeAll { $0 == id }
     case .renameCamera(let id, let name):
       _ = model.renameFeed(feedID(id), name: name)
       interface.renamingCameraID = nil
@@ -371,7 +393,9 @@ struct UISessionBridge {
       let gamut = model.descriptor(for: feedID(id))?.gamut ?? FeedDescriptor().gamut
       UIMonitorBridge.toggle(tool, for: id, coordinator: model.monitorCoordinator,
         defaultSourceProfile: UIMonitorBridge.sourceProfile(forGamut: gamut))
-    case .freeze, .toggleClean, .detachMonitor: UIMonitorBridge.perform(action, coordinator: model.monitorCoordinator)
+    case .detachMonitor(let id):
+      MonitorDetachedWindows.open(coordinator: model.monitorCoordinator, target: MonitorTargetID(id), sonyCameras: model.sonyCameras)
+    case .freeze, .toggleClean: UIMonitorBridge.perform(action, coordinator: model.monitorCoordinator)
     case .resetMonitorTools(let id):
       model.monitorCoordinator.resetSettings(for: MonitorTargetID(id))
     case .copyMonitorSettings(let from, let to):

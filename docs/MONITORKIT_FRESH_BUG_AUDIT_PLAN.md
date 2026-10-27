@@ -4,13 +4,13 @@
 
 Audit the current MonitorKit implementation as if no prior review exists, find real defects, repair them, and leave a reproducible, tested commit. The audit target is the complete MonitorKit delivery surface:
 
-- `Packages/MonitorKit/Sources`, including Swift, Metal shader text, and all five products.
+- `Packages/MonitorKit/Sources`, including Swift, Metal shader text, and all five products. This is a pinned git submodule, so its upstream implementation findings and Ultracam integration findings must be reported separately.
 - `Packages/MonitorKit/Tests`, with new tests added for every confirmed defect.
 - The app integration that owns MonitorKit behavior: `Sources/App/Monitor*.swift`, the MonitorKit host checks, `Tools/MonitorAppIntegration`, and build or validation scripts that package or exercise the monitor.
 
-Existing audit logs, changelogs, progress notes, and prior claims are context only. They are not evidence that a behavior is correct. The current worktree is the baseline and must be captured before any repair starts.
+Existing audit logs, changelogs, progress notes, and prior claims are context only. They are not evidence that a behavior is correct. The current branch and worktree are the live audit subject; record their starting status for traceability, but do not freeze development or require a separate checkout before auditing or repairing.
 
-The baseline capture is non-destructive: save the complete diff and untracked-file list, create a dedicated audit worktree from that snapshot, and leave the user's original worktree untouched. Do not reset, clean, or discard existing work. Every agent works from the same captured baseline in its own worktree; reports and artifacts live under a run-specific directory outside the source tree.
+Record the complete diff and untracked-file list, then continue in the current worktree. Do not reset, clean, stash, or discard existing work. Parallel workstreams may use isolated worktrees when useful, but they are optional and do not define the baseline. Reports and artifacts live under a run-specific directory outside the source tree and use the repo-wide audit's shared evidence and finding ledger.
 
 ## Invariants to prove
 
@@ -29,9 +29,9 @@ Every finding is evaluated against the contract it can violate:
 
 ### 0. Baseline and evidence
 
-- Snapshot the complete current worktree, including untracked files, before edits.
+- Record the complete current diff, untracked files, and starting environment before edits.
 - Record toolchain, OS, GPU, package revision, build settings, and environment variables.
-- Establish a clean audit branch from that snapshot. Verify that its status is clean before the first test and record the exact baseline commit or tree hash.
+- Record the starting commit, status, diff hash, package revision, and environment before the first test.
 - Run a clean package build and the complete package test suite from a new build directory.
 - Run the app host checks, integration executable, UI type-check, UI verification, and app self-test where hardware permits.
 - Run once with Metal API and shader validation enabled and once with sanitizers or thread checking where supported.
@@ -81,9 +81,11 @@ Integration is serialized. The primary agent cherry-picks only verified agent co
 
 ## Parallel execution matrix
 
-Twenty agents are used with model `gpt-6.1-sol`. The first pass is read-only except for per-agent reports and tests in isolated worktrees. The second pass assigns each confirmed finding to its reporting agent or a dedicated owner in an isolated worktree. No two agents edit the same file set concurrently.
+The numbered workstreams are a coverage map, not a requirement to start twenty agents. Use isolated parallel worktrees only when capacity and file boundaries make that safe; otherwise run the same matrix sequentially.
 
-Each slot receives the same fresh-audit brief, the baseline tree hash, its file ownership boundary, and a unique worktree and artifact directory. Agents must not read old audit reports to close a finding, must not amend another agent's commit, and must stop at a shared-file boundary rather than editing through it. The primary agent remains responsible for cross-module findings, cherry-pick order, and final verification.
+The twenty numbered workstreams may be assigned to available reviewers. Review and repair can proceed on the live branch; use isolated worktrees only when parallel edits would otherwise collide. Keep ownership boundaries clear and run the affected checks after each repair group.
+
+Each workstream receives the same fresh-audit brief, the starting commit/status/diff metadata, its file ownership boundary, and an artifact directory. Reviewers must not read old audit reports to close a finding, must not overwrite another workstream's edits, and must stop at a shared-file boundary rather than editing through it. The primary reviewer remains responsible for cross-module findings, integration order, and final verification.
 
 1. Repository inventory and public-contract map.
 2. Core colorimetry and transfer math.
@@ -106,7 +108,7 @@ Each slot receives the same fresh-audit brief, the baseline tree hash, its file 
 19. Build, packaging, generated project, release symbols, and integration gates.
 20. Adversarial end-to-end reviewer: cross-module races, unsupported combinations, and reproducibility of all findings.
 
-Each agent must report: `finding ID`, severity (`blocker`, `high`, `medium`, `low`), exact location, trigger, violated invariant, reproducer, proposed fix, test name, and verification command. Agents must commit only their isolated, verified fix with a descriptive message and must not rewrite unrelated code.
+Each workstream must report: `finding ID`, severity (`blocker`, `high`, `medium`, `low`), exact location, trigger, violated invariant, reproducer, proposed fix, test name, and verification command. Reviewers must commit only isolated, verified fixes with descriptive messages and must not rewrite unrelated code.
 
 Reports must distinguish a confirmed defect from an untested suspicion. A finding is confirmed only when the reproducer fails on the captured baseline and passes after the fix, or when a static proof establishes an invariant violation and a focused test demonstrates the affected behavior. Duplicate findings are merged under one ID before repair assignment.
 

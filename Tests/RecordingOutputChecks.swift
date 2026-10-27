@@ -202,6 +202,18 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertFalse(FileManager.default.fileExists(atPath: take.finalURL.path))
   }
 
+  func testRecoveryJournalAcceptsConfiguredCustomExtension() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, fileExtension: "mxf", minimumFreeBytes: 0)
+    let take = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1, 2, 3]).write(to: take.temporaryURL)
+    take.preserveForRecovery()
+    let interrupted = try XCTUnwrap(RecordingRecovery.scan(root: root).first)
+    XCTAssertEqual(interrupted.finalURL.pathExtension, "mxf")
+    XCTAssertEqual(interrupted.temporaryURL, take.temporaryURL)
+  }
+
   func testCompletedAndCancelledSessionsRemoveRecoveryJournal() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

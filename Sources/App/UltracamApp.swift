@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
   weak var model: AppModel?
   private var menuBar: UIMenuBarController?
+  private var terminationPending = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     let model = UIAppEnvironment.model
@@ -19,6 +20,9 @@ import SwiftUI
       }
     }
     menuBar = UIMenuBarController(model: model, interface: UIAppEnvironment.interface)
+    if !CommandLine.arguments.contains("--ui-self-test") {
+      Task { @MainActor in await model.sonyCameras.restoreConnections() }
+    }
     // scripts/ui-tour.sh reviews both appearances without changing the system setting.
     if let flag = CommandLine.arguments.firstIndex(of: "--ui-appearance"), CommandLine.arguments.indices.contains(flag + 1) {
       NSApplication.shared.appearance = NSAppearance(named: CommandLine.arguments[flag + 1] == "dark" ? .darkAqua : .aqua)
@@ -38,11 +42,24 @@ import SwiftUI
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    guard let model, model.recordingModel.hasActiveRecordings else { return .terminateNow }
-    model.saveSettings()
-    model.stopAllCameras()
-    model.recordingModel.stopAll {
-      DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) }
+    if terminationPending { return .terminateLater }
+    guard let model else { return .terminateNow }
+    let recording = model.recordingModel.hasActiveRecordings
+    guard recording || model.sonyCameras.needsShutdown else { return .terminateNow }
+    terminationPending = true
+    if recording {
+      model.saveSettings()
+      model.stopAllCameras()
+    }
+    Task { @MainActor in
+      async let sonyCleanup = model.sonyCameras.shutdown()
+      if recording {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          model.recordingModel.stopAll { continuation.resume() }
+        }
+      }
+      if let message = await sonyCleanup { NSLog("Sony camera cleanup on quit: %@", message) }
+      sender.reply(toApplicationShouldTerminate: true)
     }
     return .terminateLater
   }
@@ -79,7 +96,7 @@ struct UltracamApp: App {
     .windowResizability(.contentSize)
 
     Settings {
-      UISettingsView(model: model)
+      UISettingsView(model: model, interface: interface)
     }
   }
 }

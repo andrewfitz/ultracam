@@ -556,6 +556,7 @@ final class LUTProcessor: @unchecked Sendable {
     let type = CVPixelBufferGetPixelFormatType(input)
     let matrix = CVBufferCopyAttachment(input, kCVImageBufferYCbCrMatrixKey, nil) as? String
     var parameters = Self.parameters(for: input, matrix: matrix, lut: applied)
+    parameters.geometry.z = configuration.outputColor.isEightBit ? 8 : 10
     // Reserve output before mapping a borrowed capture frame. A consumer that
     // holds every output buffer is a stall, reported by the caller.
     let pool = try preparePool(configuration)
@@ -566,8 +567,8 @@ final class LUTProcessor: @unchecked Sendable {
       throw VideoError.message("Output buffers are unavailable (\(status)).")
     }
     flushTextureCache()
-    let y = try outputTexture(output, plane: 0, format: configuration.convertTo420 ? .r8Unorm : .r16Unorm)
-    let uv = try outputTexture(output, plane: 1, format: configuration.convertTo420 ? .rg8Unorm : .rg16Unorm)
+    let y = try outputTexture(output, plane: 0, format: configuration.outputColor.isEightBit ? .r8Unorm : .r16Unorm)
+    let uv = try outputTexture(output, plane: 1, format: configuration.outputColor.isEightBit ? .rg8Unorm : .rg16Unorm)
     var inputs: [MTLTexture] = []
     var wrappers: [AnyObject] = []
     let packed = type == kCVPixelFormatType_422YpCbCr10
@@ -590,10 +591,11 @@ final class LUTProcessor: @unchecked Sendable {
       inputs += [luma, chroma]
       wrappers += [yWrapper, uvWrapper]
     }
-    let horizontal = configuration.downscale ? try intermediate(width: configuration.width, height: height) : nil
+    let resizing = configuration.width != width || configuration.height != height
+    let horizontal = resizing ? try intermediate(width: configuration.width, height: height) : nil
     // Frames in flight may still use it: release at an idle moment (normally
     // the next frame) rather than wait for the GPU on the capture thread.
-    if !configuration.downscale, horizontalTexture != nil, framesInFlight == 0 { releaseIntermediate() }
+    if !resizing, horizontalTexture != nil, framesInFlight == 0 { releaseIntermediate() }
     stampAttachments(output, from: input, configuration: configuration, matrix: matrix)
     // The frame retains its LUT and keeps its texture resident until it completes.
     let lutTexture = applied?.texture ?? placeholderLUT
@@ -625,17 +627,17 @@ final class LUTProcessor: @unchecked Sendable {
         second.setTexture(y.gpuResourceID, index: 3)
         second.setTexture(uv.gpuResourceID, index: 4)
         encoder.setArgumentTable(second)
-        guard let vertical = pipelines[configuration.convertTo420 ? "verticalNV12" : "vertical422"] else { return false }
+        guard let vertical = pipelines[configuration.outputColor.is420 ? "verticalNV12" : "vertical422"] else { return false }
         encoder.setComputePipelineState(vertical)
         dispatchBlocks(encoder, state: vertical, width: configuration.width, height: configuration.height,
-          is420: configuration.convertTo420)
+          is420: configuration.outputColor.is420)
       } else {
         first.setTexture(y.gpuResourceID, index: 3)
         first.setTexture(uv.gpuResourceID, index: 4)
-        let name = (packed ? "fullPacked" : "fullPlanar") + (configuration.convertTo420 ? "NV12" : "422")
+        let name = (packed ? "fullPacked" : "fullPlanar") + (configuration.outputColor.is420 ? "NV12" : "422")
         guard let state = pipelines[name] else { return false }
         encoder.setComputePipelineState(state)
-        dispatchBlocks(encoder, state: state, width: width, height: height, is420: configuration.convertTo420)
+        dispatchBlocks(encoder, state: state, width: width, height: height, is420: configuration.outputColor.is420)
       }
       return true
     }
@@ -866,6 +868,9 @@ final class LUTProcessor: @unchecked Sendable {
     case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
       return [CopyPlane(index: 0, format: .r16Uint, width: width, height: height),
         CopyPlane(index: 1, format: .rg16Uint, width: width / 2, height: height / 2)]
+    case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+      return [CopyPlane(index: 0, format: .r8Uint, width: width, height: height),
+        CopyPlane(index: 1, format: .rg8Uint, width: width / 2, height: height)]
     case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
       return [CopyPlane(index: 0, format: .r8Uint, width: width, height: height),
         CopyPlane(index: 1, format: .rg8Uint, width: width / 2, height: height / 2)]

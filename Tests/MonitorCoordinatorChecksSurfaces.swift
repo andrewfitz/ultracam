@@ -221,6 +221,17 @@ extension MonitorCoordinatorChecks {
     XCTAssertFalse(presenter.isFrozen)
   }
 
+  func testCaptureFailureMessageIsShownWhenSourceStops() throws {
+    let value = portedCoordinator()
+    let (presenter, _, _) = portedSurface(value, portedAlpha)
+
+    value.sourceStateChanged(
+      target: portedAlpha, running: false,
+      message: "Capture failed: UltraStudio input disconnected")
+
+    XCTAssertEqual(presenter.status, "Capture failed: UltraStudio input disconnected")
+  }
+
   /// MonitorToolsUITests:347. A pending freeze says so, takes the next frame with
   /// the tools current then, and a cancelled request freezes nothing.
   func testPendingFreezeUsesTheNextAdmittedPictureAndCanCancel() throws {

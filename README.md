@@ -7,30 +7,45 @@ The Xcode project is `Ultracam.xcodeproj`, with the `Ultracam` scheme.
 The custom macOS icon and its reproducible asset catalog are documented in
 [docs/ICON.md](docs/ICON.md).
 
-A standalone native macOS app and Core Media I/O camera extension for a Sony
-FX3 log feed through an UltraStudio Mini Recorder 12G. Select **Ultracam**
+A standalone native macOS app and Core Media I/O camera extension for a 4K
+HDMI camera feed through a supported Blackmagic capture device. Select **Ultracam**
 as the camera in Zoom or another macOS camera application.
 
 ## Processing
 
-The four checkboxes are independent and ordered:
+Each camera has four independent effects, applied in order:
 
-1. **Apply LUT:** decode source 10-bit Y′CbCr to floating-point log RGB and apply
-   a `.cube` at the original 3840 × 2160 resolution. No implicit linearization
-   or additional log-to-display transform is applied. The LUT must match
-   S-Gamut3.Cine/S-Log3 or S-Gamut3/S-Log3 and output display Rec.709.
-2. **Downscale:** use a separable Lanczos-3 filter with scale-adjusted support
-   and normalized weights to reduce 4K to 1920 × 1080. Intermediate textures
-   remain 32-bit float.
-3. **Color format:** produce 4:2:0 8-bit video-range NV12. When disabled, produce
-   4:2:2 10-bit video-range `x422`. Chroma sampling and integer quantization occur
-   after LUT processing and spatial scaling.
-4. **Frame rate:** reduce 59.94 to 29.97 by selecting every second source frame
-   after pixel processing. This does not affect a 29.97 source.
+1. **LUT:** load any matching `.cube` LUT. The input-profile selector includes
+   Sony, Canon, Panasonic, Blackmagic, ARRI, RED, Rec.709, HLG, PQ and a custom
+   choice (the default for new cameras). This label documents the LUT's expected input; it adds no transform.
+2. **Resize:** select **720p**, **1080p** or **4K UHD**. Lanczos-3 filtering keeps
+   floating-point precision until output quantization. Disable Resize to retain
+   source dimensions.
+3. **Color format:** select **4:2:0 8-bit**, **4:2:0 10-bit**, **4:2:2 8-bit** or
+   **4:2:2 10-bit**, all video range. Disable this effect to retain the native
+   10-bit 4:2:2 output path.
+4. **Frame-rate cap:** **60, 59.94, 50, 30, 29.97, 25, 24 or 23.976 fps**.
+   Caps select source frames without interpolation or duplication and never
+   exceed the detected input rate. Disable the cap to follow the source.
 
-Defaults: LUT off, downscale and color conversion enabled, frame-rate reduction
-disabled. A LUT is optional; loading one enables its checkbox. Both source rates use their exact rational values, 30000/1001 and
-60000/1001. DF is a timecode convention, not a pixel-processing operation.
+The inspector holds each effect's target picker; the channel-strip chips show
+those saved targets. Defaults remain LUT off, 1080p and 4:2:0 8-bit enabled,
+frame-rate cap off with 29.97 saved. Existing settings migrate without losing LUTs.
+Fractional rates retain exact rational durations.
+
+**Sync cameras**, in the inspector and Settings → Camera, initially copies the
+selected camera's processing and monitor effects to all enabled camera feeds.
+Subsequent edits from any enabled camera propagate to the others, including
+burn-in and monitor LUT choices, processing bypass, preview and monitor tools.
+New cameras inherit the current shared effects. Disabled feeds and Program are
+excluded. Device assignments, camera names, automatic-start choices, signal
+profiles/calibration, exposure reference offsets and recording folders stay
+per camera. Turn sync off to edit effects independently again; existing choices
+remain saved. Sync is off by default and persists between launches.
+
+These are **output** choices: physical capture still requires the validated
+DeckLink 4K 10-bit 4:2:2 29.97/59.94 input contract described below. Selecting a
+profile label does not add support for another capture device or input mode.
 
 With all pixel-processing switches disabled, the original input pixel buffer
 is forwarded without color conversion. A bounded bit-exact IOSurface copy is
@@ -48,7 +63,7 @@ keeps detecting the source without processing unused frames.
 
 Effects can change while capture runs. The producer stops and drains its camera
 transport before negotiating a changed output format, then resumes delivery.
-The camera publishes supported 4K/1080p, 10-bit 4:2:2/8-bit 4:2:0 modes; consumers
+The camera publishes 720p/1080p/4K modes in every selectable output color format; consumers
 must accept the selected format. Installed-service format changes still need
 qualification with a signed extension.
 
@@ -71,7 +86,7 @@ feed continues under manual control.
 
 The metadata panel also reports the detected RP188 video timecode when the HDMI
 source carries one. It shows two embedded-audio meters from the UltraStudio's
-48 kHz, 16-bit stereo input, with peak and RMS values for left and right. The
+48 kHz, 32-bit stereo input, with peak and RMS values for left and right. The
 diagnostics disclosure includes audio channels, sample rate, packet/sample/byte
 counts, estimated audio bitrate and audio gaps, plus video bitrate and separate
 video drop counters. If the source carries no audio or timecode, the UI says so
@@ -81,6 +96,24 @@ A missing or invalid saved LUT leaves capture usable and keeps
 the saved choice for recovery.
 
 ## Interface
+
+**Sony Wi-Fi control:** open **Sony Camera** in a camera strip or inspector to
+assign an FX3 to that HDMI feed, change its supported camera settings, and toggle
+an automatically updated settings overlay. Opening the pop-up automatically
+detects named cameras; Rescan finds newly powered cameras. Successful camera sign-ins are
+stored in macOS Keychain; saved assignments reconnect once at launch across
+signed app updates and installs. Reconnect/Forget Saved Sign-In manage them.
+Camera change notifications update settings automatically, with a 500 ms burst
+window and no periodic polling. Refresh is available as an optional fallback.
+The Sony settings include an HDMI display toggle that remotely enables the FX3's
+own Face/Eye frames and camera display information in the HDMI signal. It does
+not enable Sony Wi-Fi live-view acquisition. AF subject-recognition and
+transition controls appear when supported. Sony live-view acquisition and the
+SDK's automatic retry loop are disabled. See
+[Sony setup, SDK installation and hardware checks](docs/SONY_CONTROL.md).
+The settings sheet also exposes the FX3's HDMI output resolution and, when the
+camera allows it, HDMI 4K/RAW output frame-rate controls. These are separate from
+the movie recording and S&Q frame-rate settings.
 
 The main window is a native macOS window in light or dark appearance:
 
@@ -190,7 +223,7 @@ each camera feed's recording row. **Use default** clears that camera's override.
 Each camera can record with its own folder even if no default is selected.
 Folder changes apply to the next take. **PC time** is the default timecode mode;
 it writes the computer's clock into the file, aligned to the first video frame.
-ProRes 422 10-bit and HEVC Main10 4:2:2 use fragmented QuickTime MOV containers,
+ProRes 422 HQ 10-bit and HEVC Main10 4:2:2 use fragmented QuickTime MOV containers,
 with a one-second initial fragment and ten-second subsequent fragment intervals.
 Normal Stop drains the encoder and finalizes the whole take on a worker, while
 **Finishing…** keeps duplicate recording actions disabled. Quitting waits for

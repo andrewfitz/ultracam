@@ -33,6 +33,11 @@ enum VirtualCameraRegistryWire {
 
   static func update(_ desired: VirtualCameraRegistrySnapshot,
     after current: VirtualCameraRegistrySnapshot) throws -> VirtualCameraRegistrySnapshot? {
+    // Zero is the local bootstrap baseline and max is exhausted; neither may
+    // cross the transport publication boundary.
+    guard desired.generation > 0, desired.generation < UInt64.max else {
+      throw VirtualCameraRegistryError.invalidGeneration
+    }
     _ = try encode(desired)
     _ = try encode(current)
     guard desired.appGroupIdentifier == current.appGroupIdentifier else {

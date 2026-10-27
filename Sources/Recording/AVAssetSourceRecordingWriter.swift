@@ -1204,7 +1204,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       }
     }
     let closing = writerQueue.sync { () -> Result<AVAssetWriter?, SourceRecordingError> in
-      drainForFinish()
+      let stalled = drainForFinish()
       fifoLock.withLock { acceptingMedia = false }
       writerClosed = true
       let leftovers = fifoLock.withLock { () -> (video: Int, audio: Int) in
@@ -1214,9 +1214,19 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         bufferedBytes = 0
         return counts
       }
+      let pendingTimecodeCount = pendingTimecode.count
       pendingTimecode.removeAll()
+      if stalled && pendingTimecodeCount > 0 {
+        let message = "\(pendingTimecodeCount) timecode samples were still waiting for the disk when recording stopped."
+        telemetryLock.withLock {
+          telemetryValue.droppedTimecode &+= UInt64(pendingTimecodeCount)
+          telemetryValue.lastError = message
+          if terminalError == nil { terminalError = .writerFailure(message) }
+        }
+        return .failure(.writerFailure(message))
+      }
       guard let writer else {
-        if leftovers.audio > 0 {
+        if leftovers.video > 0 || leftovers.audio > 0 {
           return .failure(.writerFailure("Recording stopped before video established the file."))
         }
         return .success(nil)
@@ -1252,20 +1262,20 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
 
   /// Writer-queue only. Waits for every queued sample, giving up only when
   /// the writer makes no progress at all for `finishStallTimeout`.
-  private func drainForFinish() {
+  private func drainForFinish() -> Bool {
     var lastProgress = ProcessInfo.processInfo.systemUptime
     var lastWritten = writtenItems
     var delayMS = 1
     while true {
       let result = drainOnce()
-      guard result == .blocked else { return }
+      guard result == .blocked else { return false }
       let now = ProcessInfo.processInfo.systemUptime
       if writtenItems != lastWritten {
         lastWritten = writtenItems
         lastProgress = now
         delayMS = 1
       } else if now - lastProgress > Self.finishStallTimeout {
-        return
+        return true
       }
       Thread.sleep(forTimeInterval: Double(delayMS) / 1_000)
       delayMS = min(20, delayMS * 2)

@@ -720,6 +720,22 @@ final class RecordingModel {
       return state
     }
     let retainedIDs = Set(descriptors.map(\.id))
+    // Per-feed folders are keyed by the stable feed ID. Once a feed is gone,
+    // discard its in-memory choice and persisted sandbox bookmark as well.
+    // Keep the choice briefly for an active take that disappeared during a
+    // topology refresh; its stop callback still needs the folder to resolve
+    // the finished output. A later refresh removes it after the take is idle.
+    let activeRetainedIDs = old.values
+      .filter { $0.isActive && !retainedIDs.contains($0.id) }
+      .map(\.id)
+    let removableFolderIDs = Set(feedOutputFolders.keys)
+      .subtracting(retainedIDs)
+      .subtracting(activeRetainedIDs)
+    for feedID in removableFolderIDs {
+      feedOutputFolders.removeValue(forKey: feedID)
+      loadedFolderFeedIDs.remove(feedID)
+      try? folderStore?.save(nil, feedID: feedID.rawValue)
+    }
     feeds.append(contentsOf: old.values
       .filter { $0.isActive && !retainedIDs.contains($0.id) }
       .sorted { $0.id.rawValue < $1.id.rawValue })

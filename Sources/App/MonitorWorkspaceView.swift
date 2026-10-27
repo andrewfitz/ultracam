@@ -46,6 +46,7 @@ private struct MonitorBoundTile: View {
   let target: MonitorTargetID
   let targetBinding: Binding<MonitorTargetID?>
   let preferences: Binding<MonitorFeedPreferences>
+  var sonyCameras: SonyCameraStore?
   var compact: Bool
   var focused = false
   @State private var scopeExpanded = false
@@ -110,7 +111,7 @@ private struct MonitorBoundTile: View {
               .accessibilityLabel("Hold for clean view; Control Option C toggles clean view")
           }
           if !compact {
-            Button("Detach") { MonitorDetachedWindows.open(coordinator: coordinator, target: target) }
+            Button("Detach") { MonitorDetachedWindows.open(coordinator: coordinator, target: target, sonyCameras: sonyCameras) }
           }
         }.fixedSize(horizontal: true, vertical: false)
         HStack(spacing: 8) {
@@ -122,7 +123,7 @@ private struct MonitorBoundTile: View {
             surfaceViewActions
             Button(presenter.isClean ? "Decorated view" : "Clean view") { presenter.toggleClean() }
             if !compact {
-              Button("Detach") { MonitorDetachedWindows.open(coordinator: coordinator, target: target) }
+              Button("Detach") { MonitorDetachedWindows.open(coordinator: coordinator, target: target, sonyCameras: sonyCameras) }
             }
           }.menuStyle(.borderlessButton).fixedSize()
           Spacer(minLength: 0)
@@ -363,7 +364,8 @@ private struct MonitorDiagnosticsDisclosure: View {
 @MainActor enum MonitorDetachedWindows {
   private static var windows: [UUID: MonitorWindowOwner] = [:]
   @discardableResult
-  static func open(coordinator: MonitorCoordinator, target: MonitorTargetID) -> MonitorWindowOwner {
+  static func open(coordinator: MonitorCoordinator, target: MonitorTargetID,
+    sonyCameras: SonyCameraStore? = nil) -> MonitorWindowOwner {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 800, height: 580),
       styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false
@@ -375,7 +377,7 @@ private struct MonitorDiagnosticsDisclosure: View {
       windows.removeValue(forKey: id)
     }
     window.contentView = NSHostingView(
-      rootView: DetachedMonitorContent(coordinator: coordinator, owner: owner).padding(12))
+      rootView: DetachedMonitorContent(coordinator: coordinator, owner: owner, sonyCameras: sonyCameras).padding(12))
     windows[id] = owner
     window.delegate = owner
     window.center()
@@ -402,6 +404,7 @@ private struct MonitorDiagnosticsDisclosure: View {
 private struct DetachedMonitorContent: View {
   @ObservedObject var coordinator: MonitorCoordinator
   @ObservedObject var owner: MonitorWindowOwner
+  var sonyCameras: SonyCameraStore?
   @State private var surfaceID = UUID()
   var body: some View {
     if let target = owner.target {
@@ -410,7 +413,7 @@ private struct DetachedMonitorContent: View {
         surfaceID: surfaceID, target: target, targetBinding: $owner.target,
         preferences: Binding(
           get: { coordinator.preferences(for: target) },
-          set: { coordinator.setPreferences($0, for: target) }), compact: false
+          set: { coordinator.setPreferences($0, for: target) }), sonyCameras: sonyCameras, compact: false
       ).id(target)
         .background(
           MonitorWindowTitle(

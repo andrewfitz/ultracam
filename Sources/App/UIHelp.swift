@@ -46,7 +46,7 @@ struct UIHelpView: View {
         Text("Clicking a picture selects that camera; it never cuts. Cut with the toolbar, a strip's Cut button or ⌃1–⌃4.")
         Text("Stopping a camera that is recording or on air asks first.")
         Text("Record › Pause All pauses every take. When every take is paused, it becomes Resume All.")
-        Text("Changing Downscale, Color, Frame rate or Processing renegotiates the camera format, so the meeting's video updates briefly. The LUT doesn't.")
+        Text("Changing Resize, Color format, Frame-rate cap or Processing renegotiates the camera format, so the meeting's video updates briefly. The LUT doesn't.")
       }
       Section {
         ForEach(shortcuts, id: \.0) { key, command in

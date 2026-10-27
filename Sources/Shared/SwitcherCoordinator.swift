@@ -257,7 +257,7 @@ struct SwitcherCoordinator {
         .flatMap { feedIDs.contains($0) ? $0 : nil } ?? feedIDs.dropFirst().first
       director.reset()
       pendingDirectorDecision = nil
-      programOutput.cancelPendingCut()
+      cancelPendingCut()
     }
     fixedIntervalOrigin = nil
     automaticRequestPending = false
@@ -418,6 +418,13 @@ struct SwitcherCoordinator {
     guard director.acknowledgeOutput(decision, appliedAt: appliedAt) else { return false }
     pendingDirectorDecision = nil
     let target = FeedID(rawValue: decision.targetCameraID)
+    if programOutput.pendingCut == target {
+      // The bridge can acknowledge before the target frame is ingested.
+      // Reconcile the scheduler now so the acknowledged cut cannot land a
+      // second time when that frame eventually arrives.
+      programOutput.select(target)
+      _ = programOutput.takeAbandonedCut()
+    }
     if programOutput.selectedSource == target {
       selectedFeedID = target
       settings.selectedFeedID = target
@@ -445,6 +452,14 @@ struct SwitcherCoordinator {
     guard feedIDs.contains(feedID), isFeedHealthy(feedID) else { return false }
     guard programOutput.selectedSource == feedID || programOutput.pendingCut == feedID else {
       return false
+    }
+    // An output adapter may acknowledge before the target frame reaches the
+    // scheduler. Treat that acknowledgement as the applied boundary: move the
+    // route on air immediately and clear the queued cut so it cannot later
+    // land a second time.
+    if programOutput.pendingCut == feedID {
+      programOutput.select(feedID)
+      _ = programOutput.takeAbandonedCut()
     }
     selectedFeedID = feedID
     settings.selectedFeedID = feedID
@@ -476,6 +491,12 @@ struct SwitcherCoordinator {
   }
 
   mutating func cancelPendingCut() {
+    // Cancellation is still an outcome for whoever requested the cut. The
+    // scheduler's public cancellation API clears silently, so preserve the
+    // target here and report it through the coordinator's one-shot channel.
+    if let target = programOutput.pendingCut {
+      abandonedCut = (target, .targetUnavailable)
+    }
     programOutput.cancelPendingCut()
     pendingDirectorDecision = nil
     automaticRequestPending = false

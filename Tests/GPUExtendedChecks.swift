@@ -26,6 +26,42 @@ private final class GPUReleaseCounter: @unchecked Sendable {
 }
 
 @objcMembers final class GPUExtendedChecks: XCTestCase {
+  func testEverySelectableResizeAndColorProducesValidVideo() throws {
+    let processor = try LUTProcessor()
+    let source = try input(luma: { _, _ in 400 })
+    for resize in ResizeTarget.allCases {
+      for color in ColorTarget.allCases {
+        let configuration = PipelineConfiguration(resizeTarget: resize, colorTarget: color)
+        let output = try processor.process(source, configuration: configuration)
+        XCTAssertEqual(CVPixelBufferGetWidth(output), resize.width)
+        XCTAssertEqual(CVPixelBufferGetHeight(output), resize.height)
+        XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), color.pixelFormat)
+        try VideoBufferLayout.validate(output)
+        CVPixelBufferLockBaseAddress(output, .readOnly)
+        let base = CVPixelBufferGetBaseAddressOfPlane(output, 0)!
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
+        let row = base.advanced(by: resize.height / 2 * stride)
+        let value = color.isEightBit ? Int(row.assumingMemoryBound(to: UInt8.self)[resize.width / 2]) * 4
+          : Int(row.assumingMemoryBound(to: UInt16.self)[resize.width / 2] >> 6)
+        XCTAssertEqual(value, 400, accuracy: 4, "\(resize.title) \(color.title)")
+        CVPixelBufferUnlockBaseAddress(output, .readOnly)
+      }
+    }
+  }
+
+  func test720ResizeUsesTheWholeSourcePicture() throws {
+    let processor = try LUTProcessor()
+    let source = try input(luma: { x, y in x < 1920 && y < 1080 ? 64 : 940 })
+    let output = try processor.process(source, configuration: PipelineConfiguration(resizeTarget: .hd720))
+    CVPixelBufferLockBaseAddress(output, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+    let stride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
+    let pixels = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt8.self)
+    XCTAssertEqual(pixels[180 * stride + 320], 16, accuracy: 1)
+    XCTAssertEqual(pixels[180 * stride + 960], 235, accuracy: 1)
+    XCTAssertEqual(pixels[540 * stride + 320], 235, accuracy: 1)
+  }
+
   private func input(packed: Bool = false, width: Int = 3840, height: Int = 2160,
     luma: (Int, Int) -> UInt16 = { _, _ in 400 },
     cb: (Int, Int) -> UInt16 = { _, _ in 512 },

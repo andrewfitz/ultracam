@@ -109,10 +109,13 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var inUse = false
   var processing = true
   var effects: [Bool] = [false, true, true, false]
+  var resizeTarget: ResizeTarget = .hd1080
+  var colorTarget: ColorTarget = .yuv4208
+  var frameRateTarget: FrameRateTarget = .fps2997
   var lutName: String?
   var lutLoading = false
   var lutError: String?
-  var gamut = "S-Gamut3.Cine / S-Log3"
+  var gamut = "Unspecified / custom LUT"
   var previewEnabled = true
   var automaticStart = false
   var automaticStatus: String?
@@ -176,6 +179,7 @@ struct UIInstallState: Sendable, Equatable {
 }
 
 struct UISessionSnapshot: Sendable, Equatable {
+  var syncCameras = false
   var outputMode: UIOutputMode = .separate
   var cameras: [UICameraSnapshot] = []
   var selectedID: String = ""
@@ -197,7 +201,7 @@ struct UISessionSnapshot: Sendable, Equatable {
   /// A Program cut that did not land, or Program frames the output dropped.
   var programIssue: String?
   var recentCuts: [UICutRecord] = []
-  var codecTitle = "ProRes 422 10-bit"
+  var codecTitle = "ProRes 422 HQ 10-bit"
   var timecodeTitle = "Mac Clock"
   var defaultFolderPath: String?
   var drives: [UIDrive] = []
@@ -495,8 +499,7 @@ enum UIFormat {
 // MARK: - Derivation
 
 enum UIPresentationBuilder {
-  static let effectTitles = ["LUT", "1080p", "4:2:0", "29.97"]
-  static let effectLongTitles = ["LUT", "Downscale to 1080p", "Color 4:2:0 8-bit", "Limit to 29.97 fps"]
+  static let effectLongTitles = ["LUT", "Resize", "Color format", "Frame-rate cap"]
 
   static func tally(for camera: UICameraSnapshot, in session: UISessionSnapshot) -> UITally {
     switch session.outputMode {
@@ -612,7 +615,8 @@ enum UIPresentationBuilder {
       return "Record (⌘R)"
     }()
 
-    let chips = effectTitles.enumerated().map { index, title in
+    let titles = ["LUT", camera.resizeTarget.title, camera.colorTarget.title, camera.frameRateTarget.title]
+    let chips = titles.enumerated().map { index, title in
       UIChip(id: index, title: title, isOn: camera.effects.indices.contains(index) && camera.effects[index],
         enabled: index != 0 || camera.lutName != nil,
         help: index == 0

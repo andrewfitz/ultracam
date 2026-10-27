@@ -6,10 +6,11 @@ import SwiftUI
 /// Settings change app-wide state, so these panes work on the models directly.
 struct UISettingsView: View {
   let model: AppModel
+  let interface: UIInterfaceState
 
   var body: some View {
     TabView {
-      UISettingsGeneralPane(model: model)
+      UISettingsGeneralPane(model: model, interface: interface)
         .tabItem { Label("General", systemImage: "gearshape") }
       UISettingsRecordingPane(model: model)
         .tabItem { Label("Recording", systemImage: "record.circle") }
@@ -39,6 +40,7 @@ private struct UISettingsFootnote: View {
 
 struct UISettingsGeneralPane: View {
   @Bindable var model: AppModel
+  let interface: UIInterfaceState
   @AppStorage("ui.layout") private var defaultLayout = UILayout.sideBySide.rawValue
   /// "collapsed" or "expanded"; the app reads it when a new camera is added.
   @AppStorage("ui.collapsed.default") private var stripDensity = "expanded"
@@ -83,6 +85,11 @@ struct UISettingsGeneralPane: View {
         Picker("Layout", selection: $defaultLayout) {
           ForEach(UILayout.allCases, id: \.rawValue) { layout in
             Text(layout.title).tag(layout.rawValue)
+          }
+        }
+        .onChange(of: defaultLayout) { _, rawValue in
+          if let layout = UILayout(rawValue: rawValue), layout != .programView || model.outputMode == .program {
+            interface.layout = layout
           }
         }
         .help("The main window's layout; the same as View › Layout. Program View is available only in Program mode.")
@@ -291,6 +298,11 @@ struct UISettingsCameraPane: View {
     let outputMode = Binding(get: { model.outputMode }, set: { model.setOutputMode($0) })
     let needsApproval = installer.status.localizedCaseInsensitiveContains("approve")
     Form {
+      Section {
+        Toggle("Sync cameras", isOn: Binding(get: { model.syncCameras }, set: { model.setSyncCameras($0) }))
+        Text("Enabled cameras share processing and monitor effect edits. Turning this on copies the selected camera’s effects. Inputs and recording folders stay separate. Source declarations and calibration remain camera-specific.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
       Section {
         LabeledContent {
           HStack {
@@ -652,7 +664,7 @@ struct UISettingsMonitorPane: View {
         Label("Monitor tools never change camera output or recordings.", systemImage: "checkmark.shield")
       } header: { Text("Monitor Tools") } footer: {
         VStack(alignment: .leading, spacing: 6) {
-          UISettingsFootnote("False color works when a camera's source is declared as Sony S-Log3. Declare what the camera actually sends: declarations don't calibrate the capture device or change camera output.")
+          UISettingsFootnote("Six-band false color works with any source. Sony S-Log3 and ARRI LogC modes require the matching source declaration. Declare what the camera actually sends: declarations don't calibrate the capture device or change camera output.")
           UISettingsFootnote("Every monitor shows every camera frame with its tools, on the GPU. Only a scope may skip an update while the GPU is still drawing earlier scopes. Hidden or covered monitors do no GPU work.")
         }
       }

@@ -24,6 +24,120 @@ import SystemExtensions
   }
 }
 
+/// With Sync cameras on, one LUT edit reads each camera's file at most once,
+/// writes made by sync never trigger sync again, nothing reads while idle,
+/// and both monitors settle on the LUT. Scripted capture; no hardware.
+extension UIVerify {
+  func lutReadsWithSync() throws {
+    let suiteName = "org.ultracam.ui-verify-lut-sync.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut sync: defaults suite", false); return }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-sync-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    func cube(_ title: String) throws -> URL {
+      var lattice = ["TITLE \"\(title)\"", "LUT_3D_SIZE 2"]
+      for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lattice.append("\(1 - Float(r)) \(1 - Float(g)) \(1 - Float(b))") } } }
+      let url = folder.appendingPathComponent("\(title).cube")
+      try lattice.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+      return url
+    }
+    let shared = try cube("Shared"), other = try cube("Other")
+    // Another path to the same file: its bookmark has other bytes, as a
+    // refreshed bookmark would.
+    let alias = folder.appendingPathComponent("alias.cube")
+    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: shared)
+    let alpha = FeedID(rawValue: "ui-verify-sync-alpha"), beta = FeedID(rawValue: "ui-verify-sync-beta")
+    let settings = AppSettingsStore(defaults: defaults)
+    settings.saveSnapshot(AppSettingsSnapshot(feeds: [
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-a", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-b", applyLUT: false, automaticFeed: false),
+    ], selectedFeedID: alpha, outputMode: .separateCameras))
+    var hardware = AppHardware.offline
+    hardware.devices = { [InputDevice(id: "dev-a", name: "UltraStudio A"), InputDevice(id: "dev-b", name: "UltraStudio B")] }
+    hardware.captureServices = { _ in
+      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+        send: { _ in true })
+      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
+      return services
+    }
+    func makeModel() -> AppModel {
+      AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
+        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+        recordingFolderStore: RecordingFolderStore(defaults: defaults),
+        installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
+    }
+    func settle(_ seconds: Double = 5, until condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(seconds)
+      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+    }
+    do {
+      let setup = makeModel()
+      setup.loadLUT(url: alias, feedID: alpha)
+      setup.loadLUT(url: shared, feedID: beta)
+      settle { setup.lutState(alpha).loaded && setup.lutState(beta).loaded }
+    }
+    let model = makeModel()
+    func reads(_ id: FeedID) -> Int { model.lutReads[id] ?? 0 }
+    func idle() -> Bool { !model.isLUTLoading(alpha) && !model.isLUTLoading(beta) }
+    let surfaces = [alpha, beta].map { id -> (FeedID, UUID) in
+      let surface = UUID()
+      model.monitorCoordinator.registerSurface(id: surface, target: MonitorTargetID(id.rawValue), isVisible: true,
+        scopeVisible: false)
+      return (id, surface)
+    }
+    defer {
+      model.setSyncCameras(false)
+      for (_, surface) in surfaces { model.monitorCoordinator.unregisterSurface(id: surface) }
+      model.stopCamera(alpha)
+      model.stopCamera(beta)
+    }
+    func burns(_ id: FeedID) -> Bool {
+      guard let (_, surface) = surfaces.first(where: { $0.0 == id }), let lut = model.burnInLUT(for: id) else { return false }
+      let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
+      presenter.refreshBurnInLUT()
+      return presenter.host.burnInLUT === lut
+    }
+    settle { idle() && model.lutState(alpha).loaded && model.lutState(beta).loaded }
+    model.startCamera(alpha)
+    model.startCamera(beta)
+    settle { burns(alpha) && burns(beta) }
+    model.setSyncCameras(true)
+    settle(1) { !idle() }
+    settle { idle() }
+    verifier.check("lut sync: turning Sync on with one file under two bookmarks reads nothing",
+      reads(alpha) == 1 && reads(beta) == 1 && burns(alpha) && burns(beta), "\(reads(alpha)), \(reads(beta))")
+
+    model.updateCamera(alpha) { $0.applyLUT = false }
+    settle { !burns(alpha) && !burns(beta) }
+    verifier.check("lut sync: Apply LUT off reaches both cameras", !burns(alpha) && !burns(beta))
+    model.updateCamera(alpha) { $0.applyLUT = true }
+    settle { burns(alpha) && burns(beta) }
+    verifier.check("lut sync: Apply LUT toggles read no file", reads(alpha) == 1 && reads(beta) == 1 && burns(alpha) && burns(beta),
+      "\(reads(alpha)), \(reads(beta))")
+
+    model.loadLUT(url: other, feedID: alpha)
+    settle { idle() && model.lutState(alpha).displayTitle.hasPrefix("Other") && model.lutState(beta).displayTitle.hasPrefix("Other") }
+    verifier.check("lut sync: a new file reads each camera once", reads(alpha) == 2 && reads(beta) == 2,
+      "\(reads(alpha)), \(reads(beta))")
+    // Monitor edits sync too; they never touch the LUT pipeline.
+    for _ in 0..<4 {
+      var preferences = model.monitorCoordinator.preferences(for: MonitorTargetID(alpha.rawValue))
+      preferences.toolsEnabled.toggle()
+      model.monitorCoordinator.setPreferences(preferences, for: MonitorTargetID(alpha.rawValue))
+      MainLoop.run(seconds: 0.1)
+    }
+    verifier.check("lut sync: monitor edits reach the other camera",
+      model.monitorCoordinator.preferences(for: MonitorTargetID(beta.rawValue)).toolsEnabled
+        == model.monitorCoordinator.preferences(for: MonitorTargetID(alpha.rawValue)).toolsEnabled)
+    settle(3) { false }
+    verifier.check("lut sync: nothing reads while idle or for monitor edits", reads(alpha) == 2 && reads(beta) == 2,
+      "\(reads(alpha)), \(reads(beta))")
+    verifier.check("lut sync: both monitors settle on the new LUT", burns(alpha) && burns(beta)
+      && model.lutState(beta).displayTitle.hasPrefix("Other"))
+  }
+}
+
 /// LUT files are read only when an edit needs them: once per camera at launch
 /// and per new file, never for a bookmark that names the file already loaded,
 /// and never while nothing happens. Scripted capture; no hardware.
@@ -595,7 +709,7 @@ extension UIVerify {
     pressInStrip(one, "Pause", expect: .pauseOrResume(cameraID: one.id))
     pressInStrip(one, "Stop Camera 1", expect: .stopCamera(cameraID: one.id))
     pressInStrip(one, "1080p", expect: .setEffect(cameraID: one.id, index: 1, false))
-    pressInStrip(two, "4:2:0", expect: .setEffect(cameraID: two.id, index: 2, false))
+    pressInStrip(two, "4:2:0 8-bit", expect: .setEffect(cameraID: two.id, index: 2, false))
     // Camera 2 has no LUT loaded, so its LUT chip is disabled and must not act.
     do {
       let hosted = HostedView(UIChannelStripView(camera: two, context: context), size: CGSize(width: 560, height: 230), dark: false)
@@ -720,6 +834,22 @@ extension UIVerify {
     verifier.check("lut: a 3D cube's title", lut(alpha).displayTitle == "Check LUT · 2³", lut(alpha).displayTitle)
     verifier.check("lut: loading turns Apply LUT on", model.effectiveConfiguration(for: alpha).applyLUT)
     verifier.check("lut: a load saves its bookmark", bookmark(alpha) != nil)
+
+    let sharedBookmark = bookmark(alpha)
+    model.loadLUT(url: cube1D, feedID: beta)
+    model.setSyncCameras(true)
+    MainLoop.run(seconds: 0.25)
+    settle { model.canEditFeedTopology }
+    verifier.check("sync regression: an earlier peer LUT load cannot overwrite shared settings",
+      bookmark(alpha) == sharedBookmark && bookmark(beta) == sharedBookmark, model.lutState(alpha).displayTitle)
+    model.loadLUT(url: cube1D, feedID: beta)
+    model.updateCamera(alpha) { $0.resizeTarget = .hd720 }
+    MainLoop.run(seconds: 0.25)
+    settle { model.canEditFeedTopology }
+    verifier.check("sync regression: a newer effect edit supersedes a peer load even with the same saved LUT",
+      bookmark(alpha) == sharedBookmark && bookmark(beta) == sharedBookmark, model.lutState(alpha).displayTitle)
+    model.setSyncCameras(false)
+    model.forgetLUT(beta)
 
     model.loadLUT(url: cube1D, feedID: alpha)
     settle { idle(alpha) && lut(alpha).displayTitle != "Check LUT · 2³" }
@@ -858,6 +988,49 @@ extension UIVerify {
     verifier.check("bridge: effect on selected camera", model.descriptor(for: alpha)?.convertTo420 == false && bridge.snapshot().cameras[0].effects[2] == false)
     bridge.perform(.setGamut(cameraID: beta.rawValue, "S-Gamut3 / S-Log3"))
     verifier.check("bridge: gamut", model.descriptor(for: beta)?.gamut == "S-Gamut3 / S-Log3")
+
+    bridge.perform(.setSyncCameras(true))
+    bridge.perform(.setResizeTarget(cameraID: beta.rawValue, .hd720))
+    bridge.perform(.setColorTarget(cameraID: beta.rawValue, .yuv42010))
+    bridge.perform(.setFrameRateTarget(cameraID: beta.rawValue, .fps24))
+    verifier.check("sync: headless edits reach selected camera without selecting source", model.selectedFeedID == alpha &&
+      model.descriptor(for: alpha)?.configuration.resizeTarget == .hd720 && model.descriptor(for: alpha)?.configuration.colorTarget == .yuv42010
+        && model.descriptor(for: alpha)?.configuration.frameRateTarget == .fps24)
+    verifier.check("sync: preference persists", AppSettingsStore(defaults: defaults).loadSnapshot().syncCameras)
+    model.monitorCoordinator.setPreviewEnabled(false, for: MonitorTargetID(beta.rawValue))
+    verifier.check("sync regression: detached preview edits reach selected camera", model.descriptor(for: alpha)?.previewEnabled == false)
+    model.monitorCoordinator.setPreviewEnabled(true, for: MonitorTargetID(beta.rawValue))
+    var monitorPreferences = model.monitorCoordinator.preferences(for: MonitorTargetID(alpha.rawValue))
+    monitorPreferences.toolsEnabled = true
+    model.monitorCoordinator.setPreferences(monitorPreferences, for: MonitorTargetID(alpha.rawValue))
+    verifier.check("sync: monitor effects reach other cameras", model.monitorCoordinator.preferences(for: MonitorTargetID(beta.rawValue)).toolsEnabled)
+    var logTools = model.monitorCoordinator.preferences(for: MonitorTargetID(alpha.rawValue))
+    logTools.signal.logProfileID = "sony-slog3-sgamut3cine"
+    logTools.state.falseColor.mode = .sonySLog3
+    model.monitorCoordinator.setPreferences(logTools, for: MonitorTargetID(alpha.rawValue))
+    var undeclaredTools = model.monitorCoordinator.preferences(for: MonitorTargetID(beta.rawValue))
+    verifier.check("sync regression: undeclared cameras skip Log false colour", undeclaredTools.state.falseColor.mode == .off)
+    undeclaredTools.toolsEnabled = false
+    model.monitorCoordinator.setPreferences(undeclaredTools, for: MonitorTargetID(beta.rawValue))
+    verifier.check("sync regression: editing an ineligible camera preserves eligible false colour",
+      model.monitorCoordinator.preferences(for: MonitorTargetID(alpha.rawValue)).state.falseColor.mode == .sonySLog3)
+    logTools.state.falseColor.mode = .off
+    model.monitorCoordinator.setPreferences(logTools, for: MonitorTargetID(alpha.rawValue))
+    let identitiesBefore = model.feedDescriptors.map { ($0.id, $0.name, $0.selectedDevice) }
+    let foldersBefore = model.feedDescriptors.map { model.recordingModel.outputFolder(for: $0.id) }
+    model.updateCamera(beta) { $0.enabled = false }
+    bridge.perform(.setColorTarget(cameraID: alpha.rawValue, .yuv4228))
+    verifier.check("sync: disabled camera is ineligible", model.descriptor(for: beta)?.configuration.colorTarget == .yuv42010)
+    verifier.check("sync: devices and names stay separate", zip(identitiesBefore, model.feedDescriptors).allSatisfy {
+      $0.0.0 == $0.1.id && $0.0.1 == $0.1.name && $0.0.2 == $0.1.selectedDevice
+    })
+    verifier.check("sync: recording destinations stay separate", foldersBefore == model.feedDescriptors.map { model.recordingModel.outputFolder(for: $0.id) })
+    model.updateCamera(beta) { $0.enabled = true }
+    bridge.perform(.setSyncCameras(false))
+    bridge.perform(.setResizeTarget(cameraID: alpha.rawValue, .hd1080))
+    verifier.check("sync: off restores independent editing", model.descriptor(for: beta)?.configuration.resizeTarget == .hd720)
+    bridge.perform(.setColorTarget(cameraID: alpha.rawValue, .yuv4208))
+    bridge.perform(.setFrameRateTarget(cameraID: alpha.rawValue, .fps2997))
 
     // Stopping cameras that aren't running does nothing.
     bridge.perform(.stopCamera(cameraID: beta.rawValue))
@@ -1471,6 +1644,30 @@ extension UIVerify {
     both("after toggling Camera 2 while Camera 1 is selected")
     toggle(alpha)
     both("after toggling the selected Camera 1")
+    let goodBookmark = model.descriptor(for: alpha)?.lutBookmark
+    model.updateCamera(alpha) { $0.lutBookmark = Data([1, 2, 3]) }
+    settle { !model.isLUTLoading(alpha) && !burns(alpha) }
+    verifier.check("sync regression: a failed replacement stops the previous burn-in LUT",
+      model.burnInLUT(for: alpha) == nil && !model.effectiveConfiguration(for: alpha).applyLUT)
+    verifier.check("sync regression: failed replacement preserves the saved LUT intent",
+      model.descriptor(for: alpha)?.applyLUT == true)
+    model.updateCamera(alpha) { $0.lutBookmark = goodBookmark }
+    settle { !model.isLUTLoading(alpha) }
+    both("after restoring the intended LUT")
+    model.setSyncCameras(true)
+    model.stopCamera(beta)
+    let temporarilyMissing = folder.appendingPathComponent("temporarily-missing.cube")
+    try FileManager.default.copyItem(at: cube, to: temporarilyMissing)
+    try FileManager.default.removeItem(at: cube)
+    // A camera keeps its LUT in its pipeline across a restart; nothing is re-read.
+    model.startCamera(beta)
+    settle { model.isCameraRunning(beta) }
+    verifier.check("sync regression: a peer restore failure keeps the healthy camera's LUT enabled",
+      model.descriptor(for: alpha)?.applyLUT == true && burns(alpha))
+    verifier.check("sync regression: a peer restore failure keeps its saved choice for retry",
+      model.descriptor(for: beta)?.applyLUT == true)
+    try FileManager.default.copyItem(at: temporarilyMissing, to: cube)
+    model.setSyncCameras(false)
     model.stopCamera(beta)
     model.stopCamera(alpha)
 
@@ -1690,6 +1887,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }
   do { try run.cameraSymmetry() } catch { verifier.check("camera symmetry tests threw", false, "\(error)") }
   do { try run.lutReadsAreBounded() } catch { verifier.check("LUT read tests threw", false, "\(error)") }
+  do { try run.lutReadsWithSync() } catch { verifier.check("LUT sync read tests threw", false, "\(error)") }
   run.adoption()
   run.sharedInput()
   run.pictureMenus()

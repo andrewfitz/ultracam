@@ -115,7 +115,7 @@ public struct RecordingOutputConfiguration: Equatable, Sendable {
     self.minimumFreeBytes = minimumFreeBytes
   }
 
-  fileprivate static func validateExtension(_ value: String) throws -> String {
+  static func validateExtension(_ value: String) throws -> String {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     let withoutDot = trimmed.hasPrefix(".") ? String(trimmed.dropFirst()) : trimmed
     guard !withoutDot.isEmpty, withoutDot.count <= 16,
@@ -289,8 +289,20 @@ public final class RecordingOutputManager: @unchecked Sendable {
   fileprivate func checkHeadroom(_ headroom: UInt64, for session: ObjectIdentifier) throws {
     volume.lock.lock()
     defer { volume.lock.unlock() }
+    let previous = volume.headrooms[session]
     volume.headrooms[session] = headroom
-    try checkAndReserveLocked(additional: 0)
+    do {
+      try checkAndReserveLocked(additional: 0)
+    } catch {
+      // A rejected check must not leave the failed candidate headroom in the
+      // shared pool and starve otherwise-admissible sessions.
+      if let previous {
+        volume.headrooms[session] = previous
+      } else {
+        volume.headrooms.removeValue(forKey: session)
+      }
+      throw error
+    }
   }
 
   /// Records `session`'s headroom without checking. Used when a paused take
@@ -511,8 +523,12 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     do { handle?.synchronizeFile() }
     stateValue = .paused
-    // An external writer's headroom stays until its recorder reports what it
-    // still owes (within a check interval): admitted media is still written.
+    // A paused writer no longer promises to write through the next check
+    // interval. Withdraw its old headroom so it cannot become stale capacity
+    // that blocks other sessions.
+    if externalWriterOwnsFile {
+      manager.setHeadroom(0, for: ObjectIdentifier(self))
+    }
   }
 
   public func resume() throws {
@@ -587,7 +603,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     // session is paused: record what they still need, unchecked. Space is
     // rechecked once recording resumes, which restores the last full headroom.
     if externalWriterOwnsFile, stateValue == .paused {
-      manager.setHeadroom(headroom, for: ObjectIdentifier(self))
+      manager.setHeadroom(0, for: ObjectIdentifier(self))
       return
     }
     guard externalWriterOwnsFile, stateValue == .recording else {

@@ -413,8 +413,13 @@ import MonitorKit
   func sourceStateChanged(target: MonitorTargetID, running: Bool, message: String) {
     if !running {
       hosts[target]?.invalidate(rejectingCaptureGeneration: nil)
+      // CaptureController's stop update carries the useful failure reason. Keep
+      // it on the surface when one was supplied; an empty update is the normal
+      // teardown path and retains the established fallback.
+      let reason = message.trimmingCharacters(in: .whitespacesAndNewlines)
+      let unavailable = reason.isEmpty ? "Feed stopped" : reason
       for surface in surfaces.values where surface.target == target {
-        surface.presenter.setUnavailable("Feed stopped")
+        surface.presenter.setUnavailable(unavailable)
       }
     }
   }

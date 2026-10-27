@@ -1,7 +1,39 @@
+import CoreMedia
 import Foundation
 import XCTest
 
 @MainActor @objcMembers final class SettingsChecks: XCTestCase {
+  func testFractionalSourceReachesEverySelectableFrameRateCapWithoutDrift() {
+    for target in FrameRateTarget.allCases {
+      var gate = FrameRateGate()
+      let configuration = PipelineConfiguration(reduceFrameRate: true, frameRateTarget: target)
+      let count = (0..<600).filter {
+        gate.shouldDeliver(CMTimeMultiply(VideoContract.fastDuration, multiplier: Int32($0)), duration: configuration.duration)
+      }.count
+      let expected = 600 * VideoContract.fastDuration.seconds / configuration.duration.seconds
+      XCTAssertEqual(Double(count), expected, accuracy: 1, target.title)
+    }
+  }
+
+  func testSelectableTargetsAndSyncMigrateAndPersist() throws {
+    let legacy = Data(#"{"id":"camera","name":"Camera","downscale":true,"convertTo420":true,"reduceFrameRate":true}"#.utf8)
+    let migrated = try JSONDecoder().decode(FeedDescriptor.self, from: legacy)
+    XCTAssertEqual(migrated.configuration.resizeTarget, .hd1080)
+    XCTAssertEqual(migrated.configuration.colorTarget, .yuv4208)
+    XCTAssertEqual(migrated.configuration.frameRateTarget, .fps2997)
+    let feed = FeedDescriptor(resizeTarget: .hd720, colorTarget: .yuv4228, frameRateTarget: .fps24)
+    let snapshot = AppSettingsSnapshot(feeds: [feed], syncCameras: true)
+    let decoded = try JSONDecoder().decode(AppSettingsSnapshot.self, from: JSONEncoder().encode(snapshot))
+    XCTAssertEqual(decoded, snapshot)
+    XCTAssertTrue(FeedCoordinator(snapshot: decoded).snapshot.syncCameras)
+    for target in FrameRateTarget.allCases {
+      let configuration = PipelineConfiguration(reduceFrameRate: true, frameRateTarget: target)
+      XCTAssertGreaterThanOrEqual(configuration.duration.seconds, VideoContract.fastDuration.seconds)
+    }
+    XCTAssertEqual(PipelineConfiguration(reduceFrameRate: true, frameRateTarget: .fps24).duration,
+      CMTime(value: 1, timescale: 24))
+  }
+
   func testDockVisibilityPreferencePersistsIndependentlyOfFeedSettings() throws {
     let suiteName = "org.ultracam.tests.dock.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -110,6 +142,23 @@ import XCTest
     XCTAssertEqual(loaded.naturalTalkingHead.minimumShotDuration, 10)
     XCTAssertEqual(loaded.naturalTalkingHead.maximumShotDuration, 30)
     XCTAssertEqual(loaded.naturalTalkingHead.mode, .transcriptAssisted)
+  }
+
+  func testMissingGamutUsesCustomLUTFallback() throws {
+    let feed = try JSONDecoder().decode(FeedDescriptor.self, from: Data(#"{"id":"feed-a","name":"A"}"#.utf8))
+    XCTAssertEqual(feed.gamut, "Unspecified / custom LUT")
+  }
+
+  func testUnknownEnumValuesPreserveSnapshotAndRepairDanglingReferences() throws {
+    let json = #"{"version":2,"feeds":[{"id":"feed-a","name":"A","resizeTarget":"future","gamut":"custom"}],"selectedFeedID":"removed","outputMode":"future","switcher":{"selectedFeedID":"removed","strategy":"future","naturalTalkingHead":{"anchorFeedID":"removed","emphasisFeedID":"removed","mode":"future"}}}"#
+    let snapshot = try JSONDecoder().decode(AppSettingsSnapshot.self, from: Data(json.utf8))
+    let repaired = try XCTUnwrap(snapshot.validated())
+    XCTAssertEqual(repaired.feeds.count, 1)
+    XCTAssertEqual(repaired.feeds[0].gamut, "custom")
+    XCTAssertEqual(repaired.selectedFeedID, FeedID(rawValue: "feed-a"))
+    XCTAssertNil(repaired.switcher.selectedFeedID)
+    XCTAssertNil(repaired.switcher.naturalTalkingHead.anchorFeedID)
+    XCTAssertNil(repaired.switcher.naturalTalkingHead.emphasisFeedID)
   }
 
   func testOlderShortMinimumShotDurationIsRaisedToSafeFloor() throws {

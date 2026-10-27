@@ -697,6 +697,45 @@ import XCTest
       gpu.meanGPUMilliseconds, gpu.maxGPUMilliseconds, stats.meanStageMilliseconds, stats.maxStageMilliseconds, wall))
   }
 
+  func testNewOutputFormatsNormalizeToEveryColorTarget() throws {
+    let normalizer = try ProgramNormalizer()
+    for sourceColor in ColorTarget.allCases {
+      let source = try ioSurfaceFrame(1280, 720, sourceColor.pixelFormat) { image in
+        for plane in 0..<2 {
+          let rows = CVPixelBufferGetHeightOfPlane(image, plane)
+          let stride = CVPixelBufferGetBytesPerRowOfPlane(image, plane)
+          let pointer = CVPixelBufferGetBaseAddressOfPlane(image, plane)!
+          if sourceColor.isEightBit { memset(pointer, plane == 0 ? 100 : 128, rows * stride) }
+          else {
+            let samples = pointer.assumingMemoryBound(to: UInt16.self)
+            for index in 0..<(rows * stride / 2) { samples[index] = UInt16(plane == 0 ? 400 : 512) << 6 }
+          }
+        }
+      }
+      for destination in ColorTarget.allCases {
+        let done = DispatchSemaphore(value: 0)
+        let box = EventLog()
+        let format = ProgramOutputFormat(width: 1920, height: 1080, pixelFormat: destination.pixelFormat,
+          duration: FrameRateTarget.fps24.duration)
+        try normalizer.normalize(source, to: format) { result in
+          if case let .success(output) = result { box.setBuffer(output) }
+          done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+        let output = try XCTUnwrap(box.buffer)
+        try VideoBufferLayout.validate(output)
+        CVPixelBufferLockBaseAddress(output, .readOnly)
+        for plane in 0..<2 {
+          let base = CVPixelBufferGetBaseAddressOfPlane(output, plane)!
+          let value = destination.isEightBit ? UInt16(base.assumingMemoryBound(to: UInt8.self)[0]) * 4
+            : base.assumingMemoryBound(to: UInt16.self)[0] >> 6
+          XCTAssertEqual(value, plane == 0 ? 400 : 512)
+        }
+        CVPixelBufferUnlockBaseAddress(output, .readOnly)
+      }
+    }
+  }
+
   func testV210AndUpscaleConversionsAreLevelExact() throws {
     let normalizer = try ProgramNormalizer()
     func convert(_ source: CVPixelBuffer, _ format: ProgramOutputFormat) throws -> CVPixelBuffer {

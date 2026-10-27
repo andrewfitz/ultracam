@@ -129,12 +129,16 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     self.output = output
     super.init()
     do {
-      for (width, height) in [(1920, 1080), (3840, 2160)] {
-        for type in [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] + VideoContract.tenBit422 {
+      // Keep the original eight indices stable for clients that remember a mode.
+      let legacyTypes = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] + VideoContract.tenBit422
+      let addedTypes = [ColorTarget.yuv42010.pixelFormat, ColorTarget.yuv4228.pixelFormat]
+      for (width, height, types) in [(1920, 1080, legacyTypes), (3840, 2160, legacyTypes),
+        (1920, 1080, addedTypes), (3840, 2160, addedTypes), (1280, 720, legacyTypes + addedTypes)] {
+        for type in types {
           let description = try VideoContract.formatDescription(width: width, height: height, pixelFormat: type)
           formats.append(CMIOExtensionStreamFormat(formatDescription: description,
-            maxFrameDuration: VideoContract.slowDuration, minFrameDuration: VideoContract.fastDuration,
-            validFrameDurations: [VideoContract.slowDuration, VideoContract.fastDuration]))
+            maxFrameDuration: FrameRateTarget.fps23976.duration, minFrameDuration: FrameRateTarget.fps60.duration,
+            validFrameDurations: FrameRateTarget.allCases.map(\.duration)))
         }
       }
       // CMIOExtensionProvider is a process singleton. In-process tests create
@@ -211,12 +215,11 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     guard formats.indices.contains(nextIndex) else { throw VideoError.message("Unsupported camera format.") }
     let nextDuration: CMTime
     if let requested = frameDuration {
-      guard requested.isNumeric, requested.epoch == 0 else { throw VideoError.message("Use 29.97 or 59.94 fps.") }
-      if abs(requested.seconds - VideoContract.slowDuration.seconds) < 0.000001 {
-        nextDuration = VideoContract.slowDuration
-      } else if abs(requested.seconds - VideoContract.fastDuration.seconds) < 0.000001 {
-        nextDuration = VideoContract.fastDuration
-      } else { throw VideoError.message("Use 29.97 or 59.94 fps.") }
+      guard requested.isNumeric, requested.epoch == 0,
+        let target = FrameRateTarget.allCases.first(where: { abs(requested.seconds - $0.duration.seconds) < 0.000001 }) else {
+        throw VideoError.message("Unsupported camera frame rate.")
+      }
+      nextDuration = target.duration
     } else { nextDuration = duration }
     // Validate the complete request before modifying either property. The host
     // selects the common source/sink contract before starting the producer.
@@ -422,7 +425,7 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
       for plane in 0..<CVPixelBufferGetPlaneCount(result) {
         guard let base = CVPixelBufferGetBaseAddressOfPlane(result, plane) else { continue }
         let length = CVPixelBufferGetBytesPerRowOfPlane(result, plane) * CVPixelBufferGetHeightOfPlane(result, plane)
-        if type == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+        if ColorTarget.allCases.contains(where: { $0.pixelFormat == type && $0.isEightBit }) {
           memset(base, plane == 0 ? 16 : 128, length)
         } else {
           let value: UInt16 = plane == 0 ? (type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? 0 : 64 << 6) : 512 << 6

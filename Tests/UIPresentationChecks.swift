@@ -450,7 +450,7 @@ import XCTest
     withLUT.lutName = "FX3.cube"
     withLUT.effects = [true, true, false, false]
     let chips = presented(separate([withLUT])).chips
-    XCTAssertEqual(chips.map(\.title), ["LUT", "1080p", "4:2:0", "29.97"])
+    XCTAssertEqual(chips.map(\.title), ["LUT", "1080p", "4:2:0 8-bit", "29.97"])
     XCTAssertEqual(chips.map(\.isOn), [true, true, false, false])
     XCTAssertTrue(chips[0].enabled)
     XCTAssertTrue(chips[0].help.contains("Doesn't change the camera output format"), "LUT is live-safe")

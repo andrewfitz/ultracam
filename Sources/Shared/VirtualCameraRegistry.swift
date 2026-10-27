@@ -218,10 +218,11 @@ struct VirtualCameraRegistrySnapshot: Codable, Equatable, Sendable {
   }
 
   /// Produces the next complete snapshot without mutating the current one.
-  /// The precondition makes generation overflow impossible to publish.
+  /// Saturating at `UInt64.max` keeps malformed state from trapping; the
+  /// publication boundary rejects that reserved generation explicitly.
   func advancing(to devices: [VirtualCameraDescriptor]) -> VirtualCameraRegistrySnapshot {
-    precondition(generation < UInt64.max, "Virtual-camera registry generation overflow")
-    return VirtualCameraRegistrySnapshot(schemaVersion: schemaVersion, generation: generation + 1,
+    let nextGeneration = generation == UInt64.max ? UInt64.max : generation + 1
+    return VirtualCameraRegistrySnapshot(schemaVersion: schemaVersion, generation: nextGeneration,
       appGroupIdentifier: appGroupIdentifier, devices: devices)
   }
 

@@ -213,6 +213,13 @@ struct UICameraPictureView: View {
         }
       }
       Spacer(minLength: 0)
+      if !isClean, let store = context.sonyCameras {
+        HStack {
+          UISonySettingsOverlay(feedID: camera.id, store: store)
+          Spacer(minLength: 0)
+        }
+        .padding(.bottom, 4)
+      }
       HStack(alignment: .center, spacing: 6) {
         if revealed {
           // The timecode alone follows the camera's updates (4 Hz), not the picture.
@@ -641,6 +648,14 @@ struct UIChannelStripView: View {
       alertRows
       Divider()
       outputRow
+      if let store = context.sonyCameras {
+        HStack(spacing: 8) {
+          gutterIcon("wifi").accessibilityHidden(true)
+          UISonyCameraButton(feedID: camera.id, name: camera.name, store: store)
+            .buttonStyle(.borderless).font(.uiRow)
+          Spacer(minLength: 0)
+        }
+      }
       HStack(spacing: 8) {
         // Red while a take measures the audio: the take started the maxima and OVER over.
         gutterIcon("waveform", color: takeMeasuresAudio ? .red : .secondary)
@@ -691,14 +706,30 @@ struct UIChannelStripView: View {
   private func header(compact: Bool) -> some View {
     HStack(spacing: 8) {
       chevron
+      if let brand = feedBrand {
+        UIFeedBrandMark(brand: brand)
+      }
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
         .help("\(camera.name) · \(camera.inputName)")
-      UIBadge(text: camera.statusBadge, tone: camera.statusTone)
+      if let sonyStore = context.sonyCameras {
+        UIFeedSettingsMenu(camera: camera, snapshot: snapshot, sonyStore: sonyStore)
+      } else {
+        UIBadge(text: camera.statusBadge, tone: camera.statusTone)
+      }
       tallyBadge
       Spacer(minLength: 4)
       cameraButton(compact: compact)
       overflowMenu
     }
+  }
+
+  private var feedBrand: UIFeedBrandMark.Brand? {
+    let input = camera.inputName.lowercased()
+    if let store = context.sonyCameras, store.assignment(for: camera.id) != nil { return .sony }
+    if input.contains("blackmagic") || input.contains("ultrastudio") || input.contains("decklink") {
+      return .blackmagic
+    }
+    return nil
   }
 
   private var chevron: some View {
@@ -996,6 +1027,7 @@ struct UIChannelStripView: View {
         .accessibilityLabel("Updating output")
       }
       effectChips
+      sonyHDMIDisplayToggle
       if minimal { processingToggle.labelsHidden() } else { processingToggle }
     }
   }
@@ -1008,6 +1040,53 @@ struct UIChannelStripView: View {
     .controlSize(.mini)
     .fixedSize()
     .help("Processing. Off = complete bypass: the original resolution, color, pixels and frame rate. Effect choices stay saved. ⇧⌘B")
+  }
+
+  /// Camera-side OSD is carried by the HDMI signal, so keep this switch with
+  /// the video/output controls rather than in the Wi-Fi settings sheet.
+  @ViewBuilder private var sonyHDMIDisplayToggle: some View {
+    if let store = context.sonyCameras {
+      let state = store.state(for: camera.id)
+      if state.connected,
+        let display = state.properties.first(where: { $0.id == "monitoringDisplayHDMI" }),
+        display.writable {
+        Toggle(isOn: Binding(
+          get: { sonyPropertyIsOn(display) },
+          set: { enabled in
+            Task { await setSonyHDMIDisplay(enabled, store: store, feedID: camera.id) }
+          })) {
+          Text("HDMI display").font(.uiMeta).foregroundStyle(.secondary)
+        }
+        .toggleStyle(.switch)
+        .controlSize(.mini)
+        .fixedSize()
+        .help("Show the Sony camera's Face/Eye frames and display information in the HDMI output. This changes the camera-side HDMI composition.")
+        .accessibilityLabel("Sony HDMI display")
+      }
+    }
+  }
+
+  private func sonyPropertyIsOn(_ property: SonyCameraProperty) -> Bool {
+    property.label.caseInsensitiveCompare("On") == .orderedSame || property.value == 2
+  }
+
+  private func setSonyHDMIDisplay(_ enabled: Bool, store: SonyCameraStore, feedID: String) async {
+    let state = store.state(for: feedID)
+    let display = state.properties.first(where: { $0.id == "monitoringDisplayHDMI" })
+    let face = state.properties.first(where: { $0.id == "faceEyeFrameDisplay" })
+    if let display, let value = sonyChoice(display, enabled: enabled) {
+      await store.set(display, value: value, feedID: feedID)
+    }
+    if let face, let value = sonyChoice(face, enabled: enabled) {
+      await store.set(face, value: value, feedID: feedID)
+    }
+  }
+
+  private func sonyChoice(_ property: SonyCameraProperty, enabled: Bool) -> UInt64? {
+    property.choices.first { choice in
+      enabled ? choice.label.caseInsensitiveCompare("On") == .orderedSame || choice.value == 2
+        : choice.label.caseInsensitiveCompare("Off") == .orderedSame || choice.value == 1
+    }?.value
   }
 
   /// Effects only apply with Processing on, so the chips are disabled (not just dimmed) without it.

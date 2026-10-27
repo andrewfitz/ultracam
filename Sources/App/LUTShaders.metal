@@ -11,7 +11,7 @@ using namespace metal;
 
 // Mirrors LUTProcessor.Parameters (16-byte rows).
 struct Parameters {
-  uint4 geometry;       // x: source width, y: source height
+  uint4 geometry;       // x: source width, y: source height, z: output bit depth
   float4 decodeRange;   // luma black, luma range, chroma zero, chroma range (10-bit codes)
   float4 decodeMatrix;
   float4 encodeMatrix;  // x: Kr, y: Kb
@@ -83,24 +83,27 @@ inline float3 graded(Source source, uint x, uint y, texture3d<float, access::sam
   return mk_applyLUT(source.pixel(x, y, p), lut, p.lut);
 }
 
+inline float quantizeY(float value, constant Parameters &p) {
+  if (p.geometry.z == 8) return clamp(round(16 + 219 * value), 0.0f, 255.0f) / 255;
+  return clamp(round(64 + 876 * value), 0.0f, 1023.0f) * 64 / 65535;
+}
+inline float2 quantizeC(float2 value, constant Parameters &p) {
+  if (p.geometry.z == 8) return clamp(round(128 + 224 * value), 0.0f, 255.0f) / 255;
+  return clamp(round(512 + 896 * value), 0.0f, 1023.0f) * 64 / 65535;
+}
 inline void writeNV12(float3 c00, float3 c10, float3 c01, float3 c11, uint2 base,
   texture2d<float, access::write> y, texture2d<float, access::write> uv, constant Parameters &p) {
-  y.write(float4((16 + 219 * encode(c00, p).x) / 255), base);
-  y.write(float4((16 + 219 * encode(c10, p).x) / 255), base + uint2(1, 0));
-  y.write(float4((16 + 219 * encode(c01, p).x) / 255), base + uint2(0, 1));
-  y.write(float4((16 + 219 * encode(c11, p).x) / 255), base + uint2(1, 1));
-  float3 color = (c00 + c10 + c01 + c11) / 4;
-  float2 c = (128 + 224 * encode(color, p).yz) / 255;
-  uv.write(float4(c, 0, 1), base / 2);
+  y.write(float4(quantizeY(encode(c00, p).x, p)), base);
+  y.write(float4(quantizeY(encode(c10, p).x, p)), base + uint2(1, 0));
+  y.write(float4(quantizeY(encode(c01, p).x, p)), base + uint2(0, 1));
+  y.write(float4(quantizeY(encode(c11, p).x, p)), base + uint2(1, 1));
+  uv.write(float4(quantizeC(encode((c00 + c10 + c01 + c11) / 4, p).yz, p), 0, 1), base / 2);
 }
-
 inline void write422(float3 c0, float3 c1, uint2 base,
   texture2d<float, access::write> y, texture2d<float, access::write> uv, constant Parameters &p) {
-  y.write(float4(clamp(round(64 + 876 * encode(c0, p).x), 0.0f, 1023.0f) * 64 / 65535), base);
-  y.write(float4(clamp(round(64 + 876 * encode(c1, p).x), 0.0f, 1023.0f) * 64 / 65535), base + uint2(1, 0));
-  float3 color = (c0 + c1) / 2;
-  float2 c = clamp(round(512 + 896 * encode(color, p).yz), 0.0f, 1023.0f) * 64 / 65535;
-  uv.write(float4(c, 0, 1), uint2(base.x / 2, base.y));
+  y.write(float4(quantizeY(encode(c0, p).x, p)), base);
+  y.write(float4(quantizeY(encode(c1, p).x, p)), base + uint2(1, 0));
+  uv.write(float4(quantizeC(encode((c0 + c1) / 2, p).yz, p), 0, 1), uint2(base.x / 2, base.y));
 }
 
 // ---- Full resolution: decode + LUT + encode in one pass, no intermediate.
@@ -145,7 +148,8 @@ kernel void fullPlanar422(texture2d<float, access::read> luma [[texture(0)]], te
   full422(PlanarSource{luma, chroma}, lut, y, uv, p, gid);
 }
 
-// ---- UHD -> 1080 (exactly 2:1) antialiasing Lanczos-3. The normalized weights
+// ---- Lanczos-3 resize. The optimized 2:1 path uses constant weights; other
+// ratios calculate scale-adjusted, normalized weights. The 2:1 weights
 // are identical at every output pixel, so they are constants.
 constant float lanczosHalfWeights[12] = {
   0.003689135430f, 0.015056142681f, -0.033998631514f, -0.066637317768f,
@@ -162,6 +166,21 @@ constant constexpr uint horizontalSpan = horizontalGroup * 2 + 11;
 template <typename Source>
 inline void horizontalPass(Source s, texture3d<float, access::sample> lut, texture2d<float, access::write> out,
   constant Parameters &p, threadgroup float4 *row, uint2 group, uint lid) {
+  if (p.geometry.x != out.get_width() * 2) {
+    uint ox = group.x * horizontalGroup + lid;
+    if (ox >= out.get_width() || group.y >= out.get_height()) return;
+    float scale = float(p.geometry.x) / out.get_width();
+    float center = (float(ox) + 0.5f) * scale - 0.5f;
+    float4 sum = 0; float total = 0;
+    for (int ix = int(ceil(center - 3 * scale)); ix <= int(floor(center + 3 * scale)); ++ix) {
+      float t = abs((float(ix) - center) / scale);
+      float w = t < 0.00001f ? 1.0f : (t >= 3 ? 0.0f : sin(M_PI_F * t) * sin(M_PI_F * t / 3) / (M_PI_F * M_PI_F * t * t / 3));
+      sum += float4(graded(s, uint(clamp(ix, 0, int(p.geometry.x) - 1)), group.y, lut, p), 1) * w;
+      total += w;
+    }
+    out.write(sum / total, uint2(ox, group.y));
+    return;
+  }
   int firstOut = int(group.x * horizontalGroup);
   int firstIn = firstOut * 2 - 5;
   uint y = group.y;
@@ -193,7 +212,18 @@ kernel void horizontalPlanar(texture2d<float, access::read> luma [[texture(0)]],
 }
 
 // Pass 2: vertical Lanczos + output encode, one thread per output block.
-inline float3 vertical(texture2d<float, access::read> input, uint x, uint y) {
+inline float3 vertical(texture2d<float, access::read> input, uint x, uint y, uint outputHeight) {
+  if (input.get_height() != outputHeight * 2) {
+    float scale = float(input.get_height()) / outputHeight;
+    float center = (float(y) + 0.5f) * scale - 0.5f;
+    float3 sum = 0; float total = 0;
+    for (int iy = int(ceil(center - 3 * scale)); iy <= int(floor(center + 3 * scale)); ++iy) {
+      float t = abs((float(iy) - center) / scale);
+      float w = t < 0.00001f ? 1.0f : (t >= 3 ? 0.0f : sin(M_PI_F * t) * sin(M_PI_F * t / 3) / (M_PI_F * M_PI_F * t * t / 3));
+      sum += input.read(uint2(x, uint(clamp(iy, 0, int(input.get_height()) - 1)))).rgb * w; total += w;
+    }
+    return sum / total;
+  }
   int begin = int(y) * 2 - 5;
   int last = int(input.get_height()) - 1;
   float4 sum = 0;
@@ -208,8 +238,8 @@ kernel void verticalNV12(texture2d<float, access::read> input [[texture(0)]],
   constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   uint2 base = gid * 2;
   if (base.x >= y.get_width() || base.y >= y.get_height()) return;
-  writeNV12(vertical(input, base.x, base.y), vertical(input, base.x + 1, base.y),
-    vertical(input, base.x, base.y + 1), vertical(input, base.x + 1, base.y + 1), base, y, uv, p);
+  writeNV12(vertical(input, base.x, base.y, y.get_height()), vertical(input, base.x + 1, base.y, y.get_height()),
+    vertical(input, base.x, base.y + 1, y.get_height()), vertical(input, base.x + 1, base.y + 1, y.get_height()), base, y, uv, p);
 }
 
 kernel void vertical422(texture2d<float, access::read> input [[texture(0)]],
@@ -217,5 +247,5 @@ kernel void vertical422(texture2d<float, access::read> input [[texture(0)]],
   constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   uint2 base = uint2(gid.x * 2, gid.y);
   if (base.x >= y.get_width() || base.y >= y.get_height()) return;
-  write422(vertical(input, base.x, base.y), vertical(input, base.x + 1, base.y), base, y, uv, p);
+  write422(vertical(input, base.x, base.y, y.get_height()), vertical(input, base.x + 1, base.y, y.get_height()), base, y, uv, p);
 }

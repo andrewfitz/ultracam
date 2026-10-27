@@ -102,7 +102,7 @@ struct NaturalTalkingHeadSettings: Codable, Equatable, Sendable {
     enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
     anchorFeedID = try values.decodeIfPresent(FeedID.self, forKey: .anchorFeedID)
     emphasisFeedID = try values.decodeIfPresent(FeedID.self, forKey: .emphasisFeedID)
-    mode = try values.decodeIfPresent(TalkingHeadDirectorMode.self, forKey: .mode)
+    mode = (try? values.decodeIfPresent(TalkingHeadDirectorMode.self, forKey: .mode))
       ?? .transcriptAssisted
     let storedMinimumShotDuration = try values.decodeIfPresent(Double.self,
       forKey: .minimumShotDuration) ?? 10
@@ -188,7 +188,7 @@ struct SwitcherSettings: Codable, Equatable, Sendable {
     selectedFeedID = try values.decodeIfPresent(FeedID.self, forKey: .selectedFeedID)
     automatic = try values.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
     intervalSeconds = try values.decodeIfPresent(Double.self, forKey: .intervalSeconds) ?? 5.0
-    strategy = try values.decodeIfPresent(SwitcherStrategy.self, forKey: .strategy) ?? .manual
+    strategy = (try? values.decodeIfPresent(SwitcherStrategy.self, forKey: .strategy)) ?? .manual
     naturalTalkingHead = try values.decodeIfPresent(NaturalTalkingHeadSettings.self,
       forKey: .naturalTalkingHead) ?? .init()
   }
@@ -203,7 +203,10 @@ struct AppSettings: Codable, Equatable, Sendable {
   var downscale = true
   var convertTo420 = true
   var reduceFrameRate = false
-  var gamut = "S-Gamut3.Cine / S-Log3"
+  var resizeTarget: ResizeTarget?
+  var colorTarget: ColorTarget?
+  var frameRateTarget: FrameRateTarget?
+  var gamut = "Unspecified / custom LUT"
   var pipelineEnabled = true
   var previewEnabled = true
   var lutBookmark: Data?
@@ -221,7 +224,10 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   var downscale = true
   var convertTo420 = true
   var reduceFrameRate = false
-  var gamut = "S-Gamut3.Cine / S-Log3"
+  var resizeTarget: ResizeTarget?
+  var colorTarget: ColorTarget?
+  var frameRateTarget: FrameRateTarget?
+  var gamut = "Unspecified / custom LUT"
   var pipelineEnabled = true
   var previewEnabled = true
   var lutBookmark: Data?
@@ -245,10 +251,15 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
 
   init(id: FeedID = .primary, name: String = "Camera 1", selectedDevice: String = "",
     applyLUT: Bool = false, downscale: Bool = true, convertTo420: Bool = true,
-    reduceFrameRate: Bool = false, gamut: String = "S-Gamut3.Cine / S-Log3",
+    reduceFrameRate: Bool = false, gamut: String = "Unspecified / custom LUT",
     pipelineEnabled: Bool = true, previewEnabled: Bool = true, lutBookmark: Data? = nil,
     automaticFeed: Bool = false, enabled: Bool = true,
-    monitor: MonitorFeedPreferences = MonitorFeedPreferences()) {
+    monitor: MonitorFeedPreferences = MonitorFeedPreferences(),
+    resizeTarget: ResizeTarget? = nil, colorTarget: ColorTarget? = nil,
+    frameRateTarget: FrameRateTarget? = nil) {
+    self.resizeTarget = resizeTarget
+    self.colorTarget = colorTarget
+    self.frameRateTarget = frameRateTarget
     self.id = id
     self.name = name
     self.selectedDevice = selectedDevice
@@ -271,25 +282,28 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
       convertTo420: settings.convertTo420, reduceFrameRate: settings.reduceFrameRate,
       gamut: settings.gamut, pipelineEnabled: settings.pipelineEnabled,
       previewEnabled: settings.previewEnabled, lutBookmark: settings.lutBookmark,
-      automaticFeed: settings.automaticFeed ?? false)
+      automaticFeed: settings.automaticFeed ?? false, resizeTarget: settings.resizeTarget,
+      colorTarget: settings.colorTarget, frameRateTarget: settings.frameRateTarget)
   }
 
   var configuration: PipelineConfiguration {
     PipelineConfiguration(applyLUT: applyLUT, downscale: downscale,
-      convertTo420: convertTo420, reduceFrameRate: reduceFrameRate)
+      convertTo420: convertTo420, reduceFrameRate: reduceFrameRate,
+      resizeTarget: resizeTarget ?? .hd1080, colorTarget: colorTarget ?? .yuv4208,
+      frameRateTarget: frameRateTarget ?? .fps2997)
   }
 
   private enum CodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, pipelineEnabled, previewEnabled, lutBookmark,
-      automaticFeed, enabled, monitor
+      automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
   }
 
   /// `CodingKeys` and the MonitorTools key, read only to migrate.
   private enum DecodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, pipelineEnabled, previewEnabled, lutBookmark,
-      automaticFeed, enabled, monitor
+      automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
     case legacyMonitorConfiguration = "monitorConfiguration"
   }
 
@@ -306,7 +320,11 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     downscale = try values.decodeIfPresent(Bool.self, forKey: .downscale) ?? true
     convertTo420 = try values.decodeIfPresent(Bool.self, forKey: .convertTo420) ?? true
     reduceFrameRate = try values.decodeIfPresent(Bool.self, forKey: .reduceFrameRate) ?? false
-    gamut = try values.decodeIfPresent(String.self, forKey: .gamut) ?? "S-Gamut3.Cine / S-Log3"
+    // Unknown enum values from a newer build must not discard this feed.
+    resizeTarget = try? values.decodeIfPresent(ResizeTarget.self, forKey: .resizeTarget)
+    colorTarget = try? values.decodeIfPresent(ColorTarget.self, forKey: .colorTarget)
+    frameRateTarget = try? values.decodeIfPresent(FrameRateTarget.self, forKey: .frameRateTarget)
+    gamut = try values.decodeIfPresent(String.self, forKey: .gamut) ?? "Unspecified / custom LUT"
     pipelineEnabled = try values.decodeIfPresent(Bool.self, forKey: .pipelineEnabled) ?? true
     previewEnabled = try values.decodeIfPresent(Bool.self, forKey: .previewEnabled) ?? true
     lutBookmark = try values.decodeIfPresent(Data.self, forKey: .lutBookmark)
@@ -331,13 +349,15 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
   var programMonitor = MonitorFeedPreferences()
   /// Key `monitorWorkspace`, the same JSON as before.
   var monitorWorkspacePreferences = MonitorWorkspacePreferences()
+  var syncCameras = false
   var virtualCameraRegistryVersion = 1
 
   init(feeds: [FeedDescriptor] = [FeedDescriptor()], selectedFeedID: FeedID? = nil,
     outputMode: FeedOutputMode = .separateCameras, switcher: SwitcherSettings = SwitcherSettings(),
     virtualCameraRegistryVersion: Int = 1,
     programMonitor: MonitorFeedPreferences = MonitorFeedPreferences(),
-    monitorWorkspace: MonitorWorkspacePreferences = MonitorWorkspacePreferences()) {
+    monitorWorkspace: MonitorWorkspacePreferences = MonitorWorkspacePreferences(), syncCameras: Bool = false) {
+    self.syncCameras = syncCameras
     self.feeds = feeds
     self.selectedFeedID = selectedFeedID ?? feeds.first?.id ?? .primary
     self.outputMode = outputMode
@@ -356,21 +376,35 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
     for feed in feeds {
       guard feed.version == 1, !feed.id.rawValue.isEmpty, seen.insert(feed.id).inserted else { return nil }
     }
+    // Repair references to removed feeds while retaining the rest of the
+    // snapshot. A stale selection should not discard every saved setting.
+    var repaired = self
+    let firstID = feeds[0].id
+    if !seen.contains(selectedFeedID) { repaired.selectedFeedID = firstID }
+    if let selected = switcher.selectedFeedID, !seen.contains(selected) {
+      repaired.switcher.selectedFeedID = nil
+    }
+    if let anchor = switcher.naturalTalkingHead.anchorFeedID, !seen.contains(anchor) {
+      repaired.switcher.naturalTalkingHead.anchorFeedID = nil
+    }
+    if let emphasis = switcher.naturalTalkingHead.emphasisFeedID, !seen.contains(emphasis) {
+      repaired.switcher.naturalTalkingHead.emphasisFeedID = nil
+    }
     // Persistence preserves a valid descriptor ID even when that feed is
     // currently disabled. Runtime coordinators choose an enabled fallback
     // when they start; rewriting the snapshot here would lose the user's
     // stable selection and break round-trip fidelity.
-    return self
+    return repaired
   }
 
   private enum CodingKeys: String, CodingKey {
-    case version, feeds, selectedFeedID, outputMode, switcher, virtualCameraRegistryVersion, programMonitor
+    case version, feeds, selectedFeedID, outputMode, switcher, virtualCameraRegistryVersion, programMonitor, syncCameras
     case monitorWorkspacePreferences = "monitorWorkspace"
   }
 
   /// `CodingKeys` and the MonitorTools key, read only to migrate.
   private enum DecodingKeys: String, CodingKey {
-    case version, feeds, selectedFeedID, outputMode, switcher, virtualCameraRegistryVersion, programMonitor
+    case version, feeds, selectedFeedID, outputMode, switcher, virtualCameraRegistryVersion, programMonitor, syncCameras
     case legacyProgramMonitorConfiguration = "programMonitorConfiguration"
     case monitorWorkspacePreferences = "monitorWorkspace"
   }
@@ -381,8 +415,9 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
     feeds = try values.decodeIfPresent([FeedDescriptor].self, forKey: .feeds) ?? []
     selectedFeedID = try values.decodeIfPresent(FeedID.self, forKey: .selectedFeedID)
       ?? feeds.first?.id ?? .primary
-    outputMode = try values.decodeIfPresent(FeedOutputMode.self, forKey: .outputMode) ?? .separateCameras
-    switcher = try values.decodeIfPresent(SwitcherSettings.self, forKey: .switcher) ?? SwitcherSettings()
+    outputMode = (try? values.decodeIfPresent(FeedOutputMode.self, forKey: .outputMode)) ?? .separateCameras
+    switcher = (try? values.decodeIfPresent(SwitcherSettings.self, forKey: .switcher)) ?? SwitcherSettings()
+    syncCameras = try values.decodeIfPresent(Bool.self, forKey: .syncCameras) ?? false
     virtualCameraRegistryVersion = try values.decodeIfPresent(Int.self, forKey: .virtualCameraRegistryVersion) ?? 1
     programMonitor = values.monitorPreferences(.programMonitor, legacy: .legacyProgramMonitorConfiguration)
     monitorWorkspacePreferences = try values.decodeIfPresent(MonitorWorkspacePreferences.self,
@@ -399,6 +434,8 @@ final class AppSettingsStore {
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
   private let defaults: UserDefaults
+  /// Share the injected preference domain with independent control-plane stores.
+  var preferenceDefaults: UserDefaults { defaults }
 
   init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
@@ -527,5 +564,13 @@ actor LUTFileLoader {
     }
     return try CubeLUT(text: text,
       fallbackTitle: url.deletingPathExtension().lastPathComponent)
+  }
+}
+
+
+extension FeedDescriptor {
+  func processingChoicesDiffer(from other: FeedDescriptor) -> Bool {
+    configuration != other.configuration || lutBookmark != other.lutBookmark ||
+      pipelineEnabled != other.pipelineEnabled || gamut != other.gamut || previewEnabled != other.previewEnabled
   }
 }

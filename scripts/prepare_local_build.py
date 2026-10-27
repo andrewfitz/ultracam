@@ -30,6 +30,23 @@ def write_plist(path, value):
         plistlib.dump(value, stream)
 
 
+def sign_staged_libraries(app):
+    """Sign nested code in the copied bundle before sealing its parents.
+
+    Sony ships a mixture of signed and unsigned libraries. App signing does not
+    recursively sign them, and Debug also embeds separate code/preview dylibs.
+    Never alter the downloaded SDK or the original build's library signatures.
+    """
+    libraries = sorted(app.rglob("*.dylib"), key=lambda path: (-len(path.parts), str(path)))
+    for library in libraries:
+        if library.is_symlink() or not library.is_file():
+            continue
+        subprocess.run([
+            "/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none",
+            "--options", "runtime", str(library),
+        ], check=True)
+
+
 def main():
     if len(sys.argv) != 3:
         raise SystemExit("Usage: prepare_local_build.py INPUT.app STAGED.app")
@@ -77,6 +94,7 @@ def main():
         if bundle == extension:
             info["CMIOExtension"]["CMIOExtensionMachServiceName"] = LOCAL_GROUP + ".camera"
         write_plist(info_path, info)
+    sign_staged_libraries(destination)
     # Generate outside the repo; both signatures must contain the exact same
     # app group, and the extension's Mach service must start with that group.
     with tempfile.TemporaryDirectory(prefix="ultracam-sign-", dir=os.environ.get("TMPDIR")) as work:
@@ -85,6 +103,9 @@ def main():
             (destination, "App.entitlements", "app"),
         ):
             entitlements = read_plist(ROOT / "Config" / template)
+            # Ad-hoc builds have no authorized app-identifier prefix/profile.
+            # Keychain persistence is available in provisioned signed builds.
+            entitlements.pop("keychain-access-groups", None)
             entitlements["com.apple.security.application-groups"] = [LOCAL_GROUP]
             entitlements_path = Path(work) / (name + ".entitlements")
             write_plist(entitlements_path, entitlements)

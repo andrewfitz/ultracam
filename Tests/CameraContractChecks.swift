@@ -22,7 +22,7 @@ import XCTest
       XCTAssertTrue(camera.receive(tenBit, discontinuity: [], producerCanNegotiate: true))
       XCTAssertEqual(camera.activeIndex, 5)
       XCTAssertTrue(camera.receive(tenBit, discontinuity: []), "Contract remains strict after negotiation")
-      let invalidRate = try sample(duration: CMTime(value: 1, timescale: 60))
+      let invalidRate = try sample(duration: CMTime(value: 1, timescale: 120))
       XCTAssertFalse(camera.receive(invalidRate, discontinuity: [], producerCanNegotiate: true))
       XCTAssertEqual(camera.activeIndex, 5, "Invalid producer request must not partially change the contract")
       XCTAssertEqual(camera.duration, VideoContract.fastDuration)
@@ -74,15 +74,15 @@ import XCTest
     try camera.queue.sync {
       XCTAssertEqual(camera.provider.devices.count, 1)
       XCTAssertEqual(camera.device.streams.count, 2)
-      XCTAssertEqual(camera.formats.count, 8)
+      XCTAssertEqual(camera.formats.count, 18)
       for format in camera.formats {
-        XCTAssertEqual(format.validFrameDurations, [VideoContract.slowDuration, VideoContract.fastDuration])
-        XCTAssertEqual(format.minFrameDuration, VideoContract.fastDuration)
-        XCTAssertEqual(format.maxFrameDuration, VideoContract.slowDuration)
+        XCTAssertEqual(format.validFrameDurations, FrameRateTarget.allCases.map(\.duration))
+        XCTAssertEqual(format.minFrameDuration, FrameRateTarget.fps60.duration)
+        XCTAssertEqual(format.maxFrameDuration, FrameRateTarget.fps23976.duration)
       }
       let properties = CMIOExtensionStreamProperties(dictionary: [:])
       properties.activeFormatIndex = 5
-      properties.frameDuration = CMTime(value: 1, timescale: 24)
+      properties.frameDuration = CMTime(value: 1, timescale: 120)
       XCTAssertThrowsError(try camera.source.setStreamProperties(properties))
       XCTAssertEqual(camera.activeIndex, 0, "Invalid frame rate must not partially change the format")
       XCTAssertEqual(camera.duration, VideoContract.fastDuration)
@@ -95,7 +95,7 @@ import XCTest
         XCTAssertEqual(current.activeFormatIndex, 5)
         XCTAssertEqual(current.frameDuration, VideoContract.slowDuration)
       }
-      for invalid in [CMTime.invalid, .indefinite, .positiveInfinity, .zero, CMTime(value: 1, timescale: 60)] {
+      for invalid in [CMTime.invalid, .indefinite, .positiveInfinity, .zero, CMTime(value: 1, timescale: 120)] {
         properties.frameDuration = invalid
         XCTAssertThrowsError(try camera.sink.setStreamProperties(properties))
         XCTAssertEqual(camera.duration, VideoContract.slowDuration)
@@ -270,7 +270,7 @@ import XCTest
     XCTAssertEqual(CVPixelBufferLockBaseAddress(image, .readOnly), kCVReturnSuccess)
     defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
     let type = CVPixelBufferGetPixelFormatType(image)
-    if type == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+    if ColorTarget.allCases.contains(where: { $0.pixelFormat == type && $0.isEightBit }) {
       for plane in 0..<2 {
         let pointer = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(image, plane)).assumingMemoryBound(to: UInt8.self)
         let bytes = CVPixelBufferGetBytesPerRowOfPlane(image, plane) * CVPixelBufferGetHeightOfPlane(image, plane)

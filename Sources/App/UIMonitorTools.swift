@@ -223,6 +223,9 @@ struct UIMonitorToolSettingsView: View {
   let isProgram: Bool
   let provider: any UIMonitorSettingsProviding
   @State private var preferences: MonitorFeedPreferences
+  /// The provider snapshot represented by `preferences` when the popover last synchronized.
+  /// Keeping this separately lets us distinguish an external update from our own write.
+  @State private var synchronizedPreferences: MonitorFeedPreferences
 
   init(panel: UIMonitorPanel, cameraID: String, cameraName: String, isProgram: Bool,
     provider: any UIMonitorSettingsProviding) {
@@ -231,7 +234,9 @@ struct UIMonitorToolSettingsView: View {
     self.cameraName = cameraName
     self.isProgram = isProgram
     self.provider = provider
-    _preferences = State(initialValue: provider.preferences(for: cameraID))
+    let initial = provider.preferences(for: cameraID)
+    _preferences = State(initialValue: initial)
+    _synchronizedPreferences = State(initialValue: initial)
   }
 
   init(tool: UIMonitorTool, cameraID: String, cameraName: String, isProgram: Bool, provider: any UIMonitorSettingsProviding) {
@@ -337,7 +342,21 @@ struct UIMonitorToolSettingsView: View {
     .frame(width: UIToolLayout.panelWidth, alignment: .leading)
     .controlSize(.small)
     .labeledContentStyle(UIToolLabeledContentStyle())
-    .onChange(of: preferences) { _, value in provider.setPreferences(value, for: cameraID) }
+    // Slider updates should only redraw the value and monitor surface. Do not
+    // animate the popover or its host layout while a value is being dragged.
+    .transaction { transaction in transaction.animation = nil }
+    .onChange(of: preferences) { _, value in
+      provider.setPreferences(value, for: cameraID)
+      synchronizedPreferences = value
+    }
+    // A provider update can arrive while this popover is open (for example from
+    // another surface). Refresh the local draft before the next edit so a later
+    // slider change cannot write the stale draft back over that newer state.
+    .onChange(of: provider.preferences(for: cameraID)) { _, value in
+      guard value != synchronizedPreferences else { return }
+      preferences = value
+      synchronizedPreferences = value
+    }
   }
 
   @ViewBuilder private var settings: some View {

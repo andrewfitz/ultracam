@@ -198,6 +198,79 @@ final class AppModel {
     _ = cameraStateRevision
     return feedDescriptors.contains { feedCoordinator.isFeedRunning($0.id) }
   }
+  var syncCameras: Bool { feedCoordinator.syncCameras }
+  private var synchronizingCameras = false
+
+  func setSyncCameras(_ enabled: Bool) {
+    guard enabled != syncCameras else { return }
+    feedCoordinator.syncCameras = enabled
+    if enabled {
+      synchronizeProcessing(from: feedCoordinator.selectedDescriptor)
+      synchronizeMonitoring(from: MonitorTargetID(selectedFeedID.rawValue), preferences: feedCoordinator.selectedDescriptor.monitor)
+    }
+    saveSettings()
+  }
+
+  private func synchronizeProcessing(from source: FeedDescriptor) {
+    guard syncCameras, source.enabled, !synchronizingCameras else { return }
+    synchronizingCameras = true
+    defer { synchronizingCameras = false }
+    for camera in feedDescriptors where camera.enabled && camera.id != source.id {
+      // The shared edit supersedes an older file choice, even if the saved
+      // descriptors already match. Its asynchronous upload must not win later.
+      let supersededLoad = lutLoadingFeeds.contains(camera.id)
+      if supersededLoad { cancelLUTLoad(camera.id) }
+      updateCamera(camera.id) {
+        $0.applyLUT = source.applyLUT
+        $0.lutBookmark = source.lutBookmark
+        $0.downscale = source.downscale
+        $0.convertTo420 = source.convertTo420
+        $0.reduceFrameRate = source.reduceFrameRate
+        $0.resizeTarget = source.resizeTarget
+        $0.colorTarget = source.colorTarget
+        $0.frameRateTarget = source.frameRateTarget
+        $0.pipelineEnabled = source.pipelineEnabled
+        $0.gamut = source.gamut
+        $0.previewEnabled = source.previewEnabled
+      }
+      // Upload may already have reached the capture queue before its main-actor
+      // completion was cancelled. Invalidate that runtime LUT and restore the
+      // winning choice, including when its saved descriptor never changed.
+      if supersededLoad, !lutLoadingFeeds.contains(camera.id), descriptor(for: camera.id)?.lutBookmark != nil {
+        cameraLUTs[camera.id] = nil
+        applyPipeline(camera.id)
+        restoreLUT(camera.id)
+      }
+    }
+  }
+
+  private func synchronizeMonitoring(from target: MonitorTargetID, preferences: MonitorFeedPreferences,
+    previous: MonitorFeedPreferences? = nil) {
+    guard syncCameras, !target.isProgram, !synchronizingCameras,
+      feedDescriptors.contains(where: { $0.id.rawValue == target.rawValue && $0.enabled }) else { return }
+    synchronizingCameras = true
+    defer { synchronizingCameras = false }
+    for camera in feedDescriptors where camera.enabled && camera.id.rawValue != target.rawValue {
+      var value = camera.monitor
+      value.copyTools(from: preferences)
+      // A synchronized false-color choice is a shared monitor choice. Keep it
+      // selected even when the destination's signal declaration is not yet
+      // compatible; MonitorKit will report it as unavailable until that camera
+      // is declared. The declaration itself remains camera-specific.
+      if preferences.state.falseColor.mode != .off {
+        value.state.falseColor.mode = preferences.state.falseColor.mode
+      }
+      // Editing another tool there must not erase a destination's own
+      // false-color choice when the source false-color setting did not change.
+      if let previous, previous.state.falseColor == preferences.state.falseColor {
+        value.state.falseColor = camera.monitor.state.falseColor
+      }
+      value.monitorLUT = preferences.monitorLUT
+      value.monitorLUTEnabled = preferences.monitorLUTEnabled
+      monitorCoordinator.setPreferences(value, for: MonitorTargetID(camera.id.rawValue))
+    }
+  }
+
   /// Each camera's burn-in LUT as its controller holds it.
   private(set) var cameraLUTs: [FeedID: CameraLUTState] = [:]
   func lutState(_ id: FeedID) -> CameraLUTState { cameraLUTs[id] ?? CameraLUTState() }
@@ -268,6 +341,7 @@ final class AppModel {
   let recordingModel: RecordingModel
   private let feedCoordinator: FeedCoordinator
   private let settingsStore: AppSettingsStore
+  let sonyCameras: SonyCameraStore
   private let virtualCameraRegistryStore: VirtualCameraRegistryStore
   private let lutLoader: LUTFileLoader
   private var launching = true
@@ -313,6 +387,7 @@ final class AppModel {
     self.installer = installer ?? ExtensionInstaller()
     let store = settingsStore ?? AppSettingsStore()
     self.settingsStore = store
+    self.sonyCameras = SonyCameraStore(defaults: store.preferenceDefaults)
     self.registryPublisher = registryPublisher ?? VirtualCameraRegistryPublisher()
     hideFromDock = store.hideFromDock
     // Before discovery starts (observeDevices, below), so devices present at
@@ -344,12 +419,14 @@ final class AppModel {
     monitorCoordinator.onConfigurationChange = { [weak self] target, configuration in
       guard let self else { return }
       // The coordinator reports a target's whole preferences: they replace the saved ones.
+      let previous = self.monitorPreferences(of: target)
       if target.rawValue == "program" {
         self.feedCoordinator.programMonitor = configuration
       } else if var descriptor = self.feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
         descriptor.monitor = configuration
         self.feedCoordinator.update(descriptor)
       }
+      self.synchronizeMonitoring(from: target, preferences: configuration, previous: previous)
       self.saveSettings()
     }
     monitorCoordinator.onResetSettings = { [weak self] target in
@@ -670,8 +747,11 @@ final class AppModel {
   @discardableResult
   func addFeed(name: String? = nil) -> FeedID? {
     guard canEditFeedTopology else { return nil }
+    let source = feedCoordinator.selectedDescriptor
     let id = feedCoordinator.add(name: name)
     wireCamera(id)
+    synchronizeProcessing(from: source)
+    synchronizeMonitoring(from: MonitorTargetID(source.id.rawValue), preferences: source.monitor)
     syncRecordingFeeds()
     guard selectFeed(id) else { return nil }
     saveSettings()
@@ -705,6 +785,7 @@ final class AppModel {
     guard feedCoordinator.remove(id) else { return false }
     cancelLUTLoad(id)
     takeAudio[id] = nil
+    sonyCameras.removeFeed(id.rawValue)
     cameraLUTs[id] = nil
     cameraUpdates[id] = nil
     feedPolicies[id] = nil
@@ -930,7 +1011,10 @@ final class AppModel {
     }
     if update.audioPresent {
       autoSwitcherBridge?.ingestAudio(time: update.audioPacketTime ?? time,
-        rms: Float(max(update.audioRMSLeft, update.audioRMSRight)),
+        // Feed the director the stereo RMS energy. Taking the louder channel
+        // exaggerates speech whenever one side is noisier than the other.
+        rms: Float(sqrt((update.audioRMSLeft * update.audioRMSLeft +
+          update.audioRMSRight * update.audioRMSRight) / 2)),
         peak: Float(max(update.audioPeakLeft, update.audioPeakRight)),
         present: true)
     } else {
@@ -984,6 +1068,7 @@ final class AppModel {
     } else if var descriptor = feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
       change(&descriptor.monitor)
       feedCoordinator.update(descriptor)
+      synchronizeMonitoring(from: target, preferences: descriptor.monitor)
     } else {
       return false
     }
@@ -1111,11 +1196,16 @@ final class AppModel {
   /// or automatic, in either output mode.
   private func launchCapture(_ id: FeedID) {
     guard let descriptor = descriptor(for: id) else { return }
-    feedCoordinator.setProgramSourceHealth(id, healthy: true)
     feedCoordinator.setCameraOutputEnabled(feedID: id, enabled: outputMode != .program)
     detectedInputCadence[id] = nil
     guard feedCoordinator.startCapture(feedID: id, deviceID: descriptor.selectedDevice,
-      configuration: effectiveConfiguration(for: id), pipelineEnabled: descriptor.pipelineEnabled) else { return }
+      configuration: effectiveConfiguration(for: id), pipelineEnabled: descriptor.pipelineEnabled) else {
+      feedCoordinator.setProgramSourceHealth(id, healthy: false)
+      return
+    }
+    // A source retired after a failure must become eligible again only after
+    // its next capture actually starts.
+    feedCoordinator.setProgramSourceHealth(id, healthy: true)
     appliedPipelines[id] = pipeline(for: id)
     cameraUpdates[id] = CaptureUpdate(message: "Opening UltraStudio…")
     cameraStateRevision &+= 1
@@ -1488,6 +1578,7 @@ final class AppModel {
       lutLog.notice("Apply LUT \(descriptor.applyLUT ? "on" : "off", privacy: .public): \(id.rawValue, privacy: .public), running: \(self.isCameraRunning(id), privacy: .public), saved LUT: \(descriptor.lutBookmark != nil, privacy: .public)")
     }
     feedCoordinator.update(descriptor)
+    if descriptor.processingChoicesDiffer(from: before) { synchronizeProcessing(from: descriptor) }
     saveSettings(reason: "camera settings changed")
     if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
     if descriptor.previewEnabled != before.previewEnabled {
@@ -1522,6 +1613,7 @@ final class AppModel {
   func resetAllSettings() -> Bool {
     guard canEditFeedTopology else { return false }
     settingsResetPending = true
+    sonyCameras.reset()
     settingsStore.resetAll()
     return true
   }

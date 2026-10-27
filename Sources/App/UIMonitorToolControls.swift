@@ -190,7 +190,7 @@ struct UIMonitorSlider: View {
         Group {
           if let step { Slider(value: $value, in: range, step: step) } else { Slider(value: $value, in: range) }
         }
-        .frame(minWidth: 100)
+        .frame(minWidth: 148, maxWidth: .infinity)
         Text(format(value))
           .font(.uiMeta.monospacedDigit()).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
       }

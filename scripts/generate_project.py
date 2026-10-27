@@ -14,6 +14,8 @@ if not (ROOT / "Packages/MonitorKit/Package.swift").is_file():
              "MonitorKit is a git submodule: run git submodule update --init")
 EXTERNAL_ROOT = Path("/Volumes/8TB/cinesomatic-director-work").resolve(strict=False)
 objects = {}
+sony_root = ROOT / "ThirdParty/SonyCameraRemoteSDK"
+sony_available = (sony_root / "include/CameraRemote_SDK.h").is_file() and (sony_root / "lib/libCr_Core.dylib").is_file()
 
 
 def ref(key):
@@ -141,12 +143,30 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
                         OTHER_LDFLAGS=["$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv",
                                        "-framework", "Security", "-framework", "CoreFoundation",
                                        "-framework", "SystemConfiguration"])
+        if sony_available:
+            settings["GCC_PREPROCESSOR_DEFINITIONS"] = ["$(inherited)", "ULTRACAM_SONY_SDK=1"]
+            settings["HEADER_SEARCH_PATHS"].append("$(SRCROOT)/ThirdParty/SonyCameraRemoteSDK/include")
+            settings["LIBRARY_SEARCH_PATHS"].append("$(SRCROOT)/ThirdParty/SonyCameraRemoteSDK/lib")
+            settings["OTHER_LDFLAGS"].append("-lCr_Core")
     resources = [add(f"{key}-resource-{path}", "PBXBuildFile", fileRef=source_refs[path]) for path in sources if path.endswith(".metal")]
     resource_phase = add(f"{key}-resources", "PBXCopyFilesBuildPhase", buildActionMask=2147483647, files=resources, dstPath="", dstSubfolderSpec=7, name="Copy GPU Shader Source", runOnlyForDeploymentPostprocessing=0)
     phases = [phase, frameworks, resource_phase]
     if key == "app":
         icon_build = add("app-icon-build", "PBXBuildFile", fileRef=icon_catalog_ref)
         phases.append(add("app-icon-resources", "PBXResourcesBuildPhase", buildActionMask=2147483647, files=[icon_build], runOnlyForDeploymentPostprocessing=0))
+        if sony_available:
+            for directory in (Path("."), Path("CrAdapter")):
+                library_builds = []
+                for library in sorted((sony_root / "lib" / directory).glob("*.dylib")):
+                    path = library.relative_to(ROOT).as_posix()
+                    library_ref = file(path, "compiled.mach-o.dylib")
+                    objects[group]["children"].append(library_ref)
+                    library_builds.append(add(path + "-embed", "PBXBuildFile", fileRef=library_ref,
+                        settings=dict(ATTRIBUTES=["CodeSignOnCopy"])))
+                phases.append(add("sony-embed-" + str(directory), "PBXCopyFilesBuildPhase",
+                    buildActionMask=2147483647, files=library_builds,
+                    dstPath="" if directory == Path(".") else str(directory), dstSubfolderSpec=10,
+                    name="Embed Sony SDK " + str(directory), runOnlyForDeploymentPostprocessing=0))
     return add(f"{key}-target", "PBXNativeTarget", buildConfigurationList=configs(key, settings, release), buildPhases=phases, buildRules=[], dependencies=[], packageProductDependencies=monitor_products if key == "app" else [], name=name, productName=name, productReference=product, productType=product_type)
 
 

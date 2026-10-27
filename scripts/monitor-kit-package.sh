@@ -118,6 +118,13 @@ monitor_kit_failed_cases() {
   { LC_ALL=C grep -aE "^Test Case '-\[[^ ]+ [^]]+\]' failed" "$1" || true; } \
     | sed -E "s/^Test Case '-\[([^ ]+) ([^]]+)\]'.*/\1\/\2/" | sort -u
 }
+# Prints the skipped cases of a log, sorted. Skips are expected on hosts without
+# optional platform capabilities (for example Metal), but remain part of the
+# run accounting so a passing run cannot imply that every case executed.
+monitor_kit_skipped_cases() {
+  { LC_ALL=C grep -aE "^Test Case '-\[[^ ]+ [^]]+\]' skipped" "$1" || true; } \
+    | sed -E "s/^Test Case '-\[([^ ]+) ([^]]+)\]'.*/\1\/\2/" | sort -u
+}
 # Prints the failure messages the case $2 (Module.Class/test) logged in $1, one per line,
 # each cut short: a pixel array's message can be hundreds of megabytes.
 monitor_kit_case_failures() {
@@ -275,6 +282,7 @@ STUB
   { bundle MonitorKitTests passed "$bench/passed" ContractTests/testA/passed
     bundle MonitorKitAudioTests passed RealtimeTests/testX/skipped; } > "$dir/first.log"
   expect "$(monitor_kit_log_problems "$dir/first.log")" "" "complete log has no problems"
+  expect "$(monitor_kit_skipped_cases "$dir/first.log")" "MonitorKitAudioTests.RealtimeTests/testX" "skipped cases are accounted for"
   scenario 'clean run' 0 0 0 1
   # A timing budget failed; the retry passes.
   { bundle MonitorKitTests failed "$bench/failed" ContractTests/testA/passed

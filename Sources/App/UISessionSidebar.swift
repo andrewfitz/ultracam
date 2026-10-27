@@ -95,6 +95,13 @@ struct UISessionSidebarViewContent: View {
   private var outputSection: some View {
     Section("Output") {
       UIOutputModeControlView(context: context)
+      // The same setting as the inspector's and Settings' (the model holds it).
+      if session.cameras.count > 1 {
+        Toggle("Sync cameras", isOn: Binding(get: { session.syncCameras }, set: { context.send(.setSyncCameras($0)) }))
+          .toggleStyle(.switch)
+          .controlSize(.small)
+          .help("Cameras share processing and monitor effect edits. Turning this on copies the selected camera’s effects. Inputs and recording folders stay separate; source declarations and calibration stay per camera.")
+      }
       switch session.outputMode {
       case .program:
         UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · Program",

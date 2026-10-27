@@ -239,6 +239,13 @@ final class ProgramOutputRoute: @unchecked Sendable {
   func setOutput(contract: ProgramOutputFormat?, active: Bool) {
     locked {
       let changed = outputContract != contract || outputActive != active
+      if changed {
+        // Frames already staged under the previous output contract (or while
+        // the output was inactive) must never be published after the contract
+        // changes. Invalidate the ordered stage and cadence clock together.
+        flushOutputLocked()
+        nextSlot = nil
+      }
       outputContract = contract
       outputActive = active
       if active { errorReported = false }
@@ -275,6 +282,11 @@ final class ProgramOutputRoute: @unchecked Sendable {
     lock.lock()
     guard state.feedIDs != feedIDs else { lock.unlock(); return }
     let valid = Set(feedIDs)
+    // Topology is authoritative for capture gating. In particular, a source
+    // removed and later re-added must not inherit its old live state.
+    if let liveSources {
+      self.liveSources = liveSources.intersection(valid)
+    }
     let selected = state.selectedFeedID.flatMap { valid.contains($0) ? $0 : nil }
     var settings = state.settings
     settings.selectedFeedID = selected ?? feedIDs.first
@@ -766,6 +778,7 @@ final class FeedCoordinator {
   var switcherCoordinator: SwitcherCoordinator { programOutput.switcher }
   private(set) var virtualCameraRegistrySnapshot: VirtualCameraRegistrySnapshot
   private let registryStore: VirtualCameraRegistryStore?
+  var syncCameras = false
   var programMonitor: MonitorFeedPreferences
   var monitorWorkspace: MonitorWorkspacePreferences
   private var sessions: [FeedID: FeedSession] = [:]
@@ -785,6 +798,7 @@ final class FeedCoordinator {
        capturePool: FeedCapturePool = FeedCapturePool(),
        registryStore: VirtualCameraRegistryStore? = nil) {
     let safe = snapshot.validated() ?? AppSettingsSnapshot()
+    syncCameras = safe.syncCameras
     programMonitor = safe.programMonitor
     monitorWorkspace = safe.monitorWorkspacePreferences
     descriptors = safe.feeds
@@ -1240,7 +1254,7 @@ final class FeedCoordinator {
       outputMode: outputMode, switcher: switcher,
       virtualCameraRegistryVersion: virtualCameraRegistryVersion,
       programMonitor: programMonitor,
-      monitorWorkspace: monitorWorkspace)
+      monitorWorkspace: monitorWorkspace, syncCameras: syncCameras)
   }
 
   @discardableResult
@@ -1250,7 +1264,9 @@ final class FeedCoordinator {
     if let current = registryStore?.load() {
       next = current.advancing(to: devices)
     } else {
-      let generation = max(virtualCameraRegistrySnapshot.generation + 1, 1)
+      let generation = virtualCameraRegistrySnapshot.generation == UInt64.max
+        ? UInt64.max
+        : max(virtualCameraRegistrySnapshot.generation + 1, 1)
       next = VirtualCameraRegistrySnapshot(generation: generation, devices: devices)
     }
     virtualCameraRegistrySnapshot = next

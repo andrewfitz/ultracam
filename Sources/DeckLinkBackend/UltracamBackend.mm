@@ -2867,3 +2867,5 @@ BOOL UltracamRunAutoSyntheticChecks(NSError **error) {
   return [formatChanges runFormatChangeChecks:error];
 }
 #endif
+
+#include "SonyCameraControl.inc"

@@ -45,18 +45,44 @@ final class AutoSwitcherBridge: @unchecked Sendable {
 
   private let queue = DispatchQueue(label: "org.ultracam.auto-switcher",
     qos: .userInteractive)
+  private let stateLock = NSLock()
   private let queueKey = DispatchSpecificKey<UInt8>()
   private var handle: OpaquePointer?
   private var nextAudioID: UInt64 = 1
   private var silenceStartedAt: CMTime?
   private var speaking = false
   private var lastCueSeconds: Double?
-  private(set) var lastError: String?
-  var onInstruction: InstructionHandler?
-  var onError: ErrorHandler?
-  var onDecisionExpired: ExpiredHandler?
-  var onAudioCue: AudioCueHandler?
-  var onTranscriptCue: TranscriptCueHandler?
+  private var _lastError: String?
+  private var _onInstruction: InstructionHandler?
+  private var _onError: ErrorHandler?
+  private var _onDecisionExpired: ExpiredHandler?
+  private var _onAudioCue: AudioCueHandler?
+  private var _onTranscriptCue: TranscriptCueHandler?
+
+  private(set) var lastError: String? {
+    get { stateLock.withLock { _lastError } }
+    set { stateLock.withLock { _lastError = newValue } }
+  }
+  var onInstruction: InstructionHandler? {
+    get { stateLock.withLock { _onInstruction } }
+    set { stateLock.withLock { _onInstruction = newValue } }
+  }
+  var onError: ErrorHandler? {
+    get { stateLock.withLock { _onError } }
+    set { stateLock.withLock { _onError = newValue } }
+  }
+  var onDecisionExpired: ExpiredHandler? {
+    get { stateLock.withLock { _onDecisionExpired } }
+    set { stateLock.withLock { _onDecisionExpired = newValue } }
+  }
+  var onAudioCue: AudioCueHandler? {
+    get { stateLock.withLock { _onAudioCue } }
+    set { stateLock.withLock { _onAudioCue = newValue } }
+  }
+  var onTranscriptCue: TranscriptCueHandler? {
+    get { stateLock.withLock { _onTranscriptCue } }
+    set { stateLock.withLock { _onTranscriptCue = newValue } }
+  }
 
   init?(settings: NaturalTalkingHeadSettings, anchor: FeedID, emphasis: FeedID) {
     queue.setSpecific(key: queueKey, value: 1)
@@ -163,7 +189,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
           "session_generation": 0,
         ],
       ]
-      self.onAudioCue?(AutoSwitcherAudioCue(id: self.nextAudioID, time: seconds,
+      let audioCueHandler = self.onAudioCue
+      audioCueHandler?(AutoSwitcherAudioCue(id: self.nextAudioID, time: seconds,
         duration: duration,
         speechEnergy: energy, pauseDuration: pause, emphasis: emphasis, laughter: 0,
         speechStart: speechStart, speechStop: speechStop,
@@ -185,7 +212,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
       confidence: max(0, min(1, confidence)), isFinal: isFinal, sessionGeneration: 0)
     queue.async { [weak self] in
       guard let self, self.handle != nil else { return }
-      self.onTranscriptCue?(cue)
+      let transcriptCueHandler = self.onTranscriptCue
+      transcriptCueHandler?(cue)
       self.send([
         "type": "transcript",
         "cue": ["segment_id": segmentID, "revision": revision, "start": start,
@@ -255,7 +283,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
           let decisionID = UUID(uuidString: instruction.decisionID),
           let cutTime = CMTime(seconds: instruction.cutTime, preferredTimescale: 60_000).validValue,
           let expiresAt = CMTime(seconds: instruction.expiresAt, preferredTimescale: 60_000).validValue else { continue }
-        onInstruction?(AutoSwitcherInstruction(decisionID: decisionID,
+        let instructionHandler = onInstruction
+        instructionHandler?(AutoSwitcherInstruction(decisionID: decisionID,
           sessionGeneration: instruction.sessionGeneration,
           targetCameraID: FeedID(rawValue: target), cutTime: cutTime,
           expiresAt: expiresAt, confidence: instruction.confidence,
@@ -263,7 +292,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
       case "error": report(value.message ?? "Rust auto-switcher error")
       case "decisionExpired":
         if let decisionID = value.decisionID.flatMap(UUID.init(uuidString:)) {
-          onDecisionExpired?(decisionID)
+          let expiredHandler = onDecisionExpired
+          expiredHandler?(decisionID)
         }
       default: break
       }
@@ -272,7 +302,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
 
   private func report(_ message: String) {
     lastError = message
-    onError?(message)
+    let errorHandler = onError
+    errorHandler?(message)
   }
 
   private func seconds(_ time: CMTime) -> Double? { secondsValue(time) }

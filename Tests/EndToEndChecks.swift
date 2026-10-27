@@ -185,12 +185,13 @@ import XCTest
     let inputDuration = VideoContract.fastDuration
     let deliveredFrames = (0..<12).filter { frame in
       // Frame 2 would normally be delivered but is lost at capture. Frame 3
-      // can be delivered next; the gate must avoid freezing after a gap.
+      // can be delivered next; subsequent frames retain the target-clock phase
+      // instead of shifting it permanently after a source gap.
       guard frame != 2 else { return false }
       return gate.shouldDeliver(CMTimeMultiply(inputDuration, multiplier: Int32(frame)),
         duration: VideoContract.slowDuration)
     }
-    XCTAssertEqual(deliveredFrames, [0, 3, 5, 7, 9, 11])
+    XCTAssertEqual(deliveredFrames, [0, 3, 4, 6, 8, 10])
     XCTAssertFalse(gate.shouldDeliver(.invalid, duration: VideoContract.slowDuration))
     XCTAssertFalse(gate.shouldDeliver(.indefinite, duration: VideoContract.slowDuration))
     XCTAssertTrue(gate.shouldDeliver(.zero, duration: VideoContract.slowDuration),

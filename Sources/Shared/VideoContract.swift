@@ -46,14 +46,14 @@ enum VideoContract {
     guard width > 0, height > 0, width <= Int(Int32.max), height <= Int(Int32.max) else {
       throw VideoError.message("Invalid video dimensions.")
     }
-    guard tenBit422.contains(pixelFormat) || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
+    guard tenBit422.contains(pixelFormat) || ColorTarget.allCases.contains(where: { $0.pixelFormat == pixelFormat }) else {
       throw VideoError.message("Unsupported video pixel format.")
     }
     // Core Media accepts odd dimensions when creating a description, but the
     // advertised bi-planar Y'CbCr layouts cannot represent them: 4:2:2 needs
     // paired luma samples and 4:2:0 additionally needs paired rows. Packed
     // v210 is handled separately and permits a final partial six-pixel group.
-    let is420 = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    let is420 = ColorTarget.allCases.contains { $0.pixelFormat == pixelFormat && $0.is420 }
     let isPacked422 = pixelFormat == kCVPixelFormatType_422YpCbCr10
     guard isPacked422 || width.isMultiple(of: 2), !is420 || height.isMultiple(of: 2) else {
       throw VideoError.message("Invalid video dimensions for pixel format.")
@@ -129,6 +129,44 @@ final class VideoSampleFactory {
   }
 }
 
+enum ResizeTarget: String, Codable, CaseIterable, Sendable {
+  case hd720, hd1080, uhd4K
+  var title: String { switch self { case .hd720: "720p"; case .hd1080: "1080p"; case .uhd4K: "4K UHD" } }
+  var width: Int { switch self { case .hd720: 1280; case .hd1080: 1920; case .uhd4K: 3840 } }
+  var height: Int { width * 9 / 16 }
+}
+
+enum ColorTarget: String, Codable, CaseIterable, Sendable {
+  case yuv4208, yuv42010, yuv4228, yuv42210
+  var title: String { switch self {
+    case .yuv4208: "4:2:0 8-bit"; case .yuv42010: "4:2:0 10-bit"
+    case .yuv4228: "4:2:2 8-bit"; case .yuv42210: "4:2:2 10-bit"
+  } }
+  var is420: Bool { self == .yuv4208 || self == .yuv42010 }
+  var isEightBit: Bool { self == .yuv4208 || self == .yuv4228 }
+  var pixelFormat: OSType { switch self {
+    case .yuv4208: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    case .yuv42010: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    case .yuv4228: kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange
+    case .yuv42210: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+  } }
+}
+
+enum FrameRateTarget: String, Codable, CaseIterable, Sendable {
+  case fps60, fps5994, fps50, fps30, fps2997, fps25, fps24, fps23976
+  var title: String { switch self {
+    case .fps60: "60"; case .fps5994: "59.94"; case .fps50: "50"
+    case .fps30: "30"; case .fps2997: "29.97"; case .fps25: "25"
+    case .fps24: "24"; case .fps23976: "23.976"
+  } }
+  var duration: CMTime { switch self {
+    case .fps5994: VideoContract.fastDuration
+    case .fps2997: VideoContract.slowDuration
+    case .fps23976: CMTime(value: 1001, timescale: 24000)
+    default: CMTime(value: 1, timescale: Int32(title)!)
+  } }
+}
+
 struct PipelineConfiguration: Equatable, Sendable {
   var applyLUT = false
   var downscale = true
@@ -136,17 +174,22 @@ struct PipelineConfiguration: Equatable, Sendable {
   var reduceFrameRate = false
   var inputFast = true
 
-  var width: Int { downscale ? 1920 : 3840 }
-  var height: Int { downscale ? 1080 : 2160 }
+  var resizeTarget: ResizeTarget = .hd1080
+  var colorTarget: ColorTarget = .yuv4208
+  var frameRateTarget: FrameRateTarget = .fps2997
+  var width: Int { downscale ? resizeTarget.width : 3840 }
+  var height: Int { downscale ? resizeTarget.height : 2160 }
+  var outputColor: ColorTarget { convertTo420 ? colorTarget : .yuv42210 }
   var pixelFormat: OSType {
-    convertTo420 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+    outputColor.pixelFormat
   }
   var duration: CMTime {
-    inputFast && !reduceFrameRate ? VideoContract.fastDuration : VideoContract.slowDuration
+    let source = inputFast ? VideoContract.fastDuration : VideoContract.slowDuration
+    return reduceFrameRate ? CMTimeMaximum(source, frameRateTarget.duration) : source
   }
-  var untouched: Bool { !applyLUT && !downscale && !convertTo420 }
+  var untouched: Bool { !applyLUT && (!downscale || resizeTarget == .uhd4K) && !convertTo420 }
   var outputLabel: String {
-    "\(width) × \(height) · \(convertTo420 ? "4:2:0 8-bit" : "4:2:2 10-bit") · \(duration == VideoContract.fastDuration ? "59.94" : "29.97") fps"
+    "\(width) × \(height) · \(outputColor.title) · \(String(format: "%.3f", 1 / duration.seconds)) fps"
   }
 }
 

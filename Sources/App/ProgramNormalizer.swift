@@ -49,7 +49,11 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     var meanGPUMilliseconds: Double { frames == 0 ? 0 : totalGPUMilliseconds / Double(frames) }
   }
 
-  private enum Code: UInt32 { case yuv420 = 0, yuv422 = 1, v210 = 2 }
+  private enum Code: UInt32 {
+    case yuv420 = 0, yuv422 = 1, v210 = 2, yuv42010 = 3, yuv4228 = 4
+    var is420: Bool { self == .yuv420 || self == .yuv42010 }
+    var eight: Bool { self == .yuv420 || self == .yuv4228 }
+  }
 
   /// Keeps both frames alive until the GPU is done. CVPixelBuffer is
   /// thread-safe to retain and release; nothing reads its pixels on the CPU.
@@ -239,23 +243,23 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     let height = CVPixelBufferGetHeight(source)
     let resized = width != contract.width || height != contract.height
     Self.stampAttachments(output, from: source, resized: resized,
-      chromaResampled: resized || (sourceCode == .yuv420) != (destinationCode == .yuv420))
+      chromaResampled: resized || sourceCode.is420 != destinationCode.is420)
     let fullRange: UInt32 = sourceFormat == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? 1 : 0
     var residencyChanged = false
     let sourcePlanes: [MTLTexture]
     switch sourceCode {
-    case .yuv420:
+    case .yuv420, .yuv42010:
       sourcePlanes = [
-        try texture(sourceSurface, plane: 0, format: .r8Uint, width: width, height: height,
+        try texture(sourceSurface, plane: 0, format: sourceCode.eight ? .r8Uint : .r16Uint, width: width, height: height,
           sequence: sequence, changed: &residencyChanged),
-        try texture(sourceSurface, plane: 1, format: .rg8Uint, width: (width + 1) / 2,
+        try texture(sourceSurface, plane: 1, format: sourceCode.eight ? .rg8Uint : .rg16Uint, width: (width + 1) / 2,
           height: (height + 1) / 2, sequence: sequence, changed: &residencyChanged),
       ]
-    case .yuv422:
+    case .yuv422, .yuv4228:
       sourcePlanes = [
-        try texture(sourceSurface, plane: 0, format: .r16Uint, width: width, height: height,
+        try texture(sourceSurface, plane: 0, format: sourceCode.eight ? .r8Uint : .r16Uint, width: width, height: height,
           sequence: sequence, changed: &residencyChanged),
-        try texture(sourceSurface, plane: 1, format: .rg16Uint, width: (width + 1) / 2,
+        try texture(sourceSurface, plane: 1, format: sourceCode.eight ? .rg8Uint : .rg16Uint, width: (width + 1) / 2,
           height: height, sequence: sequence, changed: &residencyChanged),
       ]
     case .v210:
@@ -269,9 +273,9 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     let dw = contract.width, dh = contract.height
     var passes: [(MTLComputePipelineState, MTLTexture, MTLSize)] = []
     switch destinationCode {
-    case .yuv420, .yuv422:
-      let eight = destinationCode == .yuv420
-      let chromaHeight = eight ? (dh + 1) / 2 : dh
+    case .yuv420, .yuv422, .yuv42010, .yuv4228:
+      let eight = destinationCode.eight
+      let chromaHeight = destinationCode.is420 ? (dh + 1) / 2 : dh
       let y = try texture(outputSurface, plane: 0, format: eight ? .r8Uint : .r16Uint,
         width: dw, height: dh, sequence: sequence, changed: &residencyChanged)
       let c = try texture(outputSurface, plane: 1, format: eight ? .rg8Uint : .rg16Uint,
@@ -511,6 +515,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   private static func sourceCode(_ format: OSType) -> Code? {
     switch format {
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return .yuv42010
+    case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange: return .yuv4228
     case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return .yuv420
     case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
          kCVPixelFormatType_422YpCbCr10BiPlanarFullRange: return .yuv422
@@ -521,6 +527,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   private static func destinationCode(_ format: OSType) -> Code? {
     switch format {
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return .yuv42010
+    case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange: return .yuv4228
     case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return .yuv420
     case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange: return .yuv422
     case kCVPixelFormatType_422YpCbCr10: return .v210
@@ -544,6 +552,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   constant uint kYUV420 = 0;
   constant uint kYUV422 = 1;
+  constant uint kYUV42010 = 3;
+  constant uint kYUV4228 = 4;
 
   struct Taps { int index[4]; float weight[4]; int count; };
 
@@ -589,8 +599,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   static float fetchLuma(texture2d<uint, access::read> p0, constant ProgramNormalizeParams &p,
                          int x, int y) {
     float v;
-    if (p.source.z == kYUV420) v = float(p0.read(uint2(x, y)).x) * 4.0f;
-    else if (p.source.z == kYUV422) v = float(p0.read(uint2(x, y)).x >> 6);
+    if ((p.source.z == kYUV420 || p.source.z == kYUV4228)) v = float(p0.read(uint2(x, y)).x) * 4.0f;
+    else if ((p.source.z == kYUV422 || p.source.z == kYUV42010)) v = float(p0.read(uint2(x, y)).x >> 6);
     else v = float(v210Luma(p0.read(uint2(x / 6, y)), uint(x % 6)));
     if (p.source.w != 0) v = 64.0f + v * (876.0f / 1023.0f);
     return v;
@@ -599,8 +609,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   static float2 fetchChroma(texture2d<uint, access::read> p0, texture2d<uint, access::read> p1,
                             constant ProgramNormalizeParams &p, int x, int y) {
     float2 c;
-    if (p.source.z == kYUV420) c = float2(p1.read(uint2(x, y)).xy) * 4.0f;
-    else if (p.source.z == kYUV422) c = float2(p1.read(uint2(x, y)).xy >> 6);
+    if ((p.source.z == kYUV420 || p.source.z == kYUV4228)) c = float2(p1.read(uint2(x, y)).xy) * 4.0f;
+    else if ((p.source.z == kYUV422 || p.source.z == kYUV42010)) c = float2(p1.read(uint2(x, y)).xy >> 6);
     else c = float2(v210Chroma(p0.read(uint2(x / 3, y)), uint(x % 3)));
     if (p.source.w != 0) c = 512.0f + (c - 512.0f) * (896.0f / 1023.0f);
     return c;
@@ -620,7 +630,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   }
 
   static int2 chromaSize(uint4 g) {
-    return int2((int(g.x) + 1) / 2, g.z == kYUV420 ? (int(g.y) + 1) / 2 : int(g.y));
+    return int2((int(g.x) + 1) / 2, (g.z == kYUV420 || g.z == kYUV42010) ? (int(g.y) + 1) / 2 : int(g.y));
   }
 
   static float2 sampleChroma(texture2d<uint, access::read> p0, texture2d<uint, access::read> p1,
@@ -639,9 +649,9 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   }
 
   static uint quantize(float v, uint format) {
-    if (format == kYUV420) return uint(clamp(floor(v * 0.25f + 0.5f), 0.0f, 255.0f));
+    if ((format == kYUV420 || format == kYUV4228)) return uint(clamp(floor(v * 0.25f + 0.5f), 0.0f, 255.0f));
     uint ten = uint(clamp(floor(v + 0.5f), 0.0f, 1023.0f));
-    return format == kYUV422 ? (ten << 6) : ten;
+    return (format == kYUV422 || format == kYUV42010) ? (ten << 6) : ten;
   }
 
   kernel void programNormalizeLuma(texture2d<uint, access::read> src0 [[texture(0)]],

@@ -86,9 +86,15 @@ final class MonitorGPUContext: @unchecked Sendable {
 
   /// The GPU core, built once on first use. Concurrent callers wait for the one build.
   /// A failure is kept and rethrown until its retry delay (1 s, doubling to 30 s) runs out.
-  func core() throws -> Core {
+  func core(nonblocking: Bool = false) throws -> Core {
     if let ready = try readyCore() { return ready }
-    buildLock.lock()
+    if nonblocking {
+      guard buildLock.try() else {
+        throw MonitorKitError.gpu("Monitor GPU is preparing asynchronously.")
+      }
+    } else {
+      buildLock.lock()
+    }
     defer { buildLock.unlock() }
     if let ready = try readyCore() { return ready }
     let made: Core
@@ -114,6 +120,18 @@ final class MonitorGPUContext: @unchecked Sendable {
       pendingDrawables.removeAll()
     }
     return made
+  }
+
+  /// Discards the cached device-wide objects after Metal reports a failed
+  /// submission (typically a device/core loss). The old core remains alive for
+  /// any in-flight completion handlers; the next render builds a fresh one.
+  func invalidate() {
+    stateLock.withLock {
+      built = nil
+      failure = nil
+      retryAt = 0
+      retryDelay = 1
+    }
   }
 
   private func readyCore() throws -> Core? {

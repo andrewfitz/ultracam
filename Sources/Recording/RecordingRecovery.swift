@@ -56,12 +56,14 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
         info.st_size > 0, info.st_size < 16_384 else { throw RecordingOutputError.unsafePath }
       let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
       entry = try JSONDecoder().decode(Entry.self, from: handle.readToEnd() ?? Data())
+      let finalExtension = URL(fileURLWithPath: entry.finalName).pathExtension
+      let validFinalExtension = (try? RecordingOutputConfiguration.validateExtension(finalExtension))
       guard entry.version == 1,
         Self.safeName(entry.temporaryName), Self.safeName(entry.finalName),
         entry.temporaryName.hasPrefix("."), entry.temporaryName.hasSuffix(".partial"),
-        entry.finalName.hasSuffix(".mov"),
+        validFinalExtension == finalExtension.lowercased(),
         url.lastPathComponent == entry.temporaryName + ".ultracam-recovery",
-        entry.temporaryName == "." + String(entry.finalName.dropLast(4)) + ".partial",
+        entry.temporaryName == "." + String(entry.finalName.dropLast(finalExtension.count + 1)) + ".partial",
         entry.recoveredName.map(Self.safeName) ?? true else { throw RecordingOutputError.unsafePath }
     } catch { close(descriptor); throw error }
   }
