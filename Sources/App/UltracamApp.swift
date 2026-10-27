@@ -6,10 +6,18 @@ import SwiftUI
   private var menuBar: UIMenuBarController?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    let hideFromDock = AppSettingsStore().hideFromDock
-    NSApplication.shared.setActivationPolicy(hideFromDock ? .accessory : .regular)
     let model = UIAppEnvironment.model
     self.model = model
+    UIDockPresence.update(hideFromDock: model.hideFromDock)
+    // In the Dock while a window is open; with "Menu bar when closed", only the menu bar
+    // item once the last one closes (it is still visible while it closes, so look after).
+    for name in [NSWindow.didBecomeKeyNotification, NSWindow.willCloseNotification, NSWindow.didMiniaturizeNotification] {
+      NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+        DispatchQueue.main.async {
+          MainActor.assumeIsolated { UIDockPresence.update(hideFromDock: UIAppEnvironment.model.hideFromDock) }
+        }
+      }
+    }
     menuBar = UIMenuBarController(model: model, interface: UIAppEnvironment.interface)
     // scripts/ui-tour.sh reviews both appearances without changing the system setting.
     if let flag = CommandLine.arguments.firstIndex(of: "--ui-appearance"), CommandLine.arguments.indices.contains(flag + 1) {
@@ -21,6 +29,12 @@ import SwiftUI
       let runner = NSClassFromString("UISelfTestRunner") as? NSObject.Type {
       _ = runner.perform(NSSelectorFromString("run"))
     }
+  }
+
+  /// A Dock click with every window closed opens the main window again.
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+    if !hasVisibleWindows { UIAppEnvironment.openWindow?("main") }
+    return true
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

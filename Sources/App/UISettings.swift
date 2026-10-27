@@ -54,9 +54,9 @@ struct UISettingsGeneralPane: View {
       Section {
         Picker("Show Ultracam in", selection: showInDock) {
           Text("Dock and menu bar").tag(true)
-          Text("Menu bar only").tag(false)
+          Text("Menu bar when closed").tag(false)
         }
-        .help("Menu bar only hides the Dock icon. Closing the window never stops capture, camera output or recording.")
+        .help("Menu bar when closed: Ultracam is in the Dock, with its menus, while a window is open, and only in the menu bar once you close them; open it again from the menu bar. Closing the window never stops capture, camera output or recording.")
         Toggle("Open Ultracam at login", isOn: Binding(
           get: { loginStatus == .enabled || loginStatus == .requiresApproval },
           set: { setOpenAtLogin($0) }))

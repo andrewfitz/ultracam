@@ -15,6 +15,13 @@ struct UICommands: Commands {
       openSettings: { openSettings() })
   }
 
+  /// Hands SwiftUI's scene actions to AppKit (`UIAppEnvironment`).
+  private func registerSceneActions() {
+    let openWindow = openWindow, openSettings = openSettings
+    UIAppEnvironment.openWindow = { openWindow(id: $0) }
+    UIAppEnvironment.openSettings = { openSettings() }
+  }
+
   var body: some Commands {
     let bridge = self.bridge
     let session = bridge.snapshot()
@@ -22,9 +29,12 @@ struct UICommands: Commands {
     let selected = presentation.selected
     let selectedSnapshot = session.cameras.first { $0.id == session.selectedID }
     let send: @MainActor (UIAction) -> Void = { bridge.send($0) }
+    // The menus exist from launch, with or without a window: the menu bar item and a Dock
+    // click open windows through these.
+    let _ = registerSceneActions()
 
     CommandGroup(after: .appSettings) {
-      Toggle("Hide from Dock", isOn: Binding(get: { model.hideFromDock }, set: { model.hideFromDock = $0 }))
+      Toggle("Menu Bar Only When Closed", isOn: Binding(get: { model.hideFromDock }, set: { model.hideFromDock = $0 }))
     }
 
     CommandGroup(replacing: .appTermination) {

@@ -95,7 +95,7 @@ final class AppModel {
     didSet {
       guard hideFromDock != oldValue else { return }
       settingsStore.hideFromDock = hideFromDock
-      NSApplication.shared.setActivationPolicy(hideFromDock ? .accessory : .regular)
+      UIDockPresence.update(hideFromDock: hideFromDock)
     }
   }
   /// Lets cameras send HLG and PQ over HDMI: each UltraStudio's EDID advertises

@@ -78,16 +78,20 @@ final class UIMenuCommandBox: NSObject {
   }
 
   private func open(windowID id: String) {
+    // Into the Dock first, so the window opens with its menus ("Menu bar when closed").
+    if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
     if let window = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix(id) == true }) {
       window.makeKeyAndOrderFront(nil)
-    } else if let openWindow {
+    } else if let openWindow = openWindow ?? UIAppEnvironment.openWindow {
+      // A closed SwiftUI window is gone; SwiftUI makes it again.
       openWindow(id)
     }
     NSApp.activate(ignoringOtherApps: true)
   }
 
   private func showSettings() {
-    if let openSettings { openSettings() }
+    if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+    if let openSettings = openSettings ?? UIAppEnvironment.openSettings { openSettings() }
     else { NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) }
     NSApp.activate(ignoringOtherApps: true)
   }
