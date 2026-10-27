@@ -931,6 +931,14 @@ final class FeedCoordinator {
     capture(for: feedID).setCameraOutputEnabled(enabled)
   }
 
+  /// Every running camera whose virtual camera isn't connected tries again now: CMIO's
+  /// cameras changed, so the camera extension may have just started.
+  func requestCameraReconnects() {
+    for descriptor in descriptors where isFeedRunning(descriptor.id) {
+      capture(for: descriptor.id).requestCameraReconnect()
+    }
+  }
+
   /// Updates the live Program scheduler. Capture failure of one source must
   /// not leave that source eligible for the next cut.
   func setProgramSourceHealth(_ feedID: FeedID, healthy: Bool) {

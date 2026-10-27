@@ -1316,6 +1316,32 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(absent.starts, 1)
   }
 
+  /// The camera extension starting after the camera did (installed, approved or updated while
+  /// it runs): CMIO's cameras change and the camera connects, with no change of settings.
+  func testInitiallyAbsentCameraConnectsWhenVirtualCamerasChange() throws {
+    let source = try EndToEndChecks.source()
+    let harness = CaptureHarness()
+    var services = harness.services(automatic: true)
+    services.cameraRetryInterval = 0
+    harness.failNextConnections(1)
+    let controller = CaptureController(services: services)
+    defer { controller.onUpdate = nil; controller.stop() }
+    ready(controller, harness: harness, configuration: config)
+    harness.emitAutomatic(source, at: .zero, duration: VideoContract.fastDuration)
+    awaitCondition("Preview runs without the camera") { harness.previewed == 1 }
+    XCTAssertEqual(harness.negotiated.count, 1)
+    XCTAssertEqual(harness.sent, 0)
+    controller.requestCameraReconnect()
+    allowQueueWork()
+    harness.emitAutomatic(source, at: VideoContract.fastDuration, duration: VideoContract.fastDuration)
+    awaitCondition("The camera connects and delivers once its extension's cameras appear") { harness.sent == 1 }
+    XCTAssertEqual(harness.negotiated.count, 2)
+    controller.requestCameraReconnect()
+    allowQueueWork()
+    XCTAssertEqual(harness.negotiated.count, 2, "A connected camera ignores the change")
+    XCTAssertEqual(harness.starts, 1, "Capture is never reopened")
+  }
+
   func testSuccessfulReconnectWithoutSuccessfulSendCannotRenewRetryBudget() throws {
     let harness = CaptureHarness(failSending: true)
     var services = harness.services(automatic: true)

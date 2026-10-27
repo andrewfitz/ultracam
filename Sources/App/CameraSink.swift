@@ -154,6 +154,37 @@ enum CameraStreamNames {
   }
 }
 
+/// Calls `changed` on the main queue whenever CMIO's device list changes, as when the camera
+/// extension starts and its cameras appear. Removes its listener when released.
+final class CMIODeviceListWatcher {
+  private let block: CMIOObjectPropertyListenerBlock
+  private let registered: Bool
+
+  init(changed: @escaping @MainActor () -> Void) {
+    let system = CMIOObjectID(kCMIOObjectSystemObject)
+    // A process sees software cameras, and hears of them, only after opting in.
+    var visibility = Self.address(kCMIOHardwarePropertyAllowScreenCaptureDevices)
+    var allow: UInt32 = 1
+    _ = CMIOObjectSetPropertyData(system, &visibility, 0, nil, UInt32(MemoryLayout<UInt32>.size), &allow)
+    block = { _, _ in MainActor.assumeIsolated { changed() } }
+    var devices = Self.address(kCMIOHardwarePropertyDevices)
+    let status = CMIOObjectAddPropertyListenerBlock(system, &devices, .main, block)
+    registered = status == noErr
+    if !registered { cameraOutputLog.error("Virtual camera watch unavailable: CMIO status \(status, privacy: .public)") }
+  }
+
+  deinit {
+    guard registered else { return }
+    var devices = Self.address(kCMIOHardwarePropertyDevices)
+    _ = CMIOObjectRemovePropertyListenerBlock(CMIOObjectID(kCMIOObjectSystemObject), &devices, .main, block)
+  }
+
+  private static func address(_ selector: Int) -> CMIOObjectPropertyAddress {
+    CMIOObjectPropertyAddress(mSelector: UInt32(selector), mScope: UInt32(kCMIOObjectPropertyScopeGlobal),
+      mElement: UInt32(kCMIOObjectPropertyElementMain))
+  }
+}
+
 final class CameraSink {
   private var deviceID: CMIODeviceID = 0
   private var streamID: CMIOStreamID = 0

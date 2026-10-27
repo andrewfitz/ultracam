@@ -34,6 +34,9 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   var devices: () throws -> [InputDevice]
   var driverWarning: () -> String?
   var observeDevices: (@escaping @MainActor @Sendable ([InputDevice]) -> Void) -> Any?
+  /// Calls the handler whenever CMIO's device list changes (the camera extension starting,
+  /// its cameras appearing). Holds the observation until the returned value is released.
+  var observeVirtualCameras: (@escaping @MainActor () -> Void) -> Any? = { _ in nil }
   var diagnostics: (String) -> UltracamDeviceDiagnostics?
   /// "Advertise HDR to cameras": whether discovery writes the HDR EDID. Never
   /// at a capture start (an EDID write makes the camera renegotiate HDMI).
@@ -48,6 +51,7 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
         handler(list.map { InputDevice(id: $0.identifier, name: $0.name) })
       }
     },
+    observeVirtualCameras: { CMIODeviceListWatcher(changed: $0) },
     diagnostics: { UltracamBackend.diagnostics(deviceID: $0) },
     setAdvertisesHDR: { UltracamBackend.setAdvertisesHDR($0) })
 
@@ -109,6 +113,7 @@ final class AppModel {
   /// reject the SDK 16 interfaces and would otherwise list no inputs.
   var driverWarning: String?
   @ObservationIgnored private var deviceListObserver: Any?
+  @ObservationIgnored private var virtualCameraObserver: Any?
   var feedDescriptors: [FeedDescriptor] { feedCoordinator.descriptors }
   /// The LUT a camera burns into its output now (nil when none): what its
   /// virtual camera, recording, Program and monitor Output stage get. Never
@@ -443,6 +448,12 @@ final class AppModel {
     // Hot-plug: arrivals and removals update the list without a manual refresh.
     deviceListObserver = hardware.observeDevices { [weak self] list in
       self?.applyDevices(list, fromDiscovery: true)
+    }
+    // The camera extension can start after a camera does (installed, approved or updated while
+    // the app runs): when its cameras appear, every running camera whose virtual camera isn't
+    // connected connects, without a restart or a change of settings.
+    virtualCameraObserver = hardware.observeVirtualCameras { [weak self] in
+      self?.feedCoordinator.requestCameraReconnects()
     }
     demandMonitor.onRouteChange = { [weak self] change in
       guard let self else { return }
