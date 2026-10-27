@@ -272,6 +272,8 @@ struct UICameraPictureView: View {
 
   private var signalMenu: some View {
     let stage = context.monitor.preferences(for: camera.id).state.pictureStage
+    // What the camera sends ("1080p 29.97"): the picture runs at its frame rate.
+    let output = context.session.cameras.first { $0.id == camera.id }?.outputFormat
     return Menu {
       Picker("Picture", selection: Binding(
         get: { context.monitor.preferences(for: camera.id).state.pictureStage },
@@ -281,21 +283,22 @@ struct UICameraPictureView: View {
           context.monitor.setPreferences(next, for: camera.id)
         })) {
         Text("Source (camera signal)").tag(SignalStage.source)
-        Text("Output (LUT)").tag(SignalStage.output)
+        Text(output.map { "Output (LUT, sent as \($0))" } ?? "Output (LUT)").tag(SignalStage.output)
         Text("Monitor").tag(SignalStage.monitor)
       }
       .pickerStyle(.inline)
     } label: {
-      UIPictureMenuLabel(title: Self.stageTitle(stage))
+      UIPictureMenuLabel(title: Self.stageTitle(stage, output: output))
     }
     .menuStyle(.button)
     .buttonStyle(.plain)
     .menuIndicator(.hidden)
     .fixedSize()
     .uiPictureMenuBacking()
-    .help("Choose what this picture shows")
+    .help(output.map { "Choose what this picture shows. The camera sends \($0), and the picture runs at its frame rate." }
+      ?? "Choose what this picture shows")
     .accessibilityLabel("Picture signal")
-    .accessibilityValue(Self.stageTitle(stage))
+    .accessibilityValue(Self.stageTitle(stage, output: output))
   }
 
   /// What the picture shows when it isn't the Output stage, always on the
@@ -330,10 +333,11 @@ struct UICameraPictureView: View {
     }
   }
 
-  static func stageTitle(_ stage: SignalStage) -> String {
+  /// The stage menu's title; on the Output stage, with what the camera sends ("Output · 1080p 29.97").
+  static func stageTitle(_ stage: SignalStage, output: String? = nil) -> String {
     switch stage {
     case .source: return "Source"
-    case .output: return "Output"
+    case .output: return output.map { "Output · \($0)" } ?? "Output"
     case .monitor: return "Monitor"
     }
   }

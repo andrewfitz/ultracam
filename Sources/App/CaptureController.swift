@@ -1082,10 +1082,15 @@ final class CaptureController: @unchecked Sendable {
       let sink = monitorSink
       let hasPreview = previewEnabled && services.preview != nil
       let processedHandler = lock.withLock { processedFrameHandler }
+      // Temporal selection happens before any GPU work or buffer allocation;
+      // complete bypass keeps the source duration and so every frame. The
+      // monitor shows the output's frames only, so with a lower output rate
+      // (59.94 to 29.97) the picture runs at that rate too.
+      let selected = frameRateGate.shouldDeliver(frame.pts, duration: effective.duration)
       // No downstream demand: keep metadata/detection alive without allocating,
       // submitting GPU work or staging raw buffers that nobody can consume.
       guard cameraConnected || cameraConnecting || hasPreview || processedHandler != nil else {
-        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token, untouched: effective.untouched) }
+        if let sink, selected { offerSourceOnlyInOrder(sink, frame: frame, token: token, untouched: effective.untouched) }
         if preparedConfiguration != nil {
           processor?.releaseIdleResources()
           preparedConfiguration = nil
@@ -1098,12 +1103,7 @@ final class CaptureController: @unchecked Sendable {
         publishIfDue(token: token, force: metadataChanged)
         return
       }
-      // Temporal selection happens before any GPU work or buffer allocation;
-      // complete bypass keeps the source duration and so every frame.
-      guard frameRateGate.shouldDeliver(frame.pts, duration: effective.duration) else {
-        if let sink { offerSourceOnlyInOrder(sink, frame: frame, token: token, untouched: effective.untouched) }
-        return
-      }
+      guard selected else { return }
       // Created on first demand; a complete bypass still uses it for the owned GPU copy.
       let processor = try makeProcessor()
       try ensurePrepared(effective, wait: false)
@@ -1141,9 +1141,9 @@ final class CaptureController: @unchecked Sendable {
     } catch { fail(error.localizedDescription, token: token) }
   }
 
-  /// A monitor offer for a frame that skips the GPU (no other consumer, or
-  /// removed by the frame-rate gate). Ordered behind every frame already on
-  /// the GPU, whose offers are made when they complete.
+  /// A monitor offer for a frame that skips the GPU (no other consumer).
+  /// Ordered behind every frame already on the GPU, whose offers are made
+  /// when they complete.
   private func offerSourceOnlyInOrder(
     _ sink: any MonitorFrameSink, frame: CapturedFrame, token: UInt64, untouched: Bool
   ) {

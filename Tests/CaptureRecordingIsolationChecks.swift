@@ -715,8 +715,19 @@ import XCTest
     XCTAssertTrue(offers.allSatisfy(\.untouched), "Processing off: published untouched")
   }
 
+  /// With the output limited to 29.97 from a 59.94 source, the monitor gets the
+  /// output's frames only, every second source frame, so the picture runs at the
+  /// rate the camera sends.
+  @MainActor func testMonitorRunsAtTheOutputFrameRate() throws {
+    var configuration = PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true)
+    configuration.reduceFrameRate = true
+    let offers = try monitorAloneOffers(configuration, pipelineEnabled: true, every: 2)
+    XCTAssertEqual(offers.map(\.pts), [0, 2, 4].map { CMTimeMultiply(VideoContract.fastDuration, multiplier: Int32($0)) })
+  }
+
+  /// `every`: the monitor gets every `every`th source frame (the output's frame rate).
   @MainActor private func monitorAloneOffers(
-    _ configuration: PipelineConfiguration, pipelineEnabled: Bool
+    _ configuration: PipelineConfiguration, pipelineEnabled: Bool, every: Int = 1
   ) throws -> [SourceOfferLog.Offer] {
     let image = try syntheticRamp()
     let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
@@ -757,15 +768,15 @@ import XCTest
     for frame in 0..<count {
       harness.emit(image, pts: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration)
     }
-    pumpUntil { sink.offers.count == count }
+    pumpUntil { sink.offers.count == count / every }
     pumpUntil { updates.contains { $0.message == "Camera ready — no active video destination." } }
     let offers = sink.offers
-    XCTAssertEqual(offers.count, count)
+    XCTAssertEqual(offers.count, count / every)
     for (index, offer) in offers.enumerated() {
       XCTAssertTrue(offer.image === image, "The monitor gets the capture buffer itself")
-      XCTAssertEqual(offer.pts, CMTimeMultiply(duration, multiplier: Int32(index)))
+      XCTAssertEqual(offer.pts, CMTimeMultiply(duration, multiplier: Int32(index * every)))
       XCTAssertEqual(offer.captureGeneration, offers[0].captureGeneration)
-      if index > 0 { XCTAssertEqual(offer.sequence, offers[index - 1].sequence + 1) }
+      if index > 0 { XCTAssertEqual(offer.sequence, offers[index - 1].sequence + UInt64(every)) }
     }
     XCTAssertTrue(updates.allSatisfy { $0.framesInFlight == 0 && $0.gpuMS == 0 },
       "A monitor-only feed submits no GPU work")
