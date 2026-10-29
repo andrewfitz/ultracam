@@ -260,6 +260,18 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     }
   }
 
+  /// Rust decisions carry absolute seconds. Quantize each absolute boundary
+  /// once onto the same clock as Program and the durable session timeline.
+  static func instructionTime(seconds: Double) -> CMTime? {
+    guard seconds.isFinite, seconds >= 0 else { return nil }
+    // CMTime(seconds:preferredTimescale:) can truncate a binary Double just
+    // below an integral tick. Explicit nearest rounding preserves boundaries
+    // that crossed the director's seconds-based JSON API.
+    let ticks = (seconds * 240_000).rounded(.toNearestOrAwayFromZero)
+    guard let value = Int64(exactly: ticks) else { return nil }
+    return CMTime(value: value, timescale: 240_000).validValue
+  }
+
   private func send(_ event: [String: Any]) {
     guard let handle,
       let data = try? JSONSerialization.data(withJSONObject: event),
@@ -281,8 +293,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
         guard let instruction = value.instruction,
           let target = instruction.targetCameraID,
           let decisionID = UUID(uuidString: instruction.decisionID),
-          let cutTime = CMTime(seconds: instruction.cutTime, preferredTimescale: 60_000).validValue,
-          let expiresAt = CMTime(seconds: instruction.expiresAt, preferredTimescale: 60_000).validValue else { continue }
+          let cutTime = Self.instructionTime(seconds: instruction.cutTime),
+          let expiresAt = Self.instructionTime(seconds: instruction.expiresAt) else { continue }
         let instructionHandler = onInstruction
         instructionHandler?(AutoSwitcherInstruction(decisionID: decisionID,
           sessionGeneration: instruction.sessionGeneration,

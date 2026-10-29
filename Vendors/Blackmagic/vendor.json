@@ -1,0 +1,189 @@
+{
+  "schemaVersion": 1,
+  "headerSearchPaths": [],
+  "frameworks": [
+    "Foundation"
+  ],
+  "libraries": [],
+  "defines": [],
+  "embedLibraries": [],
+  "tests": [],
+  "id": "decklink",
+  "kinds": [
+    "capture"
+  ],
+  "sources": [
+    {
+      "path": "Sources/DeckLinkBackend.h",
+      "membership": [
+        "app",
+        "test"
+      ]
+    },
+    {
+      "path": "Sources/DeckLinkBackend.mm",
+      "membership": [
+        "app",
+        "test"
+      ]
+    },
+    {
+      "path": "Sources/DeckLinkCapturePlugin.swift",
+      "membership": [
+        "app",
+        "test"
+      ]
+    },
+    {
+      "path": "SDK/include/DeckLinkAPIDispatch.cpp",
+      "membership": [
+        "app",
+        "test"
+      ]
+    },
+    {
+      "path": "Tests/BackendTestSupport.inc",
+      "membership": [
+        "test"
+      ]
+    },
+    {
+      "path": "Tests/DeckLinkAdapterContractChecks.swift",
+      "membership": [
+        "test"
+      ]
+    },
+    {
+      "path": "Tests/DeckLinkChecks.swift",
+      "membership": [
+        "test"
+      ]
+    },
+    {
+      "path": "Tests/DeckLinkChecksAudioMetering.swift",
+      "membership": [
+        "test"
+      ]
+    },
+    {
+      "path": "Tests/DeckLinkChecksAudioOvers.swift",
+      "membership": [
+        "test"
+      ]
+    },
+    {
+      "path": "Tests/DeckLinkReusableConformanceChecks.swift",
+      "membership": [
+        "test"
+      ]
+    },
+    {
+      "path": "Sources/OwnedCaptureAllocator.inc",
+      "membership": [
+        "app",
+        "test"
+      ]
+    }
+  ],
+  "publicHeaders": [
+    "Sources/DeckLinkBackend.h"
+  ],
+  "resources": [
+    {
+      "path": "Resources/Assets.xcassets",
+      "membership": [
+        "app"
+      ]
+    },
+    {
+      "path": "Resources/en.lproj/BlackmagicCapture.strings",
+      "membership": [
+        "app"
+      ]
+    }
+  ],
+  "testBuild": {
+    "defines": [
+      "ULTRACAM_BACKEND_TESTING"
+    ]
+  },
+  "testGroups": {},
+  "sdk": {
+    "root": "SDK",
+    "policy": "vendored",
+    "optional": false,
+    "version": "16.0",
+    "requiredFiles": [
+      "SDK/include/DeckLinkAPI.h",
+      "SDK/include/DeckLinkAPIDispatch.cpp"
+    ],
+    "enabledBuild": {
+      "headerSearchPaths": [
+        "SDK/include"
+      ]
+    },
+    "fileSHA256": {
+      "SDK/include/DeckLinkAPI.h": "ec4e03ccc7885a855f9d5b62a6832509da34cd55ac9a11ab4fbcc72abdedbd77",
+      "SDK/include/DeckLinkAPIConfiguration.h": "e9ac1108e4fa7c738ea147eebaedb603b21cdc0b3f8ce308cec13b4b9adfe88a",
+      "SDK/include/DeckLinkAPIConfiguration_v10_11.h": "8d60de3b743daa22f8baa961636f9cdcef88b9a3f9b0187b3d819d76ca9af474",
+      "SDK/include/DeckLinkAPIConfiguration_v10_2.h": "8a848952009d931f77e9c77544f42c3ec0692ee82a0d046861ec26aa0ec167ef",
+      "SDK/include/DeckLinkAPIConfiguration_v10_4.h": "13eb6ddfc60ab94b4d9457d40b59a35029a004e6f7707fb597389a80485b125d",
+      "SDK/include/DeckLinkAPIConfiguration_v10_5.h": "651e5a3d7b9024de5b7bbb40e5e8b0ca34119057ac97139afa89e1a7d5b048cc",
+      "SDK/include/DeckLinkAPIConfiguration_v10_9.h": "1491818611193e9b08c5086658e0917ea8d6c243faf4cab752896abefbf4f54c",
+      "SDK/include/DeckLinkAPIConfiguration_v15_3_1.h": "5782672f91d5783e02068ae7d3b6730886c71e81f1b8b0f1137bdedbfc444c56",
+      "SDK/include/DeckLinkAPIDeckControl.h": "314fc4c935932086daaa8059dc490349a7b36656a3077580c27128fb30bb18f8",
+      "SDK/include/DeckLinkAPIDiscovery.h": "b95e2c3bd01f1360c29695b3d6e68b2bb3f644d90ddbf81e86ef06bd0e7e7327",
+      "SDK/include/DeckLinkAPIDispatch.cpp": "f40630a5372c017d9f0cf4968b39a9573de65e929de7d0c448cb4ddec6b8e729",
+      "SDK/include/DeckLinkAPIDispatch_v10_11.cpp": "b96b3758851928838fc9e624ca307f1c7c38877403f3ad68966cfb0dfd2b031b",
+      "SDK/include/DeckLinkAPIDispatch_v10_8.cpp": "6028a11c13f378c686b124165e2ed4b6f4d91598297c17bced8ad605e972c83f",
+      "SDK/include/DeckLinkAPIDispatch_v14_2_1.cpp": "6ae2abf314ac5c33716257b39085abb1d29997c749a83bc7936688f1b6a75ca4",
+      "SDK/include/DeckLinkAPIDispatch_v15_2.cpp": "7c161bf7ad8c9404c0ce3f641604d4db23e486d0f213b96bad9269065213ed8f",
+      "SDK/include/DeckLinkAPIDispatch_v15_3_1.cpp": "9fafffa5c3bf1cff2d82d40ed6ce918c8197df396223ab0b8615fa604d29bfb7",
+      "SDK/include/DeckLinkAPIGLScreenPreview_v14_2_1.h": "7306d9304ab21e37831b2c9062ed2ec9345a4ee37bb4aa4a402f7e95e4f50f80",
+      "SDK/include/DeckLinkAPIMemoryAllocator_v14_2_1.h": "e1255fed36cd9755cd5394287ea01ca32f1dbff82f13b066c2fd3f8ced362527",
+      "SDK/include/DeckLinkAPIMetalScreenPreview_v14_2_1.h": "a10efb51245cbac35d26e3107ff2e0dcedf010540de251bb0a9cfe148e1edf7a",
+      "SDK/include/DeckLinkAPIModes.h": "8a3e453553df384e70404a91d811ac0588d0a1894d2203e261b5dbae38d27865",
+      "SDK/include/DeckLinkAPIScreenPreviewCallback_v14_2_1.h": "74b73d7c5e5fa28db1981730158ff9438353664cf7b7a8ce5b2ce6f1c1be4281",
+      "SDK/include/DeckLinkAPIStreaming.h": "ea2624b56f39c2ae5104aa87a580cce190833a37302301f0a40cd9c5709858da",
+      "SDK/include/DeckLinkAPIStreaming_v10_11.h": "05cb8bfa70333becdb3f2b5d06300816204a01b0afb9b6c72e6325b2df6298ac",
+      "SDK/include/DeckLinkAPITypes.h": "b0ada762c45a9f09f4e1333f5c9e2e5fc8f38d563fcc5e54df6d0d375aed9988",
+      "SDK/include/DeckLinkAPIVersion.h": "074dd64520cf26eb58334390fef661aef503af584244be50846321fc905ba4f4",
+      "SDK/include/DeckLinkAPIVideoConversion_v14_2_1.h": "683779b76199bd87b33ecae06df6042d87b24ded52d6a05f22ab4b0c2968ad42",
+      "SDK/include/DeckLinkAPIVideoEncoderInput_v10_11.h": "c86b4e5fb2596c138b1d8987e285c3c2a4f6775058dc4e04c5ce5aa2c380e5b6",
+      "SDK/include/DeckLinkAPIVideoFrame3DExtensions_v14_2_1.h": "e326e62b67e7c5c2f3bb23c97f3b0706b24e6c354c3dbc57ee0702af652a0f36",
+      "SDK/include/DeckLinkAPIVideoFrame_v14_2_1.h": "2667052ec986d7609f17ea18dc13aa78f9666b3e37cb41ff86e9e63597efbc19",
+      "SDK/include/DeckLinkAPIVideoInput_v10_11.h": "0e765cb86884b8d257e0fb39d4847cca734657155a5a3514ff50917dd78c133e",
+      "SDK/include/DeckLinkAPIVideoInput_v11_4.h": "47e79e382ea4a4c382298b2eeae381b598794177325eddc0f0c435a9ed94e87e",
+      "SDK/include/DeckLinkAPIVideoInput_v11_5_1.h": "b3753c43d2e6e328941671b639efbd9ce2fd3d31d1f748144ff4b5f62cfd0b59",
+      "SDK/include/DeckLinkAPIVideoInput_v14_2_1.h": "5561338520a35741ec613a7c9c47e3ee3f8bc1575f7deb84beb4029258725a99",
+      "SDK/include/DeckLinkAPIVideoInput_v15_3_1.h": "a9ee12b525682c21ca8b0be761753ed538fca9fdc451826a77e3b1fdb7dd8d9e",
+      "SDK/include/DeckLinkAPIVideoOutput_v10_11.h": "a21fa49ec16069be73dc9dc653ab46f845bd5f6b6a5551fec8aeaa9ac82df089",
+      "SDK/include/DeckLinkAPIVideoOutput_v11_4.h": "51ee1399c450cc3191f5352e0fc56f2aa62e19a619b670e9aa51901972391302",
+      "SDK/include/DeckLinkAPIVideoOutput_v14_2_1.h": "74de43d7f7d3ae5ee32fb4b512289bf69f51c479f403b488903f5fe7868d193f",
+      "SDK/include/DeckLinkAPIVideoOutput_v15_3_1.h": "21f86d441ba9832af468ebf9c121a796bb67e55aa02837f9b350c7c847085bbe",
+      "SDK/include/DeckLinkAPI_v10_11.h": "5c2b1dbae17bf82e6f94835647647385a5e8d83d031f7fe60ad491c34e107cbd",
+      "SDK/include/DeckLinkAPI_v10_2.h": "8b9af56d0b3453789ce8ddf53e9dbd9c0cc88929ef0002b6537f169c05b9299f",
+      "SDK/include/DeckLinkAPI_v10_4.h": "47c9bdcdfdcdbf7618a20685e87d68289dc6559cf6fd4c5330740718ac88f0f9",
+      "SDK/include/DeckLinkAPI_v10_5.h": "441148b63e5f1e9b66b462d22ae9bc546c20afb108b20ea5c872921f9058bd15",
+      "SDK/include/DeckLinkAPI_v10_6.h": "0a518e5be1e5317dcb4748d62924589b3d008edc7d1290052cc6d28f200b1331",
+      "SDK/include/DeckLinkAPI_v10_9.h": "5f932b7f88f8710d49d67cf14f5fe4340f591b870841e7361ad11acb80f451c3",
+      "SDK/include/DeckLinkAPI_v11_5.h": "0c1d934b07ef62a8f07de60b687e95e20201ad558ee6dc0a17341a229655a8fe",
+      "SDK/include/DeckLinkAPI_v11_5_1.h": "c0a7637b1835dcef6407b8e5e452b9fc03106fbb033ae88eed91ca1c34b51290",
+      "SDK/include/DeckLinkAPI_v14_2_1.h": "98d85516007b7e6ec12f3cf523680e03fe1ed5256e8f3d17b6973cd3120023fe",
+      "SDK/include/DeckLinkAPI_v15_2.h": "06bb25cd9ab096bbd883188dcbadcc543340b54cce48eb2d7452d9c1674d561f",
+      "SDK/include/DeckLinkAPI_v15_3_1.h": "a6aec59a5c29f0f16dc1f4b42d1ab45d7c8728d8deeefa0f8e0a0edf7ded84b6"
+    },
+    "externalDrivers": [
+      "/Library/Frameworks/DeckLinkAPI.framework",
+      "/Library/Application Support/Blackmagic Design/Streaming/BMDStreamingAPI.bundle"
+    ]
+  },
+  "capabilities": {
+    "entitlements": [
+      "com.apple.security.cs.disable-library-validation",
+      "com.apple.security.temporary-exception.mach-lookup.global-name",
+      "com.apple.security.temporary-exception.shared-preference.read-only"
+    ],
+    "infoPlist": []
+  }
+}

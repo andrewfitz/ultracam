@@ -109,29 +109,29 @@ import XCTest
   func testBypassedHeadlessProgramUsesUntouchedSourceContractAndDetectedCadence() {
     let saved = PipelineConfiguration(
       applyLUT: true, downscale: true,
-      convertTo420: true, reduceFrameRate: true, inputFast: true)
+      convertTo420: true, reduceFrameRate: true)
     let bypass = FeedLifecycleDemandPolicy.programContract(
       configuration: saved,
-      pipelineEnabled: false, detectedInputFast: false)
+      pipelineEnabled: false, detectedSourceDuration: VideoContract.slowDuration)
     XCTAssertFalse(bypass.applyLUT)
     XCTAssertFalse(bypass.downscale)
     XCTAssertFalse(bypass.convertTo420)
     XCTAssertFalse(bypass.reduceFrameRate)
-    XCTAssertFalse(bypass.inputFast)
+    XCTAssertEqual(bypass.sourceDuration, VideoContract.slowDuration)
     XCTAssertEqual(bypass.width, 3840)
     XCTAssertEqual(bypass.height, 2160)
     XCTAssertTrue(bypass.untouched)
     var expectedProcessed = saved
-    expectedProcessed.inputFast = false
+    expectedProcessed.sourceDuration = VideoContract.slowDuration
     XCTAssertEqual(
       FeedLifecycleDemandPolicy.programContract(
         configuration: saved,
-        pipelineEnabled: true, detectedInputFast: false), expectedProcessed)
-    XCTAssertTrue(
+        pipelineEnabled: true, detectedSourceDuration: VideoContract.slowDuration), expectedProcessed)
+    XCTAssertEqual(
       FeedLifecycleDemandPolicy.programContract(
         configuration: saved,
-        pipelineEnabled: false, detectedInputFast: nil
-      ).inputFast)
+        pipelineEnabled: false, detectedSourceDuration: nil
+      ).sourceDuration, saved.sourceDuration)
   }
 
 }

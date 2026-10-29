@@ -53,11 +53,11 @@ import XCTest
     let input = try Self.source()
     // Every checkbox is independent, including rate reduction. Test both
     // source rates: reducing a 29.97 source must never halve it again.
-    for inputFast in [false, true] {
+    for inputDuration in [VideoContract.slowDuration, VideoContract.fastDuration] {
       for bits in 0..<16 {
         try autoreleasepool {
           let config = PipelineConfiguration(applyLUT: bits & 1 != 0, downscale: bits & 2 != 0,
-            convertTo420: bits & 4 != 0, reduceFrameRate: bits & 8 != 0, inputFast: inputFast)
+            convertTo420: bits & 4 != 0, reduceFrameRate: bits & 8 != 0, sourceDuration: inputDuration)
           let output = try processor.process(input, configuration: config)
           XCTAssertEqual(CVPixelBufferGetWidth(output), bits & 2 != 0 ? 1920 : 3840)
           XCTAssertEqual(CVPixelBufferGetHeight(output), bits & 2 != 0 ? 1080 : 2160)
@@ -66,12 +66,11 @@ import XCTest
           let expectedCode = config.convertTo420 ? (config.applyLUT ? 180 : 71) : (config.applyLUT ? 721 : 283)
           for point in [(0, 0), (config.width / 2, config.height / 2), (config.width - 1, config.height - 1)] {
             XCTAssertEqual(Double(try luma(output, x: point.0, y: point.1)), Double(expectedCode), accuracy: 1,
-              "Constant neutral image must survive processing and scaling, flags=\(bits), inputFast=\(inputFast)")
+              "Constant neutral image must survive processing and scaling, flags=\(bits), sourceDuration=\(inputDuration)")
           }
           if config.untouched { XCTAssertTrue(output === input) }
 
-          let inputDuration = inputFast ? VideoContract.fastDuration : VideoContract.slowDuration
-          let expectedDuration = CMTime(value: 1001, timescale: inputFast && bits & 8 == 0 ? 60_000 : 30_000)
+          let expectedDuration = bits & 8 == 0 ? inputDuration : CMTimeMaximum(inputDuration, VideoContract.slowDuration)
           var gate = FrameRateGate()
           var delivered = [CMTime]()
           let hostOrigin = CMTime(value: 120, timescale: 1)
@@ -93,7 +92,7 @@ import XCTest
             XCTAssertEqual(CMFormatDescriptionGetMediaSubType(description), CVPixelBufferGetPixelFormatType(output))
             delivered.append(outputPTS)
           }
-          XCTAssertEqual(delivered.count, inputFast && config.reduceFrameRate ? 3 : 6)
+          XCTAssertEqual(delivered.count, inputDuration == VideoContract.fastDuration && config.reduceFrameRate ? 3 : 6)
           for index in 1..<delivered.count {
             XCTAssertEqual(CMTimeSubtract(delivered[index], delivered[index - 1]), expectedDuration)
           }
@@ -108,7 +107,7 @@ import XCTest
     for bits in 0..<8 {
       try autoreleasepool {
         let config = PipelineConfiguration(applyLUT: false, downscale: bits & 1 != 0,
-          convertTo420: bits & 2 != 0, reduceFrameRate: bits & 4 != 0, inputFast: true)
+          convertTo420: bits & 2 != 0, reduceFrameRate: bits & 4 != 0, sourceDuration: VideoContract.fastDuration)
         let output = try processor.process(input, configuration: config)
         let sample = try VideoContract.sample(output, at: .zero, duration: config.duration)
         XCTAssertTrue(CMSampleBufferDataIsReady(sample))
@@ -117,7 +116,7 @@ import XCTest
       }
     }
     XCTAssertThrowsError(try processor.process(input, configuration: PipelineConfiguration(
-      applyLUT: true, downscale: false, convertTo420: false, reduceFrameRate: false, inputFast: true)),
+      applyLUT: true, downscale: false, convertTo420: false, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration)),
       "An enabled, missing LUT must report an error instead of reading an uninitialized cube")
   }
 
@@ -131,7 +130,7 @@ import XCTest
     try processor.load(CubeLUT(text: cube))
     let input = try Self.source { UInt16(400 + $0 % 80) }
     let config = PipelineConfiguration(applyLUT: true, downscale: false,
-      convertTo420: true, reduceFrameRate: false, inputFast: true)
+      convertTo420: true, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration)
     let output = try processor.process(input, configuration: config)
     var levels = Set<Int>()
     for x in 0..<80 {
@@ -156,7 +155,7 @@ import XCTest
     let processor = try LUTProcessor()
     let input = try Self.source()
     let config = PipelineConfiguration(applyLUT: false, downscale: true,
-      convertTo420: true, reduceFrameRate: false, inputFast: true)
+      convertTo420: true, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration)
     var retained = [CVPixelBuffer]()
     for frame in 0..<VideoContract.outputBufferLimit {
       let output = try processor.process(input, configuration: config)
@@ -424,7 +423,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
 
 @objcMembers final class CaptureLifecycleChecks: XCTestCase {
   private let config = PipelineConfiguration(applyLUT: false, downscale: true,
-    convertTo420: true, reduceFrameRate: false, inputFast: true)
+    convertTo420: true, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration)
 
   private func allowQueueWork(_ seconds: TimeInterval = 0.02) {
     let resumed = expectation(description: "Allow asynchronous capture/preview work")
@@ -505,7 +504,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let controller = CaptureController(services: harness.services(automatic: true))
     defer { controller.onUpdate = nil; controller.stop() }
     let saved = PipelineConfiguration(applyLUT: true, downscale: true,
-      convertTo420: true, reduceFrameRate: true, inputFast: false)
+      convertTo420: true, reduceFrameRate: true, sourceDuration: VideoContract.slowDuration)
     ready(controller, harness: harness, configuration: saved, pipelineEnabled: false)
     let statuses = CaptureStatusRecorder()
     controller.onUpdate = { statuses.record($0) }
@@ -697,7 +696,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop() }
     var saved = config
-    saved.inputFast = false
+    saved.sourceDuration = VideoContract.slowDuration
     ready(controller, harness: harness, configuration: saved)
     XCTAssertEqual(harness.negotiated.count, 1, "Known native storage permits connection before callbacks begin")
     XCTAssertEqual(harness.negotiated.first?.0.duration, VideoContract.slowDuration,
@@ -713,8 +712,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       awaitCondition("Actual source duration must reach UI metadata") { statuses.last?.sourceDuration == duration }
       let sample = try XCTUnwrap(harness.lastSample)
       XCTAssertEqual(CMSampleBufferGetDuration(sample), duration,
-        "Saved inputFast must not override detected source cadence")
-      XCTAssertEqual(statuses.last?.inputFast, duration == VideoContract.fastDuration)
+        "Remembered duration must not override detected source cadence")
       let rate = duration == VideoContract.fastDuration ? "59.94" : "29.97"
       XCTAssertTrue(statuses.last?.input.contains(rate) == true)
       XCTAssertTrue(statuses.last?.output.contains(rate) == true)
@@ -914,7 +912,6 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     awaitCondition("Startup must still report undetected input") { statuses.last != nil }
     XCTAssertEqual(statuses.last?.input, "Waiting for detected input")
     XCTAssertNil(statuses.last?.sourceDuration)
-    XCTAssertNil(statuses.last?.inputFast)
     XCTAssertEqual(statuses.last?.output, "")
     XCTAssertEqual(harness.processingTiming.count, 0)
   }
@@ -948,7 +945,11 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let entered = expectation(description: "Capture queue held inside native start")
     let gate = DispatchSemaphore(value: 0)
     let harness = CaptureHarness(startGate: gate, started: entered)
-    let controller = CaptureController(services: harness.services())
+    // A bounded fixture budget preserves this all-admitted-frames regression;
+    // production defaults remain 12 slots, 384 MiB and 0.25 seconds.
+    let budget = CaptureAdmissionBudget(maximumSlots: 30, maximumBytes: 1024 * 1024 * 1024,
+      maximumDuration: 1, minimumSlots: 3)
+    let controller = CaptureController(services: harness.services(), retentionBudget: budget)
     let statuses = CaptureStatusRecorder()
     defer { controller.onUpdate = nil; controller.stop(); gate.signal() }
     controller.onUpdate = { statuses.record($0) }
@@ -956,7 +957,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     wait(for: [entered], timeout: 5)
     let source = try EndToEndChecks.source()
     // Half a second of 59.94 video arrives while the capture queue is held.
-    // There is no admission limit: every frame is kept and processed.
+    // Every frame fits this explicitly bounded test budget.
     let burst = 30
     for frame in 0..<burst { harness.emit(source, frame: frame) }
     XCTAssertEqual(harness.sent, 0, "The held processing queue cannot consume the burst yet")
@@ -967,6 +968,8 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     awaitCondition("The backlog must be visible in status") { (statuses.last?.maxCaptureBacklog ?? 0) >= burst }
     XCTAssertEqual(statuses.drops, 0)
     XCTAssertEqual(statuses.last?.sourceDrops, 0)
+    XCTAssertEqual(statuses.last?.deviceDrops, 0)
+    XCTAssertEqual(statuses.last?.coreRejectedFrames, 0)
     XCTAssertEqual(statuses.last?.poolDrops, 0)
     XCTAssertEqual(statuses.last?.cameraDrops, 0)
     XCTAssertGreaterThan(statuses.last?.lateFrames ?? 0, 0, "Frames processed long after capture are counted late")
@@ -978,6 +981,77 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertTrue(harness.cameraAndPreviewSamplesMatch)
     XCTAssertEqual(harness.starts, 1)
     XCTAssertTrue(harness.active)
+  }
+
+  func testDefaultBudgetRefusesBurstOverflowAndRecoversWithoutDeviceLoss() throws {
+    let entered = expectation(description: "Capture queue held inside native start")
+    let gate = DispatchSemaphore(value: 0)
+    let harness = CaptureHarness(startGate: gate, started: entered)
+    // Exercise the actual production defaults, rather than an injected copy.
+    let controller = CaptureController(services: harness.services())
+    let statuses = CaptureStatusRecorder()
+    defer { harness.observeDelivery(nil); controller.onUpdate = nil; controller.stop(); gate.signal() }
+    controller.onUpdate = { statuses.record($0) }
+    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
+    wait(for: [entered], timeout: 5)
+    let source = try EndToEndChecks.source()
+    let burst = 30
+    let admitted = 12
+    let refused = burst - admitted
+    for frame in 0..<burst { harness.emit(source, frame: frame) }
+    let held = controller.retentionSnapshotForTesting
+    XCTAssertEqual(held.accepted, admitted)
+    XCTAssertEqual(held.currentSlots, admitted)
+    XCTAssertEqual(held.rejected, refused)
+    XCTAssertEqual(held.released, 0)
+    XCTAssertEqual(held.peakSlots, admitted)
+    XCTAssertLessThanOrEqual(held.peakBytes, 384 * 1024 * 1024)
+    XCTAssertEqual(harness.sent, 0)
+    XCTAssertEqual(harness.previewed, 0)
+    let delivered = expectation(description: "All 12 admitted GPU frames reach camera and preview")
+    harness.observeDelivery { count in if count == admitted { delivered.fulfill() } }
+    Thread.sleep(forTimeInterval: 0.1)
+    gate.signal()
+    wait(for: [delivered], timeout: 1.5)
+    harness.observeDelivery(nil)
+    XCTAssertEqual(harness.sent, admitted)
+    XCTAssertEqual(harness.previewed, admitted)
+    let drainDeadline = Date().addingTimeInterval(0.5)
+    while controller.retentionSnapshotForTesting.currentSlots > 0, Date() < drainDeadline { allowQueueWork(0.005) }
+    let drained = controller.retentionSnapshotForTesting
+    XCTAssertEqual(drained.currentSlots, 0)
+    XCTAssertEqual(drained.currentBytes, 0)
+    XCTAssertEqual(drained.currentDuration, 0)
+    XCTAssertEqual(drained.accepted, drained.released)
+    XCTAssertEqual(drained.accepted + drained.rejected, burst)
+    let statusDeadline = Date().addingTimeInterval(0.5)
+    while (statuses.last?.coreRejectedFrames != UInt64(refused) || statuses.last?.maxCaptureBacklog != admitted),
+      Date() < statusDeadline { allowQueueWork(0.005) }
+    XCTAssertEqual(statuses.last?.coreRejectedFrames, UInt64(refused))
+    XCTAssertEqual(statuses.last?.maxCaptureBacklog, admitted)
+    XCTAssertEqual(statuses.drops, UInt64(refused))
+    XCTAssertEqual(statuses.last?.sourceDrops, 0)
+    XCTAssertEqual(statuses.last?.deviceDrops, 0)
+    XCTAssertEqual(statuses.last?.poolDrops, 0)
+    XCTAssertEqual(statuses.last?.cameraDrops, 0)
+    XCTAssertEqual(statuses.failures, [])
+    let resumed = expectation(description: "Frame 31 reaches camera after all leases drain")
+    harness.observeDelivery { count in if count == admitted + 1 { resumed.fulfill() } }
+    harness.emit(source, frame: burst)
+    wait(for: [resumed], timeout: 1.5)
+    harness.observeDelivery(nil)
+    XCTAssertEqual(harness.sent, admitted + 1)
+    XCTAssertEqual(harness.previewed, admitted + 1)
+    let resumeDrainDeadline = Date().addingTimeInterval(0.5)
+    while controller.retentionSnapshotForTesting.currentSlots > 0, Date() < resumeDrainDeadline { allowQueueWork(0.005) }
+    XCTAssertEqual(controller.retentionSnapshotForTesting.currentSlots, 0)
+    XCTAssertEqual(controller.retentionSnapshotForTesting.accepted, admitted + 1)
+    XCTAssertEqual(controller.retentionSnapshotForTesting.released, admitted + 1)
+    XCTAssertEqual(controller.retentionSnapshotForTesting.rejected, refused)
+    XCTAssertTrue(harness.cameraAndPreviewSamplesMatch)
+    XCTAssertEqual(harness.starts, 1)
+    XCTAssertTrue(harness.active)
+    XCTAssertEqual(statuses.failures, [])
   }
 
   func testQueuedReconfigureCannotReconnectOrRenderAfterCaptureStop() throws {
@@ -1182,7 +1256,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     defer { controller.onUpdate = nil; controller.onProcessedFrame = nil; controller.stop() }
     ready(controller, harness: harness, configuration: config)
     let order = ProgramOrderLog()
-    let install = { controller.onProcessedFrame = { _, _ in order.record(sentBefore: harness.sent) } }
+    let install: @Sendable () -> Void = { controller.onProcessedFrame = { _, _ in order.record(sentBefore: harness.sent) } }
     install()
     let swapping = DispatchGroup()
     DispatchQueue.global(qos: .userInitiated).async(group: swapping) {
@@ -1422,6 +1496,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     CVBufferSetAttachment(source, kCVImageBufferYCbCrMatrixKey,
       kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
 
+    let sourceOwner = CapturedPixelBuffer(immutable: source)
     let frameCount = 180
     for reduce in [false, true] {
       let harness = CaptureHarness()
@@ -1440,7 +1515,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
         if update.message.hasPrefix("Waiting") { ready.fulfill() }
       }
       let config = PipelineConfiguration(applyLUT: true, downscale: true,
-        convertTo420: true, reduceFrameRate: reduce, inputFast: true)
+        convertTo420: true, reduceFrameRate: reduce, sourceDuration: VideoContract.fastDuration)
       controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic:v210", configuration: config)
       wait(for: [ready], timeout: 5)
       let produced = expectation(description: "180 source frames at 59.94 fps")
@@ -1448,8 +1523,8 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       let finished = DispatchSemaphore(value: 0)
       var timebase = mach_timebase_info_data_t()
       XCTAssertEqual(mach_timebase_info(&timebase), KERN_SUCCESS)
-      let tickInterval = VideoContract.fastDuration.seconds * 1_000_000_000 *
-        Double(timebase.denom) / Double(timebase.numer)
+      let tickScale = 1_000_000_000 * Double(timebase.denom) / Double(timebase.numer)
+      let tickInterval = VideoContract.fastDuration.seconds * tickScale
       // A hardware-clock-like source must not acquire the unrelated ordinary
       // thread scheduling jitter we retain in the earlier failure receipts.
       // Only this dedicated, sleeping source thread receives a bounded Mach
@@ -1459,7 +1534,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
         let thread = pthread_mach_thread_np(pthread_self())
         let words = mach_msg_type_number_t(MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
         func ticks(_ seconds: Double) -> UInt32 {
-          UInt32((seconds * 1_000_000_000 * Double(timebase.denom) / Double(timebase.numer)).rounded())
+          UInt32((seconds * tickScale).rounded())
         }
         var policy = thread_time_constraint_policy_data_t(period: UInt32(tickInterval.rounded()),
           computation: ticks(0.0005), constraint: ticks(0.001), preemptible: 1)
@@ -1499,7 +1574,7 @@ private final class PacedDriverMetrics: @unchecked Sendable {
           var cpuEnd = timespec()
           let startStatus = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuStart)
           producerMetrics.record()
-          harness.emit(source, frame: frame)
+          harness.emit(sourceOwner.value, frame: frame)
           let endStatus = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuEnd)
           let ms = startStatus == 0 && endStatus == 0 ?
             Double(cpuEnd.tv_sec - cpuStart.tv_sec) * 1000 + Double(cpuEnd.tv_nsec - cpuStart.tv_nsec) / 1_000_000 : .infinity

@@ -19,10 +19,36 @@ import Synchronization
 /// Scripted UltraStudios: each started device gets a thread that delivers frames,
 /// timecode and embedded audio at 59.94 Hz until it is stopped.
 final class ScriptedLiveCapture: @unchecked Sendable {
+  /// Legacy CaptureServices callbacks are designed for capture-thread delivery.
+  /// This fixture supplies CaptureController's synchronized entry points, never
+  /// UI closures. Each run retains its callbacks unchanged and serializes calls;
+  /// the controller owns cancellation/lifetime checks. The legacy function types
+  /// cannot express that contract, so only this boundary needs a manual audit.
+  private final class DeliveryCallbacks: @unchecked Sendable {
+    private let lock = NSLock()
+    private let frames: (CVPixelBuffer, CMTime, Bool) -> Void
+    private let media: (CaptureMediaStats) -> Void
+    private let audio: (CaptureRawAudio) -> Void
+
+    init(frames: @escaping (CVPixelBuffer, CMTime, Bool) -> Void,
+      media: @escaping (CaptureMediaStats) -> Void, audio: @escaping (CaptureRawAudio) -> Void) {
+      self.frames = frames
+      self.media = media
+      self.audio = audio
+    }
+
+    func frame(_ image: CVPixelBuffer, _ pts: CMTime) {
+      lock.withLock { frames(image, pts, true) }
+    }
+    func packet(_ value: CaptureRawAudio) { lock.withLock { audio(value) } }
+    func statistics(_ value: CaptureMediaStats) { lock.withLock { media(value) } }
+  }
+
   private let lock = NSLock()
   private var running: Set<String> = []
   private var generation: [String: Int] = [:]
-  private let buffers: [CVPixelBuffer]
+  // Attachments are initialized once; producers and consumers only read these images.
+  private let buffers: [CapturedPixelBuffer]
 
   init() {
     buffers = (0..<6).compactMap { _ in
@@ -32,7 +58,7 @@ final class ScriptedLiveCapture: @unchecked Sendable {
       if let made {
         CVBufferSetAttachment(made, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
       }
-      return made
+      return made.map { CapturedPixelBuffer(immutable: $0) }
     }
   }
 
@@ -57,6 +83,7 @@ final class ScriptedLiveCapture: @unchecked Sendable {
       return generation[device]!
     }
     let buffers = buffers
+    let callbacks = DeliveryCallbacks(frames: frames, media: media, audio: audio)
     let thread = Thread { [self] in
       var timebase = mach_timebase_info_data_t()
       mach_timebase_info(&timebase)
@@ -68,7 +95,7 @@ final class ScriptedLiveCapture: @unchecked Sendable {
       var phase = 0.0
       while lock.withLock({ running.contains(device) && generation[device] == token }) {
         let pts = CMTimeMultiply(VideoContract.fastDuration, multiplier: Int32(truncatingIfNeeded: sequence))
-        frames(buffers[Int(sequence) % buffers.count], pts, true)
+        callbacks.frame(buffers[Int(sequence) % buffers.count].value, pts)
         // A 1 kHz tone whose level drifts, so the peaks and timecode change with every update.
         let level = 0.25 + 0.2 * sin(Double(sequence) / 40)
         var pcm = [Int32](repeating: 0, count: samplesPerFrame * 2)
@@ -79,11 +106,11 @@ final class ScriptedLiveCapture: @unchecked Sendable {
           phase += 2 * .pi * 1000 / 48_000
         }
         let packetTime = CMTime(value: sequence * Int64(samplesPerFrame), timescale: 48_000)
-        audio(CaptureRawAudio(samples: pcm.withUnsafeBytes { Data($0) }, packetTime: packetTime,
+        callbacks.packet(CaptureRawAudio(samples: pcm.withUnsafeBytes { Data($0) }, packetTime: packetTime,
           sampleFrames: UInt64(samplesPerFrame), channels: 2, bytesPerSample: 4))
         let seconds = Int(Double(sequence) / hz)
         let timecode = String(format: "14:%02d:%02d:%02d", (seconds / 60) % 60, seconds % 60, Int(sequence) % 60)
-        media(CaptureMediaStats(timecode: timecode, audioPacketTime: packetTime, audioSampleFrames: UInt64(samplesPerFrame),
+        callbacks.statistics(CaptureMediaStats(timecode: timecode, audioPacketTime: packetTime, audioSampleFrames: UInt64(samplesPerFrame),
           audioChannels: 2, leftPeak: level, rightPeak: level / 2, leftRMS: level * 0.7, rightRMS: level * 0.35,
           audioBytes: UInt64(pcm.count * 4), audioPresent: true))
         sequence += 1

@@ -322,7 +322,7 @@ pub enum SwitcherOutput {
     },
 }
 
-pub const SESSION_TIMELINE_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_TIMELINE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionTimebase {
@@ -338,7 +338,7 @@ impl Default for SessionTimebase {
         Self {
             kind: "media".to_string(),
             units: "seconds".to_string(),
-            timescale: 60_000,
+            timescale: 240_000,
             epoch: 0,
             origin: "source_pts".to_string(),
         }
@@ -416,6 +416,6 @@ pub struct SessionTimeline {
 }
 
 /// Backwards-compatible name for callers that used the original offline
-/// result type. The v2 result is a complete replay ledger rather than just a
+/// result type. The current result is a complete replay ledger rather than just a
 /// list of proposed cuts.
 pub type OfflineAnalysis = SessionTimeline;

@@ -84,6 +84,7 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
   private(set) var duration = VideoContract.fastDuration
   private(set) var latest: CVPixelBuffer?
   private(set) var receivedAt: CMTime = .invalid
+  private var sourcePauseAllowanceSeconds: Double = 0
   var consumers = 0
   // A source authorization callback can arrive before CMIO invokes
   // startStream(). Keep a runtime published while that lease is pending: the
@@ -94,6 +95,43 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
       source?.hasPendingStart == true
   }
   private var black: CVPixelBuffer?
+  private var gpuStandby: GPUStandbyLifecycle?
+  var standbyFailureCount: UInt64 { gpuStandby?.failureCount ?? 0 }
+  var standbyError: String? { gpuStandby?.lastError }
+
+  // Capability/pipeline preparation completes before a source consumer lease
+  // starts. No legacy Metal or CPU fallback is permitted on failure.
+  fileprivate func prepareGPUStandby() throws {
+    dispatchPrecondition(condition: .onQueue(queue))
+    guard gpuStandby == nil else { return }
+    let producer: GPUStandbyProducer
+#if ULTRACAM_TEST_SUPPORT
+    if let makeGPUStandbyProducerForTesting { producer = try makeGPUStandbyProducerForTesting() }
+    else { producer = try GPUStandbyProducer() }
+#else
+    producer = try GPUStandbyProducer()
+#endif
+    configureGPUStandby { format, completion in try producer.makeBlack(format: format, completion: completion) }
+  }
+
+  private func configureGPUStandby(submit: @escaping GPUStandbyLifecycle.Submitter) {
+    gpuStandby?.invalidate()
+    black = nil
+    standbyFactory.reset()
+    gpuStandby = GPUStandbyLifecycle(queue: queue, submit: submit, failure: { [weak self] message in
+      self?.logger.error("GPU standby failed: \(message, privacy: .public)")
+    }) { [weak self] in self?.emitStandby() }
+  }
+#if ULTRACAM_TEST_SUPPORT
+  var makeGPUStandbyProducerForTesting: (() throws -> GPUStandbyProducer)?
+  var gpuStandbyPreparedForTesting: Bool { gpuStandby != nil }
+  var gpuStandbyFailuresForTesting: UInt64 { standbyFailureCount }
+  var gpuStandbyErrorForTesting: String? { standbyError }
+  func enableGPUStandbyForTesting(submit: @escaping GPUStandbyLifecycle.Submitter) {
+    dispatchPrecondition(condition: .onQueue(queue))
+    configureGPUStandby(submit: submit)
+  }
+#endif
   // Standby frames reuse one format description for the black image.
   private let standbyFactory = VideoSampleFactory()
   private var timer: DispatchSourceTimer?
@@ -129,17 +167,10 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     self.output = output
     super.init()
     do {
-      // Keep the original eight indices stable for clients that remember a mode.
-      let legacyTypes = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] + VideoContract.tenBit422
-      let addedTypes = [ColorTarget.yuv42010.pixelFormat, ColorTarget.yuv4228.pixelFormat]
-      for (width, height, types) in [(1920, 1080, legacyTypes), (3840, 2160, legacyTypes),
-        (1920, 1080, addedTypes), (3840, 2160, addedTypes), (1280, 720, legacyTypes + addedTypes)] {
-        for type in types {
-          let description = try VideoContract.formatDescription(width: width, height: height, pixelFormat: type)
-          formats.append(CMIOExtensionStreamFormat(formatDescription: description,
-            maxFrameDuration: FrameRateTarget.fps23976.duration, minFrameDuration: FrameRateTarget.fps60.duration,
-            validFrameDurations: FrameRateTarget.allCases.map(\.duration)))
-        }
+      formats = try OutputFormatCatalog.descriptions().map { description in
+        CMIOExtensionStreamFormat(formatDescription: description,
+          maxFrameDuration: FrameRateTarget.fps23976.duration, minFrameDuration: FrameRateTarget.fps120.duration,
+          validFrameDurations: FrameRateTarget.allCases.map(\.duration))
       }
       // CMIOExtensionProvider is a process singleton. In-process tests create
       // native streams/devices but omit a second native provider registration.
@@ -215,11 +246,12 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     guard formats.indices.contains(nextIndex) else { throw VideoError.message("Unsupported camera format.") }
     let nextDuration: CMTime
     if let requested = frameDuration {
-      guard requested.isNumeric, requested.epoch == 0,
-        let target = FrameRateTarget.allCases.first(where: { abs(requested.seconds - $0.duration.seconds) < 0.000001 }) else {
-        throw VideoError.message("Unsupported camera frame rate.")
-      }
-      nextDuration = target.duration
+      let allowed = FrameRateTarget.allCases.map(\.duration)
+      let normalized = fromProducer
+        ? allowed.first(where: { DerivedOutputContract.sameDuration(requested, $0) })
+        : DerivedOutputContract.clientDuration(requested, allowed: allowed)
+      guard let normalized else { throw VideoError.message("Unsupported camera frame rate; choose an advertised cadence.") }
+      nextDuration = normalized
     } else { nextDuration = duration }
     // Validate the complete request before modifying either property. The host
     // selects the common source/sink contract before starting the producer.
@@ -232,6 +264,8 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
       latest = nil
       receivedAt = .invalid
       black = nil
+      gpuStandby?.invalidate()
+      standbyFactory.reset()
       changes[.streamActiveFormatIndex] = CMIOExtensionPropertyState(value: NSNumber(value: nextIndex))
     }
     if nextDuration != duration {
@@ -261,6 +295,8 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
       // while the previous viewer disconnected.
       wasStandby = true
       black = nil
+      gpuStandby?.invalidate()
+      standbyFactory.reset()
       return
     }
     guard automaticTimers else { return }
@@ -309,23 +345,21 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     guard time.isNumeric, time.epoch == 0, time.seconds >= 0,
       sampleDuration.isNumeric, sampleDuration.epoch == 0 else { return "invalid timestamp or duration" }
     let expected = formats[activeIndex].formatDescription
-    let dimensions = CMVideoFormatDescriptionGetDimensions(expected)
-    if CVPixelBufferGetWidth(image) != dimensions.width || CVPixelBufferGetHeight(image) != dimensions.height ||
-      CVPixelBufferGetPixelFormatType(image) != CMFormatDescriptionGetMediaSubType(expected) ||
-      abs(sampleDuration.seconds - duration.seconds) >= 0.000001 {
-      // Only the signature-authorized sink client can establish its output
-      // contract from a frame. This handles a camera app already holding CMIO
-      // device control when the producer starts. Generic ingress stays strict.
+    let contract = DerivedOutputContract(format: expected, duration: duration)
+    if let mismatch = contract.mismatch(sample) ?? (OutputFormatCatalog.matches(sample, description: expected) ? nil : "sample colour or aspect differs from the negotiated output") {
+      // Only the signature-authorized producer may select an existing entry.
+      // Sample metadata remains exact, even when a client property setter used
+      // a rounded Double representation of that same published cadence.
       guard producerCanNegotiate, let index = formats.firstIndex(where: {
-        let description = $0.formatDescription
-        let size = CMVideoFormatDescriptionGetDimensions(description)
-        return size.width == CVPixelBufferGetWidth(image) && size.height == CVPixelBufferGetHeight(image) &&
-          CMFormatDescriptionGetMediaSubType(description) == CVPixelBufferGetPixelFormatType(image)
-      }) else { return "format, size or frame rate doesn't match the negotiated stream" }
+        DerivedOutputContract(format: $0.formatDescription, duration: sampleDuration).mismatch(sample) == nil &&
+          OutputFormatCatalog.matches(sample, description: $0.formatDescription)
+      }) else { return mismatch }
       do { try setProperties(index: index, frameDuration: sampleDuration, fromProducer: true) }
       catch { return "renegotiation failed: \(error.localizedDescription)" }
     }
     latest = image
+    sourcePauseAllowanceSeconds = CameraStandbyTimingPolicy.clampedPauseAllowance(
+      (CMGetAttachment(sample, key: VideoContract.sourcePauseAllowanceAttachmentKey, attachmentModeOut: nil) as? NSNumber)?.doubleValue)
     receivedAt = clock()
     nextStandby = .invalid
     guard consumers > 0 else { return nil }
@@ -371,6 +405,7 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
   func clearInput() {
     latest = nil
     receivedAt = .invalid
+    sourcePauseAllowanceSeconds = 0
     nextStandby = .invalid
   }
 
@@ -378,13 +413,17 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     guard consumers > 0 else { return }
     let now = clock()
     guard now.isNumeric else { return }
-    if receivedAt.isNumeric, CMTimeSubtract(now, receivedAt).seconds < 0.5 { return }
+    if receivedAt.isNumeric, CMTimeSubtract(now, receivedAt).seconds <
+      CameraStandbyTimingPolicy.delay(frameDuration: duration, pauseAllowance: sourcePauseAllowanceSeconds) { return }
     do {
       latest = nil
-      if black == nil { black = try makeBlack() }
+      if black == nil {
+        try prepareGPUStandby()
+        black = gpuStandby?.image(for: formats[activeIndex].formatDescription)
+      }
       guard let black else { return }
       if !nextStandby.isNumeric {
-        nextStandby = CMTimeConvertScale(now, timescale: 60_000, method: .roundTowardZero)
+        nextStandby = CMTimeConvertScale(now, timescale: 240_000, method: .roundTowardZero)
       }
       if lastOutput.isNumeric, CMTimeCompare(nextStandby, lastOutput) <= 0 {
         nextStandby = CMTimeAdd(lastOutput, duration)
@@ -411,39 +450,7 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     else { source.stream.send(sample, discontinuity: discontinuity, hostTimeInNanoseconds: nanoseconds) }
   }
 
-  private func makeBlack() throws -> CVPixelBuffer {
-    let description = formats[activeIndex].formatDescription
-    let dimensions = CMVideoFormatDescriptionGetDimensions(description)
-    let type = CMFormatDescriptionGetMediaSubType(description)
-    var result: CVPixelBuffer?
-    let status = CVPixelBufferCreate(kCFAllocatorDefault, Int(dimensions.width), Int(dimensions.height), type,
-      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &result)
-    guard status == kCVReturnSuccess, let result else { throw VideoError.message("Cannot allocate standby image.") }
-    guard CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess else { throw VideoError.message("Cannot fill standby image.") }
-    defer { CVPixelBufferUnlockBaseAddress(result, []) }
-    if CVPixelBufferIsPlanar(result) {
-      for plane in 0..<CVPixelBufferGetPlaneCount(result) {
-        guard let base = CVPixelBufferGetBaseAddressOfPlane(result, plane) else { continue }
-        let length = CVPixelBufferGetBytesPerRowOfPlane(result, plane) * CVPixelBufferGetHeightOfPlane(result, plane)
-        if ColorTarget.allCases.contains(where: { $0.pixelFormat == type && $0.isEightBit }) {
-          memset(base, plane == 0 ? 16 : 128, length)
-        } else {
-          let value: UInt16 = plane == 0 ? (type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? 0 : 64 << 6) : 512 << 6
-          base.assumingMemoryBound(to: UInt16.self).initialize(repeating: value, count: length / 2)
-        }
-      }
-    } else if let base = CVPixelBufferGetBaseAddress(result) {
-      let count = CVPixelBufferGetBytesPerRow(result) * CVPixelBufferGetHeight(result) / 4
-      let words = base.assumingMemoryBound(to: UInt32.self)
-      let pattern: [UInt32] = [512 | (64 << 10) | (512 << 20), 64 | (512 << 10) | (64 << 20),
-        512 | (64 << 10) | (512 << 20), 64 | (512 << 10) | (64 << 20)]
-      for i in 0..<count { words[i] = pattern[i % 4] }
-    }
-    CVBufferSetAttachment(result, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
-    CVBufferSetAttachment(result, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
-    CVBufferSetAttachment(result, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
-    return result
-  }
+
 }
 
 /// Descriptor-backed CMIO provider. Each registry descriptor owns an independent
@@ -460,7 +467,8 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
   private let automaticTimers: Bool
   private let clock: () -> CMTime
   private let output: ((CMSampleBuffer, CMIOExtensionStream.DiscontinuityFlags, UInt64) -> Void)?
-  private static let queueKey = DispatchSpecificKey<ObjectIdentifier>()
+  fileprivate static let queueKey = DispatchSpecificKey<ObjectIdentifier>()
+  fileprivate static let queueContextKey = "org.ultracam.camera.queue-context"
   let logger = Logger(subsystem: VideoContract.extensionID, category: "camera.registry")
 
   init(automaticTimers: Bool = true, createNativeProvider: Bool = true,
@@ -653,7 +661,7 @@ final class CameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
   func deviceProperties(forProperties properties: Set<CMIOExtensionProperty>) throws -> CMIOExtensionDeviceProperties {
     let result = CMIOExtensionDeviceProperties(dictionary: [:])
     result.transportType = kIOAudioDeviceTransportTypeVirtual
-    result.model = "FX3 LUT camera"
+    result.model = "Ultracam virtual camera"
     return result
   }
   func setDeviceProperties(_ properties: CMIOExtensionDeviceProperties) throws {}
@@ -745,11 +753,30 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
         return false
       }
       self.client = client
-    } else if !activeSourceClientIDs.contains(client.clientID), !pendingSourceClientIDs.contains(client.clientID) {
-      pendingSourceClientIDs.append(client.clientID)
+    } else {
+      authorizeSource(clientID: client.clientID)
     }
     return true
   }
+  private func authorizeSource(clientID: UUID) {
+    if !activeSourceClientIDs.contains(clientID), !pendingSourceClientIDs.contains(clientID) {
+      pendingSourceClientIDs.append(clientID)
+    }
+  }
+#if ULTRACAM_TEST_SUPPORT
+  // CMIOExtensionClient has no public initializer. Exercise the exact native
+  // callback's UUID bookkeeping without constructing a fake framework object.
+  func authorizeSourceForTesting(clientID: UUID) {
+    dispatchPrecondition(condition: .onQueue(owner.queue))
+    precondition(!isSink)
+    authorizeSource(clientID: clientID)
+  }
+  func disconnectSourceForTesting(clientID: UUID) {
+    dispatchPrecondition(condition: .onQueue(owner.queue))
+    precondition(!isSink)
+    disconnect(clientID: clientID)
+  }
+#endif
   private func logAuthorizationRejection(_ client: CMIOExtensionClient, reason: String) {
     // A failed host may retry; bound diagnostics for the extension's lifetime.
     guard authorizationRejections < 8 else { return }
@@ -757,12 +784,28 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
     owner.logger.error("Camera producer rejected: pid=\(client.pid, privacy: .public), signingID=\(client.signingID ?? "<nil>", privacy: .public), reason=\(reason, privacy: .public)")
   }
   func startStream() throws {
+    if String(cString: __dispatch_queue_get_label(nil)) != owner.queue.label {
+      return try owner.queue.sync { try self.startStream() }
+    }
     if isSink {
       guard let client else { throw VideoError.message("Missing camera producer.") }
       beginConsumption { [weak self] completion in
         self?.stream.consumeSampleBuffer(from: client, completionHandler: completion)
       }
     } else {
+      // Prepare the capability before admitting a source consumer. A failed
+      // Metal4 setup must not publish demand or increment the lease count.
+      do { try owner.prepareGPUStandby() }
+      catch {
+        // A failed start never becomes an active consumer. Release only the
+        // authorization associated with this start, so a removed runtime can
+        // finish teardown without dropping other clients' pending leases.
+        if !pendingSourceClientIDs.isEmpty {
+          pendingSourceClientIDs.removeFirst()
+          owner.onDemandChange?()
+        }
+        throw error
+      }
       if let clientID = pendingSourceClientIDs.first {
         pendingSourceClientIDs.removeFirst()
         activeSourceClientIDs.append(clientID)
@@ -778,13 +821,19 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
     }
   }
   func stopStream() throws {
+    if String(cString: __dispatch_queue_get_label(nil)) != owner.queue.label {
+      return try owner.queue.sync { try self.stopStream() }
+    }
     if isSink { stopConsumption() }
     else {
       guard owner.consumers > 0 else {
-        // A host can abandon an authorization probe without ever starting the
-        // stream.  Do not let that stale authorization attach to a later
-        // client's start.
-        pendingSourceClientIDs.removeAll()
+        // An unqualified stop balances the oldest pending authorization,
+        // just as the active path balances starts in order. Other clients'
+        // pending starts still pin this runtime until their own release.
+        if !pendingSourceClientIDs.isEmpty {
+          pendingSourceClientIDs.removeFirst()
+          owner.onDemandChange?()
+        }
         return
       }
       if anonymousSourceStarts > 0 {
@@ -808,11 +857,15 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
       stopConsumption()
       return
     }
+    let hadPendingLease = pendingSourceClientIDs.contains(clientID)
     pendingSourceClientIDs.removeAll { $0 == clientID }
     let removed = activeSourceClientIDs.reduce(into: 0) { count, activeID in
       if activeID == clientID { count += 1 }
     }
-    guard removed > 0 else { return }
+    guard removed > 0 else {
+      if hadPendingLease { owner.onDemandChange?() }
+      return
+    }
     activeSourceClientIDs.removeAll { $0 == clientID }
     owner.consumers = max(0, owner.consumers - removed)
     if owner.consumers == 0 { owner.restartTimer(); publishDemand() }

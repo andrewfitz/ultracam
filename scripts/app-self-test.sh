@@ -11,11 +11,7 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
-external_root=/Volumes/8TB/cinesomatic-director-work
-if ! mount | /usr/bin/grep -F ' on /Volumes/8TB ' >/dev/null; then
-  echo 'External drive /Volumes/8TB is not mounted.' >&2
-  exit 1
-fi
+external_root="$(python3 "$task_root/scripts/work_paths.py" --path work_root)"
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
   bash "$task_root/scripts/build.sh" --debug
 fi

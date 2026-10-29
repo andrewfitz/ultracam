@@ -1009,7 +1009,10 @@ extension UIVerify {
     logTools.state.falseColor.mode = .sonySLog3
     model.monitorCoordinator.setPreferences(logTools, for: MonitorTargetID(alpha.rawValue))
     var undeclaredTools = model.monitorCoordinator.preferences(for: MonitorTargetID(beta.rawValue))
-    verifier.check("sync regression: undeclared cameras skip Log false colour", undeclaredTools.state.falseColor.mode == .off)
+    // Sync keeps the shared choice, while each camera keeps its own declaration.
+    verifier.check("sync regression: undeclared cameras keep shared Log false colour unavailable",
+      undeclaredTools.state.falseColor.mode == .sonySLog3 && undeclaredTools.signal.logProfileID == nil
+        && !undeclaredTools.falseColorDeclared)
     undeclaredTools.toolsEnabled = false
     model.monitorCoordinator.setPreferences(undeclaredTools, for: MonitorTargetID(beta.rawValue))
     verifier.check("sync regression: editing an ineligible camera preserves eligible false colour",
@@ -1205,13 +1208,13 @@ extension UIVerify {
     }
 
     // Settings and Diagnostics with the real model.
-    render("settings-general", UISettingsGeneralPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
+    render("settings-general", UISettingsGeneralPane(model: model, interface: interface), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
     render("settings-recording", UISettingsRecordingPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
     render("settings-camera", UISettingsCameraPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
     render("settings-switcher", UISettingsSwitcherPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
     render("settings-monitor", UISettingsMonitorPane(), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
     render("settings-advanced", UISettingsAdvancedPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
-    render("settings-window", UISettingsView(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
+    render("settings-window", UISettingsView(model: model, interface: interface), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
     render("diagnostics", UIDiagnosticsView(model: model), size: CGSize(width: 1100, height: 760)).forEach { $0.close() }
     interface.inspectorOpen = false
     interface.sidebarVisible = true
@@ -1332,16 +1335,16 @@ extension UIVerify {
       model.startRefusal(gamma) == nil, model.startRefusal(gamma) ?? "")
 
     // No input listed at all: there is none to choose, so a camera without one
-    // asks for the UltraStudio, selected or not. (The automatic feed's status
+    // asks for an input device, selected or not. (The automatic feed's status
     // gives the same reason; the verifier has no virtual camera to demand it.)
     model.updateCamera(beta) { $0.selectedDevice = "" }
     model.startCamera(beta)
-    verifier.check("discovery: with no inputs, Start with none chosen asks for the UltraStudio",
-      model.startRefusal(beta) == "Connect the UltraStudio.", model.startRefusal(beta) ?? "nil")
+    verifier.check("discovery: with no inputs, Start with none chosen asks for an input device",
+      model.startRefusal(beta) == "Connect an input device.", model.startRefusal(beta) ?? "nil")
     model.updateCamera(gamma) { $0.selectedDevice = "" }
     model.startCamera(gamma)
-    verifier.check("discovery: with no inputs, the selected camera's Start asks for the UltraStudio",
-      model.startRefusal(gamma) == "Connect the UltraStudio.", model.startRefusal(gamma) ?? "nil")
+    verifier.check("discovery: with no inputs, the selected camera's Start asks for an input device",
+      model.startRefusal(gamma) == "Connect an input device.", model.startRefusal(gamma) ?? "nil")
 
     publish([x, y])
     verifier.check("discovery: None set in the inspector stays None when inputs arrive",
@@ -1702,38 +1705,57 @@ extension UIVerify {
     relaunched.stopCamera(alpha)
   }
 
-  /// "Advertise HDR to cameras": off by default, persisted, and applied to the
-  /// backend at launch (before discovery) and on every change; no hardware.
+  /// Per-device settings preserve the legacy fallback and verified overrides;
+  /// this fixture never loads an SDK or touches a real capture device.
   func hdrAdvertisement() {
     let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("HDR: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
-    final class Calls { var values: [Bool] = []; var discoveryStartedAfter: Int? }
-    let calls = Calls()
+    func settle(_ label: String, until condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(2)
+      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+      verifier.check(label, condition())
+    }
+    @MainActor final class SettingsFixture: VendorSettingsProviding {
+      nonisolated let descriptor = VendorDescriptor(id: "decklink", displayName: "Fixture capture", badgeText: "FIXTURE", signalHint: nil, sdkVersion: nil, sdkPresent: true)
+      var values: [String: Bool] = [:]
+      var writes: [(String, Bool)] = []
+      func settings(deviceID: String) async throws -> [VendorSetting] {
+        [.init(id: "decklink:advertiseHDRToCameras", labelKey: "Advertise HDR to cameras", value: .boolean(values[deviceID] ?? false), allowedValues: .unrestricted, mutable: true, availabilityReason: nil, interruptsCapture: true)]
+      }
+      func apply(_ value: VendorSettingValue, to setting: String, deviceID: String) async throws {
+        guard case .boolean(let enabled) = value else { throw PluginError.unsupported("Boolean required") }
+        values[deviceID] = enabled; writes.append((deviceID, enabled))
+      }
+    }
+    let fixture = SettingsFixture()
     var hardware = AppHardware.offline
-    hardware.setAdvertisesHDR = { calls.values.append($0) }
-    hardware.observeDevices = { _ in calls.discoveryStartedAfter = calls.values.count; return nil }
+    hardware.settingsPlugins = { [fixture] }
+    hardware.devices = { [InputDevice(id: "decklink:first", name: "Fixture one"), InputDevice(id: "decklink:second", name: "Fixture two")] }
     let make = {
       AppModel(settingsStore: AppSettingsStore(defaults: defaults), registryStore: VirtualCameraRegistryStore(defaults: defaults),
         registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
         installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
     }
     let model = make()
-    verifier.check("HDR: off by default", !model.advertiseHDRToCameras && calls.values == [false], "\(calls.values)")
-    verifier.check("HDR: the setting reaches the backend before discovery starts", calls.discoveryStartedAfter == 1,
-      "\(calls.discoveryStartedAfter.map(String.init) ?? "never")")
-    model.advertiseHDRToCameras = true
-    verifier.check("HDR: turning it on reaches the backend once", calls.values == [false, true], "\(calls.values)")
-    model.advertiseHDRToCameras = true
-    verifier.check("HDR: setting the same value again does nothing", calls.values == [false, true], "\(calls.values)")
-    verifier.check("HDR: the setting persists", AppSettingsStore(defaults: defaults).advertiseHDRToCameras)
-    calls.values = []
+    settle("HDR: both device settings load") { model.vendorSettings.state(for: "decklink:first").settings.count == 1 && model.vendorSettings.state(for: "decklink:second").settings.count == 1 && !model.vendorSettings.state(for: "decklink:first").busy && !model.vendorSettings.state(for: "decklink:second").busy }
+    verifier.check("HDR: per-device defaults remain off without SDK writes", fixture.writes.isEmpty && fixture.values.values.allSatisfy { !$0 })
+    Task { await model.vendorSettings.apply(.boolean(true), to: "decklink:advertiseHDRToCameras", deviceID: "decklink:first", pluginID: "decklink") }
+    settle("HDR: setting write completes") { fixture.values["decklink:first"] == true && !model.vendorSettings.state(for: "decklink:first").busy }
+    verifier.check("HDR: changing one input leaves its peer unchanged", fixture.writes.count == 1 && fixture.values["decklink:second"] != true)
+    var repeatedCompleted = false
+    Task { await model.vendorSettings.apply(.boolean(true), to: "decklink:advertiseHDRToCameras", deviceID: "decklink:first", pluginID: "decklink"); repeatedCompleted = true }
+    settle("HDR: unchanged setting check completes") { repeatedCompleted }
+    verifier.check("HDR: applying the same value does not rewrite EDID", fixture.writes.count == 1)
+    let saved = try? VendorSettingsPreferences(defaults: defaults).load()
+    verifier.check("HDR: only the verified per-device override persists", saved?.desiredByDevice["decklink:first"]?["decklink:advertiseHDRToCameras"] == .boolean(true) && saved?.desiredByDevice["decklink:second"]?["decklink:advertiseHDRToCameras"] == .boolean(false))
+    fixture.values = [:]; fixture.writes = []
     let relaunched = make()
-    verifier.check("HDR: a relaunch applies the saved setting", relaunched.advertiseHDRToCameras && calls.values == [true],
-      "\(calls.values)")
-    relaunched.advertiseHDRToCameras = false
-    verifier.check("HDR: turning it off reaches the backend", calls.values == [true, false] &&
-      !AppSettingsStore(defaults: defaults).advertiseHDRToCameras, "\(calls.values)")
+    settle("HDR: saved settings restore") { fixture.values["decklink:first"] == true && !relaunched.vendorSettings.state(for: "decklink:first").busy }
+    verifier.check("HDR: relaunch restores the selected input only", fixture.writes.count == 1 && fixture.writes.first?.0 == "decklink:first")
+    let count = fixture.writes.count
+    if let id = relaunched.feedDescriptors.first?.id { relaunched.startCamera(id); relaunched.stopCamera(id) }
+    verifier.check("HDR: capture start and stop never rewrite EDID", fixture.writes.count == count)
   }
 
   func menuItems(_ items: [NSMenuItem]) -> [NSMenuItem] {
@@ -1882,6 +1904,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   do { try run.lutModel() } catch { verifier.check("LUT model tests threw", false, "\(error)") }
   do { try MonitorLUTVerify.run(verifier: verifier) } catch { verifier.check("monitor LUT tests threw", false, "\(error)") }
   run.discovery()
+  SyntheticCaptureVerify.run(verifier: verifier)
   run.hdrAdvertisement()
   do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
   do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }

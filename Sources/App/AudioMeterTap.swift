@@ -9,7 +9,7 @@ let audioLog = Logger(subsystem: "org.ultracam.app", category: "audio")
 
 /// One capture's broadcast audio meters (MonitorKitAudio: sample and true peak,
 /// EBU R 128 loudness and phase correlation), fed from the embedded audio the
-/// DeckLink driver thread hands `CaptureController.receiveRawAudio`.
+/// capture delivery thread hands `CaptureController.receiveRawAudio`.
 ///
 /// The meters run off the driver thread, on the tap's own serial queue. The
 /// driver thread (`ingest`) only hands the packet over: it stores a reference
@@ -18,24 +18,18 @@ let audioLog = Logger(subsystem: "org.ultracam.app", category: "audio")
 /// single-consumer ring, publishes it with a release store and signals the
 /// queue through a user-data dispatch source. No heap allocation or release,
 /// no lock, no Swift concurrency and no wait on the driver thread; atomics
-/// only. By then recording and the video frame of the same DeckLink callback
+/// only. By then recording and the video frame of the same capture callback
 /// have already been handed off (the backend reports a callback's audio after
 /// its frame, and the controller hands the packet to recording before the
 /// meters), so metering can never delay or drop either.
 ///
-/// Backpressure: the meters take every packet. The default ring holds 4096
-/// callbacks (68 s at 59.94p, 137 s at 29.97p), far longer than any stall of a
-/// userInitiated queue whose work is a few microseconds a packet, so the
-/// meters never lose audio to a busy queue in practice. Only a ring that is
-/// still full (the meter queue `packetCapacity` packets behind) leaves a packet
-/// out of the meters: never waiting and never allocating on the driver thread
-/// leaves no other choice. That packet is counted in `Counters.coalesced`
-/// (shown per capture in `CaptureUpdate.audioMeterCoalesced`), and the next
-/// metered packet is marked as following a gap, so the meter primes its
-/// true-peak interpolator and K-weighting there
-/// (`AudioMeter.noteDiscontinuity()`) instead of interpolating across missing
-/// audio. A stall holds its packets (a retain of each one's `Data`, at most
-/// about 26 MB for a full ring of 2-channel 59.94p packets), never copies.
+/// Backpressure: retention is bounded independently by packet slots, two
+/// seconds of source audio and 8 MiB of retained PCM by default. Any exhausted
+/// budget leaves the packet out of metering and counts it in `coalesced`;
+/// recording and video already received it. The next metered packet primes
+/// the filters instead of interpolating across the missing audio. Every plane
+/// contributes its actual byte count, and the meter queue releases both its
+/// packet reference and budget charge after processing, including stale sessions.
 ///
 /// Demand driven: the meters run only while a view shows them (`attach` /
 /// `detach`), so a feed nobody is metering pays one atomic load per packet.
@@ -68,7 +62,7 @@ final class AudioMeterTap: @unchecked Sendable {
   // from `head` back to `tail`), and `consumerMeter`/`consumerSession` are
   // confined to `meterQueue`. Everything else is atomic or under a Mutex.
 
-  /// The capture's fixed embedded-audio format: 48 kHz, 2 channels, Int32.
+  /// Legacy embedded-audio defaults; source declarations configure the live format.
   /// Only what the meters show runs: true peak (and the sample peak behind
   /// the clip count), R 128 loudness and phase correlation; no RMS, VU or PPM.
   static let configuration = AudioMeterConfiguration(
@@ -89,10 +83,8 @@ final class AudioMeterTap: @unchecked Sendable {
   /// the old tap.
   let identity: UInt64 = AudioMeterTap.identities.add(1, ordering: .relaxed).newValue
 
-  /// Packets the hand-off holds before the meters coalesce: 4096 DeckLink
-  /// callbacks, 68 s at 59.94p and 137 s at 29.97p. The slots are
-  /// preallocated (about 48 B each, 192 KB in all); a packet's samples are
-  /// only retained while it waits.
+  /// A preallocated slot ceiling, independent of the tighter default time and
+  /// byte budgets. Packets retain their samples only while waiting.
   static let defaultPacketCapacity = 4096
 
   /// The meters' owner; `attach` and `detach`, and the meter queue when a
@@ -100,6 +92,7 @@ final class AudioMeterTap: @unchecked Sendable {
   private struct Sessions {
     /// The current session's meter; nil until the first attach.
     var live: AudioMeter?
+    var format: SourceAudioFormat?
     /// Starts at 0 (no session); each session start adds one.
     var number: UInt64 = 0
     /// Meters retained by session number until the meter queue first adopts them.
@@ -110,10 +103,13 @@ final class AudioMeterTap: @unchecked Sendable {
   /// cleared by the meter queue.
   private struct Slot {
     var samples: Data?
+    var packet: CaptureAudioPacket?
     var frames = 0
     var stride = 0
     var session: UInt64 = 0
     var followsGap = false
+    var nanoseconds = 0
+    var retainedBytes = 0
   }
 
   private let sessions = Mutex(Sessions())
@@ -128,6 +124,10 @@ final class AudioMeterTap: @unchecked Sendable {
   private let slots: UnsafeMutablePointer<Slot>
   private let packetCapacity: Int
   private let slotMask: Int
+  private let maxBufferedNanoseconds: Int
+  private let maxBufferedBytes: Int
+  private let bufferedBytes = Atomic<Int>(0)
+  private let bufferedNanoseconds = Atomic<Int>(0)
   /// Next packet the producer writes; stored only by the producer.
   private let head = Atomic<Int>(0)
   /// Next packet the meter queue reads; stored only by the meter queue.
@@ -174,8 +174,14 @@ final class AudioMeterTap: @unchecked Sendable {
   private let stale = Atomic<UInt64>(0)
   private let maxQueued = Atomic<Int>(0)
 
-  /// `packetCapacity` is rounded up to a power of two.
-  init(packetCapacity: Int = AudioMeterTap.defaultPacketCapacity) {
+  /// `packetCapacity` is rounded up to a power of two. The independent time
+  /// budget bounds retention even for sources with large or variable packets.
+  init(packetCapacity: Int = AudioMeterTap.defaultPacketCapacity, maxBufferedSeconds: Double = 2,
+    maxBufferedBytes: Int = 8 * 1024 * 1024) {
+    precondition(maxBufferedSeconds.isFinite && maxBufferedSeconds > 0 && maxBufferedSeconds < Double(Int.max) / 1e9)
+    precondition(maxBufferedBytes > 0)
+    self.maxBufferedBytes = maxBufferedBytes
+    maxBufferedNanoseconds = Int(maxBufferedSeconds * 1e9)
     var capacity = 1
     while capacity < max(1, packetCapacity) { capacity <<= 1 }
     self.packetCapacity = capacity
@@ -206,30 +212,82 @@ final class AudioMeterTap: @unchecked Sendable {
     // Acquiring: a viewer seen here implies its session in `session`.
     guard viewers.load(ordering: .acquiring) > 0, let samples else { return }
     let meterChannels = Self.configuration.channelCount
-    guard bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample, channels >= meterChannels,
+    guard bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample, channels >= meterChannels, channels <= audioMeterMaximumChannelCount,
       sampleFrames > 0, sampleFrames <= UInt64(Int.max / (channels * bytesPerSample)),
-      samples.count >= Int(sampleFrames) * channels * bytesPerSample
+      samples.count == Int(sampleFrames) * channels * bytesPerSample
     else {
       rejected.add(1, ordering: .relaxed)
       gapPending.store(true, ordering: .relaxed)
       return
     }
+    enqueue(samples: samples, frames: Int(sampleFrames), channels: channels, packet: nil)
+  }
+
+  /// Ordered declarations configure meters before packets arrive. This runs on
+  /// the capture control queue, never the driver thread.
+  func configure(format: SourceAudioFormat) throws {
+    let candidate = try AudioMeter(configuration: Self.configuration(for: format, take: false))
+    sessions.withLock { state in
+      guard state.format != format else { return }
+      state.format = format
+      guard viewers.load(ordering: .relaxed) > 0 else { return }
+      state.live = candidate
+      state.number &+= 1
+      state.history[state.number] = candidate
+      session.store(state.number, ordering: .releasing)
+    }
+    noteGap()
+  }
+
+  private static func configuration(for format: SourceAudioFormat, take: Bool) throws -> AudioMeterConfiguration {
+    AudioMeterConfiguration(sampleRate: format.sampleRate, channelCount: format.channels,
+      meters: take ? [.samplePeak, .truePeak, .loudness] : [.samplePeak, .truePeak, .loudness, .correlation],
+      loudnessChannels: try SourceAudioMeterInput.loudnessChannels(for: format))
+  }
+
+  /// Retains validated immutable source PCM; conversion happens on the meter queue.
+  func ingest(_ packet: CaptureAudioPacket) {
+    guard viewers.load(ordering: .acquiring) > 0, packet.sampleFrameCount > 0 else { return }
+    enqueue(samples: nil, frames: packet.sampleFrameCount, channels: packet.format.channels, packet: packet)
+  }
+
+  private func enqueue(samples: Data?, frames: Int, channels: Int, packet: CaptureAudioPacket?) {
     guard !producing.exchange(true, ordering: .acquiring) else {
       overlapped.add(1, ordering: .relaxed)
       gapPending.store(true, ordering: .relaxed)
       return
     }
+    // Packet constructors validate exact per-plane sizes. Count every retained
+    // plane, rather than estimating from rate/channels or only plane zero.
+    var retainedBytes = samples?.count ?? 0
+    var byteOverflow = false
+    if let packet {
+      for plane in packet.planes {
+        let sum = retainedBytes.addingReportingOverflow(plane.count)
+        retainedBytes = sum.partialValue
+        byteOverflow = byteOverflow || sum.overflow
+      }
+    }
     let next = head.load(ordering: .relaxed)
     // Acquiring: the meter queue released the slot (and its packet) before moving `tail` past it.
     let queued = next &- tail.load(ordering: .acquiring)
-    if queued >= packetCapacity {
+    let rate = packet?.format.sampleRate ?? EmbeddedAudioFormat.sampleRate
+    let duration = (Double(frames) / rate * 1e9).rounded(.up)
+    let nanos = duration.isFinite && duration >= 0 && duration < Double(Int.max) ? Int(duration) : Int.max
+    if byteOverflow || retainedBytes > maxBufferedBytes - bufferedBytes.load(ordering: .acquiring)
+      || queued >= packetCapacity || nanos > maxBufferedNanoseconds - bufferedNanoseconds.load(ordering: .acquiring) {
       coalesced.add(1, ordering: .relaxed)
       gapPending.store(true, ordering: .relaxed)
     } else {
       let slot = slots + (next & slotMask)
       // The slot is empty (the meter queue cleared it), so this only retains the packet.
       slot.pointee.samples = samples
-      slot.pointee.frames = Int(sampleFrames)
+      slot.pointee.packet = packet
+      slot.pointee.nanoseconds = nanos
+      slot.pointee.retainedBytes = retainedBytes
+      bufferedBytes.add(retainedBytes, ordering: .releasing)
+      bufferedNanoseconds.add(nanos, ordering: .releasing)
+      slot.pointee.frames = frames
       slot.pointee.stride = channels
       slot.pointee.session = session.load(ordering: .acquiring)
       slot.pointee.followsGap = gapPending.exchange(false, ordering: .relaxed)
@@ -275,34 +333,26 @@ final class AudioMeterTap: @unchecked Sendable {
           adoptCurrentSession()
         }
       }
-      if packetSession == consumerSession, let meter = consumerMeter, let samples = slot.pointee.samples {
+      if packetSession == consumerSession, let meter = consumerMeter {
         if slot.pointee.followsGap { meter.noteDiscontinuity() }
-        let frames = slot.pointee.frames
-        let stride = slot.pointee.stride
-        samples.withUnsafeBytes { raw in
-          guard let base = raw.baseAddress else { return }
-          meter.process(interleaved: base.assumingMemoryBound(to: Int32.self), frameCount: frames,
-            frameStride: stride)
+        if Self.process(slot.pointee, with: meter) {
+          metered.add(1, ordering: .relaxed)
+          watchForOvers(meter)
+        } else {
+          rejected.add(1, ordering: .relaxed)
+          meter.noteDiscontinuity()
         }
-        metered.add(1, ordering: .relaxed)
-        watchForOvers(meter)
       } else {
         stale.add(1, ordering: .relaxed)
       }
       // The take's own meter, from the packet the take started at.
-      if let currentTake, next >= currentTake.start, let samples = slot.pointee.samples {
+      if let currentTake, next >= currentTake.start {
         let takeMeter = currentTake.meter
         // A gap in the stream, or audio left out while the take was paused.
         if slot.pointee.followsGap || (lastTakePacket.map { $0 != next &- 1 } ?? false) { takeMeter.noteDiscontinuity() }
-        let frames = slot.pointee.frames
-        let stride = slot.pointee.stride
-        samples.withUnsafeBytes { raw in
-          guard let base = raw.baseAddress else { return }
-          takeMeter.process(interleaved: base.assumingMemoryBound(to: Int32.self), frameCount: frames,
-            frameStride: stride)
-        }
+        _ = Self.process(slot.pointee, with: takeMeter)
         lastTakePacket = next
-        if takeWatch.observe(takeMeter.snapshot(), source: currentTake.number) != nil {
+        if takeWatch.observe(takeMeter.snapshot(), source: currentTake.number, sampleRate: takeMeter.configuration.sampleRate) != nil {
           take.withLock { state in
             if state?.number == currentTake.number { state?.overs += 1 }
           }
@@ -310,10 +360,34 @@ final class AudioMeterTap: @unchecked Sendable {
       }
       // The packet is released here, never on the driver thread.
       slot.pointee.samples = nil
+      slot.pointee.packet = nil
+      bufferedNanoseconds.subtract(slot.pointee.nanoseconds, ordering: .releasing)
+      bufferedBytes.subtract(slot.pointee.retainedBytes, ordering: .releasing)
+      slot.pointee.retainedBytes = 0
       next &+= 1
       // Releasing: the slot is clear before the producer can reuse it.
       tail.store(next, ordering: .releasing)
     }
+  }
+
+  private static func process(_ slot: Slot, with meter: AudioMeter) -> Bool {
+    if let packet = slot.packet {
+      guard packet.format.channels == meter.configuration.channelCount,
+        packet.format.sampleRate == meter.configuration.sampleRate else { return false }
+      let samples = SourceAudioMeterInput.interleavedSamples(packet)
+      samples.withUnsafeBufferPointer { buffer in
+        if let base = buffer.baseAddress { meter.process(interleaved: base, frameCount: packet.sampleFrameCount) }
+      }
+    } else if let samples = slot.samples {
+      samples.withUnsafeBytes { raw in
+        guard let base = raw.baseAddress else { return }
+        meter.process(interleaved: base.assumingMemoryBound(to: Int32.self), frameCount: slot.frames,
+          frameStride: slot.stride)
+      }
+    } else {
+      return false
+    }
+    return true
   }
 
   /// Takes the current session's meter for the packets of that session; any
@@ -339,7 +413,7 @@ final class AudioMeterTap: @unchecked Sendable {
   /// of their own a second after the last if no other over follows. Meter queue only.
   private func watchForOvers(_ meter: AudioMeter) {
     let snapshot = meter.snapshot()
-    guard let event = overWatch.observe(snapshot, source: consumerSession) else { return }
+    guard let event = overWatch.observe(snapshot, source: consumerSession, sampleRate: meter.configuration.sampleRate) else { return }
     overEvents.add(1, ordering: .relaxed)
     let now = DispatchTime.now().uptimeNanoseconds
     let timecode = timecodeSource.withLock { $0 }?()
@@ -412,7 +486,7 @@ final class AudioMeterTap: @unchecked Sendable {
   private func startSession(_ sessions: inout Sessions) {
     let meter: AudioMeter
     do {
-      meter = try AudioMeter(configuration: Self.configuration)
+      meter = try AudioMeter(configuration: sessions.format.map { try Self.configuration(for: $0, take: false) } ?? Self.configuration)
     } catch {
       preconditionFailure("The embedded-audio meter configuration is invalid: \(error)")
     }
@@ -463,7 +537,8 @@ final class AudioMeterTap: @unchecked Sendable {
   func beginTake() {
     let meter: AudioMeter
     do {
-      meter = try AudioMeter(configuration: Self.takeConfiguration)
+      let format = sessions.withLock { $0.format }
+      meter = try AudioMeter(configuration: format.map { try Self.configuration(for: $0, take: true) } ?? Self.takeConfiguration)
     } catch {
       preconditionFailure("The take meter configuration is invalid: \(error)")
     }
@@ -520,13 +595,16 @@ final class AudioMeterTap: @unchecked Sendable {
   /// The current (or last) session's meter; nil before the first attach.
   var meter: AudioMeter? { sessions.withLock { $0.live } }
 
+  /// Exact PCM plane bytes retained by the ring, including the packet being consumed.
+  var queuedPCMBytes: Int { bufferedBytes.load(ordering: .acquiring) }
+
   /// Packets handed over and not yet metered.
   var queuedPackets: Int { max(0, head.load(ordering: .acquiring) &- tail.load(ordering: .acquiring)) }
 
   struct Counters: Sendable, Equatable {
     /// Packets the meter processed.
     var metered: UInt64
-    /// Packets refused for their format (not 32-bit, fewer than 2 channels, short data).
+    /// Packets refused for invalid legacy PCM or a declared meter-format mismatch.
     var rejected: UInt64
     /// Packets skipped because another driver thread was handing one over at the same time.
     var overlapped: UInt64

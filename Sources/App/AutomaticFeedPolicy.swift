@@ -1,3 +1,5 @@
+import CoreMedia
+
 /// Source ownership and transport demand are independent of the UI selection.
 enum FeedLifecycleDemandPolicy {
   static func programTransportRequired(programMode: Bool, cameraRequested: Bool,
@@ -6,10 +8,18 @@ enum FeedLifecycleDemandPolicy {
   }
 
   static func programContract(configuration: PipelineConfiguration, pipelineEnabled: Bool,
-                              detectedInputFast: Bool?) -> PipelineConfiguration {
-    var result = pipelineEnabled ? configuration : PipelineConfiguration(
-      applyLUT: false, downscale: false, convertTo420: false, reduceFrameRate: false)
-    result.inputFast = detectedInputFast ?? configuration.inputFast
+                              detectedSourceDuration: CMTime?) -> PipelineConfiguration {
+    var result = configuration
+    if !pipelineEnabled {
+      result.applyLUT = false
+      result.downscale = false
+      result.convertTo420 = false
+      result.reduceFrameRate = false
+    }
+    if let duration = detectedSourceDuration,
+       duration.isNumeric, duration.epoch == 0, CMTimeCompare(duration, .zero) > 0 {
+      result.sourceDuration = duration
+    }
     return result
   }
 

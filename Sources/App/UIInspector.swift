@@ -13,7 +13,6 @@ struct UIInspectorView: View {
 struct UIInspectorViewContent: View {
   let context: UIContext
 
-  private static let gamuts = ["Unspecified / custom LUT", "Rec.709", "S-Gamut3.Cine / S-Log3", "S-Gamut3 / S-Log3", "Canon Cinema Gamut / C-Log2", "Canon Cinema Gamut / C-Log3", "Panasonic V-Gamut / V-Log", "Blackmagic Wide Gamut / Film Gen 5", "ARRI Wide Gamut 3 / LogC3", "ARRI Wide Gamut 4 / LogC4", "REDWideGamutRGB / Log3G10", "Rec.2020 / HLG", "Rec.2020 / PQ"]
 
   var body: some View {
     let _ = UIRenderProbe.count("UIInspectorViewContent")
@@ -31,11 +30,11 @@ struct UIInspectorViewContent: View {
         header(camera: camera, snapshot: snapshot)
       }
       sourceSection(camera: camera, snapshot: snapshot)
-      if let store = context.sonyCameras {
-        Section("Sony Wi-Fi Control") {
-          UISonyCameraButton(feedID: camera.id, name: camera.name, store: store)
+      if let store = context.cameraControls {
+        Section("Camera Control") {
+          UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
           if let assignment = store.assignment(for: camera.id) {
-            Text("\(assignment.camera.model) · \(store.state(for: camera.id).cacheStatus)")
+            Text("\(assignment.camera.name) · \(store.state(for: camera.id).cacheStatus)")
               .font(.caption).foregroundStyle(.secondary)
           }
         }
@@ -79,6 +78,16 @@ struct UIInspectorViewContent: View {
 
   // MARK: Sections
 
+  @ViewBuilder private func inputOptions(_ inputs: [UIInput], options: [UIInputOption], selectedID: String?) -> some View {
+    ForEach(inputs) { input in
+      if let option = options.first(where: { $0.id == input.id }) {
+        Text(option.usedBy.map { "\(option.label) (used by \($0))" } ?? option.label)
+          .lineLimit(1).truncationMode(.middle).tag(option.id)
+          .disabled(!UIInputPicker.selectable(input, usedBy: option.usedBy, selectedID: selectedID))
+      }
+    }
+  }
+
   private func sourceSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
       // Selected by ID: two units of one model share a name. An input another camera
@@ -91,10 +100,10 @@ struct UIInspectorViewContent: View {
         set: { context.send(.setInput(cameraID: camera.id, deviceID: $0)) })) {
         Text("None").tag("")
         Divider()
-        ForEach(options) { option in
-          Text(option.usedBy.map { "\(option.label) (used by \($0))" } ?? option.label)
-            .lineLimit(1).truncationMode(.middle).tag(option.id)
-            .disabled(option.usedBy != nil && option.id != snapshot.inputID)
+        ForEach(UIInputPicker.groups(context.inputs)) { group in
+          if let title = group.title {
+            Section(title) { inputOptions(group.inputs, options: options, selectedID: snapshot.inputID) }
+          } else { inputOptions(group.inputs, options: options, selectedID: snapshot.inputID) }
         }
         if let missingID { Text("\(snapshot.inputName ?? missingID) (disconnected)").tag(missingID) }
       }
@@ -102,7 +111,12 @@ struct UIInspectorViewContent: View {
       .lineLimit(1)
       .disabled(snapshot.running)
       .help(snapshot.running ? "Stop the camera to change its input."
-        : "Choose the Blackmagic capture device. Each input serves one camera.")
+        : "Choose an input device. Shared inputs may serve more than one camera.")
+      LabeledContent("Supported source formats") {
+        Text(UIInputPicker.supportedModes(context.inputs.first { $0.id == snapshot.inputID }))
+          .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+          .textSelection(.enabled)
+      }
       LabeledContent("Signal") {
         // The tone goes on the symbol; small orange text is hard to read in light mode.
         HStack(spacing: 4) {
@@ -157,9 +171,20 @@ struct UIInspectorViewContent: View {
         .disabled(!chip.enabled || !snapshot.processing)
         .help(chip.help)
       }
-      Picker("Resize to", selection: Binding(get: { snapshot.resizeTarget },
+      Picker("Output size", selection: Binding(get: { snapshot.resizeTarget },
         set: { context.send(.setResizeTarget(cameraID: camera.id, $0)) })) {
         ForEach(ResizeTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+      }
+      Picker("Program color", selection: Binding(get: { snapshot.programColorSpaceID },
+        set: { context.send(.setProgramColorSpace(cameraID: camera.id, $0)) })) {
+        Text("Rec.709").tag("rec709-video")
+        Text("Rec.2020 / PQ").tag("rec2020-pq-video")
+        Text("Rec.2020 / HLG").tag("rec2020-hlg-video")
+      }
+      Picker("Aspect", selection: Binding(get: { snapshot.scalingMode },
+        set: { context.send(.setScalingMode(cameraID: camera.id, $0)) })) {
+        Text("Fit").tag(ProgramScalingMode.fit)
+        Text("Crop").tag(ProgramScalingMode.crop)
       }
       Picker("Color format", selection: Binding(get: { snapshot.colorTarget },
         set: { context.send(.setColorTarget(cameraID: camera.id, $0)) })) {
@@ -169,7 +194,7 @@ struct UIInspectorViewContent: View {
         set: { context.send(.setFrameRateTarget(cameraID: camera.id, $0)) })) {
         ForEach(FrameRateTarget.allCases, id: \.self) { Text($0.title + " fps").tag($0) }
       }
-      Text("Caps never exceed the detected source rate. Turn off an effect above to keep the source setting.")
+      Text("Source size chooses the nearest supported camera size; Fit or Crop preserves the source aspect ratio. Frame-rate caps never exceed the detected source rate; turn off the rate effect to preserve source timing.")
         .font(.caption).foregroundStyle(.secondary)
     } header: {
       Text("Effects")
@@ -219,15 +244,40 @@ struct UIInspectorViewContent: View {
         .font(.subheadline)
         .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
       }
-      Picker("Input gamut", selection: Binding(get: { snapshot.gamut }, set: { context.send(.setGamut(cameraID: camera.id, $0)) })) {
-        ForEach(Self.gamuts, id: \.self) { Text($0).tag($0) }
+      Picker("Source profile", selection: Binding(get: { snapshot.sourceProfileID }, set: { context.send(.setSourceProfile(cameraID: camera.id, $0)) })) {
+        Text("From source tags / unspecified").tag("unspecified")
+        colorSpaceOptions(selected: snapshot.sourceProfileID)
       }
-      .help("The input your LUT expects. This label does not add another log transform. The LUT should output Rec.709.")
+      .help("Declares the captured signal for monitoring and capture. This does not declare either LUT edge.")
+      if snapshot.sourceProfileID != "unspecified", !SourceColorSpaceCatalog.entries.contains(where: { $0.id == snapshot.sourceProfileID }) {
+        Text("This saved source profile is unavailable. Choose a supported declaration before processing.").font(.caption).foregroundStyle(.orange)
+      }
+      Picker("LUT input space", selection: Binding(get: { snapshot.lutInputSpaceID }, set: { context.send(.setLUTInputSpace(cameraID: camera.id, $0)) })) {
+        colorSpaceOptions(selected: snapshot.lutInputSpaceID)
+      }
+      Picker("LUT output space", selection: Binding(get: { snapshot.lutOutputSpaceID }, set: { context.send(.setLUTOutputSpace(cameraID: camera.id, $0)) })) {
+        colorSpaceOptions(selected: snapshot.lutOutputSpaceID)
+      }
+      Text("Choose the spaces specified by the LUT author. LUT spaces are never inferred from its file name; legacy LUTs keep Rec.709 input and output.").font(.caption).foregroundStyle(.secondary)
+
     }
+  }
+
+  @ViewBuilder private func colorSpaceOptions(selected: String) -> some View {
+    if selected != "unspecified", !SourceColorSpaceCatalog.entries.contains(where: { $0.id == selected }) {
+      Text("Unknown: \(selected)").tag(selected)
+    }
+    ForEach(SourceColorSpaceCatalog.entries) { Text($0.title).tag($0.id) }
   }
 
   private func recordingSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
+      if snapshot.showsRecordingConstantFrameRateCompatibility {
+        Toggle("Constant frame rate (compatibility)", isOn: Binding(
+          get: { snapshot.recordingConstantFrameRate },
+          set: { context.send(.setRecordingConstantFrameRate(cameraID: camera.id, $0)) }))
+          .help("Recording only, from the next take. Repeats or skips whole frames onto the source’s nominal rate. Capture, preview and monitoring keep the original source cadence.")
+      }
       let folder = snapshot.recording
       LabeledContent {
         // With its own folder, Choose… also offers the way back to the default folder.

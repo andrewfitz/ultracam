@@ -21,6 +21,7 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
     let temporaryName: String
     let finalName: String
     var recoveredName: String?
+    var sidecarOwned: Bool? = nil
   }
   let url: URL
   private let descriptor: Int32
@@ -82,6 +83,10 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
     try handle.synchronize()
   }
 
+  func claimSidecar() throws {
+    entry.sidecarOwned = true
+    try save()
+  }
   func markRecovered(_ url: URL) throws {
     entry.recoveredName = url.lastPathComponent
     try save()
@@ -183,11 +188,21 @@ enum RecordingRecovery {
     let stem = take.finalURL.deletingPathExtension().lastPathComponent + "_Recovered"
     var destination = folder.appendingPathComponent(stem + ".mov")
     var counter = 2
-    while fm.fileExists(atPath: destination.path) {
+    while fm.fileExists(atPath: destination.path) || fm.fileExists(atPath: RecordingTakeSidecar.url(for: destination).path)
+      || fm.fileExists(atPath: RecordingTakeSidecar.url(for: destination).appendingPathExtension("journal").path) {
       destination = folder.appendingPathComponent(stem + "_\(counter).mov")
       counter += 1
     }
-    try fm.moveItem(at: staging, to: destination)
+    if journal.entry.sidecarOwned == true {
+      try RecordingTakeSidecar.copyPairedMetadata(from: RecordingTakeSidecar.url(for: take.finalURL), toMovie: destination)
+    }
+    do { try fm.moveItem(at: staging, to: destination) }
+    catch {
+      if journal.entry.sidecarOwned == true {
+        try? RecordingTakeSidecar.removePairedMetadata(for: destination)
+      }
+      throw error
+    }
     try journal.markRecovered(destination)
     return destination
   }
@@ -197,9 +212,44 @@ enum RecordingRecovery {
 /// after restarting the app. Tests opt in with an isolated defaults suite.
 final class RecordingFolderStore {
   private let defaults: UserDefaults
+  private var unresolvedRecoveryBookmarks: [String: Any] = [:]
+  private(set) var recoveryRootWarnings: [String] = []
   init(defaults: UserDefaults = .standard) { self.defaults = defaults }
   private func key(for feedID: String?) -> String {
     feedID.map { "recordingFolderBookmark.feed.\($0)" } ?? "recordingFolderBookmark"
+  }
+  func saveRecoveryRoots(_ urls: [URL]) throws {
+    var bookmarks = unresolvedRecoveryBookmarks
+    var seen = Set<String>()
+    for url in urls {
+      let path = url.standardizedFileURL.path
+      guard seen.insert(path).inserted else { continue }
+      let access = RecordingDirectoryAccess(url)
+      defer { withExtendedLifetime(access) {} }
+      bookmarks[path] = try url.bookmarkData(options: .withSecurityScope,
+        includingResourceValuesForKeys: nil, relativeTo: nil)
+      unresolvedRecoveryBookmarks.removeValue(forKey: path)
+    }
+    defaults.set(bookmarks, forKey: "recordingRecoveryRootBookmarks")
+  }
+  func loadRecoveryRoots() throws -> [URL] {
+    let bookmarks = defaults.dictionary(forKey: "recordingRecoveryRootBookmarks") ?? [:]
+    unresolvedRecoveryBookmarks = [:]
+    recoveryRootWarnings = []
+    var roots: [URL] = []
+    for path in bookmarks.keys.sorted() {
+      do {
+        guard let data = bookmarks[path] as? Data else { throw CocoaError(.fileReadCorruptFile) }
+        var stale = false
+        let root = try URL(resolvingBookmarkData: data, options: [.withSecurityScope, .withoutUI],
+          relativeTo: nil, bookmarkDataIsStale: &stale)
+        roots.append(root)
+      } catch {
+        unresolvedRecoveryBookmarks[path] = bookmarks[path]
+        recoveryRootWarnings.append(path)
+      }
+    }
+    return roots
   }
   func save(_ url: URL?, feedID: String? = nil) throws {
     let key = key(for: feedID)

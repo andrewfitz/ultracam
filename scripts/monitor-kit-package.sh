@@ -15,7 +15,7 @@ fi
 # The release products build incrementally in one shared scratch. Each run copies them out
 # while it still holds the cache lock, so it compiles and links against exactly what it
 # built, whatever another run rebuilds afterwards.
-monitor_kit_cache_root="${MONITOR_KIT_PACKAGE_CACHE:-/Volumes/8TB/cinesomatic-director-work/agent-work/build/ultracam/monitor-kit-package-cache}"
+monitor_kit_cache_root="${MONITOR_KIT_PACKAGE_CACHE:-$(python3 "$task_root/scripts/work_paths.py" --path package_cache_root)}"
 mkdir -p "$monitor_kit_cache_root/modules"
 monitor_kit_scratch="$monitor_kit_cache_root/scratch"
 monitor_kit_build_lock="$monitor_kit_cache_root/build.lock"

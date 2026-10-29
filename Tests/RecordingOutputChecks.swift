@@ -211,7 +211,7 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     take.preserveForRecovery()
     let interrupted = try XCTUnwrap(RecordingRecovery.scan(root: root).first)
     XCTAssertEqual(interrupted.finalURL.pathExtension, "mxf")
-    XCTAssertEqual(interrupted.temporaryURL, take.temporaryURL)
+    XCTAssertEqual(interrupted.temporaryURL.resolvingSymlinksInPath(), take.temporaryURL.resolvingSymlinksInPath())
   }
 
   func testCompletedAndCancelledSessionsRemoveRecoveryJournal() throws {
@@ -422,10 +422,10 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     try wide.checkExternalWriterCapacity(headroom: 600)
     XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 600))
     try wide.pause()
-    XCTAssertEqual(volumes.usage(for: root).headroom, 1_200, "Paused, it holds its claim until it reports what it owes")
+    XCTAssertEqual(volumes.usage(for: root).headroom, 600, "The rejected sibling check adds no claim; pause retains accepted work until it reports what it owes")
     // Its recorder reports what is still being written; recorded, not checked.
     XCTAssertNoThrow(try wide.checkExternalWriterCapacity(headroom: 100))
-    XCTAssertEqual(volumes.usage(for: root).headroom, 700)
+    XCTAssertEqual(volumes.usage(for: root).headroom, 100)
     XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 600))
     try wide.resume()
     XCTAssertEqual(volumes.usage(for: root).headroom, 1_200, "Resume restores the last full headroom")
@@ -506,14 +506,4 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try Data(contentsOf: session.temporaryURL), original)
   }
 
-  static let allTests = [
-    ("per-feed paths and atomic finalization", testPerFeedPathsAndAtomicFinalization),
-    ("pause preserves temporary file and sessions are independent", testPausePreservesTemporaryFileAndSessionsAreIndependent),
-    ("reject traversal and escaping symlink", testRejectsTraversalAndEscapingSymlink),
-    ("admission rejects insufficient space", testAdmissionRejectsInsufficientSpaceAndReleasesReservation),
-    ("repeated session does not replace output", testRepeatedSessionDoesNotReplaceExistingOutput),
-    ("external writer atomic finalization", testExternalWriterSessionLeavesPathForContainerAndFinalizesAtomically),
-    ("external writer rejects empty output", testExternalWriterWithoutContainerCannotCreateEmptyFinalFile),
-    ("external writer pause and resume", testExternalWriterPauseAndResumePreservesSession),
-  ]
 }

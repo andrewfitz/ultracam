@@ -1,0 +1,111 @@
+name: Signed bundle validation
+
+# This opt-in credentialed lane is validation only. External execution remains
+# unverified until repository owners provision inputs and run it successfully.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signed-release-validation:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && vars.ULTRACAM_SIGNED_CI == 'enabled'
+    environment: signed-validation
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-signed-work
+      ULTRACAM_SDK_INVENTORY: ${{ runner.temp }}/ultracam-signed-inventory.json
+      DEVELOPMENT_TEAM: ${{ vars.ULTRACAM_DEVELOPMENT_TEAM }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install owner-provisioned identity and provisioning profiles
+        env:
+          SIGNING_P12: ${{ secrets.ULTRACAM_SIGNING_P12_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.ULTRACAM_SIGNING_P12_PASSWORD }}
+          APP_PROFILE: ${{ secrets.ULTRACAM_APP_PROFILE_BASE64 }}
+          CAMERA_PROFILE: ${{ secrets.ULTRACAM_CAMERA_PROFILE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DEVELOPMENT_TEAM" && test -n "$SIGNING_P12" && test -n "$SIGNING_PASSWORD" && test -n "$APP_PROFILE" && test -n "$CAMERA_PROFILE" || { echo 'Signing inputs are not configured.' >&2; exit 1; }
+          material="$RUNNER_TEMP/ultracam-signing"
+          mkdir -p "$material"
+          python3 - "$material" <<'PY'
+          import base64, os, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          for name, key in [('identity.p12', 'SIGNING_P12'), ('app.provisionprofile', 'APP_PROFILE'), ('camera.provisionprofile', 'CAMERA_PROFILE')]:
+              (root / name).write_bytes(base64.b64decode(os.environ[key], validate=True))
+          PY
+          keychain="$material/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$material/identity.p12" -k "$keychain" -P "$SIGNING_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          : > "$material/profiles-installed.txt"
+          for name in app camera; do
+            security cms -D -i "$material/$name.provisionprofile" > "$material/$name.plist"
+          done
+          python3 - "$material" <<'PY'
+          import os, pathlib, plistlib, re, sys
+          root = pathlib.Path(sys.argv[1])
+          folder = pathlib.Path.home() / 'Library/MobileDevice/Provisioning Profiles'
+          folder.mkdir(parents=True, exist_ok=True)
+          for name, bundle in [('app', 'org.ultracam.app'), ('camera', 'org.ultracam.app.camera')]:
+              profile = plistlib.loads((root / (name + '.plist')).read_bytes())
+              uuid = profile['UUID']
+              if not re.fullmatch(r'[A-Fa-f0-9-]{36}', uuid) or os.environ['DEVELOPMENT_TEAM'] not in profile.get('TeamIdentifier', []):
+                  raise SystemExit('Provisioning profile identity/team mismatch')
+              entitlements = profile.get('Entitlements', {})
+              identifier = entitlements.get('com.apple.application-identifier', entitlements.get('application-identifier', ''))
+              if identifier != os.environ['DEVELOPMENT_TEAM'] + '.' + bundle:
+                  raise SystemExit('Provisioning profile bundle identifier mismatch')
+              target = folder / (uuid + '.provisionprofile')
+              with target.open('xb') as output:
+                  output.write((root / (name + '.provisionprofile')).read_bytes())
+              with (root / 'profiles-installed.txt').open('a') as receipt:
+                  receipt.write(str(target) + '\n')
+          PY
+      - name: Install licensed SDK and verify manifest pins
+        env:
+          SONY_SDK_ARCHIVE_URL: ${{ secrets.ULTRACAM_SONY_SDK_ARCHIVE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SONY_SDK_ARCHIVE_URL" || { echo 'Licensed SDK source is not configured.' >&2; exit 1; }
+          archive="$RUNNER_TEMP/ultracam-signed-sdk.zip"
+          trap 'rm -f "$archive"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$SONY_SDK_ARCHIVE_URL" --output "$archive"
+          python3 scripts/vendor-sdk.py install sony "$archive"
+          python3 scripts/vendor-sdk.py verify sony
+          printf '%s\n' '{"sony": true}' > "$ULTRACAM_SDK_INVENTORY"
+      - name: Build signed Release using installed profiles
+        run: bash scripts/build.sh --signed --sdk-inventory "$ULTRACAM_SDK_INVENTORY"
+      - name: Validate signed host and embedded extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          product="$ULTRACAM_WORK_ROOT/agent-work/ultracam/Ultracam.app"
+          python3 scripts/validate_bundle.py "$product"
+          /usr/bin/codesign --verify --deep --strict "$product"
+          /usr/bin/codesign --verify --deep --strict "$product/Contents/Library/SystemExtensions/org.ultracam.app.camera.systemextension"
+      - name: Remove ephemeral signing material and profiles
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          material="$RUNNER_TEMP/ultracam-signing"
+          if [[ -f "$material/profiles-installed.txt" ]]; then
+            while IFS= read -r profile; do rm -f "$profile"; done < "$material/profiles-installed.txt"
+          fi
+          security delete-keychain "$material/signing.keychain-db" 2>/dev/null || true
+          rm -rf "$material"
+          rm -f "$RUNNER_TEMP/ultracam-signed-sdk.zip" "$ULTRACAM_SDK_INVENTORY"

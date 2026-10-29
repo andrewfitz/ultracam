@@ -199,30 +199,19 @@ import XCTest
     try lattice.joined(separator: "\n").write(to: cube, atomically: true, encoding: .utf8)
     let settings = AppSettingsStore(defaults: defaults)
     settings.saveSnapshot(AppSettingsSnapshot(feeds: [
-      FeedDescriptor(id: alpha, name: "Integration Wide", selectedDevice: "integration-device-a",
+      FeedDescriptor(id: alpha, name: "Integration Wide", selectedDevice: "fake:fixture-a",
         applyLUT: false, automaticFeed: true),
-      FeedDescriptor(id: beta, name: "Integration Tight", selectedDevice: "integration-device-b",
+      FeedDescriptor(id: beta, name: "Integration Tight", selectedDevice: "fake:fixture-b",
         applyLUT: false, automaticFeed: true),
     ], selectedFeedID: alpha, outputMode: .separateCameras))
-    final class Frames: @unchecked Sendable {
-      let lock = NSLock()
-      var handlers: [String: (CVPixelBuffer, CMTime, CMTime, Bool) -> Void] = [:]
-    }
-    let frames = Frames()
-    var hardware = AppHardware.offline
-    hardware.devices = {
-      [InputDevice(id: "integration-device-a", name: "A"), InputDevice(id: "integration-device-b", name: "B")]
-    }
-    hardware.captureServices = { _ in
-      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
-        send: { _ in true })
-      services.startAutomatic = { device, handler, _ in frames.lock.withLock { frames.handlers[device] = handler } }
-      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
-      return services
-    }
+    let fixture = try AppHardwareSyntheticFixture(duration: VideoContract.slowDuration, deviceIDs: ["fake:fixture-a", "fake:fixture-b"])
+    fixture.connect()
+    let hardware = fixture.hardware
+    let pattern = try fixture.makePattern()
+    defer { fixture.stop() }
     func makeModel() -> AppModel {
       AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
-        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
+        registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: fixture.publisher,
         recordingFolderStore: RecordingFolderStore(defaults: defaults), hardware: hardware)
     }
     do {
@@ -238,7 +227,7 @@ import XCTest
       var snapshot = settings.loadSnapshot()
       snapshot.selectedFeedID = selected
       settings.saveSnapshot(snapshot)
-      frames.lock.withLock { frames.handlers = [:] }
+      let sessionsBefore = fixture.plugin.sessions.count
       let model = makeModel()
       let coordinator = model.monitorCoordinator
       // Both pictures are on screen at launch while both cameras restore their LUTs.
@@ -258,21 +247,18 @@ import XCTest
         model.isCameraRunning(alpha) && model.isCameraRunning(beta) &&
           model.burnInLUT(for: alpha) != nil && model.burnInLUT(for: beta) != nil
       }, "Both cameras start on demand with their LUTs burned in (\(label))")
-      XCTAssertTrue(spinUntil(seconds: 5) {
-        frames.lock.withLock { frames.handlers["integration-device-a"] != nil && frames.handlers["integration-device-b"] != nil }
-      })
-      let buffers = try pool(4, width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10)
-      let handlers = frames.lock.withLock { [frames.handlers["integration-device-a"]!, frames.handlers["integration-device-b"]!] }
+      XCTAssertTrue(spinUntil(seconds: 5) { fixture.plugin.sessions.count >= sessionsBefore + 2 })
       var index = 0
       func drawsLUT(_ presenter: MonitorSurfacePresenter) -> Bool {
         presenter.shownStatus.activeLabels.contains { $0.hasPrefix("LUT") }
       }
       let drawn = spinUntil(seconds: 10) {
         index += 1
-        for handler in handlers {
-          handler(buffers[index % buffers.count], CMTimeMultiply(VideoContract.slowDuration, multiplier: Int32(index)),
-            VideoContract.slowDuration, true)
+        do {
+          let emitted = try fixture.emit(pattern, index: Int32(index))
+          XCTAssertGreaterThanOrEqual(emitted, 2)
         }
+        catch { XCTFail("Typed synthetic source failed: \(error)") }
         RunLoop.main.run(until: Date().addingTimeInterval(1 / 30))
         return drawsLUT(presenterA) && drawsLUT(presenterB)
       }

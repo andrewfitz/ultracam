@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import IOSurface
 
 /// The result of routing one processed frame through the Program output.
 /// The scheduler decision remains available to diagnostics while the route
@@ -19,12 +20,17 @@ struct ProgramOutputFormat: Equatable, Sendable, CustomStringConvertible {
   let height: Int
   let pixelFormat: OSType
   let duration: CMTime
+  let scalingMode: ProgramScalingMode
+  let colour: Colorimetry
 
-  init(width: Int, height: Int, pixelFormat: OSType, duration: CMTime) {
+  init(width: Int, height: Int, pixelFormat: OSType, duration: CMTime, scalingMode: ProgramScalingMode = .fit, colour: Colorimetry = .rec709Video) {
     self.width = width
     self.height = height
     self.pixelFormat = pixelFormat
     self.duration = duration
+    self.scalingMode = scalingMode
+    self.colour = Colorimetry(primaries: colour.primaries, transfer: colour.transfer, matrix: colour.matrix,
+      range: colour.range, horizontalChromaSiting: .center, verticalChromaSiting: .center)
   }
 
   /// Mirrors `CameraSink.connect`: an untouched configuration negotiates the
@@ -32,8 +38,16 @@ struct ProgramOutputFormat: Equatable, Sendable, CustomStringConvertible {
   init(configuration: PipelineConfiguration, passthroughFormat: OSType) {
     width = configuration.width
     height = configuration.height
-    pixelFormat = configuration.untouched ? passthroughFormat : configuration.pixelFormat
-    duration = configuration.duration
+    let nativeProgramPixels: Set<OSType> = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr10,
+      kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange]
+    pixelFormat = configuration.untouched && nativeProgramPixels.contains(passthroughFormat)
+      ? passthroughFormat : configuration.pixelFormat
+    duration = configuration.reduceFrameRate ? configuration.frameRateTarget.duration : configuration.duration
+    scalingMode = configuration.scalingMode
+    let target = configuration.programColorimetry
+    colour = Colorimetry(primaries: target.primaries, transfer: target.transfer, matrix: target.matrix,
+      range: target.range, horizontalChromaSiting: .center, verticalChromaSiting: .center)
   }
 
   /// Geometry and pixel format. Cadence is converted separately, on the
@@ -97,6 +111,8 @@ struct ProgramRouteStatistics: Equatable, Sendable {
   /// IOSurface). Intentional, not errors.
   var cadenceSkipped: UInt64 = 0
   var cadenceRepeats: UInt64 = 0
+  /// Source spans longer than the bounded repeat window.
+  var cadenceDiscontinuities: UInt64 = 0
   /// Frames the scheduler skipped, by reason. Non-selected and stale-queued
   /// skips are normal (another source is on air, or a timed cut has not been
   /// reached). Missing-source and invalid-timestamp skips of the on-air
@@ -146,16 +162,15 @@ struct ProgramRouteStatistics: Equatable, Sendable {
 /// strictly increasing and spaced by the contract duration, which labels
 /// every sample, so samples never overlap and a cut lands on the next slot.
 final class ProgramOutputRoute: @unchecked Sendable {
-  /// Frames awaiting GPU conversion or publication. A real GPU stall of this
-  /// many frames (~0.4 s at 59.94) is an error, reported and counted.
-  static let stageCapacity = 24
-  /// Consecutive skipped frames of the on-air source before it is reported.
-  /// One or two can race a source being retired; more is a broken stream.
+  /// Metadata safety ceiling; media admission is independently time/byte bounded.
+  static let stageMaximumMetadataSlots = 256
+  /// Compatibility for the normalizer preconversion metadata ceiling.
+  static let stageCapacity = stageMaximumMetadataSlots
+  static let consumerCapacity = 24
+  static let stagePolicy = try! MediaRetentionPolicy(maximumBytes: 512 * 1024 * 1024,
+    maximumDuration: 0.4, maximumSlots: stageMaximumMetadataSlots, minimumSlots: 2)
   static let onAirSkipReportThreshold = 3
-  /// Consecutive frames sent to the camera after which the error latch
-  /// re-arms (~1 s at 59.94): the next failure is reported again. Shorter
-  /// would turn an intermittent fault into one main-actor event per frame.
-  static let healthyPublishesToRearm = 60
+  static let healthyPublishDurationToRearm = 1.0
 
   private struct StageEntry {
     let sequence: UInt64
@@ -168,6 +183,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
     /// The source frame stays retained until its conversion completes.
     var source: ProcessedFrame<CVPixelBuffer>?
     var ready: ProcessedFrame<CVPixelBuffer>?
+    var retention: MediaRetentionLedger.Lease?
+    var backing: GPUAllocationBudget.Lease?
     var failed = false
   }
 
@@ -187,14 +204,26 @@ final class ProgramOutputRoute: @unchecked Sendable {
   private var stats = ProgramRouteStatistics()
   private var errorReported = false
   /// Frames sent since the last failure; re-arms `errorReported`.
-  private var healthyPublishes = 0
+  private var healthyPublishedDuration = 0.0
+  private var healthyPublishedEnd: CMTime?
+  private let stageRetention = MediaRetentionLedger(policy: stagePolicy)
+  private let stageBacking = GPUAllocationBudget(policy: try! GPUAllocationBudgetPolicy(maximumBytes: stagePolicy.maximumBytes, minimumSlots: 2))
+  var stageRetentionSnapshot: MediaRetentionLedger.Snapshot { stageRetention.snapshot }
+  var stageAllocationSnapshot: GPUAllocationBudget.Snapshot { stageBacking.snapshot() }
   /// Program time of the next contract-cadence slot.
   private var nextSlot: CMTime?
+  /// Furthest bounded source span covered on this output timeline.
+  private var coveredSourceEnd: CMTime?
+  private var sourcePauseTolerances: [FeedID: Duration] = [:]
+  /// A long or paused source cannot manufacture an unbounded burst of output.
+  private let maximumRepeatDuration: Duration
   private var onAirSkips = 0
   let fanOut: FrameFanOut<CVPixelBuffer>
 
   init(settings: SwitcherSettings = .init(), feedIDs: [FeedID],
-       routeLabel: String = "org.ultracam.program-output") {
+       routeLabel: String = "org.ultracam.program-output",
+       maximumRepeatDuration: Duration = .seconds(2)) {
+    self.maximumRepeatDuration = max(.zero, maximumRepeatDuration)
     state = SwitcherCoordinator(settings: settings, feedIDs: feedIDs)
     fanOut = FrameFanOut(label: routeLabel)
   }
@@ -214,6 +243,11 @@ final class ProgramOutputRoute: @unchecked Sendable {
   var isOnAir: Bool { locked { state.isOnAir } }
   var statistics: ProgramRouteStatistics { locked { stats } }
   var contract: ProgramOutputFormat? { locked { outputContract } }
+
+  /// Declared source gaps may shorten, but never extend, the configured limit.
+  func setSourcePauseTolerance(_ feedID: FeedID, mayPause: Duration?) {
+    locked { sourcePauseTolerances[feedID] = mayPause.map { max(.zero, $0) } }
+  }
 
   /// Called under the route lock, in Program order, from the ingesting thread.
   var onMonitorFrame: ((FeedID, ProcessedFrame<CVPixelBuffer>, CMTime, CMTime, Bool) -> Void)? {
@@ -245,6 +279,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
         // changes. Invalidate the ordered stage and cadence clock together.
         flushOutputLocked()
         nextSlot = nil
+        coveredSourceEnd = nil
       }
       outputContract = contract
       outputActive = active
@@ -475,25 +510,48 @@ final class ProgramOutputRoute: @unchecked Sendable {
   /// Grid slots of the contract cadence that start inside one accepted
   /// frame's span on the Program clock. Lock held.
   private func cadenceSlotsLocked(start: CMTime, duration: CMTime,
-                                  step: CMTime) -> (first: CMTime, count: Int) {
+                                  step: CMTime, events: inout [ProgramRouteEvent]) -> (first: CMTime, count: Int) {
     guard step.isNumeric, step.value > 0, duration.isNumeric, duration.value > 0 else {
       return (start, 1)
     }
-    let end = CMTimeAdd(start, duration)
-    var slot = nextSlot ?? start
-    // A gap of half a slot or more (source frames missing, or output was off)
-    // restarts the grid at this frame. A slot behind the frame by less than
-    // that is clock jitter: keep the grid. A slot past this frame's span by a
-    // whole step cannot come from a monotonic Program clock: restart too.
-    if CMTimeCompare(CMTimeAdd(slot, CMTimeMultiplyByRatio(step, multiplier: 1, divisor: 2)), start) <= 0 ||
-      CMTimeCompare(slot, CMTimeAdd(end, step)) > 0 {
-      slot = start
+    let tolerance = state.selectedFeedID.flatMap { sourcePauseTolerances[$0] } ?? maximumRepeatDuration
+    let window = min(tolerance, maximumRepeatDuration).components
+    let seconds = Double(window.seconds) + Double(window.attoseconds) / 1e18
+    // At least the original frame is allowed even when repetition is disabled.
+    let limit = max(CMTimeGetSeconds(step), seconds)
+    let clipped = CMTimeGetSeconds(duration) > limit
+    let boundedDuration = clipped
+      ? CMTime(seconds: limit, preferredTimescale: max(240_000, duration.timescale, step.timescale)) : duration
+    let end = CMTimeAdd(start, boundedDuration)
+    let missingDuration = coveredSourceEnd.map { CMTimeGetSeconds(CMTimeSubtract(start, $0)) } ?? 0
+    if clipped || missingDuration > limit {
+      stats.cadenceDiscontinuities &+= 1
+      reportErrorLocked("Program source gap exceeded its repeat window; output resumes with the next source frame.", events: &events)
     }
+    if coveredSourceEnd == nil || CMTimeCompare(end, coveredSourceEnd!) > 0 {
+      coveredSourceEnd = end
+    }
+    var slot = nextSlot ?? start
+    // Keep the original contract grid through missing callbacks. Jump directly
+    // to its first slot at/after resume (constant work even for a long pause).
+    // Sub-half-slot clock jitter keeps the pending slot, as before.
+    if CMTimeCompare(CMTimeAdd(slot, CMTimeMultiplyByRatio(step, multiplier: 1, divisor: 2)), start) <= 0 {
+      let delta = CMTimeSubtract(start, slot)
+      let numerator = Int128(delta.value) * Int128(step.timescale)
+      let denominator = Int128(delta.timescale) * Int128(step.value)
+      guard numerator > 0, denominator > 0,
+        let ticks = Int64(exactly: ((numerator + denominator - 1) / denominator) * Int128(step.value)) else {
+        return (slot, 0)
+      }
+      slot = CMTimeAdd(slot, CMTime(value: ticks, timescale: step.timescale))
+    }
+    // An overlapping source prediction never rewinds slots already emitted.
+    // A wholly covered span produces zero sends until source time catches up.
     let first = slot
     var count = 0
-    // Bounded: a source at a quarter of the contract rate is the slowest
-    // supported ratio by far (29.97 into 59.94 sends each frame twice).
-    while CMTimeCompare(slot, end) < 0, count < 4 {
+    // Bounded in time, so low-rate sources fill the grid without an arbitrary
+    // four-frame cutoff and paused sources stop at their repeat window.
+    while CMTimeCompare(slot, end) < 0 {
       count += 1
       slot = CMTimeAdd(slot, step)
     }
@@ -516,17 +574,23 @@ final class ProgramOutputRoute: @unchecked Sendable {
     if let contract {
       let step = CMTimeConvertScale(contract.duration, timescale: source.presentationTime.timescale,
         method: .roundHalfAwayFromZero)
-      (sendTime, sends) = cadenceSlotsLocked(start: source.presentationTime, duration: source.duration, step: step)
+      (sendTime, sends) = cadenceSlotsLocked(start: source.presentationTime, duration: source.duration, step: step, events: &events)
       guard sends > 0 else {
         // Faster than the contract: this frame falls between two slots.
         stats.cadenceSkipped &+= 1
         return (FrameFanOutSummary(), false)
       }
     }
-    guard stage.count < Self.stageCapacity else {
+    let retention: MediaRetentionLedger.Lease
+    let backing: GPUAllocationBudget.Lease
+    do {
+      let bytes = try Self.storageBytes(frame.payload)
+      try stageBacking.policy.validateMinimum(bytesPerSlot: bytes)
+      retention = try stageRetention.admit(bytes: bytes, duration: CMTimeGetSeconds(source.duration))
+      backing = try retainBacking(frame.payload, bytes: bytes)
+    } catch {
       stats.overflowRejected &+= 1
-      reportErrorLocked("Program output is behind: the GPU stage is full, so a frame was dropped.",
-        events: &events)
+      reportErrorLocked("Program output is behind: its GPU stage retention budget refused a frame.", events: &events)
       return (FrameFanOutSummary(), false)
     }
     nextSequence &+= 1
@@ -537,8 +601,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
       pixelFormat: contract.map { UInt32($0.pixelFormat) } ?? source.pixelFormat,
       processingRevision: source.processingRevision)
     var entry = StageEntry(sequence: nextSequence, timeline: timeline, metadata: metadata,
-      sends: sends, acceptedAt: acceptedAt)
-    if let contract, !contract.matches(source) {
+      sends: sends, acceptedAt: acceptedAt, retention: retention, backing: backing)
+    if let contract, !contract.matches(source) || !contract.matchesColourAndAspect(frame.payload) {
       guard let normalizer = normalizerProvider?() else {
         stats.normalizerNotReady &+= 1
         stats.normalizationFailures &+= 1
@@ -557,7 +621,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
       let sequence = entry.sequence
       let timeline = entry.timeline
       do {
-        try normalizer.normalize(frame.payload, to: contract) { [weak self] result in
+        try normalizer.normalize(frame.payload, to: contract) { [weak self, retention, backing] result in
+          defer { withExtendedLifetime((retention, backing)) {} }
           self?.completeNormalization(sequence: sequence, timeline: timeline, result: result)
         }
       } catch {
@@ -577,6 +642,25 @@ final class ProgramOutputRoute: @unchecked Sendable {
     return flushStageLocked(events: &events)
   }
 
+  static func storageBytes(_ buffer: CVPixelBuffer) throws -> Int {
+    let count = CVPixelBufferGetPlaneCount(buffer)
+    let planes = count == 0
+      ? [MediaStorageExtent.Plane(rowBytes: CVPixelBufferGetBytesPerRow(buffer), rows: CVPixelBufferGetHeight(buffer))]
+      : (0..<count).map { MediaStorageExtent.Plane(rowBytes: CVPixelBufferGetBytesPerRowOfPlane(buffer, $0), rows: CVPixelBufferGetHeightOfPlane(buffer, $0)) }
+    let surface = CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue()
+    return try MediaStorageExtent.allocationBytes(planes: planes,
+      pixelBufferDataSize: CVPixelBufferGetDataSize(buffer),
+      ioSurfaceAllocationSize: surface.map { IOSurfaceGetAllocSize($0) })
+  }
+
+  private func retainBacking(_ buffer: CVPixelBuffer, bytes: Int) throws -> GPUAllocationBudget.Lease {
+    if let surface = CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue() {
+      return try stageBacking.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: bytes, generation: 0, owner: surface)
+    }
+    return try stageBacking.acquire(backingID: UInt64(UInt(bitPattern: Unmanaged.passUnretained(buffer).toOpaque())),
+      bytes: bytes, generation: 0, owner: buffer)
+  }
+
   private func completeNormalization(sequence: UInt64, timeline: UInt64,
                                      result: Result<CVPixelBuffer, Error>) {
     var events: [ProgramRouteEvent] = []
@@ -587,7 +671,17 @@ final class ProgramOutputRoute: @unchecked Sendable {
       case let .success(output):
         stats.normalized &+= 1
         stats.cadenceRepeats &+= UInt64(stage[index].sends - 1)
-        stage[index].ready = ProcessedFrame(payload: output, metadata: stage[index].metadata)
+        do {
+          let bytes = try Self.storageBytes(output)
+          // Acquire before releasing the source charge: both backings can coexist.
+          let outputBacking = try retainBacking(output, bytes: bytes)
+          stage[index].backing = outputBacking
+          stage[index].ready = ProcessedFrame(payload: output, metadata: stage[index].metadata)
+        } catch {
+          stage[index].failed = true
+          stats.overflowRejected &+= 1
+          reportErrorLocked("Program normalized output exceeded its storage budget.", events: &events)
+        }
       case let .failure(error):
         stage[index].failed = true
         stats.normalizationFailures &+= 1
@@ -633,8 +727,19 @@ final class ProgramOutputRoute: @unchecked Sendable {
         if summary.enqueued > 0 {
           stats.published &+= 1
           published = true
-          healthyPublishes += 1
-          if healthyPublishes >= Self.healthyPublishesToRearm { errorReported = false }
+          if summary.rejected == 0 {
+            let start = frame.metadata.presentationTime
+            let duration = CMTimeGetSeconds(frame.metadata.duration)
+            if let end = healthyPublishedEnd,
+               abs(CMTimeGetSeconds(CMTimeSubtract(start, end))) > 0.000_001 {
+              healthyPublishedDuration = 0
+            }
+            if duration.isFinite, duration > 0 {
+              healthyPublishedDuration += duration
+              healthyPublishedEnd = CMTimeAdd(start, frame.metadata.duration)
+              if healthyPublishedDuration + 1e-9 >= Self.healthyPublishDurationToRearm { errorReported = false }
+            }
+          }
           let elapsed = (ProcessInfo.processInfo.systemUptime - head.acceptedAt) * 1_000
           stats.lastStageMilliseconds = elapsed
           stats.maxStageMilliseconds = max(stats.maxStageMilliseconds, elapsed)
@@ -648,7 +753,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
   /// Reports the first failure after a healthy stretch. Every failure, shown
   /// or not, restarts the stretch.
   private func reportErrorLocked(_ message: String, events: inout [ProgramRouteEvent]) {
-    healthyPublishes = 0
+    healthyPublishedDuration = 0
+    healthyPublishedEnd = nil
     guard !errorReported else { return }
     errorReported = true
     events.append(.outputError(message))
@@ -664,7 +770,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
     fanOut.drain()
   }
 
-  func addConsumerRoute(id: String = "program-camera", capacity: Int = stageCapacity,
+  func addConsumerRoute(id: String = "program-camera", capacity: Int = consumerCapacity,
                         policy: FrameQueueOverflowPolicy = .reject)
     throws -> FrameRoute<CVPixelBuffer> {
     try fanOut.addRoute(id: id, capacity: capacity, policy: policy)
@@ -677,6 +783,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
       flushOutputLocked()
       state.reset()
       nextSlot = nil
+      coveredSourceEnd = nil
       onAirSkips = 0
     }
   }
@@ -765,7 +872,7 @@ final class FeedSession: Identifiable {
 /// Main-actor collection of stable feed descriptors, runtime sessions, and
 /// capture owners. Persisted ordering remains the source of truth for the
 /// collection; sessions and controllers are created only for descriptors that
-/// are accessed. Each controller owns an independent DeckLink backend.
+/// are accessed. Each controller owns an independent capture session.
 @MainActor
 final class FeedCoordinator {
   private(set) var descriptors: [FeedDescriptor]
@@ -883,7 +990,7 @@ final class FeedCoordinator {
   func prepareProgramOutputBridge() throws {
     guard programBridge == nil else { return }
     let route = try programOutput.addConsumerRoute(id: "program-camera",
-      capacity: ProgramOutputRoute.stageCapacity, policy: .reject)
+      capacity: ProgramOutputRoute.consumerCapacity, policy: .reject)
     let bridge = ProgramOutputBridge(route: route)
     attachProgramBridge(bridge)
   }

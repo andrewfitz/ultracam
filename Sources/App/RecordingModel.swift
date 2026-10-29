@@ -6,21 +6,36 @@ import CoreVideo
 /// The codecs exposed by the recording UI. The media writer is injected through
 /// `RecordingSessionDriver`, so this model does not own capture or file I/O.
 enum RecordingCodec: String, CaseIterable, Codable, Equatable, Sendable {
-  case proRes42210Bit
-  case hevcMain10_422
+  case proResLT, proRes422, proRes42210Bit, proRes4444
+  case hevcMain, hevcMain10, hevcMain10_422
 
-  var title: String {
+  var matrixProfile: RecordingProfileMatrixProfile {
     switch self {
-    case .proRes42210Bit: return "ProRes 422 HQ"
-    case .hevcMain10_422: return "HEVC Main10 4:2:2"
+    case .proResLT: return .proResLT
+    case .proRes422: return .proRes422
+    case .proRes42210Bit: return .proRes422HQ
+    case .proRes4444: return .proRes4444
+    case .hevcMain: return .hevcMain
+    case .hevcMain10: return .hevcMain10
+    case .hevcMain10_422: return .hevcMain10_422
     }
   }
-
-  var fileExtension: String {
+  var title: String { matrixProfile.displayName }
+  var fileExtension: String { "mov" }
+  var sizeEstimatorCodec: RecordingSizeEstimator.Codec {
     switch self {
-    case .proRes42210Bit, .hevcMain10_422: return "mov"
+    case .proResLT: return .proResLT
+    case .proRes422: return .proRes422
+    case .proRes42210Bit: return .proRes422HQ
+    case .proRes4444: return .proRes4444
+    case .hevcMain: return .hevcMain
+    case .hevcMain10: return .hevcMain10
+    case .hevcMain10_422: return .hevcMain10_422
     }
   }
+  func isAvailable(for source: SourceFormat) -> Bool { RecordingProfileMatrix.supports(matrixProfile, source: source) }
+  static func available(for source: SourceFormat) -> [Self] { allCases.filter { $0.isAvailable(for: source) } }
+
 }
 
 enum RecordingTimecodeMode: String, CaseIterable, Codable, Equatable, Sendable {
@@ -39,7 +54,7 @@ enum RecordingTimecodeMode: String, CaseIterable, Codable, Equatable, Sendable {
   var help: String {
     switch self {
     case .source:
-      return "No timecode track is written. Camera timecode still appears in the metadata panel when the signal has it."
+      return "Preserves available native source timecode. Variable-rate or late-arriving labels are retained in the sidecar when no movie timecode track exists."
     case .recordStart:
       return "Writes a timecode track that starts at 00:00:00:00."
     case .wallClock:
@@ -53,13 +68,23 @@ struct RecordingConfiguration: Equatable, Sendable {
   var outputFolder: URL?
   var timecodeMode: RecordingTimecodeMode = .wallClock
   var feedName: String?
+  var compatibilityPolicy = RecordingCompatibilityPolicy()
+  var recordingConstantFrameRate = false
+  /// Explicit bounded rounding for variable source timestamps; sampled per take.
+  var variableRateQuantizationPolicy: RecordingTimebase.QuantizationPolicy = .nearest240000
 
   init(codec: RecordingCodec = .proRes42210Bit, outputFolder: URL? = nil,
-    timecodeMode: RecordingTimecodeMode = .wallClock, feedName: String? = nil) {
+    timecodeMode: RecordingTimecodeMode = .wallClock, feedName: String? = nil,
+    compatibilityPolicy: RecordingCompatibilityPolicy = .init(),
+    recordingConstantFrameRate: Bool = false,
+    variableRateQuantizationPolicy: RecordingTimebase.QuantizationPolicy = .nearest240000) {
+    self.recordingConstantFrameRate = recordingConstantFrameRate
+    self.variableRateQuantizationPolicy = variableRateQuantizationPolicy
     self.codec = codec
     self.outputFolder = outputFolder
     self.timecodeMode = timecodeMode
     self.feedName = feedName
+    self.compatibilityPolicy = compatibilityPolicy
   }
 }
 
@@ -67,9 +92,11 @@ struct RecordingFeedDescriptor: Identifiable, Hashable, Sendable {
   let id: FeedID
   var name: String
 
-  init(id: FeedID, name: String) {
+  var recordingConstantFrameRate: Bool
+  init(id: FeedID, name: String, recordingConstantFrameRate: Bool = false) {
     self.id = id
     self.name = name
+    self.recordingConstantFrameRate = recordingConstantFrameRate
   }
 }
 
@@ -123,7 +150,7 @@ enum RecordingUIError: LocalizedError, Equatable {
     case .unavailable: return "Recording is unavailable until a recording backend is connected."
     case .outputFolderRequired: return "Choose an output folder before recording."
     case .rawAudioUnavailable:
-      return "Blackmagic raw audio recording is unavailable; video will be recorded without audio."
+      return "Raw input audio recording is unavailable; video will be recorded without audio."
     case .feedNotActive:
       return "Start this camera before recording it. Only a running camera can produce media."
     }
@@ -197,6 +224,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     /// writer is finalized or cancelled.
     let output: RecordingOutputSession
     let folderAccess: RecordingFolderAccess
+    let compatibilityPolicy: RecordingCompatibilityPolicy
     let clock = RecordingSessionClock()
     let statistics = StatisticsOwner()
   }
@@ -271,6 +299,9 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     let folder: URL
     let capture: CaptureController
     let sourceTimecode: String?
+    let takeContext: RecordingTakeContext?
+    let videoFormat: SourceFormat?
+    let nativeTimecode: Timecode?
   }
 
   /// Synchronous start, for callers that may block (tests, tools).
@@ -323,7 +354,9 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     }
     // Only record-start timecode follows the camera's drop-frame flag.
     return StartRequest(feedID: feedID, configuration: configuration, folder: folder, capture: capture,
-      sourceTimecode: configuration.timecodeMode == .recordStart ? capture.latestSourceTimecode : nil)
+      sourceTimecode: configuration.timecodeMode == .recordStart ? capture.latestSourceTimecode : nil,
+      takeContext: capture.recordingTakeContext, videoFormat: capture.recordingVideoFormat,
+      nativeTimecode: capture.latestNativeTimecode)
   }
 
   /// Worker: builds and starts the session, then publishes it. A stop that
@@ -354,6 +387,20 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     return (.success(()), stops, Result { try finalize(session, feedID: request.feedID) })
   }
 
+  static func nativeTimecodeMetadata(_ timecode: Timecode?, rate: FrameRate?) -> TimecodeMetadata? {
+    guard let timecode, let rate, !rate.isVariable,
+      let exactRate = RecordingFrameRate(numerator: Int64(rate.nominal.timescale), denominator: rate.nominal.value) else { return nil }
+    let separator = timecode.dropFrame ? ";" : ":"
+    let label = String(format: "%02d:%02d:%02d%@%02d", timecode.hours, timecode.minutes,
+      timecode.seconds, separator, timecode.frames)
+    return TimecodeMetadata(label: label, frameRate: exactRate)
+  }
+
+  static func legacyFrameRate(for rate: FrameRate?) -> RecordingFrameRate {
+    guard let rate else { return .fps5994 }
+    return RecordingFrameRate(numerator: Int64(rate.nominal.timescale), denominator: rate.nominal.value) ?? .fps5994
+  }
+
   /// Worker: the output reservation (file system), the recorder and its
   /// prepared encoder.
   private func prepareSession(_ request: StartRequest) throws -> Session {
@@ -367,17 +414,30 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     do {
       let sourceConfiguration = try SourceRecordingConfiguration(
         feedID: SourceRecordingFeedID(request.feedID.rawValue), outputURL: output.temporaryURL,
-        width: 3840, height: 2160,
-        videoCodec: request.configuration.codec == .proRes42210Bit
-          ? kCMVideoCodecType_AppleProRes422HQ : kCMVideoCodecType_HEVC,
+        width: request.videoFormat?.width ?? 3840,
+        height: request.videoFormat?.height ?? 2160,
+        videoCodec: request.configuration.codec.matrixProfile.codec,
+        videoProfile: .matrix(request.configuration.codec.matrixProfile),
+        frameRate: Self.legacyFrameRate(for: request.videoFormat?.rate),
+        quantizationPolicy: request.videoFormat?.rate.isVariable == true
+          ? request.configuration.variableRateQuantizationPolicy : nil,
+        sourceFrameRate: request.videoFormat?.rate,
+        recordingConstantFrameRate: request.configuration.recordingConstantFrameRate,
+        nativeTimecodeMetadata: Self.nativeTimecodeMetadata(request.nativeTimecode,
+          rate: request.videoFormat?.rate),
         timecodePolicy: Self.timecodePolicy(for: request.configuration.timecodeMode),
         sourceTimecode: request.sourceTimecode,
         timecodeSamplesComputerClockAtFirstFrame: request.configuration.timecodeMode == .wallClock,
-        checkAvailableSpace: { try output.checkExternalWriterCapacity(headroom: $0) })
+        checkAvailableSpace: { try output.checkExternalWriterCapacity(headroom: $0) },
+        sourceAdmission: request.takeContext?.sourceAdmission,
+        expectedSourceFormat: request.videoFormat,
+        compatibilityPolicy: request.configuration.compatibilityPolicy, sidecarMovieURL: output.finalURL,
+        sidecarCreated: { try output.claimSidecar() })
       let recorder = try recorderFactory(sourceConfiguration)
       let adapter = SourceRecordingCallbackAdapter(feedID: sourceConfiguration.feedID, recorder: recorder)
       try adapter.start()
-      return Session(adapter: adapter, feedID: request.feedID, output: output, folderAccess: folderAccess)
+      return Session(adapter: adapter, feedID: request.feedID, output: output, folderAccess: folderAccess,
+        compatibilityPolicy: request.configuration.compatibilityPolicy)
     } catch {
       try? output.cancel()
       throw error
@@ -466,6 +526,9 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     return plan
   }
 
+  /// Audio may be staged before the first picture. It cannot start a movie.
+  static func canPublishMovie(appendedVideo: UInt64) -> Bool { appendedVideo > 0 }
+
   private func finalize(_ session: Session, feedID: FeedID) throws {
     defer {
       let final = snapshot(session, stopped: true)
@@ -483,13 +546,13 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
       stopError = error
     }
     let telemetry = session.adapter.telemetry
-    let hadMedia = telemetry.appendedVideo > 0 || telemetry.appendedAudio > 0
+    let hadVideo = Self.canPublishMovie(appendedVideo: telemetry.appendedVideo)
     // A failed flush must never publish an unfinished movie as a successful
     // take, nor delete its completed fragments. Recovery owns it after stop.
     do {
       if stopError != nil || session.adapter.state == .failed {
         session.output.preserveForRecovery()
-      } else if hadMedia {
+      } else if hadVideo {
         _ = try session.output.finish()
       } else {
         try session.output.cancel()
@@ -522,7 +585,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
       let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
       let bytes = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
       return session.statistics.sampler.sample(session.adapter.telemetry,
-        elapsed: session.clock.elapsed, fileBytes: bytes, fileURL: url, stopped: stopped)
+        elapsed: session.clock.elapsed, fileBytes: bytes, fileURL: url, stopped: stopped, compatibilityPolicy: session.compatibilityPolicy)
     }
   }
 
@@ -586,9 +649,15 @@ final class RecordingModel {
   private let folderStore: RecordingFolderStore?
   private var recoveryScanGeneration = 0
   private var feedOutputFolders: [FeedID: URL] = [:]
+  /// Original bookmarked roots survive changes to next-take destinations.
+  private var activeTakeFolders: [FeedID: URL] = [:]
+  private var retainedTakeRoots: [String: URL] = [:]
+  private var feedConstantFrameRate: [FeedID: Bool] = [:]
   private var loadedFolderFeedIDs = Set<FeedID>()
   private var interruptedRecordingRoots: [URL: URL] = [:]
   var timecodeMode: RecordingTimecodeMode = .wallClock
+  /// Copied into RecordingConfiguration before asynchronous take preparation.
+  var compatibilityPolicy = RecordingCompatibilityPolicy()
   /// Observers are told when a take's state changes; its running statistics (2 Hz) are
   /// stored without telling them (`RecordingStatisticsState`) and published as telemetry.
   private(set) var feeds: [RecordingFeedState] = []
@@ -602,15 +671,26 @@ final class RecordingModel {
   var onRecordingPaused: ((FeedID, Bool) -> Void)?
 
   private let driver: RecordingSessionDriver
+  private let resolveFinishedFile: (URL?, URL?) -> URL?
   private var finishedCallbacks: [() -> Void] = []
   @ObservationIgnored private var statisticsTask: Task<Void, Never>?
   private var recordingGenerations: [FeedID: UInt64] = [:]
 
   init(feeds: [RecordingFeedDescriptor] = [], driver: RecordingSessionDriver = UnavailableRecordingSessionDriver(),
-    folderStore: RecordingFolderStore? = nil) {
+    folderStore: RecordingFolderStore? = nil,
+    resolveFinishedFile: @escaping (URL?, URL?) -> URL? = RecordingModel.existingFile) {
+    self.resolveFinishedFile = resolveFinishedFile
     self.driver = driver
     self.folderStore = folderStore
     updateFeeds(feeds)
+    do {
+      for root in try folderStore?.loadRecoveryRoots() ?? [] {
+        retainedTakeRoots[root.standardizedFileURL.path] = root
+      }
+      if let warnings = folderStore?.recoveryRootWarnings, !warnings.isEmpty {
+        recoveryMessage = "Choose original recording folders again to check interrupted recordings: " + warnings.joined(separator: ", ")
+      }
+    } catch { recoveryMessage = "Choose the original recording folder to check interrupted recordings: \(error.localizedDescription)" }
     do { _outputFolder = try folderStore?.load() }
     catch { recoveryMessage = "Choose your recording folder to check for interrupted recordings." }
     refreshRecovery()
@@ -621,7 +701,7 @@ final class RecordingModel {
     let generation = recoveryScanGeneration
     var seenPaths = Set<String>()
     // Keep the original bookmarked URLs so their sandbox grants survive.
-    let roots = ([outputFolder].compactMap { $0 } + Array(feedOutputFolders.values))
+    let roots = ([outputFolder].compactMap { $0 } + Array(feedOutputFolders.values) + Array(retainedTakeRoots.values))
       .filter { seenPaths.insert($0.standardizedFileURL.path).inserted }
       .sorted { $0.path < $1.path }
     guard !roots.isEmpty else {
@@ -642,6 +722,9 @@ final class RecordingModel {
       for (root, result) in results {
         switch result {
         case let .success(takes):
+          if takes.isEmpty && !self.activeTakeFolders.values.contains(where: { $0.standardizedFileURL.path == root.standardizedFileURL.path }) {
+            self.retainedTakeRoots.removeValue(forKey: root.standardizedFileURL.path)
+          }
           for take in takes {
             takesByID[take.id] = take
             self.interruptedRecordingRoots[take.id] = root
@@ -651,6 +734,8 @@ final class RecordingModel {
           self.recoveryMessageIsScanError = true
         }
       }
+      do { try self.folderStore?.saveRecoveryRoots(Array(self.retainedTakeRoots.values)) }
+      catch { self.recoveryMessage = "Could not save recovery folder access: \(error.localizedDescription)" }
       self.interruptedRecordings = takesByID.values.sorted { $0.id.path < $1.id.path }
     }
   }
@@ -677,7 +762,8 @@ final class RecordingModel {
   }
 
   var configuration: RecordingConfiguration {
-    RecordingConfiguration(codec: codec, outputFolder: outputFolder, timecodeMode: timecodeMode)
+    RecordingConfiguration(codec: codec, outputFolder: outputFolder, timecodeMode: timecodeMode,
+      compatibilityPolicy: compatibilityPolicy)
   }
 
   func customOutputFolder(for feedID: FeedID) -> URL? { feedOutputFolders[feedID] }
@@ -713,6 +799,7 @@ final class RecordingModel {
     var old: [FeedID: RecordingFeedState] = [:]
     for state in feeds { old[state.id] = state }
     var seen = Set<FeedID>()
+    feedConstantFrameRate = Dictionary(descriptors.map { ($0.id, $0.recordingConstantFrameRate) }, uniquingKeysWith: { first, _ in first })
     feeds = descriptors.compactMap { descriptor in
       guard seen.insert(descriptor.id).inserted else { return nil }
       var state = old[descriptor.id] ?? RecordingFeedState(id: descriptor.id, name: descriptor.name)
@@ -761,9 +848,14 @@ final class RecordingModel {
       feeds[index].error = RecordingUIError.outputFolderRequired.localizedDescription
       return
     }
+    activeTakeFolders[feedID] = folder
+    retainedTakeRoots[folder.standardizedFileURL.path] = folder
+    do { try folderStore?.saveRecoveryRoots(Array(retainedTakeRoots.values)) }
+    catch { recoveryMessage = "Could not retain the original recording folder for recovery: \(error.localizedDescription)" }
     var take = configuration
     take.outputFolder = folder
     take.feedName = feeds[index].name
+    take.recordingConstantFrameRate = feedConstantFrameRate[feedID] ?? false
     recordingGenerations[feedID, default: 0] &+= 1
     let generation = recordingGenerations[feedID, default: 0]
     let previous = (savedURL: feeds[index].savedURL, statistics: feeds[index].statistics)
@@ -771,7 +863,7 @@ final class RecordingModel {
     feeds[index].status = .recording
     feeds[index].isStarting = true
     feeds[index].error = nil
-    feeds[index].statistics = (driver is RecordingSessionDriverStatistics) ? RecordingStatistics() : nil
+    feeds[index].statistics = (driver is RecordingSessionDriverStatistics) ? RecordingStatistics(compatibilityPolicy: take.compatibilityPolicy) : nil
     driver.startRecording(feedID: feedID, configuration: take) { [weak self] result in
       self?.finishStart(feedID: feedID, generation: generation, result: result,
         previousSavedURL: previous.savedURL, previousStatistics: previous.statistics)
@@ -798,6 +890,8 @@ final class RecordingModel {
       feeds[index].status = .idle
       feeds[index].savedURL = previousSavedURL
       feeds[index].statistics = previousStatistics
+      activeTakeFolders.removeValue(forKey: feedID)
+      refreshRecovery()
       notifyFinished()
     }
   }
@@ -832,15 +926,16 @@ final class RecordingModel {
       feeds[index].status == .recording || feeds[index].status == .paused else { return }
     let artifacts = driver as? RecordingSessionDriverArtifacts
     let output = artifacts?.recordingOutputURL(feedID: feedID)
-    let folder = outputFolder(for: feedID)
+    let folder = activeTakeFolders[feedID] ?? outputFolder(for: feedID)
     feeds[index].status = .finishing
     feeds[index].error = nil
     driver.stopRecording(feedID: feedID) { [weak self] result in
       guard let self, let index = self.index(of: feedID) else { return }
       self.feeds[index].status = .idle
       self.feeds[index].isStarting = false
+      self.activeTakeFolders.removeValue(forKey: feedID)
       // A take stopped while it was starting had no live output to ask for.
-      let saved = Self.existingFile(output ?? artifacts?.finishedOutputURL(feedID: feedID), scope: folder)
+      let saved = self.resolveFinishedFile(output ?? artifacts?.finishedOutputURL(feedID: feedID), folder)
       // A start that failed after Stop was pressed already set the error.
       if case let .failure(error) = result { self.feeds[index].error = error.localizedDescription }
       else if self.feeds[index].error == nil { self.feeds[index].savedURL = saved }
@@ -881,7 +976,7 @@ final class RecordingModel {
     }
   }
 
-  private static func existingFile(_ url: URL?, scope: URL? = nil) -> URL? {
+  nonisolated static func existingFile(_ url: URL?, scope: URL? = nil) -> URL? {
     guard let url else { return nil }
     // The take's security-scoped folder is released when the session ends.
     // Start it again for this existence check, or a bookmark-restored folder

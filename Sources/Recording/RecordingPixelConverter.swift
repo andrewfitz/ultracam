@@ -59,6 +59,16 @@ final class RecordingPixelConverter: @unchecked Sendable {
   /// feeds) is released; the pools in use rotate far faster than that.
   static let idleConversions: UInt64 = 480
   static let maxCachedTextures = 384
+  private let cacheByteLimit: Int
+  private let cacheIdleAge: TimeInterval
+  private let monotonicNow: () -> TimeInterval
+  private let allocationBudget: GPUAllocationBudget
+#if ULTRACAM_TEST_SUPPORT
+  var cachedAllocationBytesForTesting: Int { lock.withLock { allocationBudget.snapshot().bytes } }
+  func evictExpiredCacheForTesting() {
+    lock.withLock { if evictIdleTextures(sequence: sequence) { residency.commit() } }
+  }
+#endif
   private static let gpuTimeout: TimeInterval = 2
 
   private struct TextureKey: Hashable {
@@ -71,10 +81,15 @@ final class RecordingPixelConverter: @unchecked Sendable {
     let surface: IOSurfaceRef
     let texture: MTLTexture
     var lastUsed: UInt64
-    init(surface: IOSurfaceRef, texture: MTLTexture, lastUsed: UInt64) {
+    var lastUsedTime: TimeInterval
+    let allocationLease: GPUAllocationBudget.Lease
+    init(surface: IOSurfaceRef, texture: MTLTexture, lastUsed: UInt64,
+      time: TimeInterval, lease: GPUAllocationBudget.Lease) {
       self.surface = surface
       self.texture = texture
       self.lastUsed = lastUsed
+      self.lastUsedTime = time
+      self.allocationLease = lease
     }
   }
 
@@ -120,6 +135,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
   private var users = 0
   /// A purge is waiting for in-flight GPU work (at most one is scheduled).
   private var purgeScheduled = false
+  private var ageSweepScheduled = false
   /// How long a purge waits for GPU work still in flight before it retries.
   static let purgeRetryInterval: TimeInterval = 0.25
 
@@ -139,7 +155,15 @@ final class RecordingPixelConverter: @unchecked Sendable {
     DispatchQueue.global(qos: .utility).async { _ = try? shared() }
   }
 
-  init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
+  init(device: MTLDevice? = MTLCreateSystemDefaultDevice(), cacheMaximumBytes: Int = 2 * 1024 * 1024 * 1024,
+    cacheIdleAge: TimeInterval = 2, monotonicNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws {
+    guard cacheMaximumBytes > 0, cacheIdleAge.isFinite, cacheIdleAge > 0 else {
+      throw ConversionError.metalUnavailable("Invalid recording GPU cache policy.")
+    }
+    self.cacheByteLimit = cacheMaximumBytes
+    self.cacheIdleAge = cacheIdleAge
+    self.monotonicNow = monotonicNow
+    allocationBudget = GPUAllocationBudget(policy: try GPUAllocationBudgetPolicy(maximumBytes: cacheMaximumBytes, minimumSlots: 1))
     guard let device else { throw ConversionError.metalUnavailable("No Metal device.") }
     self.device = device
     do {
@@ -204,7 +228,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
   /// recorder's encoder queue, never the capture thread. Returns the GPU
   /// execution time in ms.
   @discardableResult
-  func convert(_ source: CVPixelBuffer, into destination: CVPixelBuffer) throws -> Double {
+  func convert(_ source: CVPixelBuffer, into destination: CVPixelBuffer, sourceRange: Colorimetry.Range = .video) throws -> Double {
     guard CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_422YpCbCr10 else {
       throw ConversionError.unsupportedSource("The source is not v210.")
     }
@@ -229,7 +253,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
     }
     let completion = Completion([source, destination])
     try encode(completion: completion, width: width, height: height, groups: groups,
-      source: (sourceSurface, sourceRowBytes / 4), destination: destinationSurface)
+      source: (sourceSurface, sourceRowBytes / 4), destination: destinationSurface, fullRange: sourceRange == .full)
     guard completion.done.wait(timeout: .now() + Self.gpuTimeout) == .success else {
       throw ConversionError.gpuFailure("The GPU did not finish the repack within 2 seconds.")
     }
@@ -239,7 +263,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
 
   /// Encodes and commits one conversion under `lock`.
   private func encode(completion: Completion, width: Int, height: Int, groups: Int,
-    source: (surface: IOSurfaceRef, words: Int), destination: IOSurfaceRef) throws {
+    source: (surface: IOSurfaceRef, words: Int), destination: IOSurfaceRef, fullRange: Bool) throws {
     lock.lock()
     defer { lock.unlock() }
     // Committed to `self.sequence` only once the work is on the GPU, so a
@@ -250,6 +274,23 @@ final class RecordingPixelConverter: @unchecked Sendable {
       // Every slot is busy: wait for this one's previous work, never skip.
       guard event.wait(untilSignaledValue: slot.lastSequence, timeoutMS: 2_000) else {
         throw ConversionError.gpuFailure("The GPU stalled for more than 2 seconds.")
+      }
+    }
+    // Mapping/budget/encoder failures must not leave entries tagged with a
+    // sequence that will never be signalled. Keep previous completion pins.
+    let previous = textures.mapValues { ($0.lastUsed, $0.lastUsedTime) }
+    var committed = false
+    defer {
+      if !committed {
+        for (key, entry) in textures where entry.lastUsed == sequence {
+          if let old = previous[key] {
+            entry.lastUsed = old.0; entry.lastUsedTime = old.1
+          } else {
+            residency.removeAllocation(entry.texture)
+            textures.removeValue(forKey: key)
+          }
+        }
+        residency.commit()
       }
     }
     var residencyChanged = false
@@ -264,6 +305,8 @@ final class RecordingPixelConverter: @unchecked Sendable {
 
     var pixelWidth = UInt32(width)
     slot.parameters.contents().copyMemory(from: &pixelWidth, byteCount: MemoryLayout<UInt32>.size)
+    var rangeFlag: UInt32 = fullRange ? 1 : 0
+    slot.parameters.contents().advanced(by: 4).copyMemory(from: &rangeFlag, byteCount: 4)
     slot.table.setTexture(sourceTexture.gpuResourceID, index: 0)
     slot.table.setTexture(lumaTexture.gpuResourceID, index: 1)
     slot.table.setTexture(chromaTexture.gpuResourceID, index: 2)
@@ -292,7 +335,9 @@ final class RecordingPixelConverter: @unchecked Sendable {
       completion.done.signal()
     }
     queue.commit([command], options: options)
+    committed = true
     queue.signalEvent(event, value: sequence)
+    scheduleAgeSweepLocked()
     slot.lastSequence = sequence
     self.sequence = sequence
   }
@@ -304,6 +349,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
     if let cached = textures[key], cached.surface === surface,
       cached.texture.width == width, cached.texture.height == height {
       cached.lastUsed = sequence
+      cached.lastUsedTime = monotonicNow()
       return cached.texture
     }
     if let stale = textures.removeValue(forKey: key) {
@@ -317,7 +363,21 @@ final class RecordingPixelConverter: @unchecked Sendable {
     guard let texture = device.makeTexture(descriptor: descriptor, iosurface: surface, plane: plane) else {
       throw ConversionError.unsupportedSource("Metal could not wrap the IOSurface.")
     }
-    textures[key] = CachedTexture(surface: surface, texture: texture, lastUsed: sequence)
+    // Every texture view of one IOSurface shares the same allocation charge.
+    // Actual IOSurface size includes all plane padding and allocator overhead.
+    let bytes = IOSurfaceGetAllocSize(surface)
+    let lease: GPUAllocationBudget.Lease
+    do {
+      lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: bytes,
+        generation: 0, owner: surface)
+    } catch {
+      // Pressure can evict completed cache entries, never pending GPU work.
+      _ = evictIdleTextures(sequence: sequence, pressure: true)
+      lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: bytes,
+        generation: 0, owner: surface)
+    }
+    textures[key] = CachedTexture(surface: surface, texture: texture, lastUsed: sequence,
+      time: monotonicNow(), lease: lease)
     residency.addAllocation(texture)
     changed = true
     return texture
@@ -325,18 +385,32 @@ final class RecordingPixelConverter: @unchecked Sendable {
 
   /// Under `lock`: drops surfaces idle long enough whose last GPU use has
   /// completed.
-  private func evictIdleTextures(sequence: UInt64) -> Bool {
-    let overCap = textures.count > Self.maxCachedTextures
-    guard overCap || sequence % 64 == 0 else { return false }
+  private func evictIdleTextures(sequence: UInt64, pressure: Bool = false) -> Bool {
     let completed = event.signaledValue
+    let now = monotonicNow()
     var removed = false
     for (key, entry) in textures where entry.lastUsed <= completed &&
-      (overCap || sequence &- entry.lastUsed > Self.idleConversions) {
+      (pressure || (now >= entry.lastUsedTime && now - entry.lastUsedTime >= cacheIdleAge)) {
       residency.removeAllocation(entry.texture)
       textures.removeValue(forKey: key)
       removed = true
     }
     return removed
+  }
+
+  /// A paused source still ages out completed cached storage. One lightweight
+  /// timer is pending per converter, independent of frame rate and slot count.
+  private func scheduleAgeSweepLocked() {
+    guard !ageSweepScheduled, !textures.isEmpty else { return }
+    ageSweepScheduled = true
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + cacheIdleAge) { [weak self] in
+      guard let self else { return }
+      self.lock.withLock {
+        self.ageSweepScheduled = false
+        if self.evictIdleTextures(sequence: self.sequence) { self.residency.commit() }
+        self.scheduleAgeSweepLocked()
+      }
+    }
   }
 
   /// A recorder starts converting through this instance.
@@ -402,8 +476,9 @@ final class RecordingPixelConverter: @unchecked Sendable {
     texture2d<uint, access::read> source [[texture(0)]],
     texture2d<uint, access::write> luma [[texture(1)]],
     texture2d<uint, access::write> chroma [[texture(2)]],
-    constant uint &width [[buffer(0)]],
+    constant uint2 &parameters [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]) {
+    const uint width = parameters.x;
     const uint x0 = gid.x * 6;
     if (x0 >= width || gid.y >= luma.get_height() || gid.x * 4 + 3 >= source.get_width()) return;
     const uint w0 = source.read(uint2(gid.x * 4 + 0, gid.y)).x;
@@ -415,11 +490,18 @@ final class RecordingPixelConverter: @unchecked Sendable {
     const uint cbs[3] = { w0 & 0x3ff, (w1 >> 10) & 0x3ff, (w2 >> 20) & 0x3ff };
     const uint crs[3] = { (w0 >> 20) & 0x3ff, w2 & 0x3ff, (w3 >> 10) & 0x3ff };
     for (uint i = 0; i < 6; i++) {
-      if (x0 + i < width) luma.write(uint4(ys[i] << 6, 0, 0, 0), uint2(x0 + i, gid.y));
+      if (x0 + i < width) {
+        const uint y = parameters.y != 0 ? 64u + (ys[i] * 876u + 511u) / 1023u : ys[i];
+        luma.write(uint4(y << 6, 0, 0, 0), uint2(x0 + i, gid.y));
+      }
     }
     for (uint i = 0; i < 3; i++) {
       const uint cx = gid.x * 3 + i;
-      if (cx < chroma.get_width()) chroma.write(uint4(cbs[i] << 6, crs[i] << 6, 0, 0), uint2(cx, gid.y));
+      if (cx < chroma.get_width()) {
+        const uint cb = parameters.y != 0 ? 64u + (cbs[i] * 896u + 511u) / 1023u : cbs[i];
+        const uint cr = parameters.y != 0 ? 64u + (crs[i] * 896u + 511u) / 1023u : crs[i];
+        chroma.write(uint4(cb << 6, cr << 6, 0, 0), uint2(cx, gid.y));
+      }
     }
   }
   """

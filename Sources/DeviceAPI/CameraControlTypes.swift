@@ -13,13 +13,13 @@ struct ControlCamera: Codable, Identifiable, Equatable, Sendable {
     var authenticationMode: ControlAuthenticationMode = .none
 }
 
-struct ControlEndpoint: Equatable, Sendable {
+struct ControlEndpoint: Codable, Equatable, Sendable {
     var address: String
     var expectedIdentity: String?
     var authenticationMode: ControlAuthenticationMode
     var transport: ControlTransport = .network
 }
-enum ControlPreparationRequest: Equatable, Sendable {
+enum ControlPreparationRequest: Codable, Equatable, Sendable {
     case camera(ControlCamera)
     case endpoint(ControlEndpoint)
 }
@@ -41,7 +41,7 @@ enum ControlCredentials: Sendable, Equatable, CustomStringConvertible, CustomDeb
     var customMirror: Mirror { Mirror(self, children: ["payload": "<redacted>"]) }
 }
 
-enum ControlValue: Codable, Equatable, Sendable {
+enum ControlValue: Codable, Hashable, Sendable {
     case boolean(Bool)
     case integer(Int64)
     case unsignedInteger(UInt64)
@@ -58,12 +58,19 @@ struct ControlOption: Codable, Equatable, Identifiable, Sendable {
     var id: String
     var label: String
     var value: ControlValue
+    var labelKey: String? = nil
+    var localizationTable: String? = nil
+    func localizedLabel(in bundle: Bundle = .main) -> String {
+        VendorDisplayLocalization.resolve(key: labelKey, fallback: label, table: localizationTable, in: bundle)
+    }
 }
 struct ControlRange: Codable, Equatable, Sendable {
     var minimum: ControlValue
     var maximum: ControlValue
     var step: ControlValue?
 }
+enum ControlPropertyRole: String, Codable, Sendable { case standard, outputTiming, cameraDisplay, hidden }
+
 struct ControlProperty: Codable, Equatable, Identifiable, Sendable {
     typealias ID = String
     var id: ID
@@ -73,6 +80,18 @@ struct ControlProperty: Codable, Equatable, Identifiable, Sendable {
     var value: ControlValue
     var options: [ControlOption] = []
     var range: ControlRange? = nil
+    var role: ControlPropertyRole = .standard
+    var overlayOrder: Int? = nil
+    var currentValueLabel: String? = nil
+    var labelKey: String? = nil
+    var localizationTable: String? = nil
+    var unavailableReasonKey: String? = nil
+    func localizedLabel(in bundle: Bundle = .main) -> String {
+        VendorDisplayLocalization.resolve(key: labelKey, fallback: label, table: localizationTable, in: bundle)
+    }
+    func localizedUnavailableReason(in bundle: Bundle = .main) -> String? {
+        unavailableReason.map { VendorDisplayLocalization.resolve(key: unavailableReasonKey, fallback: $0, table: localizationTable, in: bundle) }
+    }
 }
 
 enum ControlReasonCode: String, Codable, Sendable {

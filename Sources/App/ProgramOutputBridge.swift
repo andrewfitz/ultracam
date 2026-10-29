@@ -39,6 +39,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
     /// Frames converted for a previous contract that were still queued when
     /// the camera reconnected with a new one (before its first frame).
     var staleFormat: UInt64 = 0
+    var lastRefusal: String?
     /// Sends issued on the main thread. Stays 0 when the app pumps from the
     /// delivery path.
     var mainThreadSends: UInt64 = 0
@@ -67,6 +68,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
   /// nothing queued behind them, and how late (seconds) they were then.
   private var lateSince: (start: Double, lateness: Double)?
   private var anchoredConnection: UInt64 = 0
+  private var outputAdmission: (format: ProgramOutputFormat, contract: DerivedOutputContract)?
 
   private let lock = NSLock()
   private var link = Link.disconnected
@@ -258,7 +260,14 @@ final class ProgramOutputBridge: @unchecked Sendable {
       locked { contractHandler }?(nil)
     }
     do {
-      try connectSink(configuration, passthroughFormat)
+      // CameraSink also serves feed routes, where rate controls may only
+      // reduce source cadence. Program owns a CFR clock and may repeat up to
+      // its explicitly selected rate, so negotiate that output cadence here.
+      var transportConfiguration = configuration
+      if configuration.reduceFrameRate {
+        transportConfiguration.sourceDuration = configuration.frameRateTarget.duration
+      }
+      try connectSink(transportConfiguration, passthroughFormat)
     } catch {
       locked {
         link = .disconnected
@@ -352,8 +361,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
         continue
       }
       if let expected, let metadata = lease.metadata,
-        !expected.matches(metadata) || metadata.duration != expected.duration {
-        locked { statistics.staleFormat &+= 1 }
+        !expected.matches(metadata) || !DerivedOutputContract.sameDuration(metadata.duration, expected.duration) {
+        locked { statistics.staleFormat &+= 1; statistics.lastRefusal = "Program frame differs from negotiated output \(expected)" }
         continue
       }
       guard let image = lease.payload, let metadata = lease.metadata,
@@ -366,6 +375,21 @@ final class ProgramOutputBridge: @unchecked Sendable {
         CVPixelBufferGetPixelFormatType(image) == OSType(metadata.pixelFormat) else {
         locked { statistics.invalid &+= 1 }
         continue
+      }
+      if let expected {
+        do {
+          if outputAdmission?.format != expected {
+            let description = try expected.formatDescription()
+            outputAdmission = (expected, DerivedOutputContract(format: description, duration: expected.duration))
+          }
+          if let refusal = outputAdmission?.contract.mismatch(image: image, time: metadata.presentationTime, duration: metadata.duration) {
+            locked { statistics.invalid &+= 1; statistics.lastRefusal = refusal }
+            continue
+          }
+        } catch {
+          locked { statistics.invalid &+= 1; statistics.lastRefusal = error.localizedDescription }
+          continue
+        }
       }
       if connection != anchoredConnection {
         anchoredConnection = connection

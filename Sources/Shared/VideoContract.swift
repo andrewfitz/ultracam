@@ -2,6 +2,20 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
+/// A finite producer allowance plus cadence grace controls loss-of-source black.
+enum CameraStandbyTimingPolicy {
+  static func clampedPauseAllowance(_ value: Double?) -> Double {
+    guard let value, value.isFinite, value > 0 else { return 0 }
+    return min(value, 60)
+  }
+
+  static func delay(frameDuration: CMTime, pauseAllowance: Double?) -> TimeInterval {
+    let seconds = frameDuration.seconds
+    let cadence = seconds.isFinite && seconds > 0 ? seconds : 1.0 / 30
+    return max(12 * cadence, clampedPauseAllowance(pauseAllowance) + 2 * cadence)
+  }
+}
+
 enum VideoContract {
   static let cameraName = "Ultracam"
   static let sinkName = "Ultracam Input"
@@ -9,9 +23,13 @@ enum VideoContract {
   static let extensionID = "org.ultracam.app.camera"
   // Read-only source demand, independent of the host's producer/sink stream.
   static let demandProperty = "4cc_udmd_glob_0000"
+  static var sourcePauseAllowanceAttachmentKey: CFString { "org.ultracam.source-pause-allowance-seconds" as CFString }
   static let demandSelector: UInt32 = 0x75646d64 // 'udmd'
   static let slowDuration = CMTime(value: 1001, timescale: 30_000)
   static let fastDuration = CMTime(value: 1001, timescale: 60_000)
+  /// Warm-up compatibility before a source declaration arrives. Real source
+  /// timing always overrides this provisional value.
+  static let provisionalSourceDuration = fastDuration
   // GPU frames encoded and committed but not yet complete. The capture queue
   // encodes frame N+1 while the GPU runs frame N; it never waits for a frame.
   static let maxFramesInFlight = 3
@@ -129,11 +147,47 @@ final class VideoSampleFactory {
   }
 }
 
+/// How a source frame is placed in the fixed output canvas.
+enum ProgramScalingMode: String, Codable, CaseIterable, Sendable {
+  case fit
+  case crop
+}
+
 enum ResizeTarget: String, Codable, CaseIterable, Sendable {
-  case hd720, hd1080, uhd4K
-  var title: String { switch self { case .hd720: "720p"; case .hd1080: "1080p"; case .uhd4K: "4K UHD" } }
-  var width: Int { switch self { case .hd720: 1280; case .hd1080: 1920; case .uhd4K: 3840 } }
-  var height: Int { width * 9 / 16 }
+  case hd720, hd1080, uhd4K, source, dci4K
+  var title: String { switch self { case .hd720: "720p"; case .hd1080: "1080p"; case .uhd4K: "4K UHD"; case .source: "Source size"; case .dci4K: "4K DCI" } }
+  // Source size is resolved by PipelineConfiguration; these defaults retain
+  // compatibility for UI callers without an active source declaration.
+  var width: Int { switch self { case .hd720: 1280; case .hd1080: 1920; case .uhd4K, .source: 3840; case .dci4K: 4096 } }
+  var height: Int { switch self { case .hd720: 720; case .hd1080: 1080; case .uhd4K, .source, .dci4K: 2160 } }
+}
+
+/// Resolves source-size output into the finite published client canvases.
+/// Minimize absolute native pixel-area difference, then aspect-ratio distance;
+/// remaining ties keep this ascending catalog order. This never invents a size
+/// or changes a published index. Fit/crop handles source display aspect later.
+enum PublishedSourceSizeSelection {
+  static let targets: [ResizeTarget] = [.hd720, .hd1080, .uhd4K, .dci4K]
+  static func nearest(width: Int, height: Int) throws -> ResizeTarget {
+    let (area, overflow) = width.multipliedReportingOverflow(by: height)
+    guard width > 0, height > 0, !overflow, area > 0 else {
+      throw VideoError.message("Source size is invalid or its pixel area overflows.")
+    }
+    let aspect = Double(width) / Double(height)
+    var best = targets[0]
+    var bestAreaDistance = Int.max
+    var bestAspectDistance = Double.infinity
+    for target in targets {
+      let targetArea = target.width * target.height
+      // Both areas are positive, so subtracting smaller from larger is safe.
+      let areaDistance = area >= targetArea ? area - targetArea : targetArea - area
+      let aspectDistance = abs(aspect - Double(target.width) / Double(target.height))
+      if areaDistance < bestAreaDistance || (areaDistance == bestAreaDistance && aspectDistance < bestAspectDistance) {
+        best = target; bestAreaDistance = areaDistance; bestAspectDistance = aspectDistance
+      }
+    }
+    return best
+  }
 }
 
 enum ColorTarget: String, Codable, CaseIterable, Sendable {
@@ -154,16 +208,28 @@ enum ColorTarget: String, Codable, CaseIterable, Sendable {
 
 enum FrameRateTarget: String, Codable, CaseIterable, Sendable {
   case fps60, fps5994, fps50, fps30, fps2997, fps25, fps24, fps23976
+  case fps47952, fps48, fps100, fps11988, fps120
   var title: String { switch self {
     case .fps60: "60"; case .fps5994: "59.94"; case .fps50: "50"
     case .fps30: "30"; case .fps2997: "29.97"; case .fps25: "25"
     case .fps24: "24"; case .fps23976: "23.976"
+    case .fps47952: "47.952"; case .fps48: "48"; case .fps100: "100"
+    case .fps11988: "119.88"; case .fps120: "120"
   } }
   var duration: CMTime { switch self {
     case .fps5994: VideoContract.fastDuration
     case .fps2997: VideoContract.slowDuration
     case .fps23976: CMTime(value: 1001, timescale: 24000)
-    default: CMTime(value: 1, timescale: Int32(title)!)
+    case .fps47952: CMTime(value: 1001, timescale: 48000)
+    case .fps11988: CMTime(value: 1001, timescale: 120000)
+    case .fps60: CMTime(value: 1, timescale: 60)
+    case .fps50: CMTime(value: 1, timescale: 50)
+    case .fps30: CMTime(value: 1, timescale: 30)
+    case .fps25: CMTime(value: 1, timescale: 25)
+    case .fps24: CMTime(value: 1, timescale: 24)
+    case .fps48: CMTime(value: 1, timescale: 48)
+    case .fps100: CMTime(value: 1, timescale: 100)
+    case .fps120: CMTime(value: 1, timescale: 120)
   } }
 }
 
@@ -172,22 +238,47 @@ struct PipelineConfiguration: Equatable, Sendable {
   var downscale = true
   var convertTo420 = true
   var reduceFrameRate = false
-  var inputFast = true
 
   var resizeTarget: ResizeTarget = .hd1080
   var colorTarget: ColorTarget = .yuv4208
   var frameRateTarget: FrameRateTarget = .fps2997
-  var width: Int { downscale ? resizeTarget.width : 3840 }
-  var height: Int { downscale ? resizeTarget.height : 2160 }
+  var sourceWidth: Int? = nil
+  var sourceHeight: Int? = nil
+  var sourceDuration: CMTime? = nil
+  /// Runtime transport policy from the selected capture device, never stored.
+  var sourcePauseAllowanceSeconds: Double? = nil
+  var sourcePixelAspect: Rational? = nil
+  var scalingMode: ProgramScalingMode = .fit
+  /// A manual interpretation of source pixels; never replaces the immutable
+  /// physical source declaration retained by capture and recording.
+  var sourceColorimetryOverride: Colorimetry? = nil
+  /// Expected loaded-LUT output contract, projected by the feed descriptor.
+  var lutOutputColorimetry: Colorimetry? = nil
+  var programColorimetry: Colorimetry = .rec709Video
+  var resolvedSourceWidth: Int { sourceWidth ?? 3840 }
+  var resolvedSourceHeight: Int { sourceHeight ?? 2160 }
+  var resolvedSourcePixelAspect: Rational { sourcePixelAspect ?? .one }
+  var resolvedSourceDuration: CMTime { sourceDuration ?? VideoContract.provisionalSourceDuration }
+  var resolvedResizeTarget: ResizeTarget {
+    guard resizeTarget == .source else { return resizeTarget }
+    // Physical source declarations are validated before production processing.
+    // Invalid, unbound UI configurations use the smallest supported canvas.
+    return (try? PublishedSourceSizeSelection.nearest(width: resolvedSourceWidth, height: resolvedSourceHeight)) ?? .hd720
+  }
+  var width: Int { downscale ? resolvedResizeTarget.width : resolvedSourceWidth }
+  var height: Int { downscale ? resolvedResizeTarget.height : resolvedSourceHeight }
   var outputColor: ColorTarget { convertTo420 ? colorTarget : .yuv42210 }
   var pixelFormat: OSType {
     outputColor.pixelFormat
   }
   var duration: CMTime {
-    let source = inputFast ? VideoContract.fastDuration : VideoContract.slowDuration
+    let source = resolvedSourceDuration
     return reduceFrameRate ? CMTimeMaximum(source, frameRateTarget.duration) : source
   }
-  var untouched: Bool { !applyLUT && (!downscale || resizeTarget == .uhd4K) && !convertTo420 }
+  var untouched: Bool {
+    sourceColorimetryOverride == nil && !applyLUT && !convertTo420 && width == resolvedSourceWidth && height == resolvedSourceHeight &&
+      resolvedSourcePixelAspect == .one && CMTimeCompare(duration, resolvedSourceDuration) == 0
+  }
   var outputLabel: String {
     "\(width) × \(height) · \(outputColor.title) · \(String(format: "%.3f", 1 / duration.seconds)) fps"
   }

@@ -4,7 +4,7 @@ import AudioToolbox
 import CoreMedia
 import Foundation
 
-/// Errors raised while validating an embedded Blackmagic audio packet.
+/// Errors raised while validating an embedded source audio packet.
 public enum EmbeddedAudioError: Error, Equatable {
   case invalidChannelCount
   case invalidSampleFrameCount
@@ -16,9 +16,9 @@ public enum EmbeddedAudioError: Error, Equatable {
   case sampleBufferCreationFailed(OSStatus)
 }
 
-/// The audio contract used by Blackmagic embedded audio capture.
+/// The current embedded-audio capture contract.
 ///
-/// Blackmagic's 32-bit integer input is interleaved, signed, little-endian
+/// The source's 32-bit integer input is interleaved, signed, little-endian
 /// PCM. The recorder stores the 24 significant high bits in packed little
 /// endian samples. This preserves the source's 24-bit signal while avoiding a
 /// lossy float conversion.
@@ -47,9 +47,9 @@ public enum EmbeddedAudioFormat {
   }
 }
 
-/// Converts Blackmagic's interleaved signed 32-bit PCM to packed signed
+/// Converts The source's interleaved signed 32-bit PCM to packed signed
 /// little-endian 24-bit PCM without going through floating point.
-public enum BlackmagicAudioConverter {
+public enum EmbeddedAudioConverter {
   /// Converts bytes containing interleaved little-endian Int32 samples.
   ///
   /// The low eight bits are discarded with an arithmetic shift. This is the
@@ -119,7 +119,7 @@ public enum BlackmagicAudioConverter {
 
   /// Converts an array of host-endian Int32 samples. The host is expected to
   /// be little-endian on supported macOS targets; this overload is intended
-  /// for tests and code that already decoded the DeckLink packet.
+  /// for tests and code that already decoded the source packet.
   public static func convert32BitIntegerSamplesTo24BitPacked(
     _ source: [Int32]
   ) -> Data {
@@ -165,7 +165,7 @@ public struct EmbeddedAudioPacket {
     guard sourcePCM32.count == expectedBytes else {
       throw EmbeddedAudioError.byteCountMismatch(expected: expectedBytes, actual: sourcePCM32.count)
     }
-    self.pcm24 = try BlackmagicAudioConverter.convert32BitIntegerPCMTo24BitPacked(
+    self.pcm24 = try EmbeddedAudioConverter.convert32BitIntegerPCMTo24BitPacked(
       sourcePCM32, channelCount: channelCount)
     self.sampleFrameCount = sampleFrameCount
     self.presentationTime = presentationTime
@@ -223,7 +223,7 @@ public enum EmbeddedAudioRecording {
     }
   }
 
-  /// Builds a sample buffer directly from Blackmagic's 32-bit integer PCM.
+  /// Builds a sample buffer directly from The source's 32-bit integer PCM.
   ///
   /// The SDK packet has already been copied into `sourcePCM32` by the native
   /// callback boundary.  Convert the significant 24 bits straight into the
@@ -258,13 +258,13 @@ public enum EmbeddedAudioRecording {
       presentationTime: presentationTime) { destination in
       sourcePCM32.withUnsafeBytes { sourceBytes in
         guard let sourceBase = sourceBytes.baseAddress else { return }
-        BlackmagicAudioConverter.packSignificant24Bits(from: sourceBase, to: destination,
+        EmbeddedAudioConverter.packSignificant24Bits(from: sourceBase, to: destination,
           sampleCount: sampleFrameCount * channelCount)
       }
     }
   }
 
-  /// Builds a sample buffer from the frames of a Blackmagic packet after its
+  /// Builds a sample buffer from the frames of a source packet after its
   /// first `skippingFrames`, which overlapped audio already recorded. With a
   /// `continuation` (the interleaved 32-bit frames the recorded audio would
   /// have continued with), the first kept frames are crossfaded in from it,
@@ -296,7 +296,7 @@ public enum EmbeddedAudioRecording {
       sourcePCM32.withUnsafeBytes { sourceBytes in
         guard let base = sourceBytes.baseAddress else { return }
         let kept = base + skippingFrames * sourceBytesPerFrame
-        BlackmagicAudioConverter.packSignificant24Bits(from: kept, to: destination,
+        EmbeddedAudioConverter.packSignificant24Bits(from: kept, to: destination,
           sampleCount: sampleFrameCount * channelCount)
         guard let continuation, !continuation.isEmpty else { return }
         let fadeFrames = min(continuation.count / channelCount, sampleFrameCount)

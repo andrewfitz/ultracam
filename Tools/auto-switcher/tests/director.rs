@@ -436,7 +436,7 @@ fn recorder_matches_accepted_and_rejected_manual_overrides() {
             assert_eq!(cut.requested_cut_time, Some(time));
             assert_eq!(cut.applied_source_time, Some(time));
             assert_eq!(cut.applied_program_time, Some(time));
-            let ticks = Some(auto_switcher::timeline::to_ticks(time, 60_000));
+            let ticks = Some(auto_switcher::timeline::to_ticks(time, 240_000));
             assert_eq!(cut.requested_cut_time_ticks, ticks);
             assert_eq!(cut.applied_source_time_ticks, ticks);
             assert_eq!(cut.applied_program_time_ticks, ticks);
@@ -649,4 +649,26 @@ fn reset_at_clock_zero_still_resets_the_director_and_recorder() {
     assert_eq!(cut.from_camera_id.as_deref(), Some("A"));
     assert_eq!(cut.applied_source_time, Some(0.0));
     assert_eq!(cut.session_generation, 2);
+}
+
+#[test]
+fn timeline_v3_uses_exact_common_video_timebase_and_reads_v2() {
+    let recorder = TimelineRecorder::new(config(), "offline", Uuid::new_v4());
+    let timeline = &recorder.timeline;
+    assert_eq!(timeline.schema_version, 3);
+    assert_eq!(timeline.timebase.timescale, 240_000);
+    for (numerator, denominator, expected) in [
+        (1001, 24000, 10010), (1001, 30000, 8008),
+        (1001, 60000, 4004), (1001, 120000, 2002),
+        (1, 25, 9600), (1, 120, 2000),
+    ] {
+        assert_eq!(auto_switcher::timeline::to_ticks(
+            f64::from(numerator) / f64::from(denominator), timeline.timebase.timescale), expected);
+    }
+    let mut old = serde_json::to_value(timeline).unwrap();
+    old["schema_version"] = 2.into();
+    old["timebase"]["timescale"] = 60000.into();
+    let decoded: auto_switcher::model::SessionTimeline = serde_json::from_value(old).unwrap();
+    assert_eq!(decoded.schema_version, 2);
+    assert_eq!(decoded.timebase.timescale, 60000);
 }

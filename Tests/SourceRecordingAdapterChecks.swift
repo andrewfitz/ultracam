@@ -238,7 +238,7 @@ private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecke
       let second = expectation(description: "Second stop finished")
       let secondEntered = DispatchSemaphore(value: 0)
       let secondReturned = DispatchSemaphore(value: 0)
-      let stop = {
+      let stop: @Sendable () -> Void = {
         do {
           try recorder.stop()
           XCTAssertNil(failure)

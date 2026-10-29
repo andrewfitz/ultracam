@@ -3,7 +3,7 @@ name = "ultracam-auto-switcher"
 version = "0.1.0"
 edition = "2021"
 description = "Realtime and offline talking-head camera direction engine"
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 name = "auto_switcher"

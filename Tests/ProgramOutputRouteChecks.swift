@@ -326,6 +326,12 @@ import XCTest
     CVPixelBufferLockBaseAddress(image, [])
     fill(image)
     CVPixelBufferUnlockBaseAddress(image, [])
+    // Synthetic YUV fixtures explicitly declare the target identity so
+    // passthrough/cadence tests do not accidentally exercise colour admission.
+    CVBufferSetAttachment(image, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(image, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(image, kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Center, .shouldPropagate)
     return image
   }
 
@@ -361,13 +367,15 @@ import XCTest
     let consumer = try route.addConsumerRoute(capacity: 1_000)
     let image = try frame(a, at: 0).payload
     let frames = 300
+    // Immutable frame owners cross the capture queues, retaining the shared image.
+    let captureFrames = (0..<frames).map { processed(image, at: Int64($0)) }
     let group = DispatchGroup()
     // Two capture delivery threads, as in the app: A on air, B starting.
     route.setSourceHealth(b, healthy: true)
     let cutRequested = DispatchSemaphore(value: 0)
     DispatchQueue.global(qos: .userInteractive).async(group: group) {
       for index in 0..<frames {
-        route.ingest(feedID: a, frame: self.processed(image, at: Int64(index)))
+        route.ingest(feedID: a, frame: captureFrames[index])
         if index == frames / 3 {
           _ = route.requestCut(to: b)
           cutRequested.signal()
@@ -376,7 +384,7 @@ import XCTest
     }
     DispatchQueue.global(qos: .userInteractive).async(group: group) {
       cutRequested.wait()  // B finishes opening while A is on air
-      for index in 0..<frames { route.ingest(feedID: b, frame: self.processed(image, at: Int64(index))) }
+      for index in 0..<frames { route.ingest(feedID: b, frame: captureFrames[index]) }
     }
     XCTAssertEqual(group.wait(timeout: .now() + 30), .success)
     let stats = route.statistics
@@ -447,10 +455,11 @@ import XCTest
       ProgramOutputFormat(configuration: contract, passthroughFormat: kCVPixelFormatType_422YpCbCr10))
     XCTAssertTrue(coordinator.start(a.id))
     let image = try ioSurfaceFrame(1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    let captureFrames = (0..<30).map { processed(image, at: Int64($0)) }
     let done = expectation(description: "capture thread")
     DispatchQueue.global(qos: .userInteractive).async {
       for index in 0..<30 {
-        coordinator.programOutput.ingest(fromCapture: a.id, frame: self.processed(image, at: Int64(index)))
+        coordinator.programOutput.ingest(fromCapture: a.id, frame: captureFrames[index])
       }
       done.fulfill()
     }
@@ -810,6 +819,73 @@ import XCTest
     return sent
   }
 
+  func testFractional5994SourceRunsOnExact23976ProgramGrid() throws {
+    let target = CMTime(value: 1001, timescale: 24_000)
+    let (route, consumer, image) = try cadenceRoute(contractDuration: target)
+    for index in 0..<25 {
+      route.ingest(feedID: feed("alpha"), frame: processed(image, at: Int64(index),
+        duration: CMTime(value: 1001, timescale: 60_000)))
+    }
+    let sent = drain(consumer)
+    XCTAssertEqual(sent.count, 10)
+    for (index, sample) in sent.enumerated() {
+      XCTAssertEqual(CMTimeCompare(sample.0, CMTime(value: Int64(index) * 10_010, timescale: 240_000)), 0)
+      XCTAssertEqual(CMTimeCompare(sample.1, target), 0)
+    }
+    XCTAssertEqual(route.statistics.accepted, 25)
+    XCTAssertEqual(route.statistics.cadenceSkipped, 15)
+    XCTAssertEqual(route.statistics.cadenceRepeats, 0)
+  }
+
+  func testProgramSinkNegotiatesExplicit120AndKeepsClockAcrossSourceChanges() throws {
+    let route = ProgramOutputRoute(feedIDs: [feed("alpha"), feed("beta")])
+    let consumer = try route.addConsumerRoute(capacity: 32)
+    var requested: [CMTime] = []
+    let bridge = ProgramOutputBridge(route: consumer, connect: { configuration, _ in
+      requested.append(configuration.duration)
+    }, disconnect: {}, send: { _ in true })
+    var configuration = PipelineConfiguration()
+    configuration.sourceDuration = CMTime(value: 1, timescale: 24)
+    configuration.reduceFrameRate = true
+    configuration.frameRateTarget = .fps120
+    try bridge.setDemand(true, configuration: configuration,
+      passthroughFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    XCTAssertEqual(CMTimeCompare(try XCTUnwrap(requested.first), CMTime(value: 1, timescale: 120)), 0)
+    XCTAssertEqual(CMTimeCompare(try XCTUnwrap(bridge.contract).duration,
+      try XCTUnwrap(requested.first)), 0)
+    XCTAssertEqual(CMTimeCompare(try XCTUnwrap(configuration.sourceDuration), CMTime(value: 1, timescale: 24)), 0)
+    configuration.sourceDuration = CMTime(value: 1001, timescale: 60_000)
+    try bridge.setDemand(true, configuration: configuration,
+      passthroughFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    XCTAssertEqual(requested.count, 1, "Changing sources keeps the selected Program clock")
+    XCTAssertEqual(CMTimeCompare(try XCTUnwrap(bridge.contract).duration, CMTime(value: 1, timescale: 120)), 0)
+    bridge.disconnect()
+  }
+
+  func testExplicit120ProgramRepeats24SourceWithoutClampingTarget() throws {
+    var configuration = PipelineConfiguration()
+    configuration.sourceDuration = CMTime(value: 1, timescale: 24)
+    configuration.reduceFrameRate = true
+    configuration.frameRateTarget = .fps120
+    let format = ProgramOutputFormat(configuration: configuration,
+      passthroughFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    XCTAssertEqual(CMTimeCompare(configuration.duration, CMTime(value: 1, timescale: 24)), 0,
+      "Feed conversion continues to reduce only")
+    XCTAssertEqual(CMTimeCompare(format.duration, CMTime(value: 1, timescale: 120)), 0)
+    let (route, consumer, image) = try cadenceRoute(contractDuration: format.duration)
+    for index in 0..<4 {
+      route.ingest(feedID: feed("alpha"), frame: processed(image, at: Int64(index),
+        duration: CMTime(value: 1, timescale: 24)))
+    }
+    let sent = drain(consumer)
+    XCTAssertEqual(sent.count, 20)
+    for (index, sample) in sent.enumerated() {
+      XCTAssertEqual(CMTimeCompare(sample.0, CMTime(value: Int64(index) * 2000, timescale: 240_000)), 0)
+    }
+    XCTAssertEqual(route.statistics.cadenceRepeats, 16)
+    XCTAssertEqual(route.statistics.cadenceSkipped, 0)
+  }
+
   func testFasterSourceSendsEveryOtherFrameOnASlowerContract() throws {
     let (route, consumer, image) = try cadenceRoute(contractDuration: VideoContract.slowDuration)
     for index in 0..<20 { route.ingest(feedID: feed("alpha"), frame: processed(image, at: Int64(index))) }
@@ -834,6 +910,33 @@ import XCTest
     XCTAssertTrue(sent.allSatisfy { $0.2 === image }, "A repeat is the same IOSurface with the next time: no copy")
     XCTAssertEqual(route.statistics.cadenceRepeats, 10)
     XCTAssertEqual(route.statistics.published, 20)
+  }
+
+  func testLowRateSourceFillsMoreThanFourProgramSlots() throws {
+    let (route, consumer, image) = try cadenceRoute(contractDuration: VideoContract.fastDuration)
+    route.ingest(feedID: feed("alpha"), frame: processed(image, at: 0,
+      duration: CMTimeMultiply(VideoContract.fastDuration, multiplier: 8)))
+    XCTAssertEqual(drain(consumer).count, 8)
+    XCTAssertEqual(route.statistics.cadenceRepeats, 7)
+  }
+
+  func testDeclaredPauseWindowBoundsProgramRepeatsAndReportsDiscontinuity() throws {
+    let (route, consumer, image) = try cadenceRoute(contractDuration: CMTime(value: 1, timescale: 60))
+    route.setSourcePauseTolerance(feed("alpha"), mayPause: .milliseconds(100))
+    route.ingest(feedID: feed("alpha"), frame: processed(image, at: 0,
+      duration: CMTime(value: 10, timescale: 1)))
+    XCTAssertEqual(drain(consumer).count, 6)
+    XCTAssertEqual(route.statistics.cadenceRepeats, 5)
+    XCTAssertEqual(route.statistics.cadenceDiscontinuities, 1)
+  }
+
+  func testLongPauseToleranceStillUsesConfiguredRepeatMaximum() throws {
+    let (route, consumer, image) = try cadenceRoute(contractDuration: CMTime(value: 1, timescale: 10), capacity: 64)
+    route.setSourcePauseTolerance(feed("alpha"), mayPause: .seconds(60))
+    route.ingest(feedID: feed("alpha"), frame: processed(image, at: 0,
+      duration: CMTime(value: 60, timescale: 1)))
+    XCTAssertEqual(drain(consumer).count, 20)
+    XCTAssertEqual(route.statistics.cadenceDiscontinuities, 1)
   }
 
   func testCutsBetweenCadencesStayOnTheContractGrid() throws {
@@ -957,10 +1060,11 @@ import XCTest
     ingest(other)  // converter not built yet, early in the session
     ingest(other)
     XCTAssertEqual(events.errors.count, 1, "Repeats of one fault are latched")
-    for _ in 1..<ProgramOutputRoute.healthyPublishesToRearm { ingest(matching) }
+    let healthyFrames = Int(ceil(ProgramOutputRoute.healthyPublishDurationToRearm / CMTimeGetSeconds(VideoContract.fastDuration)))
+    for _ in 1..<healthyFrames { ingest(matching) }
     ingest(other)
     XCTAssertEqual(events.errors.count, 1, "A stretch shorter than the re-arm bound keeps the latch")
-    for _ in 0..<ProgramOutputRoute.healthyPublishesToRearm { ingest(matching) }
+    for _ in 0..<healthyFrames { ingest(matching) }
     // Later, a different fault: the GPU stalls.
     route.setNormalizerProvider { StalledNormalizer() }
     ingest(other)
@@ -1012,10 +1116,24 @@ import XCTest
       }
       XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
       let output = try XCTUnwrap(box.buffer)
+      XCTAssertTrue(contract.matchesColourAndAspect(output), "Pixels must carry the fixed Program target identity")
+      CVPixelBufferLockBaseAddress(output, .readOnly)
+      let luma = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt8.self)[0]
+      CVPixelBufferUnlockBaseAddress(output, .readOnly)
+      if CVBufferCopyAttachment(source, kCVImageBufferTransferFunctionKey, nil) as? String == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String {
+        XCTAssertNotEqual(luma, 100, "PQ to709 must transform pixels, not merely replace tags")
+      } else { XCTAssertEqual(luma, 100) }
       let attachments = (CVBufferCopyAttachments(output, .shouldPropagate) as? [String: Any]) ?? [:]
       return (IOSurfaceGetID(CVPixelBufferGetIOSurface(output)!.takeUnretainedValue()), attachments)
     }
-    let hdr = try ioSurfaceFrame(3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+    let neutral: (CVPixelBuffer) -> Void = { image in
+      for plane in 0..<2 {
+        let samples = CVPixelBufferGetBaseAddressOfPlane(image, plane)!.assumingMemoryBound(to: UInt16.self)
+        let count = CVPixelBufferGetBytesPerRowOfPlane(image, plane) * CVPixelBufferGetHeightOfPlane(image, plane) / 2
+        for index in 0..<count { samples[index] = UInt16(plane == 0 ? 400 : 512) << 6 }
+      }
+    }
+    let hdr = try ioSurfaceFrame(3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, fill: neutral)
     let tags: [(CFString, CFTypeRef)] = [
       (kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020),
       (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ),
@@ -1028,14 +1146,15 @@ import XCTest
         kCVImageBufferCleanApertureVerticalOffsetKey: 0] as CFDictionary),
     ]
     for (key, value) in tags { CVBufferSetAttachment(hdr, key, value, .shouldPropagate) }
-    let untagged = try ioSurfaceFrame(3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+    let untagged = try ioSurfaceFrame(3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, fill: neutral)
+    CVBufferRemoveAllAttachments(untagged)
     // Enough HDR frames that every pool buffer has carried HDR tags.
     var hdrSurfaces = Set<IOSurfaceID>()
     for _ in 0..<8 {
       let (surface, attachments) = try convert(hdr)
       hdrSurfaces.insert(surface)
       XCTAssertEqual(attachments[kCVImageBufferTransferFunctionKey as String] as? String,
-        kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String, "The source's own color tags are carried")
+        kCVImageBufferTransferFunction_ITU_R_709_2 as String, "HDR pixels are converted to the fixed709 target")
       XCTAssertNil(attachments[kCVImageBufferCleanApertureKey as String],
         "A 3840×2160 clean aperture does not describe a 1920×1080 image")
       XCTAssertEqual(attachments[kCVImageBufferChromaLocationTopFieldKey as String] as? String,
@@ -1045,8 +1164,7 @@ import XCTest
     for _ in 0..<8 {
       let (surface, attachments) = try convert(untagged)
       reused = reused || hdrSurfaces.contains(surface)
-      for key in [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey,
-                  kCVImageBufferYCbCrMatrixKey, kCVImageBufferMasteringDisplayColorVolumeKey,
+      for key in [kCVImageBufferMasteringDisplayColorVolumeKey,
                   kCVImageBufferContentLightLevelInfoKey, kCVImageBufferCleanApertureKey] {
         XCTAssertNil(attachments[key as String], "Cut to an untagged camera: no stale \(key) on Program")
       }
@@ -1123,36 +1241,6 @@ import XCTest
     XCTAssertGreaterThanOrEqual(queued, 2, "Fixed-interval switching asks again after the dead cut expires")
   }
 
-  static let allTests = [
-    ("selected feed and boundary cut", testProgramRoutePublishesSelectedFeedOnlyAndCutsAtBoundary),
-    ("timestamped auto cut boundary", testProgramCutHonorsEarliestMediaTimeFromAutoDirector),
-    ("coordinator uses live Program scheduler", testFeedCoordinatorMutatesTheLiveProgramScheduler),
-    ("enabled feed reconfiguration", testProgramRouteReconfigurationKeepsOnlyEnabledFeeds),
-    ("Program reset drains old timeline", testProgramRouteResetDrainsOldTimelineFrames),
-    ("registry modes and Program demand", testFeedCoordinatorPublishesSeparateOrProgramRegistryAndProgramDemand),
-    ("selection with nothing on air", testSelectionWithNothingOnAirChangesAtOnce),
-    ("Program bridge lifecycle and timing", testProgramBridgePreservesImageAndTimingAndOwnsDemandLifecycle),
-    ("Program bridge reconnects after sink failure", testProgramBridgeReconnectsAfterTransientSinkFailure),
-    ("in-order delivery from capture threads", testEverySelectedFrameReachesProgramInOrderFromCaptureThreads),
-    ("full camera route is a counted error", testFullCameraRouteIsACountedVisibleErrorNotASilentDrop),
-    ("no client queues nothing", testNoCameraClientMeansNothingIsQueuedOrCountedAsAnError),
-    ("capture delivery off the main thread", testCaptureDeliveryReachesTheProgramCameraOffTheMainThread),
-    ("starting camera cut and rollback", testCutToStartingCameraWaitsAndFailedStartRollsBackVisibly),
-    ("GPU normalization to the contract", testDifferentFormatSourceIsConvertedToTheContractOnTheGPUInOrder),
-    ("v210 and upscale levels", testV210AndUpscaleConversionsAreLevelExact),
-    ("Program latency", testProgramLatencyFromCaptureToCameraSend),
-    ("faster source halved to the contract", testFasterSourceSendsEveryOtherFrameOnASlowerContract),
-    ("slower source repeated to the contract", testSlowerSourceRepeatsTheSameSurfaceOnAFasterContract),
-    ("cuts between cadences stay on the grid", testCutsBetweenCadencesStayOnTheContractGrid),
-    ("normalizer not built or stalled never blocks", testNormalizerThatIsNotBuiltOrFailsIsACountedErrorThatNeverBlocks),
-    ("on-air timestamp skips reported", testOnAirTimestampSkipsAreCountedAndReported),
-    ("on-air clock restart stays on the grid", testOnAirStreamClockRestartKeepsProgramOnTheGrid),
-    ("error latch re-arms after a healthy stretch", testErrorLatchRearmsAfterAHealthyStretch),
-    ("feed rebuild keeps cut state", testFeedRebuildKeepsTheCutOnAirAndReportsADroppedCut),
-    ("normalizer replaces stale tags", testNormalizerReplacesThePoolBuffersStaleColorAndGeometryTags),
-    ("idle normalizer releases surfaces", testIdleNormalizerReleasesItsSurfacesAndPool),
-    ("no-signal cut expires, auto continues", testCutToCameraWithNoSignalExpiresAndAutomaticSwitchingContinues),
-  ]
 }
 
 private enum SinkFailure: Error { case disconnected }

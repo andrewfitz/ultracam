@@ -2,47 +2,46 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
-/// The two video rates supported by the UltraStudio capture contract.
+/// The two video rates supported by the current capture contract.
 ///
 /// The media clock is exact (1001/30000 or 1001/60000 seconds per frame),
 /// while the timecode clock uses the corresponding nominal integer rate (30 or
 /// 60 frames per second).  That distinction is what makes drop-frame labels
 /// necessary when a timecode is anchored to wall clock time.
-public enum RecordingFrameRate: Equatable, Sendable {
-  case fps2997
-  case fps5994
+public struct RecordingFrameRate: Equatable, Sendable {
+  let rateNumerator: Int64
+  let rateDenominator: Int64
 
-  public var frameDuration: CMTime {
-    switch self {
-    case .fps2997:
-      return CMTime(value: 1001, timescale: 30_000)
-    case .fps5994:
-      return CMTime(value: 1001, timescale: 60_000)
-    }
+  /// Exact frames per second, reduced to a canonical rational.
+  public init?(numerator: Int64, denominator: Int64) {
+    guard numerator > 0, denominator > 0,
+      numerator <= Int64(Int32.max), denominator <= Int64(Int32.max),
+      numerator <= 120 * denominator, numerator >= denominator else { return nil }
+    var a = numerator, b = denominator
+    while b != 0 { let r = a % b; a = b; b = r }
+    rateNumerator = numerator / a; rateDenominator = denominator / a
   }
-
-  public var nominalFramesPerSecond: Int64 {
-    switch self {
-    case .fps2997: return 30
-    case .fps5994: return 60
-    }
+  private init(_ numerator: Int64, _ denominator: Int64 = 1) {
+    self = Self(numerator: numerator, denominator: denominator)!
   }
+  public static let fps23976 = Self(24_000, 1_001)
+  public static let fps24 = Self(24)
+  public static let fps25 = Self(25)
+  public static let fps2997 = Self(30_000, 1_001)
+  public static let fps30 = Self(30)
+  public static let fps47952 = Self(48_000, 1_001)
+  public static let fps48 = Self(48)
+  public static let fps50 = Self(50)
+  public static let fps5994 = Self(60_000, 1_001)
+  public static let fps60 = Self(60)
+  public static let fps100 = Self(100)
+  public static let fps11988 = Self(120_000, 1_001)
+  public static let fps120 = Self(120)
 
-  fileprivate var rateNumerator: Int64 {
-    switch self {
-    case .fps2997: return 30_000
-    case .fps5994: return 60_000
-    }
-  }
-
-  fileprivate var rateDenominator: Int64 { 1_001 }
-
-  fileprivate var dropFramesPerMinute: Int64 {
-    switch self {
-    case .fps2997: return 2
-    case .fps5994: return 4
-    }
-  }
+  public var frameDuration: CMTime { CMTime(value: rateDenominator, timescale: Int32(rateNumerator)) }
+  public var nominalFramesPerSecond: Int64 { (rateNumerator + rateDenominator - 1) / rateDenominator }
+  public var supportsDropFrame: Bool { self == .fps2997 || self == .fps5994 }
+  fileprivate var dropFramesPerMinute: Int64 { self == .fps5994 ? 4 : 2 }
 }
 
 /// Chooses whether a recorder creates a timecode from the computer clock or
@@ -130,8 +129,8 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
     // before normalizing so malformed mixed-separator labels are rejected.
     let chars = Array(string)
     let expectedSeparator: Character = dropFrame ? ";" : ":"
-    guard chars.count == 11, chars[2] == expectedSeparator,
-      chars[5] == expectedSeparator, chars[8] == expectedSeparator else { return nil }
+    guard (11...12).contains(chars.count), chars[2] == ":",
+      chars[5] == ":", chars[8] == expectedSeparator else { return nil }
     let normalized = string.replacingOccurrences(of: ";", with: ":")
     let fields = normalized.split(separator: ":", omittingEmptySubsequences: false)
     guard fields.count == 4,
@@ -139,9 +138,10 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
       let seconds = Int(fields[2]), let frames = Int(fields[3]),
       (0..<24).contains(hours), (0..<60).contains(minutes),
       (0..<60).contains(seconds), (0..<Int(frameRate.nominalFramesPerSecond)).contains(frames),
-      string.count == 11 else {
+      (11...12).contains(string.count) else {
       return nil
     }
+    guard !dropFrame || frameRate.supportsDropFrame else { return nil }
     if dropFrame && minutes % 10 != 0 && seconds == 0 && frames < Int(frameRate.dropFramesPerMinute) {
       return nil
     }
@@ -167,7 +167,7 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
   /// separator, or nil when the label is not in that form.
   public static func dropFrame(declaredBy label: String) -> Bool? {
     let characters = Array(label)
-    guard characters.count == 11 else { return nil }
+    guard (11...12).contains(characters.count) else { return nil }
     switch characters[8] {
     case ";": return true
     case ":": return false
@@ -325,6 +325,7 @@ public final class QuickTimeTimecodeTrack {
   public let formatDescription: CMFormatDescription
 
   public init(frameRate: RecordingFrameRate, dropFrame: Bool = true) throws {
+    guard !dropFrame || frameRate.supportsDropFrame else { throw RecordingTimecodeError.incompatibleTimecode }
     self.frameRate = frameRate
     self.dropFrame = dropFrame
     var description: CMFormatDescription?

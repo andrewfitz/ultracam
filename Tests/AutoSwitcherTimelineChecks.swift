@@ -32,13 +32,13 @@ import XCTest
       of: #"^auto-switcher-\d{8}-\d{6}-\d{3}(?:-\d+)?\.json$"#, options: .regularExpression))
 
     let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
-    XCTAssertEqual(object["schema_version"] as? Int, 2)
+    XCTAssertEqual(object["schema_version"] as? Int, 3)
     let cuts = try XCTUnwrap(object["cuts"] as? [[String: Any]])
     XCTAssertEqual(cuts.first?["status"] as? String, "applied")
-    XCTAssertEqual(cuts.first?["requested_cut_time_ticks"] as? Int, 300_000)
-    XCTAssertEqual(cuts.first?["applied_source_time_ticks"] as? Int, 300_600)
-    XCTAssertEqual(cuts.first?["applied_program_time_ticks"] as? Int, 300_660)
-    XCTAssertEqual((object["timebase"] as? [String: Any])?["timescale"] as? Int, 60_000)
+    XCTAssertEqual(cuts.first?["requested_cut_time_ticks"] as? Int, 1_200_000)
+    XCTAssertEqual(cuts.first?["applied_source_time_ticks"] as? Int, 1_202_400)
+    XCTAssertEqual(cuts.first?["applied_program_time_ticks"] as? Int, 1_202_640)
+    XCTAssertEqual((object["timebase"] as? [String: Any])?["timescale"] as? Int, 240_000)
     let events = try XCTUnwrap(object["events"] as? [[String: Any]])
     let transcript = try XCTUnwrap(events.first(where: { event in
       guard let payload = event["event"] as? [String: Any] else { return false }
@@ -49,7 +49,18 @@ import XCTest
     XCTAssertEqual(cue["kind"] as? String, "sentenceEnd")
   }
 
-  static let allTests = [
-    ("timeline records exact cut ticks", testTimelinePersistsExactTicksAndAppliedProgramCut),
-  ]
+  func testTimelinePreservesFractionalFrameTicksWithoutCumulativeRounding() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "anchor"), emphasis: FeedID(rawValue: "emphasis"), outputFolder: folder)
+    for index: Int64 in [1, 2, 1_000_000] {
+      recorder.recordTick(time: CMTime(value: index * 1001, timescale: 24_000))
+    }
+    recorder.finish()
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
+    let events = try XCTUnwrap(object["events"] as? [[String: Any]])
+    XCTAssertEqual(events.compactMap { $0["media_time_ticks"] as? Int64 }, [10_010, 20_020, 10_010_000_000])
+  }
+
 }

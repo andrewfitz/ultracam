@@ -27,8 +27,11 @@ import SwiftUI
   static func sizes(_ verifier: Verifier) {
     for screen in UIMonitorToolScreens.screens() {
       guard let size = screen.popover else { continue }
+      // The 356-point columns intentionally keep sliders and readouts stable
+      // while dragging. Check their actual panel width so unexpected horizontal
+      // growth fails, rather than imposing the former 320-point layout's cap.
       verifier.check("\(screen.name) fits without scrolling",
-        (480...740).contains(size.width) && size.height <= 560 && size.height >= 120,
+        abs(size.width - UIToolLayout.panelWidth) < 0.5 && size.height <= 560 && size.height >= 120,
         "\(Int(size.width))×\(Int(size.height)) pt")
     }
   }

@@ -212,6 +212,43 @@ struct AppSettings: Codable, Equatable, Sendable {
   var lutBookmark: Data?
   // Optional on disk to migrate v1 preferences without losing the saved LUT.
   var automaticFeed: Bool?
+
+  private enum CodingKeys: String, CodingKey {
+    case version, selectedDevice, applyLUT, downscale, convertTo420, reduceFrameRate
+    case resizeTarget, colorTarget, frameRateTarget, gamut, pipelineEnabled, previewEnabled
+    case lutBookmark, automaticFeed
+  }
+
+  init(version: Int = 1, selectedDevice: String = "", applyLUT: Bool = false,
+    downscale: Bool = true, convertTo420: Bool = true, reduceFrameRate: Bool = false,
+    resizeTarget: ResizeTarget? = nil, colorTarget: ColorTarget? = nil,
+    frameRateTarget: FrameRateTarget? = nil, gamut: String = "Unspecified / custom LUT",
+    pipelineEnabled: Bool = true, previewEnabled: Bool = true,
+    lutBookmark: Data? = nil, automaticFeed: Bool? = nil) {
+    self.version = version; self.selectedDevice = selectedDevice; self.applyLUT = applyLUT
+    self.downscale = downscale; self.convertTo420 = convertTo420; self.reduceFrameRate = reduceFrameRate
+    self.resizeTarget = resizeTarget; self.colorTarget = colorTarget; self.frameRateTarget = frameRateTarget
+    self.gamut = gamut; self.pipelineEnabled = pipelineEnabled; self.previewEnabled = previewEnabled
+    self.lutBookmark = lutBookmark; self.automaticFeed = automaticFeed
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 1
+    selectedDevice = try c.decodeIfPresent(String.self, forKey: .selectedDevice) ?? ""
+    applyLUT = try c.decodeIfPresent(Bool.self, forKey: .applyLUT) ?? false
+    downscale = try c.decodeIfPresent(Bool.self, forKey: .downscale) ?? true
+    convertTo420 = try c.decodeIfPresent(Bool.self, forKey: .convertTo420) ?? true
+    reduceFrameRate = try c.decodeIfPresent(Bool.self, forKey: .reduceFrameRate) ?? false
+    resizeTarget = try? c.decodeIfPresent(ResizeTarget.self, forKey: .resizeTarget)
+    colorTarget = try? c.decodeIfPresent(ColorTarget.self, forKey: .colorTarget)
+    frameRateTarget = try? c.decodeIfPresent(FrameRateTarget.self, forKey: .frameRateTarget)
+    gamut = try c.decodeIfPresent(String.self, forKey: .gamut) ?? "Unspecified / custom LUT"
+    pipelineEnabled = try c.decodeIfPresent(Bool.self, forKey: .pipelineEnabled) ?? true
+    previewEnabled = try c.decodeIfPresent(Bool.self, forKey: .previewEnabled) ?? true
+    lutBookmark = try c.decodeIfPresent(Data.self, forKey: .lutBookmark)
+    automaticFeed = try c.decodeIfPresent(Bool.self, forKey: .automaticFeed)
+  }
 }
 
 /// Persisted settings for one camera.
@@ -228,6 +265,14 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   var colorTarget: ColorTarget?
   var frameRateTarget: FrameRateTarget?
   var gamut = "Unspecified / custom LUT"
+  /// Stable source-profile identity; display strings remain a UI concern.
+  var sourceProfileID: String = "unspecified"
+  var scalingMode: ProgramScalingMode = .fit
+  var lutInputSpaceID = "rec709-video"
+  var lutOutputSpaceID = "rec709-video"
+  var programColorSpaceID = "rec709-video"
+  /// Recording-only VFR compatibility; capture and monitoring keep source cadence.
+  var recordingConstantFrameRate = false
   var pipelineEnabled = true
   var previewEnabled = true
   var lutBookmark: Data?
@@ -252,11 +297,17 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   init(id: FeedID = .primary, name: String = "Camera 1", selectedDevice: String = "",
     applyLUT: Bool = false, downscale: Bool = true, convertTo420: Bool = true,
     reduceFrameRate: Bool = false, gamut: String = "Unspecified / custom LUT",
+    sourceProfileID: String? = nil,
     pipelineEnabled: Bool = true, previewEnabled: Bool = true, lutBookmark: Data? = nil,
     automaticFeed: Bool = false, enabled: Bool = true,
     monitor: MonitorFeedPreferences = MonitorFeedPreferences(),
-    resizeTarget: ResizeTarget? = nil, colorTarget: ColorTarget? = nil,
-    frameRateTarget: FrameRateTarget? = nil) {
+    resizeTarget: ResizeTarget? = .hd1080, colorTarget: ColorTarget? = .yuv4208,
+    frameRateTarget: FrameRateTarget? = .fps2997, scalingMode: ProgramScalingMode = .fit,
+    lutInputSpaceID: String = "rec709-video", lutOutputSpaceID: String = "rec709-video", programColorSpaceID: String = "rec709-video", recordingConstantFrameRate: Bool = false) {
+    self.recordingConstantFrameRate = recordingConstantFrameRate
+    self.programColorSpaceID = programColorSpaceID
+    self.lutInputSpaceID = lutInputSpaceID; self.lutOutputSpaceID = lutOutputSpaceID
+    self.scalingMode = scalingMode
     self.resizeTarget = resizeTarget
     self.colorTarget = colorTarget
     self.frameRateTarget = frameRateTarget
@@ -268,41 +319,50 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     self.convertTo420 = convertTo420
     self.reduceFrameRate = reduceFrameRate
     self.gamut = gamut
+    self.sourceProfileID = sourceProfileID
+      ?? monitor.signal.logProfileID.flatMap { id in SourceColorSpaceCatalog.entries.contains(where: { $0.id == id }) ? id : nil }
+      ?? Self.profileID(forLegacyGamut: gamut)
     self.pipelineEnabled = pipelineEnabled
     self.previewEnabled = previewEnabled
     self.lutBookmark = lutBookmark
     self.automaticFeed = automaticFeed
     self.enabled = enabled
     self.monitor = monitor
+    self.monitor.signal.logProfileID = Self.logProfileID(self.sourceProfileID)
   }
 
   init(legacy settings: AppSettings, id: FeedID = .primary, name: String = "Camera 1") {
     self.init(id: id, name: name, selectedDevice: settings.selectedDevice,
       applyLUT: settings.applyLUT, downscale: settings.downscale,
       convertTo420: settings.convertTo420, reduceFrameRate: settings.reduceFrameRate,
-      gamut: settings.gamut, pipelineEnabled: settings.pipelineEnabled,
+      gamut: settings.gamut, sourceProfileID: Self.profileID(forLegacyGamut: settings.gamut),
+      pipelineEnabled: settings.pipelineEnabled,
       previewEnabled: settings.previewEnabled, lutBookmark: settings.lutBookmark,
-      automaticFeed: settings.automaticFeed ?? false, resizeTarget: settings.resizeTarget,
-      colorTarget: settings.colorTarget, frameRateTarget: settings.frameRateTarget)
+      automaticFeed: settings.automaticFeed ?? false,
+      resizeTarget: settings.resizeTarget ?? .hd1080,
+      colorTarget: settings.colorTarget ?? .yuv4208, frameRateTarget: settings.frameRateTarget ?? .fps2997)
   }
 
   var configuration: PipelineConfiguration {
     PipelineConfiguration(applyLUT: applyLUT, downscale: downscale,
       convertTo420: convertTo420, reduceFrameRate: reduceFrameRate,
       resizeTarget: resizeTarget ?? .hd1080, colorTarget: colorTarget ?? .yuv4208,
-      frameRateTarget: frameRateTarget ?? .fps2997)
+      frameRateTarget: frameRateTarget ?? .fps2997, scalingMode: scalingMode,
+      sourceColorimetryOverride: sourceProfileID == "unspecified" ? nil : (try? SourceColorSpaceCatalog.color(sourceProfileID)),
+      lutOutputColorimetry: applyLUT && lutBookmark != nil ? (try? SourceColorSpaceCatalog.color(lutOutputSpaceID)) : nil,
+      programColorimetry: (try? SourceColorSpaceCatalog.color(programColorSpaceID)) ?? .rec709Video)
   }
 
   private enum CodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
-      reduceFrameRate, gamut, pipelineEnabled, previewEnabled, lutBookmark,
+      reduceFrameRate, gamut, sourceProfileID, scalingMode, lutInputSpaceID, lutOutputSpaceID, programColorSpaceID, recordingConstantFrameRate, pipelineEnabled, previewEnabled, lutBookmark,
       automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
   }
 
   /// `CodingKeys` and the MonitorTools key, read only to migrate.
   private enum DecodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
-      reduceFrameRate, gamut, pipelineEnabled, previewEnabled, lutBookmark,
+      reduceFrameRate, gamut, sourceProfileID, scalingMode, lutInputSpaceID, lutOutputSpaceID, programColorSpaceID, recordingConstantFrameRate, pipelineEnabled, previewEnabled, lutBookmark,
       automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
     case legacyMonitorConfiguration = "monitorConfiguration"
   }
@@ -325,6 +385,13 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     colorTarget = try? values.decodeIfPresent(ColorTarget.self, forKey: .colorTarget)
     frameRateTarget = try? values.decodeIfPresent(FrameRateTarget.self, forKey: .frameRateTarget)
     gamut = try values.decodeIfPresent(String.self, forKey: .gamut) ?? "Unspecified / custom LUT"
+    recordingConstantFrameRate = (try? values.decodeIfPresent(Bool.self, forKey: .recordingConstantFrameRate)) ?? false
+    programColorSpaceID = try values.decodeIfPresent(String.self, forKey: .programColorSpaceID) ?? "rec709-video"
+    lutInputSpaceID = try values.decodeIfPresent(String.self, forKey: .lutInputSpaceID) ?? "rec709-video"
+    lutOutputSpaceID = try values.decodeIfPresent(String.self, forKey: .lutOutputSpaceID) ?? "rec709-video"
+    scalingMode = (try? values.decodeIfPresent(ProgramScalingMode.self, forKey: .scalingMode)) ?? .fit
+    sourceProfileID = try values.decodeIfPresent(String.self, forKey: .sourceProfileID)
+      ?? Self.profileID(forLegacyGamut: gamut)
     pipelineEnabled = try values.decodeIfPresent(Bool.self, forKey: .pipelineEnabled) ?? true
     previewEnabled = try values.decodeIfPresent(Bool.self, forKey: .previewEnabled) ?? true
     lutBookmark = try values.decodeIfPresent(Data.self, forKey: .lutBookmark)
@@ -333,6 +400,49 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     // New keys only: `version` stays 1, since `validated()` rejects any other
     // and a rejected snapshot loses every feed.
     monitor = values.monitorPreferences(.monitor, legacy: .legacyMonitorConfiguration)
+    // An explicit source ID is authoritative. Before this key existed the
+    // monitor declaration described actual pixels, while gamut was a LUT label.
+    let explicitSource = try values.decodeIfPresent(String.self, forKey: .sourceProfileID)
+    if let explicitSource {
+      sourceProfileID = explicitSource
+    } else if let monitorID = monitor.signal.logProfileID,
+      SourceColorSpaceCatalog.entries.contains(where: { $0.id == monitorID }) {
+      sourceProfileID = monitorID
+    } else {
+      sourceProfileID = Self.profileID(forLegacyGamut: gamut)
+    }
+    monitor.signal.logProfileID = Self.logProfileID(sourceProfileID)
+  }
+
+  static func profileID(forLegacyGamut gamut: String) -> String {
+    SourceColorSpaceCatalog.profile(forLegacyName: gamut)
+  }
+
+  var processingDeclarationError: String? {
+    do {
+      if sourceProfileID != "unspecified" { _ = try SourceColorSpaceCatalog.color(sourceProfileID) }
+      _ = try lutColorSpaceContract()
+      guard ["rec709-video", "rec2020-pq-video", "rec2020-hlg-video"].contains(programColorSpaceID) else {
+        throw PluginError.unsupported("Unknown Program color declaration ‘\(programColorSpaceID)’. Choose Rec.709, Rec.2020 PQ or HLG.")
+      }
+      return nil
+    } catch { return error.localizedDescription }
+  }
+  func lutColorSpaceContract() throws -> LUTColorSpaceContract {
+    try .init(input: SourceColorSpaceCatalog.color(lutInputSpaceID), output: SourceColorSpaceCatalog.color(lutOutputSpaceID))
+  }
+  private static func logProfileID(_ id: String) -> String? {
+    id == "unspecified" || id == "rec709-video" || id.hasPrefix("rec2020-") ? nil : id
+  }
+  mutating func setSourceProfile(_ id: String) {
+    sourceProfileID = id
+    gamut = id == "unspecified" ? "Unspecified / custom LUT" : SourceColorSpaceCatalog.title(id)
+    monitor.signal.logProfileID = Self.logProfileID(id)
+  }
+
+  mutating func setGamut(_ displayName: String) {
+    setSourceProfile(Self.profileID(forLegacyGamut: displayName))
+    gamut = displayName
   }
 }
 
@@ -430,6 +540,7 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
 @MainActor
 final class AppSettingsStore {
   static let hideFromDockKey = "ultracam.hideFromDock"
+  static let allowCPUConversionKey = "ultracam.allowCPUConversion"
   static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
@@ -445,10 +556,17 @@ final class AppSettingsStore {
   /// Recordings and their recovery journals on disk are not touched.
   func resetAll() {
     let names = defaults.dictionaryRepresentation().keys.filter {
-      $0 == Self.hideFromDockKey || $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
+      $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
+        $0 == VendorSettingsKeys.preferences || $0 == "ultracam.settings.pre-b1d.backup" ||
         $0.hasPrefix("ui.") || $0.hasPrefix("recordingFolderBookmark")
     }
     for name in names { defaults.removeObject(forKey: name) }
+  }
+
+  /// Sampled when a session/take begins; never read from a frame callback.
+  var allowCPUConversion: Bool {
+    get { defaults.bool(forKey: Self.allowCPUConversionKey) }
+    set { defaults.set(newValue, forKey: Self.allowCPUConversionKey) }
   }
 
   var hideFromDock: Bool {
@@ -457,16 +575,28 @@ final class AppSettingsStore {
   }
 
   /// "Advertise HLG to cameras" (the driver default already has SDR and PQ). Off when never saved.
-  var advertiseHDRToCameras: Bool {
-    get { defaults.bool(forKey: Self.advertiseHDRKey) }
-    set { defaults.set(newValue, forKey: Self.advertiseHDRKey) }
-  }
+
 
   /// Loads the v2 collection and migrates the original one-feed record on the
   /// first read. The v1 value is intentionally retained until a v2 snapshot is
   /// successfully encoded and stored, allowing recovery after a failed write.
   func loadSnapshot() -> AppSettingsSnapshot {
-    if let snapshot = loadV2() { return snapshot }
+    if let snapshot = loadV2() {
+      var explicit = snapshot
+      for index in explicit.feeds.indices {
+        if explicit.feeds[index].resizeTarget == nil { explicit.feeds[index].resizeTarget = .hd1080 }
+        if explicit.feeds[index].colorTarget == nil { explicit.feeds[index].colorTarget = .yuv4208 }
+        if explicit.feeds[index].frameRateTarget == nil { explicit.feeds[index].frameRateTarget = .fps2997 }
+      }
+      if explicit != snapshot || missingExplicitFeedDeclarations {
+        if defaults.data(forKey: "ultracam.settings.pre-b1d.backup") == nil,
+          let original = defaults.data(forKey: Self.snapshotKey) {
+          defaults.set(original, forKey: "ultracam.settings.pre-b1d.backup")
+        }
+        saveSnapshot(explicit)
+      }
+      return explicit
+    }
     guard let legacy = loadLegacy() else { return AppSettingsSnapshot() }
     let migrated = AppSettingsSnapshot(feeds: [FeedDescriptor(legacy: legacy)], selectedFeedID: .primary)
     saveSnapshot(migrated)
@@ -481,6 +611,14 @@ final class AppSettingsStore {
     guard let snapshot = snapshot.validated(),
       let data = try? JSONEncoder().encode(snapshot) else { return }
     defaults.set(data, forKey: Self.snapshotKey)
+  }
+
+  private var missingExplicitFeedDeclarations: Bool {
+    guard let data = defaults.data(forKey: Self.snapshotKey),
+      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let feeds = root["feeds"] as? [[String: Any]] else { return false }
+    let keys = ["sourceProfileID", "lutInputSpaceID", "lutOutputSpaceID", "programColorSpaceID", "scalingMode", "recordingConstantFrameRate"]
+    return feeds.contains { feed in keys.contains { feed[$0] == nil } }
   }
 
   private func loadLegacy() -> AppSettings? {
@@ -571,6 +709,8 @@ actor LUTFileLoader {
 extension FeedDescriptor {
   func processingChoicesDiffer(from other: FeedDescriptor) -> Bool {
     configuration != other.configuration || lutBookmark != other.lutBookmark ||
-      pipelineEnabled != other.pipelineEnabled || gamut != other.gamut || previewEnabled != other.previewEnabled
+      pipelineEnabled != other.pipelineEnabled || sourceProfileID != other.sourceProfileID ||
+      lutInputSpaceID != other.lutInputSpaceID || lutOutputSpaceID != other.lutOutputSpaceID ||
+      gamut != other.gamut || previewEnabled != other.previewEnabled
   }
 }

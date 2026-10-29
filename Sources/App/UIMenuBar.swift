@@ -205,7 +205,7 @@ final class UIMenuCommandBox: NSObject {
     previewHost = host
     previewItem = item
     let items = Self.buildItems(presentation: presentation, session: session,
-      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name) },
+      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
       stats: statsLine(session: session), target: self, previewItem: item, showLivePreview: showLivePreview)
     menu.removeAllItems()
     for item in items { menu.addItem(item) }
@@ -224,7 +224,7 @@ final class UIMenuCommandBox: NSObject {
     guard menuOpen, let previewItem else { return }
     let session = bridge().snapshot()
     let fresh = Self.buildItems(presentation: UIPresentationBuilder.session(session), session: session,
-      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name) },
+      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
       stats: statsLine(session: session), target: self, previewItem: previewItem, showLivePreview: showLivePreview)
     guard !Self.refresh(menu.items, with: fresh) else { return }
     menu.removeAllItems()
@@ -553,10 +553,19 @@ final class UIMenuCommandBox: NSObject {
       checked: inputID == nil, enabled: !running, target: target))
     inputMenu.addItem(.separator())
     let options = UIInputLabels.options(inputs.map { ($0.id, $0.name) }, cameras: session.cameras, for: camera.id)
-    for option in options {
-      inputMenu.addItem(row(option.label, action(.setInput(cameraID: camera.id, deviceID: option.id)),
-        checked: option.id == inputID, enabled: !running && (option.usedBy == nil || option.id == inputID),
-        subtitle: option.usedBy.map { "Used by \($0)" }, target: target))
+    for group in UIInputPicker.groups(inputs) {
+      let destination: NSMenu
+      if let title = group.title {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let menu = NSMenu(title: title); menu.autoenablesItems = false
+        item.submenu = menu; inputMenu.addItem(item); destination = menu
+      } else { destination = inputMenu }
+      for input in group.inputs {
+        guard let option = options.first(where: { $0.id == input.id }) else { continue }
+        destination.addItem(row(option.label, action(.setInput(cameraID: camera.id, deviceID: option.id)),
+          checked: option.id == inputID, enabled: !running && UIInputPicker.selectable(input, usedBy: option.usedBy, selectedID: inputID),
+          subtitle: option.usedBy.map { "Used by \($0)" }, target: target))
+      }
     }
     if let inputID, !options.contains(where: { $0.id == inputID }) {
       inputMenu.addItem(row(camera.inputName, [], checked: true, enabled: false, subtitle: "Disconnected", target: target))

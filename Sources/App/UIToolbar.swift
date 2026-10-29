@@ -84,7 +84,7 @@ struct UIToolbarContent: ToolbarContent {
     if presentation.camerasRunning {
       return "Stop capture and output for every camera (⌘↩). Asks first if a recording or on-air camera is affected."
     }
-    if !presentation.canStartAny { return "No camera can start: connect its UltraStudio or choose another input in the inspector." }
+    if !presentation.canStartAny { return "No camera can start: connect its input device or choose another input in the inspector." }
     return presentation.cameras.count == 1 ? "Start the camera (⌘↩)." : "Start every camera (⌘↩)."
   }
 

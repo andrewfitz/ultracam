@@ -4,67 +4,6 @@ import Observation
 import os
 import UniformTypeIdentifiers
 
-struct InputDevice: Identifiable {
-  let id: String
-  /// The driver's model name, unchanged. Two units of one model share it; show `label`.
-  let name: String
-}
-
-extension Array where Element == InputDevice {
-  /// The device's label in this list (`UIInputLabels.label`); nil when it isn't listed.
-  func label(for id: String) -> String? {
-    guard let device = first(where: { $0.id == id }) else { return nil }
-    return UIInputLabels.label(id: id, name: device.name, among: map { ($0.id, $0.name) })
-  }
-}
-
-@MainActor protocol AppVirtualCameraRegistryPublishing {
-  func publish(_ snapshot: VirtualCameraRegistrySnapshot)
-}
-
-extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
-
-/// AppModel's paths to the DeckLink driver and the per-camera extension
-/// streams. Tools that build a real model, such as ui-verify, pass `.offline`
-/// so they can never open the user's capture device or send to their camera.
-/// The Program stream connects only behind a running camera, which `.offline`
-/// can't start.
-@MainActor struct AppHardware {
-  var captureServices: (FeedID) -> CaptureServices
-  var devices: () throws -> [InputDevice]
-  var driverWarning: () -> String?
-  var observeDevices: (@escaping @MainActor @Sendable ([InputDevice]) -> Void) -> Any?
-  /// Calls the handler whenever CMIO's device list changes (the camera extension starting,
-  /// its cameras appearing). Holds the observation until the returned value is released.
-  var observeVirtualCameras: (@escaping @MainActor @Sendable () -> Void) -> Any? = { _ in nil }
-  var diagnostics: (String) -> UltracamDeviceDiagnostics?
-  /// "Advertise HDR to cameras": whether discovery writes the HDR EDID. Never
-  /// at a capture start (an EDID write makes the camera renegotiate HDMI).
-  var setAdvertisesHDR: (Bool) -> Void = { _ in }
-
-  static let live = AppHardware(
-    captureServices: { .live(feedID: $0) },
-    devices: { try UltracamBackend.devices().map { InputDevice(id: $0.identifier, name: $0.name) } },
-    driverWarning: { UltracamBackend.driverInfo().message },
-    observeDevices: { handler in
-      UltracamBackend.addDeviceListObserver { list in
-        handler(list.map { InputDevice(id: $0.identifier, name: $0.name) })
-      }
-    },
-    observeVirtualCameras: { CMIODeviceListWatcher(changed: $0) },
-    diagnostics: { UltracamBackend.diagnostics(deviceID: $0) },
-    setAdvertisesHDR: { UltracamBackend.setAdvertisesHDR($0) })
-
-  /// No devices; starting a camera fails with an error and nothing is sent.
-  static let offline = AppHardware(
-    captureServices: { _ in
-      CaptureServices(
-        start: { _, _, _, _ in throw CocoaError(.featureUnsupported) },
-        stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in false })
-    },
-    devices: { [] }, driverWarning: { nil }, observeDevices: { _ in nil }, diagnostics: { _ in nil })
-}
-
 /// One camera's burn-in LUT as its own controller holds it. Runtime state:
 /// the saved choice is the descriptor's `lutBookmark` and `applyLUT`.
 struct CameraLUTState: Equatable, Sendable {
@@ -98,15 +37,17 @@ final class AppModel {
       UIDockPresence.update(hideFromDock: hideFromDock)
     }
   }
-  /// Lets cameras send HLG and PQ over HDMI: each UltraStudio's EDID advertises
-  /// them from discovery on. Off by default. Changing it makes connected
-  /// cameras renegotiate HDMI once; a camera start never does.
-  var advertiseHDRToCameras = false {
+  /// Changes the next session/take only; admitted requests hold value snapshots.
+  var allowCPUConversion = false {
     didSet {
-      guard advertiseHDRToCameras != oldValue else { return }
-      settingsStore.advertiseHDRToCameras = advertiseHDRToCameras
-      hardware.setAdvertisesHDR(advertiseHDRToCameras)
+      guard allowCPUConversion != oldValue else { return }
+      settingsStore.allowCPUConversion = allowCPUConversion
+      recordingModel.compatibilityPolicy = sampledRecordingCompatibilityPolicy
+      hardware.setCompatibilityPolicy(sampledRecordingCompatibilityPolicy)
     }
+  }
+  var sampledRecordingCompatibilityPolicy: RecordingCompatibilityPolicy {
+    RecordingCompatibilityPolicy(allowCPUConversion: allowCPUConversion)
   }
   var devices: [InputDevice] = [] { didSet { expireResolvedStartRefusals() } }
   /// Set when Desktop Video is missing or older than 16.0, whose drivers
@@ -229,8 +170,12 @@ final class AppModel {
         $0.resizeTarget = source.resizeTarget
         $0.colorTarget = source.colorTarget
         $0.frameRateTarget = source.frameRateTarget
+        $0.scalingMode = source.scalingMode
         $0.pipelineEnabled = source.pipelineEnabled
-        $0.gamut = source.gamut
+        $0.setSourceProfile(source.sourceProfileID)
+        $0.lutInputSpaceID = source.lutInputSpaceID
+        $0.lutOutputSpaceID = source.lutOutputSpaceID
+        $0.programColorSpaceID = source.programColorSpaceID
         $0.previewEnabled = source.previewEnabled
       }
       // Upload may already have reached the capture queue before its main-actor
@@ -312,10 +257,10 @@ final class AppModel {
   private var programTransportRequired = false
   private var programTransportConfiguration: PipelineConfiguration?
   /// The input cadence each camera detected in its current run.
-  private var detectedInputCadence: [FeedID: Bool] = [:]
+  @ObservationIgnored private var detectedSourceDurations: [FeedID: CMTime] = [:]
   /// The last cadence each camera detected, kept across stops: the
   /// provisional rate its next start warms up for.
-  @ObservationIgnored private var lastInputCadence: [FeedID: Bool] = [:]
+  @ObservationIgnored private var lastSourceDurations: [FeedID: CMTime] = [:]
   /// What each running camera's controller was last told (start or
   /// reconfigure), cadence aside, so an unchanged edit reconfigures nothing.
   @ObservationIgnored private var appliedPipelines: [FeedID: AppliedPipeline] = [:]
@@ -341,7 +286,10 @@ final class AppModel {
   let recordingModel: RecordingModel
   private let feedCoordinator: FeedCoordinator
   private let settingsStore: AppSettingsStore
-  let sonyCameras: SonyCameraStore
+  let vendorSettings: VendorSettingsStore
+  let cameraControls: CameraControlStore
+  var controlViewFactories: [String: ControlViewFactory] { hardware.controlViewFactories() }
+  func captureVendor(for deviceID: String) -> VendorDescriptor? { hardware.captureDescriptor(deviceID) }
   private let virtualCameraRegistryStore: VirtualCameraRegistryStore
   private let lutLoader: LUTFileLoader
   private var launching = true
@@ -387,14 +335,12 @@ final class AppModel {
     self.installer = installer ?? ExtensionInstaller()
     let store = settingsStore ?? AppSettingsStore()
     self.settingsStore = store
-    self.sonyCameras = SonyCameraStore(defaults: store.preferenceDefaults)
+    self.vendorSettings = VendorSettingsStore(plugins: Dictionary(uniqueKeysWithValues: hardware.settingsPlugins().map { ($0.descriptor.id, $0) }),
+      persistence: VendorSettingsPreferences(defaults: store.preferenceDefaults))
+    self.cameraControls = CameraControlStore(plugins: Dictionary(uniqueKeysWithValues: hardware.controlPlugins().map { ($0.descriptor.id, $0) }),
+      persistence: CameraControlPreferences(defaults: store.preferenceDefaults))
     self.registryPublisher = registryPublisher ?? VirtualCameraRegistryPublisher()
     hideFromDock = store.hideFromDock
-    // Before discovery starts (observeDevices, below), so devices present at
-    // launch get the EDID the setting asks for, once, before any capture.
-    let advertiseHDR = store.advertiseHDRToCameras
-    advertiseHDRToCameras = advertiseHDR
-    hardware.setAdvertisesHDR(advertiseHDR)
     self.virtualCameraRegistryStore = registryStore ?? VirtualCameraRegistryStore()
     let snapshot = store.loadSnapshot()
     persistedSnapshot = snapshot
@@ -411,11 +357,14 @@ final class AppModel {
     feedCoordinator = FeedCoordinator(snapshot: snapshot, capturePool: capturePool)
     let coordinator = feedCoordinator
     recordingModel = RecordingModel(
-      feeds: feedCoordinator.descriptors.map { RecordingFeedDescriptor(id: $0.id, name: $0.name) },
+      feeds: feedCoordinator.descriptors.map { RecordingFeedDescriptor(id: $0.id, name: $0.name, recordingConstantFrameRate: $0.recordingConstantFrameRate) },
       driver: NativeRecordingSessionDriver(captureForFeed: { id in coordinator.capture(for: id) },
         rawAudioCallbackAvailable: true),
       folderStore: recordingFolderStore ?? RecordingFolderStore())
     self.lutLoader = lutLoader
+    allowCPUConversion = store.allowCPUConversion
+    recordingModel.compatibilityPolicy = sampledRecordingCompatibilityPolicy
+    hardware.setCompatibilityPolicy(sampledRecordingCompatibilityPolicy)
     monitorCoordinator.onConfigurationChange = { [weak self] target, configuration in
       guard let self else { return }
       // The coordinator reports a target's whole preferences: they replace the saved ones.
@@ -524,6 +473,7 @@ final class AppModel {
     refresh()
     // Hot-plug: arrivals and removals update the list without a manual refresh.
     deviceListObserver = hardware.observeDevices { [weak self] list in
+      self?.driverWarning = hardware.driverWarning()
       self?.applyDevices(list, fromDiscovery: true)
     }
     // The camera extension can start after a camera does (installed, approved or updated while
@@ -542,20 +492,26 @@ final class AppModel {
   }
 
   func refresh() {
-    driverWarning = hardware.driverWarning()
     do {
       applyDevices(try hardware.devices(), fromDiscovery: false)
     } catch {
       applyDevices([], fromDiscovery: false)
       showStatus(error.localizedDescription)
     }
+    driverWarning = hardware.driverWarning()
   }
 
   private func applyDevices(_ next: [InputDevice], fromDiscovery: Bool) {
     // Discovery reports every arrival, including devices already listed.
-    if fromDiscovery, next.map(\.id) == devices.map(\.id), next.map(\.name) == devices.map(\.name) { return }
+    if fromDiscovery, next.map(\.id) == devices.map(\.id), next.map(\.name) == devices.map(\.name),
+      next.map(\.shareable) == devices.map(\.shareable),
+      next.map(\.mayPause) == devices.map(\.mayPause) { return }
     for device in next { lastInputNames[device.id] = device.name }
     devices = next
+    for device in next {
+      guard let pluginID = try? VendorRegistry.pluginID(for: device.id) else { continue }
+      Task { await vendorSettings.restore(deviceID: device.id, pluginID: pluginID) }
+    }
     // Lists can be partial (discovery publishes after each arrival), and a saved
     // input names one unit, so an assignment is never moved: an unplugged input
     // stays the camera's until the user picks another. Only a camera that never
@@ -655,7 +611,15 @@ final class AppModel {
     lutFiles[loaded.bookmark] = loaded.path
     if let requested { lutFiles[requested] = loaded.path }
     let restoring = requested != nil
-    feedCoordinator.capture(for: feedID).load(lut) { [weak self] result in
+    let colorSpace: LUTColorSpaceContract
+    do {
+      guard let declaration = descriptor(for: feedID) else { return }
+      colorSpace = try declaration.lutColorSpaceContract()
+    } catch {
+      lutLoadFailed(error, restoring: restoring, generation: generation, feedID: feedID)
+      return
+    }
+    feedCoordinator.capture(for: feedID).load(lut, colorSpace: colorSpace) { [weak self] result in
       MainActor.assumeIsolated {
         guard let self, generation == self.lutLoadGenerations[feedID] else { return }
         switch result {
@@ -785,12 +749,12 @@ final class AppModel {
     guard feedCoordinator.remove(id) else { return false }
     cancelLUTLoad(id)
     takeAudio[id] = nil
-    sonyCameras.removeFeed(id.rawValue)
+    Task { await cameraControls.removeFeed(id.rawValue) }
     cameraLUTs[id] = nil
     cameraUpdates[id] = nil
     feedPolicies[id] = nil
-    detectedInputCadence[id] = nil
-    lastInputCadence[id] = nil
+    detectedSourceDurations[id] = nil
+    lastSourceDurations[id] = nil
     appliedPipelines[id] = nil
     monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(id.rawValue), nil)
     syncRecordingFeeds()
@@ -1011,11 +975,10 @@ final class AppModel {
     }
     if update.audioPresent {
       autoSwitcherBridge?.ingestAudio(time: update.audioPacketTime ?? time,
-        // Feed the director the stereo RMS energy. Taking the louder channel
-        // exaggerates speech whenever one side is noisier than the other.
-        rms: Float(sqrt((update.audioRMSLeft * update.audioRMSLeft +
-          update.audioRMSRight * update.audioRMSRight) / 2)),
-        peak: Float(max(update.audioPeakLeft, update.audioPeakRight)),
+        // Activity includes every declared source channel, including speech
+        // arriving beyond the stereo meter pair.
+        rms: update.audioActivityRMS,
+        peak: update.audioActivityPeak,
         present: true)
     } else {
       autoSwitcherTimeline?.recordTick(time: time)
@@ -1078,7 +1041,7 @@ final class AppModel {
 
   private func syncRecordingFeeds() {
     recordingModel.updateFeeds(feedCoordinator.descriptors.map {
-      RecordingFeedDescriptor(id: $0.id, name: $0.name)
+      RecordingFeedDescriptor(id: $0.id, name: $0.name, recordingConstantFrameRate: $0.recordingConstantFrameRate)
     })
   }
 
@@ -1108,22 +1071,30 @@ final class AppModel {
   func effectiveConfiguration(for id: FeedID) -> PipelineConfiguration {
     guard let descriptor = descriptor(for: id) else { return PipelineConfiguration() }
     var configuration = descriptor.configuration
+    if let pause = devices.first(where: { $0.id == descriptor.selectedDevice })?.mayPause {
+      let value = pause.components
+      configuration.sourcePauseAllowanceSeconds = Double(value.seconds) + Double(value.attoseconds) / 1e18
+    } else {
+      configuration.sourcePauseAllowanceSeconds = nil
+    }
     configuration.applyLUT = descriptor.applyLUT && lutState(id).loaded
-    configuration.inputFast = detectedInputCadence[id] ?? lastInputCadence[id] ?? configuration.inputFast
+    configuration.sourceDuration = detectedSourceDurations[id] ?? lastSourceDurations[id] ?? configuration.sourceDuration
     return configuration
   }
 
   private func pipeline(for id: FeedID) -> AppliedPipeline? {
     guard let descriptor = descriptor(for: id) else { return nil }
     var configuration = effectiveConfiguration(for: id)
-    // The controller follows the detected cadence itself.
-    configuration.inputFast = true
+    // Detected cadence belongs to the controller, so telemetry alone must not
+    // make an unchanged settings edit reconfigure the running pipeline.
+    configuration.sourceDuration = nil
     return AppliedPipeline(configuration: configuration, pipelineEnabled: descriptor.pipelineEnabled)
   }
 
   /// Brings a running camera's controller to its effective configuration.
   /// A no-op when nothing it uses changed, so it is safe to call after any edit.
   private func applyPipeline(_ id: FeedID) {
+    if let error = descriptor(for: id)?.processingDeclarationError { showStatus(error); return }
     guard feedCoordinator.isFeedRunning(id), let descriptor = descriptor(for: id),
       let next = pipeline(for: id), next != appliedPipelines[id] else { return }
     appliedPipelines[id] = next
@@ -1171,7 +1142,7 @@ final class AppModel {
       captureLog.notice("Stopped \(feedID.rawValue, privacy: .public): \(update.message, privacy: .public)")
       cameraStateRevision &+= 1
       monitorCoordinator.sourceStateChanged(target: MonitorTargetID(feedID.rawValue), running: false, message: update.message)
-      detectedInputCadence[feedID] = nil
+      detectedSourceDurations[feedID] = nil
       appliedPipelines[feedID] = nil
       feedCoordinator.stopCapture(feedID: feedID)
       // A camera can fail on its own. Stop only its recording; the director
@@ -1182,12 +1153,11 @@ final class AppModel {
       reconcileProgramTransportDemand()
       return
     }
-    if let inputFast = update.inputFast {
-      lastInputCadence[feedID] = inputFast
-      if detectedInputCadence[feedID] != inputFast {
-        detectedInputCadence[feedID] = inputFast
-        reconcileProgramTransportDemand()
-      }
+    if let duration = update.sourceDuration, duration.isNumeric, duration.epoch == 0, duration.value > 0,
+      detectedSourceDurations[feedID] != duration {
+      lastSourceDurations[feedID] = duration
+      detectedSourceDurations[feedID] = duration
+      reconcileProgramTransportDemand()
     }
     if feedID == selectedFeedID { feedAutoSwitcherAudio(update) }
   }
@@ -1196,8 +1166,11 @@ final class AppModel {
   /// or automatic, in either output mode.
   private func launchCapture(_ id: FeedID) {
     guard let descriptor = descriptor(for: id) else { return }
+    if let error = descriptor.processingDeclarationError { showStatus(error); return }
     feedCoordinator.setCameraOutputEnabled(feedID: id, enabled: outputMode != .program)
-    detectedInputCadence[id] = nil
+    detectedSourceDurations[id] = nil
+    feedCoordinator.programOutput.setSourcePauseTolerance(id,
+      mayPause: devices.first(where: { $0.id == descriptor.selectedDevice })?.mayPause)
     guard feedCoordinator.startCapture(feedID: id, deviceID: descriptor.selectedDevice,
       configuration: effectiveConfiguration(for: id), pipelineEnabled: descriptor.pipelineEnabled) else {
       feedCoordinator.setProgramSourceHealth(id, healthy: false)
@@ -1207,7 +1180,7 @@ final class AppModel {
     // its next capture actually starts.
     feedCoordinator.setProgramSourceHealth(id, healthy: true)
     appliedPipelines[id] = pipeline(for: id)
-    cameraUpdates[id] = CaptureUpdate(message: "Opening UltraStudio…")
+    cameraUpdates[id] = CaptureUpdate(message: "Opening input device…")
     cameraStateRevision &+= 1
     if outputMode == .program { reconcileAutoSwitcher() }
     reconcileProgramTransportDemand()
@@ -1218,7 +1191,7 @@ final class AppModel {
     recordingModel.stop(feedID: id)
     feedCoordinator.stopCapture(feedID: id)
     appliedPipelines[id] = nil
-    detectedInputCadence[id] = nil
+    detectedSourceDurations[id] = nil
     if outputMode == .program { retireProgramSource(id) }
     monitorCoordinator.sourceStateChanged(target: MonitorTargetID(id.rawValue), running: false, message: message)
     cameraUpdates[id] = nil
@@ -1241,16 +1214,22 @@ final class AppModel {
     return devices.label(for: device) ?? UIInputLabels.missingLabel(id: device, lastName: lastInputNames[device])
   }
 
-  /// Another camera assigned `device`. One input serves one camera.
+  /// Only an explicit plugin declaration permits multiple camera owners.
+  func inputShareable(_ deviceID: String) -> Bool {
+    devices.first(where: { $0.id == deviceID })?.shareable == true
+  }
+
+  /// Another camera assigned an exclusive input. Shared sources can serve several cameras.
   func inputHolder(_ device: String, excluding id: FeedID) -> FeedDescriptor? {
-    guard !device.isEmpty else { return nil }
+    guard !device.isEmpty, !inputShareable(device) else { return nil }
     return feedDescriptors.first { $0.id != id && $0.selectedDevice == device }
   }
 
-  /// A running camera on this camera's input. Settings saved before inputs were
-  /// exclusive can give two cameras one input; the first to start keeps it.
+  /// A running camera holding this camera's exclusive input. Unknown sources
+  /// remain exclusive until discovery explicitly declares them shareable.
   private func inputInUse(by id: FeedID) -> FeedDescriptor? {
-    guard let device = descriptor(for: id)?.selectedDevice, !device.isEmpty else { return nil }
+    guard let device = descriptor(for: id)?.selectedDevice, !device.isEmpty,
+      !inputShareable(device) else { return nil }
     return feedDescriptors.first { $0.id != id && $0.selectedDevice == device && feedCoordinator.isFeedRunning($0.id) }
   }
 
@@ -1282,10 +1261,10 @@ final class AppModel {
   }
 
   /// Why camera `id` on input `device` can't start, nil while that input is listed and free.
-  /// With no input listed there is none to choose: the UltraStudio is missing.
+  /// With no input listed there is no available device to choose.
   private func inputUnavailableReason(_ device: String, for id: FeedID) -> String? {
     if device.isEmpty && !devices.isEmpty { return driverWarning ?? "Choose an input for this camera." }
-    if !devices.contains(where: { $0.id == device }) { return driverWarning ?? "Connect the UltraStudio." }
+    if !devices.contains(where: { $0.id == device }) { return driverWarning ?? "Connect an input device." }
     if let holder = inputInUse(by: id) { return "\(holder.name) is using this input. Choose another input." }
     return nil
   }
@@ -1446,10 +1425,10 @@ final class AppModel {
   private func programContract(for descriptor: FeedDescriptor?) -> PipelineConfiguration {
     guard let descriptor else {
       return FeedLifecycleDemandPolicy.programContract(configuration: PipelineConfiguration(),
-        pipelineEnabled: true, detectedInputFast: nil)
+        pipelineEnabled: true, detectedSourceDuration: nil)
     }
     var contract = FeedLifecycleDemandPolicy.programContract(configuration: effectiveConfiguration(for: descriptor.id),
-      pipelineEnabled: descriptor.pipelineEnabled, detectedInputFast: detectedInputCadence[descriptor.id])
+      pipelineEnabled: descriptor.pipelineEnabled, detectedSourceDuration: detectedSourceDurations[descriptor.id])
     contract.applyLUT = false
     return contract
   }
@@ -1479,7 +1458,7 @@ final class AppModel {
 
   /// Cached device facts and live counters for the camera's input; never
   /// calls into the driver.
-  func deviceDiagnostics(_ id: FeedID) -> UltracamDeviceDiagnostics? {
+  func deviceDiagnostics(_ id: FeedID) -> DeviceDiagnostics? {
     guard let deviceID = descriptor(for: id)?.selectedDevice, !deviceID.isEmpty else { return nil }
     return hardware.diagnostics(deviceID)
   }
@@ -1512,6 +1491,7 @@ final class AppModel {
   /// Starts one camera, whichever is selected. It then stays up until Stop.
   func startCamera(_ id: FeedID) {
     guard let descriptor = descriptor(for: id), descriptor.enabled else { return }
+    if let error = descriptor.processingDeclarationError { showStatus(error); return }
     manuallyStoppedFeeds.remove(id)
     guard !feedCoordinator.isFeedRunning(id) else { return }
     guard canStart(id) else {
@@ -1578,6 +1558,7 @@ final class AppModel {
       lutLog.notice("Apply LUT \(descriptor.applyLUT ? "on" : "off", privacy: .public): \(id.rawValue, privacy: .public), running: \(self.isCameraRunning(id), privacy: .public), saved LUT: \(descriptor.lutBookmark != nil, privacy: .public)")
     }
     feedCoordinator.update(descriptor)
+    if descriptor.recordingConstantFrameRate != before.recordingConstantFrameRate { syncRecordingFeeds() }
     if descriptor.processingChoicesDiffer(from: before) { synchronizeProcessing(from: descriptor) }
     saveSettings(reason: "camera settings changed")
     if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
@@ -1587,7 +1568,11 @@ final class AppModel {
     // The saved LUT changed to another file than the one in this camera's
     // pipeline, or a load in flight is superseded: read it. A bookmark for the
     // same file reads nothing.
-    if descriptor.lutBookmark != before.lutBookmark,
+    if descriptor.lutInputSpaceID != before.lutInputSpaceID || descriptor.lutOutputSpaceID != before.lutOutputSpaceID {
+      cancelLUTLoad(id)
+      cameraLUTs[id] = nil
+      if descriptor.lutBookmark != nil { restoreLUT(id) }
+    } else if descriptor.lutBookmark != before.lutBookmark,
       lutLoadingFeeds.contains(id) || !sameLUTFile(descriptor.lutBookmark, lutState(id).bookmark) {
       cancelLUTLoad(id)
       cameraLUTs[id] = nil
@@ -1613,7 +1598,8 @@ final class AppModel {
   func resetAllSettings() -> Bool {
     guard canEditFeedTopology else { return false }
     settingsResetPending = true
-    sonyCameras.reset()
+    cameraControls.reset()
+    vendorSettings.reset()
     settingsStore.resetAll()
     return true
   }

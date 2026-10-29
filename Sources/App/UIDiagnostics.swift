@@ -77,6 +77,9 @@ private struct UIDiagnosticsRow: View {
 }
 
 enum UIDiagnosticsFormat {
+  static func outputFormat(_ format: ProgramOutputFormat) -> String {
+    "\(FormatDisplayIdentity.resolution(width: format.width, height: format.height)) · \(FormatDisplayIdentity.rate(.constant(format.duration))) · \(VideoContract.fourCC(format.pixelFormat))"
+  }
   static func megabits(_ value: Double) -> String {
     guard value.isFinite, value > 0 else { return "—" }
     return value >= 1000 ? String(format: "%.1f Gb/s", value / 1000) : String(format: "%.2f Mb/s", value)
@@ -112,7 +115,7 @@ private struct UIDiagnosticsCameraTab: View {
       }
       if running, let update {
         Section("Capture") {
-          UIDiagnosticsRow("Input", update.input)
+          UIDiagnosticsRow("Input", update.sourceFormat.map { FormatDisplayIdentity($0).detail } ?? update.input)
           UIDiagnosticsRow("Output", update.output.isEmpty ? "—" : update.output)
           UIDiagnosticsRow("Delivered", String(format: "%.2f fps", update.outputFPS))
           UIDiagnosticsRow("Processing", String(format: "%.2f ms", update.processingMS))
@@ -126,8 +129,11 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Video drops", UIDiagnosticsFormat.count(update.videoDrops), warning: update.videoDrops > 0)
         }
         Section {
+          UIDiagnosticsRow("Signal dropouts · frames lost", "\(UIDiagnosticsFormat.count(update.signalDropouts)) · \(UIDiagnosticsFormat.count(update.signalLostFrames))",
+            warning: update.signalDropouts > 0)
           UIDiagnosticsRow("Source gaps", UIDiagnosticsFormat.count(update.sourceDrops), warning: update.sourceDrops > 0)
           UIDiagnosticsRow("Device", UIDiagnosticsFormat.count(update.deviceDrops), warning: update.deviceDrops > 0)
+          UIDiagnosticsRow("Ingest · CPU copied frames", UIDiagnosticsFormat.count(update.ingestCPUCopyFrames), warning: update.ingestCPUCopyFrames > 0)
           UIDiagnosticsRow("Late processing", UIDiagnosticsFormat.count(update.lateFrames), warning: update.lateFrames > 0)
           UIDiagnosticsRow("Output stalls", UIDiagnosticsFormat.count(update.poolDrops), warning: update.poolDrops > 0)
           UIDiagnosticsRow("Camera stalls", UIDiagnosticsFormat.count(update.cameraDrops), warning: update.cameraDrops > 0)
@@ -160,11 +166,14 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Encode rate · bitrate", String(format: "%.1f fps · ", stats.framesPerSecond) + UIDiagnosticsFormat.megabits(stats.videoMegabitsPerSecond))
           UIDiagnosticsRow("Encode latency", "\(stats.encoderLatencyMS.map { String(format: "%.1f ms", $0) } ?? "—") · peak \(stats.maxEncoderLatencyMS.map { String(format: "%.1f ms", $0) } ?? "—")")
           UIDiagnosticsRow("Encoder input", stats.encoderInput ?? "Waiting for encoder")
-          UIDiagnosticsRow("CPU-converted frames", UIDiagnosticsFormat.count(stats.cpuConvertedFrames), warning: stats.cpuConvertedFrames > 0)
+          UIDiagnosticsRow("Compatibility policy · this take", stats.compatibilityPolicy.allowCPUConversion ? "Enabled" : "Disabled")
+          UIDiagnosticsRow("Recording · system compatibility frames", UIDiagnosticsFormat.count(stats.systemCompatibilityFrames), warning: stats.systemCompatibilityFrames > 0)
+          UIDiagnosticsRow("GPU conversion failures", UIDiagnosticsFormat.count(stats.gpuConversionFailures), warning: stats.gpuConversionFailures > 0)
+          UIDiagnosticsRow("Recording · frames refused after GPU failure", UIDiagnosticsFormat.count(stats.droppedGPUFrames), warning: stats.droppedGPUFrames > 0)
           UIDiagnosticsRow("Writer queue · encoder pending", "\(stats.queueSamples)/\(stats.queueCapacity) samples · \(stats.encoderPendingFrames) frames")
           UIDiagnosticsRow("Dropped video frames", UIDiagnosticsFormat.count(stats.droppedVideoFrames), warning: stats.droppedVideoFrames > 0)
           if stats.deviceSkippedFrames > 0 {
-            UIDiagnosticsRow("Skipped by the device", UIDiagnosticsFormat.count(stats.deviceSkippedFrames), warning: true)
+            UIDiagnosticsRow("Missing from the input", UIDiagnosticsFormat.count(stats.deviceSkippedFrames), warning: true)
           }
           UIDiagnosticsRow("Audio packets dropped", UIDiagnosticsFormat.count(stats.droppedAudioPackets), warning: stats.droppedAudioPackets > 0)
           UIDiagnosticsRow("Encoder · writer errors", "\(stats.encoderErrors) · \(stats.writerErrors)", warning: stats.encoderErrors + stats.writerErrors > 0)
@@ -234,35 +243,31 @@ private struct UIDiagnosticsLoudness: View {
 /// The capture device and driver: cached SDK attributes plus the last
 /// session's device-side counters. Reading never calls into the driver.
 private struct UIDiagnosticsDeviceSection: View {
-  let device: UltracamDeviceDiagnostics?
+  let device: DeviceDiagnostics?
   let driverWarning: String?
 
   var body: some View {
     Section("Device") {
-      if let driverWarning { UIDiagnosticsRow("Desktop Video", driverWarning, warning: true) }
+      if let driverWarning { UIDiagnosticsRow("Driver", driverWarning, warning: true) }
       if let device {
-        UIDiagnosticsRow("Device", device.name)
-        UIDiagnosticsRow("Desktop Video", device.driverVersion)
-        UIDiagnosticsRow("HDMI audio", device.maximumHDMIAudioChannels > 0
-          ? "\(device.capturedAudioChannels) of \(device.maximumHDMIAudioChannels) ch · 32-bit" : "\(device.capturedAudioChannels) ch · 32-bit")
-        UIDiagnosticsRow("HDMI EDID dynamic range", device.hdmiDynamicRange)
-        UIDiagnosticsRow("HDR · colorspace metadata", "\(yesNo(device.supportsHDRMetadata)) · \(yesNo(device.supportsColorspaceMetadata))")
-        UIDiagnosticsRow("HDMI timecode · HFR timecode", "\(yesNo(device.supportsHDMITimecode)) · \(yesNo(device.supportsHighFrameRateTimecode))")
-        if device.sessionActive || device.signal != nil {
-          UIDiagnosticsRow("Signal", device.signal ?? "—")
-          UIDiagnosticsRow("Device drops", UIDiagnosticsFormat.count(device.deviceDroppedFrames), warning: device.deviceDroppedFrames > 0)
-          UIDiagnosticsRow("Driver backlog · peak", "\(device.frameBacklog) · \(device.maximumFrameBacklog) frames",
-            warning: device.maximumFrameBacklog > 2)
-          UIDiagnosticsRow("Host capture clock", device.hostTimeMapped ? "Mapped" : "Unavailable", warning: !device.hostTimeMapped)
+        ForEach(Array(device.vendorFields.enumerated()), id: \.offset) { _, field in
+          UIDiagnosticsRow(field.label, field.value)
         }
-        UIDiagnosticsRow("Temperature", device.temperatureCelsius == NSNotFound ? "—" : "\(device.temperatureCelsius) °C")
+        if let signal = device.signalPresent {
+          UIDiagnosticsRow("Signal", signal ? "Present" : "Absent", warning: !signal)
+        }
+        UIDiagnosticsRow("Device drops", UIDiagnosticsFormat.count(device.counters.deviceDroppedFrames),
+          warning: device.counters.deviceDroppedFrames > 0)
+        UIDiagnosticsRow("Driver backlog · peak", "\(device.counters.currentBacklog) · \(device.counters.maximumBacklog) frames",
+          warning: device.counters.maximumBacklog > 2)
+        UIDiagnosticsRow("Host capture clock", device.hostTimeMapped ? "Mapped" : "Unavailable", warning: !device.hostTimeMapped)
+        UIDiagnosticsRow("Temperature", device.temperatureCelsius.map { "\($0) °C" } ?? "—")
       } else if driverWarning == nil {
         Text("No capture device is connected.").foregroundStyle(.secondary)
       }
     }
   }
 
-  private func yesNo(_ value: Bool) -> String { value ? "Yes" : "No" }
 }
 
 /// The shared monitor target's rates and GPU time, one value per row.
@@ -324,7 +329,7 @@ private struct UIDiagnosticsProgramTab: View {
       TimelineView(.periodic(from: .now, by: 1)) { _ in
         let stats = model.programOutputDiagnostics
         Section("Program Frames") {
-          UIDiagnosticsRow("Output format", stats.contract?.description ?? "Not connected")
+          UIDiagnosticsRow("Output format", stats.contract.map(UIDiagnosticsFormat.outputFormat) ?? "Not connected")
           UIDiagnosticsRow("Accepted · delivered",
             "\(UIDiagnosticsFormat.count(stats.route.accepted)) · \(UIDiagnosticsFormat.count(stats.camera.delivered))")
           UIDiagnosticsRow("Converted on the GPU", UIDiagnosticsFormat.count(stats.route.normalized))

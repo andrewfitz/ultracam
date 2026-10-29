@@ -9,7 +9,13 @@ import XCTest
     XCTAssertEqual(CVPixelBufferCreate(nil, 1920, 1080,
       kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
       [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &image), kCVReturnSuccess)
-    return try VideoContract.sample(XCTUnwrap(image), at: time, duration: VideoContract.fastDuration)
+    let buffer = try XCTUnwrap(image)
+    for (key, value) in [(kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2),
+      (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2),
+      (kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2)] {
+      CVBufferSetAttachment(buffer, key, value, .shouldPropagate)
+    }
+    return try VideoContract.sample(buffer, at: time, duration: VideoContract.fastDuration)
   }
 
   private func queue(capacity: Int32 = 2) throws -> CameraBufferQueue {
@@ -103,23 +109,34 @@ import XCTest
     var betaFrame: CMSampleBuffer? = try sample(at: CMTime(value: 61_001, timescale: 60_000))
     weak let alphaWeak = alphaFrame
     weak let betaWeak = betaFrame
+    weak let alphaStorage = CMSampleBufferGetImageBuffer(try XCTUnwrap(alphaFrame))
+    weak let betaStorage = CMSampleBufferGetImageBuffer(try XCTUnwrap(betaFrame))
     XCTAssertTrue(try alphaSink.send(XCTUnwrap(alphaFrame)))
     XCTAssertTrue(try betaSink.send(XCTUnwrap(betaFrame)))
     alphaFrame = nil
     betaFrame = nil
-    XCTAssertNotNil(alphaWeak)
-    XCTAssertNotNil(betaWeak)
+    XCTAssertNil(alphaWeak, "Transport owns an independent metadata copy")
+    XCTAssertNil(betaWeak, "Transport owns an independent metadata copy")
+    XCTAssertNotNil(alphaStorage)
+    XCTAssertNotNil(betaStorage)
+    XCTAssertEqual(alphaQueue.retentionSnapshot.currentSlots, 1)
+    XCTAssertEqual(betaQueue.retentionSnapshot.currentSlots, 1)
     XCTAssertEqual(CMSimpleQueueGetCount(alphaQueue.queue), 1)
     XCTAssertEqual(CMSimpleQueueGetCount(betaQueue.queue), 1)
 
     alphaSink.disconnect()
     XCTAssertEqual(CMSimpleQueueGetCount(alphaQueue.queue), 0)
-    XCTAssertNil(alphaWeak, "Stopping one feed must drain only that feed's queue")
+    XCTAssertNil(alphaStorage, "Stopping one feed must drain only that feed's pixel storage")
+    XCTAssertEqual(alphaQueue.retentionSnapshot.currentSlots, 0)
+    XCTAssertEqual(alphaQueue.retentionSnapshot.currentBytes, 0)
     XCTAssertEqual(CMSimpleQueueGetCount(betaQueue.queue), 1)
-    XCTAssertNotNil(betaWeak, "The second feed retains its queued frame")
+    XCTAssertNotNil(betaStorage, "The second feed retains its queued pixel storage")
+    XCTAssertEqual(betaQueue.retentionSnapshot.currentSlots, 1)
 
     betaSink.disconnect()
-    XCTAssertNil(betaWeak)
+    XCTAssertNil(betaStorage)
+    XCTAssertEqual(betaQueue.retentionSnapshot.currentSlots, 0)
+    XCTAssertEqual(betaQueue.retentionSnapshot.currentBytes, 0)
   }
 
   func testFeedCapturePoolCreatesRouteAwareServicesForNewFeeds() {

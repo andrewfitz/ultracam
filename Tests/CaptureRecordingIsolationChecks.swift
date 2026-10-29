@@ -2,6 +2,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import XCTest
+import Synchronization
 
 /// In-memory synthetic recording: no encoder, device, or media files are opened.
 @objcMembers final class CaptureRecordingIsolationChecks: XCTestCase {
@@ -298,13 +299,13 @@ import XCTest
       kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
     let processor = try LUTProcessor()
     let downscaled = try processor.process(source, configuration:
-      PipelineConfiguration(downscale: true, convertTo420: true, inputFast: false))
+      PipelineConfiguration(downscale: true, convertTo420: true, sourceDuration: VideoContract.slowDuration))
     XCTAssertEqual(CVPixelBufferGetWidth(downscaled), 1920)
     XCTAssertEqual(CVPixelBufferGetHeight(downscaled), 1080)
     XCTAssertNil(CVBufferCopyAttachment(downscaled, kCVImageBufferCleanApertureKey, nil))
     XCTAssertNil(CVBufferCopyAttachment(downscaled, kCVImageBufferDisplayDimensionsKey, nil))
     let fullSize = try processor.process(source, configuration:
-      PipelineConfiguration(downscale: false, convertTo420: true, inputFast: false))
+      PipelineConfiguration(downscale: false, convertTo420: true, sourceDuration: VideoContract.slowDuration))
     XCTAssertEqual(CVPixelBufferGetWidth(fullSize), 3840)
     XCTAssertEqual(CVPixelBufferGetHeight(fullSize), 2160)
     let keptAperture = try XCTUnwrap(CVBufferCopyAttachment(fullSize, kCVImageBufferCleanApertureKey, nil))
@@ -372,7 +373,7 @@ import XCTest
         feedID: feed, deviceID: "synthetic:v210",
         configuration:
           PipelineConfiguration(
-            applyLUT: true, downscale: true, convertTo420: true, inputFast: false))
+            applyLUT: true, downscale: true, convertTo420: true, sourceDuration: VideoContract.slowDuration))
       wait(for: [ready], timeout: 5)
       controller.onUpdate = nil
       harness.emit(source, pts: .zero, duration: duration)
@@ -509,7 +510,6 @@ import XCTest
     controller.start(feedID: feed, deviceID: "synthetic", configuration: configuration,
       pipelineEnabled: false, previewEnabled: false)
     wait(for: [restarted], timeout: 3)
-    let duration = VideoContract.fastDuration
     box.lock.withLock { box.handler }?(image, .zero, true)
     let deadline = Date().addingTimeInterval(2)
     while box.lock.withLock({ box.hits }) == 0 && Date() < deadline {
@@ -650,10 +650,10 @@ import XCTest
       connect: { _, _ in }, disconnect: {}, send: { _ in true })
     let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop() }
-    var sawConnected = false
+    let sawConnected = Mutex(false)
     controller.onUpdate = { update in
       if update.cameraOutputActive && update.cameraMessage.contains("Ultracam camera connected") {
-        sawConnected = true
+        sawConnected.withLock { $0 = true }
       }
       if update.message.hasPrefix("Waiting") { started.fulfill() }
     }
@@ -661,7 +661,7 @@ import XCTest
       configuration: PipelineConfiguration(downscale: false, convertTo420: false),
       pipelineEnabled: false, previewEnabled: false)
     wait(for: [started], timeout: 3)
-    XCTAssertTrue(sawConnected)
+    XCTAssertTrue(sawConnected.withLock { $0 })
     let disconnected = expectation(description: "status says not connected")
     controller.onUpdate = { update in
       if !update.cameraOutputActive && update.cameraMessage == "Ultracam camera not connected" {

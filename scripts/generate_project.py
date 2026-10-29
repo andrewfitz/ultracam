@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Generate the two-target Xcode project using only the Python standard library."""
+import argparse
+import shlex
 import hashlib
 import json
 import os
 import sys
 from pathlib import Path
+from work_paths import work_paths
+from vendors import read_inventory, build_settings, source_paths, generate_bridge, input_digest, check_capabilities
 
 ROOT = Path(__file__).resolve().parents[1]
 # MonitorKit is a git submodule; a clone without it would generate a project
@@ -12,10 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if not (ROOT / "Packages/MonitorKit/Package.swift").is_file():
     sys.exit("generate_project.py: Packages/MonitorKit/Package.swift is missing; "
              "MonitorKit is a git submodule: run git submodule update --init")
-EXTERNAL_ROOT = Path("/Volumes/8TB/cinesomatic-director-work").resolve(strict=False)
 objects = {}
-sony_root = ROOT / "ThirdParty/SonyCameraRemoteSDK"
-sony_available = (sony_root / "include/CameraRemote_SDK.h").is_file() and (sony_root / "lib/libCr_Core.dylib").is_file()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--sdk-inventory', type=Path)
+parser.add_argument('--output-dir', type=Path)
+args = parser.parse_args()
+manifests, sdk_inventory = read_inventory(ROOT, args.sdk_inventory)
+vendor_settings = build_settings(manifests, sdk_inventory)
+vendor_digest = input_digest(manifests, sdk_inventory)
+generate_bridge(ROOT, manifests)
+check_capabilities(ROOT, manifests, sdk_inventory)
 
 
 def ref(key):
@@ -28,25 +38,56 @@ def add(key, isa, **fields):
 
 
 def file(path, type):
-    return add(path, "PBXFileReference", lastKnownFileType=type, path=path, sourceTree="<group>")
+    return add(path, "PBXFileReference", lastKnownFileType=type, path=path, sourceTree="<absolute>" if Path(path).is_absolute() else "<group>")
 
 
 shared = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/Shared").glob("*.swift"))
+program = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/Program").glob("*.swift"))
 recording = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/Recording").glob("*.swift"))
-app = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/App").iterdir() if p.suffix in (".swift", ".metal")) + shared + recording
-native = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/DeckLinkBackend").iterdir() if p.suffix in (".h", ".mm", ".inc"))
-app += native
+device_api = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/DeviceAPI").glob("*.swift") if not p.name.startswith("Fake"))
+app = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/App").iterdir() if p.suffix in (".swift", ".metal")) + program + shared + recording + device_api
+app += source_paths(manifests, 'app') + ["Sources/DeviceAPI/DeviceAPI.h", "Sources/DeviceAPI/GeneratedBridgingHeader.h"]
+vendor_resources = sorted({entry['path'] for manifest in manifests for entry in manifest['resources'] if 'app' in entry['membership']})
+app += vendor_resources
+app = sorted(set(app))
+
 camera = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Sources/CameraExtension").glob("*.swift")) + [
     "Sources/Shared/VideoContract.swift", "Sources/Shared/VideoBufferLayout.swift",
+    "Sources/Shared/SourceFormat.swift", "Sources/Shared/ColorimetryContract.swift",
+    "Sources/Shared/DerivedOutputAdmission.swift",
+    "Sources/Shared/ExtensionFormatCatalog.swift",
+    "Sources/Shared/GPUStandbyProducer.swift", "Sources/Shared/GPUStandbyLifecycle.swift",
     "Sources/Shared/VirtualCameraRegistry.swift",
     "Sources/Shared/VirtualCameraRegistryTransport.swift",
 ]
 def source_type(path):
+    if path.endswith(".xcassets"): return "folder.assetcatalog"
     if path.endswith(".metal"): return "sourcecode.metal"
     if path.endswith(".mm"): return "sourcecode.cpp.objcpp"
+    if path.endswith(".m"): return "sourcecode.c.objc"
+    if path.endswith(".cpp"): return "sourcecode.cpp.cpp"
     if path.endswith((".h", ".inc")): return "sourcecode.c.h"
+    if path.endswith(".strings"): return "text.plist.strings"
     return "sourcecode.swift"
 source_refs = {path: file(path, source_type(path)) for path in sorted(set(app + camera))}
+# A localized strings file must be a variant-group child. Copying its file
+# reference directly flattens the locale directory and breaks Bundle lookup.
+localized = {}
+for path in vendor_resources:
+    resource = Path(path)
+    if resource.parent.suffix == '.lproj':
+        key = (resource.parent.parent.as_posix(), resource.name)
+        localized.setdefault(key, []).append(path)
+for (parent, name), paths in localized.items():
+    children = []
+    for path in paths:
+        child = source_refs[path]
+        objects[child]['name'] = Path(path).parent.stem
+        children.append(child)
+    variant = add('localized-' + parent + '/' + name, 'PBXVariantGroup',
+                  children=children, name=name, sourceTree='<group>')
+    for path in paths:
+        source_refs[path] = variant
 icon_catalog = "Config/Assets.xcassets"
 icon_catalog_ref = file(icon_catalog, "folder.assetcatalog")
 
@@ -58,38 +99,28 @@ def contained_path(value, root, label):
     return str(candidate)
 
 
-# The SDK interfaces are in the repo; an override must stay in the repo or the external workspace.
-sdk_override = os.environ.get("DECKLINK_SDK_DIR")
-sdk_dir = (str((ROOT / "ThirdParty/DeckLinkSDK/include").resolve()) if sdk_override is None
-  else contained_path(sdk_override, ROOT if Path(sdk_override).expanduser().resolve(strict=False).is_relative_to(ROOT)
-    else EXTERNAL_ROOT, "DECKLINK_SDK_DIR"))
+def project_path(path):
+    return path if Path(path).is_absolute() else "$(SRCROOT)/" + path
+
+
 auto_switcher_lib_dir = os.environ.get(
     "AUTO_SWITCHER_LIB_DIR",
-    "$(SRCROOT)/Tools/auto-switcher/target/release",
+    str(work_paths(ROOT)["build_root"] / "auto-switcher-target/release"),
 )
 if "$(" not in auto_switcher_lib_dir:
-    auto_switcher_lib_dir = contained_path(auto_switcher_lib_dir, ROOT, "AUTO_SWITCHER_LIB_DIR")
+    library_path = Path(auto_switcher_lib_dir).expanduser().resolve(strict=False)
+    permitted_root = ROOT if library_path.is_relative_to(ROOT) else work_paths(ROOT)["work_root"]
+    auto_switcher_lib_dir = contained_path(auto_switcher_lib_dir, permitted_root, "AUTO_SWITCHER_LIB_DIR")
     # Relative to the checkout like DECKLINK_SDK_DIR, so build.sh (which exports an
     # absolute path) regenerates the committed, relocatable project.
-    auto_switcher_lib_dir = "$(SRCROOT)/" + Path(auto_switcher_lib_dir).relative_to(ROOT).as_posix()
-dispatch_path = str(Path(sdk_dir) / "DeckLinkAPIDispatch.cpp")
-dispatch_file = Path(dispatch_path)
-if dispatch_file.is_relative_to(ROOT):
-    # Keep the generated project relocatable when the SDK is vendored.  The
-    # previous absolute reference captured the generator's checkout path in
-    # project.pbxproj, so a direct xcodebuild from another checkout failed.
-    dispatch_ref_path = dispatch_file.relative_to(ROOT).as_posix()
-    source_refs[dispatch_ref_path] = add("sdk-dispatch-reference", "PBXFileReference", lastKnownFileType="sourcecode.cpp.cpp", path=dispatch_ref_path, sourceTree="<group>")
-else:
-    dispatch_ref_path = dispatch_path
-    source_refs[dispatch_ref_path] = add("sdk-dispatch-reference", "PBXFileReference", lastKnownFileType="sourcecode.cpp.cpp", path=dispatch_path, sourceTree="<absolute>")
-app.append(dispatch_ref_path)
+    if Path(auto_switcher_lib_dir).is_relative_to(ROOT):
+        auto_switcher_lib_dir = "$(SRCROOT)/" + Path(auto_switcher_lib_dir).relative_to(ROOT).as_posix()
 config_refs = [file(p.relative_to(ROOT).as_posix(), "text.plist.xml") for p in sorted((ROOT / "Config").glob("*")) if p.is_file() and p.name != "Signing.xcconfig"]
 config_refs.append(icon_catalog_ref)
 app_product = add("app-product", "PBXFileReference", explicitFileType="wrapper.application", path="Ultracam.app", sourceTree="BUILT_PRODUCTS_DIR")
 camera_product = add("camera-product", "PBXFileReference", explicitFileType="wrapper.system-extension", path="org.ultracam.app.camera.systemextension", sourceTree="BUILT_PRODUCTS_DIR")
 products = add("products", "PBXGroup", children=[app_product, camera_product], name="Products", sourceTree="<group>")
-group = add("root-group", "PBXGroup", children=list(source_refs.values()) + config_refs + [products], sourceTree="<group>")
+group = add("root-group", "PBXGroup", children=list(dict.fromkeys(source_refs.values())) + config_refs + [products], sourceTree="<group>")
 
 
 def configs(key, settings, release=None):
@@ -114,14 +145,15 @@ monitor_products = [add(f"monitor-kit-product-{name}", "XCSwiftPackageProductDep
 
 
 def target(key, name, sources, product, product_type, bundle_id, plist, entitlements):
-    builds = [add(f"{key}-{path}", "PBXBuildFile", fileRef=source_refs[path]) for path in sources if path.endswith((".swift", ".mm", ".cpp"))]
+    builds = [add(f"{key}-{path}", "PBXBuildFile", fileRef=source_refs[path]) for path in sources if path.endswith((".swift", ".m", ".mm", ".cpp"))]
     phase = add(f"{key}-sources", "PBXSourcesBuildPhase", buildActionMask=2147483647, files=builds, runOnlyForDeploymentPostprocessing=0)
     package_builds = [add(f"{key}-package-{product}", "PBXBuildFile", productRef=product) for product in monitor_products] if key == "app" else []
     frameworks = add(f"{key}-frameworks", "PBXFrameworksBuildPhase", buildActionMask=2147483647, files=package_builds, runOnlyForDeploymentPostprocessing=0)
     settings = dict(PRODUCT_NAME=name, PRODUCT_BUNDLE_IDENTIFIER=bundle_id, INFOPLIST_FILE=plist, CODE_SIGN_ENTITLEMENTS=entitlements, GENERATE_INFOPLIST_FILE="NO", LD_RUNPATH_SEARCH_PATHS="$(inherited) @executable_path/../Frameworks", COMBINE_HIDPI_IMAGES="YES")
     release = None
     if key == "camera":
-        settings.update(PRODUCT_NAME=bundle_id, SKIP_INSTALL="YES")
+        settings.update(PRODUCT_NAME=bundle_id, SKIP_INSTALL="YES",
+                        OTHER_LDFLAGS=["$(inherited)", "-framework", "Metal"])
     else:
         # Release app only: the linker drops code nothing reaches (-dead_strip; MonitorKit,
         # the Rust switcher and the app keep every live symbol, ObjC classes and Swift
@@ -136,37 +168,43 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
                        STRIP_INSTALLED_PRODUCT="YES", STRIP_STYLE="all",
                        DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")
         settings.update(ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon",
-                        SWIFT_OBJC_BRIDGING_HEADER="Sources/DeckLinkBackend/BridgingHeader.h",
-                        DECKLINK_SDK_DIR=("$(SRCROOT)/" + Path(sdk_dir).relative_to(ROOT).as_posix() if Path(sdk_dir).is_relative_to(ROOT) else sdk_dir),
-                        HEADER_SEARCH_PATHS=["$(inherited)", "$(DECKLINK_SDK_DIR)"],
-                        LIBRARY_SEARCH_PATHS=["$(inherited)", auto_switcher_lib_dir],
+                        SWIFT_OBJC_BRIDGING_HEADER="Sources/DeviceAPI/GeneratedBridgingHeader.h",
+                        HEADER_SEARCH_PATHS=["$(inherited)"] + [project_path(path) for path in vendor_settings['headerSearchPaths']],
+                        LIBRARY_SEARCH_PATHS=["$(inherited)", auto_switcher_lib_dir] + [project_path(path) for path in vendor_settings['librarySearchPaths']],
                         OTHER_LDFLAGS=["$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv",
                                        "-framework", "Security", "-framework", "CoreFoundation",
                                        "-framework", "SystemConfiguration"])
-        if sony_available:
-            settings["GCC_PREPROCESSOR_DEFINITIONS"] = ["$(inherited)", "ULTRACAM_SONY_SDK=1"]
-            settings["HEADER_SEARCH_PATHS"].append("$(SRCROOT)/ThirdParty/SonyCameraRemoteSDK/include")
-            settings["LIBRARY_SEARCH_PATHS"].append("$(SRCROOT)/ThirdParty/SonyCameraRemoteSDK/lib")
-            settings["OTHER_LDFLAGS"].append("-lCr_Core")
+        if vendor_settings['defines']:
+            settings['GCC_PREPROCESSOR_DEFINITIONS'] = ['$(inherited)'] + vendor_settings['defines']
+        for framework in vendor_settings['frameworks']:
+            settings['OTHER_LDFLAGS'] += ['-framework', framework]
+        for library in vendor_settings['libraries']:
+            flag = '-l' + library
+            if flag not in settings['OTHER_LDFLAGS']: settings['OTHER_LDFLAGS'].append(flag)
     resources = [add(f"{key}-resource-{path}", "PBXBuildFile", fileRef=source_refs[path]) for path in sources if path.endswith(".metal")]
     resource_phase = add(f"{key}-resources", "PBXCopyFilesBuildPhase", buildActionMask=2147483647, files=resources, dstPath="", dstSubfolderSpec=7, name="Copy GPU Shader Source", runOnlyForDeploymentPostprocessing=0)
     phases = [phase, frameworks, resource_phase]
     if key == "app":
         icon_build = add("app-icon-build", "PBXBuildFile", fileRef=icon_catalog_ref)
-        phases.append(add("app-icon-resources", "PBXResourcesBuildPhase", buildActionMask=2147483647, files=[icon_build], runOnlyForDeploymentPostprocessing=0))
-        if sony_available:
-            for directory in (Path("."), Path("CrAdapter")):
-                library_builds = []
-                for library in sorted((sony_root / "lib" / directory).glob("*.dylib")):
-                    path = library.relative_to(ROOT).as_posix()
-                    library_ref = file(path, "compiled.mach-o.dylib")
-                    objects[group]["children"].append(library_ref)
-                    library_builds.append(add(path + "-embed", "PBXBuildFile", fileRef=library_ref,
-                        settings=dict(ATTRIBUTES=["CodeSignOnCopy"])))
-                phases.append(add("sony-embed-" + str(directory), "PBXCopyFilesBuildPhase",
-                    buildActionMask=2147483647, files=library_builds,
-                    dstPath="" if directory == Path(".") else str(directory), dstSubfolderSpec=10,
-                    name="Embed Sony SDK " + str(directory), runOnlyForDeploymentPostprocessing=0))
+        vendor_resource_builds = [add('vendor-resource-' + identity, 'PBXBuildFile', fileRef=identity) for identity in dict.fromkeys(source_refs[path] for path in vendor_resources)]
+        phases.append(add("app-icon-resources", "PBXResourcesBuildPhase", buildActionMask=2147483647, files=[icon_build] + vendor_resource_builds, runOnlyForDeploymentPostprocessing=0))
+        embeds = {}
+        for entry in vendor_settings['embedLibraries']:
+            path = entry['path']
+            library_ref = file(path, 'compiled.mach-o.dylib')
+            objects[group]['children'].append(library_ref)
+            library_build = add(path + '-embed', 'PBXBuildFile', fileRef=library_ref, settings=dict(ATTRIBUTES=['CodeSignOnCopy']))
+            embeds.setdefault(entry['subfolder'], []).append(library_build)
+        for folder, library_builds in sorted(embeds.items()):
+            phases.append(add('vendor-embed-' + folder, 'PBXCopyFilesBuildPhase', buildActionMask=2147483647,
+                files=library_builds, dstPath=folder, dstSubfolderSpec=10, name='Embed Vendor Runtime ' + folder, runOnlyForDeploymentPostprocessing=0))
+        guard_script = 'exec /usr/bin/python3 "$SRCROOT/scripts/vendors.py" check-generated --root "$SRCROOT" --expected-digest ' + vendor_digest
+        if args.sdk_inventory:
+            guard_script += ' --sdk-inventory ' + shlex.quote(str(args.sdk_inventory.resolve()))
+        guard = add('vendor-input-guard', 'PBXShellScriptBuildPhase', buildActionMask=2147483647, files=[],
+            inputPaths=[], outputPaths=[], runOnlyForDeploymentPostprocessing=0, alwaysOutOfDate=1,
+            name='Check Vendor Inputs', shellPath='/bin/sh', shellScript=guard_script, showEnvVarsInLog=0)
+        phases.insert(0, guard)
     return add(f"{key}-target", "PBXNativeTarget", buildConfigurationList=configs(key, settings, release), buildPhases=phases, buildRules=[], dependencies=[], packageProductDependencies=monitor_products if key == "app" else [], name=name, productName=name, productReference=product, productType=product_type)
 
 
@@ -189,7 +227,7 @@ def encode(value, level=0):
     return str(value) if isinstance(value, int) else json.dumps(value)
 
 
-directory = ROOT / "Ultracam.xcodeproj"
+directory = args.output_dir or ROOT / "Ultracam.xcodeproj"
 directory.mkdir(exist_ok=True)
 (directory / "project.pbxproj").write_text("// !$*UTF8*$!\n" + encode(dict(archiveVersion=1, classes={}, objectVersion=56, objects=objects, rootObject=project)) + "\n")
 schemes = directory / "xcshareddata/xcschemes"

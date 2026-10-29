@@ -19,7 +19,7 @@ import XCTest
       withUnsafeBytes(of: &littleEndian) { source.append(contentsOf: $0) }
     }
 
-    let packed = try BlackmagicAudioConverter.convert32BitIntegerPCMTo24BitPacked(source, channelCount: 2)
+    let packed = try EmbeddedAudioConverter.convert32BitIntegerPCMTo24BitPacked(source, channelCount: 2)
     XCTAssertEqual(Array(packed), [
       0x00, 0x00, 0x00,
       0x56, 0x34, 0x12,
@@ -31,7 +31,7 @@ import XCTest
   }
 
   func testConversionRejectsPartialInterleavedFrame() {
-    XCTAssertThrowsError(try BlackmagicAudioConverter.convert32BitIntegerPCMTo24BitPacked(
+    XCTAssertThrowsError(try EmbeddedAudioConverter.convert32BitIntegerPCMTo24BitPacked(
       Data(repeating: 0, count: 9), channelCount: 2)) { error in
       XCTAssertEqual(error as? EmbeddedAudioError,
         .byteCountMismatch(expected: 16, actual: 9))
@@ -120,15 +120,6 @@ import XCTest
     ])
   }
 
-  static let allTests = [
-    ("exact signed 32 to packed 24 conversion", testExactSigned32ToPacked24Conversion),
-    ("reject partial interleaved frame", testConversionRejectsPartialInterleavedFrame),
-    ("reject sample count size overflow", testPacketRejectsSampleCountSizeOverflow),
-    ("integer 48 kHz timeline", testTimelineKeepsInteger48KHzClockWithoutDrift),
-    ("writer settings", testWriterSettingsDescribe48KHzInterleaved24BitPCM),
-    ("packet sample buffer PTS", testPacketAndSampleBufferRetainExactPTS),
-    ("direct source sample buffer", testDirectSourceSampleBufferPacks24BitWithoutChangingPayload),
-  ]
 
   /// The vectorized packer must equal the scalar `sample >> 8` reference for
   /// every bit pattern, including negative full-scale values.
@@ -145,9 +136,9 @@ import XCTest
       reference += [UInt8(truncatingIfNeeded: packed), UInt8(truncatingIfNeeded: packed >> 8),
         UInt8(truncatingIfNeeded: packed >> 16)]
     }
-    XCTAssertEqual([UInt8](BlackmagicAudioConverter.convert32BitIntegerSamplesTo24BitPacked(samples)), reference)
+    XCTAssertEqual([UInt8](EmbeddedAudioConverter.convert32BitIntegerSamplesTo24BitPacked(samples)), reference)
     let raw = samples.withUnsafeBytes { Data($0) }
-    XCTAssertEqual([UInt8](try BlackmagicAudioConverter.convert32BitIntegerPCMTo24BitPacked(raw)), reference)
+    XCTAssertEqual([UInt8](try EmbeddedAudioConverter.convert32BitIntegerPCMTo24BitPacked(raw)), reference)
     let first = try EmbeddedAudioRecording.makeSampleBuffer(sourcePCM32: raw, sampleFrameCount: 1_601,
       presentationTime: CMTime(value: 0, timescale: 48_000))
     let second = try EmbeddedAudioRecording.makeSampleBuffer(sourcePCM32: raw, sampleFrameCount: 1_601,

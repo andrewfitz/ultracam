@@ -47,9 +47,10 @@ import XCTest
       var services = CaptureServices(
         start: { _, _, _, _ in }, stop: {},
         connect: { configuration, passthrough in
-          let pixelFormat = configuration.untouched ? passthrough : configuration.pixelFormat
-          let format = try VideoContract.formatDescription(width: configuration.width, height: configuration.height,
-            pixelFormat: pixelFormat)
+          // Exercise production negotiation, including the GPU encoder's
+          // centered chroma, instead of constructing a legacy colour identity.
+          let format = try CameraSink.requestedFormat(configuration: configuration,
+            passthroughFormat: passthrough, sourceFormat: nil)
           self.lock.withLock {
             self.format = format
             self.duration = configuration.duration
@@ -132,7 +133,8 @@ import XCTest
   func testFull2160pOutputWithLUTReachesTheCamera() throws {
     var configuration = PipelineConfiguration(applyLUT: true, downscale: false, convertTo420: false,
       reduceFrameRate: false)
-    configuration.inputFast = true
+    configuration.sourceDuration = VideoContract.fastDuration
+    configuration.lutOutputColorimetry = .rec709Video
     try run(configuration, frames: 24, expected: 24, label: "2160p59.94 4:2:2 LUT")
   }
 
@@ -140,12 +142,9 @@ import XCTest
   func testReduced1080pOutputWithLUTReachesTheCamera() throws {
     var configuration = PipelineConfiguration(applyLUT: true, downscale: true, convertTo420: true,
       reduceFrameRate: true)
-    configuration.inputFast = true
+    configuration.sourceDuration = VideoContract.fastDuration
+    configuration.lutOutputColorimetry = .rec709Video
     try run(configuration, frames: 24, expected: 12, label: "1080p29.97 4:2:0 LUT")
   }
 
-  static let allTests = [
-    ("2160p59.94 4:2:2 with a LUT reaches the camera", testFull2160pOutputWithLUTReachesTheCamera),
-    ("1080p29.97 4:2:0 with a LUT reaches the camera", testReduced1080pOutputWithLUTReachesTheCamera),
-  ]
 }

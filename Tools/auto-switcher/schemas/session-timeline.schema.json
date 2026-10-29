@@ -9,7 +9,7 @@
     "sources", "recordings", "events", "events_processed", "cuts", "instructions", "statuses"
   ],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "enum": [2, 3] },
     "session_id": { "type": "string", "format": "uuid" },
     "mode": { "enum": ["realtime", "offline"] },
     "timebase": {

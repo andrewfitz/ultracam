@@ -68,7 +68,7 @@ struct UIMainWindowView: View {
       ContentUnavailableView {
         Label("No Cameras", systemImage: "video.slash")
       } description: {
-        Text("Add a camera, then choose its UltraStudio input.")
+        Text("Add a camera, then choose its input device.")
       } actions: {
         Button("Add Camera") { context.send(.addCamera) }
           .disabled(!context.session.canEditTopology)

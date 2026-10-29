@@ -41,9 +41,9 @@ import simd
     """
 
   /// One input layout the app processes (`VideoContract.tenBit422`) with its labels.
-  private struct Layout: CustomStringConvertible {
+  private struct Layout: CustomStringConvertible, Sendable {
     let type: OSType
-    let matrix: CFString
+    let matrix: String
     let centered: Bool
     var description: String {
       "\(VideoContract.fourCC(type)) \(matrix) \(centered ? "centred" : "left-sited")"
@@ -51,13 +51,13 @@ import simd
   }
 
   private static let layouts = [
-    Layout(type: kCVPixelFormatType_422YpCbCr10, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2, centered: false),
-    Layout(type: kCVPixelFormatType_422YpCbCr10, matrix: kCVImageBufferYCbCrMatrix_ITU_R_2020, centered: true),
-    Layout(type: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+    Layout(type: kCVPixelFormatType_422YpCbCr10, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String, centered: false),
+    Layout(type: kCVPixelFormatType_422YpCbCr10, matrix: kCVImageBufferYCbCrMatrix_ITU_R_2020 as String, centered: true),
+    Layout(type: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String,
       centered: false),
-    Layout(type: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, matrix: kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+    Layout(type: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, matrix: kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String,
       centered: true),
-    Layout(type: kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, matrix: kCVImageBufferYCbCrMatrix_ITU_R_2020,
+    Layout(type: kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, matrix: kCVImageBufferYCbCrMatrix_ITU_R_2020 as String,
       centered: false),
   ]
 
@@ -145,7 +145,7 @@ import simd
       }
     }
     CVPixelBufferUnlockBaseAddress(image, [])
-    CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, layout.matrix, .shouldPropagate)
+    CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, layout.matrix as CFString, .shouldPropagate)
     if layout.centered {
       CVBufferSetAttachment(image, kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Center,
         .shouldPropagate)
@@ -437,7 +437,7 @@ import simd
     started.assertForOverFulfill = false
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
     var off = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
-    off.inputFast = true
+    off.sourceDuration = VideoContract.fastDuration
     var on = off
     on.applyLUT = true
     controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: off)
@@ -480,12 +480,4 @@ import simd
     XCTAssertTrue(processor.lut?.texture.device === device)
   }
 
-  static let allTests = [
-    ("burn-in bit-identical to MonitorKit's output stage", testBurnInIsBitIdenticalToMonitorKitOutputStageForEveryInputLayout),
-    ("published frame carries the probed burn-in", testPublishedFrameCarriesTheProbedBurnIn),
-    ("1D and shaper LUTs burn in", testOneDimensionalAndShaperLUTsBurnInCorrectly),
-    ("LUT load swaps without waiting", testLoadSwapsWithoutWaitingAndFramesInFlightKeepTheirLUT),
-    ("burn-in LUT follows the effective Apply LUT", testBurnInLUTFollowsTheEffectiveApplyLUT),
-    ("tetrahedral only, shared device", testLoadRejectsOtherInterpolationsAndDevices),
-  ]
 }

@@ -28,7 +28,7 @@ extension AudioMeterTap {
     /// the true-peak maximum rose to −1 dBTP or above, or the true-peak bar is
     /// there. Overs on a channel less than a second of audio apart are one
     /// over; overs on several channels at once are one, named by the first.
-    mutating func observe(_ snapshot: AudioMeterSnapshot, source: UInt64) -> Event? {
+    mutating func observe(_ snapshot: AudioMeterSnapshot, source: UInt64, sampleRate: Double = EmbeddedAudioFormat.sampleRate) -> Event? {
       if self.source != source { self = OverWatch(source: source) }
       let n = min(snapshot.channelCount, Self.channels)
       var event: Event?
@@ -47,7 +47,7 @@ extension AudioMeterTap {
         guard over else { continue }
         let previous = lastOverFrame[c]
         lastOverFrame[c] = snapshot.frameCount
-        let gap = UInt64(EmbeddedAudioFormat.sampleRate)
+        let gap = UInt64(sampleRate.rounded(.up))
         if event == nil, previous.map({ snapshot.frameCount &- $0 > gap }) ?? true {
           event = Event(channel: c, level: max(levels.truePeakMax, levels.truePeak), clips: levels.clipCount)
         }

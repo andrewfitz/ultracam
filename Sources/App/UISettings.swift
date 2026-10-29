@@ -130,6 +130,8 @@ struct UISettingsRecordingPane: View {
 
   var body: some View {
     let recording = model.recordingModel
+    let source = model.liveCameraUpdate(model.selectedFeedID)?.sourceFormat
+    let availableCodecs = source.map { RecordingCodec.available(for: $0) } ?? RecordingCodec.allCases
     let codec = Binding(get: { recording.codec }, set: { recording.codec = $0 })
     let timecode = Binding(get: { recording.timecodeMode }, set: { recording.timecodeMode = $0 })
     let folder = recording.outputFolder
@@ -186,7 +188,10 @@ struct UISettingsRecordingPane: View {
 
       Section {
         Picker("Codec", selection: codec) {
-          ForEach(RecordingCodec.allCases, id: \.self) { Text($0.title).tag($0) }
+          if !availableCodecs.contains(recording.codec) {
+            Text("\(recording.codec.title) (unavailable for this source)").tag(recording.codec).disabled(true)
+          }
+          ForEach(availableCodecs, id: \.self) { Text($0.title).tag($0) }
         }
         Picker("Timecode", selection: timecode) {
           ForEach(RecordingTimecodeMode.allCases, id: \.self) { Text(UITimecode.title($0)).tag($0) }
@@ -196,7 +201,7 @@ struct UISettingsRecordingPane: View {
           Text(fileNamePreview).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
         }
       } header: { Text("Format") } footer: {
-        UISettingsFootnote("Records the camera original: 2160p 10-bit 4:2:2 with embedded audio. LUT and effects are not baked in. "
+        UISettingsFootnote("Records the camera original. Available codecs follow the selected camera’s detected source format; each take validates its own source before recording. LUT and effects are not baked in. "
           + recording.timecodeMode.help)
       }
 
@@ -686,11 +691,13 @@ struct UISettingsAdvancedPane: View {
   var body: some View {
     Form {
       Section {
-        Toggle("Advertise HLG to cameras", isOn: $model.advertiseHDRToCameras)
-          .help("Tells cameras on the UltraStudio HDMI inputs that HLG is welcome. SDR and PQ always are.")
-      } header: { Text("Inputs") } footer: {
-        UISettingsFootnote("SDR and PQ are always advertised. When on, cameras can also send HLG over HDMI instead of falling back to SDR. Changing this makes connected cameras renegotiate HDMI once, so their picture drops for a few seconds.")
+        Toggle("Allow CPU conversion (compatibility)", isOn: $model.allowCPUConversion)
+          .help("Allows system conversion only when the required GPU conversion route cannot be used. Metal 4 is still required.")
+      } header: { Text("Video compatibility") } footer: {
+        UISettingsFootnote("Off by default. Changes apply to the next capture session or recording take; active frames and takes keep their sampled policy. System conversion may use CPU or GPU internally. Compatibility conversion activity is shown on the camera and counted in diagnostics and take metadata.")
       }
+
+      UISettingsDeviceSettings(model: model)
 
       Section {
         LabeledContent {
@@ -780,7 +787,7 @@ enum UIDiagnosticsText {
         lines.append("Input: \(update.input)")
         lines.append("Output: \(update.output.isEmpty ? "—" : update.output)")
         lines.append(String(format: "Delivered: %.2f fps · processing %.2f ms · video %.2f Mb/s", update.outputFPS, update.processingMS, update.videoBitrateMbps))
-        lines.append("Drops: source \(update.sourceDrops), buffers \(update.poolDrops), camera \(update.cameraDrops)")
+        lines.append("Drops: source \(update.sourceDrops), device \(update.deviceDrops), signal dropouts \(update.signalDropouts) (\(update.signalLostFrames) frames), buffers \(update.poolDrops), camera \(update.cameraDrops)")
         lines.append("Audio: \(update.audioPresent ? "\(update.audioChannels) ch \(update.audioSampleRate) Hz" : "none") · drops \(update.audioDrops)")
         lines.append("Message: \(update.message)")
         lines.append("Camera: \(update.cameraMessage)")

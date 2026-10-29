@@ -75,6 +75,12 @@ struct UICameraRecording: Sendable, Equatable {
   var fileBytes: Int64 = 0
   var megabitsPerSecond: Double = 0
   var droppedFrames = 0
+  var systemCompatibilityFrames: UInt64 = 0
+  var compatibilityConversionActive = false
+  var compatibilityBadge: String? {
+    guard status == .recording, compatibilityConversionActive, systemCompatibilityFrames > 0 else { return nil }
+    return "Compatibility conversion · Recording · \(systemCompatibilityFrames)"
+  }
   var failed = false
   var error: String?
   /// A note on the take that isn't an error, such as audio re-synced to the picture.
@@ -93,6 +99,8 @@ struct UICameraRecording: Sendable, Equatable {
 }
 
 struct UICameraSnapshot: Sendable, Equatable, Identifiable {
+  var ingestCPUCopyFrames: UInt64 = 0
+  var ingestCPUCopyActive = false
   var id: String
   var name: String
   /// The assigned input's ID, listed or not; nil when the camera has none (None).
@@ -110,12 +118,20 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var processing = true
   var effects: [Bool] = [false, true, true, false]
   var resizeTarget: ResizeTarget = .hd1080
+  var scalingMode: ProgramScalingMode = .fit
   var colorTarget: ColorTarget = .yuv4208
   var frameRateTarget: FrameRateTarget = .fps2997
   var lutName: String?
   var lutLoading = false
   var lutError: String?
   var gamut = "Unspecified / custom LUT"
+  var sourceProfileID = "unspecified"
+  var lutInputSpaceID = "rec709-video"
+  var lutOutputSpaceID = "rec709-video"
+  var programColorSpaceID = "rec709-video"
+  var recordingConstantFrameRate = false
+  var sourceFrameRate: FrameRate? = nil
+  var showsRecordingConstantFrameRateCompatibility: Bool { sourceFrameRate?.isVariable == true }
   var previewEnabled = true
   var automaticStart = false
   var automaticStatus: String?
@@ -201,7 +217,7 @@ struct UISessionSnapshot: Sendable, Equatable {
   /// A Program cut that did not land, or Program frames the output dropped.
   var programIssue: String?
   var recentCuts: [UICutRecord] = []
-  var codecTitle = "ProRes 422 HQ 10-bit"
+  var codecTitle = "ProRes 422 HQ"
   var timecodeTitle = "Mac Clock"
   var defaultFolderPath: String?
   var drives: [UIDrive] = []
@@ -330,7 +346,7 @@ struct UIInputOption: Sendable, Equatable, Identifiable {
 /// Device labels that stay apart when two units share a model name. The driver's own
 /// "(1)"/"(2)" follow enumeration order, so they can name a different unit next launch.
 enum UIInputLabels {
-  /// The last four hex digits of the persistent ID: "0AB8" for decklink:00000000a1850ab8.
+  /// The last four hex digits of the persistent ID: "0AB8" for input:00000000a1850ab8.
   static func suffix(_ id: String) -> String {
     let digits = id.split(separator: ":").last.map(String.init) ?? id
     return String(digits.filter { $0.isLetter || $0.isNumber }.suffix(4)).uppercased()
@@ -343,7 +359,7 @@ enum UIInputLabels {
 
   /// An assigned input that isn't listed. The last name seen this session when there is one.
   static func missingLabel(id: String, lastName: String?) -> String {
-    "\(lastName ?? "Blackmagic input") · \(suffix(id))"
+    "\(lastName ?? "Input device") · \(suffix(id))"
   }
 
   /// The picker rows for one camera: every listed input, labelled, with the camera that holds it.

@@ -250,12 +250,12 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     }
   }
 
-  func testInvalidSourceRejectedEvenWithEffectsOff() throws {
+  func testNativeSourceDimensionsAcceptedAndUnsupportedFormatRefused() throws {
     let processor = try LUTProcessor()
     let config = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
-    XCTAssertThrowsError(try processor.process(input(width: 1920, height: 1080), configuration: config))
+    XCTAssertNoThrow(try processor.process(input(width: 1920, height: 1080), configuration: config))
     var wrongFormat: CVPixelBuffer?
-    XCTAssertEqual(CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_32BGRA, nil, &wrongFormat), kCVReturnSuccess)
+    XCTAssertEqual(CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_OneComponent8, nil, &wrongFormat), kCVReturnSuccess)
     XCTAssertThrowsError(try processor.process(XCTUnwrap(wrongFormat), configuration: config))
   }
 
@@ -303,11 +303,18 @@ private final class GPUReleaseCounter: @unchecked Sendable {
     var config = PipelineConfiguration(applyLUT: true, downscale: true, convertTo420: true)
     for _ in 0..<8 { _ = try processor.process(source, configuration: config) }
     config.applyLUT = false
+    // The next frame declares a different signal; a reused pool must carry
+    // its actual encoding, rather than the previous LUT's Rec.709 labels.
+    CVBufferSetAttachment(source, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+    CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+    CVBufferSetAttachment(source, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
     let bypass = try processor.process(source, configuration: config)
-    XCTAssertNil(CVBufferCopyAttachment(bypass, kCVImageBufferColorPrimariesKey, nil))
-    XCTAssertNil(CVBufferCopyAttachment(bypass, kCVImageBufferTransferFunctionKey, nil))
+    XCTAssertEqual(CVBufferCopyAttachment(bypass, kCVImageBufferColorPrimariesKey, nil) as? String,
+      kCVImageBufferColorPrimaries_ITU_R_2020 as String)
+    XCTAssertEqual(CVBufferCopyAttachment(bypass, kCVImageBufferTransferFunctionKey, nil) as? String,
+      kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
     XCTAssertEqual(CVBufferCopyAttachment(bypass, kCVImageBufferYCbCrMatrixKey, nil) as? String,
-      kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String)
+      kCVImageBufferYCbCrMatrix_ITU_R_2020 as String)
   }
 
   func testPrewarmPreservesTenBitLUTProcessingAndPoolCapacity() throws {

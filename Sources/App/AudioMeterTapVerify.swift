@@ -68,7 +68,8 @@ import Synchronization
   /// Loud programme, meters hidden, shown again: the new session is a fresh meter's.
   private static func reopen(verifier: Verifier) {
     let loud = sine(dBFS: -1, phase: 0)
-    let tap = AudioMeterTap()
+    // This offline reference comparison submits just over two seconds at once.
+    let tap = AudioMeterTap(maxBufferedSeconds: 3)
     verifier.check("audio meter tap: no meter before the first viewer", tap.meter == nil && !tap.isMetering)
     feed(tap, loud, times: 3)
     verifier.check("audio meter tap: nothing metered without a viewer", tap.counters.metered == 0)
@@ -148,9 +149,11 @@ import Synchronization
   /// the meter queue holds the meter it is metering into, so no session start
   /// ever releases a meter in use.
   private static func concurrent(verifier: Verifier) {
-    // A short ring: the default holds thousands of these 5 s packets.
+    // Deliberately enlarge time/byte budgets to isolate slot saturation with
+    // synthetic five-second packets; production defaults bound live retention.
     let capacity = 128
-    let tap = AudioMeterTap(packetCapacity: capacity)
+    let tap = AudioMeterTap(packetCapacity: capacity, maxBufferedSeconds: 700,
+      maxBufferedBytes: 256 * 1024 * 1024)
     let sampleFrames = 240_000
     let packet = sine(dBFS: -6, phase: 0, frames: sampleFrames)
     let stop = Stop()

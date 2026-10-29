@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import Observation
 
@@ -44,7 +45,7 @@ struct CaptureUpdateState: Equatable {
   var message: String
   var input: String
   var output: String
-  var inputFast: Bool?
+  var sourceDuration: CMTime?
   var pipelineEnabledApplied: Bool?
   var hasFrames: Bool
   var previewDelivered: Bool
@@ -57,7 +58,7 @@ struct CaptureUpdateState: Equatable {
     message = update.message
     input = update.input
     output = update.output
-    inputFast = update.inputFast
+    sourceDuration = update.sourceDuration
     pipelineEnabledApplied = update.pipelineEnabledApplied
     hasFrames = update.frames > 0
     previewDelivered = update.previewDelivered

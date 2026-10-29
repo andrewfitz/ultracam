@@ -170,13 +170,4 @@ private final class FrameReleaseCounter: @unchecked Sendable {
     fanOut.close()
   }
 
-  static let allTests = [
-    ("independent route leases", testOneProcessedFrameHasIndependentRouteLeases),
-    ("full route rejects and keeps pending", testRejectPreservesPendingFrame),
-    ("route cancellation", testCancellationOnlyDrainsItsRoute),
-    ("serial teardown", testCloseDrainsPendingButKeepsDequeuedLeaseValid),
-    ("route validation", testInvalidAndDuplicateRoutesAreRejected),
-    ("route generation", testCancelledRouteHandleCannotControlReusedID),
-    ("reentrant drain", testReleaseCallbacksCanMutateRouterDuringDrain),
-  ]
 }

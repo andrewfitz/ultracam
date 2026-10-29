@@ -17,9 +17,14 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Capture your UltraStudio feed to apply a LUT and publish a processed camera.</string>
+	<string>Capture video from your selected input to apply a LUT and publish a processed camera.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Discover and control Sony cameras over Wi-Fi while video arrives over HDMI.</string>
+	<string>Discover and connect to cameras and video devices on your local network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Capture audio from your selected input for recording and camera switching.</string>
+	<!-- Planned network-source discovery declaration; no network capture SDK is bundled. -->
+	<key>NSBonjourServices</key>
+	<array><string>_ndi._tcp</string></array>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSSystemExtensionUsageDescription</key>

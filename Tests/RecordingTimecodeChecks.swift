@@ -78,6 +78,16 @@ import XCTest
     XCTAssertNil(RecordingTimecode(string: "00:00:00;00", frameRate: .fps2997, dropFrame: false))
     XCTAssertEqual(RecordingTimecode(string: "00:01:00:00", frameRate: .fps2997, dropFrame: false)?.stringValue,
       "00:01:00:00")
+    for rate in [RecordingFrameRate.fps2997, .fps5994] {
+      XCTAssertEqual(RecordingTimecode(string: "01:02:03;04", frameRate: rate, dropFrame: true)?.stringValue,
+        "01:02:03;04")
+      XCTAssertEqual(RecordingTimecode(string: "01:02:03:04", frameRate: rate, dropFrame: false)?.stringValue,
+        "01:02:03:04")
+      for malformed in ["01;02;03;04", "01;02:03;04", "01:02;03;04"] {
+        XCTAssertNil(RecordingTimecode(string: malformed, frameRate: rate, dropFrame: true), malformed)
+      }
+      XCTAssertNil(RecordingTimecode(string: "01;02:03:04", frameRate: rate, dropFrame: false))
+    }
   }
 
   func testQuickTimeTimecodeTrackWritesBigEndianTimeCode32Sample() throws {
@@ -169,14 +179,4 @@ import XCTest
       session.startTimecode.frameNumber + 1)
   }
 
-  static let allTests = [
-    ("wall clock NDF and independent feeds", testWallClockNDFUsesNominalFramesAndSeparatelyStartedFeeds),
-    ("drop frame boundaries and midnight", testDropFrameBoundariesAtTenMinutesAndMidnight),
-    ("59.94 drop frame", test5994DropFrameUsesFourDroppedLabels),
-    ("source policy", testSourcePolicyPreservesEmbeddedValueAndRejectsMissingSourceTime),
-    ("timecode parsing", testTimecodeParsingAndInvalidDropLabels),
-    ("QuickTime TimeCode32 sample", testQuickTimeTimecodeTrackWritesBigEndianTimeCode32Sample),
-    ("source writer timecode tracks", testSourceWriterCreatesWallClockAndRecordStartTracksAtBothRates),
-    ("PC time first-frame anchor", testPCTimeAnchorSamplesTheComputerClockAndKeepsExplicitDates),
-  ]
 }

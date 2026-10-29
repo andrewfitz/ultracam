@@ -884,7 +884,14 @@ import XCTest
     XCTAssertEqual(UIInputLabels.label(id: inputs[0].id, name: inputs[0].name, among: [inputs[0]]), "UltraStudio Mini Recorder 12G",
       "With its twin unplugged there is nothing to tell apart")
     XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: inputs[1].name), "UltraStudio Mini Recorder 12G · 46B8")
-    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: nil), "Blackmagic input · 46B8")
+    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: nil), "Input device · 46B8")
+  }
+
+  func testMissingInputFallbackDoesNotAssumeAVendor() {
+    for id in ["vendor:000000000000abcd", "other:000000000000abcd", "legacy:device:name:abcd"] {
+      XCTAssertEqual(UIInputLabels.missingLabel(id: id, lastName: nil), "Input device · ABCD")
+      XCTAssertEqual(UIInputLabels.missingLabel(id: id, lastName: "Saved input"), "Saved input · ABCD")
+    }
   }
 
   func testInputOptionsNameTheCameraThatHasAnInput() {

@@ -14,6 +14,18 @@ import XCTest
       duration: time(1.0 / 30.0))
   }
 
+  func testProgramDefaultsUseExactCommonRateTimescale() {
+    let a = feed("A")
+    var output = ProgramOutput(selectedSource: a)
+    XCTAssertEqual(output.scheduler.mapper.programTimescale, 240_000)
+    guard case let .accepted(mapped) = output.ingest(ProgramSourceFrame(sourceID: a,
+      sourceTime: .zero, duration: CMTime(value: 1001, timescale: 24_000))) else {
+      return XCTFail("selected source should reach Program")
+    }
+    XCTAssertEqual(mapped.programDuration.timescale, 240_000)
+    XCTAssertEqual(mapped.programDuration.value, 10_010)
+  }
+
   func testManualCutAppliesAtTargetFrameAndAcknowledgesSelection() {
     let a = feed("A")
     let b = feed("B")
@@ -191,14 +203,4 @@ import XCTest
     XCTAssertEqual(abandoned.1, .targetUnavailable)
   }
 
-  static let allTests = [
-    ("manual cut boundary and acknowledgement", testManualCutAppliesAtTargetFrameAndAcknowledgesSelection),
-    ("fixed interval health", testFixedIntervalAdvancesInStableOrderAndSkipsUnhealthyFeed),
-    ("dynamic analysis stub", testDynamicAnalysisIsAnExplicitDisabledStub),
-    ("natural director acknowledgement", testNaturalDirectorDecisionRequiresExactAcknowledgement),
-    ("expired automatic cut releases latch", testExpiredAutomaticCutReleasesTheFixedIntervalLatch),
-    ("no-signal starting cut releases latch", testCutToStartedCameraWithNoSignalExpiresAndReleasesTheLatch),
-    ("settings never move selection ahead", testSettingsNeverMoveTheSelectionAheadOfTheCut),
-    ("rebuild carries the automatic cut", testRebuildCarriesTheAutomaticCutAndReportsARemovedTarget),
-  ]
 }

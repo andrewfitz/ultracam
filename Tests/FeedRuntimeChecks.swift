@@ -151,14 +151,4 @@ import XCTest
     XCTAssertFalse(coordinator.select(disabled.id))
   }
 
-  static let allTests = [
-    ("stable order and lazy sessions", testCoordinatorKeepsStableOrderAndLazilyCreatesSessions),
-    ("independent session lifecycle", testSessionsHaveIndependentLifecycleAndRouteQueues),
-    ("disabled and running guards", testDisabledOrRunningFeedsCannotBeStartedOrRemoved),
-    ("selected removal chooses enabled feed", testRemovingSelectedFeedSelectsAnotherEnabledFeed),
-    ("independent native capture owners", testCaptureOwnersAreStableAndIndependentPerFeed),
-    ("Program demand follows output mode", testProgramDemandIsReleasedWhenLeavingProgramMode),
-    ("invalid dedicated demand is rejected", testDedicatedDemandRejectsDisabledAndUnknownFeeds),
-    ("disabled persisted selection fallback", testDisabledPersistedSelectionFallsBackToEnabledFeed),
-  ]
 }

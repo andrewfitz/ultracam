@@ -619,11 +619,11 @@ extension MonitorLifecycleChecks {
     let encoded = try jsonObject(JSONEncoder().encode(feed))
     XCTAssertEqual(encoded["version"] as? Int, 1)
     let suite = "MonitorLifecycleChecks.migration.\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-    defer { defaults.removePersistentDomain(forName: suite) }
     let legacy = #"{"version":2,"selectedFeedID":"a","feeds":[{"version":1,"id":"a","name":"Old","monitorConfiguration":{"toolsEnabled":true,"guides":{"enabled":true,"safeArea":true}}}]}"#
-    defaults.set(Data(legacy.utf8), forKey: "ultracam.settings.v2")
-    MainActor.assumeIsolated {
+    try MainActor.assumeIsolated {
+      let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+      defer { defaults.removePersistentDomain(forName: suite) }
+      defaults.set(Data(legacy.utf8), forKey: "ultracam.settings.v2")
       let store = AppSettingsStore(defaults: defaults)
       let loaded = store.loadSnapshot()
       XCTAssertEqual(loaded.feeds.map(\.name), ["Old"], "The v2 snapshot must still validate")

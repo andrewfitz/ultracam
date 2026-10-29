@@ -16,7 +16,7 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
-external_root=/Volumes/8TB/cinesomatic-director-work
+external_root="$(python3 "$task_root/scripts/work_paths.py" --path work_root)"
 app="${APP:-$external_root/agent-work/ultracam/Ultracam.app}"
 binary="$app/Contents/MacOS/Ultracam"
 [[ -x "$binary" ]] || { echo "Built app not found at $app" >&2; exit 1; }

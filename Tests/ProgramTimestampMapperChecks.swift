@@ -30,6 +30,28 @@ import XCTest
     XCTAssertEqual(error, expected, file: file, line: line)
   }
 
+  func testDefaultClockRepresentsAllCommonFrameDurationsExactly() throws {
+    for scale: Int32 in [24_000, 30_000, 60_000, 120_000] {
+      var mapper = ProgramTimestampMapper<String>(selectedSource: "A")
+      XCTAssertEqual(mapper.programTimescale, 240_000)
+      for index: Int64 in [0, 1, 100_000] {
+        let result = try XCTUnwrap(mapped(mapper.map(frame("A", index * 1001,
+          duration: 1001, timescale: scale))))
+        XCTAssertEqual(result.programTime.value, index * 1001 * Int64(240_000 / scale))
+        XCTAssertEqual(result.programDuration.value, 1001 * Int64(240_000 / scale))
+      }
+    }
+  }
+
+  func testDifferentLargeSourceScalesPreserveExactOffset() throws {
+    var mapper = ProgramTimestampMapper<String>(selectedSource: "A")
+    _ = try XCTUnwrap(mapped(mapper.map(frame("A", 2_000_000_000,
+      duration: 1_000_000, timescale: 2_000_000_000))))
+    let next = try XCTUnwrap(mapped(mapper.map(frame("A", 2_002_000_000,
+      duration: 1_000_000, timescale: 2_000_000_001))))
+    XCTAssertEqual(next.programTime.value, 240)
+  }
+
   func testFirstFrameAndSourceTimelineRemainMonotonic() {
     var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
     let first = mapped(mapper.map(frame("A", 10)))!
@@ -40,7 +62,7 @@ import XCTest
   }
 
   func testCutResetsSourceOriginAtNextProgramBoundary() {
-    var mapper = ProgramTimestampMapper<String>(selectedSource: "A")
+    var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
     _ = mapped(mapper.map(frame("A", 500)))
     let prior = mapped(mapper.map(frame("A", 501)))!
     mapper.cut(to: "B")
@@ -49,14 +71,50 @@ import XCTest
     XCTAssertGreaterThan(CMTimeCompare(cut.programTime, prior.programTime), 0)
   }
 
-  func testRejectsForeignEpochTimebaseBackwardsAndInvalidDuration() {
-    var mapper = ProgramTimestampMapper<String>(selectedSource: "A")
+  func testRejectsForeignEpochBackwardsDuplicatesAndInvalidDuration() {
+    var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
     failure(mapper.map(frame("A", 0, epoch: 1)), equals: .sourceEpochUnsupported(1))
     failure(mapper.map(frame("A", 0, duration: 0)), equals: .invalidSourceDuration)
-    XCTAssertNotNil(mapped(mapper.map(frame("A", 0))))
-    failure(mapper.map(frame("A", 0)), equals: .sourceTimestampRegressed)
-    failure(mapper.map(frame("A", 2, timescale: 30_000)),
-      equals: .sourceTimebaseChanged(expected: 60_000, actual: 30_000))
+    XCTAssertNotNil(mapped(mapper.map(frame("A", 100))))
+    failure(mapper.map(frame("A", 100)), equals: .sourceTimestampRegressed)
+    failure(mapper.map(frame("A", 99)), equals: .sourceTimestampRegressed)
+  }
+
+  func testMixedTimescaleRepresentationsKeepOneSourceClock() throws {
+    var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
+    let sourceTimes = [time(600_000), time(301, 30), time(30_200, 3_000), time(10_100, 1_000)]
+    for (index, sourceTime) in sourceTimes.enumerated() {
+      let result = try XCTUnwrap(mapped(mapper.map(ProgramSourceFrame(sourceID: "A",
+        sourceTime: sourceTime, duration: time(1, 30)))))
+      XCTAssertEqual(CMTimeCompare(result.programTime, time(Int64(index) * 2_000)), 0)
+      XCTAssertEqual(result.sourceTime, sourceTime, "The source representation is retained")
+      XCTAssertEqual(CMTimeCompare(result.programDuration, time(2_000)), 0)
+    }
+  }
+
+  func testEquivalentTimescaleDuplicatesAndInvalidFramesDoNotAdvanceState() throws {
+    var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
+    _ = try XCTUnwrap(mapped(mapper.map(frame("A", 60_000, duration: 2_000))))
+    failure(mapper.map(frame("A", 30, duration: 1, timescale: 30)), equals: .sourceTimestampRegressed)
+    failure(mapper.map(frame("A", 29, duration: 1, timescale: 30)), equals: .sourceTimestampRegressed)
+    failure(mapper.map(frame("A", 31, duration: 1, timescale: 30, epoch: 1)), equals: .sourceEpochUnsupported(1))
+    failure(mapper.map(frame("A", 1_100_000, duration: 1, timescale: 1_000_000)),
+      equals: .programTimestampNotMonotonic)
+    XCTAssertEqual(mapper.lastSourceTime, time(60_000))
+    XCTAssertEqual(CMTimeCompare(try XCTUnwrap(mapper.lastProgramTime), .zero), 0)
+    let next = try XCTUnwrap(mapped(mapper.map(frame("A", 31, duration: 1, timescale: 30))))
+    XCTAssertEqual(CMTimeCompare(next.programTime, time(2_000)), 0)
+  }
+
+  func testUnrepresentableMixedTimescaleOutputDoesNotCommitState() throws {
+    var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
+    _ = try XCTUnwrap(mapped(mapper.map(frame("A", 0, duration: 1, timescale: 1))))
+    failure(mapper.map(frame("A", Int64.max, duration: 1, timescale: 1)),
+      equals: .programTimestampNotMonotonic)
+    XCTAssertEqual(mapper.lastSourceTime, time(0, 1))
+    XCTAssertEqual(CMTimeCompare(try XCTUnwrap(mapper.lastProgramTime), .zero), 0)
+    let next = try XCTUnwrap(mapped(mapper.map(frame("A", 60_000, duration: 60_000))))
+    XCTAssertEqual(CMTimeCompare(next.programTime, time(60_000)), 0)
   }
 
   func testFailedFirstFrameDoesNotConsumeSourceOrProgramOrigin() {
@@ -376,25 +434,4 @@ import XCTest
     XCTAssertTrue(scheduler.hasPendingCut)
   }
 
-  static let allTests = [
-    ("first frame and monotonic source timeline", testFirstFrameAndSourceTimelineRemainMonotonic),
-    ("cut resets source origin", testCutResetsSourceOriginAtNextProgramBoundary),
-    ("invalid source timing", testRejectsForeignEpochTimebaseBackwardsAndInvalidDuration),
-    ("failed first frame is transactional", testFailedFirstFrameDoesNotConsumeSourceOrProgramOrigin),
-    ("on-air source flows until the cut", testOnAirSourceKeepsFlowingUntilTheCutLands),
-    ("live target expiry is reported", testLiveTargetThatNeverQualifiesExpiresAndIsReported),
-    ("starting target waits for first frame", testCutToStartingSourceWaitsForItsFirstFrame),
-    ("failed starting target is abandoned", testCutToStartingSourceThatFailsIsAbandonedVisibly),
-    ("no-signal starting target expires", testCutToStartingSourceWithNoSignalExpiresAtTheStartingBound),
-    ("first frame switches to live timeout", testStartingTargetThatSendsItsFirstFrameGetsTheLiveTimeout),
-    ("restarted on-air source re-anchors", testRestartedOnAirSourceIsReanchoredNotRejected),
-    ("on-air clock restart while live", testOnAirClockRestartWhileLiveResumesAtTheNextBoundary),
-    ("rebuild keeps readiness and pending cut", testRebuiltSchedulerKeepsOnAirReadinessAndThePendingCut),
-    ("rapid cuts coalesce", testRapidCutsCoalesceToLatestTarget),
-    ("invalid target preserves selection", testInvalidPendingTargetDoesNotSwitchSelection),
-    ("missing sources", testMissingSourcesAreRejectedAndPendingTargetIsDropped),
-    ("unavailable target clears cut time", testUnavailablePendingTargetClearsItsEarliestCutTime),
-    ("negative target timestamp", testNegativeTargetTimestampIsInvalidRatherThanStale),
-    ("epoch target timestamp", testEpochTargetTimestampIsReportedBeforeCutBoundaryComparison),
-  ]
 }

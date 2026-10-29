@@ -43,9 +43,11 @@ profiles/calibration, exposure reference offsets and recording folders stay
 per camera. Turn sync off to edit effects independently again; existing choices
 remain saved. Sync is off by default and persists between launches.
 
-These are **output** choices: physical capture still requires the validated
-DeckLink 4K 10-bit 4:2:2 29.97/59.94 input contract described below. Selecting a
-profile label does not add support for another capture device or input mode.
+These are **output** choices. The input inspector shows the selected plugin’s
+reported source modes; those modes still need admission by the processing and
+recording routes. Selecting an output or profile label does not qualify a new
+capture device or source mode. The established DeckLink hardware baseline is
+3840 × 2160, 10-bit 4:2:2 at 29.97/59.94 fps.
 
 With all pixel-processing switches disabled, the original input pixel buffer
 is forwarded without color conversion. A bounded bit-exact IOSurface copy is
@@ -97,9 +99,10 @@ the saved choice for recovery.
 
 ## Interface
 
-**Sony Wi-Fi control:** open **Sony Camera** in a camera strip or inspector to
+**Camera Control:** open **Camera Control** in a camera strip or inspector to
 assign an FX3 to that HDMI feed, change its supported camera settings, and toggle
-an automatically updated settings overlay. Opening the pop-up automatically
+an automatically updated settings overlay. Sony is the current control plugin.
+Opening the sheet automatically
 detects named cameras; Rescan finds newly powered cameras. Successful camera sign-ins are
 stored in macOS Keychain; saved assignments reconnect once at launch across
 signed app updates and installs. Reconnect/Forget Saved Sign-In manage them.
@@ -229,6 +232,23 @@ Normal Stop drains the encoder and finalizes the whole take on a worker, while
 **Finishing…** keeps duplicate recording actions disabled. Quitting waits for
 active recordings to finish.
 
+**Settings → Advanced → Video compatibility** offers **Allow CPU conversion
+(compatibility)**, off by default. Recording samples this policy at take start;
+changing it applies to the next take. When enabled, it permits VideoToolbox
+system conversion if the native recording route is unavailable or GPU conversion
+fails. VideoToolbox's internal CPU/GPU work is opaque, so the activity badge says
+**Compatibility conversion** and diagnostics count **system compatibility
+frames**. Metal 4 remains required. With the setting off, a missing conversion
+route refuses recording; a GPU conversion failure drops the affected frame,
+reports the loss and lets the take continue. This setting adds no new input
+formats or audio clock-resampling support.
+
+Takes carry metadata beside the movie: `Take.mov.ultracam.json` and its
+`.journal` companion record the admitted source/output contract, sampled policy
+and conversion counters. Recovery copies this pair to the recovered movie only
+when the take's recovery journal records ownership; unrelated sidecars are not
+adopted or deleted.
+
 Each feed shows its own status, elapsed recording time, current file size and
 video-frame drop count. While a take is active, its counters refresh twice a
 second; FPS and video bitrate reflect encoded output. **Encoder details** shows
@@ -269,8 +289,10 @@ audio and generated timecode. This helper never opens a capture device.
 
 ## Build and synthetic checks
 
-Requirements: Apple silicon, Xcode, macOS 15 or later, Blackmagic Desktop Video
-with its camera extension enabled. The development target is macOS 27.0.1.
+Requirements: Apple silicon with Metal 4 support, Xcode, and macOS 26 or later.
+The deployment target is macOS 26; there is no Metal 3 fallback. Capturing through
+the bundled DeckLink plugin also requires Blackmagic Desktop Video with its
+camera extension enabled.
 
 ```sh
 git clone --recurse-submodules https://github.com/andrewfitz/blackmagic-lut-webcam.git
@@ -285,9 +307,24 @@ of [github.com/andrewfitz/MonitorKit](https://github.com/andrewfitz/MonitorKit);
 run `git submodule update --init` after cloning or after a pull that moves it.
 Its development log is [docs/monitorkit/PROGRESS.md](docs/monitorkit/PROGRESS.md).
 
-These commands require the mounted `/Volumes/8TB` drive and keep all build
-products, test binaries, module caches and temporary files under
-`/Volumes/8TB/cinesomatic-director-work/`. The generated Xcode project and shared
+The production camera extension generates standby black images through Metal 4,
+with no CPU or legacy Metal fallback. The focused GPU proof passed all 18
+published format slots on M4 Max; other GPU families remain unverified.
+Production activation on that evidence was explicitly approved; it is not
+cross-device qualification. `bash scripts/check-gpu-standby.sh` writes a JSON
+receipt and logs under the configured work root without launching/installing the
+app or opening capture. `--build-only` compiles the proof without executing it.
+
+Build products, test binaries, module caches and temporary files default to
+`.build/` inside the checkout. Set `ULTRACAM_WORK_ROOT` to use an external
+directory; relative overrides resolve against the checkout. Locations inside
+the checkout must remain in its `.build/` subtree. For example:
+
+```sh
+export ULTRACAM_WORK_ROOT=/Volumes/8TB/cinesomatic-director-work
+```
+
+An external volume is optional. The generated Xcode project and shared
 scheme are checked in; `scripts/generate_project.py` regenerates them without
 third-party tools. Metal shader source is bundled and compiled through Metal at
 runtime, so the separate downloadable Xcode Metal toolchain is not required.
@@ -297,14 +334,31 @@ The app is built unsigned with Release optimization by default. Use
 alias, overwritten on every build, is at:
 
 ```text
-/Volumes/8TB/cinesomatic-director-work/agent-work/ultracam/Ultracam.app
+<work-root>/agent-work/ultracam/Ultracam.app
 ```
 
 Xcode derived data and test objects use a unique UTC timestamp/PID directory
-under `/Volumes/8TB/cinesomatic-director-work/agent-work/build/ultracam/`
+under `<work-root>/agent-work/build/ultracam/runs/`
 so overlapping builds and test runs cannot overwrite one another. The stable
 `build.log`, `test-compile.log`, and `tests.log` aliases point to the latest
 run; timestamped logs remain in the `logs/` directory.
+
+The vendor integrations live under `Vendors/Blackmagic/` and `Vendors/Sony/`.
+`python3 scripts/vendor-sdk.py status` reports installed SDK versions and
+unavailability reasons. Install a downloaded Sony archive with
+`python3 scripts/vendor-sdk.py install sony /path/to/CrSDK_Mac.zip`; see
+[the Sony build instructions](docs/SONY_CONTROL.md) to enable it locally.
+Their manifests feed the generated project and CLI build inputs; the camera
+extension uses shared value types and excludes vendor implementations. See
+[the plugin guide](docs/PLUGINS.md) for contracts, SDK policy and checks.
+[Third-party licenses](THIRD_PARTY_LICENSES.md) and
+[SDK release evidence](docs/SDK_RELEASE_EVIDENCE.md) record the distribution
+requirements. Sony runtime redistribution evidence is still required before
+an official public release; an unsigned local build is not a release approval.
+Builds accept `--sdk-inventory /path/to/sdk-inventory.json` to enable local SDK
+inputs explicitly. `--official-release` requires a signed Release build and
+artifact-bound `--release-evidence /path/to/evidence.json` (or
+`ULTRACAM_RELEASE_EVIDENCE`); an ordinary `--signed` build remains local.
 
 ## Install the camera
 
@@ -346,7 +400,7 @@ bash scripts/build.sh --local-development
 ```
 
 The ad-hoc signed package is staged at
-`/Volumes/8TB/cinesomatic-director-work/agent-work/ultracam/local-development/Ultracam.app`.
+`<work-root>/agent-work/ultracam/local-development/Ultracam.app`.
 Quit the previous app, copy this package into `/Applications`, launch it there,
 then request **Install camera** and approve **Ultracam Camera** in
 System Settings → General → Login Items & Extensions → Camera Extensions.
@@ -402,6 +456,12 @@ the actual captured dimensions, format and rate. Unsupported HDMI modes are
 reported while the detector waits for a supported signal. The build
 fetches checksum-pinned, permissively licensed Blackmagic headers and dispatch
 source from official OBS upstream; Blackmagic Desktop Video supplies the runtime.
+
+The established physical-input qualification baseline is 3840 × 2160, 10-bit
+4:2:2 at 29.97/59.94 fps. Shared format contracts, synthetic checks and a plugin’s
+reported mode list do not by themselves qualify additional physical modes.
+Confirm the actual detected source format in Capture diagnostics and consult
+VALIDATION.md for pending format-route and hardware checks.
 
 With Monitor Tools off, the selected camera's processed preview receives the
 same final pixel buffer and timing as camera output. AVSampleBufferDisplayLayer

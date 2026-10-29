@@ -248,6 +248,113 @@ import XCTest
     XCTAssertTrue(camera.sink === fallbackRuntime.sink)
   }
 
+#if ULTRACAM_TEST_SUPPORT
+  func testPendingAuthorizationDisconnectCompletesDeferredRemoval() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "pending-disconnect")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let clientID = UUID()
+    camera.queue.sync { runtime.source.authorizeSourceForTesting(clientID: clientID) }
+    let removed = snapshot([], generation: 2)
+    try camera.reconcile(removed)
+    XCTAssertTrue(camera.runtime(for: feed.id) === runtime)
+    camera.queue.sync {
+      XCTAssertTrue(runtime.inUse)
+      XCTAssertEqual(runtime.consumers, 0)
+      runtime.source.disconnectSourceForTesting(clientID: clientID)
+    }
+    camera.queue.sync {}
+    XCTAssertNil(camera.runtime(for: feed.id))
+    XCTAssertTrue(camera.devices.isEmpty)
+    try camera.reconcile(removed)
+    XCTAssertTrue(camera.devices.isEmpty, "An identical registry retry must not be needed to release the runtime")
+  }
+
+  func testStopBeforeStartCompletesDeferredRemoval() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "single-pending-stop")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    camera.queue.sync { runtime.source.authorizeSourceForTesting(clientID: UUID()) }
+    try camera.reconcile(snapshot([], generation: 2))
+    XCTAssertTrue(camera.runtime(for: feed.id) === runtime)
+    try camera.queue.sync { try runtime.source.stopStream() }
+    camera.queue.sync {}
+    XCTAssertNil(camera.runtime(for: feed.id))
+    XCTAssertTrue(camera.devices.isEmpty)
+  }
+
+  func testPendingDisconnectPreservesOtherActiveSourceLease() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "mixed-source-leases")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let active = UUID(), pending = UUID()
+    try camera.queue.sync {
+      // Install a non-hardware standby lifecycle; no frame is requested.
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.authorizeSourceForTesting(clientID: active)
+      try runtime.source.startStream()
+      runtime.source.authorizeSourceForTesting(clientID: pending)
+    }
+    try camera.reconcile(snapshot([], generation: 2))
+    camera.queue.sync {
+      runtime.source.disconnectSourceForTesting(clientID: pending)
+      XCTAssertEqual(runtime.consumers, 1)
+      XCTAssertFalse(runtime.source.hasPendingStart)
+    }
+    camera.queue.sync {}
+    XCTAssertTrue(camera.runtime(for: feed.id) === runtime)
+    camera.queue.sync { runtime.source.disconnectSourceForTesting(clientID: active) }
+    camera.queue.sync {}
+    XCTAssertEqual(runtime.consumers, 0)
+    XCTAssertNil(camera.runtime(for: feed.id))
+  }
+
+  func testStopBeforeStartReleasesOnlyItsPendingLeaseAndRemovesAfterLastRelease() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "pending-stop")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let first = UUID(), second = UUID()
+    camera.queue.sync {
+      runtime.source.authorizeSourceForTesting(clientID: first)
+      runtime.source.authorizeSourceForTesting(clientID: second)
+    }
+    try camera.reconcile(snapshot([], generation: 2))
+    try camera.queue.sync {
+      try runtime.source.stopStream()
+      XCTAssertTrue(runtime.source.hasPendingStart, "A stop must not release another client's pending authorization")
+      XCTAssertEqual(runtime.consumers, 0)
+    }
+    camera.queue.sync {}
+    XCTAssertTrue(camera.runtime(for: feed.id) === runtime)
+    camera.queue.sync { runtime.source.disconnectSourceForTesting(clientID: second) }
+    camera.queue.sync {}
+    XCTAssertNil(camera.runtime(for: feed.id))
+  }
+
+  func testFailedPreparationReleasesPendingLeaseWithoutAdmittingDemand() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "pending-failed-start")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    camera.queue.sync {
+      runtime.source.authorizeSourceForTesting(clientID: UUID())
+      runtime.makeGPUStandbyProducerForTesting = { throw VideoError.message("Injected preparation refusal") }
+    }
+    try camera.reconcile(snapshot([], generation: 2))
+    try camera.queue.sync {
+      XCTAssertThrowsError(try runtime.source.startStream())
+      XCTAssertEqual(runtime.consumers, 0)
+      XCTAssertFalse(runtime.source.hasPendingStart)
+    }
+    camera.queue.sync {}
+    XCTAssertNil(camera.runtime(for: feed.id))
+  }
+#endif
+
   private func sample(luma: UInt8, at time: CMTime) throws -> CMSampleBuffer {
     var image: CVPixelBuffer?
     let status = CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
@@ -265,6 +372,13 @@ import XCTest
     if let chroma = CVPixelBufferGetBaseAddressOfPlane(image, 1) {
       memset(chroma, 128, CVPixelBufferGetBytesPerRowOfPlane(image, 1) *
         CVPixelBufferGetHeightOfPlane(image, 1))
+    }
+    // These fixed SDR luma fixtures model the shipped producer's explicit
+    // Rec.709 metadata, independently of the registry/routing behavior tested.
+    for (key, value) in [(kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2),
+      (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2),
+      (kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2)] {
+      CVBufferSetAttachment(image, key, value, .shouldPropagate)
     }
     return try VideoContract.sample(image, at: time, duration: VideoContract.fastDuration)
   }

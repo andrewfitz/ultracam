@@ -3,12 +3,12 @@
 set -euo pipefail
 export MACOSX_DEPLOYMENT_TARGET=26.0
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
-check_root=/Volumes/8TB/cinesomatic-build/sony-sandbox-ui-check
+check_root="$(python3 "$task_root/scripts/work_paths.py" --path build_root)/sony-sandbox-ui-check"
 check_app="$check_root/SonyCameraSoftwareCheck.app"
-sdk_root="$task_root/ThirdParty/SonyCameraRemoteSDK"
-[[ -f "$sdk_root/lib/libCr_Core.dylib" ]] || { echo 'Install the Sony SDK first.' >&2; exit 1; }
 mkdir -p "$check_app/Contents/MacOS" "$check_app/Contents/Frameworks"
-cp -R "$sdk_root/lib/" "$check_app/Contents/Frameworks/"
+source "$task_root/scripts/vendor-build.sh"
+vendor_configure test sony sandbox
+vendor_embed_into "$check_app/Contents/Frameworks"
 python3 - "$check_app" "$check_root" <<'PY'
 from pathlib import Path
 import plistlib
@@ -30,15 +30,11 @@ app, root = map(Path, sys.argv[1:])
     'com.apple.security.cs.disable-library-validation': True,
 }))
 PY
-xcrun clang++ -x objective-c++ -std=c++17 -fobjc-arc -Wall -Wextra -Werror \
-  -DULTRACAM_SONY_SDK=1 -I "$sdk_root/include" \
-  -c "$task_root/Sources/DeckLinkBackend/SonyCameraControl.inc" -o "$check_root/sony.o"
+vendor_compile_native "$check_root/compile.log"
 xcrun swiftc -parse-as-library -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
-  -target arm64-apple-macos26.0 \
-  -import-objc-header "$task_root/Sources/DeckLinkBackend/SonyCameraControl.h" \
-  "$task_root/Sources/App/SonyCameraCredentials.swift" "$task_root/Sources/App/SonyCameraStore.swift" "$task_root/Sources/App/UISonyCamera.swift" \
-  "$task_root/Tools/SonyControlChecks/SandboxUI.swift" "$check_root/sony.o" \
-  -L "$sdk_root/lib" -lCr_Core -lc++ -Xlinker -rpath -Xlinker '@executable_path/../Frameworks' \
+  -target arm64-apple-macos26.0 ${vendor_swift_native_args[@]+"${vendor_swift_native_args[@]}"} \
+  -import-objc-header "$vendor_bridge" ${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"} ${vendor_native_objects[@]+"${vendor_native_objects[@]}"} \
+  ${vendor_link_args[@]+"${vendor_link_args[@]}"} -lc++ -Xlinker -rpath -Xlinker '@executable_path/../Frameworks' \
   -o "$check_app/Contents/MacOS/SonyCameraSoftwareCheck"
 python3 - "$check_app" <<'PY'
 from pathlib import Path

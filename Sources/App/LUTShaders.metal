@@ -15,10 +15,13 @@ struct Parameters {
   float4 decodeRange;   // luma black, luma range, chroma zero, chroma range (10-bit codes)
   float4 decodeMatrix;
   float4 encodeMatrix;  // x: Kr, y: Kb
-  float4 chroma;        // x: source chroma sample offset (0 cosited, 0.5 centered)
+  float4 chroma;        // xy: chroma location; z: native sample scale; w: planar vertical subsampling / RGB kind
   mk_LUTParams lut;     // MonitorLUT.parameters; shape.z is 0 when Apply LUT is off
+  uint4 inputConversion;
+  uint4 outputConversion;
+  float4 scaling; // scaled source width/height, signed canvas origin
 };
-static_assert(sizeof(Parameters) == 160, "Parameters is LUTProcessor.Parameters: ten 16-byte rows");
+static_assert(sizeof(Parameters) == 208, "Parameters is LUTProcessor.Parameters: ten 16-byte rows");
 
 float3 decode(float y, float2 c, constant Parameters &p) {
   float luma = (y - p.decodeRange.x) / p.decodeRange.y;
@@ -32,13 +35,13 @@ float3 encode(float3 rgb, constant Parameters &p) {
   return float3(y, (rgb.b - y) / (2 * (1 - kb)), (rgb.r - y) / (2 * (1 - kr)));
 }
 
-// v210 through an RGBA32Uint view, as in the DeckLink SDK's Metal sample: one
+// v210 through an RGBA32Uint view: one
 // texel is one 6-pixel group (four 32-bit words) of the capture IOSurface.
 struct PackedSource {
   texture2d<uint, access::read> groups;
 
   float2 chromaPair(int pair, uint row, constant Parameters &p) const {
-    pair = clamp(pair, 0, int(p.geometry.x / 2) - 1);
+    pair = clamp(pair, 0, int((p.geometry.x + 1) / 2) - 1);
     uint4 g = groups.read(uint2(uint(pair / 3), row));
     uint lane = uint(pair % 3);
     if (lane == 0) return float2(g.x & 1023, (g.x >> 20) & 1023);
@@ -62,25 +65,120 @@ struct PackedSource {
   }
 };
 
-// 16-bit-container bi-planar 4:2:2 (x422 / xf22).
+// CoreVideo 2vuy (Cb,Y0,Cr,Y1) and yuvs (Y0,Cb,Y1,Cr).
+// One RGBA8Uint texel stores two pixels. Codes remain in the ten-bit
+// domain used by decode(), including superblack and superwhite.
+struct Packed8Source {
+  texture2d<uint, access::read> groups;
+  float2 chromaPair(int pair, uint row, constant Parameters &p) const {
+    pair = clamp(pair, 0, int((p.geometry.x + 1) / 2) - 1);
+    uint4 g = groups.read(uint2(uint(pair), row));
+    return (p.chroma.w == 1 ? float2(g.y, g.w) : float2(g.x, g.z)) * 4.0f;
+  }
+  float3 pixel(uint x, uint y, constant Parameters &p) const {
+    uint4 g = groups.read(uint2(x / 2, y));
+    float value = p.chroma.w == 1 ? ((x & 1) ? g.z : g.x) : ((x & 1) ? g.w : g.y);
+    float position = (float(x) - p.chroma.x) / 2.0f;
+    int pair = int(floor(position));
+    float2 c = mix(chromaPair(pair, y, p), chromaPair(pair + 1, y, p), position - floor(position));
+    return decode(value * 4.0f, c, p);
+  }
+};
+
+// Bi-planar YCbCr: 420v/f, high-aligned 10-bit and native 16-bit P216.
 struct PlanarSource {
   texture2d<float, access::read> luma;
   texture2d<float, access::sample> chroma;
 
   float3 pixel(uint x, uint y, constant Parameters &p) const {
     constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
-    float2 coord = float2(float(x) + 1.0f - p.chroma.x, float(y) + 0.5f) / float2(p.geometry.xy);
-    float l = luma.read(uint2(x, y)).r * (65535.0f / 64.0f);
-    float2 c = chroma.sample(linear, coord).rg * (65535.0f / 64.0f);
+    float2 position = (float2(x, y) - p.chroma.xy) / float2(2.0f, p.chroma.w) + 0.5f;
+    float2 coord = position / float2(chroma.get_width(), chroma.get_height());
+    float l = luma.read(uint2(x, y)).r * p.chroma.z;
+    float2 c = chroma.sample(linear, coord).rg * p.chroma.z;
     return decode(l, c, p);
   }
 };
+
+// Three-plane I420 retains its native separate U/V textures.
+struct I420Source {
+  texture2d<float, access::read> luma;
+  texture2d<float, access::sample> u;
+  texture2d<float, access::sample> v;
+  float3 pixel(uint x, uint y, constant Parameters &p) const {
+    constexpr sampler linear(coord::pixel, address::clamp_to_edge, filter::linear);
+    float2 position = (float2(x,y) - p.chroma.xy) / float2(2.0f, 2.0f) + .5f;
+    return decode(luma.read(uint2(x,y)).r * p.chroma.z,
+      float2(u.sample(linear, position).r, v.sample(linear, position).r) * p.chroma.z, p);
+  }
+};
+
+// Byte-addressed RGB inputs share an integer texture view; r210 is big
+// endian, R12L is a contiguous little-endian 36-bit pixel stream.
+struct RGBSource {
+  texture2d<uint, access::read> pixels;
+  float3 pixel(uint x, uint y, constant Parameters &p) const {
+    uint kind = uint(p.chroma.w);
+    if (kind == 4) {
+      uint bit = x * 36, first = bit / 8, shift = bit % 8;
+      ulong word = 0;
+      for (uint i = 0; i < 5; ++i) word |= ulong(pixels.read(uint2(first + i, y)).r) << (i * 8);
+      word >>= shift;
+      return float3(float(word & 4095), float((word >> 12) & 4095), float((word >> 24) & 4095)) / 4095.0f;
+    }
+    uint4 b = pixels.read(uint2(x,y));
+    if (kind == 3) {
+      uint word = (b.x << 24) | (b.y << 16) | (b.z << 8) | b.w;
+      return (float3((word >> 20) & 1023, (word >> 10) & 1023, word & 1023) - 64.0f) / 876.0f;
+    }
+    return kind == 1 ? float3(b.z,b.y,b.x) / 255.0f : float3(b.xyz) / 255.0f;
+  }
+};
+
+// Explicit SDR transfer/gamut conversion, in linear light. IDs mirror Swift.
+inline float decodeTransfer(float v, uint t) {
+  float a = abs(v), sign = v < 0 ? -1.0f : 1.0f;
+  if (t == 4) {
+    float n = pow(max(v, 0.0f), 1.0f / 78.84375f);
+    return 100.0f * pow(max(n - .8359375f, 0.0f) / max(18.8515625f - 18.6875f * n, 1e-7f), 1.0f / .1593017578125f);
+  }
+  if (t == 5) return v <= .5f ? v * v / 3.0f : (exp((v - .55991073f) / .17883277f) + .28466892f) / 12.0f;
+  if (t == 2) return sign * (a < 0.081f ? a / 4.5f : pow((a + 0.099f) / 1.099f, 1.0f / 0.45f));
+  if (t == 3) return sign * (a <= 0.04045f ? a / 12.92f : pow((a + 0.055f) / 1.055f, 2.4f));
+  return v;
+}
+inline float encodeTransfer(float v, uint t) {
+  float a = abs(v), sign = v < 0 ? -1.0f : 1.0f;
+  if (t == 4) {
+    float n = pow(max(v, 0.0f) / 100.0f, .1593017578125f);
+    return pow((.8359375f + 18.8515625f * n) / (1.0f + 18.6875f * n), 78.84375f);
+  }
+  if (t == 5) return v <= 1.0f / 12.0f ? sqrt(max(3.0f * v, 0.0f)) : .17883277f * log(12.0f * v - .28466892f) + .55991073f;
+  if (t == 2) return sign * (a < 0.018f ? 4.5f * a : 1.099f * pow(a, 0.45f) - 0.099f);
+  if (t == 3) return sign * (a <= 0.0031308f ? 12.92f * a : 1.055f * pow(a, 1.0f / 2.4f) - 0.055f);
+  return v;
+}
+inline float3 convertColour(float3 rgb, uint4 conversion) {
+  if (conversion.x == 0) return rgb;
+  float3 v = float3(decodeTransfer(rgb.r, conversion.x), decodeTransfer(rgb.g, conversion.x), decodeTransfer(rgb.b, conversion.x));
+  // Working linear unit is 100 cd/m². HLG uses the BT.2100 1000-nit
+  // reference display (system gamma 1.2); PQ is absolute ST2084.
+  if (conversion.x == 5) v *= 10.0f * pow(max(dot(v, float3(.2627f,.6780f,.0593f)), 0.0f), .2f);
+  if (conversion.z == 1) v = float3(dot(v, float3(.627404f,.329283f,.043313f)), dot(v,float3(.069097f,.919540f,.011362f)), dot(v,float3(.016391f,.088013f,.895595f)));
+  if (conversion.z == 2) v = float3(dot(v, float3(1.660491f,-.587641f,-.072850f)), dot(v,float3(-.124550f,1.132900f,-.008349f)), dot(v,float3(-.018151f,-.100579f,1.118730f)));
+  if (conversion.y == 5) {
+    v /= 10.0f;
+    float luminance = max(dot(v, float3(.2627f,.6780f,.0593f)), 1e-10f);
+    v *= pow(luminance, (1.0f / 1.2f) - 1.0f);
+  }
+  return float3(encodeTransfer(v.r, conversion.y), encodeTransfer(v.g, conversion.y), encodeTransfer(v.b, conversion.y));
+}
 
 // The only place a source pixel becomes graded RGB: decode, then MonitorKit's
 // LUT (tetrahedral; a 1D shaper first when the LUT has one).
 template <typename Source>
 inline float3 graded(Source source, uint x, uint y, texture3d<float, access::sample> lut, constant Parameters &p) {
-  return mk_applyLUT(source.pixel(x, y, p), lut, p.lut);
+  return convertColour(mk_applyLUT(convertColour(source.pixel(x, y, p), p.inputConversion), lut, p.lut), p.outputConversion);
 }
 
 inline float quantizeY(float value, constant Parameters &p) {
@@ -135,6 +233,16 @@ kernel void fullPacked422(texture2d<uint, access::read> groups [[texture(0)]], t
   constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   full422(PackedSource{groups}, lut, y, uv, p, gid);
 }
+kernel void fullPacked8NV12(texture2d<uint, access::read> groups [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],
+  texture2d<float, access::write> y [[texture(3)]], texture2d<float, access::write> uv [[texture(4)]],
+  constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  fullNV12(Packed8Source{groups}, lut, y, uv, p, gid);
+}
+kernel void fullPacked8422(texture2d<uint, access::read> groups [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],
+  texture2d<float, access::write> y [[texture(3)]], texture2d<float, access::write> uv [[texture(4)]],
+  constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  full422(Packed8Source{groups}, lut, y, uv, p, gid);
+}
 kernel void fullPlanarNV12(texture2d<float, access::read> luma [[texture(0)]], texture2d<float, access::sample> chroma [[texture(1)]],
   texture3d<float, access::sample> lut [[texture(2)]],
   texture2d<float, access::write> y [[texture(3)]], texture2d<float, access::write> uv [[texture(4)]],
@@ -166,14 +274,18 @@ constant constexpr uint horizontalSpan = horizontalGroup * 2 + 11;
 template <typename Source>
 inline void horizontalPass(Source s, texture3d<float, access::sample> lut, texture2d<float, access::write> out,
   constant Parameters &p, threadgroup float4 *row, uint2 group, uint lid) {
-  if (p.geometry.x != out.get_width() * 2) {
+  if (p.geometry.x != out.get_width() * 2 || p.scaling.x != out.get_width() || p.scaling.z != 0) {
     uint ox = group.x * horizontalGroup + lid;
     if (ox >= out.get_width() || group.y >= out.get_height()) return;
-    float scale = float(p.geometry.x) / out.get_width();
-    float center = (float(ox) + 0.5f) * scale - 0.5f;
+    if (float(ox) < p.scaling.z || float(ox) >= p.scaling.z + p.scaling.x) {
+      out.write(float4(0), uint2(ox, group.y)); return;
+    }
+    float scale = float(p.geometry.x) / p.scaling.x;
+    float filterScale = max(scale, 1.0f);
+    float center = (float(ox) - p.scaling.z + 0.5f) * scale - 0.5f;
     float4 sum = 0; float total = 0;
-    for (int ix = int(ceil(center - 3 * scale)); ix <= int(floor(center + 3 * scale)); ++ix) {
-      float t = abs((float(ix) - center) / scale);
+    for (int ix = int(ceil(center - 3 * filterScale)); ix <= int(floor(center + 3 * filterScale)); ++ix) {
+      float t = abs((float(ix) - center) / filterScale);
       float w = t < 0.00001f ? 1.0f : (t >= 3 ? 0.0f : sin(M_PI_F * t) * sin(M_PI_F * t / 3) / (M_PI_F * M_PI_F * t * t / 3));
       sum += float4(graded(s, uint(clamp(ix, 0, int(p.geometry.x) - 1)), group.y, lut, p), 1) * w;
       total += w;
@@ -203,6 +315,12 @@ kernel void horizontalPacked(texture2d<uint, access::read> groups [[texture(0)]]
   threadgroup float4 row[horizontalSpan];
   horizontalPass(PackedSource{groups}, lut, out, p, row, group, lid);
 }
+kernel void horizontalPacked8(texture2d<uint, access::read> groups [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],
+  texture2d<float, access::write> out [[texture(3)]], constant Parameters &p [[buffer(0)]],
+  uint2 group [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) {
+  threadgroup float4 row[horizontalSpan];
+  horizontalPass(Packed8Source{groups}, lut, out, p, row, group, lid);
+}
 kernel void horizontalPlanar(texture2d<float, access::read> luma [[texture(0)]], texture2d<float, access::sample> chroma [[texture(1)]],
   texture3d<float, access::sample> lut [[texture(2)]],
   texture2d<float, access::write> out [[texture(3)]], constant Parameters &p [[buffer(0)]],
@@ -212,13 +330,15 @@ kernel void horizontalPlanar(texture2d<float, access::read> luma [[texture(0)]],
 }
 
 // Pass 2: vertical Lanczos + output encode, one thread per output block.
-inline float3 vertical(texture2d<float, access::read> input, uint x, uint y, uint outputHeight) {
-  if (input.get_height() != outputHeight * 2) {
-    float scale = float(input.get_height()) / outputHeight;
-    float center = (float(y) + 0.5f) * scale - 0.5f;
+inline float3 vertical(texture2d<float, access::read> input, uint x, uint y, uint outputHeight, constant Parameters &p) {
+  if (float(y) < p.scaling.w || float(y) >= p.scaling.w + p.scaling.y) return float3(0);
+  if (input.get_height() != outputHeight * 2 || p.scaling.y != outputHeight || p.scaling.w != 0) {
+    float scale = float(input.get_height()) / p.scaling.y;
+    float filterScale = max(scale, 1.0f);
+    float center = (float(y) - p.scaling.w + 0.5f) * scale - 0.5f;
     float3 sum = 0; float total = 0;
-    for (int iy = int(ceil(center - 3 * scale)); iy <= int(floor(center + 3 * scale)); ++iy) {
-      float t = abs((float(iy) - center) / scale);
+    for (int iy = int(ceil(center - 3 * filterScale)); iy <= int(floor(center + 3 * filterScale)); ++iy) {
+      float t = abs((float(iy) - center) / filterScale);
       float w = t < 0.00001f ? 1.0f : (t >= 3 ? 0.0f : sin(M_PI_F * t) * sin(M_PI_F * t / 3) / (M_PI_F * M_PI_F * t * t / 3));
       sum += input.read(uint2(x, uint(clamp(iy, 0, int(input.get_height()) - 1)))).rgb * w; total += w;
     }
@@ -238,8 +358,8 @@ kernel void verticalNV12(texture2d<float, access::read> input [[texture(0)]],
   constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   uint2 base = gid * 2;
   if (base.x >= y.get_width() || base.y >= y.get_height()) return;
-  writeNV12(vertical(input, base.x, base.y, y.get_height()), vertical(input, base.x + 1, base.y, y.get_height()),
-    vertical(input, base.x, base.y + 1, y.get_height()), vertical(input, base.x + 1, base.y + 1, y.get_height()), base, y, uv, p);
+  writeNV12(vertical(input, base.x, base.y, y.get_height(), p), vertical(input, base.x + 1, base.y, y.get_height(), p),
+    vertical(input, base.x, base.y + 1, y.get_height(), p), vertical(input, base.x + 1, base.y + 1, y.get_height(), p), base, y, uv, p);
 }
 
 kernel void vertical422(texture2d<float, access::read> input [[texture(0)]],
@@ -247,5 +367,34 @@ kernel void vertical422(texture2d<float, access::read> input [[texture(0)]],
   constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   uint2 base = uint2(gid.x * 2, gid.y);
   if (base.x >= y.get_width() || base.y >= y.get_height()) return;
-  write422(vertical(input, base.x, base.y, y.get_height()), vertical(input, base.x + 1, base.y, y.get_height()), base, y, uv, p);
+  write422(vertical(input, base.x, base.y, y.get_height(), p), vertical(input, base.x + 1, base.y, y.get_height(), p), base, y, uv, p);
+}
+
+kernel void fullRGBNV12(texture2d<uint, access::read> rgb [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],
+  texture2d<float, access::write> y [[texture(3)]], texture2d<float, access::write> uv [[texture(4)]],
+  constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  fullNV12(RGBSource{rgb}, lut, y, uv, p, gid);
+}
+kernel void fullRGB422(texture2d<uint, access::read> rgb [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],
+  texture2d<float, access::write> y [[texture(3)]], texture2d<float, access::write> uv [[texture(4)]],
+  constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  full422(RGBSource{rgb}, lut, y, uv, p, gid);
+}
+kernel void horizontalRGB(texture2d<uint, access::read> rgb [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],
+  texture2d<float, access::write> out [[texture(3)]], constant Parameters &p [[buffer(0)]],
+  uint2 group [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) {
+  threadgroup float4 row[horizontalSpan];
+  horizontalPass(RGBSource{rgb}, lut, out, p, row, group, lid);
+}
+
+kernel void fullI420NV12(texture2d<float,access::read> yIn [[texture(0)]], texture2d<float,access::sample> uIn [[texture(1)]], texture2d<float,access::sample> vIn [[texture(5)]],
+ texture3d<float,access::sample> lut [[texture(2)]],texture2d<float,access::write> y [[texture(3)]],texture2d<float,access::write> uv [[texture(4)]],
+ constant Parameters &p [[buffer(0)]],uint2 gid [[thread_position_in_grid]]) { fullNV12(I420Source{yIn,uIn,vIn},lut,y,uv,p,gid); }
+kernel void fullI420422(texture2d<float,access::read> yIn [[texture(0)]], texture2d<float,access::sample> uIn [[texture(1)]], texture2d<float,access::sample> vIn [[texture(5)]],
+ texture3d<float,access::sample> lut [[texture(2)]],texture2d<float,access::write> y [[texture(3)]],texture2d<float,access::write> uv [[texture(4)]],
+ constant Parameters &p [[buffer(0)]],uint2 gid [[thread_position_in_grid]]) { full422(I420Source{yIn,uIn,vIn},lut,y,uv,p,gid); }
+kernel void horizontalI420(texture2d<float,access::read> y [[texture(0)]],texture2d<float,access::sample> u [[texture(1)]],texture2d<float,access::sample> v [[texture(5)]],
+ texture3d<float,access::sample> lut [[texture(2)]],texture2d<float,access::write> out [[texture(3)]],constant Parameters &p [[buffer(0)]],
+ uint2 group [[threadgroup_position_in_grid]],uint lid [[thread_index_in_threadgroup]]) {
+ threadgroup float4 row[horizontalSpan]; horizontalPass(I420Source{y,u,v},lut,out,p,row,group,lid);
 }

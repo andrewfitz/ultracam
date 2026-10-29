@@ -391,7 +391,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertTrue(camera.burnInLUT === lut, "A camera's Output picture uses the LUT it burns in")
   }
 
-  static let identityCube = """
+  nonisolated static let identityCube = """
     LUT_3D_SIZE 2
     0 0 0
     1 0 0

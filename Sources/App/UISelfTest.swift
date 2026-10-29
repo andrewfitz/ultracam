@@ -50,7 +50,7 @@ import AppKit
       return
     }
     guard camera.deviceAvailable else {
-      record("live: capture input present", false, "no UltraStudio input for \(camera.name)")
+      record("live: capture input present", false, "no capture input for \(camera.name)")
       return
     }
     bridge.send(.startCamera(cameraID: camera.id))

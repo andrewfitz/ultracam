@@ -11,6 +11,7 @@ extension UISessionBridge {
   static func applyCapture(_ update: CaptureUpdate?, to camera: inout UICameraSnapshot) {
     camera.timecode = update?.timecode
     if let update {
+      camera.signal = UIFormatLabels.signal(running: camera.running, deviceAvailable: camera.deviceAvailable, update: update)
       camera.audio = UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
         peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight)
     }
@@ -22,6 +23,8 @@ extension UISessionBridge {
     rec.fileBytes = Int64(stats?.fileBytes ?? 0)
     rec.megabitsPerSecond = stats?.videoMegabitsPerSecond ?? 0
     rec.droppedFrames = Int(clamping: stats?.droppedVideoFrames ?? 0)
+    rec.systemCompatibilityFrames = stats?.systemCompatibilityFrames ?? 0
+    rec.compatibilityConversionActive = stats?.compatibilityConversionActive ?? false
     // The running take's audio so far, then the finished take's (cleared when the next starts).
     rec.audio = model.takeAudioSoFar(id) ?? model.takeAudio[id]
     rec.savedDuration = rec.savedURL != nil ? stats?.elapsed : nil
@@ -55,6 +58,7 @@ extension UISessionBridge {
 /// the environment; fixtures have none and show their snapshots as they are.
 @MainActor final class UILiveSource {
   private let bridge: UISessionBridge
+  private var ingestActivity: [String: (count: UInt64, lastChange: TimeInterval)] = [:]
 
   init(model: AppModel, interface: UIInterfaceState) {
     bridge = UISessionBridge(model: model, interface: interface)
@@ -74,7 +78,17 @@ extension UISessionBridge {
     let id = FeedID(rawValue: camera.id)
     var camera = camera
     if follows.contains(.capture) {
-      UISessionBridge.applyCapture(camera.running ? model.liveCameraUpdate(id) : nil, to: &camera)
+      let update = camera.running ? model.liveCameraUpdate(id) : nil
+      UISessionBridge.applyCapture(update, to: &camera)
+      let count = update?.ingestCPUCopyFrames ?? 0
+      let now = ProcessInfo.processInfo.systemUptime
+      let previous = ingestActivity[camera.id]
+      let changed = count > 0 && (previous == nil || previous!.count != count)
+      let lastChange = changed ? now : (previous?.lastChange ?? -.infinity)
+      ingestActivity[camera.id] = (count, lastChange)
+      camera.ingestCPUCopyFrames = count
+      camera.ingestCPUCopyActive = camera.running && count > 0 && now - lastChange < 1
+
     }
     if follows.contains(.take) {
       bridge.applyTake(id, statistics: model.recordingModel.liveStatistics(id), drives: drives, to: &camera.recording)

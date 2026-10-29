@@ -1,0 +1,8 @@
+// Blackmagic-owned static display text. SDK device/mode names stay verbatim.
+"decklink.descriptor.name" = "Blackmagic DeckLink";
+"decklink.descriptor.signal" = "HDMI / SDI / optical";
+"decklink.setting.inputConnector" = "Input connector";
+"decklink.setting.advertiseHDRToCameras" = "Advertise HDR to cameras";
+"decklink.connector.hdmi" = "HDMI";
+"decklink.connector.sdi" = "SDI";
+"decklink.connector.optical" = "Optical SDI";

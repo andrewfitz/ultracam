@@ -385,10 +385,10 @@ extension MonitorLifecycleChecks {
     XCTAssertEqual(reports.all.count, 1)
 
     // Through the coordinator: the target's preferences take the refreshed choice.
-    MainActor.assumeIsolated { coordinatorSavesTheRefreshedChoice(choice) }
+    MainActor.assumeIsolated { Self.coordinatorSavesTheRefreshedChoice(choice) }
   }
 
-  @MainActor private func coordinatorSavesTheRefreshedChoice(_ choice: MonitorLUTChoice) {
+  @MainActor private static func coordinatorSavesTheRefreshedChoice(_ choice: MonitorLUTChoice) {
     let coordinator = MonitorCoordinator()
     let target = MonitorTargetID("monitor-lut-moved-camera")
     coordinator.updateTargets(feeds: [FeedDescriptor(id: FeedID(rawValue: target.rawValue), name: "Wide")],

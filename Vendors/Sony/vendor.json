@@ -1,0 +1,269 @@
+{
+  "schemaVersion": 1,
+  "headerSearchPaths": [],
+  "frameworks": [
+    "Foundation"
+  ],
+  "libraries": [],
+  "defines": [],
+  "embedLibraries": [],
+  "tests": [
+    "../../scripts/sony-control-checks.sh",
+    "../../scripts/sony-credential-checks.sh",
+    "../../scripts/sony-plugin-checks.sh",
+    "Tests/SonyLayoutChecks.py",
+    "Tests/SonyLocalizationChecks.py",
+    "../../scripts/sony-conformance-checks.sh"
+  ],
+  "id": "sony",
+  "kinds": [
+    "control"
+  ],
+  "sources": [
+    {
+      "path": "Sources/SonyCameraControl.h",
+      "membership": [
+        "app",
+        "test"
+      ]
+    },
+    {
+      "path": "Sources/SonyCameraControl.mm",
+      "membership": [
+        "app",
+        "test"
+      ]
+    },
+    {
+      "path": "Sources/SonyControlPlugin.swift",
+      "membership": [
+        "app",
+        "test"
+      ]
+    },
+    {
+      "path": "Sources/SonyNetworkDiscovery.inc",
+      "membership": [
+        "app",
+        "test"
+      ]
+    }
+  ],
+  "publicHeaders": [
+    "Sources/SonyCameraControl.h"
+  ],
+  "resources": [
+    {
+      "path": "Resources/SonyAssets.xcassets",
+      "membership": [
+        "app"
+      ]
+    },
+    {
+      "path": "Resources/en.lproj/SonyControl.strings",
+      "membership": [
+        "app"
+      ]
+    }
+  ],
+  "testGroups": {
+    "control": {
+      "swiftSources": [
+        "../../Sources/DeviceAPI/VendorDescriptor.swift",
+        "../../Sources/DeviceAPI/CameraControlTypes.swift",
+        "../../Sources/DeviceAPI/CameraControlPlugin.swift",
+        "../../Sources/DeviceAPI/ControlViewContext.swift",
+        "Sources/SonyControlPlugin.swift",
+        "../../Sources/App/CameraControlCredentials.swift",
+        "../../Sources/App/CameraControlStore.swift",
+        "../../Sources/App/UIControlPresentation.swift",
+        "../../Sources/App/UICameraControl.swift",
+        "Tests/NativeModels.swift",
+        "Tests/Snapshot.swift",
+        "Tests/main.swift"
+      ],
+      "nativeSources": [
+        "Sources/SonyCameraControl.mm"
+      ],
+      "sdk": false
+    },
+    "credentials": {
+      "swiftSources": [
+        "../../Sources/DeviceAPI/VendorDescriptor.swift",
+        "../../Sources/DeviceAPI/CameraControlTypes.swift",
+        "../../Sources/DeviceAPI/CameraControlPlugin.swift",
+        "Sources/SonyControlPlugin.swift",
+        "../../Sources/App/CameraControlCredentials.swift",
+        "Tests/Credentials.swift"
+      ],
+      "nativeSources": [
+        "Sources/SonyCameraControl.mm"
+      ],
+      "sdk": false
+    },
+    "plugin": {
+      "swiftSources": [
+        "../../Sources/DeviceAPI/VendorDescriptor.swift",
+        "../../Sources/DeviceAPI/CameraControlTypes.swift",
+        "../../Sources/DeviceAPI/CameraControlPlugin.swift",
+        "Sources/SonyControlPlugin.swift",
+        "Tests/SonyPluginChecks.swift"
+      ],
+      "nativeSources": [
+        "Sources/SonyCameraControl.mm"
+      ],
+      "sdk": false
+    },
+    "sandbox": {
+      "swiftSources": [
+        "../../Sources/DeviceAPI/VendorDescriptor.swift",
+        "../../Sources/DeviceAPI/CameraControlTypes.swift",
+        "../../Sources/DeviceAPI/CameraControlPlugin.swift",
+        "../../Sources/DeviceAPI/ControlViewContext.swift",
+        "Sources/SonyControlPlugin.swift",
+        "../../Sources/App/CameraControlCredentials.swift",
+        "../../Sources/App/CameraControlStore.swift",
+        "../../Sources/App/UIControlPresentation.swift",
+        "../../Sources/App/UICameraControl.swift",
+        "Tests/SandboxUI.swift"
+      ],
+      "nativeSources": [
+        "Sources/SonyCameraControl.mm"
+      ],
+      "sdk": true
+    },
+    "native": {
+      "swiftSources": [],
+      "nativeSources": [
+        "Tests/Native.mm"
+      ],
+      "sdk": true
+    },
+    "hardware": {
+      "swiftSources": [],
+      "nativeSources": [
+        "Sources/SonyCameraControl.mm",
+        "Tests/Hardware.mm"
+      ],
+      "sdk": true
+    },
+    "layout": {
+      "python": "Tests/SonyLayoutChecks.py",
+      "sdk": false
+    },
+    "reusable-conformance": {
+      "swiftSources": [
+        "../../Sources/DeviceAPI/VendorDescriptor.swift",
+        "../../Sources/DeviceAPI/CameraControlTypes.swift",
+        "../../Sources/DeviceAPI/CameraControlPlugin.swift",
+        "Sources/SonyControlPlugin.swift",
+        "../../Tests/ControlPluginConformanceHarness.swift",
+        "Tests/SonyReusableConformance.swift"
+      ],
+      "nativeSources": [
+        "Sources/SonyCameraControl.mm"
+      ],
+      "sdk": false
+    }
+  },
+  "sdk": {
+    "root": "SDK",
+    "policy": "local",
+    "optional": true,
+    "version": "2.2.0",
+    "requiredFiles": [
+      "SDK/include/CameraRemote_SDK.h",
+      "SDK/lib/libCr_Core.dylib"
+    ],
+    "enabledBuild": {
+      "defines": [
+        "ULTRACAM_SONY_SDK=1"
+      ],
+      "headerSearchPaths": [
+        "SDK/include"
+      ],
+      "libraries": [
+        "Cr_Core",
+        "z",
+        "iconv"
+      ],
+      "embedLibraries": [
+        {
+          "path": "SDK/lib/CrAdapter/libCr_PTP_IP.dylib",
+          "subfolder": "CrAdapter"
+        },
+        {
+          "path": "SDK/lib/CrAdapter/libCr_PTP_USB.dylib",
+          "subfolder": "CrAdapter"
+        },
+        {
+          "path": "SDK/lib/CrAdapter/libssh2.dylib",
+          "subfolder": "CrAdapter"
+        },
+        {
+          "path": "SDK/lib/CrAdapter/libusb-1.0.0.dylib",
+          "subfolder": "CrAdapter"
+        },
+        {
+          "path": "SDK/lib/libCr_Core.dylib",
+          "subfolder": ""
+        },
+        {
+          "path": "SDK/lib/libmonitor_protocol.dylib",
+          "subfolder": ""
+        },
+        {
+          "path": "SDK/lib/libmonitor_protocol_pf.dylib",
+          "subfolder": ""
+        }
+      ],
+      "librarySearchPaths": [
+        "SDK/lib"
+      ]
+    },
+    "fileSHA256": {
+      "SDK/include/CameraRemote_SDK.h": "c49b2c967a34692e0b338c6848959bd71111ae079bbed2c893d215d2dda3cc71",
+      "SDK/include/CrCommandData.h": "0931dbaf3524638f162d5638930237d0c01253e8e9882454115db7e5b7849bc4",
+      "SDK/include/CrControlCode.h": "41e423431e0a63e55e5d9b47c50697f72bfd3e316d2cd067899be8c029aae0b6",
+      "SDK/include/CrDefines.h": "03102283ba91f8abb94a4eaa0b6b16fdaa5014c180e7a5b1fc7b99157b403354",
+      "SDK/include/CrDeviceProperty.h": "ce259dbe23849471eab0f7eba3e39da30d2d5d8b88c565f2b8104fbd8c4b80ac",
+      "SDK/include/CrError.h": "11e869338e36a0cf1fe5e8aa2a467d01186d1f1e55b10659f427367af6318b01",
+      "SDK/include/CrImageDataBlock.h": "8a9a6fc3f486ef665ff5fcff597bf86897f646a99a82e601f3ae73d1d27a5b7f",
+      "SDK/include/CrOperationCode.h": "eb5564c4a602947c449ca0057bc693cd4f35af346ddbb578756975b2795d2e0f",
+      "SDK/include/CrTypes.h": "7c9543ede297b915b89ce036052675711cbf27d780ca66a21f448532b6838817",
+      "SDK/include/ICrCameraObjectInfo.h": "b1222f4fed78b2a8113baabe3a621b0d4a6a39a2f4ed66e852c0dd70c2987d34",
+      "SDK/include/IDeviceCallback.h": "3a3bb20fe6bbcde4b7f34dc6f09c7d376d07c4e717cc8ffe196f7081b61a3f8f",
+      "SDK/lib/CrAdapter/libCr_PTP_IP.dylib": "dbcadcdd4b0c9307976cfc5ada9d3890f7f7fa7146face5c3c22202eee4a6f77",
+      "SDK/lib/CrAdapter/libCr_PTP_USB.dylib": "42fb8294e63c4e0cb5874440de59bc45a064e900ce3d4d0673aa3fdcefb3ea64",
+      "SDK/lib/CrAdapter/libssh2.dylib": "955a2a328573c6f7c6fb1ebb0f206cb3075cbe3c4c31465c4296380d09b94d45",
+      "SDK/lib/CrAdapter/libusb-1.0.0.dylib": "0e7f3544abbc2eae4afc04ac4d8ad2c8be61237de043cfc4d67fa6dbac399575",
+      "SDK/lib/libCr_Core.dylib": "8613325b6cc98e591b556e71bcabaca962fc8bc5989ec0425efb7df42e57e519",
+      "SDK/lib/libmonitor_protocol.dylib": "6c0c9102957d94beeb337609dadd344231662f7587751ff17663339add1edf1f",
+      "SDK/lib/libmonitor_protocol_pf.dylib": "877570eae4c929f7b5b8f980e82449353300c371a00e47e745564e2a346b99ee"
+    },
+    "archiveLayout": {
+      "nestedArchive": "SimpleCli.zip",
+      "mappings": [
+        {
+          "prefix": "app/CRSDK/",
+          "destination": "include",
+          "flatten": true
+        },
+        {
+          "prefix": "external/crsdk/",
+          "destination": "lib",
+          "flatten": false
+        }
+      ]
+    }
+  },
+  "capabilities": {
+    "entitlements": [
+      "com.apple.security.network.client",
+      "com.apple.security.network.server"
+    ],
+    "infoPlist": [
+      "NSLocalNetworkUsageDescription"
+    ]
+  }
+}

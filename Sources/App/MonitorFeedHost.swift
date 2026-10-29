@@ -219,6 +219,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
 
   /// Render thread only.
   private var renderFeed: MonitorFeed?
+  private var rawFrameDecoder: MonitorCVRawFrameDecoder?
   private var appliedLUTVersion: UInt64 = .max
 
   /// Why a LUT is not applied (made on another GPU than the monitor's); nil when
@@ -457,6 +458,14 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   }
 
   func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64, untouched: Bool) {
+    offer(image, pts: pts, captureGeneration: captureGeneration, sequence: sequence,
+      untouched: untouched, sourceFormat: nil)
+  }
+
+  /// Ordered capture delivery carries its immutable declared colour identity.
+  /// Program and legacy producers may omit it and retain attachment interpretation.
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
+             untouched: Bool, sourceFormat: SourceFormat?) {
     let now = ProcessInfo.processInfo.systemUptime
     lock.lock()
     defer { lock.unlock() }
@@ -474,7 +483,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let layout = MonitorFrame.layout(for: format)
     let signal = Self.interpret(
       image, format: format, range: layout?.range ?? .legal, declaration: declaration, processed: isProgram,
-      untouched: untouched, cache: &interpretation)
+      untouched: untouched, colour: sourceFormat?.colour, cache: &interpretation)
     let geometry = cachedGeometry(image, format: format)
     let current = Identity(layout: layout?.layout, signal: signal, geometry: geometry)
     if identity != current {
@@ -557,6 +566,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let format: OSType
     let declaration: MonitorSignalDeclaration?
     let untouched: Bool
+    let colour: Colorimetry?
     let signal: SignalDescription
   }
 
@@ -567,14 +577,14 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// the tagged matrix (SMPTE 240M too) where the burn-in would read BT.709.
   private static func interpret(
     _ image: CVPixelBuffer, format: OSType, range: CodeRange, declaration: MonitorSignalDeclaration?,
-    processed: Bool, untouched: Bool, cache: inout Interpretation?
+    processed: Bool, untouched: Bool, colour: Colorimetry? = nil, cache: inout Interpretation?
   ) -> SignalDescription {
     let tags = ColorTags(image)
     if let cached = cache, cached.format == format, cached.declaration == declaration,
-      cached.untouched == untouched, cached.tags.matches(tags) {
+      cached.untouched == untouched, cached.colour == colour, cached.tags.matches(tags) {
       return cached.signal
     }
-    let native = MonitorFrame.signal(of: image, range: range)
+    let native = Self.declaredSignal(colour, over: MonitorFrame.signal(of: image, range: range))
     var signal = native
     if !processed {
       signal = declaration?.applied(to: native) ?? native
@@ -586,8 +596,81 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       signal.outputReading = output == signal.sourceReading ? nil : output
     }
     cache = Interpretation(tags: tags, format: format, declaration: declaration, untouched: untouched,
-      signal: signal)
+      colour: colour, signal: signal)
     return signal
+  }
+
+  /// Apply only explicitly represented metadata. A log transfer without camera
+  /// gamut is unknown until the shared camera declaration supplies its encoding.
+  static func declaredSignal(_ colour: Colorimetry?, over native: SignalDescription) -> SignalDescription {
+    guard let colour else { return native }
+    var value = native
+    value.range = colour.range == .full ? .full : .legal
+    switch colour.matrix {
+    case .rec601: value.matrix = .bt601
+    case .rec709: value.matrix = .bt709
+    case .rec2020: value.matrix = .bt2020
+    case .unspecified, .identity: break
+    }
+    switch colour.primaries {
+    case .rec709: value.primaries = .rec709
+    case .rec2020: value.primaries = .rec2020
+    case .p3D65: value.primaries = .displayP3
+    case .canonCinemaGamut, .vGamut, .blackmagicWideGamutGen5, .redWideGamutRGB,
+      .sGamut3, .sGamut3Cine, .arriWideGamut3, .arriWideGamut4:
+      value.primaries = nil
+    case .unspecified: break
+    }
+    switch colour.transfer {
+    case .rec709: value.encoding = .display(.bt709)
+    case .sRGB: value.encoding = .display(.sRGB)
+    case .linear: value.encoding = .display(.linear)
+    case .pq: value.encoding = .display(.pq)
+    case .hlg: value.encoding = .display(.hlg)
+    case .sLog3, .canonLog, .canonLog2, .canonLog3, .vLog, .blackmagicFilmGen5, .redLog3G10, .arriLogC3, .arriLogC4:
+      let curve: LogCurve
+      switch colour.transfer {
+      case .sLog3: curve = .sLog3
+      case .arriLogC3: curve = .arriLogC3
+      case .arriLogC4: curve = .arriLogC4
+      case .canonLog: curve = .canonLog
+      case .canonLog2: curve = .canonLog2
+      case .canonLog3: curve = .canonLog3
+      case .vLog: curve = .vLog
+      case .blackmagicFilmGen5: curve = .blackmagicFilmGen5
+      case .redLog3G10: curve = .redLog3G10
+      default: preconditionFailure("Non-log transfer reached log mapping")
+      }
+      let gamut: ColorGamut?
+      switch colour.primaries {
+      case .sGamut3: gamut = .sGamut3
+      case .sGamut3Cine: gamut = .sGamut3Cine
+      case .arriWideGamut3: gamut = .arriWideGamut3
+      case .arriWideGamut4: gamut = .arriWideGamut4
+      case .rec709: gamut = .rec709
+      case .rec2020: gamut = .rec2020
+      case .p3D65: gamut = nil
+      case .canonCinemaGamut: gamut = .canonCinemaGamut
+      case .vGamut: gamut = .vGamut
+      case .blackmagicWideGamutGen5: gamut = .blackmagicWideGamutGen5
+      case .redWideGamutRGB: gamut = .redWideGamutRGB
+      case .unspecified: gamut = nil
+      }
+      value.encoding = gamut.map { .log(LogEncoding(curve: curve, gamut: $0)) } ?? .unknown
+    case .unspecified: break
+    }
+    switch colour.horizontalChromaSiting {
+    case .left, .topLeft, .bottomLeft: value.chromaSiting = .left
+    case .center, .top, .bottom: value.chromaSiting = .center
+    case .unspecified: break
+    }
+    switch colour.verticalChromaSiting {
+    case .top, .topLeft: value.chromaVerticalSiting = .top
+    case .bottom, .bottomLeft: value.chromaVerticalSiting = .bottom
+    case .center, .left: value.chromaVerticalSiting = .center
+    case .unspecified: break
+    }
+    return value
   }
 
   /// `image` read as this host reads every offered frame (`Delivery.signal`, both
@@ -650,6 +733,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   func releaseRenderState() {
     gpu?.renderThread.perform { [self] in
       renderFeed = nil
+      rawFrameDecoder = nil
       appliedLUTVersion = .max
     }
     gpu?.flushFrames(owner: owner)
@@ -679,6 +763,18 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     _ delivery: Delivery, in context: MonitorGPUContext.EncodeContext, core: MonitorGPUContext.Core
   ) throws -> MonitorFrame {
     let buffer = delivery.pixelBuffer
+    if MonitorCVRawFrameDecoder.format(for: CVPixelBufferGetPixelFormatType(buffer)) != nil {
+      if rawFrameDecoder?.residency !== core.engine.residency {
+        rawFrameDecoder = try MonitorCVRawFrameDecoder(device: core.device, residency: core.engine.residency)
+      }
+      guard let rawFrameDecoder else { throw MonitorKitError.gpu("Raw monitor decoder unavailable.") }
+      var frame = try rawFrameDecoder.frame(buffer, signal: delivery.signal, geometry: delivery.geometry,
+        submission: context.submission)
+      frame.id = delivery.frameID
+      frame.isProcessed = delivery.isProcessed
+      context.keep(frame)
+      return frame
+    }
     guard let layout = delivery.layout else {
       throw MonitorKitError.unsupportedPixelFormat(CVPixelBufferGetPixelFormatType(buffer))
     }

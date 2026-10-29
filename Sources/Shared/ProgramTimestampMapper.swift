@@ -48,11 +48,6 @@ public enum ProgramTimestampMappingError: Error, Equatable {
 /// origin. The first accepted frame after the cut therefore begins at the next
 /// Program frame boundary even when the new source starts at zero.
 public struct ProgramTimestampMapper<SourceID: Hashable> {
-  private struct SourceClock {
-    let epoch: Int64
-    let timescale: Int32
-  }
-
   public let programTimescale: Int32
   public private(set) var selectedSource: SourceID?
   public private(set) var lastProgramTime: CMTime?
@@ -60,11 +55,10 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
   /// The selected source's last accepted timestamp, on its own clock.
   public private(set) var lastSourceTime: CMTime?
 
-  private var activeClock: SourceClock?
   private var sourceOrigin: CMTime?
   private var programOrigin: CMTime?
 
-  public init(programTimescale: Int32 = 60_000, selectedSource: SourceID? = nil) {
+  public init(programTimescale: Int32 = 240_000, selectedSource: SourceID? = nil) {
     precondition(programTimescale > 0, "Program timescale must be positive")
     self.programTimescale = programTimescale
     self.selectedSource = selectedSource
@@ -74,7 +68,6 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
   /// Existing Program time is deliberately retained.
   public mutating func cut(to sourceID: SourceID) {
     selectedSource = sourceID
-    activeClock = nil
     sourceOrigin = nil
     programOrigin = nil
     lastSourceTime = nil
@@ -85,7 +78,6 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
     selectedSource = nil
     lastProgramTime = nil
     lastProgramDuration = nil
-    activeClock = nil
     sourceOrigin = nil
     programOrigin = nil
     lastSourceTime = nil
@@ -108,11 +100,8 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
       return .failure(.sourceEpochUnsupported(frame.sourceTime.epoch))
     }
 
-    let clock = SourceClock(epoch: frame.sourceTime.epoch, timescale: frame.sourceTime.timescale)
-    if let activeClock, activeClock.timescale != clock.timescale {
-      return .failure(.sourceTimebaseChanged(expected: activeClock.timescale,
-        actual: clock.timescale))
-    }
+    // Timescale describes a rational representation, not a clock identity.
+    // Compare timestamps on the selected source timeline across representations.
     if let lastSourceTime, CMTimeCompare(frame.sourceTime, lastSourceTime) <= 0 {
       return .failure(.sourceTimestampRegressed)
     }
@@ -126,11 +115,22 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
       return .failure(.programTimestampNotMonotonic)
     }
 
-    let offset = CMTimeConvertScale(CMTimeSubtract(frame.sourceTime, candidateSourceOrigin),
-      timescale: programTimescale, method: .roundHalfAwayFromZero)
-    let mappedTime = CMTimeAdd(candidateProgramOrigin, offset)
-    let mappedDuration = CMTimeConvertScale(frame.duration, timescale: programTimescale,
-      method: .roundHalfAwayFromZero)
+    // Subtract rationals before rounding. CoreMedia's common-scale fallback
+    // may round either operand when their least common multiple exceeds Int32.
+    let numerator = Int128(frame.sourceTime.value) * Int128(candidateSourceOrigin.timescale)
+      - Int128(candidateSourceOrigin.value) * Int128(frame.sourceTime.timescale)
+    let denominator = Int128(frame.sourceTime.timescale) * Int128(candidateSourceOrigin.timescale)
+    guard let offset = quantize(numerator * Int128(programTimescale), over: denominator),
+      let duration = quantize(Int128(frame.duration.value) * Int128(programTimescale),
+        over: Int128(frame.duration.timescale)) else {
+      return .failure(.programTimestampNotMonotonic)
+    }
+    let mappedValue = Int128(candidateProgramOrigin.value) + Int128(offset)
+    guard let value = Int64(exactly: mappedValue) else {
+      return .failure(.programTimestampNotMonotonic)
+    }
+    let mappedTime = CMTime(value: value, timescale: programTimescale)
+    let mappedDuration = CMTime(value: duration, timescale: programTimescale)
     guard mappedTime.isValid, mappedTime.isNumeric, mappedDuration.isValid,
       mappedDuration.isNumeric, mappedDuration.value > 0 else {
       return .failure(.programTimestampNotMonotonic)
@@ -139,8 +139,7 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
       return .failure(.programTimestampNotMonotonic)
     }
 
-    if activeClock == nil {
-      activeClock = clock
+    if sourceOrigin == nil {
       sourceOrigin = candidateSourceOrigin
       programOrigin = candidateProgramOrigin
     }
@@ -158,6 +157,14 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
     guard programTimescale == other.programTimescale else { return }
     lastProgramTime = other.lastProgramTime
     lastProgramDuration = other.lastProgramDuration
+  }
+
+  private func quantize(_ numerator: Int128, over denominator: Int128) -> Int64? {
+    var value = numerator / denominator
+    if abs(numerator % denominator) * 2 >= denominator {
+      value += numerator < 0 ? -1 : 1
+    }
+    return Int64(exactly: value)
   }
 
   private func nextProgramTime() -> CMTime {
@@ -195,7 +202,7 @@ public enum ProgramFrameDecision<SourceID: Hashable> {
 public enum ProgramSourceReadiness: Equatable, Sendable {
   /// Never reported. Treated as available; a pending cut to it can expire.
   case unknown
-  /// Started but no frame yet ("Opening UltraStudio…"). A pending cut waits
+  /// Started but no frame yet ("Opening input…"). A pending cut waits
   /// up to `startingCutTimeout` for its first frame.
   case starting
   /// Has delivered at least one frame since it last became available.
@@ -231,7 +238,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
   /// qualifying frame. The on-air source is never held while it waits.
   public var pendingCutTimeout: TimeInterval = 2
   /// How long a pending cut to a starting target waits for its first frame.
-  /// Opening an UltraStudio and locking to its signal takes a second or two;
+  /// Opening an input device and locking to its signal takes a second or two;
   /// a camera that opened without a signal must not hold the cut (and the
   /// automatic switcher's latch) forever.
   public var startingCutTimeout: TimeInterval = 8
@@ -249,7 +256,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     self.clock = clock
   }
 
-  public init(selectedSource: SourceID? = nil, programTimescale: Int32 = 60_000) {
+  public init(selectedSource: SourceID? = nil, programTimescale: Int32 = 240_000) {
     self.selectedSource = selectedSource
     self.mapper = ProgramTimestampMapper(programTimescale: programTimescale,
       selectedSource: selectedSource)
@@ -485,7 +492,7 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     if case .failure(.sourceTimestampRegressed) = result, let last = mapper.lastSourceTime,
       CMTimeCompare(frame.sourceTime, last) < 0 {
       // The on-air source's stream clock started over while it stayed live:
-      // an HDMI mode change restarts the DeckLink streams, and stream time
+      // an input mode change can restart the source streams, and stream time
       // goes back near zero. Re-anchor on this frame at the next Program
       // boundary, as a cut does, so Program stays strictly increasing. An
       // equal timestamp is a duplicate frame, not a restart, and stays skipped.

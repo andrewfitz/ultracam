@@ -1,5 +1,6 @@
 import CoreMediaIO
 import Foundation
+import IOSurface
 import os
 
 /// Virtual camera output: connects, negotiated formats, send failures, queue state.
@@ -33,18 +34,48 @@ final class CameraBufferQueue {
   let queue: CMSimpleQueue
   private let lock = NSLock()
   private var closed = false
+  private let retention: MediaRetentionLedger
+  private static var retentionKey: CFString { "org.ultracam.camera.transport-retention" as CFString }
+  private final class RetainedMedia: NSObject {
+    let lease: MediaRetentionLedger.Lease
+    init(_ lease: MediaRetentionLedger.Lease) { self.lease = lease }
+  }
 
-  init(_ queue: CMSimpleQueue) { self.queue = queue }
+  init(_ queue: CMSimpleQueue, retentionPolicy: MediaRetentionPolicy = try! MediaRetentionPolicy(
+    maximumBytes: 256 * 1024 * 1024, maximumDuration: 8 * 1001.0 / 30_000, minimumSlots: 2)) {
+    self.queue = queue
+    retention = MediaRetentionLedger(policy: retentionPolicy)
+  }
+  var retentionSnapshot: MediaRetentionLedger.Snapshot { retention.snapshot }
   deinit { drain() }
 
   func send(_ sample: CMSampleBuffer) throws -> Bool {
     lock.lock()
     defer { lock.unlock() }
     guard !closed else { throw VideoError.message("Virtual camera queue is closed.") }
+    guard let image = CMSampleBufferGetImageBuffer(sample) else { throw VideoError.message("Camera sample has no image.") }
+    let count = CVPixelBufferGetPlaneCount(image)
+    let planes = count == 0
+      ? [MediaStorageExtent.Plane(rowBytes: CVPixelBufferGetBytesPerRow(image), rows: CVPixelBufferGetHeight(image))]
+      : (0..<count).map { MediaStorageExtent.Plane(rowBytes: CVPixelBufferGetBytesPerRowOfPlane(image, $0), rows: CVPixelBufferGetHeightOfPlane(image, $0)) }
+    let bytes = try MediaStorageExtent.allocationBytes(planes: planes,
+      pixelBufferDataSize: CVPixelBufferGetDataSize(image),
+      ioSurfaceAllocationSize: CVPixelBufferGetIOSurface(image).map { IOSurfaceGetAllocSize($0.takeUnretainedValue()) })
+    let lease: MediaRetentionLedger.Lease
+    do { lease = try retention.admit(bytes: bytes, duration: CMSampleBufferGetDuration(sample).seconds) }
+    catch MediaRetentionFailure.byteLimit { return false }
+    catch MediaRetentionFailure.durationLimit { return false }
+    catch MediaRetentionFailure.slotLimit { return false }
+    // A metadata copy shares the IOSurface, but has its own lifetime. Attaching
+    // to the caller's sample would let an unrelated preview hold this budget.
+    var copy: CMSampleBuffer?
+    let copyStatus = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sample, sampleBufferOut: &copy)
+    guard copyStatus == noErr, let copy else { lease.release(); throw VideoError.message("Copy camera sample metadata failed (\(copyStatus)).") }
+    CMSetAttachment(copy, key: Self.retentionKey, value: RetainedMedia(lease), attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
     // Do not use a count-then-enqueue check. CMIO can dequeue concurrently,
     // so the count is only a hint and creates a race at the capacity edge.
     // CMSimpleQueueEnqueue is the ownership and backpressure boundary.
-    let retained = Unmanaged.passRetained(sample)
+    let retained = Unmanaged.passRetained(copy)
     let status = CMSimpleQueueEnqueue(queue, element: retained.toOpaque())
     if status != noErr { retained.release() }
     if status == kCMSimpleQueueError_QueueIsFull { return false }
@@ -75,7 +106,7 @@ final class CameraBufferQueue {
 }
 
 /// Frames reach the camera, the preview and Program as the capture card's own
-/// IOSurface (DeckLink SDK 16), or as the processor's IOSurface output. Nothing
+/// IOSurface, or as the processor's IOSurface output. Nothing
 /// is copied here: a frame without an IOSurface is an error, not a reason to copy.
 final class CameraFrameStager {
   func stage(_ sample: CMSampleBuffer) throws -> CMSampleBuffer {
@@ -191,6 +222,7 @@ final class CameraSink {
   private var queue: CameraBufferQueue?
   private var negotiatedFormat: CMVideoFormatDescription?
   private var negotiatedDuration: CMTime?
+  private var sourcePauseAllowanceSeconds: Double?
   private var stager = CameraFrameStager()
   private let registrySnapshot: () -> VirtualCameraRegistrySnapshot?
   let route: CameraSinkRoute
@@ -207,15 +239,17 @@ final class CameraSink {
   }
   deinit { disconnect() }
 
-  func connect(configuration: PipelineConfiguration, passthroughFormat: OSType) throws {
-    let pixelFormat = configuration.untouched ? passthroughFormat : configuration.pixelFormat
+  func connect(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat? = nil) throws {
+    try Self.validateCameraSource(sourceFormat)
+    sourcePauseAllowanceSeconds = configuration.sourcePauseAllowanceSeconds
+    let pixelFormat = route.feedID == nil ? ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat).pixelFormat : (configuration.untouched ? passthroughFormat : configuration.pixelFormat)
     cameraOutputLog.notice("""
       Camera connect: \(self.route.feedID ?? "Program", privacy: .public) → \(self.route.deviceUID, privacy: .public), \
       \(configuration.width, privacy: .public)×\(configuration.height, privacy: .public) \
       \(fourCC(pixelFormat), privacy: .public), frame \(configuration.duration.value, privacy: .public)/\
       \(configuration.duration.timescale, privacy: .public) s
       """)
-    do { try connectOnce(configuration: configuration, passthroughFormat: passthroughFormat) } catch {
+    do { try connectOnce(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat) } catch {
       cameraOutputLog.error("""
         Camera connect failed: \(self.route.feedID ?? "Program", privacy: .public) → \(self.route.deviceUID, privacy: .public): \
         \(error.localizedDescription, privacy: .public)
@@ -224,7 +258,91 @@ final class CameraSink {
     }
   }
 
-  private func connectOnce(configuration: PipelineConfiguration, passthroughFormat: OSType) throws {
+  static func validateCameraSource(_ sourceFormat: SourceFormat?) throws {
+    guard sourceFormat?.rate.isVariable != true else {
+      throw VideoError.message("Variable-frame-rate feed camera output is unavailable until real-client validation completes. Preview and recording remain available.")
+    }
+  }
+
+  static func resolvedOutputColour(configuration: PipelineConfiguration, sourceFormat: SourceFormat?) throws -> Colorimetry {
+    let interpreted = configuration.sourceColorimetryOverride ?? sourceFormat?.colour ?? Colorimetry(
+      primaries: .rec709, transfer: .rec709, matrix: .rec709,
+      range: .video, horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
+    let encoded: Colorimetry
+    if configuration.applyLUT {
+      guard let target = configuration.lutOutputColorimetry else {
+        throw VideoError.message("Virtual camera output requires the loaded LUT's explicit output colour contract.")
+      }
+      guard target.range == .video else {
+        throw VideoError.message("The feed GPU encoder requires a video-range LUT output contract.")
+      }
+      encoded = target
+    } else {
+      encoded = interpreted
+    }
+    if configuration.untouched { return encoded }
+    // The feed GPU encoder performs native video-range YUV encoding with
+    // centered chroma, independently of the interpreted source's storage.
+    return Colorimetry(primaries: encoded.primaries, transfer: encoded.transfer,
+      matrix: encoded.matrix == .identity ? .rec709 : encoded.matrix, range: .video,
+      horizontalChromaSiting: .center, verticalChromaSiting: .center)
+  }
+
+  static func requestedFormat(configuration: PipelineConfiguration, passthroughFormat: OSType,
+                              sourceFormat: SourceFormat?) throws -> CMVideoFormatDescription {
+    try validateCameraSource(sourceFormat)
+    let pixel = configuration.untouched ? passthroughFormat : configuration.pixelFormat
+    // A declaration-free caller selects the fixed Rec709 compatibility
+    // configuration. Frame admission still requires matching explicit tags.
+    let legacy = try VideoContract.formatDescription(width: configuration.width, height: configuration.height, pixelFormat: pixel)
+    let colour = try resolvedOutputColour(configuration: configuration, sourceFormat: sourceFormat)
+    guard colour.primaries != .unspecified, colour.transfer != .unspecified, colour.matrix != .unspecified else {
+      throw VideoError.message("Virtual camera output requires an explicit source colour contract.")
+    }
+    var tags = CMFormatDescriptionGetExtensions(legacy) as! [String: Any]
+    let primaries: CFString
+    switch colour.primaries {
+    case .rec709: primaries = kCVImageBufferColorPrimaries_ITU_R_709_2
+    case .rec2020: primaries = kCVImageBufferColorPrimaries_ITU_R_2020
+    default: throw VideoError.message("The virtual camera does not support this source colour gamut.")
+    }
+    let transfer: CFString
+    switch colour.transfer {
+    case .rec709: transfer = kCVImageBufferTransferFunction_ITU_R_709_2
+    case .pq: transfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+    case .hlg: transfer = kCVImageBufferTransferFunction_ITU_R_2100_HLG
+    default: throw VideoError.message("The virtual camera does not support this source transfer function.")
+    }
+    let matrix: CFString
+    switch colour.matrix {
+    case .rec709: matrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+    case .rec2020: matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
+    default: throw VideoError.message("The virtual camera does not support this source colour matrix.")
+    }
+    tags[kCMFormatDescriptionExtension_ColorPrimaries as String] = primaries
+    tags[kCMFormatDescriptionExtension_TransferFunction as String] = transfer
+    tags[kCMFormatDescriptionExtension_YCbCrMatrix as String] = matrix
+    // Untouched output preserves native range; processed output uses the
+    // processor's advertised native output FourCC range.
+    if configuration.untouched, sourceFormat != nil {
+      tags[kCMFormatDescriptionExtension_FullRangeVideo as String] = colour.range == .full
+    }
+    if !configuration.untouched {
+      tags[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Center
+    } else if colour.horizontalChromaSiting == .center && colour.verticalChromaSiting == .center {
+      tags[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Center
+    } else if colour.horizontalChromaSiting != .unspecified || colour.verticalChromaSiting != .unspecified {
+      throw VideoError.message("The virtual camera does not publish this untouched chroma siting; use GPU processing into a published output contract.")
+    }
+    var result: CMVideoFormatDescription?
+    let status = CMVideoFormatDescriptionCreate(allocator: nil, codecType: pixel,
+      width: Int32(configuration.width), height: Int32(configuration.height),
+      extensions: tags as CFDictionary, formatDescriptionOut: &result)
+    guard status == noErr, let result else { throw VideoError.message("Cannot create camera output declaration (\(status)).") }
+    return result
+  }
+
+  private func connectOnce(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat?) throws {
     disconnect()
     if let desired = registrySnapshot() {
       try VirtualCameraRegistryTransport.synchronize(desired)
@@ -239,8 +357,12 @@ final class CameraSink {
     for id in try discoverDevices() {
       guard try string(id, selector: kCMIODevicePropertyDeviceUID) == route.deviceUID else { continue }
       let streams = try ids(id, selector: kCMIODevicePropertyStreams)
-      let format = try VideoContract.formatDescription(width: configuration.width, height: configuration.height,
-        pixelFormat: configuration.untouched ? passthroughFormat : configuration.pixelFormat)
+      let format: CMVideoFormatDescription
+      if route.feedID == nil {
+        format = try ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat).formatDescription()
+      } else {
+        format = try Self.requestedFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+      }
       let namedStreams = try streams.map { stream -> (id: UInt32, name: String, direction: UInt32?) in
         (stream, try string(stream, selector: kCMIOObjectPropertyName), direction(stream))
       }
@@ -252,28 +374,30 @@ final class CameraSink {
         sourceName: route.sourceStreamName) else {
         throw VideoError.message("The virtual camera for \(route.feedID ?? "Program") does not publish its source and input streams.")
       }
+      let requested = DerivedOutputContract(format: format, duration: configuration.duration)
+      for stream in [paired.sink, paired.source] {
+        guard requested.matchingPublishedIndex(in: try publishedFormats(stream)) != nil else {
+          throw VideoError.message("The installed virtual camera does not publish this output size, pixel layout and complete colour contract. Update the camera extension or choose an installed output format.")
+        }
+      }
       // AVFoundation clients such as Zoom claim device control before starting
       // the source. In automatic mode the producer necessarily arrives later.
       // The extension can negotiate our authorized producer's sample contract
       // itself; don't require stealing another client's device-control lease.
       let controlled = controlledByAnotherProcess(id)
-      do {
-        if !controlled {
-          for stream in [paired.sink, paired.source] {
+      for stream in [paired.sink, paired.source] {
+        try Self.negotiateInstalledContract(format: format, duration: configuration.duration,
+          controlled: { self.controlledByAnotherProcess(id) }, set: {
             var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyFormatDescription),
               mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
             var description = Unmanaged.passUnretained(format).toOpaque()
             try check(CMIOObjectSetPropertyData(stream, &address, 0, nil,
               UInt32(MemoryLayout<CMVideoFormatDescription>.size), &description), "Set virtual camera format")
             address.mSelector = UInt32(kCMIOStreamPropertyFrameRate)
-            var rate = 1 / configuration.duration.seconds
+            var rate = Double(configuration.duration.timescale) / Double(configuration.duration.value)
             try check(CMIOObjectSetPropertyData(stream, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &rate),
               "Set virtual camera frame rate")
-          }
-        }
-      } catch {
-        // Also handle Zoom acquiring control between the read and setter.
-        guard controlledByAnotherProcess(id) else { throw error }
+          }, read: { try self.installedActiveContract(stream) })
       }
       var unmanaged: Unmanaged<CMSimpleQueue>?
       try check(CMIOStreamCopyBufferQueue(paired.sink, cameraSinkQueueAltered, nil, &unmanaged), "Open camera queue")
@@ -329,37 +453,25 @@ final class CameraSink {
       cameraOutputLog.error("Camera frame refused before sending (\(self.route.feedID ?? "Program", privacy: .public)): \(mismatch, privacy: .public)")
       throw VideoError.message("Frame does not match the virtual camera's negotiated format and timing (\(mismatch)).")
     }
-    return try queue.send(try stager.stage(sample))
+    let outgoing = try Self.transportSample(sample, pauseAllowance: sourcePauseAllowanceSeconds)
+    return try queue.send(try stager.stage(outgoing))
+  }
+
+  /// Copy metadata only: a transport attachment must not alter preview/recording's sample.
+  static func transportSample(_ sample: CMSampleBuffer, pauseAllowance: Double?) throws -> CMSampleBuffer {
+    var copy: CMSampleBuffer?
+    let status = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sample, sampleBufferOut: &copy)
+    guard status == noErr, let copy else { throw VideoError.message("Cannot copy camera transport metadata (\(status)).") }
+    CMSetAttachment(copy, key: VideoContract.sourcePauseAllowanceAttachmentKey,
+      value: NSNumber(value: CameraStandbyTimingPolicy.clampedPauseAllowance(pauseAllowance)),
+      attachmentMode: kCMAttachmentMode_ShouldPropagate)
+    return copy
   }
 
   /// Which field of `sample` differs from the negotiated contract, expected vs
   /// actual; nil when it matches.
   static func mismatch(_ sample: CMSampleBuffer, format: CMVideoFormatDescription, duration: CMTime) -> String? {
-    let expected = CMVideoFormatDescriptionGetDimensions(format)
-    let subtype = CMFormatDescriptionGetMediaSubType(format)
-    guard CMSampleBufferDataIsReady(sample) else { return "data not ready" }
-    guard let image = CMSampleBufferGetImageBuffer(sample) else { return "no image buffer" }
-    guard let sampleFormat = CMSampleBufferGetFormatDescription(sample) else { return "no format description" }
-    let sampleSubtype = CMFormatDescriptionGetMediaSubType(sampleFormat)
-    if sampleSubtype != subtype { return "format subtype: expected \(fourCC(subtype)), got \(fourCC(sampleSubtype))" }
-    let size = CMVideoFormatDescriptionGetDimensions(sampleFormat)
-    if size.width != expected.width || size.height != expected.height {
-      return "format dimensions: expected \(expected.width)×\(expected.height), got \(size.width)×\(size.height)"
-    }
-    if CVPixelBufferGetWidth(image) != Int(expected.width) || CVPixelBufferGetHeight(image) != Int(expected.height) {
-      return "image dimensions: expected \(expected.width)×\(expected.height), got \(CVPixelBufferGetWidth(image))×\(CVPixelBufferGetHeight(image))"
-    }
-    let pixelFormat = CVPixelBufferGetPixelFormatType(image)
-    if pixelFormat != subtype { return "pixel format: expected \(fourCC(subtype)), got \(fourCC(pixelFormat))" }
-    let time = CMSampleBufferGetPresentationTimeStamp(sample)
-    if !time.isNumeric || time.epoch != 0 || time.seconds < 0 {
-      return "presentation time: expected a numeric time ≥ 0 in epoch 0, got \(time.value)/\(time.timescale) epoch \(time.epoch)"
-    }
-    let sampleDuration = CMSampleBufferGetDuration(sample)
-    if sampleDuration != duration {
-      return "frame duration: expected \(duration.value)/\(duration.timescale), got \(sampleDuration.value)/\(sampleDuration.timescale)"
-    }
-    return nil
+    DerivedOutputContract(format: format, duration: duration).mismatch(sample)
   }
 
   func disconnect() {
@@ -372,6 +484,57 @@ final class CameraSink {
     stager = CameraFrameStager()
     deviceID = 0
     streamID = 0
+  }
+
+  private func publishedFormats(_ stream: CMIOStreamID) throws -> [CMVideoFormatDescription] {
+    var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyFormatDescriptions),
+      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
+    var list: Unmanaged<CFArray>?
+    var used: UInt32 = 0
+    try check(CMIOObjectGetPropertyData(stream, &address, 0, nil,
+      UInt32(MemoryLayout.size(ofValue: list)), &used, &list), "Read installed virtual-camera formats")
+    guard let list else { throw VideoError.message("The installed virtual camera returned no format catalog.") }
+    // CMIO documents this property as a retained CFArray owned by the caller.
+    let array = list.takeRetainedValue()
+    guard let descriptions = array as? [CMVideoFormatDescription] else {
+      throw VideoError.message("The installed virtual camera returned an invalid format catalog.")
+    }
+    return descriptions
+  }
+
+  // When device control prevents setting a contract, verify what the installed
+  // stream is actually using. A locally published rate list is not evidence of
+  // the installed extension's cadence, nor does format identity imply cadence.
+  static func negotiateInstalledContract(format: CMVideoFormatDescription, duration: CMTime,
+    controlled: () -> Bool, set: () throws -> Void,
+    read: () throws -> (CMVideoFormatDescription, Double)) throws {
+    if !controlled() {
+      do { try set(); return }
+      catch { guard controlled() else { throw error } }
+    }
+    let (activeFormat, activeRate) = try read()
+    guard duration.isNumeric, duration.epoch == 0, duration.value > 0, duration.timescale > 0,
+      activeRate.isFinite, activeRate > 0,
+      activeRate == Double(duration.timescale) / Double(duration.value),
+      DerivedOutputContract.matchesFormat(format, activeFormat) else {
+      throw VideoError.message("The busy installed virtual camera is using a different format or exact cadence. Stop its viewer or choose its active output contract before connecting.")
+    }
+  }
+
+  private func installedActiveContract(_ stream: CMIOStreamID) throws -> (CMVideoFormatDescription, Double) {
+    var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyFormatDescription),
+      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
+    var description: Unmanaged<CMVideoFormatDescription>?
+    var used: UInt32 = 0
+    try check(CMIOObjectGetPropertyData(stream, &address, 0, nil,
+      UInt32(MemoryLayout.size(ofValue: description)), &used, &description), "Read busy virtual camera format")
+    guard let description else { throw VideoError.message("The busy virtual camera did not return its active format.") }
+    let format = description.takeRetainedValue()
+    address.mSelector = UInt32(kCMIOStreamPropertyFrameRate)
+    var rate = 0.0
+    try check(CMIOObjectGetPropertyData(stream, &address, 0, nil,
+      UInt32(MemoryLayout<Double>.size), &used, &rate), "Read busy virtual camera cadence")
+    return (format, rate)
   }
 
   private func controlledByAnotherProcess(_ device: CMIODeviceID) -> Bool {

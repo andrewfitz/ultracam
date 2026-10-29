@@ -5,6 +5,20 @@ import Foundation
 @MainActor final class DeviceObservation {
   private var handler: (@MainActor @Sendable (CaptureDeviceSnapshot) -> Void)?
   init(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) { self.handler = handler }
-  func cancel() { handler = nil }
+  private var cleanup: (@MainActor @Sendable () -> Void)?
+  func onCancel(_ cleanup: @escaping @MainActor @Sendable () -> Void) {
+    guard handler != nil else { cleanup(); return }
+    self.cleanup = cleanup
+  }
+  func cancel() {
+    handler = nil
+    let action = cleanup
+    cleanup = nil
+    action?()
+  }
+  deinit {
+    let action = cleanup
+    Task { @MainActor in action?() }
+  }
   func deliver(_ snapshot: CaptureDeviceSnapshot) { handler?(snapshot) }
 }

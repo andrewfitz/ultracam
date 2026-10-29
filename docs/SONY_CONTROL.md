@@ -1,7 +1,8 @@
 # Sony Wi-Fi camera control
 
-Open **Sony Camera** in an expanded camera strip, or **Inspector → Sony Wi-Fi
-Control**. Enable Remote Shoot Function on each FX3 and put the Mac and cameras
+Open **Camera Control** in an expanded camera strip, or **Inspector → Camera
+Control**. Sony is the current control plugin. Enable Remote Shoot Function on
+each FX3 and put the Mac and cameras
 on the same Wi-Fi network. For several cameras, use a shared access point;
 joining one camera's Wi-Fi Direct network only reaches cameras on that network.
 Camera menu names and authentication requirements depend on firmware.
@@ -15,7 +16,7 @@ Allow Ultracam's macOS local network access when prompted.
 
 Press **Rescan** to detect newly powered cameras immediately. Recent successful
 scan results are shared across camera pop-ups for 30 seconds. There is no
-periodic scan. **Add FX3 by IP** remains a secondary recovery option if the
+periodic scan. **Add camera by address** remains a secondary recovery option if the
 network blocks discovery; ordinary setup does not require typing IP or MAC
 addresses. After the first successful connection, the camera login is stored in
 macOS Keychain and used to reconnect its saved HDMI assignment on app launch.
@@ -86,7 +87,7 @@ remain in the Sony settings panel. No camera values are saved across launches.
 
 ## Activity and threading
 
-- Opening Sony Camera starts one discovery when its cache is stale. Concurrent
+- Opening Camera Control starts one discovery when its cache is stale. Concurrent
   pop-ups share the same in-flight scan. Rescan requests a fresh scan. No scan
   runs on a repeating timer. Startup performs one shared scan only when saved
   assignments have remembered credentials (or do not require authentication).
@@ -139,11 +140,13 @@ remain in the Sony settings panel. No camera values are saved across launches.
 
 ## HDMI Face/Eye display
 
-The video controls include **Sony HDMI display** when the connected FX3 reports
-both supported properties. The toggle writes the camera's
-`MonitoringOutputDisplayHDMI` and `FaceEyeFrameDisplay` settings together, so
-the FX3 draws its own Face/Eye frames and camera display information into the
-existing HDMI signal. Ultracam does not enable Sony Wi-Fi live-view acquisition,
+The video/output controls include **HDMI display** when the connected FX3
+reports the combined display property as writable. The Sony plugin translates
+this typed Boolean into `MonitoringOutputDisplayHDMI` and `FaceEyeFrameDisplay`
+settings together, so the FX3 draws its own Face/Eye frames and camera display
+information into the existing HDMI signal. The toggle stays with the video
+controls; the full Camera Control sheet hides that property role. Ultracam does
+not enable Sony Wi-Fi live-view acquisition,
 request images or decode frames. The camera controls
 the appearance and placement of these overlays; enabling them changes the HDMI
 composition and should be checked against the capture format.
@@ -160,7 +163,11 @@ the camera may hide them while it is in a mode where HDMI output cannot be chang
 ## Build and verification
 
 ```sh
-python3 scripts/install-sony-sdk.py /path/to/CrSDK_v2.02.00_20260610a_Mac.zip
+python3 scripts/vendor-sdk.py install sony /path/to/CrSDK_v2.02.00_20260610a_Mac.zip
+python3 scripts/vendor-sdk.py verify sony
+mkdir -p .build
+printf '%s\n' '{"sony": true}' > .build/sony-sdk-inventory.json
+export ULTRACAM_SDK_INVENTORY="$PWD/.build/sony-sdk-inventory.json"
 python3 scripts/generate_project.py
 bash scripts/sony-control-checks.sh
 bash scripts/sony-credential-checks.sh
@@ -168,8 +175,20 @@ bash scripts/ui-typecheck.sh
 bash scripts/build.sh --debug
 ```
 
-The installer extracts only the SDK headers/libraries from Sony's `SimpleCli.zip`.
-Those files are ignored by Git. The generated app target embeds/signs the core
+The native bridge, plugin and focused tests live under `Vendors/Sony/`;
+`CameraControlStore` and `UICameraControl` provide the generic host interface.
+The original Sony Keychain service/account identity is retained across the move.
+Build and test outputs default to the checkout's `.build/`; set
+`ULTRACAM_WORK_ROOT` to an external directory to override it. See
+[the plugin guide](PLUGINS.md) for manifest commands and lifecycle requirements.
+
+The manifest-driven installer extracts only pinned SDK headers/libraries from
+Sony's `SimpleCli.zip`. It preserves the tracked README in a fresh clone and
+refuses to overwrite an existing SDK payload. `vendor-sdk.py status sony` reports
+availability; `verify sony` fails if required pinned files are missing or changed.
+Those files live in `Vendors/Sony/SDK/` and are ignored by Git. The explicit SDK
+inventory enables them for local generation/builds; canonical generation otherwise
+leaves optional Sony support disabled. The generated app target embeds/signs the core
 and adapter libraries; the camera extension never links them. Builds without a
 local SDK expose an explanation instead of attempting control. Existing CLI UI
 verification harnesses use this unavailable backend; the focused Sony checks
@@ -210,6 +229,12 @@ signed/unsigned ranges, unaligned data, oversized/invalid ranges and event
 coalescing. Focus checks cover demand-driven opt-in, fresh per-kind events,
 generation isolation, frame aging, malformed packed data and geometry projection. Discovery tests also cover named cameras, cache expiry, coalesced
 requests, explicit rescans and legacy saved names. They never contact a camera.
+
+Official release distribution additionally requires recorded permission to
+redistribute the exact Sony runtime and its adapter dependencies. No such terms
+were found in the inspected SDK installation. See [release evidence](SDK_RELEASE_EVIDENCE.md)
+and [third-party licenses](../THIRD_PARTY_LICENSES.md). Installation, signing and
+software checks do not establish redistribution permission.
 
 Further hardware qualification covers physical HDMI-pairing confirmation,
 readback for every editable control, loss/recovery of Wi-Fi, and checking that

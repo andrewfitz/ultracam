@@ -133,12 +133,4 @@ import XCTest
     XCTAssertEqual(coordinator.advance(to: 3), [.start(feedID: "A")])
   }
 
-  static let allTests = [
-    ("source-demand truth table", testSourceDemandTruthTable),
-    ("route demand truth", testDedicatedProgramManualAndPreviewRoutes),
-    ("idempotent leases", testAcquireAndReleaseAreIdempotentAndOwnerScoped),
-    ("selection replacement", testProgramAndManualSelectionReplaceOnlyTheirOwnRoute),
-    ("start stop debounce", testStartAndStopDebounceCanBeCancelledAndRearmed),
-    ("failed start retry", testSetRunningAllowsFailedStartRetry),
-  ]
 }

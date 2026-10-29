@@ -5,6 +5,40 @@ import SwiftUI
 struct UIInput: Identifiable, Sendable, Equatable {
   var id: String
   var name: String
+  var vendor: VendorDescriptor? = nil
+  var shareable = false
+  var supportedModes = ""
+}
+
+struct UIInputGroup: Identifiable {
+  let id: String
+  let title: String?
+  let inputs: [UIInput]
+}
+
+enum UIInputPicker {
+  static func supportedModes(_ input: UIInput?) -> String {
+    guard let input else { return "Choose an input to see its supported source formats." }
+    let modes = input.supportedModes.trimmingCharacters(in: .whitespacesAndNewlines)
+    return modes.isEmpty ? "This device does not report supported formats. Check its settings or documentation, then confirm the detected format in Capture diagnostics." : modes
+  }
+
+  static func groups(_ inputs: [UIInput]) -> [UIInputGroup] {
+    let ids = Set(inputs.map { $0.vendor?.id ?? "" })
+    guard ids.count > 1 else { return [.init(id: "", title: nil, inputs: inputs)] }
+    var order: [String] = []
+    for input in inputs {
+      let id = input.vendor?.id ?? ""
+      if !order.contains(id) { order.append(id) }
+    }
+    return order.map { id in
+      let members = inputs.filter { ($0.vendor?.id ?? "") == id }
+      return .init(id: id, title: members.first?.vendor?.localizedDisplayName() ?? "Other inputs", inputs: members)
+    }
+  }
+  static func selectable(_ input: UIInput, usedBy: String?, selectedID: String?) -> Bool {
+    input.shareable || usedBy == nil || input.id == selectedID
+  }
 }
 
 /// Supplies live pictures. The app version shows the selected camera through
@@ -57,7 +91,9 @@ struct UIContext {
   /// (inspector, sidebar) call this inside `body` so Observation tracks the models
   /// there too. Fixtures leave it nil.
   var refreshed: (@MainActor () -> UIContext)? = nil
-  var sonyCameras: SonyCameraStore? = nil
+  var cameraControls: CameraControlStore? = nil
+  var captureVendors: [String: VendorDescriptor] = [:]
+  var controlViewFactories: [String: ControlViewFactory] = [:]
 
   /// The freshest context available: rebuilt from the models in the app, unchanged in fixtures.
   var current: UIContext { refreshed?() ?? self }
@@ -191,7 +227,7 @@ enum UIFixtures {
   static func fourUp() -> UISessionSnapshot {
     var session = baseSession()
     var third = camera(3, recording: .idle, signal: .noSignal)
-    third.inputName = "DeckLink Mini Recorder 4K"
+    third.inputName = "Capture input 3"
     session.cameras = [camera(1, inUse: true), camera(2), third, camera(4, recording: .paused, elapsed: 252)]
     session.selectedID = "camera-2"
     session.layout = .fourUp
@@ -209,7 +245,7 @@ enum UIFixtures {
     two.signal = .none
     two.automaticStart = true
     two.automaticStartFailed = true
-    two.automaticStatus = "Couldn't start: the UltraStudio is in use by another app."
+    two.automaticStatus = "Couldn't start: the input device is in use by another app."
     two.lutError = "Saved LUT could not be restored: the file was moved."
     session.cameras = [one, two]
     session.selectedID = "camera-2"

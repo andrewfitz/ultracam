@@ -1213,6 +1213,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private var scopePendingAt = 0.0
   private static let pendingScopeLifetime = 0.5
   private var scopedKey: ScopeKey?
+  private var scopeCadence = MonitorRefreshCadence()
   /// When the pending scope became due, and when the next skip may be counted.
   private var scopeDueAt = 0.0
   private var nextSkipCount = 0.0
@@ -1339,8 +1340,10 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       scopes: work.preferences.scopes, monitorLUT: work.state.monitorLUT)
     guard key != scopedKey else { return }
     let now = update.targetTimestamp
-    // Every drawn frame's scope is due at once: the scope link draws it on its next refresh.
-    if scopePending == nil { scopeDueAt = now }
+    // Keep the newest picture while waiting for the saved scope-rate ceiling.
+    if scopePending == nil {
+      scopeDueAt = scopeCadence.nextRefresh(at: now, maximumHz: key.scopes.refreshHz)
+    }
     scopePending = (scopeSource, key)
     scopePendingAt = now
   }
@@ -1512,13 +1515,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     presenter.recordScopeSkip(busy: false)
   }
 
-  /// Scopes get their own submission, drawn into the scope link's drawable, which
-  /// never blocks. The scope follows the video: every frame the picture draws has
-  /// its scope accumulated and drawn on the scope link's next refresh (the link runs
-  /// at the display's rate), so a 59.94 source makes 59.94 scope updates. There is
-  /// no separate scope rate. The newest drawn frame waits here until then, so the
-  /// scope always catches up to the last picture (for example the final frame
-  /// before a feed stops).
+  /// Scopes use a separate submission and the newest drawn picture, capped in
+  /// display-link time by the saved refresh rate. Pictures continue every frame.
   private func drawScope(_ update: CAMetalDisplayLink.Update) {
     presenter?.recordScopeRefresh()
     guard let pending = scopePending, let presenter else { return }
@@ -1536,6 +1534,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       presenter.recordScopeSkip(busy: false)
       return
     }
+    guard scopeCadence.isDue(at: now, maximumHz: key.scopes.refreshHz) else { return }
     // At most two scope submissions on the GPU. Beyond that the GPU is behind:
     // this update is skipped (counted) and the newest frame's scope drawn later.
     guard presenter.beginScope(limit: 2) else {
@@ -1581,6 +1580,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       return
     }
     core.commit(context, drawable: drawable, completion: self, kind: Self.scopeKind)
+    scopeCadence.didRefresh(at: now)
     presenter.recordScope(key.stamp)
   }
 

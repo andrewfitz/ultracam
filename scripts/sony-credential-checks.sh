@@ -1,11 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
-check_root=/Volumes/8TB/cinesomatic-build/sony-credential-checks
+check_root="$(python3 "$task_root/scripts/work_paths.py" --path build_root)/sony-credential-checks"
 mkdir -p "$check_root"
-sources=("$task_root/Sources/App/SonyCameraCredentials.swift" "$task_root/Tools/SonyControlChecks/Credentials.swift")
+source "$task_root/scripts/vendor-build.sh"
+vendor_configure test sony credentials
+vendor_compile_native "$check_root/credential-compile.log"
+sources=(${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"})
+native_args=(${vendor_swift_native_args[@]+"${vendor_swift_native_args[@]}"} -import-objc-header "$vendor_bridge" ${vendor_native_objects[@]+"${vendor_native_objects[@]}"} ${vendor_link_args[@]+"${vendor_link_args[@]}"} -lc++)
 xcrun swiftc -parse-as-library -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
-  "${sources[@]}" -framework Security -o "$check_root/credential-checks"
+  -target arm64-apple-macos26.0 "${sources[@]}" "${native_args[@]}" -framework Security -o "$check_root/credential-checks"
 "$check_root/credential-checks"
 
 # Real platform qualification is explicit and uses only a random test service.
@@ -44,9 +48,9 @@ for variant in ('reinstall-A', 'reinstall-B'):
     shutil.copyfile(profile, app / 'Contents/embedded.provisionprofile')
 PY
 xcrun swiftc -parse-as-library -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
-  "${sources[@]}" -framework Security -o "$helper_a/Contents/MacOS/SonyCredentialChecks"
+  "${sources[@]}" "${native_args[@]}" -framework Security -o "$helper_a/Contents/MacOS/SonyCredentialChecks"
 xcrun swiftc -parse-as-library -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
-  -D SONY_CREDENTIAL_UPDATE_CHECK "${sources[@]}" -framework Security -o "$helper_b/Contents/MacOS/SonyCredentialChecks"
+  -D SONY_CREDENTIAL_UPDATE_CHECK "${sources[@]}" "${native_args[@]}" -framework Security -o "$helper_b/Contents/MacOS/SonyCredentialChecks"
 for helper in "$helper_a" "$helper_b"; do
   /usr/bin/codesign --force --sign "$signing_identity" --timestamp=none --options runtime \
     --entitlements "$check_root/helper-entitlements.plist" "$helper"

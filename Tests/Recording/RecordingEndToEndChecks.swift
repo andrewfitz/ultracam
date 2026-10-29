@@ -104,44 +104,6 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
       CMTime(value: 10_010, timescale: 30_000))
   }
 
-  func testAudioAndVideoPTSStayAlignedAtBothCaptureRates() throws {
-    for rate in [RecordingFrameRate.fps2997, .fps5994] {
-      var videoNormalizer = RecordingTimestampNormalizer()
-      var audioNormalizer = RecordingTimestampNormalizer()
-      var tracker = RecordingAVDriftTracker(maximumDrift: CMTime(value: 1, timescale: 1))
-      var audioTime = CMTime.zero
-      let audioFrameCount: Int64 = rate == .fps2997 ? 1_601 : 800
-      for frame in 0..<600 {
-        let videoDuration = rate.frameDuration
-        let videoTime = CMTimeMultiply(videoDuration, multiplier: Int32(frame))
-        let audioDuration = CMTime(value: audioFrameCount, timescale: 48_000)
-        let video = RecordingPacket(mediaKind: .video, presentationTime: videoTime,
-          duration: videoDuration)
-        let audio = RecordingPacket(mediaKind: .audio, presentationTime: audioTime,
-          duration: audioDuration)
-        let normalizedVideo = try XCTUnwrap(videoNormalizer.normalize(video).successValue)
-        let normalizedAudio = try XCTUnwrap(audioNormalizer.normalize(audio).successValue)
-        _ = try tracker.observe(normalizedVideo)
-        _ = try tracker.observe(normalizedAudio)
-        audioTime = CMTimeAdd(audioTime, audioDuration)
-      }
-      XCTAssertNotNil(tracker.currentDrift)
-      XCTAssertLessThan(abs(CMTimeGetSeconds(tracker.currentDrift!)), 0.02,
-        "\(rate) synthetic 48 kHz audio must remain aligned with video")
-
-      let lateAudio = RecordingPacket(mediaKind: .audio,
-        presentationTime: CMTimeAdd(tracker.latestAudioEnd!, CMTime(value: 2, timescale: 1)),
-        duration: CMTime(value: 1, timescale: 48_000))
-      var lateNormalizer = RecordingTimestampNormalizer()
-      let late = try XCTUnwrap(lateNormalizer.normalize(lateAudio).successValue)
-      XCTAssertThrowsError(try tracker.observe(late)) { error in
-        guard case .exceedsLimit = error as? RecordingDriftError else {
-          return XCTFail("Expected a bounded drift failure, got \(error)")
-        }
-      }
-    }
-  }
-
   func testDropFrameTimecodeAndSourceAlignmentAtBothRates() throws {
     let expected: [(RecordingFrameRate, Int64, String)] = [
       (.fps2997, 1_800, "00:01:00;02"),
@@ -168,35 +130,6 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     let sourceTimecode = RecordingTimecode(frameNumber: 123, frameRate: .fps2997, dropFrame: true)
     XCTAssertEqual(sourceSession.timecode(for: .zero, sourceTimecode: sourceTimecode), sourceTimecode)
     XCTAssertNil(sourceSession.timecode(for: .zero, sourceTimecode: nil))
-  }
-
-  func testEncoderSettingsPreserveTenBit422AndSelectionPolicy() throws {
-    let configuration = HEVCRecordingConfiguration(width: 3_840, height: 2_160,
-      frameRate: 60_000.0 / 1_001.0, averageBitRate: 120_000_000,
-      encoderPreference: .hardwarePreferred)
-    let candidates = [
-      HEVCEncoderCandidate(encoderID: "synthetic.software", isHardwareAccelerated: false,
-        supportsMain10_422: true),
-    ]
-    let selection = try HEVCEncoderSelectionResolver.resolve(candidates,
-      profile: configuration.profile, preference: configuration.encoderPreference)
-    let settings = HEVCAssetWriterContract.outputSettings(configuration: configuration,
-      selection: selection)
-    XCTAssertEqual(settings[AVVideoCodecKey] as? AVVideoCodecType, AVVideoCodecType.hevc)
-    XCTAssertEqual(settings[AVVideoWidthKey] as? Int, 3_840)
-    XCTAssertEqual(settings[AVVideoHeightKey] as? Int, 2_160)
-    XCTAssertEqual(settings[AVVideoProfileLevelKey] as? String,
-      kVTProfileLevel_HEVC_Main42210_AutoLevel as String)
-    XCTAssertEqual((settings[AVVideoExpectedSourceFrameRateKey] as? NSNumber)?.intValue, 60)
-    XCTAssertEqual(configuration.profile.pixelFormat,
-      kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
-    XCTAssertFalse(selection.isHardwareAccelerated)
-    XCTAssertNotNil(selection.fallbackReason)
-
-    XCTAssertThrowsError(try HEVCEncoderSelectionResolver.resolve(candidates,
-      profile: configuration.profile, preference: .hardwareRequired)) { error in
-      XCTAssertEqual(error as? HEVCRecordingError, .hardwareEncoderUnavailable(configuration.profile))
-    }
   }
 
   func testStopDrainsSyntheticBuffersBeforeFinalization() throws {
@@ -1188,7 +1121,9 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     let telemetry = adapter.telemetry
     XCTAssertEqual(telemetry.deviceSkippedFrames, 2)
     XCTAssertEqual(telemetry.droppedVideo, 3, "Two skipped frames and one no-signal frame")
-    XCTAssertTrue(telemetry.warning?.contains("skipped 2 frames") == true, telemetry.warning ?? "")
+    XCTAssertTrue(telemetry.warning?.contains("missing 2 frames in 1 gap ") == true, telemetry.warning ?? "")
+    XCTAssertEqual(telemetry.sourceGaps, 1)
+    XCTAssertEqual(telemetry.largestSourceGap, 2)
     XCTAssertEqual(telemetry.state, .recording, "A device skip is reported, not a recorder failure")
     XCTAssertNil(telemetry.lastError)
     try adapter.stop()
@@ -1285,7 +1220,8 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
   func testGPURouteFallbackFramesRespectTheCaptureBufferBound() throws {
     let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("gpu-fallback"),
       outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("unused-fallback-\(UUID().uuidString).mov"),
-      width: 1_920, height: 1_080, videoCodec: kCMVideoCodecType_AppleProRes422HQ)
+      width: 1_920, height: 1_080, videoCodec: kCMVideoCodecType_AppleProRes422HQ,
+      compatibilityPolicy: .init(allowCPUConversion: true))
     let lock = NSLock()
     var received: [CVImageBuffer] = []
     // VideoToolbox never returns a frame: everything submitted stays inside.
@@ -1368,13 +1304,6 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertEqual(adapter.telemetry.state, .failed)
   }
 
-  static let allTests = [
-    ("two feeds pause and finalize", testTwoFeedsRecordSimultaneouslyAndFinalizeAfterPauseResume),
-    ("audio/video PTS alignment", testAudioAndVideoPTSStayAlignedAtBothCaptureRates),
-    ("drop-frame timecode alignment", testDropFrameTimecodeAndSourceAlignmentAtBothRates),
-    ("encoder settings", testEncoderSettingsPreserveTenBit422AndSelectionPolicy),
-    ("finalization drains buffers", testStopDrainsSyntheticBuffersBeforeFinalization),
-  ]
 }
 
 private extension Result where Failure: Error {

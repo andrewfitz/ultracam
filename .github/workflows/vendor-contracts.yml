@@ -1,0 +1,84 @@
+name: Vendor contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      hardware:
+        description: Run synthetic GPU/UI checks on the configured Metal 4 runner
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  contracts-and-unsigned-build:
+    # GitHub's standard macos-26 image is arm64; no paid larger runner required.
+    # https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-work
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Canonical SDK modes and boundary contracts
+        run: bash scripts/ci-vendor-checks.sh --contracts-only
+      - name: Strict shipping typecheck
+        run: bash scripts/ui-typecheck.sh
+      - name: Unsigned SDK-absent app and package validation
+        run: bash scripts/build.sh
+
+  licensed-sony-unsigned-build:
+    # Enable only after the repository owner provisions a developer-licensed
+    # SDK archive URL. No SDK payload or linked app is uploaded or published.
+    if: vars.ULTRACAM_SONY_SDK_CI == 'enabled' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-sony-work
+      ULTRACAM_SDK_INVENTORY: ${{ runner.temp }}/ultracam-sony-inventory.json
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install licensed SDK and verify pinned payload
+        env:
+          SONY_SDK_ARCHIVE_URL: ${{ secrets.ULTRACAM_SONY_SDK_ARCHIVE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SONY_SDK_ARCHIVE_URL" || { echo 'Licensed Sony SDK archive source is not configured.' >&2; exit 1; }
+          archive="$RUNNER_TEMP/ultracam-sony-sdk.zip"
+          trap 'rm -f "$archive"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$SONY_SDK_ARCHIVE_URL" --output "$archive"
+          python3 scripts/vendor-sdk.py install sony "$archive"
+          python3 scripts/vendor-sdk.py verify sony
+          printf '%s\n' '{"sony": true}' > "$ULTRACAM_SDK_INVENTORY"
+      - name: Strict SDK-present shipping typecheck
+        run: bash scripts/ui-typecheck.sh
+      - name: Real SDK-present compile and unsigned package validation
+        run: bash scripts/build.sh --sdk-inventory "$ULTRACAM_SDK_INVENTORY"
+
+  synthetic-metal4-integration:
+    if: github.event_name == 'workflow_dispatch' && inputs.hardware
+    runs-on: [self-hosted, macOS, ARM64, ultracam-metal4]
+    timeout-minutes: 90
+    env:
+      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-work
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Synthetic media and strict offscreen UI integration
+        run: bash scripts/ci-vendor-checks.sh --hardware
+
+# Official release jobs intentionally remain disabled until signed artifact-bound
+# Sony redistribution evidence is supplied to validate_bundle.py.

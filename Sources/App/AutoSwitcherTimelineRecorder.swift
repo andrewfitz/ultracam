@@ -236,7 +236,7 @@ private struct AutoSwitcherTimelineCut: Codable {
 }
 
 private struct AutoSwitcherTimelineDocument: Codable {
-  let schemaVersion = 2
+  let schemaVersion = 3
   let sessionID: UUID
   let mode: String
   let timebase: AutoSwitcherTimelineTimebase
@@ -297,7 +297,7 @@ final class AutoSwitcherTimelineRecorder {
       cutThreshold: settings.cutThreshold, hysteresisMargin: settings.hysteresisMargin,
       transcriptOutputDelay: settings.transcriptOutputDelay, mode: settings.mode.rawValue,
       manualHold: settings.manualHold)
-    let timebase = AutoSwitcherTimelineTimebase(timescale: 60_000)
+    let timebase = AutoSwitcherTimelineTimebase(timescale: 240_000)
     document = AutoSwitcherTimelineDocument(
       sessionID: sessionID, mode: "realtime", timebase: timebase,
       startedAtUnixMS: Self.unixMS(), endedAtUnixMS: nil, duration: 0,
@@ -530,8 +530,9 @@ final class AutoSwitcherTimelineRecorder {
     guard time.isValid, time.isNumeric, time.epoch == 0, time.timescale > 0 else { return nil }
     let seconds = CMTimeGetSeconds(time)
     guard seconds.isFinite, seconds >= 0 else { return nil }
-    let ticks = CMTimeConvertScale(time, timescale: 60_000, method: .roundHalfAwayFromZero).value
-    return (seconds, ticks)
+    let projected = CMTimeConvertScale(time, timescale: 240_000, method: .roundHalfAwayFromZero)
+    guard projected.isValid, projected.isNumeric, projected.value >= 0 else { return nil }
+    return (seconds, projected.value)
   }
 
   private static func makeOutputURL(folder: URL?, sessionID _: UUID) -> URL {

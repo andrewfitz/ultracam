@@ -21,7 +21,7 @@ import SwiftUI
     }
     menuBar = UIMenuBarController(model: model, interface: UIAppEnvironment.interface)
     if !CommandLine.arguments.contains("--ui-self-test") {
-      Task { @MainActor in await model.sonyCameras.restoreConnections() }
+      Task { @MainActor in await model.cameraControls.restoreConnections() }
     }
     // scripts/ui-tour.sh reviews both appearances without changing the system setting.
     if let flag = CommandLine.arguments.firstIndex(of: "--ui-appearance"), CommandLine.arguments.indices.contains(flag + 1) {
@@ -45,20 +45,20 @@ import SwiftUI
     if terminationPending { return .terminateLater }
     guard let model else { return .terminateNow }
     let recording = model.recordingModel.hasActiveRecordings
-    guard recording || model.sonyCameras.needsShutdown else { return .terminateNow }
+    guard recording || model.cameraControls.needsShutdown else { return .terminateNow }
     terminationPending = true
     if recording {
       model.saveSettings()
       model.stopAllCameras()
     }
     Task { @MainActor in
-      async let sonyCleanup = model.sonyCameras.shutdown()
+      async let controlCleanup = model.cameraControls.shutdown()
       if recording {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
           model.recordingModel.stopAll { continuation.resume() }
         }
       }
-      if let message = await sonyCleanup { NSLog("Sony camera cleanup on quit: %@", message) }
+      if let message = await controlCleanup { NSLog("Camera control cleanup on quit: %@", message) }
       sender.reply(toApplicationShouldTerminate: true)
     }
     return .terminateLater

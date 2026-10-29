@@ -84,14 +84,6 @@ func syntheticRamp() throws -> CVPixelBuffer {
     XCTAssertThrowsError(try CubeLUT(text: cubeText().replacingOccurrences(of: "LUT_3D_SIZE 2",
       with: "LUT_3D_SIZE 2\nDOMAIN_MAX 1e-45 1 1")))
   }
-  static let allTests = [
-    ("ordering and whitespace", testOrderingAndWhitespace),
-    ("UTF-8 BOM", testUTF8BOMIsIgnored),
-    ("title parsing", testTitlePreservesQuotedTextAndRejectsMisplacement),
-    ("invalid LUT rejection", testRejectIncompleteOversizedAndNonFinite),
-    ("1D LUT parses", testOneDimensionalLUTParses),
-    ("domain validation", testDomain),
-  ]
 }
 
 @objcMembers final class PipelineTests: XCTestCase {
@@ -100,7 +92,7 @@ func syntheticRamp() throws -> CVPixelBuffer {
     try processor.load(CubeLUT(text: cubeText()))
     let source = try syntheticRamp()
     let configuration = PipelineConfiguration(applyLUT: true, downscale: false,
-      convertTo420: false, reduceFrameRate: false, inputFast: true)
+      convertTo420: false, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration)
     let output = try processor.process(source, configuration: configuration)
     XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
     CVPixelBufferLockBaseAddress(output, .readOnly)
@@ -130,7 +122,7 @@ func syntheticRamp() throws -> CVPixelBuffer {
     let processor = try LUTProcessor()
     let source = try syntheticRamp()
     let configuration = PipelineConfiguration(applyLUT: false, downscale: false,
-      convertTo420: false, reduceFrameRate: false, inputFast: true)
+      convertTo420: false, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration)
     let output = try processor.process(source, configuration: configuration)
     XCTAssertTrue(source === output)
   }
@@ -140,7 +132,7 @@ func syntheticRamp() throws -> CVPixelBuffer {
     let source = try syntheticRamp()
     for bits in 0..<8 {
       let config = PipelineConfiguration(applyLUT: bits & 1 != 0, downscale: bits & 2 != 0,
-        convertTo420: bits & 4 != 0, reduceFrameRate: bits & 8 != 0, inputFast: true)
+        convertTo420: bits & 4 != 0, reduceFrameRate: bits & 8 != 0, sourceDuration: VideoContract.fastDuration)
       XCTAssertEqual(config.width, bits & 2 != 0 ? 1920 : 3840)
       XCTAssertEqual(config.duration, bits & 8 != 0 ? VideoContract.slowDuration : VideoContract.fastDuration)
       XCTAssertEqual(config.pixelFormat, bits & 4 != 0 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
@@ -193,7 +185,7 @@ func syntheticRamp() throws -> CVPixelBuffer {
     let processor = try LUTProcessor()
     try processor.load(CubeLUT(text: cubeText()))
     let output = try processor.process(source, configuration: PipelineConfiguration(
-      applyLUT: true, downscale: false, convertTo420: false, reduceFrameRate: false, inputFast: true))
+      applyLUT: true, downscale: false, convertTo420: false, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration))
     CVPixelBufferLockBaseAddress(output, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
     let pixels = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt16.self)
@@ -221,13 +213,6 @@ func syntheticRamp() throws -> CVPixelBuffer {
     XCTAssertFalse(gate.shouldDeliver(CMTime(value: 5_002, timescale: 60_000, flags: .valid, epoch: 1),
       duration: VideoContract.slowDuration), "Foreign source epochs must be rejected")
   }
-  static let allTests = [
-    ("10-bit GPU precision", testTenBitPrecision),
-    ("LUT then Lanczos then NV12", testLUTAndLanczosThenNV12),
-    ("full-data passthrough", testUntouchedFrameIsSameBuffer),
-    ("independent switches", testIndependentSwitches),
-    ("exact frame-rate reduction", testRationalFrameReductionDoesNotDrift),
-  ]
 }
 
 let suite = XCTestSuite(name: "Ultracam synthetic checks")
@@ -253,6 +238,7 @@ suite.addTest(XCTestSuite(forTestCaseClass: CameraRegistryRuntimeChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: CameraSinkRoutingChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: ProgramOutputRouteChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: AutomaticFeedChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LiveTelemetryChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: EmbeddedAudioRecordingChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: RecordingChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: RecordingTimecodeChecks.self))
@@ -273,10 +259,135 @@ suite.addTest(XCTestSuite(forTestCaseClass: AutoSwitcherTimelineChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: InstallerChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: MulticamRuntimeChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: UIPresentationChecks.self))
+#if ULTRACAM_TEST_SUPPORT
+suite.addTest(XCTestSuite(forTestCaseClass: AudioVideoClockMappingChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: B1dGamutPersistenceChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: B1dSettingsMigrationChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CMIOQueueBudgetChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ColorimetryContractChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: FormatDisplayIdentityTests.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTColorSpaceContractChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: NoCopyIngestLeaseChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: Packed422FormatsChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: Planar420FormatsChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ProgramScalingPolicyChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RGBFormatsChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingProfileMatrixChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingTimebaseWriterChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ResourceEstimatorChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: SourceSizeChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: TimecodeMetadataChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VariableFrameTimelineChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ClockMappedPCMConverterChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTGPUConversionContractChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTDynamicSizeChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CPUMemoryGPUIngestChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ProgramScalingGPUChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: NoCopyGPUIngestChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: SourceAudioMeterChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CameraBufferRetentionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: Packed422GPUChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: PlanarGPUChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RGBGPUDecoderChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingSizeEstimatorChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: PipelineSourceContractChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureNativeTimecodeChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTShaderGoldenChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: MonitorDeclaredSignalChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: OrderedGPUIngestStageChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingRGBPixelConverterChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingGPUCacheBudgetChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: UIInputPickerChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VideoBufferLayoutChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureCPUMemoryBridgeChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTSpaceSettingsChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: Packed422LUTChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CPUIngestCompatibilityChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: StructuredFormatUILabelTests.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTPlanarGPUChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureSourceMetadataChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingRGBEncoderConformanceChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: NDIPlanarLayoutChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: NDIPlanarGPUChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: Packed422RecordingChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: PlanarRecordingConverterChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VendorLocalizationChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: UIVendorSettingsLocalizationChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: SourceFormatRouteChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTNDIPlanarChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTUYVAChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: UIControlLocalizationChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ProgramStageRetentionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureDiscoveryChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingNDIWriterChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTBoundaryAuditChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureAuditChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CameraBusyNegotiationChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureDeliveryLifecycleChecks.self))
+
+suite.addTest(XCTestSuite(forTestCaseClass: SourceFormatContractChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: SourceAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingSourceAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureSourceAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureTakeContextChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: DerivedOutputAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingTimebaseChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingB3TimecodeChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingCadenceConformerChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingCadenceSettingsChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingPackedWriterChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: DeviceAPIConformance.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CameraControlContractChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CameraControlStoreChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: DeckLinkAdapterContractChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: DeckLinkReusableConformanceChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VendorRegistryChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CapturePluginBridgeChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: GPUStandbyChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: GPUStandbyLifecycleChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CameraGPUStandbyChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTPassthroughOwnershipChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTSourceAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingPolicyChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingCPUAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingTakeLifecycleChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CPUCompatibilitySettingsChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CPUCompatibilityActivityChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ExtensionFormatCatalogChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: OutputFormatCatalogChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CameraControlUIStateChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VendorHardwareChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VendorSettingsStoreChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VendorSettingsBootstrapChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: VendorSettingsHardwareChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureTypedAdmissionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: SyntheticCaptureFixtureChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: MediaRetentionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: GPUAllocationBudgetChecks.self))
+#endif
 #if CAPTURE_LIFECYCLE_TESTS
 suite.addTest(XCTestSuite(forTestCaseClass: CaptureLifecycleChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: CaptureRecordingIsolationChecks.self))
 #endif
-suite.run()
-guard let run = suite.testRun, run.executionCount > 0 else { exit(2) }
+var selectedSuite = suite
+var filteredCameraBootstrap: CameraProvider?
+if let selection = ProcessInfo.processInfo.environment["ULTRACAM_TEST_SUITES"] {
+  let requested = Set(selection.split(separator: ",").map(String.init))
+  let chosen = suite.tests.filter { requested.contains($0.name) }
+  guard !requested.isEmpty, Set(chosen.map { $0.name }) == requested else {
+    fputs("Unknown or empty ULTRACAM_TEST_SUITES selection\n", stderr)
+    exit(2)
+  }
+  selectedSuite = XCTestSuite(name: "Ultracam filtered checks")
+  // CMIO requires one native provider to initialize its notification queues,
+  // even when the selected tests use only isolated non-native providers.
+  if requested.contains(where: { $0.contains("Camera") || $0.contains("Program") || $0.contains("DerivedOutput") }) {
+    filteredCameraBootstrap = CameraProvider(automaticTimers: false)
+  }
+  chosen.forEach { selectedSuite.addTest($0) }
+  print("Filtered runtime suites: " + requested.sorted().joined(separator: ","))
+}
+withExtendedLifetime(filteredCameraBootstrap) { selectedSuite.run() }
+guard let run = selectedSuite.testRun, run.executionCount > 0 else { exit(2) }
 exit(run.hasSucceeded ? 0 : 1)

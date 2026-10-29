@@ -2,6 +2,8 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 import Foundation
+import IOSurface
+import os
 import VideoToolbox
 
 /// Identifies one source feed in the recording catalog. A recorder instance owns
@@ -40,6 +42,7 @@ enum SourceRecordingDropReason: String, Equatable, Sendable {
 enum SourceRecordingVideoProfile: Equatable, Sendable {
   case hevcMain10_422
   case proRes422(ProRes422Profile)
+  case matrix(RecordingProfileMatrixProfile)
   /// Compatibility escape hatch for callers that provide another codec.
   /// Custom codecs still receive the native source format and hardware-only
   /// encoder specification, but do not get a profile-level property.
@@ -49,6 +52,7 @@ enum SourceRecordingVideoProfile: Equatable, Sendable {
     switch self {
     case .hevcMain10_422: return kCMVideoCodecType_HEVC
     case let .proRes422(profile): return profile.codecType
+    case let .matrix(profile): return profile.codec
     case let .custom(codec): return codec
     }
   }
@@ -56,6 +60,7 @@ enum SourceRecordingVideoProfile: Equatable, Sendable {
   var profileLevel: String? {
     switch self {
     case .hevcMain10_422: return kVTProfileLevel_HEVC_Main42210_AutoLevel as String
+    case let .matrix(profile): return profile.profileLevel
     case .proRes422, .custom: return nil
     }
   }
@@ -64,19 +69,37 @@ enum SourceRecordingVideoProfile: Equatable, Sendable {
     switch self {
     case .hevcMain10_422: return "HEVC Main 10 4:2:2"
     case let .proRes422(profile): return profile.displayName
+    case let .matrix(profile): return profile.displayName
     case let .custom(codec): return "Video codec \(codec)"
+    }
+  }
+
+  /// The declarative B5 profile represented by this source recorder profile.
+  /// Custom codecs remain an explicit compatibility escape hatch and are not
+  /// silently assigned a matrix contract.
+  var recordingMatrixProfile: RecordingProfileMatrixProfile? {
+    switch self {
+    case .hevcMain10_422: return .hevcMain10_422
+    case .proRes422(.standard): return .proRes422
+    case .proRes422(.highQuality): return .proRes422HQ
+    case let .matrix(profile): return profile
+    case .custom: return nil
     }
   }
 
   /// The source buffer remains packed 10-bit 4:2:2 (v210-like) through the
   /// handoff. No LUT, scaling, or pixel format conversion occurs here.
+
   var sourcePixelFormat: OSType { kCVPixelFormatType_422YpCbCr10 }
 
   /// The layout the Apple Silicon hardware encoders take natively ('x422',
   /// 10-bit 4:2:2 biplanar video range). The hardware ProRes and HEVC encoders
   /// do not list v210, so the writer repacks v210 into this on the GPU;
   /// otherwise VideoToolbox would convert every frame on the CPU.
-  var encoderPixelFormat: OSType { kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange }
+  var encoderPixelFormat: OSType {
+    if case .matrix(let profile) = self { return profile.encoderPixelFormat }
+    return kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+  }
 
   /// Require hardware instead of merely preferring it so long-running source
   /// recording cannot silently fall back to a CPU encoder.
@@ -96,6 +119,14 @@ enum SourceRecordingVideoProfile: Equatable, Sendable {
     case .hevcMain10_422: return 0.15
     case .proRes422(.standard): return 0.30
     case .proRes422(.highQuality), .custom: return 0.444
+    case .matrix(let profile):
+      switch profile {
+      case .proResLT: return 0.21
+      case .proRes422: return 0.30
+      case .proRes422HQ: return 0.444
+      case .proRes4444: return 0.889
+      case .hevcMain, .hevcMain10, .hevcMain10_422: return 0.15
+      }
     }
   }
 
@@ -104,6 +135,8 @@ enum SourceRecordingVideoProfile: Equatable, Sendable {
     case kCMVideoCodecType_HEVC: return .hevcMain10_422
     case kCMVideoCodecType_AppleProRes422: return .proRes422(.standard)
     case kCMVideoCodecType_AppleProRes422HQ: return .proRes422(.highQuality)
+    case kCMVideoCodecType_AppleProRes422LT: return .matrix(.proResLT)
+    case kCMVideoCodecType_AppleProRes4444: return .matrix(.proRes4444)
     default: return .custom(codec)
     }
   }
@@ -112,16 +145,35 @@ enum SourceRecordingVideoProfile: Equatable, Sendable {
 /// The recorder accepts the capture callback's original CMSampleBuffer. No
 /// Core Image, Metal, pixel-buffer conversion, or color transform is performed
 /// by this layer.
+struct RecordingSourceProvenance: Codable, Equatable, Sendable {
+  let epochID: CaptureEpochID
+  let formatSignature: String
+  let videoClock: ClockInstanceID
+  let audioClock: ClockInstanceID?
+  init(epochID: CaptureEpochID, formatSignature: String, videoClock: ClockInstanceID, audioClock: ClockInstanceID? = nil) {
+    self.epochID = epochID; self.formatSignature = formatSignature
+    self.videoClock = videoClock; self.audioClock = audioClock
+  }
+}
+
 struct SourceRecordingConfiguration {
   let feedID: SourceRecordingFeedID
   let outputURL: URL
+  /// Immutable original-source contract; derived encoder buffers are not source frames.
+  let sourceAdmission: SourceAdmissionSnapshot?
+  let expectedSourceFormat: SourceFormat?
+  let compatibilityPolicy: RecordingCompatibilityPolicy
+  let sidecarMovieURL: URL?
+  let sidecarCreated: (() throws -> Void)?
+  let videoRetentionPolicy: MediaRetentionPolicy
+  let audioRetentionPolicy: MediaRetentionPolicy
   let width: Int
   let height: Int
   let videoCodec: CMVideoCodecType
   let videoProfile: SourceRecordingVideoProfile
   let fileType: AVFileType
   /// Video frames that may wait for the encoder stage. Each one holds a
-  /// capture (DeckLink) buffer of about 22 MB at 2160p v210 that the driver
+  /// source capture buffer of about 22 MB at 2160p v210 that the driver
   /// cannot reuse, so this is kept to 12 (0.2 s at 59.94): an encoder that
   /// stalls fails the take visibly before the driver's own pool runs dry and
   /// the device starts dropping frames. Disk stalls are absorbed after the
@@ -129,17 +181,26 @@ struct SourceRecordingConfiguration {
   let queueCapacity: Int
   /// Audio packets that may wait for the encoder stage (about 4 s at 59.94).
   let audioQueueCapacity: Int
+  /// Supplemental metadata cap; PCM retention is primarily limited by seconds and bytes.
+  static let defaultAudioMetadataSlots = 32_768
   /// Compressed media that may wait for the disk (1 GiB, about 4.8 s of
   /// ProRes 422 HQ 2160p59.94 at 221 MB/s). Going past it fails the take.
   let maximumBufferedWriterBytes: Int
   /// How often `checkAvailableSpace` runs while recording, off the media path.
   let spaceCheckInterval: TimeInterval
   let realTimeEncoding: Bool
-  let maxKeyFrameInterval: Int
+  /// Legacy explicit frame-count request, converted at the actual source cadence.
+  let maxKeyFrameInterval: Int?
+  let maxKeyFrameIntervalDuration: TimeInterval
   /// Source cadence used to describe a generated QuickTime timecode track.
   /// The default matches the recorder's historically supported 59.94 mode;
   /// callers that detect 29.97 must pass `.fps2997`.
   let frameRate: RecordingFrameRate
+  let declaredTimebases: [Int32]?
+  let quantizationPolicy: RecordingTimebase.QuantizationPolicy?
+  let sourceFrameRate: FrameRate?
+  let recordingConstantFrameRate: Bool
+  let nativeTimecodeMetadata: TimecodeMetadata?
   let timecodePolicy: RecordingTimecodePolicy
   let timecodeDropFrame: Bool
   let timecodeStartDate: Date
@@ -156,31 +217,73 @@ struct SourceRecordingConfiguration {
   /// The capture backend's per-frame host capture time (a CFNumber of host
   /// clock seconds). Matches `UltracamCaptureHostTimeAttachmentKey`, which
   /// this module cannot import: it also builds without the bridging header.
+  static let sourceProvenanceAttachmentKey = "UltracamRecordingSourceProvenance"
+  static let sourceTimecodeAttachmentKey = "UltracamSourceTimecode"
+  static let nativeTimecodeAttachmentKey = "UltracamNativeTimecodeMetadata"
   static let captureHostTimeAttachmentKey = "UltracamCaptureHostTime"
+
+  func keyframeDuration(for rate: RecordingFrameRate) -> TimeInterval {
+    guard let maxKeyFrameInterval else { return maxKeyFrameIntervalDuration }
+    let duration = sourceFrameRate?.nominal ?? sourceAdmission?.format.rate.nominal ?? rate.frameDuration
+    return Double(maxKeyFrameInterval) * duration.seconds
+  }
+
+  var outputFrameRate: FrameRate? {
+    let source = sourceFrameRate ?? sourceAdmission?.format.rate ?? expectedSourceFormat?.rate
+    guard recordingConstantFrameRate, let source, source.isVariable else { return source }
+    return .constant(source.nominal)
+  }
+
+  var sourcePixelFormat: OSType { sourceAdmission?.format.pixel.rawValue ?? expectedSourceFormat?.pixel.rawValue ?? videoProfile.sourcePixelFormat }
 
   /// The most this take is expected to write per second before it has
   /// measured its own rate (see `SourceRecordingVideoProfile.nominalBytesPerPixel`).
   var nominalBytesPerSecond: Double {
-    let framesPerSecond = 1 / frameRate.frameDuration.seconds
-    return videoProfile.nominalBytesPerPixel * Double(width * height) * framesPerSecond
+    let duration = sourceFrameRate?.nominal ?? frameRate.frameDuration
+    let codec: RecordingSizeEstimator.Codec?
+    switch videoProfile {
+    case .hevcMain10_422: codec = .hevcMain10_422
+    case .proRes422(.standard): codec = .proRes422
+    case .proRes422(.highQuality): codec = .proRes422HQ
+    case .matrix(let profile):
+      switch profile {
+      case .proResLT: codec = .proResLT
+      case .proRes422: codec = .proRes422
+      case .proRes422HQ: codec = .proRes422HQ
+      case .proRes4444: codec = .proRes4444
+      case .hevcMain: codec = .hevcMain
+      case .hevcMain10: codec = .hevcMain10
+      case .hevcMain10_422: codec = .hevcMain10_422
+      }
+    case .custom: codec = nil
+    }
+    if let codec, let estimate = RecordingSizeEstimator(codec: codec, width: width, height: height, frameDuration: duration) {
+      return estimate.bytesPerSecond
+    }
+    return videoProfile.nominalBytesPerPixel * Double(width) * Double(height) / duration.seconds
   }
 
   init(feedID: SourceRecordingFeedID, outputURL: URL, width: Int, height: Int,
     videoCodec: CMVideoCodecType = kCMVideoCodecType_HEVC,
     videoProfile: SourceRecordingVideoProfile? = nil,
     fileType: AVFileType = .mov, queueCapacity: Int = 12,
-    audioQueueCapacity: Int = 256,
+    audioQueueCapacity: Int = SourceRecordingConfiguration.defaultAudioMetadataSlots,
     maximumBufferedWriterBytes: Int = AVAssetSourceRecordingWriter.defaultMaximumBufferedBytes,
     spaceCheckInterval: TimeInterval = 1,
-    realTimeEncoding: Bool = true, maxKeyFrameInterval: Int = 60,
+    realTimeEncoding: Bool = true, maxKeyFrameInterval: Int? = nil, maxKeyFrameIntervalDuration: TimeInterval = 1,
     frameRate: RecordingFrameRate = .fps5994,
+    declaredTimebases: [Int32]? = nil, quantizationPolicy: RecordingTimebase.QuantizationPolicy? = nil, sourceFrameRate: FrameRate? = nil, recordingConstantFrameRate: Bool = false, nativeTimecodeMetadata: TimecodeMetadata? = nil,
     timecodePolicy: RecordingTimecodePolicy = .source,
     timecodeDropFrame: Bool? = nil,
     sourceTimecode: String? = nil,
     timecodeStartDate: Date = Date(),
     timecodeSourceStartTime: CMTime = .zero,
     timecodeSamplesComputerClockAtFirstFrame: Bool = false,
-    checkAvailableSpace: ((UInt64) throws -> Void)? = nil) throws {
+    checkAvailableSpace: ((UInt64) throws -> Void)? = nil,
+    sourceAdmission: SourceAdmissionSnapshot? = nil, expectedSourceFormat: SourceFormat? = nil,
+    compatibilityPolicy: RecordingCompatibilityPolicy = .init(), sidecarMovieURL: URL? = nil,
+    sidecarCreated: (() throws -> Void)? = nil,
+    videoRetentionPolicy: MediaRetentionPolicy? = nil, audioRetentionPolicy: MediaRetentionPolicy? = nil) throws {
     guard !feedID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       throw SourceRecordingError.invalidConfiguration("A feed ID is required.")
     }
@@ -193,11 +296,16 @@ struct SourceRecordingConfiguration {
     guard spaceCheckInterval > 0 else {
       throw SourceRecordingError.invalidConfiguration("The space-check interval must be positive.")
     }
-    guard maxKeyFrameInterval > 0 else {
+    guard maxKeyFrameInterval.map({ $0 > 0 }) ?? true,
+      maxKeyFrameIntervalDuration.isFinite, maxKeyFrameIntervalDuration > 0 else {
       throw SourceRecordingError.invalidConfiguration("Key-frame interval must be positive.")
     }
     guard outputURL.isFileURL else {
       throw SourceRecordingError.invalidConfiguration("The recording destination must be a file URL.")
+    }
+    if let declaredRate = sourceFrameRate ?? sourceAdmission?.format.rate ?? expectedSourceFormat?.rate {
+      do { _ = try RecordingTimebase.Configuration(frameRate: declaredRate, declaredTimebases: declaredTimebases, quantizationPolicy: quantizationPolicy) }
+      catch { throw SourceRecordingError.invalidConfiguration("Recording timebase admission failed: " + String(describing: error)) }
     }
     let selectedProfile = videoProfile ?? SourceRecordingVideoProfile.inferred(for: videoCodec)
     guard selectedProfile.codecType == videoCodec else {
@@ -208,6 +316,39 @@ struct SourceRecordingConfiguration {
       timecodeSourceStartTime.epoch == 0, timecodeSourceStartTime.value >= 0 else {
       throw SourceRecordingError.invalidConfiguration("The timecode source start must be a non-negative CMTime.")
     }
+    if let actual = sourceAdmission?.format, let expectedSourceFormat, actual.signature != expectedSourceFormat.signature {
+      throw SourceRecordingError.invalidConfiguration("The recording source declaration changed while preparing the take.")
+    }
+    if let format = sourceAdmission?.format ?? expectedSourceFormat {
+      do { try format.validate(); _ = try SourceSizeAdmission.validate(format) }
+      catch { throw SourceRecordingError.invalidConfiguration("Recording source admission failed: " + String(describing: error)) }
+      guard sourceFrameRate == nil || sourceFrameRate == format.rate else {
+        throw SourceRecordingError.invalidConfiguration("The recording cadence differs from its source declaration.")
+      }
+      guard format.width == width, format.height == height,
+        (selectedProfile.recordingMatrixProfile != nil || format.pixel.rawValue == selectedProfile.sourcePixelFormat) else {
+        throw SourceRecordingError.invalidConfiguration("Recording source declaration differs from configured dimensions or pixel format.")
+      }
+      if let matrixProfile = selectedProfile.recordingMatrixProfile {
+        do {
+          try RecordingProfileMatrix.validate(matrixProfile, source: format)
+        } catch {
+          throw SourceRecordingError.invalidConfiguration(
+            "Recording profile (matrixProfile.displayName) is not supported by the declared source: (error).")
+        }
+      }
+    }
+    self.compatibilityPolicy = compatibilityPolicy
+    self.sidecarMovieURL = sidecarMovieURL
+    self.sidecarCreated = sidecarCreated
+    self.videoRetentionPolicy = try videoRetentionPolicy ?? MediaRetentionPolicy(maximumBytes: 512 * 1024 * 1024,
+      maximumDuration: max(0.25, (sourceFrameRate?.nominal ?? frameRate.frameDuration).seconds * Double(queueCapacity)),
+      maximumSlots: queueCapacity, minimumSlots: min(2, queueCapacity))
+    self.audioRetentionPolicy = try audioRetentionPolicy ?? MediaRetentionPolicy(maximumBytes: 64 * 1024 * 1024,
+      maximumDuration: 4, maximumSlots: audioQueueCapacity)
+
+    self.sourceAdmission = sourceAdmission
+    self.expectedSourceFormat = expectedSourceFormat
     self.feedID = feedID
     self.outputURL = outputURL
     self.width = width
@@ -221,7 +362,13 @@ struct SourceRecordingConfiguration {
     self.spaceCheckInterval = spaceCheckInterval
     self.realTimeEncoding = realTimeEncoding
     self.maxKeyFrameInterval = maxKeyFrameInterval
+    self.maxKeyFrameIntervalDuration = maxKeyFrameIntervalDuration
     self.frameRate = frameRate
+    self.declaredTimebases = declaredTimebases
+    self.quantizationPolicy = quantizationPolicy
+    self.sourceFrameRate = sourceFrameRate
+    self.recordingConstantFrameRate = recordingConstantFrameRate
+    self.nativeTimecodeMetadata = nativeTimecodeMetadata
     self.timecodePolicy = timecodePolicy
     // Drop-frame follows, in order: an explicit choice; for record-start
     // timecode (which continues the camera's count) the flag the source's own
@@ -273,15 +420,27 @@ struct SourceRecordingTelemetry: Equatable, Sendable {
   fileprivate(set) var writerBufferCapacityBytes = 0
   /// Frames repacked on the GPU into the encoder's native format, frames
   /// handed over unchanged, and frames VideoToolbox had to convert on the CPU.
+  fileprivate(set) var cadenceRepeatedFrames: UInt64 = 0
+  fileprivate(set) var cadenceSkippedFrames: UInt64 = 0
   fileprivate(set) var gpuConvertedFrames: UInt64 = 0
   fileprivate(set) var passThroughFrames: UInt64 = 0
   fileprivate(set) var cpuConvertedFrames: UInt64 = 0
+  fileprivate(set) var systemCompatibilityFrames: UInt64 = 0
+  fileprivate(set) var gpuConversionFailures: UInt64 = 0
+  fileprivate(set) var droppedGPUFrames: UInt64 = 0
+  fileprivate(set) var videoClockDiscontinuities: UInt64 = 0
+  fileprivate(set) var mappedAudioFrames: UInt64 = 0
+  fileprivate(set) var audioClockDiscontinuities: UInt64 = 0
+  fileprivate(set) var audioCorrectionRatio: Double = 1
   fileprivate(set) var gpuConversionMS: Double?
   fileprivate(set) var encoderInputFormat: String?
   fileprivate(set) var spaceChecks: UInt64 = 0
-  /// Frames missing between consecutive capture timestamps during the take:
-  /// the device skipped them (counted in `droppedVideo` too).
+  /// Frames missing between consecutive capture timestamps during the take
+  /// (counted in `droppedVideo` too): a signal dropout or a device skip. The
+  /// file holds the frame before each gap; `sourceGaps` counts the gaps.
   fileprivate(set) var deviceSkippedFrames: UInt64 = 0
+  fileprivate(set) var sourceGaps: UInt64 = 0
+  fileprivate(set) var largestSourceGap: UInt64 = 0
   /// Times the embedded audio was re-anchored to the video clock mid-take,
   /// and how many of those moved it earlier (a backward re-sync).
   fileprivate(set) var audioReanchors: UInt64 = 0
@@ -338,9 +497,17 @@ struct SourceRecordingWriterTelemetry: Equatable, Sendable {
   var maxBufferedBytes = 0
   var bufferedSamples = 0
   var bufferCapacityBytes = 0
+  var cadenceRepeatedFrames: UInt64 = 0
+  var cadenceSkippedFrames: UInt64 = 0
   var gpuConvertedFrames: UInt64 = 0
   var passThroughFrames: UInt64 = 0
   var cpuConvertedFrames: UInt64 = 0
+  var systemCompatibilityFrames: UInt64 = 0
+  var gpuConversionFailures: UInt64 = 0
+  var droppedGPUFrames: UInt64 = 0
+  var mappedAudioFrames: UInt64 = 0
+  var audioClockDiscontinuities: UInt64 = 0
+  var audioCorrectionRatio: Double = 1
   var gpuConversionMS: Double?
   var encoderInputFormat: String?
   var nativeEncoderInput: Bool?
@@ -357,14 +524,24 @@ struct SourceRecordingWriterTelemetry: Equatable, Sendable {
 /// source sample timing (the only change allowed is taking out the time a
 /// take spent paused, see `resumeAfterPause`) and must not mutate or replace
 /// the source buffers.
+enum RecordingVideoAppendOutcome { case appended, dropped }
+
 protocol SourceRecordingWriter: AnyObject {
   var telemetry: SourceRecordingWriterTelemetry { get }
   /// Read on the capture thread before admitting media. Implementations must
   /// answer without waiting on encoder, disk or any lock held across them.
   var hasFailed: Bool { get }
   func start() throws
+  func bindTakeContext(_ context: RecordingTakeContext) throws
+  func noteClockMapping(_ event: RecordingClockMappingEvent) throws
+  func finish(finalError: String?) throws
+  func finish(finalError: String?, sourceCounters: [String: UInt64]) throws
+  func appendVideoOutcome(_ sample: CMSampleBuffer) throws -> RecordingVideoAppendOutcome
+  func bindSourceAdmission(_ snapshot: SourceAdmissionSnapshot) throws
   func appendVideo(_ sample: CMSampleBuffer) throws
   func appendAudio(_ sample: CMSampleBuffer) throws
+  func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws
+  func appendPairedSourceAudio(_ sample: CMSampleBuffer, videoTime: CMTime) throws
   /// Called on the recorder queue after every sample admitted before a pause
   /// and before any sample admitted after the matching resume.
   func resumeAfterPause()
@@ -375,6 +552,16 @@ extension SourceRecordingWriter {
   var telemetry: SourceRecordingWriterTelemetry { SourceRecordingWriterTelemetry() }
   var hasFailed: Bool { telemetry.failed }
   func resumeAfterPause() {}
+  func bindSourceAdmission(_ snapshot: SourceAdmissionSnapshot) throws {}
+  func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws { try appendAudio(sample) }
+  func appendPairedSourceAudio(_ sample: CMSampleBuffer, videoTime: CMTime) throws { try appendAudio(sample) }
+  func bindTakeContext(_ context: RecordingTakeContext) throws {}
+  func noteClockMapping(_ event: RecordingClockMappingEvent) throws {}
+  func finish(finalError: String?) throws { try finish() }
+  func finish(finalError: String?, sourceCounters: [String: UInt64]) throws { try finish(finalError: finalError) }
+  func appendVideoOutcome(_ sample: CMSampleBuffer) throws -> RecordingVideoAppendOutcome {
+    try appendVideo(sample); return .appended
+  }
 }
 
 /// Queue-confined recording controller. Callback callers only perform bounded
@@ -405,11 +592,12 @@ final class SourceRecorderCore: @unchecked Sendable {
   // Sendable, so keep the cross-queue handoff explicit at this boundary.
   private struct QueuedSample: @unchecked Sendable {
     let value: CMSampleBuffer
+    let retention: MediaRetentionLedger.Lease
   }
 
   /// A gap this long or longer between capture timestamps is a discontinuity
   /// (a restarted source clock), not skipped frames.
-  private static let maximumSkippedFrames = 600
+  private static let maximumTimestampGapSeconds: Int64 = 10
 
   private let queue: DispatchQueue
   /// Short lock over state and counters. Never held across writer calls.
@@ -423,7 +611,13 @@ final class SourceRecorderCore: @unchecked Sendable {
   private var stopStarted = false
   private var stopResult: Result<Void, SourceRecordingError>?
   private let configuration: SourceRecordingConfiguration
+  private let videoRetention: MediaRetentionLedger
+  private let audioRetention: MediaRetentionLedger
   private let writer: SourceRecordingWriter
+  private var boundSourceAdmission: SourceAdmissionSnapshot?
+  private var boundTakeContext: RecordingTakeContext?
+  private var pendingMetadataEvents = 0
+  private static let maximumMetadataEvents = 64
   private var telemetryValue = SourceRecordingTelemetry()
   private var pendingVideo = 0
   private var pendingAudio = 0
@@ -437,6 +631,11 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// run, so going back means the input restarted.
   private var latestAdmittedVideoPTS: CMTime?
   private var invalidVideoSinceLastFrame = false
+  /// The take's first capture time, so each gap is logged at its place in
+  /// the take, and the bound on those lines for a flaky source.
+  private var firstAdmittedVideoPTS: CMTime?
+  private var gapLog = LossLogLimiter()
+  private static let log = Logger(subsystem: "org.ultracam.app", category: "recording")
   private var spaceTimer: DispatchSourceTimer?
   /// Space-check timer state (utility queue only).
   private var lastSpaceCheck: (time: TimeInterval, acceptedBytes: UInt64)?
@@ -445,6 +644,9 @@ final class SourceRecorderCore: @unchecked Sendable {
 
   init(configuration: SourceRecordingConfiguration, writerFactory: @escaping WriterFactory) throws {
     self.configuration = configuration
+    self.boundSourceAdmission = configuration.sourceAdmission
+    self.videoRetention = MediaRetentionLedger(policy: configuration.videoRetentionPolicy)
+    self.audioRetention = MediaRetentionLedger(policy: configuration.audioRetentionPolicy)
     self.writer = try writerFactory()
     self.queue = DispatchQueue(label: "org.ultracam.recording.\(configuration.feedID.rawValue)",
       qos: .userInitiated)
@@ -458,6 +660,9 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   deinit { spaceTimer?.cancel() }
+
+  var videoRetentionSnapshot: MediaRetentionLedger.Snapshot { videoRetention.snapshot }
+  var audioRetentionSnapshot: MediaRetentionLedger.Snapshot { audioRetention.snapshot }
 
   var state: SourceRecordingState {
     if writer.hasFailed { observeWriterFailure() }
@@ -486,8 +691,16 @@ final class SourceRecorderCore: @unchecked Sendable {
       snapshot.writerBufferedBytes = writerSnapshot.bufferedBytes
       snapshot.writerMaxBufferedBytes = writerSnapshot.maxBufferedBytes
       snapshot.writerBufferCapacityBytes = writerSnapshot.bufferCapacityBytes
+      snapshot.cadenceRepeatedFrames = writerSnapshot.cadenceRepeatedFrames
+      snapshot.cadenceSkippedFrames = writerSnapshot.cadenceSkippedFrames
       snapshot.gpuConvertedFrames = writerSnapshot.gpuConvertedFrames
       snapshot.passThroughFrames = writerSnapshot.passThroughFrames
+      snapshot.systemCompatibilityFrames = writerSnapshot.systemCompatibilityFrames
+      snapshot.gpuConversionFailures = writerSnapshot.gpuConversionFailures
+      snapshot.droppedGPUFrames = writerSnapshot.droppedGPUFrames
+      snapshot.mappedAudioFrames = writerSnapshot.mappedAudioFrames
+      snapshot.audioClockDiscontinuities = writerSnapshot.audioClockDiscontinuities
+      snapshot.audioCorrectionRatio = writerSnapshot.audioCorrectionRatio
       snapshot.cpuConvertedFrames = writerSnapshot.cpuConvertedFrames
       snapshot.gpuConversionMS = writerSnapshot.gpuConversionMS
       snapshot.encoderInputFormat = writerSnapshot.encoderInputFormat
@@ -527,6 +740,7 @@ final class SourceRecorderCore: @unchecked Sendable {
         throw SourceRecordingError.invalidState(current, operation: "start")
       }
       do {
+        if let sourceAdmission = configuration.sourceAdmission { try writer.bindSourceAdmission(sourceAdmission) }
         try writer.start()
         stateLock.withLock { telemetryValue.state = .recording }
       } catch {
@@ -542,12 +756,139 @@ final class SourceRecorderCore: @unchecked Sendable {
     startSpaceChecks()
   }
 
+  var sourceAdmission: SourceAdmissionSnapshot? { stateLock.withLock { boundSourceAdmission } }
+
+  /// Ordered declaration callback: bind once before any media. A new epoch or
+  /// clock binding ends this take even if its format signature is unchanged.
+  func bindSourceAdmission(_ snapshot: SourceAdmissionSnapshot) throws {
+    do {
+      try stateLock.withLock {
+        if let bound = boundSourceAdmission {
+          guard bound.epochID == snapshot.epochID, bound.formatSignature == snapshot.formatSignature,
+            bound.clockBindings == snapshot.clockBindings else {
+            throw SourceRecordingError.unsupportedSample("Recording source contract changed during the take; start a new take.")
+          }
+          return
+        }
+        guard telemetryValue.enqueuedVideo == 0, telemetryValue.enqueuedAudio == 0 else {
+          throw SourceRecordingError.unsupportedSample("Recording source declaration arrived after media; start a new take.")
+        }
+        guard configuration.expectedSourceFormat.map({ $0.signature == snapshot.formatSignature }) ?? true else {
+          throw SourceRecordingError.unsupportedSample("Recording source format changed before its audio declaration resolved; start a new take.")
+        }
+        guard snapshot.format.width == configuration.width, snapshot.format.height == configuration.height,
+          snapshot.format.pixel.rawValue == configuration.sourcePixelFormat else {
+          throw SourceRecordingError.unsupportedSample("Recording source declaration differs from configured dimensions or pixel format.")
+        }
+        boundSourceAdmission = snapshot
+      }
+      try writer.bindSourceAdmission(snapshot)
+    } catch {
+      let failure = Self.recordingError(error)
+      stateLock.withLock { failLocked(failure.localizedDescription) }
+      throw failure
+    }
+  }
+
+  func bindTakeContext(_ context: RecordingTakeContext) throws {
+    do { try context.validateCurrentAudio() }
+    catch {
+      stateLock.withLock { failLocked(error.localizedDescription) }
+      throw error
+    }
+    try bindSourceAdmission(context.sourceAdmission)
+    try enqueueMetadata(prepare: {
+      if let previous = self.boundTakeContext, !previous.sameContract(as: context) {
+        let message = "Recording audio declaration changed during the take; start a new take."
+        self.failLocked(message)
+        throw SourceRecordingError.unsupportedSample(message)
+      }
+      if let previous = self.boundTakeContext, previous.mappingRevision == context.mappingRevision,
+        previous.videoMapping == context.videoMapping, previous.audioMapping == context.audioMapping { return false }
+      self.boundTakeContext = context
+      return true
+    }) { writer in try writer.bindTakeContext(context) }
+  }
+
+  func noteClockMapping(_ event: RecordingClockMappingEvent) throws {
+    try stateLock.withLock {
+      guard let bound = boundSourceAdmission, bound.epochID == event.epochID,
+        bound.clockBindings.video == event.clockID || bound.clockBindings.audio == event.clockID else {
+        let message = "Recording received a stale clock mapping."
+        failLocked(message)
+        throw SourceRecordingError.unsupportedSample(message)
+      }
+    }
+    try enqueueMetadata { writer in try writer.noteClockMapping(event) }
+  }
+
+  /// Capture-side work is bounded validation and one ordered enqueue only.
+  /// Disk/JSON/fsync run here on the recorder queue before later media work.
+  private func enqueueMetadata(prepare: () throws -> Bool = { true },
+    _ operation: @escaping @Sendable (SourceRecordingWriter) throws -> Void) throws {
+    try stateLock.withLock {
+      guard telemetryValue.state == .recording || telemetryValue.state == .paused else {
+        throw SourceRecordingError.invalidState(telemetryValue.state, operation: "record take metadata")
+      }
+      guard try prepare() else { return }
+      guard pendingMetadataEvents < Self.maximumMetadataEvents else {
+        let message = "Recording metadata queue is full; the take stopped to preserve clock history."
+        failLocked(message)
+        throw SourceRecordingError.writerFailure(message)
+      }
+      pendingMetadataEvents += 1
+      // Publish the context and enqueue its work under the same admission
+      // lock: another callback cannot see ready context and queue media first.
+      queue.async { [weak self] in
+        guard let self else { return }
+        defer { self.stateLock.withLock { self.pendingMetadataEvents -= 1 } }
+        do { try operation(self.writer) }
+        catch {
+          self.stateLock.withLock {
+            self.failLocked("Recording metadata could not be preserved: " + error.localizedDescription)
+            self.drainAdmittedAfterFailure = false
+          }
+        }
+      }
+    }
+  }
+
+  /// Adapter rejection of actual envelope metadata is a take failure, never
+  /// an ordinary invalid-sample drop that silently leaves recording running.
+  func failTakeMetadata(_ message: String) {
+    stateLock.withLock { failLocked(message) }
+  }
+
+  func failSourceAdmission(_ message: String) {
+    stateLock.withLock { failSourceAdmissionLocked(message) }
+  }
+
+  private func failSourceAdmissionLocked(_ message: String) {
+    guard telemetryValue.state == .recording || telemetryValue.state == .paused else { return }
+    telemetryValue.droppedInvalidSample &+= 1
+    telemetryValue.droppedVideo &+= 1
+    failLocked(message)
+  }
+
   @discardableResult
   func appendVideo(_ sample: CMSampleBuffer) -> Bool {
     enqueue(sample, kind: .video)
   }
 
   @discardableResult
+  func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) -> Bool {
+    enqueue(sample, kind: .audio, audioMapping: mapping)
+  }
+
+  @discardableResult
+  func appendPairedSourceAudio(_ sample: CMSampleBuffer, videoTime: CMTime) -> Bool {
+    guard videoTime.isNumeric, videoTime.epoch == 0, videoTime.value >= 0 else {
+      failTakeMetadata("Paired audio requires its actual non-negative video timestamp.")
+      return false
+    }
+    return enqueue(sample, kind: .audio, pairedVideoTime: videoTime)
+  }
+
   func appendAudio(_ sample: CMSampleBuffer) -> Bool {
     enqueue(sample, kind: .audio)
   }
@@ -597,7 +938,16 @@ final class SourceRecorderCore: @unchecked Sendable {
     admission.wait()
     let result: Result<Void, SourceRecordingError> = queue.sync {
       do {
-        try writer.finish()
+        let final = stateLock.withLock { (telemetryValue.lastError, [
+          "recording.sourceVideoLost": telemetryValue.droppedVideo,
+          "recording.sourceAudioLost": telemetryValue.droppedAudio,
+          "recording.sourceSkippedFrames": telemetryValue.deviceSkippedFrames,
+          "recording.videoClockDiscontinuities": telemetryValue.videoClockDiscontinuities,
+          "recording.queueOverflows": telemetryValue.droppedQueueFull,
+          "recording.sourceErrors": telemetryValue.writerErrors,
+          "audio.trimmedFrames": telemetryValue.audioResyncTrimmedFrames,
+          "audio.silenceFilledFrames": telemetryValue.audioSilenceFilledFrames]) }
+        try writer.finish(finalError: final.0, sourceCounters: final.1)
         let writerFailed = writer.hasFailed
         stateLock.withLock {
           // A sample that failed while this stop was draining must stay failed.
@@ -618,20 +968,32 @@ final class SourceRecorderCore: @unchecked Sendable {
       }
     }
     stateLock.withLock { stopResult = result }
+    logTakeSummary()
     stopCompletion.leave()
     try result.get()
   }
 
+  /// One line per take, healthy or not, so a take's losses can be found in
+  /// the log by its feed and file name long after its stats are gone.
+  private func logTakeSummary() {
+    let t = stateLock.withLock { telemetryValue }
+    let unlogged = stateLock.withLock { gapLog.flush() }
+    let feed = configuration.feedID.rawValue
+    let file = configuration.outputURL.lastPathComponent
+    let latency = t.maxEncoderLatencyMS.map { String(format: "%.1f", $0) } ?? "—"
+    Self.log.notice("\(feed, privacy: .public): take \(t.state == .failed ? "failed" : "finished", privacy: .public), \(file, privacy: .public): frames=\(t.appendedVideo) missingFrames=\(t.deviceSkippedFrames) gaps=\(t.sourceGaps) largestGap=\(t.largestSourceGap) droppedVideo=\(t.droppedVideo) droppedAudio=\(t.droppedAudio) silenceFilledAudio=\(t.audioSilenceFilledFrames) trimmedAudio=\(t.audioResyncTrimmedFrames) clockDiscontinuities=\(t.videoClockDiscontinuities) maxEncoderMS=\(latency, privacy: .public)\(unlogged.map { " (\($0.events) gaps not logged one by one)" } ?? "", privacy: .public)")
+  }
+
   /// Runs on the capture (driver) thread. Metadata checks, one short lock and
   /// an async submit: it never waits on the encoder, the GPU or the disk.
-  private func enqueue(_ sample: CMSampleBuffer, kind: SampleKind) -> Bool {
+  private func enqueue(_ sample: CMSampleBuffer, kind: SampleKind, audioMapping: AudioVideoClockMapping? = nil, pairedVideoTime: CMTime? = nil) -> Bool {
     guard Self.isReady(sample, kind: kind) else {
       recordDrop(.invalidSample, video: kind == .video)
       return false
     }
     // Observe asynchronous writer failures before admitting media.
     if writer.hasFailed { observeWriterFailure() }
-    let queuedSample = QueuedSample(value: sample)
+    var retained: MediaRetentionLedger.Lease?
     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
     let duration = CMSampleBufferGetDuration(sample)
     let admitted = stateLock.withLock { () -> Bool in
@@ -647,6 +1009,20 @@ final class SourceRecorderCore: @unchecked Sendable {
         }
         return false
       }
+      if configuration.sidecarMovieURL != nil, boundTakeContext == nil {
+        failSourceAdmissionLocked("Recording requires a resolved take context before media.")
+        return false
+      }
+      if kind == .video, let bound = boundSourceAdmission,
+        let image = CMSampleBufferGetImageBuffer(sample) {
+        do {
+          try bound.validate(SourceAdmissionMetadata(pixelBuffer: image, presentationTime: pts, duration: duration,
+            epochID: bound.epochID, formatSignature: bound.formatSignature), stage: .recordingSource)
+        } catch {
+          failSourceAdmissionLocked(String(describing: error))
+          return false
+        }
+      }
       let waiting = kind == .video ? pendingVideo : pendingAudio
       let capacity = kind == .video ? configuration.queueCapacity : configuration.audioQueueCapacity
       guard waiting < capacity else {
@@ -657,6 +1033,31 @@ final class SourceRecorderCore: @unchecked Sendable {
         failLocked(kind == .video
           ? "Recording fell behind: \(capacity) video frames were already waiting for the encoder. The take stopped here and was kept for recovery."
           : "Recording fell behind: \(capacity) audio packets were already waiting for the encoder. The take stopped here and was kept for recovery.")
+        return false
+      }
+      do {
+        let bytes: Int
+        let seconds: Double
+        if kind == .video, let image = CMSampleBufferGetImageBuffer(sample) {
+          let planes: [MediaStorageExtent.Plane]
+          if CVPixelBufferIsPlanar(image) {
+            planes = (0..<CVPixelBufferGetPlaneCount(image)).map { .init(rowBytes: CVPixelBufferGetBytesPerRowOfPlane(image, $0), rows: CVPixelBufferGetHeightOfPlane(image, $0)) }
+          } else { planes = [.init(rowBytes: CVPixelBufferGetBytesPerRow(image), rows: CVPixelBufferGetHeight(image))] }
+          bytes = try MediaStorageExtent.allocationBytes(planes: planes, pixelBufferDataSize: CVPixelBufferGetDataSize(image),
+            ioSurfaceAllocationSize: CVPixelBufferGetIOSurface(image).map { IOSurfaceGetAllocSize($0.takeUnretainedValue()) })
+          seconds = duration.seconds
+        } else {
+          bytes = CMSampleBufferGetTotalSampleSize(sample)
+          guard let format = CMSampleBufferGetFormatDescription(sample),
+            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+            asbd.mSampleRate.isFinite, asbd.mSampleRate > 0 else { throw MediaRetentionFailure.invalidMedia }
+          seconds = Double(CMSampleBufferGetNumSamples(sample)) / asbd.mSampleRate
+        }
+        retained = try (kind == .video ? videoRetention : audioRetention).admit(bytes: bytes, duration: seconds)
+      } catch {
+        telemetryValue.droppedQueueFull &+= 1
+        if kind == .video { telemetryValue.droppedVideo &+= 1 } else { telemetryValue.droppedAudio &+= 1 }
+        failLocked("Recording retained media exceeded its byte or duration budget: " + String(describing: error))
         return false
       }
       if kind == .video, !noteCaptureTime(pts, duration: duration) { return false }
@@ -671,11 +1072,13 @@ final class SourceRecorderCore: @unchecked Sendable {
       admission.enter()
       return true
     }
-    guard admitted else { return false }
+    guard admitted, let retained else { return false }
+    let queuedSample = QueuedSample(value: sample, retention: retained)
     defer { admission.leave() }
     queue.async { [weak self] in
       guard let self else { return }
       defer {
+        queuedSample.retention.release()
         self.stateLock.withLock {
           if kind == .video { self.pendingVideo -= 1 } else { self.pendingAudio -= 1 }
         }
@@ -700,10 +1103,17 @@ final class SourceRecorderCore: @unchecked Sendable {
       do {
         switch kind {
         case .video:
-          try self.writer.appendVideo(queuedSample.value)
-          self.stateLock.withLock { self.telemetryValue.appendedVideo &+= 1 }
+          let outcome = try self.writer.appendVideoOutcome(queuedSample.value)
+          self.stateLock.withLock {
+            switch outcome {
+            case .appended: self.telemetryValue.appendedVideo &+= 1
+            case .dropped: self.telemetryValue.droppedVideo &+= 1
+            }
+          }
         case .audio:
-          try self.writer.appendAudio(queuedSample.value)
+          if let pairedVideoTime { try self.writer.appendPairedSourceAudio(queuedSample.value, videoTime: pairedVideoTime) }
+          else if let audioMapping { try self.writer.appendSourceAudio(queuedSample.value, mapping: audioMapping) }
+          else { try self.writer.appendAudio(queuedSample.value) }
           self.stateLock.withLock { self.telemetryValue.appendedAudio &+= 1 }
         }
       } catch {
@@ -744,29 +1154,72 @@ final class SourceRecorderCore: @unchecked Sendable {
       // and timeline no longer apply, so it ends here, visibly; everything
       // admitted before is still written and the file is kept for recovery.
       telemetryValue.droppedVideo &+= 1
+      telemetryValue.videoClockDiscontinuities &+= 1
       failLocked("The HDMI input changed format or restarted during the take, so its capture clock started over. The take stopped here and was kept for recovery; start a new take to keep recording.")
       return false
     }
     defer {
+      if firstAdmittedVideoPTS == nil { firstAdmittedVideoPTS = pts }
       lastAdmittedVideo = (pts, duration)
       latestAdmittedVideoPTS = pts
       invalidVideoSinceLastFrame = false
     }
     guard let last = lastAdmittedVideo, !invalidVideoSinceLastFrame,
       last.duration.seconds > 0 else { return true }
-    let steps = (CMTimeSubtract(pts, last.pts).seconds / last.duration.seconds).rounded()
-    guard steps >= 2, steps < Double(Self.maximumSkippedFrames) else { return true }
-    let skipped = UInt64(steps) - 1
+    // Compare elapsed rational time before considering cadence. A fixed
+    // frame-count threshold changes meaning between 25 and 120 fps.
+    let elapsedNumerator = Int128(pts.value) * Int128(last.pts.timescale)
+      - Int128(last.pts.value) * Int128(pts.timescale)
+    let elapsedDenominator = Int128(pts.timescale) * Int128(last.pts.timescale)
+    guard elapsedNumerator < Int128(Self.maximumTimestampGapSeconds) * elapsedDenominator else {
+      telemetryValue.videoClockDiscontinuities &+= 1
+      telemetryValue.droppedVideo &+= 1
+      failLocked("Recording source timestamp discontinuity: the capture clock advanced by at least 10 seconds without media. The take stopped and was kept for recovery.")
+      return false
+    }
+    let declaration = boundSourceAdmission?.format.rate ?? configuration.sourceFrameRate ?? .constant(last.duration)
+    guard case .constant(let cadence) = declaration else { return true }
+    let numerator = elapsedNumerator * Int128(cadence.timescale)
+    let denominator = elapsedDenominator * Int128(cadence.value)
+    guard denominator > 0, numerator >= 0 else { return true }
+    let steps = (numerator + denominator / 2) / denominator
+    guard steps >= 2, let count = UInt64(exactly: steps) else { return true }
+    let skipped = count - 1
     telemetryValue.deviceSkippedFrames &+= skipped
     telemetryValue.droppedVideo &+= skipped
+    telemetryValue.sourceGaps &+= 1
+    telemetryValue.largestSourceGap = max(telemetryValue.largestSourceGap, skipped)
+    logGap(skipped, at: pts)
     let total = telemetryValue.deviceSkippedFrames
+    let gaps = telemetryValue.sourceGaps
     guard pendingVideo < max(1, configuration.queueCapacity / 2) else {
       telemetryValue.droppedVideo &+= 1  // This frame is not recorded either.
       failLocked("The capture device skipped \(skipped) frames while \(pendingVideo) frames waited for the encoder: recording could not keep up. The take stopped here and was kept for recovery.")
       return false
     }
-    telemetryValue.warning = "The capture device skipped \(total) frame\(total == 1 ? "" : "s") during this take."
+    // The source's own clock shows the gap; the capture log says whether
+    // the signal dropped out or the device skipped.
+    telemetryValue.warning = "The input was missing \(total) frame\(total == 1 ? "" : "s") in \(gaps) gap\(gaps == 1 ? "" : "s") during this take (signal dropouts or device skips); each gap holds the frame before it."
     return true
+  }
+
+  /// Under `stateLock`: one line per gap at its place in the take, bounded
+  /// by `gapLog` so a flaky source cannot flood the log.
+  private func logGap(_ frames: UInt64, at pts: CMTime) {
+    let at = String(format: "%.3f", firstAdmittedVideoPTS.map { CMTimeSubtract(pts, $0).seconds } ?? 0)
+    let feed = configuration.feedID.rawValue
+    let decision = gapLog.note(frames: frames, at: ProcessInfo.processInfo.systemUptime)
+    switch decision {
+    case .log, .logLast:
+      Self.log.notice("\(feed, privacy: .public): \(frames) frames missing from the input before \(at, privacy: .public) s of the take (gap \(self.gapLog.events), \(self.gapLog.frames) frames so far)")
+      if decision == .logLast {
+        Self.log.notice("\(feed, privacy: .public): further input gaps in this take are summarized at most once a minute")
+      }
+    case .summary(let events, let frames):
+      Self.log.notice("\(feed, privacy: .public): \(events) more input gaps, \(frames) frames, by \(at, privacy: .public) s of the take (\(self.gapLog.events) gaps, \(self.gapLog.frames) frames so far)")
+    case .quiet:
+      break
+    }
   }
 
   /// A failure the recorder raises itself, under `stateLock`. The file writer
@@ -833,7 +1286,7 @@ final class SourceRecorderCore: @unchecked Sendable {
       rate = max(rate, Double(writerSnapshot.acceptedBytes - last.acceptedBytes) / (now - last.time))
     }
     lastSpaceCheck = (now, writerSnapshot.acceptedBytes)
-    let frameBytes = rate * configuration.frameRate.frameDuration.seconds
+    let frameBytes = rate * (configuration.sourceFrameRate?.nominal ?? configuration.frameRate.frameDuration).seconds
     let headroom = Double(writerSnapshot.bufferedBytes) + Double(rawFrames) * frameBytes
       + 2 * rate * configuration.spaceCheckInterval
     return UInt64(min(headroom, Double(UInt64.max / 2)))
@@ -846,7 +1299,7 @@ final class SourceRecorderCore: @unchecked Sendable {
     guard !writer.hasFailed else { return 0 }
     let writerSnapshot = writer.telemetry
     let rawFrames = stateLock.withLock { pendingVideo } + writerSnapshot.encoderPendingFrames
-    let frameBytes = configuration.nominalBytesPerSecond * configuration.frameRate.frameDuration.seconds
+    let frameBytes = configuration.nominalBytesPerSecond * (configuration.sourceFrameRate?.nominal ?? configuration.frameRate.frameDuration).seconds
     let owed = Double(writerSnapshot.bufferedBytes) + Double(rawFrames) * frameBytes
     return UInt64(min(owed, Double(UInt64.max / 2)))
   }
@@ -895,7 +1348,7 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   /// Records a rejection made before a CMSampleBuffer exists, such as an invalid
-  /// Blackmagic signal flag or packet metadata.
+  /// source signal-valid flag or packet metadata.
   /// The callback adapter re-placed this take's audio on the video clock: a
   /// re-anchor (`backward` when it reached into audio already recorded),
   /// frames left out because recorded audio already covered them, or a hole

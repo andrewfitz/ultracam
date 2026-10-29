@@ -523,12 +523,9 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     do { handle?.synchronizeFile() }
     stateValue = .paused
-    // A paused writer no longer promises to write through the next check
-    // interval. Withdraw its old headroom so it cannot become stale capacity
-    // that blocks other sessions.
-    if externalWriterOwnsFile {
-      manager.setHeadroom(0, for: ObjectIdentifier(self))
-    }
+    // Accepted samples can still be encoding or waiting to reach disk. Keep
+    // their last conservative claim until the recorder reports what remains
+    // owed; pause alone is not evidence that those bytes have drained.
   }
 
   public func resume() throws {
@@ -603,7 +600,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     // session is paused: record what they still need, unchecked. Space is
     // rechecked once recording resumes, which restores the last full headroom.
     if externalWriterOwnsFile, stateValue == .paused {
-      manager.setHeadroom(0, for: ObjectIdentifier(self))
+      manager.setHeadroom(headroom, for: ObjectIdentifier(self))
       return
     }
     guard externalWriterOwnsFile, stateValue == .recording else {
@@ -619,6 +616,16 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     lastHeadroom = headroom
     try manager.checkHeadroom(headroom, for: ObjectIdentifier(self))
+  }
+
+  /// Called only after exclusive metadata creation succeeded. Persisting this
+  /// ownership bit prevents cancellation from touching unrelated sidecars.
+  func claimSidecar() throws {
+    lock.lock(); defer { lock.unlock() }
+    guard stateValue == .recording || stateValue == .paused, let recoveryJournal else {
+      throw RecordingOutputError.invalidState(stateValue, operation: "claim take metadata")
+    }
+    try recoveryJournal.claimSidecar()
   }
 
   public func finish() throws -> URL {
@@ -657,6 +664,10 @@ public final class RecordingOutputSession: @unchecked Sendable {
       }
       guard !manager.fileManagerRef.fileExists(atPath: paths.finalFile.path) else {
         throw RecordingOutputError.destinationExists
+      }
+      if recoveryJournal?.entry.sidecarOwned == true {
+        let metadata = try RecordingTakeSidecar.readSnapshot(for: paths.finalFile)
+        guard metadata.finished else { throw RecordingOutputError.ioFailure("Take metadata must finish before publishing the movie.") }
       }
       try manager.fileManagerRef.moveItem(at: paths.temporaryFile, to: paths.finalFile)
       recoveryJournal?.remove()
@@ -702,6 +713,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
         throw RecordingOutputError.ioFailure(error.localizedDescription)
       }
     }
+    if recoveryJournal?.entry.sidecarOwned == true { try RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
     recoveryJournal?.remove()
     recoveryJournal = nil
     stateValue = .cancelled
@@ -714,6 +726,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     handle?.closeFile()
     handle = nil
     if ownsTemporaryFile { try? manager.fileManagerRef.removeItem(at: paths.temporaryFile) }
+    if recoveryJournal?.entry.sidecarOwned == true { try? RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
     recoveryJournal?.remove()
     recoveryJournal = nil
     stateValue = .cancelled

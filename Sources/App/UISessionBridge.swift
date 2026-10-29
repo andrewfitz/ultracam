@@ -69,6 +69,7 @@ enum UIFormatLabels {
   static func signal(running: Bool, deviceAvailable: Bool, update: CaptureUpdate?) -> UISignal {
     guard running else { return .none }
     guard let update else { return .connecting }
+    if let format = update.sourceFormat { return .live(format: FormatDisplayIdentity(format).detail) }
     let input = update.input
     if let format = shortFormat(input) { return .live(format: format) }
     let lowered = (input + " " + update.message).lowercased()
@@ -123,10 +124,11 @@ struct UISessionBridge {
       camera.signal = UIFormatLabels.signal(running: running, deviceAvailable: deviceAvailable, update: update)
       camera.outputFormat = update.flatMap { UIFormatLabels.shortFormat($0.output) }
       camera.applying = running && update != nil && update?.pipelineEnabledApplied == nil &&
-        UIFormatLabels.shortFormat(update?.input ?? "") != nil
+        (update?.sourceFormat != nil || UIFormatLabels.shortFormat(update?.input ?? "") != nil)
       camera.inUse = model.outputMode == .separateCameras && running && (model.cameraInUse(id) || update?.cameraOutputActive == true)
       camera.processing = descriptor.pipelineEnabled
       camera.resizeTarget = descriptor.configuration.resizeTarget
+      camera.scalingMode = descriptor.scalingMode
       camera.colorTarget = descriptor.configuration.colorTarget
       camera.frameRateTarget = descriptor.configuration.frameRateTarget
       camera.effects = [descriptor.applyLUT, descriptor.downscale, descriptor.convertTo420, descriptor.reduceFrameRate]
@@ -134,6 +136,12 @@ struct UISessionBridge {
       camera.lutLoading = model.isLUTLoading(id)
       camera.lutError = lut.error
       camera.gamut = descriptor.gamut
+      camera.sourceProfileID = descriptor.sourceProfileID
+      camera.lutInputSpaceID = descriptor.lutInputSpaceID
+      camera.lutOutputSpaceID = descriptor.lutOutputSpaceID
+      camera.programColorSpaceID = descriptor.programColorSpaceID
+      camera.recordingConstantFrameRate = descriptor.recordingConstantFrameRate
+      camera.sourceFrameRate = update?.sourceFormat?.rate
       camera.previewEnabled = descriptor.previewEnabled
       camera.automaticStart = descriptor.automaticFeed
       // A refused Start says why; otherwise an automatic camera's status.
@@ -313,12 +321,18 @@ struct UISessionBridge {
         }
       }
     case .setSyncCameras(let enabled): model.setSyncCameras(enabled)
+    case .setScalingMode(let id, let mode): model.updateCamera(feedID(id)) { $0.scalingMode = mode }
     case .setResizeTarget(let id, let target): model.updateCamera(feedID(id)) { $0.resizeTarget = target; $0.downscale = true }
     case .setColorTarget(let id, let target): model.updateCamera(feedID(id)) { $0.colorTarget = target; $0.convertTo420 = true }
     case .setFrameRateTarget(let id, let target): model.updateCamera(feedID(id)) { $0.frameRateTarget = target; $0.reduceFrameRate = true }
     case .chooseLUT(let id):
       model.chooseLUT(feedID: feedID(id))
-    case .setGamut(let id, let gamut): model.updateCamera(feedID(id)) { $0.gamut = gamut }
+    case .setSourceProfile(let id, let profile): model.updateCamera(feedID(id)) { $0.setSourceProfile(profile) }
+    case .setLUTInputSpace(let id, let space): model.updateCamera(feedID(id)) { $0.lutInputSpaceID = space }
+    case .setRecordingConstantFrameRate(let id, let enabled): model.updateCamera(feedID(id)) { $0.recordingConstantFrameRate = enabled }
+    case .setProgramColorSpace(let id, let space): model.updateCamera(feedID(id)) { $0.programColorSpaceID = space }
+    case .setLUTOutputSpace(let id, let space): model.updateCamera(feedID(id)) { $0.lutOutputSpaceID = space }
+    case .setGamut(let id, let gamut): model.updateCamera(feedID(id)) { $0.setGamut(gamut) }
     case .setInput(let id, let device): model.updateCamera(feedID(id)) { $0.selectedDevice = device }
     case .refreshInputs: model.refresh()
     case .setPreviewEnabled(let id, let on): model.updateCamera(feedID(id)) { $0.previewEnabled = on }
@@ -392,9 +406,9 @@ struct UISessionBridge {
     case .toggleTool(let id, let tool):
       let gamut = model.descriptor(for: feedID(id))?.gamut ?? FeedDescriptor().gamut
       UIMonitorBridge.toggle(tool, for: id, coordinator: model.monitorCoordinator,
-        defaultSourceProfile: UIMonitorBridge.sourceProfile(forGamut: gamut))
+        defaultSourceProfile: model.descriptor(for: feedID(id))?.monitor.signal.logProfileID ?? UIMonitorBridge.sourceProfile(forGamut: gamut))
     case .detachMonitor(let id):
-      MonitorDetachedWindows.open(coordinator: model.monitorCoordinator, target: MonitorTargetID(id), sonyCameras: model.sonyCameras)
+      MonitorDetachedWindows.open(coordinator: model.monitorCoordinator, target: MonitorTargetID(id), cameraControls: model.cameraControls)
     case .freeze, .toggleClean: UIMonitorBridge.perform(action, coordinator: model.monitorCoordinator)
     case .resetMonitorTools(let id):
       model.monitorCoordinator.resetSettings(for: MonitorTargetID(id))
@@ -433,7 +447,7 @@ enum UIStrategy {
 enum UITimecode {
   static func title(_ mode: RecordingTimecodeMode) -> String {
     switch mode {
-    case .source: return "No Timecode Track"
+    case .source: return "Source timecode"
     case .recordStart: return "Record Start"
     case .wallClock: return "Mac Clock"
     }

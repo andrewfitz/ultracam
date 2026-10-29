@@ -3,7 +3,7 @@ import CoreVideo
 import Foundation
 import os
 
-/// Bridges the Blackmagic capture callback boundary to one source recorder.
+/// Bridges the source capture callback boundary to one source recorder.
 ///
 /// The adapter deliberately has no image-processing policy. A callback's
 /// `CVPixelBuffer` is retained by the resulting sample buffer and handed to
@@ -20,7 +20,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   /// format or color tags changed).
   private let formatLock = RecordingLock()
   private var cachedFormat: CMVideoFormatDescription?
-  /// Puts the DeckLink audio packet clock on the video stream clock; see
+  /// Puts the source audio packet clock on the video stream clock; see
   /// ``callbacks``.
   private let clockLock = RecordingLock()
   private var audioClock = EmbeddedAudioClockAnchor()
@@ -68,7 +68,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     appendRawVideo(sample: sample)
   }
 
-  /// Wraps the original Blackmagic pixel buffer in a timed sample. Core Media
+  /// Wraps the original source pixel buffer in a timed sample. Core Media
   /// retains the original buffer; no image bytes are read or transformed.
   /// `signalValid` mirrors the backend callback and rejects no-signal frames.
   @discardableResult
@@ -86,7 +86,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     return recorder.appendVideo(sample)
   }
 
-  /// Accepts a Blackmagic frame callback using the unlabeled buffer spelling.
+  /// Accepts a source frame callback using the unlabeled buffer spelling.
   @discardableResult
   func appendRawVideo(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime,
     duration: CMTime, signalValid: Bool = true) -> Bool {
@@ -108,7 +108,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   }
 
   /// Builds the Core Media sample for an embedded packet, then forwards it to
-  /// the recorder. The packet overload is useful directly from a Blackmagic
+  /// the recorder. The packet overload is useful directly from a source
   /// audio callback that has copied its bounded PCM payload.
   @discardableResult
   func appendEmbeddedAudio(packet: EmbeddedAudioPacket) -> Bool {
@@ -123,7 +123,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     appendEmbeddedAudio(packet: packet)
   }
 
-  /// Copies one bounded Blackmagic PCM payload into the embedded-audio packet
+  /// Copies one bounded source PCM payload into the embedded-audio packet
   /// contract and queues its exact source timestamp. Invalid packet metadata
   /// is rejected before anything reaches the writer.
   @discardableResult
@@ -140,11 +140,10 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   /// preserving the per-feed routing while leaving callback callers free to
   /// pass them to a backend without any controller changes.
   ///
-  /// The closures carry one DeckLink input callback each: its frame, then its
+  /// The closures carry one source input callback each: its frame, then its
   /// audio packet, on one thread. The frame's stream time and the packet's
   /// packet time are separate device clocks whose origins can differ by a
-  /// large, device-dependent amount (0.44 s and 0.88 s were measured on two
-  /// UltraStudios opened together), so the raw packet time is moved onto the
+  /// device-dependent amount, so the raw packet time is moved onto the
   /// video clock: a packet that follows a frame is that frame's audio. Audio
   /// keeps its own sample-exact spacing; only its origin moves.
   var callbacks: Callbacks {
@@ -163,16 +162,112 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
         guard bytesPerSample == EmbeddedAudioFormat.sourceBytesPerSample else {
           return self.reject(video: false)
         }
-        return self.appendDeckLinkAudio(sourcePCM32, sampleFrameCount: sampleFrameCount,
+        return self.appendPairedSourceAudio(sourcePCM32, sampleFrameCount: sampleFrameCount,
           packetTime: presentationTime, channelCount: channelCount)
+      }, audioPair: { [weak self] time, duration in
+        self?.clockLock.withLock {
+          self?.audioClock.clearVideoPair()
+          if let time, let duration { self?.audioClock.noteVideo(time, duration: duration) }
+        }
+      }, sourceAdmission: { [weak self] snapshot in
+        guard let self else { return false }
+        do { try self.recorder.bindSourceAdmission(snapshot); return true }
+        catch { return false } // Core binding publishes a visible failed take.
+      }, videoWithAdmission: { [weak self] image, metadata, snapshot, signalValid in
+        guard let self else { return false }
+        do { try snapshot.validate(metadata, stage: .recordingSource) }
+        catch {
+          self.recorder.failSourceAdmission(String(describing: error))
+          return false
+        }
+        if signalValid {
+          self.clockLock.withLock { self.audioClock.noteVideo(metadata.presentationTime, duration: metadata.duration) }
+        }
+        return self.appendRawVideo(pixelBuffer: image, presentationTime: metadata.presentationTime,
+          duration: metadata.duration, signalValid: signalValid)
+      }, takeContext: { [weak self] context in
+        guard let self else { return false }
+        do { try self.recorder.bindTakeContext(context); return true }
+        catch { return false } // Core publishes the immutable-contract failure.
+      }, clockMapping: { [weak self] event in
+        guard let self else { return false }
+        do { try self.recorder.noteClockMapping(event); return true }
+        catch { return false }
+      }, sourceAudio: { [weak self] planes, frames, format, time, context in
+        self?.appendSourcePCM(planes: planes, frames: frames, format: format, time: time, context: context, source: nil, pairedVideoTime: nil) ?? false
+      }, videoWithTimecode: { [weak self] image, metadata, source, valid, timecode in
+        self?.appendNativeVideo(image, metadata: metadata, source: source, signalValid: valid, timecode: timecode) ?? false
+      }, metadataFailure: { [weak self] message in
+        self?.recorder.failTakeMetadata(message)
+      }, sourceAudioWithAdmission: { [weak self] planes, frames, format, time, context, source, pairedVideoTime in
+        self?.appendSourcePCM(planes: planes, frames: frames, format: format, time: time, context: context, source: source, pairedVideoTime: pairedVideoTime) ?? false
       })
   }
 
-  /// Places one DeckLink packet on the video clock (see
+  private func appendSourcePCM(planes: [Data], frames: Int, format: SourceAudioFormat, time: CMTime,
+    context: RecordingTakeContext, source: SourceAdmissionSnapshot?, pairedVideoTime: CMTime?) -> Bool {
+    do {
+      let sample = try makeSourceSample(planes: planes, sampleFrameCount: frames, format: format, presentationTime: time)
+      if let source {
+        let provenance = RecordingSourceProvenance(epochID: source.epochID, formatSignature: source.formatSignature,
+          videoClock: source.clockBindings.video, audioClock: source.clockBindings.audio)
+        CMSetAttachment(sample, key: SourceRecordingConfiguration.sourceProvenanceAttachmentKey as CFString,
+          value: try JSONEncoder().encode(provenance) as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+      }
+      if format.clock == .pairedWithFrames {
+        guard let pairedVideoTime, pairedVideoTime.isNumeric, pairedVideoTime.epoch == 0, pairedVideoTime >= .zero else {
+          throw SourceRecordingError.unsupportedSample("Recording paired source audio requires an actual matching video timestamp.")
+        }
+        return recorder.appendPairedSourceAudio(sample, videoTime: pairedVideoTime)
+      }
+      guard let mapping = try context.audioVideoClockMapping() else {
+        throw SourceRecordingError.unsupportedSample("Recording source audio requires actual audio and video clock mappings.")
+      }
+      return recorder.appendSourceAudio(sample, mapping: mapping)
+    } catch { recorder.failTakeMetadata(String(describing: error)); return false }
+  }
+
+  @discardableResult
+  func appendNativeVideo(_ image: CVPixelBuffer, metadata: SourceAdmissionMetadata,
+    source: SourceAdmissionSnapshot, signalValid: Bool, timecode: Timecode?) -> Bool {
+    do {
+      try source.validate(metadata, stage: .recordingSource)
+      guard signalValid else { return reject() }
+      guard let sample = makeSample(pixelBuffer: image, presentationTime: metadata.presentationTime,
+        duration: metadata.duration) else { return reject() }
+      let provenance = RecordingSourceProvenance(epochID: source.epochID, formatSignature: source.formatSignature,
+        videoClock: source.clockBindings.video)
+      CMSetAttachment(sample, key: SourceRecordingConfiguration.sourceProvenanceAttachmentKey as CFString,
+        value: try JSONEncoder().encode(provenance) as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+      if let timecode {
+        let original = try JSONEncoder().encode(timecode)
+        CMSetAttachment(sample, key: SourceRecordingConfiguration.sourceTimecodeAttachmentKey as CFString,
+          value: original as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+        let rate: RecordingFrameRate?
+        if case .constant(let duration) = source.format.rate {
+          rate = RecordingFrameRate(numerator: Int64(duration.timescale), denominator: duration.value)
+        } else { rate = nil }
+        if let rate {
+          let label = String(format: "%02d:%02d:%02d%@%02d", timecode.hours, timecode.minutes,
+            timecode.seconds, timecode.dropFrame ? ";" : ":", timecode.frames)
+          if let epoch = Int64(exactly: source.epochID.epoch),
+            let value = TimecodeMetadata.native(label: label, frameRate: rate, epoch: epoch) {
+            let data = try JSONEncoder().encode(value)
+            CMSetAttachment(sample, key: SourceRecordingConfiguration.nativeTimecodeAttachmentKey as CFString,
+              value: data as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+          }
+        }
+      }
+      clockLock.withLock { audioClock.noteVideo(metadata.presentationTime, duration: metadata.duration) }
+      return recorder.appendVideo(sample)
+    } catch { recorder.failSourceAdmission(String(describing: error)); return false }
+  }
+
+  /// Places one source packet on the video clock (see
   /// ``EmbeddedAudioClockAnchor``) and queues it. The ordinary packet costs
   /// one short lock; silence, trimming and the crossfade happen only around
   /// a clock jump, and every one is logged and counted on the take.
-  private func appendDeckLinkAudio(_ sourcePCM32: Data, sampleFrameCount: Int, packetTime: CMTime,
+  private func appendPairedSourceAudio(_ sourcePCM32: Data, sampleFrameCount: Int, packetTime: CMTime,
     channelCount: Int) -> Bool {
     let (placement, continuation) = clockLock.withLock { () -> (EmbeddedAudioPlacement, [Int32]?) in
       let placement = audioClock.place(packetTime, sampleFrameCount: sampleFrameCount)
@@ -258,6 +353,17 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     let video: @Sendable (CVPixelBuffer, CMTime, CMTime, Bool) -> Bool
     let audio: @Sendable (CMSampleBuffer) -> Bool
     let rawAudio: @Sendable (Data, Int, CMTime, Int, Int) -> Bool
+    /// Typed streams explicitly provide or clear the pair for each packet.
+    var audioPair: (@Sendable (CMTime?, CMTime?) -> Void)? = nil
+    var sourceAdmission: (@Sendable (SourceAdmissionSnapshot) -> Bool)? = nil
+    var videoWithAdmission: (@Sendable (CVPixelBuffer, SourceAdmissionMetadata, SourceAdmissionSnapshot, Bool) -> Bool)? = nil
+    var takeContext: (@Sendable (RecordingTakeContext) -> Bool)? = nil
+    var clockMapping: (@Sendable (RecordingClockMappingEvent) -> Bool)? = nil
+    var sourceAudio: (@Sendable ([Data], Int, SourceAudioFormat, CMTime, RecordingTakeContext) -> Bool)? = nil
+    var videoWithTimecode: (@Sendable (CVPixelBuffer, SourceAdmissionMetadata, SourceAdmissionSnapshot, Bool, Timecode?) -> Bool)? = nil
+    var metadataFailure: (@Sendable (String) -> Void)? = nil
+    /// Original ordered source identity remains distinct from the resolved take context.
+    var sourceAudioWithAdmission: (@Sendable ([Data], Int, SourceAudioFormat, CMTime, RecordingTakeContext, SourceAdmissionSnapshot, CMTime?) -> Bool)? = nil
   }
 
   private func makeSample(pixelBuffer: CVPixelBuffer, presentationTime: CMTime,
@@ -302,7 +408,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   }
 }
 
-/// Where one DeckLink audio packet goes on the video clock.
+/// Where one source audio packet goes on the video clock.
 struct EmbeddedAudioPlacement: Equatable {
   /// Video-clock start of the packet's first kept sample frame.
   var start: CMTime
@@ -340,12 +446,12 @@ struct EmbeddedAudioPlacement: Equatable {
   }
 }
 
-/// Moves DeckLink audio packet times onto the video stream clock of the same
+/// Moves source audio packet times onto the video stream clock of the same
 /// input. A packet that follows a frame from the same input callback is that
 /// frame's audio, so each such pair measures the offset between the clocks.
 /// The first pair sets it; a later pair moves it only when it disagrees by
 /// more than half a frame (the device re-based a clock, for example across an
-/// HDMI re-lock). Ordinary pairs agree to a sample: a 59.94 frame is 800.8
+/// source re-lock). Ordinary pairs agree to a sample: a 59.94 frame is 800.8
 /// samples and its packets carry 800 or 801.
 ///
 /// The placed audio stays one gapless run, as the movie's LPCM track is:
@@ -372,6 +478,8 @@ struct EmbeddedAudioClockAnchor {
   private(set) var nextStart: Int64?
   /// An overlap began and its kept audio has not started yet.
   private var crossfadePending = false
+
+  mutating func clearVideoPair() { pendingVideo = nil }
 
   mutating func noteVideo(_ time: CMTime, duration: CMTime) {
     guard time.isNumeric, time.epoch == 0, duration.isNumeric, duration.value > 0 else { return }

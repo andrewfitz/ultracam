@@ -75,16 +75,228 @@ import XCTest
   private let first = FeedID(rawValue: "feed-a")
   private let second = FeedID(rawValue: "feed-b")
 
+  func testActualSourceCadenceControlsNativeTimecodeConfiguration() throws {
+    let slow = FrameRate.constant(CMTime(value: 1001, timescale: 30000))
+    XCTAssertEqual(NativeRecordingSessionDriver.legacyFrameRate(for: slow), .fps2997)
+    let timecode = try Timecode(hours: 1, minutes: 2, seconds: 3, frames: 12, dropFrame: true)
+    let native = try XCTUnwrap(NativeRecordingSessionDriver.nativeTimecodeMetadata(timecode, rate: slow))
+    XCTAssertEqual(native.frameRate, .fps2997)
+    XCTAssertEqual(native.label, "01:02:03;12")
+    let film = try Timecode(hours: 1, minutes: 2, seconds: 3, frames: 12, dropFrame: false)
+    XCTAssertEqual(NativeRecordingSessionDriver.nativeTimecodeMetadata(film,
+      rate: .constant(CMTime(value: 1, timescale: 25)))?.frameRate, .fps25)
+    XCTAssertNil(NativeRecordingSessionDriver.nativeTimecodeMetadata(nil, rate: slow))
+  }
+
+  func testProfileChoicesUseExactCodecContractsAndSourceAvailability() throws {
+    XCTAssertEqual(RecordingCodec.proResLT.matrixProfile.codec, kCMVideoCodecType_AppleProRes422LT)
+    XCTAssertEqual(RecordingCodec.proRes4444.title, "ProRes 4444")
+    XCTAssertEqual(RecordingCodec.hevcMain10.title, "HEVC Main 10")
+    let source = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
+      rate: .constant(CMTime(value: 1001, timescale: 60000)))
+    XCTAssertEqual(RecordingCodec.available(for: source), [.proResLT, .proRes422, .proRes42210Bit, .hevcMain10_422])
+  }
+
+  func testAudioOnlyTakeCannotPublishMovie() throws {
+    XCTAssertFalse(NativeRecordingSessionDriver.canPublishMovie(appendedVideo: 0),
+      "Accepted audio before video must cancel the output reservation")
+    XCTAssertTrue(NativeRecordingSessionDriver.canPublishMovie(appendedVideo: 1))
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-no-video-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = CaptureController(services: CaptureServices(
+      start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, recorderFactory: { configuration in
+      try SourceRecorderCore(configuration: configuration, writerFactory: { Writer() })
+    })
+    try driver.startRecording(feedID: first, configuration: RecordingConfiguration(outputFolder: root))
+    let output = try XCTUnwrap(driver.recordingOutputURL(feedID: first))
+    try driver.stopRecording(feedID: first)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    XCTAssertTrue(try RecordingRecovery.scan(root: root).isEmpty)
+  }
+
+  #if ULTRACAM_TEST_SUPPORT
+  func testPendingAudioPreparationKeepsKnownVideoFormat() throws {
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210,
+      rate: .constant(CMTime(value: 1, timescale: 25)))
+    let source = FakeCaptureSession(format: format, audio: .unknown)
+    let feed = FeedID(rawValue: "pending-audio-video-format")
+    let capture = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in source }))
+    capture.setCameraOutputEnabled(false)
+    // "Waiting" is published as the source starts, before its declaration
+    // arrives on the source's queue; the declaration publishes its own message.
+    let ready = expectation(description: "Declared video")
+    ready.assertForOverFulfill = false
+    capture.onUpdate = { update in if update.message == "Source format declared" { ready.fulfill() } }
+    defer { capture.onUpdate = nil; capture.stop() }
+    capture.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(), pipelineEnabled: false, previewEnabled: false)
+    wait(for: [ready], timeout: 2)
+    XCTAssertNil(capture.recordingTakeContext)
+    XCTAssertEqual(capture.recordingVideoFormat, format)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("pending-audio-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    var prepared: SourceRecordingConfiguration?
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, recorderFactory: { config in
+      prepared = config
+      return try SourceRecorderCore(configuration: config, writerFactory: { Writer() })
+    })
+    try driver.startRecording(feedID: feed, configuration: RecordingConfiguration(outputFolder: root))
+    let configuration = try XCTUnwrap(prepared)
+    XCTAssertEqual(configuration.width, 1920); XCTAssertEqual(configuration.height, 1080)
+    XCTAssertEqual(configuration.sourceFrameRate, format.rate)
+    XCTAssertEqual(configuration.frameRate, .fps25)
+    XCTAssertNil(configuration.sourceAdmission, "Unresolved audio must not bind an epoch")
+    try driver.stopRecording(feedID: feed)
+  }
+  #endif
+
+  func testPerCameraConstantRatePreferenceIsImmutableForEachTake() {
+    let driver = Driver()
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide", recordingConstantFrameRate: true),
+      RecordingFeedDescriptor(id: second, name: "Tight")], driver: driver)
+    model.outputFolder = URL(fileURLWithPath: "/tmp/recording-cfr")
+    model.recordAll()
+    guard case .start(_, let wide) = driver.operations[0],
+      case .start(_, let tight) = driver.operations[1] else { return XCTFail("Expected take configuration") }
+    XCTAssertTrue(wide.recordingConstantFrameRate)
+    XCTAssertFalse(tight.recordingConstantFrameRate)
+    model.updateFeeds([RecordingFeedDescriptor(id: first, name: "Wide", recordingConstantFrameRate: false),
+      RecordingFeedDescriptor(id: second, name: "Tight", recordingConstantFrameRate: true)])
+    XCTAssertTrue(wide.recordingConstantFrameRate, "Changing the camera setting cannot change a prepared take")
+    XCTAssertFalse(tight.recordingConstantFrameRate)
+    model.stop(feedID: first)
+    model.record(feedID: first)
+    guard let last = driver.operations.last, case .start(_, let next) = last else { return XCTFail("Expected next take") }
+    XCTAssertFalse(next.recordingConstantFrameRate)
+  }
+
+  func testFinishedArtifactLookupUsesOriginalTakeFolderGrant() throws {
+    final class ArtifactDriver: RecordingSessionDriver, RecordingSessionDriverArtifacts {
+      let url: URL
+      init(_ url: URL) { self.url = url }
+      func startRecording(feedID: FeedID, configuration: RecordingConfiguration) throws {}
+      func pauseRecording(feedID: FeedID) throws {}
+      func resumeRecording(feedID: FeedID) throws {}
+      func stopRecording(feedID: FeedID) throws {}
+      func recordingOutputURL(feedID: FeedID) -> URL? { url }
+    }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("take-grants-\(UUID().uuidString)")
+    let original = root.appendingPathComponent("A")
+    let next = root.appendingPathComponent("B")
+    try FileManager.default.createDirectory(at: original, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let movie = original.appendingPathComponent("take.mov")
+    try Data([1, 2, 3]).write(to: movie)
+    var checkedScope: URL?
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide")],
+      driver: ArtifactDriver(movie), resolveFinishedFile: { url, scope in
+        checkedScope = scope
+        guard scope == original, let url, FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+      })
+    model.outputFolder = original
+    model.record(feedID: first)
+    model.setOutputFolder(next, for: first)
+    model.stop(feedID: first)
+    XCTAssertEqual(checkedScope, original)
+    XCTAssertEqual(model.feeds.first?.savedURL, movie)
+  }
+
+  func testFailedStartReleasesActiveRootForEmptyRecoveryPruning() throws {
+    let suite = "failed-start-root-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let driver = Driver(); driver.failingFeeds.insert(first)
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide")], driver: driver,
+      folderStore: RecordingFolderStore(defaults: defaults))
+    model.outputFolder = root
+    model.record(feedID: first)
+    let deadline = Date(timeIntervalSinceNow: 3)
+    while !(defaults.dictionary(forKey: "recordingRecoveryRootBookmarks") ?? [:]).isEmpty && Date() < deadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertEqual(model.feeds.first?.status, .idle)
+    XCTAssertTrue((defaults.dictionary(forKey: "recordingRecoveryRootBookmarks") ?? [:]).isEmpty)
+  }
+
+  func testCorruptRecoveryBookmarkKeepsValidSiblingAndRawEntry() throws {
+    let suite = "mixed-roots-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = RecordingFolderStore(defaults: defaults)
+    try store.saveRecoveryRoots([root])
+    var raw = try XCTUnwrap(defaults.dictionary(forKey: "recordingRecoveryRootBookmarks"))
+    let corrupt = Data([1, 2, 3])
+    raw["/missing-corrupt"] = corrupt
+    defaults.set(raw, forKey: "recordingRecoveryRootBookmarks")
+    let restored = try store.loadRecoveryRoots()
+    XCTAssertEqual(restored.map { $0.standardizedFileURL.path }, [root.standardizedFileURL.path])
+    XCTAssertEqual(store.recoveryRootWarnings, ["/missing-corrupt"])
+    try store.saveRecoveryRoots(restored)
+    XCTAssertEqual(defaults.dictionary(forKey: "recordingRecoveryRootBookmarks")?["/missing-corrupt"] as? Data, corrupt)
+    XCTAssertEqual(try store.loadRecoveryRoots().count, 1)
+  }
+
+  func testRecoveryRootBookmarksRoundTripAndDeduplicate() throws {
+    let suite = "recovery-roots-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = RecordingFolderStore(defaults: defaults)
+    try store.saveRecoveryRoots([root, root])
+    let restored = try store.loadRecoveryRoots()
+    XCTAssertEqual(restored.map { $0.standardizedFileURL.path }, [root.standardizedFileURL.path])
+    try store.saveRecoveryRoots([])
+    XCTAssertTrue(try store.loadRecoveryRoots().isEmpty)
+  }
+
+  func testOriginalTakeRootRemainsInRecoveryAfterNextFolderChanges() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("take-roots-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original = root.appendingPathComponent("original")
+    let next = root.appendingPathComponent("next")
+    let manager = try RecordingOutputManager(rootDirectory: original, minimumFreeBytes: 0)
+    let partial = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1, 2, 3]).write(to: partial.temporaryURL)
+    partial.preserveForRecovery()
+    let driver = Driver()
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide")], driver: driver)
+    model.outputFolder = original
+    model.record(feedID: first)
+    model.setOutputFolder(next, for: first)
+    model.outputFolder = nil
+    model.stop(feedID: first)
+    let deadline = Date(timeIntervalSinceNow: 3)
+    while model.interruptedRecordings.isEmpty && Date() < deadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertEqual(model.interruptedRecordings.count, 1)
+    let discovered = try XCTUnwrap(model.interruptedRecordings.first)
+    XCTAssertEqual(discovered.temporaryURL.resolvingSymlinksInPath(), partial.temporaryURL.resolvingSymlinksInPath(),
+      "Changing or clearing next-take folders cannot hide an interrupted original")
+    XCTAssertEqual(try Data(contentsOf: discovered.temporaryURL), Data([1, 2, 3]))
+  }
+
   func testDefaultsExposeRequiredRecordingChoices() {
-    XCTAssertEqual(RecordingCodec.allCases, [.proRes42210Bit, .hevcMain10_422])
+    XCTAssertEqual(RecordingCodec.allCases, [.proResLT, .proRes422, .proRes42210Bit, .proRes4444, .hevcMain, .hevcMain10, .hevcMain10_422])
     XCTAssertEqual(RecordingCodec.proRes42210Bit.title, "ProRes 422 HQ")
-    XCTAssertEqual(RecordingCodec.hevcMain10_422.title, "HEVC Main10 4:2:2")
+    XCTAssertEqual(RecordingCodec.hevcMain10_422.title, "HEVC Main 10 4:2:2")
     XCTAssertEqual(RecordingTimecodeMode.allCases, [.source, .recordStart, .wallClock])
     XCTAssertEqual(RecordingTimecodeMode.wallClock.title, "PC time")
     XCTAssertEqual(RecordingTimecodeMode.source.help,
-      "No timecode track is written. Camera timecode still appears in the metadata panel when the signal has it.")
+      "Preserves available native source timecode. Variable-rate or late-arriving labels are retained in the sidecar when no movie timecode track exists.")
     XCTAssertEqual(RecordingTimecodeMode.wallClock.help,
       "Writes the computer's clock into the file, aligned to the first frame.")
+    XCTAssertFalse(RecordingConfiguration().recordingConstantFrameRate)
+    XCTAssertEqual(RecordingConfiguration().variableRateQuantizationPolicy, .nearest240000)
     XCTAssertEqual(RecordingConfiguration().codec, .proRes42210Bit)
     XCTAssertEqual(RecordingConfiguration().timecodeMode, .wallClock)
     XCTAssertEqual(RecordingModel().timecodeMode, .wallClock)
@@ -156,6 +368,9 @@ import XCTest
     let clearedByRemoval = RecordingModel(feeds: descriptors, folderStore: store)
     XCTAssertNil(clearedByRemoval.customOutputFolder(for: first))
     XCTAssertNil(clearedByRemoval.customOutputFolder(for: second))
+    // Removal cleared both choices above. Restore the sibling before checking
+    // that explicitly clearing the first leaves that sibling untouched.
+    restored.setOutputFolder(tight, for: second)
     restored.setOutputFolder(nil, for: first)
     let cleared = RecordingModel(feeds: descriptors, folderStore: store)
     XCTAssertNil(cleared.customOutputFolder(for: first))
@@ -631,17 +846,4 @@ import XCTest
     XCTAssertNil(stopDriver.recordingOutputURL(feedID: first))
   }
 
-  static let allTests = [
-    ("recording choices", testDefaultsExposeRequiredRecordingChoices),
-    ("per-feed recording folders", testPerFeedFoldersOverrideDefaultAndChangesApplyToNextTake),
-    ("per-feed folder persistence", testFeedFoldersPersistByIdentityAndClearIndependently),
-    ("per-feed recovery folders", testRecoveryScansAllCameraFoldersWithoutDuplicates),
-    ("independent feed controls", testPerFeedControlsRemainIndependent),
-    ("all feed error isolation", testAllFeedActionsContinueAfterOneFeedError),
-    ("folder requirement", testFolderRequirementIsReportedPerFeed),
-    ("feed refresh state", testFeedRefreshPreservesLiveStateAndDropsRemovedFeeds),
-    ("feed refresh active retention", testFeedRefreshRetainsRemovedActiveFeedUntilStopped),
-    ("duplicate feed descriptors", testDuplicateFeedDescriptorsAreCollapsed),
-    ("native source recording driver", testNativeDriverUsesPerFeedSourceRecorderAndReportsAudioGap),
-  ]
 }

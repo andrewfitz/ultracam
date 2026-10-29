@@ -6,12 +6,16 @@ import os
 
 /// Recording destinations: free space, time left and recent takes.
 enum UIRecordingLibrary {
-  /// Nominal ProRes 422 UHD rates when no take is running to measure.
+  /// Shares the recorder's nominal disk estimate until a take has a measured rate.
   static func nominalMegabits(codec: RecordingCodec, fast: Bool) -> Double {
-    switch codec {
-    case .proRes42210Bit: return fast ? 707 : 354
-    case .hevcMain10_422: return fast ? 160 : 100
-    }
+    nominalMegabits(codec: codec, width: 3840, height: 2160,
+      frameDuration: CMTime(value: 1001, timescale: fast ? 60000 : 30000)) ?? 0
+  }
+
+  static func nominalMegabits(codec: RecordingCodec, width: Int, height: Int,
+    frameDuration: CMTime, bitDepth: Int = 10) -> Double? {
+    RecordingSizeEstimator(codec: codec.sizeEstimatorCodec, width: width, height: height,
+      frameDuration: frameDuration, bitDepth: bitDepth)?.megabitsPerSecond
   }
 
   static func volumeName(for url: URL) -> String {
@@ -32,7 +36,7 @@ enum UIRecordingLibrary {
     return takes
   }
 
-  static func drives(for folders: [URL?], recordingRates: [(URL, Double)], fallbackMegabits: Double = 707) -> [UIDrive] {
+  static func drives(for folders: [URL?], recordingRates: [(URL, Double)], fallbackMegabits: Double = nominalMegabits(codec: .proRes42210Bit, fast: true)) -> [UIDrive] {
     var seen: [String: UIDrive] = [:]
     var order: [String] = []
     for case let folder? in folders {
@@ -263,21 +267,31 @@ enum UIExtensionDetector {
 
 /// Durations of finished takes, read from the movie files in the background and
 /// cached. The first lookup returns nil; the next refresh shows the duration.
+/// A movie that can't be read yet (a take still recording has no movie
+/// header) is tried again at most every 30 s, not on every refresh.
 enum UITakeDurations {
   private static let lock = NSLock()
   nonisolated(unsafe) private static var known: [URL: TimeInterval] = [:]
   nonisolated(unsafe) private static var loading: Set<URL> = []
+  nonisolated(unsafe) private static var failedAt: [URL: TimeInterval] = [:]
+  static let retryInterval: TimeInterval = 30
 
   static func duration(for url: URL) -> TimeInterval? {
     lock.lock()
     if let value = known[url] { lock.unlock(); return value }
+    if let failed = failedAt[url], ProcessInfo.processInfo.systemUptime - failed < retryInterval { lock.unlock(); return nil }
     let start = loading.insert(url).inserted
     lock.unlock()
     if start {
       Task.detached(priority: .utility) {
         let seconds = try? await AVURLAsset(url: url).load(.duration).seconds
         lock.withLock {
-          if let seconds, seconds.isFinite, seconds > 0 { known[url] = seconds }
+          if let seconds, seconds.isFinite, seconds > 0 {
+            known[url] = seconds
+            failedAt[url] = nil
+          } else {
+            failedAt[url] = ProcessInfo.processInfo.systemUptime
+          }
           loading.remove(url)
         }
       }

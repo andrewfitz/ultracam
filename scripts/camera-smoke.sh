@@ -16,11 +16,7 @@ if [[ $# -gt 1 ]]; then
   [[ $# -eq 3 && ( "$1" == --monitor || "$1" == --monitor-full ) && "$2" == --segment-seconds && "$3" =~ ^[0-9]+([.][0-9]+)?$ ]] || usage
 fi
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
-external_root=/Volumes/8TB/cinesomatic-director-work
-if ! mount | /usr/bin/grep -F ' on /Volumes/8TB ' > /dev/null; then
-  echo 'External drive /Volumes/8TB is not mounted.' >&2
-  exit 1
-fi
+external_root="$(python3 "$task_root/scripts/work_paths.py" --path work_root)"
 export TMPDIR="$external_root/tmp"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 smoke_root="$external_root/agent-work/build/ultracam-e2e/cmio-smoke/$run_id"
@@ -32,7 +28,7 @@ source "$task_root/scripts/monitor-kit-package.sh"
 monitor_kit_package_build >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
 xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
   -target arm64-apple-macos26.0 -module-cache-path "$smoke_root/modules" "${monitor_kit_link_args[@]}" \
-  "$task_root/Sources/Shared/VideoContract.swift" "$task_root/Sources/Shared/VideoBufferLayout.swift" \
+  "$task_root/Sources/DeviceAPI/VendorSettingsKeys.swift" "$task_root/Sources/Shared/SourceFormat.swift" "$task_root/Sources/Shared/SourceAdmission.swift" "$task_root/Sources/Shared/DerivedOutputAdmission.swift" "$task_root/Sources/Shared/VideoContract.swift" "$task_root/Sources/Shared/VideoBufferLayout.swift" \
   "$task_root/Sources/Shared/VirtualCameraRegistry.swift" \
   "$task_root/Sources/Shared/VirtualCameraRegistryTransport.swift" \
   "$task_root/Sources/Shared/NaturalTalkingHeadAutoSwitcher.swift" \

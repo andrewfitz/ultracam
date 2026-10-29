@@ -15,12 +15,12 @@ enum SwitcherEvaluation: Equatable {
 struct ProgramOutput<SourceID: Hashable> {
   private(set) var scheduler: ProgramCutScheduler<SourceID>
 
-  init(selectedSource: SourceID? = nil, programTimescale: Int32 = 60_000) {
+  init(selectedSource: SourceID? = nil, programTimescale: Int32 = 240_000) {
     scheduler = ProgramCutScheduler(selectedSource: selectedSource,
       programTimescale: programTimescale)
   }
 
-  init(selectedFeedID: SourceID?, programTimescale: Int32 = 60_000) {
+  init(selectedFeedID: SourceID?, programTimescale: Int32 = 240_000) {
     self.init(selectedSource: selectedFeedID, programTimescale: programTimescale)
   }
 
@@ -330,7 +330,7 @@ struct SwitcherCoordinator {
   }
 
   mutating func evaluate(at seconds: TimeInterval) -> SwitcherEvaluation {
-    evaluate(at: CMTime(seconds: seconds, preferredTimescale: 1_000))
+    evaluate(at: CMTime(seconds: seconds, preferredTimescale: 240_000))
   }
 
   mutating func evaluate(at mediaTime: CMTime, audioCues: [AudioCue],

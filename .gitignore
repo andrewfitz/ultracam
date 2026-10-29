@@ -6,5 +6,6 @@ build/
 Tools/auto-switcher/target/
 __pycache__/
 Config/Signing.xcconfig
-ThirdParty/SonyCameraRemoteSDK/include/
-ThirdParty/SonyCameraRemoteSDK/lib/
+Vendors/Sony/SDK/include/
+Vendors/Sony/SDK/lib/
+Vendors/*/SDK/.ultracam-sdk.json

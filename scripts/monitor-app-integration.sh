@@ -5,11 +5,7 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
-external_root=/Volumes/8TB/cinesomatic-build
-if ! mount | /usr/bin/grep -F ' on /Volumes/8TB ' >/dev/null; then
-  echo 'External drive /Volumes/8TB is not mounted.' >&2
-  exit 1
-fi
+external_root="$(python3 "$task_root/scripts/work_paths.py" --path work_root)"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$external_root/monitor-app-integration/$run_id"
 mkdir -p "$test_root/modules" "$test_root/tmp"
@@ -21,37 +17,33 @@ monitor_kit_package_build > "$test_root/package-build.log" 2>&1 || {
   cat "$test_root/package-build.log"
   exit 1
 }
-bash "$task_root/scripts/fetch-decklink-sdk.sh"
-sdk_dir="${DECKLINK_SDK_DIR:-$task_root/ThirdParty/DeckLinkSDK/include}"
 rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"
 RUSTC="$rustc_path" RUSTDOC="$rustdoc_path" rustup run stable cargo build \
   --manifest-path "$rust_manifest" --release --locked > "$test_root/rust-build.log" 2>&1
-auto_switcher_lib="$task_root/Tools/auto-switcher/target/release"
-xcrun clang++ -std=c++17 -fobjc-arc -Wall -Wextra -Werror -DULTRACAM_BACKEND_TESTING \
-  -fmodules-cache-path="$test_root/modules" -I "$sdk_dir" \
-  -c "$task_root/Sources/DeckLinkBackend/UltracamBackend.mm" -o "$test_root/UltracamBackend.o" \
-  > "$test_root/compile.log" 2>&1
-xcrun clang++ -std=c++17 -I "$sdk_dir" -c "$sdk_dir/DeckLinkAPIDispatch.cpp" \
-  -o "$test_root/DeckLinkAPIDispatch.o" >> "$test_root/compile.log" 2>&1
+auto_switcher_lib="$CARGO_TARGET_DIR/release"
+source "$task_root/scripts/vendor-build.sh"
+vendor_configure test "" "" app
+vendor_compile_native "$test_root/compile.log"
 app_sources=()
 while IFS= read -r source_file; do
   if [[ "$source_file" != */UltracamApp.swift ]]; then app_sources+=("$source_file"); fi
 done < <(rg --files "$task_root/Sources/App" -g '*.swift' | sort)
 frameworks="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/Frameworks"
 libraries="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib"
-xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
+xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D ULTRACAM_TEST_SUPPORT \
   -target arm64-apple-macos26.0 \
   -module-cache-path "$test_root/modules" "${monitor_kit_link_args[@]}" \
-  -Xcc -DULTRACAM_BACKEND_TESTING \
-  -import-objc-header "$task_root/Sources/DeckLinkBackend/BridgingHeader.h" \
+  ${vendor_swift_native_args[@]+"${vendor_swift_native_args[@]}"} \
+  -import-objc-header "$vendor_bridge" \
   -F "$frameworks" -Xlinker -rpath -Xlinker "$frameworks" \
   -I "$libraries" -L "$libraries" -lXCTestSwiftSupport -Xlinker -rpath -Xlinker "$libraries" \
-  "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/Recording/*.swift \
+  "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/DeviceAPI/*.swift ${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"} "$task_root"/Sources/Recording/*.swift \
   "${app_sources[@]}" "$task_root/Tests/MonitorCoordinatorChecks.swift" \
   "$task_root/Tools/MonitorAppIntegration/main.swift" \
-  "$test_root/UltracamBackend.o" "$test_root/DeckLinkAPIDispatch.o" \
+  ${vendor_native_objects[@]+"${vendor_native_objects[@]}"} ${vendor_link_args[@]+"${vendor_link_args[@]}"} \
   -L "$auto_switcher_lib" -lauto_switcher \
   -framework Security -framework CoreFoundation -framework SystemConfiguration -lz -liconv -lc++ \
   -o "$test_root/monitor-app-integration" >> "$test_root/compile.log" 2>&1 || {

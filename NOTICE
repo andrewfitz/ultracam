@@ -1,0 +1,19 @@
+Ultracam
+
+Licensed under the Apache License, Version 2.0; see LICENSE.
+Separately licensed components retain their own terms and notices; see
+THIRD_PARTY_LICENSES.md.
+
+MonitorKit
+Copyright 2026 Andrew Fitzgerald
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Blackmagic DeckLink SDK interface headers and dispatch sources
+Copyright Blackmagic Design; original per-file years and complete license
+statements are retained in the SDK sources. See THIRD_PARTY_LICENSES.md.
+The packed v210 texture views in LUTShaders.metal and LUTProcessor.swift
+follow the layout illustrated by the DeckLink SDK's Metal sample.
+
+Sony Camera Remote SDK runtime components, when installed and bundled, are
+separately licensed. This notice grants no Sony redistribution permission.

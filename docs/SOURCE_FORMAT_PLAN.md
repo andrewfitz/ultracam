@@ -762,8 +762,11 @@ B1 (the standby frame and recording's fallback change), B2, B3, B4, B5 and B6.
     only today's entries. Session/epoch IDs reject stale deliveries independently
     of format signatures; mapping revisions are not format changes.
   - **B1b. CPU rule:**
-    - first land the extension Metal standby proof on the supported GPU
-      families; B1b does not remove the CPU fill until that proof passes;
+    - land the extension Metal standby proof before removing the CPU fill.
+      On 2026-10-27 Andrew authorized activation after all 18 published output
+      slots and lifecycle regressions passed on the available M4 Max. Track
+      other supported GPU families as unverified hardware qualification;
+      Metal 4 remains required and there is no CPU or Metal 3 standby fallback;
     - add the CPU compatibility setting (stored, with its badge and sidecar
       counts) and `CPUCompatibilityConverter`;
     - put recording's three VideoToolbox CPU routes behind it;

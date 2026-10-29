@@ -22,7 +22,7 @@ import XCTest
       XCTAssertTrue(camera.receive(tenBit, discontinuity: [], producerCanNegotiate: true))
       XCTAssertEqual(camera.activeIndex, 5)
       XCTAssertTrue(camera.receive(tenBit, discontinuity: []), "Contract remains strict after negotiation")
-      let invalidRate = try sample(duration: CMTime(value: 1, timescale: 120))
+      let invalidRate = try sample(duration: CMTime(value: 1, timescale: 121))
       XCTAssertFalse(camera.receive(invalidRate, discontinuity: [], producerCanNegotiate: true))
       XCTAssertEqual(camera.activeIndex, 5, "Invalid producer request must not partially change the contract")
       XCTAssertEqual(camera.duration, VideoContract.fastDuration)
@@ -65,7 +65,16 @@ import XCTest
     var image: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, width, height, pixelFormat,
       [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &image), kCVReturnSuccess)
-    return try VideoContract.sample(XCTUnwrap(image), at: time, duration: duration)
+    let buffer = try XCTUnwrap(image)
+    // This fixture represents the shipped producer's SDR output. The native
+    // backend and legacy LUT path both attach explicit P/T/M metadata; an
+    // untagged CVPixelBuffer is an unknown-colour input, not that legacy path.
+    for (key, value) in [(kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2),
+      (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2),
+      (kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2)] {
+      CVBufferSetAttachment(buffer, key, value, .shouldPropagate)
+    }
+    return try VideoContract.sample(buffer, at: time, duration: duration)
   }
 
   func testAllAdvertisedFormatsAndAtomicNegotiation() throws {
@@ -74,15 +83,15 @@ import XCTest
     try camera.queue.sync {
       XCTAssertEqual(camera.provider.devices.count, 1)
       XCTAssertEqual(camera.device.streams.count, 2)
-      XCTAssertEqual(camera.formats.count, 18)
+      XCTAssertEqual(camera.formats.count, OutputFormatCatalog.published.count)
       for format in camera.formats {
         XCTAssertEqual(format.validFrameDurations, FrameRateTarget.allCases.map(\.duration))
-        XCTAssertEqual(format.minFrameDuration, FrameRateTarget.fps60.duration)
+        XCTAssertEqual(format.minFrameDuration, FrameRateTarget.fps120.duration)
         XCTAssertEqual(format.maxFrameDuration, FrameRateTarget.fps23976.duration)
       }
       let properties = CMIOExtensionStreamProperties(dictionary: [:])
       properties.activeFormatIndex = 5
-      properties.frameDuration = CMTime(value: 1, timescale: 120)
+      properties.frameDuration = CMTime(value: 1, timescale: 121)
       XCTAssertThrowsError(try camera.source.setStreamProperties(properties))
       XCTAssertEqual(camera.activeIndex, 0, "Invalid frame rate must not partially change the format")
       XCTAssertEqual(camera.duration, VideoContract.fastDuration)
@@ -95,7 +104,7 @@ import XCTest
         XCTAssertEqual(current.activeFormatIndex, 5)
         XCTAssertEqual(current.frameDuration, VideoContract.slowDuration)
       }
-      for invalid in [CMTime.invalid, .indefinite, .positiveInfinity, .zero, CMTime(value: 1, timescale: 120)] {
+      for invalid in [CMTime.invalid, .indefinite, .positiveInfinity, .zero, CMTime(value: 1, timescale: 121)] {
         properties.frameDuration = invalid
         XCTAssertThrowsError(try camera.sink.setStreamProperties(properties))
         XCTAssertEqual(camera.duration, VideoContract.slowDuration)
@@ -154,16 +163,19 @@ import XCTest
       XCTAssertTrue(emitted.isEmpty)
       let live = try sample(time: now)
       XCTAssertTrue(camera.receive(live, discontinuity: [.sampleDropped]))
-      XCTAssertTrue(flags.last!.contains(.sampleDropped))
+      XCTAssertTrue((try XCTUnwrap(flags.last)).contains(.sampleDropped))
       now = CMTime(value: 89_999, timescale: 60_000)
       camera.emitStandby()
       XCTAssertEqual(emitted.count, 1)
       now = CMTime(value: 90_000, timescale: 60_000)
       camera.emitStandby()
+    }
+    try awaitGPUOutput(camera) { emitted.count >= 2 }
+    try camera.queue.sync {
       XCTAssertEqual(emitted.count, 2)
       XCTAssertNil(camera.latest, "Discard the previous image on signal loss")
-      XCTAssertTrue(flags.last!.contains(.time))
-      let standby = try XCTUnwrap(CMSampleBufferGetImageBuffer(emitted.last!))
+      XCTAssertTrue((try XCTUnwrap(flags.last)).contains(.time))
+      let standby = try XCTUnwrap(CMSampleBufferGetImageBuffer(try XCTUnwrap(emitted.last)))
       try assertBlack(standby)
       // A capture frame queued before the last standby output needs a single
       // monotonic repair at recovery, retaining the sample's image and metadata.
@@ -171,10 +183,10 @@ import XCTest
       let recovery = try sample(time: CMTime(value: 89_000, timescale: 60_000))
       XCTAssertTrue(camera.receive(recovery, discontinuity: []))
       XCTAssertEqual(emitted.count, 3)
-      XCTAssertTrue(CMSampleBufferGetImageBuffer(emitted.last!) === CMSampleBufferGetImageBuffer(recovery))
-      XCTAssertGreaterThan(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(emitted.last!),
-        CMSampleBufferGetPresentationTimeStamp(emitted[1])), 0)
-      XCTAssertTrue(flags.last!.contains(.time))
+      XCTAssertTrue(CMSampleBufferGetImageBuffer(try XCTUnwrap(emitted.last)) === CMSampleBufferGetImageBuffer(recovery))
+      XCTAssertGreaterThan(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(try XCTUnwrap(emitted.last)),
+        CMSampleBufferGetPresentationTimeStamp(try XCTUnwrap(emitted.dropFirst().first))), 0)
+      XCTAssertTrue((try XCTUnwrap(flags.last)).contains(.time))
       try camera.source.stopStream()
     }
   }
@@ -192,6 +204,9 @@ import XCTest
       XCTAssertTrue(camera.receive(try sample(time: now), discontinuity: []))
       now = CMTime(value: 90_000, timescale: 60_000)
       camera.emitStandby()
+    }
+    try awaitGPUOutput(camera) { emitted.count >= 2 }
+    try camera.queue.sync {
       XCTAssertEqual(emitted.count, 2)
       now = CMTime(value: 90_001, timescale: 60_000)
       let step = VideoContract.fastDuration
@@ -201,7 +216,10 @@ import XCTest
       }
       XCTAssertEqual(emitted.count, 5)
       let repaired = emitted.suffix(3).map { CMSampleBufferGetPresentationTimeStamp($0) }
-      XCTAssertGreaterThan(CMTimeCompare(repaired[0], CMSampleBufferGetPresentationTimeStamp(emitted[1])), 0)
+      guard repaired.count == 3, emitted.count >= 2, flags.count >= 5 else {
+        throw VideoError.message("Expected three recovered output frames and discontinuity flags")
+      }
+      XCTAssertGreaterThan(CMTimeCompare(repaired[0], CMSampleBufferGetPresentationTimeStamp(try XCTUnwrap(emitted.dropFirst().first))), 0)
       XCTAssertEqual(CMTimeSubtract(repaired[1], repaired[0]), step)
       XCTAssertEqual(CMTimeSubtract(repaired[2], repaired[1]), step)
       XCTAssertTrue(flags[2].contains(.time), "Only the standby boundary is a timestamp discontinuity")
@@ -247,12 +265,16 @@ import XCTest
     var now = CMTime(value: 60_000, timescale: 60_000)
     var emitted: CMSampleBuffer?
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, clock: { now }, output: { sample, _, _ in emitted = sample })
-    try camera.queue.sync {
-      try camera.source.startStream()
-      for index in camera.formats.indices {
+    try camera.queue.sync { try camera.source.startStream() }
+    for index in camera.formats.indices {
+      try camera.queue.sync {
+        emitted = nil
         try camera.setProperties(index: index, frameDuration: nil)
         now = CMTimeAdd(now, VideoContract.fastDuration)
         camera.emitStandby()
+      }
+      try awaitGPUOutput(camera) { emitted != nil }
+      try camera.queue.sync {
         let frame = try XCTUnwrap(emitted)
         let image = try XCTUnwrap(CMSampleBufferGetImageBuffer(frame))
         let expected = camera.formats[index].formatDescription
@@ -262,7 +284,24 @@ import XCTest
         XCTAssertEqual(CVPixelBufferGetPixelFormatType(image), CMFormatDescriptionGetMediaSubType(expected))
         try assertBlack(image)
       }
-      try camera.source.stopStream()
+    }
+    try camera.queue.sync { try camera.source.stopStream() }
+  }
+
+  /// GPU completion re-enters the runtime queue. Wait for observed output only
+  /// after leaving that queue, so tests exercise the production asynchronous
+  /// path without blocking its completion or replacing it with a CPU fixture.
+  private func awaitGPUOutput(_ camera: CameraProvider, ready: @escaping () -> Bool) throws {
+    dispatchPrecondition(condition: .notOnQueue(camera.queue))
+    let completed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+      camera.queue.sync { ready() }
+    }, object: nil)
+    let result = XCTWaiter.wait(for: [completed], timeout: 10)
+    guard result == .completed else {
+      let error = camera.queue.sync {
+        camera.runtime(for: camera.descriptors[0].id)?.standbyError ?? "No GPU standby output was received"
+      }
+      throw VideoError.message("GPU standby readiness timed out: \(error)")
     }
   }
 
@@ -305,6 +344,9 @@ import XCTest
           try camera.setProperties(index: nil, frameDuration: duration)
           try camera.source.startStream()
           camera.emitStandby()
+        }
+        try awaitGPUOutput(camera) { !timestamps.isEmpty }
+        try camera.queue.sync {
           for _ in 0..<6000 {
             now = CMTimeAdd(now, duration)
             camera.emitStandby()
@@ -313,12 +355,12 @@ import XCTest
           for index in 1..<timestamps.count {
             XCTAssertEqual(CMTimeSubtract(timestamps[index], timestamps[index - 1]), duration)
           }
-          XCTAssertEqual(CMTimeSubtract(timestamps.last!, timestamps[0]), CMTimeMultiply(duration, multiplier: 6000))
+          XCTAssertEqual(CMTimeSubtract(try XCTUnwrap(timestamps.last), try XCTUnwrap(timestamps.first)), CMTimeMultiply(duration, multiplier: 6000))
           let count = timestamps.count
           now = CMTimeAdd(now, CMTimeMultiply(duration, multiplier: 10))
           camera.emitStandby()
           XCTAssertEqual(timestamps.count, count + 1, "A late timer must skip, not burst old frames")
-          XCTAssertLessThanOrEqual(abs(CMTimeSubtract(timestamps.last!, now).seconds), duration.seconds)
+          XCTAssertLessThanOrEqual(abs(CMTimeSubtract(try XCTUnwrap(timestamps.last), now).seconds), duration.seconds)
           try camera.source.stopStream()
       }
       }
@@ -389,6 +431,9 @@ import XCTest
       try camera.source.startStream()
       XCTAssertEqual(camera.consumers, 2)
       camera.emitStandby()
+    }
+    try awaitGPUOutput(camera) { outputs >= 1 }
+    try camera.queue.sync {
       XCTAssertEqual(outputs, 1)
       try camera.source.stopStream()
       XCTAssertEqual(camera.consumers, 1)
@@ -428,41 +473,55 @@ import XCTest
     let queue = try bufferQueue(capacity: 1)
     var first: CMSampleBuffer? = try sample()
     weak let firstWeak = first
+    weak let firstStorage = CMSampleBufferGetImageBuffer(try XCTUnwrap(first))
     XCTAssertTrue(try queue.send(XCTUnwrap(first)))
     first = nil
-    XCTAssertNotNil(firstWeak, "Queue owns the successful enqueue retain")
+    XCTAssertNil(firstWeak, "Transport metadata copy must not retain the caller's sample")
+    XCTAssertNotNil(firstStorage, "Queue retains the shared pixel storage")
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 1)
+    XCTAssertGreaterThan(queue.retentionSnapshot.currentBytes, 0)
     var rejected: CMSampleBuffer? = try sample()
     weak let rejectedWeak = rejected
+    weak let rejectedStorage = CMSampleBufferGetImageBuffer(try XCTUnwrap(rejected))
     XCTAssertFalse(try queue.send(XCTUnwrap(rejected)))
     rejected = nil
-    XCTAssertNil(rejectedWeak, "Backpressure must not retain rejected frames")
+    XCTAssertNil(rejectedWeak, "Backpressure must not retain rejected samples")
+    XCTAssertNil(rejectedStorage, "Backpressure must not retain rejected pixel storage")
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 1, "Failed enqueue releases its admission lease")
     let token = try XCTUnwrap(CMSimpleQueueDequeue(queue.queue))
-    // Model the native C consumer's ownership of the successful enqueue retain.
-    // Keep it explicit so a callback regression fails the weak assertion rather
-    // than making a Swift ARC local later release an already-freed sample.
     let nativeOwner = Unmanaged<CMSampleBuffer>.fromOpaque(token)
+    weak let transportSample = nativeOwner.takeUnretainedValue()
     cameraSinkQueueAltered(0, UnsafeMutableRawPointer(mutating: token), nil)
-    let remainsOwned = firstWeak != nil
+    let remainsOwned = transportSample != nil
     XCTAssertTrue(remainsOwned, "Removal notification must not release the native consumer's sample")
+    XCTAssertNotNil(firstStorage, "Native consumer still owns the shared pixel storage")
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 1, "Dequeue transfers ownership without releasing the lease")
     if remainsOwned {
       autoreleasepool {
-        XCTAssertTrue(CMSampleBufferDataIsReady(nativeOwner.takeUnretainedValue()),
-          "The native consumer must still be able to read the sample after notification")
+        XCTAssertTrue(CMSampleBufferDataIsReady(nativeOwner.takeUnretainedValue()))
         XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(nativeOwner.takeUnretainedValue()),
           CMTime(value: 60_000, timescale: 60_000))
       }
       nativeOwner.release()
     }
-    XCTAssertNil(firstWeak, "Native consumer releases the enqueue retain exactly once after use")
+    XCTAssertNil(transportSample, "Native consumer releases the enqueue retain exactly once after use")
+    XCTAssertNil(firstStorage, "Pixel storage dies only after native consumer release")
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 0)
+    XCTAssertEqual(queue.retentionSnapshot.currentBytes, 0)
     XCTAssertEqual(CMSimpleQueueGetCount(queue.queue), 0)
     let sink = CameraSink(bufferQueue: queue, route: Self.bootstrapRoute)
     var remaining: CMSampleBuffer? = try sample()
     weak let remainingWeak = remaining
+    weak let remainingStorage = CMSampleBufferGetImageBuffer(try XCTUnwrap(remaining))
     XCTAssertTrue(try sink.send(XCTUnwrap(remaining)))
     remaining = nil
-    XCTAssertNotNil(remainingWeak)
+    XCTAssertNil(remainingWeak)
+    XCTAssertNotNil(remainingStorage)
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 1)
     sink.disconnect()
-    XCTAssertNil(remainingWeak, "Stopped queue is drained without leaking buffers")
+    XCTAssertNil(remainingStorage, "Stopped queue is drained without leaking pixel storage")
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 0)
+    XCTAssertEqual(queue.retentionSnapshot.currentBytes, 0)
     XCTAssertThrowsError(try sink.send(sample()))
   }
 

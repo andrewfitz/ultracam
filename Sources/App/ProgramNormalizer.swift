@@ -29,8 +29,9 @@ import Metal
 /// the IOSurface rather than through `CVMetalTextureCache`: a cached
 /// `CVMetalTexture` retains its `CVPixelBuffer`, which would pin the capture
 /// and Program pools' buffers and make every reuse a new allocation. The cache
-/// entry retains only the IOSurface (so its ID cannot be reused while cached)
-/// and is evicted once the surface is idle and its last GPU use has completed.
+/// entry retains only the IOSurface (so its ID cannot be reused while cached),
+/// charges its actual bytes once across plane views, and is evicted after a
+/// monotonic idle interval once its last GPU use has completed.
 /// When conversions stop (no client, or every source already matches the
 /// contract), a delayed sweep releases every completed surface and the output
 /// pool, so an idle normalizer pins no capture or Program memory.
@@ -57,6 +58,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   /// Keeps both frames alive until the GPU is done. CVPixelBuffer is
   /// thread-safe to retain and release; nothing reads its pixels on the CPU.
+  private struct RetainedSource: @unchecked Sendable { let image: CVPixelBuffer }
+
   private struct RetainedBuffers: @unchecked Sendable {
     let source: CVPixelBuffer
     let output: CVPixelBuffer
@@ -65,6 +68,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   private struct Params {
     var source: SIMD4<UInt32>
     var destination: SIMD4<UInt32>
+    var geometry: SIMD4<Int32>
   }
 
   private struct TextureKey: Hashable {
@@ -77,10 +81,14 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     let surface: IOSurfaceRef
     let texture: MTLTexture
     var lastUsed: UInt64
-    init(surface: IOSurfaceRef, texture: MTLTexture, lastUsed: UInt64) {
+    var lastUsedTime: TimeInterval
+    let allocationLease: GPUAllocationBudget.Lease
+    init(surface: IOSurfaceRef, texture: MTLTexture, lastUsed: UInt64, time: TimeInterval, lease: GPUAllocationBudget.Lease) {
       self.surface = surface
       self.texture = texture
       self.lastUsed = lastUsed
+      lastUsedTime = time
+      allocationLease = lease
     }
   }
 
@@ -99,17 +107,20 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     }
   }
 
-  /// Command slots. The Program stage holds at most
-  /// `ProgramOutputRoute.stageCapacity` conversions, so a slot is always free
-  /// unless the GPU itself has stopped; then `normalize` reports a stall.
-  static let slotCount = ProgramOutputRoute.stageCapacity + 8
-  /// An idle cached surface is released after this many frames (~2 s at 60 fps).
-  static let idleSurfaceFrames: UInt64 = 120
-  static let maxCachedSurfaces = 96
+  /// Fixed GPU command concurrency, independent of stage duration/byte admission.
+  /// Exhaustion reports a counted stall without waiting on the scheduler thread.
+  static let slotCount = 32
 
   /// With no conversion for this long, completed surfaces and the pool go.
   let idleReleaseDelay: TimeInterval
+  let scalingMode: ProgramScalingMode?
 
+  private let allocationBudget: GPUAllocationBudget
+  private let cacheIdleAge: TimeInterval
+  private let monotonicNow: @Sendable () -> TimeInterval
+  var allocationSnapshot: GPUAllocationBudget.Snapshot { allocationBudget.snapshot() }
+  private let conversionQueue = DispatchQueue(label: "org.ultracam.program-preconversion", qos: .userInteractive)
+  private var conversionProcessor: LUTProcessor?
   private let lock = NSLock()
   private let statsLock = NSLock()
   private let device: MTLDevice
@@ -126,10 +137,17 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   private var textures: [TextureKey: CachedTexture] = [:]
   private var pool: CVPixelBufferPool?
   private var poolFormat: ProgramOutputFormat?
+  private var outputBytesPerBuffer: Int = 0
   private var statistics = Statistics()
   private var idleSweepScheduled = false
 
-  init(idleReleaseDelay: TimeInterval = 2) throws {
+  init(idleReleaseDelay: TimeInterval = 2, scalingMode: ProgramScalingMode? = nil, cacheMaximumBytes: Int = 512 * 1024 * 1024,
+       cacheIdleAge: TimeInterval = 2, monotonicNow: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws {
+    self.scalingMode = scalingMode
+    guard cacheIdleAge.isFinite, cacheIdleAge > 0 else { throw GPUAllocationBudgetFailure.invalidPolicy }
+    self.cacheIdleAge = cacheIdleAge
+    self.monotonicNow = monotonicNow
+    allocationBudget = GPUAllocationBudget(policy: try GPUAllocationBudgetPolicy(maximumBytes: cacheMaximumBytes, minimumSlots: 1))
     self.idleReleaseDelay = idleReleaseDelay
     guard let device = MTLCreateSystemDefaultDevice() else {
       throw VideoError.message("A Metal GPU is required for Program output.")
@@ -193,13 +211,23 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     if sequence > 0 { _ = event.wait(untilSignaledValue: sequence, timeoutMS: 2_000) }
   }
 
+#if ULTRACAM_TEST_SUPPORT
+  func waitForTesting(_ event: MTLSharedEvent, value: UInt64) {
+    lock.lock(); defer { lock.unlock() }
+    queue.waitForEvent(event, value: value)
+  }
+#endif
+
   var currentStatistics: Statistics {
     statsLock.lock()
     defer { statsLock.unlock() }
     return statistics
   }
 
-  static func supportsSource(_ format: OSType) -> Bool { sourceCode(format) != nil }
+  static func supportsSource(_ format: OSType) -> Bool {
+    sourceCode(format) != nil || [OSType(0x32767579), OSType(0x79757673), OSType(0x34323066),
+      OSType(0x50323136), OSType(0x55595641), OSType(0x49343230), OSType(0x50413136), kCVPixelFormatType_32BGRA, OSType(0x72323130), OSType(0x5231324c)].contains(format)
+  }
 
   static func supportsDestination(_ format: OSType) -> Bool { destinationCode(format) != nil }
 
@@ -214,6 +242,44 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   func normalize(_ source: CVPixelBuffer, to contract: ProgramOutputFormat,
                  completion: @escaping @Sendable (Result<CVPixelBuffer, Error>) -> Void) throws {
     let sourceFormat = CVPixelBufferGetPixelFormatType(source)
+    let sourceColour = try LUTProcessor.sourceColorimetry(source)
+    let conversionNeeded = sourceColour.primaries != contract.colour.primaries ||
+      sourceColour.transfer != contract.colour.transfer || sourceColour.matrix != contract.colour.matrix
+    if Self.sourceCode(sourceFormat) == nil || conversionNeeded {
+      guard Self.supportsSource(sourceFormat) else {
+        throw VideoError.message("Unsupported Program source pixel format.")
+      }
+      // LUTProcessor owns queue-confined scratch resources and can wait for a
+      // reusable slot. Keep that work off the Program scheduler/capture lock.
+      // The ordered Program stage bounds outstanding retained sources.
+      let retainedSource = RetainedSource(image: source)
+      conversionQueue.async { [self] in
+        do {
+          let processor: LUTProcessor
+          if let existing = conversionProcessor { processor = existing }
+          else {
+            let created = try LUTProcessor(cacheMaximumBytes: allocationBudget.policy.maximumBytes)
+            conversionProcessor = created
+            processor = created
+          }
+          var configuration = PipelineConfiguration()
+          configuration.downscale = false
+          configuration.convertTo420 = true
+          configuration.colorTarget = .yuv42210
+          let conversion: LUTColorSpaceConversion = .sourceToLUTInput(from: sourceColour, to: contract.colour)
+          try processor.submit(retainedSource.image, configuration: configuration, colorConversion: conversion,
+            destinationColorimetry: contract.colour) { [self] result in
+            switch result.result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let output):
+              do { try normalize(output, to: contract, completion: completion) }
+              catch { completion(.failure(error)) }
+            }
+          }
+        } catch { completion(.failure(error)) }
+      }
+      return
+    }
     guard let sourceCode = Self.sourceCode(sourceFormat),
       let destinationCode = Self.destinationCode(contract.pixelFormat) else {
       throw VideoError.message("Program can't convert \(VideoContract.fourCC(sourceFormat)) to \(VideoContract.fourCC(contract.pixelFormat)).")
@@ -226,6 +292,25 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     // Committed to `self.sequence` only once the work is on the GPU, so a
     // failed encode never leaves the shared event waiting for a value.
     let sequence = self.sequence &+ 1
+    // A refused encode never reaches the shared event. Restore prior cache use
+    // so a byte-pressure failure cannot pin an uncommitted sequence forever.
+    let previousUses = textures.mapValues { ($0.lastUsed, $0.lastUsedTime) }
+    defer {
+      if self.sequence != sequence {
+        var removed = false
+        for (key, entry) in textures where entry.lastUsed == sequence {
+          if let previous = previousUses[key] {
+            entry.lastUsed = previous.0
+            entry.lastUsedTime = previous.1
+          } else {
+            residency.removeAllocation(entry.texture)
+            textures.removeValue(forKey: key)
+            removed = true
+          }
+        }
+        if removed { residency.commit() }
+      }
+    }
     let slot = slots[Int(sequence % UInt64(slots.count))]
     if slot.lastSequence > 0, event.signaledValue < slot.lastSequence {
       // The GPU is `slotCount` conversions behind: it has stopped. Waiting
@@ -241,10 +326,18 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     }
     let width = CVPixelBufferGetWidth(source)
     let height = CVPixelBufferGetHeight(source)
-    let resized = width != contract.width || height != contract.height
+    let aspect = CVBufferCopyAttachment(source, kCVImageBufferPixelAspectRatioKey, nil) as? [String: Any]
+    let aspectH = (aspect?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String] as? NSNumber)?.int64Value ?? 1
+    let aspectV = (aspect?[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String] as? NSNumber)?.int64Value ?? 1
+    let pixelAspect = try Rational(aspectH, aspectV)
+    let resized = width != contract.width || height != contract.height || pixelAspect != .one
     Self.stampAttachments(output, from: source, resized: resized,
       chromaResampled: resized || sourceCode.is420 != destinationCode.is420)
-    let fullRange: UInt32 = sourceFormat == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? 1 : 0
+    try contract.stampColour(on: output)
+    let fullRange: UInt32 = (sourceFormat == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? 1 : 0)
+      | (sourceColour.horizontalChromaSiting == .left ? 2 : 0)
+      | (sourceColour.verticalChromaSiting == .top ? 4 : 0)
+      | (sourceColour.verticalChromaSiting == .bottom ? 8 : 0)
     var residencyChanged = false
     let sourcePlanes: [MTLTexture]
     switch sourceCode {
@@ -290,9 +383,17 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     residencyChanged = evictIdleTextures(sequence: sequence) || residencyChanged
     if residencyChanged { residency.commit() }
 
-    var params = Params(
-      source: SIMD4(UInt32(width), UInt32(height), sourceCode.rawValue, fullRange),
-      destination: SIMD4(UInt32(dw), UInt32(dh), destinationCode.rawValue, 0))
+    let geometry = try ProgramScalingPolicy.plan(sourceWidth: width, sourceHeight: height,
+      targetWidth: dw, targetHeight: dh, mode: scalingMode ?? contract.scalingMode, pixelAspect: pixelAspect)
+    guard geometry.scaledWidth <= Int(Int32.max), geometry.scaledHeight <= Int(Int32.max) else {
+      throw VideoError.message("Program scaling geometry is too large.")
+    }
+    let sourceParams = SIMD4<UInt32>(UInt32(width), UInt32(height), sourceCode.rawValue, fullRange)
+    let destinationParams = SIMD4<UInt32>(UInt32(dw), UInt32(dh), destinationCode.rawValue, 0)
+    let originX: Int32 = Int32(geometry.offsetX - geometry.cropLeft)
+    let originY: Int32 = Int32(geometry.offsetY - geometry.cropTop)
+    let geometryParams = SIMD4<Int32>(Int32(geometry.scaledWidth), Int32(geometry.scaledHeight), originX, originY)
+    var params = Params(source: sourceParams, destination: destinationParams, geometry: geometryParams)
     slot.params.contents().copyMemory(from: &params, byteCount: MemoryLayout<Params>.size)
 
     slot.allocator.reset()
@@ -347,6 +448,10 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   /// output pool (in-flight frames keep their own buffers). Surfaces still on
   /// the GPU are released by the idle sweep once they complete.
   func releaseIdleResources() {
+    conversionQueue.async { [weak self] in
+      self?.conversionProcessor?.releaseIdleResources()
+      self?.conversionProcessor = nil
+    }
     lock.lock()
     defer { lock.unlock() }
     releaseCompletedLocked()
@@ -362,6 +467,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
                                        resized: Bool, chromaResampled: Bool) {
     CVBufferRemoveAllAttachments(output)
     CVBufferPropagateAttachments(source, output)
+    CVBufferRemoveAttachment(output, kCVImageBufferPixelAspectRatioKey)
     if resized {
       CVBufferRemoveAttachment(output, kCVImageBufferCleanApertureKey)
       CVBufferRemoveAttachment(output, kCVImageBufferDisplayDimensionsKey)
@@ -374,10 +480,6 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   }
 
   // MARK: - Resources
-
-  // Pool allocations past this are an output stall (`outputBackPressure`).
-  nonisolated(unsafe) private static let allocationLimit =
-    [kCVPixelBufferPoolAllocationThresholdKey: VideoContract.outputBufferLimit] as CFDictionary
 
   private func makeOutput(_ contract: ProgramOutputFormat) throws -> CVPixelBuffer {
     if poolFormat != contract || pool == nil {
@@ -397,14 +499,23 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
       }
       pool = created
       poolFormat = contract
+      outputBytesPerBuffer = 0
     }
     var output: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool!, Self.allocationLimit, &output)
+    let byteSlots = outputBytesPerBuffer > 0 ? allocationBudget.policy.maximumBytes / outputBytesPerBuffer : VideoContract.outputBufferLimit
+    let slots = max(1, min(VideoContract.outputBufferLimit, byteSlots))
+    let limit = [kCVPixelBufferPoolAllocationThresholdKey: slots] as CFDictionary
+    let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool!, limit, &output)
     // A consumer (camera client, monitor) holding this many Program frames
     // has stalled; shown as a counted error by the route.
     if status == kCVReturnWouldExceedAllocationThreshold { throw VideoError.outputBackPressure }
     guard status == kCVReturnSuccess, let output else {
       throw VideoError.message("Cannot allocate a Program output frame (\(status)).")
+    }
+    if outputBytesPerBuffer == 0, let surface = CVPixelBufferGetIOSurface(output)?.takeUnretainedValue() {
+      let bytes = IOSurfaceGetAllocSize(surface)
+      try GPUAllocationBudgetPolicy(maximumBytes: allocationBudget.policy.maximumBytes, minimumSlots: 4).validateMinimum(bytesPerSlot: bytes)
+      outputBytesPerBuffer = bytes
     }
     return output
   }
@@ -417,6 +528,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     if let cached = textures[key], cached.surface === surface,
       cached.texture.width == width, cached.texture.height == height {
       cached.lastUsed = sequence
+      cached.lastUsedTime = monotonicNow()
       return cached.texture
     }
     if let stale = textures.removeValue(forKey: key) {
@@ -431,7 +543,17 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
       plane: max(plane, 0)) else {
       throw VideoError.message("Cannot map a Program frame for the GPU.")
     }
-    textures[key] = CachedTexture(surface: surface, texture: texture, lastUsed: sequence)
+    let lease: GPUAllocationBudget.Lease
+    do {
+      lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)),
+        bytes: IOSurfaceGetAllocSize(surface), generation: 0, owner: surface)
+    } catch {
+      if evictIdleTextures(sequence: sequence, all: true) { changed = true }
+      lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)),
+        bytes: IOSurfaceGetAllocSize(surface), generation: 0, owner: surface)
+    }
+    textures[key] = CachedTexture(surface: surface, texture: texture, lastUsed: sequence,
+      time: monotonicNow(), lease: lease)
     residency.addAllocation(texture)
     changed = true
     return texture
@@ -443,9 +565,9 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   private func evictIdleTextures(sequence: UInt64, all: Bool = false) -> Bool {
     let completed = event.signaledValue
     var removed = false
-    let overCap = textures.count > Self.maxCachedSurfaces
+    let now = monotonicNow()
     for (key, entry) in textures where entry.lastUsed <= completed &&
-      (all || overCap || sequence &- entry.lastUsed > Self.idleSurfaceFrames) {
+      (all || (now >= entry.lastUsedTime && now - entry.lastUsedTime >= cacheIdleAge)) {
       residency.removeAllocation(entry.texture)
       textures.removeValue(forKey: key)
       removed = true
@@ -487,7 +609,13 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     defer { lock.unlock() }
     idleSweepScheduled = false
     let idle = sequence == mark
-    if idle { releaseCompletedLocked() }
+    if idle {
+      releaseCompletedLocked()
+      conversionQueue.async { [weak self] in
+        self?.conversionProcessor?.releaseIdleResources()
+        self?.conversionProcessor = nil
+      }
+    }
     if !idle || !textures.isEmpty { scheduleIdleSweepLocked() }
   }
 
@@ -548,6 +676,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   struct ProgramNormalizeParams {
     uint4 source;       // width, height, format code, full range
     uint4 destination;  // width, height, format code, 0
+    int4 geometry;      // scaled width/height, centered canvas origin
   };
 
   constant uint kYUV420 = 0;
@@ -557,17 +686,17 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   struct Taps { int index[4]; float weight[4]; int count; };
 
-  static Taps axisTaps(int d, int srcSize, int dstSize) {
+  static Taps axisTaps(float d, int srcSize, float dstSize, float offset = 0.0f) {
     Taps t;
-    if (srcSize % dstSize == 0 && srcSize / dstSize <= 4) {
-      int n = srcSize / dstSize;
+    if (offset == 0.0f && floor(d) == d && fmod(float(srcSize), dstSize) == 0.0f && float(srcSize) / dstSize <= 4.0f) {
+      int n = int(float(srcSize) / dstSize);
       t.count = n;
       for (int k = 0; k < 4; k++) {
-        t.index[k] = d * n + min(k, n - 1);
+        t.index[k] = int(d) * n + min(k, n - 1);
         t.weight[k] = k < n ? 1.0f / float(n) : 0.0f;
       }
     } else {
-      float s = clamp((float(d) + 0.5f) * float(srcSize) / float(dstSize) - 0.5f,
+      float s = clamp((float(d) + 0.5f) * float(srcSize) / float(dstSize) - 0.5f + offset,
         0.0f, float(srcSize - 1));
       int i0 = int(floor(s));
       int i1 = min(i0 + 1, srcSize - 1);
@@ -602,7 +731,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     if ((p.source.z == kYUV420 || p.source.z == kYUV4228)) v = float(p0.read(uint2(x, y)).x) * 4.0f;
     else if ((p.source.z == kYUV422 || p.source.z == kYUV42010)) v = float(p0.read(uint2(x, y)).x >> 6);
     else v = float(v210Luma(p0.read(uint2(x / 6, y)), uint(x % 6)));
-    if (p.source.w != 0) v = 64.0f + v * (876.0f / 1023.0f);
+    if ((p.source.w & 1) != 0) v = 64.0f + v * (876.0f / 1023.0f);
     return v;
   }
 
@@ -612,14 +741,16 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     if ((p.source.z == kYUV420 || p.source.z == kYUV4228)) c = float2(p1.read(uint2(x, y)).xy) * 4.0f;
     else if ((p.source.z == kYUV422 || p.source.z == kYUV42010)) c = float2(p1.read(uint2(x, y)).xy >> 6);
     else c = float2(v210Chroma(p0.read(uint2(x / 3, y)), uint(x % 3)));
-    if (p.source.w != 0) c = 512.0f + (c - 512.0f) * (896.0f / 1023.0f);
+    if ((p.source.w & 1) != 0) c = 512.0f + (c - 512.0f) * (896.0f / 1023.0f);
     return c;
   }
 
   static float sampleLuma(texture2d<uint, access::read> p0, constant ProgramNormalizeParams &p,
                           int dx, int dy) {
-    Taps tx = axisTaps(dx, int(p.source.x), int(p.destination.x));
-    Taps ty = axisTaps(dy, int(p.source.y), int(p.destination.y));
+    dx -= p.geometry.z; dy -= p.geometry.w;
+    if (dx < 0 || dy < 0 || dx >= p.geometry.x || dy >= p.geometry.y) return 64.0f;
+    Taps tx = axisTaps(dx, int(p.source.x), p.geometry.x);
+    Taps ty = axisTaps(dy, int(p.source.y), p.geometry.y);
     float sum = 0.0f;
     for (int j = 0; j < ty.count; j++) {
       for (int i = 0; i < tx.count; i++) {
@@ -636,16 +767,27 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   static float2 sampleChroma(texture2d<uint, access::read> p0, texture2d<uint, access::read> p1,
                              constant ProgramNormalizeParams &p, int dx, int dy) {
     int2 s = chromaSize(p.source);
-    int2 d = chromaSize(p.destination);
-    Taps tx = axisTaps(dx, s.x, d.x);
-    Taps ty = axisTaps(dy, s.y, d.y);
+    float vertical = (p.destination.z == kYUV420 || p.destination.z == kYUV42010) ? 2.0f : 1.0f;
+    float2 origin = float2(p.geometry.zw);
+    float2 scaled = float2(p.geometry.xy);
+    float2 cell = float2(float(dx) * 2.0f, float(dy) * vertical);
+    float2 extent = float2(2.0f, vertical);
+    float2 covered = max(float2(0.0f), min(cell + extent, origin + scaled) - max(cell, origin));
+    float coverage = (covered.x / extent.x) * (covered.y / extent.y);
+    if (coverage == 0.0f) return float2(512.0f);
+    float x = float(dx) - origin.x / 2.0f;
+    float y = float(dy) - origin.y / vertical;
+    float verticalOffset = (p.source.w & 4) != 0 ? 0.25f : ((p.source.w & 8) != 0 ? -0.25f : 0.0f);
+    if (p.source.z != kYUV420 && p.source.z != kYUV42010) verticalOffset = 0.0f;
+    Taps tx = axisTaps(x, s.x, scaled.x / 2.0f, (p.source.w & 2) != 0 ? 0.25f : 0.0f);
+    Taps ty = axisTaps(y, s.y, scaled.y / vertical, verticalOffset);
     float2 sum = float2(0.0f);
     for (int j = 0; j < ty.count; j++) {
       for (int i = 0; i < tx.count; i++) {
         sum += tx.weight[i] * ty.weight[j] * fetchChroma(p0, p1, p, tx.index[i], ty.index[j]);
       }
     }
-    return sum;
+    return mix(float2(512.0f), sum, coverage);
   }
 
   static uint quantize(float v, uint format) {

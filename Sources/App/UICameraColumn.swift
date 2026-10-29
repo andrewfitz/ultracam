@@ -127,13 +127,13 @@ struct UICameraPictureView: View {
         detail: "Waiting for the first frame from \(camera.inputName).", showsProgress: true)
     case .noSignal:
       UIPicturePlaceholder(symbol: "video.slash", title: "No signal", compact: compact,
-        detail: "Check the camera's HDMI output: 2160p 29.97 or 59.94, 10-bit 4:2:2, RAW off, display LUT off.")
+        detail: "Check that the source is sending video and that its input connection is selected on the capture device.")
     case .unsupported(let mode):
       UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "Unsupported format", compact: compact,
-        detail: mode.isEmpty ? "Waiting for 2160p 29.97 or 59.94, 10-bit 4:2:2." : "\(mode) Waiting for 2160p 29.97 or 59.94.")
+        detail: mode.isEmpty ? "Choose a format supported by this capture device and the current processing route." : "\(mode) Choose a supported source format or check the capture diagnostics.")
     case .deviceMissing where snapshot?.inputName == nil:
       UIPicturePlaceholder(symbol: "cable.connector", title: "No input selected", compact: compact,
-        detail: "Choose this camera's UltraStudio input in the inspector.") {
+        detail: "Choose this camera's input device in the inspector.") {
         Button("Show Inspector") { context.send(.showInspector(cameraID: camera.id)) }
       }
     case .deviceMissing:
@@ -147,7 +147,7 @@ struct UICameraPictureView: View {
         Button("Retry", systemImage: "arrow.clockwise") { context.send(.retryAutomaticStart(cameraID: camera.id)) }
       }
     case .stopped:
-      UIPicturePlaceholder(symbol: "video", title: "Camera stopped", compact: compact, detail: "Start the camera to see its HDMI input.") {
+      UIPicturePlaceholder(symbol: "video", title: "Camera stopped", compact: compact, detail: "Start the camera to see its video input.") {
         // The expanded strip's header has the same button just below.
         if camera.collapsed {
           Button("Start Camera", systemImage: "play.fill") { context.send(.startCamera(cameraID: camera.id)) }
@@ -213,9 +213,9 @@ struct UICameraPictureView: View {
         }
       }
       Spacer(minLength: 0)
-      if !isClean, let store = context.sonyCameras {
+      if !isClean, let store = context.cameraControls {
         HStack {
-          UISonySettingsOverlay(feedID: camera.id, store: store)
+          UICameraSettingsOverlay(feedID: camera.id, store: store)
           Spacer(minLength: 0)
         }
         .padding(.bottom, 4)
@@ -241,7 +241,20 @@ struct UICameraPictureView: View {
 
   /// The take's clock follows its statistics here, not in the picture.
   private var recordingPill: some View {
-    UILiveCamera(camera: camera, context: context, follows: .take) { live in recordingPill(live.snapshot) }
+    UILiveCamera(camera: camera, context: context, follows: .all) { live in
+      HStack(spacing: 5) {
+        if live.snapshot?.ingestCPUCopyActive == true {
+          Text("CPU copy · Ingest · \(live.snapshot?.ingestCPUCopyFrames ?? 0)").font(.uiOverlay).lineLimit(1).uiPictureOverlay()
+            .accessibilityLabel("CPU copy for ingest")
+        }
+        if let badge = live.snapshot?.recording.compatibilityBadge {
+          Text(badge).font(.uiOverlay).lineLimit(1).uiPictureOverlay()
+            .help("System conversion is active for this recording. VideoToolbox chooses its internal CPU/GPU route.")
+            .accessibilityLabel(badge)
+        }
+        recordingPill(live.snapshot)
+      }
+    }
   }
 
   @ViewBuilder private func recordingPill(_ snapshot: UICameraSnapshot?) -> some View {
@@ -648,10 +661,10 @@ struct UIChannelStripView: View {
       alertRows
       Divider()
       outputRow
-      if let store = context.sonyCameras {
+      if let store = context.cameraControls {
         HStack(spacing: 8) {
           gutterIcon("wifi").accessibilityHidden(true)
-          UISonyCameraButton(feedID: camera.id, name: camera.name, store: store)
+          UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
             .buttonStyle(.borderless).font(.uiRow)
           Spacer(minLength: 0)
         }
@@ -707,12 +720,12 @@ struct UIChannelStripView: View {
     HStack(spacing: 8) {
       chevron
       if let brand = feedBrand {
-        UIFeedBrandMark(brand: brand)
+        UIFeedBrandMark(descriptor: brand)
       }
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
         .help("\(camera.name) · \(camera.inputName)")
-      if let sonyStore = context.sonyCameras {
-        UIFeedSettingsMenu(camera: camera, snapshot: snapshot, sonyStore: sonyStore)
+      if let controlStore = context.cameraControls {
+        UIFeedSettingsMenu(camera: camera, snapshot: snapshot, controlStore: controlStore, viewFactories: context.controlViewFactories)
       } else {
         UIBadge(text: camera.statusBadge, tone: camera.statusTone)
       }
@@ -723,13 +736,11 @@ struct UIChannelStripView: View {
     }
   }
 
-  private var feedBrand: UIFeedBrandMark.Brand? {
-    let input = camera.inputName.lowercased()
-    if let store = context.sonyCameras, store.assignment(for: camera.id) != nil { return .sony }
-    if input.contains("blackmagic") || input.contains("ultrastudio") || input.contains("decklink") {
-      return .blackmagic
+  private var feedBrand: VendorDescriptor? {
+    if let store = context.cameraControls, let assignment = store.assignment(for: camera.id) {
+      return store.descriptor(for: assignment.camera.pluginID)
     }
-    return nil
+    return snapshot?.inputID.flatMap { context.captureVendors[$0] }
   }
 
   private var chevron: some View {
@@ -1027,7 +1038,7 @@ struct UIChannelStripView: View {
         .accessibilityLabel("Updating output")
       }
       effectChips
-      sonyHDMIDisplayToggle
+      cameraDisplayToggle
       if minimal { processingToggle.labelsHidden() } else { processingToggle }
     }
   }
@@ -1044,49 +1055,22 @@ struct UIChannelStripView: View {
 
   /// Camera-side OSD is carried by the HDMI signal, so keep this switch with
   /// the video/output controls rather than in the Wi-Fi settings sheet.
-  @ViewBuilder private var sonyHDMIDisplayToggle: some View {
-    if let store = context.sonyCameras {
+  @ViewBuilder private var cameraDisplayToggle: some View {
+    if let store = context.cameraControls {
       let state = store.state(for: camera.id)
-      if state.connected,
-        let display = state.properties.first(where: { $0.id == "monitoringDisplayHDMI" }),
-        display.writable {
-        Toggle(isOn: Binding(
-          get: { sonyPropertyIsOn(display) },
-          set: { enabled in
-            Task { await setSonyHDMIDisplay(enabled, store: store, feedID: camera.id) }
-          })) {
-          Text("HDMI display").font(.uiMeta).foregroundStyle(.secondary)
+      if state.connected, let property = state.properties.first(where: { $0.role == .cameraDisplay }),
+        property.writable, case .boolean(let enabled) = property.value {
+        Toggle(isOn: Binding(get: { enabled }, set: { value in
+          Task { await store.set(property, value: .boolean(value), feedID: camera.id) }
+        })) {
+          Text(property.localizedLabel()).font(.uiMeta).foregroundStyle(.secondary)
         }
-        .toggleStyle(.switch)
-        .controlSize(.mini)
-        .fixedSize()
-        .help("Show the Sony camera's Face/Eye frames and display information in the HDMI output. This changes the camera-side HDMI composition.")
-        .accessibilityLabel("Sony HDMI display")
+        .toggleStyle(.switch).controlSize(.mini).fixedSize()
+        .disabled(state.busy)
+        .help(property.localizedUnavailableReason() ?? property.localizedLabel())
+        .accessibilityLabel(property.localizedLabel())
       }
     }
-  }
-
-  private func sonyPropertyIsOn(_ property: SonyCameraProperty) -> Bool {
-    property.label.caseInsensitiveCompare("On") == .orderedSame || property.value == 2
-  }
-
-  private func setSonyHDMIDisplay(_ enabled: Bool, store: SonyCameraStore, feedID: String) async {
-    let state = store.state(for: feedID)
-    let display = state.properties.first(where: { $0.id == "monitoringDisplayHDMI" })
-    let face = state.properties.first(where: { $0.id == "faceEyeFrameDisplay" })
-    if let display, let value = sonyChoice(display, enabled: enabled) {
-      await store.set(display, value: value, feedID: feedID)
-    }
-    if let face, let value = sonyChoice(face, enabled: enabled) {
-      await store.set(face, value: value, feedID: feedID)
-    }
-  }
-
-  private func sonyChoice(_ property: SonyCameraProperty, enabled: Bool) -> UInt64? {
-    property.choices.first { choice in
-      enabled ? choice.label.caseInsensitiveCompare("On") == .orderedSame || choice.value == 2
-        : choice.label.caseInsensitiveCompare("Off") == .orderedSame || choice.value == 1
-    }?.value
   }
 
   /// Effects only apply with Processing on, so the chips are disabled (not just dimmed) without it.

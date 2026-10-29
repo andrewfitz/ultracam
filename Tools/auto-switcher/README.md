@@ -78,7 +78,8 @@ observations can be supplied as JSONL `video` events or with `--video-cues`.
 Full vision extraction is deliberately an adapter boundary rather than a
 dependency of this crate.
 
-Both modes use the v2 session timeline schema. It stores the complete ordered
+Both modes write the v3 session timeline schema with a 240000-tick timebase.
+Existing v2 timelines retain their declared timebase when read. It stores the complete ordered
 input event ledger, director outputs, proposed/applied/expired cuts, source and
 recording artifacts, and exact integer media ticks alongside human-readable
 seconds. The same media timebase must be retained by the video recorder so a
