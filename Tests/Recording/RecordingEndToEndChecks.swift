@@ -134,8 +134,11 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
 
   func testStopDrainsSyntheticBuffersBeforeFinalization() throws {
     let writer = SyntheticSourceWriter()
+    // Room for all 20 frames: this checks the drain at stop, so a busy machine
+    // that runs the recorder queue late must not fail the take for falling behind.
     let recorder = try SourceRecorderCore(configuration: configuration(
-      feed: "finalization", url: URL(fileURLWithPath: "/tmp/finalization.mov")), writerFactory: { writer })
+      feed: "finalization", url: URL(fileURLWithPath: "/tmp/finalization.mov"), queueCapacity: 32),
+      writerFactory: { writer })
     try recorder.start()
     let duration = RecordingFrameRate.fps5994.frameDuration
     for index in 0..<20 {
