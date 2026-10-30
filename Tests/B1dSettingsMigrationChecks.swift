@@ -210,6 +210,68 @@ import XCTest
         XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot(), loaded)
         XCTAssertEqual(defaults.data(forKey: AppSettingsStore.snapshotKey), bytes)
     }
+    /// A camera saved before LUT spaces existed applied its LUT to the source
+    /// as it was: its LUT input is its declared source, not Rec.709.
+    func testCameraSavedBeforeLUTSpacesKeepsItsSourceAsLUTInput() throws {
+        let log = try savedBeforeLUTSpaces(gamut: "S-Gamut3.Cine / S-Log3")
+        XCTAssertEqual(log.lutInputSpaceID, "sony-slog3-sgamut3cine")
+        XCTAssertEqual(log.lutOutputSpaceID, "rec709-video")
+        let source = try XCTUnwrap(SourceColorSpaceCatalog.sourceRGBOverride(log.sourceProfileID))
+        XCTAssertNoThrow(try log.lutColorSpaceContract().validate(source: source, destination: .rec709Video))
+        XCTAssertEqual(try savedBeforeLUTSpaces(gamut: "Unspecified / custom LUT").lutInputSpaceID, "rec709-video")
+        let legacy = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"version":1,"selectedDevice":"","gamut":"S-Gamut3 / S-Log3"}"#.utf8))
+        XCTAssertEqual(FeedDescriptor(legacy: legacy).lutInputSpaceID, "sony-slog3-sgamut3")
+        var chosen = FeedDescriptor(gamut: "S-Gamut3 / S-Log3")
+        chosen.lutInputSpaceID = "rec709-video"
+        XCTAssertEqual(try JSONDecoder().decode(FeedDescriptor.self, from: JSONEncoder().encode(chosen)).lutInputSpaceID,
+          "rec709-video", "A saved LUT input is the user's choice")
+    }
+
+    /// Build 37 saved Rec.709 for those cameras. The kept pre-migration copy
+    /// repairs them once; a later explicit Rec.709 choice is left alone.
+    func testRec709SavedOverAnOlderCamerasSourceIsRepairedOnce() throws {
+        let suite = "B1dSettingsMigrationChecks." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let older = FeedDescriptor(id: .primary, selectedDevice: "vendor:a", gamut: "S-Gamut3.Cine / S-Log3")
+        let plain = FeedDescriptor(id: FeedID(rawValue: "plain"), selectedDevice: "vendor:b")
+        let changed = FeedDescriptor(id: FeedID(rawValue: "changed"), selectedDevice: "vendor:c", gamut: "S-Gamut3 / S-Log3")
+        var backup = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+          AppSettingsSnapshot(feeds: [older, plain, changed]))) as? [String: Any])
+        backup["feeds"] = (backup["feeds"] as? [[String: Any]])?.map { $0.filter { $0.key != "lutInputSpaceID" } }
+        defaults.set(try JSONSerialization.data(withJSONObject: backup), forKey: "ultracam.settings.pre-b1d.backup")
+        var migrated = AppSettingsSnapshot(feeds: [older, plain, changed])
+        migrated.feeds[0].lutInputSpaceID = "rec709-video"
+        // Worked around in that build by declaring the source Rec.709 instead.
+        migrated.feeds[2].lutInputSpaceID = "rec709-video"
+        migrated.feeds[2].setSourceProfile("rec709-video")
+        defaults.set(try JSONEncoder().encode(migrated), forKey: AppSettingsStore.snapshotKey)
+
+        let repaired = AppSettingsStore(defaults: defaults).loadSnapshot()
+        XCTAssertEqual(repaired.feeds.map(\.lutInputSpaceID), ["sony-slog3-sgamut3cine", "rec709-video", "rec709-video"])
+        let stored = try JSONDecoder().decode(AppSettingsSnapshot.self,
+          from: XCTUnwrap(defaults.data(forKey: AppSettingsStore.snapshotKey)))
+        XCTAssertEqual(stored.feeds[0].lutInputSpaceID, "sony-slog3-sgamut3cine")
+
+        var chosen = repaired
+        chosen.feeds[0].lutInputSpaceID = "rec709-video"
+        AppSettingsStore(defaults: defaults).saveSnapshot(chosen)
+        XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot().feeds[0].lutInputSpaceID, "rec709-video")
+    }
+
+    func testLUTSpaceRefusalNamesBothSpaces() {
+        let refusal = LUTColorSpaceContractError.inputMismatch(expected: .rec709Video,
+          actual: SourceColorSpaceCatalog.entries[1].color)
+        XCTAssertEqual(refusal.localizedDescription, "The LUT input space is Rec.709, but the source is S-Gamut3.Cine / S-Log3. Set LUT input space to match the source in the camera's settings.")
+    }
+
+    private func savedBeforeLUTSpaces(gamut: String) throws -> FeedDescriptor {
+        var feed = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+          FeedDescriptor(selectedDevice: "vendor:a", gamut: gamut))) as? [String: Any])
+        for key in ["sourceProfileID", "lutInputSpaceID", "lutOutputSpaceID", "programColorSpaceID"] { feed[key] = nil }
+        return try JSONDecoder().decode(FeedDescriptor.self, from: JSONSerialization.data(withJSONObject: feed))
+    }
+
     func testSourceSizeAndExplicitRegionalRateRoundTrip() throws {
         let suite = "B1dSettingsMigrationChecks." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

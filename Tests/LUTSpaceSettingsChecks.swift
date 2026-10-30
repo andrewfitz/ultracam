@@ -3,9 +3,11 @@ import Foundation
 import XCTest
 
 @MainActor @objcMembers final class LUTSpaceSettingsChecks: XCTestCase {
-  func testLegacyLUTSpacesStay709AndExplicitIDsRoundTrip() throws {
+  /// Saved cameras applied the LUT to the source as it was, so the LUT input
+  /// they migrate to is that source; Rec.709 refused every log camera's LUT.
+  func testLegacyLUTInputIsItsSourceAndExplicitIDsRoundTrip() throws {
     let legacy = try JSONDecoder().decode(FeedDescriptor.self, from: Data(#"{"id":"feed","gamut":"S-Gamut3.Cine / S-Log3"}"#.utf8))
-    XCTAssertEqual(legacy.lutInputSpaceID, "rec709-video")
+    XCTAssertEqual(legacy.lutInputSpaceID, "sony-slog3-sgamut3cine")
     XCTAssertEqual(legacy.lutOutputSpaceID, "rec709-video")
     var declared = legacy
     declared.lutInputSpaceID = "canon-log2-cinemagamut"
@@ -76,7 +78,7 @@ import XCTest
     XCTAssertEqual(migrated.sourceProfileID, "panasonic-vlog-vgamut")
     XCTAssertEqual(migrated.monitor.signal.logProfileID, migrated.sourceProfileID)
     XCTAssertEqual(migrated.gamut, "S-Gamut3.Cine / S-Log3")
-    XCTAssertEqual(migrated.lutInputSpaceID, "rec709-video")
+    XCTAssertEqual(migrated.lutInputSpaceID, migrated.sourceProfileID)
     var object = try XCTUnwrap(JSONSerialization.jsonObject(with: conflict) as? [String: Any])
     object["sourceProfileID"] = "canon-log2-cinemagamut"
     let explicit = try JSONDecoder().decode(FeedDescriptor.self, from: JSONSerialization.data(withJSONObject: object))

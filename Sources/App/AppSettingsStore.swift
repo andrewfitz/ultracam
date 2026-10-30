@@ -343,7 +343,8 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
       previewEnabled: settings.previewEnabled, lutBookmark: settings.lutBookmark,
       automaticFeed: settings.automaticFeed ?? false,
       resizeTarget: settings.resizeTarget ?? .hd1080,
-      colorTarget: settings.colorTarget ?? .yuv4208, frameRateTarget: settings.frameRateTarget ?? .fps2997)
+      colorTarget: settings.colorTarget ?? .yuv4208, frameRateTarget: settings.frameRateTarget ?? .fps2997,
+      lutInputSpaceID: Self.legacyLUTInputSpace(Self.profileID(forLegacyGamut: settings.gamut)))
   }
 
   var configuration: PipelineConfiguration {
@@ -418,6 +419,13 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     }
     monitor.signal.logProfileID = Self.logProfileID(sourceProfileID)
     monitor.signal.sourceProfileID = sourceProfileID == "unspecified" || monitor.signal.logProfileID != nil ? nil : sourceProfileID
+    if !values.contains(.lutInputSpaceID) { lutInputSpaceID = Self.legacyLUTInputSpace(sourceProfileID) }
+  }
+
+  /// Before LUT spaces were declared the LUT was applied to the source pixels
+  /// as they were, so a saved camera's LUT input is its declared source.
+  static func legacyLUTInputSpace(_ sourceProfileID: String) -> String {
+    SourceColorSpaceCatalog.entries.contains { $0.id == sourceProfileID } ? sourceProfileID : "rec709-video"
   }
 
   static func profileID(forLegacyGamut gamut: String) -> String {
@@ -551,6 +559,7 @@ final class AppSettingsStore {
   static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
+  static let lutInputRepairedKey = "ultracam.settings.lut-input-repaired"
   private let defaults: UserDefaults
   /// Share the injected preference domain with independent control-plane stores.
   var preferenceDefaults: UserDefaults { defaults }
@@ -564,7 +573,7 @@ final class AppSettingsStore {
   func resetAll() {
     let names = defaults.dictionaryRepresentation().keys.filter {
       $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
-        $0 == VendorSettingsKeys.preferences || $0 == "ultracam.settings.pre-b1d.backup" ||
+        $0 == VendorSettingsKeys.preferences || $0 == "ultracam.settings.pre-b1d.backup" || $0 == Self.lutInputRepairedKey ||
         $0.hasPrefix("ui.") || $0.hasPrefix("recordingFolderBookmark")
     }
     for name in names { defaults.removeObject(forKey: name) }
@@ -595,6 +604,7 @@ final class AppSettingsStore {
         if explicit.feeds[index].colorTarget == nil { explicit.feeds[index].colorTarget = .yuv4208 }
         if explicit.feeds[index].frameRateTarget == nil { explicit.feeds[index].frameRateTarget = .fps2997 }
       }
+      repairMigratedLUTInputs(&explicit)
       if explicit != snapshot || missingExplicitFeedDeclarations {
         if defaults.data(forKey: "ultracam.settings.pre-b1d.backup") == nil,
           let original = defaults.data(forKey: Self.snapshotKey) {
@@ -618,6 +628,25 @@ final class AppSettingsStore {
     guard let snapshot = snapshot.validated(),
       let data = try? JSONEncoder().encode(snapshot) else { return }
     defaults.set(data, forKey: Self.snapshotKey)
+  }
+
+  /// Build 37 saved Rec.709 as the LUT input of cameras saved before LUT
+  /// spaces existed, so their log LUTs refused to start. Once, take those
+  /// cameras' inputs from the copy kept before that migration.
+  private func repairMigratedLUTInputs(_ snapshot: inout AppSettingsSnapshot) {
+    guard !defaults.bool(forKey: Self.lutInputRepairedKey) else { return }
+    defaults.set(true, forKey: Self.lutInputRepairedKey)
+    guard let data = defaults.data(forKey: "ultracam.settings.pre-b1d.backup"),
+      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let rawFeeds = root["feeds"] as? [[String: Any]],
+      let backup = try? JSONDecoder().decode(AppSettingsSnapshot.self, from: data),
+      backup.feeds.count == rawFeeds.count else { return }
+    for (raw, saved) in zip(rawFeeds, backup.feeds) where raw["lutInputSpaceID"] == nil {
+      // The source as it is now: one changed since that migration still matches.
+      guard let index = snapshot.feeds.firstIndex(where: { $0.id == saved.id }),
+        snapshot.feeds[index].lutInputSpaceID == "rec709-video" else { continue }
+      snapshot.feeds[index].lutInputSpaceID = FeedDescriptor.legacyLUTInputSpace(snapshot.feeds[index].sourceProfileID)
+    }
   }
 
   private var missingExplicitFeedDeclarations: Bool {
