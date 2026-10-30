@@ -21,6 +21,10 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sdk-inventory', type=Path)
 parser.add_argument('--output-dir', type=Path)
 args = parser.parse_args()
+if args.sdk_inventory is not None:
+    # Match vendors.read_inventory: relative selections belong to the checkout,
+    # independent of the caller's current working directory.
+    args.sdk_inventory = (ROOT / args.sdk_inventory).resolve()
 manifests, sdk_inventory = read_inventory(ROOT, args.sdk_inventory)
 vendor_settings = build_settings(manifests, sdk_inventory)
 vendor_digest = input_digest(manifests, sdk_inventory)

@@ -14,6 +14,7 @@ typedef void (^UCSonyReply)(NSString * _Nullable json, NSString * _Nullable erro
                authentication:(BOOL)authentication completion:(UCSonyReply)reply
   NS_SWIFT_NAME(prepareCamera(address:macAddress:authentication:completion:));
 - (void)connectFeed:(NSString *)feedID camera:(NSString *)cameraID
+           address:(NSString *)address authentication:(BOOL)authentication
               user:(NSString *)user password:(NSString *)password
        fingerprint:(NSString *)fingerprint completion:(UCSonyReply)reply;
 - (void)refreshFeed:(NSString *)feedID completion:(UCSonyReply)reply;

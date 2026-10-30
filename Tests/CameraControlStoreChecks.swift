@@ -9,9 +9,21 @@ import XCTest
 }
 private actor MemoryControlCredentials: CameraControlCredentialStoring {
     var loads = 0
+    var saves = 0
+    var failSave = false
     var saved: ControlCredentials?
-    func load(service: String, account: String) async throws -> ControlCredentials? { loads += 1; return saved }
-    func save(_ credentials: ControlCredentials, service: String, account: String) async throws { saved = credentials }
+    var holdLoad = false
+    var pendingLoad: CheckedContinuation<ControlCredentials?, Never>?
+    func suspendLoad(with credentials: ControlCredentials) { saved = credentials; holdLoad = true }
+    func resumeLoad() { pendingLoad?.resume(returning: saved); pendingLoad = nil }
+    func load(service: String, account: String) async throws -> ControlCredentials? { loads += 1; if holdLoad { return await withCheckedContinuation { pendingLoad = $0 } }; return saved }
+    func save(_ credentials: ControlCredentials, service: String, account: String) async throws {
+        saves += 1
+        if failSave { throw ControlError(code: .unavailable, retryable: true, message: "Synthetic vault unavailable") }
+        saved = credentials
+    }
+    func saveCount() -> Int { saves }
+    func setSaveFailure(_ value: Bool) { failSave = value }
     func delete(service: String, account: String) async throws { saved = nil }
     func loadCount() -> Int { loads }
 }
@@ -25,7 +37,13 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
     var holdConnect = false
     var requests: [ControlPreparationRequest] = []
     var holdRead = false
+    var propertyFailures = 0
+    var propertyCalls = 0
+    var propertyValues: [ControlProperty] = []
+    var setCalls = 0
     var connectCount = 0
+    var admittedCamera: ControlCamera?
+    var admittedCredentials: ControlCredentials?
     var connectedGeneration: UInt64?
     var connectedFeedID: String?
     var disconnects: [UInt64] = []
@@ -40,14 +58,17 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
     func connect(feedID: String, generation: UInt64, camera: ControlCamera, credentials: ControlCredentials?) async throws {
         if connectedGeneration != nil { throw ControlError(code: .staleGeneration, retryable: false, message: "Previous SDK handle still active") }
         connectCount += 1
+        admittedCamera = camera; admittedCredentials = credentials
         if holdConnect { await withCheckedContinuation { connection = $0 } }
         connectedGeneration = generation; connectedFeedID = feedID
     }
     func properties(feedID: String, generation: UInt64) async throws -> [ControlProperty] {
+        propertyCalls += 1
+        if propertyFailures > 0 { propertyFailures -= 1; throw ControlError(code: .sdkFailure, retryable: true, message: "Synthetic property read failed") }
         if holdRead { return await withCheckedContinuation { read = $0 } }
-        return []
+        return propertyValues
     }
-    func set(_ property: String, value: ControlValue, feedID: String, generation: UInt64) async throws {}
+    func set(_ property: String, value: ControlValue, feedID: String, generation: UInt64) async throws { setCalls += 1 }
     func disconnect(feedID: String, generation: UInt64) async throws {
         disconnects.append(generation)
         if disconnectFailures > 0 {
@@ -69,6 +90,33 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
 }
 
 @MainActor @objcMembers final class CameraControlStoreChecks: XCTestCase {
+    func testCredentialAwaitRetainsPreparedEndpointAndAuthentication() async throws {
+        let plugin = SuspendedControlPlugin()
+        let approved = plugin.camera
+        let credentials = MemoryControlCredentials()
+        await credentials.suspendLoad(with: .usernamePassword(username: "user", password: "mock-secret"))
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        let connection = Task { await store.connect(camera: approved, to: "approved", saveCredentials: false) }
+        while await credentials.loadCount() == 0 { await Task.yield() }
+        XCTAssertTrue(store.state(for: "approved").busy)
+        var conflicting = approved
+        conflicting.address = "192.0.2.99"
+        conflicting.authenticationMode = .none
+        plugin.camera = conflicting
+        let result = await store.prepare(pluginID: "test", request: .camera(conflicting), feedID: "conflicting")
+        XCTAssertNil(result, "A second feed cannot claim a camera whose verified connection is pending")
+        XCTAssertNotNil(store.state(for: "conflicting").message)
+        XCTAssertEqual(plugin.connectCount, 0)
+        await credentials.resumeLoad()
+        await connection.value
+        XCTAssertEqual(plugin.admittedCamera, approved, "Connect must forward the approved endpoint/authentication, never mutable discovery metadata")
+        XCTAssertEqual(plugin.admittedCredentials, .usernamePassword(username: "user", password: "mock-secret"))
+        XCTAssertTrue(store.state(for: "approved").connected)
+        XCTAssertEqual(store.assignment(for: "approved")?.camera, approved)
+        XCTAssertNil(store.assignment(for: "conflicting"))
+        _ = await store.shutdown()
+    }
+
     func testChangedPinPrecedesCredentialLookup() async throws {
         let plugin = SuspendedControlPlugin()
         let persistence = MemoryControlAssignments()
@@ -307,6 +355,63 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         XCTAssertNil(retry)
         XCTAssertEqual(plugin.shutdownCalls, 2)
         XCTAssertFalse(store.needsShutdown)
+    }
+
+    func testConfirmedSignInIsSavedEvenWhenInitialPropertyReadFails() async throws {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
+        let secret = ControlCredentials.usernamePassword(username: "user", password: "secret")
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        plugin.propertyFailures = 1
+        await store.connect(camera: plugin.camera, to: "feed", credentials: secret)
+        XCTAssertTrue(store.state(for: "feed").connected)
+        XCTAssertTrue(store.state(for: "feed").dirty)
+        XCTAssertTrue(store.state(for: "feed").hasSavedCredentials)
+        let saves = await credentials.saveCount()
+        XCTAssertEqual(saves, 1)
+        let saved = try await credentials.load(service: "test", account: "test")
+        XCTAssertEqual(saved, secret)
+        await store.disconnect("feed")
+        await store.reconnect("feed")
+        XCTAssertTrue(store.state(for: "feed").connected)
+        XCTAssertEqual(plugin.connectCount, 2)
+        _ = await store.shutdown()
+    }
+    func testResetClearsCameraSnapshotBeforeReplacementReadFailure() async throws {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
+        let stale = ControlProperty(id: "test:exposure", label: "Exposure", writable: true, value: .unsignedInteger(123), options: [.init(id: "456", label: "456", value: .unsignedInteger(456))])
+        plugin.propertyValues = [stale]
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        await store.connect(camera: plugin.camera, to: "feed", credentials: .usernamePassword(username: "user", password: "secret"))
+        XCTAssertEqual(store.state(for: "feed").properties, [stale])
+        XCTAssertNotNil(store.state(for: "feed").lastRefresh)
+        XCTAssertTrue(store.state(for: "feed").hasSavedCredentials)
+        store.reset()
+        XCTAssertTrue(store.state(for: "feed").properties.isEmpty)
+        XCTAssertNil(store.state(for: "feed").lastRefresh)
+        XCTAssertFalse(store.state(for: "feed").hasSavedCredentials)
+        plugin.camera.id = "replacement"; plugin.camera.name = "Replacement"
+        plugin.propertyFailures = 1
+        await store.connect(camera: plugin.camera, to: "feed", credentials: .usernamePassword(username: "replacement", password: "replacement-secret"), saveCredentials: false)
+        XCTAssertTrue(store.state(for: "feed").connected)
+        XCTAssertTrue(store.state(for: "feed").properties.isEmpty)
+        XCTAssertNil(store.state(for: "feed").lastRefresh)
+        XCTAssertFalse(store.state(for: "feed").hasSavedCredentials)
+        await store.set(stale, value: .unsignedInteger(456), feedID: "feed")
+        XCTAssertEqual(plugin.setCalls, 0)
+        _ = await store.shutdown()
+    }
+    func testCredentialSaveFailureDoesNotPreventPropertySnapshot() async throws {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
+        plugin.propertyValues = [.init(id: "test:iso", label: "ISO", writable: false, value: .unsignedInteger(800))]
+        await credentials.setSaveFailure(true)
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        await store.connect(camera: plugin.camera, to: "feed", credentials: .usernamePassword(username: "user", password: "secret"))
+        XCTAssertTrue(store.state(for: "feed").connected)
+        XCTAssertEqual(store.state(for: "feed").properties, plugin.propertyValues)
+        XCTAssertEqual(plugin.propertyCalls, 1)
+        XCTAssertFalse(store.state(for: "feed").hasSavedCredentials)
+        XCTAssertTrue(store.state(for: "feed").message?.contains("sign-in") == true)
+        _ = await store.shutdown()
     }
 
 }

@@ -99,6 +99,18 @@ import XCTest
     XCTAssertThrowsError(try RecordingProfileMatrix.repackRoute(.hevcMain10, sourcePixel: .i420))
   }
 
+  func testAuthoritativeFullRange420vNeverSelectsNativeBypass() throws {
+    let full = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .full,
+      horizontalChromaSiting: .left, verticalChromaSiting: .center)
+    let declaration = try SourceFormat(width: 320, height: 64, pixel: .video420, colour: full,
+      rate: .constant(CMTime(value: 1, timescale: 30)))
+    XCTAssertEqual(try RecordingProfileMatrix.repackRoute(.hevcMain, sourcePixel: declaration.pixel,
+      sourceRange: declaration.colour.range), .full420ToVideo420)
+    XCTAssertNoThrow(try RecordingProfileMatrix.validate(.hevcMain, source: declaration))
+    XCTAssertEqual(try RecordingProfileMatrix.repackRoute(.hevcMain, sourcePixel: .video420,
+      sourceRange: .video), .native)
+  }
+
   func testProfileMatrixEnumeratesSupportedAndPlannedProfiles() {
     XCTAssertEqual(RecordingProfileMatrixProfile.allCases.count, 7)
     XCTAssertEqual(RecordingProfileMatrixProfile.hevcMain10_422.codec, kCMVideoCodecType_HEVC)

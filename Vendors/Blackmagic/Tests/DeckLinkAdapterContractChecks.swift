@@ -4,6 +4,25 @@ import CoreMedia
 import CoreVideo
 
 @objcMembers final class DeckLinkAdapterContractChecks: XCTestCase {
+  @MainActor func testReleasingDeviceObservationReleasesTokenAndHandler() async {
+    final class Owner {}
+    let initialCount = UltracamNativeObserverCount()
+    weak var weakToken: DeviceObservation?
+    weak var weakOwner: Owner?
+    do {
+      let owner = Owner()
+      weakOwner = owner
+      var token: DeviceObservation? = DeckLinkCapturePlugin().observeDevices { _ in _ = owner }
+      weakToken = token
+      XCTAssertEqual(UltracamNativeObserverCount(), initialCount + 1)
+      token = nil
+    }
+    XCTAssertNil(weakToken, "Native callback must not retain its own cancellation token")
+    for _ in 0..<10 { await Task.yield() }
+    XCTAssertNil(weakOwner, "Released subscription retained its consumer")
+    XCTAssertEqual(UltracamNativeObserverCount(), initialCount)
+  }
+
   func testNativeAuditHostTimeConnectorReadbackAndSignalPresence() {
     var error: NSError?
     XCTAssertTrue(UltracamRunNativeAuditSyntheticChecks(&error), error?.localizedDescription ?? "Native audit regression failed")

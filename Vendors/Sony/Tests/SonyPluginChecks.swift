@@ -8,14 +8,30 @@ private final class Bridge: UCSonyCameraControl {
   nonisolated(unsafe) var calls: [String] = []
   nonisolated(unsafe) var lastKey = ""
   nonisolated(unsafe) var pendingCleanup = false
+  nonisolated(unsafe) var expectedConnection: (String, Bool)?
   nonisolated(unsafe) var failConnect = false
   nonisolated(unsafe) var holdCleanup = false
   nonisolated(unsafe) var cleanupReply: UCSonyReply?
+  nonisolated(unsafe) var cacheAddress: String?
+  nonisolated(unsafe) var cacheAuthentication = true
+  nonisolated(unsafe) var connectAdmissions = 0
+  nonisolated private func cachedJSON() -> String {
+    "{\"id\":\"02:11:22:33:44:55\",\"model\":\"FX3\",\"address\":\"\(cacheAddress!)\",\"authentication\":\(cacheAuthentication),\"fingerprint\":\"\(cacheAuthentication ? "pin" : "")\",\"fingerprintError\":\"\"}"
+  }
   override func discover(_ reply: @escaping UCSonyReply) {
+    if cacheAddress != nil { reply("[" + cachedJSON() + "]", nil); return }
     reply(nil, "Sony SDK is unavailable in this build.")
   }
-  override func connectFeed(_ feedID: String, camera: String, user: String, password: String,
+  override func connectFeed(_ feedID: String, camera: String, address: String, authentication: Bool, user: String, password: String,
     fingerprint: String, completion: @escaping UCSonyReply) {
+    if let cacheAddress, cacheAddress != address || cacheAuthentication != authentication {
+      completion(nil, "Camera endpoint or authentication changed after preparation."); return
+    }
+    connectAdmissions += 1
+    if let expectedConnection {
+      precondition(address == expectedConnection.0 && authentication == expectedConnection.1,
+        "Native connect must receive the immutable approved endpoint and authentication")
+    }
     lastKey = feedID; calls.append("connect")
     completion(failConnect ? nil : "[]", failConnect ? "Synthetic connect failure" : nil)
   }
@@ -35,6 +51,10 @@ private final class Bridge: UCSonyCameraControl {
   }
   override func prepareCamera(address: String, macAddress: String, authentication: Bool,
     completion: @escaping UCSonyReply) {
+    if cacheAddress != nil {
+      cacheAddress = address; cacheAuthentication = authentication
+      completion(cachedJSON(), nil); return
+    }
     completion("""
     {"id":"02:11:22:33:44:66","model":"FX3","address":"192.168.1.10","authentication":false,"fingerprint":"","fingerprintError":""}
     """, nil)
@@ -55,7 +75,7 @@ struct SonyPluginChecks {
     let localizationRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("bundle")
     defer { try? FileManager.default.removeItem(at: localizationRoot) }
     try FileManager.default.createDirectory(at: localizationRoot.appendingPathComponent("en.lproj"), withIntermediateDirectories: true)
-    try Data("\"sony.descriptor.name\" = \"Sony localized fixture\";\n".utf8).write(to: localizationRoot.appendingPathComponent("en.lproj/SonyControl.strings"))
+    try Data("\"sony.descriptor.name\" = \"Sony localized fixture\";\n\"sony.control.choice.on\" = \"Enabled fixture\";\n\"sony.control.choice.off\" = \"Disabled fixture\";\n".utf8).write(to: localizationRoot.appendingPathComponent("en.lproj/SonyControl.strings"))
     let localizationBundle = Bundle(path: localizationRoot.path)!
     precondition(plugin.descriptor.localizedDisplayName(in: localizationBundle) == "Sony localized fixture")
     precondition(plugin.descriptor.localizedDisplayName() == "Sony")
@@ -81,10 +101,15 @@ struct SonyPluginChecks {
       preconditionFailure("A disconnected generation was readmitted")
     } catch let error as ControlError { precondition(error.code == .staleGeneration) }
     precondition(bridge.calls.isEmpty)
+    bridge.expectedConnection = (camera.address, camera.authenticationMode == .usernamePassword)
     try await plugin.connect(feedID: "feed", generation: 1, camera: camera, credentials: nil)
     let firstKey = bridge.lastKey
     let properties = try await plugin.properties(feedID: "feed", generation: 1)
     precondition(properties.first?.value == .unsignedInteger(UInt64.max))
+    let mappedOn = properties.first(where: { $0.id == "monitoringDisplayHDMI" })!.options.last!
+    precondition(mappedOn.localizedLabel(in: localizationBundle) == "Enabled fixture")
+    let mappedOff = properties.first(where: { $0.id == "monitoringDisplayHDMI" })!.options.first!
+    precondition(mappedOff.localizedLabel(in: localizationBundle) == "Disabled fixture")
     precondition(properties.first?.labelKey == "sony.control.iso")
     precondition(properties.first?.localizationTable == "SonyControl")
     precondition(properties.first?.localizedLabel() == "ISO")
@@ -141,6 +166,27 @@ struct SonyPluginChecks {
     failedBridge.failConnect = false
     try await failedPlugin.connect(feedID: "replacement", generation: 2, camera: camera, credentials: nil)
     try await failedPlugin.disconnect(feedID: "replacement", generation: 2)
+    let mutable = Bridge()
+    mutable.cacheAddress = "192.0.2.1"
+    let pinnedPlugin = SonyControlPlugin(backend: mutable)
+    let prepared = try await pinnedPlugin.prepare(.camera(ControlCamera(pluginID: "sony", id: camera.id,
+      name: "FX3", transport: .network, address: "192.0.2.1", fingerprint: "pin", authenticationMode: .usernamePassword)))
+    _ = try await pinnedPlugin.prepare(.endpoint(ControlEndpoint(address: "192.0.2.2", expectedIdentity: camera.id, authenticationMode: .none)))
+    do {
+      try await pinnedPlugin.connect(feedID: "approved", generation: 1, camera: prepared.camera,
+        credentials: .usernamePassword(username: "synthetic", password: "synthetic"))
+      preconditionFailure("Mutable preparation cache replaced the approved endpoint")
+    } catch let error as ControlError { precondition(error.code == .changedIdentity) }
+    precondition(mutable.connectAdmissions == 0)
+    // A discovery replacement is subject to exactly the same atomic native gate.
+    mutable.cacheAddress = "192.0.2.3"; mutable.cacheAuthentication = false
+    _ = try await pinnedPlugin.discover()
+    do {
+      try await pinnedPlugin.connect(feedID: "approved", generation: 2, camera: prepared.camera,
+        credentials: .usernamePassword(username: "synthetic", password: "synthetic"))
+      preconditionFailure("Discovery replaced the approved authenticated endpoint")
+    } catch let error as ControlError { precondition(error.code == .changedIdentity) }
+    precondition(mutable.connectAdmissions == 0)
     print("Sony plugin checks passed")
   }
 }

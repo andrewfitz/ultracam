@@ -91,17 +91,47 @@ enum PluginConformanceHarness {
     private var sequence: UInt64 = 0
     private var epoch: CaptureEpochID?
     private var retired = Set<CaptureEpochID>()
+    private var clockBindings: CaptureClockBindings?
     private var declaredSignature: String?
+    private var audioDeclaration: SourceAudioDeclaration?
     mutating func accept(_ delivery: CaptureDelivery) throws {
       guard delivery.sequence > sequence else { throw PluginConformanceFailure.violation("Duplicate or regressed delivery") }
       guard !retired.contains(delivery.epochID) else { throw PluginConformanceFailure.violation("Retired epoch delivery") }
-      if let epoch, epoch != delivery.epochID { retired.insert(epoch); declaredSignature = nil }
+      if let epoch, epoch != delivery.epochID {
+        retired.insert(epoch); declaredSignature = nil; audioDeclaration = nil; clockBindings = nil
+      }
       epoch = delivery.epochID; sequence = delivery.sequence
+      if let clockBindings, clockBindings != delivery.clockBindings {
+        throw PluginConformanceFailure.violation("Clock bindings changed without a new capture epoch")
+      }
+      if let declaredSignature, declaredSignature != delivery.formatSignature {
+        throw PluginConformanceFailure.violation("Video contract changed without a new capture epoch")
+      }
+      clockBindings = delivery.clockBindings
       switch delivery.payload {
-      case .event(.formatChanged(let format)): declaredSignature = format.signature
-      case .frame(_, let info):
-        guard declaredSignature == delivery.formatSignature, info.epochID == delivery.epochID,
-          info.formatSignature == delivery.formatSignature else { throw PluginConformanceFailure.violation("Frame before matching declaration") }
+      case .event(.formatChanged(let format)):
+        guard format.signature == delivery.formatSignature else { throw PluginConformanceFailure.violation("Declaration signature mismatch") }
+        declaredSignature = format.signature
+      case .event(.audioFormatChanged(let declaration)):
+        if let audioDeclaration, audioDeclaration.isResolved, audioDeclaration != declaration {
+          throw PluginConformanceFailure.violation("Audio contract changed without a new capture epoch")
+        }
+        audioDeclaration = declaration
+      case .frame(_, let info), .cpuMemory(_, let info):
+        guard audioDeclaration != nil, declaredSignature == delivery.formatSignature, info.epochID == delivery.epochID,
+          info.formatSignature == delivery.formatSignature else { throw PluginConformanceFailure.violation("Frame before matching declarations") }
+        try info.validate()
+      case .rawAudio(let packet):
+        guard declaredSignature == delivery.formatSignature,
+          case .present(let format) = audioDeclaration, packet.format == format else {
+          throw PluginConformanceFailure.violation("Audio before matching declarations")
+        }
+        if let paired = packet.pairedFrameSequence, paired >= delivery.sequence {
+          throw PluginConformanceFailure.violation("Audio paired to future delivery")
+        }
+      case .media(let media):
+        guard declaredSignature == delivery.formatSignature, let audioDeclaration,
+          media.audioDeclaration == audioDeclaration else { throw PluginConformanceFailure.violation("Media before matching declarations") }
       default: break
       }
     }

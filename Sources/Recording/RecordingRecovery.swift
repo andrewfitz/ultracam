@@ -110,19 +110,28 @@ enum RecordingRecovery {
   private static let scanLock = NSLock()
   /// Only our journals directly inside feed folders are inspected. Foreign
   /// partial files and symlinks are never treated as recoverable recordings.
-  static func scan(root: URL) throws -> [InterruptedRecording] {
+  struct ScanReport {
+    let takes: [InterruptedRecording]
+    /// Busy or unreadable journals still own access to their original root.
+    let mayPruneRoot: Bool
+  }
+  static func scan(root: URL) throws -> [InterruptedRecording] { try scanReport(root: root).takes }
+  static func scanReport(root: URL) throws -> ScanReport {
     scanLock.lock()
     defer { scanLock.unlock() }
     let access = RecordingDirectoryAccess(root)
     defer { withExtendedLifetime(access) {} }
     let fm = FileManager.default
-    let folders = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+    let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+    let folders = try fm.contentsOfDirectory(at: canonicalRoot, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
     var result: [InterruptedRecording] = []
+    var hasJournal = false
     for folder in folders {
       let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
       guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
       let files = try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [])
       for url in files where url.pathExtension == "ultracam-recovery" {
+        hasJournal = true
         guard let journal = try? RecordingRecoveryJournal(opening: url) else { continue }
         let source = folder.appendingPathComponent(journal.entry.temporaryName)
         // The journal lock also covers export. Only reclaim its staging file
@@ -136,7 +145,7 @@ enum RecordingRecovery {
         result.append(InterruptedRecording(journalURL: url, temporaryURL: source, finalURL: final))
       }
     }
-    return result.sorted { $0.title < $1.title }
+    return ScanReport(takes: result.sorted { $0.title < $1.title }, mayPruneRoot: !hasJournal)
   }
 
   private static func regularNonempty(_ url: URL) -> Bool {

@@ -652,6 +652,7 @@ final class RecordingModel {
   /// Original bookmarked roots survive changes to next-take destinations.
   private var activeTakeFolders: [FeedID: URL] = [:]
   private var retainedTakeRoots: [String: URL] = [:]
+  private var activeRecoveryRoot: URL?
   private var feedConstantFrameRate: [FeedID: Bool] = [:]
   private var loadedFolderFeedIDs = Set<FeedID>()
   private var interruptedRecordingRoots: [URL: URL] = [:]
@@ -711,7 +712,7 @@ final class RecordingModel {
     }
     Task { [weak self] in
       let results = await Task.detached(priority: .utility) {
-        roots.map { root in (root, Result { try RecordingRecovery.scan(root: root) }) }
+        roots.map { root in (root, Result { try RecordingRecovery.scanReport(root: root) }) }
       }.value
       guard let self, self.recoveryScanGeneration == generation else { return }
       var takesByID: [URL: InterruptedRecording] = [:]
@@ -721,8 +722,14 @@ final class RecordingModel {
       }
       for (root, result) in results {
         switch result {
-        case let .success(takes):
-          if takes.isEmpty && !self.activeTakeFolders.values.contains(where: { $0.standardizedFileURL.path == root.standardizedFileURL.path }) {
+        case let .success(report):
+          let takes = report.takes
+          if !report.mayPruneRoot {
+            // Discovery also restores access after a folder is reselected. Keep
+            // its original grant, including when a journal is currently busy,
+            // before next-take destinations can replace this scan's roots.
+            self.retainedTakeRoots[root.standardizedFileURL.path] = root
+          } else if self.activeRecoveryRoot?.resolvingSymlinksInPath().path != root.resolvingSymlinksInPath().path && !self.activeTakeFolders.values.contains(where: { $0.standardizedFileURL.path == root.standardizedFileURL.path }) {
             self.retainedTakeRoots.removeValue(forKey: root.standardizedFileURL.path)
           }
           for take in takes {
@@ -743,6 +750,7 @@ final class RecordingModel {
   func recover(_ take: InterruptedRecording) {
     guard recoveringID == nil, let root = interruptedRecordingRoots[take.id] else { return }
     recoveringID = take.id
+    activeRecoveryRoot = root
     recoveryMessage = nil
     Task { [weak self] in
       let result = await Task.detached(priority: .utility) {
@@ -751,6 +759,7 @@ final class RecordingModel {
       }.value
       guard let self else { return }
       self.recoveringID = nil
+      self.activeRecoveryRoot = nil
       switch result {
       case let .success(url):
         self.recoveredURL = url

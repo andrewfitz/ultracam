@@ -124,14 +124,14 @@ struct RGBSource {
       ulong word = 0;
       for (uint i = 0; i < 5; ++i) word |= ulong(pixels.read(uint2(first + i, y)).r) << (i * 8);
       word >>= shift;
-      return float3(float(word & 4095), float((word >> 12) & 4095), float((word >> 24) & 4095)) / 4095.0f;
+      return (float3(float(word & 4095), float((word >> 12) & 4095), float((word >> 24) & 4095)) - p.decodeRange.x) / p.decodeRange.y;
     }
     uint4 b = pixels.read(uint2(x,y));
     if (kind == 3) {
       uint word = (b.x << 24) | (b.y << 16) | (b.z << 8) | b.w;
-      return (float3((word >> 20) & 1023, (word >> 10) & 1023, word & 1023) - 64.0f) / 876.0f;
+      return (float3((word >> 20) & 1023, (word >> 10) & 1023, word & 1023) - p.decodeRange.x) / p.decodeRange.y;
     }
-    return kind == 1 ? float3(b.z,b.y,b.x) / 255.0f : float3(b.xyz) / 255.0f;
+    return ((kind == 1 ? float3(b.z,b.y,b.x) : float3(b.xyz)) - p.decodeRange.x) / p.decodeRange.y;
   }
 };
 
@@ -200,7 +200,10 @@ inline void writeNV12(float3 c00, float3 c10, float3 c01, float3 c11, uint2 base
 inline void write422(float3 c0, float3 c1, uint2 base,
   texture2d<float, access::write> y, texture2d<float, access::write> uv, constant Parameters &p) {
   y.write(float4(quantizeY(encode(c0, p).x, p)), base);
-  y.write(float4(quantizeY(encode(c1, p).x, p)), base + uint2(1, 0));
+  // The final odd-width pair repeats the edge for centered chroma, but
+  // contains just one image pixel; never write into luma padding.
+  if (base.x + 1 < y.get_width())
+    y.write(float4(quantizeY(encode(c1, p).x, p)), base + uint2(1, 0));
   uv.write(float4(quantizeC(encode((c0 + c1) / 2, p).yz, p), 0, 1), uint2(base.x / 2, base.y));
 }
 
@@ -220,7 +223,7 @@ inline void full422(Source s, texture3d<float, access::sample> lut, texture2d<fl
   texture2d<float, access::write> uv, constant Parameters &p, uint2 gid) {
   uint2 base = uint2(gid.x * 2, gid.y);
   if (base.x >= p.geometry.x || base.y >= p.geometry.y) return;
-  write422(graded(s, base.x, base.y, lut, p), graded(s, base.x + 1, base.y, lut, p), base, y, uv, p);
+  write422(graded(s, base.x, base.y, lut, p), graded(s, min(base.x + 1, p.geometry.x - 1), base.y, lut, p), base, y, uv, p);
 }
 
 kernel void fullPackedNV12(texture2d<uint, access::read> groups [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],
@@ -367,7 +370,7 @@ kernel void vertical422(texture2d<float, access::read> input [[texture(0)]],
   constant Parameters &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   uint2 base = uint2(gid.x * 2, gid.y);
   if (base.x >= y.get_width() || base.y >= y.get_height()) return;
-  write422(vertical(input, base.x, base.y, y.get_height(), p), vertical(input, base.x + 1, base.y, y.get_height(), p), base, y, uv, p);
+  write422(vertical(input, base.x, base.y, y.get_height(), p), vertical(input, min(base.x + 1, y.get_width() - 1), base.y, y.get_height(), p), base, y, uv, p);
 }
 
 kernel void fullRGBNV12(texture2d<uint, access::read> rgb [[texture(0)]], texture3d<float, access::sample> lut [[texture(2)]],

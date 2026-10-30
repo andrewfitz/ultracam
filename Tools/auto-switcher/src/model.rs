@@ -72,6 +72,8 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StreamEvent {
+    /// Ledger-only output observation. Replaying it never drives the director.
+    DirectorOutput,
     Audio {
         cue: AudioCue,
     },

@@ -1,11 +1,14 @@
 import XCTest
 
 @objcMembers final class CameraAuthorizationChecks: XCTestCase {
-  func testKnownProducerKeepsExistingAuthorization() {
-    XCTAssertTrue(CameraProducerAuthorization.allows(signingID: "org.ultracam.app", pid: 123) { _ in
-      XCTFail("CMIO supplied the expected signing identifier; no local fallback is needed")
+  func testExpectedIdentifierStillRequiresVerifiedRunningSignature() {
+    var checkedPID: pid_t?
+    XCTAssertFalse(CameraProducerAuthorization.allows(signingID: "org.ultracam.app", pid: 123) { pid in
+      checkedPID = pid
       return false
     })
+    XCTAssertEqual(checkedPID, 123, "A matching code identifier does not establish the signing team")
+    XCTAssertTrue(CameraProducerAuthorization.allows(signingID: "org.ultracam.app", pid: 123) { $0 == 123 })
   }
 
   func testMissingIdentifiersRequireVerifiedProcess() {
@@ -33,7 +36,7 @@ import XCTest
         return true
       })
     }
-    for identifier: String? in [nil, "unknown"] {
+    for identifier: String? in [nil, "unknown", "org.ultracam.app"] {
       for pid: pid_t in [0, -1] {
         XCTAssertFalse(CameraProducerAuthorization.allows(signingID: identifier, pid: pid) { _ in
           XCTFail("An invalid PID must never be verified")

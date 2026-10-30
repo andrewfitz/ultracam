@@ -1,6 +1,6 @@
 import Foundation
 
-struct InputDevice: Identifiable {
+struct InputDevice: Identifiable, Equatable {
   let id: String
   /// The driver's model name, unchanged. Two units of one model share it; show `label`.
   let name: String

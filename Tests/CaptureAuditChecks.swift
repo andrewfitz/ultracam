@@ -48,17 +48,20 @@ import XCTest
       }
       defer { releaseBinding.signal(); releaseAudio.signal(); fixture.stop() }
       XCTAssertEqual(binding.wait(timeout: .now() + 1), .success)
-      try fixture.packet(audio, time: CMTime(value: 50, timescale: 1))
+      try fixture.frame()
+      let originalVideoSequence = fixture.source.context.nextSequence - 1
+      try fixture.packet(audio, time: CMTime(value: 50, timescale: 1), pairedFrameSequence: paired ? originalVideoSequence : nil)
       try fixture.barrier(self, message: "opening PCM retained") { _ in }
       releaseBinding.signal()
       XCTAssertEqual(popped.wait(timeout: .now() + 1), .success)
       fixture.controller.setRecordingCallbacks(feedID: fixture.feed,
         callbacks: fixture.callbacks(failure: { replacement.failure($0) }, audio: { replacement.audio($0) }))
-      try fixture.frame()
+      try fixture.frame(time: VideoContract.fastDuration)
+      let replacementVideoSequence = fixture.source.context.nextSequence - 1
       try fixture.barrier(self, message: "replacement first video") { _ in }
       releaseAudio.signal()
       XCTAssertEqual(installed.wait(timeout: .now() + 1), .success)
-      try fixture.packet(audio, time: CMTime(value: 51, timescale: 1))
+      try fixture.packet(audio, time: CMTime(value: 51, timescale: 1), pairedFrameSequence: paired ? replacementVideoSequence : nil)
       fixture.source.stop()
       XCTAssertTrue(old.audioTimes.isEmpty)
       XCTAssertEqual(replacement.audioTimes, [CMTime(value: 51, timescale: 1)], "Old queued PCM belongs to its original recording install")
@@ -109,6 +112,95 @@ import XCTest
     fixture.stop()
   }
 
+  func testPairedEightAndSixteenChannelPCMKeepRawIdentityLayoutAndMeasuredJumpAnchors() throws {
+    for channels in [8, 16] {
+      let labels = (0..<channels).map { UInt32(kAudioChannelLabel_Discrete_0) + UInt32($0) }
+      let audio = try SourceAudioFormat(sampleRate: 48000, channels: channels, sample: .int32,
+        interleaved: true, layout: AudioChannelMap(labels: labels), clock: .pairedWithFrames)
+      let samples = (0..<(8 * channels)).map { index -> Int32 in
+        let value = Int32((index % channels + 1) * 0x01010000 + (index / channels) * 0x100 + 0x55)
+        return index % 2 == 0 ? value : -value
+      }
+      let data = samples.withUnsafeBytes { Data($0) }
+      let writer = try routePairedPackets(audio, packets: [(CMTime(value: 48000, timescale: 48000), CMTime(value: 20, timescale: 1)),
+        (CMTimeAdd(CMTime(value: 1, timescale: 1), VideoContract.fastDuration),
+         CMTimeAdd(CMTime(value: 20, timescale: 1), VideoContract.fastDuration))], data: data)
+      XCTAssertEqual(writer.genericPackets, 2)
+      XCTAssertEqual(writer.legacyPackets, 0, "Typed multichannel PCM must use the declaration-aware writer path")
+      XCTAssertEqual(writer.channels, channels)
+      XCTAssertEqual(writer.channelLabels, labels)
+      XCTAssertEqual(writer.packetBytes, [data, data], "All source bits and channel positions reach the high24 converter unchanged")
+      XCTAssertEqual(writer.packetTimes, [CMTime(value: 48000, timescale: 48000), CMTimeAdd(CMTime(value: 1, timescale: 1), VideoContract.fastDuration)])
+      XCTAssertEqual(writer.videoTimes, [CMTime(value: 20, timescale: 1), CMTimeAdd(CMTime(value: 20, timescale: 1), VideoContract.fastDuration)])
+    }
+  }
+
+  func testEquivalentPairedStereoPacketTimesUseAnyValidRationalGrid() throws {
+    let audio = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: .int32,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    for scale: Int32 in [48000, 1_000_000_000, 60000] {
+      let time = CMTime(value: Int64(scale), timescale: scale)
+      let writer = try routePairedPackets(audio, packets: [(time, CMTime(value: 20, timescale: 1))], data: Data(count: 64))
+      XCTAssertEqual(writer.genericPackets, 1)
+      XCTAssertEqual(writer.legacyPackets, 0)
+      XCTAssertEqual(writer.sampleFrames, 8)
+      XCTAssertEqual(writer.packetTime.map { CMTimeCompare($0, CMTime(value: 1, timescale: 1)) }, 0)
+      XCTAssertEqual(writer.videoTime, CMTime(value: 20, timescale: 1))
+    }
+  }
+
+  func testEveryTypedPairedFormatRefusesMissingStaleOrInvalidFrameReferencesBeforeAudioCallbacks() throws {
+    for sample in [AudioSampleType.int32, .float32] {
+      for reference in ["missing", "stale", "invalid"] {
+        let audio = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: sample,
+          interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+        let fixture = try AuditCaptureFixture(audio: .present(audio))
+        let observed = AuditObservation()
+        var callbacks = fixture.callbacks(failure: { observed.failure($0) }, audio: { observed.audio($0) })
+        callbacks.sourceAudioWithAdmission = { _, _, _, time, _, _, _ in observed.audio(time); return true }
+        fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: callbacks)
+        try fixture.start(self)
+        try fixture.frame(time: CMTime(value: 20, timescale: 1))
+        var sequence: UInt64?
+        if reference == "stale" { sequence = UInt64.max - 1 }
+        if reference == "invalid" {
+          try fixture.frame(time: CMTime(value: 21, timescale: 1), signalValid: false)
+          sequence = fixture.source.context.nextSequence - 1
+        }
+        try fixture.packet(audio, time: CMTime(value: 48000, timescale: 48000), pairedFrameSequence: sequence)
+        fixture.source.stop()
+        XCTAssertTrue(observed.audioTimes.isEmpty, "\(sample), \(reference) must not reach either audio callback")
+        XCTAssertEqual(observed.failures.count, 1)
+        XCTAssertTrue(observed.failures.first?.contains("matching video frame") == true)
+        fixture.stop()
+      }
+    }
+  }
+
+  private func routePairedPackets(_ audio: SourceAudioFormat, packets: [(CMTime, CMTime)], data: Data) throws -> AuditPairedWriter {
+    let fixture = try AuditCaptureFixture(audio: .present(audio))
+    let writer = AuditPairedWriter()
+    let configuration = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("paired-routing-audit"),
+      outputURL: URL(fileURLWithPath: "/tmp/unused-paired-routing-audit.mov"), width: 128, height: 72)
+    let recorder = try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
+    let adapter = SourceRecordingCallbackAdapter(feedID: configuration.feedID, recorder: recorder)
+    try adapter.start()
+    defer { fixture.stop(); try? adapter.stop() }
+    fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: adapter.callbacks)
+    try fixture.start(self)
+    for (packetTime, videoTime) in packets {
+      try fixture.frame(time: videoTime)
+      let sequence = fixture.source.context.nextSequence - 1
+      XCTAssertTrue(fixture.source.submit(.rawAudio(try CaptureAudioPacket(planes: [data], sampleFrameCount: 8,
+        format: audio, packetTime: packetTime, pairedFrameSequence: sequence))))
+    }
+    fixture.source.stop()
+    try adapter.stop()
+    XCTAssertEqual(recorder.telemetry.droppedInvalidSample, 0)
+    XCTAssertEqual(recorder.telemetry.droppedAudio, 0)
+    return writer
+  }
+
   func testDeclaredAudioRatesCountOnlyActualMissingSamplesAndResetEpochBaseline() throws {
     for (rate, frames) in [(44100.0, 441), (96000.0, 960)] {
       let audio = try SourceAudioFormat(sampleRate: rate, channels: 2, sample: .int32,
@@ -144,20 +236,21 @@ private final class AuditCaptureFixture: @unchecked Sendable {
     audio: @escaping @Sendable (CMTime) -> Void = { _ in }) -> SourceRecordingCallbackAdapter.Callbacks {
     SourceRecordingCallbackAdapter.Callbacks(video: { _, _, _, _ in true }, audio: { _ in false },
       rawAudio: { _, _, time, _, _ in audio(time); return true }, sourceAdmission: { _ in true }, takeContext: { _ in true },
-      sourceAudio: { _, _, _, time, _ in audio(time); return true }, metadataFailure: failure)
+      sourceAudio: { _, _, _, time, _ in audio(time); return true }, metadataFailure: failure,
+      sourceAudioWithAdmission: { _, _, _, time, _, _, _ in audio(time); return true })
   }
   func packet(_ audio: SourceAudioFormat, time: CMTime, pairedFrameSequence: UInt64? = nil) throws {
     XCTAssertTrue(source.submit(.rawAudio(try CaptureAudioPacket(planes: [Data(count: 8 * audio.channels * 4)],
       sampleFrameCount: 8, format: audio, packetTime: time, pairedFrameSequence: pairedFrameSequence))))
   }
-  func frame(time: CMTime = .zero) throws {
+  func frame(time: CMTime = .zero, signalValid: Bool = true) throws {
     var image: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 128, 72, kCVPixelFormatType_422YpCbCr10,
       [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferBytesPerRowAlignmentKey: 128] as CFDictionary, &image), kCVReturnSuccess)
     let context = source.context
     XCTAssertTrue(source.submit(.frame(CapturedPixelBuffer(immutable: try XCTUnwrap(image)),
       CaptureFrameInfo(epochID: context.epochID, formatSignature: context.formatSignature,
-        presentationTime: time, duration: VideoContract.fastDuration, signalValid: true, timecode: nil))))
+        presentationTime: time, duration: VideoContract.fastDuration, signalValid: signalValid, timecode: nil))))
   }
   func resolveMappings() throws {
     let video = source.context
@@ -195,6 +288,11 @@ private final class AuditPairedWriter: SourceRecordingWriter {
   var sampleFrames = 0
   var genericPackets = 0
   var legacyPackets = 0
+  var channels: Int?
+  var channelLabels: [UInt32] = []
+  var packetBytes: [Data] = []
+  var packetTimes: [CMTime] = []
+  var videoTimes: [CMTime] = []
   func start() throws {}
   func appendVideo(_ sample: CMSampleBuffer) throws {}
   func appendAudio(_ sample: CMSampleBuffer) throws { legacyPackets += 1 }
@@ -205,6 +303,19 @@ private final class AuditPairedWriter: SourceRecordingWriter {
     sampleFrames = CMSampleBufferGetNumSamples(sample)
     let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
     sampleRate = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(format)).pointee.mSampleRate
+    channels = Int(try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(format)).pointee.mChannelsPerFrame)
+    if let layout = CMAudioFormatDescriptionGetChannelLayout(format, sizeOut: nil), layout.pointee.mNumberChannelDescriptions > 0 {
+      let offset = try XCTUnwrap(MemoryLayout<AudioChannelLayout>.offset(of: \.mChannelDescriptions))
+      let descriptions = UnsafeRawPointer(layout).advanced(by: offset).assumingMemoryBound(to: AudioChannelDescription.self)
+      channelLabels = (0..<Int(layout.pointee.mNumberChannelDescriptions)).map { descriptions[$0].mChannelLabel }
+    }
+    let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+    var bytes = Data(count: CMBlockBufferGetDataLength(block))
+    let status = bytes.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!) }
+    XCTAssertEqual(status, noErr)
+    packetBytes.append(bytes)
+    packetTimes.append(CMSampleBufferGetPresentationTimeStamp(sample))
+    videoTimes.append(videoTime)
   }
   func finish() throws {}
 }

@@ -53,6 +53,60 @@ import XCTest
     XCTAssertNotEqual(values[0], values[1], "PQ conversion must change pixels rather than just tags")
   }
 
+  func testOddWidthRGBPreconversionPreservesImageExtentAndEdges() throws {
+    var storage: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 641, 480, kCVPixelFormatType_32BGRA,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &storage), kCVReturnSuccess)
+    let source = try XCTUnwrap(storage)
+    CVPixelBufferLockBaseAddress(source, [])
+    let bytes = CVPixelBufferGetBaseAddress(source)!.assumingMemoryBound(to: UInt8.self)
+    let stride = CVPixelBufferGetBytesPerRow(source)
+    for y in 0..<480 { for x in 0..<641 {
+      let i = y * stride + x * 4
+      // Blue edge bands on red expose both crop/fit and the final odd pair.
+      bytes[i] = x < 8 || x >= 633 ? 255 : 0
+      bytes[i + 1] = 0; bytes[i + 2] = x < 8 || x >= 633 ? 0 : 255; bytes[i + 3] = 255
+    } }
+    CVPixelBufferUnlockBaseAddress(source, [])
+    for mode in [ProgramScalingMode.fit, .crop] {
+      let output = try converted(source, width: 640, height: 480, mode: mode)
+      XCTAssertEqual(CVPixelBufferGetWidth(output), 640)
+      XCTAssertEqual(CVPixelBufferGetHeight(output), 480)
+      CVPixelBufferLockBaseAddress(output, .readOnly)
+      let y = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt8.self)
+      let row = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
+      XCTAssertEqual(Int(y[240 * row]), 32, accuracy: 1)
+      XCTAssertEqual(Int(y[240 * row + 320]), 63, accuracy: 1)
+      XCTAssertEqual(Int(y[240 * row + 639]), 32, accuracy: 1)
+      // 641x480 fit occupies 640x479; padding to 642 would occupy 640x478.
+      XCTAssertEqual(Int(y[478 * row + 320]), 63, accuracy: 1)
+      XCTAssertEqual(Int(y[479 * row + 320]), mode == .fit ? 16 : 63, accuracy: 1)
+      CVPixelBufferUnlockBaseAddress(output, .readOnly)
+      XCTAssertEqual(try LUTProcessor.sourceColorimetry(output), Colorimetry(primaries: .rec709,
+        transfer: .rec709, matrix: .rec709, range: .video, horizontalChromaSiting: .center, verticalChromaSiting: .center))
+    }
+  }
+
+  func testOddWidth420WorksWithMatchingAndConvertedColour() throws {
+    let source = try chromaFixture(width: 641, height: 480, colour: .rec709Video,
+      cb: { x, _ in x >= 317 ? 192 : 128 })
+    let pq = Colorimetry(primaries: .rec2020, transfer: .pq, matrix: .rec2020, range: .video,
+      horizontalChromaSiting: .center, verticalChromaSiting: .center)
+    for colour in [Colorimetry.rec709Video, pq] {
+      let output = try converted(source, width: 640, height: 480, colour: colour)
+      XCTAssertEqual(CVPixelBufferGetWidth(output), 640)
+      XCTAssertEqual(CVPixelBufferGetHeight(output), 480)
+      let actual = try LUTProcessor.sourceColorimetry(output)
+      XCTAssertEqual(actual.primaries, colour.primaries)
+      XCTAssertEqual(actual.transfer, colour.transfer)
+      XCTAssertEqual(actual.matrix, colour.matrix)
+      XCTAssertEqual(actual.range, .video)
+      XCTAssertEqual(actual.horizontalChromaSiting, .center)
+      XCTAssertEqual(actual.verticalChromaSiting, .center)
+      XCTAssertGreaterThan(chroma(output, x: 319, y: 120), chroma(output, x: 160, y: 120))
+    }
+  }
+
   func testPackedSourcesExecuteThroughProgramOutput() throws {
     for type: OSType in [0x32767579, 0x79757673, 0x72323130, 0x5231324c] {
       var storage: CVPixelBuffer?
@@ -203,7 +257,7 @@ import XCTest
     memset(CVPixelBufferGetBaseAddressOfPlane(source, 0)!, 100, CVPixelBufferGetBytesPerRowOfPlane(source, 0) * height)
     let uv = CVPixelBufferGetBaseAddressOfPlane(source, 1)!.assumingMemoryBound(to: UInt8.self)
     let stride = CVPixelBufferGetBytesPerRowOfPlane(source, 1)
-    for y in 0..<(height / 2) { for x in 0..<(width / 2) {
+    for y in 0..<((height + 1) / 2) { for x in 0..<((width + 1) / 2) {
       uv[y * stride + x * 2] = cb(x, y); uv[y * stride + x * 2 + 1] = cr
     } }
     CVPixelBufferUnlockBaseAddress(source, [])
@@ -212,12 +266,12 @@ import XCTest
   }
 
   private func converted(_ source: CVPixelBuffer, width: Int, height: Int,
-                         mode: ProgramScalingMode = .fit) throws -> CVPixelBuffer {
+                         mode: ProgramScalingMode = .fit, colour: Colorimetry = .rec709Video) throws -> CVPixelBuffer {
     let normalizer = try ProgramNormalizer()
     let done = DispatchSemaphore(value: 0), result = Output()
     try normalizer.normalize(source, to: ProgramOutputFormat(width: width, height: height,
       pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-      duration: CMTime(value: 1, timescale: 30), scalingMode: mode)) {
+      duration: CMTime(value: 1, timescale: 30), scalingMode: mode, colour: colour)) {
       if case let .success(output) = $0 { result.set(output) }; done.signal()
     }
     XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
@@ -298,6 +352,60 @@ import XCTest
     XCTAssertEqual(chroma(crop, x: 0, y: 0), 96, "Crop origin-1 retains the half-chroma phase")
   }
 
+  func testOddSourceChromaUsesImageExtentRatherThanRoundedPlaneExtent() throws {
+    for (horizontal, vertical) in [(Colorimetry.ChromaSiting.center, Colorimetry.ChromaSiting.center), (.left, .top)] {
+      let colour = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .video,
+        horizontalChromaSiting: horizontal, verticalChromaSiting: vertical)
+      let oddWidth = try chromaFixture(width: 3, height: 4, colour: colour, cb: { x, _ in x == 0 ? 64 : 192 })
+      let wide = try converted(oddWidth, width: 6, height: 8)
+      let expected: [UInt8] = horizontal == .center ? [64, 96, 160] : [64, 128, 192]
+      for x in 0..<3 { XCTAssertEqual(chroma(wide, x: x, y: 0), expected[x]) }
+      let oddHeight = try chromaFixture(width: 4, height: 3, colour: colour, cb: { _, y in y == 0 ? 64 : 192 })
+      let tall = try converted(oddHeight, width: 8, height: 6)
+      let expectedY: [UInt8] = vertical == .center ? [64, 96, 160] : [64, 128, 192]
+      for y in 0..<3 { XCTAssertEqual(chroma(tall, x: 0, y: y), expectedY[y]) }
+    }
+  }
+
+  func testDeclaredCodeRangeOverridesSourceFourCCDefaults() throws {
+    for (pixel, range, black, white) in [
+      (kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, Colorimetry.Range.full, UInt16(0), UInt16(1023)),
+      (kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, Colorimetry.Range.video, UInt16(64), UInt16(940))] {
+      var storage: CVPixelBuffer?
+      XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, pixel,
+        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &storage), kCVReturnSuccess)
+      let source = try XCTUnwrap(storage)
+      CVPixelBufferLockBaseAddress(source, [])
+      for plane in 0..<2 {
+        let samples = CVPixelBufferGetBaseAddressOfPlane(source, plane)!.assumingMemoryBound(to: UInt16.self)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(source, plane) / 2
+        for y in 0..<16 { for x in 0..<16 { samples[y * stride + x] = (plane == 1 ? 512 : (x < 8 ? black : white)) << 6 } }
+      }
+      CVPixelBufferUnlockBaseAddress(source, [])
+      LUTProcessor.stampDeclaredColorimetry(Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709,
+        range: range, horizontalChromaSiting: .center, verticalChromaSiting: .center), on: source)
+      let output = try converted(source, width: 16, height: 16)
+      CVPixelBufferLockBaseAddress(output, .readOnly)
+      let y = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt8.self)
+      XCTAssertEqual(Int(y[0]), 16)
+      XCTAssertEqual(Int(y[15]), 235)
+      CVPixelBufferUnlockBaseAddress(output, .readOnly)
+      XCTAssertEqual(try LUTProcessor.sourceColorimetry(output).range, .video)
+    }
+    let full8 = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .full,
+      horizontalChromaSiting: .center, verticalChromaSiting: .center)
+    let image = try chromaFixture(width: 16, height: 16, colour: full8, cb: { _, _ in 128 })
+    CVPixelBufferLockBaseAddress(image, [])
+    let pixels = CVPixelBufferGetBaseAddressOfPlane(image, 0)!.assumingMemoryBound(to: UInt8.self)
+    for y in 0..<16 { for x in 0..<16 { pixels[y * CVPixelBufferGetBytesPerRowOfPlane(image, 0) + x] = x < 8 ? 0 : 255 } }
+    CVPixelBufferUnlockBaseAddress(image, [])
+    let video = try converted(image, width: 16, height: 16)
+    CVPixelBufferLockBaseAddress(video, .readOnly)
+    let result = CVPixelBufferGetBaseAddressOfPlane(video, 0)!.assumingMemoryBound(to: UInt8.self)
+    XCTAssertEqual(result[0], 16); XCTAssertEqual(result[15], 235)
+    CVPixelBufferUnlockBaseAddress(video, .readOnly)
+  }
+
   func testPortraitFitsWithBlackPillarboxAndCropFills() throws {
     var source: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 32, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -322,8 +430,8 @@ import XCTest
       let output = try XCTUnwrap(result.get())
       CVPixelBufferLockBaseAddress(output, .readOnly)
       let y = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt8.self)
-      XCTAssertEqual(y[0], mode == .fit ? 16 : 100)
-      XCTAssertEqual(y[32], 100)
+      XCTAssertEqual(Int(y[0]), mode == .fit ? 16 : 100)
+      XCTAssertEqual(Int(y[32]), 100)
       CVPixelBufferUnlockBaseAddress(output, .readOnly)
     }
   }

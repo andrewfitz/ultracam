@@ -15,6 +15,50 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 import validate_bundle as validator
 
 class VendorBundleTests(unittest.TestCase):
+    def test_rpath_first_existing_external_match_is_rejected(self):
+        self.meta[self.host]['rpaths'] = [str(self.root / 'SDK'), '@executable_path/../Frameworks']
+        with self.assertRaisesRegex(ValueError, 'dependency'):
+            self.validate()
+        (self.root / 'SDK/libCore.dylib').unlink()
+        self.validate()
+        self.binary(self.root / 'SDK/libCore.dylib', install='@rpath/libCore.dylib')
+        self.meta[self.host]['rpaths'].reverse()
+        self.validate()
+
+    def test_rpath_external_match_precedes_shared_cache_match(self):
+        external = self.binary(self.root / 'SDK/libSystem.B.dylib')
+        self.meta[self.core]['dependencies'] = ['@rpath/libSystem.B.dylib']
+        self.meta[self.core]['rpaths'] = [str(external.parent), '/usr/lib']
+        with patch.object(validator, 'system_library_available',
+                          side_effect=lambda p: str(p) == '/usr/lib/libSystem.B.dylib'):
+            with self.assertRaisesRegex(ValueError, 'dependency'):
+                self.validate()
+            external.unlink()
+            self.validate()
+            self.binary(external)
+            self.meta[self.core]['rpaths'].reverse()
+            self.validate()
+
+    def test_existing_unvalidated_candidate_blocks_later_bundled_code(self):
+        folder = self.app / 'Contents/Frameworks/Invalid'
+        folder.mkdir()
+        (folder / 'libCore.dylib').write_text('not a Mach-O')
+        self.meta[self.host]['rpaths'].insert(0, str(folder))
+        with self.assertRaisesRegex(ValueError, 'Unvalidated dependency'):
+            self.validate()
+
+    def test_rpath_explicit_external_driver_policy_and_extension_boundary(self):
+        folder = self.root / 'Driver'
+        self.binary(folder / 'libDriver.dylib')
+        self.manifests[0]['sdk']['externalDrivers'] = [str(folder)]
+        self.meta[self.core]['dependencies'] = ['@rpath/libDriver.dylib']
+        self.meta[self.core]['rpaths'] = [str(folder)]
+        self.validate()
+        self.meta[self.ext]['dependencies'] = ['@rpath/libDriver.dylib']
+        self.meta[self.ext]['rpaths'] = [str(folder)]
+        with self.assertRaisesRegex(ValueError, 'dependency'):
+            self.validate()
+
     def test_system_rpath_does_not_prove_missing_library_exists(self):
         self.meta[self.core]['dependencies'] = ['@rpath/libDefinitelyMissingAudit.dylib']
         self.meta[self.core]['rpaths'] = ['/usr/lib']
@@ -28,14 +72,17 @@ class VendorBundleTests(unittest.TestCase):
 
     def test_top_level_signed_extension_requires_extracted_entitlements(self):
         host_entitlements = {'com.apple.security.files.user-selected.read-write': True,
-                             'com.apple.security.cs.disable-library-validation': True}
-        camera_entitlements = {'com.apple.security.application-groups': ['group.fixture']}
+                             'com.apple.security.cs.disable-library-validation': True,
+                             'com.apple.security.app-sandbox': True,
+                             'com.apple.developer.system-extension.install': True,
+                             'com.apple.security.application-groups': ['group.org.ultracam.shared']}
+        camera_entitlements = {'com.apple.security.app-sandbox': True, 'com.apple.security.application-groups': ['group.org.ultracam.shared']}
         for bundle, name, identifier, kind in [(self.app, 'Ultracam', 'org.ultracam.app', 'APPL'),
                 (self.extension, 'Camera', 'org.ultracam.app.camera', 'SYSX')]:
             self.plist(bundle / 'Contents/Info.plist', dict(CFBundleExecutable=name,
                 CFBundleIdentifier=identifier, CFBundlePackageType=kind,
                 NSSystemExtensionUsageDescription='Camera',
-                CMIOExtension={'CMIOExtensionMachServiceName': 'group.fixture.camera'}))
+                CMIOExtension={'CMIOExtensionMachServiceName': 'group.org.ultracam.shared.camera'}))
         self.plist(self.root / 'Config/Camera.entitlements', camera_entitlements)
         for name, shaders in [('MonitorKit_MonitorKit.bundle', ['MKLUT.msl', 'MKDecode.msl', 'MKMonitor.msl']),
                              ('MonitorKit_MonitorKitScopes.bundle', ['MKScopes.msl'])]:
@@ -52,6 +99,65 @@ class VendorBundleTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'entitlements'):
                     validator.validate(self.app, root=self.root, signed=True)
                 validator.validate(self.app, root=self.root, signed=False)
+
+    def test_top_level_core_capabilities_match_runtime(self):
+        # Reuse the complete top-level fixture and exercise actual signed blobs.
+        self.test_top_level_signed_extension_requires_extracted_entitlements()
+        host = {'com.apple.security.files.user-selected.read-write': True,
+                'com.apple.security.cs.disable-library-validation': True,
+                'com.apple.security.app-sandbox': True,
+                'com.apple.developer.system-extension.install': True,
+                'com.apple.security.application-groups': ['group.org.ultracam.shared']}
+        camera = {'com.apple.security.app-sandbox': True,
+                  'com.apple.security.application-groups': ['group.org.ultracam.shared']}
+        def extraction(args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=plistlib.dumps(host if Path(args[-1]) == self.app else camera))
+        with patch.object(validator.subprocess, 'run', side_effect=extraction), \
+                patch.object(validator, 'validate_symbols'), patch.object(validator, 'validate_vendors'):
+            validator.validate(self.app, root=self.root, signed=True)
+            for values, key, replacement in [(host, 'com.apple.security.application-groups', []),
+                    (host, 'com.apple.security.application-groups', ['group.other']),
+                    (host, 'com.apple.developer.system-extension.install', False),
+                    (host, 'com.apple.security.app-sandbox', False),
+                    (camera, 'com.apple.security.app-sandbox', False),
+                    (camera, 'com.apple.security.application-groups', ['group.other'])]:
+                original = values[key]; values[key] = replacement
+                with self.subTest(key=key, replacement=replacement), self.assertRaises(ValueError):
+                    validator.validate(self.app, root=self.root, signed=True)
+                values[key] = original
+            for bundle in (self.app, self.extension):
+                info = plistlib.loads((bundle / 'Contents/Info.plist').read_bytes())
+                info['UltracamLocalDevelopmentBuild'] = True
+                if bundle == self.extension:
+                    info['CMIOExtension']['CMIOExtensionMachServiceName'] = 'group.org.ultracam.local.camera'
+                self.plist(bundle / 'Contents/Info.plist', info)
+            host['com.apple.security.application-groups'] = ['group.org.ultracam.local']
+            camera['com.apple.security.application-groups'] = ['group.org.ultracam.local']
+            validator.validate(self.app, root=self.root, signed=True)
+
+    def test_universal_run_paths_are_slice_specific(self):
+        for meta in self.meta.values():
+            meta['architectures'] = ['arm64', 'x86_64']
+        self.meta[self.host]['rpathsByArchitecture'] = {
+            'arm64': [], 'x86_64': ['@executable_path/../Frameworks']}
+        with self.assertRaisesRegex(ValueError, 'dependency'):
+            self.validate()
+        self.meta[self.host]['rpathsByArchitecture']['arm64'] = ['@executable_path/../Frameworks']
+        self.validate()
+
+    def test_universal_inherited_run_paths_are_slice_specific(self):
+        for meta in self.meta.values():
+            meta['architectures'] = ['arm64', 'x86_64']
+        helper = self.binary(self.app / 'Contents/Frameworks/Helpers/libHelper.dylib', install='@rpath/libHelper.dylib')
+        self.meta[helper]['architectures'] = ['arm64', 'x86_64']
+        self.meta[self.core]['dependencies'] = ['@rpath/libHelper.dylib']
+        self.meta[self.host]['rpathsByArchitecture'] = {
+            'arm64': ['@executable_path/../Frameworks'],
+            'x86_64': ['@executable_path/../Frameworks', '@executable_path/../Frameworks/Helpers']}
+        with self.assertRaisesRegex(ValueError, 'dependency'):
+            self.validate()
+        self.meta[self.host]['rpathsByArchitecture']['arm64'].append('@executable_path/../Frameworks/Helpers')
+        self.validate()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -100,7 +206,7 @@ class VendorBundleTests(unittest.TestCase):
                 deps = ([meta['install']] if meta.get('install') else []) + meta.get('dependenciesByArchitecture', {}).get(arch, meta.get('dependencies', []))
                 out = str(path) + ':\n' + ''.join('\t' + dep + ' (compatibility version 1.0.0, current version 1.0.0)\n' for dep in deps)
             elif '-l' in args:
-                out = ''.join('Load command 1\n          cmd LC_RPATH\n      cmdsize 48\n         path ' + p + ' (offset 12)\n' for p in meta.get('rpaths', []))
+                out = ''.join('Load command 1\n          cmd LC_RPATH\n      cmdsize 48\n         path ' + p + ' (offset 12)\n' for p in meta.get('rpathsByArchitecture', {}).get(args[args.index('-arch') + 1] if '-arch' in args else None, meta.get('rpaths', [])))
         elif args[0].endswith('codesign'):
             if '--entitlements' in args: out = plistlib.dumps(self.entitlements).decode()
             elif not meta.get('signed', True): rc = 1

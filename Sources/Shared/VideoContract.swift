@@ -249,8 +249,9 @@ struct PipelineConfiguration: Equatable, Sendable {
   var sourcePauseAllowanceSeconds: Double? = nil
   var sourcePixelAspect: Rational? = nil
   var scalingMode: ProgramScalingMode = .fit
-  /// A manual interpretation of source pixels; never replaces the immutable
-  /// physical source declaration retained by capture and recording.
+  /// Manual source RGB primaries/transfer only. Always merge with physical
+  /// source transport using `overridingRGBEncoding(with:)`; matrix, range and
+  /// siting in this profile value are not transport overrides.
   var sourceColorimetryOverride: Colorimetry? = nil
   /// Expected loaded-LUT output contract, projected by the feed descriptor.
   var lutOutputColorimetry: Colorimetry? = nil

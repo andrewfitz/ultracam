@@ -484,7 +484,12 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let signal = Self.interpret(
       image, format: format, range: layout?.range ?? .legal, declaration: declaration, processed: isProgram,
       untouched: untouched, colour: sourceFormat?.colour, cache: &interpretation)
-    let geometry = cachedGeometry(image, format: format)
+    var geometry = cachedGeometry(image, format: format)
+    // The immutable declaration owns sample geometry. Apply it after the
+    // IOSurface cache so a reused buffer can carry a new declaration.
+    if let aspect = sourceFormat?.pixelAspect {
+      geometry.pixelAspectRatio = Double(aspect.numerator) / Double(aspect.denominator)
+    }
     let current = Identity(layout: layout?.layout, signal: signal, geometry: geometry)
     if identity != current {
       identity = current

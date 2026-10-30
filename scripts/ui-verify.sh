@@ -17,11 +17,17 @@ run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 build_root="$external_root/agent-work/build/ultracam/ui-verify"
 # Skip when nothing the verifier compiles has changed since its last passing run.
 # FORCE=1 runs it anyway.
+# Partial performance requests always run and never consume or publish full proof.
+# Hash every Rust package input (including extensionless/config/build inputs),
+# excluding generated build output and repository metadata.
+rust_inputs_hash="$(cd "$task_root" && find Tools/auto-switcher \
+  -type d \( -name target -o -name .git \) -prune -o -type f -print0 | \
+  sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
 inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify Packages/MonitorKit/Sources Packages/MonitorKit/Package.swift \
   Vendors Config/Assets.xcassets scripts/ui-verify.sh scripts/monitor-kit-package.sh scripts/vendor-build.sh scripts/vendors.py \
   -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.msl' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' -o -name '*.py' -o -name '*.json' -o -name '*.svg' -o -name '*.png' \) \
-  -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-strict${STRICT:-1}-vendors$(python3 "$task_root/scripts/vendors.py" digest)"
-if [[ "${FORCE:-0}" != 1 && -f "$build_root/last-pass" && "$(cat "$build_root/last-pass")" == "$inputs_hash" ]]; then
+  -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-rust${rust_inputs_hash}-strict${STRICT:-1}-vendors$(python3 "$task_root/scripts/vendors.py" digest)"
+if [[ "${UI_PERF_ONLY:-0}" != 1 && "${FORCE:-0}" != 1 && -f "$build_root/last-pass" && "$(cat "$build_root/last-pass")" == "$inputs_hash" ]]; then
   echo "UI verify: unchanged since the last passing run ($build_root/latest). FORCE=1 to rerun."
   exit 0
 fi
@@ -54,7 +60,7 @@ xcrun swiftc -Onone -swift-version 5 -strict-concurrency=complete -warnings-as-e
   -module-cache-path "$test_root/modules" "${monitor_kit_link_args[@]}" \
   ${vendor_swift_native_args[@]+"${vendor_swift_native_args[@]}"} \
   -import-objc-header "$vendor_bridge" \
-  "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/DeviceAPI/*.swift ${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"} "$task_root"/Sources/Recording/*.swift \
+  "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/DeviceAPI/*.swift ${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"} "$task_root"/Sources/Recording/*.swift "$task_root"/Sources/Program/*.swift \
   "${app_sources[@]}" "$task_root"/Tools/UIVerify/*.swift \
   ${vendor_native_objects[@]+"${vendor_native_objects[@]}"} ${vendor_link_args[@]+"${vendor_link_args[@]}"} \
   -L "$auto_switcher_lib" -lauto_switcher \
@@ -69,5 +75,5 @@ status=0
 "$test_root/ui-verify" "$test_root" > "$test_root/ui-verify.log" 2>&1 || status=$?
 grep -E '^(FAIL|PENDING)' "$test_root/ui-verify.log" | head -80 || true
 tail -4 "$test_root/ui-verify.log"
-if [[ "$status" == 0 ]]; then printf '%s\n' "$inputs_hash" > "$build_root/last-pass"; fi
+if [[ "$status" == 0 && "${UI_PERF_ONLY:-0}" != 1 ]]; then printf '%s\n' "$inputs_hash" > "$build_root/last-pass"; fi
 exit "$status"

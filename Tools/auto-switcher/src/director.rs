@@ -101,6 +101,7 @@ impl Director {
 
     pub fn process_event(&mut self, event: StreamEvent) -> Vec<SwitcherOutput> {
         match event {
+            StreamEvent::DirectorOutput => Vec::new(),
             StreamEvent::Audio { cue } => {
                 self.ingest_audio(cue);
                 Vec::new()
@@ -325,6 +326,17 @@ impl Director {
             return None;
         }
 
+        // A saved boundary keeps its original one-second validity window.
+        // Once it expires, a fresh boundary must start a new candidate dwell.
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| now > candidate.boundary.time + 1.0)
+        {
+            self.candidate = None;
+            self.state = self.state_for_current();
+        }
+
         let Some(audio) = self.latest_audio(now) else {
             self.state = self.state_for_current();
             return None;
@@ -547,6 +559,9 @@ impl Director {
             .filter(|b| {
                 b.time >= deadline - self.config.forced_boundary_lookback
                     && b.time <= grace_deadline + self.config.boundary_window
+                    // Sparse ticks may arrive after this boundary's decision
+                    // would expire. Let the absolute-cap fallback cut at now.
+                    && now <= grace_deadline.max(b.time.max(self.shot_started_at)) + 1.0
             })
             .min_by(|a, b| {
                 (a.time - deadline)
@@ -685,7 +700,7 @@ impl Director {
                 } else {
                     self.config.boundary_window
                 };
-                (b.time - now).abs() <= window
+                (b.time - now).abs() <= window && now <= b.time + 1.0
             })
             .min_by(|a, b| (a.time - now).abs().total_cmp(&(b.time - now).abs()))
     }

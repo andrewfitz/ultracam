@@ -415,8 +415,8 @@ struct DeckLinkCapturePlugin: CaptureSourcePlugin {
   func devices() throws -> [CaptureDeviceInfo] { try DeckLinkBackend.devices().map(Self.device) }
   @MainActor func observeDevices(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) -> DeviceObservation {
     let observation = DeviceObservation(handler)
-    let token = DeckLinkBackend.addDeviceListObserver { values in
-      observation.deliver(CaptureDeviceSnapshot(status: driverStatus(), devices: values.map(Self.device), error: nil))
+    let token = DeckLinkBackend.addDeviceListObserver { [weak observation] values in
+      observation?.deliver(CaptureDeviceSnapshot(status: driverStatus(), devices: values.map(Self.device), error: nil))
     }
     observation.onCancel { DeckLinkBackend.removeDeviceListObserver(token) }
     return observation

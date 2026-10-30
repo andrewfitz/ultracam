@@ -7,6 +7,143 @@ import XCTest
 /// gamut display text is migrated to a stable source profile ID; unknown IDs
 /// remain opaque and survive a round trip.
 @MainActor @objcMembers final class B1dSettingsMigrationChecks: XCTestCase {
+    func testExplicitNoneUsesRealDescriptorCodableAndLegacyDefault() throws {
+        var feed = FeedDescriptor(selectedDevice: "")
+        feed.inputClearedByChoice = true
+        let restored = try JSONDecoder().decode(FeedDescriptor.self, from: JSONEncoder().encode(feed))
+        XCTAssertTrue(restored.inputClearedByChoice)
+        XCTAssertTrue(restored.selectedDevice.isEmpty)
+        let legacy = try JSONDecoder().decode(FeedDescriptor.self, from: Data(#"{"selectedDevice":""}"#.utf8))
+        XCTAssertFalse(legacy.inputClearedByChoice, "Legacy snapshots keep their prior autoassignment policy")
+        XCTAssertFalse(FeedDescriptor().inputClearedByChoice)
+    }
+
+    func testOfflineModelKeepsEveryExplicitNoneAfterRelaunchAndDiscovery() throws {
+        for count in [1, 2] {
+            let suite = "B1dNoneIntent." + UUID().uuidString
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let feeds = (0..<count).map { index in
+                FeedDescriptor(id: FeedID(rawValue: "intent-\(index)"), name: "Camera \(index + 1)",
+                    selectedDevice: "fixture:input-\(index)")
+            }
+            AppSettingsStore(defaults: defaults).saveSnapshot(AppSettingsSnapshot(feeds: feeds))
+            let inputs = feeds.map { InputDevice(id: $0.selectedDevice, name: "Fixture") }
+            var model: AppModel? = intentModel(defaults: defaults, inputs: inputs)
+            for feed in feeds { model?.updateCamera(feed.id) { $0.selectedDevice = "" } }
+            model = nil
+            let relaunched = intentModel(defaults: defaults, inputs: inputs)
+            XCTAssertTrue(relaunched.feedDescriptors.allSatisfy { $0.selectedDevice.isEmpty && $0.inputClearedByChoice })
+            relaunched.refresh()
+            XCTAssertTrue(relaunched.feedDescriptors.allSatisfy { $0.selectedDevice.isEmpty })
+        }
+    }
+
+    func testFreshOfflineModelStillAssignsAvailableInput() throws {
+        let suite = "B1dFreshInput." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = intentModel(defaults: defaults, inputs: [InputDevice(id: "fixture:available", name: "Fixture")])
+        XCTAssertEqual(model.feedDescriptors.first?.selectedDevice, "fixture:available")
+        XCTAssertEqual(model.feedDescriptors.first?.inputClearedByChoice, false)
+    }
+
+    func testMonitorPickerUpdatesAuthoritativeSourceThroughActualModelCallback() throws {
+        for initial in ["unspecified", "sony-slog3-sgamut3cine"] {
+            let suite = "B1dLogPicker." + UUID().uuidString
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let feed = FeedDescriptor(sourceProfileID: initial)
+            AppSettingsStore(defaults: defaults).saveSnapshot(AppSettingsSnapshot(feeds: [feed]))
+            let model = intentModel(defaults: defaults, inputs: [])
+            let target = MonitorTargetID(feed.id.rawValue)
+            for picked: String? in ["panasonic-vlog-vgamut", "arri-logc3-ei800", nil] {
+                var preferences = model.monitorCoordinator.preferences(for: target)
+                preferences.signal.range = .full
+                preferences.signal.transport = .fullRescaledToLegal
+                model.monitorCoordinator.setPreferences(preferences.declaringCameraLog(picked), for: target)
+                let live = try XCTUnwrap(model.descriptor(for: feed.id))
+                let restored = try XCTUnwrap(AppSettingsStore(defaults: defaults).loadSnapshot().feeds.first)
+                for value in [live, restored] {
+                    XCTAssertEqual(value.sourceProfileID, picked ?? "unspecified")
+                    XCTAssertEqual(value.monitor.signal.logProfileID, picked)
+                    XCTAssertNil(value.monitor.signal.sourceProfileID)
+                    XCTAssertEqual(value.monitor.signal.range, .full)
+                    XCTAssertEqual(value.monitor.signal.transport, .fullRescaledToLegal)
+                }
+            }
+        }
+    }
+
+    func testSyncedMonitorPickerKeepsCameraDeclarationsIsolated() throws {
+        let suite = "B1dSyncedLogPicker." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let alpha = FeedDescriptor(id: FeedID(rawValue: "alpha"))
+        let beta = FeedDescriptor(id: FeedID(rawValue: "beta"))
+        var snapshot = AppSettingsSnapshot(feeds: [alpha, beta])
+        snapshot.syncCameras = true
+        AppSettingsStore(defaults: defaults).saveSnapshot(snapshot)
+        let model = intentModel(defaults: defaults, inputs: [])
+        let alphaTarget = MonitorTargetID(alpha.id.rawValue)
+        let betaTarget = MonitorTargetID(beta.id.rawValue)
+        var tools = model.monitorCoordinator.preferences(for: alphaTarget)
+        tools = tools.declaringCameraLog("sony-slog3-sgamut3cine")
+        tools.toolsEnabled = true
+        tools.state.falseColor.mode = .sonySLog3
+        model.monitorCoordinator.setPreferences(tools, for: alphaTarget)
+        let saved = AppSettingsStore(defaults: defaults).loadSnapshot()
+        for descriptors in [model.feedDescriptors, saved.feeds] {
+            let declared = try XCTUnwrap(descriptors.first { $0.id == alpha.id })
+            let undeclared = try XCTUnwrap(descriptors.first { $0.id == beta.id })
+            XCTAssertEqual(declared.sourceProfileID, "sony-slog3-sgamut3cine")
+            XCTAssertEqual(declared.configuration.sourceColorimetryOverride?.transfer, .sLog3)
+            XCTAssertTrue(declared.monitor.falseColorDeclared)
+            XCTAssertEqual(undeclared.sourceProfileID, "unspecified")
+            XCTAssertNil(undeclared.configuration.sourceColorimetryOverride)
+            XCTAssertNil(undeclared.monitor.signal.logProfileID)
+            XCTAssertEqual(undeclared.monitor.state.falseColor.mode, .sonySLog3)
+            XCTAssertFalse(undeclared.monitor.falseColorDeclared)
+        }
+        var peerTools = model.monitorCoordinator.preferences(for: betaTarget)
+        peerTools.toolsEnabled = false
+        model.monitorCoordinator.setPreferences(peerTools, for: betaTarget)
+        XCTAssertTrue(model.monitorCoordinator.preferences(for: alphaTarget).falseColorDeclared)
+        XCTAssertEqual(model.descriptor(for: alpha.id)?.sourceProfileID, "sony-slog3-sgamut3cine")
+    }
+
+    private func intentModel(defaults: UserDefaults, inputs: [InputDevice]) -> AppModel {
+        var hardware = AppHardware.offline
+        hardware.devices = { inputs }
+        let installer = ExtensionInstaller(services: .init(
+            preflight: { .init(developerSigned: false, hasInstallEntitlement: false) },
+            makeRequest: { _ in fatalError("No installer requests in settings tests") },
+            submit: { _ in XCTFail("No installer submissions in settings tests") },
+            queryProperties: { $0([]) }))
+        return AppModel(settingsStore: AppSettingsStore(defaults: defaults),
+            registryStore: VirtualCameraRegistryStore(defaults: defaults),
+            registryPublisher: SettingsIntentRegistryPublisher(),
+            recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer,
+            hardware: hardware)
+    }
+
+    func testDisplaySourceProfilesReachMonitorOnInitDecodeAndChange() throws {
+        for id in ["rec709-video", "rec2020-hlg-video", "rec2020-pq-video"] {
+            var feed = FeedDescriptor(id: .primary, name: "Camera", sourceProfileID: id)
+            XCTAssertEqual(feed.monitor.signal.sourceProfileID, id)
+            XCTAssertNil(feed.monitor.signal.logProfileID)
+            let decoded = try JSONDecoder().decode(FeedDescriptor.self, from: JSONEncoder().encode(feed))
+            XCTAssertEqual(decoded.monitor.signal.sourceProfileID, id)
+            feed.setSourceProfile("sony-slog3-sgamut3cine")
+            XCTAssertEqual(feed.monitor.signal.logProfileID, "sony-slog3-sgamut3cine")
+            XCTAssertNil(feed.monitor.signal.sourceProfileID)
+            feed.setSourceProfile(id)
+            XCTAssertEqual(feed.monitor.signal.sourceProfileID, id)
+            feed.setSourceProfile("unspecified")
+            XCTAssertNil(feed.monitor.signal.sourceProfileID)
+            XCTAssertNil(feed.monitor.signal.logProfileID)
+        }
+    }
     func testUnknownLegacyTargetsPreserveFeedAndBookmark() throws {
         let suite = "B1dSettingsMigrationChecks." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -99,5 +236,8 @@ import XCTest
     }
     private enum MigrationFailure: Error { case implicitDefault }
 
+}
+@MainActor private final class SettingsIntentRegistryPublisher: AppVirtualCameraRegistryPublishing {
+    func publish(_ snapshot: VirtualCameraRegistrySnapshot) {}
 }
 #endif

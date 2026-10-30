@@ -255,7 +255,6 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
     guard isProgram else { return [:] }
     return [
       .focusPeaking: UIMonitorToolSettingsView.unavailableReason(.focus, isProgram: true) ?? "",
-      .falseColor: UIMonitorToolSettingsView.unavailableReason(.falseColor, isProgram: true) ?? "",
     ]
   }
 
@@ -287,7 +286,7 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
         state: toolState, name: target.flatMap { id in choices.first { $0.id == id }?.title } ?? "Monitor",
         signal: presenter?.shownSignal, status: presenter?.shownStatus,
         tools: [.guides, .zebra, .falseColor, .focusPeaking, .clipIndicators, .scopes],
-        unavailable: unavailableTools, placement: .chrome,
+        unavailable: unavailableTools, falseColorModes: isProgram ? [.sixBand, .custom] : nil, layout: presenter?.shownLayout, placement: .chrome,
         scopesEnabled: preferences.toolsEnabled && preferences.scopes.enabled,
         onScopes: { on in
           var next = preferences
@@ -306,9 +305,10 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
         Text(detail).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
       if displayed.toolsEnabled && displayed.state.falseColor.mode != .off {
-        if isProgram {
+        if isProgram && displayed.state.falseColor.mode.needsLogSource {
           Text("False Color unavailable for Program: source Log provenance is required").font(.caption2)
-        } else if let legend = FalseColorLegend(settings: displayed.state.falseColor, signal: presenter?.shownSignal) {
+        } else if let legend = FalseColorLegend(settings: displayed.state.falseColor, signal: presenter?.shownSignal,
+          layout: presenter?.shownLayout) {
           FalseColorLegendView(
             legend: legend, style: .captioned, unavailable: presenter?.shownStatus.reason(for: .falseColor))
         }

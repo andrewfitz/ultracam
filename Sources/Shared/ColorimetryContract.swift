@@ -49,3 +49,14 @@ struct ColorimetryContract: Hashable, Codable, Sendable {
                              range: .full, horizontalChromaSiting: .unspecified,
                              verticalChromaSiting: .unspecified)
 }
+
+extension Colorimetry {
+  /// A manual source profile declares the RGB encoding, never pixel transport.
+  /// Range, YCbCr matrix and chroma locations remain the admitted source's.
+  func overridingRGBEncoding(with profile: Colorimetry?) -> Colorimetry {
+    guard let profile else { return self }
+    return Colorimetry(primaries: profile.primaries, transfer: profile.transfer, matrix: matrix,
+      range: range, horizontalChromaSiting: horizontalChromaSiting,
+      verticalChromaSiting: verticalChromaSiting)
+  }
+}

@@ -3,6 +3,7 @@ import CoreVideo
 import Darwin
 import Metal
 import MonitorKit
+import MonitorKitUI
 import QuartzCore
 import XCTest
 
@@ -62,6 +63,36 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
 
 /// MonitorFeedHost (delivery side and render-side wrapping) and MonitorGPUContext
 /// (submission clock, encode contexts, render thread) against real MonitorKit.
+private final class MonitorFeedbackMailbox: @unchecked Sendable {
+  private let lock = NSLock()
+  private let ready = DispatchSemaphore(value: 0)
+  private var values: [(Int, @Sendable (Bool) -> Void)] = []
+  func accept(_ kind: Int, _ deliver: @escaping @Sendable (Bool) -> Void) {
+    lock.withLock { values.append((kind, deliver)) }; ready.signal()
+  }
+  func take(_ kind: Int) throws -> (@Sendable (Bool) -> Void) {
+    guard ready.wait(timeout: .now() + 10) == .success else { throw MonitorKitError.gpu("Timed out waiting for real GPU feedback") }
+    return lock.withLock {
+      let entry = values.removeFirst()
+      XCTAssertEqual(entry.0, kind)
+      return entry.1
+    }
+  }
+}
+
+private final class MonitorRenderResult<T>: @unchecked Sendable { var value: Result<T, Error>? }
+private final class MonitorRenderOperation<T>: @unchecked Sendable {
+  let body: () throws -> T
+  init(_ body: @escaping () throws -> T) { self.body = body }
+}
+private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () throws -> T) throws -> T {
+  let result = MonitorRenderResult<T>(); let ready = DispatchSemaphore(value: 0)
+  let operation = MonitorRenderOperation(body)
+  gpu.renderThread.perform { result.value = Result { try operation.body() }; ready.signal() }
+  guard ready.wait(timeout: .now() + 10) == .success else { throw MonitorKitError.gpu("Render thread timed out") }
+  return try XCTUnwrap(result.value).get()
+}
+
 @objcMembers final class MonitorFeedHostChecks: XCTestCase {
   // MARK: - Fixtures
 
@@ -154,6 +185,355 @@ private final class Completion: MonitorGPUCompletion, @unchecked Sendable {
   }
 
   // MARK: - Delivery side
+
+  func testDisplayProfileDeclarationChangesRGBEncodingOnly() throws {
+    let image = try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8)
+    let (host, slot) = host("display-profile")
+    let colour = Colorimetry(primaries: .rec709, transfer: .sRGB, matrix: .rec601,
+      range: .full, horizontalChromaSiting: .center, verticalChromaSiting: .top)
+    let source = try SourceFormat(width: 16, height: 8, pixel: .bgra8, colour: colour,
+      rate: .constant(CMTime(value: 1, timescale: 25)))
+    for (index, id) in ["rec709-video", "rec2020-hlg-video", "rec2020-pq-video"].enumerated() {
+      let declaration = MonitorSignalDeclaration(range: .legal, sourceProfileID: id)
+      XCTAssertEqual(try JSONDecoder().decode(MonitorSignalDeclaration.self,
+        from: JSONEncoder().encode(declaration)), declaration)
+      host.setSignalDeclaration(declaration)
+      host.offer(image, pts: CMTime(value: Int64(index + 1), timescale: 25), captureGeneration: 1,
+        sequence: UInt64(index + 1), untouched: true, sourceFormat: source)
+      let signal = try XCTUnwrap(slot.latest).signal
+      XCTAssertEqual(signal.primaries, index == 0 ? .rec709 : .rec2020)
+      XCTAssertEqual(signal.encoding, .display(index == 0 ? .bt709 : index == 1 ? .hlg : .pq))
+      XCTAssertEqual(signal.matrix, .bt601)
+      XCTAssertEqual(signal.range, .legal, "The monitor's explicit range still wins")
+      XCTAssertEqual(signal.chromaSiting, .center)
+      XCTAssertEqual(signal.chromaVerticalSiting, .top)
+    }
+    let native = SignalDescription(range: .full, encoding: .display(.sRGB))
+    XCTAssertEqual(MonitorSignalDeclaration().applied(to: native), native)
+  }
+
+  @MainActor func testShownFloatARRILegendKeepsLayoutAcrossFreeze() throws {
+    let gpu = MonitorGPUContext(device: { nil })
+    gpu.renderThread.stop()
+    let host = MonitorFeedHost(target: "float-legend", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("float-legend"), host: host, gpu: gpu)
+    host.setConsumers([presenter])
+    host.setSignalDeclaration(MonitorSignalDeclaration(logProfileID: "arri-logc3-ei800", range: .legal))
+    var preferences = MonitorFeedPreferences()
+    preferences.toolsEnabled = true
+    preferences.state.falseColor.mode = .arriLogC
+    presenter.setPreferences(preferences)
+    let image = try buffer(kCVPixelFormatType_64RGBAHalf, width: 16, height: 8)
+    offer(host, image, sequence: 1)
+    presenter.setClean(false)
+    XCTAssertEqual(presenter.shownLayout, .rgba16Float)
+    let expected = FalseColorLegend(settings: preferences.state.falseColor,
+      signal: presenter.shownSignal, arriFullRange: true)
+    let legend = FalseColorLegend(settings: preferences.state.falseColor,
+      signal: presenter.shownSignal, layout: presenter.shownLayout)
+    XCTAssertEqual(legend, expected)
+    presenter.toggleFreeze()
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 2)
+    presenter.setClean(false)
+    XCTAssertTrue(presenter.isFrozen)
+    XCTAssertEqual(presenter.shownLayout, .rgba16Float)
+    XCTAssertEqual(FalseColorLegend(settings: preferences.state.falseColor,
+      signal: presenter.shownSignal, layout: presenter.shownLayout), expected)
+  }
+
+  @MainActor func testDrawableAttachmentsSurviveCoreRebuildAndSharedDetach() throws {
+    guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else {
+      throw XCTSkip("No Metal 4 device")
+    }
+    final class Events: @unchecked Sendable {
+      let lock = NSLock()
+      var values: [(ObjectIdentifier, ObjectIdentifier, Bool)] = []
+    }
+    let events = Events()
+    let gpu = MonitorGPUContext(device: { device }, drawableResidencyChange: { queue, set, added in
+      events.lock.withLock { events.values.append((queue, set, added)) }
+    })
+    let picture = CAMetalLayer(), scope = CAMetalLayer()
+    picture.device = device; scope.device = device
+    let pictureSet = picture.residencySet, scopeSet = scope.residencySet
+    gpu.attachDrawables(pictureSet)
+    let old = try gpu.core()
+    gpu.attachDrawables(scopeSet)
+    gpu.attachDrawables(scopeSet)
+    gpu.invalidate()
+    let replacement = try gpu.core()
+    XCTAssertFalse(old === replacement)
+    let queueID = ObjectIdentifier(replacement.queue)
+    let rebuilt = events.lock.withLock { events.values.filter { $0.0 == queueID && $0.2 }.map { $0.1 } }
+    XCTAssertEqual(Set(rebuilt), Set([ObjectIdentifier(pictureSet), ObjectIdentifier(scopeSet)]))
+    XCTAssertEqual(rebuilt.count, 2, "A shared set registers once per queue")
+    gpu.detachDrawables(scopeSet)
+    XCTAssertFalse(events.lock.withLock { events.values.contains { $0.0 == queueID && !$0.2 } })
+    gpu.detachDrawables(scopeSet)
+    XCTAssertEqual(events.lock.withLock { events.values.filter { $0.0 == queueID && !$0.2 }.count }, 1)
+    gpu.detachDrawables(pictureSet)
+  }
+
+  @MainActor func testHeldScopeRetriesTransientSetupFailureWithoutNewPicture() throws {
+    guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else {
+      throw XCTSkip("No Metal 4 device")
+    }
+    let gpu = MonitorGPUContext(device: { device })
+    let core = try gpu.core()
+    let (host, slot) = host("scope-retry", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("scope-retry"), host: host, gpu: gpu)
+    let layer = CAMetalLayer()
+    layer.device = device; layer.pixelFormat = .bgra8Unorm
+    layer.drawableSize = CGSize(width: 128, height: 64)
+    gpu.attachDrawables(layer.residencySet)
+    defer { gpu.detachDrawables(layer.residencySet) }
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    var settings = MonitorScopePreferences(); settings.enabled = true
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 1)
+    loop.holdScopeForTesting(try XCTUnwrap(slot.latest), layer: layer, settings: settings)
+    var attempts = 0
+    loop.scopeSetupForTesting = {
+      attempts += 1
+      if attempts == 1 { throw MonitorKitError.gpu("injected transient setup failure") }
+    }
+    let drawable = try XCTUnwrap(layer.nextDrawable())
+    loop.drawScope(drawable: drawable, at: 1)
+    XCTAssertTrue(loop.hasPendingScopeForTesting)
+    loop.drawScope(drawable: drawable, at: 2)
+    XCTAssertFalse(loop.hasPendingScopeForTesting)
+    XCTAssertEqual(presenter.statistics.scopeUpdates, 1)
+    loop.drawScope(drawable: drawable, at: 3)
+    XCTAssertEqual(presenter.statistics.scopeUpdates, 1)
+    XCTAssertEqual(attempts, 2)
+    let completion = Completion()
+    try core.submit(completion: completion) { _ in }
+    XCTAssertTrue(completion.wait())
+  }
+
+  @MainActor func testFailedGPUFeedbackRearmsUnchangedPictureAndHeldScope() throws {
+    let (gpu, core) = try gpuCore()
+    let mailbox = MonitorFeedbackMailbox()
+    core.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    let (host, slot) = host("feedback-retry", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("feedback-retry"), host: host, gpu: gpu)
+    host.setConsumers([slot, presenter])
+    let layer = CAMetalLayer(); layer.device = core.device; layer.pixelFormat = .bgra8Unorm
+    layer.drawableSize = CGSize(width: 128, height: 64)
+    gpu.attachDrawables(layer.residencySet)
+    defer { gpu.detachDrawables(layer.residencySet) }
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 1)
+    let delivery = try XCTUnwrap(slot.latest)
+    nonisolated(unsafe) let drawable = try XCTUnwrap(layer.nextDrawable())
+    try monitorOnRender(gpu) {
+      var settings = MonitorScopePreferences(); settings.enabled = true
+      loop.holdScopeForTesting(delivery, layer: layer, settings: settings)
+      loop.drawScope(drawable: drawable, at: 1)
+      XCTAssertFalse(loop.hasPendingScopeForTesting)
+    }
+    let failedScope = try mailbox.take(MonitorSurfaceRenderLoop.scopeKind)
+    failedScope(true)
+    try monitorOnRender(gpu) {
+      XCTAssertTrue(loop.hasPendingScopeForTesting, "Failed feedback must requeue the same held scope")
+      XCTAssertTrue(loop.pictureNeedsRetryForTesting)
+    }
+    let replacement = try gpu.core()
+    replacement.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    nonisolated(unsafe) let retryDrawable = try XCTUnwrap(layer.nextDrawable())
+    try monitorOnRender(gpu) { loop.drawScope(drawable: retryDrawable, at: 2) }
+    try mailbox.take(MonitorSurfaceRenderLoop.scopeKind)(false)
+    try monitorOnRender(gpu) { XCTAssertFalse(loop.hasPendingScopeForTesting) }
+    XCTAssertEqual(presenter.statistics.scopeUpdates, 2)
+    let submittedWork = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    let submittedOutput = try target(replacement, width: 16, height: 8)
+    let pictureCompletion = try monitorOnRender(gpu) {
+      let completion = loop.pictureCompletionForTesting(core: replacement)
+      XCTAssertNil(loop.pictureWorkForTesting, "Unchanged picture is consumed before failed feedback")
+      return completion
+    }
+    try monitorOnRender(gpu) {
+      try replacement.submit(completion: pictureCompletion, kind: MonitorSurfaceRenderLoop.pictureKind) { context in
+        _ = try loop.encode(submittedWork, feed: loop.drawingFeed(for: submittedWork, core: replacement),
+          target: submittedOutput, core: replacement, context: context)
+      }
+    }
+    try mailbox.take(MonitorSurfaceRenderLoop.pictureKind)(true)
+    let retryWork = try monitorOnRender(gpu) {
+      XCTAssertTrue(loop.pictureNeedsRetryForTesting)
+      return try XCTUnwrap(loop.pictureWorkForTesting, "Failed feedback must make unchanged picture eligible again")
+    }
+    let pictureCore = try gpu.core()
+    let output = try target(pictureCore, width: 16, height: 8)
+    let done = Completion()
+    try monitorOnRender(gpu) {
+      try pictureCore.submit(completion: done) { context in
+        _ = try loop.encode(retryWork, feed: loop.drawingFeed(for: retryWork, core: pictureCore), target: output,
+          core: pictureCore, context: context)
+      }
+    }
+    XCTAssertTrue(done.wait())
+    pictureCore.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    let obsoleteCompletion = try monitorOnRender(gpu) { loop.pictureCompletionForTesting(core: pictureCore) }
+    try pictureCore.submit(completion: obsoleteCompletion, kind: MonitorSurfaceRenderLoop.pictureKind) { _ in }
+    let obsoleteFeedback = try mailbox.take(MonitorSurfaceRenderLoop.pictureKind)
+    gpu.invalidate()
+    let newestCore = try gpu.core()
+    newestCore.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    let newestCompletion = try monitorOnRender(gpu) { loop.pictureCompletionForTesting(core: newestCore) }
+    try newestCore.submit(completion: newestCompletion, kind: MonitorSurfaceRenderLoop.pictureKind) { _ in }
+    try mailbox.take(MonitorSurfaceRenderLoop.pictureKind)(false)
+    try monitorOnRender(gpu) {}
+    obsoleteFeedback(true)
+    try monitorOnRender(gpu) {
+      XCTAssertTrue(gpu.builtCore === newestCore, "Obsolete core feedback cannot discard its replacement")
+      XCTAssertNil(loop.pictureWorkForTesting, "Obsolete failure cannot consume a newer successful picture")
+    }
+  }
+
+  @MainActor func testFreezeCopyFeedbackPreservesSourceAndRejectsCancelledTransactions() throws {
+    let (gpu, core) = try gpuCore()
+    let mailbox = MonitorFeedbackMailbox()
+    core.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    let host = MonitorFeedHost(target: "copy-feedback", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("copy-feedback"), host: host, gpu: gpu)
+    host.setConsumers([presenter])
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8, fill: 0xffff0000), sequence: 1)
+    presenter.toggleFreeze()
+    let failed = try mailbox.take(MonitorSurfaceRenderLoop.freezeKind)
+    guard case .frozenLive = presenter.renderWork(after: (.max, .max), force: true)?.content else {
+      return XCTFail("Copy must retain its source until successful GPU feedback")
+    }
+    failed(true)
+    try monitorOnRender(gpu) {}
+    guard case .frozenLive = presenter.renderWork(after: (.max, .max), force: true)?.content else {
+      return XCTFail("Failed copy must keep the valid capture source")
+    }
+    let replacement = try gpu.core()
+    replacement.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    try monitorOnRender(gpu) { presenter.retryFreezeCopy() }
+    let successful = try mailbox.take(MonitorSurfaceRenderLoop.freezeKind)
+    successful(false)
+    try monitorOnRender(gpu) {}
+    let copied = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+    guard case .frozenOwned(let owned, let owner, _) = copied.content else { return XCTFail("Retry must adopt its successful copy") }
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    let output = try target(replacement, width: 16, height: 8)
+    let completion = Completion()
+    replacement.deferCompletionForTesting = nil
+    try monitorOnRender(gpu) {
+      try replacement.submit(completion: completion) { context in
+        _ = try loop.encode(copied, feed: loop.drawingFeed(for: copied, core: replacement), target: output,
+          core: replacement, context: context)
+      }
+    }
+    XCTAssertTrue(completion.wait())
+    XCTAssertEqual(pixel(output, x: 8, y: 4), [0, 0, 255, 255], "The adopted copy retains the known red source")
+    withExtendedLifetime((owned, owner)) {}
+    presenter.toggleFreeze()
+    presenter.requestFreezeOnNextFrame()
+    replacement.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 2)
+    let cancelled = try mailbox.take(MonitorSurfaceRenderLoop.freezeKind)
+    presenter.cancelPendingFreeze()
+    presenter.requestFreezeOnNextFrame()
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 3)
+    let current = try mailbox.take(MonitorSurfaceRenderLoop.freezeKind)
+    cancelled(false)
+    try monitorOnRender(gpu) {}
+    guard case .frozenLive = presenter.renderWork(after: (.max, .max), force: true)?.content else {
+      return XCTFail("A cancelled copy cannot adopt into a replacement hold")
+    }
+    current(false)
+    try monitorOnRender(gpu) {}
+    guard case .frozenOwned = presenter.renderWork(after: (.max, .max), force: true)?.content else {
+      return XCTFail("The replacement transaction must adopt successfully")
+    }
+  }
+
+  @MainActor func testFrozenOwnerPlanesBecomeResidentOnReplacementCore() throws {
+    let (gpu, old) = try gpuCore()
+    let (host, slot) = host("freeze-residency", gpu: gpu)
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8, fill: 0xffff0000), sequence: 1)
+    let delivery = try XCTUnwrap(slot.latest)
+    nonisolated(unsafe) let owner = old.engine.makeFeed()
+    owner.monitorLUT = try LUTProcessor.makeLUT(try CubeLUT(text: "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"), device: old.device)
+    let copyDone = Completion()
+    let frame = try monitorOnRender(gpu) {
+      let context = try old.begin()
+      let source = try host.frame(delivery, in: context, core: old)
+      context.keep(source)
+      let frame = try owner.freeze(source, into: context.submission)
+      old.commit(context, completion: copyDone)
+      return frame
+    }
+    XCTAssertTrue(copyDone.wait())
+    gpu.invalidate()
+    let replacement = try gpu.core()
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("freeze-residency"), host: host, gpu: gpu)
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    var state = MonitorState(); state.focus.enabled = true; state.monitorLUT = true
+    let work = MonitorSurfacePresenter.RenderWork(content: .frozenOwned(frame, owner, token: 1), stamp: delivery.stamp,
+      state: state, preferences: MonitorFeedPreferences(), latestVersion: 1, stateVersion: 1)
+    let output = try target(replacement, width: 16, height: 8)
+    let done = Completion()
+    try monitorOnRender(gpu) {
+      let context = try replacement.begin()
+      let feed = loop.drawingFeed(for: work, core: replacement)
+      XCTAssertTrue(feed.engine === replacement.engine)
+      _ = try loop.encode(work, feed: feed, target: output, core: replacement, context: context)
+      XCTAssertTrue(replacement.engine.residency.contains(try XCTUnwrap(frame.packed ?? frame.luma)), "The old owner is retained and has not released its planes")
+      XCTAssertTrue(replacement.engine.residency.contains(try XCTUnwrap(feed.focusMask)))
+      XCTAssertTrue(replacement.engine.residency.contains(try XCTUnwrap(feed.monitorLUT?.texture)))
+      replacement.commit(context, completion: done)
+    }
+    XCTAssertTrue(done.wait())
+    XCTAssertEqual(pixel(output, x: 8, y: 4), [0, 0, 255, 255])
+    let scopeLayer = CAMetalLayer(); scopeLayer.device = replacement.device
+    scopeLayer.pixelFormat = .bgra8Unorm; scopeLayer.drawableSize = CGSize(width: 128, height: 64)
+    gpu.attachDrawables(scopeLayer.residencySet)
+    defer { gpu.detachDrawables(scopeLayer.residencySet) }
+    nonisolated(unsafe) let drawable = try XCTUnwrap(scopeLayer.nextDrawable())
+    try monitorOnRender(gpu) {
+      loop.holdFrozenScopeForTesting(frame, owner: owner, stamp: delivery.stamp, layer: scopeLayer)
+      loop.scopeEncodedForTesting = {
+        XCTAssertTrue(replacement.engine.residency.contains(try XCTUnwrap(frame.packed ?? frame.luma)))
+        let feed = loop.drawingFeed(for: work, core: replacement)
+        XCTAssertTrue(feed.engine === replacement.engine)
+        XCTAssertTrue(replacement.engine.residency.contains(try XCTUnwrap(feed.monitorLUT?.texture)))
+      }
+      loop.drawScope(drawable: drawable, at: 1)
+      loop.scopeEncodedForTesting = nil
+    }
+    let scopeDone = Completion()
+    try replacement.submit(completion: scopeDone) { _ in }
+    XCTAssertTrue(scopeDone.wait())
+    XCTAssertEqual(presenter.statistics.scopeUpdates, 1)
+    withExtendedLifetime((old, owner)) {}
+  }
+
+  func testDeclaredPixelAspectOverridesAttachmentsAndUpdatesOnReusedSurface() throws {
+    let image = try buffer(kCVPixelFormatType_32BGRA, width: 720, height: 576)
+    let (host, slot) = host("declared-aspect")
+    for (sequence, horizontal, expected) in [(UInt64(1), Int64(16), 16.0 / 15.0), (2, 20, 20.0 / 15.0)] {
+      let declaration = try SourceFormat(width: 720, height: 576, pixelAspect: Rational(horizontal, 15),
+        pixel: .bgra8, rate: .constant(CMTime(value: 1, timescale: 25)))
+      host.offer(image, pts: CMTime(value: Int64(sequence), timescale: 25), captureGeneration: 1,
+        sequence: sequence, untouched: true, sourceFormat: declaration)
+      XCTAssertEqual(try XCTUnwrap(slot.latest).geometry.pixelAspectRatio, expected, accuracy: 1e-9)
+    }
+    CVBufferSetAttachment(image, kCVImageBufferPixelAspectRatioKey,
+      [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 4,
+        kCVImageBufferPixelAspectRatioVerticalSpacingKey: 3] as CFDictionary, .shouldPropagate)
+    host.invalidate(rejectingCaptureGeneration: 1)
+    let square = try SourceFormat(width: 720, height: 576, pixel: .bgra8,
+      rate: .constant(CMTime(value: 1, timescale: 25)))
+    host.offer(image, pts: CMTime(value: 3, timescale: 25), captureGeneration: 2,
+      sequence: 3, untouched: true, sourceFormat: square)
+    XCTAssertEqual(try XCTUnwrap(slot.latest).geometry.pixelAspectRatio, 1)
+    host.offer(image, pts: CMTime(value: 4, timescale: 25), captureGeneration: 3,
+      sequence: 4, untouched: true, sourceFormat: nil)
+    XCTAssertEqual(try XCTUnwrap(slot.latest).geometry.pixelAspectRatio, 4.0 / 3.0, accuracy: 1e-9)
+  }
 
   /// The kept MonitorCoordinatorChecks allocation case, against the feed host: the
   /// primaries, transfer and matrix tags, the clean aperture and the pixel aspect are

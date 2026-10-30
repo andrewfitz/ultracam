@@ -10,10 +10,9 @@ enum CameraProducerAuthorization {
   static let identifier = "org.ultracam.app"
 
   static func allows(signingID: String?, pid: pid_t, verifyLocalProcess: (pid_t) -> Bool) -> Bool {
-    if signingID == identifier { return true }
-    // CMIO can report "unknown" even for an Apple-signed host. Verify the
-    // running process rather than trusting this placeholder.
-    guard signingID == nil || signingID == "unknown", pid > 0 else { return false }
+    // A code identifier does not establish the producer's signing team.
+    // Verify matching identifiers as well as CMIO's missing/unknown values.
+    guard pid > 0, signingID == identifier || signingID == nil || signingID == "unknown" else { return false }
     return verifyLocalProcess(pid)
   }
 
@@ -24,7 +23,7 @@ enum CameraProducerAuthorization {
 #if ULTRACAM_LOCAL_DEVELOPMENT
     expression = "identifier \"\(identifier)\""
 #else
-    // Bind the fallback to our own Apple signing team. An unrelated app using
+    // Bind every producer to our own Apple signing team. An unrelated app using
     // the same bundle identifier must not acquire a producer lease.
     var ownCode: SecCode?
     var ownStaticCode: SecStaticCode?
@@ -745,7 +744,7 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
       }
       guard allowed else {
         let detail = verificationStatus.map { "; signature verification status=\($0), phase=\(verificationPhase)" } ?? ""
-        logAuthorizationRejection(client, reason: "producer signing identifier does not match\(detail)")
+        logAuthorizationRejection(client, reason: "producer signing identity or running signature is not authorized\(detail)")
         return false
       }
       guard self.client == nil || self.client?.clientID == client.clientID else {
@@ -836,6 +835,9 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
         }
         return
       }
+      // CMIO's stop callback has no client/cancellation identity. When starts
+      // are active, balance a completed start; a pending client's cancellation
+      // is correlated by disconnect(clientID:), never guessed from this stop.
       if anonymousSourceStarts > 0 {
         anonymousSourceStarts -= 1
       } else if !activeSourceClientIDs.isEmpty {
@@ -914,22 +916,28 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
     guard consuming, !consumePending, let request else { return }
     consumePending = true
     let requestedGeneration = generation
-    request { [weak self] sample, sequence, discontinuity, hasMore, error in
-      guard let self else { return }
-      // Strongly retain the immutable callback sample across asynchronous hop.
+    // The stream's owner is unowned. A native completion can outlive registry
+    // removal, so capture its immutable queue independently and resolve a weak
+    // runtime before accessing any owner state or scheduling callback handling.
+    let callbackQueue = owner.queue
+    request { [weak self, weak runtime = owner] sample, sequence, discontinuity, hasMore, error in
+      guard let self, let runtime else { return }
       let received = ReceivedSample(sample: sample)
-      self.owner.queue.async {
-        // Old callbacks must neither clear a new request nor publish old footage.
-        guard self.consuming, self.generation == requestedGeneration else { return }
-        self.consumePending = false
-        if let sample = received.sample {
-          // A refused frame is counted and logged (rate-limited) by the owner.
-          self.owner.receive(sample, discontinuity: discontinuity, producerCanNegotiate: self.client != nil)
-          self.stream.notifyScheduledOutputChanged(CMIOExtensionScheduledOutput(sequenceNumber: sequence,
-            hostTimeInNanoseconds: UInt64(max(0, CMTimeConvertScale(self.owner.clock(), timescale: 1_000_000_000, method: .default).value))))
+      callbackQueue.async {
+        // Hold the owner through the complete handler, including a subsequent
+        // consume call, without permanently cycling runtime -> stream -> owner.
+        withExtendedLifetime(runtime) {
+          // Old callbacks must neither clear a new request nor publish old footage.
+          guard self.consuming, self.generation == requestedGeneration else { return }
+          self.consumePending = false
+          if let sample = received.sample {
+            runtime.receive(sample, discontinuity: discontinuity, producerCanNegotiate: self.client != nil)
+            self.stream.notifyScheduledOutputChanged(CMIOExtensionScheduledOutput(sequenceNumber: sequence,
+              hostTimeInNanoseconds: UInt64(max(0, CMTimeConvertScale(runtime.clock(), timescale: 1_000_000_000, method: .default).value))))
+          }
+          if let error { runtime.logger.error("Camera input failed: \(error.localizedDescription, privacy: .public)") }
+          if hasMore && received.sample != nil && error == nil { self.consume() }
         }
-        if let error { self.owner.logger.error("Camera input failed: \(error.localizedDescription, privacy: .public)") }
-        if hasMore && received.sample != nil && error == nil { self.consume() }
       }
     }
   }

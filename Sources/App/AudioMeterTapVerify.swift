@@ -140,6 +140,7 @@ import Synchronization
 
   private final class Stop: Sendable {
     let requested = Atomic<Bool>(false)
+    let attempted = Atomic<UInt64>(0)
     let done = DispatchSemaphore(value: 0)
   }
 
@@ -157,45 +158,72 @@ import Synchronization
     let sampleFrames = 240_000
     let packet = sine(dBFS: -6, phase: 0, frames: sampleFrames)
     let stop = Stop()
+    // Keep demand continuously active, so every attempted packet must appear
+    // exactly once in a delivery or loss counter. Declarations exercise real
+    // session replacement without an unaccountable no-viewer interval.
+    let attachment = AudioMeterTap.Attachment(tap: tap)
     let driver = Thread {
       while !stop.requested.load(ordering: .relaxed) {
+        stop.attempted.add(1, ordering: .relaxed)
         tap.ingest(samples: packet, sampleFrames: UInt64(sampleFrames), channels: 2,
           bytesPerSample: EmbeddedAudioFormat.sourceBytesPerSample)
       }
       stop.done.signal()
     }
     driver.start()
-    var previous: AudioMeter?
-    var replaced = 0
-    for _ in 0..<300 {
-      let meter = tap.attach()
-      // Holding the previous meter only keeps a new one from reusing its address.
-      if meter !== previous { replaced += 1 }
-      previous = meter
+    for index in 0..<300 {
+      do {
+        let format = try SourceAudioFormat(sampleRate: index.isMultiple(of: 2) ? 48_000 : 48_001,
+          channels: 2, sample: .int32, interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+        try tap.configure(format: format)
+      } catch {
+        verifier.check("audio meter tap: synthetic declaration is admitted", false, "\(error)")
+      }
+      // A second view still shares demand through each declaration.
       tap.attach()
       tap.detach()
       usleep(200)
-      tap.detach()
     }
-    let last = tap.attach()
     usleep(20_000)
     stop.requested.store(true, ordering: .relaxed)
-    stop.done.wait()
+    let stopped = stop.done.wait(timeout: .now() + 3) == .success
+    verifier.check("audio meter tap: the driver never waits for session retirement", stopped)
+    guard stopped else { return }
     tap.waitUntilMetered()
-    tap.detach()
-    last.flush()
     let counters = tap.counters
-    verifier.check("audio meter tap: a driver thread hands packets over through 300 session starts",
-      counters.metered > 0 && counters.overlapped == 0 && counters.rejected == 0
-        && replaced == 300 && last.snapshot().frameCount > 0 && tap.queuedPackets == 0,
-      "\(counters), \(replaced) new meters")
-    verifier.check("audio meter tap: a meter queue far behind coalesces, counted, and the driver never waits",
+    let attempted = stop.attempted.load(ordering: .relaxed)
+    let accounted = counters.metered + counters.stale + counters.coalesced + counters.overlapped + counters.rejected
+    verifier.check("audio meter tap: all handoffs through 300 declaration changes are delivered or counted",
+      counters.metered > 0 && counters.rejected == 0 && accounted == attempted
+        && tap.queuedPackets == 0 && tap.queuedPCMBytes == 0 && tap.viewerCount == 1,
+      "\(counters), \(attempted) attempted, \(accounted) accounted")
+    verifier.check("audio meter tap: a stalled meter queue coalesces within its slot and byte bounds",
       counters.coalesced > 0 && counters.maxQueued == capacity, "\(counters)")
-    verifier.check("audio meter tap: the last session meters whole packets of its own",
-      last.snapshot().frameCount % UInt64(sampleFrames) == 0, "\(counters)")
-    let next = tap.attach()
-    tap.detach()
-    verifier.check("audio meter tap: a session start with the driver idle starts a new meter", next !== last)
+
+    // Once the producer stops, commit a final declaration and give that exact
+    // replacement one packet. The stable attachment must expose that meter,
+    // rather than a previously returned meter that a deferred request replaced.
+    do {
+      let format = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .int32,
+        interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+      try tap.configure(format: format)
+    } catch {
+      verifier.check("audio meter tap: final declaration is admitted", false, "\(error)")
+    }
+    let finalPacket = sine(dBFS: -6, phase: 0)
+    ingestFinalPacket(tap, finalPacket)
+    tap.waitUntilMetered()
+    let final = attachment.meter
+    final?.flush()
+    verifier.check("audio meter tap: a stable attachment meters only its final session's packet",
+      final === tap.meter && final?.snapshot().frameCount == UInt64(frames)
+        && tap.counters.metered == counters.metered + 1 && tap.queuedPCMBytes == 0,
+      "\(tap.counters)")
+  }
+
+  private static func ingestFinalPacket(_ tap: AudioMeterTap, _ packet: Data) {
+    tap.ingest(samples: packet, sampleFrames: UInt64(frames), channels: 2,
+      bytesPerSample: EmbeddedAudioFormat.sourceBytesPerSample)
   }
 }
 #endif

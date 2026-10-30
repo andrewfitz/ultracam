@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -68,6 +69,42 @@ class VendorSDKTests(unittest.TestCase):
         self.assertEqual(readme.read_bytes(), b'proprietary SDK installation instructions\n')
         with self.assertRaises(ValueError):
             self.sdk.install(self.manifest, self.root, self.archive())
+
+    def test_publication_failure_restores_readme_tree_and_allows_retry(self):
+        destination = self.vendor / 'SDK'
+        destination.mkdir()
+        (destination / 'README.md').write_bytes(b'keep user instructions')
+        archive = self.archive()
+        link = self.sdk.os.link
+        count = 0
+        def fail_after_directory_creation(source, target):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise OSError('injected publication failure')
+            return link(source, target)
+        with patch.object(self.sdk.os, 'link', side_effect=fail_after_directory_creation):
+            with self.assertRaisesRegex(OSError, 'publication failure'):
+                self.sdk.install(self.manifest, self.root, archive)
+        self.assertEqual([p.name for p in destination.iterdir()], ['README.md'])
+        self.assertEqual((destination / 'README.md').read_bytes(), b'keep user instructions')
+        self.assertTrue(self.sdk.install(self.manifest, self.root, archive)['available'])
+
+    def test_publication_rollback_preserves_unrelated_new_directory_contents(self):
+        destination = self.vendor / 'SDK'
+        destination.mkdir()
+        (destination / 'README.md').write_text('keep')
+        def fail_with_unrelated_file(source, target):
+            if target.parent != destination:
+                (target.parent / 'user-notes.txt').write_text('do not delete')
+                raise OSError('publication stopped')
+            return link(source, target)
+        link = self.sdk.os.link
+        with patch.object(self.sdk.os, 'link', side_effect=fail_with_unrelated_file):
+            with self.assertRaisesRegex(OSError, 'publication stopped'):
+                self.sdk.install(self.manifest, self.root, self.archive())
+        self.assertEqual((destination / 'include/user-notes.txt').read_text(), 'do not delete')
+        self.assertEqual((destination / 'README.md').read_text(), 'keep')
 
     def test_checksum_missing_file_and_wrong_version_fail_before_install(self):
         for files in ({'include/api.h': b'wrong'}, {'include/api.h': self.files['include/api.h']},

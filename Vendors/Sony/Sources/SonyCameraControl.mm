@@ -77,6 +77,13 @@ static bool sonyParseIPv4(NSString *text, uint32_t &address) {
   address = parsed.s_addr; // SDK byte layout: 192.168.1.160 -> 0xA001A8C0.
   return true;
 }
+static bool sonyPreparedConnectionMatches(NSString *address, bool authentication, NSString *fingerprint,
+    NSString *user, NSString *password, uint32_t actualAddress, bool actualAuthentication) {
+  uint32_t approvedAddress = 0;
+  return sonyParseIPv4(address, approvedAddress) && approvedAddress == actualAddress &&
+    authentication == actualAuthentication &&
+    (actualAuthentication || (!fingerprint.length && !user.length && !password.length));
+}
 static bool sonyParseMAC(NSString *text, uint8_t (&bytes)[6], NSString **normalized) {
   NSString *compact = [[[text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
     stringByReplacingOccurrencesOfString:@":" withString:@""] stringByReplacingOccurrencesOfString:@"-" withString:@""];
@@ -734,7 +741,8 @@ static SonyRuntime &sonyRuntime() {
 #endif
   }];
 }
-- (void)connectFeed:(NSString *)feedID camera:(NSString *)cameraID user:(NSString *)user password:(NSString *)password
+- (void)connectFeed:(NSString *)feedID camera:(NSString *)cameraID
+           address:(NSString *)address authentication:(BOOL)authentication user:(NSString *)user password:(NSString *)password
        fingerprint:(NSString *)fingerprint completion:(UCSonyReply)reply {
   [self enqueueSony:^{
 #if ULTRACAM_SONY_SDK
@@ -754,7 +762,15 @@ static SonyRuntime &sonyRuntime() {
       }
     }
     if (!info) { [self reply:reply object:nil error:@"Camera is no longer in discovery. Scan again."]; return; }
-    if (info->GetSSHsupport() == SCRSDK::CrSSHsupport_ON) {
+    const bool actualAuthentication = info->GetSSHsupport() == SCRSDK::CrSSHsupport_ON;
+    // Selection and validation occur on the same SDK worker turn. Cache updates
+    // cannot replace this retained object between validation and SDK Connect.
+    if (!sonyPreparedConnectionMatches(address, authentication, fingerprint, user, password,
+        info->GetIPAddress(), actualAuthentication)) {
+      [self reply:reply object:nil error:@"Camera endpoint or authentication changed after preparation. Verify its identity again before connecting."];
+      return;
+    }
+    if (actualAuthentication) {
       char buffer[128] = {}; CrInt32u length = 0;
       auto result = SCRSDK::GetFingerprint(const_cast<SCRSDK::ICrCameraObjectInfo *>(info), buffer, &length);
       if (result || !fingerprint.length || length > sizeof(buffer) ||

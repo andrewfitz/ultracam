@@ -77,11 +77,12 @@ import XCTest
   }
 
   func testActualRangeConvertedWritersRecordOutputColourAndKeepSourceColour() throws {
-    for rgb in [true, false] {
+    for pixel in [PixelFormatID.r210, .full420, .video420] {
+      let rgb = pixel == .r210
       let sourceColour = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: rgb ? .identity : .rec709,
         range: rgb ? .video : .full, horizontalChromaSiting: rgb ? .unspecified : .left,
         verticalChromaSiting: rgb ? .unspecified : .center)
-      let declaration = try source(pixel: rgb ? .r210 : .full420, colour: sourceColour)
+      let declaration = try source(pixel: pixel, colour: sourceColour)
       let folder = try temporaryFolder(); defer { try? FileManager.default.removeItem(at: folder) }
       let movie = folder.appendingPathComponent("range.mov")
       let profile: RecordingProfileMatrixProfile = rgb ? .proRes4444 : .hevcMain
@@ -89,7 +90,10 @@ import XCTest
       let writer = try AVAssetSourceRecordingWriter(configuration: configuration(source: declaration, movie: movie, profile: profile),
         encodeFrame: { session, image, pts, duration in
           let full = (CVBufferCopyAttachment(image, kCMFormatDescriptionExtension_FullRangeVideo, nil) as? NSNumber)?.boolValue
-          seen.lock.lock(); seen.fullRanges.append(full); seen.lock.unlock()
+          CVPixelBufferLockBaseAddress(image, .readOnly)
+          let luma = !rgb ? CVPixelBufferGetBaseAddressOfPlane(image, 0)?.assumingMemoryBound(to: UInt8.self).pointee : nil
+          CVPixelBufferUnlockBaseAddress(image, .readOnly)
+          seen.lock.lock(); seen.fullRanges.append(full); if let luma { seen.lumas.append(luma) }; seen.lock.unlock()
           var flags = VTEncodeInfoFlags()
           return VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration,
             frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
@@ -105,6 +109,12 @@ import XCTest
       XCTAssertEqual(metadata.metadata.outputContract?.outputColour.primaries, .rec709)
       seen.lock.lock(); let ranges = seen.fullRanges; seen.lock.unlock()
       XCTAssertEqual(ranges, [rgb])
+      if !rgb {
+        seen.lock.lock(); let lumas = seen.lumas; seen.lock.unlock()
+        XCTAssertEqual(lumas, [16], "Full-range source black must be physically mapped into legal video-range black")
+        XCTAssertEqual(writer.telemetry.gpuConvertedFrames, 1)
+        XCTAssertEqual(writer.telemetry.passThroughFrames, 0)
+      }
       XCTAssertEqual(writer.telemetry.encodedVideo, 1)
       XCTAssertEqual(writer.telemetry.systemCompatibilityFrames, 0)
     }
@@ -167,4 +177,5 @@ private final class PackedWriterInputs: @unchecked Sendable {
   let lock = NSLock()
   var formats: [OSType] = []
   var fullRanges: [Bool?] = []
+  var lumas: [UInt8] = []
 }

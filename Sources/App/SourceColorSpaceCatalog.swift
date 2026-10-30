@@ -23,6 +23,22 @@ enum SourceColorSpaceCatalog {
     entry("rec2020-hlg-video", "Rec.2020 / HLG", .rec2020, .hlg, matrix: .rec2020),
     entry("rec2020-pq-video", "Rec.2020 / PQ", .rec2020, .pq, matrix: .rec2020)
   ]
+  /// Camera declarations that use a supported log curve, in catalog order.
+  static var logProfiles: [Entry] {
+    entries.filter {
+      switch $0.color.transfer {
+      case .unspecified, .rec709, .sRGB, .linear, .pq, .hlg: return false
+      default: return true
+      }
+    }
+  }
+
+  /// The source picker declares RGB encoding only. Callers merge this with
+  /// admitted or parsed source transport using `overridingRGBEncoding(with:)`.
+  /// Complete catalog colours remain available separately for output targets.
+  static func sourceRGBOverride(_ id: String) throws -> Colorimetry? {
+    id == "unspecified" ? nil : try color(id)
+  }
   static func color(_ id: String) throws -> Colorimetry {
     guard let entry = entries.first(where: { $0.id == id }) else {
       throw PluginError.unsupported("Unknown color-space declaration ‘\(id)’. Choose a supported LUT input and output space.")

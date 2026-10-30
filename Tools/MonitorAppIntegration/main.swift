@@ -157,8 +157,7 @@ import XCTest
       loaded.fulfill()
     }
     wait(for: [loaded], timeout: 5)
-    var off = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
-    off.inputFast = true
+    let off = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
     var on = off
     on.applyLUT = true
 
@@ -343,12 +342,9 @@ import XCTest
     return (window, presenter, id)
   }
 
-  /// Scopes beside the picture follow the video: every frame the picture draws
-  /// has its scope drawn on the scope link's next refresh, so a 30 Hz source
-  /// makes 30 scope updates a second whatever refresh rate older settings saved
-  /// (it is ignored). MonitorKit's legacy-look scope is drawn in a framebufferOnly
-  /// layer, never more than two on the GPU, and the picture keeps every frame:
-  /// scopes never hold it back.
+  /// Scopes obey the saved 10/15/30 Hz ceiling while the picture keeps every
+  /// source frame. Scopes use their own display link and never hold the picture
+  /// back, even when analysis updates less often than the video.
   func testScopesDrawAtTheirRateBesideThePicture() throws {
     guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
     let coordinator = MonitorCoordinator()
@@ -371,7 +367,7 @@ import XCTest
     source.start()
     defer { source.stop() }
     let displayHz = Double(window.screen?.maximumFramesPerSecond ?? 60)
-    // Every saved rate (older settings) gives the same video-rate scopes.
+    // Each saved rate caps scope updates independently of picture delivery.
     for hz in MonitorScopePreferences.refreshRates {
       tools.scopes.refreshHz = hz
       coordinator.setPreferences(tools, for: target)
@@ -396,7 +392,7 @@ import XCTest
         let skipped = (end.scopeSkippedBusy - start.scopeSkippedBusy, end.scopeSkippedNoDrawable - start.scopeSkippedNoDrawable)
         print(
           String(
-            format: "MONITOR_SURFACE_MEASURE scopes (saved rate %d Hz, ignored) beside a %.0f Hz picture, round %d (%.1f refreshes/s on a %.0f Hz display, scope link %.1f ticks/s): drawn %.2f fps, picture %.2f fps, skipped busy %llu no drawable %llu, GPU per scope %@",
+            format: "MONITOR_SURFACE_MEASURE scopes (selected ceiling %d Hz) beside a %.0f Hz picture, round %d (%.1f refreshes/s on a %.0f Hz display, scope link %.1f ticks/s): drawn %.2f fps, picture %.2f fps, skipped busy %llu no drawable %llu, GPU per scope %@",
             hz, pictureHz, round, refreshesFPS, displayHz, scopeTicks / elapsed, scopeFPS, presentedFPS, skipped.0,
             skipped.1, end.scopeGPUMilliseconds.map { String(format: "%.3f ms", $0) } ?? "n/a"))
         // A scope is drawn only on a callback of the scope's own display link
@@ -413,13 +409,11 @@ import XCTest
         // three rounds, and they are asserted together once a round meets them all
         // or on the last. The ceiling and the failure count above hold in every round.
         //
-        // Scopes follow the video: each drawn picture's scope is drawn on the scope
-        // link's next refresh, and is lost only if the next picture is drawn first
-        // (both links tick on the display's refresh grid, at least twice per 30 Hz
-        // picture on a 60 Hz display, so an idle machine scopes 93-100% of them).
-        // The floor is 85% of the pictures drawn, which a scope held to a 10 or
-        // 15 Hz rate (a third or half of them) misses by far.
-        let scopeFloor = 0.85 * presented
+        // The useful floor follows the selected ceiling or the available
+        // pictures, whichever is slower. Allow display-grid scheduling jitter.
+        let scopeFloor = 0.85 * min(Double(hz) * elapsed, presented)
+        XCTAssertLessThanOrEqual(scopes, Double(hz) * elapsed + 2,
+          "Scopes obey the selected \(hz) Hz ceiling, allowing interval edges")
         let scopeRateMet = scopes >= scopeFloor
         let skipsMet = skipped.0 + skipped.1 <= 2
         // Strict: a 30 Hz picture has every frame presented while scopes draw. A
@@ -433,9 +427,9 @@ import XCTest
         let starved = max(0, offered - presented) * (displayHz / pictureHz - 1) <= missedRefreshes
         if (pictureMet && scopeRateMet && skipsMet) || (!pictureMet && !starved) || round == rounds {
           XCTAssertGreaterThanOrEqual(scopes, scopeFloor,
-            "Every drawn picture has its scope (saved rate \(hz) Hz ignored) in one of \(rounds) rounds (the last shown)")
-          XCTAssertGreaterThan(scopeFPS, 0.85 * pictureHz,
-            "Scopes update at the video's rate, not a chosen 10/15 Hz, in one of \(rounds) rounds (the last shown)")
+            "Scopes reach the selected \(hz) Hz rate or picture rate in one of \(rounds) rounds (the last shown)")
+          XCTAssertGreaterThan(scopeFPS, 0.85 * min(Double(hz), pictureHz),
+            "Scopes sustain their selected rate in one of \(rounds) rounds (the last shown)")
           XCTAssertLessThanOrEqual(skipped.0 + skipped.1, 2,
             "Scopes are rarely skipped in one of \(rounds) rounds (the last shown)")
           XCTAssertGreaterThan(presentedFPS, 28, "The picture keeps every frame while scopes draw: scopes never hold it back")

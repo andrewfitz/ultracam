@@ -36,6 +36,25 @@ import XCTest
     feed.sourceProfileID = "unspecified"
     XCTAssertNil(feed.processingDeclarationError)
   }
+  func testSourcePickerOverridesRGBOnlyAcrossEveryProfile() throws {
+    let source = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec601,
+      range: .full, horizontalChromaSiting: .center, verticalChromaSiting: .top)
+    var feed = FeedDescriptor()
+    for profile in SourceColorSpaceCatalog.entries {
+      feed.setSourceProfile(profile.id)
+      let merged = source.overridingRGBEncoding(with: feed.configuration.sourceColorimetryOverride)
+      XCTAssertEqual(merged.primaries, profile.color.primaries)
+      XCTAssertEqual(merged.transfer, profile.color.transfer)
+      XCTAssertEqual(merged.matrix, source.matrix)
+      XCTAssertEqual(merged.range, source.range)
+      XCTAssertEqual(merged.horizontalChromaSiting, source.horizontalChromaSiting)
+      XCTAssertEqual(merged.verticalChromaSiting, source.verticalChromaSiting)
+    }
+    feed.setSourceProfile("unspecified")
+    XCTAssertNil(feed.configuration.sourceColorimetryOverride)
+    XCTAssertThrowsError(try SourceColorSpaceCatalog.sourceRGBOverride("future-source"))
+  }
+
   func testExplicitProgramTargetsRemainIndependentFromLUTOutput() {
     var feed = FeedDescriptor()
     feed.programColorSpaceID = "rec2020-pq-video"

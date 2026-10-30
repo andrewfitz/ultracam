@@ -311,6 +311,10 @@ class FakeConfiguration final : public IDeckLinkConfiguration {
  public:
   ULONG references = 1;
   int64_t connection = bmdVideoConnectionSDI;
+  int64_t audioConnection = bmdAudioConnectionAnalog;
+  HRESULT audioWriteResult = S_OK;
+  bool failAudioReadback = false, audioReadbackPending = false;
+  bool ignoreAudioWrites = false;
   int writes = 0, persistentWrites = 0;
   bool ignoreConnectionWrites = false;
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
@@ -319,11 +323,21 @@ class FakeConfiguration final : public IDeckLinkConfiguration {
   HRESULT SetFlag(BMDDeckLinkConfigurationID, bool) override { return E_NOTIMPL; }
   HRESULT GetFlag(BMDDeckLinkConfigurationID, bool *) override { return E_NOTIMPL; }
   HRESULT SetInt(BMDDeckLinkConfigurationID key, int64_t value) override {
+    if (key == bmdDeckLinkConfigAudioInputConnection) {
+      if (audioWriteResult != S_OK) return audioWriteResult;
+      if (!ignoreAudioWrites) audioConnection = value;
+      audioReadbackPending = failAudioReadback;
+      return S_OK;
+    }
     if (key != bmdDeckLinkConfigVideoInputConnection) return E_INVALIDARG;
     if (!ignoreConnectionWrites) connection = value;
     ++writes; return S_OK;
   }
   HRESULT GetInt(BMDDeckLinkConfigurationID key, int64_t *value) override {
+    if (key == bmdDeckLinkConfigAudioInputConnection) {
+      if (audioReadbackPending) { audioReadbackPending = false; return E_FAIL; }
+      *value = audioConnection; return S_OK;
+    }
     if (key != bmdDeckLinkConfigVideoInputConnection) return E_INVALIDARG;
     *value = connection; return S_OK;
   }
@@ -620,9 +634,11 @@ class FakeAttributes final : public IDeckLinkProfileAttributes {
  public:
   ULONG references = 1;
   int64_t persistentID = 0x1234abcd;
+  HRESULT persistentIDResult = S_OK;
   bool formatDetection = true, hdrMetadata = true, colorspaceMetadata = true;
   bool hdmiTimecode = true, highFrameRateTimecode = false;
-  int64_t maximumHDMIAudioChannels = 8;
+  int64_t maximumHDMIAudioChannels = 8, maximumAudioChannels = 16;
+  int64_t audioInputConnections = bmdAudioConnectionEmbedded | bmdAudioConnectionAnalog;
   int64_t videoInputConnections = bmdVideoConnectionHDMI;
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
   ULONG AddRef() override { return ++references; }
@@ -638,9 +654,11 @@ class FakeAttributes final : public IDeckLinkProfileAttributes {
     }
   }
   HRESULT GetInt(BMDDeckLinkAttributeID key, int64_t *value) override {
+    if (key == BMDDeckLinkMaximumAudioChannels) { *value = maximumAudioChannels; return S_OK; }
+    if (key == BMDDeckLinkAudioInputConnections) { *value = audioInputConnections; return S_OK; }
     if (key == BMDDeckLinkVideoInputConnections) { *value = videoInputConnections; return S_OK; }
-    if (key == BMDDeckLinkPersistentID) { *value = persistentID; return S_OK; }
-    if (key == BMDDeckLinkMaximumHDMIAudioChannels) { *value = maximumHDMIAudioChannels; return S_OK; }
+    if (key == BMDDeckLinkPersistentID) { *value = persistentID; return persistentIDResult; }
+    if (key == BMDDeckLinkMaximumHDMIAudioChannels) { if (maximumHDMIAudioChannels <= 0) return E_INVALIDARG; *value = maximumHDMIAudioChannels; return S_OK; }
     return E_INVALIDARG;
   }
   HRESULT GetFloat(BMDDeckLinkAttributeID, double *) override { return E_NOTIMPL; }
@@ -1101,6 +1119,46 @@ static BOOL runFrameFeatureChecks(NSError **error) {
 
 // Version check and hot-plug discovery against fake SDK objects only.
 BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
+  {
+    FakeDeckLink a, b, c;
+    a.attributes.persistentIDResult = b.attributes.persistentIDResult = c.attributes.persistentIDResult = E_FAIL;
+    dispatch_queue_t queue = dispatch_queue_create("org.ultracam.legacy-identity", DISPATCH_QUEUE_SERIAL);
+    {
+    DeviceRegistry registry(queue);
+    registry.arrived(&a); registry.arrived(&b); registry.drain();
+    if (a.references != 3 || b.references != 3)
+      return fail(error, @"Legacy identity storage lost a COM reference while growing.");
+    NSString *aID = registry.snapshot()[0].identifier;
+    NSString *bID = registry.snapshot()[1].identifier;
+    registry.removed(&a); registry.drain();
+    registry.arrived(&c); registry.drain();
+    if (a.references != 2 || b.references != 3 || c.references != 3)
+      return fail(error, @"Legacy identity storage lost references after removal and reallocation.");
+    NSArray<UltracamDevice *> *devices = registry.snapshot();
+    if (devices.count != 2 || [devices[0].identifier isEqualToString:devices[1].identifier])
+      return fail(error, @"Legacy hotplug reused a live device identifier.");
+    ComRef<IDeckLink> selectedB, selectedC;
+    selectedB.value = registry.copyDevice(bID, nullptr);
+    selectedC.value = registry.copyDevice(devices[1].identifier, nullptr);
+    if (selectedB.value != &b || selectedC.value != &c)
+      return fail(error, @"Legacy identifiers selected the wrong live COM device.");
+    if (![registry.identifierForDevice(&b) isEqualToString:bID] ||
+        ![registry.identifierForDevice(&c) isEqualToString:devices[1].identifier])
+      return fail(error, @"Legacy iterator identity disagreed with discovery.");
+    auto session = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+    registry.attachSession(bID, session, session->stats);
+    registry.removed(&c); registry.drain();
+    const bool stillAccepting = session->accepting;
+    registry.detachSession(session); session->Release();
+    if (!stillAccepting)
+      return fail(error, @"Removing another legacy device disconnected the surviving session.");
+    registry.arrived(&a); registry.drain();
+    if (![registry.snapshot()[1].identifier isEqualToString:aID])
+      return fail(error, @"Legacy rearrival changed its discovery-lifetime identity.");
+    }
+    if (!a.balanced() || !b.balanced() || !c.balanced())
+      return fail(error, @"Legacy identity teardown did not release exactly its owned COM references.");
+  }
   {  // No inner pool: a failure returns its autoreleased NSError through the out-parameter.
     FakeAPIInformation old(0x0F030000, CFSTR("15.3")), current(0x10040000, CFSTR("16.4")), unnamed(0x10000000, nullptr);
     UltracamDriverInfo *oldInfo = driverInfoFrom(&old), *currentInfo = driverInfoFrom(&current);
@@ -1125,6 +1183,9 @@ BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
       DeviceRegistry registry(observers);
       id token = registry.addObserver(^(NSArray<UltracamDevice *> *list) { published = list; ++publications; });
       auto settle = [&] { registry.drain(); dispatch_sync(observers, ^{}); };
+      settle();
+      if (publications != 1 || published.count != 0)
+        return fail(error, @"A new observer did not receive its empty initial snapshot.");
       DiscoveryCallback *notifications = new DiscoveryCallback(&registry);
       notifications->DeckLinkDeviceArrived(&first);
       notifications->DeckLinkDeviceArrived(&outputOnly);
@@ -1132,9 +1193,14 @@ BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
       notifications->DeckLinkDeviceArrived(&first);  // Duplicate arrival.
       settle();
       if (published.count != 2 || ![published[0].identifier isEqualToString:@"decklink:000000001234abcd"] ||
-          ![published[1].name isEqualToString:@"UltraStudio Recorder 3G"] || publications != 2 ||
+          ![published[1].name isEqualToString:@"UltraStudio Recorder 3G"] || publications != 3 ||
           first.references != 2 || outputOnly.references != 1)
         return fail(error, @"Arrivals were not published once per usable device, keyed by persistent ID.");
+      __block NSArray<UltracamDevice *> *late = nil;
+      id lateToken = registry.addObserver(^(NSArray<UltracamDevice *> *list) { late = list; });
+      settle();
+      if (late.count != 2) return fail(error, @"A late observer missed the already-discovered devices.");
+      registry.removeObserver(lateToken);
       DeviceCapabilities capabilities;
       IDeckLink *held = registry.copyDevice(@"decklink:000000001234abcd", &capabilities);
       if (held != &first || capabilities.maximumHDMIAudioChannels != 8 || !capabilities.hdrMetadata || first.references != 3)
@@ -1165,7 +1231,7 @@ BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
       registry.removeObserver(token);
       notifications->DeckLinkDeviceRemoved(&second);
       settle();
-      if (publications != 3) return fail(error, @"A removed observer was still notified.");
+      if (publications != 4) return fail(error, @"A removed observer was still notified.");
       notifications->Release();
     }
     if (first.references != 1 || second.references != 1 || outputOnly.references != 1)

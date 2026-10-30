@@ -70,7 +70,7 @@ import XCTest
     let pairs = TypedAudioPairs()
     controller.setRecordingCallbacks(feedID: feed, callbacks: SourceRecordingCallbackAdapter.Callbacks(
       video: { _, _, _, _ in pairs.video() }, audio: { _ in false }, rawAudio: { _, _, _, _, _ in true },
-      audioPair: { time, _ in pairs.note(time) }))
+      audioPair: { time, _ in pairs.note(time) }, metadataFailure: { pairs.refused($0) }))
     let started = expectation(description: "Paired source ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
     controller.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(),
@@ -100,11 +100,9 @@ import XCTest
     source.stop()
     controller.stop()
     let values = pairs.values
-    XCTAssertEqual(values.count, 4)
-    XCTAssertEqual(values[0], firstTime)
-    XCTAssertEqual(values[1], firstTime, "Explicit sequence3 still names a valid earlier frame after unrelated no-signal frame5")
-    XCTAssertNil(values[2], "An explicit no-signal frame sequence cannot borrow earlier validframe metadata")
-    XCTAssertNil(values[3], "Unpaired audio must explicitly clear inferred pending video")
+    XCTAssertEqual(values, [firstTime, firstTime], "Only explicit valid references may reach audio callbacks, even after an unrelated no-signal frame")
+    XCTAssertEqual(pairs.failures.count, 1, "The first invalid reference visibly refuses the take; later packets stay closed")
+    XCTAssertTrue(pairs.failures.first?.contains("matching video frame") == true)
   }
   func testExplicitPairSurvivesRecorderRejectionAndUnpairedPacketHasNoStalePair() throws {
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
@@ -119,7 +117,7 @@ import XCTest
     let pairs = TypedAudioPairs()
     controller.setRecordingCallbacks(feedID: feed, callbacks: SourceRecordingCallbackAdapter.Callbacks(
       video: { _, _, _, _ in pairs.video() }, audio: { _ in false }, rawAudio: { _, _, _, _, _ in true },
-      audioPair: { time, _ in pairs.note(time) }))
+      audioPair: { time, _ in pairs.note(time) }, metadataFailure: { pairs.refused($0) }))
     let started = expectation(description: "Paired source ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
     controller.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(),
@@ -147,10 +145,9 @@ import XCTest
     source.stop()
     controller.stop()
     let values = pairs.values
-    XCTAssertEqual(values.count, 3)
-    XCTAssertEqual(values[0], firstTime)
-    XCTAssertEqual(values[1], secondTime, "The second frame was rejected by the recorder but still names its packet")
-    XCTAssertNil(values[2], "Unpaired audio must explicitly clear inferred pending video")
+    XCTAssertEqual(values, [firstTime, secondTime], "A recorder-rejected valid frame still names its packet; unpaired audio cannot reach callbacks")
+    XCTAssertEqual(pairs.failures.count, 1)
+    XCTAssertTrue(pairs.failures.first?.contains("matching video frame") == true)
   }
   func testSourceOnlyRetentionIsBoundedRecordingIndependentAndStopRejectsQueuedOffers() throws {
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
@@ -266,9 +263,12 @@ private final class TypedAudioPairs: @unchecked Sendable {
   private let lock = NSLock()
   private var videoCalls = 0
   private var pairs: [CMTime?] = []
+  private var messages: [String] = []
   func video() -> Bool { lock.withLock { videoCalls += 1; return videoCalls == 1 } }
   func note(_ time: CMTime?) { lock.withLock { pairs.append(time) } }
   var values: [CMTime?] { lock.withLock { pairs } }
+  func refused(_ message: String) { lock.withLock { messages.append(message) } }
+  var failures: [String] { lock.withLock { messages } }
 }
 private final class BlockingTypedMonitor: MonitorFrameSink, @unchecked Sendable {
   let entered = DispatchSemaphore(value: 0)

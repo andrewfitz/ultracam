@@ -1714,39 +1714,48 @@ final class CaptureController: @unchecked Sendable {
 
   private func deliverRecordingAudio(_ packet: CaptureAudioPacket, pair: CaptureFrameInfo?, source: SourceAdmissionSnapshot?,
     feed: FeedID, install: UInt64, token: UInt64) {
-      let legacyPaired = packet.format.clock == .pairedWithFrames && packet.format.interleaved &&
-        packet.format.sample == .int32 && packet.format.sampleRate == EmbeddedAudioFormat.sampleRate &&
-        [2, 8, 16].contains(packet.format.channels) && packet.planes.count == 1
-      if !legacyPaired {
-        let route = lock.withLock { () -> (FeedID, RecordingRoute, RecordingTakeContext)? in
-          guard generation == token, accepting, activeFeedID == feed, let route = recordingCallbacks[feed],
-            route.install == install, route.sourceAdmissionAccepted, route.takeContextAccepted,
-            let context = route.boundTakeContext else { return nil }
-          return (feed, route, context)
-        }
-        if let route {
-          if packet.format.clock == .pairedWithFrames, pair == nil {
-            rejectRecordingMetadata(feedID: route.0, install: route.1.install, token: token,
-              message: "Recording paired source audio requires an explicit matching video frame.")
-            return
-          }
-          let accepted: Bool
-          if let source, let callback = route.1.callbacks.sourceAudioWithAdmission {
-            accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, route.2, source,
-              pair?.presentationTime)
-          } else if packet.format.clock != .pairedWithFrames, let callback = route.1.callbacks.sourceAudio {
-            accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, route.2)
-          } else { return }
-          if !accepted { rejectRecordingMetadata(feedID: route.0, install: route.1.install, token: token) }
-        }
+    let selected = lock.withLock { () -> (RecordingRoute, RecordingTakeContext)? in
+      guard generation == token, accepting, activeFeedID == feed, let route = recordingCallbacks[feed],
+        route.install == install, route.sourceAdmissionAccepted, route.takeContextAccepted,
+        let context = route.boundTakeContext else { return nil }
+      return (route, context)
+    }
+    guard let (route, context) = selected else { return }
+    if packet.format.clock == .pairedWithFrames, pair == nil {
+      rejectRecordingMetadata(feedID: feed, install: install, token: token,
+        message: "Recording paired source audio requires an explicit matching video frame.")
+      return
+    }
+    let accepted: Bool
+    if let source, let callback = route.callbacks.sourceAudioWithAdmission {
+      // The writer owns declared layout, sample-grid conversion and exact high24
+      // scaling. Packet PTS stays rational; sample rate does not imply a CMTime grid.
+      accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, context, source,
+        pair?.presentationTime)
+    } else if packet.format.clock != .pairedWithFrames, let callback = route.callbacks.sourceAudio {
+      accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, context)
+    } else {
+      #if ULTRACAM_TEST_SUPPORT
+      // Compatibility-only callback spies have no declaration binders. Shipping
+      // recorder adapters always use the declared PCM route above.
+      if route.callbacks.sourceAdmission == nil, route.callbacks.takeContext == nil,
+        packet.format.interleaved, packet.format.sample == .int32,
+        packet.format.sampleRate == EmbeddedAudioFormat.sampleRate, packet.planes.count == 1 {
+        receiveRawAudio(CaptureRawAudio(samples: packet.planes[0], packetTime: packet.packetTime,
+          sampleFrames: UInt64(packet.sampleFrameCount), channels: packet.format.channels, bytesPerSample: 4),
+          token: token, preparePair: true, pairTime: pair?.presentationTime, pairDuration: pair?.duration,
+          meterPacket: false, expectedRecording: (feed, install))
         return
       }
-      guard packet.format.interleaved, packet.format.sample == .int32,
-        packet.format.sampleRate == EmbeddedAudioFormat.sampleRate, packet.planes.count == 1 else { return }
-      receiveRawAudio(CaptureRawAudio(samples: packet.planes[0], packetTime: packet.packetTime,
-        sampleFrames: UInt64(packet.sampleFrameCount), channels: packet.format.channels, bytesPerSample: 4),
-        token: token, preparePair: true, pairTime: pair?.presentationTime, pairDuration: pair?.duration,
-        meterPacket: false, expectedRecording: (feed, install))
+      #endif
+      rejectRecordingMetadata(feedID: feed, install: install, token: token,
+        message: "Recording paired source audio requires a declaration-aware PCM recording callback.")
+      return
+    }
+    if !accepted {
+      rejectRecordingMetadata(feedID: feed, install: install, token: token,
+        message: packet.format.clock == .pairedWithFrames ? "Recording paired source audio admission was refused." : nil)
+    }
   }
 
   private func retainRecordingAudioDiscovery(_ packet: CaptureAudioPacket, source: SourceAdmissionSnapshot,

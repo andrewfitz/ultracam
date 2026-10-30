@@ -7,6 +7,10 @@ int main() {
     UCSonyCameraControl *metadata = [UCSonyCameraControl new];
     assert(metadata.available);
     assert([metadata.sdkVersion isEqualToString:@"2.2.0"]);
+    assert(sonyPreparedConnectionMatches(@"192.0.2.1", true, @"pin", @"user", @"secret", inet_addr("192.0.2.1"), true));
+    assert(!sonyPreparedConnectionMatches(@"192.0.2.1", true, @"pin", @"user", @"secret", inet_addr("192.0.2.2"), true));
+    assert(!sonyPreparedConnectionMatches(@"192.0.2.1", true, @"pin", @"user", @"secret", inet_addr("192.0.2.1"), false));
+    assert(!sonyPreparedConnectionMatches(@"192.0.2.1", false, @"pin", @"user", @"secret", inet_addr("192.0.2.1"), false));
     using namespace SCRSDK;
     assert(sonyField(CrDeviceProperty_Movie_Recording_FrameRateSetting)->editable);
     assert(sonyField(CrDeviceProperty_Movie_HDMIOutputResolution)->editable);

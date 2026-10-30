@@ -92,9 +92,12 @@ final class AudioMeterTap: @unchecked Sendable {
   private struct Sessions {
     /// The current session's meter; nil until the first attach.
     var live: AudioMeter?
+    /// At most one deferred replacement while the producer owns the handoff.
+    var pending: AudioMeter?
     var format: SourceAudioFormat?
     /// Starts at 0 (no session); each session start adds one.
     var number: UInt64 = 0
+    var startHead = 0
     /// Meters retained by session number until the meter queue first adopts them.
     var history: [UInt64: AudioMeter] = [:]
   }
@@ -107,6 +110,7 @@ final class AudioMeterTap: @unchecked Sendable {
     var frames = 0
     var stride = 0
     var session: UInt64 = 0
+    var takeNumber: UInt64 = 0
     var followsGap = false
     var nanoseconds = 0
     var retainedBytes = 0
@@ -118,6 +122,9 @@ final class AudioMeterTap: @unchecked Sendable {
   /// Changed only under `sessions`.
   private let viewers = Atomic<Int>(0)
   private let producing = Atomic<Bool>(false)
+  private let sessionPending = Atomic<Bool>(false)
+  private let sessionRetryScheduled = Atomic<Bool>(false)
+  private let sessionQueue = DispatchQueue(label: "org.ultracam.capture.audio-meter-session", qos: .userInitiated)
 
   // The hand-off ring. `head` and `tail` count packets from the start and
   // never wrap in practice (Int is 64-bit); a slot index is the count masked.
@@ -166,6 +173,8 @@ final class AudioMeterTap: @unchecked Sendable {
   private let take = Mutex<TakeState?>(nil)
   /// Numbers the takes, so the meter queue tells one take's meter from the next.
   private let takeNumbers = Atomic<UInt64>(0)
+  /// Zero while no take is measuring; stamped into each admitted packet.
+  private let measuringTake = Atomic<UInt64>(0)
 
   private let metered = Atomic<UInt64>(0)
   private let rejected = Atomic<UInt64>(0)
@@ -231,10 +240,7 @@ final class AudioMeterTap: @unchecked Sendable {
       guard state.format != format else { return }
       state.format = format
       guard viewers.load(ordering: .relaxed) > 0 else { return }
-      state.live = candidate
-      state.number &+= 1
-      state.history[state.number] = candidate
-      session.store(state.number, ordering: .releasing)
+      requestSession(candidate, state: &state)
     }
     noteGap()
   }
@@ -257,6 +263,15 @@ final class AudioMeterTap: @unchecked Sendable {
       gapPending.store(true, ordering: .relaxed)
       return
     }
+    guard !sessionPending.load(ordering: .acquiring) else {
+      overlapped.add(1, ordering: .relaxed)
+      gapPending.store(true, ordering: .relaxed)
+      producing.store(false, ordering: .releasing)
+      return
+    }
+#if ULTRACAM_TEST_SUPPORT
+    producerAdmissionHook?()
+#endif
     // Packet constructors validate exact per-plane sizes. Count every retained
     // plane, rather than estimating from rate/channels or only plane zero.
     var retainedBytes = samples?.count ?? 0
@@ -290,6 +305,7 @@ final class AudioMeterTap: @unchecked Sendable {
       slot.pointee.frames = frames
       slot.pointee.stride = channels
       slot.pointee.session = session.load(ordering: .acquiring)
+      slot.pointee.takeNumber = measuringTake.load(ordering: .acquiring)
       slot.pointee.followsGap = gapPending.exchange(false, ordering: .relaxed)
       // Releasing: the slot's contents before the meter queue can see it.
       head.store(next &+ 1, ordering: .releasing)
@@ -310,7 +326,7 @@ final class AudioMeterTap: @unchecked Sendable {
     guard next != end else { return }
     // Once per drain, not per packet: the take, if one is running and not paused.
     let currentTake = take.withLock { state in
-      state.flatMap { $0.paused ? nil : (meter: $0.meter, number: $0.number, start: $0.startPacket) }
+      state.map { (meter: $0.meter, number: $0.number, start: $0.startPacket) }
     }
     while next != end {
       let slot = slots + (next & slotMask)
@@ -346,7 +362,7 @@ final class AudioMeterTap: @unchecked Sendable {
         stale.add(1, ordering: .relaxed)
       }
       // The take's own meter, from the packet the take started at.
-      if let currentTake, next >= currentTake.start {
+      if let currentTake, next >= currentTake.start, slot.pointee.takeNumber == currentTake.number {
         let takeMeter = currentTake.meter
         // A gap in the stream, or audio left out while the take was paused.
         if slot.pointee.followsGap || (lastTakePacket.map { $0 != next &- 1 } ?? false) { takeMeter.noteDiscontinuity() }
@@ -456,7 +472,10 @@ final class AudioMeterTap: @unchecked Sendable {
   /// this call. For tests, verification and the end of a take; never from the
   /// driver thread.
   func waitUntilMetered() {
-    meterQueue.sync { drainRing() }
+    meterQueue.sync {
+      sessions.withLock { _ = commitPendingSession(&$0) }
+      drainRing()
+    }
   }
 
   // MARK: Any thread
@@ -467,7 +486,7 @@ final class AudioMeterTap: @unchecked Sendable {
     sessions.withLock { sessions in
       if viewers.load(ordering: .relaxed) == 0 { startSession(&sessions) }
       viewers.add(1, ordering: .releasing)
-      guard let live = sessions.live else { preconditionFailure("A metering session has no meter") }
+      guard let live = sessions.pending ?? sessions.live else { preconditionFailure("A metering session has no meter") }
       return live
     }
   }
@@ -490,10 +509,83 @@ final class AudioMeterTap: @unchecked Sendable {
     } catch {
       preconditionFailure("The embedded-audio meter configuration is invalid: \(error)")
     }
-    sessions.live = meter
-    sessions.number &+= 1
-    sessions.history[sessions.number] = meter
-    session.store(sessions.number, ordering: .releasing)
+    requestSession(meter, state: &sessions)
+  }
+
+  /// Replacement requests coalesce to one meter, even if a producer stalls.
+  /// Session publication and retirement share the producer's nonwaiting claim.
+  private func requestSession(_ meter: AudioMeter, state: inout Sessions) {
+    state.pending = meter
+    sessionPending.store(true, ordering: .releasing)
+    if !commitPendingSession(&state) { scheduleSessionRetry() }
+  }
+
+  @discardableResult private func commitPendingSession(_ state: inout Sessions) -> Bool {
+    guard let replacement = state.pending else { return true }
+    guard !producing.exchange(true, ordering: .acquiring) else { return false }
+    defer { producing.store(false, ordering: .releasing) }
+#if ULTRACAM_TEST_SUPPORT
+    sessionMutationHook?()
+#endif
+    pruneUnusedSessions(&state)
+    state.startHead = head.load(ordering: .acquiring)
+    state.live = replacement
+    state.pending = nil
+    state.number &+= 1
+    state.history[state.number] = replacement
+    session.store(state.number, ordering: .releasing)
+    sessionPending.store(false, ordering: .releasing)
+    return true
+  }
+
+  private func scheduleSessionRetry() {
+    guard !sessionRetryScheduled.exchange(true, ordering: .acquiring) else { return }
+    sessionQueue.asyncAfter(deadline: .now() + .milliseconds(1)) { [weak self] in
+      guard let self else { return }
+      self.sessionRetryScheduled.store(false, ordering: .releasing)
+      let complete = self.sessions.withLock { self.commitPendingSession(&$0) }
+      if !complete { self.scheduleSessionRetry() }
+    }
+  }
+
+#if ULTRACAM_TEST_SUPPORT
+  /// Test-only barriers; installed before the corresponding operation starts.
+  var handoffClaimedForTesting: Bool { producing.load(ordering: .acquiring) }
+  var retainedSessionCount: Int { sessions.withLock { $0.history.count + ($0.pending == nil ? 0 : 1) } }
+  var producerAdmissionHook: (@Sendable () -> Void)?
+  var sessionMutationHook: (@Sendable () -> Void)?
+#endif
+
+  /// Under the shared producer claim, unchanged ring head proves this session
+  /// admitted no packets. Keep queued sessions for first-packet adoption.
+  private func pruneUnusedSessions(_ state: inout Sessions) {
+    // Caller owns the producer claim: no callback can publish across this read.
+    let currentHead = head.load(ordering: .acquiring)
+    if currentHead == tail.load(ordering: .acquiring) {
+      state.history.removeAll(keepingCapacity: true)
+    } else if state.startHead == currentHead {
+      state.history.removeValue(forKey: state.number)
+    }
+  }
+
+  /// One view owns one attachment. Resolve the current meter at display time,
+  /// so declarations change both readings and reset targets without reattaching.
+  final class Attachment {
+    private let tap: AudioMeterTap
+    private let attached = Mutex(true)
+    init(tap: AudioMeterTap) { self.tap = tap; tap.attach() }
+    var meter: AudioMeter? { attached.withLock { $0 } ? tap.meter : nil }
+    /// SwiftUI can retain disappeared view state; ownership ends explicitly
+    /// on disappearance, independently of when that state is released.
+    func close() {
+      let shouldDetach = attached.withLock { active in
+        guard active else { return false }
+        active = false
+        return true
+      }
+      if shouldDetach { tap.detach() }
+    }
+    deinit { close() }
   }
 
   var isMetering: Bool { viewers.load(ordering: .relaxed) > 0 }
@@ -549,6 +641,7 @@ final class AudioMeterTap: @unchecked Sendable {
       state = TakeState(meter: meter, number: number, startPacket: start)
       return running
     }
+    measuringTake.store(number, ordering: .releasing)
     // The take keeps the stream metered; a restart already holds its viewer.
     let live = restarted ? self.meter : attach()
     live?.resetPeaks()
@@ -558,7 +651,10 @@ final class AudioMeterTap: @unchecked Sendable {
   /// Leaves the audio out of the take while it is paused (`true`) and takes it
   /// in again on resume. Main thread; a no-op without a take.
   func pauseTake(_ paused: Bool) {
-    take.withLock { $0?.paused = paused }
+    take.withLock { state in
+      state?.paused = paused
+      measuringTake.store(paused ? 0 : (state?.number ?? 0), ordering: .releasing)
+    }
   }
 
   /// The running take's numbers so far; nil without a take. Any thread.
@@ -581,6 +677,7 @@ final class AudioMeterTap: @unchecked Sendable {
       defer { state = nil }
       return state
     }) else { return nil }
+    measuringTake.store(0, ordering: .releasing)
     detach()
     return Self.summary(state)
   }
@@ -593,7 +690,7 @@ final class AudioMeterTap: @unchecked Sendable {
   }
 
   /// The current (or last) session's meter; nil before the first attach.
-  var meter: AudioMeter? { sessions.withLock { $0.live } }
+  var meter: AudioMeter? { sessions.withLock { $0.pending ?? $0.live } }
 
   /// Exact PCM plane bytes retained by the ring, including the packet being consumed.
   var queuedPCMBytes: Int { bufferedBytes.load(ordering: .acquiring) }
@@ -606,7 +703,7 @@ final class AudioMeterTap: @unchecked Sendable {
     var metered: UInt64
     /// Packets refused for invalid legacy PCM or a declared meter-format mismatch.
     var rejected: UInt64
-    /// Packets skipped because another driver thread was handing one over at the same time.
+    /// Packets skipped by a concurrent handoff or a source-session transition.
     var overlapped: UInt64
     /// Packets left out of the meters because the hand-off ring was full (the
     /// meter queue was `packetCapacity` packets behind). Recording and video

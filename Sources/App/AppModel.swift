@@ -346,8 +346,9 @@ final class AppModel {
     persistedSnapshot = snapshot
     // Saved without an input beside cameras that have one: that camera was set to None.
     // Only a fresh setup, where no camera has an input yet, is filled in on its own.
+    inputsClearedByChoice = Set(snapshot.feeds.filter(\.inputClearedByChoice).map(\.id))
     if snapshot.feeds.contains(where: { !$0.selectedDevice.isEmpty }) {
-      inputsClearedByChoice = Set(snapshot.feeds.filter { $0.selectedDevice.isEmpty }.map(\.id))
+      inputsClearedByChoice.formUnion(snapshot.feeds.filter { $0.selectedDevice.isEmpty }.map(\.id))
     }
     monitorCoordinator = MonitorCoordinator(feeds: snapshot.feeds, program: snapshot.programMonitor,
       workspace: snapshot.monitorWorkspacePreferences)
@@ -371,9 +372,19 @@ final class AppModel {
       let previous = self.monitorPreferences(of: target)
       if target.rawValue == "program" {
         self.feedCoordinator.programMonitor = configuration
-      } else if var descriptor = self.feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
-        descriptor.monitor = configuration
-        self.feedCoordinator.update(descriptor)
+      } else if let descriptor = self.feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
+        if descriptor.monitor.signal.logProfileID != configuration.signal.logProfileID {
+          // A camera declaration updates its processing, but stays camera-specific
+          // while synchronized monitor tools are copied below.
+          self.updateCamera(descriptor.id, shareProcessing: false) { camera in
+            camera.monitor = configuration
+            camera.setSourceProfile(configuration.signal.logProfileID ?? "unspecified")
+          }
+        } else {
+          var updated = descriptor
+          updated.monitor = configuration
+          self.feedCoordinator.update(updated)
+        }
       }
       self.synchronizeMonitoring(from: target, preferences: configuration, previous: previous)
       self.saveSettings()
@@ -454,7 +465,7 @@ final class AppModel {
       self.pendingAutoDecisionID = nil
       self.pendingAutoTargetFeedID = nil
       self.autoSwitcherTimeline?.recordApplied(decisionID: decisionID, target: feedID,
-        sourceTime: sourceTime, programTime: programTime)
+        sourceTime: sourceTime, programTime: programTime, directorAppliedAt: nil)
       // The director clock is the selected input's audio time. The frame that
       // landed the cut has a different source's video PTS, so acknowledging
       // with that PTS moves the director onto the wrong timeline. Nil keeps
@@ -503,9 +514,7 @@ final class AppModel {
 
   private func applyDevices(_ next: [InputDevice], fromDiscovery: Bool) {
     // Discovery reports every arrival, including devices already listed.
-    if fromDiscovery, next.map(\.id) == devices.map(\.id), next.map(\.name) == devices.map(\.name),
-      next.map(\.shareable) == devices.map(\.shareable),
-      next.map(\.mayPause) == devices.map(\.mayPause) { return }
+    if fromDiscovery, next == devices { return }
     for device in next { lastInputNames[device.id] = device.name }
     devices = next
     for device in next {
@@ -1538,7 +1547,7 @@ final class AppModel {
 
   /// Edits one camera's saved settings and applies them to its pipeline. The
   /// one path for every camera's edits; the selection plays no part.
-  func updateCamera(_ id: FeedID, _ mutate: (inout FeedDescriptor) -> Void) {
+  func updateCamera(_ id: FeedID, shareProcessing: Bool = true, _ mutate: (inout FeedDescriptor) -> Void) {
     guard var descriptor = descriptor(for: id) else { return }
     let before = descriptor
     mutate(&descriptor)
@@ -1548,6 +1557,7 @@ final class AppModel {
       if inputHolder(descriptor.selectedDevice, excluding: id) != nil || cameraActive(id) {
         descriptor.selectedDevice = before.selectedDevice
       } else {
+        descriptor.inputClearedByChoice = descriptor.selectedDevice.isEmpty
         if descriptor.selectedDevice.isEmpty { inputsClearedByChoice.insert(id) } else { inputsClearedByChoice.remove(id) }
         // Another camera on this input: its signal calibration doesn't apply.
         descriptor.monitor.forgetCameraCalibration()
@@ -1559,7 +1569,7 @@ final class AppModel {
     }
     feedCoordinator.update(descriptor)
     if descriptor.recordingConstantFrameRate != before.recordingConstantFrameRate { syncRecordingFeeds() }
-    if descriptor.processingChoicesDiffer(from: before) { synchronizeProcessing(from: descriptor) }
+    if shareProcessing && descriptor.processingChoicesDiffer(from: before) { synchronizeProcessing(from: descriptor) }
     saveSettings(reason: "camera settings changed")
     if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
     if descriptor.previewEnabled != before.previewEnabled {

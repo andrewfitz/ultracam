@@ -119,6 +119,76 @@ final class CameraFrameStager {
   }
 }
 
+// A failed stop is not evidence that CMIO's single consumer has quiesced.
+// Active streams reserve capacity too, so failed teardown cannot accumulate
+// unbounded quarantined queues across reconnects or sink destruction.
+final class CameraStreamStopRecovery: @unchecked Sendable {
+  static let shared = CameraStreamStopRecovery(capacity: 32)
+  private struct Entry {
+    let deviceID: CMIODeviceID
+    let streamID: CMIOStreamID
+    var queue: CameraBufferQueue?
+    let stop: () -> OSStatus
+    var retryScheduled = false
+  }
+  private let lock = NSRecursiveLock()
+  private let capacity: Int
+  private let schedule: (@escaping () -> Void) -> Void
+  private var entries: [UUID: Entry] = [:]
+
+  init(capacity: Int, schedule: ((@escaping () -> Void) -> Void)? = nil) {
+    self.capacity = capacity
+    self.schedule = schedule ?? { action in
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1, execute: DispatchWorkItem(block: action))
+    }
+  }
+
+  func reserve(deviceID: CMIODeviceID, streamID: CMIOStreamID, queue: CameraBufferQueue? = nil, stop: @escaping () -> OSStatus) throws -> UUID {
+    try lock.withLock {
+      guard entries.count < capacity else { throw VideoError.message("Virtual camera stream recovery capacity is exhausted; unresolved streams must stop before reconnecting.") }
+      guard !entries.values.contains(where: { $0.deviceID == deviceID && $0.streamID == streamID }) else {
+        throw VideoError.message("This virtual camera stream still owns an active or unresolved connection. Wait for its stop to succeed before reconnecting.")
+      }
+      let token = UUID()
+      entries[token] = Entry(deviceID: deviceID, streamID: streamID, queue: queue, stop: stop)
+      return token
+    }
+  }
+
+  var retainedStreams: Int { lock.withLock { entries.count } }
+
+  func attach(_ queue: CameraBufferQueue, to token: UUID) {
+    lock.withLock { precondition(entries[token] != nil); entries[token]?.queue = queue }
+  }
+
+  func cancelUnstarted(_ token: UUID) {
+    lock.withLock { _ = entries.removeValue(forKey: token) }
+  }
+
+  func stop(_ token: UUID) {
+    lock.withLock {
+      guard var entry = entries[token], !entry.retryScheduled else { return }
+      entry.queue?.close()
+      let status = entry.stop()
+      if status == noErr {
+        entry.queue?.drain()
+        entries.removeValue(forKey: token)
+      } else {
+        cameraOutputLog.error("Virtual camera stop failed (\(status, privacy: .public)); retaining closed queue until stop succeeds.")
+        entry.retryScheduled = true
+        entries[token] = entry
+        schedule { [self] in
+          lock.withLock {
+            guard entries[token] != nil else { return }
+            entries[token]?.retryScheduled = false
+            stop(token)
+          }
+        }
+      }
+    }
+  }
+}
+
 /// Stable CMIO destination identity for one processed feed.
 ///
 /// The extension derives the same UID and stream names from
@@ -217,6 +287,7 @@ final class CMIODeviceListWatcher {
 }
 
 final class CameraSink {
+  private var stopRecoveryToken: UUID?
   private var deviceID: CMIODeviceID = 0
   private var streamID: CMIOStreamID = 0
   private var queue: CameraBufferQueue?
@@ -265,9 +336,10 @@ final class CameraSink {
   }
 
   static func resolvedOutputColour(configuration: PipelineConfiguration, sourceFormat: SourceFormat?) throws -> Colorimetry {
-    let interpreted = configuration.sourceColorimetryOverride ?? sourceFormat?.colour ?? Colorimetry(
+    let physical = sourceFormat?.colour ?? Colorimetry(
       primaries: .rec709, transfer: .rec709, matrix: .rec709,
       range: .video, horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
+    let interpreted = physical.overridingRGBEncoding(with: configuration.sourceColorimetryOverride)
     let encoded: Colorimetry
     if configuration.applyLUT {
       guard let target = configuration.lutOutputColorimetry else {
@@ -375,6 +447,14 @@ final class CameraSink {
         throw VideoError.message("The virtual camera for \(route.feedID ?? "Program") does not publish its source and input streams.")
       }
       let requested = DerivedOutputContract(format: format, duration: configuration.duration)
+      // Claim native identity before setters or CopyBufferQueue: an old retry
+      // must not stop this connection or share its still-live native queue.
+      let stopDevice = id, stopStream = paired.sink
+      let recoveryToken = try CameraStreamStopRecovery.shared.reserve(deviceID: id, streamID: paired.sink) {
+        CMIODeviceStopStream(stopDevice, stopStream)
+      }
+      var armed = false
+      defer { if !armed { CameraStreamStopRecovery.shared.cancelUnstarted(recoveryToken) } }
       for stream in [paired.sink, paired.source] {
         guard requested.matchingPublishedIndex(in: try publishedFormats(stream)) != nil else {
           throw VideoError.message("The installed virtual camera does not publish this output size, pixel layout and complete colour contract. Update the camera extension or choose an installed output format.")
@@ -403,6 +483,9 @@ final class CameraSink {
       try check(CMIOStreamCopyBufferQueue(paired.sink, cameraSinkQueueAltered, nil, &unmanaged), "Open camera queue")
       guard let unmanaged else { throw VideoError.message("Camera queue is unavailable.") }
       queue = CameraBufferQueue(unmanaged.takeRetainedValue())
+      CameraStreamStopRecovery.shared.attach(queue!, to: recoveryToken)
+      stopRecoveryToken = recoveryToken
+      armed = true
       negotiatedFormat = format
       negotiatedDuration = configuration.duration
       deviceID = id
@@ -476,8 +559,13 @@ final class CameraSink {
 
   func disconnect() {
     queue?.close()
-    if streamID != 0 { _ = CMIODeviceStopStream(deviceID, streamID) }
-    queue?.drain()
+    if let token = stopRecoveryToken {
+      CameraStreamStopRecovery.shared.stop(token)
+      stopRecoveryToken = nil
+    } else {
+      // Injected test queues have no native consumer; no CMIO stop is needed.
+      queue?.drain()
+    }
     queue = nil
     negotiatedFormat = nil
     negotiatedDuration = nil
@@ -509,7 +597,7 @@ final class CameraSink {
     controlled: () -> Bool, set: () throws -> Void,
     read: () throws -> (CMVideoFormatDescription, Double)) throws {
     if !controlled() {
-      do { try set(); return }
+      do { try set() }
       catch { guard controlled() else { throw error } }
     }
     let (activeFormat, activeRate) = try read()

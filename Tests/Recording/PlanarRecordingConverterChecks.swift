@@ -20,6 +20,29 @@ import XCTest
     try encode(destination, codec: kCMVideoCodecType_HEVC, profile: kVTProfileLevel_HEVC_Main_AutoLevel)
   }
 
+  func testAuthoritativeFullRange420vRequantizesIntoDistinctVideoStorage() throws {
+    let converter = try makeConverter()
+    let source = try image(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    let destination = try image(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    try fill(source, codes: [0, 16, 128, 235, 255], neutral: 128)
+    CVBufferSetAttachment(source, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanTrue, .shouldPropagate)
+    try converter.convert(source, sourceRange: .full, into: destination)
+    XCTAssertFalse(source === destination)
+    XCTAssertEqual(CVPixelBufferGetPixelFormatType(source), kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    try check(source, expected: [0, 16, 128, 235, 255], neutral: 128)
+    try check(destination, expected: [16, 30, 126, 218, 235], neutral: 128)
+    var description: CMVideoFormatDescription?
+    XCTAssertEqual(CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: destination,
+      formatDescriptionOut: &description), noErr)
+    XCTAssertNotEqual(CMFormatDescriptionGetExtension(try XCTUnwrap(description),
+      extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool, true)
+    XCTAssertNotEqual(CVBufferCopyAttachment(destination, kCMFormatDescriptionExtension_FullRangeVideo, nil) as? Bool, true)
+    try encode(destination, codec: kCMVideoCodecType_HEVC, profile: kVTProfileLevel_HEVC_Main_AutoLevel)
+    XCTAssertThrowsError(try converter.convert(source, sourceRange: .full, into: source),
+      "Range mapping must never mutate capture storage in place")
+    XCTAssertEqual(converter.budget.snapshot().bytes, 0)
+  }
+
   func testP216GPUQuantizesAllNativeLowBitsAndEncodersAcceptX422() throws {
     let converter = try makeConverter()
     let source = try image(0x50323136)

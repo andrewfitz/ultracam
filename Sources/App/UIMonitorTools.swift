@@ -243,12 +243,11 @@ struct UIMonitorToolSettingsView: View {
     self.init(panel: .tool(tool), cameraID: cameraID, cameraName: cameraName, isProgram: isProgram, provider: provider)
   }
 
-  /// Program's frames are not a camera's source signal: no focus peaking and no
-  /// (log) false color there.
+  /// Focus needs a camera source. False color remains editable on Program:
+  /// its mode picker disables log modes while six band and custom are available.
   static func unavailableReason(_ tool: UIMonitorTool, isProgram: Bool) -> String? {
     guard isProgram else { return nil }
     switch tool {
-    case .falseColor: return "False color needs a camera's source picture. It is unavailable on Program."
     case .focus: return "Focus peaking needs a camera's source picture. It is unavailable on Program."
     default: return nil
     }

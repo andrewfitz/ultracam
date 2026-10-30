@@ -257,6 +257,8 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   var id: FeedID
   var name: String
   var selectedDevice = ""
+  /// A deliberate None selection survives discovery and relaunch.
+  var inputClearedByChoice = false
   var applyLUT = false
   var downscale = true
   var convertTo420 = true
@@ -329,6 +331,7 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     self.enabled = enabled
     self.monitor = monitor
     self.monitor.signal.logProfileID = Self.logProfileID(self.sourceProfileID)
+    self.monitor.signal.sourceProfileID = self.sourceProfileID == "unspecified" || self.monitor.signal.logProfileID != nil ? nil : self.sourceProfileID
   }
 
   init(legacy settings: AppSettings, id: FeedID = .primary, name: String = "Camera 1") {
@@ -348,20 +351,20 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
       convertTo420: convertTo420, reduceFrameRate: reduceFrameRate,
       resizeTarget: resizeTarget ?? .hd1080, colorTarget: colorTarget ?? .yuv4208,
       frameRateTarget: frameRateTarget ?? .fps2997, scalingMode: scalingMode,
-      sourceColorimetryOverride: sourceProfileID == "unspecified" ? nil : (try? SourceColorSpaceCatalog.color(sourceProfileID)),
+      sourceColorimetryOverride: try? SourceColorSpaceCatalog.sourceRGBOverride(sourceProfileID),
       lutOutputColorimetry: applyLUT && lutBookmark != nil ? (try? SourceColorSpaceCatalog.color(lutOutputSpaceID)) : nil,
       programColorimetry: (try? SourceColorSpaceCatalog.color(programColorSpaceID)) ?? .rec709Video)
   }
 
   private enum CodingKeys: String, CodingKey {
-    case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
+    case version, id, name, selectedDevice, inputClearedByChoice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, sourceProfileID, scalingMode, lutInputSpaceID, lutOutputSpaceID, programColorSpaceID, recordingConstantFrameRate, pipelineEnabled, previewEnabled, lutBookmark,
       automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
   }
 
   /// `CodingKeys` and the MonitorTools key, read only to migrate.
   private enum DecodingKeys: String, CodingKey {
-    case version, id, name, selectedDevice, applyLUT, downscale, convertTo420,
+    case version, id, name, selectedDevice, inputClearedByChoice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, sourceProfileID, scalingMode, lutInputSpaceID, lutOutputSpaceID, programColorSpaceID, recordingConstantFrameRate, pipelineEnabled, previewEnabled, lutBookmark,
       automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
     case legacyMonitorConfiguration = "monitorConfiguration"
@@ -376,6 +379,8 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     if savedName.hasPrefix("Feed "), let number = Int(savedName.dropFirst(5)) { name = "Camera \(number)" }
     else { name = savedName }
     selectedDevice = try values.decodeIfPresent(String.self, forKey: .selectedDevice) ?? ""
+    // Old snapshots did not record intent: retain their historical autoassignment policy.
+    inputClearedByChoice = try values.decodeIfPresent(Bool.self, forKey: .inputClearedByChoice) ?? false
     applyLUT = try values.decodeIfPresent(Bool.self, forKey: .applyLUT) ?? false
     downscale = try values.decodeIfPresent(Bool.self, forKey: .downscale) ?? true
     convertTo420 = try values.decodeIfPresent(Bool.self, forKey: .convertTo420) ?? true
@@ -412,6 +417,7 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
       sourceProfileID = Self.profileID(forLegacyGamut: gamut)
     }
     monitor.signal.logProfileID = Self.logProfileID(sourceProfileID)
+    monitor.signal.sourceProfileID = sourceProfileID == "unspecified" || monitor.signal.logProfileID != nil ? nil : sourceProfileID
   }
 
   static func profileID(forLegacyGamut gamut: String) -> String {
@@ -438,6 +444,7 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     sourceProfileID = id
     gamut = id == "unspecified" ? "Unspecified / custom LUT" : SourceColorSpaceCatalog.title(id)
     monitor.signal.logProfileID = Self.logProfileID(id)
+    monitor.signal.sourceProfileID = id == "unspecified" || monitor.signal.logProfileID != nil ? nil : id
   }
 
   mutating func setGamut(_ displayName: String) {

@@ -152,7 +152,7 @@ fn timeline_time(event: &StreamEvent) -> Option<f64> {
         StreamEvent::Video { observation } => Some(observation.time),
         StreamEvent::Tick { time } => Some(*time),
         StreamEvent::Acknowledge { applied_at, .. } => *applied_at,
-        StreamEvent::Reject { .. } => None,
+        StreamEvent::DirectorOutput | StreamEvent::Reject { .. } => None,
         StreamEvent::ManualOverride { time, .. } => Some(*time),
         StreamEvent::Reset { .. } => None,
     }

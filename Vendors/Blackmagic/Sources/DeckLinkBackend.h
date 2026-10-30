@@ -239,6 +239,7 @@ NS_SWIFT_NAME(DeckLinkBackend)
 
 #if defined(ULTRACAM_BACKEND_TESTING)
 // Synthetic SDK callbacks only; never opens hardware or saves video.
+FOUNDATION_EXPORT NSUInteger UltracamNativeObserverCount(void);
 FOUNDATION_EXPORT BOOL UltracamRunSDK16SyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunDiscoverySyntheticChecks(NSError *_Nullable *_Nullable error);
 FOUNDATION_EXPORT BOOL UltracamRunSyntheticChecks(NSError *_Nullable *_Nullable error);

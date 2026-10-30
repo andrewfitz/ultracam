@@ -94,7 +94,13 @@
         "sequence": { "type": "integer", "minimum": 1 },
         "media_time": { "type": ["number", "null"] },
         "media_time_ticks": { "type": ["integer", "null"] },
-        "event": { "type": "object" },
+        "event": {
+          "description": "Director inputs plus the ledger-only directorOutput observation, which replay treats as a no-op.",
+          "oneOf": [
+            { "type": "object", "required": ["type", "cue"], "properties": { "type": { "enum": ["audio", "transcript"] }, "cue": { "type": "object" } } },
+            { "type": "object", "required": ["type"], "properties": { "type": { "enum": ["video", "tick", "acknowledge", "reject", "manualOverride", "reset", "directorOutput"] } } }
+          ]
+        },
         "outputs": { "type": "array", "items": { "type": "object" } }
       }
     },

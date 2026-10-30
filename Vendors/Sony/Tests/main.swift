@@ -127,7 +127,7 @@ private final class SonyStub: UCSonyCameraControl {
     }
     reply(json(camera), nil)
   }
-  override func connectFeed(_ feedID: String, camera: String, user: String, password: String,
+  override func connectFeed(_ feedID: String, camera: String, address: String, authentication: Bool, user: String, password: String,
     fingerprint: String, completion reply: @escaping UCSonyReply) {
     connectCalls += 1
     connectedUsers.append(user)

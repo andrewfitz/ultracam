@@ -11,15 +11,19 @@ public struct ProcessedFrameMetadata: @unchecked Sendable, Equatable {
   public let width: Int
   public let height: Int
   public let pixelFormat: UInt32
+  public let maximumRepeatDuration: Double
+  public let repeatCount: Int
   public let processingRevision: UInt64
 
   public init(presentationTime: CMTime, duration: CMTime, width: Int, height: Int,
-              pixelFormat: UInt32, processingRevision: UInt64 = 0) {
+              pixelFormat: UInt32, processingRevision: UInt64 = 0, repeatCount: Int = 1, maximumRepeatDuration: Double = 2) {
     self.presentationTime = presentationTime
     self.duration = duration
     self.width = width
     self.height = height
     self.pixelFormat = pixelFormat
+    self.maximumRepeatDuration = maximumRepeatDuration.isFinite ? max(0, maximumRepeatDuration) : 0
+    self.repeatCount = max(1, repeatCount)
     self.processingRevision = processingRevision
   }
 }
@@ -110,6 +114,8 @@ public enum FrameRouteEnqueueResult: Equatable, Sendable {
 /// report dictionary (the Program path publishes every frame).
 public struct FrameFanOutSummary: Equatable, Sendable {
   public var enqueued = 0
+  /// Distinct cadence slots accepted by at least one route.
+  public var publishedSamples = 0
   public var rejected = 0
   public var routerClosed = false
 }
@@ -149,6 +155,9 @@ public final class FrameRoute<Payload>: @unchecked Sendable {
 
   public var isCancelled: Bool { owner?.routeIsCancelled(id, token: token) ?? true }
   public var pendingCount: Int { owner?.routePendingCount(id, token: token) ?? 0 }
+  /// Changes when pending work is invalidated; in-flight owners remain valid
+  /// for retirement but must not publish a retired repeat schedule.
+  public var generation: UInt64 { owner?.routeGeneration(id, token: token) ?? .max }
 
   /// Removes and transfers the oldest pending lease to the caller.
   public func dequeue() -> FrameLease<Payload>? { owner?.dequeue(routeID: id, token: token) }
@@ -166,12 +175,15 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
   private final class RouteState {
     let capacity: Int
     let policy: FrameQueueOverflowPolicy
+    let compactRepeats: Bool
     let token = NSObject()
     var pending: [FrameLease<Payload>] = []
+    var generation: UInt64 = 0
 
-    init(capacity: Int, policy: FrameQueueOverflowPolicy) {
+    init(capacity: Int, policy: FrameQueueOverflowPolicy, compactRepeats: Bool) {
       self.capacity = capacity
       self.policy = policy
+      self.compactRepeats = compactRepeats
     }
 
     /// Detaches pending leases before releasing them. Release callbacks are
@@ -200,13 +212,13 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
   }
 
   public func addRoute(id: String, capacity: Int,
-                      policy: FrameQueueOverflowPolicy) throws -> FrameRoute<Payload> {
+                      policy: FrameQueueOverflowPolicy, compactRepeats: Bool = false) throws -> FrameRoute<Payload> {
     guard !id.isEmpty else { throw FrameFanOutError.invalidRouteID }
     guard capacity > 0 else { throw FrameFanOutError.invalidCapacity }
     return try sync {
       guard !closed else { throw FrameFanOutError.routerClosed }
       guard routes[id] == nil else { throw FrameFanOutError.duplicateRoute(id) }
-      let state = RouteState(capacity: capacity, policy: policy)
+      let state = RouteState(capacity: capacity, policy: policy, compactRepeats: compactRepeats)
       routes[id] = state
       return FrameRoute(id: id, owner: self, token: state.token)
     }
@@ -241,6 +253,33 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
     }
   }
 
+  /// Compact consumers retain one image/schedule; ordinary consumers retain
+  /// independent sample leases. Both share the original backing ownership.
+  public func publishRepeatedSummary(_ frame: ProcessedFrame<Payload>, count: Int) -> FrameFanOutSummary {
+    sync {
+      var summary = FrameFanOutSummary()
+      guard !closed else { summary.routerClosed = true; return summary }
+      let metadata = frame.metadata
+      for id in orderedRouteIDs {
+        guard let route = routes[id] else { continue }
+        let sends = route.compactRepeats ? 1 : count
+        var acceptedSamples = 0
+        for index in 0..<sends {
+          let timed = ProcessedFrame(payload: frame.payload, metadata: ProcessedFrameMetadata(
+            presentationTime: CMTimeAdd(metadata.presentationTime, CMTimeMultiply(metadata.duration, multiplier: Int32(index))),
+            duration: metadata.duration, width: metadata.width, height: metadata.height,
+            pixelFormat: metadata.pixelFormat, processingRevision: metadata.processingRevision,
+            repeatCount: route.compactRepeats ? count : 1, maximumRepeatDuration: metadata.maximumRepeatDuration), onReleased: { withExtendedLifetime(frame) {} })
+          let logicalCount = route.compactRepeats ? count : 1
+          if enqueueLocked(timed, on: route) == .enqueued { summary.enqueued += logicalCount; acceptedSamples += logicalCount }
+          else { summary.rejected += logicalCount }
+        }
+        summary.publishedSamples = max(summary.publishedSamples, acceptedSamples)
+      }
+      return summary
+    }
+  }
+
   /// A full route keeps its pending leases and rejects the new frame.
   private func enqueueLocked(_ frame: ProcessedFrame<Payload>, on route: RouteState) -> FrameRouteEnqueueResult {
     guard route.pending.count < route.capacity else { return .rejected }
@@ -267,6 +306,10 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
       guard !closed, let route = routes[routeID] else { return true }
       return route.token !== token
     }
+  }
+
+  fileprivate func routeGeneration(_ routeID: String, token: AnyObject) -> UInt64 {
+    sync { guard let route = routes[routeID], route.token === token else { return .max }; return route.generation }
   }
 
   fileprivate func cancel(routeID: String, token: AnyObject) {
@@ -302,6 +345,7 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
       // Snapshot route state before invoking callbacks. A callback can cancel
       // another route, which mutates `routes` while this operation is active.
       let activeRoutes = Array(routes.values)
+      for route in activeRoutes { route.generation &+= 1 }
       for route in activeRoutes {
         route.detachPending().forEach { $0.release() }
       }

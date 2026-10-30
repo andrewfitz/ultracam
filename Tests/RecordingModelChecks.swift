@@ -258,6 +258,108 @@ import XCTest
     XCTAssertTrue(try store.loadRecoveryRoots().isEmpty)
   }
 
+  func testBusyRecoveryJournalRetainsOriginalRootBookmark() throws {
+    let suite = "busy-root-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let partial = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1, 2, 3]).write(to: partial.temporaryURL)
+    partial.preserveForRecovery()
+    let store = RecordingFolderStore(defaults: defaults)
+    try store.saveRecoveryRoots([root])
+    let held = try RecordingRecoveryJournal(opening: RecordingRecoveryJournal.url(for: partial.temporaryURL))
+    let report = try RecordingRecovery.scanReport(root: root)
+    XCTAssertTrue(report.takes.isEmpty)
+    XCTAssertFalse(report.mayPruneRoot)
+    let model = RecordingModel(folderStore: store)
+    model.outputFolder = root.appendingPathComponent("next")
+    let deadline = Date(timeIntervalSinceNow: 0.2)
+    while Date() < deadline { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01)) }
+    XCTAssertEqual(try store.loadRecoveryRoots().count, 1)
+    withExtendedLifetime(held) {}
+  }
+
+  func testNewlySelectedBusyRecoveryRootSurvivesDestinationChange() throws {
+    let suite = "discovered-busy-root-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original = root.appendingPathComponent("original")
+    let next = root.appendingPathComponent("next")
+    try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+    let manager = try RecordingOutputManager(rootDirectory: original, minimumFreeBytes: 0)
+    let partial = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1, 2, 3]).write(to: partial.temporaryURL)
+    partial.preserveForRecovery()
+    var held: RecordingRecoveryJournal? = try RecordingRecoveryJournal(
+      opening: RecordingRecoveryJournal.url(for: partial.temporaryURL))
+    let store = RecordingFolderStore(defaults: defaults)
+    let model = RecordingModel(folderStore: store)
+    model.outputFolder = original
+    let retainedDeadline = Date(timeIntervalSinceNow: 3)
+    while (defaults.dictionary(forKey: "recordingRecoveryRootBookmarks") ?? [:]).isEmpty && Date() < retainedDeadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertEqual(try store.loadRecoveryRoots().count, 1,
+      "A newly discovered busy journal must retain its original selected grant")
+    model.outputFolder = next
+    withExtendedLifetime(held) {}
+    held = nil
+    model.refreshRecovery()
+    let deadline = Date(timeIntervalSinceNow: 3)
+    while model.interruptedRecordings.isEmpty && Date() < deadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertEqual(model.interruptedRecordings.first?.temporaryURL.resolvingSymlinksInPath(),
+      partial.temporaryURL.resolvingSymlinksInPath())
+  }
+
+  func testReselectedRecoveryRootRepairsCorruptBookmarkWithoutStartingTake() throws {
+    let suite = "reselected-root-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original = root.appendingPathComponent("original")
+    let next = root.appendingPathComponent("next")
+    try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+    let manager = try RecordingOutputManager(rootDirectory: original, minimumFreeBytes: 0)
+    let partial = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1, 2, 3]).write(to: partial.temporaryURL)
+    partial.preserveForRecovery()
+    defaults.set([original.standardizedFileURL.path: Data([1, 2, 3])],
+      forKey: "recordingRecoveryRootBookmarks")
+    let store = RecordingFolderStore(defaults: defaults)
+    let model = RecordingModel(folderStore: store)
+    XCTAssertTrue(try store.loadRecoveryRoots().isEmpty)
+    model.outputFolder = original
+    let discoveryDeadline = Date(timeIntervalSinceNow: 3)
+    while model.interruptedRecordings.isEmpty && Date() < discoveryDeadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertEqual(model.interruptedRecordings.count, 1)
+    model.outputFolder = next
+    // A fresh model must rediscover A using its repaired retained bookmark,
+    // even though the current destination persisted above is B.
+    let restoredStore = RecordingFolderStore(defaults: defaults)
+    XCTAssertEqual(try restoredStore.loadRecoveryRoots().map { $0.standardizedFileURL.path },
+      [original.standardizedFileURL.path])
+    XCTAssertTrue(restoredStore.recoveryRootWarnings.isEmpty)
+    let restored = RecordingModel(folderStore: restoredStore)
+    let deadline = Date(timeIntervalSinceNow: 3)
+    while (restored.interruptedRecordings.isEmpty || model.interruptedRecordings.isEmpty) && Date() < deadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertEqual(model.interruptedRecordings.first?.temporaryURL.resolvingSymlinksInPath(),
+      partial.temporaryURL.resolvingSymlinksInPath())
+    XCTAssertEqual(restored.interruptedRecordings.first?.temporaryURL.resolvingSymlinksInPath(),
+      partial.temporaryURL.resolvingSymlinksInPath())
+  }
+
   func testOriginalTakeRootRemainsInRecoveryAfterNextFolderChanges() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("take-roots-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }

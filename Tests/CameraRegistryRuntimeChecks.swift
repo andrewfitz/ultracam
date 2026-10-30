@@ -248,7 +248,83 @@ import XCTest
     XCTAssertTrue(camera.sink === fallbackRuntime.sink)
   }
 
+  func testRetiredSinkCompletionDoesNotDereferenceReleasedRuntime() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "retired-sink")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    var runtime: CameraDeviceRuntime? = try XCTUnwrap(camera.runtime(for: feed.id))
+    weak let retired = runtime
+    let sink: CameraStream = try XCTUnwrap(runtime).sink
+    var completion: CameraSampleCompletion?
+    camera.queue.sync {
+      sink.beginConsumption { completion = $0 }
+      sink.consume()
+      sink.stopConsumption()
+    }
+    try camera.reconcile(snapshot([], generation: 2))
+    camera.queue.sync {}
+    runtime = nil
+    XCTAssertNil(retired, "A saved callback and sink must not permanently retain its retired runtime")
+    let stale = try XCTUnwrap(completion)
+    stale(nil, 1, [], false, nil)
+    camera.queue.sync {}
+    XCTAssertNil(retired)
+    XCTAssertTrue(camera.devices.isEmpty)
+  }
+
+  func testCompletionQueuedBeforeRemovalRetainsRuntimeOnlyUntilHandlingFinishes() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "callback-removal-race")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    var runtime: CameraDeviceRuntime? = try XCTUnwrap(camera.runtime(for: feed.id))
+    weak let retired = runtime
+    let sink: CameraStream = try XCTUnwrap(runtime).sink
+    var completion: CameraSampleCompletion?
+    camera.queue.sync {
+      sink.beginConsumption { completion = $0 }
+      sink.consume()
+      sink.stopConsumption()
+    }
+    // Drain the demand notification first, so it cannot accidentally retain the
+    // runtime and hide a missing callback lifetime lease in this regression.
+    camera.queue.sync {}
+    try camera.queue.sync {
+      let submitted = try XCTUnwrap(completion)
+      // The callback resolves its owner before teardown, then queues handling
+      // behind this serial block. Teardown must not invalidate that strong lease.
+      submitted(nil, 1, [], false, nil)
+      try camera.reconcile(snapshot([], generation: 2))
+      runtime = nil
+      XCTAssertNotNil(retired)
+    }
+    camera.queue.sync {}
+    XCTAssertNil(retired, "The temporary callback lease must not form an owner/stream cycle")
+    XCTAssertTrue(camera.devices.isEmpty)
+  }
+
 #if ULTRACAM_TEST_SUPPORT
+  func testUnqualifiedStopBalancesActiveStartWhilePendingClientWaitsForDisconnect() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "active-stop-with-pending-client")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let active = UUID(), pending = UUID()
+    try camera.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.authorizeSourceForTesting(clientID: active)
+      try runtime.source.startStream()
+      runtime.source.authorizeSourceForTesting(clientID: pending)
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 0, "Native stop balances a completed start, not an unrelated authorization")
+      XCTAssertTrue(runtime.source.hasPendingStart)
+    }
+    try camera.reconcile(snapshot([], generation: 2))
+    XCTAssertTrue(camera.runtime(for: feed.id) === runtime)
+    camera.queue.sync { runtime.source.disconnectSourceForTesting(clientID: pending) }
+    camera.queue.sync {}
+    XCTAssertNil(camera.runtime(for: feed.id))
+  }
+
   func testPendingAuthorizationDisconnectCompletesDeferredRemoval() throws {
     let feed = VirtualCameraDescriptor.feed(feedID: "pending-disconnect")
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,

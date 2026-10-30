@@ -58,6 +58,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   private var lingering: Frozen?
   private var nextFreezeToken: UInt64 = 0
   private var pendingFreeze = false
+  private var freezeCopyInFlight: UInt64?
   /// The target's tools, this surface's Clean View and magnification, and the
   /// state they make (built when one of them changes, never per frame).
   private var preferences = MonitorFeedPreferences()
@@ -101,6 +102,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   @MainActor @Published private(set) var shownPreferences = MonitorFeedPreferences()
   /// The signal of the picture on screen, and what MonitorKit says about its tools.
   @MainActor @Published private(set) var shownSignal: SignalDescription?
+  @MainActor @Published private(set) var shownLayout: PixelLayout?
   @MainActor @Published private(set) var shownStatus = MonitorStatus()
   /// The statistics (clip readout) of this surface's scope accumulator, readable
   /// from any thread; nil until its first scope.
@@ -317,14 +319,17 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
 
   /// Render thread. The copy goes into a feed of the hold's own (with the target's
   /// LUTs as they are now), so other surfaces of the target, and later freezes,
-  /// never touch it. It is adopted only once encoded and committed; on failure the
+  /// never touch it. It is adopted only after successful GPU feedback; on failure the
   /// hold keeps the capture frame and the failure is counted.
   func makeFreezeCopy(token: UInt64) {
     let source: MonitorFeedHost.Delivery? = lock.withLock {
-      guard let value = frozen, value.token == token, value.owned == nil else { return nil }
+      guard let value = frozen, value.token == token, value.owned == nil, freezeCopyInFlight != token else { return nil }
+      freezeCopyInFlight = token
       return value.live
     }
     guard let source else { return }
+    var committed = false
+    defer { if !committed { lock.withLock { if freezeCopyInFlight == token { freezeCopyInFlight = nil } } } }
     let core: MonitorGPUContext.Core
     let context: MonitorGPUContext.EncodeContext
     do {
@@ -349,11 +354,29 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       recordFailure(error)
       return
     }
-    core.commit(context, completion: self, kind: MonitorSurfaceRenderLoop.freezeKind)
-    if !adoptOwnedFreeze(owned, feed: feed, token: token) {
-      // The freeze ended meanwhile; the copy's planes retire once it completes.
-      feed.unfreeze()
+    nonisolated(unsafe) let copied = (owned, feed)
+    let transaction = MonitorGPUTransaction { [weak self, core] failed, milliseconds in
+      guard let self else { return }
+      self.gpu.renderThread.perform { [self, core] in
+        if failed { self.gpu.invalidate(ifCurrent: core) }
+        self.finishFreezeCopy(copied.0, feed: copied.1, token: token, failed: failed)
+        self.recordGPU(kind: MonitorSurfaceRenderLoop.freezeKind, milliseconds: milliseconds, failed: failed)
+      }
     }
+    committed = true
+    core.commit(context, completion: transaction, kind: MonitorSurfaceRenderLoop.freezeKind)
+  }
+
+  /// Completion runs on the render thread. The capture source is retained until
+  /// successful feedback, and stale/cancelled transactions retire only their copy.
+  private func finishFreezeCopy(_ frame: MonitorFrame, feed: MonitorFeed, token: UInt64, failed: Bool) {
+    lock.withLock { if freezeCopyInFlight == token { freezeCopyInFlight = nil } }
+    if failed || !adoptOwnedFreeze(frame, feed: feed, token: token) { feed.unfreeze() }
+  }
+
+  func retryFreezeCopy() {
+    let token = lock.withLock { frozen.flatMap { $0.owned == nil ? $0.token : nil } }
+    if let token { makeFreezeCopy(token: token) }
   }
 
   /// Replaces the held capture frame with its owned GPU copy. Returns false if
@@ -367,6 +390,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       value.owned = frame
       value.feed = feed
       frozen = value
+      stateVersion &+= 1
       return true
     }
     withExtendedLifetime(released) {}
@@ -832,7 +856,9 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     }
     let signal = shown?.signal ?? live?.signal
     let geometry = shown?.geometry ?? live?.geometry
+    let layout = shown.map { $0.owned?.layout ?? $0.live?.layout } ?? live?.layout
     if shownSignal != signal { shownSignal = signal }
+    if shownLayout != layout { shownLayout = layout }
     /// How a pass on `stage` reads the frame (a declared range is the Source's alone).
     func reading(_ stage: SignalStage) -> SignalDescription? { signal?.signal(for: stage) }
     let interpretation = Self.describe(
@@ -1213,10 +1239,32 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private var scopePendingAt = 0.0
   private static let pendingScopeLifetime = 0.5
   private var scopedKey: ScopeKey?
+  private var pictureSubmission: UInt64 = 0
+  private var scopeSubmission: UInt64 = 0
+  private var lastScope: (source: ScopeSource, key: ScopeKey)?
+  private var recoveredFreezeFeed: (owner: MonitorFeed, feed: MonitorFeed)?
   private var scopeCadence = MonitorRefreshCadence()
   /// When the pending scope became due, and when the next skip may be counted.
   private var scopeDueAt = 0.0
   private var nextSkipCount = 0.0
+
+  #if ULTRACAM_TEST_SUPPORT
+  var scopeSetupForTesting: (() throws -> Void)?
+  var scopeEncodedForTesting: (() throws -> Void)?
+  func holdFrozenScopeForTesting(_ frame: MonitorFrame, owner: MonitorFeed, stamp: MonitorFeedHost.Stamp, layer: CAMetalLayer) {
+    scopeLinkLayer = layer
+    var settings = MonitorScopePreferences(); settings.enabled = true
+    scopePending = (.frozen(frame, owner), ScopeKey(stamp: stamp, frozenToken: 1,
+      layer: ObjectIdentifier(layer), scopes: settings, monitorLUT: true))
+  }
+  var hasPendingScopeForTesting: Bool { scopePending != nil }
+  func holdScopeForTesting(_ delivery: MonitorFeedHost.Delivery, layer: CAMetalLayer,
+    settings: MonitorScopePreferences) {
+    scopeLinkLayer = layer
+    scopePending = (.live(delivery), ScopeKey(stamp: delivery.stamp, frozenToken: 1,
+      layer: ObjectIdentifier(layer), scopes: settings, monitorLUT: false))
+  }
+  #endif
 
   init(presenter: MonitorSurfacePresenter, layer: CAMetalLayer) {
     self.presenter = presenter
@@ -1266,6 +1314,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       if paused {
         // A surface nobody can see holds no frame for a scope.
         scopePending = nil
+        lastScope = nil
       } else {
         // Redraw on resume: the layer may have been cleared while hidden.
         versions = (UInt64.max, UInt64.max)
@@ -1293,6 +1342,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     guard link === self.link, let presenter else { return }
     setScopeLayer(presenter.currentScopeLayer)
     noteMissedScope(now: update.targetTimestamp)
+    presenter.retryFreezeCopy()
     let drawable = update.drawable
     let size = (width: drawable.texture.width, height: drawable.texture.height)
     let resized = size != drawnSize
@@ -1331,7 +1381,10 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       versions = (UInt64.max, UInt64.max)
       return
     }
-    core.commit(context, drawable: drawable, completion: self, kind: Self.pictureKind)
+    pictureSubmission &+= 1
+    let submitted = pictureSubmission
+    let completion = submissionCompletion(core: core, kind: Self.pictureKind, serial: submitted)
+    core.commit(context, drawable: drawable, completion: completion, kind: Self.pictureKind)
     presenter.recordPresented(work.stamp)
     if let pass, scopeSource != nil { presenter.recordStatus(pass.status) }
     guard let scopeSource, let stamp = work.stamp, Self.wantsScopes(work), let scopeLinkLayer else { return }
@@ -1365,15 +1418,30 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       return .live(delivery)
     case .frozenOwned(let owned, let owner, _):
       // The copy as it is: both readings, so every stage's tools read it as live.
-      try drawPicture(owned, feed: owner, state: work.state, target: target, core: core, context: context)
+      try context.keepForeignFreeze(owned, owner: owner)
+      try drawPicture(owned, feed: feed, state: work.state, target: target, core: core, context: context)
       return .frozen(owned, owner)
     }
   }
 
   /// The feed `work` is drawn with: a hold's own, else the host's (made on first use).
   func drawingFeed(for work: MonitorSurfacePresenter.RenderWork, core: MonitorGPUContext.Core) -> MonitorFeed {
-    if case .frozenOwned(_, let owner, _) = work.content { return owner }
+    if case .frozenOwned(_, let owner, _) = work.content { return freezeFeed(owner: owner, core: core) }
+    recoveredFreezeFeed = nil
     return host.feed(engine: core.engine)
+  }
+
+  /// Rebuild feed-local GPU state on the replacement queue; old and new cores
+  /// have independent submission clocks and must never share a feed's state.
+  private func freezeFeed(owner: MonitorFeed, core: MonitorGPUContext.Core) -> MonitorFeed {
+    if owner.engine === core.engine { return owner }
+    if let recoveredFreezeFeed, recoveredFreezeFeed.owner === owner,
+       recoveredFreezeFeed.feed.engine === core.engine { return recoveredFreezeFeed.feed }
+    let feed = core.engine.makeFeed()
+    feed.burnInLUT = owner.burnInLUT
+    feed.monitorLUT = owner.monitorLUT
+    recoveredFreezeFeed = (owner, feed)
+    return feed
   }
 
   /// The picture of `frame` into `target`: focus analysis (once per frame and
@@ -1386,6 +1454,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   ) throws {
     let pass = try picturePass(core)
     context.keep(frame)
+    context.retain(feed)
     if state.focus.enabled && !state.clean {
       var focus = state.focus
       focus.stage = Self.focusAnalysisStage(
@@ -1518,6 +1587,11 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   /// Scopes use a separate submission and the newest drawn picture, capped in
   /// display-link time by the saved refresh rate. Pictures continue every frame.
   private func drawScope(_ update: CAMetalDisplayLink.Update) {
+    drawScope(drawable: update.drawable, at: update.targetTimestamp)
+  }
+
+  /// The scope tick, separated from the display-link envelope for recovery checks.
+  func drawScope(drawable: CAMetalDrawable, at now: Double) {
     presenter?.recordScopeRefresh()
     guard let pending = scopePending, let presenter else { return }
     let key = pending.key
@@ -1525,7 +1599,6 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       scopePending = nil
       return
     }
-    let now = update.targetTimestamp
     // A live frame the scope link couldn't draw for this long is dropped, counted,
     // rather than encoded from textures that may be gone; it also stops pinning
     // the capture buffer. Held (frozen) frames own theirs.
@@ -1544,12 +1617,12 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       }
       return
     }
-    scopePending = nil
-    scopedKey = key
-    let drawable = update.drawable
     let core: MonitorGPUContext.Core
     let context: MonitorGPUContext.EncodeContext
     do {
+      #if ULTRACAM_TEST_SUPPORT
+      try scopeSetupForTesting?()
+      #endif
       core = try gpu.core(nonblocking: true)
       context = try core.begin()
     } catch {
@@ -1567,19 +1640,31 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       case .frozen(let held, let owner):
         // The accumulator reads its own stage's reading (`SignalDescription.signal(for:)`).
         frame = held
-        feed = owner
+        try context.keepForeignFreeze(held, owner: owner)
+        feed = freezeFeed(owner: owner, core: core)
       }
       context.keep(frame)
+      context.retain(feed)
       let (accumulator, renderer) = try scopeObjects(core, settings: key.scopes.settings)
       try accumulator.accumulate(frame, feed: feed, monitorLUTEnabled: key.monitorLUT, into: context.submission)
       try renderer.render(accumulator, target: drawable.texture, clear: true, into: context.submission)
+      #if ULTRACAM_TEST_SUPPORT
+      try scopeEncodedForTesting?()
+      #endif
     } catch {
       core.abandon(context, drawable: drawable)
       presenter.cancelScope()
       presenter.recordFailure(error)
       return
     }
-    core.commit(context, drawable: drawable, completion: self, kind: Self.scopeKind)
+    scopeSubmission &+= 1
+    let completion = submissionCompletion(core: core, kind: Self.scopeKind, serial: scopeSubmission)
+    core.commit(context, drawable: drawable, completion: completion, kind: Self.scopeKind)
+    lastScope = pending
+    // Failed setup/encoding must leave the held frame eligible on the next
+    // scope tick, even when the picture and its settings never change.
+    scopePending = nil
+    scopedKey = key
     scopeCadence.didRefresh(at: now)
     presenter.recordScope(key.stamp)
   }
@@ -1600,6 +1685,43 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     presenter?.publishScopeStatisticsReader(made.statisticsReader)
     return (made, renderer)
   }
+
+  /// A failed obsolete submission may count a failure, but cannot invalidate a
+  /// replacement core or consume the newer picture/scope's retry bookkeeping.
+  private func submissionCompletion(core: MonitorGPUContext.Core, kind: Int, serial: UInt64) -> MonitorGPUCompletion {
+    MonitorGPUTransaction { [weak self, core] failed, milliseconds in
+      guard let self else { return }
+      self.gpu.renderThread.perform { [self, core] in
+        if failed {
+          self.gpu.invalidate(ifCurrent: core)
+          if (kind == Self.pictureKind && serial == self.pictureSubmission) ||
+             (kind == Self.scopeKind && serial == self.scopeSubmission) {
+            self.recoverFailedSubmission()
+          }
+        }
+        if !failed, kind == Self.scopeKind, serial == self.scopeSubmission { self.lastScope = nil }
+        self.presenter?.recordGPU(kind: kind, milliseconds: milliseconds, failed: failed)
+      }
+    }
+  }
+
+  private func recoverFailedSubmission() {
+    versions = (.max, .max)
+    scopedKey = nil
+    if !paused, scopePending == nil { scopePending = lastScope }
+  }
+
+  #if ULTRACAM_TEST_SUPPORT
+  var pictureNeedsRetryForTesting: Bool { versions == (.max, .max) }
+  var pictureWorkForTesting: MonitorSurfacePresenter.RenderWork? { presenter?.renderWork(after: versions, force: false) }
+  func pictureCompletionForTesting(core: MonitorGPUContext.Core) -> MonitorGPUCompletion {
+    if let work = presenter?.renderWork(after: (.max, .max), force: true) {
+      versions = (work.latestVersion, work.stateVersion)
+    }
+    pictureSubmission &+= 1
+    return submissionCompletion(core: core, kind: Self.pictureKind, serial: pictureSubmission)
+  }
+  #endif
 
   func gpuCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) {
     if failed { gpu.invalidate() }

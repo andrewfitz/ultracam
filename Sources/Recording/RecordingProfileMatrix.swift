@@ -119,7 +119,13 @@ enum RecordingProfileMatrix {
   /// Identifies implemented encoder repacks independently of whether the
   /// complete source pipeline has admitted this pixel format. Production
   /// callers must first use validate(_:source:) to require registered routes.
-  static func repackRoute(_ profile: RecordingProfileMatrixProfile, sourcePixel: PixelFormatID) throws -> RecordingRepackRoute {
+  static func repackRoute(_ profile: RecordingProfileMatrixProfile, sourcePixel: PixelFormatID, sourceRange: Colorimetry.Range? = nil) throws -> RecordingRepackRoute {
+    // Declared range is authoritative even when the fourCC matches the
+    // encoder input. Full-range 420v must be physically requantized into a
+    // distinct video-range 420v buffer before submission.
+    if profile == .hevcMain, sourcePixel == .video420, sourceRange == .full {
+      return .full420ToVideo420
+    }
     if sourcePixel.rawValue == profile.encoderPixelFormat { return .native }
     if sourcePixel == .v210, profile.requires422 { return .v210To422 }
     if profile.requires422 {
@@ -147,7 +153,7 @@ enum RecordingProfileMatrix {
     }
     // Route availability is independent of the source's theoretical precision.
     // No recording route may promise a conversion that has not been implemented.
-    _ = try repackRoute(profile, sourcePixel: source.pixel)
+    _ = try repackRoute(profile, sourcePixel: source.pixel, sourceRange: source.colour.range)
   }
 
   static func supports(_ profile: RecordingProfileMatrixProfile, source: SourceFormat) -> Bool {

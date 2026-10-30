@@ -33,7 +33,7 @@
     [self connectNext]; return;
   }
   NSString *feed = [NSString stringWithFormat:@"hardware-test-%lu", (unsigned long)self.index];
-  [self.backend connectFeed:feed camera:camera[@"id"] user:@"" password:@"" fingerprint:camera[@"fingerprint"]
+  [self.backend connectFeed:feed camera:camera[@"id"] address:camera[@"address"] authentication:[camera[@"authentication"] boolValue] user:@"" password:@"" fingerprint:camera[@"fingerprint"]
     completion:^(NSString *json, NSString *error) {
       if (error) { fprintf(stderr, "Connect %s: %s\n", [camera[@"id"] UTF8String], error.UTF8String); self.failed = YES; [self connectNext]; return; }
       NSArray *properties = [NSJSONSerialization JSONObjectWithData:[json dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];

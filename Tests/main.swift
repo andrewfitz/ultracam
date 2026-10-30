@@ -325,6 +325,11 @@ suite.addTest(XCTestSuite(forTestCaseClass: CaptureAuditChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: CameraBusyNegotiationChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: CaptureDeliveryLifecycleChecks.self))
 
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureTranscriptChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: LUTRoundTwoAuditChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CameraStopRecoveryChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ProgramCadenceCPUChecks.self))
+
 suite.addTest(XCTestSuite(forTestCaseClass: SourceFormatContractChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: SourceAdmissionChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: RecordingSourceAdmissionChecks.self))

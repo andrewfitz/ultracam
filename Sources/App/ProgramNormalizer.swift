@@ -243,6 +243,9 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
                  completion: @escaping @Sendable (Result<CVPixelBuffer, Error>) -> Void) throws {
     let sourceFormat = CVPixelBufferGetPixelFormatType(source)
     let sourceColour = try LUTProcessor.sourceColorimetry(source)
+    guard sourceColour.range == .video || sourceColour.range == .full else {
+      throw VideoError.message("Program requires a declared source code range.")
+    }
     let conversionNeeded = sourceColour.primaries != contract.colour.primaries ||
       sourceColour.transfer != contract.colour.transfer || sourceColour.matrix != contract.colour.matrix
     if Self.sourceCode(sourceFormat) == nil || conversionNeeded {
@@ -334,7 +337,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     Self.stampAttachments(output, from: source, resized: resized,
       chromaResampled: resized || sourceCode.is420 != destinationCode.is420)
     try contract.stampColour(on: output)
-    let fullRange: UInt32 = (sourceFormat == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? 1 : 0)
+    let fullRange: UInt32 = (sourceColour.range == .full ? 1 : 0)
       | (sourceColour.horizontalChromaSiting == .left ? 2 : 0)
       | (sourceColour.verticalChromaSiting == .top ? 4 : 0)
       | (sourceColour.verticalChromaSiting == .bottom ? 8 : 0)
@@ -686,9 +689,10 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   struct Taps { int index[4]; float weight[4]; int count; };
 
-  static Taps axisTaps(float d, int srcSize, float dstSize, float offset = 0.0f) {
+  static Taps axisTaps(float d, int srcSize, float dstSize, float offset = 0.0f, float geometricSourceSize = 0.0f) {
     Taps t;
-    if (offset == 0.0f && floor(d) == d && fmod(float(srcSize), dstSize) == 0.0f && float(srcSize) / dstSize <= 4.0f) {
+    float imageSize = geometricSourceSize > 0.0f ? geometricSourceSize : float(srcSize);
+    if (imageSize == float(srcSize) && offset == 0.0f && floor(d) == d && fmod(float(srcSize), dstSize) == 0.0f && float(srcSize) / dstSize <= 4.0f) {
       int n = int(float(srcSize) / dstSize);
       t.count = n;
       for (int k = 0; k < 4; k++) {
@@ -696,7 +700,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
         t.weight[k] = k < n ? 1.0f / float(n) : 0.0f;
       }
     } else {
-      float s = clamp((float(d) + 0.5f) * float(srcSize) / float(dstSize) - 0.5f + offset,
+      float s = clamp((float(d) + 0.5f) * imageSize / float(dstSize) - 0.5f + offset,
         0.0f, float(srcSize - 1));
       int i0 = int(floor(s));
       int i1 = min(i0 + 1, srcSize - 1);
@@ -731,7 +735,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     if ((p.source.z == kYUV420 || p.source.z == kYUV4228)) v = float(p0.read(uint2(x, y)).x) * 4.0f;
     else if ((p.source.z == kYUV422 || p.source.z == kYUV42010)) v = float(p0.read(uint2(x, y)).x >> 6);
     else v = float(v210Luma(p0.read(uint2(x / 6, y)), uint(x % 6)));
-    if ((p.source.w & 1) != 0) v = 64.0f + v * (876.0f / 1023.0f);
+    if ((p.source.w & 1) != 0) v = 64.0f + v * (876.0f / ((p.source.z == kYUV420 || p.source.z == kYUV4228) ? 1020.0f : 1023.0f));
     return v;
   }
 
@@ -741,7 +745,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     if ((p.source.z == kYUV420 || p.source.z == kYUV4228)) c = float2(p1.read(uint2(x, y)).xy) * 4.0f;
     else if ((p.source.z == kYUV422 || p.source.z == kYUV42010)) c = float2(p1.read(uint2(x, y)).xy >> 6);
     else c = float2(v210Chroma(p0.read(uint2(x / 3, y)), uint(x % 3)));
-    if ((p.source.w & 1) != 0) c = 512.0f + (c - 512.0f) * (896.0f / 1023.0f);
+    if ((p.source.w & 1) != 0) c = 512.0f + (c - 512.0f) * (896.0f / ((p.source.z == kYUV420 || p.source.z == kYUV4228) ? 1020.0f : 1023.0f));
     return c;
   }
 
@@ -779,8 +783,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     float y = float(dy) - origin.y / vertical;
     float verticalOffset = (p.source.w & 4) != 0 ? 0.25f : ((p.source.w & 8) != 0 ? -0.25f : 0.0f);
     if (p.source.z != kYUV420 && p.source.z != kYUV42010) verticalOffset = 0.0f;
-    Taps tx = axisTaps(x, s.x, scaled.x / 2.0f, (p.source.w & 2) != 0 ? 0.25f : 0.0f);
-    Taps ty = axisTaps(y, s.y, scaled.y / vertical, verticalOffset);
+    Taps tx = axisTaps(x, s.x, scaled.x / 2.0f, (p.source.w & 2) != 0 ? 0.25f : 0.0f, float(p.source.x) / 2.0f);
+    Taps ty = axisTaps(y, s.y, scaled.y / vertical, verticalOffset, float(p.source.y) / ((p.source.z == kYUV420 || p.source.z == kYUV42010) ? 2.0f : 1.0f));
     float2 sum = float2(0.0f);
     for (int j = 0; j < ty.count; j++) {
       for (int i = 0; i < tx.count; i++) {

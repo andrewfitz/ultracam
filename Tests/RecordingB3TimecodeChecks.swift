@@ -598,6 +598,137 @@ import XCTest
     XCTAssertNotNil(sidecar.finalError)
   }
 
+  func testGeneratedTimecodeUsesExactRationalOffsetsAcrossLargeScales() throws {
+    let origin = CMTime(value: 71583, timescale: 2147483647)
+    let session = RecordingTimecodeSession(frameRate: .fps2997, policy: .recordStart, sourceStartTime: origin)
+    // Independent Fraction oracle: exact elapsed frames are
+    // 2149631124294/2149631130647, strictly below one.
+    XCTAssertEqual(session.timecode(for: CMTime(value: 1002, timescale: 30000))?.frameNumber, 0)
+    XCTAssertEqual(session.timecode(for: CMTime(value: 167, timescale: 5000))?.frameNumber, 0)
+    let above = RecordingTimecodeSession(frameRate: .fps2997, policy: .recordStart,
+      sourceStartTime: CMTime(value: 214748, timescale: 2147483647))
+    XCTAssertEqual(above.timecode(for: CMTime(value: 1004, timescale: 30000))?.frameNumber, 1)
+    let long = RecordingTimecodeSession(frameRate: .fps2997, policy: .recordStart)
+    XCTAssertEqual(long.timecode(for: CMTime(value: Int64.max, timescale: 1))?.frameNumber, 1463825)
+  }
+
+  func testFinalTailFailuresFinalizePreviouslyAcceptedVideoAndSidecar() throws {
+    for tailEncode in [true, false] {
+      let folder = FileManager.default.temporaryDirectory.appendingPathComponent("tail-failure-\(UUID().uuidString)")
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: folder) }
+      let movie = folder.appendingPathComponent("take.mov")
+      let duration = CMTime(value: 1, timescale: 30)
+      let rate: FrameRate = tailEncode ? .variable(nominal: duration, shortest: duration, longest: duration) : .constant(duration)
+      let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: rate),
+        epochID: .init(sessionID: UUID(), epoch: 0), clockBindings: .init(video: .init()), stage: .recordingSource)
+      let config = try SourceRecordingConfiguration(feedID: .init("tail-failure"), outputURL: movie, width: 1920, height: 1080,
+        frameRate: .fps30, declaredTimebases: [30000], sourceFrameRate: rate, recordingConstantFrameRate: tailEncode,
+        sourceAdmission: source, sidecarMovieURL: movie)
+      let writer = try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { session, image, pts, duration in
+        if tailEncode, CMTimeCompare(pts, CMTime(value: 2, timescale: 30)) == 0 { return -1234 }
+        return VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration,
+          frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
+      }, completeFrames: { session in
+        let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        return !tailEncode && status == noErr ? -1234 : status
+      })
+      try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+      for index in 0..<3 { try writer.appendVideo(sample(pts: CMTime(value: Int64(index), timescale: 30), duration: duration)) }
+      XCTAssertThrowsError(try writer.finish()) { XCTAssertTrue($0.localizedDescription.contains("-1234")) }
+      XCTAssertTrue(writer.hasFailed)
+      XCTAssertThrowsError(try writer.appendVideo(sample(pts: CMTime(value: 3, timescale: 30), duration: duration)))
+      let recorded = (try? readMovieSamples(movie, type: .video)) ?? []
+      XCTAssertEqual(recorded.reduce(0) { $0 + CMSampleBufferGetNumSamples($1) }, tailEncode ? 2 : 3)
+      let sidecar = try RecordingTakeSidecar.readSnapshot(for: movie)
+      XCTAssertTrue(sidecar.finished); XCTAssertTrue(sidecar.finalError?.contains("-1234") == true)
+    }
+  }
+
+  func testPCMRefusalPreservesAlreadyEncodedVideoForFinalDrain() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("pcm-tail-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("take.mov")
+    let duration = RecordingFrameRate.fps2997.frameDuration
+    let audio = try SourceAudioFormat(sampleRate: 48000, channels: 1, sample: .int16, interleaved: true, layout: .init(), clock: .deviceClock)
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(duration)),
+      epochID: .init(sessionID: UUID(), epoch: 0), clockBindings: .init(video: .init(), audio: .init()), stage: .recordingSource)
+    let aMap = try ClockMapping(sourceAnchor: CMTime(value: 100, timescale: 1), hostAnchor: .zero, rate: Rational(101, 100))
+    let vMap = try ClockMapping(sourceAnchor: CMTime(value: 500, timescale: 1), hostAnchor: .zero, rate: .one)
+    let config = try SourceRecordingConfiguration(feedID: .init("pcm-tail"), outputURL: movie, width: 1920, height: 1080,
+      sourceFrameRate: .constant(duration), sourceAdmission: source, sidecarMovieURL: movie)
+    let gate = RecordingWriterReadyGate()
+    let writer = try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { session, image, pts, duration in
+      let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration,
+        frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
+      return status == noErr ? VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid) : status
+    }, inputReady: { _ in gate.isReady })
+    try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .present(audio), mappingRevision: 1, videoMapping: vMap, audioMapping: aMap))
+    for index in 0..<3 { try writer.appendVideo(sample(pts: CMTimeAdd(CMTime(value: 500, timescale: 1), CMTimeMultiply(duration, multiplier: Int32(index))), duration: duration)) }
+    writer.flushWriterQueue()
+    XCTAssertThrowsError(try writer.appendSourceAudio(makeSourceSample(planes: [Data(count: 960)], sampleFrameCount: 480,
+      format: audio, presentationTime: CMTime(value: 100, timescale: 1)), mapping: AudioVideoClockMapping(audio: aMap, video: vMap)))
+    XCTAssertEqual(writer.telemetry.audioClockDiscontinuities, 1)
+    XCTAssertEqual(writer.telemetry.encoderErrors, 0)
+    gate.open()
+    XCTAssertThrowsError(try writer.finish())
+    XCTAssertEqual(writer.telemetry.droppedEncodedVideo, 0)
+    XCTAssertEqual(try readMovieSamples(movie, type: .video).reduce(0) { $0 + CMSampleBufferGetNumSamples($1) }, 3)
+  }
+
+  func testConformedCFRPreservesSelectedGeneratedTimecodeAcrossPause() throws {
+    for policy in [RecordingTimecodePolicy.recordStart, .wallClock] {
+      let folder = FileManager.default.temporaryDirectory.appendingPathComponent("conformed-timecode-\(UUID().uuidString)")
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: folder) }
+      let movie = folder.appendingPathComponent("take.mov"), duration = CMTime(value: 1, timescale: 30)
+      let rate = FrameRate.variable(nominal: duration, shortest: duration, longest: duration)
+      let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: rate),
+        epochID: .init(sessionID: UUID(), epoch: 0), clockBindings: .init(video: .init()), stage: .recordingSource)
+      let date = Date(timeIntervalSince1970: 0)
+      let config = try SourceRecordingConfiguration(feedID: .init("conformed-timecode"), outputURL: movie, width: 1920, height: 1080,
+        frameRate: .fps30, declaredTimebases: [30000], sourceFrameRate: rate, recordingConstantFrameRate: true,
+        timecodePolicy: policy, timecodeDropFrame: false, timecodeStartDate: date, sourceAdmission: source, sidecarMovieURL: movie)
+      let writer = try AVAssetSourceRecordingWriter(configuration: config)
+      try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+      try writer.appendVideo(sample(pts: .zero, duration: duration))
+      try writer.appendVideo(sample(pts: duration, duration: duration))
+      writer.resumeAfterPause()
+      try writer.appendVideo(sample(pts: CMTime(value: 10, timescale: 1), duration: duration))
+      try writer.finish()
+      let codes = try readMovieSamples(movie, type: .timecode).flatMap { sample -> [Int64] in
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+        return (0..<CMSampleBufferGetNumSamples(sample)).map { index in
+          var bytes: UInt32 = 0
+          XCTAssertEqual(CMBlockBufferCopyDataBytes(block, atOffset: index * 4, dataLength: 4, destination: &bytes), noErr)
+          return Int64(UInt32(bigEndian: bytes))
+        }
+      }
+      let anchor = RecordingTimecodeSession(frameRate: .fps30, dropFrame: false, policy: policy, startDate: date).startTimecode.frameNumber
+      XCTAssertEqual(codes, [anchor, anchor + 1, anchor + (policy == .wallClock ? 300 : 2)])
+      let journal = try String(contentsOf: RecordingTakeSidecar.url(for: movie).appendingPathExtension("journal"), encoding: .utf8)
+      XCTAssertFalse(journal.contains("nativeTimecode"), "Generated output labels must not fabricate native observations")
+    }
+  }
+
+  private func readMovieSamples(_ url: URL, type: AVMediaType) throws -> [CMSampleBuffer] {
+    let asset = AVURLAsset(url: url), loaded = RecordingMovieTrackResult()
+    Task {
+      do { loaded.track = try await asset.loadTracks(withMediaType: type).first }
+      catch { loaded.error = error }
+      loaded.done.signal()
+    }
+    XCTAssertEqual(loaded.done.wait(timeout: .now() + 5), .success)
+    if let error = loaded.error { throw error }
+    let track = try XCTUnwrap(loaded.track)
+    let reader = try AVAssetReader(asset: asset), output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+    reader.add(output); XCTAssertTrue(reader.startReading())
+    var result: [CMSampleBuffer] = []
+    while let sample = output.copyNextSampleBuffer() { if CMSampleBufferGetNumSamples(sample) > 0 { result.append(sample) } }
+    return result
+  }
+
   private func sample(pts: CMTime, duration: CMTime) throws -> CMSampleBuffer {
     var image: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_422YpCbCr10,
@@ -646,4 +777,11 @@ private final class RecordingMovieTrackResult: @unchecked Sendable {
   var range: CMTimeRange?
   var assetDuration: CMTime?
   var error: Error?
+}
+
+private final class RecordingWriterReadyGate: @unchecked Sendable {
+  private let lock = NSLock()
+  private var ready = false
+  var isReady: Bool { lock.lock(); defer { lock.unlock() }; return ready }
+  func open() { lock.lock(); ready = true; lock.unlock() }
 }

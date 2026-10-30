@@ -44,9 +44,38 @@ import XCTest
       guard let payload = event["event"] as? [String: Any] else { return false }
       return payload["type"] as? String == "transcript"
     }))
-    let cue = try XCTUnwrap((transcript["event"] as? [String: Any])?["transcript"] as? [String: Any])
+    let cue = try XCTUnwrap((transcript["event"] as? [String: Any])?["cue"] as? [String: Any])
     XCTAssertEqual(cue["segment_id"] as? String, "segment-1")
     XCTAssertEqual(cue["kind"] as? String, "sentenceEnd")
+  }
+
+  func testLedgerProtocolAndAcknowledgementUseDirectorClock() throws {
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B"),
+      outputFolder: URL(fileURLWithPath: "/tmp/ultracam-switcher-protocol-fixture"))
+    recorder.recordTranscript(AutoSwitcherTranscriptCue(segmentID: "cross-language", revision: 1,
+      start: 99, end: 100, kind: "sentenceEnd", confidence: 1, isFinal: true, sessionGeneration: 1))
+    let id = UUID(uuidString: "00000000-0000-0000-0000-000000000123")!
+    let instruction = AutoSwitcherInstruction(decisionID: id, sessionGeneration: 1,
+      targetCameraID: FeedID(rawValue: "B"), cutTime: CMTime(value: 100, timescale: 1),
+      expiresAt: CMTime(value: 101, timescale: 1), confidence: 1, reason: "forcedMaximumShotDuration", forced: true)
+    recorder.recordInstruction(instruction, from: FeedID(rawValue: "A"))
+    recorder.recordRejected(decisionID: UUID(uuidString: "00000000-0000-0000-0000-000000000124")!)
+    recorder.recordApplied(decisionID: id, target: FeedID(rawValue: "B"),
+      sourceTime: CMTime(value: 5, timescale: 1), programTime: CMTime(value: 1000, timescale: 1), directorAppliedAt: nil)
+    recorder.finish()
+    let data = try Data(contentsOf: recorder.outputFileURL)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let records = try XCTUnwrap(object["events"] as? [[String: Any]])
+    let events = records.compactMap { $0["event"] as? [String: Any] }
+    XCTAssertEqual(events.compactMap { $0["type"] as? String }, ["transcript", "directorOutput", "reject", "acknowledge"])
+    XCTAssertNotNil(events.first?["cue"])
+    XCTAssertNil(events.last?["applied_at"])
+    XCTAssertNil(events.last?["time"])
+    // A real Swift-encoded fixture is consumed by the focused Rust protocol test.
+    if let path = ProcessInfo.processInfo.environment["ULTRACAM_SWITCHER_LEDGER_FIXTURE"] {
+      try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
   }
 
   func testTimelinePreservesFractionalFrameTicksWithoutCumulativeRounding() throws {

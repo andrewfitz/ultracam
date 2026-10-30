@@ -8,8 +8,11 @@
 
 `take` needs ffprobe (Homebrew ffmpeg) and reads the unified log, which keeps
 Ultracam's notice lines for a few days. The capture log names a signal
-dropout ("Signal back on … after a dropout"); a gap without one is a device
-skip. Read-only: neither command opens a capture input.
+dropout ("Signal back on … after a dropout"). Use --camera with the exact
+capture feed ID to correlate only that camera. Unmatched gaps have unknown cause.
+Only a sidecar declaring constant cadence supports inferred missing-frame counts;
+VFR/unknown cadence uses packet durations to report uncovered intervals.
+Read-only: neither command opens a capture input.
 """
 import argparse
 import datetime as dt
@@ -19,6 +22,8 @@ import subprocess
 import sys
 import re
 import tempfile
+from fractions import Fraction
+from typing import NamedTuple
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,26 +39,88 @@ def run(args, **kw):
     return subprocess.run(args, check=True, capture_output=True, text=True, **kw).stdout
 
 
+class Gap(NamedTuple):
+    at: float
+    duration: float
+    missing_frames: int | None
+
+
+def recorded_rate(movie):
+    """Use the output contract: a VFR source can explicitly be conformed to CFR."""
+    try:
+        metadata = json.loads(Path(str(movie) + ".ultracam.json").read_text())["metadata"]
+        contract = metadata.get("outputContract") or metadata.get("sourceFormat") or {}
+        rate = contract.get("rate", {})
+        return rate if isinstance(rate, dict) else {}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
 def movie_gaps(movie):
-    """(take seconds, missing frames) per gap, the frame duration and the start time."""
+    """Return uncovered intervals; only a declared CFR contract implies frame loss."""
     if not shutil.which("ffprobe"):
         sys.exit("ffprobe is required: brew install ffmpeg")
     info = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
         "stream=time_base,r_frame_rate,nb_frames:format_tags=creation_time", "-of", "json", str(movie)]))
+    if not info.get("streams"):
+        sys.exit("The movie has no video stream")
     stream = info["streams"][0]
-    base_num, base_den = (int(x) for x in stream["time_base"].split("/"))
-    rate_num, rate_den = (int(x) for x in stream["r_frame_rate"].split("/"))
-    frame = base_den * rate_den / (base_num * rate_num)  # ticks per frame
+    base = Fraction(stream["time_base"])
+    rate = recorded_rate(movie)
+    nominal = rate.get("nominal", {})
+    try:
+        # SourceFormat.ContractTime encodes normalized seconds as Rational.
+        value = nominal["value"]
+        frame_seconds = Fraction(value["numerator"], value["denominator"])
+        if nominal.get("epoch", 0) != 0:
+            raise ValueError("unsupported epoch")
+        if frame_seconds <= 0:
+            raise ValueError("invalid declared duration")
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        frame_seconds = None
+    constant = rate.get("kind") == "constant" and frame_seconds is not None
+    try:
+        fps = float(Fraction(stream["r_frame_rate"]))
+    except (KeyError, ValueError, ZeroDivisionError):
+        fps = 0.0
+    if frame_seconds:
+        fps = float(1 / frame_seconds)
     created = info.get("format", {}).get("tags", {}).get("creation_time")
-    pts = sorted(int(line) for line in run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "packet=pts", "-of", "csv=p=0", str(movie)]).split() if line.strip().lstrip("-").isdigit())
+    packets = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts,duration", "-of", "json", str(movie)])).get("packets", [])
+    timed = []
+    for packet in packets:
+        try:
+            pts = int(packet["pts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        try:
+            duration = max(0, int(packet.get("duration", 0)))
+        except (TypeError, ValueError):
+            duration = 0
+        timed.append((pts, duration))
+    timed.sort()
     gaps = []
-    for a, b in zip(pts, pts[1:]):
-        missing = round((b - a) / frame) - 1
-        if missing > 0:
-            gaps.append(((a - pts[0]) * base_num / base_den, missing))
+    origin = timed[0][0] if timed else 0
+    covered_until = origin
+    for index, (pts, duration) in enumerate(timed):
+        if index:
+            if constant:
+                prior = timed[index - 1][0]
+                missing = round((pts - prior) * base / frame_seconds) - 1
+                if missing > 0:
+                    gaps.append(Gap(float((prior - origin) * base),
+                                    float(missing * frame_seconds), missing))
+            elif pts > covered_until:
+                # Missing sample durations do not establish an uncovered range.
+                # Never substitute ffprobe's nominal rate for a VFR duration.
+                prior, prior_duration = timed[index - 1]
+                if prior_duration > 0:
+                    gaps.append(Gap(float((covered_until - origin) * base),
+                                    float((pts - covered_until) * base), None))
+        covered_until = max(covered_until, pts + duration)
     start = dt.datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone() if created else None
-    return gaps, len(pts), start, rate_num / rate_den
+    return gaps, len(timed), start, fps
 
 
 def log_lines(start, end):
@@ -72,35 +139,63 @@ def log_lines(start, end):
     return lines
 
 
+def capture_camera(message):
+    """Extract the exact feed ID emitted as CaptureController.runLabel."""
+    for pattern in (r"Signal back on (.+?) after a dropout:",
+                    r"No video from (.+?) for [0-9.]+ s;",
+                    r"Capture summary (.+?): .*signalDropouts=",
+                    r"Live (.+?) fps="):
+        match = re.match(pattern, message)
+        if match:
+            return match[1]
+    return None
+
+
+def gap_description(gap):
+    if gap.missing_frames is None:
+        return f"{gap.duration:.6f} s uncovered presentation interval (frame loss unknown)"
+    m = gap.missing_frames
+    return f"{m} frame{'s' if m != 1 else ''}"
+
+
 def take(args):
     movie = Path(args.movie).expanduser()
     gaps, frames, start, fps = movie_gaps(movie)
-    missing = sum(m for _, m in gaps)
-    print(f"{movie.name}: {frames} frames at {fps:.3f} fps, {missing} missing in {len(gaps)} gaps")
+    missing = sum(g.missing_frames or 0 for g in gaps)
+    uncovered = sum(g.missing_frames is None for g in gaps)
+    print(f"{movie.name}: {frames} frames at {fps:.3f} nominal fps, {missing} inferred missing frames in {len(gaps)} gaps"
+          + (f", {uncovered} intervals with unknown frame loss" if uncovered else ""))
     if not gaps:
         return
     if start is None:
         print("No creation time in the movie, so its gaps can't be matched to the log.")
-        for at, m in gaps:
-            print(f"  {at:10.3f} s  {m} frame{'s' if m != 1 else ''}")
+        for gap in gaps:
+            print(f"  {gap.at:10.3f} s  {gap_description(gap)}")
         return
-    end = start + dt.timedelta(seconds=gaps[-1][0] + 60)
+    end = start + dt.timedelta(seconds=max(g.at + g.duration for g in gaps) + 60)
     lines = log_lines(start - dt.timedelta(seconds=60), end)
     summaries = [text for _, _, text in lines if movie.name in text]
-    # Builds before dropout logging can't tell a dropout from a device skip.
-    tells = any("signalDropouts=" in text for _, category, text in lines if category == "capture")
+    # Current take metadata has no feed ID. Require the caller to supply the
+    # exact capture feed ID rather than guessing from a filename or another run.
+    camera = getattr(args, "camera", None)
+    camera_lines = [(w, c, t) for w, c, t in lines
+                    if camera is not None and c == "capture" and capture_camera(t) == camera]
     dropouts = 0
-    for at, m in gaps:
-        wall = start + dt.timedelta(seconds=at)
-        near = [(w, c, t) for w, c, t in lines
-                if abs((w - wall).total_seconds()) <= WINDOW and not t.startswith("Live ") and c != "lut"]
+    for gap in gaps:
+        wall = start + dt.timedelta(seconds=gap.at)
+        gap_end = wall + dt.timedelta(seconds=gap.duration)
+        near = [(w, c, t) for w, c, t in camera_lines
+                if wall - dt.timedelta(seconds=WINDOW) <= w <= gap_end + dt.timedelta(seconds=WINDOW)
+                and not t.startswith("Live ")]
         dropout = any("after a dropout" in t or "No video from" in t for _, _, t in near)
         dropouts += dropout
-        kind = "signal dropout" if dropout else ("device skip" if tells else "unknown: this build doesn't log dropouts")
-        print(f"\n{at:10.3f} s  {wall:%H:%M:%S.%f}"[:-3] + f"  {m} frame{'s' if m != 1 else ''}  [{kind}]")
+        # A movie gap alone cannot distinguish device, ingest or writer loss.
+        kind = "signal dropout" if dropout else ("unknown: no camera ID; use --camera" if camera is None
+                                                    else "unknown: no matching signal dropout")
+        print(f"\n{gap.at:10.3f} s  {wall:%H:%M:%S.%f}"[:-3] + f"  {gap_description(gap)}  [{kind}]")
         for w, c, t in near[: args.lines]:
             print(f"    {w:%H:%M:%S.%f}"[:-3] + f"  {c:<9} {t[:200]}")
-    print(f"\n{dropouts} of {len(gaps)} gaps line up with a logged signal dropout.")
+    print(f"\n{dropouts} of {len(gaps)} gaps line up with a logged signal dropout for this camera.")
     for text in summaries:
         print(f"Take summary: {text[:400]}")
 
@@ -189,6 +284,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     t = sub.add_parser("take", help="gaps in a take, matched to the log")
     t.add_argument("movie")
+    t.add_argument("--camera", help="exact capture feed ID used in Ultracam logs; required for causal attribution")
     t.add_argument("--lines", type=int, default=6, help="log lines to show per gap")
     t.set_defaults(func=take)
     sub.add_parser("devices", help="UltraStudio status now").set_defaults(func=devices)

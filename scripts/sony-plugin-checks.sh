@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+# Native compiler/linker and Swift actions must share the supported minimum.
+export MACOSX_DEPLOYMENT_TARGET=26.0
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
 check_root="$(python3 "$task_root/scripts/work_paths.py" --path build_root)/sony-plugin-checks"
 mkdir -p "$check_root"

@@ -1,0 +1,180 @@
+{
+  "config" : {
+    "anchor_camera_id" : "A",
+    "boundary_window" : 0.24,
+    "candidate_dwell" : 0.3,
+    "cooldown" : 1.5,
+    "cut_threshold" : 0.68,
+    "emphasis_camera_id" : "B",
+    "emphasis_hold" : 5,
+    "forced_boundary_lookback" : 1,
+    "forced_cut_grace_period" : 2,
+    "hysteresis_margin" : 0.12,
+    "manual_hold" : false,
+    "maximum_shot_duration" : 30,
+    "minimum_shot_duration" : 10,
+    "mode" : "transcriptAssisted",
+    "pause_boundary_duration" : 0.22,
+    "session_generation" : 1,
+    "soft_maximum_shot_duration" : 20,
+    "transcript_confidence_threshold" : 0.72,
+    "transcript_output_delay" : 0.35
+  },
+  "cuts" : [
+    {
+      "applied_program_time" : 1000,
+      "applied_program_time_ticks" : 240000000,
+      "applied_source_time" : 5,
+      "applied_source_time_ticks" : 1200000,
+      "confidence" : 1,
+      "decision_id" : "00000000-0000-0000-0000-000000000123",
+      "expires_at" : 101,
+      "expires_at_ticks" : 24240000,
+      "forced" : true,
+      "from_camera_id" : "A",
+      "reason" : "forcedMaximumShotDuration",
+      "requested_cut_time" : 100,
+      "requested_cut_time_ticks" : 24000000,
+      "session_generation" : 1,
+      "status" : "applied",
+      "target_camera_id" : "B"
+    }
+  ],
+  "duration" : 100,
+  "ended_at_unix_ms" : 1793300346050,
+  "events" : [
+    {
+      "event" : {
+        "cue" : {
+          "confidence" : 1,
+          "end" : 100,
+          "is_final" : true,
+          "kind" : "sentenceEnd",
+          "revision" : 1,
+          "segment_id" : "cross-language",
+          "session_generation" : 1,
+          "start" : 99
+        },
+        "time" : 100,
+        "time_ticks" : 24000000,
+        "type" : "transcript"
+      },
+      "media_time" : 100,
+      "media_time_ticks" : 24000000,
+      "outputs" : [
+
+      ],
+      "sequence" : 1
+    },
+    {
+      "event" : {
+        "camera_id" : "B",
+        "decision_id" : "00000000-0000-0000-0000-000000000123",
+        "time" : 100,
+        "time_ticks" : 24000000,
+        "type" : "directorOutput"
+      },
+      "media_time" : 100,
+      "media_time_ticks" : 24000000,
+      "outputs" : [
+        {
+          "decision_id" : "00000000-0000-0000-0000-000000000123",
+          "instruction" : {
+            "confidence" : 1,
+            "cut_time" : 100,
+            "cut_time_ticks" : 24000000,
+            "decision_id" : "00000000-0000-0000-0000-000000000123",
+            "expires_at" : 101,
+            "expires_at_ticks" : 24240000,
+            "forced" : true,
+            "reason" : "forcedMaximumShotDuration",
+            "session_generation" : 1,
+            "target_camera_id" : "B"
+          },
+          "type" : "cut"
+        }
+      ],
+      "sequence" : 2
+    },
+    {
+      "event" : {
+        "decision_id" : "00000000-0000-0000-0000-000000000124",
+        "type" : "reject"
+      },
+      "outputs" : [
+
+      ],
+      "sequence" : 3
+    },
+    {
+      "event" : {
+        "camera_id" : "B",
+        "decision_id" : "00000000-0000-0000-0000-000000000123",
+        "type" : "acknowledge"
+      },
+      "outputs" : [
+
+      ],
+      "sequence" : 4
+    }
+  ],
+  "events_processed" : 4,
+  "instructions" : [
+    {
+      "confidence" : 1,
+      "cut_time" : 100,
+      "cut_time_ticks" : 24000000,
+      "decision_id" : "00000000-0000-0000-0000-000000000123",
+      "expires_at" : 101,
+      "expires_at_ticks" : 24240000,
+      "forced" : true,
+      "reason" : "forcedMaximumShotDuration",
+      "session_generation" : 1,
+      "target_camera_id" : "B"
+    }
+  ],
+  "metadata" : {
+    "clock" : "source_pts"
+  },
+  "mode" : "realtime",
+  "recordings" : [
+
+  ],
+  "schema_version" : 3,
+  "session_id" : "298AA0D5-A3DF-42B0-939C-9D736ABEF6DC",
+  "sources" : [
+    {
+      "camera_id" : "A",
+      "role" : "anchor",
+      "timebase" : {
+        "epoch" : 0,
+        "kind" : "media",
+        "origin" : "source_pts",
+        "timescale" : 240000,
+        "units" : "seconds"
+      }
+    },
+    {
+      "camera_id" : "B",
+      "role" : "emphasis",
+      "timebase" : {
+        "epoch" : 0,
+        "kind" : "media",
+        "origin" : "source_pts",
+        "timescale" : 240000,
+        "units" : "seconds"
+      }
+    }
+  ],
+  "started_at_unix_ms" : 1793300346043,
+  "statuses" : [
+
+  ],
+  "timebase" : {
+    "epoch" : 0,
+    "kind" : "media",
+    "origin" : "source_pts",
+    "timescale" : 240000,
+    "units" : "seconds"
+  }
+}

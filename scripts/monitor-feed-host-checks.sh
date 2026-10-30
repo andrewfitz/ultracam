@@ -45,7 +45,7 @@ xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-error
   -import-objc-header "$vendor_bridge" \
   -F "$frameworks" -Xlinker -rpath -Xlinker "$frameworks" \
   -I "$libraries" -L "$libraries" -lXCTestSwiftSupport -Xlinker -rpath -Xlinker "$libraries" \
-  "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/DeviceAPI/*.swift ${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"} "$task_root"/Sources/Recording/*.swift \
+  "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/DeviceAPI/*.swift ${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"} "$task_root"/Sources/Recording/*.swift "$task_root"/Sources/Program/*.swift \
   "${app_sources[@]}" "$task_root"/Tests/MonitorKitHost/*.swift \
   ${vendor_native_objects[@]+"${vendor_native_objects[@]}"} ${vendor_link_args[@]+"${vendor_link_args[@]}"} \
   -L "$auto_switcher_lib" -lauto_switcher \
@@ -60,3 +60,4 @@ printf 'MonitorKit host check artifacts: %s\n' "$test_root"
   exit 1
 }
 tail -5 "$test_root/tests.log"
+python3 "$task_root/scripts/check-gpu-proof-skips.py" --app "$test_root/tests.log"

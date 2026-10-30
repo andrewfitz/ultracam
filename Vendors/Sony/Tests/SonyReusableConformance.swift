@@ -3,7 +3,7 @@ import Foundation
 @MainActor private final class ConformanceSonyBackend: UCSonyCameraControl {
   override var available: Bool { true }
   override var sdkVersion: String? { "2.2.0" }
-  override func connectFeed(_ feedID: String, camera: String, user: String, password: String,
+  override func connectFeed(_ feedID: String, camera: String, address: String, authentication: Bool, user: String, password: String,
     fingerprint: String, completion: @escaping UCSonyReply) { completion("[]", nil) }
   override func refreshFeed(_ feedID: String, completion: @escaping UCSonyReply) { completion("[{\"id\":\"iso\",\"title\":\"ISO\",\"code\":1,\"value\":100,\"writable\":true,\"choices\":[{\"value\":100,\"label\":\"100\"}]}]", nil) }
   override func setFeed(_ feedID: String, code: UInt32, value: UInt64, completion: @escaping UCSonyReply) {

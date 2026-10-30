@@ -200,16 +200,31 @@ def install(manifest, checkout, archive, sdk_roots=()):
             if any(p.name != 'README.md' or p.is_symlink() or not p.is_file() for p in entries):
                 raise ValueError('SDK destination contains existing payload; refusing replacement')
             created = []
+            created_directories = []
             try:
                 for source in sorted(stage.rglob('*')):
                     if source.is_file():
                         target = destination / source.relative_to(stage)
-                        target.parent.mkdir(parents=True, exist_ok=True)
+                        missing = []
+                        parent = target.parent
+                        while not parent.exists():
+                            missing.append(parent)
+                            parent = parent.parent
+                        for parent in reversed(missing):
+                            parent.mkdir()
+                            created_directories.append(parent)
                         os.link(source, target)
                         created.append(target)
             except BaseException:
                 for target in reversed(created):
                     target.unlink()
+                for directory in reversed(created_directories):
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        # Never remove contents introduced by another owner.
+                        # Keep the original publication failure as the error.
+                        pass
                 raise
         else:
             stage.rename(destination)

@@ -287,17 +287,17 @@ public struct RecordingTimecodeSession: Sendable {
     guard sourceTime.isValid, sourceTime.isNumeric, sourceTime.epoch == 0,
       sourceTime.timescale > 0, origin.isValid, origin.isNumeric, origin.epoch == 0,
       origin.timescale > 0 else { return nil }
-    let delta = CMTimeSubtract(sourceTime, origin)
-    guard delta.isValid, delta.isNumeric, delta.epoch == 0, delta.value >= 0 else { return nil }
-    let numerator = delta.value.multipliedReportingOverflow(by: frameRate.rateNumerator)
-    let denominator = Int64(delta.timescale).multipliedReportingOverflow(by: frameRate.rateDenominator)
-    if !numerator.overflow && !denominator.overflow && denominator.partialValue > 0 {
-      return numerator.partialValue / denominator.partialValue
-    }
-    let frames = (Double(delta.value) / Double(delta.timescale))
-      * Double(frameRate.rateNumerator) / Double(frameRate.rateDenominator)
-    guard frames.isFinite, frames >= 0, frames <= Double(Int64.max) else { return nil }
-    return Int64(frames.rounded(.down))
+    // Cross-products retain the exact difference even when its denominator
+    // cannot fit CMTime's Int32 scale. Int64×Int32×Int32 fits Int128.
+    let delta = Int128(sourceTime.value) * Int128(origin.timescale)
+      - Int128(origin.value) * Int128(sourceTime.timescale)
+    guard delta >= 0 else { return nil }
+    let numerator = delta * Int128(frameRate.rateNumerator)
+    let denominator = Int128(sourceTime.timescale) * Int128(origin.timescale) * Int128(frameRate.rateDenominator)
+    let frames = numerator / denominator
+    // Labels wrap daily; reduce before Int64 conversion and anchor addition.
+    let day = Int128(RecordingTimecode.framesPerDay(frameRate: frameRate, dropFrame: dropFrame))
+    return Int64(frames % day)
   }
 }
 

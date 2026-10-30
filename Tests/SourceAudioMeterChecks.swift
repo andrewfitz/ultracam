@@ -4,6 +4,178 @@ import CoreMedia
 import XCTest
 
 @objcMembers final class SourceAudioMeterChecks: XCTestCase {
+#if ULTRACAM_TEST_SUPPORT
+  func testHeldProducerCoalescesUnusedSessionsAndPreservesItsPacket() {
+    final class WeakMeter { weak var value: AudioMeter?; init(_ value: AudioMeter) { self.value = value } }
+    let tap = AudioMeterTap()
+    let original = tap.attach()
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let done = DispatchSemaphore(value: 0)
+    tap.meterQueue.suspend()
+    tap.producerAdmissionHook = { entered.signal(); release.wait() }
+    DispatchQueue.global().async {
+      tap.ingest(samples: Data(count: 16), sampleFrames: 2, channels: 2, bytesPerSample: 4)
+      done.signal()
+    }
+    XCTAssertEqual(entered.wait(timeout: .now() + 3), .success)
+    tap.detach()
+    var unused: [WeakMeter] = []
+    for _ in 0..<100 { unused.append(WeakMeter(tap.attach())); tap.detach() }
+    XCTAssertLessThanOrEqual(tap.retainedSessionCount, 2, "One queued/in-flight session and one coalesced replacement")
+    XCTAssertEqual(unused.filter { $0.value != nil }.count, 1)
+    release.signal()
+    XCTAssertEqual(done.wait(timeout: .now() + 3), .success)
+    tap.producerAdmissionHook = nil
+    tap.meterQueue.resume()
+    tap.waitUntilMetered()
+    original.flush()
+    XCTAssertEqual(original.snapshot().frameCount, 2, "The producer's old session cannot retire before publication")
+    XCTAssertEqual(tap.counters.stale, 0)
+    XCTAssertEqual(tap.queuedPCMBytes, 0)
+  }
+
+  func testProducerCannotPublishInsideSessionRetirementTransaction() throws {
+    let tap = AudioMeterTap()
+    tap.attach()
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let done = DispatchSemaphore(value: 0)
+    tap.sessionMutationHook = { entered.signal(); release.wait() }
+    let mono = try SourceAudioFormat(sampleRate: 44_100, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    DispatchQueue.global().async {
+      try! tap.configure(format: mono)
+      done.signal()
+    }
+    XCTAssertEqual(entered.wait(timeout: .now() + 3), .success)
+    tap.ingest(samples: Data(count: 16), sampleFrames: 2, channels: 2, bytesPerSample: 4)
+    // The control transaction is deliberately blocked: ingest must still return.
+    XCTAssertTrue(tap.handoffClaimedForTesting, "Retirement owns the same atomic claim as packet publication")
+    XCTAssertEqual(tap.counters.overlapped, 1)
+    XCTAssertEqual(tap.queuedPackets, 0)
+    release.signal()
+    XCTAssertEqual(done.wait(timeout: .now() + 3), .success)
+    tap.sessionMutationHook = nil
+    let samples = [Float](repeating: 0.25, count: 2).withUnsafeBytes { Data($0) }
+    tap.ingest(try CaptureAudioPacket(planes: [samples], sampleFrameCount: 2, format: mono, packetTime: .zero))
+    tap.waitUntilMetered()
+    let meter = try XCTUnwrap(tap.meter)
+    meter.flush()
+    XCTAssertEqual(meter.snapshot().frameCount, 2)
+    XCTAssertEqual(tap.counters.rejected, 0)
+    tap.detach()
+  }
+#endif
+
+  func testAttachmentCloseReleasesDemandWhileHandleIsStillRetained() {
+    let tap = AudioMeterTap()
+    let attachment = AudioMeterTap.Attachment(tap: tap)
+    XCTAssertEqual(tap.viewerCount, 1)
+    attachment.close()
+    XCTAssertEqual(tap.viewerCount, 0)
+    XCTAssertFalse(tap.isMetering)
+    XCTAssertNil(attachment.meter)
+    attachment.close()
+    XCTAssertEqual(tap.viewerCount, 0, "Repeated close must not detach another owner")
+    let another = AudioMeterTap.Attachment(tap: tap)
+    attachment.close()
+    XCTAssertEqual(tap.viewerCount, 1)
+    another.close()
+    XCTAssertEqual(tap.viewerCount, 0)
+  }
+
+  func testStableAttachmentFollowsDeclarationWithoutAddingViewers() throws {
+    let tap = AudioMeterTap()
+    let attachment = AudioMeterTap.Attachment(tap: tap)
+    let old = try XCTUnwrap(attachment.meter)
+    let mono = try SourceAudioFormat(sampleRate: 44_100, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    try tap.configure(format: mono)
+    let current = try XCTUnwrap(attachment.meter)
+    XCTAssertFalse(old === current)
+    XCTAssertTrue(current === tap.meter)
+    XCTAssertEqual(current.configuration.channelCount, 1)
+    XCTAssertEqual(tap.viewerCount, 1)
+    let samples = [Float](repeating: 0.25, count: 512).withUnsafeBytes { Data($0) }
+    tap.ingest(try CaptureAudioPacket(planes: [samples], sampleFrameCount: 512,
+      format: mono, packetTime: .zero))
+    tap.waitUntilMetered()
+    current.flush()
+    XCTAssertEqual(attachment.meter?.snapshot().frameCount, 512)
+    XCTAssertEqual(old.snapshot().frameCount, 0)
+  }
+
+  func testQueuedFirstSessionSurvivesUnusedLaterSessions() {
+    let tap = AudioMeterTap()
+    let first = tap.attach()
+    tap.meterQueue.suspend()
+    tap.ingest(samples: Data(count: 16), sampleFrames: 2, channels: 2, bytesPerSample: 4)
+    tap.detach()
+    for _ in 0..<30 { tap.attach(); tap.detach() }
+    tap.meterQueue.resume()
+    tap.waitUntilMetered()
+    first.flush()
+    XCTAssertEqual(first.snapshot().frameCount, 2)
+    XCTAssertEqual(tap.counters.stale, 0)
+    XCTAssertEqual(tap.queuedPCMBytes, 0)
+  }
+
+  func testNoAudioAttachAndDeclarationHistoryDoesNotRetainOldMeters() throws {
+    final class WeakMeter { weak var value: AudioMeter?; init(_ value: AudioMeter) { self.value = value } }
+    let tap = AudioMeterTap()
+    var previous: [WeakMeter] = []
+    for _ in 0..<30 {
+      previous.append(WeakMeter(tap.attach()))
+      tap.detach()
+    }
+    XCTAssertEqual(previous.filter { $0.value != nil }.count, 1)
+    tap.attach()
+    for channels in [1, 2, 3, 4, 5, 6] {
+      previous.append(WeakMeter(try XCTUnwrap(tap.meter)))
+      try tap.configure(format: SourceAudioFormat(sampleRate: 44_100, channels: channels,
+        sample: .float32, interleaved: true, layout: AudioChannelMap(), clock: .hostTime))
+    }
+    XCTAssertEqual(previous.filter { $0.value != nil }.count, 0)
+    tap.detach()
+  }
+
+  func testPausedPacketsAreExcludedAtEnqueueEvenWhenDrainRunsAfterResume() throws {
+    let tap = AudioMeterTap()
+    tap.beginTake()
+    tap.meterQueue.suspend()
+    let quiet = [Int32](repeating: 1 << 20, count: 9_600).withUnsafeBytes { Data($0) }
+    let loud = [Int32](repeating: .max, count: 9_600).withUnsafeBytes { Data($0) }
+    tap.ingest(samples: quiet, sampleFrames: 4_800, channels: 2, bytesPerSample: 4)
+    tap.pauseTake(true)
+    tap.ingest(samples: loud, sampleFrames: 4_800, channels: 2, bytesPerSample: 4)
+    tap.pauseTake(false)
+    tap.ingest(samples: quiet, sampleFrames: 4_800, channels: 2, bytesPerSample: 4)
+    tap.pauseTake(true)
+    tap.meterQueue.resume()
+    let result = try XCTUnwrap(tap.endTake())
+    XCTAssertEqual(result.duration, 0.2, accuracy: 0.000001)
+    XCTAssertLessThan(result.maximumTruePeak, -40)
+    XCTAssertEqual(result.overs, 0)
+  }
+
+  func testPausedLoudPacketStaysExcludedAfterResumeBeforeDrain() throws {
+    let tap = AudioMeterTap()
+    tap.beginTake()
+    tap.meterQueue.suspend()
+    tap.pauseTake(true)
+    let loud = [Int32](repeating: .max, count: 9_600).withUnsafeBytes { Data($0) }
+    tap.ingest(samples: loud, sampleFrames: 4_800, channels: 2, bytesPerSample: 4)
+    tap.pauseTake(false)
+    let quiet = Data(count: 9_600 * 4)
+    tap.ingest(samples: quiet, sampleFrames: 4_800, channels: 2, bytesPerSample: 4)
+    tap.meterQueue.resume()
+    let result = try XCTUnwrap(tap.endTake())
+    XCTAssertEqual(result.duration, 0.1, accuracy: 0.000001)
+    XCTAssertEqual(result.maximumTruePeak, -.infinity)
+    XCTAssertEqual(result.overs, 0)
+  }
+
   func testPlanarFloatMetersEveryChannelAtDeclaredRate() throws {
     let format = try SourceAudioFormat(sampleRate: 44_100, channels: 3, sample: .float32,
       interleaved: false, layout: AudioChannelMap(), clock: .hostTime)

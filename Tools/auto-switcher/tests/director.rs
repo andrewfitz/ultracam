@@ -176,6 +176,8 @@ fn invalid_video_and_ack_times_do_not_poison_director_state() {
 fn candidate_dwell_starts_when_candidate_is_observed() {
     let mut cfg = config();
     cfg.candidate_dwell = 1.0;
+    cfg.maximum_shot_duration = 30.0;
+    cfg.soft_maximum_shot_duration = 20.0;
     let mut director = Director::new(cfg).expect("valid config");
     director.process_event(audio(1.1, 1.0, 0.0));
     director.process_event(StreamEvent::Transcript {
@@ -192,7 +194,35 @@ fn candidate_dwell_starts_when_candidate_is_observed() {
     });
     assert!(director.tick(1.1).is_none());
     assert!(director.tick(1.9).is_none());
-    assert!(director.tick(2.2).is_some());
+    assert!(
+        director.tick(2.2).is_none(),
+        "expired boundary must not produce a cut"
+    );
+    assert!(director.pending().is_none());
+    director.process_event(audio(2.3, 1.0, 0.0));
+    director.process_event(StreamEvent::Transcript {
+        cue: TranscriptCue {
+            segment_id: "fresh".into(),
+            revision: 1,
+            start: 2.2,
+            end: 2.5,
+            kind: CueKind::SentenceEnd,
+            confidence: 1.0,
+            is_final: true,
+            session_generation: 0,
+        },
+    });
+    assert!(
+        director.tick(2.3).is_none(),
+        "fresh candidate must observe its own dwell"
+    );
+    director.process_event(audio(3.4, 1.0, 0.0));
+    let instruction = director
+        .tick(3.4)
+        .expect("fresh boundary completes dwell while valid");
+    assert_eq!(instruction.cut_time, 2.5);
+    assert_eq!(instruction.expires_at, 3.5);
+    assert!(instruction.expires_at >= 3.4);
 }
 
 #[test]
@@ -671,4 +701,34 @@ fn timeline_v3_uses_exact_common_video_timebase_and_reads_v2() {
     let decoded: auto_switcher::model::SessionTimeline = serde_json::from_value(old).unwrap();
     assert_eq!(decoded.schema_version, 2);
     assert_eq!(decoded.timebase.timescale, 60000);
+}
+
+#[test]
+fn sparse_ticks_do_not_complete_an_expired_candidate_with_default_dwell() {
+    let mut cfg = config();
+    cfg.candidate_dwell = SwitcherConfig::default().candidate_dwell;
+    let mut director = Director::new(cfg).expect("valid config");
+    director.process_event(audio(1.0, 1.0, 0.3));
+    assert!(director.tick(1.0).is_none());
+    let instruction = director.tick(2.1);
+    assert!(
+        instruction.is_none(),
+        "expired pause boundary must be discarded: {instruction:?}"
+    );
+    assert!(director.pending().is_none());
+}
+
+#[test]
+fn late_forced_cut_discards_expired_boundary_and_uses_current_time() {
+    let mut director = Director::new(config()).expect("valid config");
+    director.process_event(audio(3.0, 0.0, 0.5));
+    let instruction = director.tick(5.2).expect("elapsed absolute cap must cut");
+    assert_eq!(instruction.reason, CutReason::ForcedMaximumShotDuration);
+    assert!(instruction.forced);
+    assert!(
+        instruction.expires_at >= 5.2,
+        "already-expired forced cut: {instruction:?}"
+    );
+    assert_eq!(instruction.cut_time, 5.2);
+    assert_eq!(instruction.expires_at, 6.2);
 }

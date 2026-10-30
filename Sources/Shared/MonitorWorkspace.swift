@@ -423,6 +423,9 @@ struct MonitorLUTChoice: Codable, Equatable, Sendable {
 /// How a target's frames are to be read, declared by the user per feed.
 /// Everything left nil comes from the frame's own attachments.
 struct MonitorSignalDeclaration: Codable, Equatable, Sendable {
+  /// The source picker's RGB encoding. Transport range, matrix and siting stay
+  /// with the source; the monitor's explicit range/log controls still override it.
+  var sourceProfileID: String?
   /// A camera log profile (`LogEncoding.profileID`, e.g.
   /// "sony-slog3-sgamut3cine"); nil reads the transfer from the frame's tags.
   var logProfileID: String?
@@ -431,7 +434,9 @@ struct MonitorSignalDeclaration: Codable, Equatable, Sendable {
   /// How the camera's log codes were carried.
   var transport: LogTransport = .native
 
-  init(logProfileID: String? = nil, range: CodeRange? = nil, transport: LogTransport = .native) {
+  init(logProfileID: String? = nil, range: CodeRange? = nil, transport: LogTransport = .native,
+    sourceProfileID: String? = nil) {
+    self.sourceProfileID = sourceProfileID
     self.logProfileID = logProfileID
     self.range = range
     self.transport = transport
@@ -443,15 +448,22 @@ struct MonitorSignalDeclaration: Codable, Equatable, Sendable {
   /// `signal` with this declaration applied.
   func applied(to signal: SignalDescription) -> SignalDescription {
     var value = signal
+    switch sourceProfileID {
+    case "rec709-video": value.primaries = .rec709; value.encoding = .display(.bt709)
+    case "rec2020-hlg-video": value.primaries = .rec2020; value.encoding = .display(.hlg)
+    case "rec2020-pq-video": value.primaries = .rec2020; value.encoding = .display(.pq)
+    default: break
+    }
     if let range { value.range = range }
     if let logEncoding { value.encoding = .log(logEncoding) }
     return value
   }
 
-  private enum CodingKeys: String, CodingKey { case logProfileID, range, transport }
+  private enum CodingKeys: String, CodingKey { case sourceProfileID, logProfileID, range, transport }
   init(from decoder: Decoder) throws {
     self.init()
     guard let c = try? decoder.container(keyedBy: CodingKeys.self) else { return }
+    sourceProfileID = (try? c.decodeIfPresent(String.self, forKey: .sourceProfileID)) ?? nil
     logProfileID = (try? c.decodeIfPresent(String.self, forKey: .logProfileID)) ?? nil
     range = (try? c.decodeIfPresent(CodeRange.self, forKey: .range)) ?? nil
     transport = ((try? c.decodeIfPresent(LogTransport.self, forKey: .transport)) ?? nil) ?? .native

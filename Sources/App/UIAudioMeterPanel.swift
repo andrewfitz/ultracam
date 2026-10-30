@@ -51,21 +51,34 @@ private struct UIAudioMeterTapView: View {
   let tap: AudioMeterTap
   let present: Bool
   let name: String?
-  @State private var meter: AudioMeter?
+  @State private var attachment: AudioMeterTap.Attachment?
+  @State private var displayedMeter: AudioMeter?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
       Group {
-        if let meter { AudioMeterView(meter: meter, present: present, name: name) } else { Color.clear }
+        if let meter = displayedMeter {
+          AudioMeterView(meter: meter, present: present, name: name).id(ObjectIdentifier(meter))
+        } else { Color.clear }
       }
       Text("Click OVER to reset the peaks; right-click to reset loudness. Loudness is measured while shown or recording, and starts over with each take.")
         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
-    .onAppear { meter = tap.attach() }
-    .onDisappear {
-      tap.detach()
-      meter = nil
+    .onAppear {
+      if attachment == nil { attachment = AudioMeterTap.Attachment(tap: tap) }
+      displayedMeter = attachment?.meter
     }
+    .task { @MainActor in
+      // A declaration changes the meter object, not its normal display-rate
+      // readings. Poll identity without invalidating the body while unchanged.
+      while !Task.isCancelled {
+        let current = attachment?.meter
+        if displayedMeter !== current { displayedMeter = current }
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch { return }
+      }
+    }
+    .onDisappear { displayedMeter = nil; attachment?.close(); attachment = nil }
   }
 }
 
@@ -100,23 +113,34 @@ private struct UILiveAudioMeterTapView: View {
   let name: String
   let present: Bool
   let style: LevelMeterStyle
-  @State private var meter: AudioMeter?
+  @State private var attachment: AudioMeterTap.Attachment?
+  @State private var displayedMeter: AudioMeter?
   private static let silence = AudioMeterTap.snapshot(statusPeaks: [0, 0])
 
   var body: some View {
     Group {
-      if let meter {
-        LevelMeterView(meter: meter, style: style, present: present, name: name)
+      if let meter = displayedMeter {
+        LevelMeterView(meter: meter, style: style, present: present, name: name).id(ObjectIdentifier(meter))
       } else {
         // Before the first appearance: two silent channels, the live meter's layout.
         LevelMeterView(snapshot: Self.silence, style: style, present: present, name: name)
       }
     }
-    .onAppear { meter = tap.attach() }
-    .onDisappear {
-      tap.detach()
-      meter = nil
+    .onAppear {
+      if attachment == nil { attachment = AudioMeterTap.Attachment(tap: tap) }
+      displayedMeter = attachment?.meter
     }
+    .task { @MainActor in
+      // A declaration changes the meter object, not its normal display-rate
+      // readings. Poll identity without invalidating the body while unchanged.
+      while !Task.isCancelled {
+        let current = attachment?.meter
+        if displayedMeter !== current { displayedMeter = current }
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch { return }
+      }
+    }
+    .onDisappear { displayedMeter = nil; attachment?.close(); attachment = nil }
   }
 }
 

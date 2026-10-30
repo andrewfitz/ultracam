@@ -18,6 +18,7 @@ logs_root="$artifact_root/logs"
 mkdir -p "$TMPDIR" "$test_root/modules" "$artifact_root" "$logs_root"
 if [[ "$compile_only" == false ]]; then
 python3 -m unittest discover -s "$task_root/Tests/BuildContracts" -v
+python3 -m unittest discover -s "$task_root/Tests/DiagnosticContracts" -v
 python3 -m unittest discover -s "$task_root/Tests/VendorSDK" -v
 python3 -m unittest discover -s "$task_root/Tests/BundleContracts" -v
 python3 -m unittest discover -s "$task_root/Tests/BoundaryContracts" -v
@@ -25,6 +26,11 @@ python3 -m unittest discover -s "$task_root/Tests/CIContracts" -v
 python3 -m unittest discover -s "$task_root/Tests/CPUPixelContracts" -v
 python3 "$task_root/scripts/check-vendor-boundaries.py"
 python3 "$task_root/scripts/check-cpu-pixel-access.py"
+python3 "$task_root/scripts/test-discovery-log-picker.py"
+python3 "$task_root/scripts/test-settings-intent.py"
+python3 "$task_root/scripts/test-source-ownership.py"
+python3 "$task_root/scripts/test-app-source-integration.py"
+python3 "$task_root/scripts/test-camera-standby-timing.py"
 fi
 package_log="$logs_root/monitor-package-$run_id.log"
 source "$task_root/scripts/monitor-kit-package.sh"
@@ -157,6 +163,8 @@ if skipped:
 else:
     print("App runtime: no skipped tests")
 PY_COVERAGE
+python3 "$task_root/scripts/check-gpu-proof-skips.py" --app "$test_log"
+python3 "$task_root/scripts/check-gpu-proof-skips.py" --package "$monitor_kit_test_log"
 python3 "$task_root/scripts/vendors.py" run-tests
 # MonitorKit's XCTest bundles, one "Executed" summary each after the run. A
 # skipped case is a successful platform-qualified outcome, but it is not

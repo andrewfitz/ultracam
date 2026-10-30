@@ -84,9 +84,10 @@ import XCTest
     guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal") }
     let processor = try LUTProcessor()
     var config = PipelineConfiguration(downscale: false)
-    config.sourceColorimetryOverride = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709,
+    let fullDeclaration = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709,
       range: .full, horizontalChromaSiting: .center, verticalChromaSiting: .center)
-    let full = try processor.process(packed(kCVPixelFormatType_422YpCbCr10, width: 128, fullRamp: true), configuration: config)
+    let full = try processor.process(packed(kCVPixelFormatType_422YpCbCr10, width: 128, fullRamp: true),
+      configuration: config, declaredSourceColorimetry: fullDeclaration)
     XCTAssertEqual(try code(full, plane: 0, x: 0), 16, accuracy: 1)
     XCTAssertEqual(try code(full, plane: 0, x: 127), 235, accuracy: 1)
     let source = try packed(kCVPixelFormatType_422YpCbCr10, width: 128, edge: true)
@@ -125,9 +126,10 @@ import XCTest
       range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
     CVBufferSetAttachment(source, kCVImageBufferMasteringDisplayColorVolumeKey, Data([1,2,3]) as CFData, .shouldPropagate)
     CVBufferSetAttachment(source, kCVImageBufferContentLightLevelInfoKey, Data([4,5]) as CFData, .shouldPropagate)
-    var config = PipelineConfiguration(downscale: false); config.sourceColorimetryOverride = from
+    let config = PipelineConfiguration(downscale: false)
     let output = try LUTProcessor().process(source, configuration: config,
-      colorConversion: .sourceToLUTInput(from: from, to: .rec709Video), destinationColorimetry: .rec709Video)
+      colorConversion: .sourceToLUTInput(from: from, to: .rec709Video), destinationColorimetry: .rec709Video,
+      declaredSourceColorimetry: from)
     XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferMasteringDisplayColorVolumeKey, nil))
     XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferContentLightLevelInfoKey, nil))
     XCTAssertEqual(try LUTProcessor.sourceColorimetry(output).transfer, .rec709)

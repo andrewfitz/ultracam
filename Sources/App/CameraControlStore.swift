@@ -238,19 +238,29 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             assignments[resolved.pluginID, default: [:]][feedID] = .init(camera: resolved, showOverlay: assignment(for: feedID)?.showOverlay ?? false, preparationRequest: request)
             persist(); addCamera(resolved)
             state.connected = true; state.dirty = true
+            // Pairing succeeded independently of whether the camera can read
+            // properties right now. Save only after confirmed connect, and do
+            // not let a vault failure prevent the initial settings read.
+            if saveCredentials, let supplied, let fingerprint = resolved.fingerprint, resolved.authenticationMode == .usernamePassword {
+                do {
+                    try await credentials.save(supplied, service: plugin.credentialService,
+                        account: plugin.credentialAccount(for: resolved, fingerprint: fingerprint))
+                    guard current(feedID, generation) else { return }
+                    state.hasSavedCredentials = true
+                    savedCredentialIdentities.insert(credentialKey(resolved))
+                } catch {
+                    guard current(feedID, generation) else { return }
+                    state.message = "Connected, but the camera sign-in could not be saved. \(error.localizedDescription)"
+                }
+            }
             let revision = state.invalidationRevision
             let properties = try await plugin.properties(feedID: feedID, generation: generation)
             guard current(feedID, generation) else { return }
             apply(properties, state: state, revision: revision)
-            if saveCredentials, let supplied, let fingerprint = resolved.fingerprint, resolved.authenticationMode == .usernamePassword {
-                try await credentials.save(supplied, service: plugin.credentialService, account: plugin.credentialAccount(for: resolved, fingerprint: fingerprint))
-                guard current(feedID, generation) else { return }
-                state.hasSavedCredentials = true
-                savedCredentialIdentities.insert(credentialKey(resolved))
-            }
         } catch {
             if !current(feedID, generation) { _ = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin); return }
-            state.message = error.localizedDescription; state.dirty = true
+            state.message = [state.message, error.localizedDescription].compactMap { $0 }.joined(separator: "\n")
+            state.dirty = true
             if !state.connected { _ = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin) }
         }
     }
@@ -278,7 +288,12 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     }
     func reset() {
         let cleanup = states.map { feed, state in (feed, state.generation, plugin(for: feed)) }
-        for feed in Array(states.keys) { retire(feed); manuallyDisconnected.insert(feed) }
+        for feed in Array(states.keys) {
+            retire(feed); manuallyDisconnected.insert(feed)
+            let state = state(for: feed)
+            state.properties = []; state.lastRefresh = nil
+            state.hasSavedCredentials = false; state.message = nil
+        }
         assignments = [:]; persist()
         for (feed, generation, plugin) in cleanup {
             if let plugin {
@@ -324,8 +339,10 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     }
     func set(_ property: ControlProperty, value: ControlValue, feedID: String) async {
         let state = state(for: feedID)
-        guard state.connected, !state.busy, !shuttingDown, property.writable, value.isValid,
-            property.options.isEmpty || property.options.contains(where: { $0.value == value }),
+        guard state.connected, !state.busy, !shuttingDown,
+            let currentProperty = state.properties.first(where: { $0.id == property.id }),
+            currentProperty.writable, value.isValid,
+            currentProperty.options.isEmpty || currentProperty.options.contains(where: { $0.value == value }),
             let plugin = plugin(for: feedID) else { return }
         let generation = state.generation
         state.busy = true; state.message = nil
@@ -351,7 +368,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         retire(feedID)
         if forget {
             for id in Array(assignments.keys) { assignments[id]?.removeValue(forKey: feedID) }
-            state.properties = []; state.lastRefresh = nil; persist()
+            state.properties = []; state.lastRefresh = nil; state.hasSavedCredentials = false; persist()
         }
         if let plugin {
             let message = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin)

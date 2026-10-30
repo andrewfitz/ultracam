@@ -151,6 +151,11 @@ final class LUTProcessor: @unchecked Sendable {
   private var nextCompletion: UInt64 = 0
   private var inFlightPeak = 0
   private var timingObserver: (@Sendable (CommandTiming) -> Void)?
+#if ULTRACAM_TEST_SUPPORT
+  /// Makes feedback unwinding observable after a slot becomes available.
+  /// Tests can prove idle retirement without relying on ARC scheduling races.
+  var afterSlotReleasedForTesting: (@Sendable () -> Void)?
+#endif
 
   // Pool allocations past this are an output stall (`outputBackPressure`).
   private var outputSlotBytes = 0
@@ -194,19 +199,21 @@ final class LUTProcessor: @unchecked Sendable {
   /// output buffer, and the MonitorLUT and intermediate texture of that frame.
   private final class InFlight: @unchecked Sendable {
     let output: CVPixelBuffer
-    let retained: [AnyObject]
-    let completion: Completion
+    var retained: [AnyObject]
+    var completion: Completion?
+    let slotIndex: Int
     var timing: FrameTiming
     var error: Error?
     var done = false
     /// Work to run right after this frame's completion, in order (frames the
     /// caller did not put on the GPU but must order behind this one).
     var followers: [@Sendable () -> Void] = []
-    init(output: CVPixelBuffer, retained: [AnyObject], completion: @escaping Completion, timing: FrameTiming) {
+    init(output: CVPixelBuffer, retained: [AnyObject], completion: @escaping Completion, timing: FrameTiming, slotIndex: Int) {
       self.output = output
       self.retained = retained
       self.completion = completion
       self.timing = timing
+      self.slotIndex = slotIndex
     }
   }
 
@@ -564,10 +571,11 @@ final class LUTProcessor: @unchecked Sendable {
   // MARK: - Synchronous wrappers (warm-up and tests)
 
   func process(_ input: CVPixelBuffer, configuration: PipelineConfiguration,
-    colorConversion: LUTColorSpaceConversion = .none, destinationColorimetry: Colorimetry? = nil) throws -> CVPixelBuffer {
+    colorConversion: LUTColorSpaceConversion = .none, destinationColorimetry: Colorimetry? = nil,
+    declaredSourceColorimetry: Colorimetry? = nil) throws -> CVPixelBuffer {
     if try validate(input, untouched: configuration.untouched && colorConversion == .none && destinationColorimetry == nil) { releaseIdleResources(); return input }
     return try waitFor { try submit(input, configuration: configuration, colorConversion: colorConversion,
-      destinationColorimetry: destinationColorimetry, completion: $0) }
+      destinationColorimetry: destinationColorimetry, declaredSourceColorimetry: declaredSourceColorimetry, completion: $0) }
   }
 
   /// Processing off: one GPU copy of the capture frame into an IOSurface this
@@ -685,7 +693,8 @@ final class LUTProcessor: @unchecked Sendable {
     }
     let applied = configuration.applyLUT ? lut : nil
     guard !configuration.applyLUT || applied != nil else { throw VideoError.message("Load a LUT or turn off Apply LUT.") }
-    let sourceColour = try configuration.sourceColorimetryOverride ?? declaredSourceColorimetry ?? Self.sourceColorimetry(input)
+    let sourceColour = (try declaredSourceColorimetry ?? Self.sourceColorimetry(input))
+      .overridingRGBEncoding(with: configuration.sourceColorimetryOverride)
     let nativeOutput = Colorimetry(primaries: sourceColour.primaries, transfer: sourceColour.transfer,
       matrix: sourceColour.matrix == .identity ? .rec709 : sourceColour.matrix, range: .video, horizontalChromaSiting: .center, verticalChromaSiting: .center)
     if configuration.applyLUT, let negotiated = configuration.lutOutputColorimetry,
@@ -700,8 +709,7 @@ final class LUTProcessor: @unchecked Sendable {
         .validate(source: sourceColour, destination: destination, conversion: colorConversion)
     }
     guard destination.range == .video, [.rec709, .rec2020, .rec601].contains(destination.matrix),
-      [.rec709, .rec2020].contains(destination.primaries),
-      [.rec709, .sRGB, .linear, .pq, .hlg].contains(destination.transfer) else {
+      destination.primaries != .unspecified, destination.transfer != .unspecified else {
       throw VideoError.message("Unsupported LUT output range or matrix.")
     }
     let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
@@ -724,6 +732,16 @@ final class LUTProcessor: @unchecked Sendable {
       parameters.decodeRange = sourceColour.range == .full ? SIMD4(0, 1020, 512, 1020) : SIMD4(64, 876, 512, 896)
       parameters.chroma.x = sourceColour.horizontalChromaSiting == .center ? 0.5 : 0
     }
+    // RGB samples are unpacked in native code units before normalization.
+    // Range belongs to the authoritative transport declaration, independently
+    // of a manual gamut/transfer interpretation or a LUT's RGB encoding.
+    let rgbBits: Int? = [kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA].contains(type) ? 8 :
+      (type == 0x72323130 ? 10 : (type == 0x5231324c ? 12 : nil))
+    if let rgbBits {
+      let maximum = Float((1 << rgbBits) - 1), scale = Float(1 << (rgbBits - 8))
+      parameters.decodeRange = SIMD4(sourceColour.range == .full ? 0 : 16 * scale,
+        sourceColour.range == .full ? maximum : 219 * scale, 0, 0)
+    }
     parameters.geometry.z = configuration.outputColor.isEightBit ? 8 : 10
     if configuration.applyLUT {
       parameters.inputConversion = try Self.conversionParameters(from: sourceColour, to: lutColorSpace.input)
@@ -737,7 +755,9 @@ final class LUTProcessor: @unchecked Sendable {
     // holds every output buffer is a stall, reported by the caller.
     let outputWidth = configuration.downscale ? configuration.width : width
     let outputHeight = configuration.downscale ? configuration.height : height
-    guard outputWidth.isMultiple(of: 2), !configuration.outputColor.is420 || outputHeight.isMultiple(of: 2) else {
+    // 422 keeps an odd image width: CoreVideo rounds only the chroma plane.
+    // 420 output contracts still require complete 2×2 blocks.
+    guard !configuration.outputColor.is420 || (outputWidth.isMultiple(of: 2) && outputHeight.isMultiple(of: 2)) else {
       throw VideoError.message("The selected YUV output requires even chroma geometry; choose a resized output.")
     }
     let pool = try preparePool(configuration, width: outputWidth, height: outputHeight)
@@ -970,7 +990,7 @@ final class LUTProcessor: @unchecked Sendable {
   private func dispatchBlocks(_ encoder: MTL4ComputeCommandEncoder, state: MTLComputePipelineState,
     width: Int, height: Int, is420: Bool) {
     let w = state.threadExecutionWidth
-    encoder.dispatchThreads(threadsPerGrid: MTLSize(width: width / 2, height: is420 ? height / 2 : height, depth: 1),
+    encoder.dispatchThreads(threadsPerGrid: MTLSize(width: (width + 1) / 2, height: is420 ? height / 2 : height, depth: 1),
       threadsPerThreadgroup: MTLSize(width: w, height: max(1, min(8, state.maxTotalThreadsPerThreadgroup / w)), depth: 1))
   }
 
@@ -1097,7 +1117,8 @@ final class LUTProcessor: @unchecked Sendable {
     let cacheRetained: [AnyObject] = outputCacheLock.withLock {
       outputTextures.values.filter { $0.lastUsed == sequence }.map { $0 as AnyObject }
     }
-    let record = InFlight(output: output, retained: retained + cacheRetained, completion: completion, timing: timing)
+    let record = InFlight(output: output, retained: retained + cacheRetained, completion: completion, timing: timing,
+      slotIndex: Int(sequence % UInt64(slots.count)))
     stateLock.withLock {
       pending[sequence] = record
       inFlightPeak = max(inFlightPeak, pending.count)
@@ -1165,12 +1186,21 @@ final class LUTProcessor: @unchecked Sendable {
       let result: Result<CVPixelBuffer, Error> = record.error.map {
         .failure(VideoError.message("GPU processing failed: \($0.localizedDescription)"))
       } ?? .success(record.output)
-      record.completion(Completed(result: result, timing: record.timing))
+      record.completion?(Completed(result: result, timing: record.timing))
       record.followers.forEach { $0() }
-      withExtendedLifetime(record.retained) {}
-      // After the completion has handed the frame on, so a caller that waits
-      // for idle sees every completion already dispatched.
+      // GPU feedback proves this slot is finished, and callbacks have returned.
+      // Retire captures explicitly before making the slot available: ARC may
+      // keep the ready array alive until this feedback handler unwinds, after
+      // waitUntilIdle has already acquired every permit on another queue.
+      record.completion = nil
+      record.followers.removeAll()
+      slots[record.slotIndex].inputResidency.removeAllAllocations()
+      slots[record.slotIndex].inputResidency.commit()
+      record.retained.removeAll()
       slotPermits.signal()
+#if ULTRACAM_TEST_SUPPORT
+      afterSlotReleasedForTesting?()
+#endif
     }
   }
 

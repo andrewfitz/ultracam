@@ -254,6 +254,34 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try Data(contentsOf: target), original)
   }
 
+  func testSelectedSymlinkRootPassesRecoveryContainmentWithoutAllowingFeedEscapes() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let real = root.appendingPathComponent("real")
+    try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+    let alias = root.appendingPathComponent("alias")
+    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: real)
+    let manager = try RecordingOutputManager(rootDirectory: alias, minimumFreeBytes: 0)
+    let partial = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data("not a movie".utf8).write(to: partial.temporaryURL)
+    partial.preserveForRecovery()
+    let take = try XCTUnwrap(RecordingRecovery.scan(root: alias).first)
+    XCTAssertEqual(take.temporaryURL.resolvingSymlinksInPath(), partial.temporaryURL.resolvingSymlinksInPath())
+    let outside = root.appendingPathComponent("outside")
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: real.appendingPathComponent("escape"), withDestinationURL: outside)
+    XCTAssertEqual(try RecordingRecovery.scan(root: alias).count, 1)
+    let done = expectation(description: "Selected root admitted; invalid media refused")
+    Task {
+      do { _ = try await RecordingRecovery.recover(take, root: alias); XCTFail("Invalid media recovered") }
+      catch RecordingOutputError.unsafePath { XCTFail("Selected root alias must pass containment") }
+      catch { }
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 5)
+    XCTAssertEqual(try Data(contentsOf: partial.temporaryURL), Data("not a movie".utf8))
+  }
+
   func testRecoveryFailurePreservesOriginalAndCanBeRetried() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

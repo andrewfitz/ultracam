@@ -26,6 +26,9 @@ import Foundation
 final class ProgramOutputBridge: @unchecked Sendable {
   struct Statistics: Equatable, Sendable {
     var delivered: UInt64 = 0
+    var clockSkipped: UInt64 = 0
+    var clockRepeated: UInt64 = 0
+    var pacingDiscontinuities: UInt64 = 0
     /// CMIO's sink queue was full: the camera client is not keeping up.
     var dropped: UInt64 = 0
     var invalid: UInt64 = 0
@@ -60,6 +63,16 @@ final class ProgramOutputBridge: @unchecked Sendable {
   private let disconnectSink: Disconnect
   private let sendSink: Send
   private let hostClock: () -> CMTime
+  private let paced: Bool
+  typealias ScheduleHostWake = (CMTime, @escaping @Sendable () -> Void) -> Void
+  private let scheduleHostWake: ScheduleHostWake?
+  private var pacedImage: ProcessedFrame<CVPixelBuffer>?
+  private var pacedRemaining = 0
+  private var pacedNextTime: CMTime?
+  private var pacedFreshTime: CMTime?
+  private var pacedWakeTime: CMTime?
+  private var pacedGeneration: UInt64 = 0
+  private var pacedRouteGeneration: UInt64?
   private let sampleFactory = VideoSampleFactory()  // sendQueue only
   // sendQueue only: Program → host clock offset for the current connection.
   private var hostOffset: CMTime?
@@ -84,13 +97,13 @@ final class ProgramOutputBridge: @unchecked Sendable {
   private var enforcesContract = false
 
   /// The production bridge uses the dedicated Program CMIO destination.
-  convenience init(route: FrameRoute<CVPixelBuffer>, queueLabel: String = "org.ultracam.program-output-bridge") {
+  convenience init(route: FrameRoute<CVPixelBuffer>, queueLabel: String = "org.ultracam.program-output-bridge", paced: Bool = false) {
     let sink = CameraSink(route: CameraSinkRoute(descriptor: .program()))
     self.init(route: route, connect: { configuration, passthroughFormat in
       try sink.connect(configuration: configuration, passthroughFormat: passthroughFormat)
     }, disconnect: { sink.disconnect() }, send: { sample in
       try sink.send(sample)
-    }, queueLabel: queueLabel)
+    }, queueLabel: queueLabel, paced: paced)
   }
 
   /// Injectable sink operations keep lifecycle and ownership tests independent
@@ -99,8 +112,11 @@ final class ProgramOutputBridge: @unchecked Sendable {
   init(route: FrameRoute<CVPixelBuffer>, connect: @escaping Connect,
        disconnect: @escaping Disconnect, send: @escaping Send,
        queueLabel: String = "org.ultracam.program-output-bridge",
-       hostClock: @escaping () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) }) {
+       hostClock: @escaping () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) },
+       paced: Bool = false, scheduleHostWake: ScheduleHostWake? = nil) {
     self.route = route
+    self.paced = paced
+    self.scheduleHostWake = scheduleHostWake
     connectSink = connect
     disconnectSink = disconnect
     sendSink = send
@@ -294,7 +310,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
       link = .connecting  // blocks sends while the sink closes
       return linked
     }
-    sendQueue.sync {}
+    sendQueue.sync { clearPacing() }
     if wasLinked { disconnectSink() }
     let handler = locked { () -> (@Sendable (ProgramOutputFormat?) -> Void)? in
       link = .disconnected
@@ -348,6 +364,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
 
   private func pumpOnSendQueue() {
     locked { pumpScheduled = false }
+    if paced { pumpPacedOnSendQueue(); return }
     while let lease = route.dequeue() {
       defer { lease.release() }
       let (connected, expected, connection) = locked { () -> (Bool, ProgramOutputFormat?, UInt64) in
@@ -424,6 +441,150 @@ final class ProgramOutputBridge: @unchecked Sendable {
       }
     }
   }
+  private func clearPacing() {
+    pacedImage = nil
+    pacedRemaining = 0
+    pacedNextTime = nil
+    pacedFreshTime = nil
+    pacedWakeTime = nil
+    pacedGeneration &+= 1
+  }
+
+  private func wakePacer(at deadline: CMTime) {
+    if let scheduled = pacedWakeTime, CMTimeCompare(scheduled, deadline) <= 0 { return }
+    pacedWakeTime = deadline
+    let generation = pacedGeneration
+    let wake: @Sendable () -> Void = { [weak self] in
+      guard let self else { return }
+      self.sendQueue.async { [weak self] in
+        guard let self, self.pacedGeneration == generation else { return }
+        self.pacedWakeTime = nil
+        self.pumpPacedOnSendQueue()
+      }
+    }
+    if let scheduleHostWake { scheduleHostWake(deadline, wake) }
+    else {
+      sendQueue.asyncAfter(deadline: .now() + max(0, CMTimeGetSeconds(CMTimeSubtract(deadline, hostClock()))), execute: wake)
+    }
+  }
+
+  /// The connected camera owns a host-anchored CFR clock. A source frame is
+  /// selected at each deadline; repeats remain one retained image/schedule.
+  /// Up to two source images of phase error absorb jitter. Sustained faster
+  /// clocks skip source images; slower clocks repeat the last image. Neither
+  /// correction changes negotiated sample durations or host-grid spacing.
+  private func pumpPacedOnSendQueue() {
+    let state = locked { (link == .connected && demand, connection, enforcesContract ? contractWithoutLock() : nil) }
+    guard state.0, !route.isCancelled else { clearPacing(); drainRoute(); return }
+    let generation = route.generation
+    if pacedRouteGeneration != generation {
+      clearPacing()
+      pacedRouteGeneration = generation
+    }
+    if anchoredConnection != state.1 {
+      clearPacing()
+      anchoredConnection = state.1
+      lastSentTime = nil
+      outputAdmission = nil
+    }
+    let now = hostClock()
+    if let deadline = pacedNextTime, CMTimeCompare(now, deadline) < 0 {
+      wakePacer(at: deadline)
+      return
+    }
+    if pacedRemaining == 0 {
+      // Program rate conversion may discard images ahead of the host clock;
+      // this is counted separately from transport refusal/backpressure.
+      while route.pendingCount > 2 {
+        guard let skipped = route.dequeue() else { break }
+        let repeats = skipped.metadata?.repeatCount ?? 1
+        skipped.release()
+        locked { statistics.clockSkipped &+= UInt64(repeats) }
+      }
+      if let lease = route.dequeue() {
+        guard let image = lease.payload, let metadata = lease.metadata,
+          metadata.duration.isNumeric, metadata.duration.value > 0,
+          metadata.presentationTime.isNumeric,
+          CVPixelBufferGetWidth(image) == metadata.width,
+          CVPixelBufferGetHeight(image) == metadata.height,
+          CVPixelBufferGetPixelFormatType(image) == OSType(metadata.pixelFormat) else {
+          lease.release()
+          locked { statistics.invalid &+= 1 }
+          schedulePump()
+          return
+        }
+        if let expected = state.2 {
+          do {
+            if outputAdmission?.format != expected {
+              outputAdmission = (expected, DerivedOutputContract(format: try expected.formatDescription(), duration: expected.duration))
+            }
+            if !expected.matches(metadata) || !DerivedOutputContract.sameDuration(metadata.duration, expected.duration) ||
+              outputAdmission?.contract.mismatch(image: image, time: metadata.presentationTime, duration: metadata.duration) != nil {
+              lease.release()
+              locked { statistics.staleFormat &+= 1 }
+              schedulePump()
+              return
+            }
+          } catch {
+            lease.release()
+            locked { statistics.invalid &+= 1 }
+            return
+          }
+        }
+        pacedImage = ProcessedFrame(payload: image, metadata: metadata, onReleased: { lease.release() })
+        pacedRemaining = metadata.repeatCount
+        pacedFreshTime = now
+      }
+    }
+    guard let frame = pacedImage else { return }
+    let duration = frame.metadata.duration
+    if let fresh = pacedFreshTime, CMTimeCompare(now, fresh) > 0,
+      CMTimeGetSeconds(CMTimeSubtract(now, fresh)) >= frame.metadata.maximumRepeatDuration {
+      locked { statistics.clockSkipped &+= UInt64(pacedRemaining); statistics.pacingDiscontinuities &+= 1 }
+      clearPacing()
+      if route.pendingCount > 0 { schedulePump() }
+      return
+    }
+    var time = pacedNextTime ?? lastSentTime.map { CMTimeMaximum(now, CMTimeAdd($0, duration)) } ?? now
+    if CMTimeCompare(time, now) > 0 {
+      pacedNextTime = time
+      wakePacer(at: time)
+      return
+    }
+    // A starved send queue consumes missed scheduled slots, rather than
+    // replaying an old schedule after the host clock has passed its window.
+    if CMTimeGetSeconds(CMTimeSubtract(now, time)) > 2 * duration.seconds {
+      let missed = Int(ceil(CMTimeGetSeconds(CMTimeSubtract(now, time)) / duration.seconds))
+      pacedRemaining = max(0, pacedRemaining - missed)
+      time = CMTimeAdd(time, CMTimeMultiplyByFloat64(duration, multiplier: Double(missed)))
+      locked { statistics.clockSkipped &+= UInt64(missed); statistics.pacingDiscontinuities &+= 1 }
+    }
+    if pacedRemaining == 0 { locked { statistics.clockRepeated &+= 1 } }
+    else { pacedRemaining -= 1 }
+    do {
+      let sample = try sampleFactory.sample(frame.payload, at: time, duration: duration)
+      let accepted = try sendSink(sample)
+      lastSentTime = time
+      locked {
+        if Thread.isMainThread { statistics.mainThreadSends &+= 1 }
+        if accepted { statistics.delivered &+= 1; deliveredOnConnection &+= 1 }
+        else { statistics.dropped &+= 1 }
+      }
+    } catch {
+      locked { statistics.sendErrors &+= 1; if link == .connected { link = .failed } }
+      scheduleReconnect(after: 0)
+      return
+    }
+    pacedNextTime = CMTimeAdd(time, duration)
+    wakePacer(at: pacedNextTime!)
+  }
+
+  /// Called only with the state lock held.
+  private func contractWithoutLock() -> ProgramOutputFormat? {
+    guard let configuration, let passthroughFormat else { return nil }
+    return ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat)
+  }
+
 }
 
 extension ProgramOutputBridge {

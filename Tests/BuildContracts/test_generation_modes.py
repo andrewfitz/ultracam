@@ -172,6 +172,20 @@ class GenerationModeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('generate_project.py', result.stderr)
 
+    def test_relative_inventory_from_other_cwd_uses_checkout_path_in_guard(self):
+        self.write('profiles/present.json', json.dumps({'sony': True}))
+        subprocess.run([sys.executable, str(self.root / 'scripts/generate_project.py'),
+                        '--sdk-inventory', 'profiles/present.json'], cwd=self.root.parent,
+                       env=self.environment, check=True, capture_output=True)
+        objects = json.loads(subprocess.check_output(['plutil', '-convert', 'json', '-o', '-',
+            str(self.root / 'Ultracam.xcodeproj/project.pbxproj')]))['objects']
+        guard = next(value['shellScript'] for value in objects.values()
+                     if value.get('name') == 'Check Vendor Inputs')
+        self.assertIn(str(self.root / 'profiles/present.json'), guard)
+        result = subprocess.run(['/bin/sh', '-c', guard], cwd=self.root.parent,
+                                env=dict(self.environment, SRCROOT=str(self.root)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

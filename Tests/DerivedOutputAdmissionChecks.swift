@@ -74,7 +74,28 @@ import XCTest
     config.sourceColorimetryOverride = pq
     let interpreted = try CameraSink.requestedFormat(configuration: config,
       passthroughFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, sourceFormat: source(.rec709Video))
-    XCTAssertTrue(DerivedOutputContract.matchesFormat(interpreted, descriptions[96]))
+    // A source profile changes RGB encoding only. The no-LUT GPU path keeps
+    // the declared source matrix, so this mixed contract cannot select the
+    // published PQ entry whose physical output matrix is Rec.2020.
+    let resolved = try CameraSink.resolvedOutputColour(configuration: config, sourceFormat: source(.rec709Video))
+    XCTAssertEqual(resolved.primaries, .rec2020)
+    XCTAssertEqual(resolved.transfer, .pq)
+    XCTAssertEqual(resolved.matrix, .rec709)
+    XCTAssertEqual(resolved.range, .video)
+    XCTAssertEqual(resolved.horizontalChromaSiting, .center)
+    XCTAssertEqual(resolved.verticalChromaSiting, .center)
+    XCTAssertEqual(CMFormatDescriptionGetExtension(interpreted,
+      extensionKey: kCMFormatDescriptionExtension_YCbCrMatrix) as? String,
+      kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String)
+    XCTAssertNil(DerivedOutputContract(format: interpreted, duration: config.duration)
+      .matchingPublishedIndex(in: descriptions))
+    // The same RGB override on a physically Rec.2020-matrix source exactly
+    // matches the published PQ contract, including centered encoded chroma.
+    let interpreted2020 = try CameraSink.requestedFormat(configuration: config,
+      passthroughFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, sourceFormat: source(log))
+    XCTAssertTrue(DerivedOutputContract.matchesFormat(interpreted2020, descriptions[96]))
+    XCTAssertEqual(DerivedOutputContract(format: interpreted2020, duration: config.duration)
+      .matchingPublishedIndex(in: descriptions), 96)
     config.applyLUT = true
     XCTAssertThrowsError(try CameraSink.requestedFormat(configuration: config,
       passthroughFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, sourceFormat: source(.rec709Video)))

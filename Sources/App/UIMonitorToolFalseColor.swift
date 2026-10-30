@@ -8,12 +8,9 @@ import SwiftUI
 /// declared camera profile it reads; six band and custom need none.
 enum UIFalseColorChoices {
   /// The camera log profiles a camera can be declared as.
-  static let profiles: [(id: String, title: String)] = [
-    ("sony-slog3-sgamut3cine", "Sony S-Gamut3.Cine / S-Log3"),
-    ("sony-slog3-sgamut3", "Sony S-Gamut3 / S-Log3"),
-    (ARRIFalseColorProfile.logC3EI800.rawValue, ARRIFalseColorProfile.logC3EI800.displayName),
-    (ARRIFalseColorProfile.alexa35LogC4EI800.rawValue, ARRIFalseColorProfile.alexa35LogC4EI800.displayName),
-  ]
+  static let profiles: [(id: String, title: String)] = SourceColorSpaceCatalog.logProfiles.map {
+    (id: $0.id, title: $0.title)
+  }
 
   /// The modes, in menu order.
   static let modes: [FalseColorMode] = [.off, .sonySLog3, .arriStyleSLog3, .arriLogC, .sixBand, .custom]
@@ -253,9 +250,9 @@ struct UIFalseColorLegendSection: View {
     }
   }
 
-  @ViewBuilder static func legend(settings: FalseColorSettings, signal: SignalDescription,
+  @ViewBuilder static func legend(settings: FalseColorSettings, signal: SignalDescription, layout: PixelLayout? = nil,
     unavailable: MonitorUnavailableReason?) -> some View {
-    if let legend = FalseColorLegend(settings: settings, signal: signal) {
+    if let legend = FalseColorLegend(settings: settings, signal: signal, layout: layout) {
       UIToolGroup("Legend") {
         UIFalseColorLegendGrid(legend: legend, unavailable: unavailable)
       } accessory: {
@@ -278,6 +275,7 @@ struct UIFalseColorLegendSection: View {
     var body: some View {
       UIFalseColorLegendSection.legend(settings: settings,
         signal: declaration.applied(to: presenter.shownSignal ?? SignalDescription()),
+        layout: presenter.shownLayout,
         unavailable: presenter.shownStatus.reason(for: .falseColor))
     }
   }

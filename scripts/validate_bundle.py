@@ -16,6 +16,9 @@ def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_rele
              architectures=None, release_evidence=None):
     app = Path(app)
     extension = app / "Contents/Library/SystemExtensions/org.ultracam.app.camera.systemextension"
+    host_info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    local_build = host_info.get("UltracamLocalDevelopmentBuild") is True
+    runtime_group = "group.org.ultracam.local" if local_build else "group.org.ultracam.shared"
     for bundle, identifier, kind in (
         (app, "org.ultracam.app", "APPL"),
         (extension, "org.ultracam.app.camera", "SYSX"),
@@ -40,6 +43,12 @@ def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_rele
             else:
                 template = Path(root) / "Config/App.entitlements"
                 app_entitlements = plistlib.loads(template.read_bytes())
+            if app_entitlements.get("com.apple.security.app-sandbox") is not True:
+                raise ValueError("Host must enable the app sandbox.")
+            if app_entitlements.get("com.apple.developer.system-extension.install") is not True:
+                raise ValueError("Host must allow system-extension installation.")
+            if runtime_group not in app_entitlements.get("com.apple.security.application-groups", []):
+                raise ValueError("Host is missing the runtime shared app group.")
             if app_entitlements.get("com.apple.security.files.user-selected.read-write") is not True:
                 raise ValueError("Recording requires read/write access to user-selected folders.")
             if app_entitlements.get("com.apple.security.files.user-selected.read-only"):
@@ -62,7 +71,13 @@ def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_rele
                 # Unsigned builds still need to match the configured app group.
                 template = Path(root) / "Config/Camera.entitlements"
                 entitlements = plistlib.loads(template.read_bytes())
+            if (info.get("UltracamLocalDevelopmentBuild") is True) != local_build:
+                raise ValueError("Host and camera local-development modes must match.")
+            if entitlements.get("com.apple.security.app-sandbox") is not True:
+                raise ValueError("Camera extension must enable the app sandbox.")
             groups = entitlements.get("com.apple.security.application-groups", [])
+            if runtime_group not in groups or not service.startswith(runtime_group + "."):
+                raise ValueError("Camera extension must use the runtime shared app group.")
             if entitlements.get("com.apple.security.cs.disable-library-validation"):
                 raise ValueError("The camera extension must retain library validation; only the host loads DeckLink.")
             if not any(service.startswith(group + ".") for group in groups):
@@ -295,31 +310,32 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
         arches = set(_tool(runner, ["/usr/bin/lipo", "-archs", str(binary)]).split())
         if not required_architectures.issubset(arches):
             raise ValueError(f"Missing architecture {sorted(required_architectures - arches)} in {binary}")
-        load = "\n".join(_tool(runner, ["/usr/bin/otool", "-arch", arch, "-L", str(binary)]) for arch in required_architectures)
-        dependencies = {line.strip().split(" (compatibility version", 1)[0] for line in load.splitlines()
-                        if line[:1].isspace() and " (compatibility version" in line}
-        dependencies -= expected_embeds.get(binary, set())
-        # Other app/debug dylibs also list their own LC_ID_DYLIB in otool -L.
-        if binary.suffix == ".dylib":
-            dependencies -= _install_names(binary, runner, required_architectures)
-        commands = "\n".join(_tool(runner, ["/usr/bin/otool", "-arch", arch, "-l", str(binary)]) for arch in required_architectures).splitlines()
-        rpaths = []
-        for index, line in enumerate(commands):
-            if line.strip() == "cmd LC_RPATH":
-                for following in commands[index + 1:index + 4]:
-                    if following.strip().startswith("path "):
-                        rpaths.append(following.strip()[5:].rsplit(" (offset", 1)[0])
-        metadata[binary] = (dependencies, rpaths)
+        metadata[binary] = {}
+        for arch in required_architectures:
+            load = _tool(runner, ["/usr/bin/otool", "-arch", arch, "-L", str(binary)])
+            dependencies = {line.strip().split(" (compatibility version", 1)[0] for line in load.splitlines()
+                            if line[:1].isspace() and " (compatibility version" in line}
+            # LC_ID_DYLIB belongs to this slice, just like LC_LOAD_DYLIB and LC_RPATH.
+            if binary.suffix == ".dylib" or binary in expected_embeds:
+                dependencies -= _install_names(binary, runner, [arch])
+            commands = _tool(runner, ["/usr/bin/otool", "-arch", arch, "-l", str(binary)]).splitlines()
+            rpaths = []
+            for index, line in enumerate(commands):
+                if line.strip() == "cmd LC_RPATH":
+                    for following in commands[index + 1:index + 4]:
+                        if following.strip().startswith("path "):
+                            rpaths.append(following.strip()[5:].rsplit(" (offset", 1)[0])
+            metadata[binary][arch] = (dependencies, rpaths)
     resolved_binaries = {p.resolve(): p for p in metadata}
     visited = set()
     reached = set()
-    def inspect_dependencies(binary, inherited, executable):
-        reached.add(binary)
-        dependencies, rpaths = metadata[binary]
+    def inspect_dependencies(binary, architecture, inherited, executable):
+        reached.add((binary, architecture))
+        dependencies, rpaths = metadata[binary][architecture]
         def expand(value):
             return value.replace("@loader_path", str(binary.parent)).replace("@executable_path", str(executable.parent))
         search_paths = list(dict.fromkeys([expand(value) for value in rpaths] + inherited))
-        key = (binary, tuple(search_paths), executable)
+        key = (binary, architecture, tuple(search_paths), executable)
         if key in visited:
             return
         visited.add(key)
@@ -333,24 +349,45 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
                     raise ValueError(f"Camera extension links external vendor dependency: {dependency}")
                 continue
             candidates = [Path(folder) / dependency[len("@rpath/"): ] for folder in search_paths] if dependency.startswith("@rpath/") else [Path(expand(dependency))]
-            # Shared-cache-only libraries still need precise path membership.
-            if any(system_library_available(candidate) for candidate in candidates):
+            # dyld searches in order: an existing external match must not be
+            # hidden by a later bundled or shared-cache candidate.
+            target = None
+            external_target = False
+            for candidate in candidates:
+                if system_library_available(candidate):
+                    external_target = True
+                    break
+                if not candidate.exists():
+                    continue
+                resolved = candidate.resolve()
+                if not resolved.is_relative_to(app):
+                    allowed = any(resolved.is_relative_to(Path(driver).resolve()) for driver in external_drivers)
+                    if not allowed or binary.is_relative_to(extension):
+                        raise ValueError(f"External non-system dependency {dependency} resolves to {candidate} in {binary}")
+                    external_target = True
+                    break
+                target = resolved_binaries.get(resolved)
+                # An existing unvalidated file also stops lookup; never fall
+                # through to a later Mach-O with the same basename.
+                if target is None:
+                    raise ValueError(f"Unvalidated dependency {dependency} resolves to {candidate} in {binary}")
+                break
+            if external_target:
                 continue
-            target = next((resolved_binaries[candidate.resolve()] for candidate in candidates
-                           if candidate.resolve().is_relative_to(app) and candidate.resolve() in resolved_binaries), None)
             if target is None:
                 raise ValueError(f"Unresolved non-system dependency {dependency} in {binary}")
             if binary.is_relative_to(extension) and not target.is_relative_to(extension):
                 raise ValueError(f"Camera extension dependency escapes its bundle: {dependency}")
-            inspect_dependencies(target, search_paths, executable)
+            inspect_dependencies(target, architecture, search_paths, executable)
     roots = [host] + [p for p in extension.glob("Contents/MacOS/*") if p in metadata] + list(expected_embeds) + list(metadata)
-    for binary in roots:
-        if binary in reached:
-            continue
-        executable = next((p for p in extension.glob("Contents/MacOS/*") if p in metadata), host) if binary.is_relative_to(extension) else host
-        inherited = [value.replace("@loader_path", str(executable.parent)).replace("@executable_path", str(executable.parent))
-                     for value in metadata.get(executable, ([], []))[1]]
-        inspect_dependencies(binary, inherited, executable)
+    for architecture in required_architectures:
+        for binary in roots:
+            if (binary, architecture) in reached:
+                continue
+            executable = next((p for p in extension.glob("Contents/MacOS/*") if p in metadata), host) if binary.is_relative_to(extension) else host
+            inherited = [value.replace("@loader_path", str(executable.parent)).replace("@executable_path", str(executable.parent))
+                         for value in metadata.get(executable, {}).get(architecture, ([], []))[1]]
+            inspect_dependencies(binary, architecture, inherited, executable)
     if signed:
         for code in list(metadata) + [extension, app]:
             result = runner(["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(code)], capture_output=True, text=True)

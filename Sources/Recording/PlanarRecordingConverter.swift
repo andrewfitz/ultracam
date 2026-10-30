@@ -7,7 +7,8 @@ import Metal
 /// Recording-only native planar conversion. No resize or chroma resampling:
 /// 420f maps to video-range 420v; I420 interleaves separate U/V into 420v.
 /// P216/PA16 quantize native 16-bit codes to x422; PA16 alpha is validated,
-/// retained, and explicitly ignored. Native 420v goes directly to HEVC Main.
+/// retained, and explicitly ignored. Video-range 420v can go directly to HEVC
+/// Main; authoritative full-range 420v is requantized into distinct storage.
 final class PlanarRecordingConverter: @unchecked Sendable {
   enum ConversionError: Error { case unavailable, unsupportedFormat, invalidLayout, gpuFailed(String), timedOut }
   private let device: MTLDevice
@@ -17,7 +18,7 @@ final class PlanarRecordingConverter: @unchecked Sendable {
   let budget: GPUAllocationBudget
 
   static func supports(source: OSType, destination: OSType) -> Bool {
-    ([kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, OSType(0x49343230)].contains(source) && destination == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ||
+    ([kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, OSType(0x49343230)].contains(source) && destination == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ||
       ([OSType(0x50323136), OSType(0x50413136)].contains(source) && destination == kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
   }
 

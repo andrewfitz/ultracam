@@ -125,6 +125,14 @@ static BOOL fail(NSError **error, NSString *message, NSInteger code = 1) {
 // resources automatically; callback/frame references have independent lives.
 template <typename T> struct ComRef {
   T *value = nullptr;
+  ComRef() = default;
+  ComRef(const ComRef &) = delete;
+  ComRef &operator=(const ComRef &) = delete;
+  ComRef(ComRef &&other) noexcept : value(other.take()) {}
+  ComRef &operator=(ComRef &&other) noexcept {
+    if (this != &other) { reset(); value = other.take(); }
+    return *this;
+  }
   ~ComRef() { if (value) value->Release(); }
   T **out() { return &value; }
   T *operator->() const { return value; }
@@ -170,12 +178,15 @@ static HRESULT advertiseHDR(IDeckLink *device, ComRef<IDeckLinkHDMIInputEDID> &h
   return S_OK;
 }
 
-// Session-only HDMI selection. Never persist device preferences. Restore only
-// the value this session still owns, preserving a subsequent outside change.
+// Session-only video and embedded-audio selection. Never persist device
+// preferences. Restore each setting only while this session still owns it,
+// preserving subsequent outside changes.
 // The EDID is not the session's: see advertiseHDR.
 struct HDMILease {
   ComRef<IDeckLinkConfiguration> configuration;
   int64_t previous = bmdVideoConnectionHDMI;
+  int64_t previousAudio = bmdAudioConnectionEmbedded;
+  bool audioChanged = false;
   bool changed = false;
   bool started = false;
   BMDVideoConnection selected = bmdVideoConnectionHDMI;
@@ -190,21 +201,38 @@ struct HDMILease {
     int64_t current = 0;
     if (changed && configuration && configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &current) == S_OK && current == selected)
       configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, previous);
+    if (audioChanged && configuration && configuration->GetInt(bmdDeckLinkConfigAudioInputConnection, &current) == S_OK && current == bmdAudioConnectionEmbedded)
+      configuration->SetInt(bmdDeckLinkConfigAudioInputConnection, previousAudio);
+    audioChanged = false;
     changed = false;
   }
   HRESULT select(IDeckLink *device, BMDVideoConnection connection = bmdVideoConnectionHDMI) {
     selected = connection;
     HRESULT status = device->QueryInterface(IID_IDeckLinkConfiguration, reinterpret_cast<void **>(configuration.out()));
     if (status != S_OK) return status;
+    ComRef<IDeckLinkProfileAttributes> attributes;
+    int64_t audioConnections = 0;
+    status = device->QueryInterface(IID_IDeckLinkProfileAttributes, reinterpret_cast<void **>(attributes.out()));
+    if (status == S_OK) status = attributes->GetInt(BMDDeckLinkAudioInputConnections, &audioConnections);
+    if (status != S_OK || !(audioConnections & bmdAudioConnectionEmbedded)) return E_NOINTERFACE;
     status = configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &previous);
-    if (status != S_OK || previous == selected) return status;
-    status = configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, selected);
-    changed = status == S_OK;
-    if (status == S_OK) {
+    if (status != S_OK) return status;
+    if (previous != selected) {
+      status = configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, selected);
+      changed = status == S_OK;
       int64_t actual = 0;
-      status = configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &actual);
+      if (status == S_OK) status = configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &actual);
       if (status == S_OK && actual != selected) status = E_FAIL;
     }
+    if (status == S_OK) status = configuration->GetInt(bmdDeckLinkConfigAudioInputConnection, &previousAudio);
+    if (status == S_OK && previousAudio != bmdAudioConnectionEmbedded) {
+      status = configuration->SetInt(bmdDeckLinkConfigAudioInputConnection, bmdAudioConnectionEmbedded);
+      audioChanged = status == S_OK;
+    }
+    int64_t actualAudio = 0;
+    if (status == S_OK) status = configuration->GetInt(bmdDeckLinkConfigAudioInputConnection, &actualAudio);
+    if (status == S_OK && actualAudio != bmdAudioConnectionEmbedded) status = E_FAIL;
+    if (status != S_OK) restoreConnector();
     return status;
   }
 };
@@ -217,8 +245,7 @@ static NSString *deviceIdentifier(IDeckLink *device, NSUInteger index) {
       attributes->GetInt(BMDDeckLinkPersistentID, &persistentID) == S_OK) {
     return [NSString stringWithFormat:@"decklink:%016llx", (unsigned long long)persistentID];
   }
-  // Legacy devices without persistent IDs are distinguished within the current
-  // iterator; start re-enumerates and verifies this same identifier.
+  // The registry supplies an ordinal stable for its discovery lifetime.
   CFStringRef name = nullptr;
   device->GetDisplayName(&name);
   NSString *result = [NSString stringWithFormat:@"decklink:%@:%lu",
@@ -1279,7 +1306,13 @@ struct DeviceCapabilities {
   bool hdmiTimecode = false;
   bool highFrameRateTimecode = false;
   int64_t maximumHDMIAudioChannels = 0;
+  int64_t maximumAudioChannels = 0;
 };
+
+static NSUInteger embeddedAudioChannels(const DeviceCapabilities &capabilities, BMDVideoConnection connection) {
+  const int64_t maximum = connection == bmdVideoConnectionHDMI ? capabilities.maximumHDMIAudioChannels : capabilities.maximumAudioChannels;
+  return maximum >= 16 ? 16 : maximum >= 8 ? 8 : 2;
+}
 
 static DeviceCapabilities readCapabilities(IDeckLink *device) {
   DeviceCapabilities result;
@@ -1301,6 +1334,8 @@ static DeviceCapabilities readCapabilities(IDeckLink *device) {
   int64_t channels = 0;
   if (attributes->GetInt(BMDDeckLinkMaximumHDMIAudioChannels, &channels) == S_OK && channels > 0)
     result.maximumHDMIAudioChannels = channels;
+  if (attributes->GetInt(BMDDeckLinkMaximumAudioChannels, &channels) == S_OK && channels > 0)
+    result.maximumAudioChannels = channels;
   return result;
 }
 
@@ -1389,6 +1424,23 @@ class DeviceRegistry {
     dispatch_async(queue, ^{ erase(device); device->Release(); });
   }
   void drain() { dispatch_sync(queue, ^{}); }
+
+  NSString *identifierForDevice(IDeckLink *device) {
+    ComRef<IDeckLinkProfileAttributes> attributes;
+    int64_t persistentID = 0;
+    if (device->QueryInterface(IID_IDeckLinkProfileAttributes,
+        reinterpret_cast<void **>(attributes.out())) == S_OK &&
+        attributes->GetInt(BMDDeckLinkPersistentID, &persistentID) == S_OK)
+      return [NSString stringWithFormat:@"decklink:%016llx", (unsigned long long)persistentID];
+    std::lock_guard<std::mutex> guard(mutex);
+    for (auto &identity : identities)
+      if (identity.first.value == device) return identity.second;
+    NSString *identifier = deviceIdentifier(device, identities.size());
+    ComRef<IDeckLink> retained;
+    device->AddRef(); retained.value = device;
+    identities.emplace_back(std::move(retained), identifier);
+    return identifier;
+  }
 
   // Returns an owned reference, or null when discovery has not seen the device.
   IDeckLink *copyDevice(NSString *identifier, DeviceCapabilities *capabilities) {
@@ -1534,18 +1586,9 @@ class DeviceRegistry {
     int64_t busy = 0;
     if (device->QueryInterface(IID_IDeckLinkStatus, reinterpret_cast<void **>(status.out())) == S_OK &&
         status->GetInt(bmdDeckLinkStatusBusy, &busy) == S_OK && (busy & bmdDeviceCaptureBusy)) return E_ACCESSDENIED;
-    ComRef<IDeckLinkConfiguration> configuration;
-    HRESULT result = device->QueryInterface(IID_IDeckLinkConfiguration, reinterpret_cast<void **>(configuration.out()));
-    int64_t previous = 0, actual = 0;
-    if (result == S_OK) result = configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &previous);
-    const bool readPrevious = result == S_OK;
-    if (result == S_OK && previous != connection) result = configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, connection);
-    if (result == S_OK) result = configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &actual);
-    if (result == S_OK && actual != connection) result = E_FAIL;
-    if (result != S_OK) {
-      if (configuration && readPrevious && previous != connection) configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, previous);
-      return result;
-    }
+    HDMILease selection;
+    HRESULT result = selection.select(device, connection);
+    if (result != S_OK) return result;
     ComRef<IDeckLinkInput> input;
     NSArray<UltracamMode *> *modes = nil;
     if (device->QueryInterface(IID_IDeckLinkInput, reinterpret_cast<void **>(input.out())) == S_OK)
@@ -1585,13 +1628,25 @@ class DeviceRegistry {
 
   id addObserver(void (^handler)(NSArray<UltracamDevice *> *)) {
     NSUUID *token = [NSUUID UUID];
-    {
-      std::lock_guard<std::mutex> guard(mutex);
-      observerBlocks[token] = [handler copy];
-    }
+    // Registration and initial publication share the arrival/removal queue.
+    // Thus no older initial snapshot can overtake a later hotplug snapshot.
+    dispatch_sync(queue, ^{
+      NSArray<UltracamDevice *> *list = snapshot();
+      {
+        std::lock_guard<std::mutex> guard(mutex);
+        observerBlocks[token] = [handler copy];
+      }
+      dispatch_async(observerQueue, ^{ handler(list); });
+    });
     startDiscovery();
     return token;
   }
+#if defined(ULTRACAM_BACKEND_TESTING)
+  NSUInteger observerCount() {
+    std::lock_guard<std::mutex> guard(mutex);
+    return observerBlocks.count;
+  }
+#endif
   void removeObserver(id token) {
     if (![token isKindOfClass:[NSUUID class]]) return;
     std::lock_guard<std::mutex> guard(mutex);
@@ -1655,16 +1710,14 @@ class DeviceRegistry {
     ComRef<IDeckLinkInput> input;
     // Output-only devices, or an IID a pre-16 driver does not know.
     if (device->QueryInterface(IID_IDeckLinkInput, reinterpret_cast<void **>(input.out())) != S_OK || !input) return;
-    NSUInteger ordinal = 0;
     {
       std::lock_guard<std::mutex> guard(mutex);
       for (auto &entry : entries) if (entry.device == device) return;
-      ordinal = entries.size();
     }
     DeviceEntry entry;
     entry.capabilities = readCapabilities(device);
     UltracamDevice *description = [UltracamDevice new];
-    description.identifier = deviceIdentifier(device, ordinal);
+    description.identifier = identifierForDevice(device);
     CFStringRef name = nullptr; device->GetDisplayName(&name);
     description.name = name ? (__bridge NSString *)name : @"Blackmagic capture device";
     if (name) CFRelease(name);
@@ -1832,6 +1885,9 @@ class DeviceRegistry {
   std::atomic<bool> advertisingHDR{false};
   std::map<std::string, bool> hdrPolicies; // discovery queue only
   std::map<std::string, BMDVideoConnection> connectorPolicies; // mutex
+  // Retain identity objects until discovery ends, preventing pointer reuse and
+  // preserving legacy IDs across unplug/replug and iterator order changes.
+  std::vector<std::pair<ComRef<IDeckLink>, NSString *>> identities; // mutex
   std::map<std::string, HRESULT> connectorErrors; // mutex
   IDeckLinkDiscovery *discovery = nullptr;
   DiscoveryCallback *callback = nullptr;
@@ -2083,10 +2139,10 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   ComRef<IDeckLinkIterator> iterator; iterator.value = CreateDeckLinkIteratorInstance();
   if (!iterator) { fail(error, @"Blackmagic Desktop Video is not available. Install Desktop Video 16 or later."); return nil; }
   NSMutableArray<UltracamDevice *> *result = [NSMutableArray array];
-  IDeckLink *raw = nullptr; NSUInteger index = 0;
+  IDeckLink *raw = nullptr;
   while (iterator->Next(&raw) == S_OK) {
     ComRef<IDeckLink> device; device.value = raw;
-    NSString *identifier = deviceIdentifier(device.value, index++);
+    NSString *identifier = DeviceRegistry::shared().identifierForDevice(device.value);
     ComRef<IDeckLinkInput> input;
     if (device->QueryInterface(IID_IDeckLinkInput, reinterpret_cast<void **>(input.out())) != S_OK) continue;
     UltracamDevice *description = [UltracamDevice new]; description.identifier = identifier;
@@ -2216,10 +2272,10 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (!device) {
     ComRef<IDeckLinkIterator> iterator; iterator.value = CreateDeckLinkIteratorInstance();
     if (!iterator) return fail(error, @"Blackmagic Desktop Video is not available.");
-    IDeckLink *raw = nullptr; NSUInteger index = 0;
+    IDeckLink *raw = nullptr;
     while (iterator->Next(&raw) == S_OK) {
       ComRef<IDeckLink> candidate; candidate.value = raw;
-      if ([deviceIdentifier(candidate.value, index++) isEqualToString:deviceID]) { device.value = candidate.take(); break; }
+      if ([_registry->identifierForDevice(candidate.value) isEqualToString:deviceID]) { device.value = candidate.take(); break; }
     }
   }
   if (!device) return fail(error, @"UltraStudio is disconnected. Refresh the input list.");
@@ -2317,7 +2373,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (openDetected && detected->contract) callback->setActiveContract(*detected->contract);
   else if (selectedContract) callback->setActiveContract(*selectedContract);
   if (autoFrameHandler || selectedContract) callback->timeScale = 240000;
-  callback->audioChannels = capabilities.maximumHDMIAudioChannels >= 16 ? 16 : capabilities.maximumHDMIAudioChannels >= 8 ? 8 : 2;
+  callback->audioChannels = embeddedAudioChannels(capabilities, selectedConnection);
   callback->audioFormatHandler = [_audioFormatHandler copy];
   callback->cpuMemoryFrameHandler = [_cpuMemoryFrameHandler copy];
   callback->groupBegin = [_groupBegin copy];
@@ -2507,16 +2563,30 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
     HDMILease *lease = _connection.get();
     int64_t current = 0;
     if (!lease || !lease->configuration ||
-        lease->configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &current) != S_OK ||
-        current == lease->selected) return;
+        lease->configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &current) != S_OK) return;
+    int64_t currentAudio = 0;
+    if (lease->configuration->GetInt(bmdDeckLinkConfigAudioInputConnection, &currentAudio) != S_OK) {
+      _callback->reportFatal(@"Cannot read the configured embedded audio connector."); return;
+    }
+    if (current == lease->selected && currentAudio == bmdAudioConnectionEmbedded) return;
     os_log(backendLog(), "Desktop Video preferences moved the input to connection 0x%llx; reselecting HDMI",
       (unsigned long long)current);
-    HRESULT result = lease->configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, lease->selected);
+    HRESULT result = current == lease->selected ? S_OK : lease->configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, lease->selected);
     int64_t actual = 0;
     if (result == S_OK) result = lease->configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &actual);
-    if (result == S_OK && actual == lease->selected) {
-      // Restore the outside choice when this session ends.
+    if (result == S_OK && actual != lease->selected) result = E_FAIL;
+    if (result == S_OK && current != lease->selected) {
       lease->previous = current; lease->changed = true;
+    }
+    if (result == S_OK && currentAudio != bmdAudioConnectionEmbedded) {
+      result = lease->configuration->SetInt(bmdDeckLinkConfigAudioInputConnection, bmdAudioConnectionEmbedded);
+      if (result == S_OK) { lease->previousAudio = currentAudio; lease->audioChanged = true; }
+      int64_t audio = 0;
+      if (result == S_OK) result = lease->configuration->GetInt(bmdDeckLinkConfigAudioInputConnection, &audio);
+      if (result == S_OK && audio != bmdAudioConnectionEmbedded) result = E_FAIL;
+    }
+    if (result == S_OK) {
+      // Restore the outside choice when this session ends.
       _callback->eventHandler(lease->selected == bmdVideoConnectionHDMI ? @"Desktop Video settings changed the UltraStudio input. Ultracam reselected HDMI for this session." : @"Desktop Video settings changed the capture input. Ultracam reselected the configured connector for this session.");
     } else _callback->reportFatal(@"Desktop Video did not confirm the configured capture connector after its preferences changed.");
     return;
@@ -2785,6 +2855,35 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   dispatch_queue_t observers = dispatch_queue_create("org.ultracam.tests.sdk16", DISPATCH_QUEUE_SERIAL);
   BOOL result = NO;
   {
+    for (auto initial : {bmdVideoConnectionSDI, bmdVideoConnectionHDMI}) {
+     for (bool failReadback : {false, true}) {
+      FakeDeckLink partial;
+      DeviceRegistry partialRegistry(observers);
+      _registry = &partialRegistry;
+      partial.configuration.connection = initial;
+      partialRegistry.arrived(&partial); partialRegistry.drain();
+      __block BOOL opened = NO;
+      __block bool fatal = false;
+      __block NSError *partialError = nil;
+      [self onControlQueue:^{
+        opened = [self startOnQueue:@"decklink:000000001234abcd" inputFast:YES frameHandler:nil
+          autoFrameHandler:nil mediaHandler:nil rawAudioHandler:nil
+          eventHandler:^(NSString *event) { if ([event hasPrefix:@"Capture error:"]) fatal = true; } error:&partialError];
+      }];
+      if (!opened) { _registry = &DeviceRegistry::shared(); return fail(error, partialError.localizedDescription); }
+      partial.configuration.connection = bmdVideoConnectionOpticalSDI;
+      partial.configuration.audioConnection = bmdAudioConnectionAnalog;
+      partial.configuration.audioWriteResult = failReadback ? S_OK : E_FAIL;
+      partial.configuration.failAudioReadback = failReadback;
+      partial.notification.post(bmdPreferencesChanged, 0);
+      [self onControlQueue:^{}];
+      [self stop];
+      _registry = &DeviceRegistry::shared();
+      if (!fatal || partial.configuration.connection != bmdVideoConnectionOpticalSDI ||
+          partial.configuration.audioConnection != bmdAudioConnectionAnalog)
+        return fail(error, @"Partial preferences failure lost the latest outside video connector.");
+     }
+    }
     FakeDeckLink device, fallback, busy, denied;
     DeviceRegistry registry(observers);
     _registry = &registry;
@@ -2895,6 +2994,14 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   [self onControlQueue:^{}];
   if (device->configuration.connection != bmdVideoConnectionHDMI || ![lastEvent() containsString:@"reselected HDMI"])
     return fail(error, @"A preferences change did not reselect the HDMI input.");
+
+  // Audio-only preference drift must not overwrite the independently held
+  // prior video connector; stop restores each setting separately.
+  device->configuration.audioConnection = bmdAudioConnectionAnalog;
+  device->notification.post(bmdPreferencesChanged, 0);
+  [self onControlQueue:^{}];
+  if (device->configuration.audioConnection != bmdAudioConnectionEmbedded || _connection->previous != bmdVideoConnectionSDI)
+    return fail(error, @"Audio-only preferences changed the prior video lease or left analog audio selected.");
 
   // Unplugging the active device is a clear error, not a no-signal wait.
   registry->removed(device);
@@ -3615,7 +3722,73 @@ BOOL UltracamRunElapsedGapSyntheticChecks(NSError **error) {
   if (skips(1001, INT64_MAX) != 0) return fail(error, @"Timestamp gap arithmetic overflowed at Int64 maximum.");
   return YES;
 }
+NSUInteger UltracamNativeObserverCount(void) { return DeviceRegistry::shared().observerCount(); }
 BOOL UltracamRunConnectorSyntheticChecks(NSError **error) {
+  {
+    FakeDeckLink hybrid, sdi;
+    sdi.attributes.maximumHDMIAudioChannels = 0;
+    for (auto *device : {&hybrid, &sdi}) {
+      auto capabilities = readCapabilities(device);
+      for (auto connector : {bmdVideoConnectionSDI, bmdVideoConnectionOpticalSDI}) {
+        FakeInput input;
+        auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+        callback->audioChannels = embeddedAudioChannels(capabilities, connector);
+        const auto status = startInput(&input, callback, bmdMode4K2160p5994, bmdVideoInputFlagDefault);
+        const auto channels = input.enabledAudioChannels;
+        stopInput(&input, callback); callback->Release();
+        if (status != S_OK || channels != 16) return fail(error, @"SDI/optical startup did not enable general 16-channel capability.");
+      }
+    }
+    if (embeddedAudioChannels(readCapabilities(&hybrid), bmdVideoConnectionHDMI) != 8)
+      return fail(error, @"HDMI did not retain its connector-specific eight-channel capability.");
+  }
+
+  {
+    FakeDeckLink device; device.attributes.audioInputConnections = bmdAudioConnectionAnalog;
+    HDMILease lease;
+    if (lease.select(&device, bmdVideoConnectionHDMI) != E_NOINTERFACE || device.configuration.writes != 0)
+      return fail(error, @"Unsupported embedded audio was not refused before connector writes.");
+  }
+  for (auto connector : {bmdVideoConnectionHDMI, bmdVideoConnectionSDI, bmdVideoConnectionOpticalSDI}) {
+    FakeDeckLink device;
+    const auto previous = device.configuration.connection;
+    {
+      HDMILease lease;
+      if (lease.select(&device, connector) != S_OK || device.configuration.audioConnection != bmdAudioConnectionEmbedded)
+        return fail(error, @"Connector lease did not select embedded audio.");
+      lease.started = true;
+    }
+    if (device.configuration.connection != previous || device.configuration.audioConnection != bmdAudioConnectionAnalog)
+      return fail(error, @"Connector lease did not restore independent video/audio settings.");
+  }
+  {
+    FakeDeckLink device; device.configuration.audioWriteResult = E_FAIL;
+    HDMILease lease;
+    if (lease.select(&device, bmdVideoConnectionHDMI) == S_OK)
+      return fail(error, @"Connector lease acknowledged failed embedded audio selection.");
+    lease.abandon();
+    if (device.configuration.connection != bmdVideoConnectionSDI)
+      return fail(error, @"Partial connector selection did not roll back video.");
+  }
+
+  {
+    FakeDeckLink device; device.configuration.ignoreAudioWrites = true;
+    HDMILease lease;
+    if (lease.select(&device, bmdVideoConnectionHDMI) != E_FAIL || device.configuration.connection != bmdVideoConnectionSDI)
+      return fail(error, @"Ignored audio write was acknowledged or failed to roll back video.");
+  }
+  {
+    FakeDeckLink device;
+    {
+      HDMILease lease;
+      if (lease.select(&device, bmdVideoConnectionHDMI) != S_OK) return fail(error, @"Audio ownership fixture failed.");
+      lease.started = true;
+      device.configuration.audioConnection = bmdAudioConnectionAESEBU;
+    }
+    if (device.configuration.audioConnection != bmdAudioConnectionAESEBU)
+      return fail(error, @"Stop overwrote an outside audio connector change.");
+  }
+
   dispatch_queue_t observers = dispatch_queue_create("org.ultracam.connector-checks", DISPATCH_QUEUE_SERIAL);
   FakeDeckLink first, second;
   first.attributes.persistentID = 0xa1; second.attributes.persistentID = 0xb2;
@@ -3625,6 +3798,8 @@ BOOL UltracamRunConnectorSyntheticChecks(NSError **error) {
   if (registry.setDeviceConnector(@"decklink:00000000000000a1", bmdVideoConnectionOpticalSDI) != S_OK ||
       first.configuration.connection != bmdVideoConnectionOpticalSDI || second.configuration.connection != bmdVideoConnectionSDI)
     return fail(error, @"Per-device optical connector selection changed another device.");
+  if (first.configuration.audioConnection != bmdAudioConnectionEmbedded)
+    return fail(error, @"Per-device connector preference did not select embedded audio.");
   const int writes = first.configuration.writes;
   if (registry.setDeviceConnector(@"decklink:00000000000000a1", bmdVideoConnectionOpticalSDI) != S_OK || first.configuration.writes != writes)
     return fail(error, @"Same connector selection rewrote device configuration.");

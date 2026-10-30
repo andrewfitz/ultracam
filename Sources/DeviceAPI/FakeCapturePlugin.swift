@@ -125,7 +125,7 @@ final class FakeCaptureSession: CaptureSession, @unchecked Sendable {
       var deliveries: [CaptureDelivery] = []
       for payload in payloads {
         switch payload {
-        case .frame(_, let info):
+        case .frame(_, let info), .cpuMemory(_, let info):
           guard info.epochID == epochID, info.formatSignature == format.signature,
             (try? info.validate()) != nil else {
             (format, audio, epochID, sequence, bindings, mappingRevision) = saved

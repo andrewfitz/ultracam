@@ -169,6 +169,32 @@ private struct AutoSwitcherTimelineEvent: Codable {
     case cameraID = "camera_id"
   }
 
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    type = try c.decode(String.self, forKey: .type)
+    cue = type == "audio" ? try c.decodeIfPresent(AutoSwitcherAudioCue.self, forKey: .cue) : nil
+    transcript = type == "transcript" ? try c.decodeIfPresent(AutoSwitcherTranscriptCue.self, forKey: .cue) : nil
+    time = try c.decodeIfPresent(Double.self, forKey: .time)
+    timeTicks = try c.decodeIfPresent(Int64.self, forKey: .timeTicks)
+    decisionID = try c.decodeIfPresent(UUID.self, forKey: .decisionID)
+    appliedAt = try c.decodeIfPresent(Double.self, forKey: .appliedAt)
+    appliedAtTicks = try c.decodeIfPresent(Int64.self, forKey: .appliedAtTicks)
+    cameraID = try c.decodeIfPresent(String.self, forKey: .cameraID)
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(type, forKey: .type)
+    if let transcript { try c.encode(transcript, forKey: .cue) }
+    else { try c.encodeIfPresent(cue, forKey: .cue) }
+    try c.encodeIfPresent(time, forKey: .time)
+    try c.encodeIfPresent(timeTicks, forKey: .timeTicks)
+    try c.encodeIfPresent(decisionID, forKey: .decisionID)
+    try c.encodeIfPresent(appliedAt, forKey: .appliedAt)
+    try c.encodeIfPresent(appliedAtTicks, forKey: .appliedAtTicks)
+    try c.encodeIfPresent(cameraID, forKey: .cameraID)
+  }
+
   init(type: String, cue: AutoSwitcherAudioCue? = nil,
        transcript: AutoSwitcherTranscriptCue? = nil, time: Double? = nil,
        timeTicks: Int64? = nil, decisionID: UUID? = nil, appliedAt: Double? = nil,
@@ -374,7 +400,7 @@ final class AutoSwitcherTimelineRecorder {
       mediaTime: Self.timestamp(instruction.cutTime), outputs: [output])
   }
 
-  func recordApplied(decisionID: UUID, target: FeedID, sourceTime: CMTime, programTime: CMTime) {
+  func recordApplied(decisionID: UUID, target: FeedID, sourceTime: CMTime, programTime: CMTime, directorAppliedAt: CMTime? = nil) {
     guard let index = pending[decisionID], document.cuts.indices.contains(index),
       let source = Self.timestamp(sourceTime), let program = Self.timestamp(programTime) else { return }
     pending.removeValue(forKey: decisionID)
@@ -384,12 +410,12 @@ final class AutoSwitcherTimelineRecorder {
     document.cuts[index].appliedProgramTime = program.seconds
     document.cuts[index].appliedProgramTimeTicks = program.ticks
     currentCameraID = target
-    // `applied_at` is the director clock. Program time is already stored on
-    // the cut record and must not be replayed as the source-clock ack.
+    // Persist exactly the acknowledgement sent live, in the director clock.
+    let directorTime = directorAppliedAt.flatMap(Self.timestamp)
     let event = AutoSwitcherTimelineEvent(type: "acknowledge", cue: nil,
-      time: source.seconds, timeTicks: source.ticks, decisionID: decisionID,
-      appliedAt: source.seconds, appliedAtTicks: source.ticks, cameraID: target.rawValue)
-    append(event: event, mediaTime: source, outputs: [])
+      time: directorTime?.seconds, timeTicks: directorTime?.ticks, decisionID: decisionID,
+      appliedAt: directorTime?.seconds, appliedAtTicks: directorTime?.ticks, cameraID: target.rawValue)
+    append(event: event, mediaTime: directorTime, outputs: [])
     persist(force: true)
   }
 
@@ -409,11 +435,8 @@ final class AutoSwitcherTimelineRecorder {
     if let index = pending.removeValue(forKey: decisionID), document.cuts.indices.contains(index) {
       document.cuts[index].status = "rejected"
     }
-    let output = AutoSwitcherTimelineOutput(type: "reject", instruction: nil,
-      decisionID: decisionID, message: nil)
-    append(event: AutoSwitcherTimelineEvent(type: "directorOutput", cue: nil,
-      time: nil, timeTicks: nil, decisionID: decisionID, appliedAt: nil,
-      appliedAtTicks: nil, cameraID: nil), mediaTime: nil, outputs: [output])
+    append(event: AutoSwitcherTimelineEvent(type: "reject", decisionID: decisionID),
+      mediaTime: nil, outputs: [])
     persist(force: true)
   }
 

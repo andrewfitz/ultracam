@@ -78,7 +78,8 @@ final class SonyControlPlugin: CameraControlPlugin {
         backend.prepareCamera(address: endpoint.address, macAddress: mac,
           authentication: endpoint.authenticationMode == .usernamePassword, completion: $0)
       }
-      guard try Self.identity(resolved.id) == mac else {
+      guard try Self.identity(resolved.id) == mac, resolved.value.authenticationMode == endpoint.authenticationMode,
+        resolved.address == endpoint.address.trimmingCharacters(in: .whitespacesAndNewlines) else {
         throw Self.failure("The resolved camera identity differs from the requested identity.", .changedIdentity)
       }
       camera = resolved.value
@@ -113,7 +114,8 @@ final class SonyControlPlugin: CameraControlPlugin {
         if case .usernamePassword(let name, let secret) = credentials { user = name; password = secret }
         else { user = ""; password = "" }
         let _: [Property] = try await self.request {
-          self.backend.connectFeed(session.key, camera: identity, user: user, password: password,
+          self.backend.connectFeed(session.key, camera: identity, address: camera.address,
+            authentication: camera.authenticationMode == .usernamePassword, user: user, password: password,
             fingerprint: camera.fingerprint ?? "", completion: $0)
         }
         try self.current(feedID, generation)
@@ -259,7 +261,7 @@ final class SonyControlPlugin: CameraControlPlugin {
         if let message {
           let code: ControlReasonCode
           if message.contains("unavailable in this build") { code = .unavailable }
-          else if message.contains("fingerprint changed") || message.contains("fingerprint differs") { code = .changedIdentity }
+          else if message.contains("fingerprint changed") || message.contains("fingerprint differs") || message.contains("changed after preparation") { code = .changedIdentity }
           else if message.contains("cannot mix") || message.contains("before adding a camera by IP") { code = .unsupported }
           else { code = .sdkFailure }
           continuation.resume(throwing: Self.failure(message, code)); return
@@ -290,7 +292,7 @@ final class SonyControlPlugin: CameraControlPlugin {
       let overlay = ["iso", "aperture", "shutter", "shutterAngle", "whiteBalance", "temperature", "focusMode"]
       return ControlProperty(id: id, label: title, writable: writable, value: .unsignedInteger(self.value),
         options: choices.map { ControlOption(id: String($0.value), label: $0.label, value: .unsignedInteger($0.value),
-          labelKey: $0.label == "On" ? "sony.control.choice.on" : $0.label == "Off" ? "sony.control.choice.off" : nil) },
+          labelKey: $0.label == "On" ? "sony.control.choice.on" : $0.label == "Off" ? "sony.control.choice.off" : nil, localizationTable: "SonyControl") },
         role: ["monitoringDisplayHDMI", "faceEyeFrameDisplay"].contains(id) ? .hidden : timing.contains(id) ? .outputTiming : .standard,
         overlayOrder: overlay.firstIndex(of: id), currentValueLabel: label, labelKey: "sony.control.\(id)", localizationTable: "SonyControl")
     }

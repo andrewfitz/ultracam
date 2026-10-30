@@ -370,12 +370,16 @@ import XCTest
     // Immutable frame owners cross the capture queues, retaining the shared image.
     let captureFrames = (0..<frames).map { processed(image, at: Int64($0)) }
     let group = DispatchGroup()
+    let collected = ProgramFIFOCollector()
+    // Drain each delivered frame as a healthy consumer does. Holding the whole
+    // multi-second run would deliberately exceed Program's 0.4-second budget.
     // Two capture delivery threads, as in the app: A on air, B starting.
     route.setSourceHealth(b, healthy: true)
     let cutRequested = DispatchSemaphore(value: 0)
     DispatchQueue.global(qos: .userInteractive).async(group: group) {
       for index in 0..<frames {
         route.ingest(feedID: a, frame: captureFrames[index])
+        collected.drain(consumer, output: route)
         if index == frames / 3 {
           _ = route.requestCut(to: b)
           cutRequested.signal()
@@ -384,24 +388,26 @@ import XCTest
     }
     DispatchQueue.global(qos: .userInteractive).async(group: group) {
       cutRequested.wait()  // B finishes opening while A is on air
-      for index in 0..<frames { route.ingest(feedID: b, frame: captureFrames[index]) }
+      for index in 0..<frames {
+        route.ingest(feedID: b, frame: captureFrames[index])
+        collected.drain(consumer, output: route)
+      }
     }
     XCTAssertEqual(group.wait(timeout: .now() + 30), .success)
     let stats = route.statistics
     XCTAssertEqual(stats.mainThreadIngests, 0, "No Program frame touched the main thread")
     XCTAssertEqual(stats.published, stats.accepted, "Every accepted frame was published")
     XCTAssertEqual(stats.overflowRejected, 0)
-    XCTAssertEqual(consumer.pendingCount, Int(stats.accepted))
-    var last: CMTime?
-    var count = 0
-    while let lease = consumer.dequeue() {
-      let time = try XCTUnwrap(lease.metadata?.presentationTime)
-      if let last { XCTAssertGreaterThan(CMTimeCompare(time, last), 0, "Program time is strictly increasing") }
-      last = time
-      count += 1
-      lease.release()
+    collected.drain(consumer, output: route)
+    XCTAssertEqual(consumer.pendingCount, 0)
+    let sent = collected.timestamps
+    XCTAssertEqual(sent.count, Int(stats.accepted))
+    XCTAssertEqual(collected.missingMetadata, 0)
+    XCTAssertLessThanOrEqual(collected.maximumPending, 2, "The supported-load consumer keeps up with both capture threads")
+    XCTAssertLessThanOrEqual(collected.maximumDuration, 2 * VideoContract.fastDuration.seconds + 1e-9)
+    for index in 1..<sent.count {
+      XCTAssertGreaterThan(CMTimeCompare(sent[index], sent[index - 1]), 0, "Program time is strictly increasing")
     }
-    XCTAssertEqual(count, Int(stats.accepted))
     XCTAssertEqual(route.selectedFeedID, b)
   }
 
@@ -460,11 +466,16 @@ import XCTest
     DispatchQueue.global(qos: .userInteractive).async {
       for index in 0..<30 {
         coordinator.programOutput.ingest(fromCapture: a.id, frame: captureFrames[index])
+        // Fence this synthetic burst at each handoff: the production queue
+        // deliberately rejects more than 0.4 seconds of retained media.
+        bridge.pump()
       }
       done.fulfill()
     }
     wait(for: [done], timeout: 10)
     bridge.waitUntilIdle()
+    XCTAssertEqual(coordinator.programOutput.statistics.accepted, 30)
+    XCTAssertEqual(coordinator.programOutput.statistics.overflowRejected, 0)
     XCTAssertEqual(bridge.currentStatistics.delivered, 30)
     XCTAssertEqual(bridge.currentStatistics.mainThreadSends, 0)
     XCTAssertEqual(sent.mainThreadSends, 0)
@@ -822,17 +833,19 @@ import XCTest
   func testFractional5994SourceRunsOnExact23976ProgramGrid() throws {
     let target = CMTime(value: 1001, timescale: 24_000)
     let (route, consumer, image) = try cadenceRoute(contractDuration: target)
+    var sent: [(CMTime, CMTime)] = []
     for index in 0..<25 {
       route.ingest(feedID: feed("alpha"), frame: processed(image, at: Int64(index),
         duration: CMTime(value: 1001, timescale: 60_000)))
+      sent.append(contentsOf: drain(consumer).map { ($0.0, $0.1) })
     }
-    let sent = drain(consumer)
     XCTAssertEqual(sent.count, 10)
     for (index, sample) in sent.enumerated() {
       XCTAssertEqual(CMTimeCompare(sample.0, CMTime(value: Int64(index) * 10_010, timescale: 240_000)), 0)
       XCTAssertEqual(CMTimeCompare(sample.1, target), 0)
     }
     XCTAssertEqual(route.statistics.accepted, 25)
+    XCTAssertEqual(route.statistics.overflowRejected, 0)
     XCTAssertEqual(route.statistics.cadenceSkipped, 15)
     XCTAssertEqual(route.statistics.cadenceRepeats, 0)
   }
@@ -1307,4 +1320,30 @@ private final class EventLog: @unchecked Sendable {
   var mainThreadSends: Int { lock.lock(); defer { lock.unlock() }; return sends.filter(\.0).count }
   var times: [CMTime] { lock.lock(); defer { lock.unlock() }; return sends.map(\.1) }
   var buffer: CVPixelBuffer? { lock.lock(); defer { lock.unlock() }; return stored }
+}
+
+/// One lock covers FIFO dequeue plus metadata recording, so two capture
+/// delivery threads cannot record dequeued samples out of order. Pixel leases
+/// retire immediately and the collector stores only lightweight timestamps.
+private final class ProgramFIFOCollector: @unchecked Sendable {
+  private let lock = NSLock()
+  private var values: [CMTime] = []
+  private var missing = 0
+  private var pendingPeak = 0
+  private var durationPeak = 0.0
+  var timestamps: [CMTime] { lock.withLock { values } }
+  var missingMetadata: Int { lock.withLock { missing } }
+  var maximumPending: Int { lock.withLock { pendingPeak } }
+  var maximumDuration: Double { lock.withLock { durationPeak } }
+  func drain(_ route: FrameRoute<CVPixelBuffer>, output: ProgramOutputRoute) {
+    lock.withLock {
+      pendingPeak = max(pendingPeak, route.pendingCount)
+      durationPeak = max(durationPeak, output.stageRetentionSnapshot.currentDuration)
+      while let lease = route.dequeue() {
+        if let metadata = lease.metadata { values.append(metadata.presentationTime) }
+        else { missing += 1 }
+        lease.release()
+      }
+    }
+  }
 }

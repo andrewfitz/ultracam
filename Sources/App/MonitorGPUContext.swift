@@ -12,6 +12,14 @@ protocol MonitorGPUCompletion: AnyObject, Sendable {
   func gpuCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool)
 }
 
+/// One submission's retained transaction; its body moves confined state back to
+/// the render thread before touching a feed, presenter hold, or display-link state.
+final class MonitorGPUTransaction: MonitorGPUCompletion, @unchecked Sendable {
+  private let body: @Sendable (Bool, Double) -> Void
+  init(_ body: @escaping @Sendable (Bool, Double) -> Void) { self.body = body }
+  func gpuCompleted(kind: Int, gpuStart: Double, gpuEnd: Double, failed: Bool) { body(failed, max(0, gpuEnd - gpuStart) * 1000) }
+}
+
 /// The monitor's shared GPU side on MonitorKit: one device (`LUTProcessor.sharedDevice`,
 /// so burn-in and monitor share every `MonitorLUT`), one `MTL4CommandQueue` for all
 /// monitor work (MonitorKit's barriers rely on it), the `MonitorEngine` and
@@ -35,7 +43,7 @@ final class MonitorGPUContext: @unchecked Sendable {
   /// The thread that runs every surface's display link and encodes its frames.
   let renderThread = RenderThread(name: "Ultracam.monitor.render")
 
-  /// Guards the built core, the last failure and pending drawable sets. Held only
+  /// Guards the built core, the last failure and attached drawable sets. Held only
   /// for loads and stores, never across a shader compile.
   private let stateLock = NSLock()
   /// Serializes the one-time build.
@@ -49,19 +57,22 @@ final class MonitorGPUContext: @unchecked Sendable {
   private var failure: Error?
   private var retryAt = 0.0
   private var retryDelay = 1.0
-  /// Drawable residency sets attached before the core exists.
-  private var pendingDrawables: [ObjectIdentifier: MTLResidencySet] = [:]
+  /// Attachments outlive a core; every replacement queue must register them.
+  private var drawableAttachments: [ObjectIdentifier: (set: MTLResidencySet, count: Int)] = [:]
+  private let drawableResidencyChange: (@Sendable (ObjectIdentifier, ObjectIdentifier, Bool) -> Void)?
 
   init(
     device: @escaping @Sendable () -> MTLDevice? = { LUTProcessor.sharedDevice },
     gpuTiming: @escaping @Sendable (Double, Double) -> Void = { start, end in
       AppGPUActivity.shared.record(start: start, end: end)
     },
-    pipelineCacheDirectory: URL? = nil
+    pipelineCacheDirectory: URL? = nil,
+    drawableResidencyChange: (@Sendable (ObjectIdentifier, ObjectIdentifier, Bool) -> Void)? = nil
   ) {
     deviceProvider = device
     self.gpuTiming = gpuTiming
     self.pipelineCacheDirectory = pipelineCacheDirectory
+    self.drawableResidencyChange = drawableResidencyChange
   }
 
   /// The app's pipeline warm start: `Library/Caches/<bundle id>/MonitorKitPipelines`
@@ -116,8 +127,7 @@ final class MonitorGPUContext: @unchecked Sendable {
       failure = nil
       retryDelay = 1
       // Under the lock, so a concurrent detach cannot slip between the two.
-      for set in pendingDrawables.values { made.queue.addResidencySet(set) }
-      pendingDrawables.removeAll()
+      for attachment in drawableAttachments.values { attach(attachment.set, to: made) }
     }
     return made
   }
@@ -125,8 +135,9 @@ final class MonitorGPUContext: @unchecked Sendable {
   /// Discards the cached device-wide objects after Metal reports a failed
   /// submission (typically a device/core loss). The old core remains alive for
   /// any in-flight completion handlers; the next render builds a fresh one.
-  func invalidate() {
+  func invalidate(ifCurrent core: Core? = nil) {
     stateLock.withLock {
+      if let core, built !== core { return }
       built = nil
       failure = nil
       retryAt = 0
@@ -166,19 +177,39 @@ final class MonitorGPUContext: @unchecked Sendable {
   /// thread: before the core exists the set waits and the build attaches it. Call
   /// again when a pixel-format change gives the layer a new set.
   func attachDrawables(_ set: MTLResidencySet) {
-    let core = stateLock.withLock { () -> Core? in
-      if built == nil { pendingDrawables[ObjectIdentifier(set)] = set }
-      return built
+    stateLock.withLock {
+      let id = ObjectIdentifier(set)
+      if var attached = drawableAttachments[id] {
+        attached.count += 1
+        drawableAttachments[id] = attached
+      } else {
+        drawableAttachments[id] = (set, 1)
+        if let built { attach(set, to: built) }
+      }
     }
-    core?.queue.addResidencySet(set)
   }
 
   func detachDrawables(_ set: MTLResidencySet) {
-    let core = stateLock.withLock { () -> Core? in
-      pendingDrawables.removeValue(forKey: ObjectIdentifier(set))
-      return built
+    stateLock.withLock {
+      let id = ObjectIdentifier(set)
+      guard var attached = drawableAttachments[id] else { return }
+      attached.count -= 1
+      guard attached.count == 0 else {
+        drawableAttachments[id] = attached
+        return
+      }
+      drawableAttachments.removeValue(forKey: id)
+      if let built {
+        built.queue.removeResidencySet(set)
+        drawableResidencyChange?(ObjectIdentifier(built.queue), id, false)
+      }
     }
-    core?.queue.removeResidencySet(set)
+  }
+
+  /// Called under stateLock, so detach cannot race registration on a new queue.
+  private func attach(_ set: MTLResidencySet, to core: Core) {
+    core.queue.addResidencySet(set)
+    drawableResidencyChange?(ObjectIdentifier(core.queue), ObjectIdentifier(set), true)
   }
 
   /// Drops the cached textures of one feed's frames (its camera stopped or changed
@@ -229,6 +260,11 @@ final class MonitorGPUContext: @unchecked Sendable {
     private var failedEncodes = 0
     private var abandonedDrawables = 0
     private var maintenance: DispatchSourceTimer?
+    #if ULTRACAM_TEST_SUPPORT
+    /// Runs after real GPU completion, allowing tests to delay/adversarially
+    /// fail delivery without ever adopting pixels before the GPU finished.
+    var deferCompletionForTesting: (@Sendable (Int, @escaping @Sendable (Bool) -> Void) -> Void)?
+    #endif
 
     /// With `pipelineCacheDirectory`, both engines warm-start from the pipeline
     /// archives earlier launches saved there and save this session's (MonitorKit
@@ -330,8 +366,8 @@ final class MonitorGPUContext: @unchecked Sendable {
       // takes fresh options. The handler keeps the context alive while it is on the
       // GPU; the pool owns it again afterwards.
       let options = MTL4CommitOptions()
-      options.addFeedbackHandler { [weak self] feedback in
-        self?.completed(
+      options.addFeedbackHandler { [self] feedback in
+        completed(
           context, gpuStart: feedback.gpuStartTime, gpuEnd: feedback.gpuEndTime,
           failed: feedback.error != nil)
       }
@@ -380,7 +416,13 @@ final class MonitorGPUContext: @unchecked Sendable {
       // Feedback can arrive out of order: MonitorKit gets the contiguous watermark.
       engine.residency.release(through: clock.complete(index))
       if gpuEnd > gpuStart { gpuTiming(gpuStart, gpuEnd) }
-      completion?.gpuCompleted(kind: kind, gpuStart: gpuStart, gpuEnd: gpuEnd, failed: failed)
+      let deliver: @Sendable (Bool) -> Void = { injectedFailure in
+        completion?.gpuCompleted(kind: kind, gpuStart: gpuStart, gpuEnd: gpuEnd, failed: failed || injectedFailure)
+      }
+      #if ULTRACAM_TEST_SUPPORT
+      if let deferCompletionForTesting { deferCompletionForTesting(kind, deliver); return }
+      #endif
+      deliver(false)
     }
 
     /// A new uniform chunk for a context that outgrew its 32 KB (rare; counted).
@@ -495,6 +537,22 @@ final class MonitorGPUContext: @unchecked Sendable {
     /// Keeps `object` alive (a pixel buffer, a replaced LUT, a target) until this
     /// submission's GPU work completes.
     func retain(_ object: AnyObject) { retained.append(object) }
+    /// A held copy may outlive the core that created it. Its owner has not
+    /// released its planes, so MonitorFrame's released-plane helper cannot add
+    /// them to a replacement core. Count each read on this queue's own clock.
+    func keepForeignFreeze(_ frame: MonitorFrame, owner: MonitorFeed) throws {
+      guard let core, owner.engine.device.registryID == core.device.registryID else {
+        throw MonitorKitError.gpu("A frozen monitor picture belongs to a different Metal device.")
+      }
+      retain(owner)
+      guard owner.engine !== core.engine else { return }
+      let residency = core.engine.residency
+      for texture in [frame.packed, frame.luma, frame.chroma].compactMap({ $0 }) {
+        residency.add(texture)
+        residency.retire(texture, resident: texture, after: index)
+      }
+    }
+
     /// Keeps `frame`'s textures and pixel buffer alive until this submission completes.
     func keep(_ frame: MonitorFrame) { kept.append(frame) }
 

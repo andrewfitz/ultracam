@@ -18,6 +18,30 @@ import XCTest
     XCTAssertEqual(reads, 1)
   }
 
+  func testSuccessfulSetterStillRequiresMatchingReadableContract() throws {
+    let format = try format()
+    var wrote = false
+    XCTAssertThrowsError(try CameraSink.negotiateInstalledContract(format: format,
+      duration: VideoContract.fastDuration, controlled: { false }, set: { wrote = true },
+      read: { XCTAssertTrue(wrote); return (format, 30_000.0 / 1001) }))
+    XCTAssertThrowsError(try CameraSink.negotiateInstalledContract(format: format,
+      duration: VideoContract.fastDuration, controlled: { false }, set: {},
+      read: { throw VideoError.message("Unreadable") }))
+    var changedColour: CMVideoFormatDescription?
+    let tags = NSMutableDictionary(dictionary: try XCTUnwrap(CMFormatDescriptionGetExtensions(format)) as NSDictionary)
+    tags[kCMFormatDescriptionExtension_ColorPrimaries] = kCVImageBufferColorPrimaries_ITU_R_2020
+    XCTAssertEqual(CMVideoFormatDescriptionCreate(allocator: nil,
+      codecType: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, width: 1920, height: 1080,
+      extensions: tags as CFDictionary, formatDescriptionOut: &changedColour), noErr)
+    let other = try XCTUnwrap(changedColour)
+    XCTAssertThrowsError(try CameraSink.negotiateInstalledContract(format: format,
+      duration: VideoContract.fastDuration, controlled: { false }, set: {},
+      read: { (other, 60_000.0 / 1001) }))
+    XCTAssertNoThrow(try CameraSink.negotiateInstalledContract(format: format,
+      duration: VideoContract.fastDuration, controlled: { false }, set: {},
+      read: { (format, 60_000.0 / 1001) }))
+  }
+
   func testBusyUnsupportedCadenceRefused() throws {
     let format = try format()
     XCTAssertThrowsError(try CameraSink.negotiateInstalledContract(format: format,
