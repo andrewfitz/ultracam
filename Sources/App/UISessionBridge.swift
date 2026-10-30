@@ -69,7 +69,7 @@ enum UIFormatLabels {
   static func signal(running: Bool, deviceAvailable: Bool, update: CaptureUpdate?) -> UISignal {
     guard running else { return .none }
     guard let update else { return .connecting }
-    if let format = update.sourceFormat { return .live(format: FormatDisplayIdentity(format).detail) }
+    if let format = update.sourceFormat { return .live(format: FormatDisplayIdentity(format).short) }
     let input = update.input
     if let format = shortFormat(input) { return .live(format: format) }
     let lowered = (input + " " + update.message).lowercased()

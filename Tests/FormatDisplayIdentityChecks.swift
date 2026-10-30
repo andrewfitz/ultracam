@@ -13,6 +13,7 @@ import XCTest
     XCTAssertEqual(identity.range, "Video range")
     XCTAssertEqual(identity.pixel, "10-bit 4:2:2 packed")
     XCTAssertEqual(identity.name, "UHD 3840 × 2160 · 59.94 fps · 16:9")
+    XCTAssertEqual(identity.short, "2160p 59.94", "The strip's badge and record line need the short form")
     XCTAssertFalse(identity.detail.contains("clock"))
     XCTAssertFalse(identity.detail.contains("UUID"))
   }
@@ -26,6 +27,7 @@ import XCTest
     let source = try SourceFormat(width: 1920, height: 1080, pixel: .v210,
       rate: .variable(nominal: CMTime(value: 1, timescale: 30), shortest: CMTime(value: 1, timescale: 60), longest: CMTime(value: 1, timescale: 24)))
     XCTAssertEqual(FormatDisplayIdentity(source).frameRate, "Variable (30 fps nominal)")
+    XCTAssertEqual(FormatDisplayIdentity(source).short, "1080p VFR")
   }
 
   func testUYVAHasPacked422SignalSampling() throws {
@@ -62,7 +64,7 @@ import XCTest
     var update = CaptureUpdate(message: "")
     update.input = "stale legacy label"
     update.sourceFormat = format
-    let expected = UISignal.live(format: FormatDisplayIdentity(format).detail)
+    let expected = UISignal.live(format: "1080p 59.94")
     XCTAssertEqual(UIFormatLabels.signal(running: true, deviceAvailable: true, update: update), expected)
     var camera = UICameraSnapshot(id: "test", name: "Camera")
     camera.running = true

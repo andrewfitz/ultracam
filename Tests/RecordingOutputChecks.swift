@@ -202,6 +202,26 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertFalse(FileManager.default.fileExists(atPath: take.finalURL.path))
   }
 
+  /// A drive's root as the folder: its system folders can't be opened, and
+  /// that must not stop the scan from finding the takes beside them.
+  func testRecoveryAtADriveRootSkipsFoldersItCannotRead() throws {
+    let root = try makeRoot()
+    let locked = [root.appendingPathComponent(".DocumentRevisions-V100"), root.appendingPathComponent("Locked")]
+    defer {
+      for folder in locked { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path) }
+      try? FileManager.default.removeItem(at: root)
+    }
+    for folder in locked {
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+      try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: folder.path)
+    }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let take = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1, 2, 3, 4]).write(to: take.temporaryURL)
+    take.preserveForRecovery()
+    XCTAssertEqual(try RecordingRecovery.scan(root: root).count, 1)
+  }
+
   func testRecoveryJournalAcceptsConfiguredCustomExtension() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

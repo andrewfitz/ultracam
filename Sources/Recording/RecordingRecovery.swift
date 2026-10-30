@@ -126,10 +126,17 @@ enum RecordingRecovery {
     let folders = try fm.contentsOfDirectory(at: canonicalRoot, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
     var result: [InterruptedRecording] = []
     var hasJournal = false
-    for folder in folders {
+    var unreadable = false
+    // Feed folders are never hidden. A volume's root also holds system folders
+    // (.Spotlight-V100, .DocumentRevisions-V100) this app may not open.
+    for folder in folders where !folder.lastPathComponent.hasPrefix(".") {
       let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
       guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
-      let files = try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [])
+      // One folder it can't read must not hide the takes in the others.
+      guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: []) else {
+        unreadable = true
+        continue
+      }
       for url in files where url.pathExtension == "ultracam-recovery" {
         hasJournal = true
         guard let journal = try? RecordingRecoveryJournal(opening: url) else { continue }
@@ -145,7 +152,7 @@ enum RecordingRecovery {
         result.append(InterruptedRecording(journalURL: url, temporaryURL: source, finalURL: final))
       }
     }
-    return ScanReport(takes: result.sorted { $0.title < $1.title }, mayPruneRoot: !hasJournal)
+    return ScanReport(takes: result.sorted { $0.title < $1.title }, mayPruneRoot: !hasJournal && !unreadable)
   }
 
   private static func regularNonempty(_ url: URL) -> Bool {
