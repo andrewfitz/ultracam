@@ -137,6 +137,8 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Late processing", UIDiagnosticsFormat.count(update.lateFrames), warning: update.lateFrames > 0)
           UIDiagnosticsRow("Output stalls", UIDiagnosticsFormat.count(update.poolDrops), warning: update.poolDrops > 0)
           UIDiagnosticsRow("Camera stalls", UIDiagnosticsFormat.count(update.cameraDrops), warning: update.cameraDrops > 0)
+          UIDiagnosticsRow("Frames before the camera connected", UIDiagnosticsFormat.count(update.cameraFramesBeforeSink))
+          UIDiagnosticsRow("Connect to first frame", update.cameraFirstFrameSeconds.map { String(format: "%.2f s", $0) } ?? "—")
         } header: { Text("Drops by Stage") } footer: {
           Text("Capture keeps every frame; a stage that can't keep up is counted as a stall. Late processing counts frames started over two frame intervals after capture. Monitor pictures report their own counts below. Intentional frame-rate reduction is excluded.")
             .font(.caption).foregroundStyle(.secondary)

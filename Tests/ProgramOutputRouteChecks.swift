@@ -175,6 +175,7 @@ import XCTest
     bridge.pump()
     XCTAssertEqual(connects, 1)
     XCTAssertEqual(sent.count, 1)
+    XCTAssertNotNil(bridge.currentStatistics.firstFrameSeconds, "How long a joining client saw black")
     XCTAssertEqual(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sent[0]), hostNow), 0,
       "Program time (zero for the first frame) goes out anchored on the host clock")
     XCTAssertEqual(CMSampleBufferGetDuration(sent[0]), VideoContract.fastDuration)

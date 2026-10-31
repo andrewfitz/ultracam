@@ -141,6 +141,19 @@ import XCTest
     XCTAssertEqual(problems(separate([failing])).map(\.id), ["waiting.camera-1"], "A waiting client says it once")
   }
 
+  func testAWaitingClientSaysWhyItsConnectFailed() {
+    var failing = camera(1)
+    failing.clientWaiting = true
+    failing.sinkFailure = "Install and enable the Ultracam camera extension."
+    var session = separate([failing])
+    XCTAssertEqual(problems(session).first?.detail, "Install and enable the Ultracam camera extension.")
+    session.install.installed = false
+    session.install.system = ExtensionSystemState(records: [ExtensionSystemRecord(bundleVersion: "10", enabled: true,
+      awaitingApproval: false, uninstalling: false)], bundledVersion: "10")
+    XCTAssertEqual(problems(session).first?.detail, "Restart your Mac to finish installing the camera extension.",
+      "Enabled and publishing nothing: installing again wouldn't help")
+  }
+
   func testAppProblemsReachTheListAndAcknowledge() {
     var session = separate([camera(1)])
     session.appProblems = [UIAppProblem(id: "director", text: "Auto director: lost")]

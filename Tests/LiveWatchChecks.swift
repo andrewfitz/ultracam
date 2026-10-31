@@ -101,6 +101,62 @@ import XCTest
     model.liveWatchTick(now: 130)
     XCTAssertTrue(model.waitingClients.isEmpty, "An unknown route isn't a waiting client")
   }
+
+  /// The late-sink safety net. Nothing else retries a sink that never connected, so a
+  /// client would wait on black for good.
+  func testFailedConnectRetriesEverySecondWhileAClientWaitsAndNotOtherwise() throws {
+    let fixture = try AppHardwareSyntheticFixture()
+    defer { fixture.stop() }
+    fixture.connect()
+    fixture.sink.failNextConnects(1000)
+    let model = appModel(hardware: fixture.hardware)
+    model.refresh()
+    let id = model.selectedFeedID
+    model.updateCamera(id, shareProcessing: false) { $0.selectedDevice = "fake:fixture" }
+    model.setCameraDemandForTesting(id, requested: true)
+    model.startCamera(id)
+    XCTAssertTrue(model.isCameraRunning(id))
+    let pattern = try fixture.makePattern()
+    spin("The first frame connects") {
+      _ = try? fixture.emit(pattern, index: self.frame())
+      return fixture.sink.connectAttempts >= 1
+    }
+    let start = ProcessInfo.processInfo.systemUptime + 1000
+    var attempts = fixture.sink.connectAttempts
+    model.liveWatchTick(now: start)
+    spin("A waiting client tries again") { fixture.sink.connectAttempts == attempts + 1 }
+    attempts += 1
+    model.liveWatchTick(now: start + 0.5)
+    settle()
+    XCTAssertEqual(fixture.sink.connectAttempts, attempts, "Once a second, not on every tick")
+    model.liveWatchTick(now: start + LiveWatchLimits.connectRetry)
+    spin("And again a second later") { fixture.sink.connectAttempts == attempts + 1 }
+    attempts += 1
+    model.setCameraDemandForTesting(id, requested: false)
+    model.liveWatchTick(now: start + 10)
+    model.liveWatchTick(now: start + 20)
+    settle()
+    XCTAssertEqual(fixture.sink.connectAttempts, attempts, "With no client nothing needs it")
+    fixture.sink.failNextConnects(0)
+    model.setCameraDemandForTesting(id, requested: true)
+    model.liveWatchTick(now: start + 30)
+    spin("The extension is back") { fixture.sink.openConnections == 1 }
+    model.stopCamera(id)
+  }
+
+  private var frames: Int32 = 0
+  private func frame() -> Int32 { frames += 1; return frames }
+
+  /// Runs the main queue, where capture status lands, until `done`.
+  private func spin(_ what: String, _ done: () -> Bool) {
+    let deadline = Date(timeIntervalSinceNow: 10)
+    while !done() {
+      guard Date() < deadline else { XCTFail(what); return }
+      RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.005))
+    }
+  }
+
+  private func settle() { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1)) }
 }
 
 private final class LiveWatchRegistryPublisher: AppVirtualCameraRegistryPublishing {

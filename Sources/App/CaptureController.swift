@@ -52,6 +52,11 @@ struct CaptureUpdate: @unchecked Sendable {
   var poolDrops: UInt64 = 0
   /// Camera stalls and failures: the CMIO queue was full or the send failed.
   var cameraDrops: UInt64 = 0
+  /// Frames a wanted sink couldn't take: rendered while it connected or was down.
+  var cameraFramesBeforeSink: UInt64 = 0
+  /// Connect to the first frame its queue took, for the latest connect. A client joining
+  /// a running camera sees standby black for this long.
+  var cameraFirstFrameSeconds: Double?
   var outputFPS: Double = 0
   /// Frames committed to the GPU and not yet complete, now and at most.
   var framesInFlight = 0
@@ -355,6 +360,11 @@ final class CaptureController: @unchecked Sendable {
   private var cameraWindowStart: Double = 0
   private var cameraWindowSent: UInt64 = 0
   private var cameraWindowFull: UInt64 = 0
+  // Capture queue: when the connect now pending its first frame began, and what the
+  // last one took. A retry keeps the first attempt's time: the client waited through it.
+  private var cameraConnectStarted: Double?
+  private var cameraFirstFrameSeconds: Double?
+  private var cameraFramesBeforeSink: UInt64 = 0
   private var cameraLabel: String { activeFeed?.rawValue ?? "an idle controller" }
   // Program output consumes processed frames through FeedCoordinator. When it
   // is enabled, this controller keeps capture and GPU work alive without
@@ -581,6 +591,9 @@ final class CaptureController: @unchecked Sendable {
         self.cameraWindowStart = 0
         self.cameraWindowSent = 0
         self.cameraWindowFull = 0
+        self.cameraConnectStarted = nil
+        self.cameraFirstFrameSeconds = nil
+        self.cameraFramesBeforeSink = 0
         self.cameraMessage = "Waiting for detected input"
         // Connect and warm before enabling driver callbacks, so the first
         // frames find the camera and GPU ready. This connection waits for the
@@ -1159,6 +1172,7 @@ final class CaptureController: @unchecked Sendable {
     cameraConnecting = false
     cameraConnectError = nil
     cameraQueueFullSince = nil
+    cameraConnectStarted = nil
     let services = self.services
     controlQueue.async { services.disconnect() }
   }
@@ -1335,13 +1349,13 @@ final class CaptureController: @unchecked Sendable {
   }
 
   /// Connects the virtual camera now if it should be and isn't: CMIO's cameras changed (the
-  /// camera extension started after this camera did). A camera that never connected otherwise
-  /// waits for a change of settings.
-  func requestCameraReconnect() {
+  /// camera extension started after this camera did), or a client is waiting on a connect
+  /// that failed. A camera that never connected otherwise waits for a change of settings.
+  func requestCameraReconnect(reason: String = "virtual cameras changed") {
     let token = lock.withLock { generation }
     queue.async {
       guard self.isAccepting(token), self.cameraOutputEnabled, !self.cameraConnected, !self.cameraConnecting else { return }
-      cameraOutputLog.notice("Camera reconnect requested: \(self.cameraLabel, privacy: .public) (virtual cameras changed)")
+      cameraOutputLog.notice("Camera reconnect requested: \(self.cameraLabel, privacy: .public) (\(reason, privacy: .public))")
       self.reconnectRequested = true
       self.reconnectAfter = 0
       self.reconnectIfDue()
@@ -1391,6 +1405,7 @@ final class CaptureController: @unchecked Sendable {
     let wasConnected = cameraConnected
     cameraConnected = false
     cameraConnecting = true
+    if cameraConnectStarted == nil { cameraConnectStarted = ProcessInfo.processInfo.systemUptime }
     reconnectRequested = false
     reconnectAfter = ProcessInfo.processInfo.systemUptime + max(0, services.cameraRetryInterval)
     let attempt = camera.begin()
@@ -1423,8 +1438,9 @@ final class CaptureController: @unchecked Sendable {
     if let error {
       cameraMessage = "Camera output unavailable — \(error.localizedDescription)"
       cameraConnectError = error.localizedDescription
-      // Only a lost connection retries; a camera that never connected
-      // (extension not running) stays quiet until the user reconfigures.
+      // Only a lost connection retries here. A camera that never connected
+      // (extension not running) stays quiet until the user reconfigures or a
+      // client turns up: the app then asks again every second (`requestCameraReconnect`).
       if wasConnected { beginCameraRecovery() }
       scheduleReconnect()
     } else {
@@ -2387,6 +2403,13 @@ final class CaptureController: @unchecked Sendable {
           cameraOutputLog.notice("Camera output \(self.cameraOutage ? "recovered" : "sending", privacy: .public): \(self.cameraLabel, privacy: .public), first frame accepted by the camera queue")
           cameraFirstSendPending = false
         }
+        if let started = cameraConnectStarted {
+          let seconds = ProcessInfo.processInfo.systemUptime - started
+          cameraConnectStarted = nil
+          cameraFirstFrameSeconds = seconds
+          metadataChanged = true
+          cameraOutputLog.notice("Camera first frame: \(self.cameraLabel, privacy: .public), \(String(format: "%.3f", seconds), privacy: .public) s after connect, \(self.cameraFramesBeforeSink, privacy: .public) frames before a sink this run")
+        }
         // An opened queue is not proof of recovery. Only a successful frame
         // send ends the outage and permits a fresh retry budget.
         cameraOutage = false
@@ -2421,7 +2444,8 @@ final class CaptureController: @unchecked Sendable {
         scheduleReconnect()
         metadataChanged = true
       }
-    case .notSent: break
+    case .notSent:
+      if cameraOutputEnabled { cameraFramesBeforeSink &+= 1 }
     }
     reportCameraWindow()
     frames &+= 1
@@ -2538,6 +2562,7 @@ final class CaptureController: @unchecked Sendable {
       maxRetainedSourceFrames: retained.peakSlots, maxRetainedSourceBytes: retained.peakBytes,
       deviceDrops: deviceDrops, signalDropouts: depth.signalDropouts, signalLostFrames: depth.signalLostFrames,
       ingestCPUCopyFrames: services.ingestCPUCopyFrames(), poolDrops: poolDrops, cameraDrops: cameraDrops,
+      cameraFramesBeforeSink: cameraFramesBeforeSink, cameraFirstFrameSeconds: cameraFirstFrameSeconds,
       outputFPS: outputFPS,
       framesInFlight: depth.inFlight, maxFramesInFlight: depth.maxInFlight,
       captureBacklog: depth.backlog, maxCaptureBacklog: depth.maxBacklog, lateFrames: lateFrames,

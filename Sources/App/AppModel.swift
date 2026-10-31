@@ -299,6 +299,9 @@ final class AppModel {
   /// Early takes someone has seen, until the next take starts on that camera.
   private(set) var acknowledgedTakes: Set<FeedID> = []
   @ObservationIgnored private var liveWatchTimer: Timer?
+  /// When a failed sink connect may next try again, while its client waits.
+  @ObservationIgnored private var connectRetryAt: [FeedID: TimeInterval] = [:]
+  @ObservationIgnored private var programConnectRetryAt: TimeInterval = 0
   private var programTransportRequired = false
   private var programTransportConfiguration: PipelineConfiguration?
   /// The input cadence each camera detected in its current run.
@@ -557,6 +560,11 @@ final class AppModel {
   }
 
   private func routeDemandChanged(_ route: String, requested: Bool?, error: String?) {
+    // Every client edge, with its time in the log: whether apps open streams just to
+    // probe a camera, and how often, can be read from these.
+    if (routeDemand[route] == true) != (requested == true) || (requested == nil) != unknownRoutes.contains(route) {
+      captureLog.notice("Client \(requested == nil ? "unknown" : requested == true ? "in" : "out", privacy: .public): \(route, privacy: .public)")
+    }
     routeDemand[route] = requested == true
     if requested == nil { unknownRoutes.insert(route) } else { unknownRoutes.remove(route) }
     routeErrors[route] = error
@@ -859,6 +867,7 @@ final class AppModel {
     clearProblem("declaration.\(id.rawValue)")
     waitingClients.remove(id)
     clientWaitingSince[id] = nil
+    connectRetryAt[id] = nil
     detectedSourceDurations[id] = nil
     lastSourceDurations[id] = nil
     appliedPipelines[id] = nil
@@ -1543,7 +1552,7 @@ final class AppModel {
         self.clearProblem("program-connect")
         return
       }
-      // Let the next reconcile retry the connection.
+      // The live watch tries again in a second while the client waits.
       self.programTransportRequired = false
       self.programTransportConfiguration = nil
       self.programContractOwner = nil
@@ -1730,8 +1739,13 @@ final class AppModel {
     if programSinkConnected != feedCoordinator.programOutputConnected {
       programSinkConnected = feedCoordinator.programOutputConnected
     }
+    if programInUse, !programTransportRequired, now >= programConnectRetryAt {
+      programConnectRetryAt = now + LiveWatchLimits.connectRetry
+      reconcileProgramTransportDemand()
+    }
     for descriptor in feedDescriptors {
       let id = descriptor.id
+      retrySink(id, now: now)
       // In Program mode no camera publishes its own device yet, so only Program has clients.
       guard outputMode == .separateCameras, cameraInUse(id), !cameraDelivering(id) else {
         clientWaitingSince[id] = nil
@@ -1748,6 +1762,15 @@ final class AppModel {
       liveWatchTimer?.invalidate()
       liveWatchTimer = nil
     }
+  }
+
+  /// A sink that failed to connect tries again every second while a client waits on it.
+  /// With no client it stays quiet: nothing needs it, and that may be for hours.
+  private func retrySink(_ id: FeedID, now: TimeInterval) {
+    guard cameraInUse(id), feedCoordinator.isFeedRunning(id), cameraUpdates[id]?.cameraOutputActive != true,
+      now >= connectRetryAt[id] ?? 0 else { return }
+    connectRetryAt[id] = now + LiveWatchLimits.connectRetry
+    feedCoordinator.capture(for: id).requestCameraReconnect(reason: "a client is waiting")
   }
 
   /// Gets frames moving to a stalled or starved client. A running camera reopens its

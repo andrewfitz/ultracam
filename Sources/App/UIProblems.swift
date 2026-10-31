@@ -192,14 +192,15 @@ extension UIPresentationBuilder {
     }
     if camera.clientWaiting {
       list.append(UIProblem(id: "waiting.\(id)", title: "A camera app is waiting for \(name)",
-        detail: "It's connected, but no frames are reaching it.", level: .damage, cameraID: id,
+        detail: camera.sinkFailure.map { connectFailureDetail($0, in: session) } ?? "It's connected, but no frames are reaching it.",
+        level: .damage, cameraID: id,
         action: camera.running ? UIProblemAction(title: "Restart Camera", action: .restartCamera(cameraID: id))
           : UIProblemAction(title: "Start", action: .startCamera(cameraID: id)),
         stripText: "A camera app is waiting for frames", rank: 80))
     } else if let failure = camera.sinkFailure, camera.clientUnknown {
       // Whether anyone is waiting can't be read, which is itself what's wrong: with a
       // known empty route this stays quiet.
-      list.append(UIProblem(id: "sink.\(id)", title: "\(name) isn't reaching meeting apps", detail: failure,
+      list.append(UIProblem(id: "sink.\(id)", title: "\(name) isn't reaching meeting apps", detail: connectFailureDetail(failure, in: session),
         level: .notice, cameraID: id, action: details, stripText: "Virtual camera unavailable", rank: 130))
     }
 
@@ -258,6 +259,13 @@ extension UIPresentationBuilder {
         stripText: "LUT unavailable", rank: 170))
     }
     return list
+  }
+
+  /// A failed connect as the operator can act on it. Enabled but publishing no camera, the
+  /// extension hasn't started, and only a restart does that: installing again won't.
+  static func connectFailureDetail(_ failure: String, in session: UISessionSnapshot) -> String {
+    session.install.system?.enabled == true && !session.install.installed
+      ? "Restart your Mac to finish installing the camera extension." : failure
   }
 
   /// "12:31 saved", the one way a take's saved length is written.

@@ -1459,6 +1459,31 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(harness.starts, 1, "Capture is never reopened")
   }
 
+  /// A sink that opens late costs a client frames it never saw: counted, and timed.
+  func testLateSinkIsCountedAndTimedToItsFirstFrame() throws {
+    let source = try EndToEndChecks.source()
+    let harness = CaptureHarness()
+    var services = harness.services(automatic: true)
+    services.cameraRetryInterval = 0
+    harness.failNextConnections(1)
+    let controller = CaptureController(services: services)
+    defer { controller.onUpdate = nil; controller.stop() }
+    ready(controller, harness: harness, configuration: config)
+    let statuses = CaptureStatusRecorder()
+    controller.onUpdate = { statuses.record($0) }
+    harness.emitAutomatic(source, at: .zero, duration: VideoContract.fastDuration)
+    awaitCondition("The first frame misses the failed connect") { harness.previewed == 1 }
+    awaitCondition("It's counted") { statuses.last?.cameraFramesBeforeSink == 1 }
+    XCTAssertNil(statuses.last?.cameraFirstFrameSeconds)
+    XCTAssertEqual(statuses.last?.dropped, 0, "No frame a consumer already had was lost")
+    controller.requestCameraReconnect(reason: "a client is waiting")
+    allowQueueWork()
+    harness.emitAutomatic(source, at: VideoContract.fastDuration, duration: VideoContract.fastDuration)
+    awaitCondition("The retry takes the next frame") { harness.sent == 1 }
+    awaitCondition("Connect to first frame, including the failed try") { (statuses.last?.cameraFirstFrameSeconds ?? 0) > 0 }
+    XCTAssertEqual(statuses.last?.cameraFramesBeforeSink, 1)
+  }
+
   func testSuccessfulReconnectWithoutSuccessfulSendCannotRenewRetryBudget() throws {
     let harness = CaptureHarness(failSending: true)
     var services = harness.services(automatic: true)

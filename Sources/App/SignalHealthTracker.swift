@@ -109,6 +109,8 @@ enum LiveWatchLimits {
   static let queueStall: TimeInterval = 2
   /// A client with no frames this long is waiting, not joining.
   static let clientWaiting: TimeInterval = 2
+  /// A failed connect tries again this often while a client is waiting.
+  static let connectRetry: TimeInterval = 1
   /// A take running this long after its last client left has outlived its meeting.
   static let unusedTake: TimeInterval = 120
 }

@@ -30,7 +30,9 @@ import CoreVideo
     let plugin = plugin, sink = sink, claims = claims
     return .registry(registry, captureServices: { id in
       var services = CaptureServices.registry(feedID: id, plugins: [plugin], claims: claims)
-      services.connect = { _, _ in sink.connect() }
+      // Both paths: a fixture camera must never reach the Mac's real virtual cameras.
+      services.connect = { _, _ in try sink.connect() }
+      services.connectWithSource = { _, _, _ in try sink.connect() }
       services.disconnect = { sink.disconnect() }
       services.send = { sink.send($0) }
       return services
@@ -103,11 +105,22 @@ import CoreVideo
 final class SyntheticCameraSink: @unchecked Sendable {
   private let lock = NSLock()
   private var connections = 0
+  private var attempts = 0
+  private var failures = 0
   private var sent = 0
-  func connect() { lock.withLock { connections += 1 } }
+  func connect() throws {
+    try lock.withLock {
+      attempts += 1
+      if failures > 0 { failures -= 1; throw VideoError.message("Install and enable the Ultracam camera extension.") }
+      connections += 1
+    }
+  }
   func disconnect() { lock.withLock { connections = max(0, connections - 1) } }
   func send(_ sample: CMSampleBuffer) -> Bool { lock.withLock { sent += 1; return true } }
+  func failNextConnects(_ count: Int) { lock.withLock { failures = count } }
   var sentCount: Int { lock.withLock { sent } }
+  var connectAttempts: Int { lock.withLock { attempts } }
+  var openConnections: Int { lock.withLock { connections } }
 }
 @MainActor final class SyntheticRegistryPublisher: AppVirtualCameraRegistryPublishing {
   private(set) var snapshots: [VirtualCameraRegistrySnapshot] = []

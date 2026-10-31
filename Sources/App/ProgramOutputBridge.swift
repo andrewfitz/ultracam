@@ -43,6 +43,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
     /// the camera reconnected with a new one (before its first frame).
     var staleFormat: UInt64 = 0
     var lastRefusal: String?
+    /// Connect to the first frame the Program camera took, for the latest connect.
+    var firstFrameSeconds: Double?
     /// Sends issued on the main thread. Stays 0 when the app pumps from the
     /// delivery path.
     var mainThreadSends: UInt64 = 0
@@ -90,6 +92,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
   private var configuration: PipelineConfiguration?
   private var passthroughFormat: OSType?
   private var deliveredOnConnection: UInt64 = 0
+  /// When the connect now pending its first frame began. Under `lock`.
+  private var connectStarted: TimeInterval?
   private var connection: UInt64 = 0
   private var pumpScheduled = false
   private var reconnectScheduled = false
@@ -283,6 +287,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
     let wasLinked = locked { () -> Bool in
       let linked = link == .connected || link == .failed
       link = .connecting
+      if connectStarted == nil { connectStarted = ProcessInfo.processInfo.systemUptime }
       return linked
     }
     sendQueue.sync {}  // no send is in flight past this point
@@ -323,6 +328,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
     let wasLinked = locked { () -> Bool in
       let linked = link == .connected || link == .failed
       link = .connecting  // blocks sends while the sink closes
+      connectStarted = nil
       return linked
     }
     sendQueue.sync { clearPacing() }
@@ -438,8 +444,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
         locked {
           if Thread.isMainThread { statistics.mainThreadSends &+= 1 }
           if accepted {
-            statistics.delivered &+= 1
-            deliveredOnConnection &+= 1
+            noteDeliveredLocked()
             fullSince = nil
           } else {
             statistics.dropped &+= 1
@@ -458,6 +463,18 @@ final class ProgramOutputBridge: @unchecked Sendable {
       }
     }
   }
+  /// Called only with the state lock held.
+  private func noteDeliveredLocked() {
+    statistics.delivered &+= 1
+    deliveredOnConnection &+= 1
+    if let started = connectStarted {
+      connectStarted = nil
+      let seconds = ProcessInfo.processInfo.systemUptime - started
+      statistics.firstFrameSeconds = seconds
+      cameraOutputLog.notice("Camera first frame: Program, \(String(format: "%.3f", seconds), privacy: .public) s after connect")
+    }
+  }
+
   private func clearPacing() {
     pacedImage = nil
     pacedRemaining = 0
@@ -585,7 +602,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
       locked {
         if Thread.isMainThread { statistics.mainThreadSends &+= 1 }
         if accepted {
-          statistics.delivered &+= 1; deliveredOnConnection &+= 1
+          noteDeliveredLocked()
           fullSince = nil
         } else {
           statistics.dropped &+= 1
