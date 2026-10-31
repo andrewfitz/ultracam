@@ -149,12 +149,12 @@ import XCTest
     XCTAssertTrue(FileManager.default.fileExists(atPath: ready.url.path))
   }
 
-  func testJournalPreservationFailureClosesAdmissionBeforeQueuedMedia() throws {
+  func testAFullJournalNeverEndsTheTake() throws {
     let folder = try temporaryFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
     let source = try snapshot()
     let final = folder.appendingPathComponent("final.mov")
-    let config = try SourceRecordingConfiguration(feedID: .init("journal-failure"),
+    let config = try SourceRecordingConfiguration(feedID: .init("journal-full"),
       outputURL: folder.appendingPathComponent("partial.mov"), width: 3840, height: 2160,
       videoCodec: kCMVideoCodecType_AppleProRes422HQ, sourceAdmission: source, sidecarMovieURL: final)
     var submissions = 0
@@ -166,15 +166,56 @@ import XCTest
     let mapping = try ClockMapping(sourceAnchor: .zero, hostAnchor: CMTime(value: 100, timescale: 1), rate: .one)
     try core.noteClockMapping(.init(epochID: source.epochID, clockID: source.clockBindings.video,
       revision: 1, effectiveSequence: 2, mapping: mapping))
-    _ = core.appendVideo(try sample())
+    XCTAssertTrue(core.appendVideo(try sample()))
     try core.stop()
-    XCTAssertEqual(submissions, 0)
-    XCTAssertEqual(core.state, .failed)
-    XCTAssertTrue(core.telemetry.lastError?.contains("metadata") == true)
-    XCTAssertFalse(core.appendVideo(try sample()))
+    XCTAssertEqual(submissions, 1, "The frame after the refused record still records")
+    XCTAssertEqual(core.state, .finished)
+    XCTAssertNil(core.telemetry.lastError)
+    XCTAssertTrue(core.telemetry.warning?.contains("reached its limit") == true, core.telemetry.warning ?? "no note")
     let metadata = try RecordingTakeSidecar.readSnapshot(for: final)
     XCTAssertTrue(metadata.finished)
-    XCTAssertNotNil(metadata.finalError)
+    XCTAssertNil(metadata.finalError)
+    let truncation = try XCTUnwrap(metadata.journalTruncation)
+    XCTAssertEqual(truncation.suppressed["clockMapping"], 1)
+    XCTAssertEqual(metadata.counters["journal.suppressed"], 1)
+    XCTAssertEqual(metadata.journalBytes, 0)
+  }
+
+  func testJournalBudgetCountsRecordsPastItAndKeepsTheLastMegabyteForClockHistory() throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("take.mov")
+    var metadata = RecordingTakeSidecar.Metadata(sourceSignature: "source", outputSignature: "output")
+    metadata.conversionNotes = ["Source timing is retained in the journal."]
+    let store = try RecordingTakeSidecar(movieURL: movie, metadata: metadata,
+      maximumJournalBytes: RecordingTakeSidecar.reservedJournalBytes + 256)
+    XCTAssertTrue(store.journal(.init(kind: "nativeTimecode", detail: "kept")))
+    XCTAssertNil(store.snapshot.journalTruncation)
+    let late = RecordingTakeSidecar.Event(kind: "nativeTimecode", detail: String(repeating: "x", count: 512),
+      originalValue: 1234, originalTimescale: 60000)
+    XCTAssertFalse(store.journal(late), "Labels stop short of the reserve")
+    XCTAssertFalse(store.journal(late))
+    XCTAssertFalse(store.journal(.init(kind: "quantization", detail: String(repeating: "x", count: 512), originalValue: 9, originalTimescale: 1)))
+    XCTAssertTrue(store.journal(.init(kind: "clockMapping", detail: String(repeating: "x", count: 512)), reserved: true), "Clock history may use it")
+    XCTAssertFalse(store.journal(.init(kind: "clockMapping", detail: String(repeating: "x", count: 2 * RecordingTakeSidecar.reservedJournalBytes)), reserved: true))
+    XCTAssertEqual(store.suppressedRecords, 4)
+    // The first suppressed record reaches the disk at once, for a take that never finishes.
+    let early = try RecordingTakeSidecar.readSnapshot(for: movie)
+    XCTAssertEqual(early.journalTruncation?.firstOriginalValue, 1234)
+    XCTAssertEqual(early.journalTruncation?.firstOriginalTimescale, 60000)
+    XCTAssertTrue(early.metadata.conversionNotes.contains("Source timing is retained in the journal up to the point in journalTruncation."))
+    XCTAssertTrue(early.metadata.conversionNotes.contains(RecordingTakeSidecar.Failure.journalFull.errorDescription ?? "missing"))
+    XCTAssertEqual(RecordingTakeSidecar.Failure.journalFull.errorDescription,
+      "The recording metadata journal reached its limit. Recording continued; timing records after that point were not kept.")
+    try store.finish()
+    let final = try RecordingTakeSidecar.readSnapshot(for: movie)
+    XCTAssertEqual(final.journalTruncation?.suppressed, ["nativeTimecode": 2, "quantization": 1, "clockMapping": 1])
+    XCTAssertEqual(final.journalBytes, store.snapshot.journalBytes)
+    XCTAssertFalse(store.journal(late), "A finished take keeps nothing more")
+    XCTAssertEqual(try RecordingTakeSidecar.readSnapshot(for: movie).journalTruncation?.suppressed, final.journalTruncation?.suppressed)
+    // Sidecars from before the budget have no truncation record.
+    let legacy = Data("{\"metadata\":{\"sourceSignature\":\"s\",\"outputSignature\":\"o\"}}".utf8)
+    XCTAssertNil(try JSONDecoder().decode(RecordingTakeSidecar.Snapshot.self, from: legacy).journalTruncation)
   }
 
   func testSidecarTimescaleMatchesActualMovieForEquivalent2997Declarations() throws {

@@ -334,7 +334,7 @@ struct SourceRecordingConfiguration {
           try RecordingProfileMatrix.validate(matrixProfile, source: format)
         } catch {
           throw SourceRecordingError.invalidConfiguration(
-            "Recording profile (matrixProfile.displayName) is not supported by the declared source: (error).")
+            "Recording profile \(matrixProfile.displayName) is not supported by the declared source: \(error).")
         }
       }
     }
@@ -571,9 +571,10 @@ extension SourceRecordingWriter {
 ///
 /// Nothing is dropped for being busy. If a queue's bound is ever exceeded the
 /// take fails visibly (state `.failed`, `lastError` set) and the file written
-/// so far is kept for recovery. A failure the recorder raises itself (a full
-/// drive, an encoder that fell behind) still writes every sample it had
-/// already admitted; only a failed file writer discards them.
+/// so far is kept: published if the writer closes cleanly, otherwise left for
+/// recovery. A failure the recorder raises itself (a full drive, an encoder
+/// that fell behind) still writes every sample it had already admitted; only a
+/// failed file writer discards them.
 ///
 /// Pause: samples arriving while paused are not recorded, and the file writer
 /// is told where the take resumed so the movie continues without a gap (see
@@ -707,7 +708,7 @@ final class SourceRecorderCore: @unchecked Sendable {
       snapshot.queueSamples = pendingVideo
       snapshot.queueCapacity = configuration.queueCapacity
       snapshot.queuedAudio = pendingAudio
-      if snapshot.warning == nil { snapshot.warning = writerSnapshot.warning }
+      if let note = writerSnapshot.warning { snapshot.warning = snapshot.warning.map { "\($0) \(note)" } ?? note }
       if let note = snapshot.audioSyncNote {
         snapshot.warning = snapshot.warning.map { "\($0) \(note)" } ?? note
       }
@@ -1027,12 +1028,12 @@ final class SourceRecorderCore: @unchecked Sendable {
       let capacity = kind == .video ? configuration.queueCapacity : configuration.audioQueueCapacity
       guard waiting < capacity else {
         // Never a silent drop: the encoder stage cannot keep up, so the take
-        // fails here and everything already written is kept for recovery.
+        // fails here and everything already written is kept.
         telemetryValue.droppedQueueFull &+= 1
         if kind == .video { telemetryValue.droppedVideo &+= 1 } else { telemetryValue.droppedAudio &+= 1 }
         failLocked(kind == .video
-          ? "Recording fell behind: \(capacity) video frames were already waiting for the encoder. The take stopped here and was kept for recovery."
-          : "Recording fell behind: \(capacity) audio packets were already waiting for the encoder. The take stopped here and was kept for recovery.")
+          ? "Recording fell behind: \(capacity) video frames were already waiting for the encoder. The take stopped here. Everything recorded up to this point is kept."
+          : "Recording fell behind: \(capacity) audio packets were already waiting for the encoder. The take stopped here. Everything recorded up to this point is kept.")
         return false
       }
       do {
@@ -1134,6 +1135,7 @@ final class SourceRecorderCore: @unchecked Sendable {
             self.telemetryValue.lastError = failure.localizedDescription
             self.telemetryValue.state = .failed
             self.drainAdmittedAfterFailure = false
+            self.logFailureLocked(failure.localizedDescription)
           }
         }
       }
@@ -1152,10 +1154,10 @@ final class SourceRecorderCore: @unchecked Sendable {
       // The capture clock started over: the input was reconfigured for a new
       // HDMI format (or its driver restarted). The take's cadence, timecode
       // and timeline no longer apply, so it ends here, visibly; everything
-      // admitted before is still written and the file is kept for recovery.
+      // admitted before is still written and the file is kept.
       telemetryValue.droppedVideo &+= 1
       telemetryValue.videoClockDiscontinuities &+= 1
-      failLocked("The HDMI input changed format or restarted during the take, so its capture clock started over. The take stopped here and was kept for recovery; start a new take to keep recording.")
+      failLocked("The HDMI input changed format or restarted during the take, so its capture clock started over. The take stopped here. Everything recorded up to this point is kept; start a new take to keep recording.")
       return false
     }
     defer {
@@ -1174,7 +1176,7 @@ final class SourceRecorderCore: @unchecked Sendable {
     guard elapsedNumerator < Int128(Self.maximumTimestampGapSeconds) * elapsedDenominator else {
       telemetryValue.videoClockDiscontinuities &+= 1
       telemetryValue.droppedVideo &+= 1
-      failLocked("Recording source timestamp discontinuity: the capture clock advanced by at least 10 seconds without media. The take stopped and was kept for recovery.")
+      failLocked("Recording source timestamp discontinuity: the capture clock advanced by at least 10 seconds without media. The take stopped here. Everything recorded up to this point is kept.")
       return false
     }
     let declaration = boundSourceAdmission?.format.rate ?? configuration.sourceFrameRate ?? .constant(last.duration)
@@ -1194,7 +1196,7 @@ final class SourceRecorderCore: @unchecked Sendable {
     let gaps = telemetryValue.sourceGaps
     guard pendingVideo < max(1, configuration.queueCapacity / 2) else {
       telemetryValue.droppedVideo &+= 1  // This frame is not recorded either.
-      failLocked("The capture device skipped \(skipped) frames while \(pendingVideo) frames waited for the encoder: recording could not keep up. The take stopped here and was kept for recovery.")
+      failLocked("The capture device skipped \(skipped) frames while \(pendingVideo) frames waited for the encoder: recording could not keep up. The take stopped here. Everything recorded up to this point is kept.")
       return false
     }
     // The source's own clock shows the gap; the capture log says whether
@@ -1230,6 +1232,15 @@ final class SourceRecorderCore: @unchecked Sendable {
     telemetryValue.writerErrors &+= 1
     telemetryValue.lastError = message
     drainAdmittedAfterFailure = true
+    logFailureLocked(message)
+  }
+
+  /// At the moment of failure, not at Stop: a take can sit failed for hours
+  /// before anything closes it, and the summary line only comes then.
+  private func logFailureLocked(_ message: String) {
+    let feed = configuration.feedID.rawValue
+    let file = configuration.outputURL.lastPathComponent
+    Self.log.error("\(feed, privacy: .public): take failed, \(file, privacy: .public): frames=\(self.telemetryValue.appendedVideo): \(message, privacy: .public)")
   }
 
   /// Moves the recorder to `.failed` once the writer reports a fatal error.
@@ -1240,6 +1251,7 @@ final class SourceRecorderCore: @unchecked Sendable {
       case .recording, .paused, .stopping:
         telemetryValue.state = .failed
         if telemetryValue.lastError == nil { telemetryValue.lastError = message }
+        logFailureLocked(telemetryValue.lastError ?? "The file writer failed.")
       case .idle, .finished, .failed:
         break
       }
@@ -1338,7 +1350,7 @@ final class SourceRecorderCore: @unchecked Sendable {
   private static func spaceFailure(_ error: Error, starting: Bool = false) -> SourceRecordingError {
     let outcome = starting
       ? "Free up space or choose another recording folder."
-      : "The take stopped here and everything recorded so far was kept for recovery."
+      : "The take stopped here. Everything recorded up to this point is kept."
     if case let .insufficientDiskSpace(required, available)? = error as? RecordingOutputError {
       let format = { (bytes: UInt64) in ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file) }
       return .writerFailure("The recording drive is almost full: \(format(available)) of free space left, "

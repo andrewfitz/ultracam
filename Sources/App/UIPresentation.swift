@@ -131,7 +131,7 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var programColorSpaceID = "rec709-video"
   var recordingConstantFrameRate = false
   var sourceFrameRate: FrameRate? = nil
-  /// The source's depth and chroma ("10-bit 4:2:2 packed"), nil before a format is known.
+  /// The source's depth and chroma ("10-bit 4:2:2"), nil before a format is known.
   var sourcePixel: String? = nil
   var showsRecordingConstantFrameRateCompatibility: Bool { sourceFrameRate?.isVariable == true }
   var previewEnabled = true

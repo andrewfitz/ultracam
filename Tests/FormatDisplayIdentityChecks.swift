@@ -12,6 +12,7 @@ import XCTest
     XCTAssertEqual(identity.transfer, "Rec. 709")
     XCTAssertEqual(identity.range, "Video range")
     XCTAssertEqual(identity.pixel, "10-bit 4:2:2 packed")
+    XCTAssertEqual(identity.sampling, "10-bit 4:2:2", "The inspector's one-line signal row")
     XCTAssertEqual(identity.name, "UHD 3840 × 2160 · 59.94 fps · 16:9")
     XCTAssertEqual(identity.short, "2160p 59.94", "The strip's badge and record line need the short form")
     XCTAssertFalse(identity.detail.contains("clock"))

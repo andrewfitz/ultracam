@@ -435,8 +435,9 @@ final class CaptureController: @unchecked Sendable {
   /// The LUT this camera burns in, nil while it burns none in (Apply LUT off,
   /// LUT forgotten, complete bypass, nothing loaded): the same immutable
   /// `MonitorLUT` the app built for the load, so the monitor's output stage
-  /// (`MonitorFeed.burnInLUT`) shows exactly what Program, recording and the
-  /// virtual camera get. Follows each configuration change. Thread-safe.
+  /// (`MonitorFeed.burnInLUT`) shows exactly what Program and the virtual camera
+  /// get. Recording never does: it takes the camera original. Follows each
+  /// configuration change. Thread-safe.
   var burnInLUT: MonitorLUT? { lock.withLock { burnInActive ? loadedLUT : nil } }
 
   /// Capture queue: publishes whether frames burn the loaded LUT in, as

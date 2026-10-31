@@ -541,7 +541,169 @@ import XCTest
     let lines = try String(contentsOf: RecordingTakeSidecar.url(for: movie).appendingPathExtension("journal"), encoding: .utf8)
     let labels = try lines.split(separator: "\n").map { try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data($0.utf8)) }
       .compactMap(\.nativeTimecodeMetadata).map(\.label)
-    XCTAssertEqual(labels, ["01:00:00:00", "02:00:00:30"], "One journal line per frame filled the journal in 19 minutes")
+    // The first two frames, then the jump and the frame that shows the stride is back to 2.
+    XCTAssertEqual(labels, ["01:00:00:00", "01:00:00:02", "02:00:00:30", "02:00:00:32"],
+      "One journal line per frame filled the journal in 19 minutes")
+  }
+
+  /// One frame of a replayed run: its source time and the label on it.
+  private struct LabeledFrame {
+    var pts: CMTime
+    var value: TimecodeMetadata
+  }
+
+  private func pairedCounterLabel(_ frame: Int64, rate: RecordingFrameRate = .fps5994) throws -> TimecodeMetadata {
+    let frames = frame % 60, seconds = frame / 60 % 60, minutes = frame / 3600 % 60, hours = frame / 216000
+    return try XCTUnwrap(TimecodeMetadata.native(label: String(format: "%02lld:%02lld:%02lld:%02lld", hours, minutes, seconds, frames), frameRate: rate))
+  }
+
+  /// Rebuilds every label from the kept records alone, the way a reader of the
+  /// journal has to: a record that continues the run sets the stride, and a
+  /// frame with no record is the label two frames back plus the stride.
+  private func rebuilt(_ frames: [LabeledFrame], kept: Set<Int>, duration: CMTime) -> [Int64] {
+    func continues(_ index: Int) -> Bool { CMTimeCompare(CMTimeAdd(frames[index - 1].pts, duration), frames[index].pts) == 0 }
+    var labels: [Int64] = [], stride: Int64 = 2
+    for index in frames.indices {
+      guard kept.contains(index) else { labels.append(labels[index - 2] + stride); continue }
+      let value = frames[index].value
+      labels.append(value.frameNumber)
+      guard index >= 2, continues(index), continues(index - 1), frames[index - 1].value.frameRate == value.frameRate,
+        frames[index - 1].value.dropFrame == value.dropFrame, frames[index - 1].value.epoch == value.epoch else { continue }
+      stride = value.frameNumber - labels[index - 2]
+    }
+    return labels
+  }
+
+  private func kept(_ frames: [LabeledFrame], duration: CMTime) -> Set<Int> {
+    var run = NativeLabelRun()
+    return Set(frames.indices.filter { run.breaks(frames[$0].value, pts: frames[$0].pts, duration: duration) })
+  }
+
+  func testNativeLabelRunReplaysAnFX3TakeFromAHandfulOfRecords() throws {
+    // 19 minutes at 59.94 of a counter that holds each label for two frames and
+    // skips ahead 4 more at each drop-frame minute: the take that failed.
+    let duration = RecordingFrameRate.fps5994.frameDuration
+    var frames: [LabeledFrame] = [], label: Int64 = 0
+    for index in 0..<68_245 {
+      if index > 0, index % 3596 == 0 { label += 4 }
+      frames.append(.init(pts: CMTimeMultiply(duration, multiplier: Int32(index)), value: try pairedCounterLabel(label + Int64(index) / 2 * 2)))
+    }
+    let records = kept(frames, duration: duration)
+    XCTAssertLessThanOrEqual(records.count, 40, "\(records.count) records")
+    XCTAssertEqual(rebuilt(frames, kept: records, duration: duration), frames.map(\.value.frameNumber))
+  }
+
+  func testNativeLabelRunRecordsGapsPausesHeldLabelsAndIdentityChanges() throws {
+    let duration = RecordingFrameRate.fps5994.frameDuration
+    func take(_ build: (Int) throws -> (skip: Int32, label: TimecodeMetadata)) throws -> [LabeledFrame] {
+      var skipped: Int32 = 0
+      return try (0..<200).map { index in
+        let (skip, label) = try build(index)
+        skipped += skip
+        return LabeledFrame(pts: CMTimeMultiply(duration, multiplier: Int32(index) + skipped), value: label)
+      }
+    }
+    // The camera's clock runs on through a dropout or a pause, so the labels
+    // land exactly where elapsed time predicts. The frame there is still recorded.
+    for missing: Int32 in [3, 600] {
+      let frames = try take { index in
+        (index == 100 ? missing : 0, try self.pairedCounterLabel((Int64(index) + (index >= 100 ? Int64(missing) : 0)) / 2 * 2))
+      }
+      let records = kept(frames, duration: duration)
+      XCTAssertTrue(records.contains(100), "\(missing) frames missing")
+      XCTAssertEqual(rebuilt(frames, kept: records, duration: duration), frames.map(\.value.frameNumber))
+    }
+    // A label that freezes, then returns: a stride of 0, recorded both ways.
+    let frozen = try take { index in (0, try self.pairedCounterLabel(Int64(index < 100 || index >= 150 ? index : 100) / 2 * 2)) }
+    let held = kept(frozen, duration: duration)
+    XCTAssertTrue(held.contains { (99...102).contains($0) } && held.contains { (149...152).contains($0) }, "\(held.sorted())")
+    XCTAssertEqual(rebuilt(frozen, kept: held, duration: duration), frozen.map(\.value.frameNumber))
+    // A counter that goes 1:1 instead of held pairs.
+    let oneToOne = try take { index in (0, try self.pairedCounterLabel(index < 100 ? Int64(index) / 2 * 2 : Int64(index))) }
+    let changed = kept(oneToOne, duration: duration)
+    XCTAssertGreaterThan(changed.count, 2)
+    XCTAssertEqual(rebuilt(oneToOne, kept: changed, duration: duration), oneToOne.map(\.value.frameNumber))
+    // Rate, epoch and drop flag each break the run where they change.
+    let identities: [TimecodeMetadata?] = [
+      TimecodeMetadata.native(label: "00:00:01:40", frameRate: .fps5994, epoch: 3),
+      TimecodeMetadata.native(label: "00:00:01;40", frameRate: .fps5994),
+      TimecodeMetadata.native(label: "00:00:01:40", frameRate: .fps50)]
+    for identity in identities {
+      let changedValue = try XCTUnwrap(identity)
+      let frames = try take { index in (0, index == 100 ? changedValue : try self.pairedCounterLabel(Int64(index) / 2 * 2)) }
+      XCTAssertTrue(kept(frames, duration: duration).contains(100), changedValue.label)
+    }
+  }
+
+  func testCadenceSourceTimingIsJournaledOnlyWhereDurationOrContiguityChanges() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("cadence-journal-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let url = folder.appendingPathComponent("take.mov")
+    let rate = FrameRate.variable(nominal: CMTime(value: 1, timescale: 30), shortest: CMTime(value: 1, timescale: 60), longest: CMTime(value: 1, timescale: 15))
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: rate),
+      epochID: .init(sessionID: UUID(), epoch: 1), clockBindings: .init(video: .init()), stage: .recordingSource)
+    let config = try SourceRecordingConfiguration(feedID: .init("cadence-journal"), outputURL: url, width: 1920, height: 1080,
+      videoCodec: kCMVideoCodecType_AppleProRes422HQ, frameRate: .fps5994, declaredTimebases: [60000], sourceFrameRate: rate, recordingConstantFrameRate: true,
+      sourceAdmission: source, compatibilityPolicy: .init(allowCPUConversion: true), sidecarMovieURL: url)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    let steps: [(Int64, Int64)] = [(0, 2000), (2000, 2000), (4000, 2000), (6000, 1000), (7000, 1000), (20000, 1000), (21000, 1000)]
+    for (pts, duration) in steps {
+      try writer.appendVideo(sample(pts: CMTime(value: pts, timescale: 60000), duration: CMTime(value: duration, timescale: 60000)))
+    }
+    try writer.finish()
+    let journal = try String(contentsOf: RecordingTakeSidecar.url(for: url).appendingPathExtension("journal"), encoding: .utf8)
+    let timing = try journal.split(separator: "\n").map { try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data($0.utf8)) }
+      .filter { $0.kind == "cadenceSourceTiming" }
+    XCTAssertEqual(timing.compactMap(\.originalValue), [0, 6000, 20000], "First frame, then each change only")
+  }
+
+  func testAFlippedDropFrameBitLeavesTheSourceTakeRunning() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("flipped-drop-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("take.mov")
+    let duration = RecordingFrameRate.fps5994.frameDuration
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(duration)),
+      epochID: .init(sessionID: UUID(), epoch: 1), clockBindings: .init(video: .init()), stage: .recordingSource)
+    let first = try XCTUnwrap(TimecodeMetadata.native(label: "01:00:00:00", frameRate: .fps5994))
+    let config = try SourceRecordingConfiguration(feedID: .init("flipped-drop"), outputURL: movie, width: 1920, height: 1080,
+      declaredTimebases: [60000], sourceFrameRate: .constant(duration), nativeTimecodeMetadata: first, timecodePolicy: .source,
+      sourceAdmission: source, sidecarMovieURL: movie)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    for index in 0..<8 {
+      let frame = try sample(pts: CMTimeMultiply(duration, multiplier: Int32(index)), duration: duration)
+      let separator = (3..<6).contains(index) ? ";" : ":"
+      let native = try XCTUnwrap(TimecodeMetadata.native(label: String(format: "01:00:00%@%02d", separator, index), frameRate: .fps5994))
+      CMSetAttachment(frame, key: SourceRecordingConfiguration.nativeTimecodeAttachmentKey as CFString,
+        value: try JSONEncoder().encode(native) as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+      try writer.appendVideo(frame)
+    }
+    try writer.finish()
+    XCTAssertFalse(writer.hasFailed, writer.telemetry.lastError ?? "")
+    XCTAssertEqual(writer.telemetry.encodedVideo, 8)
+    let snapshot = try RecordingTakeSidecar.readSnapshot(for: movie)
+    XCTAssertTrue(snapshot.finished)
+    XCTAssertNil(snapshot.finalError)
+    let journal = try String(contentsOf: RecordingTakeSidecar.url(for: movie).appendingPathExtension("journal"), encoding: .utf8)
+    let changes = try journal.split(separator: "\n").map { try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data($0.utf8)) }
+      .filter { $0.kind == "nativeTimecodeIdentityChange" }
+    XCTAssertEqual(changes.map(\.detail), ["01:00:00;03"], "Once where the bit flips, not per frame")
+  }
+
+  func testUnsupportedProfileRefusalNamesTheProfileAndTheReason() throws {
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(RecordingFrameRate.fps5994.frameDuration))
+    let source = try SourceAdmissionSnapshot(format: format, epochID: .init(sessionID: UUID(), epoch: 1),
+      clockBindings: .init(video: .init()), stage: .recordingSource)
+    XCTAssertThrowsError(try SourceRecordingConfiguration(feedID: .init("unsupported-profile"), outputURL: URL(fileURLWithPath: "/tmp/unsupported-profile.mov"),
+      width: 1920, height: 1080, videoCodec: kCMVideoCodecType_AppleProRes4444, sourceAdmission: source)) { error in
+      let message = error.localizedDescription
+      XCTAssertTrue(message.contains("is not supported by the declared source"), message)
+      XCTAssertFalse(message.contains("(matrixProfile"), message)
+      XCTAssertFalse(message.contains("(error)"), message)
+    }
   }
 
   func testGenericPairedPCMRecordsActualFormatsWithoutHostMappings() throws {

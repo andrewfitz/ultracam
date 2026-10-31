@@ -668,7 +668,7 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     }
     XCTAssertEqual(recorder.state, .failed)
     let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
-    XCTAssertGreaterThan(size, 0, "The failed take's media is kept for recovery")
+    XCTAssertGreaterThan(size, 0, "The failed take's media is kept")
   }
 
   /// The encoder stage's own bound also fails the take instead of dropping,

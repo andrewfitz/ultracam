@@ -97,6 +97,41 @@ import XCTest
     XCTAssertEqual(recorder.telemetry.droppedAudio, 0)
   }
 
+  /// Desktop Video reports a no-input callback's audio with no frame. The take
+  /// carries straight on, and that audio keeps its place through the real adapter.
+  func testFrameAudioWithoutItsFrameThenFrameStaysOneTakeInSync() throws {
+    let audio = try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    let fixture = try AuditCaptureFixture(audio: .present(audio))
+    let writer = AuditPairedWriter()
+    let configuration = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("unpaired-audio-audit"),
+      outputURL: URL(fileURLWithPath: "/tmp/unused-unpaired-audio-audit.mov"), width: 128, height: 72)
+    let recorder = try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
+    let adapter = SourceRecordingCallbackAdapter(feedID: configuration.feedID, recorder: recorder)
+    try adapter.start()
+    defer { fixture.stop(); try? adapter.stop() }
+    fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: adapter.callbacks)
+    try fixture.start(self)
+    let frame = VideoContract.fastDuration
+    let video = CMTime(value: 20, timescale: 1), packet = CMTime(value: 7, timescale: 1)
+    try fixture.frame(time: video)
+    try fixture.packet(audio, time: packet, pairedFrameSequence: fixture.source.context.nextSequence - 1)
+    try fixture.packet(audio, time: CMTimeAdd(packet, frame))
+    try fixture.frame(time: CMTimeAdd(video, CMTimeMultiply(frame, multiplier: 2)))
+    try fixture.packet(audio, time: CMTimeAdd(packet, CMTimeMultiply(frame, multiplier: 2)),
+      pairedFrameSequence: fixture.source.context.nextSequence - 1)
+    fixture.source.stop()
+    try adapter.stop()
+    XCTAssertEqual(recorder.state, .finished, recorder.telemetry.lastError ?? "")
+    XCTAssertEqual(recorder.telemetry.droppedAudio, 0)
+    XCTAssertEqual(recorder.telemetry.appendedAudio, 3, "Never dropped: a dropped packet slips sync for the rest of the take")
+    XCTAssertEqual(writer.videoTimes.map { CMTimeCompare($0, video) >= 0 }, [true, true, true])
+    XCTAssertEqual(writer.videoTimes.count, 3)
+    XCTAssertEqual(CMTimeCompare(writer.videoTimes[0], video), 0)
+    XCTAssertEqual(CMTimeCompare(writer.videoTimes[1], CMTimeAdd(video, frame)), 0, "Placed from the last pair")
+    XCTAssertEqual(CMTimeCompare(writer.videoTimes[2], CMTimeAdd(video, CMTimeMultiply(frame, multiplier: 2))), 0)
+  }
+
   func testGenericPairedPCMBeforeAnyFrameIsSkippedWithoutFailingTheTake() throws {
     let audio = try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .float32,
       interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)

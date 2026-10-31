@@ -11,6 +11,8 @@ struct FormatDisplayIdentity: Hashable, Sendable {
   let transfer: String
   let range: String
   let pixel: String
+  /// Depth and chroma alone, for a one-line label: "10-bit 4:2:2".
+  let sampling: String
   let scan: String
   let frameRate: String
   /// The signal's short label in the camera strip and its badge: "2160p 59.94".
@@ -22,7 +24,8 @@ struct FormatDisplayIdentity: Hashable, Sendable {
     colour = Self.colour(format.colour.primaries)
     transfer = Self.transfer(format.colour.transfer)
     range = format.colour.range == .full ? "Full range" : "Video range"
-    pixel = Self.pixel(format.pixel)
+    sampling = Self.sampling(format.pixel)
+    pixel = sampling + (PixelFormatTable.entry(for: format.pixel)?.packed == true ? " packed" : "")
     scan = format.scan == .progressive ? "Progressive" : (format.scan == .interlaced ? "Interlaced" : "Progressive segmented frame")
     frameRate = Self.rate(format.rate)
     short = "\(format.height)\(format.scan == .interlaced ? "i" : "p") "
@@ -61,7 +64,7 @@ struct FormatDisplayIdentity: Hashable, Sendable {
   private static func transfer(_ value: Colorimetry.Transfer) -> String {
     switch value { case .rec709: "Rec. 709"; case .sRGB: "sRGB"; case .linear: "Linear"; case .pq: "PQ"; case .hlg: "HLG"; case .sLog3: "S-Log3"; case .arriLogC3: "ARRI LogC3"; case .arriLogC4: "ARRI LogC4"; case .canonLog: "Canon Log"; case .canonLog2: "Canon Log 2"; case .canonLog3: "Canon Log 3"; case .vLog: "V-Log"; case .blackmagicFilmGen5: "Blackmagic Film Gen 5"; case .redLog3G10: "Log3G10"; case .unspecified: "Unspecified transfer" }
   }
-  private static func pixel(_ value: PixelFormatID) -> String {
+  private static func sampling(_ value: PixelFormatID) -> String {
     guard let entry = PixelFormatTable.entry(for: value) else { return "Unknown pixel format" }
     let sampling = entry.planes.map { ($0.horizontalSubsampling, $0.verticalSubsampling) }
     let chroma: String
@@ -69,7 +72,7 @@ struct FormatDisplayIdentity: Hashable, Sendable {
     else if sampling.contains(where: { $0 == (2, 2) }) { chroma = "4:2:0" }
     else if sampling.contains(where: { $0 == (2, 1) }) { chroma = "4:2:2" }
     else { chroma = "4:4:4" }
-    return "\(entry.bitDepth)-bit \(chroma)" + (entry.packed ? " packed" : "")
+    return "\(entry.bitDepth)-bit \(chroma)"
   }
   static func rate(_ value: FrameRate) -> String {
     let duration = value.nominal

@@ -142,7 +142,7 @@ struct UISessionBridge {
       camera.programColorSpaceID = descriptor.programColorSpaceID
       camera.recordingConstantFrameRate = descriptor.recordingConstantFrameRate
       camera.sourceFrameRate = update?.sourceFormat?.rate
-      camera.sourcePixel = update?.sourceFormat.map { FormatDisplayIdentity($0).pixel }
+      camera.sourcePixel = update?.sourceFormat.map { FormatDisplayIdentity($0).sampling }
       camera.previewEnabled = descriptor.previewEnabled
       camera.automaticStart = descriptor.automaticFeed
       // A refused Start says why; otherwise an automatic camera's status.

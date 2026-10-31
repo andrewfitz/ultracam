@@ -88,7 +88,8 @@ struct RecordingTakeContext: Sendable {
 }
 
 /// Serialized on the writer queue. No sample arrays are retained: exceptional
-/// timing and mapping records go to a capped on-disk JSON-lines journal.
+/// timing and mapping records go to a capped on-disk JSON-lines journal. The
+/// journal is forensic: nothing reads it back, so it never gets to end a take.
 final class RecordingTakeSidecar {
   struct Metadata: Codable {
     var sourceSignature: String
@@ -156,6 +157,12 @@ final class RecordingTakeSidecar {
     var sourceDurationTimescale: Int32? = nil
     var sourceProvenance: RecordingSourceProvenance? = nil
   }
+  /// Where the journal stopped keeping records, and how many it didn't keep.
+  struct JournalTruncation: Codable, Equatable {
+    var firstOriginalValue: Int64? = nil
+    var firstOriginalTimescale: Int32? = nil
+    var suppressed: [String: UInt64] = [:]
+  }
   struct Snapshot: Codable {
     var version = 1
     var metadata: Metadata
@@ -164,7 +171,8 @@ final class RecordingTakeSidecar {
     var counters: [String: UInt64] = [:]
     var journalBytes: Int = 0
     var timebaseDiagnostics: RecordingTimebase.Diagnostics? = nil
-    private enum CodingKeys: String, CodingKey { case version, metadata, finished, finalError, counters, journalBytes, timebaseDiagnostics }
+    var journalTruncation: JournalTruncation? = nil
+    private enum CodingKeys: String, CodingKey { case version, metadata, finished, finalError, counters, journalBytes, timebaseDiagnostics, journalTruncation }
     init(metadata: Metadata) { self.metadata = metadata }
     init(from decoder: Decoder) throws {
       let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -175,20 +183,24 @@ final class RecordingTakeSidecar {
       counters = try c.decodeIfPresent([String: UInt64].self, forKey: .counters) ?? [:]
       journalBytes = try c.decodeIfPresent(Int.self, forKey: .journalBytes) ?? 0
       timebaseDiagnostics = try c.decodeIfPresent(RecordingTimebase.Diagnostics.self, forKey: .timebaseDiagnostics)
+      journalTruncation = try c.decodeIfPresent(JournalTruncation.self, forKey: .journalTruncation)
     }
   }
   enum Failure: LocalizedError {
     case occupied, closed, journalFull, unresolvedAudio, journalFailure
     var errorDescription: String? {
       switch self {
-      case .journalFailure: return "Recording metadata could not be preserved. Stop the take; the existing journal was kept for recovery."
+      case .journalFailure: return "The recording metadata journal could not be written. Recording continued; timing records after that point were not kept."
       case .unresolvedAudio: return "Recording requires a resolved audio declaration."
       case .occupied: return "Take metadata already exists; it was preserved."
       case .closed: return "Take metadata is already finalized."
-      case .journalFull: return "Recording metadata journal is full. Stop the take to preserve original timing; metadata was not discarded."
+      case .journalFull: return "The recording metadata journal reached its limit. Recording continued; timing records after that point were not kept."
       }
     }
   }
+  /// The end of the journal only takes `reserved` records: labels and other
+  /// per-frame timing stop short of it, so clock history always has room.
+  static let reservedJournalBytes = 1024 * 1024
   static func url(for movie: URL) -> URL { movie.appendingPathExtension("ultracam.json") }
   let url: URL
   let journalURL: URL
@@ -223,6 +235,42 @@ final class RecordingTakeSidecar {
     try ensureWritable()
     var data = try JSONEncoder().encode(event); data.append(0x0A)
     guard data.count <= maximumJournalBytes - snapshot.journalBytes else { throw Failure.journalFull }
+    try commit(data)
+  }
+  /// The writer's way in. Metadata must never end a take: a record past its
+  /// budget, or one the disk refused, is counted and dropped. False when it
+  /// wasn't kept. Creating the sidecar at take start stays fatal.
+  @discardableResult func journal(_ event: Event, reserved: Bool = false) -> Bool {
+    let budget = reserved ? maximumJournalBytes : maximumJournalBytes - Self.reservedJournalBytes
+    do {
+      try ensureWritable()
+      var data = try JSONEncoder().encode(event); data.append(0x0A)
+      guard data.count <= budget - snapshot.journalBytes else { suppress(event); return false }
+      try commit(data)
+      return true
+    } catch {
+      suppress(event)
+      return false
+    }
+  }
+  var suppressedRecords: UInt64 { snapshot.journalTruncation?.suppressed.values.reduce(0, &+) ?? 0 }
+  /// Saved on the first record only, or a full journal would rewrite this file
+  /// for every frame. Later counts reach the disk with the counters and at finish.
+  private func suppress(_ event: Event) {
+    guard !snapshot.finished else { return }
+    let first = snapshot.journalTruncation == nil
+    var truncation = snapshot.journalTruncation ?? JournalTruncation(firstOriginalValue: event.originalValue,
+      firstOriginalTimescale: event.originalTimescale)
+    truncation.suppressed[event.kind, default: 0] &+= 1
+    snapshot.journalTruncation = truncation
+    guard first else { return }
+    snapshot.metadata.conversionNotes = snapshot.metadata.conversionNotes.map {
+      $0.replacingOccurrences(of: "retained in the journal", with: "retained in the journal up to the point in journalTruncation")
+    }
+    snapshot.metadata.conversionNotes.append(Failure.journalFull.errorDescription ?? "")
+    try? save()
+  }
+  private func commit(_ data: Data) throws {
     var candidate = snapshot
     candidate.journalBytes += data.count
     do {
@@ -254,15 +302,20 @@ final class RecordingTakeSidecar {
   }
 
   func updateCounters(_ counters: [String: UInt64]) throws {
-    try ensureWritable()
+    guard !snapshot.finished else { throw Failure.closed }
     var candidate = snapshot
     candidate.counters = counters
     try save(candidate)
     snapshot = candidate
   }
+  /// A journal that failed doesn't stop this: the sidecar is its own file, and
+  /// a movie can't be published until it reads finished.
   func finish(finalError: String? = nil) throws {
-    try ensureWritable()
-    try journal.synchronize()
+    guard !snapshot.finished else { throw Failure.closed }
+    if !journalFailed {
+      do { try journal.synchronize() }
+      catch { suppress(Event(kind: "journalSynchronize", detail: String(describing: error))) }
+    }
     var candidate = snapshot
     candidate.finished = true; candidate.finalError = finalError
     try save(candidate)

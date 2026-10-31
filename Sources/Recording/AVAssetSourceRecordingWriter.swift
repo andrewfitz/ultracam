@@ -5,6 +5,33 @@ import Foundation
 import VideoToolbox
 import Metal
 
+/// Recorder queue. Decides which native labels the journal must keep: the first
+/// two frames, any gap or pause, any change of rate, epoch or drop-frame flag, and
+/// any frame whose label minus the label two frames back differs from the current
+/// stride. That covers 1:1 counters, counters that hold each label for two frames
+/// (stride 2, the start value) and a held label (stride 0). A label's next record
+/// gives its run's length, so nothing between two records is lost.
+struct NativeLabelRun {
+  private var last: (label: TimecodeMetadata, end: CMTime)?
+  private var older: Int64?
+  private var stride: Int64 = 2
+
+  mutating func breaks(_ value: TimecodeMetadata, pts: CMTime, duration: CMTime) -> Bool {
+    let contiguous = last.map { CMTimeCompare($0.end, pts) == 0 } ?? false
+    let same = last.map {
+      $0.label.frameRate == value.frameRate && $0.label.epoch == value.epoch && $0.label.dropFrame == value.dropFrame
+    } ?? false
+    var broke = !contiguous || !same || older == nil
+    if !broke, let older, value.frameNumber - older != stride {
+      stride = value.frameNumber - older
+      broke = true
+    }
+    older = contiguous ? last?.label.frameNumber : nil
+    last = (value, CMTimeAdd(pts, duration))
+    return broke
+  }
+}
+
 /// AVAssetWriter/VideoToolbox implementation for one source feed.
 ///
 /// Three stages, each on its own thread of control, so no stage ever waits
@@ -39,7 +66,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private var finalSourceCounters: [String: UInt64] = [:]
   private var lastNativeFieldMark: Bool?
   private var hadNativeFieldMark = false
-  private var lastNativeLabel: (label: TimecodeMetadata, pts: CMTime)?
+  private var nativeLabelRun = NativeLabelRun()
+  private var lastCadenceSource: (duration: CMTime, end: CMTime)?
+  private var nativeTimecodeIdentityChanged = false
   private var lastOriginalSourceEpoch: CaptureEpochID?
   private var lastOriginalAudioEpoch: CaptureEpochID?
   private var takeSidecar: RecordingTakeSidecar?
@@ -356,16 +385,12 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     return RecordingFrameRate(numerator: Int64(duration.timescale), denominator: duration.value)
   }
 
-  /// A label the elapsed source time predicts from the last one. Cameras may
-  /// repeat each label for two frames, and dropped frames skip ahead with time.
-  static func continuesNativeLabels(_ value: TimecodeMetadata, at pts: CMTime,
-    after last: (label: TimecodeMetadata, pts: CMTime)?) -> Bool {
-    guard let last, value.epoch == last.label.epoch, value.frameRate == last.label.frameRate,
-      value.dropFrame == last.label.dropFrame, pts.isNumeric, last.pts.isNumeric else { return false }
-    let elapsed = CMTimeSubtract(pts, last.pts).seconds / value.frameRate.frameDuration.seconds
-    guard elapsed > 0 else { return false }
-    // A repeated label is a whole frame off; under 1.5 keeps rounding from breaking it.
-    return abs(Double(value.frameNumber - last.label.frameNumber) - elapsed) < 1.5
+  /// Metadata never ends a take. The first record the journal can't keep puts a
+  /// note on the take; the sidecar already holds the detail.
+  private func journal(_ event: RecordingTakeSidecar.Event, reserved: Bool = false) {
+    guard let takeSidecar, !takeSidecar.journal(event, reserved: reserved), takeSidecar.suppressedRecords == 1 else { return }
+    let note = RecordingTakeSidecar.Failure.journalFull.errorDescription ?? ""
+    telemetryLock.withLock { telemetryValue.warning = telemetryValue.warning.map { "\($0) \(note)" } ?? note }
   }
 
   var telemetry: SourceRecordingWriterTelemetry {
@@ -442,8 +467,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         throw SourceRecordingError.unsupportedSample("Recording audio declaration changed during the take; start a new take.")
       }
       if lastMappingRevision != context.mappingRevision {
-        try takeSidecar?.append(.init(kind: "clockMapping", detail: "Ordered mapping revision update",
-          mapping: context.videoMapping, mappingRevision: context.mappingRevision))
+        journal(.init(kind: "clockMapping", detail: "Ordered mapping revision update",
+          mapping: context.videoMapping, mappingRevision: context.mappingRevision), reserved: true)
       }
       lastMappingRevision = context.mappingRevision
       return
@@ -477,6 +502,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       }
       if configuration.recordingConstantFrameRate, source.format.rate.isVariable {
         metadata.timestampTimescale = (Self.matchingFrameRate(source.format.rate.nominal) ?? configuration.frameRate).frameDuration.timescale
+        // RecordingTakeSidecar rewrites this note if the journal is truncated.
         metadata.conversionNotes.append("Explicit constant-cadence recording repeats or skips whole source frames; source timing is retained in the journal.")
       }
       metadata.sourceFormat = source.format
@@ -506,9 +532,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       event.clockID == sourceAdmission.clockBindings.video || event.clockID == sourceAdmission.clockBindings.audio else {
       throw SourceRecordingError.unsupportedSample("Recording received a stale clock mapping.")
     }
-    try takeSidecar?.append(.init(kind: "clockMapping", detail: "Ordered clock mapping update",
+    journal(.init(kind: "clockMapping", detail: "Ordered clock mapping update",
       clockID: event.clockID, mapping: event.mapping, mappingRevision: event.revision,
-      effectiveSequence: event.effectiveSequence))
+      effectiveSequence: event.effectiveSequence), reserved: true)
   }
 
   private var recordingSourceFormat: SourceFormat? { sourceAdmission?.format ?? configuration.expectedSourceFormat }
@@ -596,8 +622,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         throw SourceRecordingError.unsupportedSample("Opening source provenance changed video format or clock identity.")
       }
       if original.epochID != frozen.epochID, original.epochID != lastOriginalSourceEpoch {
-        try takeSidecar?.append(.init(kind: "openingSourceProvenance", detail: "Original frame epoch before audio discovery resolved",
-          originalValue: pts.value, originalTimescale: pts.timescale, sourceProvenance: original))
+        journal(.init(kind: "openingSourceProvenance", detail: "Original frame epoch before audio discovery resolved",
+          originalValue: pts.value, originalTimescale: pts.timescale, sourceProvenance: original), reserved: true)
       }
       lastOriginalSourceEpoch = original.epochID
     }
@@ -647,7 +673,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       variableFrameTimeline = variable
     }
     if let normalizedTiming, let original = normalizedTiming.original {
-      try takeSidecar?.append(.init(kind: "quantization", detail: "Original source timing retained", originalValue: pts.value,
+      journal(.init(kind: "quantization", detail: "Original source timing retained", originalValue: pts.value,
         originalTimescale: pts.timescale, quantizationErrorSeconds: normalizedTiming.timestampErrorSeconds,
         originalTiming: original, durationErrorSeconds: normalizedTiming.durationErrorSeconds,
         intervalErrorSeconds: normalizedTiming.intervalErrorSeconds))
@@ -693,8 +719,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       return (CMTimeSubtract(normalizedTiming?.presentationTime ?? pts, timeline.offset), held)
     }
     if let pauseBoundaryError, pauseBoundaryError != 0 {
-      try takeSidecar?.append(.init(kind: "pauseBoundaryQuantization", detail: "Pause removal uses selected-grid boundaries",
-        originalValue: pts.value, originalTimescale: pts.timescale, quantizationErrorSeconds: pauseBoundaryError))
+      journal(.init(kind: "pauseBoundaryQuantization", detail: "Pause removal uses selected-grid boundaries",
+        originalValue: pts.value, originalTimescale: pts.timescale, quantizationErrorSeconds: pauseBoundaryError), reserved: true)
     }
     for audio in resumedAudio { appendHeldAudio(audio) }
     let openingAudio = heldMappedAudio; heldMappedAudio.removeAll()
@@ -717,32 +743,33 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       let raw = try JSONDecoder().decode(Timecode.self, from: data)
       let fieldMarkChanged = raw.fieldMark != lastNativeFieldMark && (raw.fieldMark != nil || hadNativeFieldMark)
       if declaredRate?.isVariable == true || Self.matchingFrameRate(duration) == nil || fieldMarkChanged {
-        try takeSidecar?.append(.init(kind: "nativeTimecode", detail: "Original source timecode",
+        journal(.init(kind: "nativeTimecode", detail: "Original source timecode",
           originalValue: pts.value, originalTimescale: pts.timescale, nativeSourceTimecode: raw))
       }
       lastNativeFieldMark = raw.fieldMark
       hadNativeFieldMark = hadNativeFieldMark || raw.fieldMark != nil
     }
     let nativeData: Data?
+    let nativeValue: TimecodeMetadata?
     if let data = CMGetAttachment(sample, key: SourceRecordingConfiguration.nativeTimecodeAttachmentKey as CFString, attachmentModeOut: nil) as? Data {
       guard data.count <= 4096 else { throw SourceRecordingError.unsupportedSample("Native timecode metadata exceeds its bound.") }
-      _ = try JSONDecoder().decode(TimecodeMetadata.self, from: data)
+      nativeValue = try JSONDecoder().decode(TimecodeMetadata.self, from: data)
       nativeData = data
     } else if let native = configuration.nativeTimecodeMetadata, firstSourceVideoPTS.map({ CMTimeCompare($0, pts) == 0 }) == true {
       // This metadata is the observed label at take admission. Later absent
       // labels remain absent; never extrapolate native source timecode.
+      nativeValue = native
       nativeData = try JSONEncoder().encode(native)
-    } else { nativeData = nil }
+    } else { nativeValue = nil; nativeData = nil }
     if sourceNativeTrackExpected == nil { sourceNativeTrackExpected = configuration.timecodePolicy == .source && nativeData != nil && declaredRate?.isVariable != true }
-    if let nativeData, declaredRate?.isVariable == true || sourceNativeTrackExpected == false {
-      let value = try JSONDecoder().decode(TimecodeMetadata.self, from: nativeData)
-      // Only where the labels start or break: the rest follow from those. A line
-      // per frame filled the journal, and failed the take, after 19 minutes.
-      if !Self.continuesNativeLabels(value, at: pts, after: lastNativeLabel) {
-        try takeSidecar?.append(.init(kind: "nativeTimecode", detail: value.label,
+    if let value = nativeValue, declaredRate?.isVariable == true || sourceNativeTrackExpected == false {
+      // Constant rate keeps only the labels the run can't predict, and the next
+      // record's time gives its length. One line per frame filled the journal,
+      // and failed the take, after 19 minutes. Variable-rate labels stay per frame.
+      if nativeLabelRun.breaks(value, pts: pts, duration: duration) || declaredRate?.isVariable == true {
+        journal(.init(kind: "nativeTimecode", detail: value.label,
           originalValue: pts.value, originalTimescale: pts.timescale, nativeTimecodeMetadata: value))
       }
-      lastNativeLabel = (value, pts)
     }
     if var conformer = cadenceConformer {
       // Native VFR labels describe source observations. They stay in the
@@ -754,8 +781,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         telemetryValue.cadenceRepeatedFrames = UInt64(conformer.statistics.repeated)
         telemetryValue.cadenceSkippedFrames = UInt64(conformer.statistics.skipped)
       }
-      try takeSidecar?.append(.init(kind: "cadenceSourceTiming", detail: "Source duration \(duration.value)/\(duration.timescale); output uses explicit constant cadence",
-        originalValue: pts.value, originalTimescale: pts.timescale, sourceDurationValue: duration.value, sourceDurationTimescale: duration.timescale))
+      // Only where the source's duration or contiguity changes: the frames between follow from those.
+      let continuesSource = lastCadenceSource.map { CMTimeCompare($0.end, pts) == 0 && CMTimeCompare($0.duration, duration) == 0 } ?? false
+      lastCadenceSource = (duration, CMTimeAdd(pts, duration))
+      if !continuesSource {
+        journal(.init(kind: "cadenceSourceTiming", detail: "Source duration \(duration.value)/\(duration.timescale); output uses explicit constant cadence",
+          originalValue: pts.value, originalTimescale: pts.timescale, sourceDurationValue: duration.value, sourceDurationTimescale: duration.timescale))
+      }
     } else {
       timelineLock.withLock { selectedTrackTimescale = normalizedTiming?.presentationTime.timescale }
       try submitVideo(session: session, image: encoderImage, pts: outputPTS,
@@ -763,7 +795,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     }
     if case let .systemCompatibility(reason) = route {
       noteSystemCompatibility(reason)
-      try updateSidecarCounters()
+      try? updateSidecarCounters()
     }
     return .appended
   }
@@ -1148,7 +1180,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       }
       guard ProcessInfo.processInfo.systemUptime < deadline else {
         throw SourceRecordingError.writerFailure(
-          "The encoder fell behind: \(Self.encoderPoolThreshold) frames waited in VideoToolbox for 2 s. The take stopped here and was kept for recovery.")
+          "The encoder fell behind: \(Self.encoderPoolThreshold) frames waited in VideoToolbox for 2 s. The take stopped here. Everything recorded up to this point is kept.")
       }
       waitForEncoderProgress(after: seen)
     }
@@ -1166,7 +1198,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       if telemetryLock.withLock({ frameStarts.count }) < Self.maximumCaptureFramesInEncoder { return }
       guard ProcessInfo.processInfo.systemUptime < deadline else {
         throw SourceRecordingError.writerFailure(
-          "The encoder fell behind: \(Self.maximumCaptureFramesInEncoder) capture frames waited in VideoToolbox for 2 s. The take stopped here and was kept for recovery.")
+          "The encoder fell behind: \(Self.maximumCaptureFramesInEncoder) capture frames waited in VideoToolbox for 2 s. The take stopped here. Everything recorded up to this point is kept.")
       }
       waitForEncoderProgress(after: seen)
     }
@@ -1404,6 +1436,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       "recording.droppedGPUFrames": telemetryValue.droppedGPUFrames,
       "recording.cadenceRepeatedFrames": telemetryValue.cadenceRepeatedFrames,
       "recording.cadenceSkippedFrames": telemetryValue.cadenceSkippedFrames,
+      "journal.suppressed": takeSidecar?.suppressedRecords ?? 0,
       "audio.mappedFrames": mappedAudioFrames, "audio.discontinuities": mappedAudioDiscontinuities] }
     counters.merge(finalSourceCounters) { _, final in final }
     try takeSidecar?.updateCounters(counters)
@@ -1524,9 +1557,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       if original.epochID != frozen.epochID, original.epochID != lastOriginalAudioEpoch {
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         let duration = CMSampleBufferGetDuration(sample)
-        try takeSidecar?.append(.init(kind: "openingAudioSourceProvenance", detail: "Original PCM before audio discovery resolved",
+        journal(.init(kind: "openingAudioSourceProvenance", detail: "Original PCM before audio discovery resolved",
           originalValue: pts.value, originalTimescale: pts.timescale,
-          sourceDurationValue: duration.value, sourceDurationTimescale: duration.timescale, sourceProvenance: original))
+          sourceDurationValue: duration.value, sourceDurationTimescale: duration.timescale, sourceProvenance: original), reserved: true)
       }
       lastOriginalAudioEpoch = original.epochID
     }
@@ -1556,11 +1589,11 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         telemetryValue.audioClockDiscontinuities = mappedAudioDiscontinuities
         telemetryValue.audioCorrectionRatio = mappedPCMBridge!.correctionRatio
       }
-      try updateSidecarCounters()
+      try? updateSidecarCounters()
     } catch {
       mappedAudioDiscontinuities &+= 1
       telemetryLock.withLock { telemetryValue.audioClockDiscontinuities = mappedAudioDiscontinuities }
-      try takeSidecar?.append(.init(kind: "audioDiscontinuity", detail: String(describing: error)))
+      journal(.init(kind: "audioDiscontinuity", detail: String(describing: error)), reserved: true)
       fail(.unsupportedSample("Audio clock correction exceeded its bounds: " + String(describing: error)),
         discardQueued: false, countEncoderError: false)
       throw error
@@ -1789,7 +1822,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     case let .overflow(waiting):
       let megabytes = waiting / 1_000_000
       fail(.writerFailure("Recording fell behind the disk: \(megabytes) MB of encoded media were waiting to be written. "
-        + "The take stopped here and was kept for recovery."),
+        + "The take stopped here. Everything recorded up to this point is kept."),
         droppedVideo: video ? 1 : 0, droppedAudio: video ? 0 : 1, discardQueued: false)
     }
   }
@@ -2059,11 +2092,19 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     let outputPTS = CMSampleBufferGetPresentationTimeStamp(sample)
     guard timecodeInput != nil, let timecodeTrack else { return }
     if configuration.timecodePolicy == .source {
-      guard let native = try Self.nativeTimecode(from: sample),
-        let value = RecordingTimecode(string: native.label, frameRate: native.frameRate, dropFrame: native.dropFrame) else { return }
-      if let initial = nativeTimecodeMetadata, initial.frameRate != native.frameRate || initial.dropFrame != native.dropFrame {
-        throw SourceRecordingError.unsupportedSample("Native timecode rate or drop-frame flag changed within the take.")
+      guard let native = try Self.nativeTimecode(from: sample) else { return }
+      // The track keeps the identity it started with. A label that changes it
+      // doesn't end the take: the true label stays on the track where the track
+      // can hold it, a new rate leaves the sample out, and the journal says when.
+      let track = nativeTimecodeMetadata ?? native
+      let changed = track.frameRate != native.frameRate || track.dropFrame != native.dropFrame
+      if changed, !nativeTimecodeIdentityChanged {
+        journal(.init(kind: "nativeTimecodeIdentityChange", detail: native.label, originalValue: outputPTS.value,
+          originalTimescale: outputPTS.timescale, nativeTimecodeMetadata: native))
       }
+      nativeTimecodeIdentityChanged = changed
+      guard track.frameRate == native.frameRate,
+        let value = RecordingTimecode(string: native.label, frameRate: track.frameRate, dropFrame: track.dropFrame) else { return }
       try enqueueTimecode(timecodeTrack.sample(for: value, at: outputPTS)); return
     }
     guard let timecodeSession else { return }
