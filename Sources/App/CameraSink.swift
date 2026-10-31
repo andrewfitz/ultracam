@@ -331,7 +331,7 @@ final class CameraSink {
 
   static func validateCameraSource(_ sourceFormat: SourceFormat?) throws {
     guard sourceFormat?.rate.isVariable != true else {
-      throw VideoError.message("Variable-frame-rate feed camera output is unavailable until real-client validation completes. Preview and recording remain available.")
+      throw VideoError.message("Variable-frame-rate camera output is unavailable until real-client validation completes. Preview and recording remain available.")
     }
   }
 
@@ -346,7 +346,7 @@ final class CameraSink {
         throw VideoError.message("Virtual camera output requires the loaded LUT's explicit output colour contract.")
       }
       guard target.range == .video else {
-        throw VideoError.message("The feed GPU encoder requires a video-range LUT output contract.")
+        throw VideoError.message("The camera output's GPU encoder requires a video-range LUT output contract.")
       }
       encoded = target
     } else {

@@ -44,17 +44,23 @@ struct UIColumnPictureLayout: Layout {
 
 // MARK: - Picture
 
-/// The picture at 16:9 with its overlays. At rest it shows only the camera's
-/// identity, tally, recording state and active tools; the tool bar and view
-/// controls appear on hover or keyboard focus. A click selects the camera and
-/// never cuts (cuts come only from explicit cut controls).
+/// The picture at 16:9 with its overlays. At rest it shows the camera's number, name and
+/// tally, the REC pill, the tools button and every enabled tool. Hovering the picture opens
+/// the full tool bar in every state (built on the picture, not on `revealed`, which is live
+/// only); live pictures also show their timecode, signal menu and view controls. A click
+/// selects the camera and never cuts (cuts come only from explicit cut controls).
 struct UICameraPictureView: View {
   let camera: UICameraPresentation
   let context: UIContext
   var compact = false
   @State private var hovering = false
   @State private var zoom = 1.0
+  /// Narrow enough that the name row can't hold the full tool bar: it takes its own row.
+  @State private var narrow = false
+  /// Under 480 pt the timecode yields, so the REC pill never truncates.
+  @State private var showsTimecode = true
   @FocusState private var focused: Bool
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   private var revealed: Bool {
     guard (hovering || focused) && !compact else { return false }
@@ -65,17 +71,21 @@ struct UICameraPictureView: View {
   }
   private var snapshot: UICameraSnapshot? { context.snapshot(camera.id) }
   private var switching: Bool { context.presentation.programAvailable }
-  /// Clean View hides every overlay on the picture, tally included; hover still
-  /// reveals the view controls so Clean View can be turned off again.
+  /// Clean View hides the overlays, pills included; the tally ring stays, and hover still
+  /// brings the tools and view controls back so Clean View can be turned off again.
   private var isClean: Bool { !compact && UICleanViewState.shared.clean.contains(camera.id) }
+
+  private static let cornerRadius: CGFloat = 14
 
   var body: some View {
     let _ = UIRenderProbe.count("UICameraPictureView")
+    let radius = compact ? 10 : Self.cornerRadius
     ZStack {
       context.pictures.picture(cameraID: camera.id, compact: compact, zoom: zoom)
         .accessibilityElement()
         .modifier(UILiveCameraAccessibilityLabel(camera: camera, context: context))
         .accessibilityAddTraits(.isButton)
+        .accessibilityAddTraits(camera.selected ? .isSelected : [])
         .accessibilityAction { context.send(.select(cameraID: camera.id)) }
         .accessibilityAction(named: "Select \(camera.name)") { context.send(.select(cameraID: camera.id)) }
         .modifier(UICutAccessibilityAction(camera: camera, context: context))
@@ -83,10 +93,11 @@ struct UICameraPictureView: View {
       overlays
     }
     .aspectRatio(16 / 9, contentMode: .fit)
-    .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 14))
+    .clipShape(RoundedRectangle(cornerRadius: radius))
     .overlay {
-      if let color = camera.tally.ringColor, !isClean {
-        RoundedRectangle(cornerRadius: compact ? 10 : 14).strokeBorder(color, lineWidth: camera.tally.isRed || camera.tally == .noPicture ? 4 : 3)
+      // The tally ring stays in Clean View: it doesn't cover the picture.
+      if let color = camera.tally.ringColor {
+        RoundedRectangle(cornerRadius: radius).strokeBorder(color, lineWidth: camera.tally.isRed || camera.tally == .noPicture ? 4 : 3)
           .allowsHitTesting(false)
       }
     }
@@ -94,9 +105,11 @@ struct UICameraPictureView: View {
       // Selection only means something next to other pictures; alone, the ring just doubles the tally ring.
       // Always in the hierarchy and shown by opacity, without animation: selecting never inserts a
       // view or animates anything, and an overlay never changes the picture's layout. It sits in
-      // the margin around the pictures (UIPictureSpacing), so it's never clipped.
+      // the margin around the pictures (UIPictureSpacing), so it's never clipped. Beside a tally
+      // ring it thins to 1 pt: selection is the least urgent fact on that edge.
       let outset = UIPictureSpacing.ringOutset
-      RoundedRectangle(cornerRadius: (compact ? 10 : 14) + outset).strokeBorder(UIPictureSpacing.selectionRing, lineWidth: 2.5)
+      RoundedRectangle(cornerRadius: radius + outset)
+        .strokeBorder(UIPictureSpacing.selectionRing, lineWidth: camera.tally.ringColor == nil ? 2 : 1)
         .padding(-outset)
         .opacity(camera.selected && !compact && context.presentation.layout != .single ? 1 : 0)
         .transaction { $0.animation = nil }
@@ -106,24 +119,29 @@ struct UICameraPictureView: View {
     .contentShape(Rectangle())
     .onTapGesture { context.send(.select(cameraID: camera.id)) }
     .onHover { hovering = $0 }
-    .focusable(!compact)
+    .onGeometryChange(for: Bool.self) { $0.size.width < UIMonitorToolButtons.ownRowBelow } action: { narrow = $0 }
+    .onGeometryChange(for: Bool.self) { $0.size.width >= 480 } action: { showsTimecode = $0 }
+    // Only Full Keyboard Access focuses a picture: a click or window activation doesn't, so it
+    // can't silently move the target of ⌘R. Focus reveals the controls and never selects.
+    .focusable(!compact, interactions: .activate)
     // The selection ring is the focus ring (D7); the system ring would draw a second one.
     .focusEffectDisabled()
     .focused($focused)
-    .onChange(of: focused) { _, isFocused in
-      if isFocused && !camera.selected { context.send(.select(cameraID: camera.id)) }
-    }
+    .onKeyPress(.space) { context.send(.select(cameraID: camera.id)); return .handled }
+    .onKeyPress(.return) { context.send(.select(cameraID: camera.id)); return .handled }
     .contextMenu { pictureMenu }
   }
 
   // MARK: Placeholders
 
+  /// One large glyph says the cause. Problems are orange; a stopped or hidden picture,
+  /// where nothing is wrong, stays gray.
   @ViewBuilder private var placeholder: some View {
     switch camera.tileState {
     case .live:
       EmptyView()
     case .connecting:
-      UIPicturePlaceholder(symbol: "video", title: "Starting…", compact: compact,
+      UIPicturePlaceholder(symbol: UISymbol.camera, title: "Starting…", compact: compact,
         detail: "Waiting for the first frame from \(camera.inputName).", showsProgress: true)
     case .signalLost:
       // No update arrives during a loss: its clock and countdown tick here, from when it began.
@@ -131,54 +149,58 @@ struct UICameraPictureView: View {
         UILostSignalPlaceholder(camera: live.camera, compact: compact, context: context)
       }
     case .noSignal:
-      UIPicturePlaceholder(symbol: "video.slash", title: "No signal", compact: compact,
-        detail: "Check that the source is sending video and that its input connection is selected on the capture device.")
+      UIPicturePlaceholder(symbol: UISymbol.noSignal, title: "No signal", compact: compact,
+        detail: "Check that the source is sending video and that its input connection is selected on the capture device.",
+        tint: .orange)
     case .unsupported(let mode):
-      UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "Unsupported format", compact: compact,
-        detail: mode.isEmpty ? "Choose a format supported by this capture device and the current processing route." : "\(mode) Choose a supported source format or check the capture diagnostics.")
+      UIPicturePlaceholder(symbol: UISymbol.warning, title: "Unsupported format", compact: compact,
+        detail: mode.isEmpty ? "Choose a format supported by this capture device and the current processing route." : "\(mode) Choose a supported source format or check the capture diagnostics.",
+        tint: .orange) {
+        Button("Show Diagnostics") { context.send(.openDiagnostics) }
+      }
     case .deviceMissing where snapshot?.inputName == nil:
-      UIPicturePlaceholder(symbol: "cable.connector", title: "No input selected", compact: compact,
-        detail: "Choose this camera's input device in the inspector.") {
+      UIPicturePlaceholder(symbol: UISymbol.input, title: "No input", compact: compact,
+        detail: "Choose this camera's input device in the inspector.", tint: .orange) {
         Button("Show Inspector") { context.send(.showInspector(cameraID: camera.id)) }
       }
     case .deviceMissing:
-      UIPicturePlaceholder(symbol: "cable.connector.slash", title: "Input disconnected", compact: compact,
-        detail: "Reconnect \(camera.inputName) or choose another input.") {
+      UIPicturePlaceholder(symbol: UISymbol.inputDisconnected, title: "Input disconnected", compact: compact,
+        detail: "Reconnect \(camera.inputName) or choose another input.", tint: .orange) {
         Button("Refresh Inputs") { context.send(.refreshInputs) }
       }
     case .stopped where snapshot?.unexpectedStop?.reason != nil:
       // Over an expanded strip the reason is enough: Start and the take are on the strip.
       let stop = snapshot?.unexpectedStop
-      if camera.collapsed {
-        UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "\(camera.name) stopped", compact: compact,
-          detail: [stop?.reason, snapshot.flatMap(UIPresentationBuilder.takeSavedLine)].compactMap { $0 }.joined(separator: ". ")) {
-          Button("Start", systemImage: "play.fill") { context.send(.startCamera(cameraID: camera.id)) }
+      UIPicturePlaceholder(symbol: UISymbol.warning, title: "\(camera.name) stopped", compact: compact,
+        detail: camera.collapsed ? [stop?.reason.map(UICameraPictureView.sentence),
+          snapshot.flatMap(UIPresentationBuilder.takeSavedLine)].compactMap { $0 }.joined(separator: ". ")
+          : stop?.reason.map(UICameraPictureView.sentence) ?? "",
+        tint: .orange) {
+        if camera.collapsed {
+          Button("Start", systemImage: UISymbol.start) { context.send(.startCamera(cameraID: camera.id)) }
             .disabled(!camera.canStart)
         }
-      } else {
-        UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "\(camera.name) stopped", compact: compact,
-          detail: stop?.reason ?? "")
       }
     case .stopped where camera.automaticStartFailed:
-      UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "Couldn't start \(camera.name)", compact: compact,
-        detail: startFailureDetail) {
-        Button("Retry", systemImage: "arrow.clockwise") { context.send(.retryAutomaticStart(cameraID: camera.id)) }
+      UIPicturePlaceholder(symbol: UISymbol.warning, title: "Couldn't start \(camera.name)", compact: compact,
+        detail: startFailureDetail, tint: .orange) {
+        Button("Retry", systemImage: UISymbol.retry) { context.send(.retryAutomaticStart(cameraID: camera.id)) }
       }
     case .stopped:
-      UIPicturePlaceholder(symbol: "video", title: "Camera stopped", compact: compact, detail: "Start the camera to see its video input.") {
+      UIPicturePlaceholder(symbol: UISymbol.camera, title: "Camera stopped", compact: compact, detail: "Start the camera to see its picture.") {
         // The expanded strip's header has the same button just below.
         if camera.collapsed {
-          Button("Start Camera", systemImage: "play.fill") { context.send(.startCamera(cameraID: camera.id)) }
+          Button("Start Camera", systemImage: UISymbol.start) { context.send(.startCamera(cameraID: camera.id)) }
             .disabled(!camera.canStart)
         }
       }
     case .previewHidden:
-      UIPicturePlaceholder(symbol: "eye.slash", title: "Preview hidden", compact: compact,
+      UIPicturePlaceholder(symbol: UISymbol.previewHidden, title: "Preview hidden", compact: compact,
         detail: "Camera output continues. Hidden previews do no rendering work.") {
         Button("Show Preview") { context.send(.setPreviewEnabled(cameraID: camera.id, true)) }
       }
     case .updating:
-      Label("Updating output…", systemImage: "arrow.triangle.2.circlepath")
+      Label("Updating output…", systemImage: UISymbol.updating)
         .uiPictureOverlay()
         .accessibilityLabel("Updating output")
     }
@@ -195,39 +217,32 @@ struct UICameraPictureView: View {
     for prefix in ["Couldn't start: ", "Couldn’t start: "] where status.hasPrefix(prefix) {
       status = String(status.dropFirst(prefix.count))
     }
-    guard let first = status.first else { return nil }
-    return first.uppercased() + status.dropFirst()
+    guard !status.isEmpty else { return nil }
+    return sentence(status)
+  }
+
+  /// The first letter in capitals.
+  static func sentence(_ text: String) -> String {
+    guard let first = text.first else { return text }
+    return first.uppercased() + text.dropFirst()
   }
 
   // MARK: Overlays
 
   private var overlays: some View {
-    VStack(spacing: 0) {
+    VStack(spacing: 6) {
       HStack(alignment: .center, spacing: 6) {
-        if switching && !isClean {
-          Text("\(camera.number)")
-            .font(.subheadline.weight(.bold).monospacedDigit())
-            .padding(.horizontal, 6)
-            .frame(minWidth: 24, minHeight: 24)
-            .background(Color.black.opacity(0.72), in: Capsule())
-            .foregroundStyle(.white)
-            .accessibilityHidden(true)
-        }
         if !isClean {
-          Text(camera.name)
-            .font(.uiOverlay)
-            .lineLimit(1).truncationMode(.tail)
-            .uiPictureOverlay()
-            .help(camera.name)
-            // The name keeps its room; a narrow picture folds the tool bar into a menu instead.
-            .layoutPriority(1)
-          UITallyBadge(tally: camera.tally)
-          stageNotice
+          identity
         }
         Spacer(minLength: 4)
-        // The tools stay on the picture so they can be found; Clean View hides them until hover.
-        if !compact && (!isClean || revealed) {
-          UIMonitorToolButtons(camera: camera, context: context)
+        if !(narrow && hovering) { tools }
+      }
+      // Too narrow for the bar beside the name: on hover it takes its own row, right aligned.
+      if narrow && hovering {
+        HStack {
+          Spacer(minLength: 0)
+          tools
         }
       }
       Spacer(minLength: 0)
@@ -240,10 +255,13 @@ struct UICameraPictureView: View {
       }
       HStack(alignment: .center, spacing: 6) {
         if revealed {
-          // The timecode alone follows the camera's updates (4 Hz), not the picture.
-          UILiveCamera(camera: camera, context: context, follows: .capture) { live in
-            Text(live.camera.timecode).font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
-              .accessibilityLabel("Timecode \(live.camera.timecode)")
+          if showsTimecode {
+            // The timecode alone follows the camera's updates (4 Hz), not the picture.
+            UILiveCamera(camera: camera, context: context, follows: .capture) { live in
+              Text(live.camera.timecode).font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
+                .accessibilityLabel("Timecode \(live.camera.timecode)")
+            }
+            .layoutPriority(-1)
           }
           signalMenu
         }
@@ -254,21 +272,60 @@ struct UICameraPictureView: View {
       }
     }
     .padding(compact ? 6 : 10)
-    .animation(.easeOut(duration: 0.15), value: revealed)
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovering)
   }
 
-  /// The take's clock follows its statistics here, not in the picture.
+  /// Number, name, tally, and what the picture isn't: Frozen, a stage before the output, a zoom.
+  @ViewBuilder private var identity: some View {
+    if switching {
+      UINumberCapsule(number: camera.number, onPicture: true)
+    }
+    Text(camera.name)
+      .font(.uiOverlay)
+      .lineLimit(1).truncationMode(.tail)
+      .uiPictureOverlay()
+      .help(camera.name)
+      // The name keeps its room; the tool bar takes its own row instead.
+      .layoutPriority(1)
+    UITallyBadge(tally: camera.tally)
+    if !compact && UICleanViewState.shared.frozen.contains(camera.id) {
+      Label("Frozen", systemImage: UISymbol.freeze).font(.uiOverlay).uiPictureOverlay()
+        .help("This picture is held. Freeze again (⌃⌥F) to show live video.")
+        .accessibilityLabel("Picture frozen")
+    }
+    stageNotice
+    if zoom != 1 {
+      Text("\(Int(zoom * 100))%").font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
+        .help("This view is magnified. Choose Fit to see the whole picture.")
+        .accessibilityLabel("Zoomed to \(Int(zoom * 100)) percent")
+    }
+  }
+
+  /// The tools button and enabled tools at rest; the full bar on hover. Clean View shows
+  /// none at rest.
+  @ViewBuilder private var tools: some View {
+    if !isClean || hovering {
+      UIMonitorToolButtons(camera: camera, context: context, expanded: hovering)
+    }
+  }
+
+  /// The take's clock follows its statistics here, not in the picture. One clock per camera:
+  /// the digits show here only while the strip is collapsed. The CPU copy pill yields first,
+  /// so REC never truncates.
   private var recordingPill: some View {
     UILiveCamera(camera: camera, context: context, follows: .all) { live in
-      HStack(spacing: 5) {
+      HStack(spacing: 6) {
         if live.snapshot?.ingestCPUCopyActive == true {
-          Text("CPU copy · Ingest · \(live.snapshot?.ingestCPUCopyFrames ?? 0)").font(.uiOverlay).lineLimit(1).uiPictureOverlay()
-            .accessibilityLabel("CPU copy for ingest")
-        }
-        if let badge = live.snapshot?.recording.compatibilityBadge {
-          Text(badge).font(.uiOverlay).lineLimit(1).uiPictureOverlay()
-            .help("System conversion is active for this recording. VideoToolbox chooses its internal CPU/GPU route.")
-            .accessibilityLabel(badge)
+          HStack(spacing: 4) {
+            UIStateGlyph(state: .warning)
+            Text("CPU copy")
+            Text("\(live.snapshot?.ingestCPUCopyFrames ?? 0)").monospacedDigit()
+          }
+          .font(.uiOverlay).lineLimit(1).uiPictureOverlay()
+          .layoutPriority(-1)
+          .help("Ingest is copying frames on the CPU: \(live.snapshot?.ingestCPUCopyFrames ?? 0) so far. Diagnostics has the route.")
+          .accessibilityElement(children: .ignore)
+          .accessibilityLabel("CPU copy for ingest")
         }
         recordingPill(live.snapshot)
       }
@@ -276,35 +333,13 @@ struct UICameraPictureView: View {
   }
 
   @ViewBuilder private func recordingPill(_ snapshot: UICameraSnapshot?) -> some View {
-    let elapsed = UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0)
+    let elapsed = camera.collapsed ? UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0) : nil
     switch camera.stripState {
-    case .recording, .updating:
-      HStack(spacing: 5) {
-        Circle().fill(.red).frame(width: 8, height: 8)
-        Text("REC \(elapsed)").font(.uiOverlay.monospacedDigit())
-      }
-      .uiPictureOverlay()
-      .accessibilityElement(children: .ignore)
-      .accessibilityLabel("Recording \(elapsed)")
-    case .paused:
-      HStack(spacing: 5) {
-        Image(systemName: "pause.fill").imageScale(.small).foregroundStyle(.orange)
-        Text("Paused \(elapsed)").monospacedDigit()
-      }
-      .uiPictureOverlay()
-      .accessibilityElement(children: .ignore)
-      .accessibilityLabel("Recording paused at \(elapsed)")
-    case .recordingNoSignal:
-      // Plain REC: the picture says what happened, and the strip what to do.
-      HStack(spacing: 5) {
-        Circle().fill(.red).frame(width: 8, height: 8)
-        Text("REC \(elapsed)").font(.uiOverlay.monospacedDigit())
-      }
-      .uiPictureOverlay()
-      .accessibilityElement(children: .ignore)
-      .accessibilityLabel("Recording \(elapsed), no signal")
-    default:
-      EmptyView()
+    case .recording, .updating: UIPictureStatePill(style: .recording, elapsed: elapsed)
+    case .paused: UIPictureStatePill(style: .paused, elapsed: elapsed)
+    // Plain REC: the picture says what happened, and the strip what to do.
+    case .recordingNoSignal: UIPictureStatePill(style: .recording, elapsed: elapsed)
+    default: EmptyView()
     }
   }
 
@@ -326,7 +361,13 @@ struct UICameraPictureView: View {
       }
       .pickerStyle(.inline)
     } label: {
-      UIPictureMenuLabel(title: Self.stageTitle(stage, output: output))
+      HStack(spacing: 4) {
+        Text(Self.stageName(stage)).foregroundStyle(.white.opacity(0.7))
+        if stage == .output, let output { Text(output).monospacedDigit() }
+        Image(systemName: "chevron.down").font(.caption2.weight(.bold)).imageScale(.small)
+      }
+      .foregroundStyle(.white)
+      .contentShape(Rectangle())
     }
     .menuStyle(.button)
     .buttonStyle(.plain)
@@ -339,18 +380,23 @@ struct UICameraPictureView: View {
     .accessibilityValue(Self.stageTitle(stage, output: output))
   }
 
-  /// What the picture shows when it isn't the Output stage, always on the
-  /// picture (not only on hover), so a picture without the camera's LUT
-  /// explains itself. The stage menu below changes it.
+  /// What the picture shows when it isn't the Output stage, always on the picture (not only
+  /// on hover), so a picture without the camera's LUT explains itself: "Source" strong,
+  /// "before LUT" dim. The stage menu below changes it.
   @ViewBuilder private var stageNotice: some View {
     let stage = context.monitor.preferences(for: camera.id).state.pictureStage
     if let notice = Self.stageNotice(stage) {
-      Text(notice)
-        .font(.uiOverlay)
-        .lineLimit(1).truncationMode(.tail)
-        .uiPictureOverlay()
-        .help(Self.stageNoticeHelp(stage))
-        .accessibilityLabel("Picture shows \(notice)")
+      HStack(spacing: 4) {
+        Image(systemName: UISymbol.pictureSettings).symbolRenderingMode(.monochrome).imageScale(.small)
+        Text(Self.stageName(stage))
+        if stage == .source { Text("before LUT").foregroundStyle(.white.opacity(0.7)).fontWeight(.regular) }
+      }
+      .font(.uiOverlay)
+      .lineLimit(1).truncationMode(.tail)
+      .uiPictureOverlay()
+      .help(Self.stageNoticeHelp(stage))
+      .accessibilityElement(children: .ignore)
+      .accessibilityLabel("Picture shows \(notice)")
     }
   }
 
@@ -358,7 +404,15 @@ struct UICameraPictureView: View {
   static func stageNotice(_ stage: SignalStage) -> String? {
     switch stage {
     case .output: return nil
-    case .source: return "Source · before LUT"
+    case .source: return "Source before LUT"
+    case .monitor: return "Monitor"
+    }
+  }
+
+  static func stageName(_ stage: SignalStage) -> String {
+    switch stage {
+    case .source: return "Source"
+    case .output: return "Output"
     case .monitor: return "Monitor"
     }
   }
@@ -371,19 +425,19 @@ struct UICameraPictureView: View {
     }
   }
 
-  /// The stage menu's title; on the Output stage, with what the camera sends ("Output · 1080p 29.97").
+  /// The stage menu's spoken value; on the Output stage, with what the camera sends.
   static func stageTitle(_ stage: SignalStage, output: String? = nil) -> String {
     switch stage {
     case .source: return "Source"
-    case .output: return output.map { "Output · \($0)" } ?? "Output"
+    case .output: return output.map { "Output \($0)" } ?? "Output"
     case .monitor: return "Monitor"
     }
   }
 
   private var viewControls: some View {
     HStack(spacing: 2) {
-      overlayButton("snowflake", help: "Freeze (⌃⌥F)", label: "Freeze") { context.send(.freeze(cameraID: camera.id)) }
-      overlayButton(isClean ? "rectangle.inset.filled" : "rectangle.dashed", help: isClean ? "Show Overlays (⌃⌥C)" : "Clean View (⌃⌥C)",
+      overlayButton(UISymbol.freeze, help: "Freeze (⌃⌥F)", label: "Freeze") { context.send(.freeze(cameraID: camera.id)) }
+      overlayButton(UISymbol.cleanView(on: isClean), help: isClean ? "Show Overlays (⌃⌥C)" : "Clean View (⌃⌥C)",
         label: isClean ? "Show Overlays" : "Clean View") { context.send(.toggleClean(cameraID: camera.id)) }
       Menu {
         Picker("Zoom", selection: $zoom) {
@@ -404,7 +458,7 @@ struct UICameraPictureView: View {
       .frame(minWidth: 36, minHeight: 24)
       .help("Zoom (center crop, this view only)")
       .accessibilityLabel("Zoom")
-      overlayButton("arrow.up.forward.square", help: "Detach to Window", label: "Detach to Window") {
+      overlayButton(UISymbol.detach, help: "Detach to Window", label: "Detach to Window") {
         context.send(.detachMonitor(cameraID: camera.id))
       }
     }
@@ -427,7 +481,7 @@ struct UICameraPictureView: View {
       set: { _ in context.send(.freeze(cameraID: camera.id)) }))
     Button(isClean ? "Show Overlays" : "Clean View") { context.send(.toggleClean(cameraID: camera.id)) }
     Button("Reset Monitor Tools") { context.send(.resetMonitorTools(cameraID: camera.id)) }
-    UICopySettingsMenu(camera: camera, context: context, title: "Copy Settings To")
+    UICopySettingsMenu(camera: camera, context: context, title: "Copy Monitor Settings To")
     Divider()
     if context.session.expandedFrom != nil {
       Button("Restore Layout") { context.send(.restoreLayout) }
@@ -566,26 +620,46 @@ private struct UICutAccessibilityAction: ViewModifier {
   }
 }
 
-/// A camera that had a picture and lost it: how long ago, what that means for the take, and,
-/// with Auto off on Program, a large Cut. Orange everywhere; red stays for frames arriving.
+/// A camera that had a picture and lost it: how long ago, the take's countdown, and, with
+/// Auto off on Program, a large Cut. Orange everywhere; red stays for frames arriving. A
+/// Program View tile says only "Signal lost": the Program picture beside it carries the rest.
 struct UILostSignalPlaceholder: View {
   let camera: UICameraPresentation
   var compact = false
   let context: UIContext
 
   var body: some View {
-    UIPicturePlaceholder(symbol: "video.slash", title: camera.lostTitle ?? "Signal lost", compact: compact,
-      detail: camera.lostDetail ?? "", tint: .orange) {
-      if let cut = camera.lostCut {
-        Button { context.send(.cut(cameraID: cut.id)) } label: {
-          Label("Cut to \(cut.name)", systemImage: "arrow.left.arrow.right")
-            .frame(minWidth: compact ? 0 : 176, minHeight: compact ? 0 : 28)
-        }
-        .controlSize(compact ? .small : .large)
-        .help("Cut Program to \(cut.name) (⌃\(cut.number))")
-        .accessibilityLabel("Cut to \(cut.name)")
+    UIPicturePlaceholder(symbol: UISymbol.noSignal, title: compact ? "Signal lost" : camera.lostTitle ?? "Signal lost",
+      compact: compact, detail: compact ? "" : camera.lostDetail ?? "", tint: .orange) {
+      if !compact, let cut = camera.lostCut {
+        UIWideCutButton(cut: cut, context: context, title: "Cut to \(cut.name)").frame(width: 220)
       }
     }
+  }
+}
+
+/// The large Cut: 36 pt tall, the same stronger gray as LUT On, with the key. No white fill:
+/// white already means "this is on".
+struct UIWideCutButton: View {
+  let cut: UICutButton
+  let context: UIContext
+  var title = "Cut"
+
+  var body: some View {
+    Button { context.send(.cut(cameraID: cut.id)) } label: {
+      HStack(spacing: 6) {
+        Image(systemName: UISymbol.cut)
+        Text(title).fontWeight(.bold)
+        if cut.number <= 4 { Text("⌃\(cut.number)").foregroundStyle(.secondary) }
+      }
+      .frame(maxWidth: .infinity, minHeight: 36)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(UISlotButtonStyle(strong: true))
+    .disabled(!cut.enabled)
+    .help(cut.help ?? "Cut Program to \(cut.name) (⌃\(cut.number))")
+    .accessibilityLabel("Cut to \(cut.name)")
+    .environment(\.colorScheme, .dark)
   }
 }
 
@@ -620,9 +694,10 @@ struct UIPicturePlaceholder<Actions: View>: View {
           Image(systemName: symbol).font(.system(size: compact ? 26 : 32, weight: .light))
             .foregroundStyle(tint ?? .white.opacity(0.6))
         }
-        Text(title).font(compact ? .callout.weight(.semibold) : .uiPlaceholderTitle).foregroundStyle(.white.opacity(0.9))
+        Text(title).font(compact ? .callout.weight(.semibold) : .uiPlaceholderTitle).monospacedDigit()
+          .foregroundStyle(.white.opacity(0.9))
         if !detail.isEmpty {
-          Text(detail).font(compact ? .caption : .uiRow).foregroundStyle(.white.opacity(0.6))
+          Text(detail).font(compact ? .uiMeta : .uiRow).foregroundStyle(.white.opacity(0.6))
             .multilineTextAlignment(.center).frame(maxWidth: compact ? 380 : 440).fixedSize(horizontal: false, vertical: true)
         }
         actions().controlSize(.small).padding(.top, compact ? 2 : 4)
@@ -635,10 +710,34 @@ struct UIPicturePlaceholder<Actions: View>: View {
   }
 }
 
+/// A fixed-width control in a strip row: Cut and LUT. Drawn by hand so its state holds in a
+/// window that isn't key, and so toggling never changes its width.
+struct UISlotButtonStyle: ButtonStyle {
+  /// LUT On and Cut: the stronger gray.
+  var strong = false
+  var outline: Color? = nil
+  @Environment(\.isEnabled) private var enabled
+
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .font(.uiRow.weight(strong ? .semibold : .medium))
+      .foregroundStyle(enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+      .background(fill(pressed: configuration.isPressed), in: RoundedRectangle(cornerRadius: 7))
+      .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(outline ?? .clear, lineWidth: 1.5))
+  }
+
+  private func fill(pressed: Bool) -> AnyShapeStyle {
+    if !enabled { return AnyShapeStyle(.fill.quaternary) }
+    if pressed { return AnyShapeStyle(.fill) }
+    return strong ? AnyShapeStyle(.fill.secondary) : AnyShapeStyle(.fill.tertiary)
+  }
+}
+
 // MARK: - Channel strip
 
-/// A camera's own controls under its picture: recording, output, effects and audio.
-/// Every row starts with a glyph in the same gutter, so the text lines up in one column.
+/// A camera's own controls under its picture. Fixed rows, so nothing appears or vanishes and
+/// pressing Record never moves the picture: header · record · folder and format (or the
+/// problem) · output · meters. Every row starts with a glyph in the same gutter.
 struct UIChannelStripView: View {
   let camera: UICameraPresentation
   let context: UIContext
@@ -648,15 +747,21 @@ struct UIChannelStripView: View {
   private static let gutter: CGFloat = 28
   /// One row in every state: the folder, or a problem in its place.
   private static let folderRowHeight: CGFloat = 24
+  /// The Cut slot and the LUT toggle never change width.
+  static let cutWidth: CGFloat = 64
+  static let lutWidth: CGFloat = 72
   /// MonitorKit's compact level meter is 56 pt wide.
   nonisolated private static let compactMeterWidth: CGFloat = 56
   /// Whether the collapsed strip has room for its meter (set only when that changes).
   @State private var compactMeterFits = true
   /// The strip's "2 problems" is open.
   @State private var problemsOpen = false
+  /// The Camera Control sheet, from ⋯.
+  @State private var controlOpen = false
 
   private var snapshot: UICameraSnapshot? { context.snapshot(camera.id) }
   private var isRecordingOrPaused: Bool { camera.pauseTitle != nil }
+  private var isClean: Bool { UICleanViewState.shared.clean.contains(camera.id) }
 
   /// Retry's help names the reason, which a collapsed strip doesn't show.
   private var retryHelp: String {
@@ -671,34 +776,22 @@ struct UIChannelStripView: View {
     }
     .padding(.horizontal, 12)
     .padding(.vertical, camera.collapsed ? 6 : 10)
-    .background(background, in: RoundedRectangle(cornerRadius: 12))
+    .background(.fill.quaternary, in: RoundedRectangle(cornerRadius: 12))
     // The picture's ring is the one selection indicator (D7), so the strip has no accent border.
-    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: contrast == .increased ? 1.5 : 1))
+    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator, lineWidth: contrast == .increased ? 1.5 : 1))
     .accessibilityElement(children: .contain)
     .accessibilityLabel("\(camera.name) controls")
-  }
-
-  /// Orange for problems, including a failed take; red stays for on air and recording (D8).
-  private var stateTone: UITone? {
-    switch camera.stripState {
-    case .recordingNoSignal, .noFolder, .failed: return .warning
-    default: return nil
+    .sheet(isPresented: $controlOpen) {
+      if let store = context.cameraControls {
+        UICameraControlSettings(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
+      }
     }
   }
 
-  private var background: AnyShapeStyle {
-    if let tone = stateTone { return AnyShapeStyle(tone.color.opacity(0.08)) }
-    return AnyShapeStyle(.fill.quaternary)
-  }
-
-  private var border: AnyShapeStyle {
-    if let tone = stateTone { return AnyShapeStyle(tone.color.opacity(0.5)) }
-    return AnyShapeStyle(.separator)
-  }
-
-  /// A leading row glyph in the shared gutter.
+  /// A leading row glyph in the shared gutter. Decoration: the row's words say it.
   private func gutterIcon(_ symbol: String, color: Color = .secondary) -> some View {
     Image(systemName: symbol).font(.uiRow).foregroundStyle(color).frame(width: Self.gutter)
+      .accessibilityHidden(true)
   }
 
   // MARK: Expanded
@@ -711,21 +804,9 @@ struct UIChannelStripView: View {
       folderSlot
       Divider()
       outputRow
-      if let store = context.cameraControls {
-        HStack(spacing: 8) {
-          gutterIcon("wifi").accessibilityHidden(true)
-          UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
-            .buttonStyle(.borderless).font(.uiRow)
-          Spacer(minLength: 0)
-        }
-      }
       HStack(spacing: 8) {
-        // Red while a take measures the audio: the take started the maxima and OVER over.
-        gutterIcon("waveform", color: takeMeasuresAudio ? .red : .secondary)
-          .help(takeMeasuresAudio
-            ? "Embedded audio, true peak. The maxima, OVER and loudness started over with this take."
-            : "Embedded audio, true peak")
-          .accessibilityHidden(true)
+        gutterIcon(UISymbol.audio)
+          .help("Embedded audio, true peak")
         UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio)
       }
     }
@@ -742,7 +823,7 @@ struct UIChannelStripView: View {
 
   private func problemRow(_ problem: UIStripProblem) -> some View {
     HStack(spacing: 8) {
-      gutterIcon("exclamationmark.triangle.fill", color: problem.level.glyph)
+      gutterIcon(UISymbol.warning, color: problem.level.glyph)
       problemWords(problem, font: .uiRowEmphasis)
       Spacer(minLength: 4)
       if problem.count == 1, let action = problem.action {
@@ -750,34 +831,34 @@ struct UIChannelStripView: View {
       }
     }
     .frame(height: Self.folderRowHeight)
-    .background(problem.level == .damage ? AnyShapeStyle(problem.level.fill) : AnyShapeStyle(.clear), in: RoundedRectangle(cornerRadius: 5))
+    .background(problem.level.fill, in: RoundedRectangle(cornerRadius: 5))
     .accessibilityElement(children: .contain)
   }
 
   /// What's wrong, or with more than one thing wrong, how many: then the words open the list.
-  @ViewBuilder private func problemWords(_ problem: UIStripProblem, font: Font) -> some View {
+  @ViewBuilder private func problemWords(_ problem: UIStripProblem, font: Font, short: Bool = false) -> some View {
     if problem.count > 1 {
-      Button("\(problem.count) problems") { problemsOpen = true }
-        .buttonStyle(.plain).font(font).foregroundStyle(problem.level.text)
-        .popover(isPresented: $problemsOpen, arrowEdge: .bottom) {
-          UIProblemList(problems: context.presentation.problems.filter { $0.cameraID == camera.id }, context: context)
-            .padding(14).frame(width: 340, alignment: .leading)
+      Button { problemsOpen = true } label: {
+        HStack(spacing: 3) {
+          Text("\(problem.count) problems")
+          Image(systemName: UISymbol.expandStrip).imageScale(.small)
         }
+      }
+      .buttonStyle(.plain).font(font).foregroundStyle(short ? .primary : problem.level.text)
+      .help("Show \(camera.name)'s problems")
+      .popover(isPresented: $problemsOpen, arrowEdge: .bottom) {
+        UIProblemList(problems: context.presentation.problems.filter { $0.cameraID == camera.id }, context: context)
+          .padding(12).frame(width: 340, alignment: .leading)
+      }
     } else {
-      Text(problem.text).font(font).foregroundStyle(problem.level.text).lineLimit(1).truncationMode(.tail)
+      Text(short ? problem.short : problem.text).font(font).foregroundStyle(short ? .primary : problem.level.text)
+        .lineLimit(1).truncationMode(.tail)
         .help(problem.text)
     }
   }
 
-  /// The camera button names its action while the whole row fits, and shortens otherwise.
+  /// Start, or Retry, takes the header's slot while the camera is stopped. Stop Camera is in ⋯.
   private var header: some View {
-    UIFirstFitting {
-      header(compact: false)
-      header(compact: true)
-    }
-  }
-
-  private func header(compact: Bool) -> some View {
     HStack(spacing: 8) {
       chevron
       if let brand = feedBrand {
@@ -785,16 +866,13 @@ struct UIChannelStripView: View {
       }
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
         .help("\(camera.name) · \(camera.inputName)")
-      if let controlStore = context.cameraControls {
-        UIFeedSettingsMenu(camera: camera, snapshot: snapshot, controlStore: controlStore, viewFactories: context.controlViewFactories)
-      } else {
-        UIBadge(text: camera.statusBadge, tone: camera.statusTone)
-      }
-      tallyBadge
+      UIFeedSettingsMenu(camera: camera, snapshot: snapshot, controlStore: context.cameraControls,
+        viewFactories: context.controlViewFactories)
       Spacer(minLength: 4)
-      cameraButton(compact: compact)
+      cameraButton
       overflowMenu
     }
+    .frame(height: 24)
   }
 
   private var feedBrand: VendorDescriptor? {
@@ -806,7 +884,7 @@ struct UIChannelStripView: View {
 
   private var chevron: some View {
     Button { context.send(.toggleCollapsed(cameraID: camera.id)) } label: {
-      Image(systemName: camera.collapsed ? "chevron.right" : "chevron.down")
+      Image(systemName: camera.collapsed ? UISymbol.expandStrip : UISymbol.collapseStrip)
         .font(.subheadline.weight(.semibold))
         .frame(width: Self.gutter, height: 24)
         .contentShape(Rectangle())
@@ -817,37 +895,20 @@ struct UIChannelStripView: View {
     .accessibilityLabel(camera.collapsed ? "Expand \(camera.name)" : "Collapse \(camera.name)")
   }
 
-  @ViewBuilder private var tallyBadge: some View {
-    if let label = camera.tally.label {
-      switch camera.tally {
-      case .onAir, .iso: UIBadge(text: label, tone: .critical)
-      case .noPicture: UIBadge(text: label, tone: .warning)
-      case .next: UIBadge(text: label, tone: .positive)
-      default: UIBadge(text: label, tone: .neutral)
-      }
-    }
-  }
-
-  @ViewBuilder private func cameraButton(compact: Bool) -> some View {
+  @ViewBuilder private var cameraButton: some View {
     if camera.canStop {
-      Button { context.send(.stopCamera(cameraID: camera.id)) } label: {
-        if compact { Image(systemName: "stop.fill") } else { Label("Stop Camera", systemImage: "stop.fill") }
-      }
-      .controlSize(.small)
-      .help(camera.stopNeedsConfirmation ? "Stops capture and output. Asks first because it would end a recording or on-air video."
-        : "Stops this camera's capture and output.")
-      .accessibilityLabel("Stop \(camera.name)")
+      EmptyView()
     } else if camera.automaticStartFailed {
       // One problem, one action: the same Retry the picture offers.
       Button { context.send(.retryAutomaticStart(cameraID: camera.id)) } label: {
-        if compact { Image(systemName: "arrow.clockwise") } else { Label("Retry", systemImage: "arrow.clockwise") }
+        Label("Retry", systemImage: UISymbol.retry)
       }
       .controlSize(.small)
       .help(retryHelp)
       .accessibilityLabel("Retry \(camera.name)")
     } else {
       Button { context.send(.startCamera(cameraID: camera.id)) } label: {
-        if compact { Image(systemName: "play.fill") } else { Label("Start Camera", systemImage: "play.fill") }
+        Label("Start Camera", systemImage: UISymbol.start)
       }
       .controlSize(.small)
       .disabled(!camera.canStart)
@@ -856,8 +917,10 @@ struct UIChannelStripView: View {
     }
   }
 
+  /// Trimmed to what a live operator reaches for. Restart Camera sits above Stop: a hang is
+  /// the only live reason to open this menu.
   private var overflowMenu: some View {
-    return Menu {
+    Menu {
       Button("Show Inspector") { context.send(.showInspector(cameraID: camera.id)) }
       if context.presentation.programAvailable {
         // ⌃n belongs to the Program menu. The badge only shows it: a keyboard
@@ -875,13 +938,10 @@ struct UIChannelStripView: View {
         Button(pause == "Pause" ? "Pause Recording" : "Resume Recording") { context.send(.pauseOrResume(cameraID: camera.id)) }
       }
       Divider()
-      Button("Load LUT…") { context.send(.chooseLUT(cameraID: camera.id)) }
-      UIMonitorLUTMenu(cameraID: camera.id, cameraName: camera.name, monitor: context.monitor)
-      Button("Choose Recording Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }
-      if snapshot?.recording.folderIsCustom == true {
-        Button("Use Default Folder") { context.send(.useDefaultFolder(cameraID: camera.id)) }
-      }
       UICopySettingsMenu(camera: camera, context: context, title: "Copy Monitor Settings To")
+      if context.cameraControls != nil {
+        Button("Camera Control…") { controlOpen = true }
+      }
       Divider()
       // The one rename alert lives on the main window; this only asks for it.
       Button("Rename…") { context.send(.beginRename(cameraID: camera.id)) }
@@ -889,6 +949,8 @@ struct UIChannelStripView: View {
       Button("Diagnostics…") { context.send(.openDiagnostics) }
       Divider()
       if camera.canStop {
+        Button("Restart Camera") { context.send(.restartCamera(cameraID: camera.id)) }
+          .help("Reopen \(camera.name)'s output. Capture and the take keep running.")
         Button("Stop Camera") { context.send(.stopCamera(cameraID: camera.id)) }
       } else {
         Button("Start Camera") { context.send(.startCamera(cameraID: camera.id)) }.disabled(!camera.canStart)
@@ -897,11 +959,13 @@ struct UIChannelStripView: View {
         .disabled(!camera.canRemove)
         .help(camera.removeHelp)
     } label: {
-      Label("More", systemImage: "ellipsis.circle").labelStyle(.iconOnly)
+      Label("More", systemImage: UISymbol.more).labelStyle(.iconOnly)
         .frame(minWidth: 24, minHeight: 24)
         .contentShape(Rectangle())
     }
-    .menuStyle(.borderlessButton)
+    .menuStyle(.button)
+    .buttonStyle(.plain)
+    .foregroundStyle(.secondary)
     .menuIndicator(.hidden)
     .fixedSize()
     .frame(minWidth: 24, minHeight: 24)
@@ -910,49 +974,48 @@ struct UIChannelStripView: View {
     .accessibilityLabel("More for \(camera.name)")
   }
 
-  /// The footnote ("Camera original · no LUT or effects") can drop out of a
-  /// narrow strip, so the record button's help always says it too.
+  /// The camera-original note is on the Ready line, and always in the record button's help.
   private var recordHelp: String {
-    camera.recordButtonActive || isRecordingOrPaused ? camera.recordButtonHelp
+    var help = camera.recordButtonActive || isRecordingOrPaused ? camera.recordButtonHelp
       : camera.recordButtonHelp + " Records the camera original, without LUT or effects."
+    if let fallback = camera.formatFallback { help += " \(fallback): \(camera.formatHelp)" }
+    return help
   }
 
-  private var recordButton: some View {
+  private func recordButton(size: CGFloat = 28, neutralStop: Bool = false) -> some View {
     UIRecordButton(active: camera.recordButtonActive || camera.pauseTitle == "Resume", enabled: camera.recordButtonEnabled,
-      help: recordHelp) {
+      help: recordHelp, size: size, neutralStop: neutralStop, name: camera.name) {
       context.send(.toggleRecording(cameraID: camera.id))
     }
   }
 
-  /// Small status words stay in a label color; the state's color goes on a symbol.
-  private var recordSymbol: (name: String, color: Color)? {
+  /// The state's glyph before its word. The word stays in a label color.
+  @ViewBuilder private func recordGlyph(_ camera: UICameraPresentation) -> some View {
     switch camera.stripState {
-    case .paused: return ("pause.fill", .orange)
-    case .recordingNoSignal, .noFolder, .failed: return ("exclamationmark.triangle.fill", .orange)
-    case .saved: return ("checkmark.circle.fill", .green)
-    default: return nil
+    case .recording, .updating: UIStateGlyph(state: .recording, size: 7)
+    case .paused: UIStateGlyph(state: .paused)
+    case .recordingNoSignal, .noFolder, .failed: UIStateGlyph(state: .warning)
+    case .saved: Image(systemName: UISymbol.saved).foregroundStyle(.green).imageScale(.small).accessibilityHidden(true)
+    default: EmptyView()
     }
   }
 
-  /// The take's clock, size and drops follow its statistics in this row alone.
+  /// The take's clock and drops follow its statistics in this row alone.
   private var recordRow: some View {
     UILiveCamera(camera: camera, context: context, follows: .take) { live in recordRow(live.camera) }
+      .frame(height: 44)
   }
 
   private func recordRow(_ camera: UICameraPresentation) -> some View {
     HStack(spacing: 8) {
       Group {
-        if camera.stripState == .finishing { ProgressView().controlSize(.small) } else { recordButton }
+        if camera.stripState == .finishing { ProgressView().controlSize(.small) } else { recordButton() }
       }
       .frame(width: Self.gutter, height: 28)
       VStack(alignment: .leading, spacing: 2) {
         HStack(spacing: 4) {
-          if let symbol = recordSymbol {
-            Image(systemName: symbol.name).foregroundStyle(symbol.color).imageScale(.small)
-          }
-          // Red only for a live take, where the title is bold next to the red stop button.
-          Text(camera.recordTitle)
-            .foregroundStyle(camera.recordTone == .critical ? Color.red : Color.primary)
+          recordGlyph(camera)
+          Text(camera.recordTitle).monospacedDigit()
         }
         .font(.uiRowEmphasis)
         if isRecordingOrPaused {
@@ -960,27 +1023,16 @@ struct UIChannelStripView: View {
             .foregroundStyle(camera.stripState == .paused ? .secondary : .primary)
             .help(camera.takeAudioHelp ?? "")
         } else {
-          Text(camera.recordDetail).font(.uiRow).lineLimit(1).truncationMode(.middle)
-            .foregroundStyle(camera.stripState == .saved ? .primary : .secondary)
-            .help(camera.takeAudioHelp.map { "\(camera.recordDetail)\n\($0)" } ?? "")
-          // A saved take's note (an audio over, audio re-synced) stays until the next take.
-          if camera.stripState == .saved, let note = camera.recordingNote { noteLine(note) }
+          Text(camera.recordDetail).font(.uiMeta).lineLimit(1).truncationMode(.middle)
+            .foregroundStyle(.secondary)
+            .help(camera.takeAudioHelp.map { "\(camera.recordDetail)\n\($0)" } ?? camera.recordDetail)
         }
       }
       .layoutPriority(1)
-      if let size = camera.sizeLine {
-        VStack(alignment: .leading, spacing: 2) {
-          Text(size).font(.uiValue)
-          if let drops = camera.dropsLine {
-            HStack(spacing: 4) {
-              Image(systemName: camera.dropsWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                .foregroundStyle(camera.dropsWarning ? .orange : .green).imageScale(.small)
-              Text(drops).foregroundStyle(.secondary)
-            }
-            .font(.uiValue)
-          }
-          if let note = camera.recordingNote { noteLine(note) }
-        }
+      if let drops = camera.dropsLine {
+        dropsLine(drops, warning: camera.dropsWarning).padding(.leading, 6)
+      } else if camera.stripState == .saved, let note = camera.recordingNote {
+        noteLine(note)
       }
       Spacer(minLength: 4)
       recordActions
@@ -988,33 +1040,48 @@ struct UIChannelStripView: View {
     .accessibilityElement(children: .contain)
   }
 
+  /// "✓ 0 dropped", the count strong. While the signal is lost: "Losing frames" with the
+  /// triangle, so a green tick never sits beside the countdown.
+  private func dropsLine(_ text: String, warning: Bool) -> some View {
+    HStack(spacing: 4) {
+      Image(systemName: warning ? UISymbol.warning : UISymbol.saved)
+        .foregroundStyle(warning ? .orange : .green).imageScale(.small)
+        .accessibilityHidden(true)
+      if let space = text.firstIndex(of: " "), text.first?.isNumber == true {
+        Text(text[..<space]).font(.uiValueStrong).foregroundStyle(warning ? .primary : .primary)
+        Text(text[text.index(after: space)...]).font(.uiMeta).foregroundStyle(warning ? .primary : .secondary)
+      } else {
+        Text(text).font(.uiRow).foregroundStyle(.primary)
+      }
+      if let note = camera.recordingNote { noteLine(note) }
+    }
+    .lineLimit(1)
+    .accessibilityElement(children: .combine)
+  }
+
   /// A take's note that needs a look, with the orange warning symbol.
   private func noteLine(_ note: String) -> some View {
     HStack(spacing: 4) {
-      Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).imageScale(.small)
-      Text(note).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+      Image(systemName: UISymbol.warning).foregroundStyle(.orange).imageScale(.small)
+      Text(note).foregroundStyle(.primary).lineLimit(1).truncationMode(.tail)
     }
-    .font(.uiValue)
+    .font(.uiMeta)
     .help(note)
-  }
-
-  /// A take is measuring the audio: it started the meter's maxima, OVER latch and loudness over.
-  private var takeMeasuresAudio: Bool {
-    camera.stripState == .recording || camera.stripState == .recordingNoSignal || camera.stripState == .updating
   }
 
   @ViewBuilder private var recordActions: some View {
     switch camera.stripState {
     case .recording, .recordingNoSignal, .updating, .paused:
       if let pause = camera.pauseTitle {
-        Button(pause, systemImage: pause == "Pause" ? "pause.fill" : "play.fill") {
+        Button(pause, systemImage: pause == "Pause" ? UISymbol.paused : UISymbol.start) {
           context.send(.pauseOrResume(cameraID: camera.id))
         }
         .controlSize(.small)
+        .accessibilityLabel("\(pause) \(camera.name)")
       }
     case .saved:
       if let url = snapshot?.recording.savedURL {
-        Button("Show in Finder", systemImage: "folder") { context.send(.revealInFinder(url)) }.controlSize(.small)
+        Button("Show in Finder", systemImage: UISymbol.folder) { context.send(.revealInFinder(url)) }.controlSize(.small)
       }
     case .noFolder:
       Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
@@ -1026,237 +1093,334 @@ struct UIChannelStripView: View {
       } else {
         Button("Details") { context.send(.acknowledgeStop(cameraID: camera.id)) }.controlSize(.small)
       }
-    case .stopped:
-      EmptyView()
-    case .finishing:
-      Text("Saving…").font(.uiRow).foregroundStyle(.secondary)
     case .waiting:
       // The strip says a folder is also needed; offer it now rather than after the signal arrives.
       if let recording = snapshot?.recording, recording.folderPath == nil {
         Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
       }
-    case .ready:
+    case .stopped, .finishing, .ready:
       EmptyView()
     }
   }
 
-  /// The time left on the drive follows the take, and free space every few seconds.
+  /// Drive, then the folder with its last part primary, then this camera's format, read-only:
+  /// one format for every camera, chosen in the sidebar and the Record menus. Time left is
+  /// the status bar's and the sidebar's.
   private var folderRow: some View {
-    UILiveCamera(camera: camera, context: context, follows: .take, refresh: 5) { live in
-      UIFirstFitting {
-        folderContent(live.camera, footnote: true)
-        folderContent(live.camera, footnote: false)
+    HStack(spacing: 6) {
+      if let path = snapshot?.recording.folderPath {
+        let drive = UIPresentationBuilder.drive(for: snapshot ?? UICameraSnapshot(id: "", name: ""), in: context.session)
+        let low = drive.map { ($0.secondsLeft ?? .infinity) < UIPresentationBuilder.lowDriveSeconds || UIPresentationBuilder.isFull($0) } ?? false
+        Image(systemName: UISymbol.drive(low: low)).foregroundStyle(low ? Color.orange : .secondary).imageScale(.small)
+          .frame(width: Self.gutter).accessibilityHidden(true)
+        if let drive { Text(drive.name).font(.uiValueStrong).lineLimit(1).fixedSize() }
+        Image(systemName: UISymbol.folder).foregroundStyle(.secondary).imageScale(.small).accessibilityHidden(true)
+        Self.folderText(path).lineLimit(1).truncationMode(.head)
+          .help(path)
+      } else {
+        Text("—").font(.uiRow).foregroundStyle(.secondary).frame(width: Self.gutter)
+          .accessibilityLabel("No recording folder")
       }
+      Spacer(minLength: 4)
+      formatChip
     }
+    .font(.uiMeta)
   }
 
-  private func folderContent(_ camera: UICameraPresentation, footnote: Bool) -> some View {
-    HStack(spacing: 8) {
-      gutterIcon("folder")
+  /// "Takes/Camera 1": the parent dim, the folder itself primary.
+  private static func folderText(_ path: String) -> Text {
+    let name = (path as NSString).lastPathComponent
+    let parent = ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
+    return Text("\(Text("\(parent)/").foregroundStyle(.secondary))\(Text(name).foregroundStyle(.primary))")
+  }
+
+  @ViewBuilder private var formatChip: some View {
+    if let fallback = camera.formatFallback {
       HStack(spacing: 4) {
-        Text(camera.folderLine).font(.uiRow).lineLimit(1).truncationMode(.middle)
-          .help(snapshot?.recording.folderPath ?? camera.folderLine)
-        if let left = camera.timeLeftLine {
-          Text("· \(left)").font(.uiValue).foregroundStyle(.secondary).fixedSize()
-        }
+        UIStateGlyph(state: .warning)
+        Text(fallback).font(.uiBadge).lineLimit(1)
       }
-      if snapshot?.recording.folderIsCustom == true {
-        UIBadge(text: "Own folder").fixedSize()
-      }
-      Spacer(minLength: 4)
-      if footnote {
-        Text("Camera original · no LUT or effects").font(.uiMeta).foregroundStyle(.secondary).fixedSize()
-      }
-    }
-  }
-
-  private var outputRow: some View {
-    UIFirstFitting {
-      outputContent(full: true)
-      outputContent(full: false)
-      // Narrow cells: icon-only output state and an unlabeled Processing switch, so the
-      // strip never grows wider than its picture.
-      outputContent(full: false, minimal: true)
-    }
-  }
-
-  private func outputContent(full: Bool, minimal: Bool = false) -> some View {
-    HStack(spacing: 8) {
-      outputLabel(full: full, minimal: minimal)
-      Spacer(minLength: 4)
-      if camera.applying {
-        HStack(spacing: 4) {
-          ProgressView().controlSize(.mini)
-          if full { Text("Updating output…").font(.uiRow).foregroundStyle(.secondary) }
-        }
+      .fixedSize()
+      .help(camera.formatHelp)
+      .accessibilityElement(children: .ignore)
+      .accessibilityLabel("Format \(fallback)")
+    } else {
+      UIBadge(text: camera.formatTitle, symbol: UISymbol.format)
         .fixedSize()
-        .accessibilityLabel("Updating output")
+        .help(camera.formatHelp)
+        .accessibilityLabel("Format \(camera.formatTitle)")
+    }
+  }
+
+  /// Cut slot, one output value, the LUT toggle and the Effects menu. The LUT is one click
+  /// because it changes pixels, never the format; everything in the menu changes what
+  /// meeting apps receive, so it takes two deliberate clicks.
+  private var outputRow: some View {
+    HStack(spacing: 8) {
+      if context.presentation.programAvailable { cutSlot }
+      outputValue
+      Spacer(minLength: 4)
+      lutToggle
+      UIEffectsMenu(camera: camera, snapshot: snapshot, context: context)
+    }
+    .frame(height: 24)
+  }
+
+  @ViewBuilder private var outputValue: some View {
+    HStack(spacing: 6) {
+      Image(systemName: UISymbol.virtualCamera(inUse: camera.outputInUse))
+        .foregroundStyle(camera.outputInUse ? Color.green : .secondary).imageScale(.small)
+        .accessibilityHidden(true)
+      if camera.applying {
+        ProgressView().controlSize(.mini)
+        Text("Updating output…").foregroundStyle(.secondary)
+      } else {
+        Text(camera.outputValue).font(.uiValueStrong).fixedSize()
+        if camera.outputInUse && camera.tally != .onAir { Text("In use").foregroundStyle(.secondary).fixedSize() }
       }
-      effectChips
-      cameraDisplayToggle
-      if minimal { processingToggle.labelsHidden() } else { processingToggle }
     }
+    .font(.uiRow)
+    .lineLimit(1)
+    .help("Ultracam · \(camera.name) sends \(camera.outputValue). \(camera.outputLine).")
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(camera.applying ? "Updating output" : "Output \(camera.outputValue), \(camera.outputLine)")
   }
 
-  private var processingToggle: some View {
-    Toggle(isOn: Binding(get: { camera.processing }, set: { context.send(.setProcessing(cameraID: camera.id, $0)) })) {
-      Text("Processing").font(.uiMeta).foregroundStyle(.secondary)
-    }
-    .toggleStyle(.switch)
-    .controlSize(.mini)
-    .fixedSize()
-    .help("Processing. Off = complete bypass: the original resolution, color, pixels and frame rate. Effect choices stay saved. ⇧⌘B")
-  }
-
-  /// Camera-side OSD is carried by the HDMI signal, so keep this switch with
-  /// the video/output controls rather than in the Wi-Fi settings sheet.
-  @ViewBuilder private var cameraDisplayToggle: some View {
-    if let store = context.cameraControls {
-      let state = store.state(for: camera.id)
-      if state.connected, let property = state.properties.first(where: { $0.role == .cameraDisplay }),
-        property.writable, case .boolean(let enabled) = property.value {
-        Toggle(isOn: Binding(get: { enabled }, set: { value in
-          Task { await store.set(property, value: .boolean(value), feedID: camera.id) }
-        })) {
-          Text(property.localizedLabel()).font(.uiMeta).foregroundStyle(.secondary)
+  /// A fixed 64 pt slot: Cut, Next while a cut is pending, or the plain gray state of the
+  /// camera on Program, so the pill stays the only filled red.
+  @ViewBuilder private var cutSlot: some View {
+    if context.session.onAirID == camera.id {
+      HStack(spacing: 4) {
+        Image(systemName: UISymbol.program).imageScale(.small)
+        Text(camera.tally == .onAir ? "On air" : "Program")
+      }
+      .font(.uiRow).foregroundStyle(.secondary)
+      .frame(width: Self.cutWidth, alignment: .leading)
+      .accessibilityElement(children: .combine)
+    } else {
+      let pending = context.session.pendingCutID == camera.id
+      Button { context.send(.cut(cameraID: camera.id)) } label: {
+        HStack(spacing: 4) {
+          if pending { Circle().fill(.green).frame(width: 6, height: 6) }
+          else { Image(systemName: UISymbol.cut).imageScale(.small) }
+          Text(pending ? "Next" : "Cut")
         }
-        .toggleStyle(.switch).controlSize(.mini).fixedSize()
-        .disabled(state.busy)
-        .help(property.localizedUnavailableReason() ?? property.localizedLabel())
-        .accessibilityLabel(property.localizedLabel())
+        .frame(width: Self.cutWidth, height: 24)
+        .contentShape(Rectangle())
       }
-    }
-  }
-
-  /// Effects only apply with Processing on, so the chips are disabled (not just dimmed) without it.
-  private var effectChips: some View {
-    HStack(spacing: 4) {
-      ForEach(camera.chips) { chip in
-        UIChipToggle(chip: chip) { context.send(.setEffect(cameraID: camera.id, index: chip.id, $0)) }
-      }
-    }
-    .disabled(!camera.processing)
-    .fixedSize()
-  }
-
-  @ViewBuilder private func outputLabel(full: Bool, minimal: Bool = false) -> some View {
-    if camera.showsCut {
-      // Wider than the gutter; the cut button leads the row.
-      Button {
-        context.send(.cut(cameraID: camera.id))
-      } label: {
-        Label("Cut", systemImage: "arrow.left.arrow.right")
-      }
-      .controlSize(.small)
+      .buttonStyle(UISlotButtonStyle(outline: pending ? .green : nil))
       .disabled(!camera.cutEnabled)
       .help(camera.cutHelp ?? "Cut Program to \(camera.name) (⌃\(camera.number))")
-      .accessibilityLabel("Cut to \(camera.name)")
-    } else {
-      HStack(spacing: 8) {
-        gutterIcon(context.session.onAirID == camera.id ? "dot.radiowaves.left.and.right" : "video.badge.checkmark",
-          color: camera.outputInUse ? .green : .secondary)
-        if !minimal {
-          // Natural width, so the row falls back to shorter wording instead of truncating.
-          Text(full ? camera.outputLine : compactOutputLine)
-            .font(.uiRow).lineLimit(1).fixedSize()
-            .foregroundStyle(camera.outputInUse ? .primary : .secondary)
-        }
-      }
-      .help(camera.outputLine)
-      .accessibilityElement(children: .combine)
-      .accessibilityLabel(camera.outputLine)
+      .accessibilityLabel(pending ? "\(camera.name), cut pending" : "Cut to \(camera.name)")
     }
   }
 
-  /// Short output wording for narrow strips. On Program it never says "In use".
-  private var compactOutputLine: String {
-    if camera.tally == .onAir { return "On air" }
-    if context.session.onAirID == camera.id, camera.tally != .iso { return "In Program" }
-    return snapshot?.clientLine ?? "Not in use"
+  /// `LUT On` or `LUT Off`, one click, fixed width. With Sync cameras on it changes every camera.
+  private var lutToggle: some View {
+    let on = camera.lutIsOn
+    return Button { context.send(.setEffect(cameraID: camera.id, index: 0, !on)) } label: {
+      Label(on ? "LUT On" : "LUT Off", systemImage: UISymbol.lut(on: on))
+        .labelStyle(.titleAndIcon)
+        .frame(width: Self.lutWidth, height: 24)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(UISlotButtonStyle(strong: on))
+    .disabled(!camera.lutEnabled)
+    .help(lutHelp)
+    .accessibilityLabel("LUT for \(camera.name)")
+    .accessibilityValue(on ? "On" : "Off")
+  }
+
+  private var lutHelp: String {
+    if !camera.processing { return "Effects are off: the camera original goes out unchanged." }
+    guard camera.lutChip?.enabled == true else { return "Load a .cube LUT in the inspector to use this." }
+    var help = camera.lutIsOn ? "Turn the LUT off. Meeting apps keep their format." : "Turn the LUT on. Meeting apps keep their format."
+    if context.session.syncCameras { help += " Sync cameras is on, so this changes every camera." }
+    return help
   }
 
   // MARK: Collapsed
 
+  /// Name · state · LUT · ⋯ · meter · Stop: the meter keeps ⋯ away from Stop, so a miss can't
+  /// end a take. Four Up has no tile Cut, so its strips carry the Cut slot.
   private var collapsed: some View {
     HStack(spacing: 8) {
       chevron
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
-      tallyBadge
-      // A problem takes the state slot, with its action.
-      if let problem = camera.stripProblem {
-        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.uiRow)
-          .accessibilityHidden(true)
-        problemWords(problem, font: .uiRow)
-        if problem.count == 1, let action = problem.action {
-          Button(action.title) { context.send(action.action) }.controlSize(.small).fixedSize()
-        }
-      } else {
-        UILiveCamera(camera: camera, context: context, follows: .take) { live in collapsedState(live.snapshot) }
+      if isClean && camera.tally != .none {
+        // Clean View hides the picture's pill, so the tally is said here.
+        UIBadge(text: camera.tally.label ?? "", tone: camera.tally.isRed ? .onAir : camera.tally == .next ? .positive : .neutral)
       }
+      collapsedState
       Spacer(minLength: 4)
-      // One meter, outside ViewThatFits: each candidate would run its own display-rate
-      // meter, and a swap between candidates (a column animating) restarted its ballistics.
-      ViewThatFits(in: .horizontal) {
-        HStack(spacing: 6) {
-          effectChips
-          Color.clear.frame(width: Self.compactMeterWidth, height: 1)
+      if context.presentation.layout == .fourUp && context.presentation.programAvailable { cutSlot }
+      lutToggle
+      overflowMenu
+      // One meter, outside ViewThatFits: each candidate would run its own display-rate meter,
+      // and a swap between candidates (a column animating) restarted its ballistics. It yields first.
+      Color.clear.frame(minWidth: 0, idealWidth: Self.compactMeterWidth, maxWidth: Self.compactMeterWidth, maxHeight: 1)
+        .layoutPriority(-1)
+        .onGeometryChange(for: Bool.self) { $0.size.width >= Self.compactMeterWidth } action: { compactMeterFits = $0 }
+        .overlay(alignment: .trailing) {
+          if compactMeterFits {
+            UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, style: .compact)
+          }
         }
-        Color.clear.frame(width: Self.compactMeterWidth, height: 1)
-        EmptyView()
-      }
-      .onGeometryChange(for: Bool.self) { $0.size.width >= Self.compactMeterWidth } action: { compactMeterFits = $0 }
-      .overlay(alignment: .trailing) {
-        if compactMeterFits {
-          UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, style: .compact)
-        }
-      }
       if camera.stripState == .finishing {
         ProgressView().controlSize(.mini).frame(width: 24, height: 24)
       } else {
-        UIRecordButton(active: camera.recordButtonActive || camera.pauseTitle == "Resume", enabled: camera.recordButtonEnabled,
-          help: recordHelp, size: 24) {
-          context.send(.toggleRecording(cameraID: camera.id))
+        // Rolling: a neutral square, always. The REC pill already says it's rolling.
+        recordButton(size: 24, neutralStop: true)
+      }
+    }
+    .frame(height: 28)
+  }
+
+  /// A problem takes the state slot with its short name and action; otherwise the state word.
+  /// Rolling says nothing here, since the REC pill does, unless Clean View hides the pill.
+  @ViewBuilder private var collapsedState: some View {
+    if let problem = camera.stripProblem {
+      HStack(spacing: 4) {
+        UIStateGlyph(state: .warning)
+        problemWords(problem, font: .uiRow, short: true)
+        if problem.count == 1, let action = problem.action {
+          Button(action.title) { context.send(action.action) }.controlSize(.small).fixedSize()
         }
       }
-      overflowMenu
-    }
-  }
-
-  /// One collapsed status: words in a label color, the state's color on the symbol.
-  private func collapsedLabel(_ text: String, symbol: String? = nil, color: Color = .secondary, value: Bool = false) -> some View {
-    HStack(spacing: 4) {
-      if let symbol { Image(systemName: symbol).foregroundStyle(color).imageScale(.small) }
-      Text(text).foregroundStyle(.secondary).lineLimit(1)
-    }
-    .font(value ? .uiValue : .uiRow)
-  }
-
-  @ViewBuilder private func collapsedState(_ snapshot: UICameraSnapshot?) -> some View {
-    let elapsed = UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0)
-    switch camera.stripState {
-    case .recording, .updating:
-      HStack(spacing: 4) {
-        Circle().fill(.red).frame(width: 7, height: 7)
-        Text(elapsed).font(.uiValue)
-      }
-      .accessibilityElement(children: .ignore).accessibilityLabel("Recording \(elapsed)")
-    case .recordingNoSignal:
-      collapsedLabel("\(elapsed) · no signal", symbol: "exclamationmark.triangle.fill", color: .orange, value: true)
-        .accessibilityElement(children: .combine)
-    case .paused:
-      collapsedLabel(elapsed, symbol: "pause.fill", color: .orange, value: true)
+    } else if isClean, isRecordingOrPaused {
+      UILiveCamera(camera: camera, context: context, follows: .take) { live in
+        HStack(spacing: 4) {
+          UIStateGlyph(state: camera.stripState == .paused ? .paused : .recording, size: 7)
+          Text(UIFormat.shortElapsed(live.snapshot?.recording.elapsed ?? 0)).font(.uiValueStrong)
+        }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Paused at \(elapsed)")
-    case .saved: collapsedLabel("Saved", symbol: "checkmark.circle.fill", color: .green)
-    case .finishing: collapsedLabel("Finishing…")
-    case .stopped: collapsedLabel("Stopped")
-    case .waiting:
-      collapsedLabel(camera.statusBadge, symbol: camera.statusTone == .warning ? "exclamationmark.triangle.fill" : nil, color: .orange)
-    case .noFolder: collapsedLabel("No folder", symbol: "exclamationmark.triangle.fill", color: .orange)
-    case .failed:
-      collapsedLabel(camera.recordTitle, symbol: "exclamationmark.triangle.fill", color: .orange)
-        .accessibilityElement(children: .combine)
-    case .ready: collapsedLabel("Ready")
+        .accessibilityLabel("Recording \(UIFormat.shortElapsed(live.snapshot?.recording.elapsed ?? 0))")
+      }
+    } else if let word = camera.collapsedWord {
+      HStack(spacing: 4) {
+        if camera.collapsedWarns { UIStateGlyph(state: .warning) }
+        else if camera.stripState == .paused { UIStateGlyph(state: .paused) }
+        else if camera.stripState == .saved {
+          Image(systemName: UISymbol.saved).foregroundStyle(.green).imageScale(.small).accessibilityHidden(true)
+        }
+        Text(word).foregroundStyle(camera.collapsedWarns ? .primary : .secondary).lineLimit(1)
+      }
+      .font(.uiRow)
+      .accessibilityElement(children: .combine)
+      .help(camera.formatFallback.map { "\($0). \(camera.formatHelp)" } ?? word)
+    }
+  }
+}
+
+/// Every effect that changes what meeting apps receive: Output size (with Aspect), Color
+/// format, Frame rate, the camera's HDMI display, and Effects Off.
+struct UIEffectsMenu: View {
+  let camera: UICameraPresentation
+  let snapshot: UICameraSnapshot?
+  let context: UIContext
+
+  var body: some View {
+    Menu {
+      if let source = snapshot.flatMap(Self.sourceFormat) {
+        Text("\(source) → \(camera.outputValue)")
+      }
+      Menu {
+        effectPicker(index: 1, current: snapshot?.resizeTarget ?? .hd1080, all: ResizeTarget.allCases, title: \.title) {
+          .setResizeTarget(cameraID: camera.id, $0)
+        }
+        Divider()
+        Section("Aspect") {
+          Picker("Aspect", selection: Binding(get: { snapshot?.scalingMode ?? .fit },
+            set: { context.send(.setScalingMode(cameraID: camera.id, $0)) })) {
+            Text("Fit").tag(ProgramScalingMode.fit)
+            Text("Crop").tag(ProgramScalingMode.crop)
+          }
+          .pickerStyle(.inline).labelsHidden()
+        }
+      } label: { Text("Output size") }
+      .badge(effectBadge(1))
+      Menu {
+        effectPicker(index: 2, current: snapshot?.colorTarget ?? .yuv4208, all: ColorTarget.allCases, title: \.title) {
+          .setColorTarget(cameraID: camera.id, $0)
+        }
+      } label: { Text("Color format") }
+      .badge(effectBadge(2))
+      Menu {
+        effectPicker(index: 3, current: snapshot?.frameRateTarget ?? .fps2997, all: FrameRateTarget.allCases, title: \.title) {
+          .setFrameRateTarget(cameraID: camera.id, $0)
+        }
+      } label: { Text("Frame-rate cap") }
+      .badge(effectBadge(3))
+      if let store = context.cameraControls {
+        UICameraDisplayToggle(feedID: camera.id, store: store)
+      }
+      Divider()
+      // ⇧⌘B is the Camera menu's, for the selected camera: one handler per key.
+      Toggle("Effects Off", isOn: Binding(get: { !camera.processing }, set: { context.send(.setProcessing(cameraID: camera.id, !$0)) }))
+      if !camera.processing { Text("Camera original goes out unchanged.") }
+    } label: {
+      HStack(spacing: 4) {
+        Image(systemName: camera.processing ? UISymbol.effects : UISymbol.effectsOff).imageScale(.small)
+        Text(camera.processing ? "Effects" : "Effects Off")
+        Image(systemName: "chevron.down").font(.caption2.weight(.bold)).imageScale(.small)
+      }
+      .font(.uiRow.weight(.medium))
+      .padding(.horizontal, 8).frame(height: 24)
+      .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 7))
+      .contentShape(Rectangle())
+    }
+    .menuStyle(.button)
+    .buttonStyle(.plain)
+    .menuIndicator(.hidden)
+    .fixedSize()
+    .help("Effects change the format meeting apps receive; the video updates briefly. ⇧⌘B turns them all off.")
+    .accessibilityLabel("Effects for \(camera.name)")
+    .accessibilityValue(camera.processing ? "On" : "Off")
+  }
+
+  private static func sourceFormat(_ snapshot: UICameraSnapshot) -> String? {
+    if case .live(let format) = snapshot.signal { return format }
+    return nil
+  }
+
+  /// A menu row can't both toggle and open, so Off is the submenu's first choice.
+  private func effectPicker<Target: Hashable>(index: Int, current: Target, all: [Target], title: KeyPath<Target, String>,
+    action: @escaping (Target) -> UIAction) -> some View {
+    let on = camera.chips.indices.contains(index) && camera.chips[index].isOn
+    return Picker("Value", selection: Binding<Target?>(get: { on ? current : nil }, set: { value in
+      if let value { context.send(action(value)) } else { context.send(.setEffect(cameraID: camera.id, index: index, false)) }
+    })) {
+      Text("Off").tag(Target?.none)
+      Divider()
+      ForEach(all, id: \.self) { Text($0[keyPath: title]).tag(Target?.some($0)) }
+    }
+    .pickerStyle(.inline).labelsHidden()
+    .disabled(!camera.processing)
+  }
+
+  /// The value when the effect is on, "Off" otherwise: the row's state without a checkmark,
+  /// which a submenu row can't show.
+  private func effectBadge(_ index: Int) -> Text {
+    let chip = camera.chips.indices.contains(index) ? camera.chips[index] : nil
+    return Text(chip?.isOn == true ? chip?.title ?? "" : "Off")
+  }
+}
+
+/// The camera's own display on its HDMI output, when its control plugin can switch it. It's
+/// carried by the signal, so it lives with the effects that change what goes out.
+private struct UICameraDisplayToggle: View {
+  let feedID: String
+  let store: CameraControlStore
+
+  var body: some View {
+    let state = store.state(for: feedID)
+    if state.connected, let property = state.properties.first(where: { $0.role == .cameraDisplay }),
+      property.writable, case .boolean(let enabled) = property.value {
+      Toggle(property.localizedLabel(), isOn: Binding(get: { enabled }, set: { value in
+        Task { await store.set(property, value: .boolean(value), feedID: feedID) }
+      }))
+      .disabled(state.busy)
+      .help(property.localizedUnavailableReason() ?? property.localizedLabel())
     }
   }
 }

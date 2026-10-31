@@ -70,10 +70,14 @@ extension UISessionBridge {
     }
   }
 
-  /// The camera's own format once it's known, so a 1080p camera isn't counted as UHD.
+  /// The camera's own format once it's known, so a 1080p camera isn't counted as UHD, and
+  /// the codec that actually records it: a fallback can be 50 times the data.
   private func displayRate(_ id: FeedID, audioChannels: Int) -> Double {
-    let codec = model.recordingModel.codec
-    guard let format = model.cameraUpdate(id)?.sourceFormat else {
+    let recording = model.recordingModel
+    let state = recording.feeds.first { $0.id == id }
+    let source = model.cameraUpdate(id)?.sourceFormat
+    let codec = (state?.isActive == true ? state?.takeCodec : nil) ?? recording.codec.resolved(for: source)
+    guard let format = source else {
       return UIRecordingLibrary.displayMegabits(codec: codec, audioChannels: audioChannels)
     }
     return UIRecordingLibrary.displayMegabits(codec: codec, width: format.width, height: format.height,
@@ -258,11 +262,12 @@ extension UIShotTiming {
 /// A drive's free space and time left, re-read here every few seconds and as the takes run.
 struct UILiveDriveRow: View {
   let drive: UIDrive
+  var cameras: [UICameraPresentation] = []
   let context: UIContext
 
   var body: some View {
     UILiveSession(context: context, refresh: 5, probe: "UILiveSession(drive)") { session, _ in
-      UIDriveRow(drive: session.drives.first { $0.id == drive.id } ?? drive)
+      UIDriveRow(drive: session.drives.first { $0.id == drive.id } ?? drive, cameras: cameras)
     }
   }
 }

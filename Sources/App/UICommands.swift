@@ -33,10 +33,8 @@ struct UICommands: Commands {
     // click open windows through these.
     let _ = registerSceneActions()
 
-    CommandGroup(after: .appSettings) {
-      Toggle("Menu Bar Only When Closed", isOn: Binding(get: { model.hideFromDock }, set: { model.hideFromDock = $0 }))
-    }
-
+    // Menu Bar Only When Closed is in Settings › General. Quit asks first while a take rolls
+    // or a camera is on air (AppDelegate), wherever it comes from.
     CommandGroup(replacing: .appTermination) {
       Button("Quit Ultracam") {
         model.saveSettings()
@@ -66,7 +64,7 @@ struct UICommands: Commands {
                 .disabled(!selected.canStart)
             }
           }
-          Toggle("Processing", isOn: Binding(get: { selected.processing },
+          Toggle("Effects", isOn: Binding(get: { selected.processing },
             set: { send(.setProcessing(cameraID: selected.id, $0)) }))
             .keyboardShortcut("b", modifiers: [.command, .shift])
           Toggle("Video Preview", isOn: Binding(get: { selectedSnapshot?.previewEnabled ?? true },
@@ -112,12 +110,12 @@ struct UICommands: Commands {
         .keyboardShortcut("r")
         .disabled(!(selected?.recordButtonEnabled ?? false))
       switch presentation.recordControl {
-      case .record(_, let enabled):
-        Button("Record All") { send(.recordAll) }
+      case .record(_, let enabled, _, _):
+        Button(presentation.recordControl.title) { send(.recordAll) }
           .keyboardShortcut("r", modifiers: [.command, .option])
           .disabled(!enabled)
       case .stop, .stopAll:
-        Button("Stop All Recordings") { send(.stopAllRecordings) }
+        Button(presentation.recordControl.title) { send(.stopAllRecordings) }
           .keyboardShortcut("r", modifiers: [.command, .option])
       }
       if let selected, selected.pauseTitle != nil {
@@ -126,23 +124,24 @@ struct UICommands: Commands {
         }
         .keyboardShortcut("r", modifiers: [.command, .shift])
       }
-      // Pause All turns into Resume All once every take is paused.
-      let takes = session.cameras.filter { $0.recording.status == .recording || $0.recording.status == .paused }
-      if !takes.isEmpty && takes.allSatisfy({ $0.recording.status == .paused }) {
-        Button("Resume All") { send(.resumeAll) }
-      } else {
-        Button("Pause All") { send(.pauseAll) }
-          .disabled(takes.isEmpty)
+      // Pause All turns into Resume All once every take is paused, on the same key.
+      Button(presentation.pauseAllTitle) { send(presentation.pauseAllTitle == "Resume All" ? .resumeAll : .pauseAll) }
+        .keyboardShortcut("p", modifiers: [.command, .option])
+        .disabled(!presentation.canPauseAll)
+      Menu {
+        UIFormatChoices(session: session, send: send)
+      } label: {
+        Text("Format")
       }
+      .badge(Text(session.codec.title))
       Divider()
       Button("Choose Default Folder…") { send(.chooseRecordingFolder(cameraID: nil)) }
       Button("Show Recordings in Finder") { send(.revealRecordings) }
         .disabled(!presentation.canRevealRecordings)
         .help(presentation.canRevealRecordings ? "Open the recording folder in Finder." : "Choose a recording folder first.")
       Button("Recover Interrupted Takes…") {
-        // Settings › Recording lists every interrupted take with its own Recover button.
-        send(.openSettings)
-        NotificationCenter.default.post(name: Notification.Name("UIShowRecovery"), object: nil)
+        send(.openMainWindow)
+        send(.showInterruptedTakes)
       }
       .disabled(session.interruptedTakes.isEmpty)
     }
@@ -156,13 +155,14 @@ struct UICommands: Commands {
           .disabled(!camera.cutEnabled)
       }
       Divider()
-      // Auto only acts with a strategy that switches on its own; Hold only reaches the natural talking head.
+      // Auto only acts with a strategy that switches on its own; Hold needs Auto on.
       Toggle("Automatic Switching", isOn: Binding(get: { presentation.autoSwitching }, set: { send(.setAutoSwitching($0)) }))
         .keyboardShortcut("a", modifiers: [.control, .option])
         .disabled(!presentation.canAutoSwitch)
         .help(presentation.canAutoSwitch || !presentation.programAvailable ? "Cut automatically using the chosen strategy."
           : "Choose a switching strategy in Program › Strategy first.")
-      Toggle("Hold Current Shot", isOn: Binding(get: { session.autoHold }, set: { send(.setAutoHold($0)) }))
+      Toggle("Hold Current Shot", isOn: Binding(get: { presentation.canHoldShot && session.autoHold }, set: { send(.setAutoHold($0)) }))
+        .keyboardShortcut("h", modifiers: [.control, .option])
         .disabled(!presentation.canHoldShot)
       // A Picker's own submenu title doesn't grey out when disabled; a Menu's does.
       Menu("Strategy") {
@@ -176,21 +176,9 @@ struct UICommands: Commands {
       }
       .disabled(!presentation.programAvailable)
       if presentation.programAvailable && session.strategy == .naturalTalkingHead {
-        Menu("Anchor") {
-          Picker("Anchor", selection: Binding(get: { session.anchorID }, set: { send(.setAnchor(cameraID: $0)) })) {
-            Text("Automatic").tag(String?.none)
-            ForEach(presentation.cameras) { camera in Text(camera.name).tag(String?.some(camera.id)) }
-          }
-          .pickerStyle(.inline)
-          .labelsHidden()
-        }
-        Menu("Emphasis") {
-          Picker("Emphasis", selection: Binding(get: { session.emphasisID }, set: { send(.setEmphasis(cameraID: $0)) })) {
-            Text("Automatic").tag(String?.none)
-            ForEach(presentation.cameras) { camera in Text(camera.name).tag(String?.some(camera.id)) }
-          }
-          .pickerStyle(.inline)
-          .labelsHidden()
+        UICameraPickerMenu(title: "Anchor", selection: session.anchorID, cameras: presentation.cameras) { send(.setAnchor(cameraID: $0)) }
+        UICameraPickerMenu(title: "Emphasis", selection: session.emphasisID, cameras: presentation.cameras) {
+          send(.setEmphasis(cameraID: $0))
         }
       }
     }
@@ -224,6 +212,9 @@ struct UICommands: Commands {
         }
         .disabled(selected == nil || presentation.cameras.count < 2 || presentation.layout == .single)
       }
+      if let selected {
+        Button("Detach to Window") { send(.detachMonitor(cameraID: selected.id)) }
+      }
       Divider()
       if let selected {
         // The picture only offers these tools while it shows video.
@@ -237,12 +228,20 @@ struct UICommands: Commands {
           .keyboardShortcut("c", modifiers: [.control, .option])
           .disabled(!showsPicture)
         // Every tool, also with no picture yet: the choice is kept and applies when video arrives.
+        // Every tool has a key, and each key has this item, the VoiceOver path.
         Menu("Monitor Tools") {
-          ForEach(UIMonitorTool.allCases, id: \.self) { tool in
-            let toggle = Toggle(tool.title, isOn: Binding(get: { selected.activeTools.contains(tool) },
+          ForEach(UIMonitorTool.menuOrder, id: \.self) { tool in
+            Toggle(tool.title, isOn: Binding(get: { selected.activeTools.contains(tool) },
               set: { _ in send(.toggleTool(cameraID: selected.id, tool)) }))
-            if tool == .scopes { toggle.keyboardShortcut("k", modifiers: [.command, .option]) } else { toggle }
+              .keyboardShortcut(tool.key, modifiers: [.command, .option])
           }
+          Toggle("Clip Indicators", isOn: Binding(get: { selectedSnapshot?.clipIndicators == true },
+            set: { _ in send(.toggleClipIndicators(cameraID: selected.id)) }))
+            .keyboardShortcut("x", modifiers: [.command, .option])
+          Divider()
+          Button("Hide All") { send(.hideAllTools(cameraID: selected.id)) }
+            .disabled(selected.activeTools.isEmpty && selectedSnapshot?.clipIndicators != true)
+          Button("Reset Monitor Tools") { send(.resetMonitorTools(cameraID: selected.id)) }
         }
       }
       Divider()
@@ -258,6 +257,8 @@ struct UICommands: Commands {
         NSApplication.shared.activate(ignoringOtherApps: true)
       }
       .keyboardShortcut("0", modifiers: .command)
+      Button("Diagnostics") { send(.openDiagnostics) }
+        .keyboardShortcut("d", modifiers: [.control, .option])
       Divider()
     }
 

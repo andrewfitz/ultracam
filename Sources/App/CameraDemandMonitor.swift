@@ -139,7 +139,7 @@ final class CameraDemandMonitor {
   private func discover(_ route: CameraDemandRoute, devices: [UInt32]) {
     do {
       guard let device = try devices.first(where: { try string($0, kCMIODevicePropertyDeviceUID) == route.deviceUID }) else {
-        throw VideoError.message("Install and enable the \(route.displayName) virtual camera to use automatic feed.")
+        throw VideoError.message("Install and enable the \(route.displayName) virtual camera to start cameras with meeting apps.")
       }
       let streams = try ids(device, kCMIODevicePropertyStreams).map { ($0, try string($0, kCMIOObjectPropertyName)) }
       guard let source = Self.sourceStream(streams, named: route.sourceStreamName) else {
@@ -149,7 +149,7 @@ final class CameraDemandMonitor {
         demand[route.id] = nil
         var property = address(Int(VideoContract.demandSelector))
         guard CMIOObjectHasProperty(source, &property) else {
-          throw VideoError.message("Update the installed \(route.displayName) camera extension to use automatic feed.")
+          throw VideoError.message("Update the installed \(route.displayName) camera extension to start cameras with meeting apps.")
         }
         // Subscribe before reading the initial state, including when enabled
         // after Zoom has already opened the camera.

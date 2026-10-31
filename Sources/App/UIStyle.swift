@@ -225,26 +225,6 @@ struct UIRecordButton: View {
   }
 }
 
-/// An effect toggle chip: the system toggle button, so on/off, disabled,
-/// inactive-window and Increase Contrast rendering all come from the system.
-/// State is shown with a checkmark, not color alone.
-struct UIChipToggle: View {
-  let chip: UIChip
-  let set: (Bool) -> Void
-
-  var body: some View {
-    Toggle(isOn: Binding(get: { chip.isOn }, set: { set($0) })) {
-      if chip.isOn { Label(chip.title, systemImage: "checkmark") } else { Text(chip.title) }
-    }
-    .toggleStyle(.button)
-    .buttonBorderShape(.capsule)
-    .controlSize(.small)
-    .disabled(!chip.enabled)
-    .help(chip.help)
-    .accessibilityLabel(chip.title)
-  }
-}
-
 // The level meters live in UIAudioMeterPanel.swift, on MonitorKitUI's LevelMeterView and AudioMeterView.
 
 /// The first of its candidates whose ideal width fits the row, like `ViewThatFits(in: .horizontal)`,

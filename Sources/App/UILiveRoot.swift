@@ -43,17 +43,11 @@ extension UISessionBridge {
     var session = snapshot()
     // Its cameras alone can't tell "not installed" from "enabled, not started yet".
     session.install.system = model.installer.system
-    let interface = self.interface
     let bridge = self
     return UIContext(session: session, presentation: UIPresentationBuilder.session(session),
       inputs: model.devices.map { UIInput(id: $0.id, name: $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
       send: { bridge.send($0) },
       pictures: UIAppPictures(model: model), monitor: UIAppMonitorSettings(model: model),
-      confirmation: interface.confirmation,
-      confirm: {
-        if let pending = interface.confirmation { interface.confirmation = nil; bridge.send(pending.action, confirmed: true) }
-      },
-      cancelConfirmation: { interface.confirmation = nil },
       refreshed: { bridge.context() }, cameraControls: model.cameraControls,
       captureVendors: Dictionary(uniqueKeysWithValues: model.devices.compactMap { device in model.captureVendor(for: device.id).map { (device.id, $0) } }),
       controlViewFactories: model.controlViewFactories)

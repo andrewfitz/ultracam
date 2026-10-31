@@ -41,16 +41,16 @@ import XCTest
     XCTAssertFalse(stopped.compatibilityConversionActive)
     XCTAssertEqual(stopped.systemCompatibilityFrames, 3)
   }
-  @MainActor func testCompatibilityBadgeIsPerCameraAndHiddenOutsideRecording() {
+  @MainActor func testCompatibilityNoteIsPerCameraAndHiddenOutsideRecording() {
     var camera = UICameraRecording(status: .recording)
     camera.systemCompatibilityFrames = 2
     camera.compatibilityConversionActive = true
-    XCTAssertEqual(camera.compatibilityBadge, "Compatibility conversion · Recording · 2")
-    XCTAssertNil(UICameraRecording(status: .recording).compatibilityBadge)
+    XCTAssertEqual(camera.compatibilityNote, "Compatibility conversion: 2 frames.")
+    XCTAssertNil(UICameraRecording(status: .recording).compatibilityNote)
     camera.status = .paused
-    XCTAssertNil(camera.compatibilityBadge)
+    XCTAssertNil(camera.compatibilityNote)
     camera.status = .recording; camera.compatibilityConversionActive = false
-    XCTAssertNil(camera.compatibilityBadge)
+    XCTAssertNil(camera.compatibilityNote)
     XCTAssertEqual(camera.systemCompatibilityFrames, 2)
   }
 }

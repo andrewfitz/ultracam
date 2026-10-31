@@ -256,7 +256,7 @@ import MonitorKit
       hosts[target]?.invalidate(rejectingCaptureGeneration: nil)
       refreshHost(target)
       for surface in surfaces.values where surface.target == target {
-        surface.presenter.setUnavailable("Missing feed")
+        surface.presenter.setUnavailable("Missing camera")
       }
     }
     if !workspace.isConfigured, let first = targets.first {
@@ -293,7 +293,7 @@ import MonitorKit
     diagnosticSnapshots[target] = nil
     for surface in surfaces.values where surface.target == target {
       surface.presenter.setBurnInLUTSource(nil)
-      surface.presenter.setUnavailable("Missing feed")
+      surface.presenter.setUnavailable("Missing camera")
     }
   }
 
@@ -418,7 +418,7 @@ import MonitorKit
       // it on the surface when one was supplied; an empty update is the normal
       // teardown path and retains the established fallback.
       let reason = message.trimmingCharacters(in: .whitespacesAndNewlines)
-      let unavailable = reason.isEmpty ? "Feed stopped" : reason
+      let unavailable = reason.isEmpty ? "Camera stopped" : reason
       for surface in surfaces.values where surface.target == target {
         surface.presenter.setUnavailable(unavailable)
       }

@@ -34,11 +34,14 @@ struct UIProblemButton: View {
 struct UIProblemRow: View {
   let problem: UIProblem
   let context: UIContext
+  /// In Attention, an on-air loss leaves its Cut to the picture.
+  var showsAction = true
 
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
       HStack(alignment: .firstTextBaseline, spacing: 6) {
-        Image(systemName: "exclamationmark.triangle.fill").imageScale(.small).foregroundStyle(problem.level.glyph)
+        Image(systemName: problem.symbol ?? UISymbol.warning).imageScale(.small)
+          .foregroundStyle(problem.symbol == nil ? problem.level.glyph : .secondary)
           .accessibilityHidden(true)
         // Line limits, not fixedSize: the split view measures its columns at their narrowest,
         // where a fixed height would be a word a line and push the window's minimum past the screen.
@@ -47,7 +50,7 @@ struct UIProblemRow: View {
       if let detail = problem.detail {
         Text(detail).font(.uiMeta).foregroundStyle(problem.level.secondaryText).lineLimit(3)
       }
-      if let action = problem.action {
+      if showsAction, let action = problem.action {
         HStack {
           Spacer(minLength: 0)
           UIProblemButton(action: action, level: problem.level, context: context)
@@ -90,17 +93,18 @@ struct UIAttentionSection: View {
 
   var body: some View {
     UILiveSession(context: context, refresh: refresh, probe: "UILiveSession(attention)") { _, presentation in
-      if !presentation.problems.isEmpty {
+      let rows = presentation.problems + presentation.setupRows
+      if !rows.isEmpty {
         VStack(alignment: .leading, spacing: 6) {
           Text("ATTENTION").font(.uiBadge).foregroundStyle(.secondary)
             .accessibilityLabel("Attention")
-          ForEach(presentation.problems.prefix(Self.shown)) { UIProblemRow(problem: $0, context: context) }
-          if presentation.problems.count > Self.shown {
-            Button("\(presentation.problems.count - Self.shown) more") { listOpen = true }
+          ForEach(rows.prefix(Self.shown)) { UIProblemRow(problem: $0, context: context, showsAction: !$0.attentionOmitsAction) }
+          if rows.count > Self.shown {
+            Button("\(rows.count - Self.shown) more") { listOpen = true }
               .buttonStyle(.link).font(.uiMeta)
               .popover(isPresented: $listOpen, arrowEdge: .trailing) {
-                UIProblemList(problems: presentation.problems, context: context)
-                  .padding(14).frame(width: 340, alignment: .leading)
+                UIProblemList(problems: rows, context: context)
+                  .padding(12).frame(width: 340, alignment: .leading)
               }
           }
         }

@@ -19,7 +19,7 @@ struct UIInspectorViewContent: View {
     if let camera = context.presentation.selected, let snapshot = context.snapshot(camera.id) {
       form(camera: camera, snapshot: snapshot)
     } else {
-      ContentUnavailableView("No Camera Selected", systemImage: "video.slash",
+      ContentUnavailableView("No Camera Selected", systemImage: UISymbol.camera,
         description: Text("Select a camera to see its settings."))
     }
   }
@@ -29,18 +29,31 @@ struct UIInspectorViewContent: View {
       Section {
         header(camera: camera, snapshot: snapshot)
       }
-      sourceSection(camera: camera, snapshot: snapshot)
+      // Signal order: what comes in, what controls it, what's done to it, what's kept.
+      inputSection(camera: camera, snapshot: snapshot)
       if let store = context.cameraControls {
-        Section("Camera Control") {
-          UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
+        Section {
           if let assignment = store.assignment(for: camera.id) {
-            Text("\(assignment.camera.name) · \(store.state(for: camera.id).cacheStatus)")
-              .font(.caption).foregroundStyle(.secondary)
+            let state = store.state(for: camera.id)
+            HStack(spacing: 6) {
+              Label(assignment.camera.name, systemImage: UISymbol.cameraBody)
+              Spacer(minLength: 4)
+              Label(state.connected ? "Connected" : "Disconnected", systemImage: UISymbol.wifi(connected: state.connected))
+                .font(.uiMeta).foregroundStyle(state.connected ? .secondary : .primary)
+                .symbolRenderingMode(.palette).tint(state.connected ? .secondary : .orange)
+            }
+            LabeledContent(state.cacheStatus) {
+              UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
+            }
+          } else {
+            UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
           }
+        } header: {
+          UIInspectorHeader(title: "Camera Control", symbol: UISymbol.cameraControl)
         }
       }
-      processingSection(camera: camera, snapshot: snapshot)
       lutSection(camera: camera, snapshot: snapshot)
+      effectsSection(camera: camera, snapshot: snapshot)
       recordingSection(camera: camera, snapshot: snapshot)
       automationSection(camera: camera, snapshot: snapshot)
       Section {
@@ -67,7 +80,7 @@ struct UIInspectorViewContent: View {
   /// and Signal row below say which device it uses and what arrives.
   private func header(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     HStack(alignment: .firstTextBaseline, spacing: 8) {
-      Text(camera.name).font(.title3.weight(.semibold)).lineLimit(1).truncationMode(.middle)
+      Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
       Spacer(minLength: 4)
       UIBadge(text: camera.statusBadge, tone: camera.statusTone)
     }
@@ -86,14 +99,14 @@ struct UIInspectorViewContent: View {
     }
   }
 
-  private func sourceSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
+  private func inputSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
       // Selected by ID: two units of one model share a name. An input another camera
       // has is shown but disabled; None frees this camera's input for another.
       let options = UIInputLabels.options(context.inputs.map { ($0.id, $0.name) }, cameras: context.session.cameras,
         for: camera.id)
       let missingID = snapshot.inputID.flatMap { id in options.contains { $0.id == id } ? nil : id }
-      Picker("Input", selection: Binding(
+      Picker("Device", selection: Binding(
         get: { snapshot.inputID ?? "" },
         set: { context.send(.setInput(cameraID: camera.id, deviceID: $0)) })) {
         Text("None").tag("")
@@ -110,18 +123,11 @@ struct UIInspectorViewContent: View {
       .disabled(snapshot.running)
       .help(snapshot.running ? "Stop the camera to change its input."
         : "Choose an input device. Shared inputs may serve more than one camera.")
-      LabeledContent("Supported source formats") {
-        Text(UIInputPicker.supportedModes(context.inputs.first { $0.id == snapshot.inputID }))
-          .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-          .textSelection(.enabled)
-      }
       LabeledContent("Signal") {
         // The tone goes on the symbol; small orange text is hard to read in light mode.
         HStack(spacing: 4) {
-          if camera.statusTone == .warning {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-          }
-          Text(Self.signalText(snapshot)).lineLimit(1).foregroundStyle(.secondary)
+          if camera.statusTone == .warning { UIStateGlyph(state: .warning) }
+          Text(Self.signalText(snapshot)).lineLimit(1).fontWeight(.semibold)
         }
       }
       .accessibilityElement(children: .ignore)
@@ -135,43 +141,84 @@ struct UIInspectorViewContent: View {
           Text(live.camera.timecode).monospacedDigit().textSelection(.enabled)
         }
       }
+      Picker("Camera log", selection: Binding(get: { snapshot.sourceProfileID }, set: { context.send(.setSourceProfile(cameraID: camera.id, $0)) })) {
+        Text("Not declared").tag("unspecified")
+        colorSpaceOptions(selected: snapshot.sourceProfileID)
+      }
+      .help("Declares the captured signal for monitoring and capture. This does not declare either LUT edge.")
+      if snapshot.sourceProfileID != "unspecified", !SourceColorSpaceCatalog.entries.contains(where: { $0.id == snapshot.sourceProfileID }) {
+        Label { Text("This saved camera log is unavailable. Choose a supported one before processing.") } icon: { UIStateGlyph(state: .warning) }
+          .font(.uiMeta)
+      }
       Toggle("Video preview", isOn: Binding(get: { snapshot.previewEnabled },
         set: { context.send(.setPreviewEnabled(cameraID: camera.id, $0)) }))
         .help("Hidden previews do no rendering work. Camera output continues.")
     } header: {
       HStack {
-        Text("Source")
+        UIInspectorHeader(title: "Input", symbol: UISymbol.input)
         Spacer()
-        Button { context.send(.refreshInputs) } label: { Image(systemName: "arrow.clockwise") }
-          .buttonStyle(.borderless)
-          .disabled(snapshot.running)
-          .help("Refresh capture devices")
-          .accessibilityLabel("Refresh capture devices")
+        Button { context.send(.refreshInputs) } label: {
+          Image(systemName: UISymbol.retry).frame(minWidth: 24, minHeight: 24).contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help("Refresh capture devices")
+        .accessibilityLabel("Refresh capture devices")
+      }
+    } footer: {
+      if snapshot.running {
+        Text("Stop the camera to change its input.").font(.uiMeta).foregroundStyle(.secondary)
+      } else if let input = context.inputs.first(where: { $0.id == snapshot.inputID }),
+        !input.supportedModes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        // A device that reports nothing gets no row: the list goes here only when there is one.
+        Text("Supported formats: \(input.supportedModes)").font(.uiMeta).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
       }
     }
   }
 
-  private func processingSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
+  /// One row per effect, its checkbox and value merged, in pipeline order. The master
+  /// switch heads the section. Sync cameras lives only here, and asks first.
+  private func effectsSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
-      Toggle("Sync cameras", isOn: Binding(get: { context.session.syncCameras },
-        set: { context.send(.setSyncCameras($0)) }))
-        .help("Copies this camera’s processing and monitor effects to enabled cameras, then keeps edits in sync. Input devices and recording folders stay separate.")
-      Toggle("Processing", isOn: Binding(get: { snapshot.processing }, set: { context.send(.setProcessing(cameraID: camera.id, $0)) }))
-        .help("Off is a complete bypass: original resolution, color, pixels and frame rate. Your effect choices stay saved. ⇧⌘B")
-      ForEach(camera.chips) { chip in
-        Toggle(isOn: Binding(get: { chip.isOn }, set: { context.send(.setEffect(cameraID: camera.id, index: chip.id, $0)) })) {
-          HStack(spacing: 6) {
-            Text("\(chip.id + 1)").monospacedDigit().foregroundStyle(.tertiary)
-            Text(UIPresentationBuilder.effectLongTitles[chip.id]).lineLimit(1)
-          }
-        }
-        .toggleStyle(.checkbox)
-        .disabled(!chip.enabled || !snapshot.processing)
-        .help(chip.help)
+      Toggle(isOn: Binding(get: { context.session.syncCameras }, set: { context.send(.setSyncCameras($0)) })) {
+        Text("Sync cameras")
+        if context.session.syncCameras { Text("Editing all cameras") }
       }
-      Picker("Output size", selection: Binding(get: { snapshot.resizeTarget },
-        set: { context.send(.setResizeTarget(cameraID: camera.id, $0)) })) {
-        ForEach(ResizeTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+      .help("Copies this camera's effects, LUT, monitor tools, source declarations and preview setting to every camera, then keeps edits in sync. Input devices and recording folders stay separate.")
+      effectRow(camera, index: 0, title: "LUT", enabled: snapshot.lutName != nil) {
+        Text(snapshot.lutName.map { ($0 as NSString).deletingPathExtension } ?? "None").foregroundStyle(.secondary)
+          .lineLimit(1).truncationMode(.middle)
+      }
+      effectRow(camera, index: 1, title: "Output size") {
+        HStack(spacing: 4) {
+          Picker("Output size", selection: Binding(get: { snapshot.resizeTarget },
+            set: { context.send(.setResizeTarget(cameraID: camera.id, $0)) })) {
+            ForEach(ResizeTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+          }
+          .labelsHidden().fixedSize()
+          Picker("Aspect", selection: Binding(get: { snapshot.scalingMode },
+            set: { context.send(.setScalingMode(cameraID: camera.id, $0)) })) {
+            Text("Fit").tag(ProgramScalingMode.fit)
+            Text("Crop").tag(ProgramScalingMode.crop)
+          }
+          .labelsHidden().fixedSize()
+          .help("Fit or Crop keeps the source's aspect ratio.")
+        }
+      }
+      effectRow(camera, index: 2, title: "Color format") {
+        Picker("Color format", selection: Binding(get: { snapshot.colorTarget },
+          set: { context.send(.setColorTarget(cameraID: camera.id, $0)) })) {
+          ForEach(ColorTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+        }
+        .labelsHidden().fixedSize()
+      }
+      effectRow(camera, index: 3, title: "Frame-rate cap") {
+        Picker("Frame-rate cap", selection: Binding(get: { snapshot.frameRateTarget },
+          set: { context.send(.setFrameRateTarget(cameraID: camera.id, $0)) })) {
+          ForEach(FrameRateTarget.allCases, id: \.self) { Text($0.title + " fps").tag($0) }
+        }
+        .labelsHidden().fixedSize()
+        .help("Never exceeds the detected source rate. Turn the cap off to keep source timing.")
       }
       Picker("Program color", selection: Binding(get: { snapshot.programColorSpaceID },
         set: { context.send(.setProgramColorSpace(cameraID: camera.id, $0)) })) {
@@ -179,46 +226,47 @@ struct UIInspectorViewContent: View {
         Text("Rec.2020 / PQ").tag("rec2020-pq-video")
         Text("Rec.2020 / HLG").tag("rec2020-hlg-video")
       }
-      Picker("Aspect", selection: Binding(get: { snapshot.scalingMode },
-        set: { context.send(.setScalingMode(cameraID: camera.id, $0)) })) {
-        Text("Fit").tag(ProgramScalingMode.fit)
-        Text("Crop").tag(ProgramScalingMode.crop)
-      }
-      Picker("Color format", selection: Binding(get: { snapshot.colorTarget },
-        set: { context.send(.setColorTarget(cameraID: camera.id, $0)) })) {
-        ForEach(ColorTarget.allCases, id: \.self) { Text($0.title).tag($0) }
-      }
-      Picker("Frame-rate cap", selection: Binding(get: { snapshot.frameRateTarget },
-        set: { context.send(.setFrameRateTarget(cameraID: camera.id, $0)) })) {
-        ForEach(FrameRateTarget.allCases, id: \.self) { Text($0.title + " fps").tag($0) }
-      }
-      Text("Source size chooses the nearest supported camera size; Fit or Crop preserves the source aspect ratio. Frame-rate caps never exceed the detected source rate; turn off the rate effect to preserve source timing.")
-        .font(.caption).foregroundStyle(.secondary)
+      .help("The color space this camera sends on Program.")
     } header: {
-      Text("Effects")
+      HStack {
+        UIInspectorHeader(title: "Effects", symbol: snapshot.processing ? UISymbol.effects : UISymbol.effectsOff)
+        Spacer()
+        Toggle("Effects", isOn: Binding(get: { snapshot.processing }, set: { context.send(.setProcessing(cameraID: camera.id, $0)) }))
+          .toggleStyle(.switch).labelsHidden().controlSize(.small)
+          .help("Effects Off sends the camera original unchanged. Your effect choices stay saved. ⇧⌘B")
+      }
     } footer: {
       Group {
         if camera.applying {
-          Label("Updating output…", systemImage: "arrow.triangle.2.circlepath")
+          Label("Updating output…", systemImage: UISymbol.updating)
         } else if !snapshot.processing {
-          Label { Text("Complete bypass: the camera original goes out unchanged.") } icon: {
-            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
-          }
+          Text("Camera original goes out unchanged.")
         } else {
-          VStack(alignment: .leading, spacing: 2) {
-            if let output = snapshot.outputFormat { Text("Applied in order. Output \(output).") }
-            if snapshot.lutName == nil { Text("Load a LUT below to use effect 1.") }
-          }
+          Text(["Applied top to bottom.", snapshot.outputFormat.map { "Output \($0)." },
+            snapshot.lutName == nil ? "Load a LUT above to turn it on." : nil].compactMap { $0 }.joined(separator: " "))
         }
       }
-      .font(.subheadline).foregroundStyle(.secondary)
+      .font(.uiMeta).foregroundStyle(.secondary)
       .fixedSize(horizontal: false, vertical: true)
     }
   }
 
+  /// An effect's checkbox and its value on one row; the value is off while its checkbox is.
+  private func effectRow<Value: View>(_ camera: UICameraPresentation, index: Int, title: String, enabled: Bool = true,
+    @ViewBuilder value: () -> Value) -> some View {
+    let chip = camera.chips.indices.contains(index) ? camera.chips[index] : nil
+    return LabeledContent {
+      value().disabled(!(chip?.isOn ?? false) || !camera.processing)
+    } label: {
+      Toggle(title, isOn: Binding(get: { chip?.isOn ?? false }, set: { context.send(.setEffect(cameraID: camera.id, index: index, $0)) }))
+        .toggleStyle(.checkbox)
+        .disabled(!enabled || !camera.processing)
+        .help(chip?.help ?? "")
+    }
+  }
+
   private func lutSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
-    Section("LUT") {
-      // Label and value like the Input gamut row below; the section header already says LUT.
+    Section {
       // One row whatever the file name's length: the name gives way (truncating in the middle)
       // before the label or the button. LabeledContent would drop a long name onto a second line.
       HStack(spacing: 6) {
@@ -226,7 +274,7 @@ struct UIInspectorViewContent: View {
         Spacer(minLength: 8)
         if snapshot.lutLoading { ProgressView().controlSize(.small) }
         Text(snapshot.lutLoading ? "Loading…" : snapshot.lutName.map { ($0 as NSString).deletingPathExtension } ?? "None")
-          .lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+          .lineLimit(1).truncationMode(.middle).fontWeight(.semibold)
           .help(snapshot.lutName ?? "")
         Button(snapshot.lutName == nil ? "Load…" : "Change…") { context.send(.chooseLUT(cameraID: camera.id)) }
           .layoutPriority(2)
@@ -236,28 +284,28 @@ struct UIInspectorViewContent: View {
       .accessibilityElement(children: .contain)
       .accessibilityLabel("LUT file")
       if let error = snapshot.lutError {
-        Label { Text(error).foregroundStyle(.secondary) } icon: {
-          Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-        }
-        .font(.subheadline)
-        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        Label { Text(error) } icon: { UIStateGlyph(state: .warning) }
+          .font(.uiMeta)
+          .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
       }
-      Picker("Source profile", selection: Binding(get: { snapshot.sourceProfileID }, set: { context.send(.setSourceProfile(cameraID: camera.id, $0)) })) {
-        Text("From source tags / unspecified").tag("unspecified")
-        colorSpaceOptions(selected: snapshot.sourceProfileID)
-      }
-      .help("Declares the captured signal for monitoring and capture. This does not declare either LUT edge.")
-      if snapshot.sourceProfileID != "unspecified", !SourceColorSpaceCatalog.entries.contains(where: { $0.id == snapshot.sourceProfileID }) {
-        Text("This saved source profile is unavailable. Choose a supported declaration before processing.").font(.caption).foregroundStyle(.orange)
-      }
-      Picker("LUT input space", selection: Binding(get: { snapshot.lutInputSpaceID }, set: { context.send(.setLUTInputSpace(cameraID: camera.id, $0)) })) {
+      Picker("Input space", selection: Binding(get: { snapshot.lutInputSpaceID }, set: { context.send(.setLUTInputSpace(cameraID: camera.id, $0)) })) {
         colorSpaceOptions(selected: snapshot.lutInputSpaceID)
       }
-      Picker("LUT output space", selection: Binding(get: { snapshot.lutOutputSpaceID }, set: { context.send(.setLUTOutputSpace(cameraID: camera.id, $0)) })) {
+      Picker("Output space", selection: Binding(get: { snapshot.lutOutputSpaceID }, set: { context.send(.setLUTOutputSpace(cameraID: camera.id, $0)) })) {
         colorSpaceOptions(selected: snapshot.lutOutputSpaceID)
       }
-      Text("Choose the spaces specified by the LUT author. LUT spaces are never inferred from its file name; legacy LUTs keep Rec.709 input and output.").font(.caption).foregroundStyle(.secondary)
-
+      if snapshot.lutName != nil || snapshot.lutError != nil {
+        HStack {
+          Spacer()
+          Button("Remove LUT") { context.send(.forgetLUT(cameraID: camera.id)) }
+            .help("Stop applying a LUT to \(camera.name). The file on disk is kept.")
+        }
+      }
+    } header: {
+      UIInspectorHeader(title: "LUT", symbol: UISymbol.lut(on: camera.lutIsOn))
+    } footer: {
+      Text("Choose the spaces specified by the LUT author. LUT spaces are never inferred from its file name; legacy LUTs keep Rec.709 input and output.")
+        .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
   }
 
@@ -296,36 +344,36 @@ struct UIInspectorViewContent: View {
       }
       .help(folder.folderPath ?? "")
       UILiveCamera(camera: camera, context: context, follows: .take, refresh: 5) { live in
-        if let left = live.camera.timeLeftLine { LabeledContent("Time left", value: left) }
+        if let seconds = live.snapshot?.recording.secondsLeft {
+          LabeledContent("Time left") { UIValue(parts: UIFormat.durationParts(seconds)) }
+        }
       }
     } header: {
-      Text("Recording")
+      UIInspectorHeader(title: "Recording", symbol: UISymbol.record)
     } footer: {
       Text("Records the camera original with embedded audio: no LUT or effects.")
-        .font(.subheadline).foregroundStyle(.secondary)
+        .font(.uiMeta).foregroundStyle(.secondary)
     }
   }
 
   private func automationSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
-      Toggle("Start with camera apps", isOn: Binding(get: { snapshot.automaticStart },
+      Toggle("Start with meeting apps", isOn: Binding(get: { snapshot.automaticStart },
         set: { context.send(.setAutomaticStart(cameraID: camera.id, $0)) }))
         .help("Starts when a meeting app opens this camera; stops when the last app closes.")
       if snapshot.automaticStartFailed {
         HStack {
-          Label { Text("Couldn't start") } icon: {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-          }
+          Label { Text("Couldn't start") } icon: { UIStateGlyph(state: .warning) }
           Spacer()
           Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }
             .help("Try starting the camera again.")
         }
       }
     } header: {
-      Text("Automation")
+      UIInspectorHeader(title: "Automation", symbol: UISymbol.startWithApps)
     } footer: {
       if let status = snapshot.automaticStatus, !status.isEmpty {
-        Text(status).font(.subheadline).foregroundStyle(.secondary)
+        Text(status).font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
       }
     }
@@ -333,12 +381,22 @@ struct UIInspectorViewContent: View {
 
   static func signalText(_ snapshot: UICameraSnapshot) -> String {
     switch snapshot.signal {
-    case .none: return snapshot.deviceAvailable ? "Camera stopped" : "Input missing"
+    case .none: return snapshot.deviceAvailable ? "Camera stopped" : "Input disconnected"
     case .connecting: return "Starting…"
-    case .live(let format): return [format, snapshot.sourcePixel].compactMap { $0 }.joined(separator: " · ")
+    case .live(let format): return [format, snapshot.sourcePixel].compactMap { $0 }.joined(separator: "  ")
     case .noSignal: return "No signal"
     case .unsupported(let mode): return mode
     case .deviceMissing: return "Input disconnected"
     }
+  }
+}
+
+/// A section header with its noun's symbol: a long pane is scanned by its headers.
+struct UIInspectorHeader: View {
+  let title: String
+  let symbol: String
+
+  var body: some View {
+    Label(title, systemImage: symbol)
   }
 }

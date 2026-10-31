@@ -31,21 +31,21 @@ extension UIPresentationChecks {
   @objc func testCleanTakeAudioIsATooltipNotAWarning() {
     let recording = takeCamera(.recording, audio: Self.clean)
     XCTAssertNil(recording.recordingNote, "no warning line for clean audio")
-    XCTAssertEqual(recording.takeAudioHelp, "This take so far: Audio −23.4 LUFS · max −2.1 dBTP · no overs")
+    XCTAssertEqual(recording.takeAudioHelp, "This take so far: Audio −23.4 LUFS, max −2.1 dBTP, no overs")
     XCTAssertFalse(recording.accessibilityLabel.contains("LUFS"))
     let saved = takeCamera(.idle, audio: Self.clean, saved: true)
     XCTAssertEqual(saved.stripState, .saved)
     XCTAssertNil(saved.recordingNote)
-    XCTAssertEqual(saved.takeAudioHelp, "Last take: Audio −23.4 LUFS · max −2.1 dBTP · no overs")
+    XCTAssertEqual(saved.takeAudioHelp, "Last take: Audio −23.4 LUFS, max −2.1 dBTP, no overs")
   }
 
   @objc func testTakeAudioWithAnOverWarns() {
     let saved = takeCamera(.idle, audio: Self.hot, saved: true, note: "Audio re-synced after a signal drop")
     XCTAssertEqual(saved.recordingNote,
-      "Audio re-synced after a signal drop · Audio −14.2 LUFS · max +0.3 dBTP · 2 overs")
+      "Audio re-synced after a signal drop. Audio −14.2 LUFS, max +0.3 dBTP, 2 overs")
     XCTAssertTrue(saved.accessibilityLabel.contains("2 overs"), saved.accessibilityLabel)
     let recording = takeCamera(.recording, audio: Self.hot)
-    XCTAssertEqual(recording.recordingNote, "Audio −14.2 LUFS · max +0.3 dBTP · 2 overs")
+    XCTAssertEqual(recording.recordingNote, "Audio −14.2 LUFS, max +0.3 dBTP, 2 overs")
   }
 
   /// A take's audio belongs to a take: none on a camera that is ready for the next one.

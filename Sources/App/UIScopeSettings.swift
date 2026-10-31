@@ -55,6 +55,7 @@ struct UIScopeSettingsView: View {
       levelControls(d)
       kindControls(d)
       if d.usesMatrix { row("Matrix") { matrixPicker } }
+      row("Refresh") { refreshPicker }
       traceControls
       caption(d)
     case .columns:
@@ -64,6 +65,7 @@ struct UIScopeSettingsView: View {
           if d.settings.kind == .histogram { row("Channels") { channelsPicker } }
           row("Signal") { signalPicker }
           if d.usesMatrix { row("Matrix") { matrixPicker } }
+          row("Refresh") { refreshPicker }
         }
         if d.hasLevelAxis {
           UIToolGroup("Levels") { levelControls(d) }
@@ -115,6 +117,14 @@ struct UIScopeSettingsView: View {
       }
     }
     .help("The stage the scope measures. Output (LUT) is the source with the burned-in LUT, as published.")
+  }
+
+  /// How often this camera's scope redraws. Per camera, so it lives here, not in Settings.
+  private var refreshPicker: some View {
+    Picker("Refresh", selection: $scopes.refreshHz) {
+      ForEach(MonitorScopePreferences.refreshRates, id: \.self) { Text("\($0) Hz").tag($0) }
+    }
+    .help("How often the scope redraws. The picture shows every frame whatever this is.")
   }
 
   private var matrixPicker: some View {

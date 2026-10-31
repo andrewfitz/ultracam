@@ -1,8 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// The session panel: cameras (only when more than two), output, Program,
-/// recording destinations, recent takes, interrupted takes and automation.
+/// The session board: what is connected, what's going out, where it's saving and what's wrong,
+/// in signal order. Attention pins above the list. Nothing about switching lives here:
+/// Auto, Strategy, Anchor, Emphasis and Hold are in the toolbar, shot time in the status bar.
 /// Rebuilds the context inside its own body so this column refreshes with the models.
 struct UISessionSidebarView: View {
   let context: UIContext
@@ -20,18 +21,11 @@ struct UISessionSidebarViewContent: View {
 
   var body: some View {
     let _ = UIRenderProbe.count("UISessionSidebarViewContent")
-    // Only the camera rows (shown with three or more cameras) are tagged, so only they select
-    // through the list; other rows that name a camera are buttons that do the same.
     List(selection: selection) {
-      if let banner = UIExtensionBanner.state(session.install) {
-        Section { UIExtensionBannerView(state: banner, context: context) }
-      }
       camerasSection
-      outputSection
+      virtualCamerasSection
       recordingSection
-      if !session.recentTakes.isEmpty { recentTakesSection }
-      if !session.interruptedTakes.isEmpty || session.recoveryMessage != nil { interruptedSection }
-      automationSection
+      if let take = session.recentTakes.first { takesSection(take) }
     }
     .listStyle(.sidebar)
     .accessibilityLabel("Session")
@@ -62,218 +56,153 @@ struct UISessionSidebarViewContent: View {
 
   // MARK: Cameras
 
+  /// Only what the strip doesn't show: capture device and camera body. The tally is the
+  /// picture's and the status bar's, and the signal badge owns format and dropouts.
   private var camerasSection: some View {
     Section {
-      if presentation.cameras.count > 2 {
-        ForEach(presentation.cameras) { camera in
-          HStack(spacing: 8) {
-            Circle().fill(camera.statusTone == .positive ? Color.green : camera.statusTone.color.opacity(0.7))
-              .frame(width: 7, height: 7)
-            VStack(alignment: .leading, spacing: 1) {
-              Text(camera.name).lineLimit(1).truncationMode(.middle)
-              Text(camera.statusBadge).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            if let label = camera.tally.label {
-              UIBadge(text: label, tone: camera.tally.isRed ? .onAir : camera.tally == .next ? .positive : .neutral)
-            }
-          }
+      ForEach(presentation.cameras) { camera in
+        UISidebarCameraRow(camera: camera, snapshot: context.snapshot(camera.id))
           .tag(camera.id)
-          .accessibilityElement(children: .combine)
-          .accessibilityLabel(camera.accessibilityLabel)
           .accessibilityHint("Shows \(camera.name) in the inspector")
-        }
       }
     } header: {
       HStack {
-        Text("Cameras · \(presentation.cameras.count)")
+        Text("Cameras")
         Spacer()
-        Button { context.send(.addCamera) } label: { Image(systemName: "plus") }
-          .buttonStyle(.borderless)
-          .disabled(!session.canAddCamera)
-          .help(UIPresentationBuilder.addCameraHelp(session))
-          .accessibilityLabel("Add Camera")
+        Button { context.send(.addCamera) } label: {
+          Image(systemName: UISymbol.add).frame(minWidth: 24, minHeight: 24).contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .disabled(!session.canAddCamera)
+        .help(UIPresentationBuilder.addCameraHelp(session))
+        .accessibilityLabel("Add Camera")
       }
     }
   }
 
-  // MARK: Output
+  // MARK: Virtual Cameras
 
-  /// Every camera meeting apps can use, and with two or more, Program and its switching
-  /// controls: Auto, its strategy, Hold and the shot timer. Cuts are in the toolbar.
-  private var outputSection: some View {
-    Section("Output") {
-      // The same setting as the inspector's and Settings' (the model holds it).
-      if session.cameras.count > 1 {
-        Toggle("Sync cameras", isOn: Binding(get: { session.syncCameras }, set: { context.send(.setSyncCameras($0)) }))
-          .toggleStyle(.switch)
-          .controlSize(.small)
-          .help("Cameras share processing and monitor effect edits. Turning this on copies the selected camera’s effects. Inputs and recording folders stay separate; source declarations and calibration stay per camera.")
-      }
-      if presentation.programAvailable {
-        UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · Program",
-          detail: session.programClientLine, positive: session.programInUse)
-          .help("One switched camera for meeting apps. Cut with the toolbar buttons or ⌃1–⌃\(min(4, max(1, presentation.cameras.count))).")
-      }
-      // Each output is its camera: a click selects the camera and shows it in the inspector.
-      ForEach(session.cameras) { camera in
-        UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · \(camera.name)",
-          detail: camera.clientLine, positive: camera.inUse)
-          .uiSidebarInspectButton(cameraName: camera.name) { inspect(camera.id) }
-          .selectionDisabled()
-      }
-      if presentation.programAvailable {
-        Toggle("Auto switching", isOn: Binding(get: { presentation.autoSwitching }, set: { context.send(.setAutoSwitching($0)) }))
-          .toggleStyle(.switch)
-          .controlSize(.small)
-          .disabled(!presentation.canAutoSwitch)
-          .help(presentation.canAutoSwitch ? "Cut automatically using the strategy below (⌃⌥A)."
-            : "Choose a strategy below to switch automatically.")
-        Picker("Strategy", selection: Binding(get: { session.strategy }, set: { context.send(.setStrategy($0)) })) {
-          ForEach(UIStrategy.offered, id: \.self) { strategy in
-            Text(UIStrategy.title(strategy)).tag(strategy)
+  /// The one section that collapses, by hand only. Closed, its header keeps the count, so
+  /// collapsing hides no state.
+  private var virtualCamerasSection: some View {
+    Section {
+      if !session.virtualCamerasCollapsed {
+        ForEach(presentation.virtualCameras) { row in
+          if let cameraID = row.cameraID {
+            UIVirtualCameraRow(row: row)
+              .uiSidebarInspectButton(cameraName: row.name) { inspect(cameraID) }
+              .selectionDisabled()
+          } else {
+            UIVirtualCameraRow(row: row)
+              .help("One switched camera for meeting apps. Cut with the toolbar or ⌃1–⌃\(min(4, max(1, presentation.cameras.count))).")
+              .selectionDisabled()
           }
         }
-        .pickerStyle(.menu)
-        .controlSize(.small)
-        .help("How Auto chooses the next camera. Manual only cuts when you do.")
-        if presentation.canHoldShot {
-          Toggle("Hold current shot", isOn: Binding(get: { session.autoHold }, set: { context.send(.setAutoHold($0)) }))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .help("Auto stays on but makes no cuts.")
-        }
-        if presentation.autoSwitching {
-          UIShotTimerView(shot: session.shot, onAirName: presentation.cameras.first { $0.id == session.onAirID }?.name)
+        if presentation.virtualCamerasInUse == 0 {
+          Label { Text(Self.microphoneReminder).lineLimit(3) } icon: { Image(systemName: UISymbol.microphoneReminder) }
+            .font(.uiMeta).foregroundStyle(.secondary)
+            .selectionDisabled()
         }
       }
+    } header: {
+      Button { context.send(.setVirtualCamerasCollapsed(!session.virtualCamerasCollapsed)) } label: {
+        HStack(spacing: 6) {
+          Text("Virtual Cameras")
+          Spacer(minLength: 4)
+          if session.virtualCamerasCollapsed {
+            Text("\(presentation.virtualCamerasInUse) of \(presentation.virtualCameras.count) in use").font(.uiMeta)
+          }
+          Image(systemName: session.virtualCamerasCollapsed ? UISymbol.expandStrip : UISymbol.collapseStrip).imageScale(.small)
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help(session.virtualCamerasCollapsed ? "Show the virtual cameras" : "Hide the virtual cameras")
+      .accessibilityLabel(session.virtualCamerasCollapsed ? "Show Virtual Cameras" : "Hide Virtual Cameras")
+      .accessibilityValue("\(presentation.virtualCamerasInUse) of \(presentation.virtualCameras.count) in use")
     }
   }
+
+  static let microphoneReminder = "Video only — select your microphone in your meeting app."
 
   // MARK: Recording
 
   private var recordingSection: some View {
     Section("Recording") {
-      let active = session.cameras.filter { $0.recording.status == .recording || $0.recording.status == .paused }
-      let paused = active.filter { $0.recording.status == .paused }.count
+      UIFormatMenu(context: context)
+        .selectionDisabled()
       HStack(spacing: 8) {
-        Circle().fill(active.isEmpty ? Color.secondary.opacity(0.4) : .red).frame(width: 7, height: 7)
-        VStack(alignment: .leading, spacing: 1) {
-          Text(active.isEmpty ? "Not recording" : paused > 0 ? "\(active.count - paused) recording · \(paused) paused" : "\(active.count) recording")
-          Text("\(session.codecTitle) · \(session.timecodeTitle)").font(.subheadline).foregroundStyle(.secondary)
-        }
+        Text("Camera original")
+        Label { Text(session.timecodeTitle) } icon: { Image(systemName: UISymbol.timecode) }
+          .labelStyle(.titleAndIcon)
       }
+      .font(.uiMeta).foregroundStyle(.secondary)
+      .help("Records the camera original, without LUT or effects. Timecode is set in Settings › Recording.")
       .accessibilityElement(children: .combine)
-      ForEach(session.drives) { drive in UILiveDriveRow(drive: drive, context: context).selectionDisabled() }
-      HStack(spacing: 8) {
-        Image(systemName: "folder").foregroundStyle(.secondary)
-        // The folder's name, and where it is underneath: a whole path doesn't fit the sidebar.
-        VStack(alignment: .leading, spacing: 1) {
-          if let path = session.defaultFolderPath {
-            Text(UIFormat.folderName(path)).lineLimit(1).truncationMode(.middle)
-            Text(UIFormat.folderLocation(path)).font(.subheadline).foregroundStyle(.secondary)
-              .lineLimit(1).truncationMode(.middle)
-          } else {
-            Text("No folder").foregroundStyle(.secondary)
-          }
-        }
-        .accessibilityElement(children: .combine)
-        .help(session.defaultFolderPath ?? "Choose where recordings are saved.")
-        Spacer(minLength: 4)
-        Button(session.defaultFolderPath == nil ? "Choose…" : "Change…") { context.send(.chooseRecordingFolder(cameraID: nil)) }
+      .selectionDisabled()
+      ForEach(session.drives) { drive in
+        UILiveDriveRow(drive: drive, cameras: UIPresentationBuilder.cameras(on: drive, in: session), context: context)
+          .selectionDisabled()
+      }
+      if session.drives.isEmpty {
+        Text("—").font(.uiRow).foregroundStyle(.secondary)
+          .accessibilityLabel("No recording drive")
+          .selectionDisabled()
+      }
+      destinationRow.selectionDisabled()
+    }
+  }
+
+  /// A change applies to the next take, so during one the button says so.
+  private var destinationRow: some View {
+    HStack(spacing: 6) {
+      Image(systemName: UISymbol.folder).foregroundStyle(.secondary).imageScale(.small)
+        .accessibilityHidden(true)
+      Text(session.defaultFolderPath.map(UIFormat.folderName) ?? "No folder")
+        .font(.uiMeta).foregroundStyle(.secondary)
+        .lineLimit(1).truncationMode(.middle)
+        .help(session.defaultFolderPath ?? "Choose where takes are saved.")
+      Spacer(minLength: 4)
+      if presentation.canPauseAll || session.defaultFolderPath != nil {
+        Button(UIPresentationBuilder.folderAction(session)) { context.send(.chooseRecordingFolder(cameraID: nil)) }
           .controlSize(.small)
+          .fixedSize()
           .help("Choose the default recording folder. Changes apply to the next take.")
       }
     }
   }
 
-  private var recentTakesSection: some View {
-    Section("Recent Takes") {
-      ForEach(session.recentTakes) { take in
-        HStack(spacing: 8) {
-          Image(systemName: "film").foregroundStyle(.secondary)
-          VStack(alignment: .leading, spacing: 1) {
-            Text(take.date.formatted(date: .abbreviated, time: .shortened)
-              + (take.duration.map { " · \(UIFormat.shortElapsed($0))" } ?? ""))
-              .lineLimit(1)
-            Text(take.name).font(.subheadline).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-            if let lost = take.lostFrames, lost > 0 {
-              Label(lost == 1 ? "1 frame lost" : "\(lost) frames lost", systemImage: "exclamationmark.triangle.fill")
-                .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-            }
-          }
-          Spacer(minLength: 4)
-          Button { context.send(.revealInFinder(take.url)) } label: { Image(systemName: "magnifyingglass") }
-            .buttonStyle(.borderless)
-            .help("Show in Finder")
-            .accessibilityLabel("Show \(take.name) in Finder")
-        }
-        .help(take.url.path)
-        .selectionDisabled()
-      }
-    }
-  }
+  // MARK: Takes
 
-  private var interruptedSection: some View {
-    Section("Interrupted Takes") {
-      ForEach(session.interruptedTakes) { take in
-        HStack(spacing: 8) {
-          Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-          Text(take.title).lineLimit(1).truncationMode(.middle).help(take.title)
+  /// The latest only, so Recording stays above the fold. Show All reveals the rest in Finder.
+  private func takesSection(_ take: UITake) -> some View {
+    Section("Takes") {
+      VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 6) {
+          Image(systemName: UISymbol.take).foregroundStyle(.secondary).imageScale(.small).accessibilityHidden(true)
+          Text("Last take").font(.uiMeta).foregroundStyle(.secondary)
+          if let duration = take.duration { UIValue(parts: [UIValuePart(number: UIFormat.shortElapsed(duration))]) }
           Spacer(minLength: 4)
-          if session.recoveringID == take.id {
-            ProgressView().controlSize(.small).accessibilityLabel("Recovering")
-          } else {
-            Button("Recover") { context.send(.recover(id: take.id)) }
-              .controlSize(.small)
-              .disabled(session.recoveringID != nil)
-              .help("Copy the complete fragments into a separate _Recovered.mov. The original is kept.")
+          Button("Show All") { context.send(.revealRecordings) }
+            .controlSize(.small)
+            .fixedSize()
+            .disabled(!presentation.canRevealRecordings)
+            .help("Show the takes in Finder")
+        }
+        HStack(spacing: 6) {
+          Text(take.date, format: .dateTime.hour().minute())
+          if let lost = take.lostFrames {
+            Image(systemName: lost > 0 ? UISymbol.warning : UISymbol.saved)
+              .imageScale(.small).foregroundStyle(lost > 0 ? Color.orange : .green)
+              .accessibilityHidden(true)
+            Text("\(lost) lost").foregroundStyle(lost > 0 ? .primary : .secondary)
           }
         }
-        .selectionDisabled()
+        .font(.uiMeta).foregroundStyle(.secondary)
       }
-      if let message = session.recoveryMessage {
-        Text(message).font(.subheadline).foregroundStyle(.secondary).textSelection(.enabled)
-          .fixedSize(horizontal: false, vertical: true)
-      }
-    }
-  }
-
-  // MARK: Automation
-
-  private var automationCamera: UICameraSnapshot? {
-    let automatic = session.cameras.filter(\.automaticStart)
-    let selected = session.cameras.first { $0.id == session.selectedID }
-    if let selected, automatic.isEmpty || selected.automaticStart { return selected }
-    return automatic.first ?? session.cameras.first
-  }
-
-  private var automationSection: some View {
-    Section("Automation") {
-      let automatic = session.cameras.filter(\.automaticStart).map(\.name)
-      VStack(alignment: .leading, spacing: 1) {
-        Text("Start with camera apps")
-        Text(automatic.isEmpty ? "Off" : automatic.joined(separator: ", "))
-          .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
-        // Sidebar rows are one line unless told otherwise, which cut this note off mid-word.
-        if let status = session.cameras.first(where: { $0.id == session.selectedID })?.automaticStatus, !status.isEmpty {
-          Text(status).font(.subheadline).foregroundStyle(.secondary)
-            .lineLimit(4).fixedSize(horizontal: false, vertical: true)
-            .padding(.top, 3)
-        }
-      }
+      .help(take.url.path)
       .accessibilityElement(children: .combine)
-      .help("A camera starts when a meeting app opens its Ultracam camera and stops when the last app closes. Set it per camera in the inspector.")
-      // The setting is per camera in the inspector: open the selected camera if it's one of
-      // those named (or none is), otherwise the first one named.
-      .modifier(UISidebarAutomationButton(camera: automationCamera, inspect: inspect))
-      VStack(alignment: .leading, spacing: 1) {
-        Text("Backup recording")
-        Text("Coming later").font(.subheadline)
-      }
-      .foregroundStyle(.secondary)
-      .help("Recording that starts with a meeting is designed but not built yet.")
-      .accessibilityElement(children: .combine)
+      .selectionDisabled()
     }
   }
 }
@@ -292,122 +221,178 @@ extension View {
   }
 }
 
-/// The Automation row opens its camera's inspector, where the setting lives.
-private struct UISidebarAutomationButton: ViewModifier {
-  let camera: UICameraSnapshot?
-  let inspect: (String) -> Void
-  func body(content: Content) -> some View {
-    if let camera {
-      content.uiSidebarInspectButton(cameraName: camera.name) { inspect(camera.id) }
-    } else {
-      content
+/// A camera's state, name and hardware: the capture device's nickname, then the camera body
+/// when one is paired. A camera with no body draws one line, not an empty one.
+struct UISidebarCameraRow: View {
+  let camera: UICameraPresentation
+  let snapshot: UICameraSnapshot?
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 8) {
+      UIStateGlyph(state: camera.state).frame(width: 12)
+      VStack(alignment: .leading, spacing: 1) {
+        Text(camera.name).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
+        Text(camera.inputName).font(.uiMeta).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+          .help(camera.inputName)
+        if let body = snapshot?.body {
+          HStack(spacing: 6) {
+            Label { Text(body.name).lineLimit(1) } icon: { Image(systemName: UISymbol.cameraBody).imageScale(.small) }
+            if !body.connected {
+              // Wi-Fi only when degraded: a healthy link draws nothing.
+              Image(systemName: UISymbol.wifi(connected: false)).imageScale(.small).foregroundStyle(.orange)
+              Text("Disconnected").foregroundStyle(.primary).fixedSize()
+            } else if let battery = body.battery {
+              UIBatteryGlyph(battery: battery)
+            }
+          }
+          .font(.uiMeta).foregroundStyle(.secondary)
+        }
+      }
+    }
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel(camera.accessibilityLabel)
+  }
+}
+
+/// One line: its state glyph, its name, and "In use" only when true.
+struct UIVirtualCameraRow: View {
+  let row: UIVirtualCamera
+
+  var body: some View {
+    HStack(spacing: 6) {
+      Image(systemName: UISymbol.virtualCamera(inUse: row.inUse)).foregroundStyle(row.inUse ? Color.green : .secondary)
+      Text(row.name).lineLimit(1).truncationMode(.middle)
+        .foregroundStyle(row.inUse ? .primary : .secondary)
+        .fontWeight(row.inUse ? .semibold : .regular)
+      Spacer(minLength: 4)
+      if row.inUse { Text("In use").font(.uiMeta).fixedSize() }
+    }
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel("\(row.name), \(row.clientLine)")
+  }
+}
+
+/// The session's one format: the same menu in the left pane, the Record toolbar menu, the
+/// Record app menu and the menu bar. Each row shows its rate and time left for the current
+/// sources. It applies to the next take; each strip shows its own, read-only.
+struct UIFormatMenu: View {
+  let context: UIContext
+
+  var body: some View {
+    Menu {
+      UIFormatChoices(session: context.session, send: context.send)
+    } label: {
+      HStack(spacing: 6) {
+        Image(systemName: UISymbol.format)
+        Text(context.session.codec.title).lineLimit(1)
+        Spacer(minLength: 0)
+      }
+    }
+    .help("The format every camera records. Applies to the next take.")
+    .accessibilityLabel("Recording format")
+    .accessibilityValue(context.session.codec.title)
+  }
+}
+
+/// A Format menu's rows.
+struct UIFormatChoices: View {
+  let session: UISessionSnapshot
+  let send: @MainActor (UIAction) -> Void
+
+  var body: some View {
+    Section("Applies to the next take") {
+      ForEach(UIPresentationBuilder.formatChoices(session)) { choice in
+        Toggle(isOn: Binding(get: { choice.selected }, set: { _ in send(.setCodec(choice.codec)) })) {
+          Text(choice.title)
+        }
+        .badge(Text(choice.reason ?? [choice.rate, choice.left].compactMap { $0 }.joined(separator: "   ")))
+        .disabled(choice.reason != nil)
+      }
     }
   }
 }
 
-struct UISidebarRow: View {
-  let symbol: String
-  let title: String
-  let detail: String
-  var positive = false
+/// Every interrupted take, one Recover each. Attention's row opens it.
+struct UIInterruptedTakesSheet: View {
+  let context: UIContext
+
+  private var session: UISessionSnapshot { context.session }
+
   var body: some View {
-    HStack(spacing: 8) {
-      // The tone is on the symbol; the words stay in label colors so they read in light mode.
-      Image(systemName: symbol).foregroundStyle(positive ? Color.green : .secondary)
-      VStack(alignment: .leading, spacing: 1) {
-        Text(title).lineLimit(1).truncationMode(.middle)
-        Text(detail).font(.subheadline).foregroundStyle(.secondary)
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Interrupted Takes").font(.uiTitle)
+      if session.interruptedTakes.isEmpty {
+        Text("No interrupted takes were found in the saved folders.").font(.uiRow).foregroundStyle(.secondary)
+      }
+      ForEach(session.interruptedTakes) { take in
+        HStack(spacing: 8) {
+          Image(systemName: UISymbol.take).foregroundStyle(.secondary).accessibilityHidden(true)
+          Text(take.title).font(.uiRow).lineLimit(1).truncationMode(.middle).help(take.title)
+          Spacer(minLength: 4)
+          if session.recoveringID == take.id {
+            ProgressView().controlSize(.small).accessibilityLabel("Recovering")
+          } else {
+            Button("Recover") { context.send(.recover(id: take.id)) }
+              .controlSize(.small)
+              .disabled(session.recoveringID != nil)
+          }
+        }
+      }
+      Text(session.recoveryMessage ?? "Recovery copies complete fragments into a separate _Recovered.mov without re-encoding and keeps the original.")
+        .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+      HStack {
+        if let url = session.recoveredURL {
+          Button("Show Recovered Movie in Finder") { context.send(.revealInFinder(url)) }
+        }
+        Spacer()
+        Button("Done") { context.send(.hideInterruptedTakes) }.keyboardShortcut(.defaultAction)
       }
     }
-    .accessibilityElement(children: .combine)
+    .padding(20)
+    .frame(width: 460, alignment: .leading)
   }
 }
 
 struct UIDriveRow: View {
   let drive: UIDrive
+  /// The cameras that record here, as their numbers: names are in help.
+  var cameras: [UICameraPresentation] = []
+
   var body: some View {
     let used = drive.totalBytes > 0 ? 1 - Double(drive.availableBytes) / Double(drive.totalBytes) : 0
-    let low = (drive.secondsLeft ?? .infinity) < 30 * 60 || UIPresentationBuilder.isFull(drive)
+    let low = (drive.secondsLeft ?? .infinity) < UIPresentationBuilder.lowDriveSeconds || UIPresentationBuilder.isFull(drive)
     VStack(alignment: .leading, spacing: 4) {
-      HStack {
-        Image(systemName: low ? "exclamationmark.triangle.fill" : "externaldrive").foregroundStyle(low ? Color.orange : .secondary)
-        Text(drive.name).lineLimit(1)
-        Spacer()
-        Text(Self.freeText(drive))
-          .font(.subheadline.monospacedDigit())
-          .foregroundStyle(low ? .primary : .secondary)
+      HStack(spacing: 4) {
+        Image(systemName: UISymbol.drive(low: low)).imageScale(.small).foregroundStyle(low ? Color.orange : .secondary)
+        Text(drive.name).font(.uiValueStrong).lineLimit(1)
+        ForEach(cameras) { UINumberCapsule(number: $0.number) }
+        Spacer(minLength: 4)
+        if let seconds = drive.secondsLeft {
+          UIValue(parts: UIFormat.durationParts(seconds))
+          Text("left").font(.uiMeta).foregroundStyle(.secondary)
+        } else {
+          Text(Self.freeText(drive)).font(.uiMeta).foregroundStyle(.secondary).lineLimit(1)
+        }
       }
-      ProgressView(value: min(1, max(0, used)))
-        .progressViewStyle(.linear)
-        .tint(low ? .orange : .secondary)
+      UILevelBar(fraction: used, tint: low ? .orange : .secondary, width: nil)
     }
     .accessibilityElement(children: .ignore)
     .accessibilityLabel("Drive \(drive.name)")
     .accessibilityValue(drive.secondsLeft.map { "\(UIFormat.duration($0)) of recording left" } ?? Self.freeText(drive))
-    .help(Self.unknown(drive) ? "Ultracam couldn't read this drive's free space."
-      : "\(UIFormat.bytes(drive.availableBytes)) free. Time left is estimated from the bitrate of the takes recording to this drive.")
+    .help(Self.help(drive, cameras: cameras))
+  }
+
+  private static func help(_ drive: UIDrive, cameras: [UICameraPresentation]) -> String {
+    if unknown(drive) { return "Ultracam couldn't read this drive's free space." }
+    let names = cameras.isEmpty ? "" : " \(cameras.map(\.name).joined(separator: ", ")) \(cameras.count == 1 ? "records" : "record") here."
+    return "\(UIFormat.bytes(drive.availableBytes)) free. Time left is estimated from the bitrate of the takes recording to this drive.\(names)"
   }
 
   /// An unreadable volume reports no size at all; that is unknown, not a full drive.
   private static func unknown(_ drive: UIDrive) -> Bool { drive.totalBytes == 0 && drive.availableBytes == 0 }
 
   private static func freeText(_ drive: UIDrive) -> String {
-    if let seconds = drive.secondsLeft { return "\(UIFormat.duration(seconds)) left" }
-    return unknown(drive) ? "Free space unknown" : "\(UIFormat.bytes(drive.availableBytes)) free"
-  }
-}
-
-/// Length of the current Program shot against the director's minimum, soft maximum and maximum.
-struct UIShotTimerView: View {
-  let shot: UIShotTiming
-  let onAirName: String?
-  /// When the current shot started, anchored when the snapshot was taken.
-  private let anchor: Date?
-
-  init(shot: UIShotTiming, onAirName: String?) {
-    self.shot = shot
-    self.onAirName = onAirName
-    // From the model's start: the snapshot may be older than this view.
-    anchor = shot.anchor
-  }
-
-  var body: some View {
-    TimelineView(.periodic(from: .now, by: 1)) { timeline in
-      bar(seconds: anchor.map { max(0, timeline.date.timeIntervalSince($0)) })
-    }
-  }
-
-  private func bar(seconds: TimeInterval?) -> some View {
-    let maximum = max(shot.maximum, 1)
-    let fraction = min(1, (seconds ?? 0) / maximum)
-    return VStack(alignment: .leading, spacing: 4) {
-      HStack {
-        Text("\(onAirName ?? "Program") · shot \(seconds.map { String(format: "%.0f s", $0) } ?? "—")")
-        Spacer()
-        Text("min \(Int(shot.minimum)) s")
-      }
-      .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
-      GeometryReader { proxy in
-        let width = proxy.size.width
-        ZStack(alignment: .leading) {
-          Capsule().fill(.fill.tertiary)
-          Capsule().fill(LinearGradient(colors: [.green, .green, .yellow], startPoint: .leading, endPoint: .trailing))
-            .frame(width: max(2, width * fraction))
-          ForEach([shot.minimum, shot.softMaximum], id: \.self) { mark in
-            Rectangle().fill(Color.primary.opacity(0.5)).frame(width: 1.5, height: 12)
-              .offset(x: width * min(1, mark / maximum) - 0.75)
-          }
-          // The maximum is a full-strength primary tick, as in Settings › Switcher; red means on air or recording.
-          Rectangle().fill(Color.primary).frame(width: 1.5, height: 12).offset(x: width - 1.5)
-        }
-      }
-      .frame(height: 6)
-    }
-    .accessibilityElement(children: .ignore)
-    .accessibilityLabel("Shot timer")
-    .accessibilityValue(seconds.map { String(format: "%.0f seconds; minimum %.0f, soft maximum %.0f, maximum %.0f",
-      $0, shot.minimum, shot.softMaximum, shot.maximum) } ?? "No shot")
-    .help("Minimum \(Int(shot.minimum)) s · soft maximum \(Int(shot.softMaximum)) s · maximum \(Int(shot.maximum)) s")
+    unknown(drive) ? "Free space unknown" : "\(UIFormat.bytes(drive.availableBytes)) free"
   }
 }
 
@@ -441,61 +426,5 @@ enum UIExtensionBanner: Equatable {
     }
     if install.canRequestChanges && !install.installed { return .notInstalled }
     return nil
-  }
-}
-
-struct UIExtensionBannerView: View {
-  let state: UIExtensionBanner
-  let context: UIContext
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      switch state {
-      case .unavailable(let reason):
-        // The reason already says what still works, so it isn't repeated here.
-        Label("Camera needs a signed build", systemImage: "info.circle").font(.body.weight(.semibold)).lineLimit(2)
-        Text(reason).font(.subheadline).foregroundStyle(.secondary).lineLimit(4)
-      case .pending(let status):
-        HStack(spacing: 6) {
-          ProgressView().controlSize(.small)
-          Text(status).lineLimit(3)
-        }
-      case .notInstalled:
-        Label("Install the Ultracam camera", systemImage: "video.badge.plus").font(.body.weight(.semibold)).lineLimit(2)
-        Text("Install the Ultracam camera to use it in your meeting app. macOS asks you to approve it in System Settings.")
-          .font(.subheadline).foregroundStyle(.secondary).lineLimit(4)
-        Button("Install Camera") { context.send(.installCameraExtension) }
-          .controlSize(.small)
-          .help("Request installation of the Ultracam camera extension.")
-      case .needsRestart:
-        Label("Finish installing the camera", systemImage: "arrow.clockwise.circle").font(.body.weight(.semibold)).lineLimit(2)
-        Text("Restart your Mac to start the Ultracam camera.")
-          .font(.subheadline).foregroundStyle(.secondary).lineLimit(4)
-          .help("macOS has the camera extension enabled but hasn't started it yet, which usually happens after an update. Capture, preview and recording work meanwhile.")
-      case .outdated(let installed, let bundled):
-        Label("Update the Ultracam camera", systemImage: "arrow.down.circle").font(.body.weight(.semibold)).lineLimit(2)
-        Text("Version \(installed) is installed; this app has \(bundled).")
-          .font(.subheadline).foregroundStyle(.secondary).lineLimit(4)
-        Button("Update Camera") { context.send(.installCameraExtension) }
-          .controlSize(.small)
-          .help("Replace the installed camera extension with this app's version. macOS may ask you to restart.")
-      case .needsApproval(let status):
-        Label {
-          Text("Approve the Ultracam camera")
-        } icon: {
-          Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-        }
-        .font(.body.weight(.semibold)).lineLimit(2)
-        Text(status).font(.subheadline).foregroundStyle(.secondary).lineLimit(4)
-        Button("Open System Settings") {
-          if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
-            NSWorkspace.shared.open(url)
-          }
-        }
-        .controlSize(.small)
-      }
-    }
-    .padding(.vertical, 2)
-    .accessibilityElement(children: .contain)
   }
 }

@@ -576,6 +576,56 @@ extension UIVerify {
     render("component-inspector", UIInspectorView(context: meeting), size: CGSize(width: 320, height: 860)).forEach { $0.close() }
     render("component-status-bar", UIStatusBarView(context: meeting), size: CGSize(width: 1320, height: 40)).forEach { $0.close() }
     render("component-program-view", UIProgramView(context: meeting), size: CGSize(width: 1060, height: 800)).forEach { $0.close() }
+    // The toolbar's controls in the states the drawn set has, on their own (the window toolbar hosts the same views).
+    var toolbarStates: [(String, UISessionSnapshot)] = []
+    var manual = UIFixtures.standalone(); manual.strategy = .manual; manual.autoSwitching = false
+    manual.cameras = manual.cameras.map { var c = $0; c.recording.status = .idle; return c }
+    toolbarStates.append(("manual", manual))
+    toolbarStates.append(("auto-on", UIFixtures.programMeeting()))
+    var hold = UIFixtures.programMeeting(); hold.autoHold = true
+    toolbarStates.append(("hold", hold))
+    var pending = UIFixtures.programMeeting(); pending.pendingCutID = "camera-2"
+    toolbarStates.append(("pending", pending))
+    for (name, session) in toolbarStates {
+      let context = UIContext.fixture(session)
+      render("component-toolbar-\(name)", HStack(spacing: 20) {
+        UIToolbarCutGroup(context: context)
+        Spacer()
+        UIToolbarRecordControl(context: context)
+      }.padding(.horizontal, 12), size: CGSize(width: 900, height: 44), both: false).forEach { $0.close() }
+    }
+    // The strip states that are new with the format and the LUT toggle.
+    var fallback = UIFixtures.standalone()
+    fallback.codec = .proRes4444
+    fallback.cameras = fallback.cameras.map { var c = $0; c.recording.status = .idle; return c }
+    var effectsOff = UIFixtures.programMeeting()
+    effectsOff.cameras[1].processing = false
+    for (name, session, index) in [("fallback", fallback, 0), ("effects-off", effectsOff, 1)] {
+      let context = UIContext.fixture(session)
+      let camera = context.presentation.cameras[index]
+      render("strip-\(name)", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 230), both: false)
+        .forEach { $0.close() }
+      var collapsedSession = session
+      collapsedSession.collapsed = [camera.id]
+      let collapsedContext = UIContext.fixture(collapsedSession)
+      render("strip-\(name)-collapsed", UIChannelStripView(camera: collapsedContext.presentation.cameras[index], context: collapsedContext),
+        size: CGSize(width: 560, height: 52), both: false).forEach { $0.close() }
+    }
+    // A frozen picture says so at rest.
+    UICleanViewState.shared.setFrozen(true, for: "camera-1")
+    if let first = meeting.presentation.cameras.first {
+      render("component-picture-frozen", UIColumnPictureLayout { UICameraPictureView(camera: first, context: meeting) },
+        size: CGSize(width: 560, height: 315), both: false).forEach { $0.close() }
+    }
+    UICleanViewState.shared.setFrozen(false, for: "camera-1")
+    var folded = UIFixtures.programMeeting(); folded.virtualCamerasCollapsed = true
+    render("component-sidebar-virtual-collapsed", UISessionSidebarView(context: .fixture(folded)), size: CGSize(width: 260, height: 860),
+      both: false).forEach { $0.close() }
+    for kind in [UIStatusSegment.Kind.program, .recording, .output, .audio] {
+      let segment = meeting.presentation.statusSegments.first { $0.kind == kind } ?? UIStatusSegment(kind: kind, text: "", tone: .neutral)
+      render("popover-status-\(kind.rawValue)", UIStatusPopover(kind: kind, segment: segment, context: meeting)
+        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 460, height: 640), both: false).forEach { $0.close() }
+    }
     // The menu bar item's preview card, for every fixture (the live preview stays off while waiting).
     for (name, session) in [("program-meeting", UIFixtures.programMeeting()), ("single-meeting", UIFixtures.singleMeeting()),
       ("standalone", UIFixtures.standalone()), ("stopped", UIFixtures.stopped())] {
@@ -603,8 +653,8 @@ extension UIVerify {
     let dump = nodes.map { "\($0.role)\t\($0.text)\t\($0.enabled ? "" : "disabled")" }.joined(separator: "\n")
     try? dump.write(to: verifier.pngDirectory.deletingLastPathComponent().appendingPathComponent("accessibility-program-meeting.tsv"),
       atomically: true, encoding: .utf8)
-    for label in ["Camera 1", "Camera 2", "On Air", "Stop Recording", "Stop Camera 1", "Processing", "LUT", "1080p",
-      "Ultracam · Program · In use", "Cut to Camera 2"] {
+    for label in ["Camera 1", "Camera 2", "On air", "Stop Recording", "LUT for Camera 1", "Effects for Camera 1",
+      "Output 1080p 29.97", "Cut to Camera 2", "Stop 2 Recordings", "Hold Current Shot", "Automatic switching"] {
       verifier.check("accessibility contains \"\(label)\"", contains(nodes, label), "", viewDependent: true)
     }
     verifier.check("no app names in accessibility text", !nodes.contains { node in
@@ -641,14 +691,14 @@ extension UIVerify {
       let staged = HostedView(mainWindow(context), size: CGSize(width: 1320, height: 860), dark: false, titled: true)
       defer { staged.close() }
       let nodes = Accessibility.nodes(in: staged.host)
-      verifier.check("picture: a Source-stage camera shows \"Source · before LUT\" without hover",
-        contains(nodes, "Picture shows Source · before LUT"), "", viewDependent: true)
+      verifier.check("picture: a Source-stage camera shows \"Source before LUT\" without hover",
+        contains(nodes, "Picture shows Source before LUT"), "", viewDependent: true)
       verifier.check("picture: a Monitor-stage camera shows its stage", contains(nodes, "Picture shows Monitor"), "",
         viewDependent: true)
       verifier.check("picture: an Output-stage camera shows no stage label",
         !contains(nodes, "Picture shows Output") && !contains(nodes, "Picture shows Source (camera"), "", viewDependent: true)
       verifier.check("picture: the stage label names Output as nothing to explain",
-        UICameraPictureView.stageNotice(.output) == nil && UICameraPictureView.stageNotice(.source) == "Source · before LUT")
+        UICameraPictureView.stageNotice(.output) == nil && UICameraPictureView.stageNotice(.source) == "Source before LUT")
     }
     // Sidebar List rows aren't exposed to accessibility offscreen (the render
     // component-sidebar-problems shows the banner), so check the banner's state and its view directly.
@@ -659,17 +709,24 @@ extension UIVerify {
       verifier.check("sidebar shows the Install banner when the camera isn't installed", false,
         "\(String(describing: UIExtensionBanner.state(problemsSession.install)))")
     }
-    let sidebar = HostedView(UIExtensionBannerView(state: .notInstalled, context: .fixture(problemsSession) { log.append($0) }),
-      size: CGSize(width: 260, height: 160), dark: false)
+    // Attention's setup row keeps its noun: the install row has its own symbol and its one action.
+    let problemsContext = UIContext.fixture(problemsSession) { log.append($0) }
+    let setup = problemsContext.presentation.setupRows
+    verifier.check("Attention offers the extension install as a setup row, not a problem",
+      setup.first?.symbol == UISymbol.installExtension && setup.first?.action?.action == .installCameraExtension
+        && !problemsContext.presentation.problems.contains { $0.id.hasPrefix("extension.") }, "\(setup.map(\.id))")
+    let sidebar = HostedView(UIAttentionSection(context: problemsContext), size: CGSize(width: 260, height: 400), dark: false)
     defer { sidebar.close() }
     let sidebarNodes = Accessibility.nodes(in: sidebar.host)
     try? sidebarNodes.map { "\($0.role)\t\($0.text)" }.joined(separator: "\n")
       .write(to: verifier.pngDirectory.deletingLastPathComponent().appendingPathComponent("accessibility-sidebar-problems.tsv"), atomically: true, encoding: .utf8)
-    verifier.check("problems sidebar offers \"Install Camera\"", contains(sidebarNodes, "Install Camera"), "", viewDependent: true)
-    if let install = sidebarNodes.first(where: { $0.text == "Install Camera" && $0.enabled }) {
+    if let install = sidebarNodes.first(where: { $0.text == "Install Camera Extension…" && $0.enabled }) {
       log.clear()
       _ = Accessibility.press(install)
-      verifier.check("pressing Install Camera sends its action", log.actions.contains(.installCameraExtension), "\(log.actions)",
+      verifier.check("pressing Install Camera Extension… sends its action", log.actions.contains(.installCameraExtension), "\(log.actions)",
+        viewDependent: true)
+    } else {
+      verifier.check("Attention offers \"Install Camera Extension…\"", false, names(sidebarNodes).prefix(20).joined(separator: "; "),
         viewDependent: true)
     }
     verifier.check("problems window offers Retry for the failed start", problemNodes.contains { $0.text.hasPrefix("Retry") },
@@ -684,7 +741,8 @@ extension UIVerify {
 
     // A sidebar row that names a camera is one button that shows it in the inspector. (A List's
     // rows expose no text offscreen, so the row is hosted on its own.)
-    let outputRow = HostedView(UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · Camera 2", detail: "Not in use")
+    let outputRow = HostedView(UIVirtualCameraRow(row: UIVirtualCamera(id: "camera-2", name: "Ultracam · Camera 2", cameraID: "camera-2",
+      inUse: false, clientLine: "Not in use", format: nil))
       .uiSidebarInspectButton(cameraName: "Camera 2") { log.append(.showInspector(cameraID: "camera-2")) },
       size: CGSize(width: 260, height: 44), dark: false)
     if let row = Accessibility.nodes(in: outputRow.host).first(where: { $0.text.contains("Camera 2") && $0.enabled }) {
@@ -736,19 +794,19 @@ extension UIVerify {
     let two = presentation.cameras[1]
     pressInStrip(one, "Stop Recording", expect: .toggleRecording(cameraID: one.id))
     pressInStrip(one, "Pause", expect: .pauseOrResume(cameraID: one.id))
-    pressInStrip(one, "Stop Camera 1", expect: .stopCamera(cameraID: one.id))
-    pressInStrip(one, "1080p", expect: .setEffect(cameraID: one.id, index: 1, false))
-    pressInStrip(two, "4:2:0 8-bit", expect: .setEffect(cameraID: two.id, index: 2, false))
-    // Camera 2 has no LUT loaded, so its LUT chip is disabled and must not act.
+    // LUT is one click, on and off; the rest of the effects are in a menu.
+    pressInStrip(one, "LUT for Camera 1", expect: .setEffect(cameraID: one.id, index: 0, false))
+    pressInStrip(two, "Cut to Camera 2", expect: .cut(cameraID: two.id))
+    // Camera 2 has no LUT loaded, so its LUT toggle is disabled and must not act.
     do {
       let hosted = HostedView(UIChannelStripView(camera: two, context: context), size: CGSize(width: 560, height: 230), dark: false)
-      let lut = Accessibility.nodes(in: hosted.host).first { $0.label == "LUT" }
-      verifier.check("Camera 2 LUT chip is disabled without a LUT", lut?.enabled == false, "", viewDependent: true)
+      let lut = Accessibility.nodes(in: hosted.host).first { $0.label == "LUT for Camera 2" }
+      verifier.check("Camera 2 LUT toggle is disabled without a LUT", lut?.enabled == false, "", viewDependent: true)
       if let lut {
         log.clear()
         _ = Accessibility.press(lut)
         hosted.settle()
-        verifier.check("disabled LUT chip sends nothing", log.actions.isEmpty, "\(log.actions)")
+        verifier.check("disabled LUT toggle sends nothing", log.actions.isEmpty, "\(log.actions)")
       }
       hosted.close()
     }
@@ -795,7 +853,9 @@ extension UIVerify {
       verifier.check("\(name) \"\(label)\" sends \(expect)", log.actions.contains(expect), "\(log.actions)", viewDependent: true)
     }
     pressIn("toolbar cut group", UIToolbarCutGroup(context: context), "Cut to Camera 2", expect: .cut(cameraID: two.id))
-    pressIn("toolbar record control", UIToolbarRecordControl(context: context), "Stop all 2 recordings, 12:31", expect: .stopAllRecordings)
+    pressIn("toolbar record control", UIToolbarRecordControl(context: context), "Stop 2 Recordings", expect: .stopAllRecordings)
+    pressIn("toolbar Hold", UIToolbarCutGroup(context: context), "Hold Current Shot", expect: .setAutoHold(true))
+    pressIn("toolbar Auto", UIToolbarCutGroup(context: context), "Automatic switching", expect: .setAutoSwitching(false))
     let idle = UIContext.fixture(UIFixtures.stopped()) { log.append($0) }
     let idleCamera = idle.presentation.cameras[0]
     let hosted = HostedView(UIChannelStripView(camera: idleCamera, context: idle), size: CGSize(width: 560, height: 230), dark: false)
@@ -1453,17 +1513,12 @@ extension UIVerify {
     verifier.check("adoption: the inspector names the camera that has an input",
       options.first { $0.id == a.id }?.usedBy == "Camera 1" && options.first { $0.id == b.id }?.usedBy == nil,
       "\(options)")
+    // Input is one camera's setup: the inspector has it, and the menu bar doesn't.
     let menu = UIMenuBarController.buildItems(presentation: UIPresentationBuilder.session(session), session: session,
-      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name) }, stats: nil, target: nil, previewItem: nil)
-    let camera2Inputs = menuItems(menu).first { $0.title == "Camera 2" }?.submenu?.items.first { $0.title == "Input" }?.submenu?.items ?? []
-    let taken = camera2Inputs.first { $0.title == "UltraStudio Mini Recorder 12G · 0AB8" }
-    let own = camera2Inputs.first { $0.title == "UltraStudio Mini Recorder 12G · 46B8" }
-    verifier.check("adoption: the menu bar disables an input another camera has",
-      taken?.isEnabled == false && taken?.subtitle == "Used by Camera 1" && own?.isEnabled == true && own?.state == .on,
-      camera2Inputs.map { "\($0.title) \($0.isEnabled) \($0.subtitle ?? "")" }.joined(separator: " | "))
-    verifier.check("adoption: the menu bar offers None",
-      camera2Inputs.first?.title == "None" && camera2Inputs.first?.state == .off,
-      camera2Inputs.map(\.title).joined(separator: " | "))
+      target: nil, previewItem: nil)
+    let camera2Rows = menuItems(menu).first { $0.title == "Camera 2" }?.submenu?.items.map(\.title) ?? []
+    verifier.check("adoption: the menu bar has no Input submenu", !camera2Rows.contains("Input") && camera2Rows.contains("LUT"),
+      camera2Rows.joined(separator: " | "))
 
     // None frees the input and sticks: neither an arrival nor Refresh fills it again.
     bridge.perform(.setInput(cameraID: beta.rawValue, deviceID: ""))
@@ -1796,8 +1851,8 @@ extension UIVerify {
       + UIFixtures.problemSessions()
     for (name, session) in fixtures {
       let presentation = UIPresentationBuilder.session(session)
-      let topLevel = UIMenuBarController.buildItems(presentation: presentation, session: session, inputs: UIFixtures.inputs,
-        stats: "CPU 31% · GPU 18%", target: nil, previewItem: nil, showLivePreview: false)
+      let topLevel = UIMenuBarController.buildItems(presentation: presentation, session: session, target: nil, previewItem: nil,
+        showLivePreview: false)
       let topLevelIDs = Set(topLevel.map(ObjectIdentifier.init))
       let items = menuItems(topLevel)
       let titles = items.filter { !$0.isSeparatorItem }.map(\.title)
@@ -1832,8 +1887,25 @@ extension UIVerify {
       }
       if session.cameras.count < 2 {
         verifier.check("menu bar \(name): no cut rows with one camera", !titles.contains { $0.hasPrefix("Cut to") })
-      } else {
-        verifier.check("menu bar \(name): cut row for the off-air camera", titles.contains("Cut to Camera 2"), titles.joined(separator: " | "))
+      } else if session.onAirID == "camera-1" {
+        verifier.check("menu bar \(name): cut row for the off-air camera", topLevel.contains { $0.title == "Cut to Camera 2" },
+          titles.joined(separator: " | "))
+        verifier.check("menu bar \(name): no cut row for the camera on Program", !topLevel.contains { $0.title == "Cut to Camera 1" },
+          topLevel.map(\.title).joined(separator: " | "))
+      }
+      // No row depends on the window's selection, and each camera's LUT is a direct row.
+      let rows = topLevel.filter { !$0.isSeparatorItem && $0.view == nil }
+      for selectionRow in ["Processing", "Video Preview", "Start with Camera Apps"] {
+        verifier.check("menu bar \(name): no top-level \(selectionRow)", !rows.contains { $0.title == selectionRow })
+      }
+      for camera in session.cameras {
+        let submenu = topLevel.first { $0.title == camera.name }?.submenu?.items.map(\.title) ?? []
+        verifier.check("menu bar \(name): \(camera.name) has a LUT row", submenu.contains("LUT"), submenu.joined(separator: " | "))
+      }
+      // Fourteen rows or fewer with two cameras, problem rows and Show Live Preview not counted.
+      let counted = rows.filter { row in !presentation.problems.contains { $0.title == row.title } && row.title != "Show Live Preview" }
+      if session.cameras.count <= 2 {
+        verifier.check("menu bar \(name): at most 14 rows", counted.count <= 14, "\(counted.count): \(counted.map(\.title).joined(separator: " | "))")
       }
       let shortcuts = items.filter { !$0.keyEquivalent.isEmpty }.map {
         UISelfTest.shortcut(key: $0.keyEquivalent, modifiers: $0.keyEquivalentModifierMask)

@@ -510,7 +510,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertEqual(live.stamp?.sequence, 2)
     XCTAssertNil(live.frozenToken)
     // Toggling with nothing on screen says why.
-    presenter.setUnavailable("Feed stopped")
+    presenter.setUnavailable("Camera stopped")
     presenter.toggleFreeze()
     XCTAssertFalse(presenter.isFrozen)
     XCTAssertEqual(presenter.detail, "Freeze unavailable: no picture")

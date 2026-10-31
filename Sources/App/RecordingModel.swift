@@ -36,6 +36,24 @@ enum RecordingCodec: String, CaseIterable, Codable, Equatable, Sendable {
   func isAvailable(for source: SourceFormat) -> Bool { RecordingProfileMatrix.supports(matrixProfile, source: source) }
   static func available(for source: SourceFormat) -> [Self] { allCases.filter { $0.isAvailable(for: source) } }
 
+  /// The nearest format `source` can record when this one can't, nil when this one can. A
+  /// missed take can't be recovered and an unexpected codec can, so a take falls back
+  /// instead of failing. With no route at all there is nothing nearer, and the existing
+  /// refusal stands.
+  func fallback(for source: SourceFormat) -> Self? {
+    guard !isAvailable(for: source) else { return nil }
+    let nearest: [Self]
+    switch self {
+    case .proRes4444: nearest = [.proRes42210Bit, .hevcMain10_422, .hevcMain10, .hevcMain]
+    case .hevcMain, .hevcMain10: nearest = [.hevcMain10_422, .hevcMain, .hevcMain10, .proRes42210Bit]
+    case .proResLT, .proRes422, .proRes42210Bit, .hevcMain10_422:
+      nearest = [.hevcMain, .hevcMain10, .proRes4444, .proRes42210Bit, .hevcMain10_422]
+    }
+    return nearest.first { $0.isAvailable(for: source) }
+  }
+
+  /// What a take on `source` records. Before any signal, the choice itself.
+  func resolved(for source: SourceFormat?) -> Self { source.flatMap(fallback) ?? self }
 }
 
 enum RecordingTimecodeMode: String, CaseIterable, Codable, Equatable, Sendable {
@@ -68,6 +86,8 @@ struct RecordingConfiguration: Equatable, Sendable {
   var outputFolder: URL?
   var timecodeMode: RecordingTimecodeMode = .wallClock
   var feedName: String?
+  /// Why this take isn't in the chosen format, for its sidecar. Nil when it is.
+  var formatNote: String?
   var compatibilityPolicy = RecordingCompatibilityPolicy()
   var recordingConstantFrameRate = false
   /// Explicit bounded rounding for variable source timestamps; sampled per take.
@@ -111,7 +131,7 @@ enum RecordingStatus: String, Equatable, Sendable {
     case .idle: return "Idle"
     case .recording: return "Recording"
     case .paused: return "Paused"
-    case .finishing: return "Finishing…"
+    case .finishing: return "Saving…"
     }
   }
 }
@@ -129,6 +149,11 @@ struct RecordingFeedState: Identifiable, Equatable, Sendable {
   /// (output file, encoder). `status` is already `.recording`; capture
   /// connects to the recorder only once it is ready.
   var isStarting = false
+  /// The format this take records in. A rolling camera shows this, whatever the global choice
+  /// has become since. Stale once the take is idle.
+  var takeCodec: RecordingCodec?
+  /// The format that was chosen, when the source couldn't use it and `takeCodec` is the fallback.
+  var takeFallbackFrom: RecordingCodec?
   var isActive: Bool { status != .idle }
   var displayStatus: String {
     if statistics?.failed == true { return "Failed" }
@@ -410,7 +435,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     // its final path after all queued samples have drained.
     let outputManager = try manager(for: request.folder, fileExtension: request.configuration.codec.fileExtension)
     let output = try outputManager.beginExternalWriterSession(
-      feedID: Self.safeComponent(request.configuration.feedName ?? "Feed"))
+      feedID: Self.safeComponent(request.configuration.feedName ?? "Camera"))
     do {
       let sourceConfiguration = try SourceRecordingConfiguration(
         feedID: SourceRecordingFeedID(request.feedID.rawValue), outputURL: output.temporaryURL,
@@ -431,8 +456,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
         checkAvailableSpace: { try output.checkExternalWriterCapacity(headroom: $0) },
         sourceAdmission: request.takeContext?.sourceAdmission,
         expectedSourceFormat: request.videoFormat,
-        compatibilityPolicy: request.configuration.compatibilityPolicy, sidecarMovieURL: output.finalURL,
-        sidecarCreated: { try output.claimSidecar() })
+        compatibilityPolicy: request.configuration.compatibilityPolicy, formatNote: request.configuration.formatNote,
+        sidecarMovieURL: output.finalURL, sidecarCreated: { try output.claimSidecar() })
       let recorder = try recorderFactory(sourceConfiguration)
       let adapter = SourceRecordingCallbackAdapter(feedID: sourceConfiguration.feedID, recorder: recorder)
       try adapter.start()
@@ -597,7 +622,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     })
     let result = String(words.joined(separator: " ").prefix(80))
       .trimmingCharacters(in: .whitespaces)
-    return result.isEmpty ? "Feed" : result
+    return result.isEmpty ? "Camera" : result
   }
 
   private func manager(for folder: URL, fileExtension: String) throws -> RecordingOutputManager {
@@ -678,6 +703,9 @@ final class RecordingModel {
   var onRecordingFinished: ((FeedID, URL?) -> Void)?
   /// A take paused (`true`) or resumed (`false`).
   var onRecordingPaused: ((FeedID, Bool) -> Void)?
+  /// What a camera is sending now: `record(feedID:)` resolves the take's format from it. Nil
+  /// before any signal, when nothing can be said about the choice.
+  var sourceFormat: ((FeedID) -> SourceFormat?)?
 
   private let driver: RecordingSessionDriver
   private let resolveFinishedFile: (URL?, URL?) -> URL?
@@ -872,6 +900,14 @@ final class RecordingModel {
     var take = configuration
     take.outputFolder = folder
     take.feedName = feeds[index].name
+    // The rate, the strip and the take's sidecar all follow the codec that actually records.
+    let source = sourceFormat?(feedID)
+    take.codec = codec.resolved(for: source)
+    if take.codec != codec {
+      take.formatNote = "\(codec.title) isn't available for \(source.map { FormatDisplayIdentity($0).short } ?? "this source"). This take records \(take.codec.title)."
+    }
+    feeds[index].takeCodec = take.codec
+    feeds[index].takeFallbackFrom = take.codec != codec ? codec : nil
     take.recordingConstantFrameRate = feedConstantFrameRate[feedID] ?? false
     recordingGenerations[feedID, default: 0] &+= 1
     let generation = recordingGenerations[feedID, default: 0]

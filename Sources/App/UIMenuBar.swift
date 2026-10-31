@@ -10,8 +10,6 @@ import SwiftUI
 //
 //   UIMenuBarController.buildItems(presentation: UISessionPresentation,
 //                                  session: UISessionSnapshot,
-//                                  inputs: [UIInput],
-//                                  stats: String?,
 //                                  target: AnyObject?,
 //                                  previewItem: NSMenuItem?,
 //                                  showLivePreview: Bool) -> [NSMenuItem]
@@ -49,7 +47,6 @@ final class UIMenuCommandBox: NSObject {
   private var menuOpen = false
   /// Refreshes the open menu's rows each second (see `refreshOpenMenu`).
   private var refreshTimer: Timer?
-  private var sampler = AppResourceSampler()
   private var lastIcon: UIMenuBarIcon?
   private var iconUpdateScheduled = false
   private var lastIconUpdate = Date.distantPast
@@ -62,7 +59,6 @@ final class UIMenuCommandBox: NSObject {
     menu.delegate = self
     menu.autoenablesItems = false
     statusItem.menu = menu
-    _ = sampler.sample()
     updateIcon()
     track()
   }
@@ -202,9 +198,8 @@ final class UIMenuCommandBox: NSObject {
     item.view = host
     previewHost = host
     previewItem = item
-    let items = Self.buildItems(presentation: presentation, session: session,
-      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
-      stats: statsLine(session: session), target: self, previewItem: item, showLivePreview: showLivePreview)
+    let items = Self.buildItems(presentation: presentation, session: session, target: self, previewItem: item,
+      showLivePreview: showLivePreview)
     menu.removeAllItems()
     for item in items { menu.addItem(item) }
     // The menu is as wide as its widest row. Lay the card out again at that width, so the
@@ -221,9 +216,8 @@ final class UIMenuCommandBox: NSObject {
   private func refreshOpenMenu() {
     guard menuOpen, let previewItem else { return }
     let session = bridge().snapshot()
-    let fresh = Self.buildItems(presentation: UIPresentationBuilder.session(session), session: session,
-      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
-      stats: statsLine(session: session), target: self, previewItem: previewItem, showLivePreview: showLivePreview)
+    let fresh = Self.buildItems(presentation: UIPresentationBuilder.session(session), session: session, target: self,
+      previewItem: previewItem, showLivePreview: showLivePreview)
     guard !Self.refresh(menu.items, with: fresh) else { return }
     menu.removeAllItems()
     for item in fresh { menu.addItem(item) }
@@ -254,6 +248,7 @@ final class UIMenuCommandBox: NSObject {
       if old.title != new.title { old.title = new.title }
       if old.attributedTitle != new.attributedTitle { old.attributedTitle = new.attributedTitle }
       if old.subtitle != new.subtitle { old.subtitle = new.subtitle }
+      if old.badge?.stringValue != new.badge?.stringValue { old.badge = new.badge }
       if old.state != new.state { old.state = new.state }
       if old.isEnabled != new.isEnabled { old.isEnabled = new.isEnabled }
       if old.toolTip != new.toolTip { old.toolTip = new.toolTip }
@@ -271,22 +266,6 @@ final class UIMenuCommandBox: NSObject {
 
   private func card(width: CGFloat) -> AnyView {
     AnyView(UIMenuPreviewCard(model: model, interface: interface, showLive: showLivePreview, width: width))
-  }
-
-  private func statsLine(session: UISessionSnapshot) -> String {
-    let usage = sampler.sample()
-    var parts: [String] = []
-    parts.append(usage.cpuPercent.map { String(format: "CPU %.0f%%", $0) } ?? "CPU —")
-    parts.append(String(format: "GPU %.0f%%", usage.gpuPercent))
-    if let memory = usage.memoryBytes {
-      parts.append(ByteCountFormatter.string(fromByteCount: Int64(clamping: memory), countStyle: .memory))
-    }
-    if let drive = session.drives.first, let left = drive.secondsLeft {
-      parts.append("\(drive.name) \(UIFormat.duration(left)) left")
-    } else if let drive = session.drives.first, UIPresentationBuilder.isFull(drive) {
-      parts.append("\(drive.name) full")
-    }
-    return parts.joined(separator: " · ")
   }
 
   // MARK: Actions
@@ -317,7 +296,7 @@ final class UIMenuCommandBox: NSObject {
 
   private static func row(_ title: String, _ commands: [UIMenuCommand], key: String = "",
     modifiers: NSEvent.ModifierFlags = [], checked: Bool = false, enabled: Bool = true,
-    symbol: String? = nil, subtitle: String? = nil, target: AnyObject?) -> NSMenuItem {
+    symbol: String? = nil, tint: NSColor? = nil, subtitle: String? = nil, badge: String? = nil, target: AnyObject?) -> NSMenuItem {
     let item = NSMenuItem(title: title, action: commands.isEmpty ? nil : #selector(UIMenuBarController.menuAction(_:)),
       keyEquivalent: key)
     item.keyEquivalentModifierMask = key.isEmpty ? [] : modifiers
@@ -325,224 +304,200 @@ final class UIMenuCommandBox: NSObject {
     item.representedObject = commands.isEmpty ? nil : UIMenuCommandBox(commands)
     item.state = checked ? .on : .off
     item.isEnabled = enabled
-    if let symbol { item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+    if let symbol { item.image = image(symbol, tint: tint) }
     if let subtitle { item.subtitle = subtitle }
+    if let badge { item.badge = NSMenuItemBadge(string: badge) }
     return item
+  }
+
+  /// A template symbol, or with `tint` a colored one: the tone goes on the image, the words
+  /// stay in label color.
+  private static func image(_ symbol: String, tint: NSColor?) -> NSImage? {
+    guard let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) else { return nil }
+    guard let tint else { return image }
+    let tinted = image.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [tint]))
+    tinted?.isTemplate = false
+    return tinted
   }
 
   private static func action(_ action: UIAction) -> [UIMenuCommand] { [.action(action)] }
 
-  static func buildItems(presentation: UISessionPresentation, session: UISessionSnapshot, inputs: [UIInput],
-    stats: String?, target: AnyObject?, previewItem: NSMenuItem?, showLivePreview: Bool = false) -> [NSMenuItem] {
+  /// Damage's solid amber: a dark triangle on an amber square, the menu's stand-in for a fill.
+  static let damageImage: NSImage = {
+    let size = NSSize(width: 16, height: 16)
+    let image = NSImage(size: size, flipped: false) { bounds in
+      NSColor.systemOrange.setFill()
+      NSBezierPath(roundedRect: bounds, xRadius: 4, yRadius: 4).fill()
+      if let glyph = NSImage(systemSymbolName: UISymbol.warning, accessibilityDescription: nil)?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
+          .applying(NSImage.SymbolConfiguration(paletteColors: [.black]))) {
+        glyph.draw(in: NSRect(x: (bounds.width - glyph.size.width) / 2, y: (bounds.height - glyph.size.height) / 2,
+          width: glyph.size.width, height: glyph.size.height))
+      }
+      return true
+    }
+    image.accessibilityDescription = "Problem"
+    return image
+  }()
+
+  /// The session with the window hidden: fourteen rows or fewer when healthy, problem rows
+  /// not counted. No row depends on the window's selection.
+  static func buildItems(presentation: UISessionPresentation, session: UISessionSnapshot,
+    target: AnyObject?, previewItem: NSMenuItem?, showLivePreview: Bool = false) -> [NSMenuItem] {
     var items: [NSMenuItem] = []
     if let previewItem { items.append(previewItem) }
-    let selected = presentation.selected
-    let selectedSnapshot = session.cameras.first { $0.id == session.selectedID }
-    let waiting = !presentation.camerasRunning && selectedSnapshot?.automaticStart == true
+    let waiting = !presentation.camerasRunning && session.cameras.contains(where: \.automaticStart)
 
-    // Problems first, in orange, each one row that does its one action.
+    // Problems first, each one row that does its one action. A row can't take a fill, so
+    // damage to what's on air or rolling is a solid amber image and a semibold title.
     for problem in presentation.problems {
       // Cuts only ever come from a "Cut to …" row (D1), and those are just below.
       var offered = problem.action
       if case .cut? = offered?.action { offered = UIProblemAction(title: "Details", action: .openDiagnostics) }
+      let damage = problem.level == .damage
       let item = row(problem.title, offered.map { action($0.action) } ?? [], enabled: offered != nil,
-        symbol: "exclamationmark.triangle.fill", subtitle: offered?.title, target: target)
-      item.attributedTitle = NSAttributedString(string: problem.title,
-        attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.menuFont(ofSize: 0)])
+        symbol: UISymbol.warning, tint: .systemOrange, subtitle: problem.detail, badge: offered?.title, target: target)
+      if damage {
+        item.image = damageImage
+        item.attributedTitle = NSAttributedString(string: problem.title,
+          attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)])
+      }
       items.append(item)
     }
     if waiting && !showLivePreview {
-      items.append(row("Show Live Preview", [.showLivePreview], symbol: "eye", target: target))
+      items.append(row("Show Live Preview", [.showLivePreview], symbol: UISymbol.showPreview, target: target))
     }
-    if !items.isEmpty && items.last !== previewItem || previewItem != nil { items.append(.separator()) }
+    if items.last !== previewItem || previewItem != nil { items.append(.separator()) }
 
-    // Cameras: start/stop, and whether the selected camera starts with meeting apps.
-    items.append(row(presentation.camerasControlTitle,
-      action(presentation.camerasRunning ? .stopAllCameras : .startAllCameras), key: "\r", modifiers: .command,
-      enabled: presentation.canStartAny,
-      symbol: presentation.camerasRunning ? "stop.fill" : "play.fill", target: target))
-    if let selected, let snapshot = selectedSnapshot {
-      items.append(row("Start with Camera Apps", action(.setAutomaticStart(cameraID: selected.id, !snapshot.automaticStart)),
-        checked: snapshot.automaticStart, symbol: "wand.and.rays",
-        subtitle: presentation.cameras.count > 1 ? selected.name : nil, target: target))
-    }
-
-    // Recording. ⌘R records the selected camera, as in the Record menu; ⌥⌘R is for all of them.
-    items.append(.separator())
-    switch presentation.recordControl {
-    case .record(let all, let enabled):
-      items.append(row(all ? "Record All" : "Record", action(all ? .recordAll : .toggleRecordingSelected), key: "r",
-        modifiers: all ? [.command, .option] : .command, enabled: enabled, symbol: "record.circle", target: target))
-    case .stop(let elapsed):
-      items.append(row("Stop Recording", action(.stopAllRecordings), key: "r", modifiers: .command,
-        symbol: "stop.circle", subtitle: elapsed, target: target))
-    case .stopAll(let count, let elapsed):
-      items.append(row("Stop All Recordings (\(count))", action(.stopAllRecordings), key: "r",
-        modifiers: [.command, .option], symbol: "stop.circle", subtitle: elapsed, target: target))
-    }
-
-    // Program: cut rows (thumbnails never cut), automatic switching, hold.
+    // Switching. The camera on Program gets no Cut row: there's nothing to cut to.
     if presentation.programAvailable {
-      items.append(.separator())
-      for button in presentation.cutButtons {
-        let title = "Cut to \(button.name)"
-        let subtitle = button.onAir ? UITally.onAir.label : button.pending ? UITally.next.label : nil
-        items.append(row(title, action(.cut(cameraID: button.id)), key: button.number <= 4 ? "\(button.number)" : "",
-          modifiers: .control, checked: button.onAir, enabled: button.enabled && !button.onAir,
-          symbol: "tv", subtitle: subtitle, target: target))
+      for button in presentation.cutButtons where !button.onAir {
+        items.append(row("Cut to \(button.name)", action(.cut(cameraID: button.id)), key: button.number <= 4 ? "\(button.number)" : "",
+          modifiers: .control, enabled: button.enabled, symbol: UISymbol.cut,
+          badge: button.pending ? UITally.next.label : nil, target: target))
       }
       let auto = row("Automatic Switching", action(.setAutoSwitching(!presentation.autoSwitching)), key: "a",
         modifiers: [.control, .option], checked: presentation.autoSwitching, enabled: presentation.canAutoSwitch,
-        symbol: "wand.and.stars", target: target)
-      if !presentation.canAutoSwitch { auto.toolTip = "Choose a strategy below to switch automatically." }
+        symbol: UISymbol.auto, target: target)
+      if !presentation.canAutoSwitch { auto.toolTip = "Choose a strategy in the window's Auto menu to switch automatically." }
       items.append(auto)
-      items.append(row("Hold Current Shot", action(.setAutoHold(!session.autoHold)), checked: session.autoHold,
-        enabled: presentation.canHoldShot, target: target))
-      // The strategy lives here too, so a disabled Automatic Switching isn't a dead end.
-      let strategies = NSMenu(title: "Strategy")
-      strategies.autoenablesItems = false
-      for strategy in UIStrategy.offered {
-        strategies.addItem(row(UIStrategy.title(strategy), action(.setStrategy(strategy)),
-          checked: session.strategy == strategy, target: target))
-      }
-      let strategyItem = NSMenuItem(title: "Strategy", action: nil, keyEquivalent: "")
-      strategyItem.subtitle = UIStrategy.title(session.strategy)
-      strategyItem.submenu = strategies
-      items.append(strategyItem)
+      items.append(row("Hold Current Shot", action(.setAutoHold(!session.autoHold)), key: "h", modifiers: [.control, .option],
+        checked: presentation.canHoldShot && session.autoHold, enabled: presentation.canHoldShot,
+        symbol: UISymbol.hold(on: presentation.canHoldShot && session.autoHold), target: target))
+      items.append(.separator())
     }
 
-    // Cameras: processing and preview for the selected camera, then one submenu per camera.
+    // Recording, per camera, then the session's.
+    for camera in presentation.cameras {
+      let taking = camera.recordButtonActive || camera.pauseTitle == "Resume"
+      let elapsed = session.cameras.first { $0.id == camera.id }.map { UIFormat.shortElapsed($0.recording.elapsed) }
+      items.append(row(taking ? "Stop Recording \(camera.name)" : "Record \(camera.name)", action(.toggleRecording(cameraID: camera.id)),
+        enabled: camera.recordButtonEnabled, symbol: taking ? UISymbol.stop : UISymbol.record,
+        badge: taking ? elapsed : nil, target: target))
+    }
+    if presentation.canPauseAll {
+      let resume = presentation.pauseAllTitle == "Resume All"
+      items.append(row(presentation.pauseAllTitle, action(resume ? .resumeAll : .pauseAll), key: "p", modifiers: [.command, .option],
+        symbol: resume ? UISymbol.start : UISymbol.paused, target: target))
+    }
+    let format = NSMenu(title: "Format")
+    format.autoenablesItems = false
+    format.addItem(NSMenuItem.sectionHeader(title: "Applies to the next take"))
+    for choice in UIPresentationBuilder.formatChoices(session) {
+      format.addItem(row(choice.title, action(.setCodec(choice.codec)), checked: choice.selected, enabled: choice.reason == nil,
+        badge: choice.reason ?? [choice.rate, choice.left].compactMap { $0 }.joined(separator: "  "), target: target))
+    }
+    let formatItem = row("Format", [], symbol: UISymbol.format, badge: session.codec.title, target: target)
+    formatItem.submenu = format
+    items.append(formatItem)
+    // All drives share one row: the one that runs out first.
+    let worst = session.drives.filter { $0.secondsLeft != nil }.min { ($0.secondsLeft ?? 0) < ($1.secondsLeft ?? 0) }
+    let low = worst.map { ($0.secondsLeft ?? .infinity) < UIPresentationBuilder.lowDriveSeconds } ?? false
+    items.append(row("Time left", [], enabled: worst != nil, symbol: UISymbol.drive(low: low), tint: low ? .systemOrange : nil,
+      badge: worst.map { "\($0.name) \(UIFormat.duration($0.secondsLeft ?? 0))" } ?? "—", target: target))
+
     if !presentation.cameras.isEmpty {
       items.append(.separator())
-      if presentation.cameras.count > 1 { items.append(NSMenuItem.sectionHeader(title: "Cameras")) }
-      if let selected {
-        items.append(row("Processing", action(.setProcessing(cameraID: selected.id, !selected.processing)), key: "b",
-          modifiers: [.command, .shift], checked: selected.processing, symbol: "square.stack.3d.up",
-          subtitle: presentation.cameras.count > 1 ? selected.name : nil, target: target))
-        if let snapshot = selectedSnapshot {
-          items.append(row("Video Preview", action(.setPreviewEnabled(cameraID: selected.id, !snapshot.previewEnabled)),
-            key: "p", modifiers: [.command, .shift], checked: snapshot.previewEnabled, symbol: "eye", target: target))
-        }
-      }
       for camera in presentation.cameras {
-        items.append(cameraItem(camera, presentation: presentation, session: session, inputs: inputs, target: target))
+        items.append(cameraItem(camera, presentation: presentation, session: session, target: target))
       }
     }
 
-    // App, with Quit last.
+    // A separator above it, so a slip off a camera row can't land on it. It keeps its prompt.
     items.append(.separator())
-    let reveal = row("Show Recordings in Finder", action(.revealRecordings), enabled: presentation.canRevealRecordings,
-      symbol: "folder", target: target)
-    if !presentation.canRevealRecordings { reveal.toolTip = "Choose a recording folder first." }
-    items.append(reveal)
-    items.append(row("Open Ultracam", action(.openMainWindow), key: "0", modifiers: .command, symbol: "macwindow", target: target))
-    items.append(row("Settings…", action(.openSettings), key: ",", modifiers: .command, symbol: "gearshape", target: target))
+    items.append(row(presentation.camerasControlTitle,
+      action(presentation.camerasRunning ? .stopAllCameras : .startAllCameras), key: "\r", modifiers: .command,
+      enabled: presentation.canStartAny,
+      symbol: presentation.camerasRunning ? UISymbol.stop : UISymbol.start, target: target))
+
     items.append(.separator())
-    if let stats {
-      // A footnote, not a command: small secondary text.
-      let item = NSMenuItem(title: stats, action: nil, keyEquivalent: "")
-      item.attributedTitle = NSAttributedString(string: stats, attributes: [
-        .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor])
-      item.isEnabled = false
-      items.append(item)
-    }
+    items.append(row("Open Ultracam", action(.openMainWindow), key: "0", modifiers: .command, symbol: UISymbol.openWindow, target: target))
+    items.append(row("Settings…", action(.openSettings), key: ",", modifiers: .command, symbol: UISymbol.settings, target: target))
     items.append(row("Quit Ultracam", action(.quit), key: "q", modifiers: .command, target: target))
     return items
   }
 
+  /// One camera's own rows. Its subtitle is two parts at most, spaced, with no dot.
   private static func cameraItem(_ camera: UICameraPresentation, presentation: UISessionPresentation,
-    session: UISessionSnapshot, inputs: [UIInput], target: AnyObject?) -> NSMenuItem {
+    session: UISessionSnapshot, target: AnyObject?) -> NSMenuItem {
+    let snapshot = session.cameras.first { $0.id == camera.id }
     var status: [String] = []
     if let label = camera.tally.label { status.append(label) }
     switch camera.stripState {
-    case .recording, .updating: status.append("REC \(UIFormat.shortElapsed(session.cameras.first { $0.id == camera.id }?.recording.elapsed ?? 0))")
-    case .recordingNoSignal: status.append("Recording, no signal")
-    case .paused: status.append("Paused")
-    case .failed: status.append(camera.recordTitle)
-    case .noFolder: status.append("No folder")
-    // "Stopped", "Couldn't start" or "Input missing", as on the camera's own badge.
-    case .stopped, .waiting: status.append(camera.statusBadge)
-    default: if camera.tileState == .live { status.append("Live") }
+    case .recording, .updating: status.append("REC \(UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0))")
+    case .recordingNoSignal: status.append("REC, no signal")
+    case .paused: status.append("Paused \(UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0))")
+    case .failed, .noFolder, .stopped, .waiting: status.append(camera.collapsedWord ?? camera.statusBadge)
+    default: if camera.tileState == .live && status.isEmpty { status.append("Live") }
     }
     let item = NSMenuItem(title: camera.name, action: nil, keyEquivalent: "")
-    item.subtitle = status.joined(separator: " · ")
-    item.image = NSImage(systemSymbolName: camera.tally.isRed ? "video.fill" : "video", accessibilityDescription: nil)
+    item.subtitle = status.prefix(2).joined(separator: "  ")
+    item.image = image(camera.tally.isRed ? UISymbol.cameraOnAir : UISymbol.camera, tint: camera.state == .warning ? .systemOrange : nil)
     let submenu = NSMenu(title: camera.name)
     submenu.autoenablesItems = false
-    let isTaking = camera.recordButtonActive || camera.pauseTitle == "Resume"
-    submenu.addItem(row(isTaking ? "Stop Recording" : "Record", action(.toggleRecording(cameraID: camera.id)),
-      enabled: camera.recordButtonEnabled, symbol: isTaking ? "stop.circle" : "record.circle", target: target))
+    let taking = camera.recordButtonActive || camera.pauseTitle == "Resume"
+    submenu.addItem(row(taking ? "Stop Recording" : "Record", action(.toggleRecording(cameraID: camera.id)),
+      enabled: camera.recordButtonEnabled, symbol: taking ? UISymbol.stop : UISymbol.record, target: target))
     if let pause = camera.pauseTitle {
       submenu.addItem(row(pause == "Pause" ? "Pause Recording" : "Resume Recording",
-        action(.pauseOrResume(cameraID: camera.id)), symbol: pause == "Pause" ? "pause" : "play", target: target))
+        action(.pauseOrResume(cameraID: camera.id)), symbol: pause == "Pause" ? UISymbol.paused : UISymbol.start, target: target))
     }
-    // Always there with two cameras (checked while on air), so an automatic cut changes the
-    // row's state, not the submenu's rows, and the open menu updates in place.
+    // Always there with two cameras (checked while on Program), so an automatic cut changes
+    // the row's state, not the submenu's rows, and the open menu updates in place.
     if presentation.programAvailable {
       let onAir = session.onAirID == camera.id
-      submenu.addItem(row("Cut to \(camera.name)", action(.cut(cameraID: camera.id)), key: "",
-        modifiers: .control, checked: onAir, enabled: camera.cutEnabled && !onAir, symbol: "tv", target: target))
+      submenu.addItem(row("Cut to \(camera.name)", action(.cut(cameraID: camera.id)),
+        checked: onAir, enabled: camera.cutEnabled && !onAir, symbol: UISymbol.cut, target: target))
     }
     submenu.addItem(.separator())
-    submenu.addItem(row("Processing", action(.setProcessing(cameraID: camera.id, !camera.processing)),
-      checked: camera.processing, target: target))
+    // LUT is the panic control, so it's a direct row: the format meeting apps get doesn't change.
+    submenu.addItem(row("LUT", action(.setEffect(cameraID: camera.id, index: 0, !camera.lutIsOn)), checked: camera.lutIsOn,
+      enabled: camera.lutEnabled, symbol: UISymbol.lut(on: camera.lutIsOn), subtitle: snapshot?.lutName, target: target))
     let effects = NSMenu(title: "Effects")
     effects.autoenablesItems = false
-    for chip in camera.chips {
-      effects.addItem(row("\(chip.id + 1) · \(UIPresentationBuilder.effectLongTitles[chip.id])",
+    for chip in camera.chips.dropFirst() {
+      effects.addItem(row("\(chip.id + 1)  \(UIPresentationBuilder.effectLongTitles[chip.id])",
         action(.setEffect(cameraID: camera.id, index: chip.id, !chip.isOn)), checked: chip.isOn,
-        enabled: chip.enabled, target: target))
+        enabled: chip.enabled && camera.processing, badge: chip.title, target: target))
     }
-    let effectsItem = NSMenuItem(title: "Effects", action: nil, keyEquivalent: "")
-    effectsItem.subtitle = "\(camera.chips.filter(\.isOn).count) of \(camera.chips.count)"
+    effects.addItem(.separator())
+    effects.addItem(row("Effects Off", action(.setProcessing(cameraID: camera.id, !camera.processing)), checked: !camera.processing,
+      symbol: UISymbol.effectsOff, target: target))
+    let effectsItem = row("Effects", [], symbol: camera.processing ? UISymbol.effects : UISymbol.effectsOff,
+      badge: camera.processing ? "\(camera.chips.filter(\.isOn).count) of \(camera.chips.count)" : "Off", target: target)
     effectsItem.submenu = effects
     submenu.addItem(effectsItem)
-    submenu.addItem(row("Load LUT…", action(.chooseLUT(cameraID: camera.id)), symbol: "cube", target: target))
-    let inputMenu = NSMenu(title: "Input")
-    inputMenu.autoenablesItems = false
-    let cameraSnapshot = session.cameras.first { $0.id == camera.id }
-    let running = cameraSnapshot?.running == true
-    let inputID = cameraSnapshot?.inputID
-    // By ID, as in the inspector: an input another camera has is disabled and says which.
-    inputMenu.addItem(row("None", action(.setInput(cameraID: camera.id, deviceID: "")),
-      checked: inputID == nil, enabled: !running, target: target))
-    inputMenu.addItem(.separator())
-    let options = UIInputLabels.options(inputs.map { ($0.id, $0.name) }, cameras: session.cameras, for: camera.id)
-    for group in UIInputPicker.groups(inputs) {
-      let destination: NSMenu
-      if let title = group.title {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        let menu = NSMenu(title: title); menu.autoenablesItems = false
-        item.submenu = menu; inputMenu.addItem(item); destination = menu
-      } else { destination = inputMenu }
-      for input in group.inputs {
-        guard let option = options.first(where: { $0.id == input.id }) else { continue }
-        destination.addItem(row(option.label, action(.setInput(cameraID: camera.id, deviceID: option.id)),
-          checked: option.id == inputID, enabled: !running && UIInputPicker.selectable(input, usedBy: option.usedBy, selectedID: inputID),
-          subtitle: option.usedBy.map { "Used by \($0)" }, target: target))
-      }
-    }
-    if let inputID, !options.contains(where: { $0.id == inputID }) {
-      inputMenu.addItem(row(camera.inputName, [], checked: true, enabled: false, subtitle: "Disconnected", target: target))
-    } else if inputs.isEmpty {
-      let none = NSMenuItem(title: "No inputs detected", action: nil, keyEquivalent: "")
-      none.isEnabled = false
-      inputMenu.addItem(none)
-    }
-    inputMenu.addItem(.separator())
-    inputMenu.addItem(row("Refresh Inputs", action(.refreshInputs), target: target))
-    let inputItem = NSMenuItem(title: "Input", action: nil, keyEquivalent: "")
-    inputItem.subtitle = camera.inputName
-    inputItem.submenu = inputMenu
-    if running { inputItem.toolTip = "Stop the camera to change its input." }
-    submenu.addItem(inputItem)
+    submenu.addItem(row("Video Preview", action(.setPreviewEnabled(cameraID: camera.id, !(snapshot?.previewEnabled ?? true))),
+      checked: snapshot?.previewEnabled ?? true, symbol: UISymbol.showPreview, target: target))
+    submenu.addItem(row("Start with Meeting Apps", action(.setAutomaticStart(cameraID: camera.id, !(snapshot?.automaticStart ?? false))),
+      checked: snapshot?.automaticStart ?? false, symbol: UISymbol.startWithApps, target: target))
     submenu.addItem(.separator())
     submenu.addItem(row("Show Inspector", [.action(.showInspector(cameraID: camera.id)), .action(.openMainWindow)],
-      symbol: "sidebar.right", target: target))
+      symbol: UISymbol.inspector, target: target))
     submenu.addItem(camera.canStop
-      ? row("Stop \(camera.name)", action(.stopCamera(cameraID: camera.id)), symbol: "stop.fill", target: target)
+      ? row("Stop \(camera.name)", action(.stopCamera(cameraID: camera.id)), symbol: UISymbol.stop, target: target)
       : row("Start \(camera.name)", action(.startCamera(cameraID: camera.id)), enabled: camera.canStart,
-        symbol: "play.fill", target: target))
+        symbol: UISymbol.start, target: target))
     item.submenu = submenu
     return item
   }
@@ -613,7 +568,7 @@ struct UIMenuPreviewContent: View {
       // Only the two-picture layout has nothing on it that says whether a meeting uses Ultracam.
       if twoUp && !showsPlaceholder {
         Text(presentation.outputSummary)
-          .font(.subheadline)
+          .font(.uiMeta)
           .foregroundStyle(.secondary)
           .lineLimit(1)
           .padding(.horizontal, 2)
@@ -637,10 +592,10 @@ struct UIMenuPreviewContent: View {
     UIColumnPictureLayout { RoundedRectangle(cornerRadius: 10).fill(Color.black) }
       .overlay {
         VStack(spacing: 6) {
-          Image(systemName: "video").font(.system(size: 26, weight: .light))
+          Image(systemName: waiting ? UISymbol.waitingCamera : UISymbol.camera).font(.system(size: 26, weight: .light))
           Text(waiting ? "Waiting to start" : presentation.cameras.count == 1 ? "Camera stopped" : "Cameras stopped")
             .font(.callout.weight(.semibold))
-          Text(waiting ? "Starts when a meeting app opens Ultracam." : "Start the camera to see its HDMI input.")
+          Text(waiting ? "Starts when a meeting app opens Ultracam." : "Start the camera to see its picture.")
             .font(.caption).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center)
         }
         .foregroundStyle(.white)
@@ -655,11 +610,13 @@ struct UIMenuPreviewContent: View {
     // bar (which covered the tally badge here) and its scopes, and shares Clean View state.
     UIColumnPictureLayout { pictures.picture(cameraID: MonitorFeedHost.programTarget, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 10))
-      .overlay(alignment: .topLeading) { Label("Ultracam · Program", systemImage: "tv").font(.caption.weight(.semibold)).uiPictureOverlay().padding(7) }
+      .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(programTally.ringColor ?? .clear, lineWidth: 3))
+      .overlay(alignment: .topLeading) { Label("Ultracam · Program", systemImage: UISymbol.program).font(.uiCompactOverlay).uiPictureOverlay().padding(7) }
       .overlay(alignment: .topTrailing) { UITallyBadge(tally: programTally).padding(7) }
       .overlay(alignment: .bottomLeading) {
-        Text(session.cameras.first { $0.id == session.onAirID }?.timecode ?? "—").font(.caption.monospacedDigit().weight(.semibold))
-          .uiPictureOverlay().padding(7)
+        if let onAir = session.cameras.first(where: { $0.id == session.onAirID }) {
+          Text(onAir.name).font(.uiCompactOverlay).uiPictureOverlay().padding(7)
+        }
       }
       .overlay(alignment: .bottomTrailing) { recPill(for: recordingCameras).padding(7) }
   }
@@ -672,11 +629,10 @@ struct UIMenuPreviewContent: View {
     UIColumnPictureLayout { pictures.picture(cameraID: camera.id, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 10))
       .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(camera.tally.ringColor ?? .clear, lineWidth: 3))
-      .overlay(alignment: .topLeading) { Text("Ultracam · \(camera.name)").font(.caption.weight(.semibold)).uiPictureOverlay().padding(7) }
+      .overlay(alignment: .topLeading) { Text("Ultracam · \(camera.name)").font(.uiCompactOverlay).uiPictureOverlay().padding(7) }
       .overlay(alignment: .topTrailing) { UITallyBadge(tally: camera.tally).padding(7) }
       .overlay(alignment: .bottomLeading) {
         HStack(spacing: 6) {
-          Text(camera.timecode).font(.caption.monospacedDigit().weight(.semibold)).uiPictureOverlay()
           UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio,
             style: .compact)
             .uiPictureOverlay()
@@ -692,8 +648,8 @@ struct UIMenuPreviewContent: View {
   private func miniPicture(_ camera: UICameraPresentation) -> some View {
     UIColumnPictureLayout { pictures.picture(cameraID: camera.id, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 8))
-      .overlay(alignment: .bottomLeading) { Text(camera.name).font(.caption2.weight(.semibold)).uiPictureOverlay().padding(5) }
-      .overlay(alignment: .topLeading) {
+      .overlay(alignment: .topLeading) { Text(camera.name).font(.uiCompactOverlay).uiPictureOverlay().padding(5) }
+      .overlay(alignment: .bottomTrailing) {
         recPill(for: session.cameras.filter { $0.id == camera.id && ($0.recording.status == .recording || $0.recording.status == .paused) })
           .padding(5)
       }
@@ -704,10 +660,9 @@ struct UIMenuPreviewContent: View {
     UIColumnPictureLayout { pictures.picture(cameraID: camera.id, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 7))
       .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(camera.tally.ringColor ?? .clear, lineWidth: 2.5))
+      // The number only: the ring and the row's subtitle carry the state.
       .overlay(alignment: .bottomLeading) {
-        Text(camera.tally == .onAir ? "\(camera.number) · on air" : camera.tally == .iso ? "\(camera.number) · ISO"
-          : camera.tally == .next ? "\(camera.number) · next" : "\(camera.number)")
-          .font(.caption2.weight(.semibold)).uiPictureOverlay().padding(4)
+        Text("\(camera.number)").font(.uiCompactOverlay.monospacedDigit()).uiPictureOverlay().padding(4)
       }
       .accessibilityElement(children: .ignore)
       .accessibilityLabel(camera.accessibilityLabel)
@@ -716,15 +671,8 @@ struct UIMenuPreviewContent: View {
   @ViewBuilder private func recPill(for cameras: [UICameraSnapshot]) -> some View {
     if !cameras.isEmpty {
       let paused = cameras.allSatisfy { $0.recording.status == .paused }
-      let elapsed = UIFormat.shortElapsed(cameras.map(\.recording.elapsed).max() ?? 0)
-      HStack(spacing: 5) {
-        if paused { Image(systemName: "pause.fill").foregroundStyle(.orange) }
-        else { Circle().fill(.red).frame(width: 7, height: 7) }
-        Text(paused ? "Paused \(elapsed)" : (cameras.count > 1 ? "REC \(cameras.count) · \(elapsed)" : "REC \(elapsed)"))
-          .font(.caption.monospacedDigit().weight(.semibold))
-      }
-      .uiPictureOverlay()
-      .accessibilityElement(children: .combine)
+      UIPictureStatePill(style: paused ? .paused : .recording, count: cameras.count,
+        elapsed: UIFormat.shortElapsed(cameras.map(\.recording.elapsed).max() ?? 0), compact: true)
     }
   }
 }

@@ -76,8 +76,8 @@ private struct MonitorBoundTile: View {
         Rectangle().fill(.black).aspectRatio(16.0 / 9, contentMode: .fit)
           .overlay {
             MonitorNativePicture(presenter: presenter)
-            if presenter.status == "No Signal" || presenter.status == "Feed stopped"
-              || presenter.status == "Missing feed" || presenter.status == "Stale"
+            if presenter.status == "No Signal" || presenter.status == "Camera stopped"
+              || presenter.status == "Missing camera" || presenter.status == "Stale"
             {
               Text(presenter.status).foregroundStyle(.secondary)
             }
@@ -262,9 +262,9 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
     VStack(alignment: .leading, spacing: 6) {
       HStack {
         Picker("Monitor target", selection: $target) {
-          Text("Choose feed").tag(Optional<MonitorTargetID>.none)
+          Text("Choose camera").tag(Optional<MonitorTargetID>.none)
           if let target, !choices.contains(where: { $0.id == target }) {
-            Text("Missing feed").tag(Optional(target))
+            Text("Missing camera").tag(Optional(target))
           }
           ForEach(choices) { Text($0.title).tag(Optional($0.id)) }
         }.labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
@@ -370,7 +370,7 @@ private struct MonitorDiagnosticsDisclosure: View {
       contentRect: NSRect(x: 0, y: 0, width: 800, height: 580),
       styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false
     )
-    window.title = "Monitor · \(coordinator.targets.first(where: { $0.id == target })?.title ?? "Missing feed")"
+    window.title = "Monitor · \(coordinator.targets.first(where: { $0.id == target })?.title ?? "Missing camera")"
     window.isReleasedWhenClosed = false
     let id = UUID()
     let owner = MonitorWindowOwner(window: window, target: target) {
@@ -417,18 +417,18 @@ private struct DetachedMonitorContent: View {
       ).id(target)
         .background(
           MonitorWindowTitle(
-            title: "Monitor · \(coordinator.targets.first(where: { $0.id == target })?.title ?? "Missing feed")"))
+            title: "Monitor · \(coordinator.targets.first(where: { $0.id == target })?.title ?? "Missing camera")"))
     } else {
       MonitorDetachedChrome(
         target: $owner.target, preferences: .constant(MonitorFeedPreferences()),
         choices: coordinator.targets, status: "No Signal", compact: false
       ) {
         Rectangle().fill(.black).aspectRatio(16.0 / 9, contentMode: .fit)
-          .overlay { Text("Choose a feed or Program").foregroundStyle(.secondary) }
+          .overlay { Text("Choose a camera or Program").foregroundStyle(.secondary) }
       } scopes: {
         EmptyView()
       }
-      .background(MonitorWindowTitle(title: "Monitor · Choose a feed"))
+      .background(MonitorWindowTitle(title: "Monitor · Choose a camera"))
     }
   }
 }

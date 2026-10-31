@@ -163,6 +163,8 @@ struct SourceRecordingConfiguration {
   let sourceAdmission: SourceAdmissionSnapshot?
   let expectedSourceFormat: SourceFormat?
   let compatibilityPolicy: RecordingCompatibilityPolicy
+  /// Why the take isn't in the chosen format; it goes in the sidecar's notes.
+  let formatNote: String?
   let sidecarMovieURL: URL?
   let sidecarCreated: (() throws -> Void)?
   let videoRetentionPolicy: MediaRetentionPolicy
@@ -281,7 +283,7 @@ struct SourceRecordingConfiguration {
     timecodeSamplesComputerClockAtFirstFrame: Bool = false,
     checkAvailableSpace: ((UInt64) throws -> Void)? = nil,
     sourceAdmission: SourceAdmissionSnapshot? = nil, expectedSourceFormat: SourceFormat? = nil,
-    compatibilityPolicy: RecordingCompatibilityPolicy = .init(), sidecarMovieURL: URL? = nil,
+    compatibilityPolicy: RecordingCompatibilityPolicy = .init(), formatNote: String? = nil, sidecarMovieURL: URL? = nil,
     sidecarCreated: (() throws -> Void)? = nil,
     videoRetentionPolicy: MediaRetentionPolicy? = nil, audioRetentionPolicy: MediaRetentionPolicy? = nil) throws {
     guard !feedID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -339,6 +341,7 @@ struct SourceRecordingConfiguration {
       }
     }
     self.compatibilityPolicy = compatibilityPolicy
+    self.formatNote = formatNote
     self.sidecarMovieURL = sidecarMovieURL
     self.sidecarCreated = sidecarCreated
     self.videoRetentionPolicy = try videoRetentionPolicy ?? MediaRetentionPolicy(maximumBytes: 512 * 1024 * 1024,

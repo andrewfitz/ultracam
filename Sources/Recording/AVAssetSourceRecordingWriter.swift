@@ -505,6 +505,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         // RecordingTakeSidecar rewrites this note if the journal is truncated.
         metadata.conversionNotes.append("Explicit constant-cadence recording repeats or skips whole source frames; source timing is retained in the journal.")
       }
+      if let note = configuration.formatNote { metadata.conversionNotes.append(note) }
       metadata.sourceFormat = source.format
       metadata.keyframeIntervalDuration = configuration.keyframeDuration(for: Self.matchingFrameRate(source.format.rate.nominal) ?? configuration.frameRate)
       if [PixelFormatID.uyva, PixelFormatID.pa16].contains(source.format.pixel) {

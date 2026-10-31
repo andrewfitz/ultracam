@@ -6,6 +6,8 @@ import SwiftUI
   private var menuBar: UIMenuBarController?
   private var alerts: UIAlertCoordinator?
   private var terminationPending = false
+  /// A Quit the operator has confirmed, so the second pass through here doesn't ask again.
+  private var quitConfirmed = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     let model = UIAppEnvironment.model
@@ -32,6 +34,12 @@ import SwiftUI
       notifications.opened = { [weak self] in self?.showMainWindow() }
       alerts = UIAlertCoordinator(model: model, interface: UIAppEnvironment.interface,
         preferences: UIAppEnvironment.alertPreferences, delivery: notifications, panel: UIAlertPanelController())
+      let shortcuts = UIAppEnvironment.backgroundShortcuts
+      shortcuts.perform = { shortcut in
+        let bridge = UISessionBridge.live(model: model, interface: interface)
+        shortcut.actions(in: bridge.presentation()).forEach { bridge.perform($0) }
+      }
+      shortcuts.start()
     }
     // scripts/ui-tour.sh reviews both appearances without changing the system setting.
     if let flag = CommandLine.arguments.firstIndex(of: "--ui-appearance"), CommandLine.arguments.indices.contains(flag + 1) {
@@ -61,6 +69,16 @@ import SwiftUI
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     if terminationPending { return .terminateLater }
     guard let model else { return .terminateNow }
+    // Ending takes or on-air video asks first, behind Settings › General's switch. Cancel is
+    // the default, so Return never ends a take.
+    let bridge = UISessionBridge.live(model: model, interface: UIAppEnvironment.interface)
+    let presentation = bridge.presentation()
+    if !quitConfirmed, presentation.askBeforeEnding, let message = UIAction.endingMessage(in: presentation) {
+      let alert = UISessionBridge.confirmationAlert(for: .quit, message: message, in: presentation)
+      NSApplication.shared.activate(ignoringOtherApps: true)
+      guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
+      quitConfirmed = true
+    }
     let recording = model.recordingModel.hasActiveRecordings
     guard recording || model.cameraControls.needsShutdown else { return .terminateNow }
     terminationPending = true

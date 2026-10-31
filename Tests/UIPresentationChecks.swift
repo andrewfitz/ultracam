@@ -225,20 +225,33 @@ import XCTest
 
   // MARK: Record control and record button
 
-  func testRecordControlLabelsAlwaysHaveAVerb() {
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).recordControl, .record(all: false, enabled: true))
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1), camera(2)])).recordControl, .record(all: true, enabled: true))
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, recording: .recording)])).recordControl, .stop(elapsed: "12:31"))
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, recording: .recording), camera(2)])).recordControl,
-      .stopAll(count: 1, elapsed: "12:31"))
+  func testRecordControlLabelsAlwaysHaveAVerbAndNoClock() {
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).recordControl, .record(all: false, enabled: true, ready: 1, total: 1))
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1), camera(2)])).recordControl,
+      .record(all: true, enabled: true, ready: 2, total: 2))
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, recording: .recording)])).recordControl, .stop)
+    // One take of several keeps Stop All's action, with the one-take words.
+    let one = UIPresentationBuilder.session(separate([camera(1, recording: .recording), camera(2)]))
+    XCTAssertEqual(one.recordControl, .stopAll(count: 1))
+    XCTAssertEqual(one.recordControl.title, "Stop Recording")
     let both = UIPresentationBuilder.session(separate([camera(1, recording: .recording), camera(2, recording: .paused, elapsed: 252)]))
-    XCTAssertEqual(both.recordControl, .stopAll(count: 2, elapsed: "12:31"))
-    XCTAssertEqual(both.recordControl.title, "Stop All (2)")
-    XCTAssertEqual(UIRecordControl.record(all: true, enabled: true).title, "Record All")
-    XCTAssertEqual(UIRecordControl.record(all: false, enabled: true).title, "Record")
-    XCTAssertEqual(UIRecordControl.stop(elapsed: "1:00").title, "Stop Recording")
+    XCTAssertEqual(both.recordControl, .stopAll(count: 2))
+    XCTAssertEqual(both.recordControl.title, "Stop 2 Recordings", "Stop All (n) never appears")
+    XCTAssertEqual(UIRecordControl.record(all: true, enabled: true, ready: 2, total: 2).title, "Record All")
+    XCTAssertEqual(UIRecordControl.record(all: true, enabled: true, ready: 1, total: 2).title, "Record 1 of 2")
+    XCTAssertEqual(UIRecordControl.record(all: false, enabled: true, ready: 1, total: 1).title, "Record")
+    XCTAssertEqual(UIRecordControl.stop.title, "Stop Recording")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, running: false)])).recordControl,
-      .record(all: false, enabled: false))
+      .record(all: false, enabled: false, ready: 0, total: 1))
+  }
+
+  func testStartControlNamesTheStoppedCameraAndLeavesWhileAllRun() {
+    XCTAssertNil(UIPresentationBuilder.session(separate([camera(1), camera(2)])).startControl, "Stop Cameras leaves the toolbar")
+    let one = UIPresentationBuilder.session(separate([camera(1), camera(2, running: false)])).startControl
+    XCTAssertEqual(one?.title, "Start Camera 2")
+    XCTAssertEqual(one?.action, .startCamera(cameraID: "camera-2"))
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, running: false), camera(2, running: false)])).startControl?.title,
+      "Start Cameras")
   }
 
   func testRecordButtonEnablementAndHelp() {
@@ -727,10 +740,10 @@ import XCTest
     XCTAssertEqual(UIAction.stopAllCameras.confirmationTitle(in: presentation), "Stop All Cameras?")
     XCTAssertEqual(UIAction.resetAllSettings.confirmationTitle(in: presentation), "Reset All Settings?")
     // S2: the destructive button says what it does, never "Stop Camera" for a removal or a reset.
-    XCTAssertEqual(UIAction.stopCamera(cameraID: "camera-1").confirmationButtonTitle, "Stop Camera")
-    XCTAssertEqual(UIAction.stopAllCameras.confirmationButtonTitle, "Stop All Cameras")
-    XCTAssertEqual(UIAction.removeCamera(cameraID: "camera-2").confirmationButtonTitle, "Remove Camera")
-    XCTAssertEqual(UIAction.resetAllSettings.confirmationButtonTitle, "Reset and Quit")
+    XCTAssertEqual(UIAction.stopCamera(cameraID: "camera-1").confirmationButtonTitle(in: presentation), "Stop Camera")
+    XCTAssertEqual(UIAction.stopAllCameras.confirmationButtonTitle(in: presentation), "Stop All Cameras")
+    XCTAssertEqual(UIAction.removeCamera(cameraID: "camera-2").confirmationButtonTitle(in: presentation), "Remove Camera")
+    XCTAssertEqual(UIAction.resetAllSettings.confirmationButtonTitle(in: presentation), "Reset and Quit")
     for action in [UIAction.removeCamera(cameraID: "camera-2"), .resetAllSettings, .stopAllCameras] {
       let message = action.needsConfirmation(in: presentation) ?? ""
       XCTAssertFalse(message.contains("?"), "The message doesn't repeat the title's question: \(message)")

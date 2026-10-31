@@ -427,7 +427,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             throw ControlError(code: .changedIdentity, retryable: false, message: "Camera identity differs from the saved assignment. Unassign and pair again after verifying the camera.")
         }
         if holder(of: camera.id, pluginID: pluginID, excluding: feedID) != nil {
-            throw ControlError(code: .busy, retryable: false, message: "Camera is assigned to another feed.")
+            throw ControlError(code: .busy, retryable: false, message: "This control camera is assigned to another Ultracam camera.")
         }
     }
     private func begin(_ feed: String, _ pluginID: String) -> UInt64 {

@@ -108,7 +108,7 @@ private struct UIDiagnosticsCameraTab: View {
       if !running {
         // Values from a stopped camera would be stale, so only the last take's encoder details stay.
         Section {
-          ContentUnavailableView("Camera Stopped", systemImage: "video.slash",
+          ContentUnavailableView("Camera Stopped", systemImage: UISymbol.camera,
             description: Text("Live capture, drops, audio and monitoring details appear while this camera runs."))
             .frame(maxWidth: .infinity)
         }

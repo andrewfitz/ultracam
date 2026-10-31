@@ -237,10 +237,6 @@ struct UISettingsRecordingPane: View {
     .scrollBounceBehavior(.basedOnSize)
     .frame(height: 700)
     .sheet(isPresented: $showingRecovery) { UISettingsRecoverySheet(model: model) }
-    // Record › Recover Interrupted Takes… opens Settings and asks for this sheet.
-    .onReceive(NotificationCenter.default.publisher(for: Notification.Name("UIShowRecovery"))) { _ in
-      showingRecovery = true
-    }
   }
 
   private var fileNamePreview: String {

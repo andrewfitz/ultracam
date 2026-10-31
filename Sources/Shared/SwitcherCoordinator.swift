@@ -304,6 +304,12 @@ struct SwitcherCoordinator {
     programOutput.expirePendingCutIfNeeded()
     reconcilePendingState()
     guard settings.automatic, settings.strategy == .fixedInterval else { return .idle }
+    // Hold: Auto stays on and makes no cuts, whatever the strategy. The interval starts
+    // again from release, so the held shot gets a full one after it.
+    guard !settings.naturalTalkingHead.manualHold else {
+      fixedIntervalOrigin = now
+      return .idle
+    }
     guard !automaticRequestPending, !programOutput.hasPendingCut else { return .idle }
 
     if fixedIntervalOrigin == nil {

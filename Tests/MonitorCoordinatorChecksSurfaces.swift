@@ -215,9 +215,9 @@ extension MonitorCoordinatorChecks {
     XCTAssertTrue(presenter.isFrozen)
     XCTAssertEqual(presenter.status, "Frozen")
     presenter.toggleFreeze()
-    XCTAssertEqual(presenter.status, "Feed stopped")
+    XCTAssertEqual(presenter.status, "Camera stopped")
     value.updateTargets(feeds: [FeedDescriptor(id: FeedID(rawValue: "beta"), name: "Beta")], programAvailable: false)
-    XCTAssertEqual(presenter.status, "Missing feed")
+    XCTAssertEqual(presenter.status, "Missing camera")
     XCTAssertFalse(presenter.isFrozen)
   }
 
@@ -405,7 +405,7 @@ extension MonitorCoordinatorChecks {
     presenter.accept(newest)  // An equal stamp is the same frame: not accepted again.
     XCTAssertEqual(presenter.currentStamp, newest.stamp)
     XCTAssertEqual(presenter.statistics.acceptedFrames, 1)
-    presenter.setUnavailable("Feed stopped")
+    presenter.setUnavailable("Camera stopped")
     presenter.accept(delivery(7, revision: 3))
     XCTAssertNil(presenter.currentStamp)
     let restarted = delivery(1, revision: 1, generation: base.stamp.generation + 1)
@@ -836,7 +836,7 @@ extension MonitorCoordinatorChecks {
           if let presenter = presenters[index] {
             Color.black.aspectRatio(16.0 / 9, contentMode: .fit).overlay { MonitorNativePicture(presenter: presenter) }
           } else {
-            Text("Choose feed")
+            Text("Choose camera")
           }
         }
       }

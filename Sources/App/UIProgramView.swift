@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// Optional Program View layout: the Program picture (what the virtual camera
-/// sends), sources with explicit Cut buttons, the cut bar with shot timer,
-/// collapsed strips and recent cuts. Side by Side with tally stays the default.
+/// Program View: the Program picture (what the virtual camera sends) beside the sources, each
+/// with a full-width Cut, then collapsed strips anchored at the bottom. Spare height goes to
+/// Program, by narrowing the source column. Cuts, Auto and Hold are the toolbar's; the shot
+/// timer and recent cuts are in the status bar and its Program popover.
 struct UIProgramView: View {
   let context: UIContext
 
@@ -11,31 +12,32 @@ struct UIProgramView: View {
 
   var body: some View {
     let _ = UIRenderProbe.count("UIProgramView")
-    ScrollView {
-      VStack(alignment: .leading, spacing: UIPictureSpacing.gutter) {
-        HStack(alignment: .top, spacing: UIPictureSpacing.gutter) {
-          programPicture
-            .frame(maxWidth: .infinity)
-          VStack(spacing: 10) {
-            ForEach(context.presentation.cameras) { camera in
-              source(camera)
-            }
+    VStack(alignment: .leading, spacing: UIPictureSpacing.gutter) {
+      UIProgramRowLayout(gutter: UIPictureSpacing.gutter) {
+        programPicture
+        VStack(spacing: 12) {
+          ForEach(context.presentation.cameras) { camera in
+            source(camera)
           }
-          .frame(width: 300)
         }
-        UIProgramCutBar(context: context)
+      }
+      // The height left over goes to Program; the strips stay anchored at the bottom.
+      .frame(maxHeight: .infinity, alignment: .top)
+      VStack(spacing: 8) {
         ForEach(context.presentation.cameras) { camera in
           UIChannelStripView(camera: camera, context: context)
         }
-        UIRecentCutsList(cuts: session.recentCuts)
       }
     }
-    .scrollBounceBehavior(.basedOnSize)
-    .contentMargins(UIPictureSpacing.margin, for: .scrollContent)
+    .padding(UIPictureSpacing.margin)
+  }
+
+  private var programTally: UITally {
+    context.presentation.cameras.first { $0.id == session.onAirID }?.tally ?? .none
   }
 
   private var programPicture: some View {
-    let tally = context.presentation.cameras.first { $0.id == session.onAirID }?.tally ?? .none
+    let tally = programTally
     return context.pictures.programPicture()
       .aspectRatio(16 / 9, contentMode: .fit)
       .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -54,212 +56,92 @@ struct UIProgramView: View {
           RoundedRectangle(cornerRadius: 14).strokeBorder(color, lineWidth: 4).allowsHitTesting(false)
         }
       }
-      .overlay(alignment: .topLeading) {
+      .overlay(alignment: .top) {
         HStack(spacing: 6) {
-          Label("Ultracam · Program", systemImage: "tv").font(.subheadline.weight(.semibold)).uiPictureOverlay()
+          HStack(spacing: 4) {
+            Image(systemName: UISymbol.program).imageScale(.small)
+            Text("Ultracam").foregroundStyle(.white.opacity(0.7)).fontWeight(.regular)
+            Text("Program")
+          }
+          .font(.uiOverlay).uiPictureOverlay()
+          .accessibilityElement(children: .combine)
           UITallyBadge(tally: tally)
+          Spacer(minLength: 4)
+          UIMonitorToolButtons(targetID: MonitorFeedHost.programTarget, name: "Program",
+            activeTools: UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(context.monitor.preferences(for: MonitorFeedHost.programTarget)).contains($0) },
+            isProgram: true, toggle: { context.send(.toggleTool(cameraID: MonitorFeedHost.programTarget, $0)) },
+            monitor: context.monitor)
         }
         .padding(10)
       }
       .overlay(alignment: .bottomLeading) {
         HStack(spacing: 6) {
           if let onAir {
-            // "On air" only while a meeting app shows Program; otherwise it's just the Program camera.
-            Text("\(onAir.name) \(tally == .onAir ? "on air" : "in Program")").font(.subheadline.weight(.semibold)).uiPictureOverlay()
+            Text(onAir.name).font(.uiOverlay).uiPictureOverlay()
           }
           if let format = onAir?.outputFormat {
-            Text(format).font(.subheadline.weight(.semibold).monospacedDigit()).uiPictureOverlay()
+            Text(format).font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
           }
           if session.programFormatMismatch {
-            Label {
-              Text("Cameras use different formats — converted to the Program format")
-            } icon: {
-              Image(systemName: "arrow.triangle.2.circlepath")
-            }
-            .font(.subheadline.weight(.semibold))
-            .uiPictureOverlay()
+            Label("Formats converted", systemImage: UISymbol.updating)
+              .font(.uiOverlay)
+              .uiPictureOverlay()
+              .help("Program cameras use different formats. The GPU converts each to the Program camera's format, so cuts don't interrupt the output.")
           }
         }
         .padding(10)
       }
-      .accessibilityElement(children: .combine)
+      .accessibilityElement(children: .contain)
       .accessibilityLabel("Program, \(onAir?.name ?? "no camera") \(tally == .onAir ? "on air" : "selected")")
   }
 
+  /// A source's picture and its Cut. The camera on Program keeps the slot's height with
+  /// nothing in it: its ring says it, and nothing moves.
   private func source(_ camera: UICameraPresentation) -> some View {
     VStack(alignment: .leading, spacing: 6) {
       UIColumnPictureLayout {
         UICameraPictureView(camera: camera, context: context, compact: true)
       }
-      HStack {
-        Text("\(camera.number)").font(.headline.monospacedDigit()).foregroundStyle(.secondary)
-        Text(camera.name).font(.headline).lineLimit(1).truncationMode(.middle)
-        Spacer()
-        if camera.tally == .onAir || camera.tally == .program, let label = camera.tally.label {
-          UIBadge(text: label, tone: camera.tally == .onAir ? .onAir : .neutral)
-        } else {
-          Button {
-            context.send(.cut(cameraID: camera.id))
-          } label: {
-            Label("Cut", systemImage: "arrow.right.circle")
-          }
-          .disabled(!camera.cutEnabled)
-          .help(camera.cutHelp ?? "Cut to \(camera.name) (⌃\(camera.number))")
-          .accessibilityLabel("Cut to \(camera.name)")
-        }
-      }
-    }
-  }
-}
-
-/// Numbered cuts, Auto, strategy, Hold Shot and the shot timer.
-struct UIProgramCutBar: View {
-  let context: UIContext
-  @State private var anchor: (value: TimeInterval?, at: Date) = (nil, .now)
-
-  private var session: UISessionSnapshot { context.session }
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      HStack(spacing: 8) {
-        ForEach(context.presentation.cutButtons) { button in
-          cutButton(button)
-        }
-        Divider().frame(height: 20)
-        // Auto needs a strategy first, so the strategy picker stays available while Auto is off.
-        Toggle("Auto", isOn: Binding(get: { context.presentation.autoSwitching }, set: { context.send(.setAutoSwitching($0)) }))
-          .toggleStyle(.switch)
-          .disabled(!context.presentation.canAutoSwitch)
-          .help(context.presentation.canAutoSwitch
-            ? "Automatic switching (⌃⌥A)" : "Choose a switching strategy first.")
-        Picker("Strategy", selection: strategyBinding) {
-          // The same strategies as the sidebar and Program menu: Dynamic analysis isn't built, and
-          // choosing it would offer Auto with no director behind it.
-          ForEach(UIStrategy.offered, id: \.self) { strategy in
-            Text(UIStrategy.title(strategy)).tag(strategy)
-          }
-        }
-        .labelsHidden()
-        .fixedSize()
-        .help("Switching strategy")
-        Toggle("Hold Shot", isOn: Binding(get: { session.autoHold }, set: { context.send(.setAutoHold($0)) }))
-          .toggleStyle(.button)
-          .disabled(!context.presentation.canHoldShot)
-          .help("Keep the current shot: Auto stays on but makes no cuts")
-        Spacer()
-      }
-      if session.strategy == .naturalTalkingHead {
-        HStack(spacing: 14) {
-          Picker("Anchor", selection: Binding(get: { session.anchorID }, set: { context.send(.setAnchor(cameraID: $0)) })) {
-            Text("Automatic").tag(String?.none)
-            ForEach(context.presentation.cameras) { camera in Text(camera.name).tag(String?.some(camera.id)) }
-          }
-          .fixedSize()
-          .help("The camera the director returns to between emphasis shots")
-          Picker("Emphasis", selection: Binding(get: { session.emphasisID }, set: { context.send(.setEmphasis(cameraID: $0)) })) {
-            Text("Automatic").tag(String?.none)
-            ForEach(context.presentation.cameras) { camera in Text(camera.name).tag(String?.some(camera.id)) }
-          }
-          .fixedSize()
-          .help("The camera the director cuts to for emphasis")
-          Spacer()
-        }
-        .disabled(!context.presentation.autoSwitching)
-      }
-      TimelineView(.periodic(from: .now, by: 1)) { timeline in
-        shotTimer(now: timeline.date)
-      }
-    }
-    .padding(12)
-    .background(.fill.quaternary, in: RoundedRectangle(cornerRadius: 12))
-    .onAppear { anchor = (session.shot.currentShot, .now) }
-    .onChange(of: session.shot.currentShot) { _, value in anchor = (value, .now) }
-  }
-
-  private var strategyBinding: Binding<SwitcherStrategy> {
-    Binding(get: { session.strategy }, set: { context.send(.setStrategy($0)) })
-  }
-
-  @ViewBuilder private func cutButton(_ button: UICutButton) -> some View {
-    let label = UICutButtonLabel(button: button, showsNext: true)
-    if button.onAir {
-      Button { context.send(.cut(cameraID: button.id)) } label: { label }
-        .buttonStyle(.borderedProminent).tint(.red)
-        .accessibilityLabel("\(button.name), on air")
-    } else {
-      // A pending cut is outlined in green; the capsule shape keeps the outline on the button's edge.
-      Button { context.send(.cut(cameraID: button.id)) } label: { label }
-        .buttonStyle(.bordered)
-        .buttonBorderShape(.capsule)
-        .overlay(Capsule().strokeBorder(button.pending ? Color.green : .clear, lineWidth: 1.5).allowsHitTesting(false))
-        .disabled(!button.enabled)
-        .help(button.help ?? "Cut to \(button.name) (⌃\(button.number))")
-        .accessibilityLabel(button.pending ? "\(button.name), cut pending" : "Cut to \(button.name)")
-    }
-  }
-
-  @ViewBuilder private func shotTimer(now: Date) -> some View {
-    let shot = session.shot
-    let current = anchor.value.map { $0 + max(0, now.timeIntervalSince(anchor.at)) }
-    let maximum = max(shot.maximum, 1)
-    HStack(spacing: 12) {
-      Text(current.map { String(format: "Shot %.0f s", $0) } ?? "No shot yet")
-        .font(.callout.monospacedDigit().weight(.semibold))
-        .frame(width: 96, alignment: .leading)
-      GeometryReader { proxy in
-        let width = proxy.size.width
-        ZStack(alignment: .leading) {
-          Capsule().fill(.fill.tertiary).frame(height: 8)
-          Capsule().fill(LinearGradient(colors: [.green, .green, .yellow], startPoint: .leading, endPoint: .trailing))
-            .frame(width: width * min(1, (current ?? 0) / maximum), height: 8)
-          marker(at: shot.minimum / maximum, width: width, label: "min \(Int(shot.minimum)) s")
-          marker(at: shot.softMaximum / maximum, width: width, label: "soft max \(Int(shot.softMaximum)) s")
-          // Primary, not red, as in Settings › Switcher: red means on air or recording.
-          marker(at: 1, width: width, label: "max \(Int(shot.maximum)) s", color: .primary)
-        }
-        .frame(maxHeight: .infinity, alignment: .top)
-      }
-      .frame(height: 30)
-    }
-    .accessibilityElement(children: .ignore)
-    .accessibilityLabel("Shot timer")
-    .accessibilityValue(current.map { "\(Int($0)) seconds, minimum \(Int(shot.minimum)), maximum \(Int(shot.maximum))" } ?? "No shot")
-  }
-
-  private func marker(at fraction: Double, width: CGFloat, label: String, color: Color = .secondary) -> some View {
-    let x = width * min(1, max(0, fraction))
-    return ZStack(alignment: .topLeading) {
-      Rectangle().fill(color).frame(width: 1.5, height: 14).offset(x: x - 0.75, y: -3)
-      Text(label).font(.subheadline).foregroundStyle(.secondary).fixedSize()
-        .offset(x: min(max(0, x - 24), width - 60), y: 13)
-    }
-  }
-}
-
-/// Program cuts applied this session, newest first.
-struct UIRecentCutsList: View {
-  let cuts: [UICutRecord]
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      Text("Recent Cuts").font(.headline)
-      if cuts.isEmpty {
-        Text("No cuts yet.").font(.callout).foregroundStyle(.secondary)
+      if let cut = context.presentation.cutButtons.first(where: { $0.id == camera.id }), !cut.onAir {
+        UIWideCutButton(cut: cut, context: context)
       } else {
-        ForEach(cuts.prefix(6)) { cut in
-          HStack(spacing: 10) {
-            Text(cut.at, format: .dateTime.hour().minute().second())
-              .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
-            Text("Cut to \(cut.cameraName)").font(.callout)
-            Spacer()
-            UIBadge(text: cut.automatic ? "Auto" : "Manual")
-          }
-          .accessibilityElement(children: .combine)
-        }
+        Color.clear.frame(height: 36).accessibilityHidden(true)
       }
     }
-    .padding(12)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.fill.quaternary, in: RoundedRectangle(cornerRadius: 12))
   }
+}
+
+/// Program and its sources side by side. Program is as large as the height allows; the source
+/// column takes the rest of the width, between its narrowest and widest.
+struct UIProgramRowLayout: Layout {
+  var gutter: CGFloat
+  static let sourceWidth: ClosedRange<CGFloat> = 220...320
+
+  private func widths(_ width: CGFloat, height: CGFloat?) -> (program: CGFloat, sources: CGFloat) {
+    let byHeight = height.map { $0 * 16 / 9 } ?? .infinity
+    let program = max(320, min(width - gutter - Self.sourceWidth.lowerBound, byHeight))
+    let sources = min(Self.sourceWidth.upperBound, max(Self.sourceWidth.lowerBound, width - gutter - program))
+    return (min(program, width - gutter - sources), sources)
+  }
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    let width = proposal.width ?? 1000
+    let split = widths(width, height: proposal.height)
+    let sources = subviews.count > 1 ? subviews[1].sizeThatFits(ProposedViewSize(width: split.sources, height: nil)).height : 0
+    return CGSize(width: width, height: max(split.program * 9 / 16, sources))
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    let split = widths(bounds.width, height: proposal.height)
+    guard subviews.count == 2 else { return }
+    subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: split.program, height: split.program * 9 / 16))
+    subviews[1].place(at: CGPoint(x: bounds.maxX - split.sources, y: bounds.minY),
+      proposal: ProposedViewSize(width: split.sources, height: nil))
+  }
+
+  func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+  func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
 }

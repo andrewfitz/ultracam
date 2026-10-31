@@ -35,6 +35,8 @@ enum UIAction: Sendable, Equatable {
   case setColorTarget(cameraID: String, ColorTarget)
   case setFrameRateTarget(cameraID: String, FrameRateTarget)
   case setSyncCameras(Bool)
+  /// The format of the next take, for every camera.
+  case setCodec(RecordingCodec)
   case chooseLUT(cameraID: String)
   case setGamut(cameraID: String, String)
   case setSourceProfile(cameraID: String, String)
@@ -86,9 +88,15 @@ enum UIAction: Sendable, Equatable {
   case revealInFinder(URL)
   case revealRecordings
   case recover(id: String)
+  /// The sheet that lists every interrupted take, from Attention's row.
+  case showInterruptedTakes
+  case hideInterruptedTakes
 
   // Monitor
   case toggleTool(cameraID: String, UIMonitorTool)
+  case toggleClipIndicators(cameraID: String)
+  /// Turns off every tool on the camera, and leaves their settings.
+  case hideAllTools(cameraID: String)
   case freeze(cameraID: String)
   case toggleClean(cameraID: String)
   case detachMonitor(cameraID: String)
@@ -101,6 +109,11 @@ enum UIAction: Sendable, Equatable {
   case openSettings
   case openDiagnostics
   case openMainWindow
+  /// System Settings at Camera Extensions, where macOS waits for an approval.
+  case openExtensionApproval
+  case setVirtualCamerasCollapsed(Bool)
+  /// The window crossed the width under which toolbar cuts keep only their digits.
+  case setNarrowWindow(Bool)
   /// Asks for notification permission. Only offered before a session.
   case turnOnAlerts
   case dismissAlertsPrompt
@@ -119,19 +132,32 @@ extension UIAction {
       return camera.stopConfirmationMessage
     case .removeCamera:
       return "Its settings are deleted. Recordings on disk are kept."
+    case .setSyncCameras(true):
+      guard let source = presentation.selected, presentation.cameras.count > 1 else { return nil }
+      let others = presentation.cameras.filter { $0.id != source.id }.map(\.name).joined(separator: ", ")
+      return "\(others) \(presentation.cameras.count > 2 ? "take" : "takes") \(source.name)'s effects, LUT, monitor tools, source declarations and preview setting, and meeting apps may see \(presentation.cameras.count > 2 ? "their" : "its") format change. Inputs and folders stay separate."
+    case .stopAllRecordings:
+      let takes = presentation.cameras.filter { $0.recordButtonActive || $0.pauseTitle == "Resume" }.count
+      guard presentation.askBeforeEnding, takes > 1 else { return nil }
+      return "\(takes) recordings end. Cameras keep running and on-air video continues."
     case .resetAllSettings:
       return "Cameras, effects, folders, monitor tools and layout return to their defaults. Recordings are not touched. Ultracam quits when it's done."
     case .stopAllCameras:
-      let recording = presentation.cameras.filter { $0.recordButtonActive || $0.pauseTitle == "Resume" }
-      let onAir = presentation.cameras.contains { $0.tally.isRed }
-      guard !recording.isEmpty || onAir else { return nil }
-      var parts: [String] = []
-      if !recording.isEmpty { parts.append("\(recording.count == 1 ? "1 recording ends" : "\(recording.count) recordings end")") }
-      if onAir { parts.append(recording.isEmpty ? "On-air video stops" : "on-air video stops") }
-      return parts.joined(separator: " and ") + "."
+      return Self.endingMessage(in: presentation)
     default:
       return nil
     }
+  }
+
+  /// What ending everything would cost, or nil when it costs nothing.
+  static func endingMessage(in presentation: UISessionPresentation) -> String? {
+    let recording = presentation.cameras.filter { $0.recordButtonActive || $0.pauseTitle == "Resume" }
+    let onAir = presentation.cameras.contains { $0.tally.isRed }
+    guard !recording.isEmpty || onAir else { return nil }
+    var parts: [String] = []
+    if !recording.isEmpty { parts.append("\(recording.count == 1 ? "1 recording ends" : "\(recording.count) recordings end")") }
+    if onAir { parts.append(recording.isEmpty ? "On-air video stops" : "on-air video stops") }
+    return parts.joined(separator: " and ") + "."
   }
 
   /// The confirmation dialog's title: the question the message answers.
@@ -142,17 +168,23 @@ extension UIAction {
     case .stopAllCameras: return "Stop All Cameras?"
     case .removeCamera(let id): return "Remove \(name(id))?"
     case .resetAllSettings: return "Reset All Settings?"
+    case .setSyncCameras: return "Sync cameras from \(presentation.selected?.name ?? "this camera")?"
+    case .stopAllRecordings: return "\(presentation.recordControl.title)?"
+    case .quit: return "Quit Ultracam?"
     default: return "Are you sure?"
     }
   }
 
-  /// The destructive button of the confirmation dialog, named for what it does.
-  var confirmationButtonTitle: String {
+  /// The verb of the confirmation dialog, named for what it does.
+  func confirmationButtonTitle(in presentation: UISessionPresentation) -> String {
     switch self {
     case .stopCamera: return "Stop Camera"
     case .stopAllCameras: return "Stop All Cameras"
     case .removeCamera: return "Remove Camera"
     case .resetAllSettings: return "Reset and Quit"
+    case .setSyncCameras: return "Sync Cameras"
+    case .stopAllRecordings: return presentation.recordControl.title
+    case .quit: return "Quit Ultracam"
     default: return "Continue"
     }
   }

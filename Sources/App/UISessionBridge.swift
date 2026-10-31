@@ -22,12 +22,20 @@ final class UIInterfaceState {
   var inspectorOpen = false { didSet { if inspectorOpen { lastOpenedColumn = .inspector } } }
   /// Which side column the user opened most recently; it stays when space runs out.
   var lastOpenedColumn: UISideColumn = .sidebar
-  /// Tests set this so confirmations are recorded instead of shown as modal alerts.
+  /// Tests set this so confirmations are recorded instead of shown as alerts.
   var alertsDisabled = false
   /// A pending confirmation: the message and the action to run when confirmed.
   var confirmation: (message: String, action: UIAction)?
   /// The camera whose rename prompt is open (`uiRenameAlert`), if any.
   var renamingCameraID: String?
+  /// The left pane's Virtual Cameras section is closed. Only the operator closes it.
+  var virtualCamerasCollapsed: Bool {
+    didSet { defaults.set(virtualCamerasCollapsed, forKey: "ui.virtualCamerasCollapsed") }
+  }
+  /// The window is under 1100 pt wide.
+  var narrowWindow = false
+  /// The Interrupted Takes sheet is open.
+  var interruptedTakesOpen = false
   /// Notification permission is undecided, so Attention may offer it. Set by `UIAlertCoordinator`.
   var offerAlerts = false
   @ObservationIgnored var turnOnAlerts: (@MainActor () -> Void)?
@@ -39,7 +47,12 @@ final class UIInterfaceState {
     collapsed = Set(defaults.stringArray(forKey: "ui.collapsed") ?? [])
     sidebarVisible = defaults.object(forKey: "ui.sidebar") as? Bool ?? true
     order = defaults.stringArray(forKey: "ui.order") ?? []
+    virtualCamerasCollapsed = defaults.bool(forKey: "ui.virtualCamerasCollapsed")
   }
+
+  /// Settings › General, "Ask before ending a recording or on-air video". On by default.
+  static let askBeforeEndingKey = "ui.askBeforeEnding"
+  var askBeforeEnding: Bool { defaults.object(forKey: Self.askBeforeEndingKey) as? Bool ?? true }
 
   /// Settings › General › Channel strips: new cameras start collapsed.
   /// Reads the preference at the time a camera is added. Settings can be
@@ -141,6 +154,9 @@ struct UISessionBridge {
       camera.sinkConnected = update?.cameraOutputActive == true
       camera.clientWaiting = model.waitingClients.contains(id)
       camera.queueStalled = model.stalledCameras.contains(id)
+      if let assignment = model.cameraControls.assignment(for: id.rawValue) {
+        camera.body = UICameraBody(name: assignment.camera.name, connected: model.cameraControls.state(for: id.rawValue).connected)
+      }
       camera.sinkFailure = running ? update?.cameraConnectError : nil
       camera.canRemove = model.canRemoveCamera(id)
       camera.unexpectedStop = model.unexpectedStops[id].map(Self.unexpectedStop)
@@ -160,6 +176,8 @@ struct UISessionBridge {
       camera.programColorSpaceID = descriptor.programColorSpaceID
       camera.recordingConstantFrameRate = descriptor.recordingConstantFrameRate
       camera.sourceFrameRate = update?.sourceFormat?.rate
+      camera.sourceFormat = update?.sourceFormat
+      camera.signalDropouts = Int(clamping: update?.signalDropouts ?? 0)
       camera.sourcePixel = update?.sourceFormat.map { FormatDisplayIdentity($0).sampling }
       camera.previewEnabled = descriptor.previewEnabled
       camera.automaticStart = descriptor.automaticFeed
@@ -170,6 +188,7 @@ struct UISessionBridge {
       camera.cutBlockedFor = model.cutBlockedFor(id)
       let monitor = model.monitorCoordinator.preferences(for: MonitorTargetID(id.rawValue))
       camera.activeTools = UIMonitorBridge.activeTools(monitor)
+      camera.clipIndicators = UIMonitorBridge.clipIndicatorsOn(monitor)
       camera.message = update?.message ?? ""
       var rec = UICameraRecording()
       switch state?.status ?? .idle {
@@ -179,6 +198,8 @@ struct UISessionBridge {
       case .finishing: rec.status = .finishing
       }
       rec.note = stats?.warning
+      rec.takeCodec = state?.takeCodec
+      rec.takeFallbackFrom = state?.takeFallbackFrom
       // Once someone has seen an early take, its strip goes back to the take's result.
       let acknowledged = model.acknowledgedTakes.contains(id)
       rec.failed = !acknowledged && stats?.failed == true
@@ -221,7 +242,7 @@ struct UISessionBridge {
     session.appProblems = model.appProblems
     session.offerAlerts = interface.offerAlerts
     session.recentCuts = model.recentCuts
-    session.codecTitle = recording.codec.title
+    session.codec = recording.codec
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
     session.defaultFolderPath = recording.outputFolder?.path
     session.drives = drives
@@ -229,6 +250,8 @@ struct UISessionBridge {
     session.interruptedTakes = recording.interruptedRecordings.map { UIInterruptedTake(id: $0.id.path, title: $0.title) }
     session.recoveringID = recording.recoveringID?.path
     session.recoveryMessage = recording.recoveryMessage
+    session.recoveredURL = recording.recoveredURL
+    session.interruptedTakesOpen = interface.interruptedTakesOpen
     session.install = UIInstallState(canRequestChanges: model.installer.canRequestChanges, pending: model.installer.pending,
       status: model.installer.status, unavailableReason: model.installer.unavailableReason,
       installed: UIExtensionDetector.isInstalled())
@@ -238,6 +261,9 @@ struct UISessionBridge {
     session.sidebarVisible = interface.sidebarVisible
     session.inspectorOpen = interface.inspectorOpen
     session.renamingCameraID = interface.renamingCameraID
+    session.virtualCamerasCollapsed = interface.virtualCamerasCollapsed
+    session.narrowWindow = interface.narrowWindow
+    session.askBeforeEnding = interface.askBeforeEnding
     return session
   }
 
@@ -288,31 +314,35 @@ struct UISessionBridge {
       perform(action)
       return
     }
-    // Ask in the window in front: the main window shows its own dialog, any
-    // other key window (Settings, Diagnostics) gets a sheet, and without a key
-    // window (menus while the app is in the background, the menu bar item) a
-    // standard alert.
-    let key = NSApplication.shared.keyWindow
-    if interface.alertsDisabled || key?.identifier?.rawValue.hasPrefix("main") == true {
+    if interface.alertsDisabled {
       interface.confirmation = (message, action)
       return
     }
-    let alert = NSAlert()
-    alert.messageText = action.confirmationTitle(in: presentation)
-    alert.informativeText = message
-    alert.alertStyle = .warning
-    alert.addButton(withTitle: UISessionBridge.confirmTitle(for: action)).hasDestructiveAction = true
-    alert.addButton(withTitle: "Cancel")
-    if let key, key.isVisible, key.attachedSheet == nil {
+    // Ask in the window in front as a sheet; without a key window (menus while the app is
+    // in the background, the menu bar item) as a standard alert.
+    let alert = Self.confirmationAlert(for: action, message: message, in: presentation)
+    if let key = NSApplication.shared.keyWindow, key.isVisible, key.attachedSheet == nil {
       let bridge = self
       alert.beginSheetModal(for: key) { response in
-        if response == .alertFirstButtonReturn { bridge.perform(action) }
+        if response == .alertSecondButtonReturn { bridge.perform(action) }
       }
       return
     }
     NSApplication.shared.activate(ignoringOtherApps: true)
-    guard alert.runModal() == .alertFirstButtonReturn else { return }
+    guard alert.runModal() == .alertSecondButtonReturn else { return }
     perform(action)
+  }
+
+  /// Cancel first, because the first button is the default: Return never ends a take. The
+  /// verb names what it does. Every question in the app comes through here.
+  static func confirmationAlert(for action: UIAction, message: String, in presentation: UISessionPresentation) -> NSAlert {
+    let alert = NSAlert()
+    alert.messageText = action.confirmationTitle(in: presentation)
+    alert.informativeText = message
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: action.confirmationButtonTitle(in: presentation))
+    return alert
   }
 
   func perform(_ action: UIAction) {
@@ -360,6 +390,7 @@ struct UISessionBridge {
         }
       }
     case .setSyncCameras(let enabled): model.setSyncCameras(enabled)
+    case .setCodec(let codec): recording.codec = codec
     case .setScalingMode(let id, let mode): model.updateCamera(feedID(id)) { $0.scalingMode = mode }
     case .setResizeTarget(let id, let target): model.updateCamera(feedID(id)) { $0.resizeTarget = target; $0.downscale = true }
     case .setColorTarget(let id, let target): model.updateCamera(feedID(id)) { $0.colorTarget = target; $0.convertTo420 = true }
@@ -431,7 +462,11 @@ struct UISessionBridge {
       case .paused: recording.resume(feedID: fid)
       default: break
       }
-    case .recordAll: recording.recordAll()
+    case .recordAll:
+      // What the control counted: a camera that can't roll yet stays out of it.
+      for camera in presentation().cameras where camera.recordButtonEnabled && !camera.recordButtonActive {
+        recording.record(feedID: feedID(camera.id))
+      }
     case .stopAllRecordings: recording.stopAll()
     case .pauseAll: recording.pauseAll()
     case .resumeAll:
@@ -446,10 +481,20 @@ struct UISessionBridge {
         NSWorkspace.shared.open(folder)
       }
     case .recover(let id): if let take = recording.interruptedRecordings.first(where: { $0.id.path == id }) { recording.recover(take) }
+    case .showInterruptedTakes: interface.interruptedTakesOpen = true
+    case .hideInterruptedTakes: interface.interruptedTakesOpen = false
     case .toggleTool(let id, let tool):
       let gamut = model.descriptor(for: feedID(id))?.gamut ?? FeedDescriptor().gamut
       UIMonitorBridge.toggle(tool, for: id, coordinator: model.monitorCoordinator,
         defaultSourceProfile: model.descriptor(for: feedID(id))?.monitor.signal.logProfileID ?? UIMonitorBridge.sourceProfile(forGamut: gamut))
+    case .toggleClipIndicators(let id):
+      let target = MonitorTargetID(id)
+      model.monitorCoordinator.setPreferences(UIMonitorBridge.toggledClipIndicators(in: model.monitorCoordinator.preferences(for: target)), for: target)
+    case .hideAllTools(let id):
+      let target = MonitorTargetID(id)
+      var preferences = model.monitorCoordinator.preferences(for: target)
+      preferences.hideAllTools()
+      model.monitorCoordinator.setPreferences(preferences, for: target)
     case .detachMonitor(let id):
       MonitorDetachedWindows.open(coordinator: model.monitorCoordinator, target: MonitorTargetID(id), cameraControls: model.cameraControls)
     case .freeze, .toggleClean: UIMonitorBridge.perform(action, coordinator: model.monitorCoordinator)
@@ -461,6 +506,12 @@ struct UISessionBridge {
     case .removeCameraExtension: model.installer.uninstall()
     case .openSettings: openSettings()
     case .openDiagnostics: openWindow("diagnostics")
+    case .openExtensionApproval:
+      if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+        NSWorkspace.shared.open(url)
+      }
+    case .setVirtualCamerasCollapsed(let collapsed): interface.virtualCamerasCollapsed = collapsed
+    case .setNarrowWindow(let narrow): if interface.narrowWindow != narrow { interface.narrowWindow = narrow }
     case .turnOnAlerts: interface.turnOnAlerts?()
     case .dismissAlertsPrompt: interface.dismissAlertsPrompt?()
     case .openMainWindow:
@@ -471,11 +522,6 @@ struct UISessionBridge {
       NSApplication.shared.terminate(nil)
     }
   }
-}
-
-extension UISessionBridge {
-  /// The destructive button of a confirmation, shared by every place that asks.
-  static func confirmTitle(for action: UIAction) -> String { action.confirmationButtonTitle }
 }
 
 enum UIStrategy {

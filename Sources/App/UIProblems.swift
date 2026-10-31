@@ -40,7 +40,13 @@ struct UIProblem: Sendable, Equatable, Identifiable {
   /// What the strip says to do, in place of its folder row. Nil when the record row or
   /// nothing on the strip carries it.
   var stripText: String?
+  /// The same in a collapsed strip's state slot: "Check HDMI".
+  var stripShort: String?
   var alert: UIProblemAlert?
+  /// A leading symbol other than the warning triangle, for a row where nothing's wrong yet.
+  var symbol: String? = nil
+  /// You're looking at the picture for this one, so Attention leaves its big Cut to it.
+  var attentionOmitsAction = false
   /// Lower is worse. Internal to the ordering.
   fileprivate var rank = 0
 }
@@ -48,6 +54,8 @@ struct UIProblem: Sendable, Equatable, Identifiable {
 /// A camera's worst problem as its strip shows it.
 struct UIStripProblem: Sendable, Equatable {
   var text: String
+  /// The collapsed strip's words.
+  var short: String
   var level: UIProblemLevel
   var action: UIProblemAction?
   /// More than one: the row says how many, and its words open the list.
@@ -148,8 +156,20 @@ extension UIPresentationBuilder {
   static func stripProblem(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> UIStripProblem? {
     let own = cameraProblems(camera, in: session).filter { $0.stripText != nil }
       .sorted { $0.rank < $1.rank }
-    guard let worst = own.first, let text = worst.stripText else { return nil }
-    return UIStripProblem(text: text, level: worst.level, action: worst.action, count: own.count)
+    guard let worst = own.first, let text = worst.stripText else { return stoppedInputProblem(camera) }
+    return UIStripProblem(text: text, short: worst.stripShort ?? text, level: worst.level, action: worst.action, count: own.count)
+  }
+
+  /// A stopped camera that can't start says why on its strip. Nothing's happening to it yet,
+  /// so it isn't one of the session's problems.
+  private static func stoppedInputProblem(_ camera: UICameraSnapshot) -> UIStripProblem? {
+    guard !camera.running, !camera.deviceAvailable else { return nil }
+    if let input = camera.inputName {
+      return UIStripProblem(text: "Reconnect \(input)", short: "Disconnected", level: .notice,
+        action: UIProblemAction(title: "Refresh Inputs", action: .refreshInputs), count: 1)
+    }
+    return UIStripProblem(text: "Choose this camera's input", short: "No input", level: .notice,
+      action: UIProblemAction(title: "Show Inspector", action: .showInspector(cameraID: camera.id)), count: 1)
   }
 
   private static func cameraProblems(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> [UIProblem] {
@@ -186,22 +206,22 @@ extension UIPresentationBuilder {
 
     if camera.queueStalled {
       list.append(UIProblem(id: "stall.\(id)", title: "\(name): the meeting app has stopped taking video",
-        detail: "Queue full for 2 s.", level: .damage, cameraID: id,
+        level: .damage, cameraID: id,
         action: UIProblemAction(title: "Restart Camera", action: .restartCamera(cameraID: id)),
-        stripText: "The meeting app has stopped taking video", rank: 70))
+        stripText: "The meeting app has stopped taking video", stripShort: "App stalled", rank: 70))
     }
     if camera.clientWaiting {
-      list.append(UIProblem(id: "waiting.\(id)", title: "A camera app is waiting for \(name)",
+      list.append(UIProblem(id: "waiting.\(id)", title: "A meeting app is waiting for \(name)",
         detail: camera.sinkFailure.map { connectFailureDetail($0, in: session) } ?? "It's connected, but no frames are reaching it.",
         level: .damage, cameraID: id,
         action: camera.running ? UIProblemAction(title: "Restart Camera", action: .restartCamera(cameraID: id))
           : UIProblemAction(title: "Start", action: .startCamera(cameraID: id)),
-        stripText: "A camera app is waiting for frames", rank: 80))
+        stripText: "A meeting app is waiting for frames", stripShort: "App waiting", rank: 80))
     } else if let failure = camera.sinkFailure, camera.clientUnknown {
       // Whether anyone is waiting can't be read, which is itself what's wrong: with a
       // known empty route this stays quiet.
       list.append(UIProblem(id: "sink.\(id)", title: "\(name) isn't reaching meeting apps", detail: connectFailureDetail(failure, in: session),
-        level: .notice, cameraID: id, action: details, stripText: "Virtual camera unavailable", rank: 130))
+        level: .notice, cameraID: id, action: details, stripText: "Virtual camera unavailable", stripShort: "Unavailable", rank: 130))
     }
 
     if camera.running {
@@ -214,26 +234,26 @@ extension UIPresentationBuilder {
         let action = !auto ? next.map { UIProblemAction(title: "Cut to \($0.name)", action: .cut(cameraID: $0.id)) } : nil
         list.append(UIProblem(id: "onair.\(id)", title: lost.isEmpty ? "\(name) on air: no signal" : "\(name) signal lost\(lost)",
           detail: takeCountdown(camera) ?? "Still on Program", level: .damage, cameraID: id, action: action ?? details,
-          stripText: "Check \(name)'s HDMI",
+          stripText: "Check \(name)'s HDMI", stripShort: "Check HDMI",
           alert: UIProblemAlert(key: "onair.\(name)", event: .onAirLost, title: "\(name) signal lost",
-            body: others ? "Still on Program" : "No camera has a picture", showsPanel: true), rank: 10))
+            body: others ? "Still on Program" : "No camera has a picture", showsPanel: true), attentionOmitsAction: action != nil, rank: 10))
       case .noSignal where rolling:
         list.append(UIProblem(id: "signal.\(id)", title: lost.isEmpty ? "\(name): recording, no signal" : "\(name) signal lost\(lost)",
           detail: takeCountdown(camera), level: .damage, cameraID: id, action: details,
-          stripText: "Check \(name)'s HDMI",
+          stripText: "Check \(name)'s HDMI", stripShort: "Check HDMI",
           alert: UIProblemAlert(event: .recordingNoSignal, title: "\(name) recording, no signal", body: "The take ends if the signal stays off"), rank: 20))
       case .noSignal:
         list.append(UIProblem(id: "signal.\(id)", title: lost.isEmpty ? "\(name): no signal" : "\(name) signal lost\(lost)",
-          level: .notice, cameraID: id, action: details, stripText: "Check \(name)'s HDMI", rank: 150))
+          level: .notice, cameraID: id, action: details, stripText: "Check \(name)'s HDMI", stripShort: "Check HDMI", rank: 150))
       case .unsupported:
         list.append(UIProblem(id: "signal.\(id)", title: onAirHere && session.programInUse ? "\(name) on air: unsupported format" : "\(name): unsupported format",
           level: onAirHere && session.programInUse ? .damage : .notice, cameraID: id, action: details,
-          stripText: "Choose a supported source format", rank: onAirHere && session.programInUse ? 11 : 150))
+          stripText: "Choose a supported source format", stripShort: "Unsupported", rank: onAirHere && session.programInUse ? 11 : 150))
       case .deviceMissing:
         list.append(UIProblem(id: "signal.\(id)", title: onAirHere && session.programInUse ? "\(name) on air: input disconnected" : "\(name): input disconnected",
           level: onAirHere && session.programInUse ? .damage : .notice, cameraID: id,
           action: UIProblemAction(title: "Refresh Inputs", action: .refreshInputs),
-          stripText: "Reconnect \(camera.inputName ?? "the input")", rank: onAirHere && session.programInUse ? 11 : 150))
+          stripText: "Reconnect \(camera.inputName ?? "the input")", stripShort: "Disconnected", rank: onAirHere && session.programInUse ? 11 : 150))
       case .none, .connecting, .live:
         break
       }
@@ -249,14 +269,20 @@ extension UIPresentationBuilder {
     if camera.automaticStartFailed {
       list.append(UIProblem(id: "start.\(id)", title: "\(name): couldn't start", detail: camera.automaticStatus,
         level: .notice, cameraID: id,
-        action: UIProblemAction(title: "Retry", action: .retryAutomaticStart(cameraID: id)),
-        stripText: "Couldn't start \(name)", rank: 8))
+        action: UIProblemAction(title: "Retry", action: .retryAutomaticStart(cameraID: id)), rank: 8))
     }
     if let error = camera.lutError {
       list.append(UIProblem(id: "lut.\(id)", title: "\(name): LUT unavailable", detail: error,
         level: .notice, cameraID: id,
         action: UIProblemAction(title: "Locate…", action: .chooseLUT(cameraID: id)),
-        stripText: "LUT unavailable", rank: 170))
+        stripText: "LUT unavailable", stripShort: "LUT missing", rank: 170))
+    }
+    let format = format(of: camera, in: session)
+    if let fallback = format.fallback {
+      let rate = UIFormat.bitrate(estimateMegabits(format.actual, camera))
+      let left = camera.recording.secondsLeft.map { ", \(UIFormat.duration($0)) left" } ?? ""
+      list.append(UIProblem(id: "format.\(id)", title: fallback, detail: "\(name) records ~\(rate)\(left).",
+        level: .notice, cameraID: id, action: details, rank: 160))
     }
     return list
   }
@@ -280,7 +306,6 @@ extension UIPresentationBuilder {
     func recordsTo(_ drive: UIDrive) -> Bool {
       session.cameras.contains { isRolling($0) && UIPresentationBuilder.drive(for: $0, in: session)?.id == drive.id }
     }
-    let rollingAnywhere = session.cameras.contains(where: isRolling)
 
     // Program has nothing to show. Not while something is still starting for the meeting.
     if session.programInUse, !session.cameras.contains(where: isLive),
@@ -305,23 +330,24 @@ extension UIPresentationBuilder {
 
     // A drive with nothing free has no time left at all, so the check below never sees it.
     for drive in session.drives where isFull(drive) {
-      list.append(UIProblem(id: "drive.\(drive.id)", title: "\(drive.name): no space left",
+      list.append(UIProblem(id: "drive.\(drive.id)", title: "\(drive.name) is full", detail: "No space left.",
         level: recordsTo(drive) ? .damage : .notice,
-        action: UIProblemAction(title: rollingAnywhere ? "Folder for Next Take…" : "Change…", action: .chooseRecordingFolder(cameraID: nil)),
+        action: UIProblemAction(title: folderAction(session), action: .chooseRecordingFolder(cameraID: nil)),
         alert: UIProblemAlert(event: .driveLow, title: "Recording drive full", body: "No space left"), rank: 90))
     }
     for drive in session.drives {
       guard !isFull(drive), let left = drive.secondsLeft, left < lowDriveSeconds else { continue }
-      list.append(UIProblem(id: "drive.\(drive.id)", title: "\(drive.name): \(UIFormat.duration(left)) left",
+      // The time stays on the drive row and in the status bar.
+      list.append(UIProblem(id: "drive.\(drive.id)", title: "\(drive.name) is low",
         detail: driveUsers(drive, in: session), level: recordsTo(drive) ? .damage : .notice,
-        action: UIProblemAction(title: rollingAnywhere ? "Folder for Next Take…" : "Change…", action: .chooseRecordingFolder(cameraID: nil)),
+        action: UIProblemAction(title: folderAction(session), action: .chooseRecordingFolder(cameraID: nil)),
         alert: UIProblemAlert(event: .driveLow, title: "Recording drive low", body: "\(UIFormat.duration(left)) left"), rank: 95))
     }
 
     // Cuts land on Program, and a meeting on a camera's own device won't see them.
     if session.cutsMissClient, !session.programInUse, let iso = session.cameras.first(where: \.inUse) {
-      list.append(UIProblem(id: "program.cuts", title: "Cuts aren't reaching a meeting app",
-        detail: "It's using \(iso.name), not Program.", level: .notice, action: details, rank: 110))
+      list.append(UIProblem(id: "program.cuts", title: "Meeting app is on \(iso.name), not Program",
+        detail: "Cuts aren't reaching it. Choose Program in that app.", level: .notice, action: details, rank: 110))
     }
     if session.unusedTake {
       let rolling = session.cameras.filter(isRolling).count
@@ -333,6 +359,17 @@ extension UIPresentationBuilder {
     // so they are not a problem. A cut that did not land or dropped Program frames are.
     if let issue = session.programIssue {
       list.append(UIProblem(id: "program.issue", title: issue, level: .notice, action: details, rank: 180))
+    }
+    // Said once, here: every row that needs a folder points at this one.
+    if session.defaultFolderPath == nil, session.cameras.contains(where: { $0.recording.folderPath == nil }) {
+      list.append(UIProblem(id: "folder.none", title: "No folder", detail: "Choose where takes are saved.", level: .notice,
+        action: UIProblemAction(title: "Choose Folder…", action: .chooseRecordingFolder(cameraID: nil)), rank: 140))
+    }
+    if !session.interruptedTakes.isEmpty {
+      let count = session.interruptedTakes.count
+      list.append(UIProblem(id: "takes.interrupted", title: count == 1 ? "1 interrupted take" : "\(count) interrupted takes",
+        detail: session.recoveryMessage, level: .notice,
+        action: UIProblemAction(title: "Recover", action: .showInterruptedTakes), rank: 145))
     }
     for message in session.appProblems {
       list.append(UIProblem(id: "app.\(message.id)", title: message.text, level: .notice,
@@ -353,6 +390,74 @@ extension UIPresentationBuilder {
   private static func starting(_ camera: UICameraSnapshot) -> Bool {
     if camera.running { return camera.signal == .none || camera.signal == .connecting }
     return camera.automaticStart && !camera.automaticStartFailed && camera.deviceAvailable
+  }
+
+  /// Attention's rows where nothing has gone wrong yet: the camera extension, in the states
+  /// that need a click. Each keeps its noun as its symbol.
+  static func setupRows(_ session: UISessionSnapshot) -> [UIProblem] {
+    guard let banner = UIExtensionBanner.state(session.install) else { return [] }
+    switch banner {
+    case .unavailable(let reason):
+      return [UIProblem(id: "extension.unavailable", title: "Camera needs a signed build", detail: reason, level: .notice,
+        symbol: UISymbol.information)]
+    case .pending(let status):
+      return [UIProblem(id: "extension.pending", title: status, level: .notice, symbol: UISymbol.updating)]
+    case .notInstalled:
+      return [UIProblem(id: "extension.install", title: "Install the Ultracam camera",
+        detail: "Install the Ultracam camera to use it in your meeting app. macOS asks you to approve it in System Settings.", level: .notice,
+        action: UIProblemAction(title: "Install Camera Extension…", action: .installCameraExtension), symbol: UISymbol.installExtension)]
+    case .needsRestart:
+      return [UIProblem(id: "extension.restart", title: "Finish installing the camera", detail: "Restart your Mac to start the Ultracam camera.",
+        level: .notice, symbol: UISymbol.restartNeeded)]
+    case .outdated(let installed, let bundled):
+      return [UIProblem(id: "extension.update", title: "Update the Ultracam camera",
+        detail: "Version \(installed) is installed; this app has \(bundled).", level: .notice,
+        action: UIProblemAction(title: "Update Camera Extension…", action: .installCameraExtension), symbol: UISymbol.updateExtension)]
+    case .needsApproval(let status):
+      return [UIProblem(id: "extension.approve", title: "Approve the Ultracam camera", detail: status, level: .notice,
+        action: UIProblemAction(title: "Open System Settings", action: .openExtensionApproval))]
+    }
+  }
+
+  /// One camera's rate for `codec` from its real size, frame rate and channels. Before a
+  /// format is known it's the UHD 59.94 estimate the drive rows use.
+  static func estimateMegabits(_ codec: RecordingCodec, _ camera: UICameraSnapshot) -> Double {
+    let channels = camera.audioChannels > 0 ? camera.audioChannels : 2
+    guard let source = camera.sourceFormat else { return UIRecordingLibrary.displayMegabits(codec: codec, audioChannels: channels) }
+    return UIRecordingLibrary.displayMegabits(codec: codec, width: source.width, height: source.height,
+      frameDuration: source.rate.nominal, audioChannels: channels)
+  }
+
+  /// The Format menus' rows. Each shows its rate per camera and the time left: the shortest
+  /// across the drives in use, counting every camera assigned to each. A codec no current
+  /// source can use is off and says what it needs.
+  static func formatChoices(_ session: UISessionSnapshot) -> [UIFormatChoice] {
+    let order: [RecordingCodec] = [.hevcMain10_422, .hevcMain10, .hevcMain, .proResLT, .proRes422, .proRes42210Bit, .proRes4444]
+    let sources = session.cameras.compactMap(\.sourceFormat)
+    let widest = session.cameras.max { ($0.sourceFormat?.width ?? 0) < ($1.sourceFormat?.width ?? 0) }
+    return order.map { codec in
+      let usable = sources.isEmpty || sources.contains(where: codec.isAvailable)
+      var left: TimeInterval?
+      for drive in session.drives where drive.totalBytes > 0 {
+        let assigned = session.cameras.filter { UIPresentationBuilder.drive(for: $0, in: session)?.id == drive.id }
+        let rate = assigned.reduce(0) { $0 + estimateMegabits(codec.resolved(for: $1.sourceFormat), $1) }
+        guard rate > 0 else { continue }
+        let seconds = Double(drive.availableBytes) * 8 / (rate * 1_000_000)
+        left = min(left ?? seconds, seconds)
+      }
+      return UIFormatChoice(codec: codec, title: codec.title, selected: codec == session.codec,
+        rate: usable ? widest.map { "~\(UIFormat.bitrate(estimateMegabits(codec, $0)))" } : nil,
+        left: usable ? left.map { "\(UIFormat.duration($0)) left" } : nil,
+        reason: usable ? nil : formatNeeds(codec))
+    }
+  }
+
+  private static func formatNeeds(_ codec: RecordingCodec) -> String {
+    switch codec {
+    case .proRes4444: return "Needs an RGB source"
+    case .hevcMain, .hevcMain10: return "Needs a 4:2:0 source"
+    case .proResLT, .proRes422, .proRes42210Bit, .hevcMain10_422: return "Needs a 4:2:2 source"
+    }
   }
 
   /// Under half an hour left counts as low.

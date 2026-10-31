@@ -61,6 +61,23 @@ import XCTest
     XCTAssertEqual(coordinator.selectedFeedID, c)
   }
 
+  func testHoldStopsFixedIntervalCutsAndRestartsTheIntervalOnRelease() {
+    let a = feed("A")
+    let b = feed("B")
+    var settings = SwitcherSettings(selectedFeedID: a, automatic: true,
+      intervalSeconds: 2, strategy: .fixedInterval)
+    settings.naturalTalkingHead.manualHold = true
+    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b])
+    XCTAssertEqual(coordinator.evaluate(at: time(0)), .idle)
+    XCTAssertEqual(coordinator.evaluate(at: time(5)), .idle, "Hold makes no cuts on Fixed interval either")
+    XCTAssertNil(coordinator.pendingCut)
+    settings.naturalTalkingHead.manualHold = false
+    coordinator.updateSettings(settings)
+    XCTAssertEqual(coordinator.evaluate(at: time(6)), .idle, "The interval starts again from release")
+    XCTAssertEqual(coordinator.evaluate(at: time(7.9)), .idle)
+    XCTAssertEqual(coordinator.evaluate(at: time(8)), .cutQueued(b))
+  }
+
   func testDynamicAnalysisIsAnExplicitDisabledStub() {
     let a = feed("A")
     let settings = SwitcherSettings(selectedFeedID: a, automatic: true,

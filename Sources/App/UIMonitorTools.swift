@@ -27,9 +27,11 @@ enum UIMonitorPanel: Hashable {
   }
 }
 
-/// Split-button monitor tools for one camera: the icon toggles the tool, the
-/// chevron opens that tool's settings. The last button opens the picture's
-/// settings. Settings are remembered per camera.
+/// Monitor tools for one picture. At rest: the tools button and every enabled tool, white
+/// glyphs on the dark capsule with no fill, so an enabled tool stays readable without being
+/// the brightest thing on the picture, and one click turns it off. On hover: the full bar of
+/// split buttons, the icon toggling the tool and the chevron opening its settings, enabled
+/// tools filled white. Settings are remembered per camera.
 struct UIMonitorToolButtons: View {
   let targetID: String
   let name: String
@@ -38,12 +40,19 @@ struct UIMonitorToolButtons: View {
   let isProgram: Bool
   let toggle: @MainActor (UIMonitorTool) -> Void
   let monitor: any UIMonitorSettingsProviding
+  /// The pointer is over the picture: the full bar.
+  var expanded = false
+
+  /// A picture narrower than this can't hold the bar beside its name, so the bar takes its
+  /// own row under it, right aligned.
+  static let ownRowBelow: CGFloat = 560
   @State private var openPanel: UIMonitorPanel?
   /// The popover opened from the collapsed menu's Settings items.
   @State private var menuPanel: UIMonitorPanel?
 
   /// A camera's tools; toggles go through the interface's actions.
-  init(camera: UICameraPresentation, context: UIContext) {
+  init(camera: UICameraPresentation, context: UIContext, expanded: Bool = false) {
+    self.expanded = expanded
     targetID = camera.id
     name = camera.name
     activeTools = camera.activeTools
@@ -56,7 +65,8 @@ struct UIMonitorToolButtons: View {
 
   /// Any monitor target, for example "program".
   init(targetID: String, name: String, activeTools: [UIMonitorTool], isProgram: Bool,
-    toggle: @escaping @MainActor (UIMonitorTool) -> Void, monitor: any UIMonitorSettingsProviding) {
+    toggle: @escaping @MainActor (UIMonitorTool) -> Void, monitor: any UIMonitorSettingsProviding, expanded: Bool = false) {
+    self.expanded = expanded
     self.targetID = targetID
     self.name = name
     self.activeTools = activeTools
@@ -79,11 +89,33 @@ struct UIMonitorToolButtons: View {
   }
 
   var body: some View {
-    // A narrow picture (Four Up, a small window) gets one menu button instead of the full bar.
-    ViewThatFits(in: .horizontal) {
-      bar
+    // A popover open from the bar keeps the bar, so it doesn't collapse under its own popover.
+    if expanded || openPanel != nil { bar } else { rest }
+  }
+
+  /// The tools button, then each enabled tool as a glyph that turns it off.
+  private var rest: some View {
+    HStack(spacing: 2) {
+      ForEach(activeTools, id: \.self) { tool in
+        restGlyph(UIMonitorPanel.tool(tool)) { toggle(tool) }
+      }
+      if clipOn { restGlyph(.clipIndicators, action: toggleClip) }
       menu
     }
+    .uiPictureControls()
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("Monitor tools for \(name)")
+  }
+
+  private func restGlyph(_ panel: UIMonitorPanel, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      Image(systemName: panel.symbol).font(.callout.weight(.medium))
+        .frame(width: 24, height: 24).foregroundStyle(.white).contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help("\(panel.title) is on. Click to turn it off.")
+    .accessibilityLabel(panel.title)
+    .accessibilityValue("On")
   }
 
   private var menu: some View {
@@ -112,7 +144,6 @@ struct UIMonitorToolButtons: View {
     .buttonStyle(.plain)
     .menuIndicator(.hidden)
     .fixedSize()
-    .uiPictureControls()
     .help(activeTitles.isEmpty ? "Monitor tools" : "Monitor tools: " + activeTitles.joined(separator: ", "))
     .accessibilityLabel("Monitor tools for \(name)")
     .popover(isPresented: Binding(get: { menuPanel != nil }, set: { if !$0 { menuPanel = nil } }),
@@ -166,8 +197,8 @@ private struct UIMonitorToolSplitButton: View {
         Image(systemName: panel.symbol)
           .font(.callout.weight(.medium))
           .frame(width: 24, height: 24)
-          .foregroundStyle(.white)
-          .background(isOn ? Color.white.opacity(0.24) : .clear, in: RoundedRectangle(cornerRadius: 6))
+          .foregroundStyle(isOn ? Color.black : .white)
+          .background(isOn ? Color.white.opacity(0.9) : .clear, in: RoundedRectangle(cornerRadius: 6))
           .contentShape(Rectangle())
       }
       .buttonStyle(.plain)
@@ -203,9 +234,10 @@ private struct UIMonitorPictureButton: View {
     Button(action: open) {
       Image(systemName: UIMonitorPanel.picture.symbol)
         .font(.callout.weight(.medium))
+        .symbolRenderingMode(.monochrome)
         .frame(width: 24, height: 24)
-        .foregroundStyle(.white)
-        .background(isAdjusted ? Color.white.opacity(0.24) : .clear, in: RoundedRectangle(cornerRadius: 6))
+        .foregroundStyle(isAdjusted ? Color.black : .white)
+        .background(isAdjusted ? Color.white.opacity(0.9) : .clear, in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
@@ -368,7 +400,8 @@ struct UIMonitorToolSettingsView: View {
       UIScopeSettingsForm(preferences: $preferences, isProgram: isProgram,
         measurement: provider.scopeMeasurement(for: cameraID))
     case .clipIndicators: UIClipIndicatorSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
-    case .picture: UIPictureSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
+    case .picture: UIPictureSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram,
+      cameraName: cameraName, provider: provider)
     }
   }
 }

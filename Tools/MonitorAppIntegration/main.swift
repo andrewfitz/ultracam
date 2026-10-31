@@ -87,7 +87,7 @@ import XCTest
         "The real removeFeed path must immediately retire the old chooser option")
       XCTAssertEqual(demand, [retainedTarget])
       XCTAssertFalse(removedSink.hasConsumers)
-      XCTAssertEqual(removedPresenter.status, "Missing feed")
+      XCTAssertEqual(removedPresenter.status, "Missing camera")
       XCTAssertEqual(coordinator.workspace.tileBindings[0], removedTarget.rawValue,
         "A removed feed remains visibly missing instead of silently rebinding")
       let persisted = settings.loadSnapshot()
@@ -101,7 +101,7 @@ import XCTest
       do {
         // Selected or not, a removed camera's late stop changes nothing.
         removedUpdate(CaptureUpdate(message: "Late stop from removed feed", stopped: true))
-        XCTAssertEqual(removedPresenter.status, "Missing feed",
+        XCTAssertEqual(removedPresenter.status, "Missing camera",
           "A queued stop from a removed controller must not overwrite the missing target")
         XCTAssertEqual(demand, [retainedTarget])
         XCTAssertEqual(coordinator.targets.map(\.id), [retainedTarget])
@@ -296,7 +296,7 @@ import XCTest
     detached.contentView?.layoutSubtreeIfNeeded()
     XCTAssertGreaterThan(try XCTUnwrap(detached.contentView).fittingSize.height, 100,
       "An empty detached monitor must retain its chooser and visible empty-state picture")
-    XCTAssertEqual(detached.title, "Monitor · Choose a feed")
+    XCTAssertEqual(detached.title, "Monitor · Choose a camera")
 
     owner.target = betaTarget
 

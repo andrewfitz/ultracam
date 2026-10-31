@@ -83,10 +83,6 @@ struct UIContext {
   var send: @MainActor (UIAction) -> Void
   var pictures: any UIPictureProviding
   var monitor: any UIMonitorSettingsProviding
-  /// A confirmation waiting for an answer (Stop Camera while recording, …).
-  var confirmation: (message: String, action: UIAction)? = nil
-  var confirm: @MainActor () -> Void = {}
-  var cancelConfirmation: @MainActor () -> Void = {}
   /// Rebuilds the context from the live models. Views hosted in their own column
   /// (inspector, sidebar) call this inside `body` so Observation tracks the models
   /// there too. Fixtures leave it nil.
@@ -178,6 +174,7 @@ enum UIFixtures {
     camera.inputID = inputs[(index - 1) % inputs.count].id
     camera.running = true
     camera.signal = signal
+    if case .live(let format) = signal { camera.sourceFormat = sourceFormat(format) }
     camera.outputFormat = "1080p 29.97"
     camera.inUse = inUse
     camera.sinkConnected = inUse
@@ -201,8 +198,15 @@ enum UIFixtures {
     return camera
   }
 
+  /// A 10-bit 4:2:2 source, as this rig's cameras send.
+  private static func sourceFormat(_ label: String) -> SourceFormat? {
+    let duration = label.hasSuffix("59.94") ? VideoContract.fastDuration : VideoContract.slowDuration
+    return try? SourceFormat(width: 3840, height: 2160, pixel: .v210, rate: .constant(duration))
+  }
+
   static func baseSession() -> UISessionSnapshot {
     var session = UISessionSnapshot()
+    session.codec = .hevcMain10_422
     session.drives = [UIDrive(name: "8TB", availableBytes: 595_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 6720),
       UIDrive(name: "Archive", availableBytes: 3_000_000_000_000, totalBytes: 4_000_000_000_000, secondsLeft: 20400)]
     session.recentTakes = [UITake(url: URL(fileURLWithPath: "/Volumes/8TB/Takes/Camera 1/Camera 1_2026-10-21_08-02-11_001.mov"),

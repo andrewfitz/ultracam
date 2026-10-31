@@ -11,6 +11,9 @@ struct UIPictureSettingsForm: View {
   @Binding var preferences: MonitorFeedPreferences
   let cameraID: String
   let isProgram: Bool
+  var cameraName = ""
+  /// For the camera's monitor-only LUT, which lives here with the picture it changes.
+  var provider: (any UIMonitorSettingsProviding)? = nil
 
   /// The PQ mastering peaks offered for HDR transforms, in cd/m².
   static let pqPeaks: [Double] = [300, 500, 800, 1000, 2000, 4000]
@@ -53,6 +56,11 @@ struct UIPictureSettingsForm: View {
         UIMonitorToolCaption(isProgram
           ? "On Program the picture is Program Output; Source is unavailable."
           : "Output (LUT) is the camera's source with the burn-in LUT, as published. Zebra 1 measures the picture shown.")
+        if let provider, !isProgram {
+          UIMonitorLUTMenu(cameraID: cameraID, cameraName: cameraName, monitor: provider)
+            .fixedSize()
+            .uiToolRow("Monitor LUT")
+        }
         UIMonitorStatusNote(cameraID: cameraID, tools: [.picture, .burnInLUT, .monitorLUT], explainsCodeValues: true)
       }
       UIToolGroup("Display transform") {

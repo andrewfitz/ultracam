@@ -157,12 +157,12 @@ struct AudioTakeSummary: Sendable, Equatable {
   /// Seconds of audio measured.
   var duration: Double
 
-  /// For the take's note: "Audio −23.4 LUFS · max −2.1 dBTP · no overs".
+  /// For the take's note: "Audio −23.4 LUFS, max −2.1 dBTP, no overs".
   var note: String {
     let loudness = integrated.isFinite ? "\(MeterText.level(integrated)) LUFS" : "no programme loudness"
     let peak = maximumTruePeak.isFinite ? "max \(MeterText.level(maximumTruePeak)) dBTP" : "silent"
     let overText = overs == 0 ? "no overs" : overs == 1 ? "1 over" : "\(overs) overs"
-    return "Audio \(loudness) · \(peak) · \(overText)"
+    return "Audio \(loudness), \(peak), \(overText)"
   }
 
   /// Worth a warning: an over, or a true peak at or above −1 dBTP.

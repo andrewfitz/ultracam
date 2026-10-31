@@ -48,11 +48,13 @@ struct UIMainWindowView: View {
         .clipped()
         .inspectorColumnWidth(min: 280, ideal: 320, max: 460)
     }
-    .confirmationDialog(confirmationTitle, isPresented: confirmationBinding, titleVisibility: .visible) {
-      Button(confirmationButton, role: .destructive) { context.confirm() }
-      Button("Cancel", role: .cancel) { context.cancelConfirmation() }
-    } message: {
-      Text(context.confirmation?.message ?? "")
+    // Under 1100 pt the toolbar's cuts keep their digits. Read here, not with ViewThatFits:
+    // a toolbar item has no documented width proposal.
+    .onGeometryChange(for: Bool.self) { $0.size.width < 1100 } action: { context.send(.setNarrowWindow($0)) }
+    // The Interrupted Takes sheet, from Attention's row.
+    .sheet(isPresented: Binding(get: { context.session.interruptedTakesOpen },
+      set: { if !$0 { context.send(.hideInterruptedTakes) } })) {
+      UIInterruptedTakesSheet(context: context.current)
     }
     // The one rename prompt; the strip, inspector and Camera menu only ask for it.
     .uiRenameAlert(context)
@@ -66,7 +68,7 @@ struct UIMainWindowView: View {
     let cameras = context.presentation.cameras
     if cameras.isEmpty {
       ContentUnavailableView {
-        Label("No Cameras", systemImage: "video.slash")
+        Label("No Cameras", systemImage: UISymbol.noCameras)
       } description: {
         Text("Add a camera, then choose its input device.")
       } actions: {
@@ -185,38 +187,6 @@ struct UIMainWindowView: View {
         columns.inspectorOpen = open
         context.send(.setInspectorOpen(open))
       })
-  }
-
-  private var confirmationBinding: Binding<Bool> {
-    Binding(
-      get: { context.confirmation != nil },
-      // Dismissal (Escape, clicking away) clears the pending action after the buttons
-      // have run, so the destructive button never loses its action to the dismissal.
-      set: { presented in
-        guard !presented else { return }
-        let cancel = context.cancelConfirmation
-        DispatchQueue.main.async { cancel() }
-      })
-  }
-
-  private var confirmationTitle: String {
-    switch context.confirmation?.action {
-    case .stopCamera(let id): return "Stop \(context.camera(id)?.name ?? "Camera")?"
-    case .stopAllCameras: return "Stop All Cameras?"
-    case .removeCamera(let id): return "Remove \(context.camera(id)?.name ?? "Camera")?"
-    case .resetAllSettings: return "Reset All Settings?"
-    default: return "Are you sure?"
-    }
-  }
-
-  private var confirmationButton: String {
-    switch context.confirmation?.action {
-    case .stopCamera: return "Stop Camera"
-    case .stopAllCameras: return "Stop All Cameras"
-    case .removeCamera: return "Remove Camera"
-    case .resetAllSettings: return "Reset and Quit"
-    default: return "Continue"
-    }
   }
 }
 

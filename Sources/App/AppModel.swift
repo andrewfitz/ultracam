@@ -442,6 +442,7 @@ final class AppModel {
       self.settingsStore.recordingTimecodeMode = self.recordingModel.timecodeMode
     }
     recordingModel.compatibilityPolicy = sampledRecordingCompatibilityPolicy
+    recordingModel.sourceFormat = { [weak self] id in self?.cameraUpdate(id)?.sourceFormat }
     hardware.setCompatibilityPolicy(sampledRecordingCompatibilityPolicy)
     monitorCoordinator.onConfigurationChange = { [weak self] target, configuration in
       guard let self else { return }

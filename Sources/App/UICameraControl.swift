@@ -7,9 +7,9 @@ struct UICameraControlButton: View {
     var viewFactories: [String: ControlViewFactory] = [:]
     @State private var presented = false
     var body: some View {
-        Button { presented = true } label: { Label("Camera Control", systemImage: "camera.aperture") }
+        Button { presented = true } label: { Label("Camera Control…", systemImage: UISymbol.cameraControl) }
             .help("Assign a control camera to \(name) and change its settings")
-            .accessibilityLabel("Camera settings for \(name)")
+            .accessibilityLabel("Camera Control for \(name)")
             .sheet(isPresented: $presented) { UICameraControlSettings(feedID: feedID, name: name, store: store, viewFactories: viewFactories) }
     }
 }
@@ -100,7 +100,7 @@ struct UICameraControlSettings: View {
     @ViewBuilder private var properties: some View {
         Divider()
         HStack {
-            Toggle("Show camera settings over this feed", isOn: Binding(get: { assignment?.showOverlay ?? false }, set: { store.showOverlay($0, for: feedID) }))
+            Toggle("Show camera settings over this picture", isOn: Binding(get: { assignment?.showOverlay ?? false }, set: { store.showOverlay($0, for: feedID) }))
             Spacer()
             Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh(feedID) } }.disabled(!state.connected || state.busy)
         }
@@ -171,7 +171,7 @@ struct UICameraControlSettings: View {
             if let message = store.discoveryMessages[pluginID] { Text(message).foregroundStyle(.secondary) }
             if let camera = selectedCamera {
                 if store.holder(of: camera.id, pluginID: camera.pluginID, excluding: feedID) != nil {
-                    Text("This camera is assigned to another feed. Unassign it there first.").foregroundStyle(.orange)
+                    Text("This control camera is assigned to another Ultracam camera. Unassign it there first.").foregroundStyle(.orange)
                 } else {
                     if store.hasSavedCredentials(for: camera) {
                         Button("Connect Using Saved Sign-In") { Task { await store.connectUsingSavedCredentials(camera, to: feedID) } }.disabled(state.busy || scanning)

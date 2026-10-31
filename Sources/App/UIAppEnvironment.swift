@@ -7,6 +7,8 @@ import AppKit
   static let model = AppModel()
   static let interface = UIInterfaceState()
   static let alertPreferences = UIAlertPreferences()
+  /// Settings › General's switch binds this.
+  static let backgroundShortcuts = UIBackgroundShortcuts()
   /// SwiftUI's scene actions, for AppKit (the menu bar item, a Dock click). The app's menu
   /// commands set them at launch, before any window opens, and they keep working after
   /// every window has closed.

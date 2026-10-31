@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// The feed badge opens camera-provided output properties and generic settings.
+/// The camera's signal badge: its state, the dropouts since Start when there are any, and a
+/// menu naming both links (capture device and camera body) with the body's output properties.
 struct UIFeedSettingsMenu: View {
     let camera: UICameraPresentation
     let snapshot: UICameraSnapshot?
@@ -11,12 +12,17 @@ struct UIFeedSettingsMenu: View {
         guard let controlStore, controlStore.assignment(for: camera.id) != nil else { return nil }
         return controlStore.state(for: camera.id)
     }
+    private var live: Bool { camera.statusTone == .positive }
     var body: some View {
         Menu {
-            Text(camera.inputName).font(.caption)
-            if let format = snapshot?.outputFormat { Text("Ultracam output · " + format).font(.caption) }
+            Label(camera.inputName, systemImage: UISymbol.input)
+            if let format = snapshot?.outputFormat {
+                Label("Ultracam · \(camera.name)", systemImage: UISymbol.virtualCamera(inUse: camera.outputInUse)).badge(Text(format))
+            }
             Divider()
-            if let controlStore, let state {
+            if let controlStore, let state, let assignment = controlStore.assignment(for: camera.id) {
+                Label(assignment.camera.name, systemImage: UISymbol.cameraBody)
+                    .badge(Text(state.connected ? "Connected" : "Disconnected"))
                 if state.connected {
                     ForEach(state.properties.filter { $0.role == .outputTiming }) { property in
                         if property.writable, !property.options.isEmpty {
@@ -28,24 +34,51 @@ struct UIFeedSettingsMenu: View {
                                 }
                                 ForEach(property.options) { Text($0.localizedLabel()).tag($0.value) }
                             }.disabled(state.busy)
-                        } else { Text("\(property.localizedLabel()) · \(UIControlPresentation.value(property))") }
+                        } else {
+                            Text(property.localizedLabel()).badge(Text(UIControlPresentation.value(property)))
+                        }
                     }
-                } else { Label("Control camera disconnected", systemImage: "wifi.slash") }
-                Button("Open camera settings…") { showingSettings = true }
-            } else { Label("Output timing is controlled by the source", systemImage: "info.circle") }
+                }
+                Divider()
+            } else {
+                Label("Output timing is controlled by the source", systemImage: UISymbol.information)
+            }
+            if controlStore != nil {
+                Button("Camera Control…", systemImage: UISymbol.cameraControl) { showingSettings = true }
+            }
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: "circle.fill").font(.system(size: 6)).foregroundStyle(camera.statusTone.color)
+                if live {
+                    UIStateGlyph(state: .healthy, size: 6)
+                } else if camera.statusTone == .warning {
+                    UIStateGlyph(state: .warning)
+                } else {
+                    UIStateGlyph(state: .inactive, size: 6)
+                }
                 Text(camera.statusBadge)
+                UICountChip(symbol: UISymbol.noSignal, count: camera.signalDropouts,
+                    help: "\(camera.signalDropouts) signal dropouts since Start")
                 Image(systemName: "chevron.down").font(.caption2.weight(.bold))
-            }.font(.uiBadge).lineLimit(1).padding(.horizontal, 6).frame(height: 18)
-                .foregroundStyle(camera.statusTone == .neutral ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-                .background(.fill.tertiary, in: Capsule()).contentShape(Capsule())
-        }.menuStyle(.borderlessButton).fixedSize().help("Feed settings for " + camera.name)
-            .accessibilityLabel("Feed settings, " + camera.statusBadge)
-            .sheet(isPresented: $showingSettings) {
-                if let controlStore { UICameraControlSettings(feedID: camera.id, name: camera.name, store: controlStore, viewFactories: viewFactories) }
             }
+            .font(.uiBadge).lineLimit(1).padding(.horizontal, 6).frame(height: 18)
+            .foregroundStyle(camera.statusTone == .neutral ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            .background(.fill.tertiary, in: Capsule()).contentShape(Capsule())
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .help(help)
+        .accessibilityLabel("\(camera.name) signal, \(camera.statusBadge)")
+        .accessibilityValue(camera.signalDropouts > 0 ? "\(camera.signalDropouts) signal dropouts since Start" : "")
+        .sheet(isPresented: $showingSettings) {
+            if let controlStore { UICameraControlSettings(feedID: camera.id, name: camera.name, store: controlStore, viewFactories: viewFactories) }
+        }
+    }
+
+    private var help: String {
+        var help = live ? "Signal arriving from \(camera.inputName)" : camera.statusBadge
+        if camera.signalDropouts > 0 {
+            help += ". \(camera.signalDropouts) signal dropout\(camera.signalDropouts == 1 ? "" : "s") since Start"
+        }
+        return help
     }
 }
 

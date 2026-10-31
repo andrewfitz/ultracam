@@ -19,14 +19,21 @@ import SwiftUI
   }
 }
 
-/// Which pictures are in Clean View. The presenter owns the clean state; the
-/// picture's overlays (name, tally, REC, tool chips) read it here so Clean View
-/// hides them too. Fixtures never set it, so their pictures stay decorated.
+/// Which pictures are in Clean View, and which are frozen. The presenter owns both; the
+/// picture's overlays (name, tally, REC, tools, the Frozen pill) read them here. Fixtures
+/// set them only to render those states.
 @MainActor @Observable final class UICleanViewState {
   static let shared = UICleanViewState()
   private(set) var clean: Set<String> = []
+  /// Pictures held by Freeze: they look live at rest, so the picture says so.
+  private(set) var frozen: Set<String> = []
   func set(_ isClean: Bool, for targetID: String) {
     if isClean { clean.insert(targetID) } else { clean.remove(targetID) }
+  }
+  func setFrozen(_ isFrozen: Bool, for targetID: String) {
+    if isFrozen != frozen.contains(targetID) {
+      if isFrozen { frozen.insert(targetID) } else { frozen.remove(targetID) }
+    }
   }
 }
 
@@ -141,11 +148,17 @@ private struct UIAppSurfacePicture: View {
     .onDisappear {
       coordinator.unregisterSurface(id: surfaceID, target: target)
       UIMonitorBridge.unregister(cameraID: target.rawValue, presenter: presenter)
-      if !compact { UICleanViewState.shared.set(false, for: target.rawValue) }
+      if !compact {
+        UICleanViewState.shared.set(false, for: target.rawValue)
+        UICleanViewState.shared.setFrozen(false, for: target.rawValue)
+      }
     }
     .onChange(of: zoom) { _, value in presenter.setMagnification(.centered(zoom: value)) }
     .onChange(of: presenter.isClean) { _, isClean in
       if !compact { UICleanViewState.shared.set(isClean, for: target.rawValue) }
+    }
+    .onChange(of: presenter.isFrozen) { _, isFrozen in
+      if !compact { UICleanViewState.shared.setFrozen(isFrozen, for: target.rawValue) }
     }
     .onChange(of: previewEnabled) { _, _ in register() }
     .onChange(of: presenter.isFreezePending) { _, _ in register() }
