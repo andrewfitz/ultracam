@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ultracam r5 mockup</title>
+<style>
+:root {
+  --bg:#1c1c1e; --side:#262628; --panel:#232325; --line:#3a3a3d; --ctl:#3a3a3c; --ctl2:#2e2e30;
+  --text:#f2f2f4; --dim:#a6a6ab; --faint:#77777c;
+  --red:#ff453a; --green:#30d158; --orange:#ff9f0a; --yellow:#ffd60a; --blue:#0a84ff;
+}
+* { box-sizing:border-box; }
+body { margin:0; padding:40px; width:1500px; background:#101012; color:var(--text);
+  font:13px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; -webkit-font-smoothing:antialiased; }
+h1 { font-size:22px; margin:0 0 4px; }
+h2 { font-size:15px; margin:38px 0 12px; color:var(--dim); font-weight:600; }
+.sub { color:var(--dim); margin-bottom:22px; }
+.mono { font-variant-numeric:tabular-nums; }
+
+/* Window */
+.win { position:relative; width:1420px; height:900px; background:var(--bg); border-radius:12px;
+  border:1px solid #47474a; overflow:visible; display:grid; grid-template-columns:262px 1fr; grid-template-rows:56px 1fr 30px; }
+.lights { grid-column:1; grid-row:1; background:var(--side); border-radius:12px 0 0 0; display:flex; align-items:center; gap:8px; padding:0 16px; border-right:1px solid #000; }
+.lights i { width:12px; height:12px; border-radius:50%; background:#5a5a5e; }
+.lights .tog { margin-left:auto; color:var(--dim); font-size:15px; }
+
+/* Toolbar */
+.bar { grid-column:2; grid-row:1; display:flex; align-items:center; gap:14px; padding:0 14px; border-bottom:1px solid #000; }
+.glass { display:flex; align-items:center; gap:2px; background:#2b2b2e; border-radius:18px; padding:3px; }
+.tb { height:30px; padding:0 12px; border-radius:15px; display:flex; align-items:center; gap:6px; color:var(--text); font-weight:500; white-space:nowrap; }
+.tb.on { background:#454549; }
+.tb.off { color:var(--faint); }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--red); flex:none; }
+.dot.g { background:var(--green); }
+.spacer { flex:1; }
+.chev { color:var(--dim); font-size:11px; padding:0 8px 0 2px; }
+.lay { width:34px; height:30px; display:flex; align-items:center; justify-content:center; border-radius:15px; color:var(--dim); }
+.lay.on { background:#454549; color:var(--text); }
+
+/* Sidebar */
+.side { grid-column:1; grid-row:2 / 4; background:var(--side); border-right:1px solid #000; border-radius:0 0 0 12px; padding:6px 12px; overflow:hidden; display:flex; flex-direction:column; gap:12px; }
+.sec h3 { margin:4px 0 5px; font-size:11px; color:var(--faint); font-weight:600; display:flex; justify-content:space-between; }
+.row { padding:3px 0; }
+.row .t { display:flex; justify-content:space-between; gap:6px; }
+.row .d { color:var(--dim); font-size:11.5px; }
+.attn { background:rgba(255,159,10,.13); border:1px solid rgba(255,159,10,.45); border-radius:9px; padding:7px 9px; }
+.mini { display:inline-block; background:var(--ctl); border-radius:6px; padding:2px 8px; font-size:11.5px; white-space:nowrap; }
+.sel { display:flex; justify-content:space-between; background:var(--ctl); border-radius:6px; padding:4px 9px; width:178px; }
+.lbl { display:flex; align-items:center; justify-content:space-between; }
+.track { height:6px; background:#3b3b3e; border-radius:3px; margin:4px 0; overflow:hidden; }
+.track b { display:block; height:100%; background:#8c8c91; }
+.shot { position:relative; height:6px; border-radius:3px; background:#3b3b3e; margin-top:5px; }
+.shot b { position:absolute; left:0; top:0; bottom:0; width:27%; border-radius:3px; background:var(--green); }
+.shot i { position:absolute; top:-3px; width:1.5px; height:12px; background:#cfcfd3; }
+.tagred { color:#fff; background:#c9352c; border-radius:4px; font-size:10px; font-weight:700; padding:1px 5px; }
+
+/* Cameras */
+.main { grid-column:2; grid-row:2; display:grid; grid-template-columns:1fr 1fr; gap:20px; padding:22px 20px 0; align-items:start; align-content:start; }
+.pic { position:relative; aspect-ratio:16/9; border-radius:14px; background:linear-gradient(135deg,#4b3f68,#3a2e3c); }
+.pic.two { background:#17171a; }
+.pic.onair { box-shadow:inset 0 0 0 4px var(--red); }
+.pic.sel1::after { content:""; position:absolute; inset:-7px; border:2px solid var(--blue); border-radius:20px; }
+.pill { position:absolute; display:flex; gap:6px; align-items:center; background:rgba(0,0,0,.72); color:#fff; border-radius:10px; height:24px; padding:0 9px; font-size:12px; font-weight:600; }
+.onairp { position:absolute; left:124px; top:12px; height:24px; line-height:24px; padding:0 9px; border-radius:10px; background:#cc372e; font-size:12px; font-weight:700; color:#fff; }
+.tools { position:absolute; right:12px; top:12px; display:flex; gap:2px; background:rgba(0,0,0,.72); border-radius:11px; padding:2px; }
+.tools span { width:26px; height:22px; display:flex; align-items:center; justify-content:center; border-radius:8px; font-size:12px; color:#fff; }
+.tools .act { background:rgba(255,255,255,.2); }
+.hold { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; }
+.hold .big { font-size:17px; font-weight:600; }
+.strip { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin-top:12px; padding:0 14px; }
+.sr { display:flex; align-items:center; gap:10px; height:38px; border-bottom:1px solid var(--line); }
+.sr:last-child { border-bottom:0; }
+.sr.tall { height:58px; }
+.sr.meter { height:64px; display:block; padding-top:9px; }
+.name { font-weight:600; font-size:14px; }
+.badge { display:flex; align-items:center; gap:5px; background:#333336; border-radius:9px; height:20px; padding:0 8px; font-size:11.5px; font-weight:600; }
+.more { margin-left:auto; color:var(--dim); font-size:16px; letter-spacing:1px; }
+.rec { width:34px; height:34px; border-radius:50%; border:2px solid #c9c9cd; display:flex; align-items:center; justify-content:center; flex:none; }
+.rec b { width:14px; height:14px; border-radius:3px; background:var(--red); }
+.clock { font-size:21px; font-weight:600; }
+.btn { background:var(--ctl); border-radius:7px; padding:4px 11px; font-weight:500; white-space:nowrap; }
+.cut { width:64px; text-align:center; background:var(--ctl); border-radius:7px; padding:4px 0; font-weight:600; flex:none; }
+.cut.air { background:none; color:var(--dim); font-weight:500; }
+.lut { background:#4a4a4e; border-radius:7px; padding:4px 11px; font-weight:600; flex:none; }
+.fx { background:var(--ctl2); border-radius:7px; padding:4px 10px; flex:none; }
+.warnrow { background:rgba(255,159,10,.12); margin:0 -14px; padding:0 14px; }
+.ml { display:grid; grid-template-columns:14px 1fr; gap:6px; align-items:center; }
+.bars { display:flex; flex-direction:column; gap:2px; }
+.bars i { display:block; height:5px; border-radius:1px; background:linear-gradient(90deg,var(--green) 0 74%, var(--yellow) 74% 82%, #333 82%); }
+.bars.q i { background:#333; }
+.read { display:flex; justify-content:space-between; color:var(--dim); font-size:11px; margin-top:6px; }
+
+/* Status bar */
+.stat { grid-column:2; grid-row:3; display:flex; align-items:center; gap:16px; padding:0 14px; border-top:1px solid #000; color:var(--dim); font-size:12px; white-space:nowrap; }
+.stat .prob { color:var(--text); display:flex; align-items:center; gap:6px; }
+
+/* Callouts */
+.n { position:absolute; z-index:5; width:20px; height:20px; border-radius:50%; background:#ffe14d; color:#000; font-weight:800; font-size:11.5px; display:flex; align-items:center; justify-content:center; box-shadow:0 0 0 2px #000; }
+.legend { columns:2; column-gap:40px; margin-top:20px; width:1420px; }
+.legend div { break-inside:avoid; display:flex; gap:9px; margin-bottom:9px; color:#d6d6da; }
+.legend .k { flex:none; width:20px; height:20px; border-radius:50%; background:#ffe14d; color:#000; font-weight:800; font-size:11.5px; display:flex; align-items:center; justify-content:center; }
+
+/* Lower frames */
+.lower { display:grid; grid-template-columns:820px 380px; gap:40px; align-items:start; width:1420px; }
+.set { background:var(--bg); border:1px solid #47474a; border-radius:12px; overflow:hidden; }
+.tabs { display:flex; justify-content:center; gap:2px; background:#29292b; border-bottom:1px solid #000; padding:9px 8px 8px; }
+.tab { width:92px; padding:4px 0; border-radius:7px; text-align:center; font-size:11px; color:var(--dim); }
+.tab b { display:block; font-size:16px; font-weight:400; margin-bottom:2px; }
+.tab.on { background:#404043; color:var(--text); }
+.form { padding:20px 28px 26px; }
+.fh { font-weight:600; margin:16px 0 7px 2px; }
+.fh:first-child { margin-top:0; }
+.group { background:var(--panel); border-radius:10px; }
+.fr { display:flex; justify-content:space-between; align-items:center; padding:9px 12px; border-bottom:1px solid var(--line); }
+.fr:last-child { border-bottom:0; }
+.fr .s { color:var(--dim); font-size:11.5px; margin-top:1px; }
+.foot { color:var(--dim); font-size:11.5px; margin:7px 2px 0; }
+.menu { background:#2b2b2e; border:1px solid #47474a; border-radius:13px; padding:9px; }
+.card { aspect-ratio:16/9; border-radius:9px; background:linear-gradient(135deg,#4b3f68,#3a2e3c); position:relative; margin-bottom:6px; }
+.mrow { display:flex; justify-content:space-between; padding:5px 8px; border-radius:6px; }
+.mrow .d { color:var(--dim); }
+.mw { background:rgba(255,159,10,.14); }
+.sep { height:1px; background:#454548; margin:4px 8px; }
+</style>
+</head>
+<body>
+<h1>Ultracam: proposed interface</h1>
+<div class="sub">Quick static mockup of the audit plan, with made-up data. Shown: two cameras recording, Camera 1 on Program in Zoom, Camera 2 has lost its signal. Yellow numbers mark what changes.</div>
+
+<div class="win">
+  <div class="lights"><i></i><i></i><i></i><span class="tog">▯▯</span></div>
+
+  <div class="bar">
+    <span class="n" style="left:274px;top:-9px">1</span>
+    <div class="glass">
+      <div class="tb on"><span class="dot"></span><b>1</b> Camera 1</div>
+      <div class="tb off"><b>2</b> Camera 2</div>
+    </div>
+    <div class="glass">
+      <span class="n" style="left:474px;top:-9px">2</span>
+      <div class="tb on" style="width:86px;justify-content:center">Auto On</div><span class="chev">⌄</span>
+      <div class="tb">Hold</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="glass" style="position:relative">
+      <span class="n" style="left:-10px;top:-12px">3</span>
+      <div class="tb"><span class="dot"></span>Stop 2 Recordings</div><span class="chev">⌄</span>
+    </div>
+    <div class="glass">
+      <span class="lay">▭</span><span class="lay on">▯▯</span><span class="lay">▣</span><span class="lay">⊞</span><span class="lay">▯|</span>
+    </div>
+  </div>
+
+  <div class="side">
+    <span class="n" style="left:240px;top:60px">4</span>
+    <div class="sec">
+      <h3>ATTENTION</h3>
+      <div class="attn"><b>▲ Camera 2: signal lost 0:06</b><div class="row d" style="color:var(--dim);font-size:11.5px">Take continues for up to 10 s</div></div>
+    </div>
+    <div class="sec">
+      <h3>CAMERAS <span>＋</span></h3>
+      <div class="row"><div class="t"><span><span class="dot g" style="display:inline-block"></span>&nbsp; Camera 1</span><span class="tagred">ON AIR</span></div>
+        <div class="d">2160p 59.94 · UltraStudio 12G</div><div class="d">Sony FX3 · connected · 78%</div></div>
+      <div class="row"><div class="t"><span><span class="dot" style="display:inline-block;background:var(--orange)"></span>&nbsp; Camera 2</span></div>
+        <div class="d">No signal · 5 dropouts · UltraStudio 12G</div><div class="d">Sony FX3 · connected · 64%</div></div>
+    </div>
+    <div class="sec">
+      <h3>VIRTUAL CAMERAS <span>⌄</span></h3>
+      <div class="row t" style="display:flex;justify-content:space-between"><span><span style="color:var(--green)">✓</span> Ultracam · Program</span><span class="d">In use</span></div>
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--dim)">&nbsp;&nbsp; Ultracam · Camera 1</span><span class="d">Not in use</span></div>
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--dim)">&nbsp;&nbsp; Ultracam · Camera 2</span><span class="d">Not in use</span></div>
+    </div>
+    <div class="sec">
+      <h3>SWITCHING <span>⌄</span></h3>
+      <div class="row">Auto On · Natural talking head</div>
+      <div class="row"><div class="d" style="display:flex;justify-content:space-between"><span>Camera 1 · shot 8 s</span><span>min 10 s</span></div><div class="shot"><b></b><i style="left:33%"></i><i style="left:66%"></i><i style="right:0"></i></div></div>
+    </div>
+    <div class="sec">
+      <span class="n" style="left:240px;top:590px">5</span>
+      <h3>RECORDING</h3>
+      <div class="lbl row"><span>Format</span><span class="sel" style="width:150px"><span>HEVC 4:2:2</span><span style="color:var(--dim)">⌄</span></span></div>
+      <div class="row d">Camera original · Mac Clock</div>
+      <div class="row"><div class="t"><span>Takes · 8TB</span><span class="d">1 h 52 m left</span></div><div class="d">Camera 1, Camera 2</div><div class="track"><b style="width:68%"></b></div><span class="mini">Folder for Next Take…</span></div>
+    </div>
+    <div class="sec">
+      <h3>TAKES</h3>
+      <div class="row" style="display:flex;justify-content:space-between;align-items:center"><span class="d" style="color:var(--text)">5:40 PM · 12:31 · 2 cameras · 0 lost</span><span class="mini">All</span></div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div style="position:relative">
+      <span class="n" style="right:-9px;top:-9px">6</span>
+      <div class="pic onair sel1">
+        <span class="pill" style="left:12px;top:12px">1 &nbsp;Camera 1</span>
+        <span class="onairp">ON AIR</span>
+        <div class="tools"><span class="act">◩</span><span>⚙︎</span></div>
+        <span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC</span>
+      </div>
+      <div class="strip" style="position:relative">
+        <span class="n" style="left:-10px;top:112px">7</span>
+        <span class="n" style="left:-10px;top:150px">8</span>
+        <div class="sr"><span style="color:var(--dim)">⌄</span><span class="name">Camera 1</span><span class="badge"><span class="dot g"></span>2160p 59.94 ⌄</span><span class="more">⋯</span></div>
+        <div class="sr tall"><span class="rec"><b></b></span><div><div style="display:flex;align-items:center;gap:6px;font-size:12px"><span class="dot"></span>Recording</div><div class="clock mono">12:31</div></div><span style="color:var(--dim);margin-left:10px"><span style="color:var(--green)">✓</span> 0 dropped</span><span class="btn" style="margin-left:auto">Pause</span></div>
+        <div class="sr"><span style="color:var(--dim)">▱</span><span>8TB/Takes/Camera 1 · 1 h 52 m left</span><span class="d" style="margin-left:auto;color:var(--dim)">HEVC 4:2:2 · ~64 Mb/s</span></div>
+        <div class="sr"><span class="cut air">On air</span><span style="color:var(--dim)">Output 1080p · 4:2:0 8-bit · 29.97 · In use</span><span class="lut" style="margin-left:auto">✓ LUT</span><span class="fx">Effects ⌄</span></div>
+        <div class="sr meter"><div class="ml"><span class="d" style="font-size:9px;color:var(--dim)">L<br>R</span><div class="bars"><i></i><i style="background:linear-gradient(90deg,var(--green) 0 74%, var(--yellow) 74% 79%, #333 79%)"></i></div></div><div class="read mono"><span>L −5.7 &nbsp; R −6.4 dBTP</span><span>OVER</span></div></div>
+      </div>
+    </div>
+
+    <div style="position:relative">
+      <div class="pic two">
+        <span class="pill" style="left:12px;top:12px">2 &nbsp;Camera 2</span>
+        <div class="tools"><span>⚙︎</span></div>
+        <div class="hold"><div style="font-size:22px;color:var(--orange)">▲</div><div class="big">Signal lost 0:06</div><div style="color:var(--dim)">Take continues for up to 10 s</div></div>
+        <span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC · no signal</span>
+      </div>
+      <div class="strip" style="position:relative">
+        <span class="n" style="right:-10px;top:112px">9</span>
+        <div class="sr"><span style="color:var(--dim)">⌄</span><span class="name">Camera 2</span><span class="badge"><span class="dot" style="background:var(--orange)"></span>No signal · 5 ⌄</span><span class="more">⋯</span></div>
+        <div class="sr tall"><span class="rec"><b></b></span><div><div style="display:flex;align-items:center;gap:6px;font-size:12px"><span class="dot"></span>Recording</div><div class="clock mono">12:31</div></div><span style="color:var(--dim);margin-left:10px"><span style="color:var(--green)">✓</span> 0 dropped</span><span class="btn" style="margin-left:auto">Pause</span></div>
+        <div class="sr warnrow"><span style="color:var(--orange)">▲</span><span>No signal for 0:06. Check Camera 2's HDMI.</span><span class="btn" style="margin-left:auto;padding:3px 10px">Details</span></div>
+        <div class="sr"><span class="cut" style="color:var(--faint);background:var(--ctl2)">Cut</span><span style="color:var(--dim)">Output 1080p · 4:2:0 8-bit · 29.97 · Not in use</span><span class="lut" style="margin-left:auto">✓ LUT</span><span class="fx">Effects ⌄</span></div>
+        <div class="sr meter"><div class="ml"><span class="d" style="font-size:9px;color:var(--dim)">L<br>R</span><div class="bars q"><i></i><i></i></div></div><div class="read mono"><span>L −∞ &nbsp; R −∞ dBTP</span><span>OVER</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stat">
+    <span class="n" style="left:272px;top:855px">10</span>
+    <span class="prob" style="margin-left:18px"><span style="color:var(--orange)">▲</span>Camera 2 no signal</span>
+    <span>Ultracam · Program · In use</span>
+    <span>Camera 1 · shot 8 s · Auto</span>
+    <span><span class="dot" style="display:inline-block"></span> REC 2 · 12:31 · 1 h 52 m left</span>
+    <span>Audio 2 of 2</span>
+    <span style="margin-left:auto">CPU 31% · GPU 18%</span>
+  </div>
+</div>
+
+<div class="legend">
+  <div><span class="k">1</span>Cut buttons are always there with two cameras. There's no ISO/Program mode, so nothing has to stop first.</div>
+  <div><span class="k">2</span>Auto says On or Off in words, with Strategy in its menu. Hold is always in the same spot.</div>
+  <div><span class="k">3</span>"Stop Cameras" is gone while running. Stop Recordings has a red dot that survives Zoom being in front, and its menu has Format and Pause All.</div>
+  <div><span class="k">4</span>The left bar is now a session board, in signal order. Attention only appears when something's wrong. Output mode, Sync, Auto, Hold, Automation and "Coming later" are gone. Real hardware is listed per camera.</div>
+  <div><span class="k">5</span>Format is a picker in the main window, and it's remembered. Takes shows the latest only. Timecode is set in Settings and shown here as a caption.</div>
+  <div><span class="k">6</span>The seven-button tool bar becomes one tools button plus active tools. The full bar appears on hover. The clock moves off the picture when the strip is open.</div>
+  <div><span class="k">7</span>Format and data rate sit read-only on the folder row. Size, bitrate and the footnote are gone.</div>
+  <div><span class="k">8</span>Effect chips become a one-click LUT toggle plus an Effects menu. Stop Camera moves to ⋯. Cut keeps a fixed spot.</div>
+  <div><span class="k">9</span>A problem replaces the folder row, so the strip never changes height. The signal badge keeps a dropout count, and Cut is disabled until the signal has been steady for 5 s.</div>
+  <div><span class="k">10</span>Status bar leads with problems, and shows shot time and "Auto in 4 s" when the sidebar is closed. The session clock lives here.</div>
+</div>
+
+<h2>Settings: eight tabs, wider, with Audio holding Channels Shown &nbsp;·&nbsp; Menu bar: run the session with the window hidden</h2>
+<div class="lower">
+  <div class="set">
+    <div class="tabs">
+      <div class="tab"><b>⚙︎</b>General</div><div class="tab"><b>⛁</b>Hardware</div><div class="tab"><b>▣</b>Virtual Cameras</div><div class="tab"><b>◉</b>Recording</div>
+      <div class="tab on"><b>♪</b>Audio</div><div class="tab"><b>⇄</b>Switching</div><div class="tab"><b>▲</b>Alerts</div><div class="tab"><b>⋯</b>Advanced</div>
+    </div>
+    <div class="form">
+      <div class="fh">Channels Shown</div>
+      <div class="group">
+        <div class="fr"><div>Camera 1<div class="s">Showing 2 of 8</div></div><span class="sel"><span>As Detected</span><span style="color:var(--dim)">⌄</span></span></div>
+        <div class="fr"><div>Camera 2<div class="s">Showing 2 of 8</div></div><span class="sel"><span>As Detected</span><span style="color:var(--dim)">⌄</span></span></div>
+      </div>
+      <div class="foot">As Detected shows the channels that have carried signal. Hidden channels are still recorded and still trigger OVER.</div>
+      <div class="fh">Level Warning</div>
+      <div class="group"><div class="fr"><span>True-peak warning</span><span class="sel"><span>−1 dBTP</span><span style="color:var(--dim)">⌄</span></span></div></div>
+    </div>
+  </div>
+
+  <div class="menu">
+    <div class="card"><span class="pill" style="left:8px;top:8px">Ultracam · Program</span><span class="onairp" style="left:auto;right:8px;top:8px">ON AIR</span><span class="pill" style="left:8px;bottom:8px;font-size:11px">Camera 1</span><span class="pill" style="right:8px;bottom:8px;font-size:11px"><span class="dot"></span>REC 2 · 12:31</span></div>
+    <div class="mrow mw"><span>▲ Camera 2: signal lost 0:06</span><span class="d">Details</span></div>
+    <div class="sep"></div>
+    <div class="mrow"><span>✓ Cut to Camera 1</span></div>
+    <div class="mrow"><span>&nbsp;&nbsp; Cut to Camera 2</span></div>
+    <div class="mrow"><span>✓ Automatic Switching</span></div>
+    <div class="mrow"><span>&nbsp;&nbsp; Hold Current Shot</span></div>
+    <div class="sep"></div>
+    <div class="mrow"><span>Stop 2 Recordings</span></div>
+    <div class="mrow"><span>Pause All</span></div>
+    <div class="mrow"><span>Format</span><span class="d">HEVC 4:2:2 ›</span></div>
+    <div class="mrow"><span>Time left</span><span class="d">8TB 1 h 52 m</span></div>
+    <div class="sep"></div>
+    <div class="mrow"><span>Camera 1</span><span class="d">›</span></div>
+    <div class="mrow"><span>Camera 2</span><span class="d">›</span></div>
+    <div class="mrow"><span>Stop Cameras</span></div>
+    <div class="sep"></div>
+    <div class="mrow"><span>Open Ultracam</span></div>
+    <div class="mrow"><span>Settings…</span></div>
+    <div class="mrow"><span>Quit Ultracam</span></div>
+  </div>
+</div>
+</body>
+</html>
