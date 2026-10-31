@@ -327,7 +327,8 @@ struct UISessionBridge {
   }
 
   static func unexpectedStop(_ stop: UnexpectedStop) -> UIUnexpectedStop {
-    var shown = UIUnexpectedStop(reason: stop.cameraStopped ? stop.reason : nil, wasOnAir: stop.wasOnAir)
+    var shown = UIUnexpectedStop(reason: stop.cameraStopped ? stop.reason : nil, wasOnAir: stop.wasOnAir,
+      restarted: stop.restarted)
     switch stop.take {
     case .saved(_, let duration, _): shown.take = true; shown.savedDuration = duration
     case .interrupted: shown.take = true
@@ -361,9 +362,10 @@ struct UISessionBridge {
     if id != model.selectedFeedID { _ = model.selectFeed(id) }
   }
 
+  /// Camera numbers count in strip order, as every picture, button and menu labels them.
   private func cameraID(number: Int) -> FeedID? {
-    let descriptors = model.feedDescriptors
-    return descriptors.indices.contains(number - 1) ? descriptors[number - 1].id : nil
+    let cameras = interface.ordered(model.feedDescriptors, id: \.id.rawValue)
+    return cameras.indices.contains(number - 1) ? cameras[number - 1].id : nil
   }
 
   /// Runs an action, asking for confirmation first when it would end a recording or on-air output.
@@ -380,15 +382,19 @@ struct UISessionBridge {
     // Ask in the window in front as a sheet; without a key window (menus while the app is
     // in the background, the menu bar item) as a standard alert.
     let alert = Self.confirmationAlert(for: action, message: message, in: presentation)
+    let escape = Self.cancelOnEscape(alert)
     if let key = NSApplication.shared.keyWindow, key.isVisible, key.attachedSheet == nil {
       let bridge = self
       alert.beginSheetModal(for: key) { response in
+        if let escape { NSEvent.removeMonitor(escape) }
         if response == .alertSecondButtonReturn { bridge.perform(action) }
       }
       return
     }
     NSApplication.shared.activate(ignoringOtherApps: true)
-    guard alert.runModal() == .alertSecondButtonReturn else { return }
+    let response = alert.runModal()
+    if let escape { NSEvent.removeMonitor(escape) }
+    guard response == .alertSecondButtonReturn else { return }
     perform(action)
   }
 
@@ -400,9 +406,26 @@ struct UISessionBridge {
     alert.informativeText = message
     alert.alertStyle = .warning
     // NSAlert gives a button titled Cancel the Escape key, which would leave Return with nothing.
+    // A button has one key, so Escape comes back through `cancelOnEscape`.
     alert.addButton(withTitle: "Cancel").keyEquivalent = "\r"
     alert.addButton(withTitle: action.confirmationButtonTitle(in: presentation))
     return alert
+  }
+
+  /// Escape (and ⌘.) answer Cancel too, as in every other Mac alert, while `alert` is up.
+  /// The caller removes the monitor once it has its answer.
+  static func cancelOnEscape(_ alert: NSAlert) -> Any? {
+    NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak alert] event in
+      guard let alert, event.window === alert.window, cancels(event) else { return event }
+      alert.buttons.first?.performClick(nil)
+      return nil
+    }
+  }
+
+  static func cancels(_ event: NSEvent) -> Bool {
+    let escape: UInt16 = 0x35  // kVK_Escape
+    return event.keyCode == escape ||
+      (event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command && event.charactersIgnoringModifiers == ".")
   }
 
   func perform(_ action: UIAction) {

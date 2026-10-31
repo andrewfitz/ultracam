@@ -343,7 +343,12 @@ extension UIAlertDelivering {
 @MainActor final class UIAlertPanelController: UIAlertPanelPresenting {
   static let size = NSSize(width: 340, height: 64)
   private var panel: NSPanel?
-  private var shown: String?
+  /// What the panel says now. One problem can change what it says (a loss, then the cut away
+  /// from it) without becoming another problem.
+  private(set) var shown: UIPanelAlert?
+
+  /// Tests hand in a panel they keep invisible.
+  init(panel: NSPanel? = nil) { self.panel = panel }
 
   static func makePanel() -> NSPanel {
     let panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -362,11 +367,14 @@ extension UIAlertDelivering {
   }
 
   func show(_ alert: UIPanelAlert, send: @escaping @MainActor (UIAction) -> Void) {
-    guard shown != alert.id else { return }
-    shown = alert.id
+    guard shown != alert else { return }
+    let sameProblem = shown?.id == alert.id
+    shown = alert
     let panel = panel ?? Self.makePanel()
     self.panel = panel
     panel.contentView = NSHostingView(rootView: UIAlertPanelView(alert: alert, send: send))
+    // The same problem saying something new stays where it is, and where it was moved to.
+    guard !sameProblem || !panel.isVisible else { return }
     if let screen = NSScreen.main {
       let frame = screen.visibleFrame
       panel.setFrameOrigin(NSPoint(x: frame.maxX - Self.size.width - 16, y: frame.maxY - Self.size.height - 16))

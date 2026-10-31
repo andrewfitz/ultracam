@@ -233,6 +233,8 @@ struct UIUnexpectedStop: Sendable, Equatable {
   /// A take ended early with it. Stays until acknowledged.
   var take = false
   var savedDuration: TimeInterval?
+  /// The camera stopped and has been started again: what's left is the take's half.
+  var restarted = false
 }
 
 /// Program moved off a camera that lost its signal. It stays until it's acknowledged.

@@ -260,6 +260,22 @@ import XCTest
     XCTAssertNil(model.programMoved, "The camera is back, so the notice has served")
   }
 
+  /// Swap Pictures puts the second camera first: number 1 is the camera the strip calls 1.
+  func testCameraNumbersCountInStripOrder() throws {
+    try prepare()
+    defer { finish() }
+    _ = onAirFirst()
+    let suite = "org.ultracam.tests.failover.ui.\(UUID().uuidString)"
+    addTeardownBlock { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let bridge = UISessionBridge(model: model, interface: UIInterfaceState(defaults: UserDefaults(suiteName: suite)!))
+    bridge.perform(.swapPictures)
+    XCTAssertEqual(bridge.presentation().cameras.first?.id, ids[1].rawValue)
+    bridge.perform(.selectNumber(1))
+    XCTAssertEqual(model.selectedFeedID, ids[1])
+    bridge.perform(.cutNumber(1))
+    XCTAssertEqual(program, ids[1], "Not the first camera in the saved settings")
+  }
+
   func testAFailedOnAirCameraDoesNotWaitOutTheHold() throws {
     try prepare()
     defer { finish() }

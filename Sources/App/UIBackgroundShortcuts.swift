@@ -39,8 +39,10 @@ enum UIBackgroundShortcut: Hashable, Sendable {
   @MainActor func actions(in presentation: UISessionPresentation) -> [UIAction] {
     switch self {
     case .cut(let number):
+      // The camera the strip and toolbar number so, in their order, when it can take a cut.
       guard presentation.programAvailable, presentation.cameras.indices.contains(number - 1) else { return [] }
-      return [.cutNumber(number)]
+      let camera = presentation.cameras[number - 1]
+      return camera.cutEnabled ? [.cut(cameraID: camera.id)] : []
     case .auto:
       return presentation.canAutoSwitch ? [.setAutoSwitching(!presentation.autoSwitching)] : []
     case .hold:
@@ -68,55 +70,80 @@ enum UIBackgroundShortcut: Hashable, Sendable {
   /// Chords another app already holds, so the switch can say which didn't register.
   private(set) var unavailable: [UIBackgroundShortcut] = []
 
-  @ObservationIgnored private var handler: EventHandlerRef?
-  @ObservationIgnored private var registered: [EventHotKeyRef] = []
+  @ObservationIgnored private let carbon: UIHotKeyRegistration
   /// Chords registered now: every one the switch could get while it's on, none while it's off.
-  var registeredCount: Int { registered.count }
-  private static let signature: OSType = 0x5543_414D  // "UCAM"
+  var registeredCount: Int { carbon.hotKeys.count }
+  /// The Carbon handler is installed: only while chords are registered.
+  var handlerInstalled: Bool { carbon.handler != nil }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
+    carbon = UIHotKeyRegistration()
     enabled = defaults.bool(forKey: Self.enabledKey)
+    carbon.owner = self
   }
 
   /// Registers the chords when the switch is on. Call once the app has launched.
   func start() { if enabled { register() } }
 
   private func register() {
-    guard registered.isEmpty else { return }
-    if handler == nil {
-      var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-      InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
-        guard let event, let userData else { return OSStatus(eventNotHandledErr) }
-        var id = EventHotKeyID()
-        let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
-          nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
-        guard status == noErr else { return status }
-        let index = Int(id.id)
-        let owner = Unmanaged<UIBackgroundShortcuts>.fromOpaque(userData)
-        // Carbon calls on the main thread, from the main event loop.
-        MainActor.assumeIsolated { owner.takeUnretainedValue().pressed(index) }
-        return noErr
-      }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
-    }
+    guard carbon.hotKeys.isEmpty else { return }
+    carbon.installHandler()
     var missing: [UIBackgroundShortcut] = []
     for (index, shortcut) in UIBackgroundShortcut.all.enumerated() {
       var ref: EventHotKeyRef?
       let status = RegisterEventHotKey(UInt32(shortcut.keyCode), UInt32(controlKey | optionKey | cmdKey),
-        EventHotKeyID(signature: Self.signature, id: UInt32(index)), GetApplicationEventTarget(), 0, &ref)
-      if status == noErr, let ref { registered.append(ref) } else { missing.append(shortcut) }
+        EventHotKeyID(signature: uiHotKeySignature, id: UInt32(index)), GetApplicationEventTarget(), 0, &ref)
+      if status == noErr, let ref { carbon.hotKeys.append(ref) } else { missing.append(shortcut) }
     }
     unavailable = missing
   }
 
   private func unregister() {
-    registered.forEach { UnregisterEventHotKey($0) }
-    registered = []
+    carbon.removeAll()
     unavailable = []
   }
 
-  private func pressed(_ index: Int) {
+  fileprivate func pressed(_ index: Int) {
     guard UIBackgroundShortcut.all.indices.contains(index) else { return }
     perform?(UIBackgroundShortcut.all[index])
   }
+}
+
+/// Ultracam's chords, so a hot key another part of the process registers isn't taken for one.
+private let uiHotKeySignature: OSType = 0x5543_414D  // "UCAM"
+
+/// The Carbon side of the switch. It goes with its owner: the handler and chords are removed
+/// then, so nothing calls into a freed object, and the handler reaches the owner only weakly.
+private final class UIHotKeyRegistration: @unchecked Sendable {
+  weak var owner: UIBackgroundShortcuts?
+  var handler: EventHandlerRef?
+  var hotKeys: [EventHotKeyRef] = []
+
+  func installHandler() {
+    guard handler == nil else { return }
+    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+      guard let event, let userData else { return OSStatus(eventNotHandledErr) }
+      var id = EventHotKeyID()
+      let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+        nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+      guard status == noErr else { return status }
+      guard id.signature == uiHotKeySignature else { return OSStatus(eventNotHandledErr) }
+      let index = Int(id.id)
+      let registration = Unmanaged<UIHotKeyRegistration>.fromOpaque(userData).takeUnretainedValue()
+      // Carbon calls on the main thread, from the main event loop.
+      MainActor.assumeIsolated { registration.owner?.pressed(index) }
+      return noErr
+    }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
+  }
+
+  func removeAll() {
+    hotKeys.forEach { UnregisterEventHotKey($0) }
+    hotKeys = []
+    if let handler { RemoveEventHandler(handler) }
+    handler = nil
+  }
+
+  deinit { removeAll() }
 }

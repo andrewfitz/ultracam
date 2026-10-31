@@ -7,6 +7,7 @@ import XCTest
 /// touches, on a real model with fake capture. Reset alone still needs the whole app idle.
 @MainActor @objcMembers final class LiveTopologyChecks: XCTestCase {
   private var fixture: AppHardwareSyntheticFixture!
+  private var defaults: UserDefaults!
 
   private func appModel(_ snapshot: AppSettingsSnapshot? = nil, cameras: Int = 2) throws -> AppModel {
     let devices = (1...max(cameras, 1)).map { "fake:\($0)" }
@@ -16,6 +17,7 @@ import XCTest
     let suite = "org.ultracam.tests.topology.\(UUID().uuidString)"
     addTeardownBlock { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
     let defaults = UserDefaults(suiteName: suite)!
+    self.defaults = defaults
     let store = AppSettingsStore(defaults: defaults)
     if let snapshot { store.saveSnapshot(snapshot) }
     let installer = ExtensionInstaller(services: .init(
@@ -117,6 +119,45 @@ import XCTest
     let model = try appModel(AppSettingsSnapshot(feeds: feeds, selectedFeedID: feeds[0].id), cameras: 1)
     defer { fixture.stop() }
     XCTAssertTrue(model.appProblems.contains { $0.id == "registry" && $0.text.contains("32") })
+  }
+
+  /// Reset clears the input names it has seen, and a device listed before the quit doesn't
+  /// write them back.
+  func testResetLeavesNoInputNamesBehind() throws {
+    let model = try appModel()
+    defer { fixture.stop() }
+    XCTAssertNotNil(defaults.dictionary(forKey: HardwareInventory.lastKnownNamesKey), "Seen and saved")
+    XCTAssertTrue(model.resetAllSettings())
+    XCTAssertNil(defaults.dictionary(forKey: HardwareInventory.lastKnownNamesKey))
+    model.refresh()
+    XCTAssertNil(defaults.dictionary(forKey: HardwareInventory.lastKnownNamesKey), "Nothing is saved after Reset")
+  }
+
+  /// Settings from a build that kept Program's color per camera: Program declares one color
+  /// whichever camera is on air, the first camera's, and says so on disk too.
+  func testProgramColorIsOneSettingFromLaunch() throws {
+    var first = FeedDescriptor(id: FeedID(rawValue: "camera-a"), name: "Camera 1")
+    first.programColorSpaceID = "rec2020-pq-video"
+    var second = FeedDescriptor(id: FeedID(rawValue: "camera-b"), name: "Camera 2")
+    second.programColorSpaceID = "rec709-video"
+    let suite = "org.ultracam.tests.topology.color.\(UUID().uuidString)"
+    addTeardownBlock { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let defaults = UserDefaults(suiteName: suite)!
+    let store = AppSettingsStore(defaults: defaults)
+    store.saveSnapshot(AppSettingsSnapshot(feeds: [first, second], selectedFeedID: first.id))
+    let installer = ExtensionInstaller(services: .init(
+      preflight: { .init(developerSigned: false, hasInstallEntitlement: false) },
+      makeRequest: { _ in fatalError("No installer requests in this fixture") },
+      submit: { _ in XCTFail("No installer submissions in this fixture") },
+      queryProperties: { $0([]) }))
+    let model = AppModel(settingsStore: store, registryStore: VirtualCameraRegistryStore(defaults: defaults),
+      registryPublisher: TopologyRegistryPublisher(),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer, hardware: .offline)
+    XCTAssertEqual(model.feedDescriptors.map(\.programColorSpaceID), ["rec2020-pq-video", "rec2020-pq-video"])
+    XCTAssertEqual(model.effectiveConfiguration(for: second.id).programColorimetry,
+      model.effectiveConfiguration(for: first.id).programColorimetry, "A cut to Camera 2 declares the same color")
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot().feeds.map(\.programColorSpaceID),
+      ["rec2020-pq-video", "rec2020-pq-video"])
   }
 
   /// The director's clock belongs to its camera, not to whatever was clicked last.

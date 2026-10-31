@@ -189,21 +189,26 @@ extension UIPresentationBuilder {
         level: wasOnAir || saved != nil ? .damage : .notice, cameraID: id,
         action: UIProblemAction(title: "Start", action: .startCamera(cameraID: id)),
         stripText: nil,
-        alert: UIProblemAlert(event: .cameraStopped, title: "\(name) stopped",
+        alert: UIProblemAlert(key: "incident.\(id)", event: .cameraStopped, title: "\(name) stopped",
           body: wasOnAir ? "Was on Program" : "Stopped on its own", showsPanel: wasOnAir), rank: wasOnAir ? 30 : 60))
     } else if camera.recording.failed || camera.recording.error != nil || camera.unexpectedStop?.take == true {
       // `failed` closes the take; a saved movie is still safe, and Details acknowledges it.
+      // After a stop and a Start it's the same incident as the stop: one notification, and
+      // the panel only if the stop had it.
       let acknowledge = UIProblemAction(title: "Details", action: .acknowledgeStop(cameraID: id))
+      let restarted = camera.unexpectedStop?.restarted == true
       if diskFull(camera, in: session) {
         list.append(UIProblem(id: "take.\(id)", title: "\(name): disk full", detail: saved.map { "Take ended early, \($0)" },
           level: .damage, cameraID: id,
           action: UIProblemAction(title: "Choose Folder…", action: .chooseRecordingFolder(cameraID: id)),
-          alert: UIProblemAlert(event: .driveLow, title: "Recording drive full", body: "\(name) has no space left"), rank: 50))
+          alert: UIProblemAlert(key: "incident.\(id)", event: .driveLow, title: "Recording drive full",
+            body: "\(name) has no space left"), rank: 50))
       } else {
         list.append(UIProblem(id: "take.\(id)", title: "Take ended early", detail: [name, saved].compactMap { $0 }.joined(separator: ", "),
           level: .damage, cameraID: id, action: acknowledge,
-          alert: UIProblemAlert(event: .takeEndedEarly, title: "\(name) take ended",
-            body: saved.map { "\($0.prefix(1).uppercased())\($0.dropFirst())" } ?? "Stopped early", showsPanel: true), rank: 50))
+          alert: UIProblemAlert(key: "incident.\(id)", event: .takeEndedEarly, title: "\(name) take ended",
+            body: saved.map { "\($0.prefix(1).uppercased())\($0.dropFirst())" } ?? "Stopped early",
+            showsPanel: !restarted || camera.unexpectedStop?.wasOnAir == true), rank: 50))
       }
     }
 

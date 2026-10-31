@@ -30,6 +30,8 @@ struct UnexpectedStop: Equatable, Sendable {
   /// False once it restarts, or when only the take ended. The take result stays.
   var cameraStopped: Bool
   var wasOnAir = false
+  /// The camera stopped and was started again: the take's half is the same incident.
+  var restarted = false
   /// Filled in when the take finishes: nil until then, and with no take.
   var take: UnexpectedTakeResult?
 }
@@ -296,7 +298,8 @@ final class AppModel {
   /// The name of every input seen, so an unplugged one keeps its name. Saved across
   /// launches by the hardware inventory.
   @ObservationIgnored private var lastInputNames: [String: String] = [:] {
-    didSet { hardwareInventory.recordNames(lastInputNames) }
+    // After Reset nothing is saved, or a device arriving before the quit would write them back.
+    didSet { if !settingsResetPending { hardwareInventory.recordNames(lastInputNames) } }
   }
   /// Errors that used to reach only Diagnostics. Each stays until acknowledged or resolved.
   private(set) var appProblems: [UIAppProblem] = []
@@ -583,6 +586,17 @@ final class AppModel {
       self.autoSwitcherBridge?.acknowledge(decisionID: decisionID, appliedAt: nil)
     }
     launching = false
+    // Program color is one setting, kept on every camera, and older builds could save it apart:
+    // what Program declared would change with the camera on air. The first camera's wins.
+    let programColor = programColorSpaceID
+    if feedDescriptors.contains(where: { $0.programColorSpaceID != programColor }) {
+      for var descriptor in feedDescriptors where descriptor.programColorSpaceID != programColor {
+        descriptor.programColorSpaceID = programColor
+        feedCoordinator.update(descriptor)
+      }
+      persistedSnapshot = feedCoordinator.snapshot
+      store.saveSnapshot(persistedSnapshot)
+    }
     publishVirtualCameraRegistry(snapshot, reason: "launch")
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
     // Every camera is wired the same way, and every saved LUT is restored
@@ -1442,6 +1456,7 @@ final class AppModel {
     feedCoordinator.setProgramSourceCutEligible(id, eligible: true)
     // A restart clears the camera's half of an unexpected stop; the take's stays until seen.
     if var stop = unexpectedStops[id] {
+      if stop.cameraStopped { stop.restarted = true }
       stop.cameraStopped = false
       unexpectedStops[id] = stop.take == nil ? nil : stop
     }
@@ -2145,6 +2160,7 @@ final class AppModel {
     cameraControls.reset()
     vendorSettings.reset()
     hardwareInventory.reset()
+    lastInputNames = [:]
     settingsStore.resetAll()
     return true
   }

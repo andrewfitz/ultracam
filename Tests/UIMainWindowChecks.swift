@@ -177,7 +177,20 @@ import XCTest
       let alert = UISessionBridge.confirmationAlert(for: action, message: "x", in: presentation)
       XCTAssertEqual(alert.buttons.first?.title, "Cancel", "Return answers Cancel for \(action)")
       XCTAssertEqual(alert.buttons.first?.keyEquivalent, "\r")
+      XCTAssertNotEqual(alert.buttons.last?.keyEquivalent, "\r", "Return never ends anything")
+      XCTAssertNotEqual(alert.buttons.last?.keyEquivalent, "\u{1b}")
     }
+    // Escape and ⌘. answer Cancel as well, as in every Mac alert; Return and a plain period don't
+    // reach the monitor's Cancel (Return is Cancel's own key).
+    func key(_ characters: String, _ code: UInt16, _ flags: NSEvent.ModifierFlags = []) -> NSEvent {
+      NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0,
+        context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code)!
+    }
+    XCTAssertTrue(UISessionBridge.cancels(key("\u{1b}", 0x35)))
+    XCTAssertTrue(UISessionBridge.cancels(key(".", 0x2F, .command)))
+    XCTAssertFalse(UISessionBridge.cancels(key(".", 0x2F)))
+    XCTAssertFalse(UISessionBridge.cancels(key("\r", 0x24)))
+    XCTAssertFalse(UISessionBridge.cancels(key("s", 0x01, .command)))
     XCTAssertEqual(UIAction.stopAllRecordings.needsConfirmation(in: presentation),
       "2 recordings end. Cameras keep running and on-air video continues.")
     XCTAssertEqual(UIAction.stopAllRecordings.confirmationButtonTitle(in: presentation), "Stop 2 Recordings")
@@ -212,8 +225,24 @@ import XCTest
     XCTAssertEqual(UIBackgroundShortcut.all.map(\.title),
       ["⌃⌥⌘1", "⌃⌥⌘2", "⌃⌥⌘3", "⌃⌥⌘4", "⌃⌥⌘5", "⌃⌥⌘6", "⌃⌥⌘7", "⌃⌥⌘A", "⌃⌥⌘H", "⌃⌥⌘R"])
     let two = UIPresentationBuilder.session(session([camera(1), camera(2)]))
-    XCTAssertEqual(UIBackgroundShortcut.cut(2).actions(in: two), [.cutNumber(2)])
+    XCTAssertEqual(UIBackgroundShortcut.cut(2).actions(in: two), [.cut(cameraID: "camera-2")])
     XCTAssertEqual(UIBackgroundShortcut.cut(3).actions(in: two), [], "No third camera, no cut")
+    XCTAssertEqual(UIBackgroundShortcut.cut(1).actions(in: two), [], "The camera on air takes no cut")
+  }
+
+  /// Swap Pictures puts Camera 2 first: the toolbar calls it 1, and so does ⌃⌥⌘1.
+  @MainActor func testBackgroundCutsCountInStripOrderAndOnlyWhereACutIsOffered() {
+    var swapped = session([camera(2), camera(1)])
+    swapped.onAirID = "camera-1"
+    let presentation = UIPresentationBuilder.session(swapped)
+    XCTAssertEqual(presentation.cameras.map(\.number), [1, 2])
+    XCTAssertEqual(presentation.cameras.map(\.id), ["camera-2", "camera-1"])
+    XCTAssertEqual(UIBackgroundShortcut.cut(1).actions(in: presentation), [.cut(cameraID: "camera-2")])
+    XCTAssertEqual(UIBackgroundShortcut.cut(2).actions(in: presentation), [], "Camera 1 is on air")
+    var stopped = swapped
+    stopped.cameras[0].running = false
+    XCTAssertEqual(UIBackgroundShortcut.cut(1).actions(in: UIPresentationBuilder.session(stopped)), [],
+      "A camera the Program menu can't cut to gets no cut from the background either")
   }
 
   // MARK: Menu bar

@@ -1,5 +1,6 @@
 #if ULTRACAM_TEST_SUPPORT
 import AppKit
+import SwiftUI
 import Foundation
 import UserNotifications
 import XCTest
@@ -26,7 +27,7 @@ import XCTest
     plan = tracker.plan(problems: problems, live: false, notifications: true, panel: true, sound: false, timeSensitiveEntitled: false)
     XCTAssertTrue(plan.post.isEmpty, "Still the same problem")
     plan = tracker.plan(problems: [], live: false, notifications: true, panel: true, sound: false, timeSensitiveEntitled: false)
-    XCTAssertEqual(plan.remove, ["stopped.Camera 1"], "A cleared problem takes its notification back")
+    XCTAssertEqual(plan.remove, ["incident.Camera 1"], "A cleared problem takes its notification back")
   }
 
   func testTimeSensitiveNeedsTheEntitlementAndALiveSession() {
@@ -118,10 +119,73 @@ import XCTest
     XCTAssertFalse(panel.isVisible)
   }
 
-  func testCoordinatorSendsNewProblemsAndNeverAsksWhileLive() {
+  /// One problem whose words change (a loss, then the cut away from it; a Details that becomes
+  /// a Cut) is one panel saying what it says now, left where the operator put it. Its panel
+  /// is ordered in at alpha 0, ignoring the mouse: test windows stay invisible.
+  func testThePanelSaysWhatItsProblemSaysNow() throws {
+    let panel = UIAlertPanelController.makePanel()
+    panel.alphaValue = 0
+    panel.ignoresMouseEvents = true
+    panel.hasShadow = false
+    panel.animationBehavior = .none
+    let controller = UIAlertPanelController(panel: panel)
+    defer { controller.hide() }
+    func said() -> UIPanelAlert? { (panel.contentView as? NSHostingView<UIAlertPanelView>)?.rootView.alert }
+    let lost = UIPanelAlert(id: "onair.Camera 1", title: "Camera 1 signal lost", body: "Still on Program",
+      action: UIProblemAction(title: "Details", action: .openDiagnostics))
+    controller.show(lost) { _ in }
+    XCTAssertEqual(said(), lost)
+    XCTAssertTrue(panel.isVisible)
+    let placed = NSPoint(x: 40, y: 40)
+    panel.setFrameOrigin(placed)
+    var moved = lost
+    moved.body = "Program moved to Camera 2"
+    controller.show(moved) { _ in }
+    XCTAssertEqual(said(), moved, "The same problem, saying something new")
+    XCTAssertEqual(panel.frame.origin, placed, "Where it was put")
+    var cut = moved
+    cut.action = UIProblemAction(title: "Cut to Camera 2", action: .cut(cameraID: "b"))
+    controller.show(cut) { _ in }
+    XCTAssertEqual(said()?.action?.title, "Cut to Camera 2")
+    controller.hide()
+    XCTAssertNil(controller.shown)
+    XCTAssertFalse(panel.isVisible)
+  }
+
+  /// A camera that stops by itself, and the early take it leaves once it's started again,
+  /// are one incident: one notification, and no panel for a camera that wasn't on air.
+  func testAStopAndTheTakeItLeftAreOneNotification() {
+    var tracker = UIAlertTracker()
+    var camera = UICameraSnapshot(id: "a", name: "Camera 1")
+    camera.unexpectedStop = UIUnexpectedStop(reason: "input disconnected", take: true, savedDuration: 751)
+    var session = UISessionSnapshot()
+    session.cameras = [camera]
+    let first = tracker.plan(problems: UIPresentationBuilder.problems(session), live: false, notifications: true, panel: true,
+      sound: false, timeSensitiveEntitled: false)
+    XCTAssertEqual(first.post.map(\.title), ["Camera 1 stopped"])
+    XCTAssertNil(first.panel, "Off air")
+    session.cameras[0].running = true
+    session.cameras[0].unexpectedStop = UIUnexpectedStop(take: true, savedDuration: 751, restarted: true)
+    let started = tracker.plan(problems: UIPresentationBuilder.problems(session), live: false, notifications: true, panel: true,
+      sound: false, timeSensitiveEntitled: false)
+    XCTAssertTrue(started.post.isEmpty, "Start fixed the camera; the take's half is the same incident")
+    XCTAssertTrue(started.remove.isEmpty)
+    XCTAssertNil(started.panel, "Nothing pops up just after the operator fixed it")
+    XCTAssertTrue(UIPresentationBuilder.problems(session).contains { $0.id == "take.a" }, "The take still asks for a look")
+    var takeOnly = UIAlertTracker()
+    session.cameras[0].unexpectedStop = UIUnexpectedStop(take: true, savedDuration: 751)
+    XCTAssertEqual(takeOnly.plan(problems: UIPresentationBuilder.problems(session), live: false, notifications: true, panel: true,
+      sound: false, timeSensitiveEntitled: false).panel?.title, "Camera 1 take ended", "A take that ended on its own still gets it")
+  }
+
+  /// Live is a meeting app taking frames from a camera, on a real model with fake capture.
+  func testCoordinatorSendsNewProblemsAndNeverAsksWhileLive() throws {
     let suite = "org.ultracam.tests.alerts.\(UUID().uuidString)"
     addTeardownBlock { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
     let defaults = UserDefaults(suiteName: suite)!
+    let fixture = try AppHardwareSyntheticFixture(deviceIDs: ["fake:alerts"])
+    fixture.connect()
+    defer { fixture.stop() }
     let installer = ExtensionInstaller(services: .init(
       preflight: { .init(developerSigned: false, hasInstallEntitlement: false) },
       makeRequest: { _ in fatalError("No installer requests in this fixture") },
@@ -130,7 +194,11 @@ import XCTest
     let model = AppModel(settingsStore: AppSettingsStore(defaults: defaults),
       registryStore: VirtualCameraRegistryStore(defaults: defaults),
       registryPublisher: AlertsRegistryPublisher(),
-      recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer, hardware: .offline)
+      recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer, hardware: fixture.hardware)
+    defer { model.stopAllCameras() }
+    model.refresh()
+    let id = model.selectedFeedID
+    model.updateCamera(id, shareProcessing: false) { $0.selectedDevice = "fake:alerts" }
     let interface = UIInterfaceState(defaults: defaults)
     interface.alertsDisabled = true
     let delivery = FakeAlertDelivery()
@@ -138,19 +206,35 @@ import XCTest
     let coordinator = UIAlertCoordinator(model: model, interface: interface,
       preferences: UIAlertPreferences(defaults: defaults), delivery: delivery, panel: panel)
     XCTAssertTrue(interface.offerAlerts, "Undecided, and nothing is live")
+    let bridge = UISessionBridge(model: model, interface: interface)
+    XCTAssertTrue(bridge.presentation().offersAlerts)
+
+    model.startCamera(id)
+    model.setCameraDemandForTesting(id, requested: true)
+    let pattern = try fixture.makePattern()
+    var index: Int32 = 0
+    let deadline = Date(timeIntervalSinceNow: 10)
+    while !bridge.presentation().isLive, Date() < deadline {
+      try fixture.emit(pattern, index: index)
+      index += 1
+      RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.016))
+    }
+    XCTAssertTrue(bridge.presentation().isLive, "A meeting app is taking this camera's frames")
+    XCTAssertFalse(bridge.presentation().offersAlerts, "Never offered while live")
+    bridge.perform(.turnOnAlerts)
+    XCTAssertEqual(delivery.requested, 0, "And never asked, even if something sends the action")
 
     var update = CaptureUpdate(message: "Stopped")
     update.stopped = true
     update.stopCause = .failed("x")
-    model.deliverCaptureUpdateForTesting(model.selectedFeedID, update)
+    model.deliverCaptureUpdateForTesting(id, update)
     RunLoop.main.run(until: Date().addingTimeInterval(0.6))
-    XCTAssertEqual(delivery.posted.map(\.title), ["\(model.feedDescriptors[0].name) stopped"])
-
-    let bridge = UISessionBridge(model: model, interface: interface)
-    XCTAssertTrue(UIPresentationBuilder.session(bridge.snapshot()).offersAlerts)
+    XCTAssertEqual(delivery.posted.map(\.title), ["\(model.feedDescriptors[0].name) stopped"], "A new problem is sent")
+    XCTAssertFalse(bridge.presentation().isLive)
+    bridge.perform(.turnOnAlerts)
+    XCTAssertEqual(delivery.requested, 1, "Off air it asks")
     bridge.perform(.dismissAlertsPrompt)
     XCTAssertFalse(interface.offerAlerts)
-    XCTAssertEqual(delivery.requested, 0)
     withExtendedLifetime(coordinator) {}
   }
 

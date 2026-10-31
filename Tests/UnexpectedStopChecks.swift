@@ -79,10 +79,13 @@ import XCTest
     XCTAssertEqual(shown.reason, "input disconnected")
     XCTAssertTrue(shown.take)
     XCTAssertEqual(shown.savedDuration, 751)
+    XCTAssertFalse(shown.restarted)
     stop.cameraStopped = false
+    stop.restarted = true
     shown = UISessionBridge.unexpectedStop(stop)
     XCTAssertNil(shown.reason, "A restart clears the camera part")
     XCTAssertTrue(shown.take, "The take result stays until acknowledged")
+    XCTAssertTrue(shown.restarted, "And is the same incident as the stop")
     stop.take = .interrupted
     XCTAssertTrue(UISessionBridge.unexpectedStop(stop).take)
     XCTAssertNil(UISessionBridge.unexpectedStop(stop).savedDuration)
