@@ -20,7 +20,8 @@ enum RecordingCodec: String, CaseIterable, Codable, Equatable, Sendable {
     case .hevcMain10_422: return .hevcMain10_422
     }
   }
-  var title: String { matrixProfile.displayName }
+  /// The menus' and strips' name. The one 4:2:2 HEVC is "HEVC 4:2:2", beside HEVC Main and Main 10.
+  var title: String { self == .hevcMain10_422 ? "HEVC 4:2:2" : matrixProfile.displayName }
   var fileExtension: String { "mov" }
   var sizeEstimatorCodec: RecordingSizeEstimator.Codec {
     switch self {

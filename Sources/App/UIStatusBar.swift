@@ -164,27 +164,28 @@ struct UIShotClock: View {
   let shot: UIShotTiming
   var bar = true
   var countsAuto = false
+  @State private var ticker = UISecondTicker.shared
 
   var body: some View {
-    TimelineView(.periodic(from: .now, by: 1)) { timeline in
-      let seconds = shot.anchor.map { max(0, timeline.date.timeIntervalSince($0)) }
-      HStack(spacing: 5) {
-        if let seconds {
-          let long = seconds >= shot.softMaximum
-          if long {
-            Image(systemName: UISymbol.shotTime).foregroundStyle(.yellow).imageScale(.small).accessibilityHidden(true)
-          }
-          UIValue(parts: Self.parts(seconds))
-          if bar { UILevelBar(fraction: seconds / max(shot.maximum, 1), tint: long ? .yellow : .secondary) }
-          if countsAuto, seconds < shot.minimum {
-            Text("Auto in").foregroundStyle(.secondary)
-            UIValue(parts: [UIValuePart(number: "\(Int((shot.minimum - seconds).rounded(.up)))", unit: "s")])
-          }
+    let seconds = shot.anchor.map { max(0, ticker.now.timeIntervalSince($0)) }
+    HStack(spacing: 5) {
+      if let seconds {
+        let long = seconds >= shot.softMaximum
+        if long {
+          Image(systemName: UISymbol.shotTime).foregroundStyle(.yellow).imageScale(.small).accessibilityHidden(true)
+        }
+        UIValue(parts: Self.parts(seconds))
+        if bar { UILevelBar(fraction: seconds / max(shot.maximum, 1), tint: long ? .yellow : .secondary) }
+        if countsAuto, seconds < shot.minimum {
+          Text("Auto in").foregroundStyle(.secondary)
+          UIValue(parts: [UIValuePart(number: "\(Int((shot.minimum - seconds).rounded(.up)))", unit: "s")])
         }
       }
-      .accessibilityElement(children: .ignore)
-      .accessibilityLabel(seconds.map { "Shot \(Int($0)) seconds" } ?? "No shot")
     }
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(seconds.map { "Shot \(Int($0)) seconds" } ?? "No shot")
+    .onAppear { ticker.retain() }
+    .onDisappear { ticker.release() }
   }
 
   /// "8 s", "1:12" past a minute.
@@ -322,7 +323,7 @@ struct UIStatusPopover: View {
       UIPopoverHeader(symbol: UISymbol.program, title: "Program", subtitle: session.strategyTitle)
       HStack(spacing: 8) {
         Text(onAir).font(.uiRowEmphasis)
-        UIShotClock(shot: session.shot, bar: false,
+        UIShotClock(shot: session.shot, bar: true,
           countsAuto: auto && !holding && session.recentCuts.first?.automatic == false)
         if holding {
           Label("Hold", systemImage: UISymbol.hold(on: true)).font(.uiMeta)
@@ -398,7 +399,7 @@ struct UIStatusPopover: View {
               }
               Text(camera.stripState == .paused ? "Paused" : camera.recordDetail).font(.uiValueStrong)
               Text(camera.sizeLine ?? "—").font(.uiValue)
-              Text(snapshot.map { UIFormat.bitrate($0.recording.megabitsPerSecond) } ?? "—").font(.uiValue)
+              Text(snapshot.map { UIFormat.bitrate($0.recording.megabitsPerSecond) } ?? "—").font(.uiValue).fixedSize()
               Text("\(snapshot?.recording.droppedFrames ?? 0)").font(.uiValue).gridColumnAlignment(.trailing)
               Text(camera.timeLeftLine?.replacingOccurrences(of: " left", with: "") ?? "—").font(.uiValue)
             }
@@ -463,7 +464,7 @@ struct UIStatusPopover: View {
   }
 
   /// What the source declares: "48 kHz", "8 ch".
-  static func audioFormat(_ camera: UICameraSnapshot?) -> (rate: String, channels: String)? {
+  nonisolated static func audioFormat(_ camera: UICameraSnapshot?) -> (rate: String, channels: String)? {
     guard let camera, camera.audioChannels > 0, camera.audioSampleRate > 0 else { return nil }
     let rate = Double(camera.audioSampleRate) / 1000
     return ("\(rate == rate.rounded() ? String(Int(rate)) : String(format: "%.1f", rate)) kHz", "\(camera.audioChannels) ch")
@@ -493,6 +494,34 @@ struct UIStatusPopover: View {
       Text("Not sent through the Ultracam cameras.")
         .font(.uiMeta).foregroundStyle(.secondary)
     }
+  }
+}
+
+/// One clock for every shot timer on screen: a TimelineView in each of the status bar's
+/// measuring copies kept the window's graph updating on every display frame. It runs only
+/// while a shot timer is shown.
+@MainActor @Observable final class UISecondTicker {
+  static let shared = UISecondTicker()
+  private(set) var now = Date()
+  @ObservationIgnored private var timer: Timer?
+  @ObservationIgnored private var users = 0
+
+  func retain() {
+    users += 1
+    guard timer == nil else { return }
+    now = Date()
+    let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.now = Date() }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    self.timer = timer
+  }
+
+  func release() {
+    users = max(0, users - 1)
+    guard users == 0 else { return }
+    timer?.invalidate()
+    timer = nil
   }
 }
 

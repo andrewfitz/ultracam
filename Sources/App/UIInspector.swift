@@ -379,7 +379,7 @@ struct UIInspectorViewContent: View {
     }
   }
 
-  static func signalText(_ snapshot: UICameraSnapshot) -> String {
+  nonisolated static func signalText(_ snapshot: UICameraSnapshot) -> String {
     switch snapshot.signal {
     case .none: return snapshot.deviceAvailable ? "Camera stopped" : "Input disconnected"
     case .connecting: return "Starting…"

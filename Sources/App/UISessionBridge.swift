@@ -340,7 +340,8 @@ struct UISessionBridge {
     alert.messageText = action.confirmationTitle(in: presentation)
     alert.informativeText = message
     alert.alertStyle = .warning
-    alert.addButton(withTitle: "Cancel")
+    // NSAlert gives a button titled Cancel the Escape key, which would leave Return with nothing.
+    alert.addButton(withTitle: "Cancel").keyEquivalent = "\r"
     alert.addButton(withTitle: action.confirmationButtonTitle(in: presentation))
     return alert
   }

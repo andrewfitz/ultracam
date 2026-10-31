@@ -39,8 +39,10 @@ struct UIMainWindowView: View {
     // Opening the inspector otherwise draws a hard line under the title bar across the
     // pictures only; content scrolling under the toolbar gets the system's soft edge instead.
     .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+    // The title stays for the Window menu, Mission Control and VoiceOver, but isn't drawn:
+    // it cost the toolbar 100 pt to repeat the status bar.
     .navigationTitle(context.presentation.title)
-    .navigationSubtitle(context.presentation.subtitle)
+    .toolbar(removing: .title)
     .inspector(isPresented: inspectorBinding) {
       // Laid out at least at the column's minimum width: while the column opens or closes the
       // form keeps that layout and is revealed, instead of laying out every row at every frame.

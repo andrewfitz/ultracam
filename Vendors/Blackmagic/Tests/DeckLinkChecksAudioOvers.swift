@@ -213,10 +213,10 @@ extension DeckLinkChecks {
       AudioMeterTap.overMessage(camera: nil, channel: 4, channels: 8, level: -0.96, clips: 0, timecode: "—", suppressed: 0),
       "Audio over on a camera, channel 5: −1.0 dBTP")
     let take = AudioTakeSummary(integrated: -23.44, maximumTruePeak: -2.06, overs: 0, duration: 60)
-    XCTAssertEqual(take.note, "Audio −23.4 LUFS · max −2.1 dBTP · no overs")
+    XCTAssertEqual(take.note, "Audio −23.4 LUFS, max −2.1 dBTP, no overs")
     XCTAssertFalse(take.needsAttention)
     let hot = AudioTakeSummary(integrated: -.infinity, maximumTruePeak: 0.3, overs: 1, duration: 1)
-    XCTAssertEqual(hot.note, "Audio no programme loudness · max +0.3 dBTP · 1 over")
+    XCTAssertEqual(hot.note, "Audio no programme loudness, max +0.3 dBTP, 1 over")
     XCTAssertTrue(hot.needsAttention)
   }
 

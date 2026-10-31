@@ -81,13 +81,15 @@ import XCTest
   }
 
   func testSavedKeepsItsLostFrames() {
-    XCTAssertEqual(presented(camera(dropped: 60, gaps: 5)).recordingNote, "60 frames lost in 5 gaps")
-    XCTAssertEqual(presented(camera(dropped: 1, gaps: 1)).recordingNote, "1 frame lost in 1 gap")
-    XCTAssertEqual(presented(camera(dropped: 2)).recordingNote, "2 frames lost")
+    // The losses take the file name's place on the detail line: they're what the next look is for.
+    XCTAssertEqual(presented(camera(dropped: 60, gaps: 5)).recordDetail, "60 frames lost in 5 gaps")
+    XCTAssertEqual(presented(camera(dropped: 1, gaps: 1)).recordDetail, "1 frame lost in 1 gap")
+    XCTAssertEqual(presented(camera(dropped: 2)).recordDetail, "2 frames lost")
     XCTAssertNil(presented(camera()).recordingNote)
     var noted = camera(dropped: 60, gaps: 5)
     noted.recording.note = "The input was missing 60 frames in 5 gaps during this take."
-    XCTAssertEqual(presented(noted).recordingNote, "60 frames lost in 5 gaps", "Said once, plainly")
+    XCTAssertEqual(presented(noted).recordDetail, "60 frames lost in 5 gaps", "Said once, plainly")
+    XCTAssertNil(presented(noted).recordingNote, "The writer's sentence is for Diagnostics")
   }
 
   func testTakesListReadsSidecarCountsAndOlderTakesShowNothing() throws {
@@ -131,9 +133,10 @@ import XCTest
     XCTAssertNil(UIStatusPopover.audioFormat(camera))
     camera.audioChannels = 8
     camera.audioSampleRate = 48000
-    XCTAssertEqual(UIStatusPopover.audioFormat(camera), "48 kHz  8 ch")
+    XCTAssertEqual(UIStatusPopover.audioFormat(camera)?.rate, "48 kHz")
+    XCTAssertEqual(UIStatusPopover.audioFormat(camera)?.channels, "8 ch")
     camera.audioSampleRate = 44100
-    XCTAssertEqual(UIStatusPopover.audioFormat(camera), "44.1 kHz  8 ch")
+    XCTAssertEqual(UIStatusPopover.audioFormat(camera)?.rate, "44.1 kHz")
   }
 
   /// The strip and the fixtures show what the rig really sends.

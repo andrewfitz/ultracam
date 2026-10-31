@@ -75,7 +75,7 @@ import XCTest
     XCTAssertEqual(problems(session).first?.action?.title, "Change…")
     session.drives[0].availableBytes = 0
     session.drives[0].secondsLeft = nil
-    XCTAssertEqual(problems(session).first?.title, "8TB: no space left")
+    XCTAssertEqual(problems(session).first?.title, "8TB is full")
   }
 
   func testStatusBarLeadsWithTheWorstProblemAndItsAction() {
@@ -120,7 +120,7 @@ import XCTest
     var waiting = camera(1)
     waiting.clientWaiting = true
     let problem = problems(separate([waiting])).first
-    XCTAssertEqual(problem?.title, "A camera app is waiting for Camera 1")
+    XCTAssertEqual(problem?.title, "A meeting app is waiting for Camera 1")
     XCTAssertEqual(problem?.detail, "It's connected, but no frames are reaching it.")
     XCTAssertEqual(problem?.action, UIProblemAction(title: "Restart Camera", action: .restartCamera(cameraID: "camera-1")))
     var stopped = camera(1, running: false)
@@ -176,8 +176,8 @@ import XCTest
     var session = program([camera(1), iso], client: false)
     XCTAssertTrue(problems(session).isEmpty, "No cut yet")
     session.cutsMissClient = true
-    XCTAssertEqual(problems(session).first?.title, "Cuts aren't reaching a meeting app")
-    XCTAssertEqual(problems(session).first?.detail, "It's using Camera 2, not Program.")
+    XCTAssertEqual(problems(session).first?.title, "Meeting app is on Camera 2, not Program")
+    XCTAssertEqual(problems(session).first?.detail, "Cuts aren't reaching it. Choose Program in that app.")
   }
 
   /// Text that can land on a shared display: camera names and state, nothing else.

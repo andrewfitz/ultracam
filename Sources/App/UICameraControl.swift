@@ -171,7 +171,9 @@ struct UICameraControlSettings: View {
             if let message = store.discoveryMessages[pluginID] { Text(message).foregroundStyle(.secondary) }
             if let camera = selectedCamera {
                 if store.holder(of: camera.id, pluginID: camera.pluginID, excluding: feedID) != nil {
-                    Text("This control camera is assigned to another Ultracam camera. Unassign it there first.").foregroundStyle(.orange)
+                    Label { Text("This control camera is assigned to another Ultracam camera. Unassign it there first.") } icon: {
+                        UIStateGlyph(state: .warning)
+                    }
                 } else {
                     if store.hasSavedCredentials(for: camera) {
                         Button("Connect Using Saved Sign-In") { Task { await store.connectUsingSavedCredentials(camera, to: feedID) } }.disabled(state.busy || scanning)

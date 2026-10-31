@@ -83,29 +83,28 @@ import XCTest
     for session in sessions {
       let presentation = UIPresentationBuilder.session(session)
       assertNoAppNames(presentation.outputSummary)
-      assertNoAppNames(presentation.subtitle)
       presentation.statusSegments.forEach { assertNoAppNames($0.text) }
       presentation.cameras.forEach { assertNoAppNames($0.outputLine); assertNoAppNames($0.accessibilityLabel) }
     }
     let presentation = UIPresentationBuilder.session(separate([camera(1, inUse: true), camera(2)]))
-    XCTAssertEqual(presentation.cameras[0].outputLine, "Ultracam · Camera 1 · In use")
-    XCTAssertEqual(presentation.cameras[1].outputLine, "Ultracam · Camera 2 · Not in use")
-    XCTAssertEqual(presentation.outputSummary, "Ultracam · Camera 1 · In use")
+    XCTAssertEqual(presentation.cameras[0].outputLine, "Ultracam · Camera 1, in use")
+    XCTAssertEqual(presentation.cameras[1].outputLine, "Ultracam · Camera 2, not in use")
+    XCTAssertEqual(presentation.outputSummary, "Ultracam · Camera 1 in use")
     XCTAssertEqual(UIPresentationBuilder.session(program([camera(1), camera(2)])).outputSummary,
-      "Ultracam · Program · In use")
+      "Ultracam · Program in use")
     XCTAssertEqual(UIPresentationBuilder.session(program([camera(1), camera(2, inUse: true)])).outputSummary,
-      "Ultracam · Program, Ultracam · Camera 2 · In use", "Both routes, by the names meeting apps list")
+      "Ultracam · Program and Ultracam · Camera 2 in use", "Both routes, by the names meeting apps list")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1), camera(2)])).outputSummary, "Ultracam cameras not in use")
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).outputSummary, "Ultracam · Camera 1 · Not in use",
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).outputSummary, "Ultracam · Camera 1, not in use",
       "One output is called by its published device name")
   }
 
   func testProgramOutputLines() {
     let cams = [camera(1), camera(2), camera(3)]
     let onAir = UIPresentationBuilder.session(program(cams, pending: "camera-2"))
-    XCTAssertEqual(onAir.cameras[0].outputLine, "In Program · on air")
+    XCTAssertEqual(onAir.cameras[0].outputLine, "On air")
     XCTAssertEqual(onAir.cameras[1].outputLine, "Next", "The pending camera reads \"Next\" everywhere")
-    XCTAssertEqual(onAir.cameras[2].outputLine, "Ultracam · Camera 3 · Not in use",
+    XCTAssertEqual(onAir.cameras[2].outputLine, "Ultracam · Camera 3, not in use",
       "Every camera is its own published device too")
     XCTAssertEqual(UIPresentationBuilder.session(program(cams, inUse: false)).cameras[0].outputLine, "In Program · no viewer yet")
   }
@@ -136,7 +135,7 @@ import XCTest
   func testInspectorShowsTheRealSourceFormat() {
     var camera = camera(1)
     camera.sourcePixel = "8-bit 4:2:0"
-    XCTAssertEqual(UIInspectorViewContent.signalText(camera), "2160p 59.94 · 8-bit 4:2:0", "Never a hardcoded 4:2:2")
+    XCTAssertEqual(UIInspectorViewContent.signalText(camera), "2160p 59.94  8-bit 4:2:0", "Never a hardcoded 4:2:2")
     camera.sourcePixel = nil
     XCTAssertEqual(UIInspectorViewContent.signalText(camera), "2160p 59.94", "Nothing is claimed before a format is known")
   }
@@ -198,8 +197,8 @@ import XCTest
     saved.recording.savedFileName = "Camera 1_001.mov"
     saved.recording.savedDuration = 2292
     let savedPresentation = presented(separate([saved]))
-    XCTAssertEqual(savedPresentation.recordTitle, "Saved")
-    XCTAssertEqual(savedPresentation.recordDetail, "Camera 1_001.mov · 38:12")
+    XCTAssertEqual(savedPresentation.recordTitle, "Saved 38:12", "The duration beside the word")
+    XCTAssertEqual(savedPresentation.recordDetail, "Camera 1_001.mov", "The file below it")
     XCTAssertEqual(savedPresentation.recordTone, .positive)
 
     let rec = presented(separate([camera(1, recording: .recording)]))
@@ -376,25 +375,26 @@ import XCTest
     session.drives = [UIDrive(name: "8TB", availableBytes: 1, totalBytes: 2, secondsLeft: 6720),
       UIDrive(name: "Archive", availableBytes: 1, totalBytes: 2, secondsLeft: 20400)]
     let presentation = UIPresentationBuilder.session(session)
-    XCTAssertEqual(presentation.statusSegments.map(\.kind), [.output, .program, .recording, .audio])
-    XCTAssertEqual(presentation.statusSegments[0].text, "Ultracam · Program · In use")
-    XCTAssertEqual(presentation.statusSegments[0].tone, .positive)
-    XCTAssertEqual(presentation.statusSegments[1].text, "Camera 1 on air · Auto")
-    XCTAssertEqual(presentation.statusSegments[2].text, "REC 2 · 12:31 · 8TB 1 h 52 m · Archive 5 h 40 m left")
-    XCTAssertEqual(presentation.statusSegments[2].tone, .critical)
-    XCTAssertEqual(presentation.statusSegments[3].text, "Audio OK", "Every live camera has audio")
+    // Program's segment carries the virtual camera glyph; a separate one appears only for a camera's own device.
+    XCTAssertEqual(presentation.statusSegments.map(\.kind), [.program, .recording, .audio])
+    XCTAssertEqual(presentation.statusSegments[0].text, "Camera 1 on air, Auto")
+    XCTAssertEqual(presentation.statusSegments[1].text, "REC 2 12:31, 8TB 1 h 52 m left, Archive 5 h 40 m left")
+    XCTAssertEqual(presentation.statusSegments[1].tone, .critical)
+    XCTAssertEqual(presentation.statusSegments[2].text, "Audio 2 of 2", "Every live camera has audio")
 
     session.autoHold = true
-    XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments[1].text, "Camera 1 on air · Auto · hold")
+    XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments[0].text, "Camera 1 on air, Hold")
     session.autoSwitching = false
-    XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments[1].text, "Camera 1 on air · Manual")
+    XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments[0].text, "Camera 1 on air, Manual")
+    session.cameras[1].inUse = true
+    XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments.map(\.kind), [.output, .program, .recording, .audio])
 
     let separatePresentation = UIPresentationBuilder.session(separate([camera(1)]))
     XCTAssertEqual(separatePresentation.statusSegments.map(\.kind), [.output, .recording, .audio])
-    XCTAssertEqual(separatePresentation.statusSegments[0].text, "Ultracam · Camera 1 · Not in use")
+    XCTAssertEqual(separatePresentation.statusSegments[0].text, "Ultracam · Camera 1, not in use")
     XCTAssertEqual(separatePresentation.statusSegments[0].tone, .neutral)
     XCTAssertEqual(separatePresentation.statusSegments[1].text, "Not recording")
-    XCTAssertEqual(separatePresentation.statusSegments[2].text, "Audio OK")
+    XCTAssertEqual(separatePresentation.statusSegments[2].text, "Audio 1 of 1")
   }
 
   func testAudioSegment() {
@@ -414,9 +414,9 @@ import XCTest
 
   func testProgramStatusSaysOnAirOnlyWhileInUse() {
     let idle = UIPresentationBuilder.session(program([camera(1), camera(2)], inUse: false))
-    XCTAssertEqual(idle.statusSegments.first { $0.kind == .program }?.text, "Camera 1 in Program · Manual")
+    XCTAssertEqual(idle.statusSegments.first { $0.kind == .program }?.text, "Camera 1 in Program, Manual")
     let live = UIPresentationBuilder.session(program([camera(1), camera(2)]))
-    XCTAssertEqual(live.statusSegments.first { $0.kind == .program }?.text, "Camera 1 on air · Manual")
+    XCTAssertEqual(live.statusSegments.first { $0.kind == .program }?.text, "Camera 1 on air, Manual")
   }
 
   func testOneCameraHasOnlyTheSingleLayout() {
@@ -431,12 +431,12 @@ import XCTest
 
   func testMixedPausedRecordingSummary() {
     let mixed = UIPresentationBuilder.session(separate([camera(1, recording: .recording), camera(2, recording: .paused, elapsed: 252)]))
-    XCTAssertEqual(mixed.recordingSummary, "REC 1 · paused 1 · 12:31")
+    XCTAssertEqual(mixed.recordingSummary, "REC 1, 1 paused 12:31")
     let single = UIPresentationBuilder.session(separate([camera(1, recording: .paused, elapsed: 252)]))
-    XCTAssertEqual(single.recordingSummary, "REC paused · 4:12")
+    XCTAssertEqual(single.recordingSummary, "REC paused 4:12")
     var idleWithDrive = separate([camera(1)])
     idleWithDrive.drives = [UIDrive(name: "8TB", availableBytes: 1, totalBytes: 2, secondsLeft: 600)]
-    XCTAssertEqual(UIPresentationBuilder.session(idleWithDrive).recordingSummary, "Not recording · 8TB 10 min left")
+    XCTAssertEqual(UIPresentationBuilder.session(idleWithDrive).recordingSummary, "Not recording, 8TB 10 min left")
   }
 
   func testWarningPrecedence() {
@@ -447,7 +447,7 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Take ended early")
     session.cameras[0].recording.error = nil
     session.drives = [UIDrive(name: "8TB", availableBytes: 1, totalBytes: 2, secondsLeft: 12 * 60)]
-    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB: 12 min left")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB is low", "The time stays on the drive row")
     session.drives = []
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: no signal")
     session.cameras = [camera(1, signal: .unsupported("1080i"))]
@@ -519,9 +519,9 @@ import XCTest
   }
 
   func testCamerasControlTitle() {
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).camerasControlTitle, "Stop Camera")
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).camerasControlTitle, "Stop Camera 1")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, running: false)])).camerasControlTitle, "Start Camera")
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1), camera(2)])).camerasControlTitle, "Stop Cameras")
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1), camera(2)])).camerasControlTitle, "Stop All Cameras")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, running: false), camera(2, running: false)])).camerasControlTitle,
       "Start Cameras")
     XCTAssertTrue(UIPresentationBuilder.session(separate([camera(1), camera(2, running: false)])).camerasRunning)
@@ -537,7 +537,7 @@ import XCTest
     missing.deviceAvailable = false
     XCTAssertEqual(presented(separate([missing])).statusBadge, "No input", "No input was ever chosen")
     missing.inputName = "UltraStudio 4K Mini"
-    XCTAssertEqual(presented(separate([missing])).statusBadge, "Input missing")
+    XCTAssertEqual(presented(separate([missing])).statusBadge, "Input disconnected")
 
     let label = presented(program([camera(1, recording: .recording), camera(2)])).accessibilityLabel
     XCTAssertEqual(label, "Camera 1, On air, recording 12:31")
@@ -628,16 +628,16 @@ import XCTest
     XCTAssertFalse(manual.canAutoSwitch)
     XCTAssertFalse(manual.autoSwitching)
     XCTAssertFalse(manual.canHoldShot)
-    XCTAssertEqual(manual.statusSegments.first { $0.kind == .program }?.text, "Camera 1 on air · Manual")
+    XCTAssertEqual(manual.statusSegments.first { $0.kind == .program }?.text, "Camera 1 on air, Manual")
 
     session.strategy = .fixedInterval
     let fixed = UIPresentationBuilder.session(session)
     XCTAssertTrue(fixed.canAutoSwitch)
     XCTAssertTrue(fixed.autoSwitching)
-    XCTAssertFalse(fixed.canHoldShot, "Hold only reaches the natural talking head director")
+    XCTAssertTrue(fixed.canHoldShot, "Hold reaches every strategy that cuts on its own")
     session.autoHold = true
     XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments.first { $0.kind == .program }?.text,
-      "Camera 1 on air · Auto", "A hold that does nothing isn't shown")
+      "Camera 1 on air, Hold")
 
     session.strategy = .naturalTalkingHead
     XCTAssertTrue(UIPresentationBuilder.session(session).canHoldShot)
@@ -694,16 +694,8 @@ import XCTest
     XCTAssertTrue(presentation.canStart)
     failed.deviceAvailable = false
     failed.inputName = "UltraStudio 4K Mini"
-    XCTAssertEqual(presented(separate([failed])).statusBadge, "Input missing", "A missing input says what to fix")
+    XCTAssertEqual(presented(separate([failed])).statusBadge, "Input disconnected", "A missing input says what to fix")
     XCTAssertEqual(presented(separate([camera(1, running: false)])).statusBadge, "Stopped")
-  }
-
-  func testSubtitleOnlyCarriesWhatTheStatusBarDoesNot() {
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).subtitle, "")
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, recording: .recording, inUse: true)])).subtitle, "")
-    XCTAssertEqual(UIPresentationBuilder.session(program([camera(1), camera(2)])).subtitle, "Camera 1 on air")
-    XCTAssertEqual(UIPresentationBuilder.session(program([camera(1), camera(2)], inUse: false)).subtitle, "Camera 1 in Program")
-    XCTAssertEqual(UIPresentationBuilder.session(program([camera(1), camera(2)], onAir: nil)).subtitle, "")
   }
 
   func testWaitingRecordDetailNamesWhatIsMissing() {
@@ -718,11 +710,11 @@ import XCTest
   }
 
   func testSizeLineBeforeBytesArrive() {
-    XCTAssertEqual(presented(separate([camera(1, signal: .noSignal, recording: .recording)])).sizeLine, "— · —")
+    XCTAssertEqual(presented(separate([camera(1, signal: .noSignal, recording: .recording)])).sizeLine, "—")
     var writing = camera(1, recording: .recording)
     writing.recording.fileBytes = 1_000_000
     writing.recording.megabitsPerSecond = 707
-    XCTAssertEqual(presented(separate([writing])).sizeLine, "\(UIFormat.bytes(1_000_000)) · 707 Mb/s")
+    XCTAssertEqual(presented(separate([writing])).sizeLine, UIFormat.bytes(1_000_000), "The rate is in the Recording popover")
   }
 
   func testMenuBarPreviewShowsTheCameraInTheMeeting() {
@@ -840,12 +832,12 @@ import XCTest
     // At zero free bytes the drive reports no time left at all; the < 30 min warning never saw it.
     var session = separate([camera(1, recording: .recording)])
     session.drives = [UIDrive(name: "8TB", availableBytes: 0, totalBytes: 8_000_000_000_000, secondsLeft: nil)]
-    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB: no space left")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB is full")
     XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .attention)
     XCTAssertEqual(presented(session).timeLeftLine, "No space left")
     // Low but not empty keeps the existing time-left warning.
     session.drives = [UIDrive(name: "8TB", availableBytes: 9_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 100)]
-    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB: 1 min left")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB is low")
     XCTAssertNil(presented(session).timeLeftLine, "The camera's own secondsLeft drives this line")
     session.drives = [roomy]
     XCTAssertNil(UIPresentationBuilder.warning(session))

@@ -623,8 +623,9 @@ extension UIVerify {
       both: false).forEach { $0.close() }
     for kind in [UIStatusSegment.Kind.program, .recording, .output, .audio] {
       let segment = meeting.presentation.statusSegments.first { $0.kind == kind } ?? UIStatusSegment(kind: kind, text: "", tone: .neutral)
+      let height: CGFloat = kind == .audio ? 640 : kind == .recording ? 420 : 300
       render("popover-status-\(kind.rawValue)", UIStatusPopover(kind: kind, segment: segment, context: meeting)
-        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 460, height: 640), both: false).forEach { $0.close() }
+        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 460, height: height), both: false).forEach { $0.close() }
     }
     // The menu bar item's preview card, for every fixture (the live preview stays off while waiting).
     for (name, session) in [("program-meeting", UIFixtures.programMeeting()), ("single-meeting", UIFixtures.singleMeeting()),
@@ -653,8 +654,9 @@ extension UIVerify {
     let dump = nodes.map { "\($0.role)\t\($0.text)\t\($0.enabled ? "" : "disabled")" }.joined(separator: "\n")
     try? dump.write(to: verifier.pngDirectory.deletingLastPathComponent().appendingPathComponent("accessibility-program-meeting.tsv"),
       atomically: true, encoding: .utf8)
-    for label in ["Camera 1", "Camera 2", "On air", "Stop Recording", "LUT for Camera 1", "Effects for Camera 1",
-      "Output 1080p 29.97", "Cut to Camera 2", "Stop 2 Recordings", "Hold Current Shot", "Automatic switching"] {
+    // The toolbar's controls aren't in an offscreen window's tree: they're pressed on their own below.
+    for label in ["Camera 1", "Camera 2", "On air", "Stop Recording", "LUT for Camera 1", "Effects",
+      "Output 1080p 29.97", "Cut to Camera 2"] {
       verifier.check("accessibility contains \"\(label)\"", contains(nodes, label), "", viewDependent: true)
     }
     verifier.check("no app names in accessibility text", !nodes.contains { node in
@@ -715,7 +717,11 @@ extension UIVerify {
     verifier.check("Attention offers the extension install as a setup row, not a problem",
       setup.first?.symbol == UISymbol.installExtension && setup.first?.action?.action == .installCameraExtension
         && !problemsContext.presentation.problems.contains { $0.id.hasPrefix("extension.") }, "\(setup.map(\.id))")
-    let sidebar = HostedView(UIAttentionSection(context: problemsContext), size: CGSize(width: 260, height: 400), dark: false)
+    // On its own, as the drawn set has it: problems come first, and the rest are a click away.
+    var installOnly = UIFixtures.stopped()
+    installOnly.install = problemsSession.install
+    let sidebar = HostedView(UIAttentionSection(context: .fixture(installOnly) { log.append($0) }),
+      size: CGSize(width: 260, height: 400), dark: false)
     defer { sidebar.close() }
     let sidebarNodes = Accessibility.nodes(in: sidebar.host)
     try? sidebarNodes.map { "\($0.role)\t\($0.text)" }.joined(separator: "\n")
@@ -792,8 +798,8 @@ extension UIVerify {
     }
     let one = presentation.cameras[0]
     let two = presentation.cameras[1]
-    pressInStrip(one, "Stop Recording", expect: .toggleRecording(cameraID: one.id))
-    pressInStrip(one, "Pause", expect: .pauseOrResume(cameraID: one.id))
+    pressInStrip(one, "Stop Recording, Camera 1", expect: .toggleRecording(cameraID: one.id))
+    pressInStrip(one, "Pause Camera 1", expect: .pauseOrResume(cameraID: one.id))
     // LUT is one click, on and off; the rest of the effects are in a menu.
     pressInStrip(one, "LUT for Camera 1", expect: .setEffect(cameraID: one.id, index: 0, false))
     pressInStrip(two, "Cut to Camera 2", expect: .cut(cameraID: two.id))
@@ -869,7 +875,7 @@ extension UIVerify {
     } else {
       verifier.check("stopped strip has Start", false, names(idleNodes).prefix(20).joined(separator: "; "), viewDependent: true)
     }
-    if let record = idleNodes.first(where: { $0.label == "Record" }) {
+    if let record = idleNodes.first(where: { $0.label == "Record, Camera 1" }) {
       verifier.check("record is disabled when the camera is stopped", !record.enabled, "", viewDependent: true)
     }
     hosted.close()

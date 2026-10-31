@@ -271,7 +271,7 @@ Job: see it, hear it, roll it. Each fact has one owner (06 section 2, with the c
 
 ### Right: inspector
 
-Setup only, closed during live work. Order follows the signal: Source, Camera Control, LUT, Effects, Recording, Automation, Rename and Remove. One row per effect, merging each checkbox with its value. Add Remove LUT, which doesn't exist per camera today. Sync cameras lives only here, with a confirmation naming the source camera, because turning it on rewrites other cameras' effects. Its help must state that it also copies source declarations and preview, which it does today.
+Setup only, closed during live work. Order follows the signal: Input, Camera Control, LUT, Effects, Recording, Automation, Rename and Remove (J8). One row per effect, merging each checkbox with its value. Add Remove LUT, which doesn't exist per camera today. Sync cameras lives only here, with a confirmation naming the source camera, because turning it on rewrites other cameras' effects. Its help must state that it also copies source declarations and preview, which it does today.
 
 ### Toolbar
 

@@ -96,8 +96,8 @@ import XCTest
     XCTAssertEqual(unknown.clientLine, "Use unknown")
     XCTAssertEqual(tally(session), .none, "Unknown is not red")
     let presentation = UIPresentationBuilder.session(session)
-    XCTAssertEqual(presentation.cameras[0].outputLine, "Ultracam · Camera 1 · Use unknown")
-    XCTAssertEqual(presentation.outputSummary, "Ultracam · Camera 1 · Use unknown")
+    XCTAssertEqual(presentation.cameras[0].outputLine, "Ultracam · Camera 1, use unknown")
+    XCTAssertEqual(presentation.outputSummary, "Ultracam · Camera 1, use unknown")
     var known = camera(1)
     known.clientUnknown = false
     XCTAssertEqual(known.clientLine, "Not in use")

@@ -287,7 +287,8 @@ struct UICameraPictureView: View {
       .help(camera.name)
       // The name keeps its room; the tool bar takes its own row instead.
       .layoutPriority(1)
-    UITallyBadge(tally: camera.tally)
+    // A Program View tile keeps its ring only: the Program picture beside it has the pill.
+    if !compact { UITallyBadge(tally: camera.tally) }
     if !compact && UICleanViewState.shared.frozen.contains(camera.id) {
       Label("Frozen", systemImage: UISymbol.freeze).font(.uiOverlay).uiPictureOverlay()
         .help("This picture is held. Freeze again (⌃⌥F) to show live video.")
@@ -742,6 +743,7 @@ struct UIChannelStripView: View {
   let camera: UICameraPresentation
   let context: UIContext
   @Environment(\.colorSchemeContrast) private var contrast
+  @Environment(\.colorScheme) private var colorScheme
 
   /// Width of the leading glyph column in every row.
   private static let gutter: CGFloat = 28
@@ -963,9 +965,7 @@ struct UIChannelStripView: View {
         .frame(minWidth: 24, minHeight: 24)
         .contentShape(Rectangle())
     }
-    .menuStyle(.button)
-    .buttonStyle(.plain)
-    .foregroundStyle(.secondary)
+    .menuStyle(.borderlessButton)
     .menuIndicator(.hidden)
     .fixedSize()
     .frame(minWidth: 24, minHeight: 24)
@@ -994,7 +994,9 @@ struct UIChannelStripView: View {
     switch camera.stripState {
     case .recording, .updating: UIStateGlyph(state: .recording, size: 7)
     case .paused: UIStateGlyph(state: .paused)
-    case .recordingNoSignal, .noFolder, .failed: UIStateGlyph(state: .warning)
+    case .recordingNoSignal, .noFolder: UIStateGlyph(state: .warning)
+    // On the amber row the triangle is dark, like its words.
+    case .failed: Image(systemName: UISymbol.warning).imageScale(.small).foregroundStyle(.primary).accessibilityHidden(true)
     case .saved: Image(systemName: UISymbol.saved).foregroundStyle(.green).imageScale(.small).accessibilityHidden(true)
     default: EmptyView()
     }
@@ -1004,6 +1006,11 @@ struct UIChannelStripView: View {
   private var recordRow: some View {
     UILiveCamera(camera: camera, context: context, follows: .take) { live in recordRow(live.camera) }
       .frame(height: 44)
+      // A take that ended early is damage to what was rolling: solid amber, dark text, edge to edge.
+      .padding(.horizontal, camera.stripState == .failed ? 12 : 0)
+      .background(camera.stripState == .failed ? Color.orange : .clear)
+      .environment(\.colorScheme, camera.stripState == .failed ? .light : colorScheme)
+      .padding(.horizontal, camera.stripState == .failed ? -12 : 0)
   }
 
   private func recordRow(_ camera: UICameraPresentation) -> some View {
@@ -1176,7 +1183,7 @@ struct UIChannelStripView: View {
         Text("Updating output…").foregroundStyle(.secondary)
       } else {
         Text(camera.outputValue).font(.uiValueStrong).fixedSize()
-        if camera.outputInUse && camera.tally != .onAir { Text("In use").foregroundStyle(.secondary).fixedSize() }
+        if camera.outputInUse { Text("In use").foregroundStyle(.secondary).fixedSize() }
       }
     }
     .font(.uiRow)
@@ -1195,7 +1202,8 @@ struct UIChannelStripView: View {
         Text(camera.tally == .onAir ? "On air" : "Program")
       }
       .font(.uiRow).foregroundStyle(.secondary)
-      .frame(width: Self.cutWidth, alignment: .leading)
+      .fixedSize()
+      .frame(minWidth: Self.cutWidth, alignment: .leading)
       .accessibilityElement(children: .combine)
     } else {
       let pending = context.session.pendingCutID == camera.id
@@ -1359,20 +1367,16 @@ struct UIEffectsMenu: View {
       Toggle("Effects Off", isOn: Binding(get: { !camera.processing }, set: { context.send(.setProcessing(cameraID: camera.id, !$0)) }))
       if !camera.processing { Text("Camera original goes out unchanged.") }
     } label: {
-      HStack(spacing: 4) {
-        Image(systemName: camera.processing ? UISymbol.effects : UISymbol.effectsOff).imageScale(.small)
-        Text(camera.processing ? "Effects" : "Effects Off")
-        Image(systemName: "chevron.down").font(.caption2.weight(.bold)).imageScale(.small)
-      }
-      .font(.uiRow.weight(.medium))
-      .padding(.horizontal, 8).frame(height: 24)
-      .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 7))
-      .contentShape(Rectangle())
+      // A borderless menu keeps its items reachable by VoiceOver and keyboard; the capsule
+      // goes around it, since that style drops a label's own background.
+      Label(camera.processing ? "Effects" : "Effects Off", systemImage: camera.processing ? UISymbol.effects : UISymbol.effectsOff)
+        .labelStyle(.titleAndIcon)
     }
-    .menuStyle(.button)
-    .buttonStyle(.plain)
-    .menuIndicator(.hidden)
+    .menuStyle(.borderlessButton)
     .fixedSize()
+    .font(.uiRow.weight(.medium))
+    .padding(.horizontal, 8).frame(height: 24)
+    .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 7))
     .help("Effects change the format meeting apps receive; the video updates briefly. ⇧⌘B turns them all off.")
     .accessibilityLabel("Effects for \(camera.name)")
     .accessibilityValue(camera.processing ? "On" : "Off")

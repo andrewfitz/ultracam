@@ -157,7 +157,10 @@ extension UIPresentationBuilder {
     let own = cameraProblems(camera, in: session).filter { $0.stripText != nil }
       .sorted { $0.rank < $1.rank }
     guard let worst = own.first, let text = worst.stripText else { return stoppedInputProblem(camera) }
-    return UIStripProblem(text: text, short: worst.stripShort ?? text, level: worst.level, action: worst.action, count: own.count)
+    // The strip says what to do about the camera; a cut away from it is the picture's and the bar's.
+    var action = worst.action
+    if case .cut? = action?.action { action = UIProblemAction(title: "Details", action: .openDiagnostics) }
+    return UIStripProblem(text: text, short: worst.stripShort ?? text, level: worst.level, action: action, count: own.count)
   }
 
   /// A stopped camera that can't start says why on its strip. Nothing's happening to it yet,

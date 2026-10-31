@@ -641,7 +641,6 @@ struct UIFormatChoice: Sendable, Equatable, Identifiable {
 
 struct UISessionPresentation: Sendable, Equatable {
   var title: String
-  var subtitle: String
   var cameras: [UICameraPresentation]
   var selected: UICameraPresentation?
   /// Two or more cameras: Program exists, and cut controls show in every layout.
@@ -778,8 +777,9 @@ enum UIFormat {
   static func bitrate(_ megabits: Double) -> String {
     guard megabits.isFinite, megabits > 0 else { return "—" }
     guard megabits >= 1000 else { return String(format: "%.0f Mb/s", megabits) }
-    var gigabits = String(format: "%.2f", megabits / 1000)
-    if gigabits.hasSuffix("0") { gigabits.removeLast() }
+    // Two places under 10 Gb/s, where "1.77" and "1.8" are different drives' worth.
+    var gigabits = String(format: megabits < 10_000 ? "%.2f" : "%.1f", megabits / 1000)
+    if megabits < 10_000, gigabits.hasSuffix("0") { gigabits.removeLast() }
     return "\(gigabits) Gb/s"
   }
 }
@@ -928,7 +928,7 @@ enum UIPresentationBuilder {
     } else if session.pendingCutID == camera.id {
       outputLine = "Next"
     } else {
-      outputLine = "Ultracam · \(camera.name) · \(camera.clientLine)"
+      outputLine = "Ultracam · \(camera.name), \(camera.clientLine.lowercased())"
     }
 
     let elapsedShort = UIFormat.shortElapsed(rec.elapsed)
@@ -1104,8 +1104,8 @@ enum UIPresentationBuilder {
     let inUse = (session.programInUse ? ["Program"] : []) + session.cameras.filter(\.inUse).map(\.name)
     let outputInUse = !inUse.isEmpty
     let outputSummary: String
-    if !inUse.isEmpty { outputSummary = inUse.map { "Ultracam · \($0)" }.joined(separator: ", ") + " · In use" }
-    else if session.cameras.count == 1 { outputSummary = "Ultracam · \(session.cameras[0].name) · \(session.cameras[0].clientLine)" }
+    if !inUse.isEmpty { outputSummary = inUse.map { "Ultracam · \($0)" }.joined(separator: " and ") + " in use" }
+    else if session.cameras.count == 1 { outputSummary = "Ultracam · \(session.cameras[0].name), \(session.cameras[0].clientLine.lowercased())" }
     else {
       let unknown = session.programClientUnknown || session.cameras.contains(where: \.clientUnknown)
       outputSummary = unknown ? "Ultracam cameras: use unknown" : "Ultracam cameras not in use"
@@ -1165,22 +1165,13 @@ enum UIPresentationBuilder {
         pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || session.onAirID == $0.id, help: $0.cutHelp)
     } : []
 
-    // The title stays "Ultracam". The subtitle carries only what the status bar's
-    // essential segments don't: the camera on Program (nothing with one camera).
-    let subtitle: String
-    if session.programAvailable, let onAirName {
-      subtitle = cameras.contains { $0.tally == .onAir } ? "\(onAirName) on air" : "\(onAirName) in Program"
-    } else {
-      subtitle = ""
-    }
-
     // One camera has one picture: every grid layout is the single layout.
     let available = UILayout.allCases.filter { session.programAvailable || $0 != .programView }
     let layouts = cameras.count > 1 ? available : available.filter { $0 == .single }
     let layout = layouts.contains(session.layout) ? session.layout : .single
 
     var presentation = UISessionPresentation(
-      title: "Ultracam", subtitle: subtitle,
+      title: "Ultracam",
       cameras: cameras, selected: cameras.first(where: \.selected),
       programAvailable: session.programAvailable,
       layouts: layouts, layout: layout, recordControl: recordControl,
@@ -1302,7 +1293,7 @@ enum UIPresentationBuilder {
 
   /// `Change…` when idle, `Folder for Next Take…` during a take, which keeps its own folder.
   static func folderAction(_ session: UISessionSnapshot) -> String {
-    if session.defaultFolderPath == nil { return "Choose Folder…" }
+    if session.defaultFolderPath == nil, !session.cameras.contains(where: { $0.recording.folderPath != nil }) { return "Choose Folder…" }
     return session.cameras.contains(where: isRolling) ? "Folder for Next Take…" : "Change…"
   }
 

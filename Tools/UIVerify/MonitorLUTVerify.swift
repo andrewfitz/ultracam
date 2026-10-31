@@ -27,7 +27,8 @@ import SystemExtensions
     try model(verifier: verifier)
   }
 
-  /// The ⋯ menu's Monitor LUT submenu, without and with a chosen file.
+  /// The Picture popover's Monitor LUT menu, without and with a chosen file. It moved there
+  /// from the strip's ⋯ menu: it changes this camera's monitor pictures only.
   private static func menu(verifier: Verifier) throws {
     let session = UIFixtures.standalone()
     var context = UIContext.fixture(session)
@@ -36,21 +37,22 @@ import SystemExtensions
     }
     let monitor = UIFixtureMonitorSettings(session: session)
     context.monitor = monitor
-    /// The ⋯ menu's items and the Monitor LUT submenu's.
+    /// The Monitor LUT menu's items, as the Picture popover shows it.
     func items() -> (menu: [NSMenuItem], lut: [NSMenuItem]) {
-      let strip = HostedView(UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 230), dark: false)
-      defer { strip.close() }
-      let menu = Menus.items(in: strip.host, containing: "Load LUT…")
-      return (menu, menu.first { $0.title == "Monitor LUT" }?.submenu?.items ?? [])
+      let form = HostedView(UIMonitorLUTMenu(cameraID: camera.id, cameraName: camera.name, monitor: monitor).fixedSize(),
+        size: CGSize(width: 260, height: 60), dark: false)
+      defer { form.close() }
+      let lut = Menus.items(in: form.host, containing: "Remove Monitor LUT")
+      return (lut, lut)
     }
     let empty = items()
-    let menuTitles = empty.menu.map(\.title).joined(separator: ", ")
-    verifier.check("monitor LUT: the strip ⋯ menu has a Monitor LUT submenu",
-      empty.menu.first { $0.title == "Monitor LUT" }?.submenu != nil, menuTitles, viewDependent: true)
-    if let load = empty.menu.firstIndex(where: { $0.title == "Load LUT…" }),
-      let lut = empty.menu.firstIndex(where: { $0.title == "Monitor LUT" }) {
-      verifier.check("monitor LUT: listed right after Load LUT…", lut == load + 1, menuTitles, viewDependent: true)
-    }
+    verifier.check("monitor LUT: the Picture popover has a Monitor LUT menu", !empty.lut.isEmpty,
+      "", viewDependent: true)
+    let strip = HostedView(UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 230), dark: false)
+    let more = Menus.items(in: strip.host, containing: "Show Inspector").map(\.title)
+    strip.close()
+    verifier.check("monitor LUT: the strip ⋯ menu no longer has it", !more.isEmpty && !more.contains("Monitor LUT")
+      && !more.contains("Load LUT…") && more.contains("Restart Camera"), more.joined(separator: ", "), viewDependent: true)
     func item(_ title: String, in list: [NSMenuItem]) -> NSMenuItem? { list.first { $0.title == title } }
     let titles = empty.lut.map(\.title).joined(separator: ", ")
     verifier.check("monitor LUT: offers Load Monitor LUT… without a file",

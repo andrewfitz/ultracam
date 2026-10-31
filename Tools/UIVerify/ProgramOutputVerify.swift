@@ -108,33 +108,29 @@ import SwiftUI
 
   static func items(_ session: UISessionSnapshot) -> [NSMenuItem] {
     UIMenuBarController.buildItems(presentation: UIPresentationBuilder.session(session), session: session,
-      inputs: UIFixtures.inputs, stats: "CPU 31% · GPU 18%", target: nil, previewItem: nil, showLivePreview: false)
+      target: nil, previewItem: nil, showLivePreview: false)
   }
 
   static func menuBar(_ verifier: Verifier) {
     verifier.check("menu bar: no Output submenu", !items(programManual()).contains { $0.title == "Output" })
 
-    // Program: Strategy submenu beside a disabled Automatic Switching.
+    // Program: Automatic Switching is off under Manual; Strategy lives in the window's Auto menu and the
+    // Program menu, so the panel stays within its rows.
     let manual = items(programManual())
-    let strategy = manual.first { $0.title == "Strategy" }
-    verifier.check("menu bar Program: Strategy submenu with Manual checked",
-      strategy?.submenu?.items.map(\.title) == ["Manual", "Fixed interval", "Natural talking head"]
-        && strategy?.submenu?.items.first?.state == .on, strategy?.submenu?.items.map(\.title).joined(separator: " | ") ?? "none")
+    verifier.check("menu bar Program: no Strategy row", !manual.contains { $0.title == "Strategy" })
     verifier.check("menu bar Program: Automatic Switching disabled under Manual",
       manual.first { $0.title == "Automatic Switching" }?.isEnabled == false)
-    verifier.check("menu bar one camera: no Strategy submenu", !items(oneCamera()).contains { $0.title == "Strategy" })
 
-    // An open menu follows an automatic cut in place: same rows, new checkmark.
+    // An open menu follows an automatic cut in place: the one Cut row now names the other camera.
     let meeting = UIFixtures.programMeeting()
     let open = items(meeting)
     var cut = meeting
     cut.onAirID = "camera-2"
     let refreshed = UIMenuBarController.refresh(open, with: items(cut))
-    let one = open.first { $0.title == "Cut to Camera 1" }
-    let two = open.first { $0.title == "Cut to Camera 2" }
+    let cutRows = open.filter { $0.title.hasPrefix("Cut to") }
     verifier.check("menu bar refresh: an automatic cut updates the open rows in place",
-      refreshed && two?.state == .on && two?.isEnabled == false && one?.state == .off && one?.isEnabled == true,
-      "refreshed \(refreshed), 1 \(one?.state.rawValue ?? -1)/\(one?.isEnabled ?? false), 2 \(two?.state.rawValue ?? -1)/\(two?.isEnabled ?? false)")
+      refreshed && cutRows.map(\.title) == ["Cut to Camera 1"] && cutRows.first?.isEnabled == true,
+      "refreshed \(refreshed), \(cutRows.map(\.title))")
     let nested = open.first { $0.title == "Camera 2" }?.submenu?.items.first { $0.title.hasPrefix("Cut to") }
     verifier.check("menu bar refresh: camera submenus follow too", nested?.state == .on && nested?.isEnabled == false)
     // Rows that come or go (a stopped camera loses its Pause row) need a rebuild instead.

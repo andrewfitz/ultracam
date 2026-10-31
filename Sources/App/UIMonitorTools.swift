@@ -45,7 +45,7 @@ struct UIMonitorToolButtons: View {
 
   /// A picture narrower than this can't hold the bar beside its name, so the bar takes its
   /// own row under it, right aligned.
-  static let ownRowBelow: CGFloat = 560
+  nonisolated static let ownRowBelow: CGFloat = 560
   @State private var openPanel: UIMonitorPanel?
   /// The popover opened from the collapsed menu's Settings items.
   @State private var menuPanel: UIMonitorPanel?

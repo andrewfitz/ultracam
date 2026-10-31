@@ -95,19 +95,26 @@ struct UIToolbarPillStyle: ButtonStyle {
   var selected = false
   var outline: Color? = nil
   @Environment(\.isEnabled) private var enabled
+  @Environment(\.colorScheme) private var scheme
+
+  /// The on fill: white on a dark toolbar, near black on a light one, the glyph the opposite.
+  private var onFill: Color { scheme == .dark ? .white : Color(white: 0.12) }
 
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
       .font(.body.weight(on ? .semibold : .medium))
+      .lineLimit(1)
+      .fixedSize()
       .padding(.horizontal, 9).frame(height: 26)
-      .foregroundStyle(on ? AnyShapeStyle(Color.black) : enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+      .foregroundStyle(on ? AnyShapeStyle(scheme == .dark ? Color.black : .white)
+        : enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
       .background(background(pressed: configuration.isPressed), in: Capsule())
       .overlay(Capsule().strokeBorder(outline ?? .clear, lineWidth: 1.5))
       .contentShape(Capsule())
   }
 
   private func background(pressed: Bool) -> AnyShapeStyle {
-    if on { return AnyShapeStyle(Color.white.opacity(pressed ? 0.75 : 0.9)) }
+    if on { return AnyShapeStyle(onFill.opacity(pressed ? 0.75 : 0.9)) }
     if selected || pressed { return AnyShapeStyle(.fill.secondary) }
     return AnyShapeStyle(.clear)
   }
@@ -134,6 +141,8 @@ struct UIToolbarCutGroup: View {
       autoOptions
       hold
     }
+    // A toolbar draws labels icon-only; these keep their words, which carry the state.
+    .labelStyle(.titleAndIcon)
   }
 
   @ViewBuilder private func cutButton(_ button: UICutButton) -> some View {
