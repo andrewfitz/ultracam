@@ -7,7 +7,7 @@ struct UICameraControlButton: View {
     var viewFactories: [String: ControlViewFactory] = [:]
     @State private var presented = false
     var body: some View {
-        Button { presented = true } label: { Label("Camera Control…", systemImage: UISymbol.cameraControl) }
+        Button { presented = true } label: { Label("Camera Control…", systemImage: "camera.aperture") }
             .help("Assign a control camera to \(name) and change its settings")
             .accessibilityLabel("Camera Control for \(name)")
             .sheet(isPresented: $presented) { UICameraControlSettings(feedID: feedID, name: name, store: store, viewFactories: viewFactories) }
@@ -171,8 +171,9 @@ struct UICameraControlSettings: View {
             if let message = store.discoveryMessages[pluginID] { Text(message).foregroundStyle(.secondary) }
             if let camera = selectedCamera {
                 if store.holder(of: camera.id, pluginID: camera.pluginID, excluding: feedID) != nil {
+                    // Vendor test groups compile this file on its own, without the shared components.
                     Label { Text("This control camera is assigned to another Ultracam camera. Unassign it there first.") } icon: {
-                        UIStateGlyph(state: .warning)
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                     }
                 } else {
                     if store.hasSavedCredentials(for: camera) {
