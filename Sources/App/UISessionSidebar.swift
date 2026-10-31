@@ -24,6 +24,9 @@ struct UISessionSidebarViewContent: View {
     // through the list; other rows that name a camera are buttons that do the same.
     VStack(spacing: 0) {
       UIAttentionSection(context: context)
+      if presentation.offersAlerts {
+        UIAlertsPrompt(context: context).padding(.horizontal, 10).padding(.bottom, 8)
+      }
       List(selection: selection) {
         if let banner = UIExtensionBanner.state(session.install) {
           Section { UIExtensionBannerView(state: banner, context: context) }

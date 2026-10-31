@@ -102,6 +102,9 @@ enum UIAction: Sendable, Equatable {
   case openSettings
   case openDiagnostics
   case openMainWindow
+  /// Asks for notification permission. Only offered before a session.
+  case turnOnAlerts
+  case dismissAlertsPrompt
   /// Clears every saved preference, then quits (only while nothing runs or records).
   case resetAllSettings
   case quit

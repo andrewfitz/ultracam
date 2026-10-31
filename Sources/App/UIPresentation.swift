@@ -274,6 +274,8 @@ struct UISessionSnapshot: Sendable, Equatable {
   /// A take has outlived the last client seen during it.
   var unusedTake = false
   var appProblems: [UIAppProblem] = []
+  /// Notifications have never been asked for, so Attention may offer them.
+  var offerAlerts = false
   var recentCuts: [UICutRecord] = []
   var codecTitle = "ProRes 422 HQ"
   var timecodeTitle = "Mac Clock"
@@ -509,6 +511,8 @@ struct UISessionPresentation: Sendable, Equatable {
   var statusSegments: [UIStatusSegment]
   /// Every problem, worst first: the one list all surfaces render.
   var problems: [UIProblem]
+  /// Attention offers to turn alerts on: before a session, never while live.
+  var offersAlerts = false
   var outputSummary: String
   var outputInUse: Bool
   var recordingSummary: String
@@ -517,6 +521,8 @@ struct UISessionPresentation: Sendable, Equatable {
 
 extension UISessionPresentation {
   /// The camera the menu bar preview shows: the one a meeting sees, if any, otherwise the selected one.
+  /// A camera is on air or rolling: no time to ask anyone anything.
+  var isLive: Bool { cameras.contains { $0.tally.isRed || $0.pauseTitle != nil } }
   var previewCamera: UICameraPresentation? { cameras.first { $0.tally == .onAir } ?? cameras.first { $0.tally == .iso } ?? selected }
 }
 
@@ -896,7 +902,7 @@ enum UIPresentationBuilder {
     let layouts = cameras.count > 1 ? available : available.filter { $0 == .single || $0 == .programView }
     let layout = layouts.contains(session.layout) ? session.layout : .single
 
-    return UISessionPresentation(
+    var presentation = UISessionPresentation(
       title: "Ultracam", subtitle: subtitle,
       cameras: cameras, selected: cameras.first(where: \.selected),
       outputMode: session.outputMode,
@@ -909,6 +915,8 @@ enum UIPresentationBuilder {
       canRevealRecordings: session.defaultFolderPath != nil || session.cameras.contains { $0.recording.folderPath != nil },
       statusSegments: segments, problems: problems, outputSummary: outputSummary, outputInUse: outputInUse,
       recordingSummary: recordingSummary, menuBarIcon: menuBarIcon(session, problems: problems))
+    presentation.offersAlerts = session.offerAlerts && !presentation.isLive
+    return presentation
   }
 
   /// The drive a camera records to: the volume its /Volumes folder names, or the

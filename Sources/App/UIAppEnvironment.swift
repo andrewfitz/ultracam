@@ -6,6 +6,7 @@ import AppKit
 @MainActor enum UIAppEnvironment {
   static let model = AppModel()
   static let interface = UIInterfaceState()
+  static let alertPreferences = UIAlertPreferences()
   /// SwiftUI's scene actions, for AppKit (the menu bar item, a Dock click). The app's menu
   /// commands set them at launch, before any window opens, and they keep working after
   /// every window has closed.

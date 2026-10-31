@@ -28,6 +28,10 @@ final class UIInterfaceState {
   var confirmation: (message: String, action: UIAction)?
   /// The camera whose rename prompt is open (`uiRenameAlert`), if any.
   var renamingCameraID: String?
+  /// Notification permission is undecided, so Attention may offer it. Set by `UIAlertCoordinator`.
+  var offerAlerts = false
+  @ObservationIgnored var turnOnAlerts: (@MainActor () -> Void)?
+  @ObservationIgnored var dismissAlertsPrompt: (@MainActor () -> Void)?
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -215,6 +219,7 @@ struct UISessionBridge {
     session.programQueueStalled = model.programQueueStalled
     session.unusedTake = model.unusedTake
     session.appProblems = model.appProblems
+    session.offerAlerts = interface.offerAlerts
     session.recentCuts = model.recentCuts
     session.codecTitle = recording.codec.title
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
@@ -457,6 +462,8 @@ struct UISessionBridge {
     case .removeCameraExtension: model.installer.uninstall()
     case .openSettings: openSettings()
     case .openDiagnostics: openWindow("diagnostics")
+    case .turnOnAlerts: interface.turnOnAlerts?()
+    case .dismissAlertsPrompt: interface.dismissAlertsPrompt?()
     case .openMainWindow:
       openWindow("main")
       NSApplication.shared.activate(ignoringOtherApps: true)

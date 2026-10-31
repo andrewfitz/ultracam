@@ -20,6 +20,8 @@ enum UIAlertEvent: String, Sendable, Equatable, CaseIterable {
 }
 
 struct UIProblemAlert: Sendable, Equatable {
+  /// One notification for two rows that are one event, such as a loss and the cut after it.
+  var key: String? = nil
   var event: UIAlertEvent
   var title: String
   var body: String
@@ -212,7 +214,7 @@ extension UIPresentationBuilder {
         list.append(UIProblem(id: "onair.\(id)", title: lost.isEmpty ? "\(name) on air: no signal" : "\(name) signal lost\(lost)",
           detail: takeCountdown(camera) ?? "Still on Program", level: .damage, cameraID: id, action: action ?? details,
           stripText: "Check \(name)'s HDMI",
-          alert: UIProblemAlert(event: .onAirLost, title: "\(name) signal lost",
+          alert: UIProblemAlert(key: "onair.\(name)", event: .onAirLost, title: "\(name) signal lost",
             body: others ? "Still on Program" : "No camera has a picture", showsPanel: true), rank: 10))
       case .noSignal where rolling:
         list.append(UIProblem(id: "signal.\(id)", title: lost.isEmpty ? "\(name): recording, no signal" : "\(name) signal lost\(lost)",
@@ -283,7 +285,7 @@ extension UIPresentationBuilder {
       list.append(UIProblem(id: "program.moved", title: "\(moved.from) signal lost",
         detail: "Program moved to \(moved.to).\(moved.heldShot ? " Hold stays on." : "")", level: .damage,
         action: UIProblemAction(title: "Details", action: .acknowledgeProgramMove),
-        alert: UIProblemAlert(event: .onAirLost, title: "\(moved.from) signal lost",
+        alert: UIProblemAlert(key: "onair.\(moved.from)", event: .onAirLost, title: "\(moved.from) signal lost",
           body: "Program moved to \(moved.to)", showsPanel: true), rank: 14))
     }
     if session.programQueueStalled, let onAir = onAir(session) {

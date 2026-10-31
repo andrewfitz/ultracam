@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
   weak var model: AppModel?
   private var menuBar: UIMenuBarController?
+  private var alerts: UIAlertCoordinator?
   private var terminationPending = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -26,6 +27,11 @@ import SwiftUI
     menuBar = UIMenuBarController(model: model, interface: UIAppEnvironment.interface)
     if !CommandLine.arguments.contains("--ui-self-test") {
       Task { @MainActor in await model.cameraControls.restoreConnections() }
+      // Here, before launch finishes: the system asks for the delegate that early.
+      let notifications = UIUserNotifications()
+      notifications.opened = { [weak self] in self?.showMainWindow() }
+      alerts = UIAlertCoordinator(model: model, interface: UIAppEnvironment.interface,
+        preferences: UIAppEnvironment.alertPreferences, delivery: notifications, panel: UIAlertPanelController())
     }
     // scripts/ui-tour.sh reviews both appearances without changing the system setting.
     if let flag = CommandLine.arguments.firstIndex(of: "--ui-appearance"), CommandLine.arguments.indices.contains(flag + 1) {
@@ -37,6 +43,13 @@ import SwiftUI
       let runner = NSClassFromString("UISelfTestRunner") as? NSObject.Type {
       _ = runner.perform(NSSelectorFromString("run"))
     }
+  }
+
+  /// A notification clicked: into the Dock first, so the window opens with its menus.
+  private func showMainWindow() {
+    if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+    UIAppEnvironment.openWindow?("main")
+    NSApp.activate(ignoringOtherApps: true)
   }
 
   /// A Dock click with every window closed opens the main window again.
