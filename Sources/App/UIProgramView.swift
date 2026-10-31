@@ -40,8 +40,18 @@ struct UIProgramView: View {
       .aspectRatio(16 / 9, contentMode: .fit)
       .clipShape(RoundedRectangle(cornerRadius: 14))
       .overlay {
-        if tally == .onAir {
-          RoundedRectangle(cornerRadius: 14).strokeBorder(Color.red, lineWidth: 4)
+        // What the meeting has: a picture gone, on air. The way out is here too.
+        if tally == .noPicture, let camera = context.presentation.cameras.first(where: { $0.id == session.onAirID }),
+          camera.tileState == .signalLost {
+          UILiveCamera(camera: camera, context: context, follows: [], refresh: 1) { live in
+            UILostSignalPlaceholder(camera: live.camera, context: context)
+          }
+          .clipShape(RoundedRectangle(cornerRadius: 14))
+        }
+      }
+      .overlay {
+        if let color = tally.ringColor {
+          RoundedRectangle(cornerRadius: 14).strokeBorder(color, lineWidth: 4).allowsHitTesting(false)
         }
       }
       .overlay(alignment: .topLeading) {
@@ -94,7 +104,7 @@ struct UIProgramView: View {
             Label("Cut", systemImage: "arrow.right.circle")
           }
           .disabled(!camera.cutEnabled)
-          .help("Cut to \(camera.name) (⌃\(camera.number))")
+          .help(camera.cutHelp ?? "Cut to \(camera.name) (⌃\(camera.number))")
           .accessibilityLabel("Cut to \(camera.name)")
         }
       }

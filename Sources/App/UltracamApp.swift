@@ -9,6 +9,10 @@ import SwiftUI
   func applicationDidFinishLaunching(_ notification: Notification) {
     let model = UIAppEnvironment.model
     self.model = model
+    let interface = UIAppEnvironment.interface
+    model.stripOrder = { ids in
+      interface.ordered(ids.map(\.rawValue), id: { $0 }).map { FeedID(rawValue: $0) }
+    }
     UIDockPresence.update(hideFromDock: model.hideFromDock)
     // In the Dock while a window is open; with "Menu bar when closed", only the menu bar
     // item once the last one closes (it is still visible while it closes, so look after).

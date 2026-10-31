@@ -93,11 +93,37 @@ extension UIPresentationBuilder {
     return left > 0 ? "Take ends in \(left) s" : "Take ends when the signal returns"
   }
 
+  /// The placeholder's second line. Nothing to cut to on Program comes first.
+  static func lostDetail(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> String? {
+    guard camera.signalLostFor != nil else { return nil }
+    let stranded = session.outputMode == .program && session.onAirID == camera.id
+      && nextLive(after: camera, in: session) == nil
+    let parts = [stranded ? "No camera has a picture." : nil, takeCountdown(camera)].compactMap { $0 }
+    return parts.isEmpty ? nil : parts.joined(separator: " ")
+  }
+
+  /// With Auto off nothing cuts by itself, so the way out goes on the picture.
+  static func lostCut(_ camera: UICameraSnapshot, index: Int, in session: UISessionSnapshot) -> UICutButton? {
+    guard camera.signalLostFor != nil, session.outputMode == .program, session.onAirID == camera.id,
+      !(session.autoSwitching && session.strategy != .manual), let next = nextLive(after: camera, in: session),
+      let number = session.cameras.firstIndex(where: { $0.id == next.id }) else { return nil }
+    return UICutButton(id: next.id, number: number + 1, name: next.name, onAir: false, pending: session.pendingCutID == next.id, enabled: true)
+  }
+
+  /// Why Cut is off, in words. Marking a camera unhealthy refuses its cuts, so this has to explain.
+  static func cutHelp(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> String? {
+    guard session.outputMode == .program, session.onAirID != camera.id else { return nil }
+    if let wait = camera.cutBlockedFor, isLive(camera) {
+      return "\(camera.name)'s signal just came back. It can take a cut after \(Int(wait.rounded(.up))) s more of steady signal."
+    }
+    return isLive(camera) ? nil : "\(camera.name) needs a live signal before it can go on air."
+  }
+
   private static func onAir(_ session: UISessionSnapshot) -> UICameraSnapshot? {
     session.outputMode == .program ? session.cameras.first { $0.id == session.onAirID } : nil
   }
 
-  private static func hasNoPicture(_ camera: UICameraSnapshot) -> Bool {
+  static func hasNoPicture(_ camera: UICameraSnapshot) -> Bool {
     guard camera.running else { return false }
     switch camera.signal {
     case .noSignal, .unsupported, .deviceMissing: return true
@@ -181,7 +207,8 @@ extension UIPresentationBuilder {
       case .noSignal where onAirHere && session.programInUse:
         let others = session.cameras.contains { $0.id != id && canTakeCut($0) }
         let next = nextLive(after: camera, in: session)
-        let action = !session.autoSwitching ? next.map { UIProblemAction(title: "Cut to \($0.name)", action: .cut(cameraID: $0.id)) } : nil
+        let auto = session.autoSwitching && session.strategy != .manual
+        let action = !auto ? next.map { UIProblemAction(title: "Cut to \($0.name)", action: .cut(cameraID: $0.id)) } : nil
         list.append(UIProblem(id: "onair.\(id)", title: lost.isEmpty ? "\(name) on air: no signal" : "\(name) signal lost\(lost)",
           detail: takeCountdown(camera) ?? "Still on Program", level: .damage, cameraID: id, action: action ?? details,
           stripText: "Check \(name)'s HDMI",

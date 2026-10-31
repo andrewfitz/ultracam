@@ -22,6 +22,7 @@ extension UITally {
     switch self {
     case .none: return nil
     case .onAir, .iso: return .red
+    case .noPicture: return .orange
     case .program: return nil
     case .next: return .green
     }
@@ -144,7 +145,7 @@ struct UITallyBadge: View {
       Text(text)
         .font(.subheadline.weight(.bold))
         .padding(.horizontal, 9).frame(height: 24)
-        .foregroundStyle(tally == .next ? Color.black : .white)
+        .foregroundStyle(tally == .next || tally == .noPicture ? Color.black : .white)
         .background(background, in: Capsule())
         .overlay(Capsule().strokeBorder(tally == .program ? Color.white.opacity(0.6) : .clear, lineWidth: 1.5))
         .accessibilityLabel(tally.label ?? text)
@@ -153,6 +154,7 @@ struct UITallyBadge: View {
   private var background: Color {
     switch tally {
     case .onAir, .iso: return .red
+    case .noPicture: return .orange
     case .next: return .green
     default: return .black.opacity(0.72)
     }

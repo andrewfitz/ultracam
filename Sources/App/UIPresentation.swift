@@ -301,6 +301,9 @@ enum UITally: Sendable, Equatable {
   case onAir
   /// Red ring and "ISO": frames from this camera are reaching a client of its own device.
   case iso
+  /// On Program, a client is watching, and there's no picture. Orange: red stays
+  /// reserved for frames arriving.
+  case noPicture
   /// On Program, with nothing receiving it.
   case program
   /// A cut to this camera is pending (it lands on the next Program frame).
@@ -310,6 +313,7 @@ enum UITally: Sendable, Equatable {
     case .none: return nil
     case .onAir: return "ON AIR"
     case .iso: return "ISO"
+    case .noPicture: return "NO PICTURE"
     case .program: return "PROGRAM"
     case .next: return "NEXT"
     }
@@ -320,6 +324,7 @@ enum UITally: Sendable, Equatable {
     case .none: return nil
     case .onAir: return "On air"
     case .iso: return "ISO"
+    case .noPicture: return "No picture"
     case .program: return "Program"
     case .next: return "Next"
     }
@@ -330,7 +335,7 @@ enum UITally: Sendable, Equatable {
 }
 
 enum UITileState: Sendable, Equatable {
-  case live, connecting, noSignal, unsupported(String), deviceMissing, stopped, previewHidden, updating
+  case live, connecting, noSignal, signalLost, unsupported(String), deviceMissing, stopped, previewHidden, updating
   /// True when the picture area shows video (tool chips and overlays only make sense then).
   var showsPicture: Bool { self == .live || self == .updating }
 }
@@ -377,6 +382,8 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var outputInUse: Bool
   var showsCut: Bool
   var cutEnabled: Bool
+  /// Why Cut is off, for the tooltip. Nil when it's on.
+  var cutHelp: String?
   var chips: [UIChip]
   var processing: Bool
   var applying: Bool
@@ -400,6 +407,12 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var takeAudioHelp: String? = nil
   /// This camera's worst problem, in place of its folder row. The strip never changes height.
   var stripProblem: UIStripProblem? = nil
+  /// "Signal lost 0:06", from a camera that had a picture.
+  var lostTitle: String? = nil
+  /// What that means now: the take's countdown, and that nothing can take over.
+  var lostDetail: String? = nil
+  /// With Auto off, the camera a large Cut on the placeholder goes to.
+  var lostCut: UICutButton? = nil
 }
 
 /// One row of an Input picker: a listed device, and the other camera that already uses it.
@@ -595,6 +608,7 @@ enum UIPresentationBuilder {
     // Red needs frames arriving, not just a client.
     if onAir, session.programInUse, session.programSinkConnected, live { return .onAir }
     if camera.inUse, camera.sinkConnected, live { return .iso }
+    if onAir, session.programInUse, hasNoPicture(camera) { return .noPicture }
     if session.pendingCutID == camera.id, !onAir { return .next }
     if onAir, session.cameras.count > 1 { return .program }
     return .none
@@ -605,7 +619,7 @@ enum UIPresentationBuilder {
     guard camera.running else { return .stopped }
     switch camera.signal {
     case .none, .connecting: return .connecting
-    case .noSignal: return .noSignal
+    case .noSignal: return camera.signalLostFor == nil ? .noSignal : .signalLost
     case .unsupported(let mode): return .unsupported(mode)
     case .deviceMissing: return .deviceMissing
     case .live:
@@ -668,7 +682,7 @@ enum UIPresentationBuilder {
     // Every clock on screen uses the short form ("12:31", "1:02:47").
     case .recording, .updating: recordTitle = "Recording"; recordDetail = UIFormat.shortElapsed(rec.elapsed); recordTone = .critical
     case .recordingNoSignal:
-      recordTitle = "Recording · no signal"; recordDetail = UIFormat.shortElapsed(rec.elapsed); recordTone = .warning
+      recordTitle = "Recording"; recordDetail = UIFormat.shortElapsed(rec.elapsed); recordTone = .warning
     case .paused: recordTitle = "Paused"; recordDetail = UIFormat.shortElapsed(rec.elapsed); recordTone = .warning
     case .finishing: recordTitle = "Finishing…"; recordDetail = "Writing the final fragment"
     case .saved:
@@ -751,8 +765,10 @@ enum UIPresentationBuilder {
       recordButtonActive: recordButtonActive, recordButtonEnabled: recordButtonEnabled, recordButtonHelp: recordHelp,
       pauseTitle: rec.status == .recording ? "Pause" : rec.status == .paused ? "Resume" : nil,
       sizeLine: isRecording ? "\(rec.fileBytes > 0 ? UIFormat.bytes(rec.fileBytes) : "—") · \(UIFormat.bitrate(rec.megabitsPerSecond))" : nil,
-      dropsLine: isRecording ? (rec.droppedFrames > 0 ? "\(rec.droppedFrames) dropped" : "0 dropped") : nil,
-      dropsWarning: rec.droppedFrames > 0,
+      // A green "0 dropped" doesn't sit beside a take that's losing its picture.
+      dropsLine: isRecording ? (strip == .recordingNoSignal ? "Losing frames"
+        : rec.droppedFrames > 0 ? "\(rec.droppedFrames) dropped" : "0 dropped") : nil,
+      dropsWarning: rec.droppedFrames > 0 || strip == .recordingNoSignal,
       folderLine: rec.folderPath.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "No recording folder",
       // A drive with nothing free has no time left to show; say so instead of hiding the line.
       timeLeftLine: rec.secondsLeft.map { "\(UIFormat.duration($0)) left" }
@@ -760,7 +776,8 @@ enum UIPresentationBuilder {
       outputLine: outputLine,
       outputInUse: session.outputMode == .program ? (session.onAirID == camera.id && session.programInUse) : camera.inUse,
       showsCut: session.outputMode == .program && session.onAirID != camera.id,
-      cutEnabled: session.outputMode == .program && camera.running && liveFormat != nil && session.onAirID != camera.id,
+      cutEnabled: session.outputMode == .program && canTakeCut(camera) && session.onAirID != camera.id,
+      cutHelp: cutHelp(camera, in: session),
       chips: chips, processing: camera.processing, applying: camera.applying,
       canStart: !camera.running && camera.deviceAvailable,
       canStop: camera.running,
@@ -773,7 +790,10 @@ enum UIPresentationBuilder {
       diskFull: diskFull(camera, in: session),
       recordingNote: recordingNote.isEmpty ? nil : recordingNote,
       takeAudioHelp: takeAudio.map { (isRecording ? "This take so far: " : "Last take: ") + $0.note },
-      stripProblem: stripProblem(camera, in: session))
+      stripProblem: stripProblem(camera, in: session),
+      lostTitle: lostClock(camera).map { "Signal lost \($0)" },
+      lostDetail: lostDetail(camera, in: session),
+      lostCut: lostCut(camera, index: index, in: session))
   }
 
   static func stopMessage(camera: UICameraSnapshot, recording: Bool, onAir: Bool) -> String {

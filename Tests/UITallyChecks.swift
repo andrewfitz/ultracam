@@ -41,7 +41,7 @@ import XCTest
     XCTAssertEqual(tally(program(two)), .onAir)
     XCTAssertEqual(tally(program(two, client: false)), .program, "Nobody is watching")
     XCTAssertEqual(tally(program(two, sink: false)), .program, "A connect failure is red on black")
-    XCTAssertEqual(tally(program([camera(1, signal: .noSignal), camera(2)])), .program, "No frames, no red")
+    XCTAssertEqual(tally(program([camera(1, signal: .noSignal), camera(2)])), .noPicture, "No frames, no red")
     XCTAssertEqual(tally(program([camera(1, signal: .connecting), camera(2)])), .program)
     XCTAssertEqual(tally(program([camera(1, running: false), camera(2)])), .program, "Red on a stopped camera")
   }

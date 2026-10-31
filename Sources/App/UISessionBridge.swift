@@ -66,19 +66,25 @@ enum UIFormatLabels {
     return rate.isEmpty ? "\(height)p" : "\(height)p \(rate)"
   }
 
-  static func signal(running: Bool, deviceAvailable: Bool, update: CaptureUpdate?) -> UISignal {
+  /// `withinLossHold`: a loss too short to count yet reads as live, so a 30 ms dropout
+  /// doesn't flicker the tally or the picture.
+  static func signal(running: Bool, deviceAvailable: Bool, update: CaptureUpdate?, withinLossHold: Bool = false) -> UISignal {
     guard running else { return .none }
     guard let update else { return .connecting }
     switch update.signal {
     case .unsupported(let reason): return .unsupported(reason)
+    case .lost where withinLossHold: return signal(update: update, deviceAvailable: deviceAvailable)
     case .lost: return deviceAvailable ? .noSignal : .deviceMissing
     case .waiting: return deviceAvailable ? .connecting : .deviceMissing
-    case .live:
-      // The format only names the picture; live before it's known is still starting.
-      if let format = update.sourceFormat { return .live(format: FormatDisplayIdentity(format).short) }
-      if let format = shortFormat(update.input) { return .live(format: format) }
-      return deviceAvailable ? .connecting : .deviceMissing
+    case .live: return signal(update: update, deviceAvailable: deviceAvailable)
     }
+  }
+
+  /// The format only names the picture; live before it's known is still starting.
+  private static func signal(update: CaptureUpdate, deviceAvailable: Bool) -> UISignal {
+    if let format = update.sourceFormat { return .live(format: FormatDisplayIdentity(format).short) }
+    if let format = shortFormat(update.input) { return .live(format: format) }
+    return deviceAvailable ? .connecting : .deviceMissing
   }
 }
 
@@ -122,7 +128,6 @@ struct UISessionBridge {
       camera.inputName = model.inputLabel(descriptor.selectedDevice)
       camera.deviceAvailable = deviceAvailable
       camera.running = running
-      camera.signal = UIFormatLabels.signal(running: running, deviceAvailable: deviceAvailable, update: update)
       camera.outputFormat = update.flatMap { UIFormatLabels.shortFormat($0.output) }
       camera.applying = running && update != nil && update?.pipelineEnabledApplied == nil &&
         (update?.sourceFormat != nil || UIFormatLabels.shortFormat(update?.input ?? "") != nil)
@@ -157,7 +162,8 @@ struct UISessionBridge {
       // A refused Start says why; otherwise an automatic camera's status.
       camera.automaticStatus = model.startRefusal(id) ?? (descriptor.automaticFeed ? model.automaticStatus(id) : nil)
       camera.automaticStartFailed = model.automaticStartFailed(id)
-      Self.applyCapture(update, to: &camera)
+      Self.applyCapture(update, withinLossHold: model.signalWithinLossHold(id), to: &camera)
+      camera.cutBlockedFor = model.cutBlockedFor(id)
       let monitor = model.monitorCoordinator.preferences(for: MonitorTargetID(id.rawValue))
       camera.activeTools = UIMonitorBridge.activeTools(monitor)
       camera.message = update?.message ?? ""

@@ -284,6 +284,10 @@ final class AppModel {
   private(set) var programQueueStalled = false
   /// A take has outlived the last client seen during it.
   private(set) var unusedTake = false
+  /// Which cameras have really lost their signal, and which may take a cut again.
+  @ObservationIgnored private var signalHealth = SignalHealthTracker()
+  /// The cameras in the order their strips show. The interface owns that order.
+  @ObservationIgnored var stripOrder: ([FeedID]) -> [FeedID] = { $0 }
   /// Program's sink is open. Polled by the live watch: the bridge isn't observable.
   private(set) var programSinkConnected = false
   /// Cameras whose client has been waiting for frames past `LiveWatchLimits.clientWaiting`.
@@ -841,6 +845,7 @@ final class AppModel {
     cameraLUTs[id] = nil
     cameraUpdates[id] = nil
     feedPolicies[id] = nil
+    signalHealth.remove(id)
     unexpectedStops[id] = nil
     acknowledgedTakes.remove(id)
     clearProblem("declaration.\(id.rawValue)")
@@ -893,6 +898,8 @@ final class AppModel {
   }
   @discardableResult
   func requestProgramCut(to feedID: FeedID) -> ProgramCutRequestResult<FeedID> {
+    // Also with nothing on air, where the switcher would just select it.
+    guard !signalHealth.isUnhealthy(feedID) else { return .rejectedMissingSource }
     let oldDecisionID = pendingAutoDecisionID
     let result = feedCoordinator.requestProgramCut(to: feedID)
     if case .rejectedMissingSource = result { return result }
@@ -1233,9 +1240,14 @@ final class AppModel {
     if update.stopped {
       captureLog.notice("Stopped \(feedID.rawValue, privacy: .public): \(update.message, privacy: .public)")
       cameraStateRevision &+= 1
+      signalHealth.remove(feedID)
+      let failed: Bool
       if case .failed(let reason)? = update.stopCause {
         unexpectedStops[feedID] = UnexpectedStop(reason: reason, at: Date(), cameraStopped: true,
           wasOnAir: outputMode == .program && programInUse && switcherSelectedFeedID == feedID)
+        failed = true
+      } else {
+        failed = false
       }
       monitorCoordinator.sourceStateChanged(target: MonitorTargetID(feedID.rawValue), running: false, message: update.message)
       detectedSourceDurations[feedID] = nil
@@ -1245,10 +1257,13 @@ final class AppModel {
       // keeps cutting between the cameras still live.
       recordingModel.stop(feedID: feedID)
       retireProgramSource(feedID)
+      // A failed camera can't wait out a hold: it has already gone.
+      if failed { moveProgram(off: feedID) }
       reconcileAutoSwitcher()
       reconcileProgramTransportDemand()
       return
     }
+    signalHealth.note(feedID, signal: update.signal, now: ProcessInfo.processInfo.systemUptime)
     if let duration = update.sourceDuration, duration.isNumeric, duration.epoch == 0, duration.value > 0,
       detectedSourceDurations[feedID] != duration {
       lastSourceDurations[feedID] = duration
@@ -1292,6 +1307,7 @@ final class AppModel {
   private func endCapture(_ id: FeedID, message: String) {
     recordingModel.stop(feedID: id)
     feedCoordinator.stopCapture(feedID: id)
+    signalHealth.remove(id)
     appliedPipelines[id] = nil
     detectedSourceDurations[id] = nil
     if outputMode == .program { retireProgramSource(id) }
@@ -1605,7 +1621,56 @@ final class AppModel {
   /// Frames going where they should, on the camera's own route.
   private func cameraDelivering(_ id: FeedID) -> Bool {
     guard feedCoordinator.isFeedRunning(id), let update = cameraUpdates[id], update.cameraOutputActive else { return false }
-    return update.signal == .live
+    return update.signal == .live || signalHealth.isWithinLossHold(id)
+  }
+
+  /// A dropout inside the hold: every surface keeps calling it live.
+  func signalWithinLossHold(_ id: FeedID) -> Bool { signalHealth.isWithinLossHold(id) }
+
+  /// Why Program can't cut here though the picture is back: seconds of steady signal to go.
+  func cutBlockedFor(_ id: FeedID) -> TimeInterval? {
+    signalHealth.secondsUntilEligible(id, now: ProcessInfo.processInfo.systemUptime)
+  }
+
+  private func signalChanged(_ change: SignalHealthTracker.Change) {
+    cameraStateRevision &+= 1
+    switch change {
+    case .unhealthy(let id):
+      captureLog.notice("Signal lost \(id.rawValue, privacy: .public): past the 1 s hold")
+      feedCoordinator.setProgramSourceHealth(id, healthy: false)
+      autoSwitcherBridge?.setCameraHealth(cameraID: id, healthy: false, at: directorClock())
+      moveProgram(off: id)
+    case .eligible(let id):
+      captureLog.notice("Signal steady \(id.rawValue, privacy: .public): eligible for Program again")
+      feedCoordinator.setProgramSourceHealth(id, healthy: true)
+      autoSwitcherBridge?.setCameraHealth(cameraID: id, healthy: true, at: directorClock())
+      if programMoved?.from == descriptor(for: id)?.name { programMoved = nil }
+    }
+  }
+
+  /// One failover rule for every strategy. With Auto on, Program leaves a camera with no
+  /// picture for the next live one in strip order, over Hold if need be: a shot with no
+  /// picture isn't worth holding, and Hold stays on for the new one. With Auto off, or
+  /// nothing live, it stays and the problem list offers what can be done.
+  private func moveProgram(off id: FeedID) {
+    guard outputMode == .program, switcherSelectedFeedID == id else { return }
+    let settings = switcherSettings
+    guard settings.automatic, settings.strategy != .manual else { return }
+    let order = stripOrder(feedDescriptors.filter(\.enabled).map(\.id))
+    guard let next = ProgramFailover.nextLive(after: id, order: order, isLive: { candidate in
+      candidate != id && feedCoordinator.isFeedRunning(candidate) && cameraUpdates[candidate]?.signal == .live &&
+        !signalHealth.isUnhealthy(candidate)
+    }) else { return }
+    switch requestProgramCut(to: next) {
+    case .queued, .coalesced, .selectedImmediately:
+      captureLog.notice("Program moved: \(id.rawValue, privacy: .public) → \(next.rawValue, privacy: .public), signal lost")
+      if let from = descriptor(for: id)?.name, let to = descriptor(for: next)?.name {
+        programMoved = UIProgramMove(from: from, to: to, heldShot: settings.naturalTalkingHead.manualHold)
+      }
+    case .ignoredSameSource, .rejectedMissingSource:
+      break
+    }
+    reconcileProgramTransportDemand()
   }
 
   /// What can only be learned by watching the clock: nothing arrives to say a client has
@@ -1631,6 +1696,7 @@ final class AppModel {
   }
 
   func liveWatchTick(now: TimeInterval) {
+    signalHealth.tick(now: now).forEach(signalChanged)
     if programSinkConnected != feedCoordinator.programOutputConnected {
       programSinkConnected = feedCoordinator.programOutputConnected
     }
@@ -1829,6 +1895,7 @@ final class AppModel {
   }
 
   #if ULTRACAM_TEST_SUPPORT
+  func isSignalUnhealthy(_ id: FeedID) -> Bool { signalHealth.isUnhealthy(id) }
   var demandMonitorIsRunning: Bool { demandMonitor.isRunning }
   /// What the demand monitor reports, without CMIO. Nil is an unreadable route.
   func setCameraDemandForTesting(_ id: FeedID, requested: Bool?) {

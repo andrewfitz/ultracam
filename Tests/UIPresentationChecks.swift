@@ -210,7 +210,7 @@ import XCTest
     XCTAssertFalse(rec.dropsWarning)
 
     XCTAssertEqual(presented(separate([camera(1, recording: .paused)])).pauseTitle, "Resume")
-    XCTAssertEqual(presented(separate([camera(1, signal: .noSignal, recording: .recording)])).recordTitle, "Recording · no signal")
+    XCTAssertEqual(presented(separate([camera(1, signal: .noSignal, recording: .recording)])).recordTitle, "Recording")
     XCTAssertEqual(presented(separate([camera(1, signal: .noSignal, recording: .recording)])).recordTone, .warning)
     XCTAssertEqual(presented(separate([camera(1, folder: nil)])).recordDetail, "Choose where Camera 1 records")
     XCTAssertNil(presented(separate([camera(1)])).pauseTitle)

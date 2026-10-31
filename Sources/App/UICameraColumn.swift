@@ -86,7 +86,7 @@ struct UICameraPictureView: View {
     .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 14))
     .overlay {
       if let color = camera.tally.ringColor, !isClean {
-        RoundedRectangle(cornerRadius: compact ? 10 : 14).strokeBorder(color, lineWidth: camera.tally.isRed ? 4 : 3)
+        RoundedRectangle(cornerRadius: compact ? 10 : 14).strokeBorder(color, lineWidth: camera.tally.isRed || camera.tally == .noPicture ? 4 : 3)
           .allowsHitTesting(false)
       }
     }
@@ -125,6 +125,11 @@ struct UICameraPictureView: View {
     case .connecting:
       UIPicturePlaceholder(symbol: "video", title: "Starting…", compact: compact,
         detail: "Waiting for the first frame from \(camera.inputName).", showsProgress: true)
+    case .signalLost:
+      // No update arrives during a loss: its clock and countdown tick here, from when it began.
+      UILiveCamera(camera: camera, context: context, follows: [], refresh: 1) { live in
+        UILostSignalPlaceholder(camera: live.camera, compact: compact, context: context)
+      }
     case .noSignal:
       UIPicturePlaceholder(symbol: "video.slash", title: "No signal", compact: compact,
         detail: "Check that the source is sending video and that its input connection is selected on the capture device.")
@@ -290,14 +295,14 @@ struct UICameraPictureView: View {
       .accessibilityElement(children: .ignore)
       .accessibilityLabel("Recording paused at \(elapsed)")
     case .recordingNoSignal:
+      // Plain REC: the picture says what happened, and the strip what to do.
       HStack(spacing: 5) {
-        Image(systemName: "exclamationmark.triangle.fill").imageScale(.small)
-        Text("REC · no signal")
+        Circle().fill(.red).frame(width: 8, height: 8)
+        Text("REC \(elapsed)").font(.uiOverlay.monospacedDigit())
       }
-      .foregroundStyle(.orange)
       .uiPictureOverlay()
       .accessibilityElement(children: .ignore)
-      .accessibilityLabel("Recording, no signal")
+      .accessibilityLabel("Recording \(elapsed), no signal")
     default:
       EmptyView()
     }
@@ -561,22 +566,48 @@ private struct UICutAccessibilityAction: ViewModifier {
   }
 }
 
-private struct UIPicturePlaceholder<Actions: View>: View {
+/// A camera that had a picture and lost it: how long ago, what that means for the take, and,
+/// with Auto off on Program, a large Cut. Orange everywhere; red stays for frames arriving.
+struct UILostSignalPlaceholder: View {
+  let camera: UICameraPresentation
+  var compact = false
+  let context: UIContext
+
+  var body: some View {
+    UIPicturePlaceholder(symbol: "video.slash", title: camera.lostTitle ?? "Signal lost", compact: compact,
+      detail: camera.lostDetail ?? "", tint: .orange) {
+      if let cut = camera.lostCut {
+        Button { context.send(.cut(cameraID: cut.id)) } label: {
+          Label("Cut to \(cut.name)", systemImage: "arrow.left.arrow.right")
+            .frame(minWidth: compact ? 0 : 176, minHeight: compact ? 0 : 28)
+        }
+        .controlSize(compact ? .small : .large)
+        .help("Cut Program to \(cut.name) (⌃\(cut.number))")
+        .accessibilityLabel("Cut to \(cut.name)")
+      }
+    }
+  }
+}
+
+struct UIPicturePlaceholder<Actions: View>: View {
   let symbol: String
   let title: String
   let detail: String
   /// Small pictures (Program sources) keep the small sizes.
   var compact = false
   var showsProgress = false
+  /// The glyph's color, when the placeholder is a problem.
+  var tint: Color? = nil
   @ViewBuilder var actions: () -> Actions
 
   init(symbol: String, title: String, compact: Bool = false, detail: String, showsProgress: Bool = false,
-    @ViewBuilder actions: @escaping () -> Actions = { EmptyView() }) {
+    tint: Color? = nil, @ViewBuilder actions: @escaping () -> Actions = { EmptyView() }) {
     self.symbol = symbol
     self.title = title
     self.compact = compact
     self.detail = detail
     self.showsProgress = showsProgress
+    self.tint = tint
     self.actions = actions
   }
 
@@ -586,11 +617,14 @@ private struct UIPicturePlaceholder<Actions: View>: View {
       VStack(spacing: compact ? 6 : 8) {
         if showsProgress { ProgressView().controlSize(compact ? .small : .regular) }
         else {
-          Image(systemName: symbol).font(.system(size: compact ? 26 : 32, weight: .light)).foregroundStyle(.white.opacity(0.6))
+          Image(systemName: symbol).font(.system(size: compact ? 26 : 32, weight: .light))
+            .foregroundStyle(tint ?? .white.opacity(0.6))
         }
         Text(title).font(compact ? .callout.weight(.semibold) : .uiPlaceholderTitle).foregroundStyle(.white.opacity(0.9))
-        Text(detail).font(compact ? .caption : .uiRow).foregroundStyle(.white.opacity(0.6))
-          .multilineTextAlignment(.center).frame(maxWidth: compact ? 380 : 440).fixedSize(horizontal: false, vertical: true)
+        if !detail.isEmpty {
+          Text(detail).font(compact ? .caption : .uiRow).foregroundStyle(.white.opacity(0.6))
+            .multilineTextAlignment(.center).frame(maxWidth: compact ? 380 : 440).fixedSize(horizontal: false, vertical: true)
+        }
         actions().controlSize(.small).padding(.top, compact ? 2 : 4)
       }
       .padding(.horizontal, 24)
@@ -787,6 +821,7 @@ struct UIChannelStripView: View {
     if let label = camera.tally.label {
       switch camera.tally {
       case .onAir, .iso: UIBadge(text: label, tone: .critical)
+      case .noPicture: UIBadge(text: label, tone: .warning)
       case .next: UIBadge(text: label, tone: .positive)
       default: UIBadge(text: label, tone: .neutral)
       }
@@ -1117,7 +1152,7 @@ struct UIChannelStripView: View {
       }
       .controlSize(.small)
       .disabled(!camera.cutEnabled)
-      .help(camera.cutEnabled ? "Cut Program to \(camera.name) (⌃\(camera.number))" : "\(camera.name) needs a live signal before it can go on air.")
+      .help(camera.cutHelp ?? "Cut Program to \(camera.name) (⌃\(camera.number))")
       .accessibilityLabel("Cut to \(camera.name)")
     } else {
       HStack(spacing: 8) {

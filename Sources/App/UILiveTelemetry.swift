@@ -8,10 +8,19 @@ import Observation
 
 extension UISessionBridge {
   /// A camera's running capture values: timecode and audio levels.
-  static func applyCapture(_ update: CaptureUpdate?, to camera: inout UICameraSnapshot) {
+  static func applyCapture(_ update: CaptureUpdate?, withinLossHold: Bool = false, to camera: inout UICameraSnapshot) {
     camera.timecode = update?.timecode
+    camera.signal = UIFormatLabels.signal(running: camera.running, deviceAvailable: camera.deviceAvailable,
+      update: update, withinLossHold: withinLossHold)
+    // Only a camera that had a picture has lost one.
+    if case .lost(let since)? = update?.signal, !withinLossHold, update?.frames ?? 0 > 0 {
+      camera.signalLostSince = since
+      camera.signalLostFor = ProcessInfo.processInfo.systemUptime - since
+    } else {
+      camera.signalLostSince = nil
+      camera.signalLostFor = nil
+    }
     if let update {
-      camera.signal = UIFormatLabels.signal(running: camera.running, deviceAvailable: camera.deviceAvailable, update: update)
       camera.audio = UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
         peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight)
     }
@@ -79,7 +88,7 @@ extension UISessionBridge {
     var camera = camera
     if follows.contains(.capture) {
       let update = camera.running ? model.liveCameraUpdate(id) : nil
-      UISessionBridge.applyCapture(update, to: &camera)
+      UISessionBridge.applyCapture(update, withinLossHold: model.signalWithinLossHold(id), to: &camera)
       let count = update?.ingestCPUCopyFrames ?? 0
       let now = ProcessInfo.processInfo.systemUptime
       let previous = ingestActivity[camera.id]
