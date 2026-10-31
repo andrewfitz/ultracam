@@ -57,8 +57,8 @@ final class AppModel {
   @ObservationIgnored private var virtualCameraObserver: Any?
   var feedDescriptors: [FeedDescriptor] { feedCoordinator.descriptors }
   /// The LUT a camera burns into its output now (nil when none): what its
-  /// virtual camera, recording, Program and monitor Output stage get. Never
-  /// creates a capture controller.
+  /// virtual camera, Program and monitor Output stage get. Recording never
+  /// does: it takes the camera original. Never creates a capture controller.
   func burnInLUT(for id: FeedID) -> MonitorLUT? {
     feedCoordinator.capturePool.existingController(for: id)?.burnInLUT
   }
@@ -364,6 +364,13 @@ final class AppModel {
       folderStore: recordingFolderStore ?? RecordingFolderStore())
     self.lutLoader = lutLoader
     allowCPUConversion = store.allowCPUConversion
+    recordingModel.codec = store.recordingCodec
+    recordingModel.timecodeMode = store.recordingTimecodeMode
+    recordingModel.onRecordingChoicesChanged = { [weak self] in
+      guard let self else { return }
+      self.settingsStore.recordingCodec = self.recordingModel.codec
+      self.settingsStore.recordingTimecodeMode = self.recordingModel.timecodeMode
+    }
     recordingModel.compatibilityPolicy = sampledRecordingCompatibilityPolicy
     hardware.setCompatibilityPolicy(sampledRecordingCompatibilityPolicy)
     monitorCoordinator.onConfigurationChange = { [weak self] target, configuration in
@@ -1612,6 +1619,16 @@ final class AppModel {
     vendorSettings.reset()
     settingsStore.resetAll()
     return true
+  }
+
+  /// Every strategy control comes through here: Manual turns automatic off, so
+  /// choosing a strategy later doesn't turn it back on unasked.
+  func setStrategy(_ strategy: SwitcherStrategy) {
+    var settings = switcherSettings
+    settings.strategy = strategy
+    if strategy == .manual { settings.automatic = false }
+    settings.naturalTalkingHead.enabled = settings.automatic && strategy == .naturalTalkingHead
+    updateSwitcher(settings)
   }
 
   /// Holds the current Program shot: automatic switching stays on but makes no cuts.

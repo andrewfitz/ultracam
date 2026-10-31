@@ -96,7 +96,7 @@ struct UICameraPictureView: View {
       // view or animates anything, and an overlay never changes the picture's layout. It sits in
       // the margin around the pictures (UIPictureSpacing), so it's never clipped.
       let outset = UIPictureSpacing.ringOutset
-      RoundedRectangle(cornerRadius: (compact ? 10 : 14) + outset).strokeBorder(Color.accentColor, lineWidth: 2.5)
+      RoundedRectangle(cornerRadius: (compact ? 10 : 14) + outset).strokeBorder(UIPictureSpacing.selectionRing, lineWidth: 2.5)
         .padding(-outset)
         .opacity(camera.selected && !compact && context.presentation.layout != .single ? 1 : 0)
         .transaction { $0.animation = nil }
@@ -453,9 +453,9 @@ private struct UICopySettingsMenu: View {
 }
 
 /// A camera's monitor-only LUT: a .cube file its pictures show on the Monitor
-/// stage, over the burn-in LUT. Never burned in: Program, recording and the
-/// camera output keep the burn-in LUT only. Saved in the camera's monitor
-/// preferences as a read-only bookmark, like the burn-in LUT.
+/// stage, over the burn-in LUT. Never burned in: Program and the camera output
+/// keep the burn-in LUT only, and recording keeps the camera original. Saved in
+/// the camera's monitor preferences as a read-only bookmark, like the burn-in LUT.
 struct UIMonitorLUTMenu: View {
   let cameraID: String
   let cameraName: String

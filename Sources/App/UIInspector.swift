@@ -123,12 +123,12 @@ struct UIInspectorViewContent: View {
           if camera.statusTone == .warning {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
           }
-          Text(signalText(snapshot)).lineLimit(1).foregroundStyle(.secondary)
+          Text(Self.signalText(snapshot)).lineLimit(1).foregroundStyle(.secondary)
         }
       }
       .accessibilityElement(children: .ignore)
       .accessibilityLabel("Signal")
-      .accessibilityValue(signalText(snapshot))
+      .accessibilityValue(Self.signalText(snapshot))
       // Always present ("—" while stopped): a row that comes and goes with Start and Stop
       // moved everything below it under the pointer.
       LabeledContent("Timecode") {
@@ -333,11 +333,11 @@ struct UIInspectorViewContent: View {
     }
   }
 
-  private func signalText(_ snapshot: UICameraSnapshot) -> String {
+  static func signalText(_ snapshot: UICameraSnapshot) -> String {
     switch snapshot.signal {
     case .none: return snapshot.deviceAvailable ? "Camera stopped" : "Input missing"
     case .connecting: return "Starting…"
-    case .live(let format): return "\(format) · 4:2:2"
+    case .live(let format): return [format, snapshot.sourcePixel].compactMap { $0 }.joined(separator: " · ")
     case .noSignal: return "No signal"
     case .unsupported(let mode): return mode
     case .deviceMissing: return "Input disconnected"

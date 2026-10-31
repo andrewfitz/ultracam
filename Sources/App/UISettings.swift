@@ -415,12 +415,7 @@ struct UISettingsSwitcherPane: View {
   @State private var loaded = false
 
   var body: some View {
-    let strategy = Binding(get: { model.switcherSettings.strategy }, set: { value in
-      var settings = model.switcherSettings
-      settings.strategy = value
-      settings.naturalTalkingHead.enabled = settings.automatic && value == .naturalTalkingHead
-      model.updateSwitcher(settings)
-    })
+    let strategy = Binding(get: { model.switcherSettings.strategy }, set: { model.setStrategy($0) })
     let mode = Binding(get: { model.switcherSettings.naturalTalkingHead.mode }, set: { value in
       draft.mode = value
       commitDirector()

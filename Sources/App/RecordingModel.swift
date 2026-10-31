@@ -549,8 +549,10 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     let hadVideo = Self.canPublishMovie(appendedVideo: telemetry.appendedVideo)
     // A failed flush must never publish an unfinished movie as a successful
     // take, nor delete its completed fragments. Recovery owns it after stop.
+    // The writer closing cleanly means the movie is whole, whatever ended the
+    // take: that one is published, and the failure is still reported below.
     do {
-      if stopError != nil || session.adapter.state == .failed {
+      if stopError != nil || (session.adapter.state == .failed && !hadVideo) {
         session.output.preserveForRecovery()
       } else if hadVideo {
         _ = try session.output.finish()
@@ -630,7 +632,9 @@ final class UnavailableRecordingSessionDriver: RecordingSessionDriver {
 
 @MainActor @Observable
 final class RecordingModel {
-  var codec: RecordingCodec = .proRes42210Bit
+  var codec: RecordingCodec = .proRes42210Bit {
+    didSet { if codec != oldValue { onRecordingChoicesChanged?() } }
+  }
   var outputFolder: URL? {
     didSet {
       do { try folderStore?.save(outputFolder) }
@@ -656,7 +660,9 @@ final class RecordingModel {
   private var feedConstantFrameRate: [FeedID: Bool] = [:]
   private var loadedFolderFeedIDs = Set<FeedID>()
   private var interruptedRecordingRoots: [URL: URL] = [:]
-  var timecodeMode: RecordingTimecodeMode = .wallClock
+  var timecodeMode: RecordingTimecodeMode = .wallClock {
+    didSet { if timecodeMode != oldValue { onRecordingChoicesChanged?() } }
+  }
   /// Copied into RecordingConfiguration before asynchronous take preparation.
   var compatibilityPolicy = RecordingCompatibilityPolicy()
   /// Observers are told when a take's state changes; its running statistics (2 Hz) are
@@ -666,6 +672,8 @@ final class RecordingModel {
   @ObservationIgnored let telemetry = UITelemetryStore()
 
   var onOutputFolderChanged: ((URL?) -> Void)?
+  /// The codec or timecode choice changed. Both apply to the next take.
+  var onRecordingChoicesChanged: (() -> Void)?
   var onRecordingStarted: ((FeedID, URL) -> Void)?
   var onRecordingFinished: ((FeedID, URL?) -> Void)?
   /// A take paused (`true`) or resumed (`false`).
@@ -946,8 +954,11 @@ final class RecordingModel {
       // A take stopped while it was starting had no live output to ask for.
       let saved = self.resolveFinishedFile(output ?? artifacts?.finishedOutputURL(feedID: feedID), folder)
       // A start that failed after Stop was pressed already set the error.
-      if case let .failure(error) = result { self.feeds[index].error = error.localizedDescription }
-      else if self.feeds[index].error == nil { self.feeds[index].savedURL = saved }
+      if case let .failure(error) = result {
+        self.feeds[index].error = error.localizedDescription
+        // A failed take whose movie closed cleanly is published: Show in Finder finds it.
+        self.feeds[index].savedURL = saved
+      } else if self.feeds[index].error == nil { self.feeds[index].savedURL = saved }
       self.onRecordingFinished?(feedID, saved)
       self.refreshRecovery()
       self.notifyFinished()
@@ -974,14 +985,20 @@ final class RecordingModel {
     for (id, snapshot) in snapshots {
       guard generations[id] == recordingGenerations[id], let index = index(of: id) else { continue }
       let previous = _feeds[index].statistics
-      guard previous != snapshot else { continue }
-      if RecordingStatisticsState(previous) == RecordingStatisticsState(snapshot) {
-        // Only the clock, size or rate moved: stored without telling the observers of `feeds`.
-        _feeds[index].statistics = snapshot
-      } else {
-        feeds[index].statistics = snapshot
+      if previous != snapshot {
+        if RecordingStatisticsState(previous) == RecordingStatisticsState(snapshot) {
+          // Only the clock, size or rate moved: stored without telling the observers of `feeds`.
+          _feeds[index].statistics = snapshot
+        } else {
+          feeds[index].statistics = snapshot
+        }
+        telemetry.statisticsChanged(id)
       }
-      telemetry.statisticsChanged(id)
+      // A failed take has stopped writing. Close it now, so the movie gets its
+      // index and nothing goes on reading as recording until someone presses Stop.
+      if snapshot.failed, feeds[index].status == .recording || feeds[index].status == .paused {
+        stop(feedID: id)
+      }
     }
   }
 

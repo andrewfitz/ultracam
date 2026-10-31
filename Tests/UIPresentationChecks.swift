@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import XCTest
 
 /// Rules from the UI audit (docs/mockups/r3/audit/REPORT.md, decisions D1–D8)
@@ -126,6 +127,21 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.tileState(for: updating), .updating)
   }
 
+  // MARK: Inspector
+
+  func testInspectorShowsTheRealSourceFormat() {
+    var camera = camera(1)
+    camera.sourcePixel = "8-bit 4:2:0"
+    XCTAssertEqual(UIInspectorViewContent.signalText(camera), "2160p 59.94 · 8-bit 4:2:0", "Never a hardcoded 4:2:2")
+    camera.sourcePixel = nil
+    XCTAssertEqual(UIInspectorViewContent.signalText(camera), "2160p 59.94", "Nothing is claimed before a format is known")
+  }
+
+  func testSelectionRingIsFixedBlueNotTheSystemAccent() {
+    XCTAssertEqual(UIPictureSpacing.selectionRing, Color.blue)
+    XCTAssertNotEqual(UIPictureSpacing.selectionRing, Color.accentColor)
+  }
+
   // MARK: Strip states
 
   func testStripStates() {
@@ -148,6 +164,25 @@ import XCTest
     var failedFlag = camera(1)
     failedFlag.recording.failed = true
     XCTAssertEqual(UIPresentationBuilder.stripState(for: failedFlag), .failed)
+    // A failed take reads as failed at once, before it has closed, whatever else is true.
+    for signal: UISignal in [.live(format: "2160p 59.94"), .noSignal] {
+      for status: UIRecordingStatus in [.recording, .paused] {
+        var failedTake = camera(1, signal: signal, recording: status)
+        failedTake.recording.failed = true
+        failedTake.applying = true
+        XCTAssertEqual(UIPresentationBuilder.stripState(for: failedTake), .failed)
+      }
+    }
+    var failedFinishing = camera(1, recording: .finishing)
+    failedFinishing.recording.failed = true
+    XCTAssertEqual(UIPresentationBuilder.stripState(for: failedFinishing), .finishing, "Closing the file comes first")
+    var failedOnScreen = UISessionSnapshot()
+    failedOnScreen.cameras = [camera(1, recording: .recording)]
+    failedOnScreen.cameras[0].recording.failed = true
+    failedOnScreen.selectedID = failedOnScreen.cameras[0].id
+    let failedRow = UIPresentationBuilder.session(failedOnScreen).cameras[0]
+    XCTAssertEqual(failedRow.recordTitle, "Recording failed")
+    XCTAssertEqual(failedRow.recordTone, .warning, "Red means recording or on air")
     XCTAssertEqual(UIPresentationBuilder.stripState(for: camera(1, running: false)), .stopped)
     for signal: UISignal in [.noSignal, .connecting, .unsupported("1080i"), .deviceMissing] {
       XCTAssertEqual(UIPresentationBuilder.stripState(for: camera(1, signal: signal)), .waiting)

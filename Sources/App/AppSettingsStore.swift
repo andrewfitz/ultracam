@@ -556,6 +556,8 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
 final class AppSettingsStore {
   static let hideFromDockKey = "ultracam.hideFromDock"
   static let allowCPUConversionKey = "ultracam.allowCPUConversion"
+  static let recordingCodecKey = "ultracam.recordingCodec"
+  static let recordingTimecodeModeKey = "ultracam.recordingTimecodeMode"
   static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
@@ -572,7 +574,8 @@ final class AppSettingsStore {
   /// Recordings and their recovery journals on disk are not touched.
   func resetAll() {
     let names = defaults.dictionaryRepresentation().keys.filter {
-      $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
+      $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.recordingCodecKey || $0 == Self.recordingTimecodeModeKey ||
+        $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
         $0 == VendorSettingsKeys.preferences || $0 == "ultracam.settings.pre-b1d.backup" || $0 == Self.lutInputRepairedKey ||
         $0.hasPrefix("ui.") || $0.hasPrefix("recordingFolderBookmark")
     }
@@ -583,6 +586,18 @@ final class AppSettingsStore {
   var allowCPUConversion: Bool {
     get { defaults.bool(forKey: Self.allowCPUConversionKey) }
     set { defaults.set(newValue, forKey: Self.allowCPUConversionKey) }
+  }
+
+  /// A missing or unknown value is the default: an older or newer build's
+  /// choice never stops the app from starting.
+  var recordingCodec: RecordingCodec {
+    get { defaults.string(forKey: Self.recordingCodecKey).flatMap(RecordingCodec.init(rawValue:)) ?? .proRes42210Bit }
+    set { defaults.set(newValue.rawValue, forKey: Self.recordingCodecKey) }
+  }
+
+  var recordingTimecodeMode: RecordingTimecodeMode {
+    get { defaults.string(forKey: Self.recordingTimecodeModeKey).flatMap(RecordingTimecodeMode.init(rawValue:)) ?? .wallClock }
+    set { defaults.set(newValue.rawValue, forKey: Self.recordingTimecodeModeKey) }
   }
 
   var hideFromDock: Bool {

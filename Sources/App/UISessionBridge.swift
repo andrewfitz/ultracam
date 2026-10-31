@@ -142,6 +142,7 @@ struct UISessionBridge {
       camera.programColorSpaceID = descriptor.programColorSpaceID
       camera.recordingConstantFrameRate = descriptor.recordingConstantFrameRate
       camera.sourceFrameRate = update?.sourceFormat?.rate
+      camera.sourcePixel = update?.sourceFormat.map { FormatDisplayIdentity($0).pixel }
       camera.previewEnabled = descriptor.previewEnabled
       camera.automaticStart = descriptor.automaticFeed
       // A refused Start says why; otherwise an automatic camera's status.
@@ -360,12 +361,7 @@ struct UISessionBridge {
       settings.naturalTalkingHead.enabled = on && settings.strategy == .naturalTalkingHead
       model.updateSwitcher(settings)
     case .setAutoHold(let hold): model.setAutoHold(hold)
-    case .setStrategy(let strategy):
-      var settings = model.switcherSettings
-      settings.strategy = strategy
-      if strategy == .manual { settings.automatic = false }
-      settings.naturalTalkingHead.enabled = settings.automatic && strategy == .naturalTalkingHead
-      model.updateSwitcher(settings)
+    case .setStrategy(let strategy): model.setStrategy(strategy)
     case .setOutputMode(let mode): model.setOutputMode(mode == .program ? .program : .separateCameras)
     case .setAnchor(let id): model.naturalAnchorFeedID = id.map(feedID)
     case .setEmphasis(let id): model.naturalEmphasisFeedID = id.map(feedID)

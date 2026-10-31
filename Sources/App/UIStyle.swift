@@ -61,6 +61,8 @@ enum UIPictureSpacing {
   /// How far the selection ring sits outside its picture. It stays well inside the
   /// margin and half the gutter, so it's never clipped and never touches a neighbour.
   static let ringOutset: CGFloat = 4
+  /// Fixed, not the system accent: a Red or Orange accent would read as on air or a warning.
+  static let selectionRing = Color.blue
 }
 
 extension View {

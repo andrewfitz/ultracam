@@ -619,6 +619,126 @@ import XCTest
     XCTAssertEqual(model.feeds[0].status, .recording)
   }
 
+  func testFailedTakeStopsItselfFromRecordingOrPausedAndLeavesOtherFeedsRolling() {
+    let driver = StatisticsDriver()
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide"),
+      RecordingFeedDescriptor(id: second, name: "Tight")], driver: driver)
+    model.outputFolder = URL(fileURLWithPath: "/tmp/failed-take-stops")
+    var finished: [FeedID] = []
+    model.onRecordingFinished = { feedID, _ in finished.append(feedID) }
+    model.record(feedID: first)
+    model.record(feedID: second)
+    model.pause(feedID: second)
+    var failed = RecordingStatistics(elapsed: 1139, encodedFrames: 68245)
+    failed.failed = true
+    let done = expectation(description: "Failed takes closed")
+    Task {
+      driver.snapshots = [first: failed, second: RecordingStatistics(elapsed: 1139, encodedFrames: 68245)]
+      await model.refreshStatistics()
+      XCTAssertEqual(model.feeds[0].status, .idle, "Nothing keeps reading as recording until someone presses Stop")
+      XCTAssertEqual(model.feeds[1].status, .paused, "One camera's failure leaves the other's take alone")
+      driver.snapshots = [second: failed]
+      await model.refreshStatistics()
+      XCTAssertEqual(model.feeds[1].status, .idle, "A paused take that failed closes too")
+      await model.refreshStatistics()
+      XCTAssertEqual(finished, [self.first, self.second], "Each failed take closes once")
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 3)
+  }
+
+  private final class FailingAfterFirstFrameWriter: SourceRecordingWriter, @unchecked Sendable {
+    private let lock = NSLock()
+    private var frames: Int
+    init(framesBeforeFailure: Int = 1) { frames = framesBeforeFailure }
+    func start() throws {}
+    func appendVideo(_ sample: CMSampleBuffer) throws {
+      let fail = lock.withLock { () -> Bool in defer { frames -= 1 }; return frames <= 0 }
+      if fail { throw SourceRecordingError.unsupportedSample("Metadata refused the frame.") }
+    }
+    func appendAudio(_ sample: CMSampleBuffer) throws {}
+    func finish() throws {}
+  }
+
+  private func failingTakeSample(at index: Int64) throws -> CMSampleBuffer {
+    let duration = RecordingFrameRate.fps5994.frameDuration
+    var buffer: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer), kCVReturnSuccess)
+    let image = try XCTUnwrap(buffer)
+    var format: CMVideoFormatDescription?
+    XCTAssertEqual(CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image,
+      formatDescriptionOut: &format), noErr)
+    var timing = CMSampleTimingInfo(duration: duration,
+      presentationTimeStamp: CMTimeMultiply(duration, multiplier: Int32(index)), decodeTimeStamp: .invalid)
+    var sample: CMSampleBuffer?
+    XCTAssertEqual(CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image,
+      formatDescription: try XCTUnwrap(format), sampleTiming: &timing, sampleBufferOut: &sample), noErr)
+    return try XCTUnwrap(sample)
+  }
+
+  /// Starts one native take whose writer refuses a frame, and waits for the take
+  /// to close by itself: no Stop is pressed.
+  private func runFailingTake(root: URL, framesBeforeFailure: Int, media: Data) throws -> RecordingModel {
+    let capture = CaptureController(services: CaptureServices(
+      start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
+    var recorder: SourceRecorderCore?
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, recorderFactory: { configuration in
+      try media.write(to: configuration.outputURL)
+      let core = try SourceRecorderCore(configuration: configuration,
+        writerFactory: { FailingAfterFirstFrameWriter(framesBeforeFailure: framesBeforeFailure) })
+      recorder = core
+      return core
+    })
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide")], driver: driver)
+    model.outputFolder = root
+    model.record(feedID: first)
+    XCTAssertTrue(waitForStarts(model))
+    let core = try XCTUnwrap(recorder)
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 3840, height: 2160, pixel: .v210,
+      rate: .constant(RecordingFrameRate.fps5994.frameDuration)), epochID: .init(sessionID: UUID(), epoch: 0),
+      clockBindings: .init(video: .init(), audio: nil), stage: .recordingSource)
+    try core.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent, mappingRevision: 0))
+    for index in 0...Int64(framesBeforeFailure) { _ = core.appendVideo(try failingTakeSample(at: index)) }
+    let deadline = Date(timeIntervalSinceNow: 5)
+    while model.feeds[0].status != .idle && Date() < deadline {
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    XCTAssertEqual(core.state, .failed)
+    XCTAssertEqual(model.feeds[0].status, .idle, "The take closes without anyone pressing Stop")
+    return model
+  }
+
+  func testFailedTakeWhoseWriterClosedCleanlyIsPublishedAndStillReported() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-whole-failed-take-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let media = Data([10, 20, 30])
+    let model = try runFailingTake(root: root, framesBeforeFailure: 1, media: media)
+    let saved = try XCTUnwrap(model.feeds[0].savedURL, "Show in Finder needs the movie")
+    XCTAssertEqual(try Data(contentsOf: saved), media)
+    XCTAssertTrue(model.feeds[0].error?.contains("Metadata refused the frame") == true, model.feeds[0].error ?? "no error")
+    XCTAssertTrue(try RecordingRecovery.scan(root: root).isEmpty, "A whole movie isn't an interrupted take")
+    // The next take starts clean: the failed one's statistics can't stop it.
+    model.record(feedID: first)
+    XCTAssertTrue(waitForStarts(model))
+    let refreshed = expectation(description: "Next take refreshed")
+    Task { await model.refreshStatistics(); refreshed.fulfill() }
+    wait(for: [refreshed], timeout: 3)
+    XCTAssertEqual(model.feeds[0].status, .recording)
+    model.stop(feedID: first)
+  }
+
+  func testFailedTakeWithNoVideoStaysWithRecovery() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-empty-failed-take-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let media = Data([10, 20, 30])
+    let model = try runFailingTake(root: root, framesBeforeFailure: 0, media: media)
+    XCTAssertNil(model.feeds[0].savedURL)
+    XCTAssertTrue(model.feeds[0].error?.contains("Metadata refused the frame") == true, model.feeds[0].error ?? "no error")
+    let take = try XCTUnwrap(RecordingRecovery.scan(root: root).first, "Its error record isn't deleted")
+    XCTAssertEqual(try Data(contentsOf: take.temporaryURL), media)
+  }
+
   func testFolderRequirementIsReportedPerFeed() {
     let driver = Driver()
     let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "One")], driver: driver)

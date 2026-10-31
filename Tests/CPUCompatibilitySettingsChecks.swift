@@ -17,6 +17,73 @@ import XCTest
     XCTAssertFalse(AppSettingsStore(defaults: defaults).allowCPUConversion)
   }
 
+  func testRecordingChoicesDefaultPersistResetAndIgnoreUnknownValues() throws {
+    let suite = "RecordingChoicesChecks." + UUID().uuidString
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let settings = AppSettingsStore(defaults: defaults)
+    XCTAssertEqual(settings.recordingCodec, .proRes42210Bit)
+    XCTAssertEqual(settings.recordingTimecodeMode, .wallClock)
+    settings.recordingCodec = .hevcMain10_422
+    settings.recordingTimecodeMode = .source
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).recordingCodec, .hevcMain10_422)
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).recordingTimecodeMode, .source)
+    settings.resetAll()
+    XCTAssertNil(defaults.object(forKey: AppSettingsStore.recordingCodecKey))
+    XCTAssertNil(defaults.object(forKey: AppSettingsStore.recordingTimecodeModeKey))
+    defaults.set("a codec from a later build", forKey: AppSettingsStore.recordingCodecKey)
+    defaults.set("a mode from a later build", forKey: AppSettingsStore.recordingTimecodeModeKey)
+    XCTAssertEqual(settings.recordingCodec, .proRes42210Bit)
+    XCTAssertEqual(settings.recordingTimecodeMode, .wallClock)
+  }
+
+  func testAppModelRestoresAndSavesRecordingChoices() throws {
+    let suite = "RecordingChoicesAppModelChecks." + UUID().uuidString
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let first = appModel(defaults)
+    XCTAssertEqual(first.recordingModel.codec, .proRes42210Bit)
+    XCTAssertEqual(first.recordingModel.timecodeMode, .wallClock)
+    first.recordingModel.codec = .hevcMain10_422
+    first.recordingModel.timecodeMode = .source
+    let second = appModel(defaults)
+    XCTAssertEqual(second.recordingModel.codec, .hevcMain10_422)
+    XCTAssertEqual(second.recordingModel.timecodeMode, .source)
+  }
+
+  func testEveryStrategyControlTurnsAutomaticOffForManual() throws {
+    let suite = "StrategyChecks." + UUID().uuidString
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let model = appModel(defaults)
+    var settings = model.switcherSettings
+    settings.automatic = true
+    settings.strategy = .naturalTalkingHead
+    settings.naturalTalkingHead.enabled = true
+    model.updateSwitcher(settings)
+    model.setStrategy(.manual)
+    XCTAssertEqual(model.switcherSettings.strategy, .manual)
+    XCTAssertFalse(model.switcherSettings.automatic)
+    XCTAssertFalse(model.switcherSettings.naturalTalkingHead.enabled)
+    model.setStrategy(.naturalTalkingHead)
+    XCTAssertEqual(model.switcherSettings.strategy, .naturalTalkingHead)
+    XCTAssertFalse(model.switcherSettings.automatic, "Picking a strategy later doesn't turn Auto back on")
+    XCTAssertFalse(model.switcherSettings.naturalTalkingHead.enabled)
+  }
+
+  private func appModel(_ defaults: UserDefaults) -> AppModel {
+    let installer = ExtensionInstaller(services: .init(
+      preflight: { .init(developerSigned: false, hasInstallEntitlement: false) },
+      makeRequest: { _ in fatalError("No installer requests in this fixture") },
+      submit: { _ in XCTFail("No installer submissions in this fixture") },
+      queryProperties: { $0([]) }))
+    return AppModel(settingsStore: AppSettingsStore(defaults: defaults),
+      registryStore: VirtualCameraRegistryStore(defaults: defaults),
+      registryPublisher: NoCompatibilityRegistryPublisher(),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer,
+      hardware: .offline)
+  }
+
   func testEachTakeSamplesPolicyBeforeDriverPreparation() throws {
     let driver = PolicyDriver()
     let first = FeedID(rawValue: "compatibility-first")

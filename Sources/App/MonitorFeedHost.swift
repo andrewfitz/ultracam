@@ -69,9 +69,9 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     /// frame the camera publishes untouched keeps its tagged matrix, as its
     /// passthrough copy does. A declared code range is the Source stage's alone,
     /// so the Output (LUT) picture, and every tool on the Output and Monitor
-    /// stages, read what Program, recording and the virtual camera get. MonitorKit
-    /// decodes each stage with its own reading in the same pass. Program's frames
-    /// have one reading.
+    /// stages, read what Program and the virtual camera get. Recording takes the
+    /// camera original, as the Source stage shows it. MonitorKit decodes each stage
+    /// with its own reading in the same pass. Program's frames have one reading.
     let signal: SignalDescription
     /// Size, pixel aspect ratio and clean aperture (top-left origin, ISO/IEC 14496-12).
     let geometry: MonitorFrameGeometry
