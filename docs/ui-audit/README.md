@@ -1,6 +1,6 @@
 # Ultracam UI and UX audit: decisions and plan
 
-Date: 2026-10-30. Revision 2, after an independent validation pass. Code reviewed at `2c4929c`. This is a review only: no source changed.
+Date: 2026-10-30. Revision 3: revision 2 followed an independent validation pass, and this one records the owner's choice of tabs for Settings. Code reviewed at `2c4929c`. This is a review only: no source changed.
 
 This file is the decision record. Where anything below it disagrees, this file wins.
 
@@ -35,7 +35,7 @@ This file is the decision record. Where anything below it disagrees, this file w
 | Loudness pair setting | **Dropped** | Nobody asked, and it would do half a job, because Auto still reads channels 1-2 |
 | Rig presets | **Still not now, plus a Setup block** | "Configurations" most likely means how each vendor's gear is set up, which the first pass missed |
 
-**Survived unchanged:** retiring the output mode, the three-pane structure, the session board idea, global format, Stop Cameras off the toolbar, a sidebar Settings window, Channels Shown in Settings, and the placement rule.
+**Survived unchanged:** retiring the output mode, the three-pane structure, the session board idea, global format, Stop Cameras off the toolbar, Channels Shown in Settings, and the placement rule.
 
 **Rejected from the review:** making the Settings rebuild optional. It was called out of scope, but you asked for that overhaul by name.
 
@@ -305,7 +305,7 @@ Follow 06 section 5, with two changes: the noun is **Effects**, and **Program co
 
 ## 7. Settings window
 
-**Rebuild as a sidebar window like System Settings.** Fixed 820 pt wide, default height 620, resizable in height, no per-pane heights. It deviates from the HIG's toolbar panes the way System Settings does, because hardware rows vary in number and a window that resizes between panes, or during an edit, moves controls under the pointer. Keep the `Settings` scene. If the first build fails its three checks (full-height sidebar, height-only resizing, title follows the section), switch to a plain `Window` with ⌘, replaced; the recipe is in validation D. Row kinds and help-text rules: 06 section 8.
+**Keep native toolbar tabs, with one tab for each section below. Decided by the owner, 2026-10-30, overriding 03, 06 and validation D, which chose a sidebar window.** Tabs are the standard Mac pattern and the smaller change. Widen the window to 820 pt so eight tabs fit, and keep the `Settings` scene. Remove the six hardcoded pane heights, which cause the cut-off content, and let long panes scroll. The window may resize between tabs: that's normal Mac behavior. It reopens on the last tab. Row kinds and help-text rules: 06 section 8. Its sidebar and sizing instructions no longer apply.
 
 | Section | Contains |
 |---|---|
@@ -386,7 +386,7 @@ If a camera's source later can't use the choice, it takes the nearest format, be
 | Hold under signal loss | A stays on, C clears | **Overrides once, stays on** |
 | Low-drive estimates | C phase 1, E phase 3 | **Phase 1.** A false alarm teaches you to ignore the real one |
 | Background shortcuts home | 02, D Alerts. E General | **General.** It isn't an alert |
-| Settings structure | 03 six, 04 Devices, E eight | **Eight sidebar sections,** named Hardware |
+| Settings structure | 03 six, 04 Devices, E eight. 03, 06, D sidebar window | **Eight tabs,** one named Hardware. You chose tabs over the sidebar window |
 | Copy Diagnostics | 03 remove | **Removed from Settings.** It's in the Diagnostics window |
 | Supported Formats | 03 device, 04 inspector | **Hardware row.** A device fact |
 | Pairing | 03 inspector, 04 Hardware | **Hardware.** Reconnect stays near the camera |
@@ -445,7 +445,7 @@ Sizes are estimates. In phase 2, test the late-sink change against real Zoom bef
 6. Full-screen Zoom, with and without sharing the screen: notifications and panel, with Ultracam's window open and closed, and what viewers can see.
 7. Zoom through the upgrade: does it need a restart to list Program, what format does it pick, and how does it react to a format change under its lease?
 8. Program in Zoom plus ISO in a second app at 4K, with time to first frame.
-9. Settings from the menu bar 20 times, and the sidebar checks.
+9. Settings from the menu bar 20 times.
 10. ⌃⌥⌘ shortcuts with Zoom frontmost.
 11. A real FX3: which fields it reports, and whether it can embed more than two audio channels.
 12. Whether the OWC hub was in the same wiring at 13:59:04 on 2026-10-30. Both units sit behind it now. It's a lead for the simultaneous drop, not a finding.
