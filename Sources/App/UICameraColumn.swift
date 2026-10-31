@@ -809,9 +809,7 @@ struct UIChannelStripView: View {
       HStack(spacing: 8) {
         gutterIcon(UISymbol.audio)
           .help("Embedded audio, true peak")
-        UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, channels: camera.channelsShown) { shown in
-          context.send(.setChannelsShown(cameraID: camera.id, shown))
-        }
+        UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, channels: camera.channelsShown, menu: true)
       }
     }
   }

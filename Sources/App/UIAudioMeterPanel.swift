@@ -8,6 +8,9 @@ import SwiftUI
 /// show the plain level meter instead.
 @MainActor struct UIAudioMeterSource {
   let tap: @MainActor (_ cameraID: String) -> AudioMeterTap?
+  /// Channels Shown from a meter's right-click menu. Here rather than on each meter, so a
+  /// meter's inputs stay comparable and a strip's update doesn't redraw it.
+  var choose: (@MainActor (_ cameraID: String, UIChannelsShown) -> Void)? = nil
 }
 
 private struct UIAudioMeterSourceKey: EnvironmentKey {
@@ -93,21 +96,22 @@ private struct UIAudioMeterTapView: View {
 /// previews, a camera not capturing).
 ///
 /// `channels` limits the bars to the first channels (Settings › Audio's Channels Shown); nil
-/// shows every channel. `choose` adds Channels Shown to the meter's right-click menu.
+/// shows every channel. `menu` adds Channels Shown to the meter's right-click menu.
 struct UILiveAudioMeter: View {
   let cameraID: String
   let name: String
   let audio: UIAudioLevels
   var style: LevelMeterStyle = .strip
   var channels: UIChannelsShown? = nil
-  var choose: (@MainActor (UIChannelsShown) -> Void)? = nil
+  var menu = false
   @Environment(\.uiAudioMeters) private var source
 
   var body: some View {
     if let tap = source?.tap(cameraID) {
       // A new capture is a new tap: a new view pairs attach and detach. Only
       // `present` goes in, so the 4 Hz status peaks don't re-evaluate it.
-      UILiveAudioMeterTapView(tap: tap, name: name, present: audio.present, style: style, channels: channels, choose: choose)
+      UILiveAudioMeterTapView(tap: tap, cameraID: cameraID, name: name, present: audio.present, style: style,
+        channels: channels, menu: menu)
         .id(tap.identity)
     } else {
       let snapshot = audio.meterSnapshot
@@ -122,11 +126,13 @@ struct UILiveAudioMeter: View {
 /// Meters one tap while shown; the tap meters off the capture thread only while a view attaches.
 private struct UILiveAudioMeterTapView: View {
   let tap: AudioMeterTap
+  let cameraID: String
   let name: String
   let present: Bool
   let style: LevelMeterStyle
   let channels: UIChannelsShown?
-  let choose: (@MainActor (UIChannelsShown) -> Void)?
+  let menu: Bool
+  @Environment(\.uiAudioMeters) private var source
   @State private var attachment: AudioMeterTap.Attachment?
   /// Every channel the capture meters.
   @State private var fullMeter: AudioMeter?
@@ -148,8 +154,8 @@ private struct UILiveAudioMeterTapView: View {
             }
           }
           .overlay {
-            if let choose, let channels {
-              UIMeterContextMenu(shown: channels, resetPeaks: { resetPeaks() }, choose: choose)
+            if menu, let choose = source?.choose, let channels {
+              UIMeterContextMenu(shown: channels, resetPeaks: { resetPeaks() }, choose: { [cameraID] in choose(cameraID, $0) })
             }
           }
       } else {
