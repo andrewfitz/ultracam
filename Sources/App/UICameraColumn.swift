@@ -1328,6 +1328,14 @@ struct UIEffectsMenu: View {
   let context: UIContext
 
   var body: some View {
+    menu
+      .font(.uiRow.weight(.medium))
+      .padding(.horizontal, 8).frame(height: 24)
+      .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 7))
+      .help("Effects change the format meeting apps receive; the video updates briefly. ⇧⌘B turns them all off.")
+  }
+
+  private var menu: some View {
     Menu {
       if let source = snapshot.flatMap(Self.sourceFormat) {
         Text("\(source) → \(camera.outputValue)")
@@ -1367,19 +1375,13 @@ struct UIEffectsMenu: View {
       Toggle("Effects Off", isOn: Binding(get: { !camera.processing }, set: { context.send(.setProcessing(cameraID: camera.id, !$0)) }))
       if !camera.processing { Text("Camera original goes out unchanged.") }
     } label: {
-      // A borderless menu keeps its items reachable by VoiceOver and keyboard; the capsule
-      // goes around it, since that style drops a label's own background.
-      Label(camera.processing ? "Effects" : "Effects Off", systemImage: camera.processing ? UISymbol.effects : UISymbol.effectsOff)
-        .labelStyle(.titleAndIcon)
+      // One Text with the symbol inside it: a borderless menu names its button after a
+      // separate image view ("hdr" for this one), and the words are the name.
+      Text("\(Image(systemName: camera.processing ? UISymbol.effects : UISymbol.effectsOff)) \(camera.processing ? "Effects" : "Effects Off")")
     }
+    // Borderless keeps the items reachable by VoiceOver and the keyboard.
     .menuStyle(.borderlessButton)
     .fixedSize()
-    .font(.uiRow.weight(.medium))
-    .padding(.horizontal, 8).frame(height: 24)
-    .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 7))
-    .help("Effects change the format meeting apps receive; the video updates briefly. ⇧⌘B turns them all off.")
-    .accessibilityLabel("Effects for \(camera.name)")
-    .accessibilityValue(camera.processing ? "On" : "Off")
   }
 
   private static func sourceFormat(_ snapshot: UICameraSnapshot) -> String? {

@@ -390,7 +390,7 @@ import XCTest
   func testDefaultsExposeRequiredRecordingChoices() {
     XCTAssertEqual(RecordingCodec.allCases, [.proResLT, .proRes422, .proRes42210Bit, .proRes4444, .hevcMain, .hevcMain10, .hevcMain10_422])
     XCTAssertEqual(RecordingCodec.proRes42210Bit.title, "ProRes 422 HQ")
-    XCTAssertEqual(RecordingCodec.hevcMain10_422.title, "HEVC Main 10 4:2:2")
+    XCTAssertEqual(RecordingCodec.hevcMain10_422.title, "HEVC 4:2:2", "The menus name the one 4:2:2 HEVC as drawn")
     XCTAssertEqual(RecordingTimecodeMode.allCases, [.source, .recordStart, .wallClock])
     XCTAssertEqual(RecordingTimecodeMode.wallClock.title, "PC time")
     XCTAssertEqual(RecordingTimecodeMode.source.help,

@@ -39,7 +39,9 @@ import SystemExtensions
     context.monitor = monitor
     /// The Monitor LUT menu's items, as the Picture popover shows it.
     func items() -> (menu: [NSMenuItem], lut: [NSMenuItem]) {
-      let form = HostedView(UIMonitorLUTMenu(cameraID: camera.id, cameraName: camera.name, monitor: monitor).fixedSize(),
+      // Borderless here, as an AppKit pull-down the harness can open; the popover's own style is SwiftUI's.
+      let form = HostedView(UIMonitorLUTMenu(cameraID: camera.id, cameraName: camera.name, monitor: monitor)
+        .menuStyle(.borderlessButton).fixedSize(),
         size: CGSize(width: 260, height: 60), dark: false)
       defer { form.close() }
       let lut = Menus.items(in: form.host, containing: "Remove Monitor LUT")
