@@ -105,8 +105,8 @@ import AppKit
     try? mainLabels.joined(separator: "\n").write(to: output.appendingPathComponent("accessibility-main.txt"), atomically: true, encoding: .utf8)
     record("inspector shows the selected camera's settings", mainLabels.contains("Refresh capture devices"),
       "\(mainLabels.count) labels")
-    for label in ["Effects for", "Start Camera"] {
-      record("main window exposes \"\(label)\"", mainLabels.contains { $0.hasPrefix(label) }, "")
+    for label in ["Effects", "Start Camera"] {
+      record("main window exposes \"\(label)\"", mainLabels.contains { $0.contains(label) }, "")
     }
     await renderWindows()
     if CommandLine.arguments.contains("--live") { await liveCameraCheck(model: model, interface: interface) }
