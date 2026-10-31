@@ -1,6 +1,6 @@
 # Ultracam UI and UX audit: decisions and plan
 
-Date: 2026-10-30. Revision 4: revision 2 followed an independent validation pass. Revisions 3 and 4 record the owner's review: tabs for Settings, the monitor tool bar stays on the picture, and Switching leaves the sidebar. Code reviewed at `2c4929c`. This is a review only: no source changed.
+Date: 2026-10-30. Revision 4: revision 2 followed an independent validation pass. Revisions 3 and 4 record the owner's review: tabs for Settings, the monitor tool bar collapses on hover-off but keeps enabled tools visible, and Switching leaves the sidebar. Code reviewed at `2c4929c`. This is a review only: no source changed.
 
 This file is the decision record. Where anything below it disagrees, this file wins.
 
@@ -255,7 +255,7 @@ TAKES
 
 Job: see it, hear it, roll it. Each fact has one owner (06 section 2, with the corrections in validation C).
 
-- **Picture at rest:** name, tally, REC pill, and **the full monitor tool bar, unchanged and always visible, in every state.** Monitor tools are used live, so they stay one click away. The first plan hid them behind hover, and the owner rejected that. The REC pill never truncates.
+- **Picture at rest:** name, tally, REC pill, a tools button, and **every enabled monitor tool, which stays visible after the pointer leaves.** So you can always see what's active, and turning one off is one click. Hovering the picture expands the full tool bar, with chevrons, in every state, including no signal and stopped. Build the hover on the picture itself, not on `revealed`, which is live-only and would bring back the `b621bc7` bug. The owner set this behavior. The REC pill never truncates.
 - **Program View:** loses the cut bar and Recent Cuts. Tiles get full-width Cut buttons.
 - **Strip removed:** On Air badge, Stop Camera button (moves to ⋯), size and bitrate, Own Folder badge, footnote, Camera Control row, effect chips, Processing switch.
 - **Strip rows, fixed:** header · record row · folder, time left and read-only format (or the problem) · output row · meters. Nothing appears or vanishes, and pressing Record doesn't resize the picture.
@@ -373,7 +373,7 @@ If a camera's source later can't use the choice, it takes the nearest format, be
 | Channels Shown home | 05 inspector | **Settings › Audio.** Your sentence names the Settings window |
 | Effect chips | 02 inspector, 06 menu | **LUT toggle plus Effects menu.** LUT is the panic control; the rest change Zoom's format |
 | Stop Cameras | 02 remove, 06 keep | **Remove.** Also fixes a double-click on Start landing on Stop |
-| Tool bar at rest | 02 active tools, 06 one button | **Neither. Keep the full bar, as today.** Your call: no extra steps for monitor tools. Both reports overrode the deliberate fix in `b621bc7` |
+| Tool bar at rest | 02 active tools, 06 one button | **Your call: collapse at rest, keep enabled tools showing, expand on hover** |
 | ⋯ menu | 02 trim, 03 remove | **Trim.** Stop Camera moves into it, and Monitor LUT moves to the Picture popover |
 | Strip Cut | 02 keep, 03 remove | **Keep** in a fixed slot. Eyes are on the pictures |
 | Hardware on the strip | 04 source row, 02 sidebar | **Sidebar** |
@@ -402,7 +402,7 @@ If a camera's source later can't use the choice, it takes the nearest format, be
 | D6, backup automation rules | Holds; placeholder rows go until it's built |
 | D7, selection and focus merged | **Revised.** A click or window activation no longer focuses a picture, and focus no longer selects, because it could silently move the target of ⌘R. The menu bar stops depending on selection |
 | D8, time left, recent takes, director timeline, Saved, no app names | Holds; the sidebar stops repeating recording state |
-| `b621bc7`, tool bar always on the picture | Holds, unchanged |
+| `b621bc7`, tools findable on every picture | **Revised:** the tools button and enabled tools stay at rest, and the full bar appears on hover in every state |
 | Left sidebar as V1 session panel | **Revised** to the session board |
 | `UI_REDESIGN.md:105,226`, output locked while running | **Overridden** |
 
