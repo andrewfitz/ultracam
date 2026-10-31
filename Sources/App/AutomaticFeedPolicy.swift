@@ -27,9 +27,20 @@ enum FeedLifecycleDemandPolicy {
     automaticEnabled && !manuallyStopped && deviceAvailable && !loading
   }
 
-  static func canEditTopology(loading: Bool, sourceActive: Bool, recordingActive: Bool) -> Bool {
+  /// Reset wipes every setting and quits, so it alone still needs the whole app idle.
+  static func canResetSettings(loading: Bool, sourceActive: Bool, recordingActive: Bool) -> Bool {
     !loading && !sourceActive && !recordingActive
   }
+
+  /// One camera's removal waits on that camera alone: the others can run and record.
+  static func canRemoveCamera(cameraCount: Int, loading: Bool, sourceActive: Bool, recordingActive: Bool) -> Bool {
+    cameraCount > 1 && !loading && !sourceActive && !recordingActive
+  }
+
+  /// Every camera is a device, and so is Program, inside the extension's device limit.
+  static let maximumCameras = VirtualCameraRegistryWire.maximumDevices - 1
+
+  static func canAddCamera(enabledCameras: Int) -> Bool { enabledCameras < maximumCameras }
 
   static func retainsAutomaticOwnership(automaticEnabled: Bool, wasAutomaticallyStarted: Bool) -> Bool {
     automaticEnabled && wasAutomaticallyStarted

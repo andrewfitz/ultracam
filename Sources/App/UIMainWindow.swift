@@ -71,7 +71,7 @@ struct UIMainWindowView: View {
         Text("Add a camera, then choose its input device.")
       } actions: {
         Button("Add Camera") { context.send(.addCamera) }
-          .disabled(!context.session.canEditTopology)
+          .disabled(!context.session.canAddCamera)
       }
     } else {
       switch context.presentation.layout {

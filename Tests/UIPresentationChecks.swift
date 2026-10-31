@@ -569,6 +569,24 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.warning(separate([lut, recordingNoSignal])), "Camera 2: recording, no signal")
   }
 
+  func testRemoveHelpNamesWhatItWaitsOn() {
+    var running = camera(1)
+    running.canRemove = false
+    let session = { (cameras: [UICameraSnapshot]) in
+      var value = UISessionSnapshot()
+      value.cameras = cameras
+      return value
+    }
+    var stopped = camera(2)
+    stopped.running = false
+    XCTAssertEqual(UIPresentationBuilder.removeHelp(running, in: session([running, stopped])), "Stop Camera 1 to remove it.")
+    XCTAssertEqual(UIPresentationBuilder.removeHelp(stopped, in: session([running, stopped])), "Remove Camera 2 and its settings.")
+    XCTAssertEqual(UIPresentationBuilder.removeHelp(stopped, in: session([stopped])), "Ultracam needs at least one camera.")
+    var full = session([stopped])
+    full.canAddCamera = false
+    XCTAssertEqual(UIPresentationBuilder.addCameraHelp(full), "Ultracam supports 31 cameras.")
+  }
+
   func testRemoveAndResetNeedConfirmation() {
     let presentation = UIPresentationBuilder.session(separate([camera(1), camera(2)]))
     let remove = UIAction.removeCamera(cameraID: "camera-2").needsConfirmation(in: presentation)

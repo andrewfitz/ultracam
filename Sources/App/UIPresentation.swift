@@ -129,6 +129,8 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var queueStalled = false
   /// Why this camera's virtual camera couldn't connect, while it can't.
   var sinkFailure: String?
+  /// Its own run, take and LUT load are over, and it isn't the last camera.
+  var canRemove = true
   /// How long the signal has been gone from a camera that had a picture, past the loss
   /// hold. Nil for a camera that never had one, which just has no signal.
   var signalLostFor: TimeInterval?
@@ -296,6 +298,7 @@ struct UISessionSnapshot: Sendable, Equatable {
   var recoveryMessage: String?
   var install = UIInstallState()
   var canEditTopology = true
+  var canAddCamera = true
   var layout: UILayout = .sideBySide
   var collapsed: Set<String> = []
   var sidebarVisible = true
@@ -424,6 +427,8 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var lostDetail: String? = nil
   /// With Auto off, the camera a large Cut on the placeholder goes to.
   var lostCut: UICutButton? = nil
+  var canRemove = false
+  var removeHelp = ""
 }
 
 /// One row of an Input picker: a listed device, and the other camera that already uses it.
@@ -813,7 +818,21 @@ enum UIPresentationBuilder {
       stripProblem: stripProblem(camera, in: session),
       lostTitle: lostClock(camera).map { "Signal lost \($0)" },
       lostDetail: lostDetail(camera, in: session),
-      lostCut: lostCut(camera, index: index, in: session))
+      lostCut: lostCut(camera, index: index, in: session),
+      canRemove: camera.canRemove, removeHelp: removeHelp(camera, in: session))
+  }
+
+  /// Why this camera can't be removed yet, or what removing it does.
+  static func removeHelp(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> String {
+    if session.cameras.count < 2 { return "Ultracam needs at least one camera." }
+    if camera.canRemove { return "Remove \(camera.name) and its settings." }
+    if camera.running { return "Stop \(camera.name) to remove it." }
+    if camera.recording.status != .idle { return "\(camera.name)'s take has to finish first." }
+    return camera.lutLoading ? "\(camera.name)'s LUT is still loading." : "\(camera.name) is still stopping."
+  }
+
+  static func addCameraHelp(_ session: UISessionSnapshot) -> String {
+    session.canAddCamera ? "Add Camera" : "Ultracam supports \(FeedLifecycleDemandPolicy.maximumCameras) cameras."
   }
 
   /// "60 frames lost in 5 gaps".

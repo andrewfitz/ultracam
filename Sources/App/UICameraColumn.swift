@@ -857,8 +857,6 @@ struct UIChannelStripView: View {
   }
 
   private var overflowMenu: some View {
-    let canEdit = context.session.canEditTopology
-    let lastCamera = context.presentation.cameras.count < 2
     return Menu {
       Button("Show Inspector") { context.send(.showInspector(cameraID: camera.id)) }
       if context.presentation.outputMode == .program {
@@ -887,8 +885,7 @@ struct UIChannelStripView: View {
       Divider()
       // The one rename alert lives on the main window; this only asks for it.
       Button("Rename…") { context.send(.beginRename(cameraID: camera.id)) }
-        .disabled(!canEdit)
-        .help(canEdit ? "Rename \(camera.name)" : "Stop all cameras to rename a camera.")
+        .help("Rename \(camera.name)")
       Button("Diagnostics…") { context.send(.openDiagnostics) }
       Divider()
       if camera.canStop {
@@ -897,8 +894,8 @@ struct UIChannelStripView: View {
         Button("Start Camera") { context.send(.startCamera(cameraID: camera.id)) }.disabled(!camera.canStart)
       }
       Button("Remove Camera…") { context.send(.removeCamera(cameraID: camera.id)) }
-        .disabled(!canEdit || lastCamera)
-        .help(!canEdit ? "Stop all cameras to remove a camera." : lastCamera ? "The only camera can't be removed." : "Remove \(camera.name)")
+        .disabled(!camera.canRemove)
+        .help(camera.removeHelp)
     } label: {
       Label("More", systemImage: "ellipsis.circle").labelStyle(.iconOnly)
         .frame(minWidth: 24, minHeight: 24)

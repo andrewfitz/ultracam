@@ -5,6 +5,15 @@ import Foundation
 /// FeedDescriptor; this small adapter keeps the two targets' contracts
 /// independent while giving every configured feed a stable CMIO identity.
 extension VirtualCameraRegistrySnapshot {
+  /// Whether the extension can take this snapshot. Its `validate()` is compiled into the
+  /// extension, so the device limit is checked here: past it `synchronize` refuses the whole
+  /// snapshot, and the publisher, which can't report that, would quietly lose the update.
+  func validateDeviceCount() throws {
+    guard devices.count <= VirtualCameraRegistryWire.maximumDevices else {
+      throw VideoError.message("Ultracam supports at most \(VirtualCameraRegistryWire.maximumDevices) virtual cameras.")
+    }
+  }
+
   /// Builds a complete registry snapshot for the current feed collection.
   ///
   /// Separate-camera mode publishes one descriptor per enabled feed. Program

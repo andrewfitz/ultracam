@@ -90,8 +90,8 @@ struct UISessionSidebarViewContent: View {
         Spacer()
         Button { context.send(.addCamera) } label: { Image(systemName: "plus") }
           .buttonStyle(.borderless)
-          .disabled(!session.canEditTopology)
-          .help(session.canEditTopology ? "Add Camera" : "Stop all cameras and recordings to add a camera.")
+          .disabled(!session.canAddCamera)
+          .help(UIPresentationBuilder.addCameraHelp(session))
           .accessibilityLabel("Add Camera")
       }
     }

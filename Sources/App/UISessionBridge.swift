@@ -144,6 +144,7 @@ struct UISessionBridge {
       camera.clientWaiting = model.waitingClients.contains(id)
       camera.queueStalled = model.stalledCameras.contains(id)
       camera.sinkFailure = running ? update?.cameraConnectError : nil
+      camera.canRemove = model.canRemoveCamera(id)
       camera.unexpectedStop = model.unexpectedStops[id].map(Self.unexpectedStop)
       camera.processing = descriptor.pipelineEnabled
       camera.resizeTarget = descriptor.configuration.resizeTarget
@@ -233,7 +234,8 @@ struct UISessionBridge {
     session.install = UIInstallState(canRequestChanges: model.installer.canRequestChanges, pending: model.installer.pending,
       status: model.installer.status, unavailableReason: model.installer.unavailableReason,
       installed: UIExtensionDetector.isInstalled())
-    session.canEditTopology = model.canEditFeedTopology
+    session.canEditTopology = model.canResetSettings
+    session.canAddCamera = model.canAddCamera
     session.layout = model.outputMode == .program || interface.layout != .programView ? interface.layout : .sideBySide
     session.collapsed = interface.collapsed
     session.sidebarVisible = interface.sidebarVisible

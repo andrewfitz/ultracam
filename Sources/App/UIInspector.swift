@@ -47,14 +47,12 @@ struct UIInspectorViewContent: View {
         HStack {
           // The shared rename alert (uiRenameAlert) asks for the name.
           Button("Rename…") { context.send(.beginRename(cameraID: camera.id)) }
-            .disabled(!context.session.canEditTopology)
-            .help(context.session.canEditTopology ? "Rename this camera." : "Stop all cameras and recordings to rename.")
+            .help("Rename this camera.")
           Spacer()
           // The bridge asks for confirmation before removing.
           Button("Remove Camera…", role: .destructive) { context.send(.removeCamera(cameraID: camera.id)) }
-            .disabled(!context.session.canEditTopology || context.presentation.cameras.count < 2)
-            .help(!context.session.canEditTopology ? "Stop all cameras and recordings to remove a camera."
-              : context.presentation.cameras.count < 2 ? "Ultracam needs at least one camera." : "Remove this camera and its settings.")
+            .disabled(!camera.canRemove)
+            .help(camera.removeHelp)
         }
       }
     }

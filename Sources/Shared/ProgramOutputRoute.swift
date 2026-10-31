@@ -327,10 +327,11 @@ final class ProgramOutputRoute: @unchecked Sendable {
     let selected = state.selectedFeedID.flatMap { valid.contains($0) ? $0 : nil }
     var settings = state.settings
     settings.selectedFeedID = selected ?? feedIDs.first
-    // A topology change invalidates every queued source frame. Keeping those
-    // leases would let a removed feed leak into the next Program segment and
-    // would retain pixel buffers until the consumer happened to dequeue them.
-    flushOutputLocked()
+    // Losing a source invalidates every queued frame. Keeping those leases
+    // would let a removed feed leak into the next Program segment and would
+    // retain pixel buffers until the consumer happened to dequeue them. An
+    // add invalidates nothing: those frames are still valid, and on air.
+    if !Set(state.feedIDs).isSubset(of: valid) { flushOutputLocked() }
     let previous = state
     state = SwitcherCoordinator(settings: settings, feedIDs: feedIDs)
     // Readiness and a pending cut carry over; a cut whose target was removed

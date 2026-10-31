@@ -77,8 +77,7 @@ struct UICommands: Commands {
             send(.openMainWindow)
             send(.beginRename(cameraID: selected.id))
           }
-          .disabled(!session.canEditTopology)
-          .help(session.canEditTopology ? "Rename this camera." : "Stop all cameras and recordings to rename.")
+          .help("Rename this camera.")
         }
       }
       Divider()
@@ -98,14 +97,13 @@ struct UICommands: Commands {
       }
       Divider()
       Button("Add Camera") { send(.addCamera) }
-        .disabled(!session.canEditTopology)
-        .help(session.canEditTopology ? "Add a camera." : "Stop all cameras and recordings to add a camera.")
+        .disabled(!session.canAddCamera)
+        .help(UIPresentationBuilder.addCameraHelp(session))
       if let selected {
         // The bridge asks for confirmation before removing.
         Button("Remove \(selected.name)…") { send(.removeCamera(cameraID: selected.id)) }
-          .disabled(!session.canEditTopology || !several)
-          .help(!session.canEditTopology ? "Stop all cameras and recordings to remove a camera."
-            : !several ? "Ultracam needs at least one camera." : "Remove this camera and its settings.")
+          .disabled(!selected.canRemove)
+          .help(selected.removeHelp)
       }
     }
 

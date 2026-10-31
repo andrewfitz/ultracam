@@ -868,13 +868,13 @@ extension UIVerify {
     model.loadLUT(url: cube1D, feedID: beta)
     model.setSyncCameras(true)
     MainLoop.run(seconds: 0.25)
-    settle { model.canEditFeedTopology }
+    settle { model.canResetSettings }
     verifier.check("sync regression: an earlier peer LUT load cannot overwrite shared settings",
       bookmark(alpha) == sharedBookmark && bookmark(beta) == sharedBookmark, model.lutState(alpha).displayTitle)
     model.loadLUT(url: cube1D, feedID: beta)
     model.updateCamera(alpha) { $0.resizeTarget = .hd720 }
     MainLoop.run(seconds: 0.25)
-    settle { model.canEditFeedTopology }
+    settle { model.canResetSettings }
     verifier.check("sync regression: a newer effect edit supersedes a peer load even with the same saved LUT",
       bookmark(alpha) == sharedBookmark && bookmark(beta) == sharedBookmark, model.lutState(alpha).displayTitle)
     model.setSyncCameras(false)
@@ -1106,10 +1106,10 @@ extension UIVerify {
       model.loadLUT(url: missingCube, feedID: alpha)
       let lutDeadline = Date().addingTimeInterval(5)
       // Both loads fail (a bogus bookmark, a missing file); wait for both.
-      while (model.lutState(alpha).error == nil || model.lutState(beta).error == nil || !model.canEditFeedTopology)
+      while (model.lutState(alpha).error == nil || model.lutState(beta).error == nil || !model.canResetSettings)
         && Date() < lutDeadline { MainLoop.run(seconds: 0.01) }
       verifier.check("bridge: another camera's LUT load doesn't drop this camera's restore",
-        model.lutState(beta).error?.contains("Saved LUT could not be restored") == true && model.canEditFeedTopology,
+        model.lutState(beta).error?.contains("Saved LUT could not be restored") == true && model.canResetSettings,
         model.lutState(beta).error ?? "no error")
       verifier.check("bridge: a failed load names its own camera",
         model.lutState(alpha).error?.hasPrefix("LUT was not changed") == true

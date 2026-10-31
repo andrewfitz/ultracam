@@ -345,11 +345,11 @@ struct UISettingsCameraPane: View {
           Text("Program").tag(FeedOutputMode.program)
         }
         .pickerStyle(.segmented)
-        .disabled(!model.canEditFeedTopology)
-        .help(model.canEditFeedTopology ? "Separate cameras publishes an Ultracam camera for each camera. Program publishes one switched camera, Ultracam · Program."
+        .disabled(!model.canResetSettings)
+        .help(model.canResetSettings ? "Separate cameras publishes an Ultracam camera for each camera. Program publishes one switched camera, Ultracam · Program."
           : "Change while all cameras are stopped and nothing is recording.")
       } header: { Text("Output") } footer: {
-        UISettingsFootnote(model.canEditFeedTopology ? "After changing the output mode, choose the new camera in your meeting app."
+        UISettingsFootnote(model.canResetSettings ? "After changing the output mode, choose the new camera in your meeting app."
           : "Change while all cameras are stopped and nothing is recording. Then choose the new camera in your meeting app.")
       }
 
@@ -727,12 +727,12 @@ struct UISettingsAdvancedPane: View {
             // The bridge asks for confirmation (in the main window, or as an alert), then resets and quits.
             UISessionBridge.live(model: model, interface: UIAppEnvironment.interface).send(.resetAllSettings)
           }
-          .disabled(!model.canEditFeedTopology)
-          .help(model.canEditFeedTopology ? "Reset every saved preference and quit."
+          .disabled(!model.canResetSettings)
+          .help(model.canResetSettings ? "Reset every saved preference and quit."
             : "Stop all cameras and let recordings finish before resetting.")
         } label: {
           Text("Reset all settings")
-          Text(model.canEditFeedTopology ? "Cameras, effects, folders, monitor tools and layout"
+          Text(model.canResetSettings ? "Cameras, effects, folders, monitor tools and layout"
             : "Stop all cameras and let recordings finish first").font(.caption).foregroundStyle(.secondary)
         }
       } header: { Text("Reset") } footer: {

@@ -1117,6 +1117,26 @@ import XCTest
     XCTAssertEqual(events.abandoned.first?.1, .targetUnavailable)
   }
 
+  /// An add invalidates nothing, so nothing on its way to a client goes. Losing a source does.
+  func testAnAddKeepsQueuedFramesAndARemovalFlushesThem() throws {
+    let a = feed("alpha"), b = feed("beta"), c = feed("gamma")
+    let route = ProgramOutputRoute(feedIDs: [a, b])
+    let consumer = try route.addConsumerRoute(id: "camera", capacity: 8)
+    let image = try frame(a, at: 0).payload
+    route.setSourceHealth(a, healthy: true)
+    route.setSourceHealth(b, healthy: true)
+    route.ingest(feedID: a, frame: processed(image, at: 0))
+    route.ingest(feedID: a, frame: processed(image, at: 1))
+    route.updateFeeds([a, b, c])
+    route.ingest(feedID: a, frame: processed(image, at: 2))
+    XCTAssertEqual(consumer.pendingCount, 3, "Every frame published across the add")
+    XCTAssertEqual(route.statistics.published, 3)
+    XCTAssertTrue(route.isOnAir)
+    route.updateFeeds([a, c])
+    XCTAssertEqual(consumer.pendingCount, 0, "A removed source's frames must not reach the next segment")
+    XCTAssertTrue(route.isOnAir, "Removing another camera leaves the on-air one on air")
+  }
+
   func testNormalizerReplacesThePoolBuffersStaleColorAndGeometryTags() throws {
     let normalizer = try ProgramNormalizer()
     let contract = ProgramOutputFormat(width: 1920, height: 1080,

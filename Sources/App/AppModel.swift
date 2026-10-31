@@ -145,12 +145,23 @@ final class AppModel {
     return running ? "Waiting for two enabled cameras" : "Starts with Program output"
   }
 
-  var canEditFeedTopology: Bool {
-    FeedLifecycleDemandPolicy.canEditTopology(loading: !lutLoadingFeeds.isEmpty,
-      sourceActive: feedDescriptors.contains {
-        feedCoordinator.isFeedRunning($0.id) ||
-          feedCoordinator.capturePool.existingController(for: $0.id)?.hasActiveFeed == true
-      }, recordingActive: recordingModel.feeds.contains { $0.isActive })
+  /// Nothing runs, stops, records or loads anywhere: settings can be wiped.
+  var canResetSettings: Bool {
+    FeedLifecycleDemandPolicy.canResetSettings(loading: !lutLoadingFeeds.isEmpty,
+      sourceActive: feedDescriptors.contains { cameraActive($0.id) },
+      recordingActive: recordingModel.feeds.contains { $0.isActive })
+  }
+
+  var canAddCamera: Bool {
+    FeedLifecycleDemandPolicy.canAddCamera(enabledCameras: feedDescriptors.filter(\.enabled).count)
+  }
+
+  /// A camera can go while the others run and record. Its own run, take and LUT load have to
+  /// finish first; a meeting client on it keeps its device, on black, until that client leaves.
+  func canRemoveCamera(_ id: FeedID) -> Bool {
+    FeedLifecycleDemandPolicy.canRemoveCamera(cameraCount: feedDescriptors.count,
+      loading: lutLoadingFeeds.contains(id), sourceActive: cameraActive(id),
+      recordingActive: recordingModel.feeds.contains { $0.id == id && $0.isActive })
   }
 
   /// At least one camera is capturing.
@@ -349,6 +360,8 @@ final class AppModel {
   private let demandMonitor = CameraDemandMonitor()
   private var persistedSnapshot = AppSettingsSnapshot()
   private var autoSwitcherBridge: AutoSwitcherBridge?
+  /// The cameras the running director cuts between, fixed when it was built.
+  private var directorCameras: (anchor: FeedID, emphasis: FeedID)?
   private var autoSwitcherTimeline: AutoSwitcherTimelineRecorder?
   private var recordingTimelines: [FeedID: AutoSwitcherTimelineRecorder] = [:]
   /// The tap each running take measures its audio on: the one it started on,
@@ -524,7 +537,7 @@ final class AppModel {
       self.pendingAutoTargetFeedID = nil
       self.autoSwitcherTimeline?.recordApplied(decisionID: decisionID, target: feedID,
         sourceTime: sourceTime, programTime: programTime, directorAppliedAt: nil)
-      // The director clock is the selected input's audio time. The frame that
+      // The director clock is one camera's audio time. The frame that
       // landed the cut has a different source's video PTS, so acknowledging
       // with that PTS moves the director onto the wrong timeline. Nil keeps
       // the shot start on the decision's own cut time.
@@ -793,10 +806,11 @@ final class AppModel {
   }
 
   /// Adds an idle feed, persists the new topology, and selects it so the UI
-  /// immediately edits the new feed's independent settings.
+  /// immediately edits the new feed's independent settings. Other cameras keep
+  /// running and recording, and Program keeps its frames.
   @discardableResult
   func addFeed(name: String? = nil) -> FeedID? {
-    guard canEditFeedTopology else { return nil }
+    guard canAddCamera else { return nil }
     let source = feedCoordinator.selectedDescriptor
     let id = feedCoordinator.add(name: name)
     wireCamera(id)
@@ -848,12 +862,17 @@ final class AppModel {
     audioLog.notice("Take on \(name, privacy: .public): \(summary.note, privacy: .public), \(String(format: "%.1f", summary.duration), privacy: .public) s measured")
   }
 
-  /// Removes an idle feed. The coordinator owns the running/removal guard and
-  /// moves the selection to the first remaining camera.
+  /// Removes an idle feed while the others carry on. The coordinator owns the
+  /// running/removal guard and moves the selection to the first remaining camera.
   @discardableResult
   func removeFeed(_ id: FeedID) -> Bool {
-    guard canEditFeedTopology else { return false }
+    guard canRemoveCamera(id) else { return false }
     guard feedCoordinator.remove(id) else { return false }
+    let route = feedRouteID(id)
+    routeDemand[route] = nil
+    unknownRoutes.remove(route)
+    routeErrors[route] = nil
+    feedRouteIDs[id] = nil
     cancelLUTLoad(id)
     takeAudio[id] = nil
     Task { await cameraControls.removeFeed(id.rawValue) }
@@ -874,13 +893,17 @@ final class AppModel {
     monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(id.rawValue), nil)
     syncRecordingFeeds()
     saveSettings(reason: "camera removed")
+    // It may have been the director's anchor or emphasis, or Program's selection.
+    reconcileAutoSwitcher()
+    reconcileProgramTransportDemand()
     return true
   }
 
+  /// Live: no device, sink or take depends on the name. A running extension keeps the
+  /// name it published, so meeting apps see the new one after it next restarts.
   @discardableResult
   func renameFeed(_ id: FeedID, name: String) -> Bool {
-    guard canEditFeedTopology,
-      let existing = feedCoordinator.descriptors.first(where: { $0.id == id }) else { return false }
+    guard let existing = feedCoordinator.descriptors.first(where: { $0.id == id }) else { return false }
     let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return false }
     var updated = existing
@@ -892,7 +915,7 @@ final class AppModel {
   }
 
   func setOutputMode(_ mode: FeedOutputMode) {
-    guard canEditFeedTopology, feedCoordinator.outputMode != mode else { return }
+    guard canResetSettings, feedCoordinator.outputMode != mode else { return }
     feedCoordinator.setOutputMode(mode)
     programCutIssue = nil
     if mode == .program { programMonitorTap?.restart() }
@@ -968,21 +991,26 @@ final class AppModel {
     settingsStore.saveSnapshot(persistedSnapshot)
   }
 
-  /// The director's clock source: the selected input's status. Program's
-  /// Rust director ticks on one camera's audio; which one is the selection,
-  /// a UI choice. No camera's pipeline depends on it.
-  private var directorUpdate: CaptureUpdate? { cameraUpdates[selectedFeedID] }
+  /// The camera whose audio and clock the director runs on: the anchor while it runs,
+  /// otherwise the emphasis camera, otherwise the first one running. Each input has its own
+  /// stream clock, so this can't follow the selection, which any click moves, or Program.
+  private var directorClockFeedID: FeedID? {
+    let settings = feedCoordinator.switcher.naturalTalkingHead
+    let preferred = [directorCameras?.anchor ?? settings.anchorFeedID, directorCameras?.emphasis ?? settings.emphasisFeedID]
+    return preferred.compactMap { $0 }.first(where: feedCoordinator.isFeedRunning)
+      ?? feedDescriptors.first { $0.enabled && feedCoordinator.isFeedRunning($0.id) }?.id
+  }
 
-  /// Audio packet time from the selected input. That is the clock the Rust
+  /// The director's clock source. No camera's pipeline depends on it.
+  private var directorUpdate: CaptureUpdate? { directorClockFeedID.flatMap { cameraUpdates[$0] } }
+
+  /// Audio packet time from the clock camera. That is the clock the Rust
   /// director ticks, so manual cuts have to be expressed on it.
   private func directorClock() -> CMTime {
     directorUpdate?.audioPacketTime ?? directorUpdate?.mediaTime ?? .zero
   }
   private func reconcileAutoSwitcher() {
-    // The director ticks on the selected input's audio (`directorClock`), so
-    // it runs while that camera does.
     guard feedCoordinator.outputMode == .program,
-      feedCoordinator.isFeedRunning(selectedFeedID),
       feedCoordinator.switcherCoordinator.settings.naturalTalkingHead.enabled,
       feedCoordinator.switcherCoordinator.settings.automatic,
       feedCoordinator.switcherCoordinator.settings.strategy == .naturalTalkingHead else {
@@ -1003,7 +1031,12 @@ final class AppModel {
       stopAutoSwitcher()
       return
     }
-    if autoSwitcherBridge != nil { return }
+    // A running director keeps its two cameras, and its clock moves from one to the other.
+    // With neither left it hears nothing, so it starts over on two that run.
+    if let directorCameras, autoSwitcherBridge != nil {
+      if enabledIDs.contains(directorCameras.anchor) || enabledIDs.contains(directorCameras.emphasis) { return }
+      stopAutoSwitcher()
+    }
     guard let bridge = AutoSwitcherBridge(settings: settings, anchor: anchor, emphasis: emphasis) else {
       reportProblem("Natural Talking Head could not start its Rust director.", key: "director")
       return
@@ -1065,6 +1098,7 @@ final class AppModel {
       }
     }
     autoSwitcherBridge = bridge
+    directorCameras = (anchor, emphasis)
     if let current = feedCoordinator.programOutput.selectedFeedID,
       (current == anchor || current == emphasis) {
       bridge.manualOverride(cameraID: current, at: directorUpdate?.mediaTime ?? .zero)
@@ -1079,6 +1113,7 @@ final class AppModel {
     feedCoordinator.cancelProgramCut()
     autoSwitcherBridge?.stop()
     autoSwitcherBridge = nil
+    directorCameras = nil
     autoSwitcherTimeline?.finish()
     autoSwitcherTimeline = nil
   }
@@ -1169,6 +1204,7 @@ final class AppModel {
     let candidate = VirtualCameraRegistrySnapshot.forFeeds(snapshot.feeds,
       outputMode: snapshot.outputMode, previous: previous)
     do {
+      try candidate.validateDeviceCount()
       try virtualCameraRegistryStore.save(candidate)
       if candidate != previous {
         registryLog.notice("Registry publish: generation \(candidate.generation, privacy: .public), \(candidate.devices.filter(\.enabled).count, privacy: .public) cameras (\(snapshot.outputMode == .program ? "Program" : "separate cameras", privacy: .public)), reason: \(reason, privacy: .public)")
@@ -1288,7 +1324,7 @@ final class AppModel {
       detectedSourceDurations[feedID] = duration
       reconcileProgramTransportDemand()
     }
-    if feedID == selectedFeedID { feedAutoSwitcherAudio(update) }
+    if feedID == directorClockFeedID { feedAutoSwitcherAudio(update) }
   }
 
   /// Opens one camera's capture. The one start path, for every camera, manual
@@ -1409,9 +1445,8 @@ final class AppModel {
   /// session. The director hears the same health change on its next tick.
   private func retireProgramSource(_ feedID: FeedID) {
     feedCoordinator.setProgramSourceHealth(feedID, healthy: false)
-    // The director clock is the selected input's. The stopped source's own
-    // timestamps are cleared and must not be used. A zero sample still
-    // records health without moving that clock backward.
+    // The stopped source's own timestamps are cleared and must not be used.
+    // A zero sample still records health without moving the clock backward.
     autoSwitcherBridge?.setCameraHealth(cameraID: feedID, healthy: false, at: directorClock())
   }
 
@@ -1923,7 +1958,7 @@ final class AppModel {
   /// the app should quit afterwards so nothing writes the old state back.
   @discardableResult
   func resetAllSettings() -> Bool {
-    guard canEditFeedTopology else { return false }
+    guard canResetSettings else { return false }
     settingsResetPending = true
     cameraControls.reset()
     vendorSettings.reset()
@@ -1950,6 +1985,7 @@ final class AppModel {
   }
 
   #if ULTRACAM_TEST_SUPPORT
+  var directorClockFeedIDForTesting: FeedID? { directorClockFeedID }
   func isSignalUnhealthy(_ id: FeedID) -> Bool { signalHealth.isUnhealthy(id) }
   var demandMonitorIsRunning: Bool { demandMonitor.isRunning }
   /// What the demand monitor reports, without CMIO. Nil is an unreadable route.

@@ -91,19 +91,24 @@ import XCTest
     XCTAssertNil(policy.action(ready: connected, running: false))
   }
 
-  func testOtherFeedCaptureAndFinishingRecordingBlockTopologyChanges() {
-    XCTAssertFalse(
-      FeedLifecycleDemandPolicy.canEditTopology(
-        loading: false,
-        sourceActive: true, recordingActive: false))
-    XCTAssertFalse(
-      FeedLifecycleDemandPolicy.canEditTopology(
-        loading: false,
-        sourceActive: false, recordingActive: true))
-    XCTAssertTrue(
-      FeedLifecycleDemandPolicy.canEditTopology(
-        loading: false,
-        sourceActive: false, recordingActive: false))
+  func testOnlyResetWaitsOnEveryCamera() {
+    XCTAssertFalse(FeedLifecycleDemandPolicy.canResetSettings(loading: false, sourceActive: true, recordingActive: false))
+    XCTAssertFalse(FeedLifecycleDemandPolicy.canResetSettings(loading: false, sourceActive: false, recordingActive: true))
+    XCTAssertFalse(FeedLifecycleDemandPolicy.canResetSettings(loading: true, sourceActive: false, recordingActive: false))
+    XCTAssertTrue(FeedLifecycleDemandPolicy.canResetSettings(loading: false, sourceActive: false, recordingActive: false))
+  }
+
+  func testRemovalWaitsOnItsOwnCameraAndAddOnTheDeviceLimit() {
+    func removable(cameras: Int = 2, loading: Bool = false, active: Bool = false, recording: Bool = false) -> Bool {
+      FeedLifecycleDemandPolicy.canRemoveCamera(cameraCount: cameras, loading: loading, sourceActive: active, recordingActive: recording)
+    }
+    XCTAssertTrue(removable())
+    XCTAssertFalse(removable(cameras: 1), "The last camera stays")
+    XCTAssertFalse(removable(loading: true))
+    XCTAssertFalse(removable(active: true))
+    XCTAssertFalse(removable(recording: true))
+    XCTAssertTrue(FeedLifecycleDemandPolicy.canAddCamera(enabledCameras: 30))
+    XCTAssertFalse(FeedLifecycleDemandPolicy.canAddCamera(enabledCameras: 31), "Camera 32 would leave Program no device")
   }
 
   func testBypassedHeadlessProgramUsesUntouchedSourceContractAndDetectedCadence() {
