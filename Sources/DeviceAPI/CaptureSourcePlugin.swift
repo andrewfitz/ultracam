@@ -10,6 +10,10 @@ struct CaptureDeviceInfo: Identifiable, Sendable {
   let supportedModes: String
   var supportedModesKey: String? = nil
   var localizationTable: String? = nil
+  /// The model, which two units of one model share; `name` is the driver's display name.
+  var model: String? = nil
+  /// The modes the selected connector supports, for human names ("2160p 59.94").
+  var modes: [SourceFormat] = []
   func localizedSupportedModes(in bundle: Bundle = .main) -> String {
     VendorDisplayLocalization.resolve(key: supportedModesKey, fallback: supportedModes, table: localizationTable, in: bundle)
   }
@@ -30,6 +34,10 @@ protocol CaptureSourcePlugin: VendorSettingsProviding {
   func expectedFormat(deviceID: String, timing: CaptureTiming) -> SourceFormat?
   func makeSession() -> any CaptureSession
   func diagnostics(deviceID: String) -> DeviceDiagnostics?
+  /// Status, its observer and the idle read: defaults in `DeviceStatus.swift` report unknown.
+  func status(deviceID: String) -> CaptureDeviceStatus?
+  @MainActor func observeStatus(_ handler: @escaping @MainActor @Sendable (String, CaptureDeviceStatus) -> Void) -> DeviceStatusObservation?
+  func refreshIdleStatus()
   func settings(deviceID: String) async throws -> [VendorSetting]
   func apply(_ value: VendorSettingValue, to setting: VendorSetting.ID, deviceID: String) async throws
 }

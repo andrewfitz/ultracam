@@ -400,17 +400,23 @@ struct DeckLinkCapturePlugin: CaptureSourcePlugin {
     if let inherited { Self.setAdvertisesHDR(inherited) }
   }
   var descriptor: VendorDescriptor {
+    // A unit that falls back to USB never gets a PCIe device, so DeckLink never lists it:
+    // the symptom is a saved input gone missing, and the fix is the Thunderbolt hub.
     return VendorDescriptor(id: "decklink", displayName: "Blackmagic DeckLink", badgeText: "DECKLINK",
       signalHint: "HDMI / SDI / optical", sdkVersion: DeckLinkBackend.sdkVersion(), sdkPresent: true, badgeAssetName: "BlackmagicLogo",
-      displayNameKey: "decklink.descriptor.name", signalHintKey: "decklink.descriptor.signal", localizationTable: Self.localizationTable)
+      displayNameKey: "decklink.descriptor.name", signalHintKey: "decklink.descriptor.signal", localizationTable: Self.localizationTable,
+      missingDeviceHint: "If it is plugged in, it may have fallen back to USB and can’t be used. Connect it through a Thunderbolt hub.",
+      missingDeviceHintKey: "decklink.descriptor.missingDevice")
   }
   func driverStatus() -> DriverStatus {
     let info = DeckLinkBackend.driverInfo()
     return DriverStatus(installed: info.installed, supported: info.supported, version: info.version, reason: info.message)
   }
   private static func device(_ value: UltracamDevice) -> CaptureDeviceInfo {
-    CaptureDeviceInfo(id: value.identifier, name: value.name, connectors: connectors.filter { value.videoInputConnections & $0.bit != 0 }.map(\.connector), shareable: false,
-      mayPause: nil, supportedModes: value.modes.map { "\($0.width) × \($0.height), \($0.frameDuration.value)/\($0.frameDuration.timescale) s" }.joined(separator: "; "))
+    let modes = value.modes.compactMap { try? activeFormat(width: $0.width, height: $0.height, duration: $0.frameDuration) }
+    return CaptureDeviceInfo(id: value.identifier, name: value.name, connectors: connectors.filter { value.videoInputConnections & $0.bit != 0 }.map(\.connector), shareable: false,
+      mayPause: nil, supportedModes: modes.map { FormatDisplayIdentity($0).short }.joined(separator: ", "),
+      model: value.model, modes: modes)
   }
   func devices() throws -> [CaptureDeviceInfo] { try DeckLinkBackend.devices().map(Self.device) }
   @MainActor func observeDevices(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) -> DeviceObservation {
@@ -431,6 +437,76 @@ struct DeckLinkCapturePlugin: CaptureSourcePlugin {
   func diagnostics(deviceID: String) -> DeviceDiagnostics? {
     guard let value = DeckLinkBackend.diagnostics(deviceID: deviceID) else { return nil }
     return Self.translateDiagnostics(value)
+  }
+  func status(deviceID: String) -> CaptureDeviceStatus? {
+    DeckLinkBackend.status(deviceID: deviceID).map(Self.translateStatus)
+  }
+  @MainActor func observeStatus(_ handler: @escaping @MainActor @Sendable (String, CaptureDeviceStatus) -> Void) -> DeviceStatusObservation? {
+    let observation = DeviceStatusObservation(handler)
+    let token = DeckLinkBackend.addStatusObserver { [weak observation] value in
+      observation?.deliver(value.identifier, Self.translateStatus(value))
+    }
+    observation.onCancel { DeckLinkBackend.removeStatusObserver(token) }
+    return observation
+  }
+  func refreshIdleStatus() { DeckLinkBackend.refreshIdleStatus() }
+  /// BMDDeviceInterface values ('pci ', 'usb ', 'thun').
+  static func link(_ interface: UInt32) -> DeviceLinkKind {
+    switch interface {
+    case 0x7468756E: return .thunderbolt
+    case 0x70636920: return .pcie
+    case 0x75736220: return .usb
+    default: return .unknown
+    }
+  }
+  /// A nil lock or mode is unknown, so an idle unit that reports neither reads as unknown.
+  static func translateStatus(_ value: UCDeckLinkDeviceStatus) -> CaptureDeviceStatus {
+    var status = CaptureDeviceStatus()
+    status.availability = value.sessionActive ? .inUseHere :
+      value.busyElsewhere.map { $0.boolValue ? .inUseElsewhere : .free } ?? .unknown
+    status.link = link(value.deviceInterface)
+    status.connector = connectors.first { $0.bit == value.connection }?.connector
+    status.signalLocked = value.signalLocked?.boolValue
+    if value.detectedWidth > 0, value.detectedHeight > 0, value.detectedDuration.isValid {
+      status.detected = try? activeFormat(width: value.detectedWidth, height: value.detectedHeight, duration: value.detectedDuration)
+    }
+    var facts: [DeviceFact] = []
+    if let model = value.model, !model.isEmpty {
+      facts.append(DeviceFact(id: "model", group: .identity, label: "Model", values: [model],
+        labelKey: "decklink.fact.model", localizationTable: localizationTable))
+    }
+    var connection: [String] = []
+    switch status.link {
+    case .thunderbolt: connection.append("Thunderbolt")
+    case .pcie: connection.append("PCIe")
+    case .usb: connection.append("USB")
+    default: break
+    }
+    if value.pcieWidth > 0 {
+      connection.append("PCIe x\(value.pcieWidth)" + (value.pcieGeneration > 0 ? " Gen\(value.pcieGeneration)" : ""))
+    }
+    if !connection.isEmpty {
+      facts.append(DeviceFact(id: "connection", group: .connection, label: "Connection", values: connection,
+        labelKey: "decklink.fact.connection", localizationTable: localizationTable))
+    }
+    if let detected = status.detected {
+      let pieces = FormatDisplayIdentity(detected).short.split(separator: " ").map(String.init)
+        + [value.detectedSampling, value.detectedColorspace, value.detectedDynamicRange].compactMap { $0 }
+      facts.append(DeviceFact(id: "signal", group: .signal, label: "Signal", values: pieces,
+        labelKey: "decklink.fact.signal", localizationTable: localizationTable))
+    }
+    if value.temperatureCelsius != NSNotFound {
+      facts.append(DeviceFact(id: "temperature", group: .other, label: "Temperature", values: ["\(value.temperatureCelsius) °C"],
+        labelKey: "decklink.fact.temperature", localizationTable: localizationTable))
+    }
+    status.facts = facts
+    if status.availability == .inUseElsewhere {
+      // The SDK can't name the other app, so the text doesn't try.
+      status.problems = [DeviceProblem(id: "busy", severity: .warning, title: "In use by another app",
+        detail: "Close it, then start this camera.", titleKey: "decklink.problem.busy",
+        detailKey: "decklink.problem.busy.detail", localizationTable: localizationTable)]
+    }
+    return status
   }
   static func setAdvertisesHDR(_ enabled: Bool) { DeckLinkBackend.setAdvertisesHDR(enabled) }
   static func seedHDRAdvertisements(_ values: [String: Bool]) {

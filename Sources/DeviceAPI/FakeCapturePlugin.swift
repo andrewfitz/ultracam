@@ -11,10 +11,37 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   private var createdSessions: [FakeCaptureSession] = []
   @MainActor private var observers: [WeakObservation] = []
   @MainActor private struct WeakObservation { weak var value: DeviceObservation? }
-  init(format: SourceFormat, audio: SourceAudioDeclaration, deviceIDs: [String] = ["fake:fixture"]) {
+  @MainActor private var statusObservers: [WeakStatusObservation] = []
+  @MainActor private struct WeakStatusObservation { weak var value: DeviceStatusObservation? }
+  /// Scripted hardware facts, by device ID (`pluginLock`).
+  struct Details: Sendable { var name: String; var model: String? = nil; var modes: [SourceFormat] = []; var connectors: [Connector] = [] }
+  private var details: [String: Details] = [:]
+  private var statuses: [String: CaptureDeviceStatus] = [:]
+  private var scriptedSettings: [String: [VendorSetting]] = [:]
+  private var idleRefreshCount = 0
+  init(format: SourceFormat, audio: SourceAudioDeclaration, deviceIDs: [String] = ["fake:fixture"],
+       descriptor: VendorDescriptor = VendorDescriptor(id: "fake", displayName: "Fake capture", badgeText: "FAKE", signalHint: nil, sdkVersion: nil, sdkPresent: true)) {
     precondition(!deviceIDs.isEmpty && Set(deviceIDs).count == deviceIDs.count && deviceIDs.allSatisfy { $0.hasPrefix("fake:") })
-    self.format = format; self.audio = audio; self.deviceIDs = deviceIDs
+    self.format = format; self.audio = audio; self.deviceIDs = deviceIDs; self.descriptor = descriptor
   }
+  /// Names, models and modes for the listed devices.
+  func setDetails(_ value: Details, for deviceID: String) { pluginLock.withLock { details[deviceID] = value } }
+  func setSettings(_ settings: [VendorSetting], for deviceID: String) { pluginLock.withLock { scriptedSettings[deviceID] = settings } }
+  /// A status as the plugin's reader would publish it.
+  @MainActor func setStatus(_ status: CaptureDeviceStatus, for deviceID: String) {
+    pluginLock.withLock { statuses[deviceID] = status }
+    statusObservers = statusObservers.filter { $0.value != nil }
+    statusObservers.compactMap(\.value).forEach { $0.deliver(deviceID, status) }
+  }
+  /// How often the host asked for an idle read.
+  var idleRefreshes: Int { pluginLock.withLock { idleRefreshCount } }
+  func status(deviceID: String) -> CaptureDeviceStatus? { pluginLock.withLock { statuses[deviceID] } }
+  @MainActor func observeStatus(_ handler: @escaping @MainActor @Sendable (String, CaptureDeviceStatus) -> Void) -> DeviceStatusObservation? {
+    let observation = DeviceStatusObservation(handler)
+    statusObservers.append(WeakStatusObservation(value: observation))
+    return observation
+  }
+  func refreshIdleStatus() { pluginLock.withLock { idleRefreshCount += 1 } }
   var sessions: [FakeCaptureSession] { pluginLock.withLock { createdSessions } }
   @MainActor func setConnected(_ connected: Bool) {
     pluginLock.withLock { self.connected = connected }
@@ -22,12 +49,15 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
     observers = observers.filter { $0.value != nil }
     observers.compactMap(\.value).forEach { $0.deliver(snapshot) }
   }
-  let descriptor = VendorDescriptor(id: "fake", displayName: "Fake capture", badgeText: "FAKE", signalHint: nil, sdkVersion: nil, sdkPresent: true)
+  let descriptor: VendorDescriptor
   func driverStatus() -> DriverStatus { DriverStatus(installed: true, supported: true, version: nil, reason: nil) }
   func devices() throws -> [CaptureDeviceInfo] {
     guard pluginLock.withLock({ connected }) else { return [] }
+    let details = pluginLock.withLock { self.details }
     return deviceIDs.enumerated().map { index, id in
-      CaptureDeviceInfo(id: id, name: "Fixture source \(index + 1)", connectors: [], shareable: true, mayPause: nil, supportedModes: "Scripted fixture")
+      let detail = details[id]
+      return CaptureDeviceInfo(id: id, name: detail?.name ?? "Fixture source \(index + 1)", connectors: detail?.connectors ?? [],
+        shareable: true, mayPause: nil, supportedModes: "Scripted fixture", model: detail?.model, modes: detail?.modes ?? [])
     }
   }
   @MainActor func observeDevices(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) -> DeviceObservation {
@@ -43,9 +73,15 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
     return session
   }
   func diagnostics(deviceID: String) -> DeviceDiagnostics? { nil }
-  func settings(deviceID: String) async throws -> [VendorSetting] { [] }
+  func settings(deviceID: String) async throws -> [VendorSetting] { pluginLock.withLock { scriptedSettings[deviceID] ?? [] } }
   func apply(_ value: VendorSettingValue, to setting: VendorSetting.ID, deviceID: String) async throws {
-    throw PluginError.unsupported("Fixture has no settings")
+    try pluginLock.withLock {
+      guard let index = scriptedSettings[deviceID]?.firstIndex(where: { $0.id == setting }),
+        let old = scriptedSettings[deviceID]?[index] else { throw PluginError.unsupported("Fixture has no settings") }
+      scriptedSettings[deviceID]?[index] = VendorSetting(id: old.id, labelKey: old.labelKey, value: value, allowedValues: old.allowedValues,
+        mutable: old.mutable, availabilityReason: old.availabilityReason, interruptsCapture: old.interruptsCapture,
+        labelFallback: old.labelFallback)
+    }
   }
 }
 

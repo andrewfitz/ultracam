@@ -21,7 +21,9 @@ final class SonyControlPlugin: CameraControlPlugin {
     self.backend = backend
     descriptor = VendorDescriptor(id: "sony", displayName: "Sony", badgeText: "Sony",
       signalHint: nil, sdkVersion: backend.available ? backend.sdkVersion : nil, sdkPresent: backend.available, badgeAssetName: "SonyLogo",
-      displayNameKey: "sony.descriptor.name", localizationTable: "SonyControl")
+      displayNameKey: "sony.descriptor.name", localizationTable: "SonyControl",
+      missingDeviceHint: "Turn on Remote Shoot Function on the body, and put it on the same Wi-Fi network as this Mac.",
+      missingDeviceHintKey: "sony.descriptor.missingDevice")
     backend.eventHandler = { [weak self] key, kind, message in
       MainActor.assumeIsolated {
         guard let self, !self.closed,
@@ -30,6 +32,10 @@ final class SonyControlPlugin: CameraControlPlugin {
         case "changed": self.handler?(.changed(feedID: feed, generation: session.generation))
         case "disconnected": self.handler?(.disconnected(feedID: feed, generation: session.generation,
           reason: ControlDisconnectReason(code: .transport, retryable: true, message: message)))
+        case "warning":
+          guard let notice = Self.notice(forWarning: message) else { return }
+          let text = VendorDisplayLocalization.resolve(key: "sony.notice.\(message)", fallback: notice.message, table: "SonyControl")
+          self.handler?(.notice(feedID: feed, generation: session.generation, message: text, severity: notice.severity))
         default: self.handler?(.error(feedID: feed, generation: session.generation,
           error: Self.failure(message)))
         }
@@ -280,7 +286,40 @@ final class SonyControlPlugin: CameraControlPlugin {
     var value: ControlCamera {
       ControlCamera(pluginID: "sony", id: id, name: name?.isEmpty == false ? name! : model,
         transport: .network, address: address, fingerprint: fingerprintError.isEmpty ? fingerprint : nil,
-        authenticationMode: authentication ? .usernamePassword : .none)
+        authenticationMode: authentication ? .usernamePassword : .none, model: model.isEmpty ? nil : model)
+    }
+  }
+  /// OnWarning, by the bridge's stable key. Unknown keys are dropped, never shown as codes.
+  nonisolated static func notice(forWarning key: String) -> (message: String, severity: DeviceSeverity)? {
+    switch key {
+    case "reconnecting": return ("Reconnecting to the camera body", .notice)
+    case "reconnected": return ("Camera body reconnected", .info)
+    case "storageFull": return ("The camera body’s card is full", .warning)
+    case "networkError": return ("The camera body’s Wi-Fi had an error", .warning)
+    case "networkRecovered": return ("The camera body’s Wi-Fi recovered", .info)
+    case "mediaChanged": return ("The camera body’s media changed", .info)
+    default: return nil
+    }
+  }
+  /// The battery's reading in the unit the body reports. Only a known unit can warn:
+  /// under 20% or under 15 minutes. Volts and a missing unit show the number alone.
+  nonisolated static func battery(value: UInt64, unitLabel: String?) -> (label: String, unit: ControlValueUnit?, severity: DeviceSeverity?) {
+    switch unitLabel {
+    case "Percent" where value <= 100: return ("\(value)%", .percent, value < 20 ? .warning : nil)
+    case "Minutes": return ("\(value) min", .minutes, value < 15 ? .warning : nil)
+    case "Voltage": return ("\(value)", .volts, nil)
+    default: return ("\(value)", nil, nil)
+    }
+  }
+  /// The source profile a picture setting matches, by its gamma and gamut. Only pictures a
+  /// declaration can describe exactly suggest one; any other look suggests nothing.
+  nonisolated static func sourceProfile(gamma: String?, gamut: String?) -> String? {
+    switch (gamma, gamut) {
+    case ("S-Log3", "S-Gamut3.Cine"): return "sony-slog3-sgamut3cine"
+    case ("S-Log3", "S-Gamut3"): return "sony-slog3-sgamut3"
+    case ("ITU709", _): return "rec709-video"
+    case ("HLG", "BT.2020"), ("HLG1", "BT.2020"), ("HLG2", "BT.2020"), ("HLG3", "BT.2020"): return "rec2020-hlg-video"
+    default: return nil
     }
   }
   private struct Property: Decodable, Sendable {
@@ -290,15 +329,48 @@ final class SonyControlPlugin: CameraControlPlugin {
     var controlValue: ControlProperty {
       let timing = ["frameRate", "sqFrameRate", "hdmiResolution", "hdmiOutput4K", "hdmiRawFrameRate"]
       let overlay = ["iso", "aperture", "shutter", "shutterAngle", "whiteBalance", "temperature", "focusMode"]
+      let roles: [String: ControlPropertyRole] = ["battery": .power, "batteryUnit": .hidden, "overheating": .thermal,
+        "slot1": .media, "slot2": .media, "hdmiTimecode": .timecodeOutput, "hdmiAudio": .hdmiAudio, "firmware": .firmware,
+        "gamma": .colorProfile, "colorMode": .colorProfile, "shootingMode": .hidden, "cinemaGamut": .hidden]
       return ControlProperty(id: id, label: title, writable: writable, value: .unsignedInteger(self.value),
         options: choices.map { ControlOption(id: String($0.value), label: $0.label, value: .unsignedInteger($0.value),
           labelKey: $0.label == "On" ? "sony.control.choice.on" : $0.label == "Off" ? "sony.control.choice.off" : nil, localizationTable: "SonyControl") },
-        role: ["monitoringDisplayHDMI", "faceEyeFrameDisplay"].contains(id) ? .hidden : timing.contains(id) ? .outputTiming : .standard,
+        role: ["monitoringDisplayHDMI", "faceEyeFrameDisplay"].contains(id) ? .hidden : timing.contains(id) ? .outputTiming : roles[id] ?? .standard,
         overlayOrder: overlay.firstIndex(of: id), currentValueLabel: label, labelKey: "sony.control.\(id)", localizationTable: "SonyControl")
     }
   }
   private static func present(_ properties: [Property]) -> [ControlProperty] {
     var result = properties.map(\.controlValue)
+    func label(_ id: String) -> String? { properties.first { $0.id == id }?.label }
+    func update(_ id: String, _ change: (inout ControlProperty) -> Void) {
+      if let index = result.firstIndex(where: { $0.id == id }) { change(&result[index]) }
+    }
+    if let battery = properties.first(where: { $0.id == "battery" }) {
+      let reading = Self.battery(value: battery.value, unitLabel: label("batteryUnit"))
+      update("battery") { $0.currentValueLabel = reading.label; $0.unit = reading.unit; $0.severity = reading.severity }
+    }
+    update("overheating") { property in
+      property.severity = property.currentValueLabel == "Overheating" ? .critical :
+        property.currentValueLabel == "About to overheat" ? .warning : nil
+    }
+    for slot in ["slot1", "slot2"] {
+      update(slot) { property in
+        let fine = ["OK", "No card", "Reading card", nil].contains(property.currentValueLabel)
+        property.severity = fine ? nil : .warning
+      }
+    }
+    // Cine EI always records S-Log3, in the cinema gamut; otherwise the picture profile decides.
+    let cineEI = ["Cine EI", "Cine EI Quick"].contains(label("shootingMode"))
+    if cineEI {
+      for id in ["gamma", "colorMode"] { update(id) { $0.role = .hidden } }
+      update("shootingMode") { $0.role = .colorProfile }
+      update("cinemaGamut") {
+        $0.role = .colorProfile
+        $0.suggestedSourceProfileID = Self.sourceProfile(gamma: "S-Log3", gamut: $0.currentValueLabel)
+      }
+    } else {
+      update("gamma") { $0.suggestedSourceProfileID = Self.sourceProfile(gamma: $0.currentValueLabel, gamut: label("colorMode")) }
+    }
     if let display = properties.first(where: { $0.id == "monitoringDisplayHDMI" }) {
       result.append(ControlProperty(id: "cameraDisplay", label: "HDMI display", writable: display.writable,
         value: .boolean(display.value == 2), role: .cameraDisplay, labelKey: "sony.control.cameraDisplay", localizationTable: "SonyControl"))

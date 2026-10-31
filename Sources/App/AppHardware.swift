@@ -49,6 +49,16 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   var captureDescriptor: (String) -> VendorDescriptor? = { _ in nil }
   /// Capture vendors in registry order, for Settings › Hardware's sections.
   var captureVendors: () -> [VendorDescriptor] = { [] }
+  /// Each capture vendor's driver, by vendor ID.
+  var captureDrivers: () -> [String: DriverStatus] = { [:] }
+  /// A listed device as its plugin describes it (model, connectors, modes). Nil once unlisted.
+  var captureDevice: (String) -> CaptureDeviceInfo? = { _ in nil }
+  /// Cached status; never calls a driver.
+  var deviceStatus: (String) -> CaptureDeviceStatus? = { _ in nil }
+  /// Calls the handler whenever a device's status changes. Holds the observation until released.
+  var observeDeviceStatus: (@escaping @MainActor @Sendable (String, CaptureDeviceStatus) -> Void) -> Any? = { _ in nil }
+  /// Asks every plugin for one idle read on its own queue (`CaptureSourcePlugin.refreshIdleStatus`).
+  var refreshIdleStatus: () -> Void = {}
   var controlViewFactories: () -> [String: ControlViewFactory] = { [:] }
   /// Follows which virtual cameras have clients from launch. CMIO listeners only, and
   /// off in harnesses, which have no clients and shouldn't enumerate the Mac's cameras.
@@ -113,6 +123,11 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
       controlPlugins: { registry.controlPlugins },
       captureDescriptor: { id in (try? registry.capturePlugin(for: id))?.descriptor },
       captureVendors: { registry.snapshot.capture.map(\.descriptor) },
+      captureDrivers: { Dictionary(registry.snapshot.capture.map { ($0.descriptor.id, $0.status) }, uniquingKeysWith: { first, _ in first }) },
+      captureDevice: { id in registry.snapshot.devices.first { $0.id == id } },
+      deviceStatus: { id in (try? registry.capturePlugin(for: id))?.status(deviceID: id) },
+      observeDeviceStatus: { handler in registry.readyCapturePlugins.compactMap { $0.observeStatus(handler) } },
+      refreshIdleStatus: { registry.readyCapturePlugins.forEach { $0.refreshIdleStatus() } },
       controlViewFactories: { registry.controlViewFactories },
       setCompatibilityPolicy: { compatibility.update($0) })
   }

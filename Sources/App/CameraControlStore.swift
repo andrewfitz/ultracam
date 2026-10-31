@@ -60,6 +60,11 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     var hasSavedCredentials = false
     var generation: UInt64 = 0
     var invalidationRevision: UInt64 = 0
+    /// When the body dropped on its own; nil while connected or after a manual disconnect.
+    var lostAt: Date?
+    /// The body's latest notice that still matters (reconnecting, card full); recoveries clear it.
+    var notice: String?
+    var noticeSeverity: DeviceSeverity?
     var cacheStatus: String {
         if !connected { return "Disconnected · cached values" }
         if dirty { return message == nil ? "Updating settings…" : "Settings update failed" }
@@ -208,6 +213,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
                 throw ControlError(code: .changedIdentity, retryable: false, message: "Camera identity changed after selection. Check the camera again before signing in.")
             }
             if case .endpoint = request, !camera.name.isEmpty { prepared.camera.name = camera.name }
+            if prepared.camera.firmware == nil { prepared.camera.firmware = assignment(for: feedID)?.camera.firmware }
             let resolved = prepared.camera
             pendingCameras[feedID] = resolved
             let credential: ControlCredentials?
@@ -237,7 +243,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             }
             assignments[resolved.pluginID, default: [:]][feedID] = .init(camera: resolved, showOverlay: assignment(for: feedID)?.showOverlay ?? false, preparationRequest: request)
             persist(); addCamera(resolved)
-            state.connected = true; state.dirty = true
+            state.connected = true; state.dirty = true; state.lostAt = nil; state.notice = nil; state.noticeSeverity = nil
             // Pairing succeeded independently of whether the camera can read
             // properties right now. Save only after confirmed connect, and do
             // not let a vault failure prevent the initial settings read.
@@ -366,6 +372,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         let plugin = plugin(for: feedID)
         manuallyDisconnected.insert(feedID)
         retire(feedID)
+        state.lostAt = nil; state.notice = nil; state.noticeSeverity = nil
         if forget {
             for id in Array(assignments.keys) { assignments[id]?.removeValue(forKey: feedID) }
             state.properties = []; state.lastRefresh = nil; state.hasSavedCredentials = false; persist()
@@ -464,6 +471,12 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     }
     private func apply(_ properties: [ControlProperty], state: CameraControlFeedState, revision: UInt64) {
         state.properties = properties; state.lastRefresh = now(); state.dirty = state.invalidationRevision != revision
+        // A body reports its firmware once connected; keep it on the assignment for the rig's record.
+        guard let firmware = properties.first(where: { $0.role == .firmware })?.currentValueLabel, !firmware.isEmpty,
+            let feed = states.first(where: { $0.value === state })?.key, let pluginID = routes[feed],
+            assignments[pluginID]?[feed] != nil, assignments[pluginID]?[feed]?.camera.firmware != firmware else { return }
+        assignments[pluginID]?[feed]?.camera.firmware = firmware
+        persist()
     }
     private func cameraKey(_ camera: ControlCamera) -> String { "\(camera.pluginID.utf8.count):\(camera.pluginID)\(camera.id)" }
     private func addCamera(_ camera: ControlCamera) {
@@ -478,7 +491,8 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     private func handle(_ event: ControlEvent, pluginID: String) {
         let feed: String, generation: UInt64
         switch event {
-        case .changed(let id, let value), .disconnected(let id, let value, _), .error(let id, let value, _): feed = id; generation = value
+        case .changed(let id, let value), .disconnected(let id, let value, _), .error(let id, let value, _),
+            .notice(let id, let value, _, _): feed = id; generation = value
         }
         guard !shuttingDown, !removed.contains(feed), routes[feed] == pluginID, state(for: feed).generation == generation else { return }
         let state = state(for: feed); state.invalidationRevision &+= 1; state.dirty = true
@@ -486,11 +500,15 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         case .changed: scheduleRefresh(feed)
         case .disconnected(_, _, let reason):
             retire(feed); state.message = reason.message
+            if reason.code != .manual { state.lostAt = now() }
             if let plugin = plugins[pluginID] {
                 enqueueCleanup(feedID: feed, generation: generation, plugin: plugin)
                 Task { _ = await self.cleanupConnection(feedID: feed, generation: generation, plugin: plugin) }
             }
         case .error(_, _, let error): state.message = error.message
+        case .notice(_, _, let message, let severity):
+            state.notice = severity > .info ? message : nil
+            state.noticeSeverity = severity > .info ? severity : nil
         }
     }
     private func startCleanup(_ cleanup: PendingCleanup, feedID: String) {

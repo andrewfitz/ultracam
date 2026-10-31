@@ -293,8 +293,11 @@ final class AppModel {
   private var refusedStarts: Set<FeedID> = []
   /// Cameras whose input is None by choice. Discovery never fills them (`applyDevices`).
   @ObservationIgnored private var inputsClearedByChoice: Set<FeedID> = []
-  /// The name of every input seen this session, so an unplugged one keeps its name.
-  @ObservationIgnored private var lastInputNames: [String: String] = [:]
+  /// The name of every input seen, so an unplugged one keeps its name. Saved across
+  /// launches by the hardware inventory.
+  @ObservationIgnored private var lastInputNames: [String: String] = [:] {
+    didSet { hardwareInventory.recordNames(lastInputNames) }
+  }
   /// Errors that used to reach only Diagnostics. Each stays until acknowledged or resolved.
   private(set) var appProblems: [UIAppProblem] = []
   private(set) var unexpectedStops: [FeedID: UnexpectedStop] = [:]
@@ -363,7 +366,13 @@ final class AppModel {
   private let settingsStore: AppSettingsStore
   let vendorSettings: VendorSettingsStore
   let cameraControls: CameraControlStore
+  /// Nicknames, last known names and cached device status (Settings › Hardware, the left pane).
+  let hardwareInventory: HardwareInventory
   var controlViewFactories: [String: ControlViewFactory] { hardware.controlViewFactories() }
+  /// A listed capture device as its plugin describes it; nil once unlisted.
+  func captureDevice(_ deviceID: String) -> CaptureDeviceInfo? { hardware.captureDevice(deviceID) }
+  /// Each capture vendor's driver, by vendor ID.
+  var captureDrivers: [String: DriverStatus] { hardware.captureDrivers() }
   func captureVendor(for deviceID: String) -> VendorDescriptor? { hardware.captureDescriptor(deviceID) }
   /// Capture vendors in registry order; Settings › Hardware groups devices by them.
   var captureVendors: [VendorDescriptor] { hardware.captureVendors() }
@@ -420,6 +429,8 @@ final class AppModel {
       persistence: VendorSettingsPreferences(defaults: store.preferenceDefaults))
     self.cameraControls = CameraControlStore(plugins: Dictionary(uniqueKeysWithValues: hardware.controlPlugins().map { ($0.descriptor.id, $0) }),
       persistence: CameraControlPreferences(defaults: store.preferenceDefaults))
+    self.hardwareInventory = HardwareInventory(defaults: store.preferenceDefaults, hardware: hardware)
+    lastInputNames = hardwareInventory.lastKnownNames
     self.registryPublisher = registryPublisher ?? VirtualCameraRegistryPublisher()
     hideFromDock = store.hideFromDock
     self.virtualCameraRegistryStore = registryStore ?? VirtualCameraRegistryStore()
@@ -1448,6 +1459,7 @@ final class AppModel {
   /// its last name seen and ID digits while unplugged, nil for none.
   func inputLabel(_ device: String) -> String? {
     guard !device.isEmpty else { return nil }
+    if let nickname = hardwareInventory.nickname(for: device) { return nickname }
     return devices.label(for: device) ?? UIInputLabels.missingLabel(id: device, lastName: lastInputNames[device])
   }
 
@@ -2079,6 +2091,7 @@ final class AppModel {
     settingsResetPending = true
     cameraControls.reset()
     vendorSettings.reset()
+    hardwareInventory.reset()
     settingsStore.resetAll()
     return true
   }

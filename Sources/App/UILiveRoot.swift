@@ -46,7 +46,7 @@ extension UISessionBridge {
     session.install.system = model.installer.system
     let bridge = self
     return UIContext(session: session, presentation: UIPresentationBuilder.session(session),
-      inputs: model.devices.map { UIInput(id: $0.id, name: $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
+      inputs: model.devices.map { UIInput(id: $0.id, name: model.inputLabel($0.id) ?? $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
       send: { bridge.send($0) },
       pictures: UIAppPictures(model: model), monitor: UIAppMonitorSettings(model: model),
       refreshed: { bridge.context() }, cameraControls: model.cameraControls,

@@ -58,6 +58,18 @@ static const SonyField sonyFields[] = {
   {CrDeviceProperty_ExposureIndex, "exposureIndex", "Exposure index", true},
   {CrDeviceProperty_IsoCurrentSensitivity, "actualISO", "Current ISO", false},
   {CrDeviceProperty_BatteryRemain, "battery", "Battery", false},
+  // Battery's unit (minutes, percent or volts): 78 minutes must never read as 78%.
+  {CrDeviceProperty_BatteryRemainDisplayUnit, "batteryUnit", "Battery unit", false},
+  {CrDeviceProperty_DeviceOverheatingState, "overheating", "Overheating", false},
+  {CrDeviceProperty_MediaSLOT1_Status, "slot1", "Slot 1", false},
+  {CrDeviceProperty_MediaSLOT2_Status, "slot2", "Slot 2", false},
+  // How the body meets the capture device (Settings › Hardware, Setup).
+  {CrDeviceProperty_Movie_HDMIOutputTimeCode, "hdmiTimecode", "Timecode out", true},
+  {CrDeviceProperty_Movie_HDMIOutputAudioCH, "hdmiAudio", "Audio on HDMI", false},
+  {CrDeviceProperty_PictureProfile_Gamma, "gamma", "Gamma", false},
+  {CrDeviceProperty_PictureProfile_ColorMode, "colorMode", "Color mode", false},
+  {CrDeviceProperty_MovieShootingMode, "shootingMode", "Shooting mode", false},
+  {CrDeviceProperty_MovieShootingModeColorGamut, "cinemaGamut", "Cinema color gamut", false},
   {CrDeviceProperty_FocusIndication, "focusStatus", "Focus status", false},
   {CrDeviceProperty_FocusPositionCurrentValue, "focusPosition", "Focus position", false},
   {CrDeviceProperty_RecordingState, "recording", "Camera recording state", false},
@@ -165,7 +177,68 @@ static NSString *sonyLabel(uint32_t code, uint64_t v) {
     case CrDeviceProperty_ShutterAngle: return v ? [NSString stringWithFormat:@"%.3g°", v / 1000.0] : @"Off";
     case CrDeviceProperty_ExposureBiasCompensation: return [NSString stringWithFormat:@"%+.2f EV", (int16_t)v / 1000.0];
     case CrDeviceProperty_Colortemp: return [NSString stringWithFormat:@"%llu K", (unsigned long long)v];
-    case CrDeviceProperty_BatteryRemain: return v <= 100 ? [NSString stringWithFormat:@"%llu%%", (unsigned long long)v] : @"Unknown";
+    // The unit is BatteryRemainDisplayUnit's: the plugin adds it, never assumes percent.
+    case CrDeviceProperty_BatteryRemain: return [NSString stringWithFormat:@"%llu", (unsigned long long)v];
+    case CrDeviceProperty_BatteryRemainDisplayUnit:
+      if (v == CrBatteryRemainDisplayUnit_minute) return @"Minutes";
+      if (v == CrBatteryRemainDisplayUnit_percent) return @"Percent";
+      if (v == CrBatteryRemainDisplayUnit_voltage) return @"Voltage";
+      break;
+    case CrDeviceProperty_DeviceOverheatingState:
+      if (v == CrDeviceOverheatingState_NotOverheating) return @"Not overheating";
+      if (v == CrDeviceOverheatingState_PreOverheating) return @"About to overheat";
+      if (v == CrDeviceOverheatingState_Overheating) return @"Overheating";
+      break;
+    case CrDeviceProperty_MediaSLOT1_Status: case CrDeviceProperty_MediaSLOT2_Status:
+      switch (v) {
+        case CrSlotStatus_OK: return @"OK";
+        case CrSlotStatus_NoCard: return @"No card";
+        case CrSlotStatus_CardError: return @"Card error";
+        case CrSlotStatus_RecognizingOrLockedError: case CrSlotStatus_CardLockedAndDBError: return @"Card locked";
+        case CrSlotStatus_DBError: return @"Database error";
+        case CrSlotStatus_CardRecognizing: return @"Reading card";
+        case CrSlotStatus_DBError_CantRepairAndNeedFormat: return @"Needs formatting";
+        case CrSlotStatus_CardError_ReadOnlyMedia: return @"Read-only card";
+      } break;
+    case CrDeviceProperty_Movie_HDMIOutputTimeCode:
+      if (v == CrHDMIOutputTimeCodeMovie_Off) return @"Off";
+      if (v == CrHDMIOutputTimeCodeMovie_On) return @"On";
+      break;
+    case CrDeviceProperty_Movie_HDMIOutputAudioCH:
+      if (v == CrHDMIOutputAudioCH_CH1CH2) return @"CH1/CH2";
+      if (v == CrHDMIOutputAudioCH_CH3CH4) return @"CH3/CH4";
+      break;
+    case CrDeviceProperty_PictureProfile_Gamma:
+      switch (v) {
+        case CrPictureProfileGamma_Movie: return @"Movie"; case CrPictureProfileGamma_Still: return @"Still";
+        case CrPictureProfileGamma_S_Cinetone: return @"S-Cinetone";
+        case CrPictureProfileGamma_Cine1: return @"Cine1"; case CrPictureProfileGamma_Cine2: return @"Cine2";
+        case CrPictureProfileGamma_Cine3: return @"Cine3"; case CrPictureProfileGamma_Cine4: return @"Cine4";
+        case CrPictureProfileGamma_ITU709: return @"ITU709"; case CrPictureProfileGamma_ITU709_800: return @"ITU709 (800%)";
+        case CrPictureProfileGamma_S_Log2: return @"S-Log2"; case CrPictureProfileGamma_S_Log3: return @"S-Log3";
+        case CrPictureProfileGamma_HLG: return @"HLG"; case CrPictureProfileGamma_HLG1: return @"HLG1";
+        case CrPictureProfileGamma_HLG2: return @"HLG2"; case CrPictureProfileGamma_HLG3: return @"HLG3";
+      } break;
+    case CrDeviceProperty_PictureProfile_ColorMode:
+      switch (v) {
+        case CrPictureProfileColorMode_Movie: return @"Movie"; case CrPictureProfileColorMode_Still: return @"Still";
+        case CrPictureProfileColorMode_S_Cinetone: return @"S-Cinetone"; case CrPictureProfileColorMode_Cinema: return @"Cinema";
+        case CrPictureProfileColorMode_Pro: return @"Pro"; case CrPictureProfileColorMode_ITU709_Matrix: return @"ITU709 Matrix";
+        case CrPictureProfileColorMode_BlackWhite: return @"Black & White";
+        case CrPictureProfileColorMode_S_Gamut3_Cine: return @"S-Gamut3.Cine"; case CrPictureProfileColorMode_S_Gamut3: return @"S-Gamut3";
+        case CrPictureProfileColorMode_BT_2020: return @"BT.2020"; case CrPictureProfileColorMode_709: return @"709";
+        case CrPictureProfileColorMode_S_Gamut: return @"S-Gamut"; case CrPictureProfileColorMode_709tone: return @"709tone";
+      } break;
+    case CrDeviceProperty_MovieShootingMode:
+      switch (v) {
+        case CrMovieShootingMode_Off: return @"Off"; case CrMovieShootingMode_CineEI: return @"Cine EI";
+        case CrMovieShootingMode_CineEIQuick: return @"Cine EI Quick"; case CrMovieShootingMode_Custom: return @"Custom";
+        case CrMovieShootingMode_FlexibleISO: return @"Flexible ISO";
+      } break;
+    case CrDeviceProperty_MovieShootingModeColorGamut:
+      if (v == CrMovieShootingModeColorGamut_S_Gamut3_Cine) return @"S-Gamut3.Cine";
+      if (v == CrMovieShootingModeColorGamut_S_Gamut3) return @"S-Gamut3";
+      break;
     case CrDeviceProperty_GainBaseIsoSensitivity:
       if (v == CrGainBaseIsoSensitivity_High) return @"High";
       if (v == CrGainBaseIsoSensitivity_Low) return @"Low";
@@ -317,6 +390,29 @@ static NSString *sonyLabel(uint32_t code, uint64_t v) {
   }
   return [NSString stringWithFormat:@"%llu", (unsigned long long)v];
 }
+// OnWarning codes the host can act on, as stable keys; the plugin words them.
+// Anything else is dropped rather than shown as a code.
+static NSString *sonyWarningKey(CrInt32u warning) {
+  switch (warning) {
+    case CrWarning_Connect_Reconnecting: return @"reconnecting";
+    case CrWarning_Connect_Reconnected: return @"reconnected";
+    case CrWarning_File_StorageFull: return @"storageFull";
+    case CrWarning_NetworkErrorOccurred: return @"networkError";
+    case CrWarning_NetworkErrorRecovered: return @"networkRecovered";
+    case CrWarning_MediaProfileChanged_Slot1: case CrWarning_MediaProfileChanged_Slot2: return @"mediaChanged";
+    default: return nil;
+  }
+}
+// A string property: the first element counts the UTF-16 units that follow,
+// including a terminating null. Anything malformed or unprintable reads as absent.
+static NSString *sonyText(const CrInt16u *text) {
+  if (!text || !text[0] || text[0] > 64) return nil;
+  NSUInteger length = text[0];
+  while (length > 0 && text[length] == 0) --length;
+  if (!length) return nil;
+  for (NSUInteger i = 1; i <= length; ++i) if (text[i] < 0x20 || text[i] > 0x7e) return nil;
+  return [NSString stringWithCharacters:(const unichar *)(text + 1) length:length];
+}
 static size_t sonyWidth(CrDataType type) {
   switch (type & 0xFFF) { case 1: return 1; case 2: return 2; case 3: return 4; case 4: return 8; default: return 0; }
 }
@@ -371,6 +467,10 @@ public:
       condition.notify_all(); }
     event(@"disconnected", e ? sonyError("connection", e) : @"Disconnected");
     if (afterDisconnect) afterDisconnect();
+  }
+  void OnWarning(CrInt32u w) override {
+    auto keepAlive = weak_from_this().lock();
+    if (NSString *key = sonyWarningKey(w)) event(@"warning", key);
   }
   void OnError(CrInt32u e) override {
     auto keepAlive = weak_from_this().lock();
@@ -612,6 +712,15 @@ static SonyRuntime &sonyRuntime() {
         @"writable": @(field.editable && p.IsSetEnableCurrentValue() && choices.count > 0), @"choices": choices}];
       break;
     }
+  }
+  // Firmware is a string property, read from the same local copy.
+  for (CrInt32 i = 0; properties && i < count; ++i) {
+    const auto &p = properties[i];
+    if (p.GetCode() != CrDeviceProperty_SoftwareVersion || !p.IsGetEnableCurrentValue()) continue;
+    if (NSString *version = sonyText(p.GetCurrentStr()))
+      [fields addObject:@{@"id": @"firmware", @"title": @"Firmware", @"code": @(CrDeviceProperty_SoftwareVersion),
+        @"value": @0, @"label": version, @"writable": @NO, @"choices": @[]}];
+    break;
   }
   if (properties) ReleaseDeviceProperties(session.handle, properties);
   return fields;

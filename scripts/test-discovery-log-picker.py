@@ -44,6 +44,7 @@ final class DemandFixture {func refresh() {}}
  let vendorSettings=VendorSettingsFixture();let demandMonitor=DemandFixture();let wantsDemandMonitor=true
  var bridgeInputs:[UIInput] {let model=self;return BRIDGE_EXPRESSION}
  func captureVendor(for id:String)->String? {nil}
+ func inputLabel(_ id:String)->String? {nil}
  func inputShareable(_ id:String)->Bool {devices.first {$0.id==id}?.shareable == true}
  func observeDevices(_ snapshot:[InputDevice]) {applyDevices(snapshot,fromDiscovery:true)}
  func cameraActive(_ id:Int)->Bool {false}

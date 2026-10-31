@@ -6,3 +6,10 @@
 "decklink.connector.hdmi" = "HDMI";
 "decklink.connector.sdi" = "SDI";
 "decklink.connector.optical" = "Optical SDI";
+"decklink.descriptor.missingDevice" = "If it is plugged in, it may have fallen back to USB and can’t be used. Connect it through a Thunderbolt hub.";
+"decklink.fact.model" = "Model";
+"decklink.fact.connection" = "Connection";
+"decklink.fact.signal" = "Signal";
+"decklink.fact.temperature" = "Temperature";
+"decklink.problem.busy" = "In use by another app";
+"decklink.problem.busy.detail" = "Close it, then start this camera.";

@@ -34,6 +34,35 @@ static const int64_t UCDeckLinkMaximumSourceGapSeconds = 10;
 @property(nonatomic, readonly, copy) NSString *identifier;
 @property(nonatomic, readonly, copy) NSString *name;
 @property(nonatomic, readonly, copy) NSArray<UltracamMode *> *modes;
+// IDeckLink::GetModelName; nil when the driver gives none. Two units share it.
+@property(nonatomic, readonly, copy, nullable) NSString *model;
+@end
+
+// One listed device's cached status. A device with an Ultracam session reports
+// its session's counters; any other is read on the discovery queue by
+// +refreshIdleStatus. Nil numbers are unknown: an idle device whose driver
+// does not report a lock is unknown, never "no signal".
+@interface UCDeckLinkDeviceStatus : NSObject
+@property(nonatomic, readonly, copy) NSString *identifier;
+@property(nonatomic, readonly, copy, nullable) NSString *model;
+// BMDDeckLinkDeviceInterface ('pci ', 'usb ', 'thun'), or 0 when unreported.
+@property(nonatomic, readonly) uint32_t deviceInterface;
+// The connector this device captures from (the saved policy or the default).
+@property(nonatomic, readonly) uint32_t connection;
+@property(nonatomic, readonly) BOOL sessionActive;
+// bmdDeviceCaptureBusy on a device with no Ultracam session: another app has it.
+@property(nonatomic, readonly, nullable) NSNumber *busyElsewhere;
+@property(nonatomic, readonly, nullable) NSNumber *signalLocked;
+@property(nonatomic, readonly) NSInteger detectedWidth;
+@property(nonatomic, readonly) NSInteger detectedHeight;
+@property(nonatomic, readonly) CMTime detectedDuration;
+@property(nonatomic, readonly, copy, nullable) NSString *detectedSampling;
+@property(nonatomic, readonly, copy, nullable) NSString *detectedColorspace;
+@property(nonatomic, readonly, copy, nullable) NSString *detectedDynamicRange;
+@property(nonatomic, readonly) NSInteger pcieWidth;
+@property(nonatomic, readonly) NSInteger pcieGeneration;
+// IDeckLinkStatistics device temperature in °C, or NSNotFound.
+@property(nonatomic, readonly) NSInteger temperatureCelsius;
 @end
 
 // The installed Desktop Video driver, read once with IDeckLinkAPIInformation.
@@ -229,6 +258,18 @@ NS_SWIFT_NAME(DeckLinkBackend)
 + (void)removeDeviceListObserver:(id)token;
 + (nullable UltracamDeviceDiagnostics *)diagnosticsForDeviceID:(NSString *)deviceID
   NS_SWIFT_NAME(diagnostics(deviceID:));
+// Cached status; never calls the driver and never blocks on the discovery queue.
++ (nullable UCDeckLinkDeviceStatus *)statusForDeviceID:(NSString *)deviceID
+  NS_SWIFT_NAME(status(deviceID:));
+// Reads every listed device once on the discovery queue: IDeckLinkStatus and
+// IDeckLinkStatistics for devices with no Ultracam session, the session's own
+// counters for the rest. Reads only: it never selects a connector, writes an
+// EDID or enables an input, so no HDMI renegotiates. Changed statuses go to
+// the status observers on the main queue.
++ (void)refreshIdleStatus;
++ (id)addStatusObserver:(void (NS_SWIFT_UI_ACTOR ^)(UCDeckLinkDeviceStatus *status))handler
+  NS_SWIFT_NAME(addStatusObserver(_:));
++ (void)removeStatusObserver:(id)token;
 
 // Live session counters; safe to read from any thread. deviceDroppedFrames
 // is as described on UltracamDeviceDiagnostics.

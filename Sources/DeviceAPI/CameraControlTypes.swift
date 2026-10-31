@@ -11,6 +11,10 @@ struct ControlCamera: Codable, Identifiable, Equatable, Sendable {
     var address: String
     var fingerprint: String?
     var authenticationMode: ControlAuthenticationMode = .none
+    /// The body's model and firmware when the plugin knows them. Optional on purpose: saved
+    /// assignments decode with synthesized Codable, which accepts a missing key only for optionals.
+    var model: String? = nil
+    var firmware: String? = nil
 }
 
 struct ControlEndpoint: Codable, Equatable, Sendable {
@@ -69,7 +73,17 @@ struct ControlRange: Codable, Equatable, Sendable {
     var maximum: ControlValue
     var step: ControlValue?
 }
-enum ControlPropertyRole: String, Codable, Sendable { case standard, outputTiming, cameraDisplay, hidden }
+/// Where a host places a property, never by its ID. `outputTiming` and `cameraDisplay` are how the
+/// body drives its HDMI output; the rest are read-only facts the host shows by meaning: `power`
+/// (battery, with its `unit`), `thermal`, `media`, `timecodeOutput` and `hdmiAudio` (what the
+/// body puts on HDMI), `colorProfile` (its picture, possibly with a suggested source profile)
+/// and `firmware`.
+enum ControlPropertyRole: String, Codable, Sendable {
+    case standard, outputTiming, cameraDisplay, hidden
+    case power, thermal, media, timecodeOutput, hdmiAudio, colorProfile, firmware
+}
+/// The unit of a numeric reading. A host must never read 78 minutes of battery as 78%.
+enum ControlValueUnit: String, Codable, Sendable { case percent, minutes, volts, celsius }
 
 struct ControlProperty: Codable, Equatable, Identifiable, Sendable {
     typealias ID = String
@@ -86,6 +100,14 @@ struct ControlProperty: Codable, Equatable, Identifiable, Sendable {
     var labelKey: String? = nil
     var localizationTable: String? = nil
     var unavailableReasonKey: String? = nil
+    /// Set by the plugin when the value itself is a problem (a low battery, overheating).
+    /// Nil is fine, and a battery in an unknown unit is never a problem.
+    var severity: DeviceSeverity? = nil
+    /// The unit of a numeric reading, when the body reports one.
+    var unit: ControlValueUnit? = nil
+    /// For a `colorProfile` property: the source profile (a `SourceColorSpaceCatalog` ID)
+    /// this picture matches, so the host can compare it with the camera's declaration.
+    var suggestedSourceProfileID: String? = nil
     func localizedLabel(in bundle: Bundle = .main) -> String {
         VendorDisplayLocalization.resolve(key: labelKey, fallback: label, table: localizationTable, in: bundle)
     }
@@ -113,4 +135,6 @@ enum ControlEvent: Equatable, Sendable {
     case changed(feedID: String, generation: UInt64)
     case disconnected(feedID: String, generation: UInt64, reason: ControlDisconnectReason)
     case error(feedID: String, generation: UInt64, error: ControlError)
+    /// Something the body reported that doesn't end the connection (reconnecting, card full).
+    case notice(feedID: String, generation: UInt64, message: String, severity: DeviceSeverity)
 }

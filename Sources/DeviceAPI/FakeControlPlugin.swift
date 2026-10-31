@@ -37,6 +37,13 @@ import Foundation
                 reason: .init(code: .removed, retryable: true, message: "Camera removed.")))
         }
     }
+    /// A notice from a connected body, as a vendor warning callback would send it.
+    func postNotice(_ message: String, severity: DeviceSeverity, feedID: String) {
+        guard let connection = connections[feedID] else { return }
+        handler?(.notice(feedID: feedID, generation: connection.generation, message: message, severity: severity))
+    }
+    /// Scripted readings: the next read returns these.
+    func replaceProperties(_ properties: [ControlProperty]) { values = properties }
     func discover() async throws -> [ControlCamera] { try admit(); return cameras }
     func prepare(_ request: ControlPreparationRequest) async throws -> ControlPreparationResult {
         try admit()

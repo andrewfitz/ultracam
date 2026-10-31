@@ -41,8 +41,49 @@
 @property(nonatomic, copy) NSString *identifier;
 @property(nonatomic, copy) NSString *name;
 @property(nonatomic, copy) NSArray<UltracamMode *> *modes;
+@property(nonatomic, copy, nullable) NSString *model;
 @end
 @implementation UltracamDevice
+@end
+
+@interface UCDeckLinkDeviceStatus ()
+@property(nonatomic, copy) NSString *identifier;
+@property(nonatomic, copy, nullable) NSString *model;
+@property(nonatomic) uint32_t deviceInterface;
+@property(nonatomic) uint32_t connection;
+@property(nonatomic) BOOL sessionActive;
+@property(nonatomic, nullable) NSNumber *busyElsewhere;
+@property(nonatomic, nullable) NSNumber *signalLocked;
+@property(nonatomic) NSInteger detectedWidth;
+@property(nonatomic) NSInteger detectedHeight;
+@property(nonatomic) CMTime detectedDuration;
+@property(nonatomic, copy, nullable) NSString *detectedSampling;
+@property(nonatomic, copy, nullable) NSString *detectedColorspace;
+@property(nonatomic, copy, nullable) NSString *detectedDynamicRange;
+@property(nonatomic) NSInteger pcieWidth;
+@property(nonatomic) NSInteger pcieGeneration;
+@property(nonatomic) NSInteger temperatureCelsius;
+@end
+@implementation UCDeckLinkDeviceStatus
+- (instancetype)init {
+  if ((self = [super init])) { _temperatureCelsius = NSNotFound; _detectedDuration = kCMTimeInvalid; }
+  return self;
+}
+// Publication compares whole values, so an unchanged poll publishes nothing.
+- (BOOL)isEqual:(id)object {
+  if (![object isKindOfClass:[UCDeckLinkDeviceStatus class]]) return NO;
+  UCDeckLinkDeviceStatus *other = object;
+  auto same = [](id a, id b) { return a == b || [a isEqual:b]; };
+  return same(_identifier, other.identifier) && same(_model, other.model) && _deviceInterface == other.deviceInterface &&
+    _connection == other.connection && _sessionActive == other.sessionActive && same(_busyElsewhere, other.busyElsewhere) &&
+    same(_signalLocked, other.signalLocked) && _detectedWidth == other.detectedWidth && _detectedHeight == other.detectedHeight &&
+    CMTIME_IS_VALID(_detectedDuration) == CMTIME_IS_VALID(other.detectedDuration) &&
+    (!CMTIME_IS_VALID(_detectedDuration) || CMTimeCompare(_detectedDuration, other.detectedDuration) == 0) &&
+    same(_detectedSampling, other.detectedSampling) && same(_detectedColorspace, other.detectedColorspace) &&
+    same(_detectedDynamicRange, other.detectedDynamicRange) && _pcieWidth == other.pcieWidth &&
+    _pcieGeneration == other.pcieGeneration && _temperatureCelsius == other.temperatureCelsius;
+}
+- (NSUInteger)hash { return _identifier.hash ^ (NSUInteger)_temperatureCelsius; }
 @end
 
 @interface UltracamDriverInfo ()
@@ -1340,6 +1381,57 @@ static DeviceCapabilities readCapabilities(IDeckLink *device) {
 }
 
 class DeviceRegistry;
+static std::optional<DetectedInput> detectedStatusInput(IDeckLinkStatus *status, IDeckLinkInput *input);
+
+static NSString *deviceModelName(IDeckLink *device) {
+  CFStringRef model = nullptr;
+  if (device->GetModelName(&model) != S_OK || !model) return nil;
+  return CFBridgingRelease(model);
+}
+static uint32_t deviceInterface(IDeckLink *device) {
+  ComRef<IDeckLinkProfileAttributes> attributes;
+  int64_t value = 0;
+  if (device->QueryInterface(IID_IDeckLinkProfileAttributes, reinterpret_cast<void **>(attributes.out())) != S_OK ||
+      !attributes || attributes->GetInt(BMDDeckLinkDeviceInterface, &value) != S_OK) return 0;
+  return uint32_t(value);
+}
+
+// Discovery queue only. IDeckLinkStatus and IDeckLinkStatistics reads on a
+// device with no Ultracam session: the same reads production already makes on
+// a device another app may own (the busy check before start). Nothing here
+// selects a connector, writes an EDID or enables an input.
+static void readIdleStatus(IDeckLink *device, UCDeckLinkDeviceStatus *result) {
+  ComRef<IDeckLinkStatus> status;
+  if (device->QueryInterface(IID_IDeckLinkStatus, reinterpret_cast<void **>(status.out())) == S_OK && status) {
+    int64_t value = 0;
+    bool locked = false;
+    if (status->GetInt(bmdDeckLinkStatusBusy, &value) == S_OK) result.busyElsewhere = @((value & bmdDeviceCaptureBusy) != 0);
+    if (status->GetFlag(bmdDeckLinkStatusVideoInputSignalLocked, &locked) == S_OK) result.signalLocked = @(locked);
+    if (status->GetInt(bmdDeckLinkStatusPCIExpressLinkWidth, &value) == S_OK && value > 0) result.pcieWidth = NSInteger(value);
+    if (status->GetInt(bmdDeckLinkStatusPCIExpressLinkSpeed, &value) == S_OK && value > 0) result.pcieGeneration = NSInteger(value);
+    ComRef<IDeckLinkInput> input;
+    // A mode read while unlocked would be the last one seen, not the signal.
+    if (result.signalLocked.boolValue &&
+        device->QueryInterface(IID_IDeckLinkInput, reinterpret_cast<void **>(input.out())) == S_OK && input) {
+      if (auto detected = detectedStatusInput(status.value, input.value); detected && detected->contract) {
+        result.detectedWidth = detected->contract->width; result.detectedHeight = detected->contract->height;
+        result.detectedDuration = detected->duration;
+        const auto flags = detected->flags;
+        NSString *depth = (flags & bmdDetectedVideoInput12BitDepth) ? @"12-bit" : (flags & bmdDetectedVideoInput10BitDepth) ? @"10-bit" :
+          (flags & bmdDetectedVideoInput8BitDepth) ? @"8-bit" : nil;
+        NSString *chroma = (flags & bmdDetectedVideoInputRGB444) ? @"RGB 4:4:4" : (flags & bmdDetectedVideoInputYCbCr422) ? @"4:2:2" : nil;
+        if (depth && chroma) result.detectedSampling = [NSString stringWithFormat:@"%@ %@", depth, chroma];
+        result.detectedColorspace = colorspaceName(detected->colorspace);
+        result.detectedDynamicRange = eotfName(detected->eotf);
+      }
+    }
+  }
+  ComRef<IDeckLinkStatistics> statistics;
+  int64_t temperature = 0;
+  if (device->QueryInterface(IID_IDeckLinkStatistics, reinterpret_cast<void **>(statistics.out())) == S_OK && statistics &&
+      statistics->GetInt(bmdDeckLinkStatisticDeviceTemperature, &temperature) == S_OK)
+    result.temperatureCelsius = NSInteger(temperature);
+}
 
 // Arrival and removal arrive on an API-private thread (manual 2.4.4). They
 // only take a reference and hop to the registry's serial queue.
@@ -1371,6 +1463,8 @@ class DeviceRegistry {
   explicit DeviceRegistry(dispatch_queue_t observers) : observerQueue(observers) {
     queue = dispatch_queue_create("org.ultracam.decklink.discovery", DISPATCH_QUEUE_SERIAL);
     observerBlocks = [NSMutableDictionary dictionary];
+    statusObserverBlocks = [NSMutableDictionary dictionary];
+    statuses = [NSMutableDictionary dictionary];
   }
   ~DeviceRegistry() {
     if (discovery) discovery->UninstallDeviceNotifications();
@@ -1601,6 +1695,7 @@ class DeviceRegistry {
         UltracamDevice *updated = [UltracamDevice new];
         updated.identifier = entry.description.identifier; updated.name = entry.description.name;
         updated.videoInputConnections = entry.description.videoInputConnections; updated.modes = modes;
+        updated.model = entry.description.model;
         entry.description = updated;
       }
     }
@@ -1690,10 +1785,29 @@ class DeviceRegistry {
     return result;
   }
 
+  // Cached; a lock-only read.
+  UCDeckLinkDeviceStatus *status(NSString *identifier) {
+    std::lock_guard<std::mutex> guard(mutex);
+    return statuses[identifier];
+  }
+  void refreshStatus() { dispatch_async(queue, ^{ pollStatus(); }); }
+  id addStatusObserver(void (^handler)(UCDeckLinkDeviceStatus *)) {
+    NSUUID *token = [NSUUID UUID];
+    std::lock_guard<std::mutex> guard(mutex);
+    statusObserverBlocks[token] = [handler copy];
+    return token;
+  }
+  void removeStatusObserver(id token) {
+    if (![token isKindOfClass:[NSUUID class]]) return;
+    std::lock_guard<std::mutex> guard(mutex);
+    [statusObserverBlocks removeObjectForKey:token];
+  }
+
  private:
   struct DeviceEntry {
     IDeckLink *device = nullptr;  // One owned reference.
     UltracamDevice *description = nil;
+    uint32_t interface = 0;
     DeviceCapabilities capabilities;
     // The HDR advertisement (see setAdvertiseHDR); one owned reference or null.
     IDeckLinkHDMIInputEDID *edid = nullptr;
@@ -1703,6 +1817,58 @@ class DeviceRegistry {
     NSString *identifier;
     CaptureCallback *callback;  // One owned reference.
   };
+
+  // Registry queue only. Copies each listed device under the lock and reads it
+  // outside, as applyAdvertisement does; publishes only what changed.
+  void pollStatus() {
+    struct Listed {
+      IDeckLink *device; NSString *identifier; NSString *model; uint32_t interface;
+      BMDVideoConnection connection; std::shared_ptr<SessionStats> stats;
+    };
+    std::vector<Listed> listed;
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      for (auto &entry : entries) {
+        const std::string key(entry.description.identifier.UTF8String ?: "");
+        auto policy = connectorPolicies.find(key);
+        auto stats = statsByDevice.find(key);
+        entry.device->AddRef();
+        listed.push_back({entry.device, entry.description.identifier, entry.description.model, entry.interface,
+          policy == connectorPolicies.end() ? defaultConnector(entry.capabilities.connections) : policy->second,
+          stats == statsByDevice.end() ? nullptr : stats->second});
+      }
+    }
+    NSMutableArray<UCDeckLinkDeviceStatus *> *changed = [NSMutableArray array];
+    for (auto &item : listed) {
+      UCDeckLinkDeviceStatus *next = [UCDeckLinkDeviceStatus new];
+      next.identifier = item.identifier; next.model = item.model;
+      next.deviceInterface = item.interface; next.connection = item.connection;
+      const bool session = item.stats && item.stats->active.load();
+      if (session) {
+        // The session publishes its own counters; the device is not read.
+        next.sessionActive = YES;
+        const int present = item.stats->signalPresent.load();
+        if (present >= 0) next.signalLocked = @(present != 0);
+        const int64_t temperature = item.stats->temperature.load();
+        if (temperature != INT64_MIN) next.temperatureCelsius = NSInteger(temperature);
+      } else readIdleStatus(item.device, next);
+      item.device->Release();
+      std::lock_guard<std::mutex> guard(mutex);
+      UCDeckLinkDeviceStatus *previous = statuses[item.identifier];
+      if (session && previous) { next.pcieWidth = previous.pcieWidth; next.pcieGeneration = previous.pcieGeneration; }
+      if ([next isEqual:previous]) continue;
+      statuses[item.identifier] = next;
+      [changed addObject:next];
+    }
+    if (!changed.count) return;
+    NSArray *handlers = nil;
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      handlers = statusObserverBlocks.allValues;
+    }
+    for (void (^handler)(UCDeckLinkDeviceStatus *) in handlers)
+      for (UCDeckLinkDeviceStatus *status in changed) dispatch_async(observerQueue, ^{ handler(status); });
+  }
 
   // Registry queue only.
   void insert(IDeckLink *device) {
@@ -1721,6 +1887,8 @@ class DeviceRegistry {
     CFStringRef name = nullptr; device->GetDisplayName(&name);
     description.name = name ? (__bridge NSString *)name : @"Blackmagic capture device";
     if (name) CFRelease(name);
+    description.model = deviceModelName(device);
+    entry.interface = deviceInterface(device);
     BMDVideoConnection selectedConnection = defaultConnector(entry.capabilities.connections);
     {
       std::lock_guard<std::mutex> guard(mutex);
@@ -1844,6 +2012,7 @@ class DeviceRegistry {
         owned = it->device; edid = it->edid; identifier = it->description.identifier; name = it->description.name;
         entries.erase(it); break;
       }
+      if (identifier) [statuses removeObjectForKey:identifier];
       if (!owned) return;
       for (auto &session : sessions) {
         if (![session.identifier isEqualToString:identifier]) continue;
@@ -1879,6 +2048,8 @@ class DeviceRegistry {
   std::vector<Session> sessions;
   std::map<std::string, std::shared_ptr<SessionStats>> statsByDevice;
   NSMutableDictionary<NSUUID *, id> *observerBlocks;
+  NSMutableDictionary<NSUUID *, id> *statusObserverBlocks; // mutex
+  NSMutableDictionary<NSString *, UCDeckLinkDeviceStatus *> *statuses; // mutex
   std::once_flag discoveryOnce;
   std::atomic<bool> installed{false};
   // Off until the app applies its setting: tools never write the EDID.
@@ -2118,6 +2289,14 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 + (UltracamDeviceDiagnostics *)diagnosticsForDeviceID:(NSString *)deviceID {
   return DeviceRegistry::shared().diagnostics(deviceID);
 }
++ (UCDeckLinkDeviceStatus *)statusForDeviceID:(NSString *)deviceID {
+  return DeviceRegistry::shared().status(deviceID);
+}
++ (void)refreshIdleStatus { DeviceRegistry::shared().refreshStatus(); }
++ (id)addStatusObserver:(void (^)(UCDeckLinkDeviceStatus *))handler {
+  return DeviceRegistry::shared().addStatusObserver(handler);
+}
++ (void)removeStatusObserver:(id)token { DeviceRegistry::shared().removeStatusObserver(token); }
 
 - (uint64_t)deviceDroppedFrames {
   return _stats->deviceDrops.load(std::memory_order_relaxed);
@@ -2149,6 +2328,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
     CFStringRef name = nullptr; device->GetDisplayName(&name);
     description.name = name ? (__bridge NSString *)name : @"Blackmagic capture device";
     if (name) CFRelease(name);
+    description.model = deviceModelName(device.value);
     const auto capabilities = readCapabilities(device.value);
     description.videoInputConnections = capabilities.connections;
     BMDVideoConnection selectedConnection = DeviceRegistry::defaultConnector(capabilities.connections);
