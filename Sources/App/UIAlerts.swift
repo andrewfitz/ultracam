@@ -8,12 +8,15 @@ import SwiftUI
 // while a screen is shared, and the panel only reaches a full-screen meeting while
 // Ultracam's windows are closed. Text is treated as public, because viewers may see either.
 
-/// What Settings › Alerts will bind to. Off by default is only ever sound.
+/// What Settings › Alerts binds to. Off by default is only ever sound.
 @MainActor @Observable final class UIAlertPreferences {
   /// Time Sensitive needs a capability the current provisioning profiles don't include,
   /// and an entitlement a profile lacks fails the signed build. Until the profile has
   /// it, notifications go out at the `.active` level.
   static let timeSensitiveEntitled = false
+  static let lowSpaceMinutesKey = "ui.alerts.lowSpaceMinutes"
+  /// Settings' choices for Low Space, in minutes.
+  static let lowSpaceChoices = [15, 30, 60, 120]
 
   private let defaults: UserDefaults
   var notificationsEnabled: Bool { didSet { defaults.set(notificationsEnabled, forKey: "ui.alerts.notifications") } }
@@ -21,6 +24,19 @@ import SwiftUI
   var soundEnabled: Bool { didSet { defaults.set(soundEnabled, forKey: "ui.alerts.sound") } }
   /// "Not Now" on the Attention prompt: don't ask again from there.
   var promptDismissed: Bool { didSet { defaults.set(promptDismissed, forKey: "ui.alerts.promptDismissed") } }
+  /// Events that notify. All five by default; the panel follows its own switch.
+  var events: Set<UIAlertEvent> {
+    didSet {
+      let off = UIAlertEvent.allCases.filter { !events.contains($0) }.map(\.rawValue)
+      defaults.set(off, forKey: "ui.alerts.eventsOff")
+    }
+  }
+  /// Less recording time left than this is low: the drive rows turn orange and a problem is raised.
+  var lowSpaceMinutes: Int { didSet { defaults.set(lowSpaceMinutes, forKey: Self.lowSpaceMinutesKey) } }
+  /// What macOS says Ultracam may do, read from the notification center, never assumed.
+  var permission = UIAlertPermission()
+  /// Reads `permission` again (Settings appearing, the app coming back to the front).
+  @ObservationIgnored var refreshPermission: (@MainActor () -> Void)?
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -28,6 +44,39 @@ import SwiftUI
     panelEnabled = defaults.object(forKey: "ui.alerts.panel") as? Bool ?? true
     soundEnabled = defaults.object(forKey: "ui.alerts.sound") as? Bool ?? false
     promptDismissed = defaults.object(forKey: "ui.alerts.promptDismissed") as? Bool ?? false
+    let off = Set((defaults.stringArray(forKey: "ui.alerts.eventsOff") ?? []).compactMap(UIAlertEvent.init(rawValue:)))
+    events = Set(UIAlertEvent.allCases).subtracting(off)
+    let minutes = defaults.object(forKey: Self.lowSpaceMinutesKey) as? Int
+    lowSpaceMinutes = minutes.flatMap { Self.lowSpaceChoices.contains($0) ? $0 : nil } ?? 30
+  }
+
+  func notifies(_ event: UIAlertEvent) -> Bool { events.contains(event) }
+
+  func setNotifies(_ event: UIAlertEvent, _ on: Bool) {
+    if on { events.insert(event) } else { events.remove(event) }
+  }
+}
+
+/// Notification permission as macOS reports it, for Settings › Alerts.
+struct UIAlertPermission: Sendable, Equatable {
+  enum Status: Sendable, Equatable { case unknown, notDetermined, denied, allowed }
+  var status: Status = .unknown
+  /// Banners or alerts are shown, not only Notification Center.
+  var banners = false
+  /// macOS lets them through Focus as Time Sensitive.
+  var timeSensitive = false
+}
+
+extension UIAlertEvent {
+  /// The event's name in Settings › Alerts.
+  var title: String {
+    switch self {
+    case .cameraStopped: return "Camera stopped unexpectedly"
+    case .takeEndedEarly: return "Take ended early"
+    case .recordingNoSignal: return "Recording with no signal"
+    case .onAirLost: return "On-air camera lost"
+    case .driveLow: return "Drive low or full"
+    }
   }
 }
 
@@ -58,15 +107,16 @@ struct UIAlertPlan: Sendable, Equatable {
 struct UIAlertTracker {
   private var active: Set<String> = []
 
+  /// `events` are the ones Settings › Alerts leaves on for notifications; the panel ignores it.
   mutating func plan(problems: [UIProblem], live: Bool, notifications: Bool, panel: Bool, sound: Bool,
-    timeSensitiveEntitled: Bool) -> UIAlertPlan {
+    timeSensitiveEntitled: Bool, events: Set<UIAlertEvent> = Set(UIAlertEvent.allCases)) -> UIAlertPlan {
     var plan = UIAlertPlan()
     var current: Set<String> = []
     for problem in problems {
       guard let alert = problem.alert else { continue }
       let key = alert.key ?? problem.id
       guard current.insert(key).inserted else { continue }
-      if notifications, !active.contains(key) {
+      if notifications, events.contains(alert.event), !active.contains(key) {
         plan.post.append(UIAlertRequest(id: key, title: alert.title, body: alert.body,
           timeSensitive: timeSensitiveEntitled && live, sound: sound))
       }
@@ -88,6 +138,12 @@ struct UIAlertTracker {
   /// Calls back with whether Ultracam may ask for permission: nothing has been decided yet.
   func checkPermissionUndetermined(_ result: @escaping @MainActor (Bool) -> Void)
   func requestPermission(_ done: @escaping @MainActor (Bool) -> Void)
+  /// Calls back with the permission macOS reports now.
+  func readPermission(_ result: @escaping @MainActor (UIAlertPermission) -> Void)
+}
+
+extension UIAlertDelivering {
+  func readPermission(_ result: @escaping @MainActor (UIAlertPermission) -> Void) { result(UIAlertPermission()) }
 }
 
 @MainActor protocol UIAlertPanelPresenting: AnyObject {
@@ -115,6 +171,8 @@ struct UIAlertTracker {
     self.panel = panel
     interface.turnOnAlerts = { [weak self] in self?.turnOn() }
     interface.dismissAlertsPrompt = { [weak self] in self?.dismissPrompt() }
+    preferences.refreshPermission = { [weak self] in self?.readPermission() }
+    readPermission()
     if !preferences.promptDismissed {
       delivery.checkPermissionUndetermined { [weak self] undetermined in self?.interface.offerAlerts = undetermined }
     }
@@ -129,7 +187,11 @@ struct UIAlertTracker {
         if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
         UIAppEnvironment.openWindow?(id)
         NSApp.activate(ignoringOtherApps: true)
-      }, openSettings: {})
+      }, openSettings: {
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        UIAppEnvironment.openSettings?()
+        NSApp.activate(ignoringOtherApps: true)
+      })
   }
 
   private func track() {
@@ -157,7 +219,8 @@ struct UIAlertTracker {
     let presentation = bridge().presentation()
     let plan = tracker.plan(problems: presentation.problems, live: presentation.isLive,
       notifications: preferences.notificationsEnabled, panel: preferences.panelEnabled,
-      sound: preferences.soundEnabled, timeSensitiveEntitled: UIAlertPreferences.timeSensitiveEntitled)
+      sound: preferences.soundEnabled, timeSensitiveEntitled: UIAlertPreferences.timeSensitiveEntitled,
+      events: preferences.events)
     plan.post.forEach(delivery.post)
     if !plan.remove.isEmpty { delivery.remove(plan.remove) }
     if let alert = plan.panel {
@@ -172,7 +235,16 @@ struct UIAlertTracker {
     interface.offerAlerts = false
     // Never while live: the prompt can't show then, and a menu can't reach this.
     guard !bridge().presentation().isLive else { return }
-    delivery.requestPermission { _ in }
+    delivery.requestPermission { [weak self] _ in self?.readPermission() }
+  }
+
+  private func readPermission() {
+    delivery.readPermission { [weak self] permission in
+      guard let self else { return }
+      if self.preferences.permission != permission { self.preferences.permission = permission }
+      // Decided elsewhere (System Settings): Attention stops offering it.
+      if permission.status != .notDetermined && permission.status != .unknown { self.interface.offerAlerts = false }
+    }
   }
 
   private func dismissPrompt() {
@@ -219,6 +291,34 @@ struct UIAlertTracker {
       let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
       done(granted)
     }
+  }
+
+  func readPermission(_ result: @escaping @MainActor (UIAlertPermission) -> Void) {
+    Task { @MainActor in
+      let settings = await center.notificationSettings()
+      result(Self.permission(status: settings.authorizationStatus, style: settings.alertStyle,
+        timeSensitive: settings.timeSensitiveSetting))
+    }
+  }
+
+  /// Provisional delivers quietly to Notification Center only, which can't reach anyone live.
+  static func permission(status: UNAuthorizationStatus, style: UNAlertStyle, timeSensitive: UNNotificationSetting) -> UIAlertPermission {
+    var permission = UIAlertPermission()
+    switch status {
+    case .notDetermined: permission.status = .notDetermined
+    case .denied: permission.status = .denied
+    case .authorized, .ephemeral: permission.status = .allowed
+    case .provisional: permission.status = .notDetermined
+    @unknown default: permission.status = .unknown
+    }
+    permission.banners = style != .none
+    permission.timeSensitive = timeSensitive == .enabled
+    return permission
+  }
+
+  /// System Settings at Ultracam's notifications.
+  static var settingsURL: URL? {
+    URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(Bundle.main.bundleIdentifier ?? "org.ultracam.app")")
   }
 
   /// Attention already shows it when the main window is key.

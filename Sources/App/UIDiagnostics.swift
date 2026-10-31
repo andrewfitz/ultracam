@@ -464,3 +464,42 @@ private struct UIDiagnosticsSparkline: View {
     .accessibilityHidden(true)
   }
 }
+
+// MARK: - Plain-text diagnostics
+
+@MainActor
+enum UIDiagnosticsText {
+  static func summary(model: AppModel) -> String {
+    var lines = ["Ultracam diagnostics"]
+    if model.programAvailable {
+      lines.append("Program: \(model.programInUse ? "in use" : "not in use")")
+    }
+    for descriptor in model.feedDescriptors {
+      lines.append("")
+      lines.append("[\(descriptor.name)] \(model.isCameraRunning(descriptor.id) ? "running" : "stopped")")
+      if let update = model.cameraUpdate(descriptor.id) {
+        lines.append("Input: \(update.input)")
+        lines.append("Output: \(update.output.isEmpty ? "—" : update.output)")
+        lines.append(String(format: "Delivered: %.2f fps · processing %.2f ms · video %.2f Mb/s", update.outputFPS, update.processingMS, update.videoBitrateMbps))
+        lines.append("Drops: source \(update.sourceDrops), device \(update.deviceDrops), signal dropouts \(update.signalDropouts) (\(update.signalLostFrames) frames), buffers \(update.poolDrops), camera \(update.cameraDrops)")
+        lines.append("Audio: \(update.audioPresent ? "\(update.audioChannels) ch \(update.audioSampleRate) Hz" : "none") · drops \(update.audioDrops)")
+        lines.append("Message: \(update.message)")
+        lines.append("Camera: \(update.cameraMessage)")
+      }
+      if let state = model.recordingModel.feeds.first(where: { $0.id == descriptor.id }) {
+        lines.append("Recording: \(state.displayStatus)")
+        if let stats = state.statistics {
+          lines.append("Take: \(stats.elapsedText) · \(stats.sizeText) · dropped \(stats.droppedVideoFrames) · encoder errors \(stats.encoderErrors) · writer errors \(stats.writerErrors)")
+          if let error = stats.lastError { lines.append("Last error: \(error)") }
+        }
+        if let error = state.error { lines.append("Error: \(error)") }
+      }
+    }
+    return lines.joined(separator: "\n")
+  }
+
+  static func copy(model: AppModel) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(summary(model: model), forType: .string)
+  }
+}

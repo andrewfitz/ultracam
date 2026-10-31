@@ -659,6 +659,26 @@ extension UIVerify {
       "Output 1080p 29.97", "Cut to Camera 2"] {
       verifier.check("accessibility contains \"\(label)\"", contains(nodes, label), "", viewDependent: true)
     }
+    // A take that ended early keeps Details on a collapsed strip: it acknowledges the take (J34).
+    do {
+      var failed = stripFixture(.failed)
+      failed.collapsed = Set(failed.cameras.map(\.id))
+      let collapsedLog = ActionLog()
+      let hosted = HostedView(mainWindow(.fixture(failed) { collapsedLog.append($0) }), size: CGSize(width: 1320, height: 860),
+        dark: false, titled: true)
+      defer { hosted.close() }
+      let details = Accessibility.nodes(in: hosted.host).filter { $0.text.hasPrefix("Details for") }
+      verifier.check("a collapsed strip whose take ended early offers Details", !details.isEmpty, "", viewDependent: true)
+      if let first = details.first, Accessibility.press(first) {
+        hosted.settle()
+        verifier.check("collapsed Details acknowledges the take",
+          collapsedLog.actions.contains { if case .acknowledgeStop = $0 { return true }; return false }, "", viewDependent: true)
+      }
+    }
+    // The Effects menu is named by its words alone: its symbol is an attachment in the label.
+    let effects = nodes.filter { $0.role == "AXMenuButton" && $0.text.contains("Effects") }
+    verifier.check("the Effects menu's name is its words", !effects.isEmpty && effects.allSatisfy { $0.label == "Effects" || $0.label == "Effects Off" },
+      effects.map { "[\($0.label)]" }.joined(separator: ", "), viewDependent: true)
     verifier.check("no app names in accessibility text", !nodes.contains { node in
       ["Zoom", "Teams", "FaceTime", "Webex"].contains { node.text.contains($0) }
     })
@@ -1246,19 +1266,22 @@ extension UIVerify {
     bridge.send(.removeCamera(cameraID: beta.rawValue))
     verifier.check("bridge: remove asks first", interface.confirmation != nil && model.feedDescriptors.count == 2)
     interface.confirmation = nil
-    defaults.set("collapsed", forKey: "ui.collapsed.default")
-    let collapsedInterface = UIInterfaceState(defaults: defaults)
-    collapsedInterface.alertsDisabled = true
-    UISessionBridge(model: model, interface: collapsedInterface).perform(.addCamera)
+    // New Camera Strips left Settings: a new camera's strip starts expanded, and its Program
+    // color is the one every camera sends.
+    model.setProgramColorSpace("rec2020-hlg-video")
+    bridge.perform(.addCamera)
     if let added = model.feedDescriptors.last?.id, model.feedDescriptors.count == 3 {
-      verifier.check("bridge: new camera starts collapsed when that is the default", collapsedInterface.collapsed.contains(added.rawValue))
+      verifier.check("bridge: new camera starts expanded", !interface.collapsed.contains(added.rawValue))
       verifier.check("bridge: new cameras are named Camera N", model.descriptor(for: added)?.name == "Camera 3",
         model.descriptor(for: added)?.name ?? "")
+      verifier.check("bridge: a new camera sends Program's one color",
+        model.feedDescriptors.allSatisfy { $0.programColorSpaceID == "rec2020-hlg-video" },
+        model.feedDescriptors.map(\.programColorSpaceID).joined(separator: ", "))
       bridge.perform(.removeCamera(cameraID: added.rawValue))
     } else {
-      verifier.check("bridge: add camera for default density", false, "\(model.feedDescriptors.count)")
+      verifier.check("bridge: add camera", false, "\(model.feedDescriptors.count)")
     }
-    defaults.removeObject(forKey: "ui.collapsed.default")
+    model.setProgramColorSpace("rec709-video")
 
     // The sidebar's camera banner follows the installer: two failed removals, then an
     // install, leave no "Requesting … removal…" behind. List rows aren't exposed to
@@ -1301,18 +1324,19 @@ extension UIVerify {
     }
 
     // Settings and Diagnostics with the real model.
-    render("settings-general", UISettingsGeneralPane(model: model, interface: interface), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
-    render("settings-recording", UISettingsRecordingPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
-    render("settings-camera", UISettingsCameraPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
-    render("settings-switcher", UISettingsSwitcherPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
-    render("settings-monitor", UISettingsMonitorPane(), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
-    render("settings-advanced", UISettingsAdvancedPane(model: model), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
-    render("settings-window", UISettingsView(model: model, interface: interface), size: CGSize(width: 640, height: 720)).forEach { $0.close() }
+    settingsWindow(model: model, interface: interface, defaults: defaults)
     render("diagnostics", UIDiagnosticsView(model: model), size: CGSize(width: 1100, height: 760)).forEach { $0.close() }
     interface.inspectorOpen = false
     interface.sidebarVisible = true
     let live = UISessionBridge.live(model: model, interface: interface).context()
     render("main-live-model", mainWindow(live), size: CGSize(width: 1320, height: 860), titled: true).forEach { $0.close() }
+  }
+
+  /// Settings' tabs, sizes, links and renders (`SettingsVerify`).
+  func settingsWindow(model: AppModel, interface: UIInterfaceState, defaults: UserDefaults) {
+    SettingsVerify.run(verifier: verifier, model: model, interface: interface, defaults: defaults) { name, view, size in
+      render(name, view, size: size).forEach { $0.close() }
+    }
   }
 
   // MARK: Picture menus

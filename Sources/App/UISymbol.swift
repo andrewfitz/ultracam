@@ -96,4 +96,6 @@ enum UISymbol {
   static let diagnostics = "stethoscope"
   static let settings = "gearshape"
   static let openWindow = "macwindow"
+  static let alerts = "bell"
+  static let advancedSettings = "gearshape.2"
 }

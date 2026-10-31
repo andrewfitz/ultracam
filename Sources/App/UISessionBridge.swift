@@ -40,6 +40,20 @@ final class UIInterfaceState {
   var offerAlerts = false
   @ObservationIgnored var turnOnAlerts: (@MainActor () -> Void)?
   @ObservationIgnored var dismissAlertsPrompt: (@MainActor () -> Void)?
+  /// Settings' tab. Settings reopens on it, and a "Settings › Audio" link sets it before opening.
+  var settingsTab: UISettingsTab { didSet { defaults.set(settingsTab.rawValue, forKey: Self.settingsTabKey) } }
+  /// Settings › Audio: how many channels each camera's strip meters show, by camera ID.
+  /// A camera not listed shows As Detected.
+  var channelsShown: [String: UIChannelsShown] {
+    didSet { defaults.set(channelsShown.mapValues(\.rawValue), forKey: Self.channelsShownKey) }
+  }
+  /// Settings › Audio: the true peak, in dBTP, at or above which an over is counted and logged.
+  var truePeakWarning: Double {
+    didSet {
+      defaults.set(truePeakWarning, forKey: Self.truePeakWarningKey)
+      AudioMeterTap.setWarningLevel(truePeakWarning)
+    }
+  }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -48,18 +62,31 @@ final class UIInterfaceState {
     sidebarVisible = defaults.object(forKey: "ui.sidebar") as? Bool ?? true
     order = defaults.stringArray(forKey: "ui.order") ?? []
     virtualCamerasCollapsed = defaults.bool(forKey: "ui.virtualCamerasCollapsed")
+    settingsTab = defaults.string(forKey: Self.settingsTabKey).flatMap(UISettingsTab.init(rawValue:)) ?? .general
+    channelsShown = (defaults.dictionary(forKey: Self.channelsShownKey) as? [String: Int] ?? [:])
+      .compactMapValues(UIChannelsShown.init(rawValue:))
+    let warning = defaults.object(forKey: Self.truePeakWarningKey) as? Double
+    truePeakWarning = warning.flatMap { UITruePeakWarning.levels.contains($0) ? $0 : nil } ?? -1
+    AudioMeterTap.setWarningLevel(truePeakWarning)
   }
+
+  static let settingsTabKey = "ui.settings.tab"
+  static let channelsShownKey = "ui.audio.channelsShown"
+  static let truePeakWarningKey = "ui.audio.truePeakWarning"
 
   /// Settings › General, "Ask before ending a recording or on-air video". On by default.
   static let askBeforeEndingKey = "ui.askBeforeEnding"
   var askBeforeEnding: Bool { defaults.object(forKey: Self.askBeforeEndingKey) as? Bool ?? true }
 
-  /// Settings › General › Channel strips: new cameras start collapsed.
-  /// Reads the preference at the time a camera is added. Settings can be
-  /// changed while the app is running, so caching this at interface-state
-  /// initialization would leave newly added strips using the old density.
-  var defaultCollapsed: Bool {
-    defaults.string(forKey: "ui.collapsed.default") == "collapsed"
+  /// Settings › Alerts, Low Space: less time left than this is low. `UIAlertPreferences` writes it.
+  var lowSpaceSeconds: TimeInterval {
+    TimeInterval(defaults.object(forKey: UIAlertPreferences.lowSpaceMinutesKey) as? Int ?? 30) * 60
+  }
+
+  func channelsShown(for cameraID: String) -> UIChannelsShown { channelsShown[cameraID] ?? .asDetected }
+
+  func setChannelsShown(_ value: UIChannelsShown, for cameraID: String) {
+    if value == .asDetected { channelsShown[cameraID] = nil } else { channelsShown[cameraID] = value }
   }
 
   /// Sorts cameras into the display order.
@@ -174,6 +201,7 @@ struct UISessionBridge {
       camera.lutInputSpaceID = descriptor.lutInputSpaceID
       camera.lutOutputSpaceID = descriptor.lutOutputSpaceID
       camera.programColorSpaceID = descriptor.programColorSpaceID
+      camera.channelsShown = interface.channelsShown(for: id.rawValue)
       camera.recordingConstantFrameRate = descriptor.recordingConstantFrameRate
       camera.sourceFrameRate = update?.sourceFormat?.rate
       camera.sourceFormat = update?.sourceFormat
@@ -245,7 +273,11 @@ struct UISessionBridge {
     session.codec = recording.codec
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
     session.defaultFolderPath = recording.outputFolder?.path
-    session.drives = drives
+    session.drives = drives.map { drive in
+      var drive = drive
+      drive.lowSeconds = interface.lowSpaceSeconds
+      return drive
+    }
     session.recentTakes = UIRecordingLibrary.cachedRecentTakes(in: model.feedDescriptors.compactMap { recording.outputFolder(for: $0.id) })
     session.interruptedTakes = recording.interruptedRecordings.map { UIInterruptedTake(id: $0.id.path, title: $0.title) }
     session.recoveringID = recording.recoveringID?.path
@@ -401,7 +433,7 @@ struct UISessionBridge {
     case .setSourceProfile(let id, let profile): model.updateCamera(feedID(id)) { $0.setSourceProfile(profile) }
     case .setLUTInputSpace(let id, let space): model.updateCamera(feedID(id)) { $0.lutInputSpaceID = space }
     case .setRecordingConstantFrameRate(let id, let enabled): model.updateCamera(feedID(id)) { $0.recordingConstantFrameRate = enabled }
-    case .setProgramColorSpace(let id, let space): model.updateCamera(feedID(id)) { $0.programColorSpaceID = space }
+    case .setProgramColorSpace(let space): model.setProgramColorSpace(space)
     case .setLUTOutputSpace(let id, let space): model.updateCamera(feedID(id)) { $0.lutOutputSpaceID = space }
     case .setGamut(let id, let gamut): model.updateCamera(feedID(id)) { $0.setGamut(gamut) }
     case .setInput(let id, let device): model.updateCamera(feedID(id)) { $0.selectedDevice = device }
@@ -422,7 +454,7 @@ struct UISessionBridge {
       model.acknowledgeProblem(id)
       openWindow("diagnostics")
     case .addCamera:
-      if let id = model.addFeed(), interface.defaultCollapsed { interface.collapsed.insert(id.rawValue) }
+      _ = model.addFeed()
     case .removeCamera(let id):
       _ = model.removeFeed(feedID(id))
       interface.collapsed.remove(id)
@@ -506,6 +538,10 @@ struct UISessionBridge {
     case .installCameraExtension: model.installer.install()
     case .removeCameraExtension: model.installer.uninstall()
     case .openSettings: openSettings()
+    case .setChannelsShown(let id, let shown): interface.setChannelsShown(shown, for: id)
+    case .openSettingsTab(let tab):
+      interface.settingsTab = tab
+      openSettings()
     case .openDiagnostics: openWindow("diagnostics")
     case .openExtensionApproval:
       if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {

@@ -183,6 +183,21 @@ final class AudioMeterTap: @unchecked Sendable {
   private let stale = Atomic<UInt64>(0)
   private let maxQueued = Atomic<Int>(0)
 
+  /// The channels the highest pair that has carried signal covers, since the capture
+  /// started (`channelsWithSignal`). Only grows; `noteGap` starts it over. Written on the
+  /// meter queue, read by views and Settings › Audio.
+  private let detected = Atomic<Int>(0)
+  /// Meters for strips that show fewer channels than the source (Settings › Audio). Each
+  /// reads the first channels of the same packets, in place. They belong to one session's
+  /// meter, so a new session starts new ones.
+  private struct DisplayMeters {
+    weak var owner: AudioMeter?
+    var meters: [Int: AudioMeter] = [:]
+  }
+  private let displays = Mutex(DisplayMeters())
+  /// Settings › Audio's true-peak warning level, dBTP, as a Float's bits. Any thread.
+  private static let warning = Atomic<UInt32>(Float(-1).bitPattern)
+
   /// `packetCapacity` is rounded up to a power of two. The independent time
   /// budget bounds retention even for sources with large or variable packets.
   init(packetCapacity: Int = AudioMeterTap.defaultPacketCapacity, maxBufferedSeconds: Double = 2,
@@ -350,13 +365,18 @@ final class AudioMeterTap: @unchecked Sendable {
         }
       }
       if packetSession == consumerSession, let meter = consumerMeter {
-        if slot.pointee.followsGap { meter.noteDiscontinuity() }
-        if Self.process(slot.pointee, with: meter) {
+        let shown = displayMeters(of: meter)
+        if slot.pointee.followsGap {
+          meter.noteDiscontinuity()
+          shown.forEach { $0.noteDiscontinuity() }
+        }
+        if Self.process(slot.pointee, with: meter, displays: shown) {
           metered.add(1, ordering: .relaxed)
           watchForOvers(meter)
         } else {
           rejected.add(1, ordering: .relaxed)
           meter.noteDiscontinuity()
+          shown.forEach { $0.noteDiscontinuity() }
         }
       } else {
         stale.add(1, ordering: .relaxed)
@@ -368,7 +388,8 @@ final class AudioMeterTap: @unchecked Sendable {
         if slot.pointee.followsGap || (lastTakePacket.map { $0 != next &- 1 } ?? false) { takeMeter.noteDiscontinuity() }
         _ = Self.process(slot.pointee, with: takeMeter)
         lastTakePacket = next
-        if takeWatch.observe(takeMeter.snapshot(), source: currentTake.number, sampleRate: takeMeter.configuration.sampleRate) != nil {
+        if takeWatch.observe(takeMeter.snapshot(), source: currentTake.number, sampleRate: takeMeter.configuration.sampleRate,
+          level: Self.warningLevel) != nil {
           take.withLock { state in
             if state?.number == currentTake.number { state?.overs += 1 }
           }
@@ -386,19 +407,29 @@ final class AudioMeterTap: @unchecked Sendable {
     }
   }
 
-  private static func process(_ slot: Slot, with meter: AudioMeter) -> Bool {
+  /// Meters one packet. `displays` read the first channels of each frame of the same samples
+  /// (`frameStride`), so a strip showing fewer channels costs no copy.
+  private static func process(_ slot: Slot, with meter: AudioMeter, displays: [AudioMeter] = []) -> Bool {
     if let packet = slot.packet {
       guard packet.format.channels == meter.configuration.channelCount,
         packet.format.sampleRate == meter.configuration.sampleRate else { return false }
       let samples = SourceAudioMeterInput.interleavedSamples(packet)
       samples.withUnsafeBufferPointer { buffer in
-        if let base = buffer.baseAddress { meter.process(interleaved: base, frameCount: packet.sampleFrameCount) }
+        guard let base = buffer.baseAddress else { return }
+        meter.process(interleaved: base, frameCount: packet.sampleFrameCount)
+        for display in displays where display.configuration.channelCount <= packet.format.channels
+          && display.configuration.sampleRate == packet.format.sampleRate {
+          display.process(interleaved: base, frameCount: packet.sampleFrameCount, frameStride: packet.format.channels)
+        }
       }
     } else if let samples = slot.samples {
       samples.withUnsafeBytes { raw in
         guard let base = raw.baseAddress else { return }
-        meter.process(interleaved: base.assumingMemoryBound(to: Int32.self), frameCount: slot.frames,
-          frameStride: slot.stride)
+        let pcm = base.assumingMemoryBound(to: Int32.self)
+        meter.process(interleaved: pcm, frameCount: slot.frames, frameStride: slot.stride)
+        for display in displays where display.configuration.channelCount <= slot.stride {
+          display.process(interleaved: pcm, frameCount: slot.frames, frameStride: slot.stride)
+        }
       }
     } else {
       return false
@@ -429,7 +460,11 @@ final class AudioMeterTap: @unchecked Sendable {
   /// of their own a second after the last if no other over follows. Meter queue only.
   private func watchForOvers(_ meter: AudioMeter) {
     let snapshot = meter.snapshot()
-    guard let event = overWatch.observe(snapshot, source: consumerSession, sampleRate: meter.configuration.sampleRate) else { return }
+    // As Detected: the highest pair with signal, which only grows.
+    let covered = Self.channelsWithSignal(snapshot)
+    if covered > detected.load(ordering: .relaxed) { detected.store(covered, ordering: .relaxed) }
+    guard let event = overWatch.observe(snapshot, source: consumerSession, sampleRate: meter.configuration.sampleRate,
+      level: Self.warningLevel) else { return }
     overEvents.add(1, ordering: .relaxed)
     let now = DispatchTime.now().uptimeNanoseconds
     let timecode = timecodeSource.withLock { $0 }?()
@@ -616,7 +651,43 @@ final class AudioMeterTap: @unchecked Sendable {
   /// interpolating across the gap. Any thread.
   func noteGap() {
     gapPending.store(true, ordering: .relaxed)
+    // A new capture: As Detected starts over.
+    detected.store(0, ordering: .relaxed)
   }
+
+  // MARK: Channels shown
+
+  /// The channels the highest pair that has carried signal covers since the capture started,
+  /// while metered; 0 before any. Any thread.
+  var detectedChannels: Int { detected.load(ordering: .relaxed) }
+
+  /// A meter for a strip that shows only the first `channels` channels of the current
+  /// session, made on first use and fed from the same packets. Nil before the first attach,
+  /// or when `channels` is every channel the session meters (show `meter` then). Main thread.
+  func displayMeter(channels: Int) -> AudioMeter? {
+    guard channels > 0, let full = meter, channels < full.configuration.channelCount else { return nil }
+    return displays.withLock { state in
+      if state.owner !== full { state = DisplayMeters(owner: full) }
+      if let existing = state.meters[channels] { return existing }
+      let configuration = AudioMeterConfiguration(sampleRate: full.configuration.sampleRate, channelCount: channels,
+        meters: [.samplePeak, .truePeak])
+      guard let display = try? AudioMeter(configuration: configuration) else { return nil }
+      state.meters[channels] = display
+      return display
+    }
+  }
+
+  /// The display meters fed alongside `meter`. Meter queue.
+  private func displayMeters(of meter: AudioMeter) -> [AudioMeter] {
+    displays.withLock { $0.owner === meter ? Array($0.meters.values) : [] }
+  }
+
+  /// Settings › Audio: overs count and log from this true peak, dBTP. Any thread.
+  static func setWarningLevel(_ dBTP: Double) {
+    warning.store(Float(dBTP).bitPattern, ordering: .relaxed)
+  }
+
+  static var warningLevel: Float { Float(bitPattern: warning.load(ordering: .relaxed)) }
 
   // MARK: Takes
 
@@ -686,7 +757,7 @@ final class AudioMeterTap: @unchecked Sendable {
     let snapshot = state.meter.snapshot()
     return AudioTakeSummary(
       integrated: Double(snapshot.loudness.integrated), maximumTruePeak: Double(snapshot.programmeMaximumTruePeak),
-      overs: state.overs, duration: snapshot.loudness.duration)
+      overs: state.overs, duration: snapshot.loudness.duration, warningLevel: Double(warningLevel))
   }
 
   /// The current (or last) session's meter; nil before the first attach.

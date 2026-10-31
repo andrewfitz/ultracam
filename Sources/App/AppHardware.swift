@@ -47,6 +47,8 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   var settingsPlugins: () -> [any VendorSettingsProviding] = { [] }
   var controlPlugins: () -> [any CameraControlPlugin] = { [] }
   var captureDescriptor: (String) -> VendorDescriptor? = { _ in nil }
+  /// Capture vendors in registry order, for Settings › Hardware's sections.
+  var captureVendors: () -> [VendorDescriptor] = { [] }
   var controlViewFactories: () -> [String: ControlViewFactory] = { [:] }
   /// Follows which virtual cameras have clients from launch. CMIO listeners only, and
   /// off in harnesses, which have no clients and shouldn't enumerate the Mac's cameras.
@@ -110,6 +112,7 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
       settingsPlugins: { registry.readyCapturePlugins.map { $0 as any VendorSettingsProviding } },
       controlPlugins: { registry.controlPlugins },
       captureDescriptor: { id in (try? registry.capturePlugin(for: id))?.descriptor },
+      captureVendors: { registry.snapshot.capture.map(\.descriptor) },
       controlViewFactories: { registry.controlViewFactories },
       setCompatibilityPolicy: { compatibility.update($0) })
   }

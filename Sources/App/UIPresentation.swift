@@ -193,6 +193,8 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var automaticStartFailed = false
   var timecode: String?
   var audio = UIAudioLevels()
+  /// How many channels the expanded strip's meter shows (Settings › Audio).
+  var channelsShown: UIChannelsShown = .asDetected
   /// What the source really declares; 0 before it has.
   var audioChannels = 0
   var audioSampleRate = 0
@@ -268,6 +270,8 @@ struct UIDrive: Sendable, Equatable, Identifiable {
   var availableBytes: Int64
   var totalBytes: Int64
   var secondsLeft: TimeInterval?
+  /// Less time left than this is low (Settings › Alerts, Low Space).
+  var lowSeconds: TimeInterval = UIPresentationBuilder.defaultLowDriveSeconds
 }
 
 struct UITake: Sendable, Equatable, Identifiable {
@@ -474,6 +478,8 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var automaticStartFailed: Bool
   /// The failed take ran out of disk space: the strip offers another folder.
   var diskFull = false
+  /// How many channels the expanded strip's meter shows. Collapsed strips show 1–2.
+  var channelsShown: UIChannelsShown = .asDetected
   /// A note on the current or last take that needs a look, such as audio
   /// re-synced after a signal drop, or an audio over. Shown with a warning symbol.
   var recordingNote: String? = nil
@@ -979,7 +985,7 @@ enum UIPresentationBuilder {
       activeTools: UIMonitorTool.allCases.filter { camera.activeTools.contains($0) },
       accessibilityLabel: labelParts.joined(separator: ", "),
       lutError: camera.lutError, automaticStartFailed: camera.automaticStartFailed,
-      diskFull: diskFull(camera, in: session),
+      diskFull: diskFull(camera, in: session), channelsShown: camera.channelsShown,
       recordingNote: recordingNote.isEmpty ? nil : recordingNote,
       takeAudioHelp: takeAudio.map { (isRecording ? "This take so far: " : "Last take: ") + $0.note },
       stripProblem: stripProblem(camera, in: session),

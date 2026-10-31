@@ -132,10 +132,16 @@ struct NaturalTalkingHeadSettings: Codable, Equatable, Sendable {
 }
 
 extension NaturalTalkingHeadSettings {
+  /// Nothing feeds the director a transcript yet (`AutoSwitcherBridge.ingestTranscript` has
+  /// no caller), so Transcript Assisted would only wait for one. Until a source exists the
+  /// director runs Low Latency and Settings hides the transcript rows (B14).
+  static let transcriptSourceAvailable = false
+
   /// Produces finite, ordered values before crossing the Rust configuration
   /// boundary. Preferences are user-editable JSON, so runtime validation must
   /// not depend on the UI having already visited every field.
   mutating func normalizeForRuntime() {
+    if !Self.transcriptSourceAvailable { mode = .lowLatency }
     func nonNegative(_ value: Double, _ fallback: Double) -> Double {
       value.isFinite ? max(0, value) : fallback
     }
@@ -560,6 +566,7 @@ final class AppSettingsStore {
   static let allowCPUConversionKey = "ultracam.allowCPUConversion"
   static let recordingCodecKey = "ultracam.recordingCodec"
   static let recordingTimecodeModeKey = "ultracam.recordingTimecodeMode"
+  static let recordingNamingKey = "ultracam.recordingNaming"
   static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
@@ -576,7 +583,7 @@ final class AppSettingsStore {
   /// Recordings and their recovery journals on disk are not touched.
   func resetAll() {
     let names = defaults.dictionaryRepresentation().keys.filter {
-      $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.recordingCodecKey || $0 == Self.recordingTimecodeModeKey ||
+      $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.recordingCodecKey || $0 == Self.recordingTimecodeModeKey || $0 == Self.recordingNamingKey ||
         $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
         $0 == VendorSettingsKeys.preferences || $0 == "ultracam.settings.pre-b1d.backup" || $0 == Self.lutInputRepairedKey ||
         $0.hasPrefix("ui.") || $0.hasPrefix("recordingFolderBookmark")
@@ -600,6 +607,15 @@ final class AppSettingsStore {
   var recordingTimecodeMode: RecordingTimecodeMode {
     get { defaults.string(forKey: Self.recordingTimecodeModeKey).flatMap(RecordingTimecodeMode.init(rawValue:)) ?? .wallClock }
     set { defaults.set(newValue.rawValue, forKey: Self.recordingTimecodeModeKey) }
+  }
+
+  /// File-name pieces and camera subfolders; anything unreadable is the standard naming.
+  var recordingNaming: RecordingFileNaming {
+    get {
+      defaults.data(forKey: Self.recordingNamingKey)
+        .flatMap { try? JSONDecoder().decode(RecordingFileNaming.self, from: $0) } ?? .standard
+    }
+    set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Self.recordingNamingKey) }
   }
 
   var hideFromDock: Bool {

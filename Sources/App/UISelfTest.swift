@@ -258,7 +258,7 @@ import AppKit
     record("Diagnostics window is visible", titles.contains { $0.hasPrefix("diagnostics") }, titles.joined(separator: ", "))
     record("Settings window is visible", windows.contains { window in
       identifier(of: window).localizedCaseInsensitiveContains("settings") || window.title.localizedCaseInsensitiveContains("settings")
-        || ["General", "Recording", "Camera", "Switcher", "Monitor", "Advanced"].contains(window.title)
+        || UISettingsTab.allCases.map(\.title).contains(window.title)
     }, windows.map { "\(identifier(of: $0)) (\($0.title))" }.joined(separator: ", "))
     let previous = NSApp.appearance
     for (appearanceName, suffix) in [(NSAppearance.Name.aqua, "light"), (.darkAqua, "dark")] {

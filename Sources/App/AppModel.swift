@@ -75,6 +75,14 @@ final class AppModel {
   @ObservationIgnored private var deviceListObserver: Any?
   @ObservationIgnored private var virtualCameraObserver: Any?
   var feedDescriptors: [FeedDescriptor] { feedCoordinator.descriptors }
+  /// What Ultracam · Program sends. One value for Program, kept on every camera because
+  /// Program takes it from the camera on air; the first camera's is the setting.
+  var programColorSpaceID: String { feedDescriptors.first?.programColorSpaceID ?? "rec709-video" }
+  func setProgramColorSpace(_ space: String) {
+    for descriptor in feedDescriptors where descriptor.programColorSpaceID != space {
+      updateCamera(descriptor.id, shareProcessing: false) { $0.programColorSpaceID = space }
+    }
+  }
   /// The LUT a camera burns into its output now (nil when none): what its
   /// virtual camera, Program and monitor Output stage get. Recording never
   /// does: it takes the camera original. Never creates a capture controller.
@@ -357,6 +365,10 @@ final class AppModel {
   let cameraControls: CameraControlStore
   var controlViewFactories: [String: ControlViewFactory] { hardware.controlViewFactories() }
   func captureVendor(for deviceID: String) -> VendorDescriptor? { hardware.captureDescriptor(deviceID) }
+  /// Capture vendors in registry order; Settings › Hardware groups devices by them.
+  var captureVendors: [VendorDescriptor] { hardware.captureVendors() }
+  /// Camera Control vendors in registry order.
+  var controlVendors: [VendorDescriptor] { hardware.controlPlugins().map(\.descriptor) }
   private let virtualCameraRegistryStore: VirtualCameraRegistryStore
   private let lutLoader: LUTFileLoader
   private var launching = true
@@ -436,10 +448,12 @@ final class AppModel {
     allowCPUConversion = store.allowCPUConversion
     recordingModel.codec = store.recordingCodec
     recordingModel.timecodeMode = store.recordingTimecodeMode
+    recordingModel.naming = store.recordingNaming
     recordingModel.onRecordingChoicesChanged = { [weak self] in
       guard let self else { return }
       self.settingsStore.recordingCodec = self.recordingModel.codec
       self.settingsStore.recordingTimecodeMode = self.recordingModel.timecodeMode
+      self.settingsStore.recordingNaming = self.recordingModel.naming
     }
     recordingModel.compatibilityPolicy = sampledRecordingCompatibilityPolicy
     recordingModel.sourceFormat = { [weak self] id in self?.cameraUpdate(id)?.sourceFormat }
@@ -830,8 +844,15 @@ final class AppModel {
   func addFeed(name: String? = nil) -> FeedID? {
     guard canAddCamera else { return nil }
     let source = feedCoordinator.selectedDescriptor
+    let programColor = programColorSpaceID
     let id = feedCoordinator.add(name: name)
     wireCamera(id)
+    // Program color is one setting: a new camera sends what the others do.
+    if let added = descriptor(for: id), added.programColorSpaceID != programColor {
+      var updated = added
+      updated.programColorSpaceID = programColor
+      feedCoordinator.update(updated)
+    }
     feedCoordinator.capture(for: id).setProgramPictureWanted(programPictureWanted)
     synchronizeProcessing(from: source)
     synchronizeMonitoring(from: MonitorTargetID(source.id.rawValue), preferences: source.monitor)

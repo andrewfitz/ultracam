@@ -339,7 +339,7 @@ extension UIPresentationBuilder {
         alert: UIProblemAlert(event: .driveLow, title: "Recording drive full", body: "No space left"), rank: 90))
     }
     for drive in session.drives {
-      guard !isFull(drive), let left = drive.secondsLeft, left < lowDriveSeconds else { continue }
+      guard !isFull(drive), let left = drive.secondsLeft, isLow(drive) else { continue }
       // The time stays on the drive row and in the status bar.
       list.append(UIProblem(id: "drive.\(drive.id)", title: "\(drive.name) is low",
         detail: driveUsers(drive, in: session), level: recordsTo(drive) ? .damage : .notice,
@@ -463,8 +463,11 @@ extension UIPresentationBuilder {
     }
   }
 
-  /// Under half an hour left counts as low.
-  static let lowDriveSeconds: TimeInterval = 30 * 60
+  /// Under half an hour left counts as low, unless Settings › Alerts says otherwise.
+  static let defaultLowDriveSeconds: TimeInterval = 30 * 60
+
+  /// Less time left than the drive's low-space level; a full drive is `isFull`.
+  static func isLow(_ drive: UIDrive) -> Bool { (drive.secondsLeft ?? .infinity) < drive.lowSeconds }
 
   /// The single most important problem, if any: the head of the list.
   static func warning(_ session: UISessionSnapshot) -> String? { problems(session).first?.title }

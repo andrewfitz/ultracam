@@ -19,8 +19,13 @@ enum UIControlPresentation {
         case .text(let value), .choice(let value): return value
         }
     }
-    static func overlay(_ properties: [ControlProperty], compact: Bool = false, in bundle: Bundle = .main) -> String {
+    /// The picture's camera-settings overlay: one typed piece per field, set apart by spacing, never joined with dots.
+    static func overlayPieces(_ properties: [ControlProperty], compact: Bool = false, in bundle: Bundle = .main) -> [String] {
         let fields = properties.filter { $0.overlayOrder != nil }.sorted { $0.overlayOrder! < $1.overlayOrder! }
-        return (compact ? Array(fields.prefix(3)) : fields).map { "\($0.localizedLabel(in: bundle)) \(value($0, in: bundle))" }.joined(separator: " · ")
+        return (compact ? Array(fields.prefix(3)) : fields).map { "\($0.localizedLabel(in: bundle)) \(value($0, in: bundle))" }
+    }
+    /// The pieces as one line, for VoiceOver and help.
+    static func overlay(_ properties: [ControlProperty], compact: Bool = false, in bundle: Bundle = .main) -> String {
+        overlayPieces(properties, compact: compact, in: bundle).joined(separator: ", ")
     }
 }

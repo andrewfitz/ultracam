@@ -42,7 +42,8 @@ enum UIAction: Sendable, Equatable {
   case setSourceProfile(cameraID: String, String)
   case setLUTInputSpace(cameraID: String, String)
   case setLUTOutputSpace(cameraID: String, String)
-  case setProgramColorSpace(cameraID: String, String)
+  /// What Ultracam · Program sends: one color space for every camera (Settings › Virtual Cameras).
+  case setProgramColorSpace(String)
   case setRecordingConstantFrameRate(cameraID: String, Bool)
   case setInput(cameraID: String, deviceID: String)
   case refreshInputs
@@ -107,6 +108,10 @@ enum UIAction: Sendable, Equatable {
   case installCameraExtension
   case removeCameraExtension
   case openSettings
+  /// How many channels a camera's strip meter shows (Settings › Audio, and the meter's menu).
+  case setChannelsShown(cameraID: String, UIChannelsShown)
+  /// Settings at one tab: what a "Settings › Recording" link does.
+  case openSettingsTab(UISettingsTab)
   case openDiagnostics
   case openMainWindow
   /// System Settings at Camera Extensions, where macOS waits for an approval.

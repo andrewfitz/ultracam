@@ -133,12 +133,18 @@ struct UISessionSidebarViewContent: View {
         .selectionDisabled()
       HStack(spacing: 8) {
         Text("Camera original")
-        Label { Text(session.timecodeTitle) } icon: { Image(systemName: UISymbol.timecode) }
-          .labelStyle(.titleAndIcon)
+        // Timecode is set once per rig: the caption opens Settings › Recording.
+        Button { context.send(.openSettingsTab(.recording)) } label: {
+          Label { Text(session.timecodeTitle) } icon: { Image(systemName: UISymbol.timecode) }
+            .labelStyle(.titleAndIcon)
+        }
+        .buttonStyle(.plain)
+        .help("Timecode is set in Settings › Recording. Click to open it.")
+        .accessibilityLabel("Timecode \(session.timecodeTitle)")
+        .accessibilityHint("Opens Settings › Recording")
       }
       .font(.uiMeta).foregroundStyle(.secondary)
       .help("Records the camera original, without LUT or effects. Timecode is set in Settings › Recording.")
-      .accessibilityElement(children: .combine)
       .selectionDisabled()
       ForEach(session.drives) { drive in
         UILiveDriveRow(drive: drive, cameras: UIPresentationBuilder.cameras(on: drive, in: session), context: context)
@@ -281,6 +287,8 @@ struct UIFormatMenu: View {
   var body: some View {
     Menu {
       UIFormatChoices(session: context.session, send: context.send)
+      Divider()
+      Button("Timecode and Folders…") { context.send(.openSettingsTab(.recording)) }
     } label: {
       HStack(spacing: 6) {
         Image(systemName: UISymbol.format)
@@ -360,7 +368,7 @@ struct UIDriveRow: View {
 
   var body: some View {
     let used = drive.totalBytes > 0 ? 1 - Double(drive.availableBytes) / Double(drive.totalBytes) : 0
-    let low = (drive.secondsLeft ?? .infinity) < UIPresentationBuilder.lowDriveSeconds || UIPresentationBuilder.isFull(drive)
+    let low = UIPresentationBuilder.isLow(drive) || UIPresentationBuilder.isFull(drive)
     VStack(alignment: .leading, spacing: 4) {
       HStack(spacing: 4) {
         Image(systemName: UISymbol.drive(low: low)).imageScale(.small).foregroundStyle(low ? Color.orange : .secondary)

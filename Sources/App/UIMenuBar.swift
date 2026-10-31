@@ -412,7 +412,7 @@ final class UIMenuCommandBox: NSObject {
     items.append(formatItem)
     // All drives share one row: the one that runs out first.
     let worst = session.drives.filter { $0.secondsLeft != nil }.min { ($0.secondsLeft ?? 0) < ($1.secondsLeft ?? 0) }
-    let low = worst.map { ($0.secondsLeft ?? .infinity) < UIPresentationBuilder.lowDriveSeconds } ?? false
+    let low = worst.map { UIPresentationBuilder.isLow($0) } ?? false
     items.append(row("Time left", [], enabled: worst != nil, symbol: UISymbol.drive(low: low), tint: low ? .systemOrange : nil,
       badge: worst.map { "\($0.name) \(UIFormat.duration($0.secondsLeft ?? 0))" } ?? "—", target: target))
 
@@ -634,7 +634,7 @@ struct UIMenuPreviewContent: View {
       .overlay(alignment: .bottomLeading) {
         HStack(spacing: 6) {
           UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio,
-            style: .compact)
+            style: .compact, channels: .two)
             .uiPictureOverlay()
         }
         .padding(7)

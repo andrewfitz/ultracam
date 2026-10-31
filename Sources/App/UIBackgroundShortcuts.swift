@@ -70,6 +70,8 @@ enum UIBackgroundShortcut: Hashable, Sendable {
 
   @ObservationIgnored private var handler: EventHandlerRef?
   @ObservationIgnored private var registered: [EventHotKeyRef] = []
+  /// Chords registered now: every one the switch could get while it's on, none while it's off.
+  var registeredCount: Int { registered.count }
   private static let signature: OSType = 0x5543_414D  // "UCAM"
 
   init(defaults: UserDefaults = .standard) {

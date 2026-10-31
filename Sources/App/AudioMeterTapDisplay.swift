@@ -25,10 +25,12 @@ extension AudioMeterTap {
     }
 
     /// Looks at the readings after a packet for a new over: a sample clipped,
-    /// the true-peak maximum rose to −1 dBTP or above, or the true-peak bar is
-    /// there. Overs on a channel less than a second of audio apart are one
-    /// over; overs on several channels at once are one, named by the first.
-    mutating func observe(_ snapshot: AudioMeterSnapshot, source: UInt64, sampleRate: Double = EmbeddedAudioFormat.sampleRate) -> Event? {
+    /// the true-peak maximum rose to the warning level (−1 dBTP unless Settings ›
+    /// Audio says −2 or −3) or above, or the true-peak bar is there. Overs on a
+    /// channel less than a second of audio apart are one over; overs on several
+    /// channels at once are one, named by the first.
+    mutating func observe(_ snapshot: AudioMeterSnapshot, source: UInt64, sampleRate: Double = EmbeddedAudioFormat.sampleRate,
+      level warning: Float = -1) -> Event? {
       if self.source != source { self = OverWatch(source: source) }
       let n = min(snapshot.channelCount, Self.channels)
       var event: Event?
@@ -40,8 +42,8 @@ extension AudioMeterTap {
           lastClips[c] = levels.clipCount
         }
         let clipped = levels.clipCount > lastClips[c]
-        let rose = levels.truePeakMax > lastMax[c] && levels.truePeakMax >= -1
-        let over = clipped || rose || levels.truePeak >= -1
+        let rose = levels.truePeakMax > lastMax[c] && levels.truePeakMax >= warning
+        let over = clipped || rose || levels.truePeak >= warning
         lastMax[c] = levels.truePeakMax
         lastClips[c] = levels.clipCount
         guard over else { continue }
@@ -126,6 +128,30 @@ extension AudioMeterTap {
     return text
   }
 
+  /// Signal for As Detected: a true peak above −90 dBTP, one 16-bit step. Silent embedded
+  /// channels are exactly zero, so any threshold separates them.
+  static let signalThreshold: Float = -90
+
+  /// How many channels the highest pair carrying signal covers: 2 for 1–2, 4 for 3–4,
+  /// 6 for 5–6. 0 when nothing has. Settings › Audio rounds it up to a tier.
+  static func channelsWithSignal(_ snapshot: AudioMeterSnapshot) -> Int {
+    var highest: Int?
+    for c in 0..<min(snapshot.channelCount, OverWatch.channels) {
+      let levels = snapshot.channels[c]
+      if max(levels.truePeak, levels.truePeakMax) > signalThreshold { highest = c }
+    }
+    return highest.map { ($0 / 2 + 1) * 2 } ?? 0
+  }
+
+  /// The first channel from `first` on that is over (a clipped sample, or a true peak at or
+  /// above −1 dBTP, as the meter's OVER latch reads it), for a strip that hides it. Nil if none.
+  static func hiddenOver(_ snapshot: AudioMeterSnapshot, from first: Int) -> Int? {
+    guard first < snapshot.channelCount else { return nil }
+    return (first..<min(snapshot.channelCount, OverWatch.channels)).first { c in
+      snapshot.channels[c].clipCount > 0 || snapshot.channels[c].truePeakMax >= -1
+    }
+  }
+
   /// Readings for a camera without a live meter (fixtures, previews, a camera
   /// not capturing): its 4 Hz status peaks (0…1 sample-peak amplitudes) as
   /// the bars, the hold and the maximum, on the same scale.
@@ -156,6 +182,8 @@ struct AudioTakeSummary: Sendable, Equatable {
   var overs: Int
   /// Seconds of audio measured.
   var duration: Double
+  /// The true-peak warning level the take was measured against (Settings › Audio).
+  var warningLevel: Double = -1
 
   /// For the take's note: "Audio −23.4 LUFS, max −2.1 dBTP, no overs".
   var note: String {
@@ -165,6 +193,6 @@ struct AudioTakeSummary: Sendable, Equatable {
     return "Audio \(loudness), \(peak), \(overText)"
   }
 
-  /// Worth a warning: an over, or a true peak at or above −1 dBTP.
-  var needsAttention: Bool { overs > 0 || maximumTruePeak >= -1 }
+  /// Worth a warning: an over, or a true peak at or above the warning level.
+  var needsAttention: Bool { overs > 0 || maximumTruePeak >= warningLevel }
 }

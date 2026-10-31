@@ -220,13 +220,6 @@ struct UIInspectorViewContent: View {
         .labelsHidden().fixedSize()
         .help("Never exceeds the detected source rate. Turn the cap off to keep source timing.")
       }
-      Picker("Program color", selection: Binding(get: { snapshot.programColorSpaceID },
-        set: { context.send(.setProgramColorSpace(cameraID: camera.id, $0)) })) {
-        Text("Rec.709").tag("rec709-video")
-        Text("Rec.2020 / PQ").tag("rec2020-pq-video")
-        Text("Rec.2020 / HLG").tag("rec2020-hlg-video")
-      }
-      .help("The color space this camera sends on Program.")
     } header: {
       HStack {
         UIInspectorHeader(title: "Effects", symbol: snapshot.processing ? UISymbol.effects : UISymbol.effectsOff)

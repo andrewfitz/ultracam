@@ -232,15 +232,21 @@ struct UIControlPropertyField: View {
 struct UICameraSettingsOverlay: View {
     let feedID: String
     let store: CameraControlStore
+    /// Typed pieces set apart by spacing (J 22).
+    private func pieces(_ pieces: [String]) -> some View {
+        HStack(spacing: 12) { ForEach(Array(pieces.enumerated()), id: \.offset) { Text($0.element).lineLimit(1).fixedSize() } }
+    }
     var body: some View {
         let state = store.state(for: feedID)
         if store.assignment(for: feedID)?.showOverlay == true, state.connected, state.properties.contains(where: { $0.overlayOrder != nil }) {
             ViewThatFits(in: .horizontal) {
-                Text(UIControlPresentation.overlay(state.properties)).lineLimit(1)
-                Text(UIControlPresentation.overlay(state.properties, compact: true)).lineLimit(1)
+                pieces(UIControlPresentation.overlayPieces(state.properties))
+                pieces(UIControlPresentation.overlayPieces(state.properties, compact: true))
             }.font(.caption.monospacedDigit()).foregroundStyle(.white).padding(6)
                 .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityElement(children: .combine).allowsHitTesting(false)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(UIControlPresentation.overlay(state.properties))
+                .allowsHitTesting(false)
         }
     }
 }

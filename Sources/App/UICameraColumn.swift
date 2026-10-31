@@ -809,7 +809,9 @@ struct UIChannelStripView: View {
       HStack(spacing: 8) {
         gutterIcon(UISymbol.audio)
           .help("Embedded audio, true peak")
-        UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio)
+        UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, channels: camera.channelsShown) { shown in
+          context.send(.setChannelsShown(cameraID: camera.id, shown))
+        }
       }
     }
   }
@@ -1117,7 +1119,7 @@ struct UIChannelStripView: View {
     HStack(spacing: 6) {
       if let path = snapshot?.recording.folderPath {
         let drive = UIPresentationBuilder.drive(for: snapshot ?? UICameraSnapshot(id: "", name: ""), in: context.session)
-        let low = drive.map { ($0.secondsLeft ?? .infinity) < UIPresentationBuilder.lowDriveSeconds || UIPresentationBuilder.isFull($0) } ?? false
+        let low = drive.map { UIPresentationBuilder.isLow($0) || UIPresentationBuilder.isFull($0) } ?? false
         Image(systemName: UISymbol.drive(low: low)).foregroundStyle(low ? Color.orange : .secondary).imageScale(.small)
           .frame(width: Self.gutter).accessibilityHidden(true)
         if let drive { Text(drive.name).font(.uiValueStrong).lineLimit(1).fixedSize() }
@@ -1271,7 +1273,8 @@ struct UIChannelStripView: View {
         .onGeometryChange(for: Bool.self) { $0.size.width >= Self.compactMeterWidth } action: { compactMeterFits = $0 }
         .overlay(alignment: .trailing) {
           if compactMeterFits {
-            UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, style: .compact)
+            // Collapsed strips always show channels 1–2.
+            UILiveAudioMeter(cameraID: camera.id, name: camera.name, audio: camera.audio, style: .compact, channels: .two)
           }
         }
       if camera.stripState == .finishing {
@@ -1316,6 +1319,12 @@ struct UIChannelStripView: View {
       .font(.uiRow)
       .accessibilityElement(children: .combine)
       .help(camera.formatFallback.map { "\($0). \(camera.formatHelp)" } ?? word)
+      // A take that ended early keeps Details collapsed too: it says why and acknowledges the take (J34).
+      if camera.stripState == .failed, !camera.diskFull {
+        Button("Details") { context.send(.acknowledgeStop(cameraID: camera.id)) }
+          .controlSize(.small).fixedSize()
+          .accessibilityLabel("Details for \(camera.name)")
+      }
     }
   }
 }
@@ -1334,6 +1343,8 @@ struct UIEffectsMenu: View {
       .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 7))
       .help("Effects change the format meeting apps receive; the video updates briefly. ⇧⌘B turns them all off.")
   }
+
+  private var effectsWord: String { camera.processing ? "Effects" : "Effects Off" }
 
   private var menu: some View {
     Menu {
@@ -1377,7 +1388,9 @@ struct UIEffectsMenu: View {
     } label: {
       // One Text with the symbol inside it: a borderless menu names its button after a
       // separate image view ("hdr" for this one), and the words are the name.
-      Text("\(Image(systemName: camera.processing ? UISymbol.effects : UISymbol.effectsOff)) \(camera.processing ? "Effects" : "Effects Off")")
+      // The gap after the symbol is kerning, not a space, so the name has no stray leading
+      // character. Any modifier on this label makes the menu host a view, which loops layout.
+      Text("\(Text(Image(systemName: camera.processing ? UISymbol.effects : UISymbol.effectsOff)).kerning(5))\(effectsWord)")
     }
     // Borderless keeps the items reachable by VoiceOver and the keyboard.
     .menuStyle(.borderlessButton)

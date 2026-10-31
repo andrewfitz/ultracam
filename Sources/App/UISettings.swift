@@ -2,37 +2,204 @@ import AppKit
 import ServiceManagement
 import SwiftUI
 
-/// Settings window (⌘,): General, Recording, Camera, Switcher, Monitor, Advanced.
-/// Settings change app-wide state, so these panes work on the models directly.
-struct UISettingsView: View {
-  let model: AppModel
-  let interface: UIInterfaceState
+/// Settings' sections, one native toolbar tab each, in this order. The raw value is saved
+/// (`UIInterfaceState.settingsTab`), so Settings reopens where it was left.
+enum UISettingsTab: String, CaseIterable, Identifiable, Sendable {
+  case general, hardware, virtualCameras, recording, audio, switching, alerts, advanced
 
-  var body: some View {
-    TabView {
-      UISettingsGeneralPane(model: model, interface: interface)
-        .tabItem { Label("General", systemImage: "gearshape") }
-      UISettingsRecordingPane(model: model)
-        .tabItem { Label("Recording", systemImage: "record.circle") }
-      UISettingsCameraPane(model: model)
-        .tabItem { Label("Camera", systemImage: "video") }
-      UISettingsSwitcherPane(model: model)
-        .tabItem { Label("Switcher", systemImage: "tv") }
-      UISettingsMonitorPane()
-        .tabItem { Label("Monitor", systemImage: "waveform.path.ecg") }
-      UISettingsAdvancedPane(model: model)
-        .tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .general: return "General"
+    case .hardware: return "Hardware"
+    case .virtualCameras: return "Virtual Cameras"
+    case .recording: return "Recording"
+    case .audio: return "Audio"
+    case .switching: return "Switching"
+    case .alerts: return "Alerts"
+    case .advanced: return "Advanced"
     }
-    // Each pane sets its own height, so the window resizes to fit the tab like other Settings windows.
-    .frame(width: 640)
+  }
+
+  /// A "Settings › Audio" link in text: `ultracam-settings:audio`.
+  static let linkScheme = "ultracam-settings"
+
+  static func linked(_ url: URL) -> UISettingsTab? {
+    guard url.scheme == linkScheme else { return nil }
+    return UISettingsTab(rawValue: url.absoluteString.dropFirst(linkScheme.count + 1).trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+  }
+
+  var symbol: String {
+    switch self {
+    case .general: return UISymbol.settings
+    case .hardware: return UISymbol.input
+    case .virtualCameras: return UISymbol.virtualCamera(inUse: true)
+    case .recording: return UISymbol.record
+    case .audio: return UISymbol.audio
+    case .switching: return UISymbol.cut
+    case .alerts: return UISymbol.alerts
+    case .advanced: return UISymbol.advancedSettings
+    }
   }
 }
 
-private struct UISettingsFootnote: View {
+/// Settings window (⌘,). Settings change app-wide state, so the panes work on the models
+/// directly. Each pane is as tall as its content, up to the screen, so the window resizes
+/// between tabs and a long pane scrolls.
+struct UISettingsView: View {
+  let model: AppModel
+  @Bindable var interface: UIInterfaceState
+  var shortcuts: UIBackgroundShortcuts = UIAppEnvironment.backgroundShortcuts
+  var alerts: UIAlertPreferences = UIAppEnvironment.alertPreferences
+
+  var body: some View {
+    TabView(selection: $interface.settingsTab) {
+      ForEach(UISettingsTab.allCases) { tab in
+        pane(tab)
+          .tabItem { Label(tab.title, systemImage: tab.symbol) }
+          .tag(tab)
+      }
+    }
+    .frame(width: UISettingsLayout.width)
+  }
+
+  @ViewBuilder private func pane(_ tab: UISettingsTab) -> some View {
+    switch tab {
+    case .general: UISettingsGeneralPane(model: model, interface: interface, shortcuts: shortcuts)
+    case .hardware: UISettingsHardwarePane(model: model)
+    case .virtualCameras: UISettingsVirtualCamerasPane(model: model)
+    case .recording: UISettingsRecordingPane(model: model)
+    case .audio: UISettingsAudioPane(model: model, interface: interface)
+    case .switching: UISettingsSwitchingPane(model: model)
+    case .alerts: UISettingsAlertsPane(model: model, interface: interface, preferences: alerts)
+    case .advanced: UISettingsAdvancedPane(model: model)
+    }
+  }
+}
+
+enum UISettingsLayout {
+  /// Wide enough for the eight tabs.
+  static let width: CGFloat = 820
+  static let minimumHeight: CGFloat = 200
+  /// Until a pane has measured its content.
+  static let initialHeight: CGFloat = 460
+  /// Room for the title bar, the tabs and the Dock.
+  @MainActor static var maximumHeight: CGFloat { max(minimumHeight, (NSScreen.main?.visibleFrame.height ?? 900) - 120) }
+
+  /// A pane's height for its measured content: all of it, up to the screen.
+  @MainActor static func height(content: CGFloat?, extra: CGFloat = 0) -> CGFloat {
+    guard let content, content > 0 else { return initialHeight }
+    return min(max((content + extra).rounded(.up), minimumHeight), maximumHeight)
+  }
+}
+
+/// One tab: a grouped form, as tall as what it holds. A pane may end with one action at the
+/// bottom trailing edge, outside any section (Restore Defaults).
+struct UISettingsPane<Content: View, Trailing: View>: View {
+  let content: Content
+  let trailing: Trailing
+  @State private var contentHeight: CGFloat?
+
+  init(@ViewBuilder content: () -> Content) where Trailing == EmptyView {
+    self.content = content()
+    trailing = EmptyView()
+  }
+
+  init(@ViewBuilder content: () -> Content, @ViewBuilder trailing: () -> Trailing) {
+    self.content = content()
+    self.trailing = trailing()
+  }
+
+  private var hasTrailing: Bool { Trailing.self != EmptyView.self }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      Form { content }
+        .formStyle(.grouped)
+        .scrollBounceBehavior(.basedOnSize)
+        .onScrollGeometryChange(for: CGFloat.self) { geometry in
+          geometry.contentSize.height + geometry.contentInsets.top + geometry.contentInsets.bottom
+        } action: { _, height in
+          if height != contentHeight { contentHeight = height }
+        }
+      if hasTrailing {
+        HStack {
+          Spacer()
+          trailing
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 16)
+      }
+    }
+    .frame(height: UISettingsLayout.height(content: contentHeight, extra: hasTrailing ? 36 : 0))
+  }
+}
+
+/// A section's one sentence, under it.
+struct UISettingsFootnote: View {
   let text: String
   init(_ text: String) { self.text = text }
   var body: some View {
-    Text(text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    Text(text).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+  }
+}
+
+/// Anything longer than a sentence: an ⓘ beside the row or header that opens it.
+struct UISettingsInfoButton: View {
+  let title: String
+  let text: String
+  @State private var shown = false
+
+  var body: some View {
+    Button { shown.toggle() } label: { Image(systemName: UISymbol.information) }
+      .buttonStyle(.borderless)
+      .frame(width: 24, height: 24)
+      .help(title)
+      .accessibilityLabel("About \(title)")
+      .popover(isPresented: $shown, arrowEdge: .trailing) {
+        VStack(alignment: .leading, spacing: 6) {
+          Text(title).font(.uiRowEmphasis)
+          Text(text).font(.uiRow).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        }
+        .padding(12)
+        .frame(width: 320, alignment: .leading)
+      }
+  }
+}
+
+/// A section header with an info button at its trailing edge.
+struct UISettingsHeader: View {
+  let title: String
+  var info: String?
+
+  init(_ title: String, info: String? = nil) {
+    self.title = title
+    self.info = info
+  }
+
+  var body: some View {
+    HStack {
+      Text(title)
+      Spacer(minLength: 4)
+      if let info { UISettingsInfoButton(title: title, text: info) }
+    }
+  }
+}
+
+/// A row that opens another tab: "Settings › Recording" on another surface, in place.
+struct UISettingsLink: View {
+  let tab: UISettingsTab
+  var title: String?
+  @Environment(\.openSettings) private var openSettings
+
+  var body: some View {
+    Button(title ?? "Settings › \(tab.title)") {
+      UIAppEnvironment.interface.settingsTab = tab
+      openSettings()
+    }
+    .buttonStyle(.link)
+    .help("Open Settings at \(tab.title)")
   }
 }
 
@@ -41,9 +208,8 @@ private struct UISettingsFootnote: View {
 struct UISettingsGeneralPane: View {
   @Bindable var model: AppModel
   let interface: UIInterfaceState
-  @AppStorage("ui.layout") private var defaultLayout = UILayout.sideBySide.rawValue
-  /// "collapsed" or "expanded"; the app reads it when a new camera is added.
-  @AppStorage("ui.collapsed.default") private var stripDensity = "expanded"
+  @Bindable var shortcuts: UIBackgroundShortcuts
+  @AppStorage(UIInterfaceState.askBeforeEndingKey) private var askBeforeEnding = true
   @State private var loginStatus = SMAppService.mainApp.status
   @State private var loginError: String?
 
@@ -52,13 +218,13 @@ struct UISettingsGeneralPane: View {
   }
 
   var body: some View {
-    Form {
+    UISettingsPane {
       Section {
         Picker("Show Ultracam in", selection: showInDock) {
           Text("Dock and menu bar").tag(true)
           Text("Menu bar when closed").tag(false)
         }
-        .help("Menu bar when closed: Ultracam is in the Dock, with its menus, while a window is open, and only in the menu bar once you close them; open it again from the menu bar. Closing the window never stops capture, camera output or recording.")
+        .help("Menu bar when closed: Ultracam is in the Dock while a window is open, and only in the menu bar once you close them. Closing the window never stops capture, camera output or recording.")
         Toggle("Open Ultracam at login", isOn: Binding(
           get: { loginStatus == .enabled || loginStatus == .requiresApproval },
           set: { setOpenAtLogin($0) }))
@@ -67,48 +233,58 @@ struct UISettingsGeneralPane: View {
           LabeledContent {
             Button("Open System Settings") { SMAppService.openSystemSettingsLoginItems() }
           } label: {
-            Text("Needs approval")
+            Label { Text("Needs approval") } icon: {
+              Image(systemName: UISymbol.warning).foregroundStyle(.orange)
+            }
             Text("System Settings › General › Login Items & Extensions")
           }
         }
         if let loginError {
           Label { Text(loginError).foregroundStyle(.secondary) } icon: {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Image(systemName: UISymbol.warning).foregroundStyle(.orange)
           }
-          .font(.callout)
+          .font(.uiRow)
+        }
+        Toggle(isOn: $askBeforeEnding) {
+          Text("Ask before ending a recording or on-air video")
+          Text("Covers Stop All Recordings and Quit. Plain ⌘R on one camera stays unprompted.")
         }
       } header: { Text("App") } footer: {
-        UISettingsFootnote("Quitting waits for active recordings to finish writing. The menu bar icon shows a dot while recording and a triangle when something needs attention.")
+        UISettingsFootnote("Quitting waits for active recordings to finish writing.")
       }
 
       Section {
-        Picker("Layout", selection: $defaultLayout) {
-          ForEach(UILayout.allCases, id: \.rawValue) { layout in
-            Text(layout.title).tag(layout.rawValue)
-          }
+        Toggle(isOn: $shortcuts.enabled) {
+          Text("Use background shortcuts")
+          Text("They work while another app is in front. No Accessibility permission needed.")
         }
-        .onChange(of: defaultLayout) { _, rawValue in
-          if let layout = UILayout(rawValue: rawValue), layout != .programView || model.programAvailable {
-            interface.layout = layout
-          }
+        if shortcuts.enabled {
+          shortcutRow("Cut to Camera 1 to 7", key: "⌃⌥⌘1 to ⌃⌥⌘7",
+            unavailable: shortcuts.unavailable.contains { if case .cut = $0 { return true }; return false })
+          shortcutRow("Auto", key: UIBackgroundShortcut.auto.title, unavailable: shortcuts.unavailable.contains(.auto))
+          shortcutRow("Hold", key: UIBackgroundShortcut.hold.title, unavailable: shortcuts.unavailable.contains(.hold))
+          shortcutRow("Record", detail: "Starts a recording. Never stops one, so a stray chord can’t end a take.",
+            key: UIBackgroundShortcut.record.title, unavailable: shortcuts.unavailable.contains(.record))
         }
-        .help("The main window's layout; the same as View › Layout. Program View needs two or more cameras.")
-        Picker("New camera strips", selection: $stripDensity) {
-          Text("Expanded").tag("expanded")
-          Text("Collapsed").tag("collapsed")
-        }
-        .pickerStyle(.segmented)
-        .help("How a newly added camera's strip starts. Collapse or expand any strip at any time (⌥⌘S collapses all).")
-      } header: {
-        Text("Window")
-      } footer: {
-        UISettingsFootnote("Hide any camera's picture from its menu or with ⇧⌘P. Hidden previews do no rendering work.")
-      }
+      } header: { Text("Background Shortcuts") }
     }
-    .formStyle(.grouped)
-    .scrollBounceBehavior(.basedOnSize)
-    .frame(height: 400)
     .onAppear { loginStatus = SMAppService.mainApp.status }
+  }
+
+  private func shortcutRow(_ title: String, detail: String? = nil, key: String, unavailable: Bool) -> some View {
+    LabeledContent {
+      HStack(spacing: 8) {
+        if unavailable {
+          Label("In use by another app", systemImage: UISymbol.warning)
+            .labelStyle(.titleAndIcon).foregroundStyle(.secondary)
+            .symbolRenderingMode(.multicolor)
+        }
+        UIKeycap(key)
+      }
+    } label: {
+      Text(title)
+      if let detail { Text(detail) }
+    }
   }
 
   private func setOpenAtLogin(_ enabled: Bool) {
@@ -122,201 +298,50 @@ struct UISettingsGeneralPane: View {
   }
 }
 
-// MARK: - Recording
-
-struct UISettingsRecordingPane: View {
-  let model: AppModel
-  @State private var showingRecovery = false
-
+/// A key combination on a keycap chip, in Help and Settings. The system font draws ⌘ ⇧ ⌥ ⌃
+/// at full size, as menus do; SF Mono shrinks them.
+struct UIKeycap: View {
+  let key: String
+  init(_ key: String) { self.key = key }
   var body: some View {
-    let recording = model.recordingModel
-    let source = model.liveCameraUpdate(model.selectedFeedID)?.sourceFormat
-    let availableCodecs = source.map { RecordingCodec.available(for: $0) } ?? RecordingCodec.allCases
-    let codec = Binding(get: { recording.codec }, set: { recording.codec = $0 })
-    let timecode = Binding(get: { recording.timecodeMode }, set: { recording.timecodeMode = $0 })
-    let folder = recording.outputFolder
-    let drive = UIRecordingLibrary.drives(for: [folder], recordingRates: [],
-      fallbackMegabits: UIRecordingLibrary.displayMegabits(codec: recording.codec)).first
-    Form {
-      Section {
-        LabeledContent("Default folder") {
-          HStack {
-            Text(folder.map { ($0.path as NSString).abbreviatingWithTildeInPath } ?? "None")
-              .lineLimit(1).truncationMode(.middle)
-              .foregroundStyle(folder == nil ? .secondary : .primary)
-              .textSelection(.enabled)
-            Button(folder == nil ? "Choose…" : "Change…") { UIPanels.chooseFolder(model: model, cameraID: nil) }
-            if let folder {
-              Button { NSWorkspace.shared.activateFileViewerSelecting([folder]) } label: { Image(systemName: "magnifyingglass") }
-                .help("Show in Finder").accessibilityLabel("Show default folder in Finder")
-              Button("Clear") { recording.outputFolder = nil }
-            }
-          }
-        }
-        if let drive {
-          VStack(alignment: .leading, spacing: 4) {
-            HStack {
-              Text(drive.name)
-              Spacer()
-              Text(driveSummary(drive)).foregroundStyle(.secondary).monospacedDigit()
-            }
-            .font(.callout)
-            ProgressView(value: usedFraction(drive))
-              .accessibilityLabel("\(drive.name) space used")
-          }
-        }
-      } header: { Text("Destination") } footer: {
-        UISettingsFootnote("Folder changes apply to the next take. Read/write access is remembered between launches.")
-      }
-
-      Section("Per-Camera Folders") {
-        ForEach(model.feedDescriptors) { descriptor in
-          LabeledContent(descriptor.name) {
-            HStack {
-              if let custom = recording.customOutputFolder(for: descriptor.id) {
-                Text((custom.path as NSString).abbreviatingWithTildeInPath).lineLimit(1).truncationMode(.middle)
-                Button("Change…") { UIPanels.chooseFolder(model: model, cameraID: descriptor.id) }
-                Button("Use Default Folder") { recording.setOutputFolder(nil, for: descriptor.id) }
-              } else {
-                Text("Default folder").foregroundStyle(.secondary)
-                Button("Choose…") { UIPanels.chooseFolder(model: model, cameraID: descriptor.id) }
-              }
-            }
-          }
-        }
-      }
-
-      Section {
-        Picker("Codec", selection: codec) {
-          if !availableCodecs.contains(recording.codec) {
-            Text("\(recording.codec.title) (unavailable for this source)").tag(recording.codec).disabled(true)
-          }
-          ForEach(availableCodecs, id: \.self) { Text($0.title).tag($0) }
-        }
-        Picker("Timecode", selection: timecode) {
-          ForEach(RecordingTimecodeMode.allCases, id: \.self) { Text(UITimecode.title($0)).tag($0) }
-        }
-        .help(recording.timecodeMode.help)
-        LabeledContent("File names") {
-          Text(fileNamePreview).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-        }
-      } header: { Text("Format") } footer: {
-        UISettingsFootnote("Records the camera original. Available codecs follow the selected camera’s detected source format; each take validates its own source before recording. LUT and effects are not baked in. "
-          + recording.timecodeMode.help)
-      }
-
-      Section {
-        Toggle(isOn: .constant(false)) {
-          VStack(alignment: .leading, spacing: 2) {
-            Text("Backup recording with camera apps")
-            Text("Coming later").font(.caption).foregroundStyle(.secondary)
-          }
-        }
-        .disabled(true)
-      } header: { Text("Automation") } footer: {
-        UISettingsFootnote("When available: a backup take starts after 10 seconds of continuous camera use, and only takes it started stop automatically when the last camera app closes.")
-      }
-
-      Section {
-        LabeledContent("Interrupted takes") {
-          HStack {
-            Text(recording.interruptedRecordings.isEmpty ? "None found in saved folders"
-              : "\(recording.interruptedRecordings.count) found").foregroundStyle(.secondary)
-            Button("Recover Interrupted Takes…") { showingRecovery = true }
-              .disabled(recording.interruptedRecordings.isEmpty)
-          }
-        }
-        if let message = recording.recoveryMessage {
-          Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-        }
-      } header: { Text("Crash Recovery") } footer: {
-        UISettingsFootnote("Takes are always written as fragmented QuickTime movies. The first fragment is written after 1 s, then every 10 s. Hidden .partial files and journals sit beside each take until it finishes. Recovery copies complete fragments into a separate _Recovered.mov without re-encoding and keeps the original.")
-      }
-    }
-    .formStyle(.grouped)
-    .scrollBounceBehavior(.basedOnSize)
-    .frame(height: 700)
-    .sheet(isPresented: $showingRecovery) { UISettingsRecoverySheet(model: model) }
-  }
-
-  private var fileNamePreview: String {
-    let name = model.feedDescriptors.first?.name ?? "Camera 1"
-    let formatter = DateFormatter()
-    formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-    return "\(name)/\(name)_\(formatter.string(from: Date()))_001.mov"
-  }
-
-  private func usedFraction(_ drive: UIDrive) -> Double {
-    guard drive.totalBytes > 0 else { return 0 }
-    return min(1, max(0, 1 - Double(drive.availableBytes) / Double(drive.totalBytes)))
-  }
-
-  private func driveSummary(_ drive: UIDrive) -> String {
-    var parts = ["\(UIFormat.bytes(drive.availableBytes)) free"]
-    if let seconds = drive.secondsLeft { parts.append("about \(UIFormat.duration(seconds)) per camera") }
-    return parts.joined(separator: " · ")
+    Text(key).font(.body).padding(.horizontal, 6).frame(minHeight: 20)
+      .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 5))
   }
 }
 
-private struct UISettingsRecoverySheet: View {
-  let model: AppModel
-  @Environment(\.dismiss) private var dismiss
+// MARK: - Virtual Cameras
 
-  var body: some View {
-    let recording = model.recordingModel
-    VStack(alignment: .leading, spacing: 12) {
-      Text("Interrupted Takes").font(.headline)
-      if recording.interruptedRecordings.isEmpty {
-        Text("No interrupted takes were found in the saved folders.").foregroundStyle(.secondary)
-      }
-      ForEach(recording.interruptedRecordings) { take in
-        HStack {
-          Text(take.title).lineLimit(1).truncationMode(.middle)
-          Spacer()
-          if recording.recoveringID == take.id { ProgressView().controlSize(.small) }
-          Button("Recover") { recording.recover(take) }.disabled(recording.recoveringID != nil)
-        }
-      }
-      if let url = recording.recoveredURL {
-        Button("Show Recovered Movie in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-      }
-      HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
-    }
-    .padding(20)
-    .frame(width: 460)
-  }
-}
-
-// MARK: - Camera
-
-struct UISettingsCameraPane: View {
+struct UISettingsVirtualCamerasPane: View {
   let model: AppModel
   /// The installer's status before any request; the footer shows only what a request reported since.
   private static let readyStatus = ExtensionInstallPreflight.current().readyStatus
 
   var body: some View {
     let installer = model.installer
-    let needsApproval = installer.status.localizedCaseInsensitiveContains("approve")
-    Form {
-      Section {
-        Toggle("Sync cameras", isOn: Binding(get: { model.syncCameras }, set: { model.setSyncCameras($0) }))
-        Text("Enabled cameras share processing and monitor effect edits. Turning this on copies the selected camera’s effects. Inputs and recording folders stay separate. Source declarations and calibration remain camera-specific.")
-          .font(.caption).foregroundStyle(.secondary)
-      }
+    let state = UISettingsExtensionState(installer: installer, published: UIExtensionDetector.isInstalled())
+    let locked = !installer.canRequestChanges || installer.pending || model.running
+    UISettingsPane {
       Section {
         LabeledContent {
-          HStack {
+          HStack(spacing: 8) {
             if installer.pending { ProgressView().controlSize(.small) }
-            Button(installer.system?.outdated == true ? "Update Camera Extension…" : "Install Camera Extension…") { installer.install() }
-            Button("Remove Camera Extension…") { installer.uninstall() }
+            switch state.action {
+            case .install, .update:
+              Button(state.action == .update ? "Update Camera Extension…" : "Install Camera Extension…") { installer.install() }
+                .disabled(locked)
+                .help(installHelp)
+            case .none:
+              if let version = state.version { Text("Version \(version)").foregroundStyle(.secondary).monospacedDigit() }
+            }
           }
-          .disabled(!installer.canRequestChanges || installer.pending || model.running)
-          .help(installHelp)
         } label: {
-          Text("Ultracam camera")
-          Text(extensionStatus(needsApproval: needsApproval))
+          Label { Text(state.title) } icon: {
+            Image(systemName: state.symbol).foregroundStyle(state.color)
+          }
+          // A request's result sits beside the control until the state changes, never in the footer.
+          if let result = requestResult(needsApproval: state.needsApproval) { Text(result) }
         }
-        if needsApproval {
+        if state.needsApproval {
           LabeledContent {
             Button("Open System Settings") {
               if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
@@ -324,60 +349,43 @@ struct UISettingsCameraPane: View {
               }
             }
           } label: {
-            Label { Text("Needs approval") } icon: {
-              Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
-            }
             Text("System Settings › General › Login Items & Extensions › Camera Extensions")
           }
         }
+        if state.removable {
+          LabeledContent("Remove the extension") {
+            Button("Remove Camera Extension…") { installer.uninstall() }
+              .disabled(locked)
+              .help(installHelp)
+          }
+        }
       } header: { Text("Camera Extension") } footer: {
-        UISettingsFootnote(extensionFooter(needsApproval: needsApproval))
+        UISettingsFootnote(extensionFooter(needsApproval: state.needsApproval))
       }
 
       Section {
-        if model.programAvailable {
-          LabeledContent("Ultracam · Program") { Text(model.programInUse ? "In use" : model.programClientUnknown ? "Use unknown" : "Not in use").foregroundStyle(.secondary) }
+        Picker(selection: Binding(get: { model.programColorSpaceID }, set: { model.setProgramColorSpace($0) })) {
+          ForEach(UIProgramColor.choices, id: \.id) { Text($0.title).tag($0.id) }
+        } label: {
+          Text("Program color")
+          Text("The color space Ultracam · Program sends")
         }
-        ForEach(model.feedDescriptors.filter(\.enabled)) { descriptor in
-          LabeledContent("Ultracam · \(descriptor.name)") {
-            Text(model.cameraInUse(descriptor.id) ? "In use" : model.cameraClientUnknown(descriptor.id) ? "Use unknown" : "Not in use").foregroundStyle(.secondary)
-          }
-        }
-      } header: { Text("Published Cameras") } footer: {
-        UISettingsFootnote("Every camera is published, plus Ultracam · Program with two or more. A camera does no work for one nobody is using. Meeting apps may need a restart to list a new camera.")
-      }
+      } header: { Text("Program") }
     }
-    .formStyle(.grouped)
-    .scrollBounceBehavior(.basedOnSize)
-    .frame(height: 430)
   }
 
-  /// A short state under "Ultracam camera"; the footer carries the long explanation.
-  private func extensionStatus(needsApproval: Bool) -> String {
+  /// The last request's result, while it says something the status line doesn't.
+  private func requestResult(needsApproval: Bool) -> String? {
     let installer = model.installer
-    if installer.unavailableReason != nil { return "Needs a signed build" }
-    if installer.pending { return "Waiting for macOS…" }
-    if needsApproval || (installer.system?.awaitingApproval == true && installer.system?.enabled == false) { return "Needs approval" }
-    let published = UIExtensionDetector.isInstalled()
-    if let system = installer.system, system.enabled {
-      // Enabled but not started (after an update, until a restart): installing again wouldn't help.
-      if system.outdated, let installed = system.enabledVersion, let bundled = system.bundledVersion {
-        return "Version \(installed) installed · \(bundled) available"
-      }
-      return published ? "Installed" : "Restart your Mac to finish installing"
-    }
-    return published ? "Installed" : "Not installed"
+    guard installer.unavailableReason == nil, !needsApproval, !installer.pending,
+      installer.status != Self.readyStatus else { return nil }
+    return installer.status
   }
 
+  /// One sentence; a reason it can't install replaces it, as that already says capture still works.
   private func extensionFooter(needsApproval: Bool) -> String {
-    let installer = model.installer
-    let general = "Installing and removing go through System Settings and are unavailable while a camera is running. Capture, preview and recording work without the extension."
-    // The approval row already shows where to approve; the reason or last result otherwise leads.
-    let detail = installer.unavailableReason
-      ?? (needsApproval || installer.pending || installer.status == Self.readyStatus ? nil : installer.status)
-    guard let detail else { return general }
-    // Reasons and failures already end with "Capture and preview still work."
-    return detail.localizedCaseInsensitiveContains("still work") ? detail : "\(detail) \(general)"
+    model.installer.unavailableReason
+      ?? "Installing and removing go through System Settings and are unavailable while a camera is running. Capture, preview and recording work without the extension."
   }
 
   private var installHelp: String {
@@ -388,83 +396,108 @@ struct UISettingsCameraPane: View {
   }
 }
 
-// MARK: - Switcher
+/// Program's three color spaces, by the catalog's IDs.
+enum UIProgramColor {
+  static let choices: [(id: String, title: String)] = [
+    ("rec709-video", "Rec.709"), ("rec2020-pq-video", "Rec.2020 PQ"), ("rec2020-hlg-video", "Rec.2020 HLG"),
+  ]
+}
 
-struct UISettingsSwitcherPane: View {
+/// The camera extension's one status line and which button its row offers.
+struct UISettingsExtensionState: Equatable {
+  enum Action: Equatable { case none, install, update }
+  var title: String
+  var symbol: String
+  var color: Color
+  var action: Action
+  /// Installed, or installed and waiting for a restart: Remove gets its own row.
+  var removable: Bool
+  var needsApproval = false
+  var version: String?
+
+  @MainActor init(installer: ExtensionInstaller, published: Bool) {
+    let system = installer.system
+    needsApproval = installer.status.localizedCaseInsensitiveContains("approve")
+      || (system?.awaitingApproval == true && system?.enabled == false)
+    version = system?.enabledVersion ?? system?.bundledVersion
+    if installer.unavailableReason != nil {
+      (title, symbol, color, action, removable) = ("Needs a signed build", UISymbol.warning, .orange, .install, false)
+    } else if installer.pending {
+      (title, symbol, color, action, removable) = ("Waiting for macOS…", UISymbol.waitingCamera, .secondary, .install, false)
+    } else if needsApproval {
+      (title, symbol, color, action, removable) = ("Needs approval", UISymbol.warning, .orange, .none, false)
+      version = nil
+    } else if let system, system.enabled {
+      if system.outdated, let installed = system.enabledVersion, let bundled = system.bundledVersion {
+        (title, symbol, color, action, removable) = ("\(installed) installed   \(bundled) available", UISymbol.updateExtension, .orange, .update, true)
+        version = nil
+      } else if published {
+        (title, symbol, color, action, removable) = ("Installed", UISymbol.saved, .green, .none, true)
+      } else {
+        // Enabled but not started until a restart: installing again wouldn't help.
+        (title, symbol, color, action, removable) = ("Restart your Mac to finish installing", UISymbol.restartNeeded, .orange, .none, true)
+        version = nil
+      }
+    } else if published {
+      (title, symbol, color, action, removable) = ("Installed", UISymbol.saved, .green, .none, true)
+    } else {
+      (title, symbol, color, action, removable) = ("Not installed", UISymbol.installExtension, .secondary, .install, false)
+      version = nil
+    }
+  }
+}
+
+// MARK: - Switching
+
+struct UISettingsSwitchingPane: View {
   let model: AppModel
   @State private var draft = NaturalTalkingHeadSettings()
-  @State private var interval = 8.0
+  @State private var interval = UISettingsSwitchingPane.defaultInterval
   @State private var loaded = false
+  @State private var advancedOpen = false
+  /// What Restore Defaults puts the fixed interval back to.
+  static let defaultInterval = 8.0
 
   var body: some View {
-    let strategy = Binding(get: { model.switcherSettings.strategy }, set: { model.setStrategy($0) })
-    let mode = Binding(get: { model.switcherSettings.naturalTalkingHead.mode }, set: { value in
-      draft.mode = value
-      commitDirector()
-    })
-    // Director mode, shot timing and cut decisions only drive Natural talking head;
-    // they stay visible but disabled under the other strategies.
-    let natural = model.switcherSettings.strategy == .naturalTalkingHead
-    Form {
-      Section {
-        Picker("Automatic strategy", selection: strategy) {
-          Text("Manual").tag(SwitcherStrategy.manual)
-          Text("Fixed interval").tag(SwitcherStrategy.fixedInterval)
-          Text("Natural talking head").tag(SwitcherStrategy.naturalTalkingHead)
-          Text("Dynamic analysis (Coming later)").tag(SwitcherStrategy.dynamicAnalysis).disabled(true)
-        }
-        if model.switcherSettings.strategy == .fixedInterval {
-          UISettingsSlider(title: "Fixed interval", value: $interval, range: 1...30, step: 0.5, unit: "s") { commitInterval() }
-        }
-        Picker("Director mode", selection: mode) {
-          Text("Low latency").tag(TalkingHeadDirectorMode.lowLatency)
-          Text("Transcript assisted").tag(TalkingHeadDirectorMode.transcriptAssisted)
-        }
-        .disabled(!natural)
-      } header: { Text("Strategy") } footer: {
-        UISettingsFootnote(natural
-          ? "Transcript assisted needs an external transcript source; without one it cuts on audio alone. Low latency cuts on audio cues without waiting for a transcript."
-          : "Director mode, shot timing and cut decisions are used by Natural talking head.")
+    UISettingsPane {
+      Section("Fixed Interval") {
+        UISettingsNumberRow(title: "Interval", value: $interval, range: 1...30, step: 0.5, unit: "s") { commitInterval() }
       }
 
       Section {
         UISettingsShotTimeline(minimum: draft.minimumShotDuration, softMaximum: draft.softMaximumShotDuration,
           maximum: draft.maximumShotDuration, grace: draft.forcedCutGracePeriod)
-        UISettingsSlider(title: "Minimum shot", value: $draft.minimumShotDuration, range: 10...60, step: 1, unit: "s") { commitDirector() }
-        UISettingsSlider(title: "Soft maximum", value: $draft.softMaximumShotDuration, range: 10...120, step: 1, unit: "s") { commitDirector() }
-        UISettingsSlider(title: "Maximum shot", value: $draft.maximumShotDuration, range: 10...180, step: 1, unit: "s") { commitDirector() }
-        UISettingsSlider(title: "Cooldown", value: $draft.cooldown, range: 0...10, step: 0.5, unit: "s") { commitDirector() }
-        UISettingsSlider(title: "Emphasis hold", value: $draft.emphasisHold, range: 0...30, step: 0.5, unit: "s") { commitDirector() }
-        UISettingsSlider(title: "Forced-cut grace", value: $draft.forcedCutGracePeriod, range: 0...10, step: 0.5, unit: "s") { commitDirector() }
-      } header: { Text("Shot Timing") } footer: {
-        if !natural { UISettingsFootnote("Used by Natural talking head.") }
+        UISettingsNumberRow(title: "Minimum shot", value: $draft.minimumShotDuration, range: 10...60, step: 1, unit: "s") { commitDirector() }
+        UISettingsNumberRow(title: "Soft maximum", value: $draft.softMaximumShotDuration, range: 10...120, step: 1, unit: "s") { commitDirector() }
+        UISettingsNumberRow(title: "Maximum shot", value: $draft.maximumShotDuration, range: 10...180, step: 1, unit: "s") { commitDirector() }
+        UISettingsNumberRow(title: "Cooldown", value: $draft.cooldown, range: 0...10, step: 0.5, unit: "s") { commitDirector() }
+        UISettingsNumberRow(title: "Emphasis hold", value: $draft.emphasisHold, range: 0...30, step: 0.5, unit: "s") { commitDirector() }
+        UISettingsNumberRow(title: "Forced-cut grace", value: $draft.forcedCutGracePeriod, range: 0...10, step: 0.5, unit: "s") { commitDirector() }
+      } header: {
+        UISettingsHeader("Natural Talking Head", info: "Before the minimum shot nothing cuts. Cuts are allowed after it, encouraged after the soft maximum, and forced within the grace after the maximum. Strategy, Anchor, Emphasis and Hold are in the toolbar's Auto menu.")
       }
-      .disabled(!natural)
 
       Section {
-        DisclosureGroup("Advanced cut decisions") {
+        DisclosureGroup("Advanced cut decisions", isExpanded: $advancedOpen) {
           UISettingsSlider(title: "Cut threshold", value: floatBinding(\.cutThreshold), range: 0...1, step: 0.01, unit: "") { commitDirector() }
           UISettingsSlider(title: "Hysteresis margin", value: floatBinding(\.hysteresisMargin), range: 0...1, step: 0.01, unit: "") { commitDirector() }
-          UISettingsSlider(title: "Transcript confidence", value: floatBinding(\.transcriptConfidenceThreshold), range: 0...1, step: 0.01, unit: "") { commitDirector() }
-          UISettingsSlider(title: "Pause boundary", value: $draft.pauseBoundaryDuration, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
-          UISettingsSlider(title: "Boundary window", value: $draft.boundaryWindow, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
-          UISettingsSlider(title: "Candidate dwell", value: $draft.candidateDwell, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
-          UISettingsSlider(title: "Forced boundary lookback", value: $draft.forcedBoundaryLookback, range: 0...5, step: 0.1, unit: "s") { commitDirector() }
-          UISettingsSlider(title: "Transcript output delay", value: $draft.transcriptOutputDelay, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
-        }
-        .disabled(!natural)
-        // Restores the fixed interval too, so it stays available under every strategy.
-        HStack {
-          Spacer()
-          Button("Restore Defaults") { restoreDefaults() }
+          UISettingsNumberRow(title: "Pause boundary", value: $draft.pauseBoundaryDuration, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
+          UISettingsNumberRow(title: "Boundary window", value: $draft.boundaryWindow, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
+          UISettingsNumberRow(title: "Candidate dwell", value: $draft.candidateDwell, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
+          UISettingsNumberRow(title: "Forced boundary lookback", value: $draft.forcedBoundaryLookback, range: 0...5, step: 0.1, unit: "s") { commitDirector() }
+          // Nothing feeds the director a transcript yet, so these do nothing until a source exists (B14).
+          if NaturalTalkingHeadSettings.transcriptSourceAvailable {
+            UISettingsSlider(title: "Transcript confidence", value: floatBinding(\.transcriptConfidenceThreshold), range: 0...1, step: 0.01, unit: "") { commitDirector() }
+            UISettingsNumberRow(title: "Transcript output delay", value: $draft.transcriptOutputDelay, range: 0...2, step: 0.01, unit: "s") { commitDirector() }
+          }
         }
       } footer: {
         UISettingsFootnote("Decisions apply at Program frame boundaries. A timeline sidecar is written to the recording folder.")
       }
+    } trailing: {
+      // Restores the fixed interval too.
+      Button("Restore Defaults") { restoreDefaults() }
     }
-    .formStyle(.grouped)
-    .scrollBounceBehavior(.basedOnSize)
-    .frame(height: 660)
     .onAppear {
       guard !loaded else { return }
       loaded = true
@@ -486,6 +519,7 @@ struct UISettingsSwitcherPane: View {
     next.anchorFeedID = current.anchorFeedID
     next.emphasisFeedID = current.emphasisFeedID
     next.manualHold = current.manualHold
+    next.mode = current.mode
     guard next != current else { return }
     settings.naturalTalkingHead = next
     model.updateSwitcher(settings)
@@ -499,16 +533,61 @@ struct UISettingsSwitcherPane: View {
   }
 
   private func restoreDefaults() {
-    var defaults = NaturalTalkingHeadSettings()
-    defaults.mode = draft.mode
-    draft = defaults
-    interval = 8
+    draft = NaturalTalkingHeadSettings()
+    interval = Self.defaultInterval
     commitDirector()
     commitInterval()
   }
 }
 
-/// A slider that reports its value live but commits only when editing ends.
+/// A number typed into a field or stepped, with its unit: shot limits and the other seconds.
+/// Commits on Return, on leaving the field and on each step. While editing, the row says the range.
+struct UISettingsNumberRow: View {
+  let title: String
+  @Binding var value: Double
+  let range: ClosedRange<Double>
+  let step: Double
+  let unit: String
+  let onCommit: () -> Void
+  @FocusState private var focused: Bool
+
+  private var digits: Int { step < 0.1 ? 2 : step < 1 ? 1 : 0 }
+
+  private var committed: Binding<Double> {
+    Binding(get: { value }, set: { newValue in
+      let stepped = (min(max(newValue, range.lowerBound), range.upperBound) / step).rounded() * step
+      guard stepped != value else { return }
+      value = stepped
+      onCommit()
+    })
+  }
+
+  var body: some View {
+    LabeledContent {
+      HStack(spacing: 4) {
+        TextField(title, value: committed, format: .number.precision(.fractionLength(digits)))
+          .labelsHidden()
+          .multilineTextAlignment(.trailing)
+          .monospacedDigit()
+          .frame(width: 56)
+          .focused($focused)
+        Text(unit).foregroundStyle(.secondary)
+        Stepper(title, value: committed, in: range, step: step).labelsHidden()
+      }
+    } label: {
+      Text(title)
+      if focused { Text("\(Self.number(range.lowerBound, digits: digits)) to \(Self.number(range.upperBound, digits: digits)) \(unit)") }
+    }
+    .accessibilityElement(children: .contain)
+  }
+
+  private static func number(_ value: Double, digits: Int) -> String {
+    value.formatted(.number.precision(.fractionLength(0...digits)))
+  }
+}
+
+/// A slider for a 0–1 scale, where exact values matter less. Reports its value live and
+/// commits once editing ends.
 struct UISettingsSlider: View {
   let title: String
   @Binding var value: Double
@@ -631,65 +710,20 @@ private struct UIShotTimelineLabels: Layout {
   }
 }
 
-// MARK: - Monitor
-
-/// Monitor tools are set per camera on its picture; this pane only explains them.
-struct UISettingsMonitorPane: View {
-  var body: some View {
-    Form {
-      Section {
-        Label("Each camera has its own guides, zebra, false color, focus peaking and scopes. Use the tool bar at the top right of its picture, or View › Monitor Tools.",
-          systemImage: "waveform.path.ecg")
-        Label("New cameras start with monitor tools off. Zebra starts at 95 IRE, and the picture shows the camera's output with its LUT.",
-          systemImage: "plus.rectangle.on.rectangle")
-        Label("Right-click a picture to copy its tools to another camera.", systemImage: "doc.on.doc")
-        Label("Monitor tools never change camera output or recordings.", systemImage: "checkmark.shield")
-      } header: { Text("Monitor Tools") } footer: {
-        VStack(alignment: .leading, spacing: 6) {
-          UISettingsFootnote("Six-band false color works with any source. Sony S-Log3 and ARRI LogC modes require the matching source declaration. Declare what the camera actually sends: declarations don't calibrate the capture device or change camera output.")
-          UISettingsFootnote("Every monitor shows every camera frame with its tools, on the GPU. Only a scope may skip an update while the GPU is still drawing earlier scopes. Hidden or covered monitors do no GPU work.")
-        }
-      }
-    }
-    .formStyle(.grouped)
-    .scrollBounceBehavior(.basedOnSize)
-    .frame(height: 360)
-  }
-}
-
 // MARK: - Advanced
 
 struct UISettingsAdvancedPane: View {
   @Bindable var model: AppModel
-  @Environment(\.openWindow) private var openWindow
   @State private var confirmForgetLUTs = false
-  @State private var copied = false
 
   var body: some View {
-    Form {
+    UISettingsPane {
       Section {
         Toggle("Allow CPU conversion (compatibility)", isOn: $model.allowCPUConversion)
-          .help("Allows system conversion only when the required GPU conversion route cannot be used. Metal 4 is still required.")
-      } header: { Text("Video compatibility") } footer: {
-        UISettingsFootnote("Off by default. Changes apply to the next capture session or recording take; active frames and takes keep their sampled policy. System conversion may use CPU or GPU internally. Compatibility conversion activity is shown on the camera and counted in diagnostics and take metadata.")
-      }
-
-      UISettingsDeviceSettings(model: model)
-
-      Section {
-        LabeledContent {
-          HStack {
-            Button("Open Diagnostics") { openWindow(id: "diagnostics") }
-            Button(copied ? "Copied" : "Copy Diagnostics") {
-              UIDiagnosticsText.copy(model: model)
-              copied = true
-            }
-          }
-        } label: {
-          Text("Drops per stage, audio, encoder and monitoring details")
-        }
-      } header: { Text("Diagnostics") } footer: {
-        UISettingsFootnote("Copy Diagnostics puts a plain-text summary on the clipboard for support. It has no image data.")
+      } header: {
+        UISettingsHeader("Video Compatibility", info: "Allows system conversion only when the required GPU conversion route can’t be used. Metal 4 is still required. It may use the CPU or GPU internally, and it’s shown on the camera and counted in diagnostics and take metadata.")
+      } footer: {
+        UISettingsFootnote("Applies to the next capture or take.")
       }
 
       Section {
@@ -697,7 +731,7 @@ struct UISettingsAdvancedPane: View {
           Button("Forget Saved LUTs…") { confirmForgetLUTs = true }
         } label: {
           Text("Saved LUT access")
-          Text("Read-only bookmarks for each camera's .cube files, burn-in and monitor").font(.caption).foregroundStyle(.secondary)
+          Text("Read-only bookmarks for each camera’s .cube files, burn-in and monitor")
         }
       } header: { Text("LUTs") } footer: {
         UISettingsFootnote("A missing LUT never blocks capture. The camera keeps its choice so it can be located again.")
@@ -715,23 +749,16 @@ struct UISettingsAdvancedPane: View {
         } label: {
           Text("Reset all settings")
           Text(model.canResetSettings ? "Cameras, effects, folders, monitor tools and layout"
-            : "Stop all cameras and let recordings finish first").font(.caption).foregroundStyle(.secondary)
+            : "Stop all cameras and let recordings finish first")
         }
       } header: { Text("Reset") } footer: {
-        UISettingsFootnote("Recordings are never touched. Reset asks for confirmation, then Ultracam quits so it starts fresh next time.")
+        UISettingsFootnote("Recordings are never touched. Reset asks first, then Ultracam quits so it starts fresh.")
       }
-    }
-    .formStyle(.grouped)
-    .scrollBounceBehavior(.basedOnSize)
-    .frame(height: 520)
-    // "Copied" confirms the copy briefly, then the button reads Copy Diagnostics again.
-    .task(id: copied) {
-      guard copied else { return }
-      try? await Task.sleep(for: .seconds(2))
-      copied = false
     }
     .confirmationDialog("Forget saved LUTs?", isPresented: $confirmForgetLUTs) {
       Button("Forget Saved LUTs", role: .destructive) { forgetLUTs() }
+      Button("Cancel", role: .cancel) {}
+        .keyboardShortcut(.defaultAction)
     } message: {
       Text("Each camera stops applying its saved LUT and its monitor LUT until you choose a .cube file again.")
     }
@@ -745,44 +772,5 @@ struct UISettingsAdvancedPane: View {
     for descriptor in model.feedDescriptors {
       UIMonitorLUTMenu.remove(cameraID: descriptor.id.rawValue, monitor: monitor)
     }
-  }
-}
-
-// MARK: - Plain-text diagnostics
-
-@MainActor
-enum UIDiagnosticsText {
-  static func summary(model: AppModel) -> String {
-    var lines = ["Ultracam diagnostics"]
-    if model.programAvailable {
-      lines.append("Program: \(model.programInUse ? "in use" : "not in use")")
-    }
-    for descriptor in model.feedDescriptors {
-      lines.append("")
-      lines.append("[\(descriptor.name)] \(model.isCameraRunning(descriptor.id) ? "running" : "stopped")")
-      if let update = model.cameraUpdate(descriptor.id) {
-        lines.append("Input: \(update.input)")
-        lines.append("Output: \(update.output.isEmpty ? "—" : update.output)")
-        lines.append(String(format: "Delivered: %.2f fps · processing %.2f ms · video %.2f Mb/s", update.outputFPS, update.processingMS, update.videoBitrateMbps))
-        lines.append("Drops: source \(update.sourceDrops), device \(update.deviceDrops), signal dropouts \(update.signalDropouts) (\(update.signalLostFrames) frames), buffers \(update.poolDrops), camera \(update.cameraDrops)")
-        lines.append("Audio: \(update.audioPresent ? "\(update.audioChannels) ch \(update.audioSampleRate) Hz" : "none") · drops \(update.audioDrops)")
-        lines.append("Message: \(update.message)")
-        lines.append("Camera: \(update.cameraMessage)")
-      }
-      if let state = model.recordingModel.feeds.first(where: { $0.id == descriptor.id }) {
-        lines.append("Recording: \(state.displayStatus)")
-        if let stats = state.statistics {
-          lines.append("Take: \(stats.elapsedText) · \(stats.sizeText) · dropped \(stats.droppedVideoFrames) · encoder errors \(stats.encoderErrors) · writer errors \(stats.writerErrors)")
-          if let error = stats.lastError { lines.append("Last error: \(error)") }
-        }
-        if let error = state.error { lines.append("Error: \(error)") }
-      }
-    }
-    return lines.joined(separator: "\n")
-  }
-
-  static func copy(model: AppModel) {
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(summary(model: model), forType: .string)
   }
 }
