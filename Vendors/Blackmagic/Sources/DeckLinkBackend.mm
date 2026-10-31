@@ -3103,6 +3103,25 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (device->edid.writes != 1 || device->edid.value != kAdvertisedDynamicRange || device->edid.references != 2 ||
       ![registry->diagnostics(@"decklink:000000001234abcd").hdmiDynamicRange isEqualToString:@"SDR · PQ · HLG"])
     return fail(error, @"Discovery did not advertise HDR in the HDMI EDID with the setting on.");
+  // The idle reader reads status and statistics only: never the connector, the EDID or an input.
+  const int64_t connectionBeforePoll = device->configuration.connection;
+  const auto callsBeforePoll = device->input.calls;
+  registry->refreshStatus();
+  registry->drain();
+  UCDeckLinkDeviceStatus *idle = registry->status(identifier);
+  if (!idle || idle.sessionActive || ![idle.busyElsewhere isEqual:@NO] || ![idle.signalLocked isEqual:@YES] ||
+      idle.detectedWidth != 3840 || idle.detectedHeight != 2160 || idle.temperatureCelsius != 47 ||
+      ![idle.model isEqualToString:@"UltraStudio Mini Recorder 12G"] || device->configuration.connection != connectionBeforePoll ||
+      device->edid.writes != 1 || device->input.calls != callsBeforePoll)
+    return fail(error, @"The idle status reader did more than read the device's status.");
+  device->status.busy = bmdDeviceCaptureBusy;
+  registry->refreshStatus();
+  registry->drain();
+  if (![registry->status(identifier).busyElsewhere isEqual:@YES])
+    return fail(error, @"The idle status reader missed a device another app holds.");
+  device->status.busy = 0;
+  registry->refreshStatus();
+  registry->drain();
 
   __block BOOL started = NO;
   __block NSError *startError = nil;
@@ -3118,6 +3137,12 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (device->edid.writes != 1 || device->edid.value != kAdvertisedDynamicRange || device->edid.references != 2 ||
       device->configuration.connection != bmdVideoConnectionHDMI || device->notification.subscriptions.size() != 2)
     return fail(error, @"Start wrote the EDID or did not hold the HDMI and notification leases.");
+  // With a session the device is not read: its session's counters stand in.
+  const auto callsInSession = device->input.calls;
+  registry->refreshStatus();
+  registry->drain();
+  if (!registry->status(identifier).sessionActive || device->input.calls != callsInSession)
+    return fail(error, @"The status reader read a device that has an Ultracam session.");
   if (![lastEvent() hasPrefix:@"Detected HDMI input: "] || ![lastEvent() containsString:@"29.97"] ||
       ![lastEvent() containsString:@"Rec.709 · SDR"])
     return fail(error, @"The directly opened mode was not announced with its colorimetry.");

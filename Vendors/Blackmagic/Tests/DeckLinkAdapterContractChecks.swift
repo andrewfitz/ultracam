@@ -4,6 +4,16 @@ import CoreMedia
 import CoreVideo
 
 @objcMembers final class DeckLinkAdapterContractChecks: XCTestCase {
+  func testDeviceInterfaceMapsToLinkAndTheMissingDeviceHintNamesTheHub() {
+    XCTAssertEqual(DeckLinkCapturePlugin.link(0x7468756E), .thunderbolt)
+    XCTAssertEqual(DeckLinkCapturePlugin.link(0x70636920), .pcie)
+    XCTAssertEqual(DeckLinkCapturePlugin.link(0x75736220), .usb)
+    XCTAssertEqual(DeckLinkCapturePlugin.link(0), .unknown)
+    // A unit that falls back to USB is never listed: the hint is the only symptom's answer.
+    let descriptor = DeckLinkCapturePlugin().descriptor
+    XCTAssertEqual(descriptor.missingDeviceHint?.contains("Thunderbolt hub"), true)
+    XCTAssertEqual(descriptor.missingDeviceHintKey, "decklink.descriptor.missingDevice")
+  }
   @MainActor func testReleasingDeviceObservationReleasesTokenAndHandler() async {
     final class Owner {}
     let initialCount = UltracamNativeObserverCount()

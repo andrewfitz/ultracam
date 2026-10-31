@@ -2036,6 +2036,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.discovery()
   SyntheticCaptureVerify.run(verifier: verifier)
   run.hdrAdvertisement()
+  HardwareVerify.run(verifier: verifier) { name, view, size in run.render(name, view, size: size).forEach { $0.close() } }
   do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
   do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }
   do { try run.cameraSymmetry() } catch { verifier.check("camera symmetry tests threw", false, "\(error)") }

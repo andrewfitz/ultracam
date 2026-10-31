@@ -44,7 +44,9 @@ import Foundation
     }
     /// Scripted readings: the next read returns these.
     func replaceProperties(_ properties: [ControlProperty]) { values = properties }
-    func discover() async throws -> [ControlCamera] { try admit(); return cameras }
+    /// How many scans were asked for.
+    private(set) var discoveries = 0
+    func discover() async throws -> [ControlCamera] { try admit(); discoveries += 1; return cameras }
     func prepare(_ request: ControlPreparationRequest) async throws -> ControlPreparationResult {
         try admit()
         try Task.checkCancellation()

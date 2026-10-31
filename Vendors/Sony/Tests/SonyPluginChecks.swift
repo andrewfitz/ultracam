@@ -1,5 +1,16 @@
 import Foundation
 
+/// Scripted readings for the hardware-awareness fields; connects and disconnects at once.
+@MainActor
+private final class ReadingsBridge: UCSonyCameraControl {
+  nonisolated(unsafe) var json = "[]"
+  override var available: Bool { false }
+  override func connectFeed(_ feedID: String, camera: String, address: String, authentication: Bool, user: String, password: String,
+    fingerprint: String, completion: @escaping UCSonyReply) { completion("[]", nil) }
+  override func refreshFeed(_ feedID: String, completion: @escaping UCSonyReply) { completion(json, nil) }
+  override func disconnectFeed(_ feedID: String, completion: @escaping UCSonyReply) { completion("[]", nil) }
+}
+
 @MainActor
 private final class Bridge: UCSonyCameraControl {
   nonisolated(unsafe) var simulatedAvailable = false
@@ -187,6 +198,47 @@ struct SonyPluginChecks {
       preconditionFailure("Discovery replaced the approved authenticated endpoint")
     } catch let error as ControlError { precondition(error.code == .changedIdentity) }
     precondition(mutable.connectAdmissions == 0)
+    // Battery in the unit the body reports: 78 minutes is never 78%, and only a known unit warns.
+    let minutes = SonyControlPlugin.battery(value: 78, unitLabel: "Minutes")
+    precondition(minutes.label == "78 min" && minutes.unit == .minutes && minutes.severity == nil)
+    precondition(SonyControlPlugin.battery(value: 78, unitLabel: "Percent") == ("78%", .percent, nil))
+    precondition(SonyControlPlugin.battery(value: 12, unitLabel: "Percent").severity == .warning)
+    precondition(SonyControlPlugin.battery(value: 10, unitLabel: "Minutes").severity == .warning)
+    precondition(SonyControlPlugin.battery(value: 12, unitLabel: nil) == ("12", nil, nil), "No unit: raw, no warning")
+    precondition(SonyControlPlugin.battery(value: 7, unitLabel: "Voltage").severity == nil)
+    // OnWarning: known keys become notices, recoveries are info, anything else is dropped.
+    precondition(SonyControlPlugin.notice(forWarning: "storageFull")?.severity == .warning)
+    precondition(SonyControlPlugin.notice(forWarning: "reconnecting")?.severity == .notice)
+    precondition(SonyControlPlugin.notice(forWarning: "networkRecovered")?.severity == .info)
+    precondition(SonyControlPlugin.notice(forWarning: "131089") == nil)
+    // A picture suggests a source profile only when a declaration describes it exactly.
+    precondition(SonyControlPlugin.sourceProfile(gamma: "S-Log3", gamut: "S-Gamut3.Cine") == "sony-slog3-sgamut3cine")
+    precondition(SonyControlPlugin.sourceProfile(gamma: "S-Log3", gamut: "S-Gamut3") == "sony-slog3-sgamut3")
+    precondition(SonyControlPlugin.sourceProfile(gamma: "ITU709", gamut: "709") == "rec709-video")
+    precondition(SonyControlPlugin.sourceProfile(gamma: "S-Cinetone", gamut: "S-Cinetone") == nil)
+    precondition(SonyControlPlugin.sourceProfile(gamma: "S-Log3", gamut: "S-Gamut") == nil)
+    precondition(plugin.descriptor.localizedMissingDeviceHint()?.contains("Remote Shoot Function") == true)
+    let readings = ReadingsBridge()
+    readings.json = """
+    [{"id":"battery","title":"Battery","code":10,"value":78,"writable":false,"choices":[],"label":"78"},\
+    {"id":"batteryUnit","title":"Battery unit","code":11,"value":1,"writable":false,"choices":[],"label":"Minutes"},\
+    {"id":"overheating","title":"Overheating","code":12,"value":1,"writable":false,"choices":[],"label":"About to overheat"},\
+    {"id":"gamma","title":"Gamma","code":13,"value":771,"writable":false,"choices":[],"label":"S-Log3"},\
+    {"id":"colorMode","title":"Color mode","code":14,"value":8,"writable":false,"choices":[],"label":"S-Gamut3.Cine"},\
+    {"id":"firmware","title":"Firmware","code":15,"value":0,"writable":false,"choices":[],"label":"7.02"}]
+    """
+    let readingsPlugin = SonyControlPlugin(backend: readings)
+    try await readingsPlugin.connect(feedID: "readings", generation: 1, camera: camera, credentials: nil)
+    let read = try await readingsPlugin.properties(feedID: "readings", generation: 1)
+    let battery = read.first { $0.id == "battery" }
+    precondition(battery?.role == .power && battery?.unit == .minutes && battery?.currentValueLabel == "78 min" && battery?.severity == nil)
+    precondition(read.first { $0.id == "batteryUnit" }?.role == .hidden)
+    let heat = read.first { $0.id == "overheating" }
+    precondition(heat?.role == .thermal && heat?.severity == .warning)
+    precondition(read.first { $0.id == "gamma" }?.suggestedSourceProfileID == "sony-slog3-sgamut3cine")
+    precondition(read.first { $0.id == "colorMode" }?.role == .colorProfile)
+    precondition(read.first { $0.id == "firmware" }?.role == .firmware)
+    try await readingsPlugin.disconnect(feedID: "readings", generation: 1)
     print("Sony plugin checks passed")
   }
 }
