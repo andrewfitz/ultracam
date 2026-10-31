@@ -21,8 +21,8 @@ enum UIMonitorPanel: Hashable {
   var symbol: String {
     switch self {
     case .tool(let tool): return tool.symbol
-    case .clipIndicators: return "exclamationmark.triangle"
-    case .picture: return "camera.filters"
+    case .clipIndicators: return UISymbol.clipIndicators
+    case .picture: return UISymbol.pictureSettings
     }
   }
 }

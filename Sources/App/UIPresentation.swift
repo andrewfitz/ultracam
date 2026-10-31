@@ -22,7 +22,8 @@ enum UILayout: String, CaseIterable, Sendable, Equatable {
     switch self {
     case .single: return "rectangle"
     case .sideBySide: return "rectangle.split.2x1"
-    case .programView: return "tv"
+    // Not `tv`: that's Program itself, and this names a layout (large pane plus thumbnails).
+    case .programView: return "sidebar.squares.trailing"
     case .fourUp: return "square.grid.2x2"
     }
   }
@@ -54,11 +55,11 @@ enum UIMonitorTool: Int, CaseIterable, Sendable, Equatable {
   }
   var symbol: String {
     switch self {
-    case .guides: return "squareshape.split.3x3"
-    case .zebra: return "line.diagonal"
-    case .falseColor: return "paintpalette"
-    case .focus: return "scope"
-    case .scopes: return "waveform.path.ecg"
+    case .guides: return UISymbol.guides
+    case .zebra: return UISymbol.zebra
+    case .falseColor: return UISymbol.falseColor
+    case .focus: return UISymbol.focusPeaking
+    case .scopes: return UISymbol.scopes
     }
   }
 }

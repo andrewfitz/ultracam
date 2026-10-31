@@ -49,6 +49,12 @@ extension Font {
   static let uiOverlay = Font.subheadline.weight(.semibold)
   /// The strip's recording clock. 17 pt.
   static let uiClock = Font.title2.weight(.semibold).monospacedDigit()
+  /// ON AIR, ISO, NEXT and PROGRAM on their pills. 12 pt bold.
+  static let uiTally = Font.callout.weight(.bold)
+  /// The number you came for: time left, shot time, dropouts, the session clock. 12 pt semibold.
+  static let uiValueStrong = Font.callout.weight(.semibold).monospacedDigit()
+  /// Text on the menu bar card's small pictures, a compact scale of its own. 10 pt semibold.
+  static let uiCompactOverlay = Font.caption.weight(.semibold)
   /// Title inside a full-size picture placeholder. 15 pt.
   static let uiPlaceholderTitle = Font.title3.weight(.semibold)
 }
@@ -59,9 +65,9 @@ enum UIPictureSpacing {
   static let margin: CGFloat = 20
   /// Between two cameras (side by side, four up, Program's sources).
   static let gutter: CGFloat = 20
-  /// How far the selection ring sits outside its picture. It stays well inside the
-  /// margin and half the gutter, so it's never clipped and never touches a neighbour.
-  static let ringOutset: CGFloat = 4
+  /// How far the selection ring sits outside its picture, clear of a tally ring. It stays
+  /// well inside the margin and half the gutter, so it's never clipped or touches a neighbor.
+  static let ringOutset: CGFloat = 6
   /// Fixed, not the system accent: a Red or Orange accent would read as on air or a warning.
   static let selectionRing = Color.blue
 }
@@ -110,19 +116,23 @@ struct UIPictureMenuLabel: View {
   }
 }
 
-/// A small status badge. Tone sets a colored dot; the words stay in a label
-/// color so they read in light mode too (colored text at this size doesn't).
+/// A small status badge, or with `symbol`, a read-only value chip. Tone sets a colored dot;
+/// the words stay in a label color so they read in light mode too (colored text at this
+/// size doesn't).
 struct UIBadge: View {
   let text: String
   var tone: UITone = .neutral
   var filled = false
+  var symbol: String? = nil
 
   /// The dot is drawn, never typed: VoiceOver would read a "●" aloud.
   private var words: String { text.hasPrefix("● ") ? String(text.dropFirst(2)) : text }
 
   var body: some View {
     HStack(spacing: 4) {
-      if tone != .neutral && !filled {
+      if let symbol {
+        Image(systemName: symbol).imageScale(.small).accessibilityHidden(true)
+      } else if tone != .neutral && !filled {
         Circle().fill(tone.color).frame(width: 6, height: 6)
       }
       Text(words)
@@ -137,23 +147,39 @@ struct UIBadge: View {
   }
 }
 
-/// The tally badge drawn on a picture: ON AIR (red), PROGRAM (outlined), NEXT (green).
+/// The tally drawn on a picture: ON AIR, ISO (red), PROGRAM (outlined), NEXT (green), NO
+/// PICTURE (orange). The only filled red, darkened so white stays at 4.5:1 (06 V8); the glyph
+/// keeps ON AIR and ISO apart from across a desk.
 struct UITallyBadge: View {
   let tally: UITally
   var body: some View {
     if let text = tally.badge {
-      Text(text)
-        .font(.subheadline.weight(.bold))
-        .padding(.horizontal, 9).frame(height: 24)
-        .foregroundStyle(tally == .next || tally == .noPicture ? Color.black : .white)
-        .background(background, in: Capsule())
-        .overlay(Capsule().strokeBorder(tally == .program ? Color.white.opacity(0.6) : .clear, lineWidth: 1.5))
-        .accessibilityLabel(tally == .iso ? text : text.capitalized)
+      HStack(spacing: 4) {
+        if let glyph {
+          Image(systemName: glyph).imageScale(.small).accessibilityHidden(true)
+        }
+        Text(text)
+      }
+      .font(.uiTally)
+      .padding(.horizontal, 8).frame(height: 24)
+      .foregroundStyle(tally == .next || tally == .noPicture ? Color.black : .white)
+      .background(background, in: Capsule())
+      .overlay(Capsule().strokeBorder(tally == .program ? Color.white.opacity(0.7) : .clear, lineWidth: 1.5))
+      .fixedSize()
+      .accessibilityElement(children: .ignore)
+      .accessibilityLabel(tally.label ?? text)
+    }
+  }
+  private var glyph: String? {
+    switch tally {
+    case .onAir: return UISymbol.program
+    case .iso: return UISymbol.iso
+    default: return nil
     }
   }
   private var background: Color {
     switch tally {
-    case .onAir, .iso: return .red
+    case .onAir, .iso: return Color.red.mix(with: .black, by: 0.2)
     case .noPicture: return .orange
     case .next: return .green
     default: return .black.opacity(0.72)
@@ -168,6 +194,11 @@ struct UIRecordButton: View {
   let enabled: Bool
   let help: String
   var size: CGFloat = 28
+  /// The collapsed strip's stop: a neutral square, always, because the pill already says it's
+  /// rolling. Red below the pictures then means a meter problem.
+  var neutralStop = false
+  /// Names the camera for VoiceOver, where two strips each have one of these.
+  var name: String? = nil
   let action: () -> Void
   @Environment(\.isEnabled) private var parentEnabled
 
@@ -178,9 +209,10 @@ struct UIRecordButton: View {
       ZStack {
         Circle().strokeBorder(on ? Color.primary.opacity(0.75) : Color.secondary.opacity(0.4), lineWidth: 2)
         if active {
-          RoundedRectangle(cornerRadius: size * 0.1).fill(mark).frame(width: size * 0.38, height: size * 0.38)
+          RoundedRectangle(cornerRadius: size * 0.1).fill(neutralStop && on ? Color.primary : mark)
+            .frame(width: size * 0.38, height: size * 0.38)
         } else {
-          Circle().fill(mark).frame(width: size * 0.66, height: size * 0.66)
+          Circle().fill(mark).frame(width: size * 0.5, height: size * 0.5)
         }
       }
       .frame(width: size, height: size)
@@ -189,7 +221,7 @@ struct UIRecordButton: View {
     .buttonStyle(.plain)
     .disabled(!enabled)
     .help(help)
-    .accessibilityLabel(active ? "Stop Recording" : "Record")
+    .accessibilityLabel((active ? "Stop Recording" : "Record") + (name.map { ", \($0)" } ?? ""))
   }
 }
 
