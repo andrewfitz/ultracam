@@ -144,6 +144,71 @@ import XCTest
     model.stopCamera(id)
   }
 
+  private func runningCamera(automatic: Bool = false) throws -> (AppHardwareSyntheticFixture, AppModel, FeedID) {
+    let fixture = try AppHardwareSyntheticFixture()
+    fixture.connect()
+    let model = appModel(hardware: fixture.hardware)
+    model.refresh()
+    let id = model.selectedFeedID
+    model.updateCamera(id, shareProcessing: false) {
+      $0.selectedDevice = "fake:fixture"
+      $0.automaticFeed = automatic
+    }
+    return (fixture, model, id)
+  }
+
+  /// A client's sink, and the 5 s a probe needs: a meeting app that opens and closes a
+  /// camera while looking around must not cost a reconnect.
+  func testSinkFollowsItsClientAndOutlivesItByTheHold() throws {
+    let (fixture, model, id) = try runningCamera()
+    defer { fixture.stop() }
+    model.startCamera(id)
+    let pattern = try fixture.makePattern()
+    spin("Frames arrive") {
+      _ = try? fixture.emit(pattern, index: self.frame())
+      return model.cameraUpdate(id)?.frames ?? 0 > 0
+    }
+    settle()
+    XCTAssertEqual(fixture.sink.connectAttempts, 0, "Nobody is watching, so no sink")
+    model.setCameraDemandForTesting(id, requested: true)
+    spin("A client gets a sink at once") { fixture.sink.openConnections == 1 }
+    let now = ProcessInfo.processInfo.systemUptime
+    model.setCameraDemandForTesting(id, requested: false)
+    XCTAssertFalse(model.cameraInUse(id), "Tally reads the moment, not the hold")
+    model.liveWatchTick(now: now + LiveWatchLimits.clientRelease - 1)
+    settle()
+    XCTAssertEqual(fixture.sink.openConnections, 1, "It may be a probe")
+    model.setCameraDemandForTesting(id, requested: true)
+    model.liveWatchTick(now: now + LiveWatchLimits.clientRelease + 1)
+    settle()
+    XCTAssertEqual(fixture.sink.connectAttempts, 1, "It came back: no reconnect")
+    model.setCameraDemandForTesting(id, requested: false)
+    model.liveWatchTick(now: now + 2 * LiveWatchLimits.clientRelease + 1)
+    spin("The hold ran out") { fixture.sink.openConnections == 0 }
+    XCTAssertTrue(model.isCameraRunning(id), "Capture never notices")
+    model.stopCamera(id)
+  }
+
+  func testProbeDoesntCycleAnAutomaticCameraAndStopIgnoresTheHold() throws {
+    let (fixture, model, id) = try runningCamera(automatic: true)
+    defer { fixture.stop() }
+    model.setCameraDemandForTesting(id, requested: true)
+    XCTAssertTrue(model.isCameraRunning(id), "A rise acts at once")
+    let now = ProcessInfo.processInfo.systemUptime
+    model.setCameraDemandForTesting(id, requested: false)
+    XCTAssertTrue(model.isCameraRunning(id), "A fall waits")
+    model.liveWatchTick(now: now + LiveWatchLimits.clientRelease - 1)
+    XCTAssertTrue(model.isCameraRunning(id))
+    model.liveWatchTick(now: now + LiveWatchLimits.clientRelease + 1)
+    XCTAssertFalse(model.isCameraRunning(id), "No client, no capture")
+
+    model.setCameraDemandForTesting(id, requested: true)
+    XCTAssertTrue(model.isCameraRunning(id))
+    model.setCameraDemandForTesting(id, requested: false)
+    model.stopCamera(id)
+    XCTAssertFalse(model.isCameraRunning(id), "A user Stop means now")
+  }
+
   private var frames: Int32 = 0
   private func frame() -> Int32 { frames += 1; return frames }
 

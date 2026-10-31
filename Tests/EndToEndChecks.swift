@@ -1487,6 +1487,70 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(harness.negotiated.count, closed, "No stream starts for it")
   }
 
+  /// Sinks follow clients both ways while frames flow, and capture never notices.
+  func testSinkFollowsDemandBothWaysWhileFramesFlow() throws {
+    let source = try EndToEndChecks.source()
+    let harness = CaptureHarness()
+    let controller = CaptureController(services: harness.services(automatic: true))
+    defer { controller.onUpdate = nil; controller.stop() }
+    ready(controller, harness: harness, configuration: config)
+    var time = CMTime.zero
+    func emit() {
+      harness.emitAutomatic(source, at: time, duration: VideoContract.fastDuration)
+      time = CMTimeAdd(time, VideoContract.fastDuration)
+    }
+    emit()
+    awaitCondition("Open from the start in this harness") { harness.sent == 1 }
+    let opened = harness.negotiated.count
+    controller.requestCameraOutputEnabled(false)
+    emit()
+    awaitCondition("Frames still reach the preview") { harness.previewed == 2 }
+    XCTAssertEqual(harness.sent, 1)
+    controller.requestCameraOutputEnabled(true)
+    awaitCondition("A client gets a sink without waiting for a frame") { harness.negotiated.count == opened + 1 }
+    emit()
+    awaitCondition("And the next frame") { harness.sent == 2 }
+    controller.requestCameraOutputEnabled(false)
+    emit()
+    awaitCondition("Closed again") { harness.previewed == 4 }
+    XCTAssertEqual(harness.sent, 2)
+    XCTAssertEqual(harness.starts, 1, "Capture never stopped")
+  }
+
+  /// The main actor asks, then starts: the answer has to reach that start, not be
+  /// fenced out by the generation the start just took.
+  func testSinkRequestedJustBeforeAStartAppliesToThatStart() throws {
+    let source = try EndToEndChecks.source()
+    let harness = CaptureHarness()
+    let controller = CaptureController(services: harness.services(automatic: true))
+    defer { controller.onUpdate = nil; controller.stop() }
+    controller.requestCameraOutputEnabled(false)
+    ready(controller, harness: harness, configuration: config)
+    harness.emitAutomatic(source, at: .zero, duration: VideoContract.fastDuration)
+    awaitCondition("The picture runs") { harness.previewed == 1 }
+    XCTAssertEqual(harness.negotiated.count, 0, "No client, no sink")
+    XCTAssertEqual(harness.sent, 0)
+  }
+
+  /// The fallback: a sink held open for nobody locks the format, and takes no frames.
+  func testSinkHeldOpenWithNoClientTakesNoFrames() throws {
+    let source = try EndToEndChecks.source()
+    let harness = CaptureHarness()
+    let controller = CaptureController(services: harness.services(automatic: true))
+    defer { controller.onUpdate = nil; controller.stop() }
+    controller.requestCameraOutputEnabled(true, framesWanted: false)
+    ready(controller, harness: harness, configuration: config)
+    harness.emitAutomatic(source, at: .zero, duration: VideoContract.fastDuration)
+    awaitCondition("The picture runs") { harness.previewed == 1 }
+    XCTAssertEqual(harness.negotiated.count, 1)
+    XCTAssertEqual(harness.sent, 0)
+    controller.requestCameraOutputEnabled(true, framesWanted: true)
+    allowQueueWork()
+    harness.emitAutomatic(source, at: VideoContract.fastDuration, duration: VideoContract.fastDuration)
+    awaitCondition("A client joins with no connect at all") { harness.sent == 1 }
+    XCTAssertEqual(harness.negotiated.count, 1)
+  }
+
   /// A sink that opens late costs a client frames it never saw: counted, and timed.
   func testLateSinkIsCountedAndTimedToItsFirstFrame() throws {
     let source = try EndToEndChecks.source()

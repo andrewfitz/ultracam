@@ -276,8 +276,9 @@ final class FeedCoordinator {
     }
   }
 
-  func setCameraOutputEnabled(feedID: FeedID, enabled: Bool) {
-    capture(for: feedID).setCameraOutputEnabled(enabled)
+  /// Opens or closes one camera's sink without waiting. Capture never stops for it.
+  func requestCameraOutputEnabled(feedID: FeedID, enabled: Bool, framesWanted: Bool) {
+    capture(for: feedID).requestCameraOutputEnabled(enabled, framesWanted: framesWanted)
   }
 
   /// Every running camera whose virtual camera isn't connected tries again now: CMIO's

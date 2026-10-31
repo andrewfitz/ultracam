@@ -270,7 +270,13 @@ final class AppModel {
   let monitorCoordinator: MonitorCoordinator
   private var monitorDemand: Set<MonitorTargetID> = []
   private var feedPolicies: [FeedID: AutomaticFeedPolicy] = [:]
+  /// Who is really using each route, this moment: tally and problems read this. Work reads
+  /// `routeHeld`, which outlasts a client by `LiveWatchLimits.clientRelease`.
   private var routeDemand: [String: Bool] = [:]
+  /// Routes whose client left, and when that takes effect (`systemUptime`).
+  @ObservationIgnored private var routeReleaseAt: [String: TimeInterval] = [:]
+  /// What each running camera's controller was last told about its sink.
+  @ObservationIgnored private var sinkDemand: [FeedID: FeedLifecycleDemandPolicy.SinkDemand] = [:]
   /// Routes the demand monitor can't read: whether they have a client is unknown, not "no".
   private var unknownRoutes: Set<String> = []
   /// The demand monitor's error for a virtual camera route, by route ID.
@@ -581,6 +587,12 @@ final class AppModel {
     if (routeDemand[route] == true) != (requested == true) || (requested == nil) != unknownRoutes.contains(route) {
       captureLog.notice("Client \(requested == nil ? "unknown" : requested == true ? "in" : "out", privacy: .public): \(route, privacy: .public)")
     }
+    // Rises act at once. A fall waits out the hold, in case it was a probe.
+    if requested == true {
+      routeReleaseAt[route] = nil
+    } else if routeDemand[route] == true {
+      routeReleaseAt[route] = ProcessInfo.processInfo.systemUptime + LiveWatchLimits.clientRelease
+    }
     routeDemand[route] = requested == true
     if requested == nil { unknownRoutes.insert(route) } else { unknownRoutes.remove(route) }
     routeErrors[route] = error
@@ -873,6 +885,7 @@ final class AppModel {
     guard feedCoordinator.remove(id) else { return false }
     let route = feedRouteID(id)
     routeDemand[route] = nil
+    routeReleaseAt[route] = nil
     unknownRoutes.remove(route)
     routeErrors[route] = nil
     feedRouteIDs[id] = nil
@@ -882,6 +895,7 @@ final class AppModel {
     cameraLUTs[id] = nil
     cameraUpdates[id] = nil
     feedPolicies[id] = nil
+    sinkDemand[id] = nil
     stalledCameras.remove(id)
     signalHealth.remove(id)
     unexpectedStops[id] = nil
@@ -1311,6 +1325,7 @@ final class AppModel {
       monitorCoordinator.sourceStateChanged(target: MonitorTargetID(feedID.rawValue), running: false, message: update.message)
       detectedSourceDurations[feedID] = nil
       appliedPipelines[feedID] = nil
+      sinkDemand[feedID] = nil
       feedCoordinator.stopCapture(feedID: feedID)
       // A camera can fail on its own. Stop only its recording; the director
       // keeps cutting between the cameras still live.
@@ -1337,7 +1352,7 @@ final class AppModel {
   private func launchCapture(_ id: FeedID) {
     guard let descriptor = descriptor(for: id) else { return }
     if let error = descriptor.processingDeclarationError { reportProblem(error, key: "declaration.\(id.rawValue)"); return }
-    feedCoordinator.setCameraOutputEnabled(feedID: id, enabled: outputMode != .program)
+    reconcileSink(id, starting: true)
     detectedSourceDurations[id] = nil
     feedCoordinator.programOutput.setSourcePauseTolerance(id,
       mayPause: devices.first(where: { $0.id == descriptor.selectedDevice })?.mayPause)
@@ -1369,6 +1384,7 @@ final class AppModel {
     signalHealth.remove(id)
     appliedPipelines[id] = nil
     detectedSourceDurations[id] = nil
+    sinkDemand[id] = nil
     if outputMode == .program { retireProgramSource(id) }
     monitorCoordinator.sourceStateChanged(target: MonitorTargetID(id.rawValue), running: false, message: message)
     cameraUpdates[id] = nil
@@ -1376,6 +1392,20 @@ final class AppModel {
     reconcileAutoSwitcher()
     reconcileProgramTransportDemand()
   }
+
+  /// Opens a camera's sink for its client and closes it after. Capture, its take and its
+  /// monitor run straight through either, and a start takes the current value with it.
+  private func reconcileSink(_ id: FeedID, starting: Bool = false) {
+    guard starting || feedCoordinator.isFeedRunning(id) else { return }
+    let wanted = FeedLifecycleDemandPolicy.SinkDemand(client: outputMode != .program && routeHeld(feedRouteID(id)),
+      routeUnknown: outputMode != .program && cameraClientUnknown(id))
+    guard starting || sinkDemand[id] != wanted else { return }
+    sinkDemand[id] = wanted
+    feedCoordinator.requestCameraOutputEnabled(feedID: id, enabled: wanted.open, framesWanted: wanted.framesWanted)
+  }
+
+  /// A client, or one that left less than the hold ago.
+  private func routeHeld(_ route: String) -> Bool { routeDemand[route] == true || routeReleaseAt[route] != nil }
 
   /// Whether a manual Start can open the camera now.
   private func canStart(_ id: FeedID) -> Bool {
@@ -1507,7 +1537,7 @@ final class AppModel {
     guard !launching else { return }
     // In Program mode a camera the user started keeps Program's sources up.
     let programRequested = monitorDemand.contains(MonitorTargetID("program")) ||
-      routeDemand[VirtualCameraDescriptor.program().id] == true ||
+      routeHeld(VirtualCameraDescriptor.program().id) ||
       (outputMode == .program && feedDescriptors.contains {
         feedCoordinator.isFeedRunning($0.id) && !demandStartedFeeds.contains($0.id)
       })
@@ -1521,7 +1551,7 @@ final class AppModel {
         $0.id == id && ($0.status == .recording || $0.status == .paused)
       }
       var policy = feedPolicies[id] ?? AutomaticFeedPolicy()
-      let camera = routeDemand[feedRouteID(id)] == true
+      let camera = routeHeld(feedRouteID(id))
       policy.demand(camera || (outputMode == .program && programRequested) || recording)
       policy.previewDemand(descriptor.previewEnabled && monitorDemand.contains(MonitorTargetID(id.rawValue)))
       let isRunning = feedCoordinator.isFeedRunning(id)
@@ -1535,6 +1565,7 @@ final class AppModel {
       let why = [camera ? "camera app" : nil, recording ? "recording" : nil,
         outputMode == .program && programRequested ? "Program" : nil,
         policy.previewRequested ? "preview" : nil].compactMap { $0 }.joined(separator: ", ")
+      reconcileSink(id)
       switch action {
       case .start:
         captureLog.notice("Start \(id.rawValue, privacy: .public): automatic (\(why.isEmpty ? "demand" : why, privacy: .public))")
@@ -1558,7 +1589,7 @@ final class AppModel {
     let producer = feedDescriptors.first { $0.id == producerID && $0.enabled }
     let required = FeedLifecycleDemandPolicy.programTransportRequired(
       programMode: outputMode == .program,
-      cameraRequested: routeDemand[VirtualCameraDescriptor.program().id] == true,
+      cameraRequested: routeHeld(VirtualCameraDescriptor.program().id),
       anyCameraRunning: feedDescriptors.contains { $0.enabled && feedCoordinator.isFeedRunning($0.id) })
     let contract = programContract(for: producer)
     if !programInUse, let producerID, detectedSourceDurations[producerID] != nil, contract != programPreNegotiated {
@@ -1761,7 +1792,7 @@ final class AppModel {
   /// been waiting. Reads state the models already hold, on the main actor, four times a
   /// second while a camera runs, a take rolls or a client is connected.
   private var wantsLiveWatch: Bool {
-    running || recordingModel.hasActiveRecordings || routeDemand.values.contains(true)
+    running || recordingModel.hasActiveRecordings || routeDemand.values.contains(true) || !routeReleaseAt.isEmpty
   }
 
   private func updateLiveWatch() {
@@ -1781,6 +1812,11 @@ final class AppModel {
 
   func liveWatchTick(now: TimeInterval) {
     signalHealth.tick(now: now).forEach(signalChanged)
+    let released = routeReleaseAt.filter { now >= $0.value }.keys
+    if !released.isEmpty {
+      released.forEach { routeReleaseAt[$0] = nil }
+      reconcileAutomaticFeed()
+    }
     if programSinkConnected != feedCoordinator.programOutputConnected {
       programSinkConnected = feedCoordinator.programOutputConnected
     }
@@ -1885,6 +1921,8 @@ final class AppModel {
     manuallyStoppedFeeds.insert(id)
     refusedStarts.remove(id)
     demandStartedFeeds.remove(id)
+    // Stop means now: a client that just left holds nothing up.
+    routeReleaseAt[feedRouteID(id)] = nil
     if feedCoordinator.isFeedRunning(id) {
       captureLog.notice("Stop \(id.rawValue, privacy: .public): user")
       endCapture(id, message: "Camera stopped")

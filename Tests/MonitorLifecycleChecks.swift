@@ -51,6 +51,18 @@ import XCTest
     XCTAssertEqual(first.action(ready: true, running: true), .stop)
     XCTAssertNil(second.action(ready: true, running: true))
   }
+  func testSinkOpensForAClientAndForARouteThatCantBeRead() {
+    typealias Demand = FeedLifecycleDemandPolicy.SinkDemand
+    XCTAssertFalse(FeedLifecycleDemandPolicy.sinkOpensWithCamera, "Work nobody consumes costs nothing")
+    XCTAssertEqual(Demand(client: false, routeUnknown: false, opensWithCamera: false).open, false)
+    XCTAssertEqual(Demand(client: true, routeUnknown: false, opensWithCamera: false).open, true)
+    XCTAssertEqual(Demand(client: false, routeUnknown: true, opensWithCamera: false).open, true, "It may have a client")
+    let fallback = Demand(client: false, routeUnknown: false, opensWithCamera: true)
+    XCTAssertTrue(fallback.open, "The fallback: open with the camera")
+    XCTAssertFalse(fallback.framesWanted, "And no frames until a client")
+    XCTAssertTrue(Demand(client: true, routeUnknown: false, opensWithCamera: true).framesWanted)
+  }
+
   func testProgramTransportStaysUpForAClientWhileAnyCameraRuns() {
     XCTAssertTrue(FeedLifecycleDemandPolicy.programTransportRequired(programMode: true,
       cameraRequested: true, anyCameraRunning: true))

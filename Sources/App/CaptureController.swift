@@ -370,6 +370,9 @@ final class CaptureController: @unchecked Sendable {
   // is enabled, this controller keeps capture and GPU work alive without
   // opening a per-feed CMIO sink; the Program bridge owns that sink.
   private var cameraOutputEnabled = true
+  // Capture queue. False only with a sink held open for nobody (see
+  // `FeedLifecycleDemandPolicy.sinkOpensWithCamera`): no frame goes to it.
+  private var cameraFramesWanted = true
 
   var onUpdate: (@Sendable (CaptureUpdate) -> Void)?
   /// Carries the capture generation that produced the frame. Consumers that
@@ -457,6 +460,30 @@ final class CaptureController: @unchecked Sendable {
       closeCamera()
       cameraMessage = "Ultracam camera not connected"
       publishCurrent(token: token)
+    }
+  }
+
+  /// The main actor's way to open or close the sink: it never waits, where the synchronous
+  /// toggle waits out a connect holding the capture queue during a start. Not tied to the
+  /// current capture, so a value set just before a start applies to that start. A sink
+  /// opened on a running camera connects now rather than on its next frame, which may
+  /// be a while with no signal. Capture and any take never notice.
+  func requestCameraOutputEnabled(_ enabled: Bool, framesWanted: Bool = true) {
+    queue.async { [self] in
+      cameraFramesWanted = framesWanted
+      guard enabled != cameraOutputEnabled else { return }
+      cameraOutputEnabled = enabled
+      let token = lock.withLock { generation }
+      guard isAccepting(token) else { return }
+      if enabled {
+        reconnectRequested = true
+        reconnectAfter = 0
+        reconnectIfDue()
+      } else {
+        closeCamera()
+        cameraMessage = "Ultracam camera not connected"
+        publishCurrent(token: token)
+      }
     }
   }
 
@@ -2289,7 +2316,7 @@ final class CaptureController: @unchecked Sendable {
         duration: effective.duration, receivedAt: frame.receivedAt, encodeStart: entryTime,
         pipelineEnabled: pipelineEnabled, applyLUT: effective.applyLUT,
         preview: previewEnabled ? services.preview : nil,
-        cameraAttempt: cameraAttempt, monitorSink: sink, untouched: effective.untouched,
+        cameraAttempt: cameraAttempt, sendsToCamera: cameraFramesWanted, monitorSink: sink, untouched: effective.untouched,
         processedHandler: processedHandler, retention: frame.retention, epochRevision: frame.epochRevision,
         sourceAdmission: frame.sourceAdmission)
       let completion: LUTProcessor.Completion = { [self] completed in
@@ -2387,7 +2414,7 @@ final class CaptureController: @unchecked Sendable {
     guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
     item.preview?(sample)
     guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
-    let outcome = camera.send(sample, attempt: item.cameraAttempt, using: services.send)
+    let outcome = item.sendsToCamera ? camera.send(sample, attempt: item.cameraAttempt, using: services.send) : .notSent
     guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
     if let handler = item.processedHandler {
       let metadata = ProcessedFrameMetadata(
@@ -2458,7 +2485,7 @@ final class CaptureController: @unchecked Sendable {
         metadataChanged = true
       }
     case .notSent:
-      if cameraOutputEnabled { cameraFramesBeforeSink &+= 1 }
+      if cameraOutputEnabled, cameraFramesWanted { cameraFramesBeforeSink &+= 1 }
     }
     reportCameraWindow()
     frames &+= 1
@@ -2632,6 +2659,7 @@ private struct DeliveryItem: @unchecked Sendable {
   let applyLUT: Bool
   let preview: ((CMSampleBuffer) -> Void)?
   let cameraAttempt: UInt64
+  let sendsToCamera: Bool
   let monitorSink: (any MonitorFrameSink)?
   /// Published as captured (the passthrough copy): the monitor's offer says so.
   let untouched: Bool

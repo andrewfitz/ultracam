@@ -109,6 +109,9 @@ enum LiveWatchLimits {
   static let queueStall: TimeInterval = 2
   /// A client with no frames this long is waiting, not joining.
   static let clientWaiting: TimeInterval = 2
+  /// How long a client's demand outlives it. A meeting app probing a camera opens and
+  /// closes it: without this each probe would stop capture and restart the director.
+  static let clientRelease: TimeInterval = 5
   /// A failed connect tries again this often while a client is waiting.
   static let connectRetry: TimeInterval = 1
   /// A take running this long after its last client left has outlived its meeting.

@@ -10,6 +10,23 @@ enum FeedLifecycleDemandPolicy {
     programMode && cameraRequested && anyCameraRunning
   }
 
+  /// The fallback, if a meeting app won't take a format change mid-stream: every sink opens
+  /// with its camera and takes no frames until a client comes, so its format is locked first
+  /// and a join is instant, as before sinks followed demand. The cost is the extension's
+  /// poll at 4x the frame rate for every running camera. False: a sink opens for its client.
+  static let sinkOpensWithCamera = false
+
+  /// One camera's sink. An unreadable route may have a client, so it gets a sink too:
+  /// otherwise that client would wait on black for a reason nothing can see.
+  struct SinkDemand: Equatable {
+    var open: Bool
+    var framesWanted: Bool
+    init(client: Bool, routeUnknown: Bool, opensWithCamera: Bool = sinkOpensWithCamera) {
+      framesWanted = client || routeUnknown
+      open = framesWanted || opensWithCamera
+    }
+  }
+
   static func programContract(configuration: PipelineConfiguration, pipelineEnabled: Bool,
                               detectedSourceDuration: CMTime?) -> PipelineConfiguration {
     var result = configuration
