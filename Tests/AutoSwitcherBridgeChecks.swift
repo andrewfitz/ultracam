@@ -57,4 +57,35 @@ import XCTest
     bridge?.stop()
   }
 
+  /// The anchor came back, so the director's clock moves from the emphasis camera's stream
+  /// clock to the anchor's, ten minutes on. Without starting its timing over the director
+  /// reads that as a ten-minute shot and cuts at once.
+  func testAClockHandoffStartsTheDirectorsTimingOverOnTheNewClock() throws {
+    let anchor = FeedID(rawValue: "anchor"), emphasis = FeedID(rawValue: "emphasis")
+    func cuts(rebasing: Bool) throws -> [AutoSwitcherInstruction] {
+      var settings = NaturalTalkingHeadSettings()
+      settings.enabled = true
+      let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: settings, anchor: anchor, emphasis: emphasis))
+      let log = InstructionLog()
+      bridge.onInstruction = { log.append($0) }
+      bridge.manualOverride(cameraID: emphasis, at: .zero)
+      for step in 0...20 { bridge.ingestAudio(time: CMTime(value: Int64(step), timescale: 10), rms: 0, peak: 0, present: true) }
+      let handoff = CMTime(value: 600, timescale: 1)
+      if rebasing { bridge.rebaseClock(at: handoff, onAir: emphasis, health: [(anchor, true), (emphasis, true)]) }
+      for step in 0...20 {
+        bridge.ingestAudio(time: CMTimeAdd(handoff, CMTime(value: Int64(step), timescale: 10)), rms: 0, peak: 0, present: true)
+      }
+      bridge.stop()  // Waits for every event already queued.
+      return log.instructions
+    }
+    XCTAssertFalse(try cuts(rebasing: false).isEmpty, "The hazard: a forced cut on the first tick of the new clock")
+    XCTAssertEqual(try cuts(rebasing: true), [], "The shot on air starts over at the handoff")
+  }
+}
+
+private final class InstructionLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored: [AutoSwitcherInstruction] = []
+  func append(_ instruction: AutoSwitcherInstruction) { lock.withLock { stored.append(instruction) } }
+  var instructions: [AutoSwitcherInstruction] { lock.withLock { stored } }
 }

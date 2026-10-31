@@ -69,7 +69,9 @@ import XCTest
   /// Every camera has sent frames, so Program has something on air.
   private func allProducing() throws {
     model.startAllCameras()
-    try emitUntil("Every camera produces") { ids.allSatisfy { model.isProgramSourceProducingForTesting($0) } }
+    try emitUntil("Every camera produces, and says it's live") {
+      ids.allSatisfy { model.isProgramSourceProducingForTesting($0) && model.cameraUpdate($0)?.signal == .live }
+    }
   }
 
   // MARK: Sources
@@ -95,6 +97,43 @@ import XCTest
     XCTAssertTrue(model.isCameraRunning(ids[1]), "It may be a probe")
     model.liveWatchTick(now: now + LiveWatchLimits.clientRelease + 1)
     XCTAssertFalse(model.isCameraRunning(ids[1]))
+  }
+
+  /// Down to one camera, Program and its client are gone, and so is what they started.
+  func testRemovingTheSecondCameraReleasesWhatProgramStarted() throws {
+    try prepare()
+    defer { finish() }
+    model.updateCamera(ids[1], shareProcessing: false) { $0.automaticFeed = true }
+    model.setProgramDemandForTesting(requested: true)
+    XCTAssertTrue(model.isCameraRunning(ids[1]))
+    XCTAssertTrue(model.removeFeed(ids[0]))
+    XCTAssertFalse(model.programAvailable)
+    XCTAssertFalse(model.programInUse)
+    XCTAssertFalse(model.isCameraRunning(ids[1]), "Nothing needs it now")
+    XCTAssertFalse(model.cameraRequested(ids[1]))
+  }
+
+  /// Program's camera gets the on-air camera's format before a client finds it: when it is
+  /// published, when it's published again after a spell with one camera, and after a session.
+  func testProgramIsPreparedEachTimeItIsPublishedAndAfterEachSession() throws {
+    try prepare(cameras: 1)
+    defer { finish() }
+    model.startCamera(ids[0])
+    try emitUntil("Its cadence is known") { model.cameraUpdate(ids[0])?.sourceDuration != nil }
+    settle()
+    XCTAssertEqual(fixture.programSink.preNegotiations, 0, "One camera: no Program")
+    let second = try XCTUnwrap(model.addFeed())
+    spin("Published, and prepared") { fixture.programSink.preNegotiations == 1 }
+    XCTAssertTrue(model.removeFeed(second))
+    _ = try XCTUnwrap(model.addFeed())
+    spin("Published again, and prepared again") { fixture.programSink.preNegotiations == 2 }
+    model.setProgramDemandForTesting(requested: true)
+    spin("A client opens it") { fixture.programSink.openConnections == 1 }
+    let now = ProcessInfo.processInfo.systemUptime
+    model.setProgramDemandForTesting(requested: false)
+    model.liveWatchTick(now: now + LiveWatchLimits.clientRelease + 1)
+    spin("It closes") { fixture.programSink.openConnections == 0 }
+    spin("And is prepared for the next client") { fixture.programSink.preNegotiations == 3 }
   }
 
   // MARK: Cuts
@@ -144,6 +183,50 @@ import XCTest
     XCTAssertNil(model.programMoved, "It's back")
   }
 
+  /// Auto off, the on-air HDMI drops past the hold and comes back. Cuts to it wait out
+  /// the 5 s; Program shows its frames again from the first one.
+  func testTheOnAirCameraIsBackOnProgramTheMomentItsSignalIs() throws {
+    try prepare()
+    defer { finish() }
+    try allProducing()
+    let onAir = try XCTUnwrap(model.switcherSelectedFeedID)
+    let start = ProcessInfo.processInfo.systemUptime
+    var lost = CaptureUpdate(message: "")
+    lost.signal = .lost(since: start)
+    model.deliverCaptureUpdateForTesting(onAir, lost)
+    model.liveWatchTick(now: start + SignalHealthTracker.lossHold)
+    XCTAssertTrue(model.isSignalUnhealthy(onAir))
+    XCTAssertEqual(model.switcherSelectedFeedID, onAir, "Auto off: Program stays")
+    let before = model.programOutputDiagnostics.route
+    try emitUntil("The signal is back, and so is Program") {
+      model.programOutputDiagnostics.route.accepted >= before.accepted + 10
+    }
+    XCTAssertTrue(model.isSignalUnhealthy(onAir), "Still inside the 5 s")
+    XCTAssertEqual(model.programOutputDiagnostics.route.skippedMissingSource, before.skippedMissingSource)
+    XCTAssertNil(model.programIssue)
+    let other = try XCTUnwrap(ids.first { $0 != onAir })
+    _ = model.requestProgramCut(to: other)
+    try emitUntil("A cut away lands") { model.switcherSelectedFeedID == other }
+    if case .rejectedMissingSource = model.requestProgramCut(to: onAir) {} else {
+      XCTFail("But no cut goes back to it until it has been steady")
+    }
+  }
+
+  /// A stop moves Program by the same rule as a lost signal: strip order, and a live signal.
+  func testAStopMovesProgramByTheLossRule() throws {
+    try prepare(cameras: 3)
+    defer { finish() }
+    try allProducing()
+    model.stripOrder = { [ids] _ in [ids[0], ids[2], ids[1]] }
+    model.stopCamera(ids[0])
+    XCTAssertEqual(model.switcherSelectedFeedID, ids[2], "Next in the strip, not next in the settings")
+    var lost = CaptureUpdate(message: "")
+    lost.signal = .lost(since: ProcessInfo.processInfo.systemUptime)
+    model.deliverCaptureUpdateForTesting(ids[1], lost)
+    model.stopCamera(ids[2])
+    XCTAssertEqual(model.switcherSelectedFeedID, ids[2], "A camera whose signal just dropped is no picture to move to")
+  }
+
   func testNobodyIsToldAboutASelectionNoClientCanSee() throws {
     try prepare()
     defer { finish() }
@@ -157,7 +240,9 @@ import XCTest
     try prepare()
     defer { finish() }
     model.startCamera(ids[1])
-    try emitUntil("One camera has a picture") { model.isProgramSourceProducingForTesting(ids[1]) }
+    try emitUntil("One camera has a picture") {
+      model.isProgramSourceProducingForTesting(ids[1]) && model.cameraUpdate(ids[1])?.signal == .live
+    }
     XCTAssertEqual(model.switcherSelectedFeedID, ids[0], "Stopped and on air: nothing moved it yet")
     model.setProgramDemandForTesting(requested: true)
     XCTAssertEqual(model.switcherSelectedFeedID, ids[1])

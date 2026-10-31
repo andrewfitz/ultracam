@@ -175,6 +175,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
   private struct StageEntry {
     let sequence: UInt64
     let timeline: UInt64
+    /// The source it came from, so removing another camera leaves it staged.
+    let feedID: FeedID
     /// Timing of the first send; `sends` slots follow at the contract
     /// duration, all carrying the same image.
     let metadata: ProcessedFrameMetadata
@@ -322,20 +324,34 @@ final class ProgramOutputRoute: @unchecked Sendable {
     let selected = state.selectedFeedID.flatMap { valid.contains($0) ? $0 : nil }
     var settings = state.settings
     settings.selectedFeedID = selected ?? feedIDs.first
-    // Losing a source invalidates every queued frame. Keeping those leases
-    // would let a removed feed leak into the next Program segment and would
-    // retain pixel buffers until the consumer happened to dequeue them. An
-    // add invalidates nothing: those frames are still valid, and on air.
-    if !Set(state.feedIDs).isSubset(of: valid) { flushOutputLocked() }
+    // Losing the source on Program invalidates every queued frame. Keeping those
+    // leases would let a removed feed leak into the next Program segment and would
+    // retain pixel buffers until the consumer happened to dequeue them. Any other
+    // removal, like an add, leaves what's on its way to the client alone: those
+    // frames are still valid, and on air. A removed source's own staged frames, left
+    // from just before a cut away from it, go.
+    var events: [ProgramRouteEvent] = []
+    var published = false
+    let removed = Set(state.feedIDs).subtracting(valid)
+    if let onAir = state.selectedFeedID, removed.contains(onAir) {
+      flushOutputLocked()
+    } else if stage.contains(where: { removed.contains($0.feedID) }) {
+      let staged = stage.count
+      stage.removeAll { removed.contains($0.feedID) }
+      stats.flushedOnReset &+= UInt64(staged - stage.count)
+      published = flushStageLocked(events: &events).1
+    }
     let previous = state
     state = SwitcherCoordinator(settings: settings, feedIDs: feedIDs)
     // Readiness and a pending cut carry over; a cut whose target was removed
     // is reported, so its requester (the automatic director) is released.
     state.carryProgramTimeline(from: previous)
-    let abandoned = state.takeAbandonedCut()
+    if let (feedID, reason) = state.takeAbandonedCut() { events.append(.cutAbandoned(feedID: feedID, reason: reason)) }
     let handler = eventHandler
+    let publishedHandler = self.publishedHandler
     lock.unlock()
-    if let (feedID, reason) = abandoned { handler?(.cutAbandoned(feedID: feedID, reason: reason)) }
+    events.forEach { handler?($0) }
+    if published { publishedHandler?() }
   }
 
   /// Updates switch policy on the same coordinator that ingests Program
@@ -380,6 +396,12 @@ final class ProgramOutputRoute: @unchecked Sendable {
   /// source is abandoned and reported; the on-air source keeps flowing.
   func setSourceHealth(_ feedID: FeedID, healthy: Bool) {
     mutate { $0.setFeedHealth(feedID, healthy: healthy) }
+  }
+
+  /// Takes a running source out of future cuts, or back. Its frames keep flowing: a camera on
+  /// air whose signal came back is shown again at once, whatever cuts may wait for.
+  func setSourceCutEligible(_ feedID: FeedID, eligible: Bool) {
+    mutate { $0.setCutEligible(feedID, eligible: eligible) }
   }
 
   func setPendingCutClock(_ clock: @escaping () -> TimeInterval, timeout: TimeInterval,
@@ -492,7 +514,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
       let programFrame = ProcessedFrame(payload: frame.payload, metadata: mappedMetadata)
       stats.accepted &+= 1
       monitorHandler?(feedID, programFrame, mapped.sourceTime, mapped.programTime, cut)
-      (report, published) = enqueueLocked(programFrame, acceptedAt: acceptedAt, events: &events)
+      (report, published) = enqueueLocked(programFrame, from: feedID, acceptedAt: acceptedAt, events: &events)
       if cut {
         events.append(.cutApplied(feedID: feedID, sourceTime: mapped.sourceTime,
           programTime: mapped.programTime))
@@ -589,7 +611,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
 
   /// Appends one accepted frame to the ordered stage. Lock held. Never waits:
   /// GPU conversion is encoded and committed here, and completes later.
-  private func enqueueLocked(_ frame: ProcessedFrame<CVPixelBuffer>, acceptedAt: TimeInterval,
+  private func enqueueLocked(_ frame: ProcessedFrame<CVPixelBuffer>, from feedID: FeedID, acceptedAt: TimeInterval,
                              events: inout [ProgramRouteEvent]) -> (FrameFanOutSummary, Bool) {
     guard outputActive else {
       stats.withoutConsumer &+= 1
@@ -631,7 +653,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
       width: contract?.width ?? source.width, height: contract?.height ?? source.height,
       pixelFormat: contract.map { UInt32($0.pixelFormat) } ?? source.pixelFormat,
       processingRevision: source.processingRevision, maximumRepeatDuration: repeatSeconds)
-    var entry = StageEntry(sequence: nextSequence, timeline: timeline, metadata: metadata,
+    var entry = StageEntry(sequence: nextSequence, timeline: timeline, feedID: feedID, metadata: metadata,
       sends: sends, acceptedAt: acceptedAt, retention: retention, backing: backing)
     if let contract, !contract.matches(source) || !contract.matchesColourAndAspect(frame.payload) {
       guard let normalizer = normalizerProvider?() else {

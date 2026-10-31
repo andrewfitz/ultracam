@@ -136,18 +136,40 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     guard let seconds = seconds(time) else { return }
     queue.async { [weak self] in
       guard let self, self.handle != nil else { return }
-      self.send([
-        "type": "video",
-        "observation": [
-          "time": seconds,
-          "camera_id": cameraID.rawValue,
-          "healthy": healthy,
-          "motion": 0.0,
-          "scene_change": 0.0,
-          "session_generation": 0,
-        ],
-      ])
+      self.sendHealth(cameraID: cameraID, healthy: healthy, seconds: seconds)
     }
+  }
+
+  /// The director's clock moved to another camera's stream clock. Each input keeps its own,
+  /// so the new one can be minutes from the last: later reads as a shot held that long and
+  /// forces a cut at once, earlier drops every cue until it catches up. The director starts
+  /// its timing over on the new clock, with `onAir` still the shot and each camera's health
+  /// as given. One block on the queue, so nothing on either clock lands in between.
+  func rebaseClock(at time: CMTime, onAir: FeedID?, health: [(FeedID, Bool)]) {
+    guard let seconds = seconds(time) else { return }
+    queue.async { [weak self] in
+      guard let self, self.handle != nil else { return }
+      self.speaking = false
+      self.silenceStartedAt = nil
+      self.lastCueSeconds = nil
+      self.send(["type": "reset"])
+      for (cameraID, healthy) in health { self.sendHealth(cameraID: cameraID, healthy: healthy, seconds: seconds) }
+      if let onAir { self.send(["type": "manualOverride", "camera_id": onAir.rawValue, "time": seconds]) }
+    }
+  }
+
+  private func sendHealth(cameraID: FeedID, healthy: Bool, seconds: Double) {
+    send([
+      "type": "video",
+      "observation": [
+        "time": seconds,
+        "camera_id": cameraID.rawValue,
+        "healthy": healthy,
+        "motion": 0.0,
+        "scene_change": 0.0,
+        "session_generation": 0,
+      ],
+    ])
   }
 
   func ingestAudio(time: CMTime, rms: Float, peak: Float, present: Bool) {

@@ -104,6 +104,9 @@ struct SwitcherCoordinator {
   private(set) var settings: SwitcherSettings
   private(set) var feedIDs: [FeedID]
   private(set) var feedHealth: [FeedID: Bool]
+  /// Running sources no cut may go to: a lost signal, until it has been steady a while. Unlike
+  /// `feedHealth` this leaves the scheduler alone, so the one on air keeps sending its frames.
+  private(set) var cutIneligible: Set<FeedID> = []
   private(set) var selectedFeedID: FeedID?
   private(set) var programOutput: ProgramOutput<FeedID>
 
@@ -212,6 +215,15 @@ struct SwitcherCoordinator {
     reconcilePendingState()
   }
 
+  /// Whether cuts may go to a source, apart from whether it runs. A cut already waiting for
+  /// it is dropped and reported; its frames, on air or not, are untouched.
+  mutating func setCutEligible(_ feedID: FeedID, eligible: Bool) {
+    guard feedIDs.contains(feedID) else { return }
+    guard !eligible else { cutIneligible.remove(feedID); return }
+    cutIneligible.insert(feedID)
+    if programOutput.pendingCut == feedID { cancelPendingCut() }
+  }
+
   /// Copies the Program clock, remaining source health and readiness, and a
   /// pending cut onto a coordinator rebuilt for a feed add, remove, or
   /// disable. The new mapper would otherwise start presentation time at zero
@@ -224,6 +236,7 @@ struct SwitcherCoordinator {
       feedHealth[id] = healthy
       programOutput.setSourceHealth(id, healthy: healthy)
     }
+    cutIneligible = previous.cutIneligible.intersection(feedIDs)
     if let target = programOutput.pendingCut {
       automaticRequestPending = previous.automaticRequestPending
       if previous.pendingDirectorDecision?.targetCameraID == target.rawValue {
@@ -259,8 +272,9 @@ struct SwitcherCoordinator {
     reconcilePendingState()
   }
 
+  /// Running and able to take a cut.
   func isFeedHealthy(_ feedID: FeedID) -> Bool {
-    feedHealth[feedID] ?? false
+    (feedHealth[feedID] ?? false) && !cutIneligible.contains(feedID)
   }
 
   /// Adds a manual cut to the Program boundary queue. `selectedFeedID` changes

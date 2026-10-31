@@ -1149,8 +1149,9 @@ import XCTest
     XCTAssertEqual(route.statistics.accepted, 3, "A stopped source takes no new frames")
   }
 
-  /// An add invalidates nothing, so nothing on its way to a client goes. Losing a source does.
-  func testAnAddKeepsQueuedFramesAndARemovalFlushesThem() throws {
+  /// An add invalidates nothing, so nothing on its way to a client goes, and neither does
+  /// removing an idle camera while another serves the meeting. Losing the one on Program does.
+  func testAnAddOrAnIdleRemovalKeepsQueuedFramesAndLosingTheOnAirSourceFlushesThem() throws {
     let a = feed("alpha"), b = feed("beta"), c = feed("gamma")
     let route = ProgramOutputRoute(feedIDs: [a, b])
     let consumer = try route.addConsumerRoute(id: "camera", capacity: 8)
@@ -1164,9 +1165,66 @@ import XCTest
     XCTAssertEqual(consumer.pendingCount, 3, "Every frame published across the add")
     XCTAssertEqual(route.statistics.published, 3)
     XCTAssertTrue(route.isOnAir)
+    route.setSourceHealth(b, healthy: false)  // stopped, as a removable camera is
     route.updateFeeds([a, c])
-    XCTAssertEqual(consumer.pendingCount, 0, "A removed source's frames must not reach the next segment")
+    XCTAssertEqual(consumer.pendingCount, 3, "Removing an idle camera doesn't touch Program's frames")
+    XCTAssertEqual(route.statistics.flushedOnReset, 0)
     XCTAssertTrue(route.isOnAir, "Removing another camera leaves the on-air one on air")
+    route.ingest(feedID: a, frame: processed(image, at: 3))
+    XCTAssertEqual(consumer.pendingCount, 4, "And delivery carries straight on")
+    var times: [CMTime] = []
+    while let sent = consumer.dequeue() {
+      times.append(sent.metadata?.presentationTime ?? .invalid)
+      sent.release()
+    }
+    XCTAssertEqual(times, (0..<4).map { CMTime(value: $0 * VideoContract.fastDuration.value,
+      timescale: VideoContract.fastDuration.timescale) }, "In order, with no gap")
+
+    route.ingest(feedID: a, frame: processed(image, at: 4))
+    route.setSourceHealth(a, healthy: false)
+    route.updateFeeds([c])
+    XCTAssertEqual(consumer.pendingCount, 0, "A removed on-air source's frames must not reach the next segment")
+    XCTAssertEqual(route.statistics.flushedOnReset, 0, "Nothing was staged: it had all been sent")
+  }
+
+  /// The camera on Program lost its signal for longer than the hold and got it back. Cuts to
+  /// it wait for 5 s of steady signal; its own frames never did.
+  func testALostSignalBlocksCutsButNotTheOnAirCamerasFrames() throws {
+    let a = feed("alpha"), b = feed("beta")
+    let route = ProgramOutputRoute(feedIDs: [a, b])
+    let consumer = try route.addConsumerRoute(id: "camera", capacity: 8)
+    let events = EventLog()
+    route.onEvent = { events.append($0) }
+    let image = try frame(a, at: 0).payload
+    route.setSourceHealth(a, healthy: true)
+    route.setSourceHealth(b, healthy: true)
+    route.ingest(feedID: a, frame: processed(image, at: 0))
+    route.ingest(feedID: b, frame: processed(image, at: 0))
+    route.setSourceCutEligible(a, eligible: false)
+    for index in 1...4 {
+      guard case .accepted = route.ingest(feedID: a, frame: processed(image, at: Int64(index))).decision else {
+        return XCTFail("The on-air camera's frames are Program's again as soon as they arrive")
+      }
+    }
+    XCTAssertEqual(consumer.pendingCount, 5)
+    XCTAssertEqual(route.statistics.skippedMissingSource, 0)
+    XCTAssertTrue(events.errors.isEmpty, "No \"skipping the on-air camera's frames\"")
+    XCTAssertTrue(route.isOnAir)
+
+    route.setSourceCutEligible(b, eligible: false)
+    guard case .rejectedMissingSource = route.requestSelection(b) else { return XCTFail("No cut to a lost camera") }
+    route.setSourceCutEligible(b, eligible: true)
+    guard case .queued = route.requestSelection(b) else { return XCTFail("Steady again: a cut") }
+    route.setSourceCutEligible(b, eligible: false)
+    XCTAssertFalse(route.hasPendingCut, "A cut waiting for a camera that loses its signal is dropped")
+    let deadline = Date().addingTimeInterval(1)
+    while events.abandoned.isEmpty, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+    XCTAssertEqual(events.abandoned.map(\.0), [b], "And reported, so its requester is released")
+    route.updateFeeds([a, b, feed("gamma")])
+    guard case .rejectedMissingSource = route.requestSelection(b) else { return XCTFail("A rebuild keeps it out of cuts") }
+    guard case .accepted = route.ingest(feedID: a, frame: processed(image, at: 5)).decision else {
+      return XCTFail("And keeps the on-air camera a source")
+    }
   }
 
   func testNormalizerReplacesThePoolBuffersStaleColorAndGeometryTags() throws {

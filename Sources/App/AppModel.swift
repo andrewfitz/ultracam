@@ -391,6 +391,8 @@ final class AppModel {
   private var autoSwitcherBridge: AutoSwitcherBridge?
   /// The cameras the running director cuts between, fixed when it was built.
   private var directorCameras: (anchor: FeedID, emphasis: FeedID)?
+  /// The camera whose clock the running director last heard (`directorClockFeedID`).
+  @ObservationIgnored private var directorClockOwner: FeedID?
   private var autoSwitcherTimeline: AutoSwitcherTimelineRecorder?
   private var recordingTimelines: [FeedID: AutoSwitcherTimelineRecorder] = [:]
   /// The tap each running take measures its audio on: the one it started on,
@@ -602,6 +604,9 @@ final class AppModel {
       self?.feedCoordinator.requestCameraReconnects()
       // Retries a monitor that couldn't register, now that CMIO's cameras changed.
       if self?.wantsDemandMonitor == true { self?.demandMonitor.refresh() }
+      // Program's camera may be new, after its write found none to go to.
+      self?.programPreNegotiated = nil
+      self?.reconcileProgramTransportDemand()
     }
     demandMonitor.onRouteChange = { [weak self] change in
       self?.routeDemandChanged(change.route.id, requested: change.requested, error: change.error)
@@ -870,6 +875,8 @@ final class AppModel {
     syncRecordingFeeds()
     guard selectFeed(id) else { return nil }
     saveSettings()
+    // A second camera publishes Program: prepare its format before a client finds it.
+    reconcileProgramTransportDemand()
     return id
   }
 
@@ -946,9 +953,10 @@ final class AppModel {
     monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(id.rawValue), nil)
     syncRecordingFeeds()
     saveSettings(reason: "camera removed")
-    // It may have been the director's anchor or emphasis, or Program's selection.
-    reconcileAutoSwitcher()
-    reconcileProgramTransportDemand()
+    // It may have been the director's anchor or emphasis, or Program's selection. Down to one
+    // camera, Program's demand went with it (`saveSettings`): cameras stop rendering for it,
+    // and one started for it stops. This reconciles the director and the transport too.
+    reconcileAutomaticFeed()
     return true
   }
 
@@ -1143,6 +1151,7 @@ final class AppModel {
     }
     autoSwitcherBridge = bridge
     directorCameras = (anchor, emphasis)
+    directorClockOwner = directorClockFeedID
     if let current = feedCoordinator.programOutput.selectedFeedID,
       (current == anchor || current == emphasis) {
       bridge.manualOverride(cameraID: current, at: directorUpdate?.mediaTime ?? .zero)
@@ -1160,6 +1169,7 @@ final class AppModel {
     autoSwitcherBridge?.stop()
     autoSwitcherBridge = nil
     directorCameras = nil
+    directorClockOwner = nil
     autoSwitcherTimeline?.finish()
     autoSwitcherTimeline = nil
   }
@@ -1210,8 +1220,12 @@ final class AppModel {
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
     publishVirtualCameraRegistry(persistedSnapshot, reason: reason)
     let available = programAvailable
-    // A monitor that lost Program takes frames again from a new generation.
-    if available, !monitorProgramAvailable { programMonitorTap?.restart() }
+    // A monitor that lost Program takes frames again from a new generation, and a Program
+    // camera published again has had nothing written to it.
+    if available, !monitorProgramAvailable {
+      programMonitorTap?.restart()
+      programPreNegotiated = nil
+    }
     // Down to one camera: the monitor no longer follows Program, so its client is
     // forgotten here. Any client left keeps the device, on standby black, until it goes.
     if !available {
@@ -1383,7 +1397,29 @@ final class AppModel {
       detectedSourceDurations[feedID] = duration
       reconcileProgramTransportDemand()
     }
-    if feedID == directorClockFeedID { feedAutoSwitcherAudio(update) }
+    if feedID == directorClockFeedID {
+      if autoSwitcherBridge != nil, directorClockOwner != feedID { rebaseDirectorClock(on: feedID, update) }
+      feedAutoSwitcherAudio(update)
+    }
+  }
+
+  /// The running director's clock moved to another camera, the anchor having stopped or come
+  /// back: its timing starts over on that camera's clock (`AutoSwitcherBridge.rebaseClock`).
+  /// A cut it asked for on the old clock goes with that timing.
+  private func rebaseDirectorClock(on feedID: FeedID, _ update: CaptureUpdate) {
+    guard let bridge = autoSwitcherBridge, let cameras = directorCameras,
+      let time = update.audioPacketTime ?? update.mediaTime else { return }
+    captureLog.notice("Director clock: \(self.directorClockOwner?.rawValue ?? "none", privacy: .public) → \(feedID.rawValue, privacy: .public)")
+    directorClockOwner = feedID
+    if let decisionID = pendingAutoDecisionID {
+      pendingAutoDecisionID = nil
+      pendingAutoTargetFeedID = nil
+      autoSwitcherTimeline?.recordRejected(decisionID: decisionID)
+      feedCoordinator.cancelProgramCut()
+    }
+    bridge.rebaseClock(at: time, onAir: switcherSelectedFeedID, health: [cameras.anchor, cameras.emphasis].map {
+      ($0, feedCoordinator.isFeedRunning($0) && !signalHealth.isUnhealthy($0))
+    })
   }
 
   /// Opens one camera's capture. The one start path, for every camera, manual
@@ -1401,8 +1437,9 @@ final class AppModel {
       return
     }
     // A source retired after a failure must become eligible again only after
-    // its next capture actually starts.
+    // its next capture actually starts. Its signal starts over with it.
     feedCoordinator.setProgramSourceHealth(id, healthy: true)
+    feedCoordinator.setProgramSourceCutEligible(id, eligible: true)
     // A restart clears the camera's half of an unexpected stop; the take's stays until seen.
     if var stop = unexpectedStops[id] {
       stop.cameraStopped = false
@@ -1571,8 +1608,10 @@ final class AppModel {
 
   /// Program has a client, or its monitor is showing: someone wants its pixels. Cuts land
   /// without this; it decides what renders, starts automatic cameras and runs the director.
+  /// With one camera there is no Program to want.
   private var programPicture: Bool {
-    routeHeld(VirtualCameraDescriptor.program().id) || monitorDemand.contains(MonitorTargetID("program"))
+    programAvailable &&
+      (routeHeld(VirtualCameraDescriptor.program().id) || monitorDemand.contains(MonitorTargetID("program")))
   }
 
   private var takeActive: Bool { recordingModel.feeds.contains { $0.status == .recording || $0.status == .paused } }
@@ -1641,14 +1680,13 @@ final class AppModel {
   /// Program with nothing to show while another camera has a picture: move to it, at once,
   /// as nothing is on air to cut from. A starting camera yields too, as its first frame
   /// may be seconds off. Never cuts a live source, so a lost signal stays the operator's
-  /// call (`moveProgram`). Next in camera order. The contract owner doesn't change, so
-  /// frames convert rather than renegotiate under a client.
+  /// call (`moveProgram`). The next live camera with frames, as `programFailover` finds it.
+  /// The contract owner doesn't change, so frames convert rather than renegotiate under a client.
   private func moveProgramToProducingCamera(_ cause: UIProgramMove.Cause) {
     let output = feedCoordinator.programOutput
     guard let onAir = switcherSelectedFeedID, !output.isOnAir, !output.hasPendingCut else { return }
-    guard let next = ProgramFailover.nextLive(after: onAir, order: feedDescriptors.filter(\.enabled).map(\.id), isLive: {
-      $0 != onAir && output.isProducing($0) && !signalHealth.isUnhealthy($0)
-    }), case .selectedImmediately = requestProgramCut(to: next) else { return }
+    guard let next = programFailover(after: onAir, withFrames: true),
+      case .selectedImmediately = requestProgramCut(to: next) else { return }
     captureLog.notice("Program moved: \(onAir.rawValue, privacy: .public) → \(next.rawValue, privacy: .public), \(String(describing: cause), privacy: .public)")
     programShotStartedAt = Date()
     // Nobody is told about a selection no one can see.
@@ -1667,11 +1705,15 @@ final class AppModel {
       cameraRequested: routeHeld(VirtualCameraDescriptor.program().id),
       anyCameraRunning: feedDescriptors.contains { $0.enabled && feedCoordinator.isFeedRunning($0.id) })
     let contract = programContract(for: producer)
-    if programAvailable, !programInUse, let producerID, detectedSourceDurations[producerID] != nil,
-      contract != programPreNegotiated {
-      programPreNegotiated = contract
-      feedCoordinator.requestProgramOutputPreNegotiation(configuration: contract,
-        passthroughFormat: kCVPixelFormatType_422YpCbCr10)
+    // After any connect or close below: the bridge's control queue runs them in order, and
+    // it writes the closed camera only once its session has closed.
+    defer {
+      if programAvailable, !programInUse, let producerID, detectedSourceDurations[producerID] != nil,
+        contract != programPreNegotiated {
+        programPreNegotiated = contract
+        feedCoordinator.requestProgramOutputPreNegotiation(configuration: contract,
+          passthroughFormat: kCVPixelFormatType_422YpCbCr10)
+      }
     }
     // One contract per client session: the format of the camera on air when
     // the client connected (its "owner"). Cuts never renegotiate; frames from
@@ -1687,6 +1729,8 @@ final class AppModel {
       programOutputIssue = nil
       feedCoordinator.programOutput.acknowledgeOutputError()
       programContractOwner = required ? producerID : nil
+      // A session leaves the camera on its own contract: write the closed one afresh.
+      programPreNegotiated = nil
     } else if required, producerID == programContractOwner, contract != programTransportConfiguration {
       renegotiate = true
     } else {
@@ -1833,12 +1877,14 @@ final class AppModel {
     switch change {
     case .unhealthy(let id):
       captureLog.notice("Signal lost \(id.rawValue, privacy: .public): past the 1 s hold")
-      feedCoordinator.setProgramSourceHealth(id, healthy: false)
+      // No cut goes to it, but it stays a source: on air, its frames show again the moment
+      // the signal does. The 5 s of steady signal are for cuts, not for what's on air.
+      feedCoordinator.setProgramSourceCutEligible(id, eligible: false)
       autoSwitcherBridge?.setCameraHealth(cameraID: id, healthy: false, at: directorClock())
       moveProgram(off: id)
     case .eligible(let id):
       captureLog.notice("Signal steady \(id.rawValue, privacy: .public): eligible for Program again")
-      feedCoordinator.setProgramSourceHealth(id, healthy: true)
+      feedCoordinator.setProgramSourceCutEligible(id, eligible: true)
       autoSwitcherBridge?.setCameraHealth(cameraID: id, healthy: true, at: directorClock())
       if programMoved?.from == descriptor(for: id)?.name { programMoved = nil }
     }
@@ -1852,11 +1898,7 @@ final class AppModel {
     guard switcherSelectedFeedID == id else { return }
     let settings = switcherSettings
     guard settings.automatic, settings.strategy != .manual else { return }
-    let order = stripOrder(feedDescriptors.filter(\.enabled).map(\.id))
-    guard let next = ProgramFailover.nextLive(after: id, order: order, isLive: { candidate in
-      candidate != id && feedCoordinator.isFeedRunning(candidate) && cameraUpdates[candidate]?.signal == .live &&
-        !signalHealth.isUnhealthy(candidate)
-    }) else { return }
+    guard let next = programFailover(after: id) else { return }
     switch requestProgramCut(to: next) {
     case .queued, .coalesced, .selectedImmediately:
       captureLog.notice("Program moved: \(id.rawValue, privacy: .public) → \(next.rawValue, privacy: .public), signal lost")
@@ -1867,6 +1909,17 @@ final class AppModel {
       break
     }
     reconcileProgramTransportDemand()
+  }
+
+  /// Where Program goes off a camera with no picture, for both moves: the next camera in strip
+  /// order that runs with a live signal not lost past the hold. `withFrames` also needs it to
+  /// have sent Program a frame, for a move that shows it at once.
+  private func programFailover(after onAir: FeedID, withFrames: Bool = false) -> FeedID? {
+    let output = feedCoordinator.programOutput
+    return ProgramFailover.nextLive(after: onAir, order: stripOrder(feedDescriptors.filter(\.enabled).map(\.id))) { candidate in
+      candidate != onAir && feedCoordinator.isFeedRunning(candidate) && cameraUpdates[candidate]?.signal == .live &&
+        !signalHealth.isUnhealthy(candidate) && (!withFrames || output.isProducing(candidate))
+    }
   }
 
   /// What can only be learned by watching the clock: nothing arrives to say a client has

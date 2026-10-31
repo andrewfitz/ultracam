@@ -307,6 +307,12 @@ final class FeedCoordinator {
     programOutput.setSourceHealth(feedID, healthy: healthy)
   }
 
+  /// Whether Program may cut to a running camera (its signal). Its frames still reach Program.
+  func setProgramSourceCutEligible(_ feedID: FeedID, eligible: Bool) {
+    guard descriptors.contains(where: { $0.id == feedID }) else { return }
+    programOutput.setSourceCutEligible(feedID, eligible: eligible)
+  }
+
   /// Lazily creates a session while preserving descriptor ordering.
   func session(for id: FeedID) -> FeedSession {
     if let session = sessions[id] { return session }

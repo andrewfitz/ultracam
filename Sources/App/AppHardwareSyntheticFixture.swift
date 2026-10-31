@@ -41,7 +41,8 @@ import CoreVideo
     })
     hardware.programBridge = { route in
       ProgramOutputBridge(route: route, connect: { _, _ in try programSink.connect() },
-        disconnect: { programSink.disconnect() }, send: { programSink.send($0) }, paced: true)
+        disconnect: { programSink.disconnect() }, send: { programSink.send($0) },
+        preNegotiate: { _, _ in programSink.preNegotiate() }, paced: true)
     }
     return hardware
   }
@@ -115,6 +116,7 @@ final class SyntheticCameraSink: @unchecked Sendable {
   private var attempts = 0
   private var failures = 0
   private var sent = 0
+  private var preNegotiated = 0
   func connect() throws {
     try lock.withLock {
       attempts += 1
@@ -125,7 +127,10 @@ final class SyntheticCameraSink: @unchecked Sendable {
   func disconnect() { lock.withLock { connections = max(0, connections - 1) } }
   func send(_ sample: CMSampleBuffer) -> Bool { lock.withLock { sent += 1; return true } }
   func failNextConnects(_ count: Int) { lock.withLock { failures = count } }
+  /// A format written to the closed camera, for its first client.
+  func preNegotiate() { lock.withLock { preNegotiated += 1 } }
   var sentCount: Int { lock.withLock { sent } }
+  var preNegotiations: Int { lock.withLock { preNegotiated } }
   var connectAttempts: Int { lock.withLock { attempts } }
   var openConnections: Int { lock.withLock { connections } }
 }
