@@ -1315,6 +1315,45 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(harness.stops, 1)
   }
 
+  /// A client that stops taking frames looks healthy to everything else. Its stall is
+  /// published once, dated from the first refusal, and any accepted frame ends it.
+  func testAFullCameraQueueIsPublishedAndEndsWithAnAcceptedFrame() throws {
+    let harness = CaptureHarness()
+    let refusing = RefusingSends()
+    var services = harness.services(automatic: true)
+    let send = services.send
+    services.send = { sample in refusing.refuses ? false : try send(sample) }
+    let controller = CaptureController(services: services)
+    defer { controller.onUpdate = nil; controller.stop() }
+    ready(controller, harness: harness, configuration: config)
+    let statuses = CaptureStatusRecorder()
+    controller.onUpdate = { statuses.record($0) }
+    let source = try EndToEndChecks.source()
+    refusing.refuses = true
+    harness.emitAutomatic(source, at: .zero, duration: VideoContract.fastDuration)
+    awaitCondition("The stall must be published") { statuses.last?.cameraQueueFullSince != nil }
+    let since = statuses.last?.cameraQueueFullSince
+    harness.emitAutomatic(source, at: VideoContract.fastDuration, duration: VideoContract.fastDuration)
+    awaitCondition("The second refusal must be counted") { statuses.last?.cameraDrops == 2 }
+    XCTAssertEqual(statuses.last?.cameraQueueFullSince, since, "It dates from the first refusal")
+    refusing.refuses = false
+    harness.emitAutomatic(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: 2), duration: VideoContract.fastDuration)
+    awaitCondition("An accepted frame ends the stall") { statuses.last?.cameraQueueFullSince == nil }
+  }
+
+  func testRestartingTheOutputKeepsCaptureRunning() throws {
+    let harness = CaptureHarness()
+    let controller = CaptureController(services: harness.services(automatic: true))
+    defer { controller.onUpdate = nil; controller.stop() }
+    ready(controller, harness: harness, configuration: config)
+    let source = try EndToEndChecks.source()
+    harness.emitAutomatic(source, at: .zero, duration: VideoContract.fastDuration)
+    awaitCondition("Connected") { harness.negotiated.count == 1 }
+    controller.restartCameraOutput()
+    awaitCondition("Restart reopens the virtual camera") { harness.negotiated.count == 2 }
+    XCTAssertEqual(harness.starts, 1, "Capture, and any take on it, never stopped")
+  }
+
   func testTransientCameraLossRetriesWithoutReopeningCaptureOrBreakingPreviewCadence() throws {
     let harness = CaptureHarness()
     harness.failNextSends(1)
@@ -1638,6 +1677,14 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       XCTAssertEqual(Double(pixel), 16 + 219 * 0.0625, accuracy: 1)
       print("PACED_CAPTURE v210 3840x2160 source=59.94 output=\(reduce ? 29.97 : 59.94) produced=\(emissionTimes.count) emissionSpan=\(actualSpan) camera=\(harness.sent) preview=\(harness.previewed) reportedDrops=\(statuses.drops)")
     }
+  }
+}
+private final class RefusingSends: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored = false
+  var refuses: Bool {
+    get { lock.withLock { stored } }
+    set { lock.withLock { stored = newValue } }
   }
 }
 #endif

@@ -1820,7 +1820,10 @@ final class CaptureController: @unchecked Sendable {
         let placed = CMTimeAdd(anchor.video, CMTimeSubtract(packet.packetTime, anchor.audio))
         return placed.isNumeric && placed.epoch == 0 && placed.value >= 0 ? placed : nil
       }
-      guard pairTime != nil else { return }
+      guard pairTime != nil else {
+        route.callbacks.audioBeforeFirstFrame?()
+        return
+      }
     }
     let accepted: Bool
     if let source, let callback = route.callbacks.sourceAudioWithAdmission {

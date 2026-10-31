@@ -293,6 +293,9 @@ final class AppModel {
   /// Cameras whose client has been waiting for frames past `LiveWatchLimits.clientWaiting`.
   private(set) var waitingClients: Set<FeedID> = []
   @ObservationIgnored private var clientWaitingSince: [FeedID: TimeInterval] = [:]
+  /// Cameras whose extension queue has been full past `LiveWatchLimits.queueStall`.
+  private(set) var stalledCameras: Set<FeedID> = []
+  @ObservationIgnored private var unusedTakeWatch = UnusedTakeWatch()
   /// Early takes someone has seen, until the next take starts on that camera.
   private(set) var acknowledgedTakes: Set<FeedID> = []
   @ObservationIgnored private var liveWatchTimer: Timer?
@@ -845,6 +848,7 @@ final class AppModel {
     cameraLUTs[id] = nil
     cameraUpdates[id] = nil
     feedPolicies[id] = nil
+    stalledCameras.remove(id)
     signalHealth.remove(id)
     unexpectedStops[id] = nil
     acknowledgedTakes.remove(id)
@@ -1193,7 +1197,8 @@ final class AppModel {
   /// Brings a running camera's controller to its effective configuration.
   /// A no-op when nothing it uses changed, so it is safe to call after any edit.
   private func applyPipeline(_ id: FeedID) {
-    if let error = descriptor(for: id)?.processingDeclarationError { showStatus(error); return }
+    if let error = descriptor(for: id)?.processingDeclarationError { reportProblem(error, key: "declaration.\(id.rawValue)"); return }
+    clearProblem("declaration.\(id.rawValue)")
     guard feedCoordinator.isFeedRunning(id), let descriptor = descriptor(for: id),
       let next = pipeline(for: id), next != appliedPipelines[id] else { return }
     appliedPipelines[id] = next
@@ -1624,6 +1629,27 @@ final class AppModel {
     return update.signal == .live || signalHealth.isWithinLossHold(id)
   }
 
+  /// The extension's counters alone don't show a hang: a client that stops taking frames
+  /// leaves the tally red and Zoom frozen. A queue full this long means exactly that.
+  private func watchQueues(now: TimeInterval) {
+    for descriptor in feedDescriptors {
+      let id = descriptor.id
+      let stalled = cameraUpdates[id]?.cameraQueueFullSince.map { now - $0 >= LiveWatchLimits.queueStall } == true
+      if stalled != stalledCameras.contains(id) {
+        if stalled { stalledCameras.insert(id) } else { stalledCameras.remove(id) }
+      }
+    }
+    let program = feedCoordinator.programQueueFullSince.map { now - $0 >= LiveWatchLimits.queueStall } == true
+    if program != programQueueStalled { programQueueStalled = program }
+  }
+
+  /// A take that has outlived its meeting says so, and only says so: a take is never stopped for this.
+  private func watchUnusedTake(now: TimeInterval) {
+    let unused = unusedTakeWatch.update(rolling: recordingModel.feeds.contains { $0.status == .recording || $0.status == .paused },
+      clientConnected: routeDemand.values.contains(true), clientsUnknown: !unknownRoutes.isEmpty, now: now)
+    if unused != unusedTake { unusedTake = unused }
+  }
+
   /// A dropout inside the hold: every surface keeps calling it live.
   func signalWithinLossHold(_ id: FeedID) -> Bool { signalHealth.isWithinLossHold(id) }
 
@@ -1712,6 +1738,8 @@ final class AppModel {
       clientWaitingSince[id] = since
       if now - since >= LiveWatchLimits.clientWaiting, !waitingClients.contains(id) { waitingClients.insert(id) }
     }
+    watchQueues(now: now)
+    watchUnusedTake(now: now)
     if !wantsLiveWatch {
       liveWatchTimer?.invalidate()
       liveWatchTimer = nil

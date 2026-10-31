@@ -142,6 +142,7 @@ struct UISessionBridge {
       camera.clientUnknown = ownDevice && model.cameraClientUnknown(id)
       camera.sinkConnected = update?.cameraOutputActive == true
       camera.clientWaiting = model.waitingClients.contains(id)
+      camera.queueStalled = model.stalledCameras.contains(id)
       camera.sinkFailure = running ? update?.cameraConnectError : nil
       camera.unexpectedStop = model.unexpectedStops[id].map(Self.unexpectedStop)
       camera.processing = descriptor.pipelineEnabled

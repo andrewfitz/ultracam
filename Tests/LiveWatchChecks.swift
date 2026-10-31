@@ -66,6 +66,22 @@ import XCTest
     XCTAssertTrue(bridge.snapshot().cameras[0].clientUnknown)
   }
 
+  func testAFullQueueCountsOnlyWhenItStaysFull() {
+    let model = appModel()
+    let id = model.selectedFeedID
+    var update = CaptureUpdate(message: "")
+    update.cameraQueueFullSince = 100
+    model.deliverCaptureUpdateForTesting(id, update)
+    model.liveWatchTick(now: 100 + LiveWatchLimits.queueStall - 0.1)
+    XCTAssertFalse(model.stalledCameras.contains(id))
+    model.liveWatchTick(now: 100 + LiveWatchLimits.queueStall)
+    XCTAssertTrue(model.stalledCameras.contains(id))
+    update.cameraQueueFullSince = nil
+    model.deliverCaptureUpdateForTesting(id, update)
+    model.liveWatchTick(now: 200)
+    XCTAssertFalse(model.stalledCameras.contains(id), "Any accepted frame ends it")
+  }
+
   /// A client with no frames waits out the grace, then raises a problem, and clears with demand.
   func testWaitingClientIsRaisedAfterItsGraceAndClearsWhenItLeaves() {
     let model = appModel()

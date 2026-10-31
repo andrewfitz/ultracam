@@ -199,6 +199,8 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
         self?.appendNativeVideo(image, metadata: metadata, source: source, signalValid: valid, timecode: timecode) ?? false
       }, metadataFailure: { [weak self] message in
         self?.recorder.failTakeMetadata(message)
+      }, audioBeforeFirstFrame: { [weak self] in
+        self?.recorder.noteAudioBeforeFirstFrame()
       }, sourceAudioWithAdmission: { [weak self] planes, frames, format, time, context, source, pairedVideoTime in
         self?.appendSourcePCM(planes: planes, frames: frames, format: format, time: time, context: context, source: source, pairedVideoTime: pairedVideoTime) ?? false
       })
@@ -362,6 +364,8 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     var sourceAudio: (@Sendable ([Data], Int, SourceAudioFormat, CMTime, RecordingTakeContext) -> Bool)? = nil
     var videoWithTimecode: (@Sendable (CVPixelBuffer, SourceAdmissionMetadata, SourceAdmissionSnapshot, Bool, Timecode?) -> Bool)? = nil
     var metadataFailure: (@Sendable (String) -> Void)? = nil
+    /// A packet arrived before the take's first paired frame, and is skipped.
+    var audioBeforeFirstFrame: (@Sendable () -> Void)? = nil
     /// Original ordered source identity remains distinct from the resolved take context.
     var sourceAudioWithAdmission: (@Sendable ([Data], Int, SourceAudioFormat, CMTime, RecordingTakeContext, SourceAdmissionSnapshot, CMTime?) -> Bool)? = nil
   }

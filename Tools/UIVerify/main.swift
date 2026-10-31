@@ -494,6 +494,7 @@ extension UIVerify {
     let fixtures: [(String, UISessionSnapshot)] = [("program-meeting", UIFixtures.programMeeting()),
       ("single-meeting", UIFixtures.singleMeeting()), ("standalone", UIFixtures.standalone()),
       ("four-up", UIFixtures.fourUp()), ("stopped", UIFixtures.stopped()), ("problems", UIFixtures.problems())]
+      + UIFixtures.problemSessions()
     for (name, session) in fixtures {
       for size in [CGSize(width: 1320, height: 860), CGSize(width: 980, height: 680)] {
         // The smallest window is used without the sidebar. (A fixed-size offscreen window
@@ -544,6 +545,38 @@ extension UIVerify {
     render("component-sidebar", UISessionSidebarView(context: meeting), size: CGSize(width: 260, height: 860)).forEach { $0.close() }
     render("component-sidebar-problems", UISessionSidebarView(context: .fixture(UIFixtures.problems())),
       size: CGSize(width: 260, height: 860)).forEach { $0.close() }
+    // Attention, the bar, the list, the placeholder and the panel, in every state that changes them.
+    for (name, session) in UIFixtures.problemSessions() {
+      let context = UIContext.fixture(session)
+      render("component-sidebar-\(name)", UISessionSidebarView(context: context), size: CGSize(width: 260, height: 860))
+        .forEach { $0.close() }
+      render("component-status-bar-\(name)", UIStatusBarView(context: context), size: CGSize(width: 1320, height: 40))
+        .forEach { $0.close() }
+      render("component-problem-list-\(name)", UIProblemList(problems: context.presentation.problems, context: context)
+        .padding(14).frame(width: 340, alignment: .leading), size: CGSize(width: 360, height: 480)).forEach { $0.close() }
+      render("component-program-view-\(name)", UIProgramView(context: context), size: CGSize(width: 1060, height: 800))
+        .forEach { $0.close() }
+      if let camera = context.presentation.cameras.first {
+        render("strip-\(name)", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 280))
+          .forEach { $0.close() }
+      }
+      if let camera = context.presentation.cameras.last {
+        render("strip-\(name)-second", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 280))
+          .forEach { $0.close() }
+      }
+    }
+    // The strip never changes height: Cut stays where it was.
+    let healthyStrip = UIContext.fixture(UIFixtures.standalone())
+    let problemStrip = UIContext.fixture(UIFixtures.twoProblems())
+    if let healthy = healthyStrip.presentation.cameras.last, let problem = problemStrip.presentation.cameras.last {
+      let heights = [UIChannelStripView(camera: healthy, context: healthyStrip), UIChannelStripView(camera: problem, context: problemStrip)].map {
+        NSHostingView(rootView: $0.frame(width: 560)).fittingSize.height
+      }
+      verifier.check("strip height is the same with a problem", heights[0] == heights[1], "\(heights)")
+    }
+    render("component-alert-panel", UIAlertPanelView(alert: UIPanelAlert(id: "a", title: "Camera 1 signal lost", body: "Still on Program",
+      action: UIProblemAction(title: "Cut to Camera 2", action: .cut(cameraID: "camera-2"))), send: { _ in }),
+      size: UIAlertPanelController.size).forEach { $0.close() }
     render("component-inspector", UIInspectorView(context: meeting), size: CGSize(width: 320, height: 860)).forEach { $0.close() }
     render("component-status-bar", UIStatusBarView(context: meeting), size: CGSize(width: 1320, height: 40)).forEach { $0.close() }
     render("component-program-view", UIProgramView(context: meeting), size: CGSize(width: 1060, height: 800)).forEach { $0.close() }
@@ -1766,6 +1799,7 @@ extension UIVerify {
     let fixtures: [(String, UISessionSnapshot)] = [("program-meeting", UIFixtures.programMeeting()),
       ("single-meeting", UIFixtures.singleMeeting()), ("standalone", UIFixtures.standalone()),
       ("four-up", UIFixtures.fourUp()), ("stopped", UIFixtures.stopped()), ("problems", UIFixtures.problems())]
+      + UIFixtures.problemSessions()
     for (name, session) in fixtures {
       let presentation = UIPresentationBuilder.session(session)
       let topLevel = UIMenuBarController.buildItems(presentation: presentation, session: session, inputs: UIFixtures.inputs,

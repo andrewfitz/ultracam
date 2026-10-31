@@ -21,6 +21,8 @@ extension UISessionBridge {
       camera.signalLostFor = nil
     }
     if let update {
+      camera.audioChannels = update.audioChannels
+      camera.audioSampleRate = update.audioSampleRate
       camera.audio = UIAudioLevels(present: update.audioPresent, peakLeft: update.audioPeakLeft,
         peakRight: update.audioPeakRight, rmsLeft: update.audioRMSLeft, rmsRight: update.audioRMSRight)
     }
@@ -32,6 +34,7 @@ extension UISessionBridge {
     rec.fileBytes = Int64(stats?.fileBytes ?? 0)
     rec.megabitsPerSecond = stats?.videoMegabitsPerSecond ?? 0
     rec.droppedFrames = Int(clamping: stats?.droppedVideoFrames ?? 0)
+    rec.sourceGaps = Int(clamping: stats?.sourceGaps ?? 0)
     rec.systemCompatibilityFrames = stats?.systemCompatibilityFrames ?? 0
     rec.compatibilityConversionActive = stats?.compatibilityConversionActive ?? false
     // The running take's audio so far, then the finished take's (cleared when the next starts).
@@ -49,14 +52,32 @@ extension UISessionBridge {
     let recording = model.recordingModel
     let folders = model.feedDescriptors.map { recording.outputFolder(for: $0.id) }
     return Self.cachedDrives(for: folders) {
-      UIRecordingLibrary.drives(for: folders,
-        recordingRates: model.feedDescriptors.compactMap { descriptor -> (URL, Double)? in
-          guard let folder = recording.outputFolder(for: descriptor.id),
-            let state = recording.feeds.first(where: { $0.id == descriptor.id }),
-            state.status == .recording || state.status == .paused else { return nil }
-          return (folder, state.statistics?.videoMegabitsPerSecond ?? UIRecordingLibrary.nominalMegabits(codec: recording.codec, fast: true))
-        })
+      var rolling: [(URL, Double)] = []
+      var assigned: [(URL, Double)] = []
+      for descriptor in model.feedDescriptors {
+        guard let folder = recording.outputFolder(for: descriptor.id) else { continue }
+        let channels = model.cameraUpdate(descriptor.id).map { $0.audioChannels > 0 ? $0.audioChannels : 2 } ?? 2
+        let estimate = displayRate(descriptor.id, audioChannels: channels)
+        assigned.append((folder, estimate))
+        if let state = recording.feeds.first(where: { $0.id == descriptor.id }),
+          state.status == .recording || state.status == .paused {
+          rolling.append((folder, UIRecordingLibrary.rollingMegabits(measuredVideo: state.statistics?.videoMegabitsPerSecond,
+            estimate: estimate, audioChannels: channels)))
+        }
+      }
+      return UIRecordingLibrary.drives(for: folders, recordingRates: rolling, assignedRates: assigned,
+        fallbackMegabits: UIRecordingLibrary.displayMegabits(codec: recording.codec))
     }
+  }
+
+  /// The camera's own format once it's known, so a 1080p camera isn't counted as UHD.
+  private func displayRate(_ id: FeedID, audioChannels: Int) -> Double {
+    let codec = model.recordingModel.codec
+    guard let format = model.cameraUpdate(id)?.sourceFormat else {
+      return UIRecordingLibrary.displayMegabits(codec: codec, audioChannels: audioChannels)
+    }
+    return UIRecordingLibrary.displayMegabits(codec: codec, width: format.width, height: format.height,
+      frameDuration: format.rate.nominal, audioChannels: audioChannels)
   }
 }
 

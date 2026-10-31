@@ -85,6 +85,23 @@ enum ProgramFailover {
   }
 }
 
+/// A take that has outlived the meeting it was for. Needs a client seen during the takes
+/// now rolling, so a recording with no meeting at all isn't told off, and an unreadable
+/// route says nothing, because nobody can tell.
+struct UnusedTakeWatch {
+  private var clientSeenAt: TimeInterval?
+
+  mutating func update(rolling: Bool, clientConnected: Bool, clientsUnknown: Bool, now: TimeInterval) -> Bool {
+    guard rolling else {
+      clientSeenAt = nil
+      return false
+    }
+    if clientConnected { clientSeenAt = now }
+    guard !clientsUnknown, let seen = clientSeenAt else { return false }
+    return now - seen >= LiveWatchLimits.unusedTake
+  }
+}
+
 /// How long a queue must stay full, and how long no one may have used Ultracam, before
 /// either counts. Frames and clients come and go; these are what stays true.
 enum LiveWatchLimits {

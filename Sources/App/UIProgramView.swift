@@ -193,7 +193,7 @@ struct UIProgramCutBar: View {
         .buttonBorderShape(.capsule)
         .overlay(Capsule().strokeBorder(button.pending ? Color.green : .clear, lineWidth: 1.5).allowsHitTesting(false))
         .disabled(!button.enabled)
-        .help("Cut to \(button.name) (⌃\(button.number))")
+        .help(button.help ?? "Cut to \(button.name) (⌃\(button.number))")
         .accessibilityLabel(button.pending ? "\(button.name), cut pending" : "Cut to \(button.name)")
     }
   }

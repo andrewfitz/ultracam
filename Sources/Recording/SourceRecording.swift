@@ -440,6 +440,8 @@ struct SourceRecordingTelemetry: Equatable, Sendable {
   /// file holds the frame before each gap; `sourceGaps` counts the gaps.
   fileprivate(set) var deviceSkippedFrames: UInt64 = 0
   fileprivate(set) var sourceGaps: UInt64 = 0
+  /// Audio packets before the first paired frame: no place on the take's timeline yet.
+  fileprivate(set) var audioBeforeFirstFrame: UInt64 = 0
   fileprivate(set) var largestSourceGap: UInt64 = 0
   /// Times the embedded audio was re-anchored to the video clock mid-take,
   /// and how many of those moved it earlier (a backward re-sync).
@@ -856,6 +858,11 @@ final class SourceRecorderCore: @unchecked Sendable {
 
   /// Adapter rejection of actual envelope metadata is a take failure, never
   /// an ordinary invalid-sample drop that silently leaves recording running.
+  /// Audio with no place on the take's timeline yet: counted, never fatal.
+  func noteAudioBeforeFirstFrame() {
+    stateLock.withLock { telemetryValue.audioBeforeFirstFrame &+= 1 }
+  }
+
   func failTakeMetadata(_ message: String) {
     stateLock.withLock { failLocked(message) }
   }
@@ -943,6 +950,7 @@ final class SourceRecorderCore: @unchecked Sendable {
           "recording.sourceVideoLost": telemetryValue.droppedVideo,
           "recording.sourceAudioLost": telemetryValue.droppedAudio,
           "recording.sourceSkippedFrames": telemetryValue.deviceSkippedFrames,
+          "recording.audioBeforeFirstFrame": telemetryValue.audioBeforeFirstFrame,
           "recording.videoClockDiscontinuities": telemetryValue.videoClockDiscontinuities,
           "recording.queueOverflows": telemetryValue.droppedQueueFull,
           "recording.sourceErrors": telemetryValue.writerErrors,

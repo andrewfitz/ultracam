@@ -149,6 +149,32 @@ import XCTest
     fixture.stop()
   }
 
+  /// Skipped, as it must be, but no longer uncounted, through the real adapter.
+  func testAudioBeforeTheFirstFrameIsCounted() throws {
+    let audio = try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    let fixture = try AuditCaptureFixture(audio: .present(audio))
+    let writer = AuditPairedWriter()
+    let configuration = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("early-audio-audit"),
+      outputURL: URL(fileURLWithPath: "/tmp/unused-early-audio-audit.mov"), width: 128, height: 72)
+    let recorder = try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
+    let adapter = SourceRecordingCallbackAdapter(feedID: configuration.feedID, recorder: recorder)
+    try adapter.start()
+    defer { fixture.stop(); try? adapter.stop() }
+    fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: adapter.callbacks)
+    try fixture.start(self)
+    try fixture.packet(audio, time: CMTime(value: 7, timescale: 1))
+    try fixture.packet(audio, time: CMTime(value: 8, timescale: 1))
+    try fixture.frame(time: CMTime(value: 20, timescale: 1))
+    try fixture.packet(audio, time: CMTime(value: 9, timescale: 1), pairedFrameSequence: fixture.source.context.nextSequence - 1)
+    fixture.source.stop()
+    try adapter.stop()
+    XCTAssertEqual(recorder.state, .finished, recorder.telemetry.lastError ?? "")
+    XCTAssertEqual(recorder.telemetry.audioBeforeFirstFrame, 2)
+    XCTAssertEqual(recorder.telemetry.droppedAudio, 0, "Nothing was lost from the take: it had no place yet")
+    XCTAssertEqual(recorder.telemetry.appendedAudio, 1)
+  }
+
   func testPairedEightAndSixteenChannelPCMKeepRawIdentityLayoutAndMeasuredJumpAnchors() throws {
     for channels in [8, 16] {
       let labels = (0..<channels).map { UInt32(kAudioChannelLabel_Discrete_0) + UInt32($0) }

@@ -176,6 +176,7 @@ private struct UIDiagnosticsCameraTab: View {
             UIDiagnosticsRow("Missing from the input", UIDiagnosticsFormat.count(stats.deviceSkippedFrames), warning: true)
           }
           UIDiagnosticsRow("Audio packets dropped", UIDiagnosticsFormat.count(stats.droppedAudioPackets), warning: stats.droppedAudioPackets > 0)
+          UIDiagnosticsRow("Audio before the first frame", UIDiagnosticsFormat.count(stats.audioBeforeFirstFrame))
           UIDiagnosticsRow("Encoder · writer errors", "\(stats.encoderErrors) · \(stats.writerErrors)", warning: stats.encoderErrors + stats.writerErrors > 0)
           UIDiagnosticsRow("File", stats.fileURL?.lastPathComponent ?? "—")
           if let warning = stats.warning { UIDiagnosticsRow("Warning", warning, warning: true) }

@@ -257,7 +257,8 @@ struct UIStatusPopover: View {
       }
     }
     .padding(14)
-    .frame(width: 340, alignment: .leading)
+    // Eight channels keep every maximum readable.
+    .frame(width: kind == .audio && context.session.cameras.contains { $0.audioChannels > 2 } ? 450 : 340, alignment: .leading)
   }
 
   private var output: some View {
@@ -374,6 +375,13 @@ struct UIStatusPopover: View {
     }
   }
 
+  /// What the source declares: "48 kHz  8 ch".
+  static func audioFormat(_ camera: UICameraSnapshot?) -> String? {
+    guard let camera, camera.audioChannels > 0, camera.audioSampleRate > 0 else { return nil }
+    let rate = Double(camera.audioSampleRate) / 1000
+    return "\(rate == rate.rounded() ? String(Int(rate)) : String(format: "%.1f", rate)) kHz  \(camera.audioChannels) ch"
+  }
+
   private var audio: some View {
     Group {
       Text("Embedded audio").font(.headline)
@@ -381,11 +389,17 @@ struct UIStatusPopover: View {
       if live.isEmpty { Text("No camera is running.").foregroundStyle(.secondary) }
       ForEach(live) { camera in
         VStack(alignment: .leading, spacing: 4) {
-          Text(camera.name).font(.callout.weight(.medium))
+          HStack {
+            Text(camera.name).font(.callout.weight(.medium))
+            Spacer()
+            if let format = Self.audioFormat(context.snapshot(camera.id)) {
+              Text(format).font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+            }
+          }
           UIAudioMeterPanel(cameraID: camera.id, name: camera.name, levels: camera.audio)
         }
       }
-      Text("48 kHz stereo from each input. Not sent through the Ultracam cameras.")
+      Text("Not sent through the Ultracam cameras.")
         .font(.subheadline).foregroundStyle(.secondary)
     }
   }

@@ -195,6 +195,10 @@ struct UISessionSidebarViewContent: View {
               + (take.duration.map { " · \(UIFormat.shortElapsed($0))" } ?? ""))
               .lineLimit(1)
             Text(take.name).font(.subheadline).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            if let lost = take.lostFrames, lost > 0 {
+              Label(lost == 1 ? "1 frame lost" : "\(lost) frames lost", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+            }
           }
           Spacer(minLength: 4)
           Button { context.send(.revealInFinder(take.url)) } label: { Image(systemName: "magnifyingglass") }

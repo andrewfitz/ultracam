@@ -105,7 +105,8 @@ struct UIContext {
   static func fixture(_ session: UISessionSnapshot, inputs: [UIInput] = UIFixtures.inputs,
     send: @escaping @MainActor (UIAction) -> Void = { _ in }) -> UIContext {
     UIContext(session: session, presentation: UIPresentationBuilder.session(session), inputs: inputs, send: send,
-      pictures: UIFixturePictures(), monitor: UIFixtureMonitorSettings(session: session))
+      pictures: UIFixturePictures(), monitor: UIFixtureMonitorSettings(session: session),
+      cameraControls: UIFixtures.cameraControls())
   }
 }
 
@@ -145,10 +146,30 @@ struct UIFixturePicture: View {
   func setPreferences(_ preferences: MonitorFeedPreferences, for cameraID: String) { values[cameraID] = preferences }
 }
 
+/// No Keychain and no saved assignments: a fixture has a control row and nothing behind it.
+private struct UIFixtureControlCredentials: CameraControlCredentialStoring {
+  func load(service: String, account: String) async throws -> ControlCredentials? { nil }
+  func save(_ credentials: ControlCredentials, service: String, account: String) async throws {}
+  func delete(service: String, account: String) async throws {}
+}
+
+@MainActor private final class UIFixtureControlAssignments: CameraControlAssignmentPersisting {
+  func load() throws -> CameraControlAssignmentSnapshot { .init() }
+  func save(_ snapshot: CameraControlAssignmentSnapshot) throws {}
+}
+
 /// Representative sessions for every screen. Tests and the offscreen renderer use these.
 enum UIFixtures {
   static let inputs = [UIInput(id: "mini-recorder-12g", name: "UltraStudio Mini Recorder 12G"),
     UIInput(id: "ultrastudio-4k-mini", name: "UltraStudio 4K Mini")]
+
+  /// The live strip has a Camera Control row, so the renders do too.
+  @MainActor static func cameraControls() -> CameraControlStore {
+    CameraControlStore(plugins: [:], credentials: UIFixtureControlCredentials(), persistence: UIFixtureControlAssignments())
+  }
+
+  /// This rig: eight embedded channels with sound on the first pair.
+  static let liveChannelPeaks = [0.52, 0.48, 0, 0, 0, 0, 0, 0]
 
   static func camera(_ index: Int, recording: UIRecordingStatus = .recording, elapsed: TimeInterval = 751,
     inUse: Bool = false, signal: UISignal = .live(format: "2160p 59.94")) -> UICameraSnapshot {
@@ -163,7 +184,10 @@ enum UIFixtures {
     camera.effects = index == 1 ? [true, true, true, true] : [false, true, true, false]
     camera.lutName = index == 1 ? "FX3_SLog3_to_709.cube" : nil
     camera.timecode = "14:22:31:12"
-    camera.audio = UIAudioLevels(present: true, peakLeft: 0.52, peakRight: 0.48, rmsLeft: 0.31, rmsRight: 0.28)
+    camera.audio = UIAudioLevels(present: true, peakLeft: 0.52, peakRight: 0.48, rmsLeft: 0.31, rmsRight: 0.28,
+      channelPeaks: liveChannelPeaks)
+    camera.audioChannels = 8
+    camera.audioSampleRate = 48000
     camera.activeTools = index == 1 ? [.guides, .zebra] : [.scopes]
     var rec = UICameraRecording()
     rec.status = recording
@@ -253,6 +277,85 @@ enum UIFixtures {
     session.selectedID = "camera-2"
     session.install = UIInstallState(canRequestChanges: true, pending: false, status: "", unavailableReason: nil, installed: false)
     return session
+  }
+
+  /// On air, rolling, Auto off: the signal went 3 s ago, and Camera 2 can take over.
+  static func signalLostOnAir() -> UISessionSnapshot {
+    var session = programMeeting()
+    session.autoSwitching = false
+    session.strategy = .manual
+    session.strategyTitle = "Manual"
+    session.cameras[0].signal = .noSignal
+    session.cameras[0].signalLostFor = 3.2
+    return session
+  }
+
+  /// The same with nothing to cut to, and a low drive under the takes.
+  static func signalLostNothingLive() -> UISessionSnapshot {
+    var session = signalLostOnAir()
+    session.cameras[1].signal = .noSignal
+    session.cameras[1].signalLostFor = 3
+    session.drives[0].secondsLeft = 1320
+    return session
+  }
+
+  /// Auto took Program to Camera 2 and is holding there.
+  static func programMoved() -> UISessionSnapshot {
+    var session = programMeeting()
+    session.onAirID = "camera-2"
+    session.autoHold = true
+    session.cameras[0].signal = .noSignal
+    session.cameras[0].signalLostFor = 14
+    session.cameras[0].recording.status = .idle
+    session.programMoved = UIProgramMove(from: "Camera 1", to: "Camera 2", heldShot: true)
+    return session
+  }
+
+  /// A camera stopped by itself with a take on it; a client is waiting on the other camera.
+  static func unexpectedStop() -> UISessionSnapshot {
+    var session = standalone()
+    session.cameras[0].running = false
+    session.cameras[0].signal = .none
+    session.cameras[0].recording.status = .idle
+    session.cameras[0].unexpectedStop = UIUnexpectedStop(reason: "the capture device stopped responding", wasOnAir: true,
+      take: true, savedDuration: 751)
+    session.cameras[1].recording.status = .idle
+    session.cameras[1].inUse = true
+    session.cameras[1].clientWaiting = true
+    return session
+  }
+
+  /// One camera on its own device, with the meeting app no longer taking frames.
+  static func queueStall() -> UISessionSnapshot {
+    var session = singleMeeting()
+    session.cameras[0].queueStalled = true
+    return session
+  }
+
+  /// Two takes running after their meeting ended, and an error that used to reach only Diagnostics.
+  static func stillRecording() -> UISessionSnapshot {
+    var session = standalone()
+    session.cameras[1].recording.status = .recording
+    session.unusedTake = true
+    session.appProblems = [UIAppProblem(id: "registry", text: "Virtual cameras could not be updated: the shared folder is unavailable.")]
+    return session
+  }
+
+  /// Rolling, no signal, and the LUT gone too: one row, two problems.
+  static func twoProblems() -> UISessionSnapshot {
+    var session = standalone()
+    session.cameras[1].recording.status = .recording
+    session.cameras[1].signal = .noSignal
+    session.cameras[1].signalLostFor = 6
+    session.cameras[1].lutError = "Saved LUT could not be restored: the file was moved."
+    return session
+  }
+
+  /// The sessions that show the problem list, for the renders.
+  static func problemSessions() -> [(String, UISessionSnapshot)] {
+    [("signal-lost", signalLostOnAir()), ("signal-lost-stranded", signalLostNothingLive()), ("program-moved", programMoved()),
+      ("unexpected-stop", unexpectedStop()), ("queue-stall", queueStall()), ("still-recording", stillRecording()),
+      ("two-problems", twoProblems())]
   }
 
   /// Nothing running yet.

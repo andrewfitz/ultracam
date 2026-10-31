@@ -67,6 +67,8 @@ enum UIMonitorTool: Int, CaseIterable, Sendable, Equatable {
 struct UIAudioLevels: Sendable, Equatable {
   var present = false
   var peakLeft = 0.0, peakRight = 0.0, rmsLeft = 0.0, rmsRight = 0.0
+  /// Fixtures: every channel's peak, as a live meter shows it. Nil is the stereo pair above.
+  var channelPeaks: [Double]? = nil
 }
 
 struct UICameraRecording: Sendable, Equatable {
@@ -75,6 +77,8 @@ struct UICameraRecording: Sendable, Equatable {
   var fileBytes: Int64 = 0
   var megabitsPerSecond: Double = 0
   var droppedFrames = 0
+  /// The gaps in this take's video that those frames fell in.
+  var sourceGaps = 0
   var systemCompatibilityFrames: UInt64 = 0
   var compatibilityConversionActive = false
   var compatibilityBadge: String? {
@@ -162,6 +166,9 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var automaticStartFailed = false
   var timecode: String?
   var audio = UIAudioLevels()
+  /// What the source really declares; 0 before it has.
+  var audioChannels = 0
+  var audioSampleRate = 0
   var activeTools: Set<UIMonitorTool> = []
   var recording = UICameraRecording()
   var message = ""
@@ -222,6 +229,8 @@ struct UITake: Sendable, Equatable, Identifiable {
   var name: String
   var date: Date
   var duration: TimeInterval?
+  /// Frames this take lost, from its sidecar; nil for an older take without the count.
+  var lostFrames: UInt64? = nil
 }
 
 struct UIInterruptedTake: Sendable, Equatable, Identifiable {
@@ -474,6 +483,8 @@ struct UICutButton: Sendable, Equatable, Identifiable {
   var onAir: Bool
   var pending: Bool
   var enabled: Bool
+  /// Why it's off, when it's off.
+  var help: String? = nil
 }
 
 struct UIStatusSegment: Sendable, Equatable, Identifiable {
@@ -646,13 +657,14 @@ enum UIPresentationBuilder {
       return camera.applying ? .updating : .recording
     case .idle:
       if recording.failed || recording.error != nil || camera.unexpectedStop?.take == true { return .failed }
+      // Stays until the next take, through a stop or a lost signal.
+      if recording.savedFileName != nil { return .saved }
       if !camera.running { return .stopped }
       switch camera.signal {
       case .noSignal, .unsupported, .connecting, .none, .deviceMissing: return .waiting
       case .live: break
       }
       if recording.folderPath == nil { return .noFolder }
-      if recording.savedFileName != nil { return .saved }
       return .ready
     }
   }
@@ -757,7 +769,9 @@ enum UIPresentationBuilder {
     // The take's audio warns only when it needs a look: an over, or a true peak at −1 dBTP or above.
     let takeAudio = isRecording || strip == .saved ? rec.audio : nil
     let audioNote = takeAudio.flatMap { $0.needsAttention ? $0.note : nil }
-    let recordingNote = [rec.note, audioNote].compactMap { $0 }.joined(separator: " · ")
+    // A saved take keeps its losses, said plainly; the writer's sentence is for Diagnostics.
+    let lossNote = strip == .saved && rec.droppedFrames > 0 ? lostFramesLine(rec) : nil
+    let recordingNote = [lossNote ?? rec.note, audioNote].compactMap { $0 }.joined(separator: " · ")
     if let audioNote { labelParts.append(audioNote) }
 
     return UICameraPresentation(
@@ -800,6 +814,16 @@ enum UIPresentationBuilder {
       lostTitle: lostClock(camera).map { "Signal lost \($0)" },
       lostDetail: lostDetail(camera, in: session),
       lostCut: lostCut(camera, index: index, in: session))
+  }
+
+  /// "60 frames lost in 5 gaps".
+  static func lostFramesLine(_ recording: UICameraRecording) -> String {
+    let frames = recording.droppedFrames == 1 ? "1 frame lost" : "\(recording.droppedFrames) frames lost"
+    switch recording.sourceGaps {
+    case 0: return frames
+    case 1: return "\(frames) in 1 gap"
+    default: return "\(frames) in \(recording.sourceGaps) gaps"
+    }
   }
 
   static func stopMessage(camera: UICameraSnapshot, recording: Bool, onAir: Bool) -> String {
@@ -885,7 +909,7 @@ enum UIPresentationBuilder {
 
     let cutButtons = session.outputMode == .program ? cameras.map {
       UICutButton(id: $0.id, number: $0.number, name: $0.name, onAir: session.onAirID == $0.id,
-        pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || session.onAirID == $0.id)
+        pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || session.onAirID == $0.id, help: $0.cutHelp)
     } : []
 
     // The title stays "Ultracam". The subtitle carries only what the status bar's

@@ -18,13 +18,39 @@ enum UIRecordingLibrary {
       frameDuration: frameDuration, bitDepth: bitDepth)?.megabitsPerSecond
   }
 
+  /// What HEVC really writes here, about 11 times under the recorder's figure. Display only:
+  /// `RecordingSizeEstimator` stays the cautious number that guards free space.
+  static let displayHEVCBytesPerPixel = 0.014
+  /// Embedded PCM stays 24-bit at 48 kHz, whatever the camera sends.
+  static func pcmMegabits(channels: Int) -> Double { Double(max(0, channels)) * 48_000 * 24 / 1_000_000 }
+
+  /// One camera's rate as an estimate, video plus PCM, until a take measures it.
+  static func displayMegabits(codec: RecordingCodec, width: Int = 3840, height: Int = 2160,
+    frameDuration: CMTime = CMTime(value: 1001, timescale: 60000), audioChannels: Int = 2) -> Double {
+    let pcm = pcmMegabits(channels: audioChannels)
+    switch codec.sizeEstimatorCodec {
+    case .hevcMain, .hevcMain10, .hevcMain10_422:
+      guard frameDuration.isNumeric, frameDuration.seconds > 0 else { return pcm }
+      return Double(width) * Double(height) / frameDuration.seconds * displayHEVCBytesPerPixel * 8 / 1_000_000 + pcm
+    case .proResLT, .proRes422, .proRes422HQ, .proRes4444:
+      return (nominalMegabits(codec: codec, width: width, height: height, frameDuration: frameDuration) ?? 0) + pcm
+    }
+  }
+
+  /// A rolling take's rate: what it measures, plus its PCM. Its first sample measures
+  /// nothing yet, so that one keeps the estimate instead of reading as no rate at all.
+  static func rollingMegabits(measuredVideo: Double?, estimate: Double, audioChannels: Int) -> Double {
+    guard let measuredVideo, measuredVideo > 0 else { return estimate }
+    return measuredVideo + pcmMegabits(channels: audioChannels)
+  }
+
   static func volumeName(for url: URL) -> String {
     (try? url.resourceValues(forKeys: [.volumeNameKey]).volumeName) ?? url.pathComponents.dropFirst().first ?? "Disk"
   }
 
-  /// One entry per destination volume. Time left divides free space by the
-  /// combined bitrate of the takes recording to that volume, or one nominal
-  /// take when nothing is recording there.
+  /// One entry per destination volume. Time left divides free space by the combined
+  /// rate of the takes recording to that volume, or with none, of every camera assigned
+  /// to it, since Record All fills it that fast. Rates are `displayMegabits` figures.
   @MainActor private static var takeCache: (key: [String], date: Date, takes: [UITake])?
 
   /// `recentTakes(in:)` cached for a few seconds; folder scans are not free.
@@ -36,7 +62,8 @@ enum UIRecordingLibrary {
     return takes
   }
 
-  static func drives(for folders: [URL?], recordingRates: [(URL, Double)], fallbackMegabits: Double = nominalMegabits(codec: .proRes42210Bit, fast: true)) -> [UIDrive] {
+  static func drives(for folders: [URL?], recordingRates: [(URL, Double)], assignedRates: [(URL, Double)] = [],
+    fallbackMegabits: Double = displayMegabits(codec: .proRes42210Bit)) -> [UIDrive] {
     var seen: [String: UIDrive] = [:]
     var order: [String] = []
     for case let folder? in folders {
@@ -60,8 +87,10 @@ enum UIRecordingLibrary {
       let available = reported ?? 0
       // An unreadable free figure leaves the size unknown too, so the drive isn't shown as full.
       let total = reported == nil ? 0 : Int64(values?.volumeTotalCapacity ?? 0)
-      let rate = recordingRates.filter { volumeName(for: $0.0) == name }.map(\.1).reduce(0, +)
-      let megabits = rate > 0 ? rate : fallbackMegabits
+      func sum(_ rates: [(URL, Double)]) -> Double { rates.filter { volumeName(for: $0.0) == name }.map(\.1).reduce(0, +) }
+      let rate = sum(recordingRates)
+      let assigned = sum(assignedRates)
+      let megabits = rate > 0 ? rate : assigned > 0 ? assigned : fallbackMegabits
       let seconds = available > 0 ? Double(available) * 8 / (megabits * 1_000_000) : nil
       seen[name] = UIDrive(name: name, availableBytes: available, totalBytes: total, secondsLeft: seconds)
       order.append(name)
@@ -101,7 +130,11 @@ enum UIRecordingLibrary {
         takes.append(UITake(url: url, name: url.lastPathComponent, date: date, duration: UITakeDurations.duration(for: url)))
       }
     }
-    return Array(takes.sorted { $0.date > $1.date }.prefix(limit))
+    return takes.sorted { $0.date > $1.date }.prefix(limit).map { take in
+      var take = take
+      take.lostFrames = UITakeDurations.lostFrames(for: take.url)
+      return take
+    }
   }
 }
 
@@ -274,6 +307,7 @@ enum UITakeDurations {
   nonisolated(unsafe) private static var known: [URL: TimeInterval] = [:]
   nonisolated(unsafe) private static var loading: Set<URL> = []
   nonisolated(unsafe) private static var failedAt: [URL: TimeInterval] = [:]
+  nonisolated(unsafe) private static var lost: [URL: UInt64] = [:]
   static let retryInterval: TimeInterval = 30
 
   static func duration(for url: URL) -> TimeInterval? {
@@ -285,9 +319,11 @@ enum UITakeDurations {
     if start {
       Task.detached(priority: .utility) {
         let seconds = try? await AVURLAsset(url: url).load(.duration).seconds
+        let frames = lostFrames(sidecarOf: url)
         lock.withLock {
           if let seconds, seconds.isFinite, seconds > 0 {
             known[url] = seconds
+            lost[url] = frames
             failedAt[url] = nil
           } else {
             failedAt[url] = ProcessInfo.processInfo.systemUptime
@@ -297,5 +333,14 @@ enum UITakeDurations {
       }
     }
     return nil
+  }
+
+  /// A take's lost frames, read with its duration. Nil for a take without the count.
+  static func lostFrames(for url: URL) -> UInt64? { lock.withLock { lost[url] } }
+
+  /// Device skips are already inside `sourceVideoLost`. Older sidecars have no count, and
+  /// a movie with no sidecar has nothing to say: both show nothing.
+  static func lostFrames(sidecarOf movie: URL) -> UInt64? {
+    (try? RecordingTakeSidecar.readSnapshot(for: movie))?.counters["recording.sourceVideoLost"]
   }
 }

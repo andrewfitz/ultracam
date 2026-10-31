@@ -38,7 +38,8 @@ struct UIAudioMeterPanel: View {
         // A new capture (camera removed and added again) is a new tap: a new view pairs attach and detach.
         UIAudioMeterTapView(tap: tap, present: levels.present, name: name).id(tap.identity)
       } else {
-        LevelMeterView(snapshot: levels.meterSnapshot, style: .full, present: levels.present, name: name)
+        LevelMeterView(snapshot: levels.meterSnapshot, style: .full, present: levels.present, name: name,
+          channelLabels: UIChannelLabels.labels(levels.meterSnapshot.channelCount))
       }
     }
     .frame(height: 210)
@@ -58,7 +59,8 @@ private struct UIAudioMeterTapView: View {
     VStack(alignment: .leading, spacing: 6) {
       Group {
         if let meter = displayedMeter {
-          AudioMeterView(meter: meter, present: present, name: name).id(ObjectIdentifier(meter))
+          AudioMeterView(meter: meter, channelLabels: UIChannelLabels.labels(meter.configuration.channelCount),
+            present: present, name: name).id(ObjectIdentifier(meter))
         } else { Color.clear }
       }
       Text("Click OVER to reset the peaks; right-click to reset loudness. Loudness is measured while shown or recording, and starts over with each take.")
@@ -102,7 +104,8 @@ struct UILiveAudioMeter: View {
       UILiveAudioMeterTapView(tap: tap, name: name, present: audio.present, style: style)
         .id(tap.identity)
     } else {
-      LevelMeterView(snapshot: audio.meterSnapshot, style: style, present: audio.present, name: name)
+      LevelMeterView(snapshot: audio.meterSnapshot, style: style, present: audio.present, name: name,
+        channelLabels: UIChannelLabels.labels(audio.meterSnapshot.channelCount))
     }
   }
 }
@@ -120,7 +123,8 @@ private struct UILiveAudioMeterTapView: View {
   var body: some View {
     Group {
       if let meter = displayedMeter {
-        LevelMeterView(meter: meter, style: style, present: present, name: name).id(ObjectIdentifier(meter))
+        LevelMeterView(meter: meter, style: style, present: present, name: name,
+          channelLabels: UIChannelLabels.labels(meter.configuration.channelCount)).id(ObjectIdentifier(meter))
       } else {
         // Before the first appearance: two silent channels, the live meter's layout.
         LevelMeterView(snapshot: Self.silence, style: style, present: present, name: name)
@@ -144,7 +148,15 @@ private struct UILiveAudioMeterTapView: View {
   }
 }
 
+/// Embedded audio is unlabeled, so anything but a stereo pair is numbered. MonitorKit's
+/// default gives 6 and 8 channels surround names, which would be a guess here.
+enum UIChannelLabels {
+  static func labels(_ count: Int) -> [String]? {
+    count == 2 ? nil : (0..<count).map { String($0 + 1) }
+  }
+}
+
 extension UIAudioLevels {
   /// The status peaks as meter readings, for a camera without a live meter.
-  var meterSnapshot: AudioMeterSnapshot { AudioMeterTap.snapshot(statusPeaks: [peakLeft, peakRight]) }
+  var meterSnapshot: AudioMeterSnapshot { AudioMeterTap.snapshot(statusPeaks: channelPeaks ?? [peakLeft, peakRight]) }
 }

@@ -136,7 +136,7 @@ struct UISettingsRecordingPane: View {
     let timecode = Binding(get: { recording.timecodeMode }, set: { recording.timecodeMode = $0 })
     let folder = recording.outputFolder
     let drive = UIRecordingLibrary.drives(for: [folder], recordingRates: [],
-      fallbackMegabits: UIRecordingLibrary.nominalMegabits(codec: recording.codec, fast: true)).first
+      fallbackMegabits: UIRecordingLibrary.displayMegabits(codec: recording.codec)).first
     Form {
       Section {
         LabeledContent("Default folder") {

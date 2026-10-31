@@ -62,6 +62,11 @@ struct RecordingStatistics: Equatable, Sendable {
   var audioCorrectionRatio: Double = 1
   /// Frames the capture device skipped during the take (part of `droppedVideoFrames`).
   var deviceSkippedFrames: UInt64 = 0
+  /// The gaps those frames fell in.
+  var sourceGaps: UInt64 = 0
+  /// Audio packets that arrived before the take's first paired frame, with no place on
+  /// its timeline yet. Counted apart from drops: nothing was lost from the take.
+  var audioBeforeFirstFrame: UInt64 = 0
   /// Encoded media waiting for the disk, and the limit before the take fails.
   var writerBufferedBytes = 0
   var writerBufferCapacityBytes = 0
@@ -109,7 +114,8 @@ struct RecordingStatisticsSampler: Sendable {
       gpuConversionFailures: source.gpuConversionFailures, droppedGPUFrames: source.droppedGPUFrames,
       videoClockDiscontinuities: source.videoClockDiscontinuities, mappedAudioFrames: source.mappedAudioFrames, audioClockDiscontinuities: source.audioClockDiscontinuities,
       audioCorrectionRatio: source.audioCorrectionRatio,
-      deviceSkippedFrames: source.deviceSkippedFrames,
+      deviceSkippedFrames: source.deviceSkippedFrames, sourceGaps: source.sourceGaps,
+      audioBeforeFirstFrame: source.audioBeforeFirstFrame,
       writerBufferedBytes: source.writerBufferedBytes,
       writerBufferCapacityBytes: source.writerBufferCapacityBytes)
   }
