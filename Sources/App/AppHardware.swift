@@ -51,6 +51,8 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   /// Follows which virtual cameras have clients from launch. CMIO listeners only, and
   /// off in harnesses, which have no clients and shouldn't enumerate the Mac's cameras.
   var observesCameraDemand = false
+  /// Replaces the Program camera's sink. Nil is the Mac's real one.
+  var programBridge: ((FrameRoute<CVPixelBuffer>) -> ProgramOutputBridge)?
   var setCompatibilityPolicy: (RecordingCompatibilityPolicy) -> Void = { _ in }
 
   static let live: AppHardware = {
@@ -119,7 +121,10 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
         startTyped: { _, _, _ in throw CocoaError(.featureUnsupported) },
         stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in false })
     },
-    devices: { [] }, driverWarning: { nil }, observeDevices: { _ in nil }, diagnostics: { _ in nil })
+    devices: { [] }, driverWarning: { nil }, observeDevices: { _ in nil }, diagnostics: { _ in nil },
+    programBridge: { route in
+      ProgramOutputBridge(route: route, connect: { _, _ in }, disconnect: {}, send: { _ in false }, paced: true)
+    })
 }
 
 

@@ -429,23 +429,8 @@ final class CameraSink {
     for id in try discoverDevices() {
       guard try string(id, selector: kCMIODevicePropertyDeviceUID) == route.deviceUID else { continue }
       let streams = try ids(id, selector: kCMIODevicePropertyStreams)
-      let format: CMVideoFormatDescription
-      if route.feedID == nil {
-        format = try ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat).formatDescription()
-      } else {
-        format = try Self.requestedFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
-      }
-      let namedStreams = try streams.map { stream -> (id: UInt32, name: String, direction: UInt32?) in
-        (stream, try string(stream, selector: kCMIOObjectPropertyName), direction(stream))
-      }
-      // The UID selects the feed. Match the published names, then the
-      // source/input pair. A display name that contains "input" is still the
-      // source; the input stream is the one named "<source> Input" or the
-      // stream whose direction is into the device.
-      guard let paired = CameraStreamNames.pair(namedStreams, sinkName: route.sinkStreamName,
-        sourceName: route.sourceStreamName) else {
-        throw VideoError.message("The virtual camera for \(route.feedID ?? "Program") does not publish its source and input streams.")
-      }
+      let format = try outputFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+      let paired = try pairedStreams(streams)
       let requested = DerivedOutputContract(format: format, duration: configuration.duration)
       // Claim native identity before setters or CopyBufferQueue: an old retry
       // must not stop this connection or share its still-live native queue.
@@ -461,23 +446,17 @@ final class CameraSink {
         }
       }
       // AVFoundation clients such as Zoom claim device control before starting
-      // the source. In automatic mode the producer necessarily arrives later.
-      // The extension can negotiate our authorized producer's sample contract
-      // itself; don't require stealing another client's device-control lease.
+      // the source, so with sinks on demand the producer necessarily arrives
+      // later. The extension negotiates our authorized producer's sample
+      // contract itself; don't require stealing another client's lease.
       let controlled = controlledByAnotherProcess(id)
+      var firstSampleDecides = false
       for stream in [paired.sink, paired.source] {
-        try Self.negotiateInstalledContract(format: format, duration: configuration.duration,
-          controlled: { self.controlledByAnotherProcess(id) }, set: {
-            var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyFormatDescription),
-              mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
-            var description = Unmanaged.passUnretained(format).toOpaque()
-            try check(CMIOObjectSetPropertyData(stream, &address, 0, nil,
-              UInt32(MemoryLayout<CMVideoFormatDescription>.size), &description), "Set virtual camera format")
-            address.mSelector = UInt32(kCMIOStreamPropertyFrameRate)
-            var rate = Double(configuration.duration.timescale) / Double(configuration.duration.value)
-            try check(CMIOObjectSetPropertyData(stream, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &rate),
-              "Set virtual camera frame rate")
-          }, read: { try self.installedActiveContract(stream) })
+        let outcome = try Self.negotiateInstalledContract(format: format, duration: configuration.duration,
+          controlled: { self.controlledByAnotherProcess(id) },
+          set: { try writeContract(stream, format: format, duration: configuration.duration) },
+          read: { try self.installedActiveContract(stream) })
+        if outcome == .firstSampleDecides { firstSampleDecides = true }
       }
       var unmanaged: Unmanaged<CMSimpleQueue>?
       try check(CMIOStreamCopyBufferQueue(paired.sink, cameraSinkQueueAltered, nil, &unmanaged), "Open camera queue")
@@ -498,11 +477,72 @@ final class CameraSink {
         \(size.height, privacy: .public) \(fourCC(CMFormatDescriptionGetMediaSubType(format)), privacy: .public), \
         frame \(configuration.duration.value, privacy: .public)/\(configuration.duration.timescale, privacy: .public) s, \
         queue capacity \(self.queue.map { CMSimpleQueueGetCapacity($0.queue) } ?? 0, privacy: .public)\
-        \(controlled ? ", format left to the camera app holding device control" : "", privacy: .public)
+        \(firstSampleDecides ? ", the first frame renegotiates under the camera app holding device control"
+          : controlled ? ", format left to the camera app holding device control" : "", privacy: .public)
         """)
       return
     }
     throw VideoError.message("Install and approve the Ultracam camera extension, then reconnect.")
+  }
+
+  /// Puts this contract on both streams with no sink started, so a client arriving first
+  /// finds it and a later connect has nothing to change under that client. One property
+  /// write per contract change, nothing per frame. Waits for nothing: a device that isn't
+  /// published yet, or one a client already holds, is left to the connect.
+  func preNegotiate(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat?) throws {
+    try Self.validateCameraSource(sourceFormat)
+    var address = CMIOObjectPropertyAddress(
+      mSelector: UInt32(kCMIOHardwarePropertyAllowScreenCaptureDevices),
+      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
+    var allow: UInt32 = 1
+    try check(CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &address,
+      0, nil, UInt32(MemoryLayout.size(ofValue: allow)), &allow), "Enable software camera discovery")
+    let devices = try ids(CMIOObjectID(kCMIOObjectSystemObject), selector: kCMIOHardwarePropertyDevices)
+    guard let id = try devices.first(where: { try string($0, selector: kCMIODevicePropertyDeviceUID) == route.deviceUID }),
+      !controlledByAnotherProcess(id) else { return }
+    let format = try outputFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+    let paired = try pairedStreams(try ids(id, selector: kCMIODevicePropertyStreams))
+    let requested = DerivedOutputContract(format: format, duration: configuration.duration)
+    for stream in [paired.sink, paired.source] {
+      guard requested.matchingPublishedIndex(in: try publishedFormats(stream)) != nil else { return }
+      try writeContract(stream, format: format, duration: configuration.duration)
+    }
+    cameraOutputLog.notice("Camera format prepared: \(self.route.feedID ?? "Program", privacy: .public), \(fourCC(CMFormatDescriptionGetMediaSubType(format)), privacy: .public)")
+  }
+
+  private func outputFormat(configuration: PipelineConfiguration, passthroughFormat: OSType,
+    sourceFormat: SourceFormat?) throws -> CMVideoFormatDescription {
+    if route.feedID == nil {
+      return try ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat).formatDescription()
+    }
+    return try Self.requestedFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+  }
+
+  /// The UID selects the feed. Match the published names, then the source/input
+  /// pair. A display name that contains "input" is still the source; the input
+  /// stream is the one named "<source> Input" or the stream whose direction is
+  /// into the device.
+  private func pairedStreams(_ streams: [UInt32]) throws -> (sink: UInt32, source: UInt32) {
+    let namedStreams = try streams.map { stream -> (id: UInt32, name: String, direction: UInt32?) in
+      (stream, try string(stream, selector: kCMIOObjectPropertyName), direction(stream))
+    }
+    guard let paired = CameraStreamNames.pair(namedStreams, sinkName: route.sinkStreamName,
+      sourceName: route.sourceStreamName) else {
+      throw VideoError.message("The virtual camera for \(route.feedID ?? "Program") does not publish its source and input streams.")
+    }
+    return paired
+  }
+
+  private func writeContract(_ stream: CMIOStreamID, format: CMVideoFormatDescription, duration: CMTime) throws {
+    var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyFormatDescription),
+      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
+    var description = Unmanaged.passUnretained(format).toOpaque()
+    try check(CMIOObjectSetPropertyData(stream, &address, 0, nil,
+      UInt32(MemoryLayout<CMVideoFormatDescription>.size), &description), "Set virtual camera format")
+    address.mSelector = UInt32(kCMIOStreamPropertyFrameRate)
+    var rate = Double(duration.timescale) / Double(duration.value)
+    try check(CMIOObjectSetPropertyData(stream, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &rate),
+      "Set virtual camera frame rate")
   }
 
   private func discoverDevices() throws -> [CMIOObjectID] {
@@ -590,23 +630,43 @@ final class CameraSink {
     return descriptions
   }
 
-  // When device control prevents setting a contract, verify what the installed
-  // stream is actually using. A locally published rate list is not evidence of
-  // the installed extension's cadence, nor does format identity imply cadence.
+  enum InstalledContract: Equatable {
+    /// The installed stream is on this contract.
+    case agreed
+    /// Another process's lease keeps it on a different one: the sink connects anyway, and
+    /// the extension moves the stream onto the first sample's published entry, for the
+    /// authorized producer only (`CameraDeviceRuntime.admit`).
+    case firstSampleDecides
+  }
+
+  // Verifies what the installed stream is actually using. A locally published
+  // rate list is not evidence of the installed extension's cadence, nor does
+  // format identity imply cadence. A client holding device control may keep
+  // another contract, and that must not leave it on black: the format has
+  // passed `matchingPublishedIndex` by now, and the cadence is checked here.
+  @discardableResult
   static func negotiateInstalledContract(format: CMVideoFormatDescription, duration: CMTime,
     controlled: () -> Bool, set: () throws -> Void,
-    read: () throws -> (CMVideoFormatDescription, Double)) throws {
-    if !controlled() {
+    read: () throws -> (CMVideoFormatDescription, Double)) throws -> InstalledContract {
+    var busy = controlled()
+    if !busy {
       do { try set() }
-      catch { guard controlled() else { throw error } }
+      catch {
+        guard controlled() else { throw error }
+        busy = true
+      }
+    }
+    guard duration.isNumeric, duration.epoch == 0, duration.value > 0, duration.timescale > 0,
+      FrameRateTarget.allCases.contains(where: { DerivedOutputContract.sameDuration($0.duration, duration) }) else {
+      throw VideoError.message("The installed virtual camera does not publish this output cadence.")
     }
     let (activeFormat, activeRate) = try read()
-    guard duration.isNumeric, duration.epoch == 0, duration.value > 0, duration.timescale > 0,
-      activeRate.isFinite, activeRate > 0,
-      activeRate == Double(duration.timescale) / Double(duration.value),
-      DerivedOutputContract.matchesFormat(format, activeFormat) else {
-      throw VideoError.message("The busy installed virtual camera is using a different format or exact cadence. Stop its viewer or choose its active output contract before connecting.")
+    if activeRate.isFinite, activeRate > 0, activeRate == Double(duration.timescale) / Double(duration.value),
+      DerivedOutputContract.matchesFormat(format, activeFormat) { return .agreed }
+    guard busy else {
+      throw VideoError.message("The installed virtual camera did not take the requested format or exact cadence.")
     }
+    return .firstSampleDecides
   }
 
   private func installedActiveContract(_ stream: CMIOStreamID) throws -> (CMVideoFormatDescription, Double) {

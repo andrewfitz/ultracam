@@ -108,6 +108,10 @@ final class FeedCoordinator {
   private var demandCoordinator: RouteDemandCoordinator
   private var programConsumerActive = false
   private let programNormalizer = ProgramNormalizerLoader()
+  /// Harnesses replace this: the production bridge opens the Mac's real Program camera.
+  var makeProgramBridge: (FrameRoute<CVPixelBuffer>) -> ProgramOutputBridge = { route in
+    ProgramOutputBridge(route: route, paced: true)
+  }
   var onProgramCutApplied: ((FeedID, CMTime, CMTime) -> Void)?
   /// A requested cut that will not land: the target failed to start, stopped,
   /// or never produced a qualifying frame. The selection did not change.
@@ -204,8 +208,7 @@ final class FeedCoordinator {
     guard programBridge == nil else { return }
     let route = try programOutput.addConsumerRoute(id: "program-camera",
       capacity: ProgramOutputRoute.consumerCapacity, policy: .reject, compactRepeats: true)
-    let bridge = ProgramOutputBridge(route: route, paced: true)
-    attachProgramBridge(bridge)
+    attachProgramBridge(makeProgramBridge(route))
   }
 
   /// Program's sink is open: frames sent now reach the camera.
@@ -241,6 +244,12 @@ final class FeedCoordinator {
       passthroughFormat: passthroughFormat, renegotiate: renegotiate) { error in
       Task { @MainActor in completion(error) }
     }
+  }
+
+  /// Writes the contract to the closed Program camera, off the main actor.
+  func requestProgramOutputPreNegotiation(configuration: PipelineConfiguration, passthroughFormat: OSType) {
+    do { try prepareProgramOutputBridge() } catch { return }
+    programBridge?.requestPreNegotiation(configuration: configuration, passthroughFormat: passthroughFormat)
   }
 
   var programOutputStatistics: ProgramOutputBridge.Statistics {

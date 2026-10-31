@@ -1343,9 +1343,22 @@ final class CaptureController: @unchecked Sendable {
     resetSampleFormat()
     guard cameraOutputEnabled else {
       if cameraConnected || cameraConnecting { closeCamera() }
+      preNegotiate(next, inputType: inputType, sourceFormat: sourceFormat)
       return
     }
     requestConnect(next, inputType: inputType, synchronous: synchronous, sourceFormat: sourceFormat)
+  }
+
+  /// A closed sink's contract changed, or the first frame set it. Writing it to the device
+  /// now means a client that arrives before the sink finds the right format, and the
+  /// connect has nothing to change under that client. A failure costs only that.
+  private func preNegotiate(_ next: PipelineConfiguration, inputType: OSType, sourceFormat: SourceFormat?) {
+    guard services.preNegotiate != nil else { return }
+    let services = self.services, label = cameraLabel
+    controlQueue.async {
+      do { try services.preNegotiate?(next, inputType, sourceFormat) }
+      catch { cameraOutputLog.notice("Camera format not prepared: \(label, privacy: .public): \(error.localizedDescription, privacy: .public)") }
+    }
   }
 
   /// Connects the virtual camera now if it should be and isn't: CMIO's cameras changed (the
@@ -2950,6 +2963,8 @@ struct CaptureServices: @unchecked Sendable {
   var sourcePauseAllowance: ((String) throws -> TimeInterval?)? = nil
   var deviceDroppedFrames: () -> UInt64 = { 0 }
   var cameraRetryInterval: TimeInterval = 2
+  /// Writes a contract to the closed virtual camera, on the control queue. Nil: not prepared.
+  var preNegotiate: ((PipelineConfiguration, OSType, SourceFormat?) throws -> Void)?
 
   static func live(feedID: FeedID) -> CaptureServices {
     registryLive(feedID: feedID)

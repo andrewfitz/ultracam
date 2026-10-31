@@ -1459,6 +1459,34 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     XCTAssertEqual(harness.starts, 1, "Capture is never reopened")
   }
 
+  /// A closed sink's contract goes to the device before any client: once per contract, and
+  /// never while a sink is open, where the connect does it.
+  func testClosedSinkPreNegotiatesEachContractOnce() throws {
+    let source = try EndToEndChecks.source()
+    let harness = CaptureHarness()
+    let writes = CaptureStatusRecorderCount()
+    var services = harness.services(automatic: true)
+    services.preNegotiate = { _, _, _ in writes.increment() }
+    let controller = CaptureController(services: services)
+    defer { controller.onUpdate = nil; controller.stop() }
+    ready(controller, harness: harness, configuration: config)
+    let early = writes.value
+    harness.emitAutomatic(source, at: .zero, duration: VideoContract.fastDuration)
+    awaitCondition("The sink is open") { harness.previewed == 1 }
+    XCTAssertEqual(writes.value, early, "An open sink negotiates for itself")
+    controller.setCameraOutputEnabled(false)
+    let closed = harness.negotiated.count
+    controller.reconfigure(configuration: PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: true,
+      reduceFrameRate: false), pipelineEnabled: true)
+    harness.emitAutomatic(source, at: VideoContract.fastDuration, duration: VideoContract.fastDuration)
+    awaitCondition("The new contract reaches the device") { writes.value == early + 1 }
+    harness.emitAutomatic(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: 2), duration: VideoContract.fastDuration)
+    awaitCondition("The next frame is out") { harness.previewed == 3 }
+    allowQueueWork()
+    XCTAssertEqual(writes.value, early + 1, "One write per contract, nothing per frame")
+    XCTAssertEqual(harness.negotiated.count, closed, "No stream starts for it")
+  }
+
   /// A sink that opens late costs a client frames it never saw: counted, and timed.
   func testLateSinkIsCountedAndTimedToItsFirstFrame() throws {
     let source = try EndToEndChecks.source()
@@ -1716,3 +1744,10 @@ private final class RefusingSends: @unchecked Sendable {
   }
 }
 #endif
+
+private final class CaptureStatusRecorderCount: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+  func increment() { lock.withLock { count += 1 } }
+  var value: Int { lock.withLock { count } }
+}

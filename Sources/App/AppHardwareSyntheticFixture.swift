@@ -9,6 +9,7 @@ import CoreVideo
   let plugin: FakeCapturePlugin
   let registry: VendorRegistry
   let sink = SyntheticCameraSink()
+  let programSink = SyntheticCameraSink()
   let publisher = SyntheticRegistryPublisher()
   let format: SourceFormat
   let audio: SourceAudioFormat
@@ -27,16 +28,22 @@ import CoreVideo
     registry = try VendorRegistry(capture: [plugin])
   }
   var hardware: AppHardware {
-    let plugin = plugin, sink = sink, claims = claims
-    return .registry(registry, captureServices: { id in
+    let plugin = plugin, sink = sink, programSink = programSink, claims = claims
+    var hardware = AppHardware.registry(registry, captureServices: { id in
       var services = CaptureServices.registry(feedID: id, plugins: [plugin], claims: claims)
       // Both paths: a fixture camera must never reach the Mac's real virtual cameras.
       services.connect = { _, _ in try sink.connect() }
       services.connectWithSource = { _, _, _ in try sink.connect() }
+      services.preNegotiate = nil
       services.disconnect = { sink.disconnect() }
       services.send = { sink.send($0) }
       return services
     })
+    hardware.programBridge = { route in
+      ProgramOutputBridge(route: route, connect: { _, _ in try programSink.connect() },
+        disconnect: { programSink.disconnect() }, send: { programSink.send($0) }, paced: true)
+    }
+    return hardware
   }
   func connect() { plugin.setConnected(true) }
   func disconnect() { plugin.setConnected(false) }

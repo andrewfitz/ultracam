@@ -64,6 +64,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
   private let connectSink: Connect
   private let disconnectSink: Disconnect
   private let sendSink: Send
+  private let preNegotiateSink: Connect?
   private let hostClock: () -> CMTime
   private let paced: Bool
   typealias ScheduleHostWake = (CMTime, @escaping @Sendable () -> Void) -> Void
@@ -108,6 +109,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
       try sink.connect(configuration: configuration, passthroughFormat: passthroughFormat)
     }, disconnect: { sink.disconnect() }, send: { sample in
       try sink.send(sample)
+    }, preNegotiate: { configuration, passthroughFormat in
+      try sink.preNegotiate(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: nil)
     }, queueLabel: queueLabel, paced: paced)
   }
 
@@ -115,7 +118,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
   /// of an installed camera extension. The production initializer above is the
   /// only path that supplies the real `CameraSink`.
   init(route: FrameRoute<CVPixelBuffer>, connect: @escaping Connect,
-       disconnect: @escaping Disconnect, send: @escaping Send,
+       disconnect: @escaping Disconnect, send: @escaping Send, preNegotiate: Connect? = nil,
        queueLabel: String = "org.ultracam.program-output-bridge",
        hostClock: @escaping () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) },
        paced: Bool = false, scheduleHostWake: ScheduleHostWake? = nil) {
@@ -125,6 +128,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
     connectSink = connect
     disconnectSink = disconnect
     sendSink = send
+    preNegotiateSink = preNegotiate
     self.hostClock = hostClock
     sendQueue = DispatchQueue(label: queueLabel + ".send", qos: .userInteractive)
     controlQueue = DispatchQueue(label: queueLabel + ".control", qos: .userInitiated)
@@ -212,6 +216,16 @@ final class ProgramOutputBridge: @unchecked Sendable {
     }
   }
 
+  /// Writes the on-air camera's contract to the closed Program camera, so a client arriving
+  /// first finds it (`CameraSink.preNegotiate`). A failure costs only that.
+  func requestPreNegotiation(configuration: PipelineConfiguration, passthroughFormat: OSType) {
+    controlQueue.async { [self] in
+      guard let preNegotiateSink, locked({ link == .disconnected && !demand }) else { return }
+      do { try preNegotiateSink(Self.transport(configuration), passthroughFormat) }
+      catch { cameraOutputLog.notice("Camera format not prepared: Program: \(error.localizedDescription, privacy: .public)") }
+    }
+  }
+
   /// Drains queued frames now and waits. The frame path uses `schedulePump`.
   func pump() {
     if DispatchQueue.getSpecific(key: sendKey) != nil { pumpOnSendQueue(); return }
@@ -282,6 +296,15 @@ final class ProgramOutputBridge: @unchecked Sendable {
     try connect(configuration: configuration, passthroughFormat: passthroughFormat)
   }
 
+  /// CameraSink also serves feed routes, where rate controls may only reduce
+  /// source cadence. Program owns a CFR clock and may repeat up to its explicitly
+  /// selected rate, so it negotiates that output cadence.
+  private static func transport(_ configuration: PipelineConfiguration) -> PipelineConfiguration {
+    var result = configuration
+    if configuration.reduceFrameRate { result.sourceDuration = configuration.frameRateTarget.duration }
+    return result
+  }
+
   /// Connects (or reconnects) the sink. Control queue only.
   private func connect(configuration: PipelineConfiguration, passthroughFormat: OSType) throws {
     let wasLinked = locked { () -> Bool in
@@ -296,14 +319,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
       locked { contractHandler }?(nil)
     }
     do {
-      // CameraSink also serves feed routes, where rate controls may only
-      // reduce source cadence. Program owns a CFR clock and may repeat up to
-      // its explicitly selected rate, so negotiate that output cadence here.
-      var transportConfiguration = configuration
-      if configuration.reduceFrameRate {
-        transportConfiguration.sourceDuration = configuration.frameRateTarget.duration
-      }
-      try connectSink(transportConfiguration, passthroughFormat)
+      try connectSink(Self.transport(configuration), passthroughFormat)
     } catch {
       locked {
         link = .disconnected

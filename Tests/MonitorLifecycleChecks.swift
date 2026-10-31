@@ -51,19 +51,13 @@ import XCTest
     XCTAssertEqual(first.action(ready: true, running: true), .stop)
     XCTAssertNil(second.action(ready: true, running: true))
   }
-  func testProgramTransportUsesOnAirProducerRatherThanSettingsSelection() {
-    XCTAssertTrue(
-      FeedLifecycleDemandPolicy.programTransportRequired(
-        programMode: true,
-        cameraRequested: true, onAirProducerRunning: true))
-    XCTAssertFalse(
-      FeedLifecycleDemandPolicy.programTransportRequired(
-        programMode: true,
-        cameraRequested: true, onAirProducerRunning: false))
-    XCTAssertFalse(
-      FeedLifecycleDemandPolicy.programTransportRequired(
-        programMode: true,
-        cameraRequested: false, onAirProducerRunning: true))
+  func testProgramTransportStaysUpForAClientWhileAnyCameraRuns() {
+    XCTAssertTrue(FeedLifecycleDemandPolicy.programTransportRequired(programMode: true,
+      cameraRequested: true, anyCameraRunning: true))
+    XCTAssertFalse(FeedLifecycleDemandPolicy.programTransportRequired(programMode: true,
+      cameraRequested: true, anyCameraRunning: false))
+    XCTAssertFalse(FeedLifecycleDemandPolicy.programTransportRequired(programMode: true,
+      cameraRequested: false, anyCameraRunning: true))
   }
 
   func testManualHandoffReleasesAutomaticOwnership() {

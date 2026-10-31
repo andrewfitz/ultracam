@@ -2,9 +2,12 @@ import CoreMedia
 
 /// Source ownership and transport demand are independent of the UI selection.
 enum FeedLifecycleDemandPolicy {
+  /// Any running camera keeps the sink open, not just the one on air: with none of its
+  /// frames the client gets standby black, its format stays locked, and a cut or a move
+  /// back on air doesn't have to reopen a device the client is holding.
   static func programTransportRequired(programMode: Bool, cameraRequested: Bool,
-                                       onAirProducerRunning: Bool) -> Bool {
-    programMode && cameraRequested && onAirProducerRunning
+                                       anyCameraRunning: Bool) -> Bool {
+    programMode && cameraRequested && anyCameraRunning
   }
 
   static func programContract(configuration: PipelineConfiguration, pipelineEnabled: Bool,

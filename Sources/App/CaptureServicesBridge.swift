@@ -328,6 +328,9 @@ extension CaptureServices {
     services.connectWithSource = { configuration, type, source in
       try sink.connect(configuration: configuration, passthroughFormat: type, sourceFormat: source)
     }
+    services.preNegotiate = { configuration, type, source in
+      try sink.preNegotiate(configuration: configuration, passthroughFormat: type, sourceFormat: source)
+    }
     services.ingestCPUCopyFrames = { bridge.ingestCPUCopyFrames }
     services.deviceDroppedFrames = { bridge.deviceDroppedFrames }
     return services

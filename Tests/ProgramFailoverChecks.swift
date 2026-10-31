@@ -38,6 +38,58 @@ import XCTest
     XCTAssertEqual(ids.filter(model.isCameraRunning).count, 3)
   }
 
+  /// R6. Closing here would turn the next cut into a reopen under the client's lease, and
+  /// a cut that fires no event used to leave Program black for good.
+  func testProgramSinkOutlivesItsOnAirCameraAndACutFromThereReachesTheClient() throws {
+    try prepare()
+    defer { finish() }
+    allLive()
+    model.setProgramDemandForTesting(requested: true)
+    spin("A client opens the sink") { fixture.programSink.openConnections == 1 }
+    let onAir = try XCTUnwrap(model.switcherSelectedFeedID)
+    model.stopCamera(onAir)
+    settle()
+    XCTAssertEqual(fixture.programSink.openConnections, 1, "Standby black, and the format stays locked")
+    let next = try XCTUnwrap(ids.first { $0 != onAir })
+    _ = model.requestProgramCut(to: next)
+    settle()
+    XCTAssertEqual(model.switcherSelectedFeedID, next, "Nothing on air, so it's at once")
+    XCTAssertEqual(fixture.programSink.openConnections, 1)
+    XCTAssertEqual(fixture.programSink.connectAttempts, 1, "No reopen")
+    model.stopAllCameras()
+    spin("With nothing running the sink closes") { fixture.programSink.openConnections == 0 }
+  }
+
+  func testAFailedProgramConnectRetriesEverySecondWhileItsClientWaits() throws {
+    try prepare()
+    defer { finish() }
+    fixture.programSink.failNextConnects(1000)
+    model.setProgramDemandForTesting(requested: true)
+    spin("The first try fails and says so") { model.appProblems.contains { $0.id == "program-connect" } }
+    let start = now + 1000
+    let first = fixture.programSink.connectAttempts
+    model.liveWatchTick(now: start)
+    spin("It tries again") { fixture.programSink.connectAttempts == first + 1 }
+    spin("Which fails too") { model.appProblems.contains { $0.id == "program-connect" } }
+    model.liveWatchTick(now: start + 0.5)
+    settle()
+    XCTAssertEqual(fixture.programSink.connectAttempts, first + 1, "Once a second")
+    fixture.programSink.failNextConnects(0)
+    model.liveWatchTick(now: start + LiveWatchLimits.connectRetry)
+    spin("Then connects") { fixture.programSink.openConnections == 1 }
+    spin("And clears the problem") { !model.appProblems.contains { $0.id == "program-connect" } }
+  }
+
+  private func spin(_ what: String, _ done: () -> Bool) {
+    let deadline = Date(timeIntervalSinceNow: 10)
+    while !done() {
+      guard Date() < deadline else { XCTFail(what); return }
+      RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.005))
+    }
+  }
+
+  private func settle() { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1)) }
+
   private func finish() {
     model.stopAllCameras()
     fixture.stop()

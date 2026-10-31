@@ -315,6 +315,8 @@ final class AppModel {
   @ObservationIgnored private var programConnectRetryAt: TimeInterval = 0
   private var programTransportRequired = false
   private var programTransportConfiguration: PipelineConfiguration?
+  /// The contract last written to the closed Program camera.
+  @ObservationIgnored private var programPreNegotiated: PipelineConfiguration?
   /// The input cadence each camera detected in its current run.
   @ObservationIgnored private var detectedSourceDurations: [FeedID: CMTime] = [:]
   /// The last cadence each camera detected, kept across stops: the
@@ -418,6 +420,7 @@ final class AppModel {
     })
     feedCoordinator = FeedCoordinator(snapshot: snapshot, capturePool: capturePool)
     let coordinator = feedCoordinator
+    if let programBridge = hardware.programBridge { coordinator.makeProgramBridge = programBridge }
     recordingModel = RecordingModel(
       feeds: feedCoordinator.descriptors.map { RecordingFeedDescriptor(id: $0.id, name: $0.name, recordingConstantFrameRate: $0.recordingConstantFrameRate) },
       driver: NativeRecordingSessionDriver(captureForFeed: { id in coordinator.capture(for: id) },
@@ -938,6 +941,8 @@ final class AppModel {
   }
   @discardableResult
   func requestProgramCut(to feedID: FeedID) -> ProgramCutRequestResult<FeedID> {
+    // A cut with nothing on air fires no event, so the transport hears of it here.
+    defer { reconcileProgramTransportDemand() }
     // Also with nothing on air, where the switcher would just select it.
     guard !signalHealth.isUnhealthy(feedID) else { return .rejectedMissingSource }
     let oldDecisionID = pendingAutoDecisionID
@@ -1554,8 +1559,13 @@ final class AppModel {
     let required = FeedLifecycleDemandPolicy.programTransportRequired(
       programMode: outputMode == .program,
       cameraRequested: routeDemand[VirtualCameraDescriptor.program().id] == true,
-      onAirProducerRunning: producer.map { feedCoordinator.isFeedRunning($0.id) } ?? false)
+      anyCameraRunning: feedDescriptors.contains { $0.enabled && feedCoordinator.isFeedRunning($0.id) })
     let contract = programContract(for: producer)
+    if !programInUse, let producerID, detectedSourceDurations[producerID] != nil, contract != programPreNegotiated {
+      programPreNegotiated = contract
+      feedCoordinator.requestProgramOutputPreNegotiation(configuration: contract,
+        passthroughFormat: kCVPixelFormatType_422YpCbCr10)
+    }
     // One contract per client session: the format of the camera on air when
     // the client connected (its "owner"). Cuts never renegotiate; frames from
     // cameras with other settings are converted on the GPU. Only the owner's
