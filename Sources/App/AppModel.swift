@@ -547,6 +547,8 @@ final class AppModel {
     // connected connects, without a restart or a change of settings.
     virtualCameraObserver = hardware.observeVirtualCameras { [weak self] in
       self?.feedCoordinator.requestCameraReconnects()
+      // Retries a monitor that couldn't register, now that CMIO's cameras changed.
+      if self?.wantsDemandMonitor == true { self?.demandMonitor.refresh() }
     }
     demandMonitor.onRouteChange = { [weak self] change in
       self?.routeDemandChanged(change.route.id, requested: change.requested, error: change.error)
@@ -598,8 +600,10 @@ final class AppModel {
       guard let free = devices.first(where: { inputHolder($0.id, excluding: descriptor.id) == nil }) else { break }
       updateCamera(descriptor.id) { $0.selectedDevice = free.id }
     }
-    if wantsDemandMonitor { demandMonitor.refresh() }
-    if feedDescriptors.contains(where: \.automaticFeed) { reconcileAutomaticFeed() }
+    if feedDescriptors.contains(where: \.automaticFeed) {
+      demandMonitor.refresh()
+      reconcileAutomaticFeed()
+    }
   }
 
   /// Running, or its controller still owns the device while a stop drains.
