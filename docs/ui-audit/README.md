@@ -186,6 +186,7 @@ Starting one camera no longer starts the others for Program. Start All covers th
 A problem has to reach you wherever you're looking. No single channel does, so these are layered.
 
 - **One problem list.** Status bar, Attention and menu bar render the same list, each problem with one action.
+- **One problem, said once per place.** The picture says what happened, the strip says what to do, and the signal badge holds the state. The REC pill stays plain REC.
 - **Camera problem.** It replaces that camera's folder row in place. The row is 24 pt in every state, so the strip never changes height and Cut never moves. "2 problems" opens the list.
 - **Session problem.** First status bar segment, with its action as a button in the bar, so it's one click with the sidebar closed.
 - **Attention.** Pinned above the scrolling sidebar. It never opens the sidebar by itself, because that would resize pictures mid-show.
@@ -204,7 +205,7 @@ Not used: `requestUserAttention` adds no reach. Keep on Top for detached monitor
 5. **Hold:** loss overrides it once, because a shot with no picture isn't worth holding. Hold stays on for the new shot, and you're told.
 6. A camera is eligible again after 5 s of steady signal. Nothing cuts back on its own, apart from the director's ordinary rules.
 
-The placeholder says how long the signal has been lost. A loss over 10 s ends the take by design, so "Recording · no signal" says that.
+The placeholder says how long the signal has been lost. A loss over 10 s ends the take by design, so the placeholder says that.
 
 ## 6. The placement rule and the three panes
 
@@ -232,8 +233,8 @@ ATTENTION                                       pinned
   ▲ Camera 1 stopped on its own   [Start] [Why]
 CAMERAS                                              +
   ● Camera 1                                    ON AIR
-    2160p 59.94 · 4 dropouts · UltraStudio 12G
-    Sony FX3 · connected · 78%
+    UltraStudio 12G · HDMI
+    FX3 · Wi-Fi · 78%
 VIRTUAL CAMERAS                            collapsible
   ✓ Ultracam · Program                          In use
     Ultracam · Camera 1                     Not in use
@@ -247,6 +248,7 @@ TAKES
 ```
 
 - **Heavy case:** about 663 pt, down from 1046 (estimated). It fits every display checked, including 1440 × 900. Only Virtual Cameras collapses, and nothing collapses by itself.
+- **Cameras** shows only what the strip doesn't: capture device, connector, camera body, Wi-Fi and battery. The strip's signal badge owns format and dropouts.
 - **Takes** shows the latest only. `Show All` reveals them in Finder.
 - **Virtual Cameras** is one line each. The microphone reminder appears only until something is in use.
 - **No Switching section.** Everything about switching is in the toolbar, and the shot time is in the status bar. The owner rejected a sidebar section, and it only repeated those two.
@@ -445,6 +447,8 @@ Sizes are estimates. In phase 2, test the late-sink change against real Zoom bef
 5. Stop Cameras leaves the toolbar while running.
 6. Program recording stays out of scope.
 7. Not included: starting a new take automatically after a failed one.
+8. Resize, Color, Frame rate and Effects Off move into a menu, one click further away.
+9. Stop Camera moves into ⋯, one click further away.
 
 **Live checks only you can run,** with Ultracam not serving a meeting:
 

@@ -29,17 +29,7 @@ Date: 2026-10-30. Review only: no source changed. Code reviewed at `2a99179`. Fo
 
 **Not verified.** The lookup proves a symbol exists, not that it reads well. Nothing here was built or rendered. Items marked *confirm in render* need a look at real size before they're trusted.
 
-**The mockup moved during this pass.** `docs/mockups/r5/index.html` was rewritten with real symbols while this was being written, uncommitted. This file was drawn from the committed version. Where they differ, nothing is settled yet, and these are the ones to resolve:
-
-| Item | Mockup now | This file | Why this file differs |
-|---|---|---|---|
-| Hold | `hand.raised.fill` | `pin`, `pin.fill` | A raised hand means something else in a meeting |
-| Drive, folder, camera body | `externaldrive.fill`, `folder.fill`, `camera.fill` | Outline forms | Filled is kept for state, such as `cube.fill` and `pin.fill` |
-| Time left | `hourglass` | `UIValue` beside `externaldrive` | The drive already names it. `hourglass` passes the check but isn't used |
-| LUT | "LUT" | "LUT On", "LUT Off" | The word survives a non-key window, as Auto's does |
-| Not in use | No `video.badge.ellipsis` | `video.badge.ellipsis` | A gray check still says "OK" |
-
-The mockup also adds facts this file doesn't draw: link speed with `bolt.fill` ("40 Gb/s"), device temperature with `thermometer.medium` ("68°"), and memory card state with `sdcard.fill`. All three symbols pass the check. They belong to README section 8 data, so they can go on the Hardware row and the sidebar camera row if that data ships.
+**Mockup.** `docs/mockups/r5/index.html` follows this file. Link speed, device temperature and memory card state were drawn in an early version and removed, because the plan doesn't put them on the row. Thunderbolt speed isn't in the SDK, temperature belongs in the expanded row, and media appears only when it's a problem.
 
 ---
 
