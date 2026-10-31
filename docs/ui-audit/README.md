@@ -2,7 +2,7 @@
 
 Date: 2026-10-30. Revision 4: revision 2 followed an independent validation pass. Revisions 3 and 4 record the owner's review: tabs for Settings, the monitor tool bar collapses on hover-off but keeps enabled tools visible, and Switching leaves the sidebar. Code reviewed at `2c4929c`. This is a review only: no source changed.
 
-This file is the decision record. Where anything below it disagrees, this file wins.
+This file is the decision record. Where anything below it disagrees, this file wins, with one exception: [validation J](validation/J-rulings.md) holds the rulings from the audit of the full mockup set and overrides the text here where the two differ. The drawn set in `docs/mockups/r5/` shows the result.
 
 | Evidence | Covers |
 |---|---|
@@ -13,6 +13,7 @@ This file is the decision record. Where anything below it disagrees, this file w
 | [06](06-visual-polish-and-native.md) · [validation D](validation/D-platform-feasibility.md) | 39 visual findings, color system, copy pass, and what macOS actually allows |
 | [07](07-visual-language.md) | Every surface's symbols, type levels and reusable components, with symbol names checked for macOS 26 |
 | [validation A](validation/A-defects-and-fixes.md) | Every defect and fix, re-derived, with the journal rule replayed on the real take files |
+| [validation G, H, I, J](validation/J-rulings.md) | Audits of the full mockup set for consistency, plan conformance and live use, and the rulings on them |
 | [validation F](validation/F-fact-check.md) | 104 claims checked: 73 correct, 21 partly right, 4 wrong, 6 unverifiable |
 
 **Evidence limits.** Everything comes from code, offscreen renders, files on disk and the system log. Nothing was tested on live cameras or in a meeting app. Renders use synthetic data, so no render shows the live strip: 8 meter rows, 6 of them silent on this rig, plus a Camera Control row. Labels: **verified** means read in code or on a real file. **Traced** means followed through code, not run.
@@ -203,7 +204,8 @@ Not used: `requestUserAttention` adds no reach. Keep on Top for detached monitor
 3. If no camera is live, stay and warn: "No camera has a picture".
 4. With Auto off, cut nothing. Show Cut at the warning and on the placeholder.
 5. **Hold:** loss overrides it once, because a shot with no picture isn't worth holding. Hold stays on for the new shot, and you're told.
-6. A camera is eligible again after 5 s of steady signal. Nothing cuts back on its own, apart from the director's ordinary rules.
+6. **Loud, not quiet.** On-air loss draws an orange ring, a large Cut and a live countdown, `Take ends in 4 s`. Red stays reserved for frames arriving.
+7. A camera is eligible again after 5 s of steady signal. Nothing cuts back on its own, apart from the director's ordinary rules.
 
 The placeholder says how long the signal has been lost. A loss over 10 s ends the take by design, so the placeholder says that.
 
@@ -258,6 +260,7 @@ TAKES
 
 Job: see it, hear it, roll it. Each fact has one owner (06 section 2, with the corrections in validation C).
 
+- **Clean View is the one exception to the rest rule:** it shows no tools at rest, and hover brings them back. The tally ring stays.
 - **Picture at rest:** name, tally, REC pill, a tools button, and **every enabled monitor tool, which stays visible after the pointer leaves.** So you can always see what's active, and turning one off is one click. Hovering the picture expands the full tool bar, with chevrons, in every state, including no signal and stopped. Build the hover on the picture itself, not on `revealed`, which is live-only and would bring back the `b621bc7` bug. The owner set this behavior. The REC pill never truncates.
 - **Program View:** loses the cut bar and Recent Cuts. Tiles get full-width Cut buttons.
 - **Strip removed:** On Air badge, Stop Camera button (moves to ⋯), size and bitrate, Own Folder badge, footnote, Camera Control row, effect chips, Processing switch.
@@ -462,5 +465,6 @@ Sizes are estimates. In phase 2, test the late-sink change against real Zoom bef
 8. Program in Zoom plus ISO in a second app at 4K, with time to first frame.
 9. Settings from the menu bar 20 times.
 10. ⌃⌥⌘ shortcuts with Zoom frontmost.
+10a. Native control sizes on macOS 26: the mockups were measured on 27.0.1.
 11. A real FX3: which fields it reports, and whether it can embed more than two audio channels.
 12. Whether the OWC hub was in the same wiring at 13:59:04 on 2026-10-30. Both units sit behind it now. It's a lead for the simultaneous drop, not a finding.

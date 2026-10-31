@@ -1,6 +1,6 @@
 # 07 · Visual language: symbols, type and scannability
 
-Date: 2026-10-30. Review only: no source changed. Code reviewed at `2a99179`. Follows [README](README.md) revision 4, which wins where this file and it disagree. Layouts are the plan's. This file decides how each thing is drawn.
+Date: 2026-10-30. Review only: no source changed. Code reviewed at `2a99179`. Follows [README](README.md) revision 4, which wins where this file and it disagree. Corrected on 2026-10-31 for [validation J](validation/J-rulings.md), which wins over both. Layouts are the plan's. This file decides how each thing is drawn.
 
 **The test for every row below:** it adds no click, hides no control, removes no information, and makes a state or value readable from 2 feet during a show.
 
@@ -17,7 +17,7 @@ Date: 2026-10-30. Review only: no source changed. Code reviewed at `2a99179`. Fo
 1. Signal badge and dropout count on the strip
 2. Record row, one recording state in every state
 3. Status bar segments as typed pieces
-4. Output row: state glyph, value chips, LUT On or Off
+4. Output row: one value, LUT On or Off
 5. Toolbar: red dot, Auto and Hold words, one Cut symbol
 6. Picture pills, tally glyphs and placeholders
 7. Sidebar camera rows and drive rows
@@ -27,7 +27,7 @@ Date: 2026-10-30. Review only: no source changed. Code reviewed at `2a99179`. Fo
 
 **Symbol check.** Run from `/tmp` on this Mac. This Mac is on macOS 27.0.1 and the deployment target is 26.0 (`Ultracam.xcodeproj/project.pbxproj:1220`), so an `NSImage` lookup alone proves nothing about 26. Each name was also read from the system's `name_availability.plist`. Every symbol named in this file exists and was introduced in macOS 15.0 or earlier, so all are available on 26.0. Failed lookups, all rejected: `play.badge.automatic`, `anchor`, `video.badge.exclamationmark`, `gpu`, `hdmi`, `tally`. No symbol used by today's code failed.
 
-**Not verified.** The lookup proves a symbol exists, not that it reads well. Nothing here was built or rendered. Items marked *confirm in render* need a look at real size before they're trusted.
+**Not verified.** The lookup proves a symbol exists, not that it reads well. Nothing here was built. Items marked *confirm in render* need a look at real size before they're trusted. Validation G drew the Zebra and Clip candidates at 12, 13 and 15 pt on both tool bar fills, which settled those two.
 
 **Mockup.** `docs/mockups/r5/index.html` follows this file. Link speed, device temperature and memory card state were drawn in an early version and removed, because the plan doesn't put them on the row. Thunderbolt speed isn't in the SDK, temperature belongs in the expanded row, and media appears only when it's a problem.
 
@@ -76,16 +76,16 @@ One symbol per noun, everywhere. State variants are listed with their noun. "Sam
 | Effects | `square.stack.3d.up` | Same, on one menu row |
 | Effects off | `square.stack.3d.up.slash` | None |
 | Updating output | `arrow.triangle.2.circlepath` | Same |
-| Picture settings, signal stage | `camera.filters` | Same |
+| Picture settings, signal stage | `camera.filters` | Same. Set `.symbolRenderingMode(.monochrome)`: its lower rings draw dim at 12 pt (G) |
 | Preview hidden | `eye.slash` | Same |
 | Show preview | `eye` | Same |
 | Freeze | `snowflake` | Same |
 | Clean View | `rectangle.dashed`; `rectangle.inset.filled` while on | Same in the app. MonitorKit's detached bar uses `eye.slash` and `eye` (`TileToolbar.swift:48`, `PictureControls.swift:595`), a collision with Preview hidden |
 | Detach | `arrow.up.forward.square` | Same |
 | Monitor tools | `slider.horizontal.3`; `slider.horizontal.below.square.filled.and.square` with tools on | Same |
-| Zebra | `circle.lefthalf.striped.horizontal` | `line.diagonal`, which reads as "disabled". *Confirm in render* at 13 pt on the dark capsule |
+| Zebra | `circle.lefthalf.striped.horizontal` | `line.diagonal`, which reads as "disabled". Passed its render check: distinct at 12 and 13 pt on both fills (G) |
 | False Color | `paintpalette` | Same |
-| Clip Indicators | `sun.max.trianglebadge.exclamationmark` | `exclamationmark.triangle`, the warning shape in white. *Confirm in render:* its badge must not read as a warning at 13 pt. If it does, use `arrow.up.and.line.horizontal.and.arrow.down` |
+| Clip Indicators | `arrow.up.and.line.horizontal.and.arrow.down` | `exclamationmark.triangle`, the warning shape in white. `sun.max.trianglebadge.exclamationmark` was rejected in render: it reads as brightness and carries a warning triangle (G, H O5) |
 | Focus Peaking | `scope` | Same |
 | Guides | `squareshape.split.3x3` | Same |
 | Scopes | `waveform.path.ecg` | Same, and it stops being a Settings tab icon |
@@ -122,7 +122,7 @@ One symbol per noun, everywhere. State variants are listed with their noun. "Sam
 
 **Program and Virtual Camera are two nouns.** `tv` means Program, the switched picture. `video.badge.checkmark` means a virtual camera a meeting app is using. Ultracam · Program is a virtual camera, so its row in Virtual Cameras uses the virtual camera symbol, and its switching state uses `tv`.
 
-**Color rule for every symbol.** The symbol carries the tone and words stay in a label color. Battery low, drive low, body lost and no signal are orange, never red. The only filled red is the tally pill, darkened 20% (06 V8). A red dot only ever means recording.
+**Color rule for every symbol.** The symbol carries the tone and words stay in a label color. Battery low, drive low, body lost and no signal are orange, never red. The only filled red is the tally pill, darkened 20% (06 V8). A red dot only ever means recording. Red also needs frames arriving, so on-air loss is an orange ring (J13).
 
 ---
 
@@ -143,7 +143,9 @@ The scale in `UIStyle.swift:34-53` stands. Two tokens are new, and the scale now
 | 9 | `uiOverlay` | 11 pt semibold | Text on the picture | White |
 | 10 | `uiBadge` | 10 pt semibold | Chips: the floor | Primary, or secondary when neutral |
 
-**Value and unit.** The number takes level 5 or 6, the unit takes level 8. "1 h 52 m" draws 1 and 52 strong, h and m small and dim, sharing a baseline. Label text sits at level 8 beside a level 5 or 6 value, never the other way round.
+**Value and unit.** The number takes level 5 or 6, the unit takes level 8. "1 h 52 m" draws 1 and 52 strong, h and m small and dim, sharing a baseline. This is the code's form on every surface (J31): under an hour it reads "22 min". Menu badges keep it as a plain string. Label text sits at level 8 beside a level 5 or 6 value, never the other way round.
+
+**Form rows.** Settings and inspector row text is 13 pt regular, the native form size, in primary. It sits outside the live scale above (G6).
 
 **Clocks and counts** always use monospaced digits, so digits don't move as they change.
 
@@ -165,7 +167,7 @@ The scale in `UIStyle.swift:34-53` stands. Two tokens are new, and the scale now
 | **`UICountChip`** | Symbol plus a count, shown only above zero | Dropouts on the signal badge and sidebar row |
 | **`UILevelBar`** | A 4 pt capsule, two sizes: 28 pt mini and full width. Gray fill, orange when low, and always next to a number | `UIDriveRow` (`UISessionSidebar.swift:328`), strip folder row, shot time in the status bar, full width in the Recording section |
 | **`UIBatteryGlyph`** | Picks the level symbol by bucket (88, 63, 38, 13) and shows the percent. With a minutes unit, shows `minus.plus.batteryblock` and "78 min". With no known unit, shows the raw value and no warning. Orange below the warning level | Sidebar camera row, Hardware row, Camera Control sheet, camera submenu |
-| **`UIProblemRow`** | Triangle, title at `uiRowEmphasis`, reason at `uiMeta`, one action button. One view, same height everywhere the strip needs | Replaces `UICameraColumn.swift:688-707`, `UISessionSidebar.swift:207-219`, `UIInspector.swift:240-246`, `:316-325`, `UIStatusBar.swift:330-335`. Attention, strip problem row, inspector |
+| **`UIProblemRow`** | Triangle, title at `uiRowEmphasis`, reason at `uiMeta`, one action button. Two levels (J26): on air or rolling damage is solid amber with dark text, everything else a 0.08 wash with a 0.5 border. One view, same height everywhere the strip needs | Replaces `UICameraColumn.swift:688-707`, `UISessionSidebar.swift:207-219`, `UIInspector.swift:240-246`, `:316-325`, `UIStatusBar.swift:330-335`. Attention, strip problem row, inspector |
 | **`UIPictureStatePill`** | The REC pill and all its states, in one view, with a compact size | Merges `UICameraColumn.swift:260-291` and `UIMenuBar.swift:756-769` |
 
 ### Reuse as they are
@@ -196,11 +198,12 @@ File: `UIToolbar.swift`.
 | Tier | Element | Today | Change |
 |---|---|---|---|
 | A | Record, rolling | `stop.fill` in a red filled button: "Stop All (2) 12:31" (`:202`, `:212`) | `UIStateGlyph` red dot, then "Stop 2 Recordings" in label color. The dot survives a non-key window; the fill didn't. The clock moves to the status bar (README). Keep the words: this ends something |
+| A | Cut group | None | One `arrow.left.arrow.right` at the start of the group, so it reads as Cut and not as tabs. One only, at every width. Help on each button says "Cut to Camera 2" (J16) |
 | A | Cut button, on air | Red prominent fill (`:138`), plus a dot | Red dot, bold number and name, selected glass state. No fill. The dot is the tally |
 | A | Cut button, next | Green dot and capsule outline (`:147`) | Keep both, and add the word "Next" through `UIFirstFitting` when it fits. Outline plus dot means it isn't color alone |
 | A | Camera number | Bold mono digit (`:170`) | Keep. It's the shortcut digit and the fallback under 1100 pt |
-| A | Auto | Tinted toggle, `wand.and.sparkles` (`:112-113`) | `wand.and.sparkles` plus "Auto On" or "Auto Off", fixed width. The word carries the state, because the tint goes gray in a non-key window |
-| A | Hold | Not in the toolbar | `pin` plus "Hold" off, `pin.fill` plus "Hold" on, and dimmed when Auto is off |
+| A | Auto | Tinted toggle, `wand.and.sparkles` (`:112-113`) | `wand.and.sparkles` plus "Auto On" or "Auto Off", fixed width. On is a white fill with a dark glyph, which stays put in a non-key window where a tint goes gray (J25) |
+| A | Hold | Not in the toolbar | `pin` plus "Hold" off, `pin.fill` plus "Hold" on with the same white fill as Auto On (J25), and dimmed when Auto is off |
 | B | Start Cameras | `play.fill` and words (`:27`) | Same. Keep words |
 | B | Record, idle | `record.circle`, "Record All" (`:193`) | Same, in label color. Red appears only once rolling |
 | C | Layout picker | `tv` segment (`UIPresentation.swift:26`) | `sidebar.squares.trailing` |
@@ -218,12 +221,16 @@ File: `UICameraColumn.swift`.
 | A | NEXT, PROGRAM | Word on green or outlined (`UIStyle.swift:147`) | Same forms, at `uiTally` |
 | A | REC pill | "● REC 12:31" (`:266`) | "● REC" at rest, with digits only when the strip is collapsed (README). Never truncates. One `UIPictureStatePill` |
 | A | Paused pill | `pause.fill` and "Paused 12:31" (`:273-274`) | Same, through the shared pill |
-| A | No signal pill | Whole pill orange, including words (`:284`) | Orange triangle, white "REC · no signal". The color moves off the words |
+| A | No signal pill | Whole pill orange, including words (`:284`) | Orange triangle, then "REC" and "No signal" in white as separate pieces. The color moves off the words |
+| A | On-air loss | Doesn't exist yet | 4 pt orange ring and a filled orange `NO PICTURE` pill, on Program and the on-air tile. Red stays reserved for frames arriving (J13) |
+| A | Frozen | Nothing at rest | `Frozen` stage pill beside the name at rest, in the slot "Source before LUT" uses (J17) |
+| A | Clean View | Every overlay gone | Pills go. The tally ring stays (J11) |
 | A | Number pill | Program mode only (`:189`) | Always with 2+ cameras, because the mode is retired. Strong digit in its own capsule, so it reads as the Cut digit |
 | A | Stage notice | "Source · before LUT" in one string (`:343`) | `camera.filters`, "Source" strong, "before LUT" dim. This says the picture isn't what's going out |
-| A | Monitor tools at rest | Faint 24% white fill (`UIMonitorTools.swift:170`) | Enabled tools only, with white 0.9 fill and black glyph (06 V9), so "on" is readable without looking for it |
-| B | CPU copy pill | "CPU copy · Ingest · 1234" (`:247`) | Orange triangle, "CPU copy", "Ingest" dim, mono count. It's a warning, so it should look like one |
-| B | Compatibility pill | "Compatibility conversion · Recording · 1234" (`UIPresentation.swift:82`) | Orange triangle, "Compatibility conversion", "Recording" dim, mono count. Both pills sit beside REC, which must not truncate, so they yield first |
+| A | Monitor tools at rest | Faint 24% white fill (`UIMonitorTools.swift:170`) | Enabled tools only: white glyph on the dark capsule, no fill, so a tool stays readable without being the brightest thing on the picture (J12). Clean View shows none at rest (J10) |
+| A | Monitor tools on hover | Same fill | Full bar, with enabled tools at white 0.9 fill and black glyph. When the name row can't hold the 284 pt bar, it takes its own row under the name, right aligned (J9) |
+| B | CPU copy pill | "CPU copy · Ingest · 1234" (`:247`) | Orange triangle, "CPU copy", mono count. It's a warning, so it should look like one. The stage name moves to help (I P12) |
+| B | Compatibility pill | "Compatibility conversion · Recording · 1234" (`UIPresentation.swift:82`) | Leaves the picture for the Recording popover (I P12). The CPU copy pill sits beside REC, which must not truncate, so it yields first |
 | B | Signal menu | "Output · 1080p 29.97" (`:360`) | "Output" dim, value strong |
 | B | Camera settings overlay | "ISO 800 · 1/60 · f/2.8", one string (`UIControlPresentation.swift:24`) | One cell per field: small dim label, mono value. The compact three-field fallback stays |
 | C | Timecode | Mono text on hover (`:227`) | Same. It reads as timecode without help |
@@ -235,10 +242,10 @@ File: `UICameraColumn.swift:121-166`, drawn by `UIPicturePlaceholder` (`:551`).
 
 | Tier | State | Today | Change |
 |---|---|---|---|
-| A | No signal | `video.slash`, gray, title (`:129`) | Keep the symbol, gray, so the cause reads by shape. Title row: orange triangle, "Signal lost", mono time. Sentence stays |
+| A | No signal | `video.slash`, gray, title (`:129`) | Keep the symbol, gray, so the cause reads by shape. Title row: orange triangle, "Signal lost", mono time. While rolling, a countdown replaces the 10 s sentence: `Take ends in 4 s`, so nobody subtracts (J14). On air, a large Cut joins it, with no tile timer or sentence (I B6) |
 | A | Input disconnected | `cable.connector.slash`, gray (`:140`) | Same treatment: gray cause symbol, orange triangle on the title row |
 | B | Unsupported format, Couldn't start | Outline triangle, gray (`:132`, `:145`) | `exclamationmark.triangle.fill`, orange, large. No second triangle |
-| B | No input selected | `cable.connector` (`:135`) | Same symbol, plus the orange triangle on the title row |
+| B | No input | `cable.connector` (`:135`) | Same symbol, plus the orange triangle on the title row. Title is "No input" (H P12) |
 | B | Stopped | `video` (`:150`) | Same, gray. Nothing wrong, so no orange |
 | B | Starting | Progress (`:126`) | Same |
 | B | Preview hidden | `eye.slash` (`:158`) | Same. Output continues, so no orange |
@@ -254,19 +261,18 @@ File: `UICameraColumn.swift`. Rows follow the plan: header, record, folder or pr
 | A | Signal badge, live | Green dot, format, chevron (`UIFeedSettingsMenu.swift:37-43`) | Same, with `UICountChip` (`video.slash` and count) when dropouts are above zero, at `uiBadge`. Help says "5 signal dropouts since Start" |
 | A | Signal badge, problem | Orange dot and words | Orange triangle and words. Dot and triangle mean different things now |
 | A | Signal badge, stopped | Gray dot, "Stopped" | `UIStateGlyph` inactive. Secondary words |
-| A | Record state word | Red text (`:896`) | Red dot plus "Recording" in primary (06 V6) |
+| A | Record state word | Red text (`:896`) | Red dot plus "Recording" in primary (06 V6), on expanded strips. Collapsed strips drop it, because the REC pill says it (J18) |
 | A | Clock | `uiClock` (`:900`) | Same. Paused: secondary, as today |
-| A | Dropped | `checkmark.circle.fill` green or triangle orange, "0 dropped" secondary (`:917-919`) | Same glyphs. Count at `uiValueStrong`, word at `uiMeta`, and primary above zero |
-| A | Folder row | Path, then "· 1 h 52 m left" (`:1002-1005`) | `folder`, path dim with last component primary, then `UILevelBar` mini, `UIValue` "1 h 52 m", dim "left". The full path stays in help |
-| A | Format on the folder row | Doesn't exist yet | `UIValueChip` "HEVC 4:2:2", plus dim "~64 Mb/s" |
+| A | Dropped | `checkmark.circle.fill` green or triangle orange, "0 dropped" secondary (`:917-919`) | Same glyphs. Count at `uiValueStrong`, word at `uiMeta`, and primary above zero. While signal is lost the row reads `Losing frames` with the triangle: a green `0 dropped` never sits beside the countdown (J14) |
+| A | Folder row | Path, then "· 1 h 52 m left" (`:1002-1005`) | `folder`, path dim with last component primary. The full path stays in help. Time left leaves the strip: the status bar shows the worst drive and the sidebar every drive (J19). Failed with a full disk reads "—" in the row (H O6) |
+| A | Format on the folder row | Doesn't exist yet | `UIValueChip` "HEVC 4:2:2". The rate is off the strip (J20). "~" stays wherever a rate is an estimate |
 | A | Format fallback | Doesn't exist yet | Orange triangle, "ProRes 4444 → ProRes 422 HQ" in label color (README section 9) |
-| A | Time left low | Same weight as any other | `externaldrive.badge.exclamationmark` orange before the value |
 | A | Problem row | Two shapes (`:688`, `:699`) | `UIProblemRow`, replacing the folder row at the same height |
 | A | Cut slot | `Label("Cut")` (`:1093`) | Same symbol, fixed 64 pt |
 | A | Cut slot, on air | Doesn't exist as a slot | `tv` plus "On air", plain gray text, so the pill stays the only filled red |
-| A | Output line | "Ultracam · Camera 1 · In use" (`UIPresentation.swift:654`) | State glyph, then separate values: "1080p", "4:2:0 8-bit", "29.97" as `uiValue`, then "In use" in primary or "Not in use" in secondary. Under 440 pt: "1080p 29.97" and the word |
+| A | Output line | "Ultracam · Camera 1 · In use" (`UIPresentation.swift:654`) | One value at every width: `1080p 29.97`. Chroma stays in the Effects menu and the signal badge. "In use" prints only when true (J21) |
 | A | LUT toggle | Chip with a checkmark that changes its width (`UIStyle.swift:201`) | `cube.fill` plus "LUT On", or `cube` plus "LUT Off", fixed width, same pattern as Auto. Disabled with no LUT loaded. This changes the mockup's "✓ LUT" |
-| A | Effects menu | Doesn't exist yet | `square.stack.3d.up`, "Effects", count "3 of 3". Effects off: `square.stack.3d.up.slash`, "Effects Off" |
+| A | Effects menu | Doesn't exist yet | `square.stack.3d.up`, "Effects", with no count (I P2). Effects off: `square.stack.3d.up.slash`, "Effects Off" |
 | A | Updating | Spinner and words (`:1033-1035`) | Same |
 | B | Audio gutter | Red while recording (`:674`) | Always gray |
 | B | Meter | MonitorKit's readout | Same. See section 5 |
@@ -279,10 +285,10 @@ File: `UICameraColumn.swift`. Rows follow the plan: header, record, folder or pr
 | `recording`, `updating` | Stop button, red dot | Recording | Clock | Pause |
 | `paused` | Stop button, `pause.fill` | Paused | Clock, secondary | Resume |
 | `recordingNoSignal` | Stop button, triangle | Recording, no signal | Clock. The two pieces today share one string (`UIPresentation.swift:597`) | Pause |
-| `finishing` | Spinner | Finishing… | Sentence stays | "Saving…" → "Finishing…" (06) |
-| `saved` | `checkmark.circle.fill` | Saved | File name, then `UIValue` duration, split from one string (`UIPresentation.swift:602`) | Show in Finder |
+| `finishing` | Spinner | Saving… | Sentence stays | None. 06 replaces "Finishing…" with "Saving…" (J38) |
+| `saved` | `checkmark.circle.fill` | Saved | Duration, then lost frames when there are any, split from one string (`UIPresentation.swift:602`) | Show in Finder |
 | `noFolder` | Triangle | No folder | Sentence stays | Choose Folder… |
-| `failed` | Triangle, first, also while rolling (N1) | Recording failed, or Disk full | Sentence stays | Choose Folder…, Show in Finder, Details |
+| `failed` | Triangle, first, also while rolling (N1) | Take ended early, or Disk full | `18:58 saved`, one wording everywhere (J27) | One button: Choose Folder… or Details. Details doubles as acknowledge (J34) |
 | `waiting` | Dimmed button | Can't record yet | Sentence stays | Choose Folder… when needed |
 | `stopped` | Dimmed button | Not recording | Sentence stays | None |
 
@@ -292,10 +298,11 @@ File: `UICameraColumn.swift:1126-1206`.
 
 | Tier | Element | Today | Change |
 |---|---|---|---|
-| A | Recording | Dot and clock (`:1184`) | Same, with `uiValueStrong` |
+| A | Row order | Doesn't exist yet | Name, state, `LUT On` or `LUT Off`, ⋯, meter, Stop. The meter separates ⋯ from Stop, so a miss can't end a take (J15). Stop is a neutral square at all times. Four Up adds the Cut slot, because it has no tile Cut (I B2). At 342 pt the compact meter yields first |
+| A | Recording | Dot and clock (`:1184`) | Same, with `uiValueStrong`. No word: the REC pill says it (J18) |
 | A | No signal | "12:31 · no signal", one secondary string (`:1189`) | Triangle, clock, "No signal" in primary as separate pieces |
 | A | Paused | `pause.fill` and clock (`:1192`) | Same, clock in primary |
-| B | Saved, No folder, Failed, Waiting, Stopped, Ready | `collapsedLabel`, words in secondary (`:1174`) | `UIIconValue`. Problem words go to primary, because the tone rule says label color, and problems shouldn't be dimmer than rest states. Stopped and Ready stay secondary |
+| B | Saved, No folder, Failed, Waiting, Stopped, Ready | `collapsedLabel`, words in secondary (`:1174`) | `UIIconValue`. Problem words go to primary, because the tone rule says label color, and problems shouldn't be dimmer than rest states. A problem shows its short name, such as `Check HDMI` or `LUT missing`, and its action as a small button (I B8). Stopped and Ready stay secondary |
 | B | LUT unavailable | Icon-only triangle (`:1137`) | Same. Has help and a label |
 
 ### Program View
@@ -304,8 +311,8 @@ File: `UIProgramView.swift`. The cut bar and Recent Cuts go (README).
 
 | Tier | Element | Today | Change |
 |---|---|---|---|
-| A | Tile Cut | `arrow.right.circle` (`:94`) | Full-width button with `arrow.left.arrow.right` and "Cut" |
-| A | Tile tally | `UIBadge` (`:89`) | `tv` plus "On air" in the Cut slot, same height, so nothing moves |
+| A | Tile Cut | `arrow.right.circle` (`:94`) | Full-width button, 36 pt tall, with `arrow.left.arrow.right`, bold "Cut" and the key, `Cut ⌃2`. Same stronger gray as `LUT On`, no white fill (I B4) |
+| A | Tile tally | `UIBadge` (`:89`) | The ring only. The tile's pill and the "On air" caption go, and the Cut slot keeps its height, so nothing moves (J24) |
 | A | Program title pill | `tv` and "Ultracam · Program" (`:49`) | Same symbol. "Ultracam" dim, "Program" strong |
 | A | Lower pills | "Camera 1 on air" repeats the tally (`:58`) | "Camera 1", plus format as a mono pill (06 V22) |
 | B | Format mismatch pill | Full sentence on the picture (`:65`) | `arrow.triangle.2.circlepath` and "Formats converted". The sentence moves to help. It's already in the Program popover (`UIStatusBar.swift:280`) |
@@ -318,16 +325,16 @@ File: `UISessionSidebar.swift`. All rows below are planned rows, drawn from toda
 | Tier | Element | Today | Change |
 |---|---|---|---|
 | A | Attention row | Banner and section rows (`:26`, `:205`) | `UIProblemRow`, pinned. Extension rows keep their nouns as the leading symbol where nothing's wrong yet: `video.badge.plus`, `arrow.clockwise.circle`, `arrow.down.circle` |
-| A | Camera row, line 1 | Dot, name, badge (`:60-70`) | `UIStateGlyph`, name, then a filled ON AIR or ISO chip |
-| A | Camera row, line 2 | Planned as "2160p 59.94 · 4 dropouts · UltraStudio 12G" | "2160p 59.94" at `uiValue`, `UICountChip` for dropouts, `cable.connector` plus device name at `uiMeta`. Device name truncates first |
-| A | Camera row, line 3 | Planned as "Sony FX3 · connected · 78%" | `camera` and "Sony FX3", `wifi` and "Connected" at `uiMeta`, `UIBatteryGlyph`. Lost shows `wifi.slash`, orange, with "Disconnected" in primary |
+| A | Camera row, line 1 | Dot, name, badge (`:60-70`) | `UIStateGlyph` and name. No tally chip: the picture and status bar own it (J24) |
+| A | Camera row, line 2 | Planned as "2160p 59.94 · 4 dropouts · UltraStudio 12G" | The device's nickname at `uiMeta`, such as "Left UltraStudio", with no plug glyph. The connector shows only when it isn't HDMI (J23) |
+| A | Camera row, line 3 | Planned as "Sony FX3 · connected · 78%" | `camera` and the body's nickname, `UIBatteryGlyph`. `wifi` only when degraded: lost shows `wifi.slash`, orange, with "Disconnected" in primary (J23) |
 | A | Virtual Camera row | Two lines (`:107`, `:136`) | One line: `UISymbol.virtualCamera(inUse:)`, name, "In use" trailing. Not-in-use names in secondary |
 | A | Virtual Cameras header | Doesn't exist yet | While collapsed, shows "1 of 3 in use" trailing, so collapsing hides no state |
 | A | Recording drive row | Planned as "Takes · 8TB" and "1 h 52 m left" | `folder` and "Takes", `externaldrive` and "8TB", then `UIValue` trailing, `UILevelBar` full width below |
 | A | Drive cameras | Planned as "Camera 1, Camera 2" | Number capsule and name for each camera, with the number matching the toolbar digit. If the names don't fit, `UIFirstFitting` drops to capsules alone, with names in help |
 | B | Format | Text in a caption (`:155`) | Picker with `film.stack` |
 | B | Caption | "Camera original · Mac Clock" | "Camera original" at `uiMeta`, `clock` and "Mac Clock" |
-| B | Takes row | Planned as "5:40 PM · 12:31 · 2 cameras · 0 lost" | `film`, time, `UIValue` duration, `video` and "2", then `checkmark.circle.fill` and "0 lost", or a triangle and the count in primary |
+| B | Takes row | Planned as "5:40 PM · 12:31 · 2 cameras · 0 lost" | "Last take", `UIValue` duration and Show All, then the time, `checkmark.circle.fill` and "0 lost", or a triangle and the count in primary. No camera count (I P9) |
 | B | Section headers | Plain (`:96`, `:148`, `:183`) | Same: see section 5 |
 
 Icon-only: Add Camera has help and a label (`:82-86`). The planned Show All keeps its words, so the icon-only magnifier at `:194` goes.
@@ -338,12 +345,16 @@ File: `UIStatusBar.swift`, text from `UIPresentation.swift:754-779`. Segments st
 
 | Tier | Segment | Today | Change |
 |---|---|---|---|
-| A | Problem | Last, triangle and text (`:124`) | First, `.fontWeight(.medium)`, its action as a button beside it |
-| A | Virtual Cameras | "Ultracam · Program · In use", one string (`UIPresentation.swift:733`) | `UISymbol.virtualCamera(inUse:)`, "Program" in primary, "In use" dim. With several: "2 of 3 in use". Help keeps device names |
-| A | Program | "Camera 1 on air · Auto" (`UIPresentation.swift:761`) | `tv` and "Camera 1", `timer` and "8 s", `wand.and.sparkles` and "Auto", or `pin.fill` and "Hold", or "Manual" dim with no symbol. Override: "Auto in 4 s". Shot past the soft maximum turns `timer` yellow. The number stays the reading, so color isn't alone |
-| A | Recording | "REC 2 · 12:31 · 8TB 1 h 52 m · Archive 5 h 40 m left" (`UIPresentation.swift:751`) | Red dot, "REC", count, clock at `uiValueStrong`, then one `externaldrive`, name and `UIValue` per drive with "left" on each. Narrow: the shortest drive. Paused: `pause.fill` and count |
-| A | Audio | `waveform`, "Audio OK" (`UIPresentation.swift:772`) | `waveform`, "Audio" dim, "2 of 2" strong (README). A warning keeps today's words, with a triangle. Not icon-only, despite 06 V18: the plan's count is the information |
+| A | Problem | Last, triangle and text (`:124`) | First, `.fontWeight(.medium)`, its action as a button beside it. Rolling or on-air damage is a solid amber segment with dark text, the rest a triangle and label-color text (J26) |
+| A | Virtual Cameras, Program | "Ultracam · Program · In use", one string (`UIPresentation.swift:733`) | One piece: the green `UISymbol.virtualCamera(inUse:)`, "Program" in primary, the on-air camera dim, then the shot time. "In use" prints only when true, and a gray glyph is enough otherwise. With several: "2 of 3 in use". Help keeps device names |
+| A | Shot time and Auto | "Camera 1 on air · Auto" (`UIPresentation.swift:761`) | No `tv`, `timer` or `wand.and.sparkles` beside a word (J22). `UIValue` "8 s", with "Auto" or "Hold" words only where they add state, and "Auto in 4 s" while counting. "Manual" dim. Past the soft maximum a yellow `timer` appears, and the number stays the reading, so color isn't alone |
+| A | Recording | "REC 2 · 12:31 · 8TB 1 h 52 m · Archive 5 h 40 m left" (`UIPresentation.swift:751`) | Red dot, "REC", count, clock at `uiValueStrong`, then the worst drive's name and `UIValue` with "left", and no drive glyph (J19, J22). The sidebar shows every drive. Paused: `pause.fill` and count |
+| A | Audio | `waveform`, "Audio OK" (`UIPresentation.swift:772`) | "Audio" dim, "2 of 2" strong, no `waveform` (J22). A warning keeps today's words, with a triangle. Not icon-only, despite 06 V18: the plan's count is the information |
 | B | Resources | "CPU 31% · GPU (video) 18% · Memory" (`:216`) | "CPU" and "GPU" dim, numbers mono, primary. README drops memory here; the popover keeps it |
+
+**Glyphs on this line (J22).** Three stay: the warning triangle, the REC dot and the green virtual camera glyph. Tv, timer, wand, drive and waveform go wherever a word sits beside them.
+
+**No " · " joins.** Typed pieces are separated by spacing, because the owner rejected dot-joined text. That holds in every status string, menu subtitles and badges included.
 
 Shot time gets a `UILevelBar` mini at the widest density, because it shows how close the shot is to its limit. Drives don't get one here, because time left already says it.
 
@@ -383,21 +394,22 @@ File: `UIMenuBar.swift`. Rows stay real `NSMenuItem`s, so typed elements are lim
 
 | Tier | Element | Today | Change |
 |---|---|---|---|
-| A | Problem row | Orange title text, disabled (`:351-354`) | Image tinted with `NSImage.SymbolConfiguration(paletteColors:)` and `isTemplate = false`, title in label color, enabled with its action (README) |
-| A | Cut rows | `tv`, subtitle (`:402-405`) | `arrow.left.arrow.right`. "On air" or "Next" in an `NSMenuItemBadge`, so the row stays one line and the row budget isn't taller. Available since macOS 14 (header checked). *Confirm in render* beside key equivalents |
+| A | Problem row | Orange title text, disabled (`:351-354`) | Image tinted with `NSImage.SymbolConfiguration(paletteColors:)` and `isTemplate = false`, title in label color, enabled with its action in the badge (README). Two levels (J26): a row can't take a fill, so rolling or on-air damage draws a solid amber image and a semibold title, and the rest a plain orange triangle. Rolling damage carries `Take ends in 4 s` as its subtitle. The menu widens to its longest row, so an action is never cut (G33) |
+| A | Cut rows | `tv`, subtitle (`:402-405`) | `arrow.left.arrow.right`. The on-air camera gets no Cut row, which holds the cap at two cameras (J2). "Next" in an `NSMenuItemBadge`, so the row stays one line. Available since macOS 14 (header checked). *Confirm in render* beside key equivalents |
 | A | Auto | `wand.and.stars` (`:409`) | `wand.and.sparkles` |
 | A | Hold | No symbol (`:412`) | `pin`, checked when on |
 | A | Record per camera | `record.circle` or `stop.circle` (`:384-390`, `:519`) | `record.circle` or `stop.fill`. Clock in the badge |
-| A | Time left | Planned row | `externaldrive`, "Time left", badge "8TB 1 h 52 m". Low: `externaldrive.badge.exclamationmark`, orange |
-| B | Format | Planned row | `film.stack`, badge "HEVC 4:2:2" |
-| B | Pause All | No symbol | `pause.fill` |
-| B | Camera submenu row | "On air · REC 12:31" subtitle (`:513`) | Same subtitle, at most two parts. A menu row can't hold chips: see section 5 |
+| A | Time left | Planned row | `externaldrive`, "Time left", badge "8TB 1 h 52 m" or "8TB 22 min". Low: `externaldrive.badge.exclamationmark`, orange |
+| B | Format | Planned row | `film.stack`, badge "HEVC 4:2:2". Submenu rows: badge "~64 Mb/s  1 h 52 m left", spaced, no dot |
+| B | Pause All | No symbol | `pause.fill`. Reads Resume All with `play.fill` when every take is paused, on the same key (H M9). One camera has the same row, not Pause Recording (H N7) |
+| B | Stop All Cameras | Under the camera rows | Separator above it, so a slip off a camera row can't land on it (I P22). Keeps its prompt |
+| B | Camera submenu row | "On air · REC 12:31" subtitle (`:513`) | Subtitle "On air  REC 12:31", at most two parts, spaced with no dot. A menu row can't hold chips: see section 5 |
 | B | Submenu rows | `pause`, `play`, `tv`, `sidebar.right`, no LUT toggle (`:522`, `:529`, `:586`) | `pause.fill`, `play.fill`, `arrow.left.arrow.right`, `sidebar.trailing`. New LUT row: `cube`, checked when on, file name as subtitle |
-| B | Effects submenu | "3 of 4" subtitle (`:542`), "1 · LUT" rows (`:537`) | `square.stack.3d.up`, count in the badge. Effect rows keep their numbers, because order matters. Values in the badge |
-| B | Input submenu | No symbol (`:579`) | `cable.connector` |
+| B | Effects submenu | "3 of 4" subtitle (`:542`), "1 · LUT" rows (`:537`) | `square.stack.3d.up`, count in the badge. Effect rows keep the inspector's numbers, "2  Output size", "3  Color format", "4  Frame-rate cap", because order matters (H P9). LUT is its own row. Values in the badge |
+| B | Input submenu | No symbol (`:579`) | Removed. Input is one camera's setup, so it stays in the inspector (H P8) |
 | B | Card, recording pill | Own copy (`:756-769`) | `UIPictureStatePill`, compact |
 | B | Card thumbnails | "1 · on air" pill covers a 74 pt picture (`:749`) | Number only. The ring and the row's badge carry the state (06 V20) |
-| C | Status item | Template symbols with badges (`:139-171`) | Same: see section 5 |
+| C | Status item | Template symbols with badges (`:139-171`) | Same, minus the Effects off badge (I P21): see section 5 |
 
 ### Camera badge menu
 
@@ -487,8 +499,8 @@ Files: `UIMonitorTool*.swift`, `UIScope*.swift`. Tier C, except the tool bar.
 
 | Tier | Element | Today | Change |
 |---|---|---|---|
-| B | Stop, Remove, Reset dialogs | System dialogs, verbs on buttons (`UIMainWindow.swift:51`, `UISessionBridge.swift:261`) | Same: see section 5 |
-| B | Rename alert | `UIRenameAlert.swift:19` | Same |
+| B | Stop, Remove, Reset, Forget, Sync dialogs | System dialogs, verbs on buttons (`UIMainWindow.swift:51`, `UISessionBridge.swift:261`) | Same, with Cancel as default on everything that ends or rewrites something, so Return never ends a take. The code must change (J4). See section 5 |
+| B | Rename alert | `UIRenameAlert.swift:19` | Same. Rename stays the default, because nothing ends |
 | B | No Cameras | `video.slash` (`UIMainWindow.swift:69`) | `video.badge.plus`, with Add Camera as today |
 | C | No Camera Selected | `video.slash` (`UIInspector.swift:22`) | `video` |
 | C | Camera Stopped | `video.slash` (`UIDiagnostics.swift:111`) | `video` |
@@ -540,11 +552,11 @@ Status glyphs that aren't controls, such as `video.slash` with a count, the batt
 
 **System alerts and dialogs.** Native, with a question and a named verb. A custom icon adds nothing, and macOS draws the app icon.
 
-**Menu bar subtitles.** `NSMenuItem` takes a string, and a custom view would cost keyboard navigation. Two parts at most, joined by " · ".
+**Menu bar subtitles.** `NSMenuItem` takes a string, and a custom view would cost keyboard navigation. Two parts at most, separated by spacing, not " · " (J22).
 
 **App menus.** `UICommands.swift` stays text. Mac app menus have no icons by convention, and every row has a shortcut column already.
 
-**The status item.** The template icon with its knocked-out badges works at menu bar size (06 section 10). A `square.stack.3d.up.slash` badge wouldn't read at 9 pt, so bypass keeps `arrow.right.circle.fill`. That is the one exception to section 1, and its accessibility label says "Effects off".
+**The status item.** The template icon with its knocked-out badges works at menu bar size (06 section 10). Recording and Attention keep theirs. Effects off has no badge: it was a blob at real size beside the two that matter, and the panel says it (I P21). The accessibility label still says "Effects off".
 
 **Audio meter text.** Numerals and dBTP come from MonitorKit's fixed 44 pt block, already value-over-unit. Scales, legends and graticule labels are measurement, and they keep their own type and colors (06 section 6).
 
