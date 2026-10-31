@@ -69,15 +69,16 @@ enum UIFormatLabels {
   static func signal(running: Bool, deviceAvailable: Bool, update: CaptureUpdate?) -> UISignal {
     guard running else { return .none }
     guard let update else { return .connecting }
-    if let format = update.sourceFormat { return .live(format: FormatDisplayIdentity(format).short) }
-    let input = update.input
-    if let format = shortFormat(input) { return .live(format: format) }
-    let lowered = (input + " " + update.message).lowercased()
-    if lowered.contains("unsupported") { return .unsupported(input) }
-    // The backend says so explicitly once it has looked for a signal.
-    if lowered.contains("no video signal") || lowered.contains("no hdmi") { return deviceAvailable ? .noSignal : .deviceMissing }
-    if input == "No signal" && update.frames > 0 { return .noSignal }
-    return deviceAvailable ? .connecting : .deviceMissing
+    switch update.signal {
+    case .unsupported(let reason): return .unsupported(reason)
+    case .lost: return deviceAvailable ? .noSignal : .deviceMissing
+    case .waiting: return deviceAvailable ? .connecting : .deviceMissing
+    case .live:
+      // The format only names the picture; live before it's known is still starting.
+      if let format = update.sourceFormat { return .live(format: FormatDisplayIdentity(format).short) }
+      if let format = shortFormat(update.input) { return .live(format: format) }
+      return deviceAvailable ? .connecting : .deviceMissing
+    }
   }
 }
 

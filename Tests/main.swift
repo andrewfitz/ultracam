@@ -259,6 +259,7 @@ suite.addTest(XCTestSuite(forTestCaseClass: AutoSwitcherTimelineChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: InstallerChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: MulticamRuntimeChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: UIPresentationChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: CaptureSignalChecks.self))
 #if ULTRACAM_TEST_SUPPORT
 suite.addTest(XCTestSuite(forTestCaseClass: AudioVideoClockMappingChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: B1dGamutPersistenceChecks.self))

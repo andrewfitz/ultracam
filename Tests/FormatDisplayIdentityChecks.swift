@@ -65,6 +65,7 @@ import XCTest
     var update = CaptureUpdate(message: "")
     update.input = "stale legacy label"
     update.sourceFormat = format
+    update.signal = .live
     let expected = UISignal.live(format: "1080p 59.94")
     XCTAssertEqual(UIFormatLabels.signal(running: true, deviceAvailable: true, update: update), expected)
     var camera = UICameraSnapshot(id: "test", name: "Camera")

@@ -43,6 +43,7 @@ import Observation
 /// only outside it (timecode, levels, counters, rates) goes to the camera's telemetry.
 struct CaptureUpdateState: Equatable {
   var message: String
+  var signal: CaptureSignal
   var input: String
   var output: String
   var sourceDuration: CMTime?
@@ -56,6 +57,7 @@ struct CaptureUpdateState: Equatable {
 
   init(_ update: CaptureUpdate) {
     message = update.message
+    signal = update.signal
     input = update.input
     output = update.output
     sourceDuration = update.sourceDuration

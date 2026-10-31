@@ -4,8 +4,21 @@ import CoreMedia
 import Foundation
 import os
 
+/// What the source is doing, as a fact. Everything that shows or acts on signal
+/// reads this; the labels beside it only describe it. `since` is on the
+/// `systemUptime` clock and is when frames stopped, so a view can tick from it
+/// while no updates arrive.
+enum CaptureSignal: Sendable, Equatable {
+  /// Started, and no frame or signal report yet.
+  case waiting
+  case live
+  case lost(since: TimeInterval)
+  case unsupported(String)
+}
+
 struct CaptureUpdate: @unchecked Sendable {
   var message: String
+  var signal: CaptureSignal = .waiting
   var input = "No signal"
   var output = ""
   var sourceFormat: SourceFormat?
@@ -204,6 +217,10 @@ final class CaptureController: @unchecked Sendable {
   // dropout cost are measured on the source clock, apart from device skips.
   private var lastValidSourcePTS: CMTime?
   private var signalLostAt: TimeInterval?
+  // No signal before the first frame: no dropout to measure, but the operator is
+  // still told. Capture-queue owned, like the unsupported reason below.
+  private var noSignalSince: TimeInterval?
+  private var unsupportedReason: String?
   private var signalDropouts: UInt64 = 0
   private var signalLostFrames: UInt64 = 0
   private var lastReceived: Double = 0
@@ -612,6 +629,8 @@ final class CaptureController: @unchecked Sendable {
           self.audioPairAnchor = nil
           self.coreRejectedFrames = 0
         }
+        self.noSignalSince = nil
+        self.unsupportedReason = nil
         // Driver events change capture-queue state (signal loss, fatal errors);
         // they are rare, so they stay on the capture queue.
         #if ULTRACAM_TEST_SUPPORT
@@ -629,6 +648,8 @@ final class CaptureController: @unchecked Sendable {
             if signalLost || value.localizedCaseInsensitiveContains("unsupported") {
               self.clearSignal(resetSourceClock: !signalLost)
               self.inputLabel = value
+              if signalLost { self.noteNoSignal(at: ProcessInfo.processInfo.systemUptime) }
+              else { self.unsupportedReason = value }
             }
             self.publishCurrent(token: token)
           }
@@ -733,7 +754,11 @@ final class CaptureController: @unchecked Sendable {
             if self.detected != nil {
               self.logger.notice("No video from \(self.runLabel, privacy: .public) for \(String(format: "%.1f", now - state.last), privacy: .public) s; waiting for the source.")
             }
+            // Frames stopped with no report from the source: the same loss, from
+            // the last frame. A frame that beat this hop has already ended it.
+            self.noteSignalLost(token: token, since: state.last)
             self.clearSignal()
+            self.noteNoSignal(at: state.last)
             self.message = "No video signal — waiting for source."
             self.publishCurrent(token: token)
           }
@@ -1146,17 +1171,38 @@ final class CaptureController: @unchecked Sendable {
 
   /// Driver thread, on the source's signal-lost event: a dropout begins if
   /// frames were arriving. The next valid frame measures what it cost.
-  private func noteSignalLost(token: UInt64) {
+  private func noteSignalLost(token: UInt64, since: TimeInterval? = nil) {
     lock.withLock {
       guard generation == token, accepting, signalLostAt == nil, lastValidSourcePTS != nil else { return }
-      signalLostAt = ProcessInfo.processInfo.systemUptime
+      if let since, lastReceived != since { return }
+      signalLostAt = since ?? ProcessInfo.processInfo.systemUptime
       signalDropouts &+= 1
     }
+  }
+
+  /// Capture queue: the source has no signal. The first report of an outage wins.
+  private func noteNoSignal(at time: TimeInterval) {
+    if noSignalSince == nil { noSignalSince = time }
+    unsupportedReason = nil
+  }
+
+  /// Capture queue. Read from what the frame path already keeps, so tracking the
+  /// signal adds nothing per frame: a dropout is `signalLostAt`, and any valid
+  /// frame ends one. Before the first frame, the source's own report decides.
+  private func currentSignal() -> CaptureSignal {
+    let state = lock.withLock { (lostAt: signalLostAt, framed: lastValidSourcePTS != nil) }
+    if detected == nil, let unsupportedReason { return .unsupported(unsupportedReason) }
+    if let lostAt = state.lostAt { return .lost(since: lostAt) }
+    if state.framed || detected != nil { return .live }
+    if let noSignalSince { return .lost(since: noSignalSince) }
+    return .waiting
   }
 
   /// Capture queue: one line per dropout, bounded by `signalLossLog`.
   private func logSignalReturn(_ recovered: (frames: UInt64, seconds: TimeInterval), token: UInt64) {
     guard isAccepting(token) else { return }
+    noSignalSince = nil
+    publishCurrent(token: token)
     let ms = Int((recovered.seconds * 1000).rounded())
     let decision = signalLossLog.note(frames: recovered.frames, at: ProcessInfo.processInfo.systemUptime)
     switch decision {
@@ -1635,8 +1681,10 @@ final class CaptureController: @unchecked Sendable {
             self.message = "Waiting for signal…"
           case .signalLost(let reason):
             self.clearSignal(resetSourceClock: false); self.message = "No video signal: \(reason)"
+            self.noteNoSignal(at: ProcessInfo.processInfo.systemUptime)
           case .unsupportedInput(let reason):
             self.clearSignal(); self.message = "Unsupported input: \(reason)"
+            self.unsupportedReason = reason
           case .info(let message): self.message = message
           default: break
           }
@@ -2437,7 +2485,8 @@ final class CaptureController: @unchecked Sendable {
     let audio = media.snapshot()
     let visiblePreview = previewEnabled && services.preview != nil
     let videoLosses = depth.sourceDrops + depth.signalLostFrames + deviceDrops + coreRefusals + poolDrops + cameraDrops
-    let update = CaptureUpdate(message: message, input: inputLabel, output: outputLabel,
+    let update = CaptureUpdate(message: message, signal: stopped ? .waiting : currentSignal(),
+      input: inputLabel, output: outputLabel,
       sourceFormat: lock.withLock { declaredAdmission?.format },
       sourceDuration: detected?.duration,
       mediaTime: stopped ? nil : lastDeliveredSourceTime,
