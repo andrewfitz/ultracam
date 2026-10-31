@@ -126,7 +126,13 @@ struct UISessionBridge {
       camera.outputFormat = update.flatMap { UIFormatLabels.shortFormat($0.output) }
       camera.applying = running && update != nil && update?.pipelineEnabledApplied == nil &&
         (update?.sourceFormat != nil || UIFormatLabels.shortFormat(update?.input ?? "") != nil)
-      camera.inUse = model.outputMode == .separateCameras && running && (model.cameraInUse(id) || update?.cameraOutputActive == true)
+      // A client, by the extension's own demand signal; an open sink is not a viewer. Program
+      // mode publishes no per-camera device yet, so only Program can have clients there.
+      let ownDevice = model.outputMode == .separateCameras
+      camera.inUse = ownDevice && running && model.cameraInUse(id)
+      camera.clientUnknown = ownDevice && model.cameraClientUnknown(id)
+      camera.sinkConnected = update?.cameraOutputActive == true
+      camera.clientWaiting = model.waitingClients.contains(id)
       camera.processing = descriptor.pipelineEnabled
       camera.resizeTarget = descriptor.configuration.resizeTarget
       camera.scalingMode = descriptor.scalingMode
@@ -177,6 +183,8 @@ struct UISessionBridge {
     session.cameras = interface.ordered(cameras, id: \.id)
     session.selectedID = model.selectedFeedID.rawValue
     session.programInUse = model.programInUse
+    session.programClientUnknown = model.outputMode == .program && model.programClientUnknown
+    session.programSinkConnected = model.programSinkConnected
     session.onAirID = model.outputMode == .program ? model.switcherSelectedFeedID?.rawValue : nil
     session.pendingCutID = model.switcherPendingFeedID?.rawValue
     let switcher = model.switcherSettings
@@ -193,6 +201,10 @@ struct UISessionBridge {
       maximum: switcher.naturalTalkingHead.maximumShotDuration)
     session.programFormatMismatch = model.programFormatMismatch
     session.programIssue = model.programIssue
+    session.programMoved = model.programMoved
+    session.programQueueStalled = model.programQueueStalled
+    session.unusedTake = model.unusedTake
+    session.appProblems = model.appProblems
     session.recentCuts = model.recentCuts
     session.codecTitle = recording.codec.title
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
@@ -342,6 +354,16 @@ struct UISessionBridge {
     case .retryAutomaticStart(let id):
       // A refused Start retries as Start; a failed automatic start retries the automatic start.
       if model.startRefusal(feedID(id)) != nil { model.startCamera(feedID(id)) } else { model.retryAutomaticFeed(feedID: feedID(id)) }
+    case .restartCamera(let id): model.restartCamera(feedID(id))
+    case .acknowledgeStop(let id):
+      model.acknowledgeUnexpectedStop(feedID(id))
+      openWindow("diagnostics")
+    case .acknowledgeProgramMove:
+      model.acknowledgeProgramMove()
+      openWindow("diagnostics")
+    case .acknowledgeProblem(let id):
+      model.acknowledgeProblem(id)
+      openWindow("diagnostics")
     case .addCamera:
       if let id = model.addFeed(), interface.defaultCollapsed { interface.collapsed.insert(id.rawValue) }
     case .removeCamera(let id):

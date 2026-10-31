@@ -122,6 +122,10 @@ extension UIContext {
       session.cameras[index] = live.camera(session.cameras[index], follows: follows, drives: session.drives)
     }
     if let started = session.shot.startedAt { session.shot.currentShot = Date().timeIntervalSince(started) }
+    let uptime = ProcessInfo.processInfo.systemUptime
+    for index in session.cameras.indices {
+      if let since = session.cameras[index].signalLostSince { session.cameras[index].signalLostFor = uptime - since }
+    }
     return session
   }
 }

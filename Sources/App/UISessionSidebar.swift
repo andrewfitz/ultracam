@@ -22,19 +22,22 @@ struct UISessionSidebarViewContent: View {
     let _ = UIRenderProbe.count("UISessionSidebarViewContent")
     // Only the camera rows (shown with three or more cameras) are tagged, so only they select
     // through the list; other rows that name a camera are buttons that do the same.
-    List(selection: selection) {
-      if let banner = UIExtensionBanner.state(session.install) {
-        Section { UIExtensionBannerView(state: banner, context: context) }
+    VStack(spacing: 0) {
+      UIAttentionSection(context: context)
+      List(selection: selection) {
+        if let banner = UIExtensionBanner.state(session.install) {
+          Section { UIExtensionBannerView(state: banner, context: context) }
+        }
+        camerasSection
+        outputSection
+        recordingSection
+        if !session.recentTakes.isEmpty { recentTakesSection }
+        if !session.interruptedTakes.isEmpty || session.recoveryMessage != nil { interruptedSection }
+        automationSection
       }
-      camerasSection
-      outputSection
-      recordingSection
-      if !session.recentTakes.isEmpty { recentTakesSection }
-      if !session.interruptedTakes.isEmpty || session.recoveryMessage != nil { interruptedSection }
-      automationSection
+      .listStyle(.sidebar)
+      .accessibilityLabel("Session")
     }
-    .listStyle(.sidebar)
-    .accessibilityLabel("Session")
   }
 
   private var selection: Binding<String?> {
@@ -66,7 +69,7 @@ struct UISessionSidebarViewContent: View {
             }
             Spacer(minLength: 0)
             if let label = camera.tally.label {
-              UIBadge(text: label, tone: camera.tally == .onAir ? .onAir : camera.tally == .next ? .positive : .neutral)
+              UIBadge(text: label, tone: camera.tally.isRed ? .onAir : camera.tally == .next ? .positive : .neutral)
             }
           }
           .tag(camera.id)
@@ -105,7 +108,7 @@ struct UISessionSidebarViewContent: View {
       switch session.outputMode {
       case .program:
         UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · Program",
-          detail: session.programInUse ? "In use" : "Not in use", positive: session.programInUse)
+          detail: session.programClientLine, positive: session.programInUse)
           .help("One switched camera for meeting apps. Cut with the toolbar buttons or ⌃1–⌃\(min(4, max(1, presentation.cameras.count))).")
         Toggle("Auto switching", isOn: Binding(get: { presentation.autoSwitching }, set: { context.send(.setAutoSwitching($0)) }))
           .toggleStyle(.switch)
@@ -134,7 +137,7 @@ struct UISessionSidebarViewContent: View {
         // Each output is its camera: a click selects the camera and shows it in the inspector.
         ForEach(session.cameras) { camera in
           UISidebarRow(symbol: "video.badge.checkmark", title: "Ultracam · \(camera.name)",
-            detail: camera.inUse ? "In use" : "Not in use", positive: camera.inUse)
+            detail: camera.clientLine, positive: camera.inUse)
             .uiSidebarInspectButton(cameraName: camera.name) { inspect(camera.id) }
             .selectionDisabled()
         }

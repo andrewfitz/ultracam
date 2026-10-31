@@ -48,6 +48,9 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   var controlPlugins: () -> [any CameraControlPlugin] = { [] }
   var captureDescriptor: (String) -> VendorDescriptor? = { _ in nil }
   var controlViewFactories: () -> [String: ControlViewFactory] = { [:] }
+  /// Follows which virtual cameras have clients from launch. CMIO listeners only, and
+  /// off in harnesses, which have no clients and shouldn't enumerate the Mac's cameras.
+  var observesCameraDemand = false
   var setCompatibilityPolicy: (RecordingCompatibilityPolicy) -> Void = { _ in }
 
   static let live: AppHardware = {
@@ -59,6 +62,7 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
       let registry = try VendorRegistry.makeLive(settingsPolicy: policy)
       var hardware = AppHardware.registry(registry)
       hardware.observeVirtualCameras = { CMIODeviceListWatcher(changed: $0) }
+      hardware.observesCameraDemand = true
       if let policyMessage {
         let previousWarning = hardware.driverWarning
         hardware.driverWarning = { [previousWarning] in [policyMessage, previousWarning()].compactMap { $0 }.joined(separator: "\n") }

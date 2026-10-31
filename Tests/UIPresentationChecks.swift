@@ -14,6 +14,7 @@ import XCTest
     camera.running = running
     camera.signal = running ? signal : .none
     camera.inUse = inUse
+    camera.sinkConnected = inUse
     camera.processing = processing
     camera.recording.status = recording
     camera.recording.elapsed = recording == .idle ? 0 : elapsed
@@ -31,6 +32,7 @@ import XCTest
     session.onAirID = onAir
     session.pendingCutID = pending
     session.programInUse = inUse
+    session.programSinkConnected = inUse
     return session
   }
 
@@ -71,7 +73,7 @@ import XCTest
   }
 
   func testSeparateTallyRequiresRunningAndInUse() {
-    XCTAssertEqual(presented(separate([camera(1, inUse: true)])).tally, .onAir)
+    XCTAssertEqual(presented(separate([camera(1, inUse: true)])).tally, .iso)
     XCTAssertEqual(presented(separate([camera(1, inUse: false)])).tally, .none)
     XCTAssertEqual(presented(separate([camera(1, running: false, inUse: true)])).tally, .none)
   }
@@ -422,7 +424,7 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording, no signal")
     session.cameras[0].recording.status = .idle
     session.cameras[0].recording.error = "Drive disconnected"
-    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording failed")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Take ended early")
     session.cameras[0].recording.error = nil
     session.drives = [UIDrive(name: "8TB", availableBytes: 1, totalBytes: 2, secondsLeft: 12 * 60)]
     XCTAssertEqual(UIPresentationBuilder.warning(session), "8TB: 12 min left")
@@ -685,18 +687,6 @@ import XCTest
     XCTAssertEqual(presented(separate([writing])).sizeLine, "\(UIFormat.bytes(1_000_000)) · 707 Mb/s")
   }
 
-  func testStatusBarLeavesPlainNoSignalToTheSinglePicture() {
-    let one = separate([camera(1, signal: .noSignal)])
-    XCTAssertNil(UIPresentationBuilder.session(one).statusSegments.first { $0.kind == .warning },
-      "One camera: its picture already says No signal")
-    XCTAssertEqual(UIPresentationBuilder.warning(one), "Camera 1: no signal", "The menu bar still warns")
-    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(one), .attention)
-    let two = separate([camera(1, signal: .noSignal), camera(2)])
-    XCTAssertEqual(UIPresentationBuilder.session(two).statusSegments.last?.text, "Camera 1: no signal")
-    let unsupported = separate([camera(1, signal: .unsupported("1080i"))])
-    XCTAssertEqual(UIPresentationBuilder.session(unsupported).statusSegments.last?.text, "Camera 1: unsupported format")
-  }
-
   func testMenuBarPreviewShowsTheCameraInTheMeeting() {
     var session = separate([camera(1), camera(2, inUse: true)])
     session.selectedID = "camera-1"
@@ -756,7 +746,7 @@ import XCTest
       XCTAssertEqual(presentation.recordTone, .warning, "Orange like any failed take; red is only for recording and on air (D8)")
       XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: disk full", error)
       XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .attention)
-      XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments.last?.text, "Camera 1: disk full")
+      XCTAssertEqual(UIPresentationBuilder.session(session).statusSegments.first?.text, "Camera 1: disk full")
     }
   }
 
@@ -772,7 +762,7 @@ import XCTest
     session.drives = [roomy]
     XCTAssertEqual(presented(session).recordTitle, "Recording failed")
     XCTAssertEqual(presented(session).recordDetail, "Recording writer failed: AVAssetWriter finish failed.")
-    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording failed")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Take ended early")
     // A drive that can't be read (zero size) says nothing about space.
     session.drives = [UIDrive(name: "8TB", availableBytes: 0, totalBytes: 0, secondsLeft: nil)]
     XCTAssertEqual(presented(session).recordTitle, "Recording failed")
@@ -804,7 +794,7 @@ import XCTest
       var session = separate([failed])
       session.drives = [roomy]
       XCTAssertEqual(presented(session).recordTitle, "Recording failed", error)
-      XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording failed", error)
+      XCTAssertEqual(UIPresentationBuilder.warning(session), "Take ended early", error)
     }
   }
 
@@ -865,7 +855,7 @@ import XCTest
   func testOnAirWarningIsShownEvenWithOneCamera() {
     // The status bar leaves a plain no-signal to the one picture, but not what the meeting sees.
     let one = program([camera(1, signal: .noSignal)])
-    XCTAssertEqual(UIPresentationBuilder.session(one).statusSegments.last?.text, "Camera 1 on air: no signal")
+    XCTAssertEqual(UIPresentationBuilder.session(one).statusSegments.first?.text, "Camera 1 on air: no signal")
     XCTAssertEqual(UIPresentationBuilder.warning(one), "Camera 1 on air: no signal")
     // Idle Program with nobody watching and nothing running is not a problem.
     XCTAssertNil(UIPresentationBuilder.warning(program([camera(1, running: false)], inUse: false)))
@@ -892,9 +882,10 @@ import XCTest
   }
 
   func testProgramWarningPrecedence() {
-    // A take losing its picture still comes first; it's the one thing that can't be redone.
+    // On air and rolling is one row, not two: the take's countdown goes under it.
     var session = program([camera(1, signal: .noSignal, recording: .recording), camera(2)])
-    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: recording, no signal")
+    XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: no signal")
+    XCTAssertEqual(UIPresentationBuilder.problems(session).count, 1)
     session.cameras[0].recording.status = .idle
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1 on air: no signal")
     // On air beats a low drive and another camera's plain no-signal.

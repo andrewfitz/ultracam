@@ -345,20 +345,13 @@ final class UIMenuCommandBox: NSObject {
     let selectedSnapshot = session.cameras.first { $0.id == session.selectedID }
     let waiting = !presentation.camerasRunning && selectedSnapshot?.automaticStart == true
 
-    // Problems first, in orange, one action each where there is one.
-    if let warning = UIPresentationBuilder.warning(session) {
-      let banner = NSMenuItem(title: warning, action: nil, keyEquivalent: "")
-      banner.attributedTitle = NSAttributedString(string: warning,
+    // Problems first, in orange, each one row that does its one action.
+    for problem in presentation.problems {
+      let item = row(problem.title, problem.action.map { action($0.action) } ?? [], enabled: problem.action != nil,
+        symbol: "exclamationmark.triangle.fill", subtitle: problem.action?.title, target: target)
+      item.attributedTitle = NSAttributedString(string: problem.title,
         attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.menuFont(ofSize: 0)])
-      banner.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "Warning")
-      banner.isEnabled = false
-      items.append(banner)
-    }
-    // A failed automatic start gets one explicit Retry (there is no background retry loop).
-    let failedCameras = session.cameras.filter(\.automaticStartFailed)
-    for camera in failedCameras {
-      let title = failedCameras.count > 1 ? "Retry \(camera.name)" : "Retry Camera Start"
-      items.append(row(title, action(.retryAutomaticStart(cameraID: camera.id)), symbol: "arrow.clockwise", target: target))
+      items.append(item)
     }
     if waiting && !showLivePreview {
       items.append(row("Show Live Preview", [.showLivePreview], symbol: "eye", target: target))
@@ -511,7 +504,7 @@ final class UIMenuCommandBox: NSObject {
     }
     let item = NSMenuItem(title: camera.name, action: nil, keyEquivalent: "")
     item.subtitle = status.joined(separator: " · ")
-    item.image = NSImage(systemSymbolName: camera.tally == .onAir ? "video.fill" : "video", accessibilityDescription: nil)
+    item.image = NSImage(systemSymbolName: camera.tally.isRed ? "video.fill" : "video", accessibilityDescription: nil)
     let submenu = NSMenu(title: camera.name)
     submenu.autoenablesItems = false
     let isTaking = camera.recordButtonActive || camera.pauseTitle == "Resume"
@@ -701,12 +694,16 @@ struct UIMenuPreviewContent: View {
     UIColumnPictureLayout { pictures.picture(cameraID: MonitorFeedHost.programTarget, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 10))
       .overlay(alignment: .topLeading) { Label("Ultracam · Program", systemImage: "tv").font(.caption.weight(.semibold)).uiPictureOverlay().padding(7) }
-      .overlay(alignment: .topTrailing) { UITallyBadge(tally: session.programInUse ? .onAir : .program).padding(7) }
+      .overlay(alignment: .topTrailing) { UITallyBadge(tally: programTally).padding(7) }
       .overlay(alignment: .bottomLeading) {
         Text(session.cameras.first { $0.id == session.onAirID }?.timecode ?? "—").font(.caption.monospacedDigit().weight(.semibold))
           .uiPictureOverlay().padding(7)
       }
       .overlay(alignment: .bottomTrailing) { recPill(for: recordingCameras).padding(7) }
+  }
+
+  private var programTally: UITally {
+    session.cameras.first { $0.id == session.onAirID }.map { UIPresentationBuilder.tally(for: $0, in: session) } ?? .none
   }
 
   private func cameraPicture(_ camera: UICameraPresentation) -> some View {
@@ -746,7 +743,8 @@ struct UIMenuPreviewContent: View {
       .clipShape(RoundedRectangle(cornerRadius: 7))
       .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(camera.tally.ringColor ?? .clear, lineWidth: 2.5))
       .overlay(alignment: .bottomLeading) {
-        Text(camera.tally == .onAir ? "\(camera.number) · on air" : camera.tally == .next ? "\(camera.number) · next" : "\(camera.number)")
+        Text(camera.tally == .onAir ? "\(camera.number) · on air" : camera.tally == .iso ? "\(camera.number) · ISO"
+          : camera.tally == .next ? "\(camera.number) · next" : "\(camera.number)")
           .font(.caption2.weight(.semibold)).uiPictureOverlay().padding(4)
       }
       .accessibilityElement(children: .ignore)

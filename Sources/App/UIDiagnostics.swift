@@ -323,7 +323,7 @@ private struct UIDiagnosticsProgramTab: View {
     Form {
       Section("Output") {
         UIDiagnosticsRow("Camera", "Ultracam · Program")
-        UIDiagnosticsRow("Clients", model.programInUse ? "In use" : "Not in use")
+        UIDiagnosticsRow("Clients", model.programInUse ? "In use" : model.programClientUnknown ? "Use unknown" : "Not in use")
         UIDiagnosticsRow("Camera formats", model.programFormatMismatch ? "Differ — converted on the GPU" : "Match")
       }
       TimelineView(.periodic(from: .now, by: 1)) { _ in

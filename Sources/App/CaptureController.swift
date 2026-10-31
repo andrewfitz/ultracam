@@ -1336,6 +1336,21 @@ final class CaptureController: @unchecked Sendable {
     }
   }
 
+  /// Reopens the virtual camera: its client stopped taking frames, or never got any. Only the
+  /// output: capture and any take keep running on their own paths.
+  func restartCameraOutput() {
+    let token = lock.withLock { generation }
+    queue.async {
+      guard self.isAccepting(token), self.cameraOutputEnabled else { return }
+      cameraOutputLog.notice("Camera restart requested: \(self.cameraLabel, privacy: .public)")
+      self.closeCamera()
+      self.reconnectRequested = true
+      self.reconnectAfter = 0
+      self.reconnectIfDue()
+      self.publishCurrent(token: token)
+    }
+  }
+
   /// Retries a lost camera (or an explicit reconfigure request) once its
   /// retry time has come. Driven by frames and by a timer.
   private func reconnectIfDue() {

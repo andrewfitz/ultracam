@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Bottom status bar. Fixed order: output, Program, recording, audio, warning,
-/// then resources on the right. Each segment opens a popover with details.
+/// Bottom status bar. Fixed order: the worst problem with its action, output, Program,
+/// recording, audio, then resources on the right. Each segment opens a popover with details.
 struct UIStatusBarView: View {
   let context: UIContext
   @State private var open: UIStatusSegment.Kind?
@@ -82,7 +82,9 @@ struct UIStatusBarView: View {
   /// warning) follow the takes here, not in the bar.
   @ViewBuilder private func liveSegmentButton(_ segment: UIStatusSegment, compact: Bool) -> some View {
     if segment.kind == .recording || segment.kind == .warning {
-      UILiveSession(context: context, refresh: 5, probe: "UILiveSession(status)") { _, presentation in
+      // A lost signal's clock ticks; free space only needs a look now and then.
+      UILiveSession(context: context, refresh: context.session.cameras.contains { $0.signalLostFor != nil } ? 1 : 5,
+        probe: "UILiveSession(status)") { _, presentation in
         segmentButton(presentation.statusSegments.first { $0.kind == segment.kind } ?? segment, compact: compact)
       }
     } else {
@@ -90,17 +92,34 @@ struct UIStatusBarView: View {
     }
   }
 
-  private func segmentButton(_ segment: UIStatusSegment, compact: Bool) -> some View {
+  @ViewBuilder private func segmentButton(_ segment: UIStatusSegment, compact: Bool) -> some View {
+    if let level = segment.level {
+      HStack(spacing: 4) {
+        plainSegmentButton(segment, compact: compact)
+        // One click with the sidebar closed.
+        if let action = segment.action {
+          UIProblemButton(action: action, level: level, context: context).padding(.trailing, 3)
+        }
+      }
+      .background(level.fill, in: RoundedRectangle(cornerRadius: 5))
+      .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(level.border, lineWidth: 1))
+    } else {
+      plainSegmentButton(segment, compact: compact)
+    }
+  }
+
+  private func plainSegmentButton(_ segment: UIStatusSegment, compact: Bool) -> some View {
     Button { open = segment.kind } label: {
       // The tone colors the symbol only; the words stay in a label color so they stay readable.
       HStack(spacing: 5) {
         if segment.kind == .recording && segment.tone == .critical {
           Circle().fill(.red).frame(width: 7, height: 7)
         } else {
-          Image(systemName: symbol(segment.kind)).imageScale(.small).foregroundStyle(symbolColor(segment))
+          Image(systemName: symbol(segment.kind)).imageScale(.small)
+            .foregroundStyle(segment.level?.glyph ?? symbolColor(segment))
         }
         Text(compact ? shortText(segment) : segment.text).lineLimit(1).truncationMode(.tail)
-          .foregroundStyle(segment.tone == .neutral ? .secondary : .primary)
+          .foregroundStyle(segment.level?.text ?? (segment.tone == .neutral ? .secondary : .primary))
       }
       .font(.subheadline)
       .padding(.horizontal, 7).frame(height: 22)
@@ -232,8 +251,9 @@ struct UIStatusPopover: View {
       case .recording: recording
       case .audio: audio
       case .warning:
-        Label { Text(segment.text) } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
-          .fixedSize(horizontal: false, vertical: true)
+        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(problems)") { _, presentation in
+          UIProblemList(problems: presentation.problems, context: context)
+        }
       }
     }
     .padding(14)
@@ -245,12 +265,12 @@ struct UIStatusPopover: View {
       Text("Output").font(.headline)
       switch context.session.outputMode {
       case .program:
-        row(title: "Ultracam · Program", detail: context.session.programInUse ? "In use" : "Not in use",
+        row(title: "Ultracam · Program", detail: context.session.programClientLine,
           positive: context.session.programInUse,
           format: context.session.cameras.first { $0.id == context.session.onAirID }?.outputFormat)
       case .separate:
         ForEach(context.session.cameras) { camera in
-          row(title: "Ultracam · \(camera.name)", detail: camera.inUse ? "In use" : "Not in use", positive: camera.inUse,
+          row(title: "Ultracam · \(camera.name)", detail: camera.clientLine, positive: camera.inUse,
             format: camera.outputFormat)
         }
       }

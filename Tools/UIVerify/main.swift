@@ -1777,7 +1777,7 @@ extension UIVerify {
         .appendingPathComponent("menubar-\(name).txt"), atomically: true, encoding: .utf8)
       verifier.check("menu bar \(name): has rows", items.count > 5, "\(items.count)")
       if name == "problems" {
-        verifier.check("menu bar problems: Retry Camera Start row", titles.contains { $0.hasPrefix("Retry Camera Start") }, titles.joined(separator: " | "))
+        verifier.check("menu bar problems: couldn't start row", titles.contains { $0.contains("couldn't start") }, titles.joined(separator: " | "))
         verifier.check("menu bar problems: warning banner", titles.contains { $0.contains("couldn't start") || $0.contains("LUT unavailable") }, titles.joined(separator: " | "))
       }
       for required in ["Settings…", "Quit Ultracam"] {

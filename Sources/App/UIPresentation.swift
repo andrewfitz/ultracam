@@ -115,6 +115,27 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var applying = false
   /// Separate mode: this camera's virtual camera has at least one client.
   var inUse = false
+  /// Its route can't be read, so `inUse` means nothing: the clients are unknown, not none.
+  var clientUnknown = false
+  /// Its virtual camera's sink is open, so frames sent now reach a client.
+  var sinkConnected = false
+  /// A client has been waiting and no frames are reaching it.
+  var clientWaiting = false
+  /// The extension's queue has stayed full: the client stopped taking frames.
+  var queueStalled = false
+  /// Why this camera's virtual camera couldn't connect, while it can't.
+  var sinkFailure: String?
+  /// How long the signal has been gone from a camera that had a picture, past the loss
+  /// hold. Nil for a camera that never had one, which just has no signal.
+  var signalLostFor: TimeInterval?
+  /// `systemUptime` of the same, so a view can tick it while no updates arrive.
+  var signalLostSince: TimeInterval?
+  /// Seconds of steady signal still needed before Program may cut here again.
+  var cutBlockedFor: TimeInterval?
+  /// It stopped by itself, or its take did, and nobody has acknowledged that yet.
+  var unexpectedStop: UIUnexpectedStop?
+  /// "In use", "Not in use", or that nobody can tell.
+  var clientLine: String { inUse ? "In use" : clientUnknown ? "Use unknown" : "Not in use" }
   var processing = true
   var effects: [Bool] = [false, true, true, false]
   var resizeTarget: ResizeTarget = .hd1080
@@ -144,6 +165,30 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var activeTools: Set<UIMonitorTool> = []
   var recording = UICameraRecording()
   var message = ""
+}
+
+struct UIUnexpectedStop: Sendable, Equatable {
+  /// Why the camera stopped, while it's still stopped. A restart clears this half.
+  var reason: String?
+  /// It was on air when it stopped.
+  var wasOnAir = false
+  /// A take ended early with it. Stays until acknowledged.
+  var take = false
+  var savedDuration: TimeInterval?
+}
+
+/// Program moved off a camera that lost its signal. It stays until it's acknowledged.
+struct UIProgramMove: Sendable, Equatable {
+  var from: String
+  var to: String
+  /// Hold was on: loss overrode it once, and it stays on for the new shot.
+  var heldShot = false
+}
+
+/// An error that used to reach only Diagnostics. Stays until acknowledged or resolved.
+struct UIAppProblem: Sendable, Equatable, Identifiable {
+  var id: String
+  var text: String
 }
 
 struct UIShotTiming: Sendable, Equatable {
@@ -202,6 +247,11 @@ struct UISessionSnapshot: Sendable, Equatable {
   var cameras: [UICameraSnapshot] = []
   var selectedID: String = ""
   var programInUse = false
+  /// Program's route can't be read: its clients are unknown, not none.
+  var programClientUnknown = false
+  /// Program's sink is open, so frames sent now reach its clients.
+  var programSinkConnected = false
+  var programClientLine: String { programInUse ? "In use" : programClientUnknown ? "Use unknown" : "Not in use" }
   var onAirID: String?
   var pendingCutID: String?
   var autoSwitching = false
@@ -218,6 +268,12 @@ struct UISessionSnapshot: Sendable, Equatable {
   var programFormatMismatch = false
   /// A Program cut that did not land, or Program frames the output dropped.
   var programIssue: String?
+  var programMoved: UIProgramMove?
+  /// The extension's Program queue has stayed full.
+  var programQueueStalled = false
+  /// A take has outlived the last client seen during it.
+  var unusedTake = false
+  var appProblems: [UIAppProblem] = []
   var recentCuts: [UICutRecord] = []
   var codecTitle = "ProRes 422 HQ"
   var timecodeTitle = "Mac Clock"
@@ -241,9 +297,11 @@ struct UISessionSnapshot: Sendable, Equatable {
 
 enum UITally: Sendable, Equatable {
   case none
-  /// Red ring and "ON AIR": Program (with a client) or a separate camera in use.
+  /// Red ring and "ON AIR": frames from this camera are reaching Program's clients.
   case onAir
-  /// Program is selected but nothing is receiving it yet.
+  /// Red ring and "ISO": frames from this camera are reaching a client of its own device.
+  case iso
+  /// On Program, with nothing receiving it.
   case program
   /// A cut to this camera is pending (it lands on the next Program frame).
   case next
@@ -251,6 +309,7 @@ enum UITally: Sendable, Equatable {
     switch self {
     case .none: return nil
     case .onAir: return "ON AIR"
+    case .iso: return "ISO"
     case .program: return "PROGRAM"
     case .next: return "NEXT"
     }
@@ -260,10 +319,14 @@ enum UITally: Sendable, Equatable {
     switch self {
     case .none: return nil
     case .onAir: return "On air"
+    case .iso: return "ISO"
     case .program: return "Program"
     case .next: return "Next"
     }
   }
+  /// Red means frames are reaching someone, by either route. Two reds keep their
+  /// words apart, so they never hide which picture Program is on.
+  var isRed: Bool { self == .onAir || self == .iso }
 }
 
 enum UITileState: Sendable, Equatable {
@@ -335,6 +398,8 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   /// The take's audio in full ("Audio −23.4 LUFS · max −2.1 dBTP · no overs"),
   /// for a tooltip and VoiceOver: so far while recording, the last take's once saved.
   var takeAudioHelp: String? = nil
+  /// This camera's worst problem, in place of its folder row. The strip never changes height.
+  var stripProblem: UIStripProblem? = nil
 }
 
 /// One row of an Input picker: a listed device, and the other camera that already uses it.
@@ -402,6 +467,9 @@ struct UIStatusSegment: Sendable, Equatable, Identifiable {
   var kind: Kind
   var text: String
   var tone: UITone
+  /// The problem segment's level and one action, a button in the bar.
+  var level: UIProblemLevel? = nil
+  var action: UIProblemAction? = nil
 }
 
 struct UISessionPresentation: Sendable, Equatable {
@@ -426,6 +494,8 @@ struct UISessionPresentation: Sendable, Equatable {
   /// Show Recordings in Finder has a folder to open.
   var canRevealRecordings: Bool
   var statusSegments: [UIStatusSegment]
+  /// Every problem, worst first: the one list all surfaces render.
+  var problems: [UIProblem]
   var outputSummary: String
   var outputInUse: Bool
   var recordingSummary: String
@@ -434,7 +504,7 @@ struct UISessionPresentation: Sendable, Equatable {
 
 extension UISessionPresentation {
   /// The camera the menu bar preview shows: the one a meeting sees, if any, otherwise the selected one.
-  var previewCamera: UICameraPresentation? { cameras.first { $0.tally == .onAir } ?? selected }
+  var previewCamera: UICameraPresentation? { cameras.first { $0.tally == .onAir } ?? cameras.first { $0.tally == .iso } ?? selected }
 }
 
 enum UIMenuBarIcon: String, Sendable, Equatable {
@@ -520,14 +590,14 @@ enum UIPresentationBuilder {
   static let effectLongTitles = ["LUT", "Resize", "Color format", "Frame-rate cap"]
 
   static func tally(for camera: UICameraSnapshot, in session: UISessionSnapshot) -> UITally {
-    switch session.outputMode {
-    case .program:
-      if session.pendingCutID == camera.id && session.onAirID != camera.id { return .next }
-      if session.onAirID == camera.id { return session.programInUse ? .onAir : .program }
-      return .none
-    case .separate:
-      return camera.running && camera.inUse ? .onAir : .none
-    }
+    let live: Bool = { if case .live = camera.signal { return camera.running }; return false }()
+    let onAir = session.onAirID == camera.id
+    // Red needs frames arriving, not just a client.
+    if onAir, session.programInUse, session.programSinkConnected, live { return .onAir }
+    if camera.inUse, camera.sinkConnected, live { return .iso }
+    if session.pendingCutID == camera.id, !onAir { return .next }
+    if onAir, session.cameras.count > 1 { return .program }
+    return .none
   }
 
   static func tileState(for camera: UICameraSnapshot) -> UITileState {
@@ -648,14 +718,14 @@ enum UIPresentationBuilder {
     switch session.outputMode {
     case .program:
       if session.onAirID == camera.id {
-        outputLine = session.programInUse ? "In Program · on air" : "In Program · no viewer yet"
+        outputLine = tally == .onAir ? "In Program · on air" : "In Program · no viewer yet"
       } else if session.pendingCutID == camera.id {
         outputLine = "Next"
       } else {
         outputLine = "Program source"
       }
     case .separate:
-      outputLine = "Ultracam · \(camera.name) · \(camera.inUse ? "In use" : "Not in use")"
+      outputLine = "Ultracam · \(camera.name) · \(camera.clientLine)"
     }
 
     let elapsedShort = UIFormat.shortElapsed(rec.elapsed)
@@ -693,15 +763,16 @@ enum UIPresentationBuilder {
       chips: chips, processing: camera.processing, applying: camera.applying,
       canStart: !camera.running && camera.deviceAvailable,
       canStop: camera.running,
-      stopNeedsConfirmation: camera.running && (isRecording || tally == .onAir),
-      stopConfirmationMessage: stopMessage(camera: camera, recording: isRecording, onAir: tally == .onAir),
+      stopNeedsConfirmation: camera.running && (isRecording || tally.isRed),
+      stopConfirmationMessage: stopMessage(camera: camera, recording: isRecording, onAir: tally.isRed),
       timecode: camera.timecode ?? "—", audio: camera.audio,
       activeTools: UIMonitorTool.allCases.filter { camera.activeTools.contains($0) },
       accessibilityLabel: labelParts.joined(separator: ", "),
       lutError: camera.lutError, automaticStartFailed: camera.automaticStartFailed,
       diskFull: diskFull(camera, in: session),
       recordingNote: recordingNote.isEmpty ? nil : recordingNote,
-      takeAudioHelp: takeAudio.map { (isRecording ? "This take so far: " : "Last take: ") + $0.note })
+      takeAudioHelp: takeAudio.map { (isRecording ? "This take so far: " : "Last take: ") + $0.note },
+      stripProblem: stripProblem(camera, in: session))
   }
 
   static func stopMessage(camera: UICameraSnapshot, recording: Bool, onAir: Bool) -> String {
@@ -734,14 +805,14 @@ enum UIPresentationBuilder {
     switch session.outputMode {
     case .program:
       outputInUse = session.programInUse
-      outputSummary = "Ultracam · Program · \(session.programInUse ? "In use" : "Not in use")"
+      outputSummary = "Ultracam · Program · \(session.programClientLine)"
     case .separate:
       // The published device names, as a meeting app lists them.
       let inUse = session.cameras.filter(\.inUse)
       outputInUse = !inUse.isEmpty
       if !inUse.isEmpty { outputSummary = inUse.map { "Ultracam · \($0.name)" }.joined(separator: ", ") + " · In use" }
-      else if session.cameras.count == 1 { outputSummary = "Ultracam · \(session.cameras[0].name) · Not in use" }
-      else { outputSummary = "Ultracam cameras not in use" }
+      else if session.cameras.count == 1 { outputSummary = "Ultracam · \(session.cameras[0].name) · \(session.cameras[0].clientLine)" }
+      else { outputSummary = session.cameras.contains(where: \.clientUnknown) ? "Ultracam cameras: use unknown" : "Ultracam cameras not in use" }
     }
 
     let drivesLine = session.drives.compactMap { drive in drive.secondsLeft.map { "\(drive.name) \(UIFormat.duration($0))" } }
@@ -755,13 +826,20 @@ enum UIPresentationBuilder {
       recordingSummary = "REC \(count)\(elapsed)" + (drivesLine.isEmpty ? "" : " · \(drivesLine) left")
     }
 
-    var segments = [UIStatusSegment(kind: .output, text: outputSummary, tone: outputInUse ? .positive : .neutral)]
+    // The worst problem comes first in the bar, with its action, so it's one click with the sidebar closed.
+    let problems = problems(session)
+    var segments: [UIStatusSegment] = []
+    if let worst = problems.first {
+      segments.append(UIStatusSegment(kind: .warning, text: worst.title + (problems.count > 1 ? "  +\(problems.count - 1)" : ""),
+        tone: .warning, level: worst.level, action: worst.action))
+    }
+    segments.append(UIStatusSegment(kind: .output, text: outputSummary, tone: outputInUse ? .positive : .neutral))
     let onAirName = session.cameras.first { $0.id == session.onAirID }?.name
     if session.outputMode == .program {
       let onAir = onAirName ?? "No camera"
       let mode = autoSwitching ? (canHoldShot && session.autoHold ? "Auto · hold" : "Auto") : "Manual"
-      // "On air" only while a meeting app shows Program, as in the window subtitle.
-      let state = session.programInUse ? "on air" : "in Program"
+      // "On air" only while a meeting app is receiving Program, as in the window subtitle.
+      let state = cameras.contains { $0.tally == .onAir } ? "on air" : "in Program"
       segments.append(UIStatusSegment(kind: .program, text: "\(onAir) \(state) · \(mode)", tone: .neutral))
     }
     segments.append(UIStatusSegment(kind: .recording, text: recordingSummary, tone: recording.isEmpty ? .neutral : .critical))
@@ -777,10 +855,6 @@ enum UIPresentationBuilder {
         : live.count == 1 ? "No embedded audio" : "Audio: \(withAudio.count) of \(live.count)"
       segments.append(UIStatusSegment(kind: .audio, text: audioText, tone: withAudio.count == live.count ? .neutral : .warning))
     }
-    // One camera's picture already says "No signal"; the menu bar icon still warns.
-    if let warning = warning(session, includingPlainNoSignal: session.cameras.count > 1) {
-      segments.append(UIStatusSegment(kind: .warning, text: warning, tone: .warning))
-    }
 
     let cutButtons = session.outputMode == .program ? cameras.map {
       UICutButton(id: $0.id, number: $0.number, name: $0.name, onAir: session.onAirID == $0.id,
@@ -791,7 +865,7 @@ enum UIPresentationBuilder {
     // essential segments don't: the camera on Program (nothing in Separate mode).
     let subtitle: String
     if session.outputMode == .program, let onAirName {
-      subtitle = session.programInUse ? "\(onAirName) on air" : "\(onAirName) in Program"
+      subtitle = cameras.contains { $0.tally == .onAir } ? "\(onAirName) on air" : "\(onAirName) in Program"
     } else {
       subtitle = ""
     }
@@ -812,78 +886,8 @@ enum UIPresentationBuilder {
       canAutoSwitch: canAutoSwitch, canHoldShot: canHoldShot,
       canStartAny: running || cameras.contains(where: \.canStart),
       canRevealRecordings: session.defaultFolderPath != nil || session.cameras.contains { $0.recording.folderPath != nil },
-      statusSegments: segments, outputSummary: outputSummary, outputInUse: outputInUse,
-      recordingSummary: recordingSummary, menuBarIcon: menuBarIcon(session))
-  }
-
-  /// The single most important problem, if any, for the status bar and menu bar icon.
-  /// `includingPlainNoSignal: false` skips a running camera that only lacks a signal
-  /// (the status bar with one camera, whose picture says so).
-  static func warning(_ session: UISessionSnapshot, includingPlainNoSignal: Bool = true) -> String? {
-    for camera in session.cameras {
-      if camera.recording.status == .recording, case .noSignal = camera.signal { return "\(camera.name): recording, no signal" }
-      if camera.recording.failed || camera.recording.error != nil {
-        return diskFull(camera, in: session) ? "\(camera.name): disk full" : "\(camera.name): recording failed"
-      }
-    }
-    if let failed = session.cameras.first(where: \.automaticStartFailed) { return "\(failed.name): couldn't start" }
-    // What the meeting sees comes before what might go wrong later.
-    if let program = programWarning(session) { return program }
-    // A drive with nothing free has no time left at all, so the check below never sees it.
-    if let full = session.drives.first(where: isFull) { return "\(full.name): no space left" }
-    if let low = session.drives.first(where: { ($0.secondsLeft ?? .infinity) < 30 * 60 }), let left = low.secondsLeft {
-      return "\(low.name): \(UIFormat.duration(left)) left"
-    }
-    for camera in session.cameras where camera.running {
-      switch camera.signal {
-      case .noSignal: if includingPlainNoSignal { return "\(camera.name): no signal" }
-      case .unsupported: return "\(camera.name): unsupported format"
-      case .deviceMissing: return "\(camera.name): input disconnected"
-      default: break
-      }
-    }
-    if let lut = session.cameras.first(where: { $0.lutError != nil }) { return "\(lut.name): LUT unavailable" }
-    // Different camera formats are converted on the GPU to the Program
-    // camera's format, so they are not a warning. A cut that did not land or
-    // dropped Program frames are.
-    if session.outputMode == .program, let issue = session.programIssue { return issue }
-    return nil
-  }
-
-  /// Program mode: the camera on Program has lost its picture, or no camera has one.
-  /// Not behind `includingPlainNoSignal`: the picture on screen may not be the one on air.
-  static func programWarning(_ session: UISessionSnapshot) -> String? {
-    guard session.outputMode == .program else { return nil }
-    func hasPicture(_ camera: UICameraSnapshot) -> Bool {
-      if case .live = camera.signal { return camera.running }
-      return false
-    }
-    // Capture without a first frame yet, or an automatic camera about to start for the
-    // meeting that just connected (a failed one already said "couldn't start").
-    func starting(_ camera: UICameraSnapshot) -> Bool {
-      if camera.running { return camera.signal == .none || camera.signal == .connecting }
-      return camera.automaticStart && !camera.automaticStartFailed && camera.deviceAvailable
-    }
-    let onAir = session.cameras.first { $0.id == session.onAirID }
-    if !session.cameras.contains(where: hasPicture) {
-      // Only worth saying while a meeting shows Program, and not while a camera is still starting.
-      guard session.programInUse, !session.cameras.contains(where: starting) else { return nil }
-      // One camera: name its problem below rather than "no camera".
-      if session.cameras.count != 1 || onAir == nil { return "No camera has a picture" }
-    }
-    guard let onAir, !hasPicture(onAir), !starting(onAir) else { return nil }
-    let problem: String
-    if !onAir.running {
-      problem = onAir.deviceAvailable ? "stopped" : (onAir.inputName == nil ? "no input" : "input missing")
-    } else {
-      switch onAir.signal {
-      case .noSignal: problem = "no signal"
-      case .unsupported: problem = "unsupported format"
-      case .deviceMissing: problem = "input disconnected"
-      case .none, .connecting, .live: return nil
-      }
-    }
-    return "\(onAir.name) \(session.programInUse ? "on air" : "in Program"): \(problem)"
+      statusSegments: segments, problems: problems, outputSummary: outputSummary, outputInUse: outputInUse,
+      recordingSummary: recordingSummary, menuBarIcon: menuBarIcon(session, problems: problems))
   }
 
   /// The drive a camera records to: the volume its /Volumes folder names, or the
@@ -917,7 +921,11 @@ enum UIPresentationBuilder {
   }
 
   static func menuBarIcon(_ session: UISessionSnapshot) -> UIMenuBarIcon {
-    if warning(session) != nil { return .attention }
+    menuBarIcon(session, problems: problems(session))
+  }
+
+  private static func menuBarIcon(_ session: UISessionSnapshot, problems: [UIProblem]) -> UIMenuBarIcon {
+    if !problems.isEmpty { return .attention }
     if session.cameras.contains(where: { $0.recording.status == .recording }) { return .recording }
     let running = session.cameras.filter(\.running)
     guard !running.isEmpty else {

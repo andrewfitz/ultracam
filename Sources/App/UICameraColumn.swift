@@ -86,7 +86,7 @@ struct UICameraPictureView: View {
     .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 14))
     .overlay {
       if let color = camera.tally.ringColor, !isClean {
-        RoundedRectangle(cornerRadius: compact ? 10 : 14).strokeBorder(color, lineWidth: camera.tally == .onAir ? 4 : 3)
+        RoundedRectangle(cornerRadius: compact ? 10 : 14).strokeBorder(color, lineWidth: camera.tally.isRed ? 4 : 3)
           .allowsHitTesting(false)
       }
     }
@@ -599,10 +599,14 @@ struct UIChannelStripView: View {
 
   /// Width of the leading glyph column in every row.
   private static let gutter: CGFloat = 28
+  /// One row in every state: the folder, or a problem in its place.
+  private static let folderRowHeight: CGFloat = 24
   /// MonitorKit's compact level meter is 56 pt wide.
   nonisolated private static let compactMeterWidth: CGFloat = 56
   /// Whether the collapsed strip has room for its meter (set only when that changes).
   @State private var compactMeterFits = true
+  /// The strip's "2 problems" is open.
+  @State private var problemsOpen = false
 
   private var snapshot: UICameraSnapshot? { context.snapshot(camera.id) }
   private var isRecordingOrPaused: Bool { camera.pauseTitle != nil }
@@ -657,8 +661,7 @@ struct UIChannelStripView: View {
       header
       Divider()
       recordRow
-      folderRow
-      alertRows
+      folderSlot
       Divider()
       outputRow
       if let store = context.cameraControls {
@@ -681,30 +684,41 @@ struct UIChannelStripView: View {
     }
   }
 
-  /// Problems that need one action: a failed automatic start, an unavailable LUT.
-  @ViewBuilder private var alertRows: some View {
-    // A stopped camera's picture and header already offer Retry.
-    if camera.automaticStartFailed && camera.tileState != .stopped {
-      HStack(spacing: 8) {
-        gutterIcon("exclamationmark.triangle.fill", color: .orange)
-        Text("Couldn't start \(camera.name)").font(.uiRowEmphasis)
-        Text(snapshot?.automaticStatus ?? "").font(.uiRow).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
-        Spacer(minLength: 4)
-        Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }.controlSize(.small)
-          .help("Try starting the camera again.")
-      }
-      .accessibilityElement(children: .contain)
+  /// The folder row, or the camera's worst problem in its place. One height in every
+  /// state, so the strip never grows, the pictures never shrink and Cut never moves.
+  private var folderSlot: some View {
+    Group {
+      if let problem = camera.stripProblem { problemRow(problem) } else { folderRow }
     }
-    if let error = camera.lutError {
-      HStack(spacing: 8) {
-        gutterIcon("exclamationmark.triangle.fill", color: .orange)
-        Text("LUT unavailable").font(.uiRowEmphasis)
-        Text(error).font(.uiRow).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail).help(error)
-        Spacer(minLength: 4)
-        Button("Locate…") { context.send(.chooseLUT(cameraID: camera.id)) }.controlSize(.small)
-          .help("Choose the .cube file again. Capture keeps working without it.")
+    .frame(height: Self.folderRowHeight, alignment: .leading)
+  }
+
+  private func problemRow(_ problem: UIStripProblem) -> some View {
+    HStack(spacing: 8) {
+      gutterIcon("exclamationmark.triangle.fill", color: problem.level.glyph)
+      problemWords(problem, font: .uiRowEmphasis)
+      Spacer(minLength: 4)
+      if problem.count == 1, let action = problem.action {
+        UIProblemButton(action: action, level: problem.level, context: context).padding(.trailing, 3)
       }
-      .accessibilityElement(children: .contain)
+    }
+    .frame(height: Self.folderRowHeight)
+    .background(problem.level == .damage ? AnyShapeStyle(problem.level.fill) : AnyShapeStyle(.clear), in: RoundedRectangle(cornerRadius: 5))
+    .accessibilityElement(children: .contain)
+  }
+
+  /// What's wrong, or with more than one thing wrong, how many: then the words open the list.
+  @ViewBuilder private func problemWords(_ problem: UIStripProblem, font: Font) -> some View {
+    if problem.count > 1 {
+      Button("\(problem.count) problems") { problemsOpen = true }
+        .buttonStyle(.plain).font(font).foregroundStyle(problem.level.text)
+        .popover(isPresented: $problemsOpen, arrowEdge: .bottom) {
+          UIProblemList(problems: context.presentation.problems.filter { $0.cameraID == camera.id }, context: context)
+            .padding(14).frame(width: 340, alignment: .leading)
+        }
+    } else {
+      Text(problem.text).font(font).foregroundStyle(problem.level.text).lineLimit(1).truncationMode(.tail)
+        .help(problem.text)
     }
   }
 
@@ -759,7 +773,7 @@ struct UIChannelStripView: View {
   @ViewBuilder private var tallyBadge: some View {
     if let label = camera.tally.label {
       switch camera.tally {
-      case .onAir: UIBadge(text: label, tone: .critical)
+      case .onAir, .iso: UIBadge(text: label, tone: .critical)
       case .next: UIBadge(text: label, tone: .positive)
       default: UIBadge(text: label, tone: .neutral)
       }
@@ -1118,7 +1132,7 @@ struct UIChannelStripView: View {
     if context.presentation.outputMode == .program {
       return camera.tally == .onAir ? "On air" : "In Program"
     }
-    return camera.outputInUse ? "In use" : "Not in use"
+    return snapshot?.clientLine ?? "Not in use"
   }
 
   // MARK: Collapsed
@@ -1128,15 +1142,16 @@ struct UIChannelStripView: View {
       chevron
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
       tallyBadge
-      UILiveCamera(camera: camera, context: context, follows: .take) { live in collapsedState(live.snapshot) }
-      if camera.automaticStartFailed {
-        Button("Retry") { context.send(.retryAutomaticStart(cameraID: camera.id)) }.controlSize(.small)
-          .help(retryHelp)
-      }
-      if camera.lutError != nil {
+      // A problem takes the state slot, with its action.
+      if let problem = camera.stripProblem {
         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.uiRow)
-          .help(camera.lutError ?? "")
-          .accessibilityLabel("LUT unavailable")
+          .accessibilityHidden(true)
+        problemWords(problem, font: .uiRow)
+        if problem.count == 1, let action = problem.action {
+          Button(action.title) { context.send(action.action) }.controlSize(.small).fixedSize()
+        }
+      } else {
+        UILiveCamera(camera: camera, context: context, follows: .take) { live in collapsedState(live.snapshot) }
       }
       Spacer(minLength: 4)
       // One meter, outside ViewThatFits: each candidate would run its own display-rate

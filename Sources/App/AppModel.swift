@@ -21,6 +21,25 @@ struct CameraLUTState: Equatable, Sendable {
   var displayTitle: String { title ?? (savedUnavailable ? "Saved LUT unavailable" : "No LUT loaded") }
 }
 
+/// A camera that stopped by itself, or a take that ended early. Held until someone
+/// has seen it: not persisted, because after a relaunch Interrupted Takes carries the loss.
+struct UnexpectedStop: Equatable, Sendable {
+  /// Why. Shown while `cameraStopped`, and for the take after.
+  let reason: String
+  let at: Date
+  /// False once it restarts, or when only the take ended. The take result stays.
+  var cameraStopped: Bool
+  var wasOnAir = false
+  /// Filled in when the take finishes: nil until then, and with no take.
+  var take: UnexpectedTakeResult?
+}
+
+enum UnexpectedTakeResult: Equatable, Sendable {
+  case saved(URL, duration: TimeInterval, lostFrames: UInt64)
+  /// Recovery owns it: it's in Interrupted Takes.
+  case interrupted
+}
+
 /// The app's cameras. Every camera runs the same pipeline, keyed by its
 /// `FeedID`: its own controller, LUT restore and apply, start and stop,
 /// monitor sink and burn-in source, recording and virtual camera output.
@@ -241,6 +260,8 @@ final class AppModel {
   private var monitorDemand: Set<MonitorTargetID> = []
   private var feedPolicies: [FeedID: AutomaticFeedPolicy] = [:]
   private var routeDemand: [String: Bool] = [:]
+  /// Routes the demand monitor can't read: whether they have a client is unknown, not "no".
+  private var unknownRoutes: Set<String> = []
   /// The demand monitor's error for a virtual camera route, by route ID.
   private var routeErrors: [String: String] = [:]
   private var demandStartedFeeds: Set<FeedID> = []
@@ -254,6 +275,23 @@ final class AppModel {
   @ObservationIgnored private var inputsClearedByChoice: Set<FeedID> = []
   /// The name of every input seen this session, so an unplugged one keeps its name.
   @ObservationIgnored private var lastInputNames: [String: String] = [:]
+  /// Errors that used to reach only Diagnostics. Each stays until acknowledged or resolved.
+  private(set) var appProblems: [UIAppProblem] = []
+  private(set) var unexpectedStops: [FeedID: UnexpectedStop] = [:]
+  /// Program moved off a camera that lost its signal.
+  private(set) var programMoved: UIProgramMove?
+  /// The extension's Program queue has been full past `LiveWatchLimits.queueStall`.
+  private(set) var programQueueStalled = false
+  /// A take has outlived the last client seen during it.
+  private(set) var unusedTake = false
+  /// Program's sink is open. Polled by the live watch: the bridge isn't observable.
+  private(set) var programSinkConnected = false
+  /// Cameras whose client has been waiting for frames past `LiveWatchLimits.clientWaiting`.
+  private(set) var waitingClients: Set<FeedID> = []
+  @ObservationIgnored private var clientWaitingSince: [FeedID: TimeInterval] = [:]
+  /// Early takes someone has seen, until the next take starts on that camera.
+  private(set) var acknowledgedTakes: Set<FeedID> = []
+  @ObservationIgnored private var liveWatchTimer: Timer?
   private var programTransportRequired = false
   private var programTransportConfiguration: PipelineConfiguration?
   /// The input cadence each camera detected in its current run.
@@ -501,12 +539,24 @@ final class AppModel {
       self?.feedCoordinator.requestCameraReconnects()
     }
     demandMonitor.onRouteChange = { [weak self] change in
-      guard let self else { return }
-      self.routeDemand[change.route.id] = change.requested == true
-      self.routeErrors[change.route.id] = change.error
-      self.reconcileAutomaticFeed()
+      self?.routeDemandChanged(change.route.id, requested: change.requested, error: change.error)
     }
-    if outputMode == .program || feedDescriptors.contains(where: \.automaticFeed) { demandMonitor.start() }
+    if wantsDemandMonitor { demandMonitor.start() }
+  }
+
+  private func routeDemandChanged(_ route: String, requested: Bool?, error: String?) {
+    routeDemand[route] = requested == true
+    if requested == nil { unknownRoutes.insert(route) } else { unknownRoutes.remove(route) }
+    routeErrors[route] = error
+    reconcileAutomaticFeed()
+    updateLiveWatch()
+  }
+
+  /// Tally needs real clients in every layout, so in the app this is always on. It only
+  /// registers CMIO listeners: the demand property is the extension's own signal on the
+  /// source stream, and watching it opens nothing.
+  private var wantsDemandMonitor: Bool {
+    hardware.observesCameraDemand || outputMode == .program || feedDescriptors.contains(where: \.automaticFeed)
   }
 
   func refresh() {
@@ -514,7 +564,7 @@ final class AppModel {
       applyDevices(try hardware.devices(), fromDiscovery: false)
     } catch {
       applyDevices([], fromDiscovery: false)
-      showStatus(error.localizedDescription)
+      reportProblem(error.localizedDescription, key: "inputs")
     }
     driverWarning = hardware.driverWarning()
   }
@@ -538,10 +588,8 @@ final class AppModel {
       guard let free = devices.first(where: { inputHolder($0.id, excluding: descriptor.id) == nil }) else { break }
       updateCamera(descriptor.id) { $0.selectedDevice = free.id }
     }
-    if feedDescriptors.contains(where: \.automaticFeed) {
-      demandMonitor.refresh()
-      reconcileAutomaticFeed()
-    }
+    if wantsDemandMonitor { demandMonitor.refresh() }
+    if feedDescriptors.contains(where: \.automaticFeed) { reconcileAutomaticFeed() }
   }
 
   /// Running, or its controller still owns the device while a stop drains.
@@ -769,6 +817,11 @@ final class AppModel {
     cameraLUTs[id] = nil
     cameraUpdates[id] = nil
     feedPolicies[id] = nil
+    unexpectedStops[id] = nil
+    acknowledgedTakes.remove(id)
+    clearProblem("declaration.\(id.rawValue)")
+    waitingClients.remove(id)
+    clientWaitingSince[id] = nil
     detectedSourceDurations[id] = nil
     lastSourceDurations[id] = nil
     appliedPipelines[id] = nil
@@ -904,14 +957,14 @@ final class AppModel {
     }
     if autoSwitcherBridge != nil { return }
     guard let bridge = AutoSwitcherBridge(settings: settings, anchor: anchor, emphasis: emphasis) else {
-      showStatus("Natural Talking Head could not start its Rust director.")
+      reportProblem("Natural Talking Head could not start its Rust director.", key: "director")
       return
     }
     autoSwitcherTimeline = AutoSwitcherTimelineRecorder(settings: settings, anchor: anchor,
       emphasis: emphasis, outputFolder: recordingModel.outputFolder)
     guard let timeline = autoSwitcherTimeline else { return }
     timeline.onError = { [weak self] message in
-      self?.showStatus("Auto-switcher timeline: \(message)")
+      self?.reportProblem("Auto-switcher timeline: \(message)", key: "timeline")
     }
     bridge.onAudioCue = { [weak self, weak timeline, weak bridge] cue in
       Task { @MainActor in
@@ -950,7 +1003,7 @@ final class AppModel {
       Task { @MainActor [weak self] in
         guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
         self.autoSwitcherTimeline?.recordError(message)
-        self.showStatus("Auto director: \(message)")
+        self.reportProblem("Auto director: \(message)", key: "director")
       }
     }
     bridge.onDecisionExpired = { [weak self, weak bridge] decisionID in
@@ -1014,8 +1067,7 @@ final class AppModel {
   /// demand monitor.
   private func installAutomaticFeedMonitor() {
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
-    if outputMode == .program || feedDescriptors.contains(where: \.automaticFeed) { demandMonitor.start() }
-    else { demandMonitor.stop() }
+    if wantsDemandMonitor { demandMonitor.start() } else { demandMonitor.stop() }
     reconcileAutomaticFeed()
   }
 
@@ -1076,7 +1128,7 @@ final class AppModel {
       registryPublisher.publish(candidate)
     } catch {
       registryLog.error("Registry publish failed: \(error.localizedDescription, privacy: .public)")
-      showStatus("Virtual cameras could not be updated: \(error.localizedDescription)")
+      reportProblem("Virtual cameras could not be updated: \(error.localizedDescription)", key: "registry")
     }
   }
 
@@ -1182,7 +1234,7 @@ final class AppModel {
   /// or automatic, in either output mode.
   private func launchCapture(_ id: FeedID) {
     guard let descriptor = descriptor(for: id) else { return }
-    if let error = descriptor.processingDeclarationError { showStatus(error); return }
+    if let error = descriptor.processingDeclarationError { reportProblem(error, key: "declaration.\(id.rawValue)"); return }
     feedCoordinator.setCameraOutputEnabled(feedID: id, enabled: outputMode != .program)
     detectedSourceDurations[id] = nil
     feedCoordinator.programOutput.setSourcePauseTolerance(id,
@@ -1200,6 +1252,7 @@ final class AppModel {
     cameraStateRevision &+= 1
     if outputMode == .program { reconcileAutoSwitcher() }
     reconcileProgramTransportDemand()
+    updateLiveWatch()
   }
 
   /// Ends one camera's capture, its virtual camera output and its recording.
@@ -1427,12 +1480,17 @@ final class AppModel {
     // CMIO discovery can take seconds: connect on the bridge's control queue.
     feedCoordinator.requestProgramOutputDemand(required, configuration: contract,
       passthroughFormat: kCVPixelFormatType_422YpCbCr10, renegotiate: renegotiate) { [weak self] error in
-      guard let self, let error, requestID == self.programTransportRequestID else { return }
+      guard let self, requestID == self.programTransportRequestID else { return }
+      guard let error else {
+        self.clearProblem("program-connect")
+        return
+      }
       // Let the next reconcile retry the connection.
       self.programTransportRequired = false
       self.programTransportConfiguration = nil
       self.programContractOwner = nil
-      self.showStatus("Program camera unavailable: \(error.localizedDescription)")
+      // Only demand connects Program, so a client is waiting on this.
+      self.reportProblem("Program camera unavailable: \(error.localizedDescription)", key: "program-connect")
     }
   }
 
@@ -1491,6 +1549,8 @@ final class AppModel {
 
   /// Program mode: the "Ultracam · Program" virtual camera has at least one client.
   var programInUse: Bool { routeDemand[VirtualCameraDescriptor.program().id] == true }
+  /// Program's route can't be read, so its clients are unknown.
+  var programClientUnknown: Bool { unknownRoutes.contains(VirtualCameraDescriptor.program().id) }
 
   private func feedRouteID(_ id: FeedID) -> String {
     if let cached = feedRouteIDs[id] { return cached }
@@ -1504,10 +1564,106 @@ final class AppModel {
     routeDemand[feedRouteID(id)] == true
   }
 
+  /// This camera's route can't be read, so its clients are unknown.
+  func cameraClientUnknown(_ id: FeedID) -> Bool { unknownRoutes.contains(feedRouteID(id)) }
+
+  // MARK: - Live watch
+
+  /// Frames going where they should, on the camera's own route.
+  private func cameraDelivering(_ id: FeedID) -> Bool {
+    guard feedCoordinator.isFeedRunning(id), let update = cameraUpdates[id], update.cameraOutputActive else { return false }
+    return update.signal == .live
+  }
+
+  /// What can only be learned by watching the clock: nothing arrives to say a client has
+  /// been waiting. Reads state the models already hold, on the main actor, four times a
+  /// second while a camera runs, a take rolls or a client is connected.
+  private var wantsLiveWatch: Bool {
+    running || recordingModel.hasActiveRecordings || routeDemand.values.contains(true)
+  }
+
+  private func updateLiveWatch() {
+    guard !launching, wantsLiveWatch, liveWatchTimer == nil else { return }
+    // Common modes: an open menu or a modal alert must not stop it.
+    let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] timer in
+      let alive = MainActor.assumeIsolated { () -> Bool in
+        guard let self else { return false }
+        self.liveWatchTick(now: ProcessInfo.processInfo.systemUptime)
+        return self.liveWatchTimer != nil
+      }
+      if !alive { timer.invalidate() }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    liveWatchTimer = timer
+  }
+
+  func liveWatchTick(now: TimeInterval) {
+    if programSinkConnected != feedCoordinator.programOutputConnected {
+      programSinkConnected = feedCoordinator.programOutputConnected
+    }
+    for descriptor in feedDescriptors {
+      let id = descriptor.id
+      // In Program mode no camera publishes its own device yet, so only Program has clients.
+      guard outputMode == .separateCameras, cameraInUse(id), !cameraDelivering(id) else {
+        clientWaitingSince[id] = nil
+        if waitingClients.contains(id) { waitingClients.remove(id) }
+        continue
+      }
+      let since = clientWaitingSince[id] ?? now
+      clientWaitingSince[id] = since
+      if now - since >= LiveWatchLimits.clientWaiting, !waitingClients.contains(id) { waitingClients.insert(id) }
+    }
+    if !wantsLiveWatch {
+      liveWatchTimer?.invalidate()
+      liveWatchTimer = nil
+    }
+  }
+
+  /// Gets frames moving to a stalled or starved client. A running camera reopens its
+  /// output and keeps capturing, so a take rolls straight through this. In Program
+  /// mode that output is Program's. A stopped camera just starts.
+  func restartCamera(_ id: FeedID) {
+    guard descriptor(for: id) != nil else { return }
+    guard feedCoordinator.isFeedRunning(id) else { startCamera(id); return }
+    captureLog.notice("Restart output \(id.rawValue, privacy: .public): user")
+    if outputMode == .program { feedCoordinator.restartProgramOutput() }
+    else { feedCoordinator.capture(for: id).restartCameraOutput() }
+  }
+
+  /// Someone has seen it. The take result goes; a stopped camera still says so until it starts.
+  func acknowledgeUnexpectedStop(_ id: FeedID) {
+    acknowledgedTakes.insert(id)
+    guard var stop = unexpectedStops[id] else { return }
+    if stop.cameraStopped {
+      stop.take = nil
+      unexpectedStops[id] = stop
+    } else {
+      unexpectedStops[id] = nil
+    }
+  }
+
+  func acknowledgeProgramMove() { programMoved = nil }
+
+  func acknowledgeProblem(_ id: String) { appProblems.removeAll { $0.id == id } }
+
+  /// Puts an error in the problem list as well as the selected camera's status. Repeats of
+  /// one key replace it, so a retry that keeps failing is one row, not a growing list.
+  private func reportProblem(_ message: String, key: String) {
+    showStatus(message)
+    appProblems.removeAll { $0.id == key }
+    appProblems.append(UIAppProblem(id: key, text: message))
+  }
+
+  /// The cause went away by itself.
+  private func clearProblem(_ key: String) {
+    if appProblems.contains(where: { $0.id == key }) { appProblems.removeAll { $0.id == key } }
+  }
+
   /// Starts one camera, whichever is selected. It then stays up until Stop.
   func startCamera(_ id: FeedID) {
     guard let descriptor = descriptor(for: id), descriptor.enabled else { return }
-    if let error = descriptor.processingDeclarationError { showStatus(error); return }
+    if let error = descriptor.processingDeclarationError { reportProblem(error, key: "declaration.\(id.rawValue)"); return }
+    clearProblem("declaration.\(id.rawValue)")
     manuallyStoppedFeeds.remove(id)
     guard !feedCoordinator.isFeedRunning(id) else { return }
     guard canStart(id) else {
@@ -1638,6 +1794,18 @@ final class AppModel {
     settings.naturalTalkingHead.manualHold = hold
     updateSwitcher(settings)
   }
+
+  #if ULTRACAM_TEST_SUPPORT
+  var demandMonitorIsRunning: Bool { demandMonitor.isRunning }
+  /// What the demand monitor reports, without CMIO. Nil is an unreadable route.
+  func setCameraDemandForTesting(_ id: FeedID, requested: Bool?) {
+    routeDemandChanged(feedRouteID(id), requested: requested, error: requested == nil ? "unreadable" : nil)
+  }
+  func setProgramDemandForTesting(requested: Bool?) {
+    routeDemandChanged(VirtualCameraDescriptor.program().id, requested: requested, error: requested == nil ? "unreadable" : nil)
+  }
+  func deliverCaptureUpdateForTesting(_ id: FeedID, _ update: CaptureUpdate) { cameraDidUpdate(id, update) }
+  #endif
 
   /// True when running Program sources deliver different camera formats. Cuts
   /// between them no longer renegotiate the Program camera: frames that don't

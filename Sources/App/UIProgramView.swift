@@ -35,7 +35,7 @@ struct UIProgramView: View {
   }
 
   private var programPicture: some View {
-    let tally: UITally = session.onAirID == nil ? .none : (session.programInUse ? .onAir : .program)
+    let tally = context.presentation.cameras.first { $0.id == session.onAirID }?.tally ?? .none
     return context.pictures.programPicture()
       .aspectRatio(16 / 9, contentMode: .fit)
       .clipShape(RoundedRectangle(cornerRadius: 14))

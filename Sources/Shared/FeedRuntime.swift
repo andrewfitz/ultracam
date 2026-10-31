@@ -208,6 +208,12 @@ final class FeedCoordinator {
     attachProgramBridge(bridge)
   }
 
+  /// Program's sink is open: frames sent now reach the camera.
+  var programOutputConnected: Bool { programBridge?.isConnected == true }
+  /// When the extension's Program queue last began refusing every frame, on the `systemUptime` clock.
+  var programQueueFullSince: TimeInterval? { programBridge?.queueFullSince }
+  func restartProgramOutput() { programBridge?.restartSink() }
+
   /// Wires a bridge to the route: the bridge's negotiated contract becomes the
   /// route's conversion target, and every publication pumps the bridge from
   /// the publishing thread (never the main actor).

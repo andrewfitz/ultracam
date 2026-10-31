@@ -159,6 +159,7 @@ enum UIFixtures {
     camera.signal = signal
     camera.outputFormat = "1080p 29.97"
     camera.inUse = inUse
+    camera.sinkConnected = inUse
     camera.effects = index == 1 ? [true, true, true, true] : [false, true, true, false]
     camera.lutName = index == 1 ? "FX3_SLog3_to_709.cube" : nil
     camera.timecode = "14:22:31:12"
@@ -194,6 +195,7 @@ enum UIFixtures {
     session.cameras = [camera(1), camera(2, signal: .live(format: "2160p 29.97"))]
     session.selectedID = "camera-1"
     session.programInUse = true
+    session.programSinkConnected = true
     session.onAirID = "camera-1"
     session.autoSwitching = true
     // Auto only shows as on with a strategy that switches on its own.

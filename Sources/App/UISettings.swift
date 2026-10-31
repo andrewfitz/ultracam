@@ -355,11 +355,11 @@ struct UISettingsCameraPane: View {
 
       Section("Published Cameras") {
         if model.outputMode == .program {
-          LabeledContent("Ultracam · Program") { Text(model.programInUse ? "In use" : "Not in use").foregroundStyle(.secondary) }
+          LabeledContent("Ultracam · Program") { Text(model.programInUse ? "In use" : model.programClientUnknown ? "Use unknown" : "Not in use").foregroundStyle(.secondary) }
         } else {
           ForEach(model.feedDescriptors.filter(\.enabled)) { descriptor in
             LabeledContent("Ultracam · \(descriptor.name)") {
-              Text(model.cameraInUse(descriptor.id) ? "In use" : "Not in use").foregroundStyle(.secondary)
+              Text(model.cameraInUse(descriptor.id) ? "In use" : model.cameraClientUnknown(descriptor.id) ? "Use unknown" : "Not in use").foregroundStyle(.secondary)
             }
           }
         }

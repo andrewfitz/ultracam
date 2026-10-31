@@ -47,6 +47,12 @@ enum UIAction: Sendable, Equatable {
   case setPreviewEnabled(cameraID: String, Bool)
   case setAutomaticStart(cameraID: String, Bool)
   case retryAutomaticStart(cameraID: String)
+  /// Reopens a stalled or starved camera's output. Its capture and take keep running.
+  case restartCamera(cameraID: String)
+  /// Details on an unexpected stop or an early take: shows why, and acknowledges it.
+  case acknowledgeStop(cameraID: String)
+  case acknowledgeProgramMove
+  case acknowledgeProblem(id: String)
   case addCamera
   case removeCamera(cameraID: String)
   case forgetLUT(cameraID: String)
@@ -115,7 +121,7 @@ extension UIAction {
       return "Cameras, effects, folders, monitor tools and layout return to their defaults. Recordings are not touched. Ultracam quits when it's done."
     case .stopAllCameras:
       let recording = presentation.cameras.filter { $0.recordButtonActive || $0.pauseTitle == "Resume" }
-      let onAir = presentation.cameras.contains { $0.tally == .onAir }
+      let onAir = presentation.cameras.contains { $0.tally.isRed }
       guard !recording.isEmpty || onAir else { return nil }
       var parts: [String] = []
       if !recording.isEmpty { parts.append("\(recording.count == 1 ? "1 recording ends" : "\(recording.count) recordings end")") }

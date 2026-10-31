@@ -21,7 +21,7 @@ extension UITally {
   var ringColor: Color? {
     switch self {
     case .none: return nil
-    case .onAir: return .red
+    case .onAir, .iso: return .red
     case .program: return nil
     case .next: return .green
     }
@@ -147,12 +147,12 @@ struct UITallyBadge: View {
         .foregroundStyle(tally == .next ? Color.black : .white)
         .background(background, in: Capsule())
         .overlay(Capsule().strokeBorder(tally == .program ? Color.white.opacity(0.6) : .clear, lineWidth: 1.5))
-        .accessibilityLabel(text.capitalized)
+        .accessibilityLabel(tally.label ?? text)
     }
   }
   private var background: Color {
     switch tally {
-    case .onAir: return .red
+    case .onAir, .iso: return .red
     case .next: return .green
     default: return .black.opacity(0.72)
     }

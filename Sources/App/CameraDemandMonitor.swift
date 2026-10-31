@@ -65,6 +65,7 @@ final class CameraDemandMonitor {
   var onRouteChange: ((CameraDemandChange) -> Void)?
 
   var routes: [CameraDemandRoute] { Array(routesByID.values).sorted { $0.id < $1.id } }
+  var isRunning: Bool { enabled }
 
   init(routes: [CameraDemandRoute] = []) { setRoutes(routes) }
 

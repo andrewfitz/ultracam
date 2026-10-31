@@ -85,6 +85,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
 
   private let lock = NSLock()
   private var link = Link.disconnected
+  private var fullSince: TimeInterval?
   private var demand = false
   private var configuration: PipelineConfiguration?
   private var passthroughFormat: OSType?
@@ -142,6 +143,20 @@ final class ProgramOutputBridge: @unchecked Sendable {
   var isDemanded: Bool { locked { demand } }
   var isConnected: Bool { locked { link == .connected } }
   var currentStatistics: Statistics { locked { statistics } }
+  /// The extension's queue has refused every frame since this `systemUptime`.
+  var queueFullSince: TimeInterval? { locked { fullSince } }
+
+  /// Reopens a sink whose client stopped taking frames, with the same contract. Demand
+  /// stays up throughout, so this is the same reconnect a failed send gets.
+  func restartSink() {
+    let restart = locked { () -> Bool in
+      guard demand, link == .connected else { return false }
+      link = .failed
+      fullSince = nil
+      return true
+    }
+    if restart { scheduleReconnect(after: 0) }
+  }
 
   /// The format the Program camera negotiated, or nil while not connected.
   var contract: ProgramOutputFormat? {
@@ -425,8 +440,10 @@ final class ProgramOutputBridge: @unchecked Sendable {
           if accepted {
             statistics.delivered &+= 1
             deliveredOnConnection &+= 1
+            fullSince = nil
           } else {
             statistics.dropped &+= 1
+            if fullSince == nil { fullSince = ProcessInfo.processInfo.systemUptime }
           }
         }
       } catch {
@@ -567,8 +584,13 @@ final class ProgramOutputBridge: @unchecked Sendable {
       lastSentTime = time
       locked {
         if Thread.isMainThread { statistics.mainThreadSends &+= 1 }
-        if accepted { statistics.delivered &+= 1; deliveredOnConnection &+= 1 }
-        else { statistics.dropped &+= 1 }
+        if accepted {
+          statistics.delivered &+= 1; deliveredOnConnection &+= 1
+          fullSince = nil
+        } else {
+          statistics.dropped &+= 1
+          if fullSince == nil { fullSince = ProcessInfo.processInfo.systemUptime }
+        }
       }
     } catch {
       locked { statistics.sendErrors &+= 1; if link == .connected { link = .failed } }
