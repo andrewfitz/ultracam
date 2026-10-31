@@ -187,22 +187,6 @@ struct UISettingsHeader: View {
   }
 }
 
-/// A row that opens another tab: "Settings › Recording" on another surface, in place.
-struct UISettingsLink: View {
-  let tab: UISettingsTab
-  var title: String?
-  @Environment(\.openSettings) private var openSettings
-
-  var body: some View {
-    Button(title ?? "Settings › \(tab.title)") {
-      UIAppEnvironment.interface.settingsTab = tab
-      openSettings()
-    }
-    .buttonStyle(.link)
-    .help("Open Settings at \(tab.title)")
-  }
-}
-
 // MARK: - General
 
 struct UISettingsGeneralPane: View {
@@ -455,8 +439,8 @@ struct UISettingsSwitchingPane: View {
   @State private var interval = UISettingsSwitchingPane.defaultInterval
   @State private var loaded = false
   @State private var advancedOpen = false
-  /// What Restore Defaults puts the fixed interval back to.
-  static let defaultInterval = 8.0
+  /// What Restore Defaults puts the fixed interval back to: what a first run has.
+  static let defaultInterval = SwitcherSettings().intervalSeconds
 
   var body: some View {
     UISettingsPane {
