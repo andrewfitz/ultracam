@@ -65,6 +65,7 @@ h2 { font-size:15px; margin:38px 0 12px; color:var(--dim); font-weight:600; }
 .tools { position:absolute; right:12px; top:12px; display:flex; gap:2px; background:rgba(0,0,0,.72); border-radius:11px; padding:2px; }
 .tools span { width:26px; height:22px; display:flex; align-items:center; justify-content:center; border-radius:8px; font-size:12px; color:#fff; }
 .tools .act { background:rgba(255,255,255,.2); }
+.tools .tc { width:13px; font-size:10px; color:#bbb; }
 .hold { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; }
 .hold .big { font-size:17px; font-weight:600; }
 .strip { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin-top:12px; padding:0 14px; }
@@ -171,12 +172,7 @@ h2 { font-size:15px; margin:38px 0 12px; color:var(--dim); font-weight:600; }
       <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--dim)">&nbsp;&nbsp; Ultracam · Camera 2</span><span class="d">Not in use</span></div>
     </div>
     <div class="sec">
-      <h3>SWITCHING <span>⌄</span></h3>
-      <div class="row">Auto On · Natural talking head</div>
-      <div class="row"><div class="d" style="display:flex;justify-content:space-between"><span>Camera 1 · shot 8 s</span><span>min 10 s</span></div><div class="shot"><b></b><i style="left:33%"></i><i style="left:66%"></i><i style="right:0"></i></div></div>
-    </div>
-    <div class="sec">
-      <span class="n" style="left:240px;top:590px">5</span>
+      <span class="n" style="left:240px;top:495px">5</span>
       <h3>RECORDING</h3>
       <div class="lbl row"><span>Format</span><span class="sel" style="width:150px"><span>HEVC 4:2:2</span><span style="color:var(--dim)">⌄</span></span></div>
       <div class="row d">Camera original · Mac Clock</div>
@@ -194,7 +190,7 @@ h2 { font-size:15px; margin:38px 0 12px; color:var(--dim); font-weight:600; }
       <div class="pic onair sel1">
         <span class="pill" style="left:12px;top:12px">1 &nbsp;Camera 1</span>
         <span class="onairp">ON AIR</span>
-        <div class="tools"><span class="act">◩</span><span>⚙︎</span></div>
+        <div class="tools"><span>▦</span><span class="tc">⌄</span><span class="act">╱</span><span class="tc">⌄</span><span>◕</span><span class="tc">⌄</span><span>⌖</span><span class="tc">⌄</span><span>∿</span><span class="tc">⌄</span><span>△</span><span class="tc">⌄</span><span>◐</span></div>
         <span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC</span>
       </div>
       <div class="strip" style="position:relative">
@@ -211,7 +207,7 @@ h2 { font-size:15px; margin:38px 0 12px; color:var(--dim); font-weight:600; }
     <div style="position:relative">
       <div class="pic two">
         <span class="pill" style="left:12px;top:12px">2 &nbsp;Camera 2</span>
-        <div class="tools"><span>⚙︎</span></div>
+        <div class="tools"><span>▦</span><span class="tc">⌄</span><span>╱</span><span class="tc">⌄</span><span>◕</span><span class="tc">⌄</span><span>⌖</span><span class="tc">⌄</span><span>∿</span><span class="tc">⌄</span><span>△</span><span class="tc">⌄</span><span>◐</span></div>
         <div class="hold"><div style="font-size:22px;color:var(--orange)">▲</div><div class="big">Signal lost 0:06</div><div style="color:var(--dim)">Take continues for up to 10 s</div></div>
         <span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC · no signal</span>
       </div>
@@ -239,11 +235,11 @@ h2 { font-size:15px; margin:38px 0 12px; color:var(--dim); font-weight:600; }
 
 <div class="legend">
   <div><span class="k">1</span>Cut buttons are always there with two cameras. There's no ISO/Program mode, so nothing has to stop first.</div>
-  <div><span class="k">2</span>Auto says On or Off in words, with Strategy in its menu. Hold is always in the same spot.</div>
+  <div><span class="k">2</span>Everything for switching lives here. Auto says On or Off in words, with Strategy, Anchor and Emphasis in its menu. Hold is always in the same spot.</div>
   <div><span class="k">3</span>"Stop Cameras" is gone while running. Stop Recordings has a red dot that survives Zoom being in front, and its menu has Format and Pause All.</div>
-  <div><span class="k">4</span>The left bar is now a session board, in signal order. Attention only appears when something's wrong. Output mode, Sync, Auto, Hold, Automation and "Coming later" are gone. Real hardware is listed per camera.</div>
+  <div><span class="k">4</span>The left bar is now a session board, in signal order. Attention only appears when something's wrong. Output mode, Sync, all switching controls, Automation and "Coming later" are gone. Real hardware is listed per camera.</div>
   <div><span class="k">5</span>Format is a picker in the main window, and it's remembered. Takes shows the latest only. Timecode is set in Settings and shown here as a caption.</div>
-  <div><span class="k">6</span>The seven-button tool bar becomes one tools button plus active tools. The full bar appears on hover. The clock moves off the picture when the strip is open.</div>
+  <div><span class="k">6</span>The monitor tool bar stays exactly as it is today, on every picture, always visible. The clock moves off the picture when the strip is open.</div>
   <div><span class="k">7</span>Format and data rate sit read-only on the folder row. Size, bitrate and the footnote are gone.</div>
   <div><span class="k">8</span>Effect chips become a one-click LUT toggle plus an Effects menu. Stop Camera moves to ⋯. Cut keeps a fixed spot.</div>
   <div><span class="k">9</span>A problem replaces the folder row, so the strip never changes height. The signal badge keeps a dropout count, and Cut is disabled until the signal has been steady for 5 s.</div>

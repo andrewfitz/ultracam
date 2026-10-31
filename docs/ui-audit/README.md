@@ -1,6 +1,6 @@
 # Ultracam UI and UX audit: decisions and plan
 
-Date: 2026-10-30. Revision 3: revision 2 followed an independent validation pass, and this one records the owner's choice of tabs for Settings. Code reviewed at `2c4929c`. This is a review only: no source changed.
+Date: 2026-10-30. Revision 4: revision 2 followed an independent validation pass. Revisions 3 and 4 record the owner's review: tabs for Settings, the monitor tool bar stays on the picture, and Switching leaves the sidebar. Code reviewed at `2c4929c`. This is a review only: no source changed.
 
 This file is the decision record. Where anything below it disagrees, this file wins.
 
@@ -30,7 +30,7 @@ This file is the decision record. Where anything below it disagrees, this file w
 | Every effect behind a menu | **LUT stays one click** | LUT off changes pixels, never Zoom's format. It is the panic control |
 | Time-sensitive notifications reach you | **Not on their own** | They need an entitlement, and sharing a screen may silence them. A floating panel is added, with limits (section 5) |
 | Left pane as drawn | **Trimmed** | Too tall: about 1046 pt in the heavy case, with Format below the fold on a 13-inch display |
-| "Close both panes and lose nothing" | **Reworded, and made true** | It was false: the shot timer and one-click fixes were lost |
+| "Close both panes and lose nothing" | **Reworded, and made true** | It was false: one-click fixes were lost, and the shot timer now lives in the status bar |
 | Nine Settings sections, "Devices" | **Eight, "Hardware"** | Monitoring's one control is per camera, so it belongs in the Scopes popover |
 | Loudness pair setting | **Dropped** | Nobody asked, and it would do half a job, because Auto still reads channels 1-2 |
 | Rig presets | **Still not now, plus a Setup block** | "Configurations" most likely means how each vendor's gear is set up, which the first pass missed |
@@ -236,9 +236,6 @@ CAMERAS                                              +
 VIRTUAL CAMERAS                            collapsible
   ✓ Ultracam · Program                          In use
     Ultracam · Camera 1                     Not in use
-SWITCHING                                  collapsible
-  Auto On · Natural talking head
-  Camera 1 · shot 8 s  ▬▬▬▬▬|▬▬▬|▬▬
 RECORDING
   Format [HEVC 4:2:2 ▾]
   Camera original · Mac Clock
@@ -248,16 +245,17 @@ TAKES
   5:40 PM · 12:31 · 2 cameras · 0 lost        [Show All]
 ```
 
-- **Heavy case:** about 797 pt, down from 1046. Fits 1470 × 956 and a 27-inch display. At 1440 × 900 collapse Switching. Attention, Cameras and Recording never collapse, and nothing collapses by itself.
+- **Heavy case:** about 663 pt, down from 1046 (estimated). It fits every display checked, including 1440 × 900. Only Virtual Cameras collapses, and nothing collapses by itself.
 - **Takes** shows the latest only. `Show All` reveals them in Finder.
 - **Virtual Cameras** is one line each. The microphone reminder appears only until something is in use.
-- **Removed:** Output control, Sync cameras, Auto, Strategy, Hold, the "2 recording" line, Automation, both "Coming later" rows. Interrupted Takes becomes an Attention row. An empty Attention means healthy.
+- **No Switching section.** Everything about switching is in the toolbar, and the shot time is in the status bar. The owner rejected a sidebar section, and it only repeated those two.
+- **Removed:** Output control, Sync cameras, Auto, Strategy, Hold, the shot timer, the "2 recording" line, Automation, both "Coming later" rows. Interrupted Takes becomes an Attention row. An empty Attention means healthy.
 
 ### Centre: pictures and strips
 
 Job: see it, hear it, roll it. Each fact has one owner (06 section 2, with the corrections in validation C).
 
-- **Picture at rest:** name, tally, REC pill, one tools button and any active tools. The full bar appears on hover **in every state**, not only live, or the `b621bc7` bug returns. The REC pill never truncates.
+- **Picture at rest:** name, tally, REC pill, and **the full monitor tool bar, unchanged and always visible, in every state.** Monitor tools are used live, so they stay one click away. The first plan hid them behind hover, and the owner rejected that. The REC pill never truncates.
 - **Program View:** loses the cut bar and Recent Cuts. Tiles get full-width Cut buttons.
 - **Strip removed:** On Air badge, Stop Camera button (moves to ⋯), size and bitrate, Own Folder badge, footnote, Camera Control row, effect chips, Processing switch.
 - **Strip rows, fixed:** header · record row · folder, time left and read-only format (or the problem) · output row · meters. Nothing appears or vanishes, and pressing Record doesn't resize the picture.
@@ -375,11 +373,11 @@ If a camera's source later can't use the choice, it takes the nearest format, be
 | Channels Shown home | 05 inspector | **Settings › Audio.** Your sentence names the Settings window |
 | Effect chips | 02 inspector, 06 menu | **LUT toggle plus Effects menu.** LUT is the panic control; the rest change Zoom's format |
 | Stop Cameras | 02 remove, 06 keep | **Remove.** Also fixes a double-click on Start landing on Stop |
-| Tool bar at rest | 02 active tools, 06 one button | **Both** |
+| Tool bar at rest | 02 active tools, 06 one button | **Neither. Keep the full bar, as today.** Your call: no extra steps for monitor tools. Both reports overrode the deliberate fix in `b621bc7` |
 | ⋯ menu | 02 trim, 03 remove | **Trim.** Stop Camera moves into it, and Monitor LUT moves to the Picture popover |
 | Strip Cut | 02 keep, 03 remove | **Keep** in a fixed slot. Eyes are on the pictures |
 | Hardware on the strip | 04 source row, 02 sidebar | **Sidebar** |
-| Strategy home | 02, 03 sidebar. 06 toolbar | **Toolbar Auto menu.** One control; the sidebar reads it |
+| Strategy home | 02, 03 sidebar. 06 toolbar | **Toolbar Auto menu only.** You rejected switching in the sidebar |
 | Publish Program | 01 always, B at 2+ | **At 2+.** A device add is harmless, and one camera has nothing to switch |
 | Show Switching Controls | 01 keep, B drop | **Drop** |
 | Return to eligibility | A 3 s, C 5 s | **5 s** |
@@ -404,7 +402,7 @@ If a camera's source later can't use the choice, it takes the nearest format, be
 | D6, backup automation rules | Holds; placeholder rows go until it's built |
 | D7, selection and focus merged | **Revised.** A click or window activation no longer focuses a picture, and focus no longer selects, because it could silently move the target of ⌘R. The menu bar stops depending on selection |
 | D8, time left, recent takes, director timeline, Saved, no app names | Holds; the sidebar stops repeating recording state |
-| `b621bc7`, tool bar findable at rest | Holds through the always-present tools button |
+| `b621bc7`, tool bar always on the picture | Holds, unchanged |
 | Left sidebar as V1 session panel | **Revised** to the session board |
 | `UI_REDESIGN.md:105,226`, output locked while running | **Overridden** |
 
