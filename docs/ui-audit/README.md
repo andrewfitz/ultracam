@@ -1,97 +1,209 @@
 # Ultracam UI and UX audit: decisions and plan
 
-Date: 2026-10-30. Commit reviewed: `30c8d73`. This is a review only: no source changed.
+Date: 2026-10-30. Revision 2, after an independent validation pass. Code reviewed at `2c4929c`. This is a review only: no source changed.
 
-This file is the decision record. Six specialist reports sit beside it as evidence:
+This file is the decision record. Where anything below it disagrees, this file wins.
 
-| Report | Covers |
+| Evidence | Covers |
 |---|---|
-| [01](01-output-mode-architecture.md) | ISO and Program as always-available cameras, and live add, rename and remove |
-| [02](02-live-workflows-and-panes.md) | Six live workflows, click by click, and the job of each pane |
-| [03](03-feature-inventory-and-placement.md) | 141 capabilities: every surface each appears on, its one home, shortcuts, hardcoded values |
-| [04](04-vendor-and-hardware.md) | Vendor and hardware awareness, Devices design, plugin API additions |
-| [05](05-audio-and-recording-format.md) | Audio channels by stage, recording format |
-| [06](06-visual-polish-and-native.md) | 39 ranked visual findings, color system, copy pass, Settings look and behavior |
+| [01](01-output-mode-architecture.md) · [validation B](validation/B-iso-program-red-team.md) | ISO and Program, and the attempt to break the design |
+| [02](02-live-workflows-and-panes.md) · [validation C](validation/C-operator-red-team.md) | Live workflows, and an operator's run through the proposed design, with before and after counts |
+| [03](03-feature-inventory-and-placement.md) | 141 capabilities: every surface, one home, shortcuts, hardcoded values |
+| [04](04-vendor-and-hardware.md) · [05](05-audio-and-recording-format.md) · [validation E](validation/E-settings-audio-hardware.md) | Hardware, audio, recording format, Settings contents |
+| [06](06-visual-polish-and-native.md) · [validation D](validation/D-platform-feasibility.md) | 39 visual findings, color system, copy pass, and what macOS actually allows |
+| [validation A](validation/A-defects-and-fixes.md) | Every defect and fix, re-derived, with the journal rule replayed on the real take files |
+| [validation F](validation/F-fact-check.md) | 104 claims checked: 73 correct, 21 partly right, 4 wrong, 6 unverifiable |
 
-Where a report and this file disagree, this file wins. Section 9 lists each conflict and how it was settled.
+**Evidence limits.** Everything comes from code, offscreen renders, files on disk and the system log. Nothing was tested on live cameras or in a meeting app. Renders use synthetic data, so no render shows the live strip: 8 meter rows, 6 of them silent on this rig, plus a Camera Control row. Labels: **verified** means read in code or on a real file. **Traced** means followed through code, not run.
 
-**Evidence limits.** Everything comes from code, offscreen renders and files on disk. Nothing was run against live cameras or a meeting app, because the installed app was running. Renders use synthetic data, and two gaps matter: fixtures show stereo meters and no camera-control store, so **no render shows the strip as it looks live** (05, 06 V14). The real strip has 8 meter rows, 6 of them silent on this rig, plus a Camera Control row.
+## 1. What validation changed
 
-## 1. Fix first: takes are failing at about 19 minutes
+| First pass | Now | Why |
+|---|---|---|
+| Journal fix: journal only when the run breaks | **New rule** (section 2) | The stated rule failed: the FX3 repeats labels, so "next label +1" still journals every frame. Replayed on both real journals, the new rule keeps 36 records and rebuilds all 68,245 labels |
+| One recording fault | **Three** (section 2) | A failed take keeps showing REC, and a dropout during a take very likely ends it. Fixing the journal alone would move the failure to the first dropout |
+| HDMI loss handled with a hold | **The app can't see HDMI loss after the first frame** | After the first frame the UI reads live whatever arrives, so every "No signal" state is unreachable |
+| One `programActive` flag | **Replaced** (section 4) | Cuts wouldn't land with no client, and the rule would have gone black under a red tally |
+| Program always published | **Published with 2+ cameras** | One camera has nothing to switch, and a third entry invites a wrong pick in Zoom |
+| Show Switching Controls preference | **Dropped** | It was the old mode in a new name |
+| 3 to 5 days for ISO and Program | **7 to 10 days plus two sessions with you** | The first estimate counted only removing the mode |
+| Every effect behind a menu | **LUT stays one click** | LUT off changes pixels, never Zoom's format. It is the panic control |
+| Time-sensitive notifications reach you | **Not on their own** | They need an entitlement, and sharing a screen may silence them. A floating panel is added, with limits (section 5) |
+| Left pane as drawn | **Trimmed** | Too tall: about 1046 pt in the heavy case, with Format below the fold on a 13-inch display |
+| "Close both panes and lose nothing" | **Reworded, and made true** | It was false: the shot timer and one-click fixes were lost |
+| Nine Settings sections, "Devices" | **Eight, "Hardware"** | Monitoring's one control is per camera, so it belongs in the Scopes popover |
+| Loudness pair setting | **Dropped** | Nobody asked, and it would do half a job, because Auto still reads channels 1-2 |
+| Rig presets | **Still not now, plus a Setup block** | "Configurations" most likely means how each vendor's gear is set up, which the first pass missed |
 
-**Confirmed. This is in the installed build and it is the default configuration.**
+**Survived unchanged:** retiring the output mode, the three-pane structure, the session board idea, global format, Stop Cameras off the toolbar, a sidebar Settings window, Channels Shown in Settings, and the placement rule.
 
-Both 2026-10-30 12:24 takes stopped at 12:43 and never finalized. Each journal is 16,777,011 bytes against a 16 MiB cap, and 68,245 entries at 59.94 fps is 18.98 minutes.
+**Rejected from the review:** making the Settings rebuild optional. It was called out of scope, but you asked for that overhaul by name.
 
-- **Cause.** Since `dcb58e1` (2026-10-29), any timecode mode except Source writes one journal entry per frame when the source carries timecode (`AVAssetSourceRecordingWriter.swift:723-727`). A full journal throws `journalFull` (`RecordingTakeSidecar.swift:225`), and that fails the take (`SourceRecording.swift:1119-1135`).
-- **Duration.** About 19 minutes at 59.94, 38 minutes at 29.97.
-- **Same hazard, second path.** Constant frame rate compatibility also journals every frame (`AVAssetSourceRecordingWriter.swift:739`).
-- **Also a per-frame cost.** Each entry does an `fsync` and rewrites the sidecar JSON atomically (`RecordingTakeSidecar.swift:229-231`), on the writer queue, at frame rate.
-- **Workaround until fixed.** Set Timecode to Source (from the code, not tested). It returns to Mac Clock on every launch (section 2).
-- **The two takes.** Keep the `.partial` files in `/Volumes/4TB Cam B`. Use Record › Recover Interrupted Takes. Not attempted here.
+## 2. Fix first: recording and virtual output
 
-**Fix.** Journal a label only when it breaks the run, as lines 702-709 already do for source timecode. Do the same for line 739. Metadata filling up must never end a take: past the cap, stop journaling and note it in the sidecar.
+### Takes fail at about 19 minutes
 
-## 2. Other defects found on the way
+**Verified.** In the installed build, with Mac Clock or Record Start and a source carrying timecode, every frame adds a journal entry, and a full 16 MiB journal fails the take: about 19 minutes at 59.94, 38 at 29.97.
 
-All verified in code unless marked.
+Both 12:24 takes failed at 12:43 on the same frame count. They are complete 18:58 movies with 68,245 frames, closed cleanly at 18:59 and hidden as `.partial` files on `/Volumes/4TB Cam B`. Recover them from the sidebar's Interrupted Takes section, not the Record menu, which may do nothing. Recovery has not been attempted.
 
-| # | Defect | Where | Fix |
+**Nothing reads the journal.** That makes this fix safe, and the cost is forensic detail only.
+
+**Fix.** Two parts:
+
+1. Journal a native label only when it can't be predicted: the first two frames, any gap or pause, any change of rate, epoch or drop-frame flag, or any frame whose label minus the label two frames back differs from the current stride. The stride starts at 2, which fits both 1:1 and paired counters. Variable-rate labels stay per frame. Code is in validation A.
+2. Metadata must never end a take. The writer calls a non-throwing `journal(_:)`. Label and timing records stop at 15 MiB, clock and audio records may use the last 1 MiB, and anything past that is counted and dropped. The sidecar and the take's note both say so. `RecordingTakeLifecycleChecks:152-178` must be rewritten.
+
+After this, the journal lasts about 595 hours at this rig's rate, and the limits are disk and signal. **No take has ever finished past 89 minutes, so run one take of 3 hours or more that crosses a dropout before trusting long sessions.**
+
+### A failed take still reads as recording (N1)
+
+**Verified, and this is what happened today.** Nothing reacts when a take fails, so the strip, REC pill and clock kept running for 6 h 16 m after both cameras stopped writing, until Stop at 18:59. Only an orange status segment and the menu bar triangle showed it.
+
+**Fix.** Stop the take automatically on failure. Show `.failed` first in the strip's recording and paused states. If the writer closed cleanly, publish the movie instead of hiding it for recovery. Log at the moment of failure, as the only log line today comes at Stop.
+
+### A dropout during a take very likely ends it (N2)
+
+**Path verified, runtime traced.** On a no-input callback, audio arrives with no paired frame, and since `dcb58e1` that rejects the take (`CaptureController.swift:1724-1727`). No take on this code has met a dropout yet. Today's rate of 5 per camera in 399 minutes would give a 1-hour take on two cameras about a 22% chance of surviving.
+
+**Fix.** Keep placing unpaired audio from the last valid pair, instead of rejecting or dropping it, since dropping would slip sync for the rest of the take. **Ship with the journal fix, never after it.** Add a test using `FakeCaptureSession`.
+
+### Virtual camera connections are failing
+
+**Verified in the log, cause unknown.** All 12 `Camera connect failed` lines today, with none succeeding, 11:23 to 12:33, on both cameras. Each failed within about a millisecond at the provider lookup (`VirtualCameraRegistryTransport.swift:88`), though the extension shows active at build 10. The failure shows only in Diagnostics. Whether a meeting app was affected is unknown.
+
+**Investigate first,** because every part of section 4 uses this path.
+
+### Until this is fixed
+
+Treat ISO recording in the installed build as unreliable.
+
+- Set Timecode to Source before every take and after every launch. This relies on the first frame carrying a label. It does nothing about N2.
+- Watch the status bar during a take. The strip will not show a failure.
+- Check that Zoom shows a real picture before relying on it.
+
+## 3. Other defects
+
+All verified unless marked.
+
+| # | Defect | Fix |
+|---|---|---|
+| N3 | HDMI loss is invisible after the first frame: the UI reads live whenever a source format is known (`UISessionBridge.swift:72`) | Typed `CaptureSignal` on `CaptureUpdate`, published on transition. Everything in section 5 depends on it |
+| B1 | Codec and timecode aren't saved | Two keys beside `allowCPUConversion`, no migration, include in Reset |
+| B2 | A camera that stops itself looks like a normal stop. `stopped: true` is sent for both | `CaptureStopCause`, plus an `UnexpectedStop` held until acknowledged |
+| B3 | Nothing reaches an operator outside the window | Section 5 |
+| B4 | On-air loss doesn't move Program or Auto | Section 5 |
+| B5 | A connected sink counts as a viewer, giving false ON AIR | Use real client demand **and start the demand monitor always**. The fix alone turns Separate tally off permanently |
+| B6 | Running cameras render every frame for nobody | Section 4 |
+| B7 | Settings' strategy picker leaves automatic on after Manual. Lower severity: picking a strategy later re-enables Auto silently | One `AppModel.setStrategy(_:)` |
+| B8 | The source mismatch refusal prints literal `(matrixProfile.displayName)` and `(error)` | Interpolate both |
+| B9 | Idle HEVC estimates run about 11 times high | Display only: `UIRecordingLibrary` uses 0.014 bytes per pixel plus PCM. **Do not change `RecordingSizeEstimator.swift:18`,** which also guards free space |
+| B10 | Idle time left ignores other cameras on the drive | Sum assigned cameras |
+| B11 | The inspector hardcodes "4:2:2" | Use the real format |
+| B12 | Dropouts vanish once the camera stops: Saved does show the gap note, but the Saved state is lost | Keep Saved after stop. Show lost frames in Takes |
+| B13 | One warning at a time | Return a list |
+| B14 | Transcript Assisted is the default and nothing feeds it | Hide it, and force Low Latency until a source exists |
+| B15 | Selection ring follows the system accent, so a Red accent reads as on air | Fixed blue |
+| B16 | Extension queue stalls are only counted, so Zoom can freeze while Ultracam looks healthy (traced) | Queue full for 2 s raises a problem with Restart Camera |
+| B17 | A take keeps rolling after the meeting ends | After 2 minutes unused: "Still recording: no meeting app is using Ultracam". Never stop the take (D6) |
+| B18 | Eight unlabeled channels get 7.1 names in the popover, and the status text says "48 kHz stereo" on 8 channels | Number them. Use the real count |
+| B19 | `Copy Diagnostics` has no hardware in it | Add driver, model, device ID, link and Sony state |
+
+Wrong in code comments: four say recording gets the burn-in LUT. It never does.
+
+## 4. ISO and Program
+
+**You were right. Retire the output mode.** Every camera is always published, plus Ultracam · Program once there are two or more. Nothing is locked. The extension needs no update.
+
+The lock protected nothing: recording never reads the mode, and no commit or doc gives a reason. A stable device list also suits meeting apps, because Zoom caches its list.
+
+### What decides the work
+
+```
+programClient    = Program has a client (released after a 5 s hold)
+programPicture   = programClient || Program monitor visible
+cameraClient(c)  = c's virtual camera has a client (released after a 5 s hold)
+autoTake         = automatic strategy && a take is active
+
+scheduler        = always, on metadata, so a cut lands in every layout
+source wanted(c) = automatic cameras only: cameraClient(c) || programPicture
+                   || autoTake || c records || c's preview is visible
+sink open(c)     = cameraClient(c) && c running
+GPU render(c)    = sink open(c) || sink connecting(c) || (programPicture && c running)
+Program sink     = programClient && any enabled camera running
+monitor(c)       = every output-cadence source frame, always
+recording(c)     = every source frame, always
+```
+
+| Situation | Sink | Render | Cuts |
 |---|---|---|---|
-| B1 | Codec and timecode are not saved. Every launch returns to ProRes 422 HQ and Mac Clock, so forgetting to re-pick HEVC records at about 30 times the data rate | `RecordingModel.swift:633,659` | Save both |
-| B2 | A camera that stops itself ends its take, then looks like a normal stop. The reason reaches only the log | `AppModel.swift:1150-1160`, `UIPresentation.swift:555` | Keep an unexpected-stop state (section 4) |
-| B3 | Nothing can reach an operator outside the window: no notification, sound or dock bounce exists | Search of `Sources` and MonitorKit | Section 4 |
-| B4 | On-air HDMI loss leaves Program on the dead camera, and Auto does not react. Traced, not run | Health goes false only on stop paths (`AppModel.swift:1185,1284`) | Section 4 |
-| B5 | Tally is wrong in Separate: a connected sink counts as a meeting client, so a running camera shows ON AIR with no viewer | `UISessionBridge.swift:128`, `CaptureController.swift:2448` | `inUse` means a real client only |
-| B6 | Running cameras render every frame with nobody watching. The no-demand branch can never run, against the project's GPU rule | `FeedRuntime.swift:257`, `CaptureController.swift:2140` | Section 3 |
-| B7 | Settings' strategy picker bypasses the bridge, so choosing Manual leaves automatic on | `UISettings.swift:418-423`, compare `UISessionBridge.swift:363-368` | Route through `send` |
-| B8 | The source-mismatch refusal prints the literal text `(matrixProfile.displayName)` | `SourceRecording.swift:337` | Interpolate |
-| B9 | HEVC estimates run about 11 times high, so time left is 11 times too short | `RecordingSizeEstimator.swift:18` | Use measured rates |
-| B10 | Time left ignores other cameras on the same drive until they roll | `UISupport.swift:63-65` | Sum assigned cameras |
-| B11 | The inspector hardcodes "4:2:2" in Signal | `UIInspector.swift:340` | Use the real format |
-| B12 | Saved takes hide their dropouts: the count disappears at the end of a take, so 60 lost frames read "Saved" | `UIPresentation.swift:679` | Keep it on Saved and Takes |
-| B13 | Only one warning shows at a time, yet both cameras dropped together on 2026-10-30 | `UIPresentation.swift:818-847` | Return a list |
-| B14 | Transcript assisted is the default director mode, and nothing feeds it | `ingestTranscript` has no caller in `Sources/App` beyond its definition | Hide the picker until a source exists |
-| B15 | The selection ring uses the system accent, so a Red accent reads as on air | `UICameraColumn.swift:99` | Fixed blue |
+| Running, nobody watching, preview up | No | **None** | Land |
+| Recording, no client | No | **None** | Land |
+| Program View open, no client | No | All cameras | Land, with a picture |
+| One ISO client | That camera | That camera | Land |
+| Program client | Program | All cameras | Land |
+| ISO and Program clients | Both | All cameras | Land |
 
-## 3. ISO and Program: always both
+Rules that keep this safe:
 
-**Your instinct was right. Retire the output mode.** Always publish every camera plus Ultracam · Program. What each one costs is decided by whether something is watching it.
+- **Late sink.** Pre-negotiate each camera's format when its contract changes. Replace the busy-mismatch throw from `dcb58e1` with connect-then-renegotiate. Retry once a second while a client is waiting, and raise a problem instead of a Diagnostics line. **This is the blocker:** today's code gives an ISO client black under a red tally.
+- **Release hold.** A client leaving takes effect after 5 s, so a meeting app probing devices doesn't restart capture, the director or timeline files. A user Stop ignores the hold.
+- **Losing the on-air source.** If it stops or fails and another camera is producing, Program moves to it and says so. Today Program goes black and a cut doesn't recover it.
+- **Director.** Runs when strategy is automatic, 2+ cameras run, and Program has a picture or a take is active. Its audio and clock come from the anchor, not from the UI selection.
+- **Idle path.** It has never run in the app. Set applied state and timing correctly so a camera with no client doesn't read as Updating. Keep the processor built, and free GPU resources after 30 s without a render.
 
-- The either-or lives in two app-side `switch` statements. The extension never distinguishes them, and a test already publishes both (`Tests/CameraRegistryRuntimeChecks.swift:90-110`).
-- "Stop recording first" protects nothing, because recording does not read the mode. No commit or doc records a reason for the lock.
-- A stable device list is also better for meeting apps. Zoom caches its list, so a hot-switch that changes devices would be worse (`VALIDATION.md:781`).
+The on-screen picture keeps showing the LUT without a render, and recording is unaffected: both verified.
+
+### Tally
+
+Red needs frames arriving, not just a client. A camera is either `ON AIR` (Program) or `ISO` (its own device), so two reds never hide which picture Program is on.
 
 ```
-programActive     = Program has a client || Program monitor visible || (Auto on && a take is active)
-camera sink open  = this camera's virtual camera has a client
-GPU processing    = sink open || programActive
+live(c)      = c running, signal live
+ON AIR (red) : c on air && Program client && Program sink connected && live(c)
+ISO    (red) : own client && own sink connected && live(c), and not ON AIR
+NEXT         : pending cut target, and neither of the above
+PROGRAM      : on air, not ON AIR, 2+ cameras
 ```
 
-The cost: no extension update, no macOS approval, no settings migration. The estimate in 01 is 500 to 800 lines in about 18 source files and 3 to 5 days, including real meeting-app testing.
+A client that exists but isn't receiving frames shows no red and raises a problem: "A camera app is waiting for Camera 1". If you cut while an ISO client exists and Program has none, Attention says the cuts aren't reaching it.
 
-Consequences:
+### What else this unlocks
 
-- **Removed:** the Output control in the sidebar, Settings and menus, "Stop Cameras and Switch", and every lock message.
-- **Added:** cut buttons appear with 2 or more cameras. They stay neutral while Program has no client.
-- **Kept:** View › Show Switching Controls, a never-locked view preference, stored in the existing `outputMode` key so downgrades still work.
-- **Tally:** red means a viewer can see this picture, by either route. Two cameras can be red.
-- **New hazard:** if Zoom is on Ultracam · Camera 1 and you cut Program, the cuts do not reach it. Attention says so.
-- **Also unlocked:** rename live. Add live after two fixes. Remove a stopped camera while others run. Reset stays locked.
+Rename live. Add live, once adding stops flushing Program. Remove a stopped camera while others run. Reset stays locked. A rename reaches meeting apps only when the extension restarts.
 
-Top risk: the no-demand path has never run in the app, so telemetry and first-frame behavior need work (01 section 12).
+### Behavior that changes
 
-## 4. Live alerts
+Starting one camera no longer starts the others for Program. Start All covers that habit.
 
-A problem must reach the operator wherever they are looking.
+**Fallback.** If renegotiating under a meeting app fails in testing, open the sink with the camera and send no frames until a client arrives. That gives instant joins at the cost of a polling timer per running camera.
 
-- **One problem list.** `warning()` returns all problems, worst first. The Attention section, status bar popover and menu bar all render that list, each problem with one action.
-- **Unexpected stop.** Stored per camera with its reason and the take's result, until acknowledged. "Camera 1 stopped: [reason]. Take saved up to 12:31", with Start.
-- **System notifications**, time-sensitive level, for: camera stopped unexpectedly, take ended early, recording with no signal, on-air camera lost, drive low or full. Sound off by default, because the room may have open microphones. Test inside a real full-screen meeting, as Focus settings may hold them back.
-- **No-signal feeds source health, after a hold.** Auto cuts away from a lost camera. Manual gets a Cut button at the warning. Use a hold of about 1 second: the real dropouts here were 2 frames, and cutting on those would make Auto twitch.
-- **Signal lost placeholder** says how long, and stops giving setup advice when the camera had a picture.
+## 5. Live alerts
 
-## 5. The placement rule and the three panes
+A problem has to reach you wherever you're looking. No single channel does, so these are layered.
+
+- **One problem list.** Status bar, Attention and menu bar render the same list, each problem with one action.
+- **Camera problem.** It replaces that camera's folder row in place. The row is 24 pt in every state, so the strip never changes height and Cut never moves. "2 problems" opens the list.
+- **Session problem.** First status bar segment, with its action as a button in the bar, so it's one click with the sidebar closed.
+- **Attention.** Pinned above the scrolling sidebar. It never opens the sidebar by itself, because that would resize pictures mid-show.
+- **Unexpected stop.** "Camera 1 stopped: [reason]. Take saved up to 12:31", with Start. A restart clears the camera part; the take result stays until acknowledged.
+- **System notifications** for: camera stopped unexpectedly, take ended early, recording with no signal, on-air camera lost, drive low or full. Time-sensitive only when on air or rolling. Needs the Time Sensitive capability and a change to `prepare_local_build.py`. Text stays safe to show a meeting. Sound off by default. Ask permission in Settings or before a session, never while live.
+- **Alert panel** for the three worst: on-air camera lost, take ended early, camera stopped while on air. A small non-activating panel at `.screenSaver` level, with sharing set to none. It reaches a full-screen meeting only when Ultracam's windows are closed. With a window open it's untested.
+
+Not used: `requestUserAttention` adds no reach. Keep on Top for detached monitors won't layer over a full-screen meeting.
+
+**On-air loss, for every strategy.** AppModel owns one rule, timed by its own timer, because no frames arrive during a loss:
+
+1. After 1 s without signal, mark the camera unhealthy. All 10 dropouts today lasted 23 to 33 ms.
+2. If it's on Program and Auto is on, cut to the next live camera in strip order and tell the director.
+3. If no camera is live, stay and warn: "No camera has a picture".
+4. With Auto off, cut nothing. Show Cut at the warning and on the placeholder.
+5. **Hold:** loss overrides it once, because a shot with no picture isn't worth holding. Hold stays on for the new shot, and you're told.
+6. A camera is eligible again after 5 s of steady signal. Nothing cuts back on its own, apart from the director's ordinary rules.
+
+The placeholder says how long the signal has been lost. A loss over 10 s ends the take by design, so "Recording · no signal" says that.
+
+## 6. The placement rule and the three panes
 
 | Scope | Used live? | Home |
 |---|---|---|
@@ -100,176 +212,238 @@ A problem must reach the operator wherever they are looking.
 | Whole session | A glance, sidebar closed | Status bar |
 | One camera | Yes | Picture and strip |
 | One camera | No, setup | Inspector |
-| App-wide | Set once or per rig | Settings |
+| App-wide or per rig | Set once | Settings |
 | Whole session | App hidden | Menu bar |
 | Engineering detail | No | Diagnostics |
 
-**The test of the split:** you can close both side panes during a live session and lose nothing you need.
+**The test of the split:** you can close both side panes during a live session and still see and act on everything the show needs.
+
+**Exception:** a per-camera setting gets a table in Settings only when cameras are compared side by side and it isn't needed live. Folders and Channels Shown pass.
 
 ### Left pane: the session board
 
-It reads in signal order and answers what the window cannot show today: what is connected, what is going out, where it is saving, what is wrong.
+It reads in signal order and answers what the window can't show today: what is connected, what's going out, where it's saving, what's wrong.
 
 ```
-ATTENTION                        only when something needs it
+ATTENTION                                       pinned
   ▲ Camera 1 stopped on its own   [Start] [Why]
-CAMERAS                                               +
-  ● Camera 1                                      On air
-    UltraStudio 12G · 2160p 59.94 · 4 dropouts
+CAMERAS                                              +
+  ● Camera 1                                    ON AIR
+    2160p 59.94 · 4 dropouts · UltraStudio 12G
     Sony FX3 · connected · 78%
-VIRTUAL CAMERAS
-  ✓ Ultracam · Program            In use · 1080p 29.97
-    Ultracam · Camera 1           Not in use
-    Video only. Pick your microphone in the meeting app.
-SWITCHING                                    with 2+ cameras
-  Auto · Natural talking head
+VIRTUAL CAMERAS                            collapsible
+  ✓ Ultracam · Program                          In use
+    Ultracam · Camera 1                     Not in use
+SWITCHING                                  collapsible
+  Auto On · Natural talking head
   Camera 1 · shot 8 s  ▬▬▬▬▬|▬▬▬|▬▬
-  5:22:23 Camera 1  Auto
 RECORDING
-  Format [HEVC 4:2:2 ▾]   Timecode [Mac Clock ▾]
-  Takes · 8TB · Camera 1, 2              1 h 52 m left
-  ▬▬▬▬▬▬▬▬▬▬
-  Camera original, no LUT or effects
+  Format [HEVC 4:2:2 ▾]
+  Camera original · Mac Clock
+  Takes · 8TB · Camera 1, 2            1 h 52 m left
+  ▬▬▬▬▬▬▬▬▬▬            [Folder for Next Take…]
 TAKES
-  5:40 PM · 12:31 · 2 cameras · 0 lost           [Show]
+  5:40 PM · 12:31 · 2 cameras · 0 lost        [Show All]
 ```
 
-**Removed:** Output control, Sync cameras, Auto toggle, Strategy picker, Hold, the "2 recording" line, Automation, and both "Coming later" rows. Interrupted Takes becomes an Attention row. Empty Attention means healthy.
+- **Heavy case:** about 797 pt, down from 1046. Fits 1470 × 956 and a 27-inch display. At 1440 × 900 collapse Switching. Attention, Cameras and Recording never collapse, and nothing collapses by itself.
+- **Takes** shows the latest only. `Show All` reveals them in Finder.
+- **Virtual Cameras** is one line each. The microphone reminder appears only until something is in use.
+- **Removed:** Output control, Sync cameras, Auto, Strategy, Hold, the "2 recording" line, Automation, both "Coming later" rows. Interrupted Takes becomes an Attention row. An empty Attention means healthy.
 
 ### Centre: pictures and strips
 
-Job: see it, hear it, roll it. Each fact has one owner (06 section 2).
+Job: see it, hear it, roll it. Each fact has one owner (06 section 2, with the corrections in validation C).
 
-- **Picture at rest:** name, tally, REC pill, plus one tools button and any active tools. The full tool bar appears on hover. The REC pill never truncates.
-- **Program View:** loses the cut bar and Recent Cuts, and tiles get full-width Cut buttons.
-- **Strip, removed:** the On Air badge, Stop Camera button (moves to ⋯), size and bitrate, Own Folder badge, footnote, Camera Control row, all effect chips and the Processing switch.
-- **Strip, fixed rows:** header · record row · folder and time left, with read-only format · output row · meters. Rows never appear or vanish, so nothing moves under the pointer.
-- **Output row:** Cut slot, then "Output 1080p · 4:2:0 8-bit · 29.97 · In use", then one Effects menu holding LUT, Resize, Color, Frame rate and Processing. Two deliberate clicks, because each one renegotiates what Zoom is receiving. D2 still holds: no prompt.
-- **One clock per camera.** Pressing Record must not resize the picture.
+- **Picture at rest:** name, tally, REC pill, one tools button and any active tools. The full bar appears on hover **in every state**, not only live, or the `b621bc7` bug returns. The REC pill never truncates.
+- **Program View:** loses the cut bar and Recent Cuts. Tiles get full-width Cut buttons.
+- **Strip removed:** On Air badge, Stop Camera button (moves to ⋯), size and bitrate, Own Folder badge, footnote, Camera Control row, effect chips, Processing switch.
+- **Strip rows, fixed:** header · record row · folder, time left and read-only format (or the problem) · output row · meters. Nothing appears or vanishes, and pressing Record doesn't resize the picture.
+- **Output row:** Cut slot, then "Output 1080p · 4:2:0 8-bit · 29.97 · In use", then a **LUT toggle**, then one **Effects menu** holding Resize, Color, Frame rate, Camera Display and Effects Off. The LUT toggle is one click because it changes pixels, never the format. Everything in the menu changes what Zoom receives, so it takes two deliberate clicks. D2 holds: no prompt. Below 440 pt the output line shortens to "1080p 29.97 · In use".
+- **One clock per camera.** Clean View plus a collapsed strip keeps the digits.
+- **Signal badge:** shows a dropout count above zero, so a problem with no take rolling still leaves a trace.
 
 ### Right: inspector
 
-Setup only, closed during live work. Order follows the signal: Source, Camera Control, LUT, Effects, Recording, Automation, Rename and Remove. One row per effect, merging each checkbox with its value. Sync cameras lives only here, with a confirmation naming the source camera, because turning it on rewrites other cameras' effects.
+Setup only, closed during live work. Order follows the signal: Source, Camera Control, LUT, Effects, Recording, Automation, Rename and Remove. One row per effect, merging each checkbox with its value. Add Remove LUT, which doesn't exist per camera today. Sync cameras lives only here, with a confirmation naming the source camera, because turning it on rewrites other cameras' effects. Its help must state that it also copies source declarations and preview, which it does today.
 
 ### Toolbar
 
-`[1 Camera 1] [2 Camera 2] | [Auto ▾] [Hold]` ... `[Start Cameras, only when needed]` `[● Stop 2 Recordings ▾]` | `[layouts]` | `[inspector]`
+`[1 Camera 1] [2 Camera 2] [Auto Off ⌄] [Hold]` · `[Start Cameras, only when needed]` `[● Stop 2 Recordings ⌄]` · `[layouts] [inspector]`
 
-- **Auto** gets a word on it, plus a menu with Strategy, Anchor and Emphasis. This is the only Auto control on screen.
-- **Hold** appears beside Auto when Auto is on, for every strategy, with ⌃⌥H.
-- **Stop Cameras is gone while running.** It stays at ⌘↩, in the Camera menu and in the menu bar. That ends the same-glyph confusion with Stop All Recordings.
-- **Record menu** offers Format, Record Camera 2 and Pause All.
-- **Red dots, not red fills,** because prominent tints go gray when the window isn't key, which is all of a meeting.
+- **Auto** is a toggle reading "Auto On" or "Auto Off" at fixed width, plus a chevron menu for Strategy, Anchor and Emphasis. It must not rely on a tint, which goes gray whenever the window isn't key. With Manual selected, clicking Auto opens the strategy menu.
+- **Hold** is always present, disabled when Auto is off, so nothing shifts under the pointer. ⌃⌥H. Hold for Fixed Interval needs engine work, which is in phase 3.
+- **Stop Cameras is gone while running.** It stays at ⌘↩, in the Camera menu and in the menu bar. "Start Camera 2" shows when only one is stopped.
+- **Record** is a button plus chevron menu: Format, Record Camera 2, Pause All.
+- **Red dots, not red fills.** Group these on three pieces of glass.
+- **Check on macOS 27:** `NavigationSplitView` plus `.inspector` is reported to jump and crash there. This is unverified, and it's the main window's structure.
 
 ### Status bar
 
-Problems first, then Virtual Cameras, Program, Recording, Audio. Session clock lives here. "Audio OK" becomes "Audio 2 of 2". Drop memory and "(video)".
+Problems first, then Virtual Cameras, Program, Recording, Audio.
+
+- **Program segment:** "Camera 1 · shot 8 s · Auto", and after an override "Camera 1 · shot 3 s · Auto in 4 s".
+- **Recording:** the session clock lives here.
+- **Audio:** "Audio OK" becomes "Audio 2 of 2".
+- **Resources:** drop memory and "(video)".
 
 ### Menu bar
 
-Run the session with the window hidden, in 14 rows or fewer. Order: card, problems with actions, cuts, Auto, Hold, record per camera, format, one time-left line per drive, camera submenus, Open, Settings, Quit. **No row may depend on the window's selection**, which removes top-level Processing, Video Preview and Start with Camera Apps.
+Run the session with the window hidden. Fourteen rows or fewer when healthy; problem rows don't count against that, and all drives share one row. Order: card, problems with actions, cuts, Auto, Hold, record per camera, Pause All, format, time left, camera submenus, Start or Stop Cameras, Open, Settings, Quit.
 
-## 6. Settings window
+**No row may depend on the window's selection.** That removes top-level Processing, Video Preview, Start with Camera Apps and Show Live Preview's selected-camera logic. LUT becomes a direct row in each camera submenu.
 
-**Rebuild as a sidebar window like System Settings.** Fixed 820 pt wide, default height 620, resizable in height, with no per-pane heights. Each pane scrolls, so the window never jumps. It reopens where you left it. Layout rules, row kinds and help-text rules are in 06 section 8.
+### Background shortcuts
+
+Off by default, set in Settings › General. Uses `RegisterEventHotKey`, which needs no Accessibility permission. Defaults: ⌃⌥⌘1 to ⌃⌥⌘7 for cuts, ⌃⌥⌘A Auto, ⌃⌥⌘H Hold, ⌃⌥⌘R Record. **Global Record only starts, never stops,** because a stray chord must not end a take. A Stream Deck can send these with no Ultracam work.
+
+### Copy
+
+Follow 06 section 5, with two changes: the noun is **Effects**, and **Program color keeps its name**, because it has no effect outside Program. "Feed" leaves all six user-visible strings.
+
+## 7. Settings window
+
+**Rebuild as a sidebar window like System Settings.** Fixed 820 pt wide, default height 620, resizable in height, no per-pane heights. It deviates from the HIG's toolbar panes the way System Settings does, because hardware rows vary in number and a window that resizes between panes, or during an edit, moves controls under the pointer. Keep the `Settings` scene. If the first build fails its three checks (full-height sidebar, height-only resizing, title follows the section), switch to a plain `Window` with ⌘, replaced; the recipe is in validation D. Row kinds and help-text rules: 06 section 8.
 
 | Section | Contains |
 |---|---|
-| **General** | Show Ultracam in, Open at login, Ask before ending a recording or on-air video |
-| **Devices** | Every capture device and camera body, grouped by vendor (section 7) |
-| **Virtual Cameras** | Extension status, Install, Update, Remove |
-| **Recording** | Folder table with default and per-camera rows, file-name pattern and preview, camera subfolders |
-| **Audio** | **Channels shown** and loudness pair per camera, true-peak warning level |
-| **Switching** | Program color, Fixed interval, Natural talking head timing, Advanced cut decisions |
-| **Monitoring** | Scope refresh rate |
-| **Alerts** | Which events notify, sound, low-space levels, background shortcuts |
-| **Advanced** | Allow CPU conversion, Copy Diagnostics, Forget Saved LUTs, Reset |
+| **General** | Show Ultracam in, Open at login, Ask before ending a recording or on-air video, background shortcuts |
+| **Hardware** | Every capture device and camera body, grouped by vendor (section 8) |
+| **Virtual Cameras** | Extension status, Install, Update, Remove, Program color |
+| **Recording** | Timecode, folder table with default and per-camera rows, file-name pattern and preview, camera subfolders |
+| **Audio** | **Channels Shown** per camera, true-peak warning level |
+| **Switching** | Fixed interval, Natural talking head timing, Advanced cut decisions, Restore Defaults |
+| **Alerts** | Which events notify, sound, low-space level, real notification permission state, Turn On Alerts |
+| **Advanced** | Allow CPU conversion, Forget Saved LUTs, Reset |
 
-**Leaves Settings:** Layout and New Camera Strips (no real use), Output mode, Sync cameras, Backup Recording placeholder, Dynamic analysis placeholder, Monitor prose (to Help), Codec and Timecode (to the main window), Crash Recovery (to Attention).
+**Leaves Settings:** Layout and New Camera Strips (neither does anything useful), Output mode, Published Cameras, Sync cameras, Strategy, Backup Recording and Dynamic Analysis placeholders, Monitor prose (to Help), Codec (to the main window), Crash Recovery (to Attention), the drive meter, Open and Copy Diagnostics (Diagnostics window). Scope refresh goes in the Scopes popover, because it's per camera.
 
-**Channels shown.** Per camera, because embeds differ by source. It is a per-camera table in Settings, like the Recording folder table, because you asked for it there and it is set once per rig. That makes it the exception to the inspector rule in section 5. Values: As Detected, 2, 4, 8, 16. "As Detected" is measured, because DeckLink reports only maximums: it means the highest pair that has carried signal since capture started, and it only grows. The meter block stays 44 pt tall at every value, so strip height never changes. Hidden channels are still metered and recorded, and an over on a hidden channel still lights OVER. Collapsed strips always show the loudness pair. The right-click menu on a meter offers the same choice.
+Removing "Coming later" rows reverses the rule at `docs/ui-polish/BRIEF.md:36` and `PLAN.md:23`. That's deliberate: a promise isn't a control.
 
-Today's reality: 8 channels are captured, recorded and metered, loudness reads channels 1-2, and the virtual cameras and Program carry no audio. On this rig 3-8 are silent, so "As Detected" shows 2. Detail: 05 Part A.
+### Channels Shown
 
-## 7. Hardware awareness
+- **Scope:** per camera, because embeds differ by source. As Detected is the built-in default.
+- **Values:** As Detected, 2, 4, 8, 16. Nothing is disabled, because a stopped camera has no count. A running camera reads "Showing 2 of 8".
+- **As Detected** is measured, because DeckLink reports only maximums. It's the smallest tier covering the highest pair that has carried signal (true peak above −90 dBTP) while metered since capture started. It only grows. On this rig it shows 2.
+- **Height:** the meter block stays 44 pt at every value, so the strip never changes. 4 and below print each pair's maximum. 8 and 16 print one line, "Highest 3–4 −5.7 dBTP", because the 8-channel readout overflows a narrow strip.
+- **Hidden channels** are still metered and recorded, and an over on one still lights OVER, with its channel named in help.
+- **Collapsed strips** always show channels 1-2.
+- **Right-click on a meter** offers the same choice. This needs a MonitorKit input, because the meter owns its menu.
 
-The data mostly exists in `VendorRegistry`, but `AppHardware` flattens it to IDs, names and a warning string. Connectors, SDK version and the signal hint have no UI reader. Idle devices have no status, "in use elsewhere" appears only after Start, and a Sony drop raises no warning.
+Today's reality: 8 channels are captured, recorded and metered. Loudness and Auto read channels 1-2. Virtual cameras and Program carry no audio. Channels 3-8 were silent start to finish on both 12:24 takes.
 
-**Settings › Devices.** One section per vendor, in registry order, with expandable rows: health, name, assigned camera, state, link. Includes **expected hardware that is absent**, by last known name. This rig has two identical Mini Recorder 12Gs, so per-device nicknames matter.
+## 8. Hardware awareness
 
-- **Pairing moves here.** The assignment pop-up is the pairing control, and sign-in opens inline. The Camera Control sheet keeps one job: operating a connected body.
-- **Input connector and Advertise HDR** move here from Advanced. These can drop the signal, so ask first when the device is in use.
-- **Main window shows hardware through the left pane and problems.** No extra strip row.
-- **Plugin API additions:** idle-readable device status, typed facts and problems, control telemetry tags, a control vendor snapshot, and a plugin-supplied missing-device hint. Vendor names stay out of `Sources/App`, which `scripts/check-vendor-boundaries.py` enforces.
-- **A USB 3 fallback unit cannot be detected.** DeckLink never lists it, so the symptom is a saved input gone missing. The missing-device hint should say to check the hub. An "HDMI · USB 3" chip cannot work.
-- **Rig presets: not now.** Everything a preset would hold already persists.
+The data mostly exists in `VendorRegistry`, but `AppHardware` flattens it to IDs, names and a warning string. Idle devices have no status, "in use elsewhere" appears only after Start, and a Sony drop raises no warning.
 
-A build without the Sony SDK must read as normal, with no warnings.
+**Settings › Hardware.** One section per vendor, in registry order, with expanding rows: health, name, assigned camera, state, link. This rig has two identical Mini Recorder 12Gs, so nicknames matter.
 
-## 8. Recording format
+- **Includes absent hardware,** limited to anything a camera is assigned to, by last known name. This is this rig's real failure: a USB 3 fallback unit never appears in DeckLink, so the symptom is a saved input gone missing. A plugin hint says to check the hub. An "HDMI · USB 3" chip can't work.
+- **Pairing moves here.** The assignment pop-up is the pairing control, and sign-in opens inline. Find Camera Bodies scans on request only. The Camera Control sheet keeps operating a connected body and keeps Reconnect, which also appears in Attention and the inspector.
+- **Input connector, Advertise HDR and Supported Formats** live on the capture device's row. The first two can drop the signal, so ask first when the device is in use. Supported Formats uses human names, not `1001/60000 s`.
+- **Setup block on each paired body.** This is the answer to "sony blackmagic configurations". Read-only facts about how the body meets the capture device: HDMI format, camera display, timecode out, audio on HDMI, picture profile. An advisory appears only when facts conflict, such as a body on S-Log3 with a camera declared Rec.709, with one action. No automatic changes, no per-model defaults. Vendor knowledge stays in the plugin.
+- **Idle status** is polled every 2 s on the registry queue, only while the window or Hardware is visible, and only for devices with no Ultracam session. It never selects a connector, which would renegotiate HDMI. Device subscriptions are unproven, so none are added.
+- **Sony:** read overheating and the battery's display unit, since a low-battery warning must not treat 78 minutes as 78%. Handle `OnWarning`, which is dropped today. A lost body gets a notice, and low battery or overheating raises a problem. Battery warns only when the unit is known.
+- **Plugin API additions:** cached device status with an observer, typed facts and problems, device model, a missing-device hint, control property roles with severity and a suggested source profile, a notice event, and optional model and firmware on a camera body. The control snapshot, chips and action URLs are dropped as unneeded. Vendor names stay out of `Sources/App`, enforced by `scripts/check-vendor-boundaries.py`.
+- **Main window:** hardware shows in the left pane, plus problems. No extra strip row. The strip's logo stops hiding Blackmagic when Sony is assigned, and the signal badge's menu names both links.
+- **A build without the Sony SDK** must read as normal, with no warnings.
 
-**Format is in the left pane's Recording section, the Record toolbar menu, the Record app menu and the menu bar.** Each strip shows its camera's format read-only, so closing the sidebar loses nothing. It applies to the next take. A rolling camera shows its take's own format, read-only.
+**Rig presets: not now.** One rig, one Mac, and everything a preset would hold persists once B1 lands.
 
-The menu shows each codec with its real rate and the time left on this drive, for this source. A camera whose source cannot use the choice takes the nearest format, shown in orange on its strip ("ProRes 4444 → ProRes 422 HQ"), so the UI never fails a take for something it already knew. Fallback table: 05.
+## 9. Recording format
 
-**Program is not recorded.** A streaming session leaves per-camera originals and a cut list. The UI should say so plainly. A real Program recording needs its own design, including whose audio it carries, so it stays out of this plan with no placeholder.
+**Format is in the left pane's Recording section, the Record toolbar menu, the Record app menu and the menu bar.** Each strip shows its camera's format read-only, so closing the sidebar loses nothing. It applies to the next take. A rolling camera shows its take's own format, which needs a new `takeCodec`.
 
-## 9. Conflicts between reports, settled
+**One format for all cameras.** On the evidence: both paired sessions matched in codec and drive, every take over 10 minutes is HEVC, and both sources are identical. Every HQ take is under 5 minutes, so HQ looks like the launch default rather than a choice. Per-camera can be added later with no migration.
+
+The menu shows each codec with its rate per camera for the current sources, plus time left: the shortest across drives in use, counting every camera assigned to each. A codec no current source can use is disabled. **The estimates must ship first,** or HEVC reads about 11 times too high.
+
+If a camera's source later can't use the choice, it takes the nearest format, because a missed take can't be recovered and an unexpected codec can. That shows in orange on the strip ("ProRes 4444 → ProRes 422 HQ"), in the REC popover, the record button's help, an Attention row with its rate and time left, and the take's note. The rate must follow the codec that actually records: HEVC falling back to ProRes 4444 is roughly 50 times the data. Fallback table: 05. `record(feedID:)` needs a closure to read the source, as it doesn't know it today.
+
+**Timecode** stays in Settings › Recording, shown as a caption in the sidebar. It's set once per rig once B1 saves it.
+
+**Program is not recorded.** A streaming session leaves per-camera originals and a cut list, and the UI should say so. A real Program recording needs its own design, including whose audio it carries, so it stays out with no placeholder.
+
+## 10. Conflicts settled
 
 | Question | Reports | Decision and why |
 |---|---|---|
-| Format scope | 05 per camera with default. 02, 03 global | **Global for now.** It is one control instead of a new override on every surface, and fallback already handles mismatched sources. Per-camera can be added later; see section 12 |
-| Channels shown home | 05 inspector | **Settings › Audio.** Your sentence puts it in the Settings window. The meter's right-click menu is the live shortcut |
-| Effect chips | 02 move to inspector. 06 Effects menu on the strip | **06's menu,** with Processing inside it. No always-visible switch, because Processing is the biggest single change a click can make to a live meeting |
-| Toolbar Stop Cameras | 02 remove. 06 keep and rename | **02.** Fewer controls, and it removes the hazard instead of labeling it |
-| Tool bar at rest | 02 active tools. 06 one button | **Both:** one button plus active tools |
-| ⋯ menu | 02 trim. 03 remove on expanded strips | **Trim.** Stop Camera moves into it |
-| Strip Cut button | 02 keep. 03 remove | **Keep** in a fixed slot. In Side by Side, eyes are on the pictures |
-| Hardware on the strip | 04 source row. 02 sidebar rows | **Sidebar.** The strip already has too many rows, and problems surface as warnings. 04's camera menu still names both links |
-| Strategy home | 02, 03 sidebar. 06 toolbar | **Toolbar Auto menu.** The sidebar shows it read-only, so there is one control |
-| Output mode | 03 keep in sidebar | **Removed,** per 01. 03 assumed the mode would stay |
-| Settings structure | 03 six panes. 04 Devices tab | **Nine sidebar sections.** 03's and 06's sidebar with 04's Devices |
-| Director tuning sliders | 03 remove from UI | **Keep** under Advanced in Settings › Switching. You said the feature set is how you want it, and they cost nothing there |
+| Format scope | 05 per camera. 02, 03 global | **Global.** Confirmed by the take evidence (validation E) |
+| Timecode home | 03, 05 sidebar. C Settings | **Settings,** with a sidebar caption. Set once per rig, and two pickers don't fit a 236 pt pane |
+| Channels Shown home | 05 inspector | **Settings › Audio.** Your sentence names the Settings window |
+| Effect chips | 02 inspector, 06 menu | **LUT toggle plus Effects menu.** LUT is the panic control; the rest change Zoom's format |
+| Stop Cameras | 02 remove, 06 keep | **Remove.** Also fixes a double-click on Start landing on Stop |
+| Tool bar at rest | 02 active tools, 06 one button | **Both** |
+| ⋯ menu | 02 trim, 03 remove | **Trim.** Stop Camera moves into it, and Monitor LUT moves to the Picture popover |
+| Strip Cut | 02 keep, 03 remove | **Keep** in a fixed slot. Eyes are on the pictures |
+| Hardware on the strip | 04 source row, 02 sidebar | **Sidebar** |
+| Strategy home | 02, 03 sidebar. 06 toolbar | **Toolbar Auto menu.** One control; the sidebar reads it |
+| Publish Program | 01 always, B at 2+ | **At 2+.** A device add is harmless, and one camera has nothing to switch |
+| Show Switching Controls | 01 keep, B drop | **Drop** |
+| Return to eligibility | A 3 s, C 5 s | **5 s** |
+| Hold under signal loss | A stays on, C clears | **Overrides once, stays on** |
+| Low-drive estimates | C phase 1, E phase 3 | **Phase 1.** A false alarm teaches you to ignore the real one |
+| Background shortcuts home | 02, D Alerts. E General | **General.** It isn't an alert |
+| Settings structure | 03 six, 04 Devices, E eight | **Eight sidebar sections,** named Hardware |
+| Copy Diagnostics | 03 remove | **Removed from Settings.** It's in the Diagnostics window |
+| Supported Formats | 03 device, 04 inspector | **Hardware row.** A device fact |
+| Pairing | 03 inspector, 04 Hardware | **Hardware.** Reconnect stays near the camera |
+| Director tuning | 03 remove | **Keep** under Advanced. You said the feature set is how you want it |
 
-## 10. Prior decisions
+## 11. Prior decisions
 
 | Decision | Status |
 |---|---|
 | D1, click selects and never cuts | Holds |
-| D2, format changes without prompt | Holds; controls move off the live surface |
+| D2, format changes without prompt | Holds; those controls move off the live surface, except LUT |
 | D3, Stop Camera and Stop All Cameras | Holds; placement changes |
 | D4, no orange skipped ring | Holds |
 | D5, ⋯ menu plus on-demand inspector | Holds; ⋯ shrinks |
-| D6, backup automation rules | Holds; placeholder rows go until it is built |
-| D7, one visible selection | Holds in the window; the menu bar no longer depends on it |
-| D8, keep time left, takes, Saved; no app names | Holds; the sidebar stops repeating recording state |
+| D6, backup automation rules | Holds; placeholder rows go until it's built |
+| D7, selection and focus merged | **Revised.** A click or window activation no longer focuses a picture, and focus no longer selects, because it could silently move the target of ⌘R. The menu bar stops depending on selection |
+| D8, time left, recent takes, director timeline, Saved, no app names | Holds; the sidebar stops repeating recording state |
+| `b621bc7`, tool bar findable at rest | Holds through the always-present tools button |
 | Left sidebar as V1 session panel | **Revised** to the session board |
 | `UI_REDESIGN.md:105,226`, output locked while running | **Overridden** |
 
-## 11. Order of work
+## 12. Order of work
 
-Each phase can ship alone.
+**These phases run in order.** The first plan's "each phase can ship alone" was wrong: the journal fix alone just moves the failure, and the tally fix alone turns tally off.
 
 | Phase | Work | Size |
 |---|---|---|
-| **0. Stop losing material** | Journal fix, B1, B7, B8, B11, B15 | Hours |
-| **1. Live alerts** | Section 4, B5, B12, B13, ship with fixtures for 8-channel strips and a camera-control store so renders match the app | 1 to 2 days |
-| **2. ISO and Program** | 01's order: topology rules, demand core, publish both, GPU gate, docs. Includes B6 | 3 to 5 days |
-| **3. Main window** | Section 5, format control, copy pass, color system, contrast | 3 to 4 days |
-| **4. Settings** | Section 6, channels shown, B9, B10, B14 | 2 to 3 days |
-| **5. Hardware** | Section 7, plugin API first | 3 to 5 days |
+| **0. Stop losing material** | Find why connections fail. Journal fix with N2, then N1, publish whole movies, failure log line, B1, B7, B8, B11, B15. Ends with a live take over 3 hours crossing a dropout | About 1 day, plus the live take |
+| **1. Tell the truth live** | N3 typed signal first. Always-on demand monitor, then B5 with the new tally. Problem list, unexpected stops, B4 failover, notifications and panel, B9, B10, B12, B13, B16, B17, B18. Fixtures with 8 channels and a camera-control store, so renders finally match the app | 3 to 4 days |
+| **2. ISO and Program** | In order: topology rules. Late sink with Zoom testing on today's Program path. Sinks by route with the release hold. Always-on scheduler, publish at 2+, retire the mode. GPU gate. Docs | 7 to 10 days, plus two sessions with you |
+| **3. Main window** | Section 6, format control, background shortcuts, Hold for all strategies, copy pass, color system, contrast | 4 to 5 days |
+| **4. Settings** | Section 7, Channels Shown, B14, scope refresh picker | 3 days |
+| **5. Hardware** | Section 8, plugin API first, Setup block, B19 | 3 to 5 days |
 
-Sizes other than phase 2 are rough estimates of mine.
+Sizes are estimates. In phase 2, test the late-sink change against real Zoom before sinks follow demand, because that gives evidence before every ISO user depends on it.
 
-## 12. What needs you
+## 13. What needs you
 
-**Live checks only you can run**, when Ultracam is not serving a meeting:
+**Decisions made here that you may want to reverse:**
 
-1. Zoom holding a camera through the upgrade to always-published, and whether it needs a restart to list Program.
-2. Program in Zoom plus ISO in a second app at 4K, and time to first frame on a client joining a running camera.
-3. Unplug HDMI on the on-air camera, to confirm B4.
-4. A notification during a full-screen meeting.
-5. Sony control on a real FX3: which fields it reports.
-6. Whether the OWC hub was in the same wiring at 13:59:04 on 2026-10-30. Both units now sit behind it, which makes it a lead for the simultaneous drop, not a finding.
+1. Signal loss overrides Hold once.
+2. Program is published only with 2+ cameras.
+3. Cut buttons always show with 2+ cameras, with no hide option.
+4. One format for all cameras.
+5. Stop Cameras leaves the toolbar while running.
+6. Program recording stays out of scope.
+7. Not included: starting a new take automatically after a failed one.
 
-**Decisions made here you may want to reverse:** format is global, not per camera (section 9); Stop Cameras leaves the toolbar while running; Program recording stays out of scope.
+**Live checks only you can run,** with Ultracam not serving a meeting:
+
+1. Before phase 0 ends: a take of 3 hours or more that crosses a dropout.
+2. Whether a meeting app gets a real picture today, given the failed connections.
+3. **Click-through:** with Zoom frontmost, does the first click on Cut or Record act, or only activate Ultracam? If it only activates, every "one click" costs two until fixed.
+4. Unplug HDMI on the on-air camera, after N3.
+5. Toggle the LUT with Zoom on Program and on Camera 1, and check for a visible blip.
+6. Full-screen Zoom, with and without sharing the screen: notifications and panel, with Ultracam's window open and closed, and what viewers can see.
+7. Zoom through the upgrade: does it need a restart to list Program, what format does it pick, and how does it react to a format change under its lease?
+8. Program in Zoom plus ISO in a second app at 4K, with time to first frame.
+9. Settings from the menu bar 20 times, and the sidebar checks.
+10. ⌃⌥⌘ shortcuts with Zoom frontmost.
+11. A real FX3: which fields it reports, and whether it can embed more than two audio channels.
+12. Whether the OWC hub was in the same wiring at 13:59:04 on 2026-10-30. Both units sit behind it now. It's a lead for the simultaneous drop, not a finding.
