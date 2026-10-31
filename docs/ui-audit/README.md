@@ -11,6 +11,7 @@ This file is the decision record. Where anything below it disagrees, this file w
 | [03](03-feature-inventory-and-placement.md) | 141 capabilities: every surface, one home, shortcuts, hardcoded values |
 | [04](04-vendor-and-hardware.md) · [05](05-audio-and-recording-format.md) · [validation E](validation/E-settings-audio-hardware.md) | Hardware, audio, recording format, Settings contents |
 | [06](06-visual-polish-and-native.md) · [validation D](validation/D-platform-feasibility.md) | 39 visual findings, color system, copy pass, and what macOS actually allows |
+| [07](07-visual-language.md) | Every surface's symbols, type levels and reusable components, with symbol names checked for macOS 26 |
 | [validation A](validation/A-defects-and-fixes.md) | Every defect and fix, re-derived, with the journal rule replayed on the real take files |
 | [validation F](validation/F-fact-check.md) | 104 claims checked: 73 correct, 21 partly right, 4 wrong, 6 unverifiable |
 
@@ -297,6 +298,18 @@ Run the session with the window hidden. Fourteen rows or fewer when healthy; pro
 
 Off by default, set in Settings › General. Uses `RegisterEventHotKey`, which needs no Accessibility permission. Defaults: ⌃⌥⌘1 to ⌃⌥⌘7 for cuts, ⌃⌥⌘A Auto, ⌃⌥⌘H Hold, ⌃⌥⌘R Record. **Global Record only starts, never stops,** because a stray chord must not end a take. A Stream Deck can send these with no Ultracam work.
 
+### Visual language
+
+Too much of the app is plain lines of text joined by dots, so state has to be read instead of seen. Report 07 redraws every surface. Nothing in it adds a click, hides a control or removes information. It adds no layout changes of its own.
+
+- **One symbol per noun, everywhere.** Hold is a pin, because a raised hand means something else in a meeting. Program is `tv`, Cut is `arrow.left.arrow.right`. Zebra and Clip get their own marks, so a triangle only ever means a warning.
+- **Icon plus value replaces dot-joined text.** Formats become chips. Drives, battery and shot time get level glyphs and bold values.
+- **The number is the strong element.** Labels and units are small and dim, and digits are monospaced. Two new type levels: `uiTally` and `uiValueStrong`.
+- **State is symbol plus color, never color alone.** Green check for a virtual camera in use, gray ellipsis for not in use. No red text.
+- **Icons stop where they stop helping.** Words stay on anything that ends something, on problem sentences, tally words, CPU and GPU, form rows, app menus and Help (07 section 5).
+
+Each surface's changes ship in the phase that rebuilds it. Render checks are needed for the Zebra and Clip marks at 13 pt, and for menu bar badges beside shortcuts.
+
 ### Copy
 
 Follow 06 section 5, with two changes: the noun is **Effects**, and **Program color keeps its name**, because it has no effect outside Program. "Feed" leaves all six user-visible strings.
@@ -415,7 +428,7 @@ If a camera's source later can't use the choice, it takes the nearest format, be
 | **0. Stop losing material** | Confirm the restart clears the failed connections. Journal fix with N2, then N1, publish whole movies, failure log line, B1, B7, B8, B11, B15. Ends with a live take over 3 hours crossing a dropout | About 1 day, plus the live take |
 | **1. Tell the truth live** | N3 typed signal first. Always-on demand monitor, then B5 with the new tally. Problem list, unexpected stops, B4 failover, notifications and panel, B9, B10, B12, B13, B16, B17, B18. Fixtures with 8 channels and a camera-control store, so renders finally match the app | 3 to 4 days |
 | **2. ISO and Program** | In order: topology rules. Late sink with Zoom testing on today's Program path. Sinks by route with the release hold. Always-on scheduler, publish at 2+, retire the mode. GPU gate. Docs | 7 to 10 days, plus two sessions with you |
-| **3. Main window** | Section 6, format control, background shortcuts, Hold for all strategies, copy pass, color system, contrast | 4 to 5 days |
+| **3. Main window** | Section 6, format control, background shortcuts, Hold for all strategies, visual language, copy pass, color system, contrast | 4 to 5 days |
 | **4. Settings** | Section 7, Channels Shown, B14, scope refresh picker | 3 days |
 | **5. Hardware** | Section 8, plugin API first, Setup block, B19 | 3 to 5 days |
 
