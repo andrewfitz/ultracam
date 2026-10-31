@@ -54,7 +54,7 @@ Both 12:24 takes failed at 12:43 on the same frame count. They are complete 18:5
 1. Journal a native label only when it can't be predicted: the first two frames, any gap or pause, any change of rate, epoch or drop-frame flag, or any frame whose label minus the label two frames back differs from the current stride. The stride starts at 2, which fits both 1:1 and paired counters. Variable-rate labels stay per frame. Code is in validation A.
 2. Metadata must never end a take. The writer calls a non-throwing `journal(_:)`. Label and timing records stop at 15 MiB, clock and audio records may use the last 1 MiB, and anything past that is counted and dropped. The sidecar and the take's note both say so. `RecordingTakeLifecycleChecks:152-178` must be rewritten.
 
-After this, the journal lasts about 595 hours at this rig's rate, and the limits are disk and signal. **No take has ever finished past 89 minutes, so run one take of 3 hours or more that crosses a dropout before trusting long sessions.**
+After this, the journal lasts about 595 hours at this rig's rate, and the limits are disk and signal. **The longest take on record is 101 minutes, so run one take of 3 hours or more that crosses a dropout before trusting long sessions.**
 
 ### A failed take still reads as recording (N1)
 
@@ -70,9 +70,11 @@ After this, the journal lasts about 595 hours at this rig's rate, and the limits
 
 ### Virtual camera connections are failing
 
-**Verified in the log, cause unknown.** All 12 `Camera connect failed` lines today, with none succeeding, 11:23 to 12:33, on both cameras. Each failed within about a millisecond at the provider lookup (`VirtualCameraRegistryTransport.swift:88`), though the extension shows active at build 10. The failure shows only in Diagnostics. Whether a meeting app was affected is unknown.
+**Verified in the log.** All 12 `Camera connect failed` lines today, with none succeeding, 11:23 to 12:33, on both cameras, each saying to install and enable the extension. The failure shows only in Diagnostics.
 
-**Investigate first,** because every part of section 4 uses this path.
+**Likely cause, not proven: a pending restart.** The system camera list shows the UltraStudios and OBS but no Ultracam camera, though `systemextensionsctl` shows build 10 activated and enabled. Build 10 landed on 2026-10-30 at 01:27 and the Mac last restarted on 10-25. That matches the app's own "enabled, not started until a restart" state. The camera list was read with Ultracam closed. The failing line is traced to the provider lookup (`VirtualCameraRegistryTransport.swift:88`), not confirmed by a log line. Whether the app's restart banner showed is unknown.
+
+**Restart the Mac, then confirm an Ultracam camera appears in Zoom.** If it doesn't, this is a real transport bug and comes first, because every part of section 4 uses this path. Either way, a connect failure must reach the main window, not just Diagnostics.
 
 ### Until this is fixed
 
@@ -80,7 +82,7 @@ Treat ISO recording in the installed build as unreliable.
 
 - Set Timecode to Source before every take and after every launch. This relies on the first frame carrying a label. It does nothing about N2.
 - Watch the status bar during a take. The strip will not show a failure.
-- Check that Zoom shows a real picture before relying on it.
+- Restart the Mac, then check that Zoom lists an Ultracam camera and shows a real picture.
 
 ## 3. Other defects
 
@@ -412,7 +414,7 @@ If a camera's source later can't use the choice, it takes the nearest format, be
 
 | Phase | Work | Size |
 |---|---|---|
-| **0. Stop losing material** | Find why connections fail. Journal fix with N2, then N1, publish whole movies, failure log line, B1, B7, B8, B11, B15. Ends with a live take over 3 hours crossing a dropout | About 1 day, plus the live take |
+| **0. Stop losing material** | Confirm the restart clears the failed connections. Journal fix with N2, then N1, publish whole movies, failure log line, B1, B7, B8, B11, B15. Ends with a live take over 3 hours crossing a dropout | About 1 day, plus the live take |
 | **1. Tell the truth live** | N3 typed signal first. Always-on demand monitor, then B5 with the new tally. Problem list, unexpected stops, B4 failover, notifications and panel, B9, B10, B12, B13, B16, B17, B18. Fixtures with 8 channels and a camera-control store, so renders finally match the app | 3 to 4 days |
 | **2. ISO and Program** | In order: topology rules. Late sink with Zoom testing on today's Program path. Sinks by route with the release hold. Always-on scheduler, publish at 2+, retire the mode. GPU gate. Docs | 7 to 10 days, plus two sessions with you |
 | **3. Main window** | Section 6, format control, background shortcuts, Hold for all strategies, copy pass, color system, contrast | 4 to 5 days |
@@ -436,7 +438,7 @@ Sizes are estimates. In phase 2, test the late-sink change against real Zoom bef
 **Live checks only you can run,** with Ultracam not serving a meeting:
 
 1. Before phase 0 ends: a take of 3 hours or more that crosses a dropout.
-2. Whether a meeting app gets a real picture today, given the failed connections.
+2. After a restart: does an Ultracam camera appear in Zoom with a real picture?
 3. **Click-through:** with Zoom frontmost, does the first click on Cut or Record act, or only activate Ultracam? If it only activates, every "one click" costs two until fixed.
 4. Unplug HDMI on the on-air camera, after N3.
 5. Toggle the LUT with Zoom on Program and on Camera 1, and check for a visible blip.
