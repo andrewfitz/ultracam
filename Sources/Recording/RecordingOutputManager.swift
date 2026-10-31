@@ -96,6 +96,70 @@ public enum RecordingOutputError: Error, Equatable, LocalizedError, Sendable {
   }
 }
 
+/// How a take's file is named: the pieces in order, joined by "_", then the take's session ID,
+/// which keeps two takes from ever sharing a path (two managers may share a folder). With
+/// camera subfolders each camera's takes go in a folder with its name; without, they sit in
+/// the recording folder itself. Settings › Recording edits it; it applies to the next take.
+public struct RecordingFileNaming: Codable, Equatable, Hashable, Sendable {
+  public enum Token: String, CaseIterable, Codable, Hashable, Sendable {
+    case camera, date, time, take
+
+    public var title: String {
+      switch self {
+      case .camera: return "Camera"
+      case .date: return "Date"
+      case .time: return "Time"
+      case .take: return "Take"
+      }
+    }
+  }
+
+  /// Each token at most once. Empty names the file by its take number.
+  public var tokens: [Token] {
+    didSet { if Set(tokens).count != tokens.count { tokens = Self.unique(tokens) } }
+  }
+  public var cameraSubfolders: Bool
+
+  public static let standard = RecordingFileNaming(tokens: [.camera, .date, .time, .take], cameraSubfolders: true)
+
+  public init(tokens: [Token], cameraSubfolders: Bool) {
+    self.tokens = Self.unique(tokens)
+    self.cameraSubfolders = cameraSubfolders
+  }
+
+  private static func unique(_ tokens: [Token]) -> [Token] {
+    var seen = Set<Token>()
+    return tokens.filter { seen.insert($0).inserted }
+  }
+
+  /// The name before the session ID: "Camera 1_2026-10-30_14-22-31_001".
+  public func stem(camera: String, date: Date, take: UInt64, timeZone: TimeZone = .current) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = timeZone
+    let number = String(format: "%03llu", take)
+    let pieces = (tokens.isEmpty ? [.take] : tokens).map { token -> String in
+      switch token {
+      case .camera: return camera
+      case .date:
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+      case .time:
+        formatter.dateFormat = "HH-mm-ss"
+        return formatter.string(from: date)
+      case .take: return number
+      }
+    }
+    return pieces.joined(separator: "_")
+  }
+
+  /// Where a take lands under the recording folder, as Settings previews it.
+  public func relativePath(camera: String, date: Date, take: UInt64, sessionID: UUID, fileExtension: String = "mov") -> String {
+    let name = "\(stem(camera: camera, date: date, take: take))_\(sessionID.uuidString).\(fileExtension)"
+    return cameraSubfolders ? "\(camera)/\(name)" : name
+  }
+}
+
 /// Configuration for a recording output catalog. Every session reserves its
 /// expected bytes before opening a temporary file and preserves a free-space
 /// floor throughout its lifetime.
@@ -103,9 +167,10 @@ public struct RecordingOutputConfiguration: Equatable, Sendable {
   public let rootDirectory: URL
   public let fileExtension: String
   public let minimumFreeBytes: UInt64
+  public let naming: RecordingFileNaming
 
   public init(rootDirectory: URL, fileExtension: String = "mov",
-              minimumFreeBytes: UInt64 = 128 * 1024 * 1024) throws {
+              minimumFreeBytes: UInt64 = 128 * 1024 * 1024, naming: RecordingFileNaming = .standard) throws {
     guard rootDirectory.isFileURL else { throw RecordingOutputError.invalidRoot }
     let root = rootDirectory.standardizedFileURL.resolvingSymlinksInPath()
     guard !root.path.isEmpty else { throw RecordingOutputError.invalidRoot }
@@ -113,6 +178,7 @@ public struct RecordingOutputConfiguration: Equatable, Sendable {
     self.rootDirectory = root
     self.fileExtension = extensionValue
     self.minimumFreeBytes = minimumFreeBytes
+    self.naming = naming
   }
 
   static func validateExtension(_ value: String) throws -> String {
@@ -212,12 +278,12 @@ public final class RecordingOutputManager: @unchecked Sendable {
   }
 
   public convenience init(rootDirectory: URL, fileExtension: String = "mov",
-                          minimumFreeBytes: UInt64 = 128 * 1024 * 1024,
+                          minimumFreeBytes: UInt64 = 128 * 1024 * 1024, naming: RecordingFileNaming = .standard,
                           diskSpace: any RecordingOutputDiskSpaceProviding = FileManagerRecordingOutputDiskSpaceProvider(),
                           fileManager: FileManager = .default,
                           volumes: RecordingVolumeSpaceRegistry = .shared) throws {
     try self.init(configuration: RecordingOutputConfiguration(rootDirectory: rootDirectory,
-      fileExtension: fileExtension, minimumFreeBytes: minimumFreeBytes),
+      fileExtension: fileExtension, minimumFreeBytes: minimumFreeBytes, naming: naming),
       diskSpace: diskSpace, fileManager: fileManager, volumes: volumes)
   }
 
@@ -264,6 +330,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
   fileprivate var minimumFreeBytes: UInt64 { configuration.minimumFreeBytes }
   fileprivate var fileExtension: String { configuration.fileExtension }
   fileprivate var fileManagerRef: FileManager { fileManager }
+  fileprivate var namingRef: RecordingFileNaming { configuration.naming }
 
   fileprivate func release(reserved: UInt64) {
     volume.lock.lock()
@@ -344,21 +411,23 @@ public final class RecordingOutputManager: @unchecked Sendable {
     // does not create its temporary file until after this method returns.
     lock.lock()
     defer { lock.unlock() }
-    let feedDirectory = configuration.rootDirectory.appendingPathComponent(feedID, isDirectory: true)
-      .standardizedFileURL
-    guard Self.isDescendant(feedDirectory, of: configuration.rootDirectory) else {
+    // Without camera subfolders the takes sit in the recording folder itself.
+    let subfolders = configuration.naming.cameraSubfolders
+    let feedDirectory = subfolders
+      ? configuration.rootDirectory.appendingPathComponent(feedID, isDirectory: true).standardizedFileURL
+      : configuration.rootDirectory
+    guard Self.isWithin(feedDirectory, of: configuration.rootDirectory, allowingRoot: !subfolders) else {
       throw RecordingOutputError.unsafePath
     }
     if fileManager.fileExists(atPath: feedDirectory.path) {
       let resolved = feedDirectory.resolvingSymlinksInPath()
-      guard Self.isDescendant(resolved, of: configuration.rootDirectory) else {
+      guard Self.isWithin(resolved, of: configuration.rootDirectory, allowingRoot: !subfolders) else {
         throw RecordingOutputError.unsafePath
       }
     }
     let nonce = pathNonce
     pathNonce &+= 1
-    let take = String(format: "%03llu", nonce + 1)
-    let stemBase = "\(feedID)_\(Self.fileTimestamp())_\(take)_\(sessionID.uuidString)"
+    let stemBase = "\(configuration.naming.stem(camera: feedID, date: Date(), take: nonce + 1))_\(sessionID.uuidString)"
     var stem = stemBase
     var suffix = 2
     while fileManager.fileExists(atPath: feedDirectory.appendingPathComponent(".\(stem).partial").path)
@@ -378,14 +447,6 @@ public final class RecordingOutputManager: @unchecked Sendable {
     }
     return RecordingOutputPaths(rootDirectory: configuration.rootDirectory,
       feedDirectory: feedDirectory, temporaryFile: temporary, finalFile: final)
-  }
-
-  private static func fileTimestamp() -> String {
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.timeZone = .current
-    formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-    return formatter.string(from: Date())
   }
 
   fileprivate static func prepareRoot(_ root: URL, fileManager: FileManager) throws {
@@ -409,6 +470,15 @@ public final class RecordingOutputManager: @unchecked Sendable {
       throw RecordingOutputError.invalidFeedID
     }
     return value
+  }
+
+  /// A take's folder: inside the root, or the root itself when takes don't get camera subfolders.
+  fileprivate static func isWithin(_ candidate: URL, of root: URL, allowingRoot: Bool) -> Bool {
+    if allowingRoot,
+      candidate.resolvingSymlinksInPath().standardizedFileURL.path == root.resolvingSymlinksInPath().standardizedFileURL.path {
+      return true
+    }
+    return isDescendant(candidate, of: root)
   }
 
   fileprivate static func isDescendant(_ candidate: URL, of root: URL) -> Bool {
@@ -752,7 +822,8 @@ public final class RecordingOutputSession: @unchecked Sendable {
     try manager.fileManagerRef.createDirectory(at: paths.feedDirectory,
       withIntermediateDirectories: true)
     let resolved = paths.feedDirectory.resolvingSymlinksInPath()
-    guard RecordingOutputManager.isDescendant(resolved, of: paths.rootDirectory) else {
+    guard RecordingOutputManager.isWithin(resolved, of: paths.rootDirectory,
+      allowingRoot: !manager.namingRef.cameraSubfolders) else {
       throw RecordingOutputError.unsafePath
     }
     guard !manager.fileManagerRef.fileExists(atPath: paths.temporaryFile.path),

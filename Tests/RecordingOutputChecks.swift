@@ -554,4 +554,45 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try Data(contentsOf: session.temporaryURL), original)
   }
 
+  /// Settings › Recording's name pattern: its pieces in order, then the session ID, which keeps
+  /// two takes from ever sharing a path.
+  func testNamePatternOrdersItsPiecesAndKeepsTheSessionID() throws {
+    let date = Date(timeIntervalSince1970: 1_793_370_151)  // 2026-10-30 14:22:31 UTC
+    let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+    XCTAssertEqual(RecordingFileNaming.standard.stem(camera: "Camera 1", date: date, take: 1, timeZone: utc),
+      "Camera 1_2026-10-30_14-22-31_001")
+    var naming = RecordingFileNaming(tokens: [.take, .camera, .take], cameraSubfolders: false)
+    XCTAssertEqual(naming.tokens, [.take, .camera], "Each piece at most once")
+    XCTAssertEqual(naming.stem(camera: "Wide", date: date, take: 12, timeZone: utc), "012_Wide")
+    naming.tokens = []
+    XCTAssertEqual(naming.stem(camera: "Wide", date: date, take: 3), "003", "No pieces names the take by its number")
+    let id = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"))
+    XCTAssertTrue(RecordingFileNaming.standard.relativePath(camera: "Wide", date: date, take: 1, sessionID: id)
+      .hasPrefix("Wide/Wide_"))
+    XCTAssertEqual(naming.relativePath(camera: "Wide", date: date, take: 3, sessionID: id), "003_\(id.uuidString).mov")
+    let decoded = try JSONDecoder().decode(RecordingFileNaming.self, from: JSONEncoder().encode(naming))
+    XCTAssertEqual(decoded, naming)
+  }
+
+  /// Without camera subfolders a take sits in the recording folder itself, named by the
+  /// pattern, and an interrupted one there is still found.
+  func testTakesWithoutCameraSubfoldersSitInTheRootAndAreRecovered() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let naming = RecordingFileNaming(tokens: [.camera, .take], cameraSubfolders: false)
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0, naming: naming)
+    let id = try XCTUnwrap(UUID(uuidString: "11111111-2222-3333-4444-555555555555"))
+    let session = try manager.beginExternalWriterSession(feedID: "Wide", sessionID: id)
+    XCTAssertEqual(session.paths.feedDirectory.standardizedFileURL.resolvingSymlinksInPath().path,
+      root.standardizedFileURL.resolvingSymlinksInPath().path)
+    XCTAssertEqual(session.finalURL.lastPathComponent, "Wide_001_\(id.uuidString).mov")
+    try Data([1, 2, 3]).write(to: session.temporaryURL)
+    session.preserveForRecovery()
+    let found = try RecordingRecovery.scan(root: root)
+    XCTAssertEqual(found.count, 1)
+    XCTAssertEqual(found.first?.finalURL.lastPathComponent, session.finalURL.lastPathComponent)
+    let subfolders = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let other = try subfolders.makeSession(feedID: "Tight")
+    XCTAssertEqual(other.paths.feedDirectory.lastPathComponent, "Tight", "The standard naming keeps a folder per camera")
+  }
 }

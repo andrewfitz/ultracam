@@ -108,7 +108,7 @@ enum RecordingRecovery {
   // Serialize them so their brief journal locks never hide a take from a
   // newer scan whose result replaces the earlier one.
   private static let scanLock = NSLock()
-  /// Only our journals directly inside feed folders are inspected. Foreign
+  /// Only our journals directly inside the root or its feed folders are inspected. Foreign
   /// partial files and symlinks are never treated as recoverable recordings.
   struct ScanReport {
     let takes: [InterruptedRecording]
@@ -128,10 +128,13 @@ enum RecordingRecovery {
     var hasJournal = false
     var unreadable = false
     // Feed folders are never hidden. A volume's root also holds system folders
-    // (.Spotlight-V100, .DocumentRevisions-V100) this app may not open.
-    for folder in folders where !folder.lastPathComponent.hasPrefix(".") {
-      let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-      guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+    // (.Spotlight-V100, .DocumentRevisions-V100) this app may not open. Takes
+    // recorded without camera subfolders sit in the root itself.
+    for folder in [canonicalRoot] + folders where folder == canonicalRoot || !folder.lastPathComponent.hasPrefix(".") {
+      if folder != canonicalRoot {
+        let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+      }
       // One folder it can't read must not hide the takes in the others.
       guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: []) else {
         unreadable = true

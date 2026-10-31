@@ -86,6 +86,8 @@ struct RecordingConfiguration: Equatable, Sendable {
   var codec: RecordingCodec = .proRes42210Bit
   var outputFolder: URL?
   var timecodeMode: RecordingTimecodeMode = .wallClock
+  /// How the take's file is named, and whether it goes in a folder with the camera's name.
+  var naming: RecordingFileNaming = .standard
   var feedName: String?
   /// Why this take isn't in the chosen format, for its sidecar. Nil when it is.
   var formatNote: String?
@@ -434,7 +436,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     // Allocate a per-feed atomic output before creating the writer. The
     // writer only sees the temporary path; a completed session is renamed to
     // its final path after all queued samples have drained.
-    let outputManager = try manager(for: request.folder, fileExtension: request.configuration.codec.fileExtension)
+    let outputManager = try manager(for: request.folder, fileExtension: request.configuration.codec.fileExtension,
+      naming: request.configuration.naming)
     let output = try outputManager.beginExternalWriterSession(
       feedID: Self.safeComponent(request.configuration.feedName ?? "Camera"))
     do {
@@ -617,7 +620,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     }
   }
 
-  private static func safeComponent(_ value: String) -> String {
+  /// A camera's name as it appears in folder and file names.
+  static func safeComponent(_ value: String) -> String {
     let words = value.split(whereSeparator: { character in
       !(character.isLetter || character.isNumber || character == "-" || character == "_")
     })
@@ -626,13 +630,13 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     return result.isEmpty ? "Camera" : result
   }
 
-  private func manager(for folder: URL, fileExtension: String) throws -> RecordingOutputManager {
+  private func manager(for folder: URL, fileExtension: String, naming: RecordingFileNaming) throws -> RecordingOutputManager {
     let root = folder.standardizedFileURL.resolvingSymlinksInPath()
-    let key = "\(root.path)\u{0}\(fileExtension.lowercased())"
+    let key = "\(root.path)\u{0}\(fileExtension.lowercased())\u{0}\(naming.tokens.map(\.rawValue).joined(separator: ","))\u{0}\(naming.cameraSubfolders)"
     sessionLock.lock()
     defer { sessionLock.unlock() }
     if let existing = outputManagers[key] { return existing }
-    let manager = try RecordingOutputManager(rootDirectory: root, fileExtension: fileExtension)
+    let manager = try RecordingOutputManager(rootDirectory: root, fileExtension: fileExtension, naming: naming)
     outputManagers[key] = manager
     return manager
   }
@@ -688,6 +692,10 @@ final class RecordingModel {
   private var interruptedRecordingRoots: [URL: URL] = [:]
   var timecodeMode: RecordingTimecodeMode = .wallClock {
     didSet { if timecodeMode != oldValue { onRecordingChoicesChanged?() } }
+  }
+  /// File names and camera subfolders for the next take (Settings › Recording).
+  var naming: RecordingFileNaming = .standard {
+    didSet { if naming != oldValue { onRecordingChoicesChanged?() } }
   }
   /// Copied into RecordingConfiguration before asynchronous take preparation.
   var compatibilityPolicy = RecordingCompatibilityPolicy()
@@ -808,8 +816,10 @@ final class RecordingModel {
   }
 
   var configuration: RecordingConfiguration {
-    RecordingConfiguration(codec: codec, outputFolder: outputFolder, timecodeMode: timecodeMode,
+    var configuration = RecordingConfiguration(codec: codec, outputFolder: outputFolder, timecodeMode: timecodeMode,
       compatibilityPolicy: compatibilityPolicy)
+    configuration.naming = naming
+    return configuration
   }
 
   func customOutputFolder(for feedID: FeedID) -> URL? { feedOutputFolders[feedID] }
