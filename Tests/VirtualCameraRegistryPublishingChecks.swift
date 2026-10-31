@@ -2,40 +2,64 @@ import Foundation
 import XCTest
 
 @objcMembers final class VirtualCameraRegistryPublishingChecks: XCTestCase {
-  func testSeparateModePublishesOneStableDevicePerEnabledFeed() throws {
+  func testPublishesEveryEnabledCameraThenProgramAtTwoOrMore() throws {
     let first = FeedDescriptor(id: FeedID(rawValue: "wide"), name: "Wide")
     let disabled = FeedDescriptor(id: FeedID(rawValue: "disabled"), name: "Disabled", enabled: false)
     let second = FeedDescriptor(id: FeedID(rawValue: "tight"), name: "Tight")
     let group = "group.org.ultracam.publish.\(UUID().uuidString)"
-    let snapshot = VirtualCameraRegistrySnapshot.forFeeds([first, disabled, second],
-      outputMode: .separateCameras, appGroupIdentifier: group)
+    let snapshot = VirtualCameraRegistrySnapshot.forFeeds([first, disabled, second], appGroupIdentifier: group)
 
     XCTAssertEqual(snapshot.generation, 1)
-    XCTAssertEqual(snapshot.devices.map(\.feedID), ["wide", "tight"])
+    XCTAssertEqual(snapshot.devices.map(\.kind), [.feed, .feed, .program])
+    XCTAssertEqual(snapshot.devices.map(\.feedID), ["wide", "tight", nil])
     XCTAssertEqual(snapshot.devices.map(\.displayName), [
-      "Ultracam · Wide", "Ultracam · Tight"])
-    XCTAssertEqual(Set(snapshot.devices.map(\.deviceUID)).count, 2)
+      "Ultracam · Wide", "Ultracam · Tight", "Ultracam · Program"])
+    XCTAssertEqual(Set(snapshot.devices.map(\.deviceUID)).count, 3)
     try snapshot.validate()
   }
 
-  func testProgramModePublishesOnlyProgramAndAdvancesGeneration() throws {
+  func testOneCameraPublishesNoProgramAndGenerationAdvances() throws {
     let feed = FeedDescriptor(id: .primary, name: "Primary")
     let group = "group.org.ultracam.publish.\(UUID().uuidString)"
     let current = VirtualCameraRegistrySnapshot(generation: 9, appGroupIdentifier: group,
       devices: [.feed(feedID: feed.id.rawValue)])
-    let next = VirtualCameraRegistrySnapshot.forFeeds([feed], outputMode: .program,
-      previous: current, appGroupIdentifier: group)
+    let next = VirtualCameraRegistrySnapshot.forFeeds([feed], previous: current, appGroupIdentifier: group)
 
     XCTAssertEqual(next.generation, 10)
-    XCTAssertEqual(next.devices, [.program(displayName: "Ultracam · Program")])
+    XCTAssertEqual(next.devices.map(\.kind), [.feed], "A second, slower way to the same picture is noise")
     try next.validate()
+  }
+
+  /// Whatever an older build saved, the list is the same: the key is written back, unread.
+  @MainActor func testTheSavedOutputModeChangesNothingPublished() throws {
+    let feeds = [FeedDescriptor(id: FeedID(rawValue: "wide"), name: "Wide"), FeedDescriptor(id: FeedID(rawValue: "tight"), name: "Tight")]
+    let separate = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: feeds, outputMode: .separateCameras))
+    let program = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: feeds, outputMode: .program))
+    XCTAssertEqual(separate.virtualCameraDescriptors, program.virtualCameraDescriptors)
+    XCTAssertEqual(separate.virtualCameraDescriptors.map(\.kind), [.feed, .feed, .program])
+    XCTAssertEqual(program.snapshot.outputMode, .program, "A downgrade finds what it left")
+    XCTAssertEqual(separate.snapshot.outputMode, .separateCameras)
+  }
+
+  func testProgramStopsAtTheLastDeviceTheExtensionHas() throws {
+    func feeds(_ count: Int) -> [FeedDescriptor] {
+      (0..<count).map { FeedDescriptor(id: FeedID(rawValue: "camera-\($0)"), name: "Camera \($0)") }
+    }
+    XCTAssertEqual(VirtualCameraRegistrySnapshot.devices(for: feeds(31)).count, 32)
+    XCTAssertTrue(VirtualCameraRegistrySnapshot.devices(for: feeds(31)).contains { $0.kind == .program })
+    let full = VirtualCameraRegistrySnapshot.devices(for: feeds(32))
+    XCTAssertEqual(full.count, 32)
+    XCTAssertFalse(full.contains { $0.kind == .program })
+    XCTAssertNoThrow(try VirtualCameraRegistrySnapshot(generation: 1, devices: full).validateDeviceCount())
+    XCTAssertThrowsError(try VirtualCameraRegistrySnapshot(generation: 1,
+      devices: VirtualCameraRegistrySnapshot.devices(for: feeds(33))).validateDeviceCount())
   }
 
   func testForeignGroupDoesNotSupplyGeneration() {
     let feed = FeedDescriptor(name: "Primary")
     let current = VirtualCameraRegistrySnapshot(generation: 99,
       appGroupIdentifier: "group.foreign", devices: [.feed(feedID: feed.id.rawValue)])
-    let next = VirtualCameraRegistrySnapshot.forFeeds([feed], outputMode: .separateCameras,
+    let next = VirtualCameraRegistrySnapshot.forFeeds([feed],
       previous: current, appGroupIdentifier: VirtualCameraRegistrySnapshot.defaultAppGroupIdentifier)
     XCTAssertEqual(next.generation, 1)
   }
@@ -45,7 +69,7 @@ import XCTest
     let group = "group.org.ultracam.publish.\(UUID().uuidString)"
     let invalid = VirtualCameraRegistrySnapshot(generation: 99,
       appGroupIdentifier: group, devices: [.program(), .program()])
-    let next = VirtualCameraRegistrySnapshot.forFeeds([feed], outputMode: .separateCameras,
+    let next = VirtualCameraRegistrySnapshot.forFeeds([feed],
       previous: invalid, appGroupIdentifier: group)
 
     XCTAssertEqual(next.generation, 1)

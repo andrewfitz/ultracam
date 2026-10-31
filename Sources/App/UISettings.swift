@@ -88,11 +88,11 @@ struct UISettingsGeneralPane: View {
           }
         }
         .onChange(of: defaultLayout) { _, rawValue in
-          if let layout = UILayout(rawValue: rawValue), layout != .programView || model.outputMode == .program {
+          if let layout = UILayout(rawValue: rawValue), layout != .programView || model.programAvailable {
             interface.layout = layout
           }
         }
-        .help("The main window's layout; the same as View › Layout. Program View is available only in Program mode.")
+        .help("The main window's layout; the same as View › Layout. Program View needs two or more cameras.")
         Picker("New camera strips", selection: $stripDensity) {
           Text("Expanded").tag("expanded")
           Text("Collapsed").tag("collapsed")
@@ -300,7 +300,6 @@ struct UISettingsCameraPane: View {
 
   var body: some View {
     let installer = model.installer
-    let outputMode = Binding(get: { model.outputMode }, set: { model.setOutputMode($0) })
     let needsApproval = installer.status.localizedCaseInsensitiveContains("approve")
     Form {
       Section {
@@ -340,29 +339,16 @@ struct UISettingsCameraPane: View {
       }
 
       Section {
-        Picker("Output mode", selection: outputMode) {
-          Text("Separate cameras").tag(FeedOutputMode.separateCameras)
-          Text("Program").tag(FeedOutputMode.program)
-        }
-        .pickerStyle(.segmented)
-        .disabled(!model.canResetSettings)
-        .help(model.canResetSettings ? "Separate cameras publishes an Ultracam camera for each camera. Program publishes one switched camera, Ultracam · Program."
-          : "Change while all cameras are stopped and nothing is recording.")
-      } header: { Text("Output") } footer: {
-        UISettingsFootnote(model.canResetSettings ? "After changing the output mode, choose the new camera in your meeting app."
-          : "Change while all cameras are stopped and nothing is recording. Then choose the new camera in your meeting app.")
-      }
-
-      Section("Published Cameras") {
-        if model.outputMode == .program {
+        if model.programAvailable {
           LabeledContent("Ultracam · Program") { Text(model.programInUse ? "In use" : model.programClientUnknown ? "Use unknown" : "Not in use").foregroundStyle(.secondary) }
-        } else {
-          ForEach(model.feedDescriptors.filter(\.enabled)) { descriptor in
-            LabeledContent("Ultracam · \(descriptor.name)") {
-              Text(model.cameraInUse(descriptor.id) ? "In use" : model.cameraClientUnknown(descriptor.id) ? "Use unknown" : "Not in use").foregroundStyle(.secondary)
-            }
+        }
+        ForEach(model.feedDescriptors.filter(\.enabled)) { descriptor in
+          LabeledContent("Ultracam · \(descriptor.name)") {
+            Text(model.cameraInUse(descriptor.id) ? "In use" : model.cameraClientUnknown(descriptor.id) ? "Use unknown" : "Not in use").foregroundStyle(.secondary)
           }
         }
+      } header: { Text("Published Cameras") } footer: {
+        UISettingsFootnote("Every camera is published, plus Ultracam · Program with two or more. A camera does no work for one nobody is using. Meeting apps may need a restart to list a new camera.")
       }
     }
     .formStyle(.grouped)
@@ -771,8 +757,8 @@ struct UISettingsAdvancedPane: View {
 @MainActor
 enum UIDiagnosticsText {
   static func summary(model: AppModel) -> String {
-    var lines = ["Ultracam diagnostics", "Output mode: \(model.outputMode == .program ? "Program" : "Separate cameras")"]
-    if model.outputMode == .program {
+    var lines = ["Ultracam diagnostics"]
+    if model.programAvailable {
       lines.append("Program: \(model.programInUse ? "in use" : "not in use")")
     }
     for descriptor in model.feedDescriptors {

@@ -965,7 +965,7 @@ extension UIVerify {
     let snapshot = bridge.snapshot()
     verifier.check("bridge: two cameras with names", snapshot.cameras.map(\.name) == ["Camera 1", "Camera 2"], "\(snapshot.cameras.map(\.name))")
     verifier.check("bridge: selection", snapshot.selectedID == alpha.rawValue)
-    verifier.check("bridge: separate mode", snapshot.outputMode == .separate)
+    verifier.check("bridge: two cameras have Program", bridge.presentation().programAvailable)
     verifier.check("bridge: idle recording", snapshot.cameras.allSatisfy { $0.recording.status == .idle })
     verifier.check("bridge: stopped cameras have no signal", snapshot.cameras.allSatisfy { !$0.running && $0.signal == .none })
     verifier.check("bridge: presentation builds", bridge.presentation().cameras.count == 2)
@@ -978,7 +978,8 @@ extension UIVerify {
     verifier.check("bridge: layout", interface.layout == .single && bridge.snapshot().layout == .single)
     verifier.check("bridge: layout persists", UIInterfaceState(defaults: defaults).layout == .single)
     bridge.perform(.setLayout(.programView))
-    verifier.check("bridge: Program View falls back in Separate mode", bridge.snapshot().layout == .sideBySide)
+    verifier.check("bridge: Program View is there with two cameras", bridge.snapshot().layout == .programView)
+    bridge.perform(.setLayout(.sideBySide))
     bridge.perform(.setAllCollapsed(true))
     verifier.check("bridge: collapse all", interface.collapsed == [alpha.rawValue, beta.rawValue])
     bridge.perform(.toggleCollapsed(cameraID: alpha.rawValue))
@@ -1126,11 +1127,8 @@ extension UIVerify {
     }
 
     // Topology while idle.
-    bridge.perform(.setOutputMode(.program))
-    verifier.check("bridge: output mode while idle", model.outputMode == .program && bridge.snapshot().outputMode == .program)
     bridge.perform(.setLayout(.programView))
-    verifier.check("bridge: Program View in Program mode", bridge.snapshot().layout == .programView)
-    bridge.perform(.setOutputMode(.separate))
+    verifier.check("bridge: Program View with two cameras", bridge.snapshot().layout == .programView)
     bridge.perform(.addCamera)
     verifier.check("bridge: add camera", model.feedDescriptors.count == 3)
     if let added = model.feedDescriptors.last?.id {
@@ -1832,8 +1830,8 @@ extension UIVerify {
           }
         }
       }
-      if session.outputMode == .separate {
-        verifier.check("menu bar \(name): no cut rows in Separate mode", !titles.contains { $0.hasPrefix("Cut to") })
+      if session.cameras.count < 2 {
+        verifier.check("menu bar \(name): no cut rows with one camera", !titles.contains { $0.hasPrefix("Cut to") })
       } else {
         verifier.check("menu bar \(name): cut row for the off-air camera", titles.contains("Cut to Camera 2"), titles.joined(separator: " | "))
       }

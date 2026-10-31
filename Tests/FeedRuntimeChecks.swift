@@ -116,15 +116,14 @@ import XCTest
     XCTAssertNotNil(pool.existingController(for: second))
   }
 
-  func testProgramDemandIsReleasedWhenLeavingProgramMode() {
+  func testProgramDemandIsReleasedWithItsConsumer() {
     let first = FeedDescriptor(id: FeedID(rawValue: "feed-a"), name: "Wide")
     let second = FeedDescriptor(id: FeedID(rawValue: "feed-b"), name: "Tight")
-    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(
-      feeds: [first, second], outputMode: .program))
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [first, second]))
 
     XCTAssertEqual(coordinator.setProgramConsumer(true, at: 0), [.start(feedID: "feed-a")])
     XCTAssertEqual(coordinator.activeDemandFeedIDs, Set(["feed-a"]))
-    coordinator.setOutputMode(.separateCameras)
+    _ = coordinator.setProgramConsumer(false, at: 1)
     XCTAssertTrue(coordinator.activeDemandFeedIDs.isEmpty)
   }
 

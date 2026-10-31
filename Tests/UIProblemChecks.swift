@@ -16,7 +16,6 @@ import XCTest
 
   private func program(_ cameras: [UICameraSnapshot], auto: Bool = false, client: Bool = true) -> UISessionSnapshot {
     var session = UISessionSnapshot()
-    session.outputMode = .program
     session.cameras = cameras
     session.onAirID = cameras.first?.id
     session.programInUse = client
@@ -175,7 +174,8 @@ import XCTest
     var iso = camera(2)
     iso.inUse = true
     var session = program([camera(1), iso], client: false)
-    session.recentCuts = [UICutRecord(at: Date(), cameraID: "camera-1", cameraName: "Camera 1", automatic: false)]
+    XCTAssertTrue(problems(session).isEmpty, "No cut yet")
+    session.cutsMissClient = true
     XCTAssertEqual(problems(session).first?.title, "Cuts aren't reaching a meeting app")
     XCTAssertEqual(problems(session).first?.detail, "It's using Camera 2, not Program.")
   }

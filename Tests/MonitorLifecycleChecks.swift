@@ -64,11 +64,11 @@ import XCTest
   }
 
   func testProgramTransportStaysUpForAClientWhileAnyCameraRuns() {
-    XCTAssertTrue(FeedLifecycleDemandPolicy.programTransportRequired(programMode: true,
+    XCTAssertTrue(FeedLifecycleDemandPolicy.programTransportRequired(
       cameraRequested: true, anyCameraRunning: true))
-    XCTAssertFalse(FeedLifecycleDemandPolicy.programTransportRequired(programMode: true,
+    XCTAssertFalse(FeedLifecycleDemandPolicy.programTransportRequired(
       cameraRequested: true, anyCameraRunning: false))
-    XCTAssertFalse(FeedLifecycleDemandPolicy.programTransportRequired(programMode: true,
+    XCTAssertFalse(FeedLifecycleDemandPolicy.programTransportRequired(
       cameraRequested: false, anyCameraRunning: true))
   }
 

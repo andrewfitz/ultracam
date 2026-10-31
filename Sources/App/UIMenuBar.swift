@@ -26,8 +26,6 @@ enum UIMenuCommand: Equatable {
   case action(UIAction)
   /// Automatic waiting state: render the live preview on request (a visible preview counts as demand).
   case showLivePreview
-  /// Stops every camera, then changes the output mode once they have stopped (`UIOutputModeSwitch`).
-  case stopCamerasAndSwitch(UIOutputMode)
 }
 
 final class UIMenuCommandBox: NSObject {
@@ -302,9 +300,6 @@ final class UIMenuCommandBox: NSObject {
         previewHost?.rootView = card(width: previewWidth)
       case .action(let action):
         run(action)
-      case .stopCamerasAndSwitch(let mode):
-        let bridge = bridge()
-        UIOutputModeSwitch.shared.stopCamerasAndSwitch(to: mode, send: { bridge.send($0) }, session: { bridge.snapshot() })
       }
     }
   }
@@ -386,12 +381,8 @@ final class UIMenuCommandBox: NSObject {
         modifiers: [.command, .option], symbol: "stop.circle", subtitle: elapsed, target: target))
     }
 
-    // Output: which Ultracam cameras meeting apps see, and switching between them.
-    items.append(.separator())
-    items.append(outputItem(session: session, target: target))
-
     // Program: cut rows (thumbnails never cut), automatic switching, hold.
-    if presentation.outputMode == .program {
+    if presentation.programAvailable {
       items.append(.separator())
       for button in presentation.cutButtons {
         let title = "Cut to \(button.name)"
@@ -410,7 +401,7 @@ final class UIMenuCommandBox: NSObject {
       // The strategy lives here too, so a disabled Automatic Switching isn't a dead end.
       let strategies = NSMenu(title: "Strategy")
       strategies.autoenablesItems = false
-      for strategy in UIOutputModeControl.strategies {
+      for strategy in UIStrategy.offered {
         strategies.addItem(row(UIStrategy.title(strategy), action(.setStrategy(strategy)),
           checked: session.strategy == strategy, target: target))
       }
@@ -459,38 +450,6 @@ final class UIMenuCommandBox: NSObject {
     return items
   }
 
-  /// "Output" with the mode as its subtitle; the submenu switches when the cameras are stopped,
-  /// offers to stop them when that's safe, and otherwise says what's in the way.
-  private static func outputItem(session: UISessionSnapshot, target: AnyObject?) -> NSMenuItem {
-    let availability = UIOutputModeControl.availability(session)
-    let submenu = NSMenu(title: "Output")
-    submenu.autoenablesItems = false
-    for mode in [UIOutputMode.separate, .program] {
-      submenu.addItem(row(UIOutputModeControl.title(mode), session.outputMode == mode ? [] : action(.setOutputMode(mode)),
-        checked: session.outputMode == mode, enabled: availability == .available || session.outputMode == mode,
-        subtitle: mode == .program ? "Ultracam · Program" : "Ultracam · each camera", target: target))
-    }
-    let other: UIOutputMode = session.outputMode == .program ? .separate : .program
-    switch availability {
-    case .available:
-      break
-    case .stopCamerasFirst:
-      submenu.addItem(.separator())
-      submenu.addItem(row("Stop Cameras and Switch to \(UIOutputModeControl.title(other))", [.stopCamerasAndSwitch(other)],
-        symbol: "stop.fill", target: target))
-    case .blocked(let reason):
-      submenu.addItem(.separator())
-      let note = NSMenuItem(title: reason, action: nil, keyEquivalent: "")
-      note.isEnabled = false
-      submenu.addItem(note)
-    }
-    let item = NSMenuItem(title: "Output", action: nil, keyEquivalent: "")
-    item.subtitle = UIOutputModeControl.title(session.outputMode)
-    item.image = NSImage(systemSymbolName: "video.badge.checkmark", accessibilityDescription: nil)
-    item.submenu = submenu
-    return item
-  }
-
   private static func cameraItem(_ camera: UICameraPresentation, presentation: UISessionPresentation,
     session: UISessionSnapshot, inputs: [UIInput], target: AnyObject?) -> NSMenuItem {
     var status: [String] = []
@@ -517,9 +476,9 @@ final class UIMenuCommandBox: NSObject {
       submenu.addItem(row(pause == "Pause" ? "Pause Recording" : "Resume Recording",
         action(.pauseOrResume(cameraID: camera.id)), symbol: pause == "Pause" ? "pause" : "play", target: target))
     }
-    // Always there in Program (checked while on air), so an automatic cut changes the row's
-    // state, not the submenu's rows, and the open menu updates in place.
-    if presentation.outputMode == .program {
+    // Always there with two cameras (checked while on air), so an automatic cut changes the
+    // row's state, not the submenu's rows, and the open menu updates in place.
+    if presentation.programAvailable {
       let onAir = session.onAirID == camera.id
       submenu.addItem(row("Cut to \(camera.name)", action(.cut(cameraID: camera.id)), key: "",
         modifiers: .control, checked: onAir, enabled: camera.cutEnabled && !onAir, symbol: "tv", target: target))
@@ -634,7 +593,7 @@ struct UIMenuPreviewContent: View {
       Group {
         if showsPlaceholder {
           placeholder
-        } else if presentation.outputMode == .program {
+        } else if session.programInUse {
           programPicture
         } else if twoUp {
           HStack(spacing: 6) {
@@ -644,7 +603,7 @@ struct UIMenuPreviewContent: View {
           cameraPicture(shown)
         }
       }
-      if presentation.outputMode == .program && presentation.camerasRunning {
+      if session.programInUse && presentation.camerasRunning {
         // A quarter of the card each, whatever the number of cameras, centered under the picture.
         HStack(spacing: 6) {
           ForEach(presentation.cameras.prefix(4)) { camera in thumbnail(camera).frame(width: thumbnailWidth) }
@@ -672,7 +631,7 @@ struct UIMenuPreviewContent: View {
 
   private var showsPlaceholder: Bool { !presentation.camerasRunning && !(waiting && showLive) }
   /// Two small pictures side by side while no meeting uses either camera.
-  private var twoUp: Bool { presentation.outputMode == .separate && session.cameras.count >= 2 && !presentation.outputInUse }
+  private var twoUp: Bool { session.cameras.count >= 2 && !presentation.outputInUse }
 
   private var placeholder: some View {
     UIColumnPictureLayout { RoundedRectangle(cornerRadius: 10).fill(Color.black) }

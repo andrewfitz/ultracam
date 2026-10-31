@@ -90,7 +90,8 @@ final class FeedSession: Identifiable {
 final class FeedCoordinator {
   private(set) var descriptors: [FeedDescriptor]
   private(set) var selectedFeedID: FeedID
-  private(set) var outputMode: FeedOutputMode
+  /// Never read, only carried back to disk (see `AppSettingsSnapshot.outputMode`).
+  private let savedOutputMode: FeedOutputMode
   /// Live switcher state, read from the route that ingests frames. There is
   /// no second copy that could disagree with what is on air.
   var switcher: SwitcherSettings { programOutput.switcher.settings }
@@ -132,14 +133,14 @@ final class FeedCoordinator {
     selectedFeedID = safe.feeds.first(where: { $0.id == safe.selectedFeedID && $0.enabled })?.id
       ?? safe.feeds.first(where: \.enabled)?.id
       ?? safe.feeds[0].id
-    outputMode = safe.outputMode
+    savedOutputMode = safe.outputMode
     virtualCameraRegistryVersion = safe.virtualCameraRegistryVersion
     programOutput = ProgramOutputRoute(settings: safe.switcher,
       feedIDs: safe.feeds.filter(\.enabled).map(\.id))
     demandCoordinator = RouteDemandCoordinator()
     self.registryStore = registryStore
     self.capturePool = capturePool
-    let initialDevices = Self.registryDevices(for: safe.outputMode, feeds: safe.feeds)
+    let initialDevices = VirtualCameraRegistrySnapshot.devices(for: safe.feeds)
     let stored = registryStore?.load()
     let generation = max(stored?.generation ?? 0, UInt64(max(1, safe.virtualCameraRegistryVersion)))
     // The registry store can be pointed at a test or staging app group. Keep
@@ -154,8 +155,8 @@ final class FeedCoordinator {
     // Never compiles: the route calls this under its lock on a capture
     // delivery thread. The converter is built in the background (`warm`).
     programOutput.setNormalizerProvider { loader.loadedNormalizer }
-    if outputMode == .program { loader.warm() }
-    programOutput.setAcceptingCapture(outputMode == .program)
+    // Until a client connects no frame is offered to the camera route.
+    programOutput.setOutput(contract: nil, active: false)
     programOutput.onEvent = { [weak self] event in
       // State changes only; frames never take this hop.
       Task { @MainActor [weak self] in self?.handleProgramEvent(event) }
@@ -169,7 +170,7 @@ final class FeedCoordinator {
       // app's selected feed/UI editing identity stable across an automatic
       // A→B cut; changing it here makes status callbacks and persisted device
       // settings switch to the wrong source.
-      if programConsumerActive, outputMode == .program {
+      if programConsumerActive {
         demandCoordinator.selectProgram(feedID: feedID.rawValue)
         _ = demandCoordinator.drainTransitions()
       }
@@ -338,8 +339,7 @@ final class FeedCoordinator {
     sessions[descriptor.id]?.update(descriptor: descriptor)
     programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
     if programConsumerActive {
-      let selected = outputMode == .program ? programOutput.selectedFeedID?.rawValue : nil
-      demandCoordinator.selectProgram(feedID: selected)
+      demandCoordinator.selectProgram(feedID: programOutput.selectedFeedID?.rawValue)
       _ = demandCoordinator.drainTransitions()
     }
     publishVirtualCameraRegistry()
@@ -452,29 +452,6 @@ final class FeedCoordinator {
     return report
   }
 
-  func setOutputMode(_ mode: FeedOutputMode) {
-    guard outputMode != mode else { return }
-    outputMode = mode
-    // Keep the Program scheduler aligned with the persisted selection when the
-    // program route is enabled. A feed can be selected while operating in
-    // separate-camera mode, so the live scheduler may still point at an older
-    // source when the mode changes.
-    programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
-    // Nothing is on air until a source delivers a frame in the new mode.
-    programOutput.markSourcesIdle()
-    programOutput.setAcceptingCapture(mode == .program)
-    if mode == .program { programNormalizer.warm() }
-    // A Program consumer is a source-demand route. Release it when leaving
-    // Program mode and rebind it to the live scheduler when entering Program
-    // mode, so a mode toggle cannot leave a removed/old feed running.
-    if programConsumerActive {
-      let selected = mode == .program ? programOutput.selectedFeedID?.rawValue : nil
-      demandCoordinator.selectProgram(feedID: selected)
-      _ = demandCoordinator.drainTransitions()
-    }
-    publishVirtualCameraRegistry()
-  }
-
   func setSwitcher(_ settings: SwitcherSettings) {
     let requested = settings.selectedFeedID.flatMap { candidate in
       descriptors.contains(where: { $0.id == candidate && $0.enabled }) ? candidate : nil
@@ -486,15 +463,14 @@ final class FeedCoordinator {
     publishVirtualCameraRegistry()
   }
 
-  /// A cut when something is on air in Program mode; otherwise the selection
-  /// just changes, since there is no picture to cut away from.
+  /// A cut when something is on air; otherwise the selection just changes,
+  /// since there is no picture to cut away from.
   private func requestProgramSelection(_ feedID: FeedID,
                                        noEarlierThan: CMTime? = nil) -> ProgramCutRequestResult<FeedID> {
     guard descriptors.contains(where: { $0.id == feedID && $0.enabled }) else {
       return .rejectedMissingSource
     }
-    return programOutput.requestSelection(feedID, noEarlierThan: noEarlierThan,
-      cutsAllowed: outputMode == .program)
+    return programOutput.requestSelection(feedID, noEarlierThan: noEarlierThan)
   }
 
   /// Requests a frame-boundary Program cut. The selection changes when the
@@ -511,6 +487,9 @@ final class FeedCoordinator {
     requestProgramSelection(feedID, noEarlierThan: noEarlierThan)
   }
 
+  /// Drops a pending cut whose target stopped qualifying, with no frame or director to do it.
+  func expirePendingCut() { programOutput.expirePendingCutIfNeeded() }
+
   func cancelProgramCut() {
     programOutput.cancelPendingCut()
   }
@@ -520,15 +499,13 @@ final class FeedCoordinator {
     programOutput.evaluate(at: mediaTime)
   }
 
-  /// Publishes a processed frame to the Program route when Program mode is
-  /// active. Separate-camera mode leaves the frame on its feed route only.
-  /// Test entry point; the app ingests through `installProgramFrameDelivery`.
+  /// Publishes a processed frame to the Program route. Test entry point; the app ingests through `installProgramFrameDelivery`.
   /// Cut events reach the main actor through
   /// `ProgramOutputRoute.onEvent`.
   @discardableResult
   func ingestProgramFrame(feedID: FeedID, frame: ProcessedFrame<CVPixelBuffer>)
     -> ProgramRouteResult? {
-    guard outputMode == .program, descriptors.contains(where: { $0.id == feedID && $0.enabled }) else {
+    guard descriptors.contains(where: { $0.id == feedID && $0.enabled }) else {
       return nil
     }
     return programOutput.ingest(feedID: feedID, frame: frame)
@@ -547,8 +524,7 @@ final class FeedCoordinator {
   func setProgramConsumer(_ active: Bool, at time: TimeInterval? = nil)
     -> [SourceDemandTransition] {
     programConsumerActive = active
-    let selected = active && outputMode == .program
-      ? programOutput.selectedFeedID?.rawValue : nil
+    let selected = active ? programOutput.selectedFeedID?.rawValue : nil
     demandCoordinator.selectProgram(feedID: selected,
       at: time)
     return demandCoordinator.drainTransitions()
@@ -578,16 +554,14 @@ final class FeedCoordinator {
   /// leases are intentionally omitted from this runtime-facing view.
   var activeDemandFeedIDs: Set<String> { demandCoordinator.activeSourceFeedIDs }
 
-  /// Complete registry state published to the camera extension. Separate
-  /// mode exposes one stable device per enabled feed; Program mode exposes one
-  /// Program device while feed captures remain internal sources.
+  /// Complete registry state published to the camera extension.
   var virtualCameraDescriptors: [VirtualCameraDescriptor] {
-    Self.registryDevices(for: outputMode, feeds: descriptors)
+    VirtualCameraRegistrySnapshot.devices(for: descriptors)
   }
 
   var snapshot: AppSettingsSnapshot {
     AppSettingsSnapshot(feeds: descriptors, selectedFeedID: selectedFeedID,
-      outputMode: outputMode, switcher: switcher,
+      outputMode: savedOutputMode, switcher: switcher,
       virtualCameraRegistryVersion: virtualCameraRegistryVersion,
       programMonitor: programMonitor,
       monitorWorkspace: monitorWorkspace, syncCameras: syncCameras)
@@ -613,18 +587,6 @@ final class FeedCoordinator {
       return true
     } catch {
       return false
-    }
-  }
-
-  private static func registryDevices(for mode: FeedOutputMode,
-                                      feeds: [FeedDescriptor]) -> [VirtualCameraDescriptor] {
-    switch mode {
-    case .separateCameras:
-      return feeds.filter(\.enabled).map { feed in
-        VirtualCameraDescriptor.feed(feedID: feed.id.rawValue, displayName: "Ultracam · \(feed.name)")
-      }
-    case .program:
-      return [VirtualCameraDescriptor.program()]
     }
   }
 }

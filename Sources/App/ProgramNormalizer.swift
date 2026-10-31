@@ -856,9 +856,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 }
 
 /// Builds the normalizer (one MTL4Compiler compile, tens of milliseconds)
-/// in the background, never on the frame path. `warm()` starts it when
-/// Program mode is on or a Program bridge is prepared, long before a camera
-/// client connects; until it is ready, a frame that needs conversion is a
+/// in the background, never on the frame path. `warm()` starts it when a
+/// Program bridge is prepared, long before a camera client connects; until it is ready, a frame that needs conversion is a
 /// counted, reported error rather than a compile under the route lock.
 final class ProgramNormalizerLoader: @unchecked Sendable {
   private let lock = NSLock()

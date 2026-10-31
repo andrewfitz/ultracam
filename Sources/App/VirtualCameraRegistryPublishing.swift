@@ -14,27 +14,24 @@ extension VirtualCameraRegistrySnapshot {
     }
   }
 
-  /// Builds a complete registry snapshot for the current feed collection.
-  ///
-  /// Separate-camera mode publishes one descriptor per enabled feed. Program
-  /// mode publishes the single program descriptor; the feed runtimes remain
-  /// app-owned and are selected by the switcher. The previous generation is
-  /// retained so the extension's stale-write fence works across app restarts.
-  static func forFeeds(_ feeds: [FeedDescriptor], outputMode: FeedOutputMode,
-                       previous: VirtualCameraRegistrySnapshot? = nil,
+  /// What meeting apps can see: one device per enabled camera, in order, then Program
+  /// with two or more. Stable: only adding, removing or renaming a camera changes it,
+  /// and every device's identity comes from its kind and feed ID.
+  static func devices(for feeds: [FeedDescriptor]) -> [VirtualCameraDescriptor] {
+    let enabled = feeds.filter(\.enabled)
+    let cameras = enabled.map { feed in
+      VirtualCameraDescriptor.feed(feedID: feed.id.rawValue, displayName: "Ultracam · \(feed.name)", enabled: true)
+    }
+    guard FeedLifecycleDemandPolicy.programPublished(enabledCameras: enabled.count) else { return cameras }
+    return cameras + [.program(displayName: "Ultracam · Program")]
+  }
+
+  /// Builds a complete registry snapshot for the current feed collection. The
+  /// previous generation is retained so the extension's stale-write fence works
+  /// across app restarts.
+  static func forFeeds(_ feeds: [FeedDescriptor], previous: VirtualCameraRegistrySnapshot? = nil,
                        appGroupIdentifier: String = Self.defaultAppGroupIdentifier)
     -> VirtualCameraRegistrySnapshot {
-    let devices: [VirtualCameraDescriptor]
-    switch outputMode {
-    case .separateCameras:
-      devices = feeds.filter(\.enabled).map { feed in
-        VirtualCameraDescriptor.feed(feedID: feed.id.rawValue,
-          displayName: "Ultracam · \(feed.name)", enabled: true)
-      }
-    case .program:
-      devices = [.program(displayName: "Ultracam · Program")]
-    }
-
     // A previous snapshot is only a generation source when it is itself a
     // complete snapshot for this app group.  A malformed same-group value may
     // have come from a partial write or an older schema and must not advance
@@ -52,7 +49,7 @@ extension VirtualCameraRegistrySnapshot {
     return VirtualCameraRegistrySnapshot(
       generation: generation,
       appGroupIdentifier: appGroupIdentifier,
-      devices: devices)
+      devices: Self.devices(for: feeds))
   }
 }
 

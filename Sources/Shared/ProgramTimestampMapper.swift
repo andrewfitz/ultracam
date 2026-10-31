@@ -291,12 +291,6 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     return readiness[selectedSource] == .producing
   }
 
-  /// Producing sources go back to starting, e.g. when Program mode is left and
-  /// re-entered: nothing is on air until the next frame arrives.
-  public mutating func markSourcesIdle() {
-    for (id, state) in readiness where state == .producing { readiness[id] = .starting }
-  }
-
   /// Returns, once, the cut most recently dropped without landing.
   public mutating func takeAbandonedCut() -> (SourceID, ProgramCutAbandonReason)? {
     defer { abandoned = nil }

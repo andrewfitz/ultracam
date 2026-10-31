@@ -33,7 +33,6 @@ import XCTest
     for (id, device) in zip(ids, ["fake:one", "fake:two", "fake:three"]) {
       model.updateCamera(id, shareProcessing: false) { $0.selectedDevice = device }
     }
-    model.setOutputMode(.program)
     model.startAllCameras()
     XCTAssertEqual(ids.filter(model.isCameraRunning).count, 3)
   }

@@ -17,7 +17,6 @@ import XCTest
   private func program(_ cameras: [UICameraSnapshot], client: Bool = true, sink: Bool = true,
     pending: String? = nil) -> UISessionSnapshot {
     var session = UISessionSnapshot()
-    session.outputMode = .program
     session.cameras = cameras
     session.onAirID = cameras.first?.id
     session.pendingCutID = pending
@@ -105,7 +104,7 @@ import XCTest
     var programUnknown = program([camera(1), camera(2)], client: false)
     programUnknown.programClientUnknown = true
     XCTAssertEqual(programUnknown.programClientLine, "Use unknown")
-    XCTAssertEqual(UIPresentationBuilder.session(programUnknown).outputSummary, "Ultracam · Program · Use unknown")
+    XCTAssertEqual(UIPresentationBuilder.session(programUnknown).outputSummary, "Ultracam cameras: use unknown")
   }
 
   func testPreviewPrefersOnAirThenISO() {

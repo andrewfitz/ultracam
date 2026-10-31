@@ -26,7 +26,6 @@ import XCTest
   private func program(_ cameras: [UICameraSnapshot], onAir: String? = "camera-1", pending: String? = nil,
     inUse: Bool = true) -> UISessionSnapshot {
     var session = UISessionSnapshot()
-    session.outputMode = .program
     session.cameras = cameras
     session.selectedID = cameras.first?.id ?? ""
     session.onAirID = onAir
@@ -92,8 +91,10 @@ import XCTest
     XCTAssertEqual(presentation.cameras[0].outputLine, "Ultracam · Camera 1 · In use")
     XCTAssertEqual(presentation.cameras[1].outputLine, "Ultracam · Camera 2 · Not in use")
     XCTAssertEqual(presentation.outputSummary, "Ultracam · Camera 1 · In use")
-    XCTAssertEqual(UIPresentationBuilder.session(program([camera(1)], inUse: false)).outputSummary,
-      "Ultracam · Program · Not in use")
+    XCTAssertEqual(UIPresentationBuilder.session(program([camera(1), camera(2)])).outputSummary,
+      "Ultracam · Program · In use")
+    XCTAssertEqual(UIPresentationBuilder.session(program([camera(1), camera(2, inUse: true)])).outputSummary,
+      "Ultracam · Program, Ultracam · Camera 2 · In use", "Both routes, by the names meeting apps list")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1), camera(2)])).outputSummary, "Ultracam cameras not in use")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).outputSummary, "Ultracam · Camera 1 · Not in use",
       "One output is called by its published device name")
@@ -104,7 +105,8 @@ import XCTest
     let onAir = UIPresentationBuilder.session(program(cams, pending: "camera-2"))
     XCTAssertEqual(onAir.cameras[0].outputLine, "In Program · on air")
     XCTAssertEqual(onAir.cameras[1].outputLine, "Next", "The pending camera reads \"Next\" everywhere")
-    XCTAssertEqual(onAir.cameras[2].outputLine, "Program source")
+    XCTAssertEqual(onAir.cameras[2].outputLine, "Ultracam · Camera 3 · Not in use",
+      "Every camera is its own published device too")
     XCTAssertEqual(UIPresentationBuilder.session(program(cams, inUse: false)).cameras[0].outputLine, "In Program · no viewer yet")
   }
 
@@ -287,11 +289,16 @@ import XCTest
     XCTAssertTrue(presentation.cutButtons[0].enabled)
     XCTAssertFalse(presentation.cutButtons[2].enabled)
 
-    let separatePresentation = UIPresentationBuilder.session(separate([camera(1), camera(2)]))
-    XCTAssertTrue(separatePresentation.cutButtons.isEmpty)
-    XCTAssertFalse(separatePresentation.cameras.contains { $0.showsCut || $0.cutEnabled })
-    XCTAssertFalse(separatePresentation.layouts.contains(.programView), "Program View only in Program mode")
+    let oneCamera = UIPresentationBuilder.session(separate([camera(1)]))
+    XCTAssertTrue(oneCamera.cutButtons.isEmpty)
+    XCTAssertFalse(oneCamera.cameras.contains { $0.showsCut || $0.cutEnabled })
+    XCTAssertFalse(oneCamera.layouts.contains(.programView), "Program View needs two cameras")
     XCTAssertTrue(presentation.layouts.contains(.programView))
+    for layout in UILayout.allCases {
+      var session = separate([camera(1), camera(2)])
+      session.layout = layout
+      XCTAssertEqual(UIPresentationBuilder.session(session).cutButtons.count, 2, "Two cameras can cut in every layout")
+    }
   }
 
   func testPendingCutButton() {

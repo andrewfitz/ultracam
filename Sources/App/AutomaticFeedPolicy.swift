@@ -5,9 +5,14 @@ enum FeedLifecycleDemandPolicy {
   /// Any running camera keeps the sink open, not just the one on air: with none of its
   /// frames the client gets standby black, its format stays locked, and a cut or a move
   /// back on air doesn't have to reopen a device the client is holding.
-  static func programTransportRequired(programMode: Bool, cameraRequested: Bool,
-                                       anyCameraRunning: Bool) -> Bool {
-    programMode && cameraRequested && anyCameraRunning
+  static func programTransportRequired(cameraRequested: Bool, anyCameraRunning: Bool) -> Bool {
+    cameraRequested && anyCameraRunning
+  }
+
+  /// Switching exists with two cameras, and one camera doesn't need a second, slower way
+  /// to its own picture. Past the limit Program has no device left.
+  static func programPublished(enabledCameras: Int) -> Bool {
+    enabledCameras >= 2 && enabledCameras <= maximumCameras
   }
 
   /// The fallback, if a meeting app won't take a format change mid-stream: every sink opens

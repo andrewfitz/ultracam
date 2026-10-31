@@ -148,31 +148,9 @@ struct UICommands: Commands {
     }
 
     CommandMenu("Program") {
-      // The output mode as two checked items, not a Picker: a Picker's submenu title stays
-      // enabled while it's locked, so choosing Program there did nothing and said nothing.
-      let availability = UIOutputModeControl.availability(session)
-      Section("Output") {
-        ForEach([UIOutputMode.separate, .program], id: \.self) { mode in
-          Toggle(mode == .program ? "Program" : "Separate Cameras (ISO)",
-            isOn: Binding(get: { session.outputMode == mode }, set: { if $0 { send(.setOutputMode(mode)) } }))
-            .disabled(availability != .available)
-        }
-        switch availability {
-        case .available:
-          EmptyView()
-        case .stopCamerasFirst:
-          let other: UIOutputMode = session.outputMode == .program ? .separate : .program
-          Button("Stop Cameras and Switch to \(UIOutputModeControl.title(other))") {
-            UIOutputModeSwitch.shared.stopCamerasAndSwitch(to: other, send: send, session: { bridge.snapshot() })
-          }
-        case .blocked(let reason):
-          Text(reason)
-        }
-      }
-      Divider()
-      // The camera on Program is checked; cuts need Program and a running camera with a picture.
+      // The camera on Program is checked; cuts need a running camera with a picture.
       ForEach(Array(presentation.cameras.prefix(4))) { camera in
-        let onAir = session.outputMode == .program && session.onAirID == camera.id
+        let onAir = session.onAirID == camera.id
         Toggle("Cut to \(camera.name)", isOn: Binding(get: { onAir }, set: { _ in send(.cut(cameraID: camera.id)) }))
           .keyboardShortcut(KeyEquivalent(Character("\(camera.number)")), modifiers: .control)
           .disabled(!camera.cutEnabled)
@@ -182,22 +160,22 @@ struct UICommands: Commands {
       Toggle("Automatic Switching", isOn: Binding(get: { presentation.autoSwitching }, set: { send(.setAutoSwitching($0)) }))
         .keyboardShortcut("a", modifiers: [.control, .option])
         .disabled(!presentation.canAutoSwitch)
-        .help(presentation.canAutoSwitch || session.outputMode != .program ? "Cut automatically using the chosen strategy."
+        .help(presentation.canAutoSwitch || !presentation.programAvailable ? "Cut automatically using the chosen strategy."
           : "Choose a switching strategy in Program › Strategy first.")
       Toggle("Hold Current Shot", isOn: Binding(get: { session.autoHold }, set: { send(.setAutoHold($0)) }))
         .disabled(!presentation.canHoldShot)
       // A Picker's own submenu title doesn't grey out when disabled; a Menu's does.
       Menu("Strategy") {
         Picker("Strategy", selection: Binding(get: { session.strategy }, set: { send(.setStrategy($0)) })) {
-          ForEach(UIOutputModeControl.strategies, id: \.self) { strategy in
+          ForEach(UIStrategy.offered, id: \.self) { strategy in
             Text(UIStrategy.title(strategy)).tag(strategy)
           }
         }
         .pickerStyle(.inline)
         .labelsHidden()
       }
-      .disabled(session.outputMode != .program)
-      if session.outputMode == .program && session.strategy == .naturalTalkingHead {
+      .disabled(!presentation.programAvailable)
+      if presentation.programAvailable && session.strategy == .naturalTalkingHead {
         Menu("Anchor") {
           Picker("Anchor", selection: Binding(get: { session.anchorID }, set: { send(.setAnchor(cameraID: $0)) })) {
             Text("Automatic").tag(String?.none)

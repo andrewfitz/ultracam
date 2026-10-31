@@ -167,16 +167,12 @@ struct UIStatusBarView: View {
   /// The short output text still names what is (not) in use.
   private var shortOutputText: String {
     let session = context.session
-    switch session.outputMode {
-    case .program:
-      return session.programInUse ? "Program in use" : "Program not in use"
-    case .separate:
-      if session.cameras.count == 1, let camera = session.cameras.first {
-        return camera.inUse ? "\(camera.name) in use" : "\(camera.name) not in use"
-      }
-      let inUse = session.cameras.filter(\.inUse).count
-      return inUse > 0 ? "\(inUse) of \(session.cameras.count) in use" : "Cameras not in use"
+    if session.cameras.count == 1, let camera = session.cameras.first {
+      return camera.inUse ? "\(camera.name) in use" : "\(camera.name) not in use"
     }
+    let inUse = session.cameras.filter(\.inUse).count
+    if session.programInUse { return inUse > 0 ? "Program and \(inUse) more in use" : "Program in use" }
+    return inUse > 0 ? "\(inUse) of \(session.cameras.count) in use" : "Cameras not in use"
   }
 }
 
@@ -264,16 +260,14 @@ struct UIStatusPopover: View {
   private var output: some View {
     Group {
       Text("Output").font(.headline)
-      switch context.session.outputMode {
-      case .program:
+      if context.presentation.programAvailable {
         row(title: "Ultracam · Program", detail: context.session.programClientLine,
           positive: context.session.programInUse,
           format: context.session.cameras.first { $0.id == context.session.onAirID }?.outputFormat)
-      case .separate:
-        ForEach(context.session.cameras) { camera in
-          row(title: "Ultracam · \(camera.name)", detail: camera.clientLine, positive: camera.inUse,
-            format: camera.outputFormat)
-        }
+      }
+      ForEach(context.session.cameras) { camera in
+        row(title: "Ultracam · \(camera.name)", detail: camera.clientLine, positive: camera.inUse,
+          format: camera.outputFormat)
       }
       Text("Video only — select your microphone in your meeting app.")
         .font(.subheadline).foregroundStyle(.secondary)

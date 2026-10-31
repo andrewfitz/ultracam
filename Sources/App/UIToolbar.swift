@@ -9,7 +9,7 @@ struct UIToolbarContent: ToolbarContent {
 
   var body: some ToolbarContent {
     let _ = UIRenderProbe.count("UIToolbarContent")
-    if presentation.outputMode == .program && !presentation.cutButtons.isEmpty {
+    if !presentation.cutButtons.isEmpty {
       ToolbarItem(placement: .principal) {
         UIToolbarCutGroup(context: context)
       }
@@ -117,7 +117,7 @@ struct UIToolbarCutGroup: View {
       } else {
         // Manual never cuts on its own: Auto asks how to switch, then turns on with that strategy.
         Menu {
-          ForEach(UIOutputModeControl.strategies.filter { $0 != .manual }, id: \.self) { strategy in
+          ForEach(UIStrategy.offered.filter { $0 != .manual }, id: \.self) { strategy in
             Button(UIStrategy.title(strategy)) {
               context.send(.setStrategy(strategy))
               context.send(.setAutoSwitching(true))

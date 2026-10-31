@@ -197,7 +197,6 @@ final class ProgramOutputRoute: @unchecked Sendable {
   private var outputActive = true
   private var normalizerProvider: (@Sendable () -> ProgramFrameNormalizing?)?
   private var liveSources: Set<FeedID>?
-  private var acceptingCapture = true
   private var timeline: UInt64 = 0
   private var nextSequence: UInt64 = 0
   private var stage: [StageEntry] = []
@@ -243,6 +242,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
   var pendingCutTime: CMTime? { locked { state.pendingCutTime } }
   var hasPendingCut: Bool { locked { state.hasPendingCut } }
   var isOnAir: Bool { locked { state.isOnAir } }
+  /// The source has sent a frame since it became available.
+  func isProducing(_ feedID: FeedID) -> Bool { locked { state.readiness(of: feedID) == .producing } }
   var statistics: ProgramRouteStatistics { locked { stats } }
   var contract: ProgramOutputFormat? { locked { outputContract } }
 
@@ -294,12 +295,6 @@ final class ProgramOutputRoute: @unchecked Sendable {
 
   func setNormalizerProvider(_ provider: (@Sendable () -> ProgramFrameNormalizing?)?) {
     locked { normalizerProvider = provider }
-  }
-
-  /// Program mode on or off. Capture delivery is ignored while off, so
-  /// separate-camera mode never feeds the Program scheduler.
-  func setAcceptingCapture(_ accepting: Bool) {
-    locked { acceptingCapture = accepting }
   }
 
   /// Capture delivery gating. When set, `ingest(fromCapture:)` accepts frames
@@ -366,22 +361,19 @@ final class ProgramOutputRoute: @unchecked Sendable {
     mutate { $0.selectImmediately(feedID) }
   }
 
-  /// A frame-boundary cut when something is on air and `cutsAllowed`;
-  /// otherwise the selection changes at once. Decided under one lock, so a
+  /// A frame-boundary cut when something is on air; otherwise the selection
+  /// changes at once. Decided under one lock, so a
   /// frame arriving between the check and the change cannot turn an instant
   /// selection into an unbounded cut, or the reverse.
   @discardableResult
-  func requestSelection(_ feedID: FeedID, noEarlierThan: CMTime? = nil,
-                        cutsAllowed: Bool) -> ProgramCutRequestResult<FeedID> {
+  func requestSelection(_ feedID: FeedID, noEarlierThan: CMTime? = nil) -> ProgramCutRequestResult<FeedID> {
     mutate { state in
-      guard cutsAllowed, state.isOnAir else { return state.selectImmediately(feedID) }
+      guard state.isOnAir else { return state.selectImmediately(feedID) }
       return state.requestManualCut(to: feedID, at: noEarlierThan)
     }
   }
 
   func cancelPendingCut() { mutate { $0.cancelPendingCut() } }
-
-  func markSourcesIdle() { mutate { $0.markSourcesIdle() } }
 
   /// Marks a source unavailable for future Program cuts (or, when healthy,
   /// starting until its first frame). A pending cut aimed at an unavailable
@@ -422,6 +414,38 @@ final class ProgramOutputRoute: @unchecked Sendable {
     route(feedID: feedID, frame: frame, captureGate: true)
   }
 
+  /// A frame nothing rendered, in delivery order: the scheduler needs only its time, so a
+  /// cut lands on it, `isOnAir` stays true to the facts and a pending cut still expires,
+  /// with no pixel work and no consumer. It reaches neither the monitor nor the camera route.
+  func observe(fromCapture feedID: FeedID, presentationTime: CMTime, duration: CMTime) {
+    let source = ProgramSourceFrame(sourceID: feedID, sourceTime: presentationTime, duration: duration)
+    var events: [ProgramRouteEvent] = []
+    lock.lock()
+    if liveSources.map({ !$0.contains(feedID) }) == true {
+      lock.unlock()
+      return
+    }
+    if Thread.isMainThread { stats.mainThreadIngests &+= 1 }
+    let decision = state.ingest(source)
+    if let (target, reason) = state.takeAbandonedCut() {
+      events.append(.cutAbandoned(feedID: target, reason: reason))
+    }
+    switch decision {
+    case let .accepted(mapped), let .cutApplied(mapped):
+      onAirSkips = 0
+      stats.accepted &+= 1
+      stats.withoutConsumer &+= 1
+      if case .cutApplied = decision {
+        events.append(.cutApplied(feedID: feedID, sourceTime: mapped.sourceTime, programTime: mapped.programTime))
+      }
+    case let .skipped(reason):
+      recordSkipLocked(reason, feedID: feedID, events: &events)
+    }
+    let eventHandler = self.eventHandler
+    lock.unlock()
+    events.forEach { eventHandler?($0) }
+  }
+
   /// Routes a processed frame. Frames that already match the contract (or
   /// when no contract is set) are published before this returns, with no
   /// pixel work. Other frames are converted on the GPU and published in
@@ -443,7 +467,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
       sourceTime: metadata.presentationTime, duration: metadata.duration)
     var events: [ProgramRouteEvent] = []
     lock.lock()
-    if captureGate, !acceptingCapture || liveSources.map({ !$0.contains(feedID) }) == true {
+    if captureGate, liveSources.map({ !$0.contains(feedID) }) == true {
       lock.unlock()
       return nil
     }
@@ -501,7 +525,8 @@ final class ProgramOutputRoute: @unchecked Sendable {
       stats.skippedInvalidTimestamp &+= 1
       onAirError = "its frames have invalid timing (\(error))"
     }
-    guard let onAirError, feedID == state.selectedFeedID else { return }
+    // The scheduler runs with no client too, and then nothing is missing a frame.
+    guard let onAirError, feedID == state.selectedFeedID, outputActive else { return }
     onAirSkips += 1
     // At and past the threshold: once the latch re-arms (a healthy stretch,
     // or a new client) a stream that is still broken is reported again.

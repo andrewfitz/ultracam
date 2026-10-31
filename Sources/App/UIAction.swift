@@ -68,7 +68,6 @@ enum UIAction: Sendable, Equatable {
   case setAutoSwitching(Bool)
   case setAutoHold(Bool)
   case setStrategy(SwitcherStrategy)
-  case setOutputMode(UIOutputMode)
   case setAnchor(cameraID: String?)
   case setEmphasis(cameraID: String?)
 

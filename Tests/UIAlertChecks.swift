@@ -69,7 +69,6 @@ import XCTest
     other.running = true
     other.signal = .live(format: "2160p")
     var session = UISessionSnapshot()
-    session.outputMode = .program
     session.cameras = [lost, other]
     session.onAirID = "a"
     session.programInUse = true

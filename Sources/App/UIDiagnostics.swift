@@ -12,7 +12,7 @@ struct UIDiagnosticsView: View {
 
   private var tabs: [(id: String, title: String)] {
     model.feedDescriptors.map { ($0.id.rawValue, $0.name) }
-      + (model.outputMode == .program ? [("program", "Program")] : []) + [("app", "App")]
+      + (model.programAvailable ? [("program", "Program")] : []) + [("app", "App")]
   }
 
   var body: some View {

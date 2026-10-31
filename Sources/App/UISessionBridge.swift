@@ -135,11 +135,9 @@ struct UISessionBridge {
       camera.outputFormat = update.flatMap { UIFormatLabels.shortFormat($0.output) }
       camera.applying = running && update != nil && update?.pipelineEnabledApplied == nil &&
         (update?.sourceFormat != nil || UIFormatLabels.shortFormat(update?.input ?? "") != nil)
-      // A client, by the extension's own demand signal; an open sink is not a viewer. Program
-      // mode publishes no per-camera device yet, so only Program can have clients there.
-      let ownDevice = model.outputMode == .separateCameras
-      camera.inUse = ownDevice && running && model.cameraInUse(id)
-      camera.clientUnknown = ownDevice && model.cameraClientUnknown(id)
+      // A client, by the extension's own demand signal; an open sink is not a viewer.
+      camera.inUse = running && model.cameraInUse(id)
+      camera.clientUnknown = model.cameraClientUnknown(id)
       camera.sinkConnected = update?.cameraOutputActive == true
       camera.clientWaiting = model.waitingClients.contains(id)
       camera.queueStalled = model.stalledCameras.contains(id)
@@ -195,13 +193,12 @@ struct UISessionBridge {
     }
     var session = UISessionSnapshot()
     session.syncCameras = model.syncCameras
-    session.outputMode = model.outputMode == .program ? .program : .separate
     session.cameras = interface.ordered(cameras, id: \.id)
     session.selectedID = model.selectedFeedID.rawValue
     session.programInUse = model.programInUse
-    session.programClientUnknown = model.outputMode == .program && model.programClientUnknown
+    session.programClientUnknown = model.programAvailable && model.programClientUnknown
     session.programSinkConnected = model.programSinkConnected
-    session.onAirID = model.outputMode == .program ? model.switcherSelectedFeedID?.rawValue : nil
+    session.onAirID = model.programAvailable ? model.switcherSelectedFeedID?.rawValue : nil
     session.pendingCutID = model.switcherPendingFeedID?.rawValue
     let switcher = model.switcherSettings
     session.autoSwitching = switcher.automatic
@@ -218,6 +215,7 @@ struct UISessionBridge {
     session.programFormatMismatch = model.programFormatMismatch
     session.programIssue = model.programIssue
     session.programMoved = model.programMoved
+    session.cutsMissClient = model.cutsMissClient
     session.programQueueStalled = model.programQueueStalled
     session.unusedTake = model.unusedTake
     session.appProblems = model.appProblems
@@ -234,9 +232,8 @@ struct UISessionBridge {
     session.install = UIInstallState(canRequestChanges: model.installer.canRequestChanges, pending: model.installer.pending,
       status: model.installer.status, unavailableReason: model.installer.unavailableReason,
       installed: UIExtensionDetector.isInstalled())
-    session.canEditTopology = model.canResetSettings
     session.canAddCamera = model.canAddCamera
-    session.layout = model.outputMode == .program || interface.layout != .programView ? interface.layout : .sideBySide
+    session.layout = model.programAvailable || interface.layout != .programView ? interface.layout : .sideBySide
     session.collapsed = interface.collapsed
     session.sidebarVisible = interface.sidebarVisible
     session.inspectorOpen = interface.inspectorOpen
@@ -413,7 +410,6 @@ struct UISessionBridge {
       model.updateSwitcher(settings)
     case .setAutoHold(let hold): model.setAutoHold(hold)
     case .setStrategy(let strategy): model.setStrategy(strategy)
-    case .setOutputMode(let mode): model.setOutputMode(mode == .program ? .program : .separateCameras)
     case .setAnchor(let id): model.naturalAnchorFeedID = id.map(feedID)
     case .setEmphasis(let id): model.naturalEmphasisFeedID = id.map(feedID)
     case .forgetLUT(let id): model.forgetLUT(feedID(id))
@@ -483,6 +479,9 @@ extension UISessionBridge {
 }
 
 enum UIStrategy {
+  /// The strategies the switching controls offer (Dynamic analysis isn't built yet).
+  static let offered: [SwitcherStrategy] = [.manual, .fixedInterval, .naturalTalkingHead]
+
   static func title(_ strategy: SwitcherStrategy) -> String {
     switch strategy {
     case .manual: return "Manual"

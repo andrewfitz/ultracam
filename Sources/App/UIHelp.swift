@@ -5,7 +5,7 @@ struct UIHelpView: View {
   private let steps = [
     "Install the Ultracam camera from the sidebar or Settings › Camera, and approve it in System Settings.",
     "Choose each camera's input device in its inspector (⌥⌘I), then Start Camera.",
-    "In your meeting app, choose “Ultracam · Camera 1” (or “Ultracam · Program” in Program mode).",
+    "In your meeting app, choose “Ultracam · Camera 1” (or “Ultracam · Program” with two or more cameras).",
     "To back up the meeting, choose a recording folder and press Record. Recordings are the camera original, without the LUT or effects.",
   ]
 

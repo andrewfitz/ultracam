@@ -77,7 +77,7 @@ import XCTest
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
     let b = FeedDescriptor(id: feed("beta"), name: "Tight")
     let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(
-      feeds: [a, b], outputMode: .program))
+      feeds: [a, b]))
     guard case .accepted = coordinator.ingestProgramFrame(feedID: a.id,
       frame: try frame(a.id, at: 0))?.decision else {
       return XCTFail("The initial Program source should be accepted")
@@ -115,13 +115,11 @@ import XCTest
     XCTAssertEqual(consumer.pendingCount, 0)
   }
 
-  func testFeedCoordinatorPublishesSeparateOrProgramRegistryAndProgramDemand() throws {
+  func testFeedCoordinatorPublishesEveryCameraAndProgramAndFollowsProgramDemand() throws {
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
     let b = FeedDescriptor(id: feed("beta"), name: "Tight")
     let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b]))
-    XCTAssertEqual(coordinator.virtualCameraDescriptors.map(\.kind), [.feed, .feed])
-    coordinator.setOutputMode(.program)
-    XCTAssertEqual(coordinator.virtualCameraDescriptors.map(\.kind), [.program])
+    XCTAssertEqual(coordinator.virtualCameraDescriptors.map(\.kind), [.feed, .feed, .program])
 
     let start = coordinator.setProgramConsumer(true, at: 0)
     XCTAssertEqual(start, [.start(feedID: "alpha")])
@@ -135,14 +133,12 @@ import XCTest
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
     let b = FeedDescriptor(id: feed("beta"), name: "Tight")
     let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(
-      feeds: [a, b], outputMode: .separateCameras,
-      switcher: SwitcherSettings(selectedFeedID: a.id)))
+      feeds: [a, b], switcher: SwitcherSettings(selectedFeedID: a.id)))
 
     XCTAssertEqual(coordinator.programOutput.selectedFeedID, a.id)
-    // Nothing is on air in separate-camera mode, so there is no cut to wait
-    // for: the selection, the saved value and the route agree at once.
+    // No source has sent a frame, so there is no cut to wait for: the
+    // selection, the saved value and the route agree at once.
     coordinator.setSwitcher(SwitcherSettings(selectedFeedID: b.id))
-    coordinator.setOutputMode(.program)
     XCTAssertEqual(coordinator.programOutput.selectedFeedID, b.id)
     XCTAssertNil(coordinator.programOutput.pendingFeedID)
     XCTAssertEqual(coordinator.snapshot.switcher.selectedFeedID, b.id)
@@ -444,7 +440,7 @@ import XCTest
 
   func testCaptureDeliveryReachesTheProgramCameraOffTheMainThread() throws {
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
-    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a], outputMode: .program))
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a]))
     let route = try coordinator.addProgramOutputRoute(id: "camera-test", capacity: 64, policy: .reject)
     let sent = EventLog()
     let hostNow = CMTime(value: 100 * 60_000, timescale: 60_000)
@@ -506,7 +502,7 @@ import XCTest
   func testCutToStartingCameraWaitsAndFailedStartRollsBackVisibly() throws {
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
     let b = FeedDescriptor(id: feed("beta"), name: "Tight")
-    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b], outputMode: .program))
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b]))
     var now: TimeInterval = 0
     coordinator.programOutput.setPendingCutClock({ now }, timeout: 2, startingTimeout: 30)
     let image = try frame(a.id, at: 0).payload
@@ -560,7 +556,7 @@ import XCTest
   func testProgramLatencyFromCaptureToCameraSend() throws {
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
     let b = FeedDescriptor(id: feed("beta"), name: "Tight")
-    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b], outputMode: .program))
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b]))
     let route = try coordinator.addProgramOutputRoute(id: "latency", capacity: 64, policy: .reject)
     let clock = LatencyClock()
     let bridge = ProgramOutputBridge(route: route, connect: { _, _ in }, disconnect: {},
@@ -1098,7 +1094,7 @@ import XCTest
     route.ingest(feedID: b, frame: processed(image, at: 0))
     route.updateFeeds([a, b, c])  // a camera is added while A is on air
     XCTAssertTrue(route.isOnAir, "The on-air camera is still on air after a rebuild")
-    guard case .queued = route.requestSelection(b, cutsAllowed: true) else {
+    guard case .queued = route.requestSelection(b) else {
       return XCTFail("A request right after a rebuild is a cut, not an instant selection")
     }
     route.updateFeeds([a, b])  // another rebuild while the cut is pending
@@ -1115,6 +1111,42 @@ import XCTest
     while events.abandoned.isEmpty, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
     XCTAssertEqual(events.abandoned.map(\.0), [a], "A dropped cut is reported so its requester is released")
     XCTAssertEqual(events.abandoned.first?.1, .targetUnavailable)
+  }
+
+  /// R1: no pixels, no consumer, and a cut is still a cut, in delivery order with rendered frames.
+  func testAFrameNothingRenderedStillLandsACut() throws {
+    let a = feed("alpha"), b = feed("beta")
+    let route = ProgramOutputRoute(feedIDs: [a, b])
+    route.setOutput(contract: nil, active: false)
+    let events = EventLog()
+    route.onEvent = { events.append($0) }
+    var monitored = 0
+    route.onMonitorFrame = { _, _, _, _, _ in monitored += 1 }
+    route.setSourceHealth(a, healthy: true)
+    route.setSourceHealth(b, healthy: true)
+    let time = { (index: Int64) in CMTime(value: index, timescale: 30) }
+    let duration = CMTime(value: 1, timescale: 30)
+    route.observe(fromCapture: a, presentationTime: time(0), duration: duration)
+    route.observe(fromCapture: b, presentationTime: time(0), duration: duration)
+    XCTAssertTrue(route.isOnAir, "The facts, with nobody watching")
+    XCTAssertTrue(route.isProducing(b))
+    guard case .queued = route.requestSelection(b) else { return XCTFail("A real cut, not a preselection") }
+    XCTAssertEqual(route.selectedFeedID, a, "It lands on the target's frame, not on the click")
+    route.observe(fromCapture: a, presentationTime: time(1), duration: duration)
+    XCTAssertEqual(route.selectedFeedID, a)
+    route.observe(fromCapture: b, presentationTime: time(1), duration: duration)
+    XCTAssertEqual(route.selectedFeedID, b)
+    XCTAssertFalse(route.hasPendingCut)
+    let deadline = Date().addingTimeInterval(1)
+    while events.applied.isEmpty, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+    XCTAssertEqual(events.applied, [b], "Logged and timed like any cut")
+    XCTAssertEqual(monitored, 0, "No frame to show")
+    XCTAssertEqual(route.statistics.published, 0)
+    XCTAssertEqual(route.statistics.accepted, 3)
+    XCTAssertEqual(route.statistics.withoutConsumer, 3)
+    route.setSourceLive(b, live: false)
+    route.observe(fromCapture: a, presentationTime: time(2), duration: duration)
+    XCTAssertEqual(route.statistics.accepted, 3, "A stopped source takes no new frames")
   }
 
   /// An add invalidates nothing, so nothing on its way to a client goes. Losing a source does.
@@ -1243,7 +1275,7 @@ import XCTest
   func testCutToCameraWithNoSignalExpiresAndAutomaticSwitchingContinues() throws {
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
     let b = FeedDescriptor(id: feed("beta"), name: "Tight")
-    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b], outputMode: .program))
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b]))
     coordinator.setSwitcher(SwitcherSettings(selectedFeedID: a.id, automatic: true,
       intervalSeconds: 3, strategy: .fixedInterval))
     var now: TimeInterval = 0
@@ -1337,6 +1369,10 @@ private final class EventLog: @unchecked Sendable {
   var abandoned: [(FeedID, ProgramCutAbandonReason)] {
     lock.lock(); defer { lock.unlock() }
     return events.compactMap { if case let .cutAbandoned(feedID, reason) = $0 { return (feedID, reason) }; return nil }
+  }
+  var applied: [FeedID] {
+    lock.lock(); defer { lock.unlock() }
+    return events.compactMap { if case let .cutApplied(feedID, _, _) = $0 { return feedID }; return nil }
   }
   var mainThreadSends: Int { lock.lock(); defer { lock.unlock() }; return sends.filter(\.0).count }
   var times: [CMTime] { lock.lock(); defer { lock.unlock() }; return sends.map(\.1) }

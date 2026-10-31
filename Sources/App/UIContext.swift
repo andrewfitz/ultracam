@@ -215,7 +215,6 @@ enum UIFixtures {
   /// Two cameras in a Program meeting, both recording, Camera 1 on air and selected.
   static func programMeeting() -> UISessionSnapshot {
     var session = baseSession()
-    session.outputMode = .program
     session.cameras = [camera(1), camera(2, signal: .live(format: "2160p 29.97"))]
     session.selectedID = "camera-1"
     session.programInUse = true
@@ -245,16 +244,18 @@ enum UIFixtures {
   static func standalone() -> UISessionSnapshot {
     var session = baseSession()
     session.cameras = [camera(1), camera(2, recording: .paused, elapsed: 252, signal: .live(format: "2160p 29.97"))]
+    session.onAirID = "camera-1"
     session.selectedID = "camera-1"
     return session
   }
 
-  /// Four cameras in Separate mode, Camera 1 in use, Camera 3 without a signal.
+  /// Four cameras, Camera 1 in use, Camera 3 without a signal.
   static func fourUp() -> UISessionSnapshot {
     var session = baseSession()
     var third = camera(3, recording: .idle, signal: .noSignal)
     third.inputName = "Capture input 3"
     session.cameras = [camera(1, inUse: true), camera(2), third, camera(4, recording: .paused, elapsed: 252)]
+    session.onAirID = "camera-1"
     session.selectedID = "camera-2"
     session.layout = .fourUp
     session.sidebarVisible = false

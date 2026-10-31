@@ -37,8 +37,6 @@ struct ProgramOutput<SourceID: Hashable> {
 
   mutating func select(_ sourceID: SourceID) { scheduler.select(sourceID) }
 
-  mutating func markSourcesIdle() { scheduler.markSourcesIdle() }
-
   mutating func setClock(_ clock: @escaping () -> TimeInterval) { scheduler.setClock(clock) }
 
   var pendingCutTimeout: TimeInterval {
@@ -204,9 +202,6 @@ struct SwitcherCoordinator {
     pendingDirectorDecision = nil
     return .selectedImmediately
   }
-
-  /// Producing sources return to starting; nothing is on air until a frame.
-  mutating func markSourcesIdle() { programOutput.markSourcesIdle() }
 
   mutating func setFeedHealth(_ feedID: FeedID, healthy: Bool) {
     guard feedIDs.contains(feedID) else { return }

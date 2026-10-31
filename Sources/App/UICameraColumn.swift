@@ -64,7 +64,7 @@ struct UICameraPictureView: View {
     }
   }
   private var snapshot: UICameraSnapshot? { context.snapshot(camera.id) }
-  private var isProgramMode: Bool { context.presentation.outputMode == .program }
+  private var switching: Bool { context.presentation.programAvailable }
   /// Clean View hides every overlay on the picture, tally included; hover still
   /// reveals the view controls so Clean View can be turned off again.
   private var isClean: Bool { !compact && UICleanViewState.shared.clean.contains(camera.id) }
@@ -204,7 +204,7 @@ struct UICameraPictureView: View {
   private var overlays: some View {
     VStack(spacing: 0) {
       HStack(alignment: .center, spacing: 6) {
-        if isProgramMode && !isClean {
+        if switching && !isClean {
           Text("\(camera.number)")
             .font(.subheadline.weight(.bold).monospacedDigit())
             .padding(.horizontal, 6)
@@ -448,14 +448,14 @@ struct UICameraPictureView: View {
   }
 }
 
-/// "Copy Settings To" with every other camera, plus Program in Program mode.
+/// "Copy Settings To" with every other camera, plus Program with two or more cameras.
 private struct UICopySettingsMenu: View {
   let camera: UICameraPresentation
   let context: UIContext
   let title: String
   var body: some View {
     let others = context.presentation.cameras.filter { $0.id != camera.id }
-    let program = context.presentation.outputMode == .program
+    let program = context.presentation.programAvailable
     if !others.isEmpty || program {
       Menu(title) {
         ForEach(others) { other in
@@ -859,7 +859,7 @@ struct UIChannelStripView: View {
   private var overflowMenu: some View {
     return Menu {
       Button("Show Inspector") { context.send(.showInspector(cameraID: camera.id)) }
-      if context.presentation.outputMode == .program {
+      if context.presentation.programAvailable {
         // ⌃n belongs to the Program menu. The badge only shows it: a keyboard
         // shortcut here would give the menu a second handler for the same key.
         Button("Cut to \(camera.name)") { context.send(.cut(cameraID: camera.id)) }
@@ -1141,7 +1141,7 @@ struct UIChannelStripView: View {
 
   @ViewBuilder private func outputLabel(full: Bool, minimal: Bool = false) -> some View {
     if camera.showsCut {
-      // Wider than the gutter; the cut button leads the row in Program mode.
+      // Wider than the gutter; the cut button leads the row.
       Button {
         context.send(.cut(cameraID: camera.id))
       } label: {
@@ -1153,7 +1153,7 @@ struct UIChannelStripView: View {
       .accessibilityLabel("Cut to \(camera.name)")
     } else {
       HStack(spacing: 8) {
-        gutterIcon(context.presentation.outputMode == .program ? "dot.radiowaves.left.and.right" : "video.badge.checkmark",
+        gutterIcon(context.session.onAirID == camera.id ? "dot.radiowaves.left.and.right" : "video.badge.checkmark",
           color: camera.outputInUse ? .green : .secondary)
         if !minimal {
           // Natural width, so the row falls back to shorter wording instead of truncating.
@@ -1168,11 +1168,10 @@ struct UIChannelStripView: View {
     }
   }
 
-  /// Short output wording for narrow strips. Program mode never says "In use".
+  /// Short output wording for narrow strips. On Program it never says "In use".
   private var compactOutputLine: String {
-    if context.presentation.outputMode == .program {
-      return camera.tally == .onAir ? "On air" : "In Program"
-    }
+    if camera.tally == .onAir { return "On air" }
+    if context.session.onAirID == camera.id, camera.tally != .iso { return "In Program" }
     return snapshot?.clientLine ?? "Not in use"
   }
 

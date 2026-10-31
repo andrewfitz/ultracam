@@ -24,11 +24,11 @@ The script compiles every app source except `UltracamApp.swift` with the release
    - select, layout and collapse
    - per-camera settings on a camera that isn't selected (persisted, selection unchanged)
    - stop on stopped cameras
-   - output mode, add, rename and remove
+   - add, rename and remove
    - Auto, hold and strategy
 5. **Menu bar.** `UIMenuBarController.buildItems` runs for each fixture:
    - required rows are present
-   - cuts happen only on `Cut to …` rows with ⌃n, and never in Separate mode
+   - cuts happen only on `Cut to …` rows with ⌃n, and never with one camera
    - no duplicate shortcuts and no app names
    - every icon state renders as a template image
 

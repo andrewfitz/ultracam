@@ -29,8 +29,7 @@ struct CaptureUpdate {
  var audioActivityRMS:Float;var audioActivityPeak:Float
  var audioRMSLeft=0.0;var audioRMSRight=0.0;var audioPeakLeft=0.0;var audioPeakRight=0.0
 }
-enum OutputMode {case program,separate}
-final class IntegrationCoordinator {var outputMode=OutputMode.program;func evaluateSwitcher(at:Int)->Bool {true}}
+final class IntegrationCoordinator {func evaluateSwitcher(at:Int)->Bool {true};func expirePendingCut() {}}
 final class DirectorSpy {
  var rms:Float?;var peak:Float?;var audioTime:Int?;var tickTime:Int?
  func ingestAudio(time:Int,rms:Float,peak:Float,present:Bool) { self.rms=rms;self.peak=peak;audioTime=time }
@@ -39,6 +38,7 @@ final class DirectorSpy {
 final class TimelineSpy {var tickTime:Int?;func recordTick(time:Int) {tickTime=time}}
 final class IntegrationFixture {
  let feedCoordinator=IntegrationCoordinator()
+ let directorWanted=true
  var autoSwitcherBridge:DirectorSpy?=DirectorSpy();var autoSwitcherTimeline:TimelineSpy?=TimelineSpy()
  var syncCameras=true;var synchronizingCameras=false;var lutLoadingFeeds:Set<Int>=[];var cameraLUTs:[Int:String]=[:]
  var feedDescriptors=[FeedDescriptor(id:1),FeedDescriptor(id:2,selectedDevice:"second-device"),FeedDescriptor(id:3,enabled:false)]

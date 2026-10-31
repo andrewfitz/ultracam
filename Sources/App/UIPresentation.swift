@@ -7,7 +7,6 @@ import Foundation
 
 // MARK: - Snapshot
 
-enum UIOutputMode: String, Sendable, Equatable { case separate, program }
 
 enum UILayout: String, CaseIterable, Sendable, Equatable {
   case single, sideBySide, programView, fourUp
@@ -117,7 +116,7 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var outputFormat: String?
   /// True while an effect or processing change is renegotiating the output.
   var applying = false
-  /// Separate mode: this camera's virtual camera has at least one client.
+  /// This camera's virtual camera has at least one client.
   var inUse = false
   /// Its route can't be read, so `inUse` means nothing: the clients are unknown, not none.
   var clientUnknown = false
@@ -188,10 +187,20 @@ struct UIUnexpectedStop: Sendable, Equatable {
 
 /// Program moved off a camera that lost its signal. It stays until it's acknowledged.
 struct UIProgramMove: Sendable, Equatable {
+  enum Cause: Sendable, Equatable { case signalLost, stopped, notReady }
   var from: String
   var to: String
   /// Hold was on: loss overrode it once, and it stays on for the new shot.
   var heldShot = false
+  var cause = Cause.signalLost
+
+  var title: String {
+    switch cause {
+    case .signalLost: return "\(from) signal lost"
+    case .stopped: return "\(from) stopped"
+    case .notReady: return "\(from) has no picture yet"
+    }
+  }
 }
 
 /// An error that used to reach only Diagnostics. Stays until acknowledged or resolved.
@@ -254,8 +263,9 @@ struct UIInstallState: Sendable, Equatable {
 
 struct UISessionSnapshot: Sendable, Equatable {
   var syncCameras = false
-  var outputMode: UIOutputMode = .separate
   var cameras: [UICameraSnapshot] = []
+  /// Switching exists with two cameras: Program is published and cuts are offered.
+  var programAvailable: Bool { FeedLifecycleDemandPolicy.programPublished(enabledCameras: cameras.count) }
   var selectedID: String = ""
   var programInUse = false
   /// Program's route can't be read: its clients are unknown, not none.
@@ -280,6 +290,8 @@ struct UISessionSnapshot: Sendable, Equatable {
   /// A Program cut that did not land, or Program frames the output dropped.
   var programIssue: String?
   var programMoved: UIProgramMove?
+  /// A cut landed while a client watched a camera's own device, and Program has none.
+  var cutsMissClient = false
   /// The extension's Program queue has stayed full.
   var programQueueStalled = false
   /// A take has outlived the last client seen during it.
@@ -297,7 +309,6 @@ struct UISessionSnapshot: Sendable, Equatable {
   var recoveringID: String?
   var recoveryMessage: String?
   var install = UIInstallState()
-  var canEditTopology = true
   var canAddCamera = true
   var layout: UILayout = .sideBySide
   var collapsed: Set<String> = []
@@ -508,7 +519,8 @@ struct UISessionPresentation: Sendable, Equatable {
   var subtitle: String
   var cameras: [UICameraPresentation]
   var selected: UICameraPresentation?
-  var outputMode: UIOutputMode
+  /// Two or more cameras: Program exists, and cut controls show in every layout.
+  var programAvailable: Bool
   var layouts: [UILayout]
   var layout: UILayout
   var recordControl: UIRecordControl
@@ -516,7 +528,7 @@ struct UISessionPresentation: Sendable, Equatable {
   var camerasControlTitle: String
   var cutButtons: [UICutButton]
   var autoSwitching: Bool
-  /// Program mode with a strategy that switches on its own (anything but Manual).
+  /// A strategy that switches on its own (anything but Manual), with cameras to switch.
   var canAutoSwitch: Bool
   /// Hold Current Shot only reaches the natural talking head director.
   var canHoldShot: Bool
@@ -753,16 +765,13 @@ enum UIPresentationBuilder {
     }
 
     let outputLine: String
-    switch session.outputMode {
-    case .program:
-      if session.onAirID == camera.id {
-        outputLine = tally == .onAir ? "In Program · on air" : "In Program · no viewer yet"
-      } else if session.pendingCutID == camera.id {
-        outputLine = "Next"
-      } else {
-        outputLine = "Program source"
-      }
-    case .separate:
+    if tally == .onAir {
+      outputLine = "In Program · on air"
+    } else if session.onAirID == camera.id, tally != .iso {
+      outputLine = "In Program · no viewer yet"
+    } else if session.pendingCutID == camera.id {
+      outputLine = "Next"
+    } else {
       outputLine = "Ultracam · \(camera.name) · \(camera.clientLine)"
     }
 
@@ -799,9 +808,9 @@ enum UIPresentationBuilder {
       timeLeftLine: rec.secondsLeft.map { "\(UIFormat.duration($0)) left" }
         ?? (drive(for: camera, in: session).map(isFull) == true ? "No space left" : nil),
       outputLine: outputLine,
-      outputInUse: session.outputMode == .program ? (session.onAirID == camera.id && session.programInUse) : camera.inUse,
-      showsCut: session.outputMode == .program && session.onAirID != camera.id,
-      cutEnabled: session.outputMode == .program && canTakeCut(camera) && session.onAirID != camera.id,
+      outputInUse: (session.onAirID == camera.id && session.programInUse) || camera.inUse,
+      showsCut: session.programAvailable && session.onAirID != camera.id,
+      cutEnabled: session.programAvailable && canTakeCut(camera) && session.onAirID != camera.id,
       cutHelp: cutHelp(camera, in: session),
       chips: chips, processing: camera.processing, applying: camera.applying,
       canStart: !camera.running && camera.deviceAvailable,
@@ -867,22 +876,18 @@ enum UIPresentationBuilder {
 
     let running = session.cameras.contains(where: \.running)
     // Only the strategies other than Manual cut on their own; Auto never shows as on when it can't switch.
-    let canAutoSwitch = session.outputMode == .program && session.strategy != .manual
+    let canAutoSwitch = session.programAvailable && session.strategy != .manual
     let autoSwitching = canAutoSwitch && session.autoSwitching
     let canHoldShot = autoSwitching && session.strategy == .naturalTalkingHead
-    let outputInUse: Bool
+    // The published device names, as a meeting app lists them.
+    let inUse = (session.programInUse ? ["Program"] : []) + session.cameras.filter(\.inUse).map(\.name)
+    let outputInUse = !inUse.isEmpty
     let outputSummary: String
-    switch session.outputMode {
-    case .program:
-      outputInUse = session.programInUse
-      outputSummary = "Ultracam · Program · \(session.programClientLine)"
-    case .separate:
-      // The published device names, as a meeting app lists them.
-      let inUse = session.cameras.filter(\.inUse)
-      outputInUse = !inUse.isEmpty
-      if !inUse.isEmpty { outputSummary = inUse.map { "Ultracam · \($0.name)" }.joined(separator: ", ") + " · In use" }
-      else if session.cameras.count == 1 { outputSummary = "Ultracam · \(session.cameras[0].name) · \(session.cameras[0].clientLine)" }
-      else { outputSummary = session.cameras.contains(where: \.clientUnknown) ? "Ultracam cameras: use unknown" : "Ultracam cameras not in use" }
+    if !inUse.isEmpty { outputSummary = inUse.map { "Ultracam · \($0)" }.joined(separator: ", ") + " · In use" }
+    else if session.cameras.count == 1 { outputSummary = "Ultracam · \(session.cameras[0].name) · \(session.cameras[0].clientLine)" }
+    else {
+      let unknown = session.programClientUnknown || session.cameras.contains(where: \.clientUnknown)
+      outputSummary = unknown ? "Ultracam cameras: use unknown" : "Ultracam cameras not in use"
     }
 
     let drivesLine = session.drives.compactMap { drive in drive.secondsLeft.map { "\(drive.name) \(UIFormat.duration($0))" } }
@@ -905,7 +910,7 @@ enum UIPresentationBuilder {
     }
     segments.append(UIStatusSegment(kind: .output, text: outputSummary, tone: outputInUse ? .positive : .neutral))
     let onAirName = session.cameras.first { $0.id == session.onAirID }?.name
-    if session.outputMode == .program {
+    if session.programAvailable {
       let onAir = onAirName ?? "No camera"
       let mode = autoSwitching ? (canHoldShot && session.autoHold ? "Auto · hold" : "Auto") : "Manual"
       // "On air" only while a meeting app is receiving Program, as in the window subtitle.
@@ -926,29 +931,29 @@ enum UIPresentationBuilder {
       segments.append(UIStatusSegment(kind: .audio, text: audioText, tone: withAudio.count == live.count ? .neutral : .warning))
     }
 
-    let cutButtons = session.outputMode == .program ? cameras.map {
+    let cutButtons = session.programAvailable ? cameras.map {
       UICutButton(id: $0.id, number: $0.number, name: $0.name, onAir: session.onAirID == $0.id,
         pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || session.onAirID == $0.id, help: $0.cutHelp)
     } : []
 
     // The title stays "Ultracam". The subtitle carries only what the status bar's
-    // essential segments don't: the camera on Program (nothing in Separate mode).
+    // essential segments don't: the camera on Program (nothing with one camera).
     let subtitle: String
-    if session.outputMode == .program, let onAirName {
+    if session.programAvailable, let onAirName {
       subtitle = cameras.contains { $0.tally == .onAir } ? "\(onAirName) on air" : "\(onAirName) in Program"
     } else {
       subtitle = ""
     }
 
     // One camera has one picture: every grid layout is the single layout.
-    let available = UILayout.allCases.filter { session.outputMode == .program || $0 != .programView }
-    let layouts = cameras.count > 1 ? available : available.filter { $0 == .single || $0 == .programView }
+    let available = UILayout.allCases.filter { session.programAvailable || $0 != .programView }
+    let layouts = cameras.count > 1 ? available : available.filter { $0 == .single }
     let layout = layouts.contains(session.layout) ? session.layout : .single
 
     var presentation = UISessionPresentation(
       title: "Ultracam", subtitle: subtitle,
       cameras: cameras, selected: cameras.first(where: \.selected),
-      outputMode: session.outputMode,
+      programAvailable: session.programAvailable,
       layouts: layouts, layout: layout, recordControl: recordControl,
       camerasRunning: running,
       camerasControlTitle: session.cameras.count == 1 ? (running ? "Stop Camera" : "Start Camera") : (running ? "Stop Cameras" : "Start Cameras"),

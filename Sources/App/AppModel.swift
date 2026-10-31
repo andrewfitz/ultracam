@@ -92,12 +92,9 @@ final class AppModel {
   /// The camera the inspector edits and shortcuts target. UI state only.
   var selectedFeedID: FeedID { feedCoordinator.selectedFeedID }
 
-  /// The virtual-camera topology is a persisted app setting. UI callers use
-  /// this property instead of reaching into FeedCoordinator so that changing
-  /// the output route always updates the shared registry and preferences.
-  var outputMode: FeedOutputMode {
-    get { feedCoordinator.outputMode }
-    set { setOutputMode(newValue) }
+  /// Switching exists with two cameras: Program is published and cuts are offered.
+  var programAvailable: Bool {
+    FeedLifecycleDemandPolicy.programPublished(enabledCameras: feedDescriptors.filter(\.enabled).count)
   }
 
   /// Switcher state is kept on the same coordinator that consumes frames. The
@@ -111,9 +108,7 @@ final class AppModel {
   var naturalTalkingHeadEnabled: Bool {
     get { feedCoordinator.switcher.naturalTalkingHead.enabled }
     set {
-      guard !newValue || !running || outputMode == .program else { return }
       var settings = feedCoordinator.switcher
-      if newValue, outputMode != .program { setOutputMode(.program) }
       settings.automatic = newValue
       settings.strategy = newValue ? .naturalTalkingHead : .manual
       settings.naturalTalkingHead.enabled = newValue
@@ -142,7 +137,7 @@ final class AppModel {
   var naturalDirectorStatus: String {
     if !naturalTalkingHeadEnabled { return "Disabled" }
     if autoSwitcherBridge != nil { return "Active · Rust director" }
-    return running ? "Waiting for two enabled cameras" : "Starts with Program output"
+    return "Runs with two cameras, while Program has a picture or a take rolls"
   }
 
   /// Nothing runs, stops, records or loads anywhere: settings can be wiped.
@@ -299,6 +294,8 @@ final class AppModel {
   private(set) var programMoved: UIProgramMove?
   /// The extension's Program queue has been full past `LiveWatchLimits.queueStall`.
   private(set) var programQueueStalled = false
+  /// A cut landed with a client on a camera's own device and none on Program.
+  private(set) var cutsMissClient = false
   /// A take has outlived the last client seen during it.
   private(set) var unusedTake = false
   /// Which cameras have really lost their signal, and which may take a cut again.
@@ -320,6 +317,9 @@ final class AppModel {
   @ObservationIgnored private var connectRetryAt: [FeedID: TimeInterval] = [:]
   @ObservationIgnored private var programConnectRetryAt: TimeInterval = 0
   private var programTransportRequired = false
+  /// `programPicture` as of the last reconcile: its rise moves Program off an empty camera.
+  @ObservationIgnored private var programPictureWanted = false
+  @ObservationIgnored private var monitorProgramAvailable = false
   private var programTransportConfiguration: PipelineConfiguration?
   /// The contract last written to the closed Program camera.
   @ObservationIgnored private var programPreNegotiated: PipelineConfiguration?
@@ -387,7 +387,7 @@ final class AppModel {
   /// Program frames dropped or not converted; cleared when the Program
   /// camera reconnects.
   private var programOutputIssue: String?
-  /// Shown as the status warning in Program mode until cleared.
+  /// Shown as the status warning until cleared.
   var programIssue: String? { programCutIssue ?? programOutputIssue }
   /// Bumped when an asynchronous Program camera connect is superseded.
   private var programTransportRequestID: UInt64 = 0
@@ -494,7 +494,7 @@ final class AppModel {
     feedCoordinator.programOutput.onMonitorFrame = { _, frame, sourcePTS, _, cutApplied in
       programMonitorTap.offer(frame: frame, sourcePTS: sourcePTS, cutApplied: cutApplied)
     }
-    monitorCoordinator.updateTargets(feeds: feedCoordinator.descriptors, programAvailable: snapshot.outputMode == .program)
+    monitorCoordinator.updateTargets(feeds: feedCoordinator.descriptors, programAvailable: programAvailable)
     recordingModel.onOutputFolderChanged = { [weak self] folder in
       self?.autoSwitcherTimeline?.setOutputFolder(folder)
     }
@@ -503,6 +503,7 @@ final class AppModel {
       self.acknowledgedTakes.remove(feedID)
       if self.unexpectedStops[feedID]?.cameraStopped == false { self.unexpectedStops[feedID] = nil }
       self.beginTakeAudio(feedID)
+      // A take can be what starts the director, and it binds to that director's timeline.
       self.reconcileAutomaticFeed()
       guard let timeline = self.autoSwitcherTimeline else { return }
       self.recordingTimelines[feedID] = timeline
@@ -528,6 +529,7 @@ final class AppModel {
     }
     feedCoordinator.onProgramCutApplied = { [weak self] feedID, sourceTime, programTime in
       self?.programCutIssue = nil
+      self?.noteCutReach()
       self?.reconcileProgramTransportDemand()
       // The saved selection follows what is on air. Persist only the
       // snapshot: a cut changes no device, so the camera registry is untouched.
@@ -604,7 +606,7 @@ final class AppModel {
   /// registers CMIO listeners: the demand property is the extension's own signal on the
   /// source stream, and watching it opens nothing.
   private var wantsDemandMonitor: Bool {
-    hardware.observesCameraDemand || outputMode == .program || feedDescriptors.contains(where: \.automaticFeed)
+    hardware.observesCameraDemand
   }
 
   func refresh() {
@@ -637,7 +639,7 @@ final class AppModel {
       updateCamera(descriptor.id) { $0.selectedDevice = free.id }
     }
     if feedDescriptors.contains(where: \.automaticFeed) {
-      demandMonitor.refresh()
+      if wantsDemandMonitor { demandMonitor.refresh() }
       reconcileAutomaticFeed()
     }
   }
@@ -931,16 +933,6 @@ final class AppModel {
     return true
   }
 
-  func setOutputMode(_ mode: FeedOutputMode) {
-    guard canResetSettings, feedCoordinator.outputMode != mode else { return }
-    feedCoordinator.setOutputMode(mode)
-    programCutIssue = nil
-    if mode == .program { programMonitorTap?.restart() }
-    saveSettings()
-    installAutomaticFeedMonitor()
-    reconcileAutoSwitcher()
-  }
-
   /// Applies switcher controls atomically to the live Program route and its
   /// persisted snapshot. Invalid feed IDs are normalized by the coordinator.
   func updateSwitcher(_ settings: SwitcherSettings) {
@@ -1029,7 +1021,7 @@ final class AppModel {
     directorUpdate?.audioPacketTime ?? directorUpdate?.mediaTime ?? .zero
   }
   private func reconcileAutoSwitcher() {
-    guard feedCoordinator.outputMode == .program,
+    guard directorWanted,
       feedCoordinator.switcherCoordinator.settings.naturalTalkingHead.enabled,
       feedCoordinator.switcherCoordinator.settings.automatic,
       feedCoordinator.switcherCoordinator.settings.strategy == .naturalTalkingHead else {
@@ -1080,8 +1072,7 @@ final class AppModel {
     }
     bridge.onInstruction = { [weak self, weak bridge] instruction in
       Task { @MainActor [weak self] in
-        guard let self, self.autoSwitcherBridge === bridge,
-          self.feedCoordinator.outputMode == .program else { return }
+        guard let self, self.autoSwitcherBridge === bridge else { return }
         self.autoSwitcherTimeline?.recordInstruction(instruction,
           from: self.switcherSelectedFeedID)
         // `cutTime` is on the director's audio clock, not on the target
@@ -1125,11 +1116,13 @@ final class AppModel {
   }
 
   private func stopAutoSwitcher() {
+    let directorCutPending = pendingAutoDecisionID != nil
     pendingAutoDecisionID = nil
     pendingAutoTargetFeedID = nil
     // Stopping or reconfiguring the director must not leave its queued target
     // in the Program scheduler to switch after the UI has disabled automation.
-    feedCoordinator.cancelProgramCut()
+    // A cut the operator asked for isn't the director's to cancel.
+    if directorCutPending { feedCoordinator.cancelProgramCut() }
     autoSwitcherBridge?.stop()
     autoSwitcherBridge = nil
     directorCameras = nil
@@ -1138,10 +1131,10 @@ final class AppModel {
   }
 
   private func feedAutoSwitcherAudio(_ update: CaptureUpdate) {
-    guard feedCoordinator.outputMode == .program,
-      let time = update.mediaTime ?? update.audioPacketTime else { return }
+    guard let time = update.mediaTime ?? update.audioPacketTime else { return }
     if autoSwitcherBridge == nil {
-      _ = feedCoordinator.evaluateSwitcher(at: time)
+      if directorWanted { _ = feedCoordinator.evaluateSwitcher(at: time) }
+      else { feedCoordinator.expirePendingCut() }
       return
     }
     if update.audioPresent {
@@ -1169,7 +1162,7 @@ final class AppModel {
   /// demand monitor.
   private func installAutomaticFeedMonitor() {
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
-    if wantsDemandMonitor { demandMonitor.start() } else { demandMonitor.stop() }
+    if wantsDemandMonitor { demandMonitor.start() }
     reconcileAutomaticFeed()
   }
 
@@ -1182,7 +1175,19 @@ final class AppModel {
     settingsStore.saveSnapshot(persistedSnapshot)
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
     publishVirtualCameraRegistry(persistedSnapshot, reason: reason)
-    monitorCoordinator.updateTargets(feeds: feedDescriptors, programAvailable: outputMode == .program)
+    let available = programAvailable
+    // A monitor that lost Program takes frames again from a new generation.
+    if available, !monitorProgramAvailable { programMonitorTap?.restart() }
+    // Down to one camera: the monitor no longer follows Program, so its client is
+    // forgotten here. Any client left keeps the device, on standby black, until it goes.
+    if !available {
+      let route = VirtualCameraDescriptor.program().id
+      routeDemand[route] = nil
+      routeReleaseAt[route] = nil
+      unknownRoutes.remove(route)
+    }
+    monitorProgramAvailable = available
+    monitorCoordinator.updateTargets(feeds: feedDescriptors, programAvailable: available)
   }
 
   /// The monitor preferences of a feed or Program, nil for an unknown target.
@@ -1220,13 +1225,12 @@ final class AppModel {
   /// their clients release them during reconciliation.
   private func publishVirtualCameraRegistry(_ snapshot: AppSettingsSnapshot, reason: String) {
     let previous = virtualCameraRegistryStore.load()
-    let candidate = VirtualCameraRegistrySnapshot.forFeeds(snapshot.feeds,
-      outputMode: snapshot.outputMode, previous: previous)
+    let candidate = VirtualCameraRegistrySnapshot.forFeeds(snapshot.feeds, previous: previous)
     do {
       try candidate.validateDeviceCount()
       try virtualCameraRegistryStore.save(candidate)
       if candidate != previous {
-        registryLog.notice("Registry publish: generation \(candidate.generation, privacy: .public), \(candidate.devices.filter(\.enabled).count, privacy: .public) cameras (\(snapshot.outputMode == .program ? "Program" : "separate cameras", privacy: .public)), reason: \(reason, privacy: .public)")
+        registryLog.notice("Registry publish: generation \(candidate.generation, privacy: .public), \(candidate.devices.filter(\.enabled).count, privacy: .public) devices, reason: \(reason, privacy: .public)")
       }
       registryPublisher.publish(candidate)
     } catch {
@@ -1317,7 +1321,7 @@ final class AppModel {
       let failed: Bool
       if case .failed(let reason)? = update.stopCause {
         unexpectedStops[feedID] = UnexpectedStop(reason: reason, at: Date(), cameraStopped: true,
-          wasOnAir: outputMode == .program && programInUse && switcherSelectedFeedID == feedID)
+          wasOnAir: programInUse && switcherSelectedFeedID == feedID)
         failed = true
       } else {
         failed = false
@@ -1331,6 +1335,7 @@ final class AppModel {
       // keeps cutting between the cameras still live.
       recordingModel.stop(feedID: feedID)
       retireProgramSource(feedID)
+      moveProgramToProducingCamera(.stopped)
       // A failed camera can't wait out a hold: it has already gone.
       if failed { moveProgram(off: feedID) }
       reconcileAutoSwitcher()
@@ -1372,7 +1377,8 @@ final class AppModel {
     appliedPipelines[id] = pipeline(for: id)
     cameraUpdates[id] = CaptureUpdate(message: "Opening input device…")
     cameraStateRevision &+= 1
-    if outputMode == .program { reconcileAutoSwitcher() }
+    if programMoved?.from == descriptor.name { programMoved = nil }
+    reconcileAutoSwitcher()
     reconcileProgramTransportDemand()
     updateLiveWatch()
   }
@@ -1385,7 +1391,8 @@ final class AppModel {
     appliedPipelines[id] = nil
     detectedSourceDurations[id] = nil
     sinkDemand[id] = nil
-    if outputMode == .program { retireProgramSource(id) }
+    retireProgramSource(id)
+    moveProgramToProducingCamera(.stopped)
     monitorCoordinator.sourceStateChanged(target: MonitorTargetID(id.rawValue), running: false, message: message)
     cameraUpdates[id] = nil
     cameraStateRevision &+= 1
@@ -1397,8 +1404,8 @@ final class AppModel {
   /// monitor run straight through either, and a start takes the current value with it.
   private func reconcileSink(_ id: FeedID, starting: Bool = false) {
     guard starting || feedCoordinator.isFeedRunning(id) else { return }
-    let wanted = FeedLifecycleDemandPolicy.SinkDemand(client: outputMode != .program && routeHeld(feedRouteID(id)),
-      routeUnknown: outputMode != .program && cameraClientUnknown(id))
+    let wanted = FeedLifecycleDemandPolicy.SinkDemand(client: routeHeld(feedRouteID(id)),
+      routeUnknown: cameraClientUnknown(id))
     guard starting || sinkDemand[id] != wanted else { return }
     sinkDemand[id] = wanted
     feedCoordinator.requestCameraOutputEnabled(feedID: id, enabled: wanted.open, framesWanted: wanted.framesWanted)
@@ -1487,13 +1494,8 @@ final class AppModel {
 
   // MARK: - Automatic start
 
-  /// A camera app uses this camera's virtual camera (or, in Program mode, the
-  /// Program camera).
+  /// Something needs this camera: a client of its own or of Program, or a take.
   func cameraRequested(_ id: FeedID) -> Bool { feedPolicies[id]?.requested == true }
-
-  private func demandRouteID(for id: FeedID) -> String {
-    outputMode == .program ? VirtualCameraDescriptor.program().id : feedRouteID(id)
-  }
 
   /// What a camera on automatic start is doing, and why.
   func automaticStatus(_ id: FeedID) -> String {
@@ -1505,7 +1507,7 @@ final class AppModel {
         : "Preview is live. Hide it to stop capture until a camera app needs it."
     }
     if manuallyStoppedFeeds.contains(id) { return "Camera stopped. It stays off until you start it." }
-    if let error = routeErrors[demandRouteID(for: id)] { return error }
+    if let error = routeErrors[feedRouteID(id)] { return error }
     if feedPolicies[id]?.captureRequested != true {
       return "Waiting for a camera app or visible preview. Capture and video processing are off."
     }
@@ -1525,22 +1527,35 @@ final class AppModel {
     // `start()` is idempotent while the monitor is healthy, and retries the
     // listener registration after an initial setup failure. `refresh()` alone
     // is a no-op in that failed state because the monitor is disabled there.
-    demandMonitor.start()
-    demandMonitor.refresh()
+    if wantsDemandMonitor {
+      demandMonitor.start()
+      demandMonitor.refresh()
+    }
     reconcileAutomaticFeed()
   }
 
-  /// Starts and stops cameras on automatic start from their demand: a camera
-  /// app, a visible picture, a recording, or (Program mode) Program's. The
-  /// same rules for every camera.
+  /// Program has a client, or its monitor is showing: someone wants its pixels. Cuts land
+  /// without this; it decides what renders, starts automatic cameras and runs the director.
+  private var programPicture: Bool {
+    routeHeld(VirtualCameraDescriptor.program().id) || monitorDemand.contains(MonitorTargetID("program"))
+  }
+
+  private var takeActive: Bool { recordingModel.feeds.contains { $0.status == .recording || $0.status == .paused } }
+
+  /// A strategy that cuts on its own, and something its cuts reach: Program's picture, or a
+  /// take's timeline. With neither it would cut for nobody, and write files doing it.
+  private var directorWanted: Bool {
+    let settings = feedCoordinator.switcher
+    return settings.automatic && settings.strategy != .manual && (programPicture || takeActive)
+  }
+
+  /// Starts and stops cameras on automatic start from their demand: a client of their own,
+  /// Program's picture, automatic switching during a take, a recording, or a visible
+  /// preview. The same rules for every camera.
   private func reconcileAutomaticFeed() {
     guard !launching else { return }
-    // In Program mode a camera the user started keeps Program's sources up.
-    let programRequested = monitorDemand.contains(MonitorTargetID("program")) ||
-      routeHeld(VirtualCameraDescriptor.program().id) ||
-      (outputMode == .program && feedDescriptors.contains {
-        feedCoordinator.isFeedRunning($0.id) && !demandStartedFeeds.contains($0.id)
-      })
+    let programRequested = programPicture
+    let autoTake = feedCoordinator.switcher.automatic && feedCoordinator.switcher.strategy != .manual && takeActive
     for descriptor in feedDescriptors where descriptor.enabled {
       let id = descriptor.id
       if !FeedLifecycleDemandPolicy.retainsAutomaticOwnership(automaticEnabled: descriptor.automaticFeed,
@@ -1552,7 +1567,7 @@ final class AppModel {
       }
       var policy = feedPolicies[id] ?? AutomaticFeedPolicy()
       let camera = routeHeld(feedRouteID(id))
-      policy.demand(camera || (outputMode == .program && programRequested) || recording)
+      policy.demand(camera || programRequested || autoTake || recording)
       policy.previewDemand(descriptor.previewEnabled && monitorDemand.contains(MonitorTargetID(id.rawValue)))
       let isRunning = feedCoordinator.isFeedRunning(id)
       // A camera waits for its own LUT, so its first frame is graded.
@@ -1563,7 +1578,7 @@ final class AppModel {
       let action = policy.action(ready: ready, running: isRunning)
       feedPolicies[id] = policy
       let why = [camera ? "camera app" : nil, recording ? "recording" : nil,
-        outputMode == .program && programRequested ? "Program" : nil,
+        programRequested ? "Program" : nil, autoTake ? "automatic switching" : nil,
         policy.previewRequested ? "preview" : nil].compactMap { $0 }.joined(separator: ", ")
       reconcileSink(id)
       switch action {
@@ -1580,7 +1595,31 @@ final class AppModel {
       case nil: break
       }
     }
+    if programRequested, !programPictureWanted { moveProgramToProducingCamera(.notReady) }
+    programPictureWanted = programRequested
+    reconcileAutoSwitcher()
     reconcileProgramTransportDemand()
+  }
+
+  /// Program with nothing to show while another camera has a picture: move to it, at once,
+  /// as nothing is on air to cut from. A starting camera yields too, as its first frame
+  /// may be seconds off. Never cuts a live source, so a lost signal stays the operator's
+  /// call (`moveProgram`). Next in camera order. The contract owner doesn't change, so
+  /// frames convert rather than renegotiate under a client.
+  private func moveProgramToProducingCamera(_ cause: UIProgramMove.Cause) {
+    let output = feedCoordinator.programOutput
+    guard let onAir = switcherSelectedFeedID, !output.isOnAir, !output.hasPendingCut else { return }
+    guard let next = ProgramFailover.nextLive(after: onAir, order: feedDescriptors.filter(\.enabled).map(\.id), isLive: {
+      $0 != onAir && output.isProducing($0) && !signalHealth.isUnhealthy($0)
+    }), case .selectedImmediately = requestProgramCut(to: next) else { return }
+    captureLog.notice("Program moved: \(onAir.rawValue, privacy: .public) → \(next.rawValue, privacy: .public), \(String(describing: cause), privacy: .public)")
+    programShotStartedAt = Date()
+    // Nobody is told about a selection no one can see.
+    if programPicture, let from = descriptor(for: onAir)?.name, let to = descriptor(for: next)?.name {
+      let settings = switcherSettings
+      programMoved = UIProgramMove(from: from, to: to,
+        heldShot: settings.automatic && settings.naturalTalkingHead.manualHold, cause: cause)
+    }
   }
 
   /// Program transport follows its camera clients and the actual on-air source.
@@ -1588,7 +1627,6 @@ final class AppModel {
     let producerID = feedCoordinator.programOutput.selectedFeedID
     let producer = feedDescriptors.first { $0.id == producerID && $0.enabled }
     let required = FeedLifecycleDemandPolicy.programTransportRequired(
-      programMode: outputMode == .program,
       cameraRequested: routeHeld(VirtualCameraDescriptor.program().id),
       anyCameraRunning: feedDescriptors.contains { $0.enabled && feedCoordinator.isFeedRunning($0.id) })
     let contract = programContract(for: producer)
@@ -1690,7 +1728,7 @@ final class AppModel {
     return cameraUpdates[id]
   }
 
-  /// Program mode: the "Ultracam · Program" virtual camera has at least one client.
+  /// The "Ultracam · Program" virtual camera has at least one client.
   var programInUse: Bool { routeDemand[VirtualCameraDescriptor.program().id] == true }
   /// Program's route can't be read, so its clients are unknown.
   var programClientUnknown: Bool { unknownRoutes.contains(VirtualCameraDescriptor.program().id) }
@@ -1702,7 +1740,7 @@ final class AppModel {
     return routeID
   }
 
-  /// Separate mode: this camera's virtual camera has at least one client.
+  /// This camera's virtual camera has at least one client.
   func cameraInUse(_ id: FeedID) -> Bool {
     routeDemand[feedRouteID(id)] == true
   }
@@ -1730,6 +1768,11 @@ final class AppModel {
     }
     let program = feedCoordinator.programQueueFullSince.map { now - $0 >= LiveWatchLimits.queueStall } == true
     if program != programQueueStalled { programQueueStalled = program }
+  }
+
+  /// Cuts land on Program, and a client on a camera's own device won't see them.
+  private func noteCutReach() {
+    cutsMissClient = !programInUse && feedDescriptors.contains { cameraInUse($0.id) }
   }
 
   /// A take that has outlived its meeting says so, and only says so: a take is never stopped for this.
@@ -1768,7 +1811,7 @@ final class AppModel {
   /// picture isn't worth holding, and Hold stays on for the new one. With Auto off, or
   /// nothing live, it stays and the problem list offers what can be done.
   private func moveProgram(off id: FeedID) {
-    guard outputMode == .program, switcherSelectedFeedID == id else { return }
+    guard switcherSelectedFeedID == id else { return }
     let settings = switcherSettings
     guard settings.automatic, settings.strategy != .manual else { return }
     let order = stripOrder(feedDescriptors.filter(\.enabled).map(\.id))
@@ -1827,8 +1870,7 @@ final class AppModel {
     for descriptor in feedDescriptors {
       let id = descriptor.id
       retrySink(id, now: now)
-      // In Program mode no camera publishes its own device yet, so only Program has clients.
-      guard outputMode == .separateCameras, cameraInUse(id), !cameraDelivering(id) else {
+      guard cameraInUse(id), !cameraDelivering(id) else {
         clientWaitingSince[id] = nil
         if waitingClients.contains(id) { waitingClients.remove(id) }
         continue
@@ -1837,6 +1879,7 @@ final class AppModel {
       clientWaitingSince[id] = since
       if now - since >= LiveWatchLimits.clientWaiting, !waitingClients.contains(id) { waitingClients.insert(id) }
     }
+    if cutsMissClient, programInUse || !feedDescriptors.contains(where: { cameraInUse($0.id) }) { cutsMissClient = false }
     watchQueues(now: now)
     watchUnusedTake(now: now)
     if !wantsLiveWatch {
@@ -1855,14 +1898,14 @@ final class AppModel {
   }
 
   /// Gets frames moving to a stalled or starved client. A running camera reopens its
-  /// output and keeps capturing, so a take rolls straight through this. In Program
-  /// mode that output is Program's. A stopped camera just starts.
+  /// output and keeps capturing, so a take rolls straight through this: its own sink,
+  /// and Program's if it's on air. A stopped camera just starts.
   func restartCamera(_ id: FeedID) {
     guard descriptor(for: id) != nil else { return }
     guard feedCoordinator.isFeedRunning(id) else { startCamera(id); return }
     captureLog.notice("Restart output \(id.rawValue, privacy: .public): user")
-    if outputMode == .program { feedCoordinator.restartProgramOutput() }
-    else { feedCoordinator.capture(for: id).restartCameraOutput() }
+    if switcherSelectedFeedID == id, programInUse { feedCoordinator.restartProgramOutput() }
+    if cameraInUse(id) { feedCoordinator.capture(for: id).restartCameraOutput() }
   }
 
   /// Someone has seen it. The take result goes; a stopped camera still says so until it starts.
@@ -2034,6 +2077,9 @@ final class AppModel {
 
   #if ULTRACAM_TEST_SUPPORT
   var directorClockFeedIDForTesting: FeedID? { directorClockFeedID }
+  var directorRunningForTesting: Bool { autoSwitcherBridge != nil }
+  func timelineBoundForTesting(_ id: FeedID) -> Bool { recordingTimelines[id] != nil }
+  func isProgramSourceProducingForTesting(_ id: FeedID) -> Bool { feedCoordinator.programOutput.isProducing(id) }
   func isSignalUnhealthy(_ id: FeedID) -> Bool { signalHealth.isUnhealthy(id) }
   var demandMonitorIsRunning: Bool { demandMonitor.isRunning }
   /// What the demand monitor reports, without CMIO. Nil is an unreadable route.
@@ -2050,7 +2096,6 @@ final class AppModel {
   /// between them no longer renegotiate the Program camera: frames that don't
   /// match its format are converted on the GPU.
   var programFormatMismatch: Bool {
-    guard outputMode == .program else { return false }
     let contracts = feedDescriptors.filter { $0.enabled && feedCoordinator.isFeedRunning($0.id) }.map(programContract)
     guard let first = contracts.first else { return false }
     return contracts.contains { $0 != first }

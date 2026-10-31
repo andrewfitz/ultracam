@@ -75,7 +75,6 @@ import XCTest
 
   private func program(_ cameras: [UICameraSnapshot], auto: Bool = false) -> UISessionSnapshot {
     var session = UISessionSnapshot()
-    session.outputMode = .program
     session.cameras = cameras
     session.onAirID = cameras.first?.id
     session.programInUse = true

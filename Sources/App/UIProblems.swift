@@ -98,7 +98,7 @@ extension UIPresentationBuilder {
   /// The placeholder's second line. Nothing to cut to on Program comes first.
   static func lostDetail(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> String? {
     guard camera.signalLostFor != nil else { return nil }
-    let stranded = session.outputMode == .program && session.onAirID == camera.id
+    let stranded = session.onAirID == camera.id
       && nextLive(after: camera, in: session) == nil
     let parts = [stranded ? "No camera has a picture." : nil, takeCountdown(camera)].compactMap { $0 }
     return parts.isEmpty ? nil : parts.joined(separator: " ")
@@ -106,7 +106,7 @@ extension UIPresentationBuilder {
 
   /// With Auto off nothing cuts by itself, so the way out goes on the picture.
   static func lostCut(_ camera: UICameraSnapshot, index: Int, in session: UISessionSnapshot) -> UICutButton? {
-    guard camera.signalLostFor != nil, session.outputMode == .program, session.onAirID == camera.id,
+    guard camera.signalLostFor != nil, session.onAirID == camera.id,
       !(session.autoSwitching && session.strategy != .manual), let next = nextLive(after: camera, in: session),
       let number = session.cameras.firstIndex(where: { $0.id == next.id }) else { return nil }
     return UICutButton(id: next.id, number: number + 1, name: next.name, onAir: false, pending: session.pendingCutID == next.id, enabled: true)
@@ -114,7 +114,7 @@ extension UIPresentationBuilder {
 
   /// Why Cut is off, in words. Marking a camera unhealthy refuses its cuts, so this has to explain.
   static func cutHelp(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> String? {
-    guard session.outputMode == .program, session.onAirID != camera.id else { return nil }
+    guard session.programAvailable, session.onAirID != camera.id else { return nil }
     if let wait = camera.cutBlockedFor, isLive(camera) {
       return "\(camera.name)'s signal just came back. It can take a cut after \(Int(wait.rounded(.up))) s more of steady signal."
     }
@@ -122,7 +122,7 @@ extension UIPresentationBuilder {
   }
 
   private static func onAir(_ session: UISessionSnapshot) -> UICameraSnapshot? {
-    session.outputMode == .program ? session.cameras.first { $0.id == session.onAirID } : nil
+    session.cameras.first { $0.id == session.onAirID }
   }
 
   static func hasNoPicture(_ camera: UICameraSnapshot) -> Bool {
@@ -283,17 +283,18 @@ extension UIPresentationBuilder {
     let rollingAnywhere = session.cameras.contains(where: isRolling)
 
     // Program has nothing to show. Not while something is still starting for the meeting.
-    if session.outputMode == .program, session.programInUse, !session.cameras.contains(where: isLive),
+    if session.programInUse, !session.cameras.contains(where: isLive),
       session.cameras.count != 1 || onAir(session) == nil,
       !session.cameras.contains(where: { starting($0) || $0.automaticStartFailed }) {
       list.append(UIProblem(id: "program.nopicture", title: "No camera has a picture",
         detail: onAir(session).map { "Program stays on \($0.name)." }, level: .damage, action: details, rank: 0))
     }
     if let moved = session.programMoved {
-      list.append(UIProblem(id: "program.moved", title: "\(moved.from) signal lost",
+      let title = moved.title
+      list.append(UIProblem(id: "program.moved", title: title,
         detail: "Program moved to \(moved.to).\(moved.heldShot ? " Hold stays on." : "")", level: .damage,
         action: UIProblemAction(title: "Details", action: .acknowledgeProgramMove),
-        alert: UIProblemAlert(key: "onair.\(moved.from)", event: .onAirLost, title: "\(moved.from) signal lost",
+        alert: UIProblemAlert(key: "onair.\(moved.from)", event: .onAirLost, title: title,
           body: "Program moved to \(moved.to)", showsPanel: true), rank: 14))
     }
     if session.programQueueStalled, let onAir = onAir(session) {
@@ -318,8 +319,7 @@ extension UIPresentationBuilder {
     }
 
     // Cuts land on Program, and a meeting on a camera's own device won't see them.
-    if session.outputMode == .program, !session.programInUse, !session.recentCuts.isEmpty,
-      let iso = session.cameras.first(where: \.inUse) {
+    if session.cutsMissClient, !session.programInUse, let iso = session.cameras.first(where: \.inUse) {
       list.append(UIProblem(id: "program.cuts", title: "Cuts aren't reaching a meeting app",
         detail: "It's using \(iso.name), not Program.", level: .notice, action: details, rank: 110))
     }
@@ -331,7 +331,7 @@ extension UIPresentationBuilder {
     }
     // Different camera formats are converted on the GPU to the Program camera's format,
     // so they are not a problem. A cut that did not land or dropped Program frames are.
-    if session.outputMode == .program, let issue = session.programIssue {
+    if let issue = session.programIssue {
       list.append(UIProblem(id: "program.issue", title: issue, level: .notice, action: details, rank: 180))
     }
     for message in session.appProblems {

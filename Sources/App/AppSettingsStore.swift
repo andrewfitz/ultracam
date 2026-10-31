@@ -467,6 +467,8 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
   var version = AppSettingsSnapshot.currentVersion
   var feeds: [FeedDescriptor]
   var selectedFeedID: FeedID
+  /// The retired output mode. Nothing reads it: it's kept and written back unchanged, so an
+  /// older build finds a valid mode after a downgrade and republishes its own device list.
   var outputMode: FeedOutputMode = .separateCameras
   var switcher = SwitcherSettings()
   /// Monitor tools for Program's surfaces (key `programMonitor`), migrated

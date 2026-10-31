@@ -135,7 +135,7 @@ struct UIProgramCutBar: View {
         Picker("Strategy", selection: strategyBinding) {
           // The same strategies as the sidebar and Program menu: Dynamic analysis isn't built, and
           // choosing it would offer Auto with no director behind it.
-          ForEach(UIOutputModeControl.strategies, id: \.self) { strategy in
+          ForEach(UIStrategy.offered, id: \.self) { strategy in
             Text(UIStrategy.title(strategy)).tag(strategy)
           }
         }
