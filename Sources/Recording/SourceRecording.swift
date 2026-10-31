@@ -981,7 +981,7 @@ final class SourceRecorderCore: @unchecked Sendable {
     let feed = configuration.feedID.rawValue
     let file = configuration.outputURL.lastPathComponent
     let latency = t.maxEncoderLatencyMS.map { String(format: "%.1f", $0) } ?? "—"
-    Self.log.notice("\(feed, privacy: .public): take \(t.state == .failed ? "failed" : "finished", privacy: .public), \(file, privacy: .public): frames=\(t.appendedVideo) missingFrames=\(t.deviceSkippedFrames) gaps=\(t.sourceGaps) largestGap=\(t.largestSourceGap) droppedVideo=\(t.droppedVideo) droppedAudio=\(t.droppedAudio) silenceFilledAudio=\(t.audioSilenceFilledFrames) trimmedAudio=\(t.audioResyncTrimmedFrames) clockDiscontinuities=\(t.videoClockDiscontinuities) maxEncoderMS=\(latency, privacy: .public)\(unlogged.map { " (\($0.events) gaps not logged one by one)" } ?? "", privacy: .public)")
+    Self.log.notice("\(feed, privacy: .public): take \(t.state == .failed ? "failed" : "finished", privacy: .public), \(file, privacy: .public): frames=\(t.appendedVideo) missingFrames=\(t.deviceSkippedFrames) gaps=\(t.sourceGaps) largestGap=\(t.largestSourceGap) droppedVideo=\(t.droppedVideo) droppedAudio=\(t.droppedAudio) silenceFilledAudio=\(t.audioSilenceFilledFrames) trimmedAudio=\(t.audioResyncTrimmedFrames) clockDiscontinuities=\(t.videoClockDiscontinuities) maxEncoderMS=\(latency, privacy: .public)\(unlogged.map { " (\($0.events) gaps not logged one by one)" } ?? "", privacy: .public)\(t.lastError.map { ". Failed: \($0)" } ?? "", privacy: .public)")
   }
 
   /// Runs on the capture (driver) thread. Metadata checks, one short lock and

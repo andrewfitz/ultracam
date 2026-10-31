@@ -246,6 +246,9 @@ final class CaptureController: @unchecked Sendable {
   private var declaredSequence: UInt64 = 0
   private var sourceEpochRevision: UInt64 = 0
   private var pairedFrame: (sequence: UInt64, info: CaptureFrameInfo)?
+  // The last recorded audio packet's time and its frame's, to place audio that
+  // arrives without its frame.
+  private var audioPairAnchor: (audio: CMTime, video: CMTime)?
   private var coreRejectedFrames: UInt64 = 0
   private var monitorSink: (any MonitorFrameSink)?
   private var monitorLifecycleSink: (any MonitorFrameSink)?
@@ -605,6 +608,7 @@ final class CaptureController: @unchecked Sendable {
           self.declaredEpoch = nil
           self.declaredSequence = 0
           self.pairedFrame = nil
+          self.audioPairAnchor = nil
           self.coreRejectedFrames = 0
         }
         // Driver events change capture-queue state (signal loss, fatal errors);
@@ -1414,6 +1418,7 @@ final class CaptureController: @unchecked Sendable {
         audioClockMapping = nil
         pendingClockMappings.removeAll(keepingCapacity: true)
         pairedFrame = nil
+        audioPairAnchor = nil
         lastSourcePTS = nil
       }
       declaredSequence = delivery.sequence
@@ -1512,6 +1517,7 @@ final class CaptureController: @unchecked Sendable {
               sourceEpochRevision &+= 1
               declaredAudio = .unknown
               pairedFrame = nil
+              audioPairAnchor = nil
             }
             declaredEpoch = delivery.epochID
             declaredSource = format
@@ -1721,17 +1727,29 @@ final class CaptureController: @unchecked Sendable {
       return (route, context)
     }
     guard let (route, context) = selected else { return }
-    if packet.format.clock == .pairedWithFrames, pair == nil {
-      rejectRecordingMetadata(feedID: feed, install: install, token: token,
-        message: "Recording paired source audio requires an explicit matching video frame.")
-      return
+    // Desktop Video forwards a callback's audio even when its frame was not
+    // delivered (dropped, or no signal). That audio keeps its place on the
+    // video clock through the last pairing; it never fails the take. Audio
+    // before the take's first paired frame has no place yet and is skipped.
+    var pairTime = pair?.presentationTime
+    if packet.format.clock == .pairedWithFrames {
+      pairTime = lock.withLock { () -> CMTime? in
+        if let pairTime {
+          audioPairAnchor = packet.packetTime.isNumeric ? (packet.packetTime, pairTime) : nil
+          return pairTime
+        }
+        guard let anchor = audioPairAnchor, packet.packetTime.isNumeric else { return nil }
+        let placed = CMTimeAdd(anchor.video, CMTimeSubtract(packet.packetTime, anchor.audio))
+        return placed.isNumeric && placed.epoch == 0 && placed.value >= 0 ? placed : nil
+      }
+      guard pairTime != nil else { return }
     }
     let accepted: Bool
     if let source, let callback = route.callbacks.sourceAudioWithAdmission {
       // The writer owns declared layout, sample-grid conversion and exact high24
       // scaling. Packet PTS stays rational; sample rate does not imply a CMTime grid.
       accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, context, source,
-        pair?.presentationTime)
+        pairTime)
     } else if packet.format.clock != .pairedWithFrames, let callback = route.callbacks.sourceAudio {
       accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, context)
     } else {
@@ -1743,7 +1761,7 @@ final class CaptureController: @unchecked Sendable {
         packet.format.sampleRate == EmbeddedAudioFormat.sampleRate, packet.planes.count == 1 {
         receiveRawAudio(CaptureRawAudio(samples: packet.planes[0], packetTime: packet.packetTime,
           sampleFrames: UInt64(packet.sampleFrameCount), channels: packet.format.channels, bytesPerSample: 4),
-          token: token, preparePair: true, pairTime: pair?.presentationTime, pairDuration: pair?.duration,
+          token: token, preparePair: true, pairTime: pairTime, pairDuration: pair?.duration,
           meterPacket: false, expectedRecording: (feed, install))
         return
       }

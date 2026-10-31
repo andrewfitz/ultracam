@@ -99,12 +99,14 @@ import XCTest
       format: audio, packetTime: CMTime(value: 480002, timescale: 48000)))))
     source.stop()
     controller.stop()
-    let values = pairs.values
-    XCTAssertEqual(values, [firstTime, firstTime], "Only explicit valid references may reach audio callbacks, even after an unrelated no-signal frame")
-    XCTAssertEqual(pairs.failures.count, 1, "The first invalid reference visibly refuses the take; later packets stay closed")
-    XCTAssertTrue(pairs.failures.first?.contains("matching video frame") == true)
+    // Audio with a stale or no frame reference keeps its offset from the last
+    // pairing, the way Desktop Video delivers audio through a no-signal frame.
+    let placed = CMTimeAdd(firstTime, CMTime(value: 1, timescale: 48000))
+    XCTAssertEqual(pairs.values.map { $0.map { CMTimeCompare($0, firstTime) } }, [0, 0, 1, 1])
+    XCTAssertEqual(pairs.values.dropFirst(2).map { $0.map { CMTimeCompare($0, placed) } }, [0, 0])
+    XCTAssertTrue(pairs.failures.isEmpty, "Audio without its frame never fails the take")
   }
-  func testExplicitPairSurvivesRecorderRejectionAndUnpairedPacketHasNoStalePair() throws {
+  func testExplicitPairSurvivesRecorderRejectionAndUnpairedPacketIsPlacedFromIt() throws {
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
       rate: .constant(VideoContract.fastDuration))
     let audio = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: .int32,
@@ -145,9 +147,10 @@ import XCTest
     source.stop()
     controller.stop()
     let values = pairs.values
-    XCTAssertEqual(values, [firstTime, secondTime], "A recorder-rejected valid frame still names its packet; unpaired audio cannot reach callbacks")
-    XCTAssertEqual(pairs.failures.count, 1)
-    XCTAssertTrue(pairs.failures.first?.contains("matching video frame") == true)
+    XCTAssertEqual(Array(values.prefix(2)), [firstTime, secondTime], "A recorder-rejected valid frame still names its packet")
+    XCTAssertEqual(values.last.flatMap { $0 }.map { CMTimeCompare($0, CMTimeAdd(secondTime, CMTime(value: 1, timescale: 48000))) }, 0,
+      "Unpaired audio is placed from the last pairing, never from a stale frame")
+    XCTAssertTrue(pairs.failures.isEmpty)
   }
   func testSourceOnlyRetentionIsBoundedRecordingIndependentAndStopRejectsQueuedOffers() throws {
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210,

@@ -514,6 +514,36 @@ import XCTest
     }
   }
 
+  func testNativeMetadataJournalKeepsOnlyWhereLabelsStartOrBreak() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("native-journal-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("take.mov")
+    let duration = RecordingFrameRate.fps5994.frameDuration
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(duration)),
+      epochID: .init(sessionID: UUID(), epoch: 1), clockBindings: .init(video: .init()), stage: .recordingSource)
+    let config = try SourceRecordingConfiguration(feedID: .init("native-journal"), outputURL: movie, width: 1920, height: 1080,
+      declaredTimebases: [60000], sourceFrameRate: .constant(duration), sourceAdmission: source, sidecarMovieURL: movie)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    // An FX3 at 59.94 repeats each label for two frames; the camera's clock jumps an hour at frame 30.
+    for index in 0..<60 {
+      let frame = try sample(pts: CMTimeMultiply(duration, multiplier: Int32(index)), duration: duration)
+      if index > 0 {
+        let label = String(format: "%02d:00:00:%02d", index < 30 ? 1 : 2, index / 2 * 2)
+        let native = try XCTUnwrap(TimecodeMetadata.native(label: label, frameRate: .fps5994))
+        CMSetAttachment(frame, key: SourceRecordingConfiguration.nativeTimecodeAttachmentKey as CFString,
+          value: try JSONEncoder().encode(native) as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+      }
+      try writer.appendVideo(frame)
+    }
+    try writer.finish()
+    let lines = try String(contentsOf: RecordingTakeSidecar.url(for: movie).appendingPathExtension("journal"), encoding: .utf8)
+    let labels = try lines.split(separator: "\n").map { try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data($0.utf8)) }
+      .compactMap(\.nativeTimecodeMetadata).map(\.label)
+    XCTAssertEqual(labels, ["01:00:00:00", "02:00:00:30"], "One journal line per frame filled the journal in 19 minutes")
+  }
+
   func testGenericPairedPCMRecordsActualFormatsWithoutHostMappings() throws {
     let formats = [
       try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .int16, interleaved: true, layout: .init(), clock: .pairedWithFrames),

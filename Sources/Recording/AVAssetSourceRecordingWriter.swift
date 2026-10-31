@@ -39,6 +39,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private var finalSourceCounters: [String: UInt64] = [:]
   private var lastNativeFieldMark: Bool?
   private var hadNativeFieldMark = false
+  private var lastNativeLabel: (label: TimecodeMetadata, pts: CMTime)?
   private var lastOriginalSourceEpoch: CaptureEpochID?
   private var lastOriginalAudioEpoch: CaptureEpochID?
   private var takeSidecar: RecordingTakeSidecar?
@@ -353,6 +354,18 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   static func matchingFrameRate(_ duration: CMTime) -> RecordingFrameRate? {
     guard duration.isNumeric, duration.timescale > 0, duration.value > 0, duration.epoch == 0 else { return nil }
     return RecordingFrameRate(numerator: Int64(duration.timescale), denominator: duration.value)
+  }
+
+  /// A label the elapsed source time predicts from the last one. Cameras may
+  /// repeat each label for two frames, and dropped frames skip ahead with time.
+  static func continuesNativeLabels(_ value: TimecodeMetadata, at pts: CMTime,
+    after last: (label: TimecodeMetadata, pts: CMTime)?) -> Bool {
+    guard let last, value.epoch == last.label.epoch, value.frameRate == last.label.frameRate,
+      value.dropFrame == last.label.dropFrame, pts.isNumeric, last.pts.isNumeric else { return false }
+    let elapsed = CMTimeSubtract(pts, last.pts).seconds / value.frameRate.frameDuration.seconds
+    guard elapsed > 0 else { return false }
+    // A repeated label is a whole frame off; under 1.5 keeps rounding from breaking it.
+    return abs(Double(value.frameNumber - last.label.frameNumber) - elapsed) < 1.5
   }
 
   var telemetry: SourceRecordingWriterTelemetry {
@@ -723,8 +736,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     if sourceNativeTrackExpected == nil { sourceNativeTrackExpected = configuration.timecodePolicy == .source && nativeData != nil && declaredRate?.isVariable != true }
     if let nativeData, declaredRate?.isVariable == true || sourceNativeTrackExpected == false {
       let value = try JSONDecoder().decode(TimecodeMetadata.self, from: nativeData)
-      try takeSidecar?.append(.init(kind: "nativeTimecode", detail: value.label,
-        originalValue: pts.value, originalTimescale: pts.timescale, nativeTimecodeMetadata: value))
+      // Only where the labels start or break: the rest follow from those. A line
+      // per frame filled the journal, and failed the take, after 19 minutes.
+      if !Self.continuesNativeLabels(value, at: pts, after: lastNativeLabel) {
+        try takeSidecar?.append(.init(kind: "nativeTimecode", detail: value.label,
+          originalValue: pts.value, originalTimescale: pts.timescale, nativeTimecodeMetadata: value))
+      }
+      lastNativeLabel = (value, pts)
     }
     if var conformer = cadenceConformer {
       // Native VFR labels describe source observations. They stay in the

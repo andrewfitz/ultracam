@@ -97,17 +97,19 @@ import XCTest
     XCTAssertEqual(recorder.telemetry.droppedAudio, 0)
   }
 
-  func testGenericPairedPCMWithoutAnExplicitMatchingFrameRefusesTheTake() throws {
+  func testGenericPairedPCMBeforeAnyFrameIsSkippedWithoutFailingTheTake() throws {
     let audio = try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .float32,
       interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
     let fixture = try AuditCaptureFixture(audio: .present(audio))
     let observed = AuditObservation()
-    fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: fixture.callbacks(failure: { observed.failure($0) }))
+    var callbacks = fixture.callbacks(failure: { observed.failure($0) }, audio: { observed.audio($0) })
+    callbacks.sourceAudioWithAdmission = { _, _, _, time, _, _, _ in observed.audio(time); return true }
+    fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: callbacks)
     try fixture.start(self)
     try fixture.packet(audio, time: CMTime(value: 7, timescale: 1))
     fixture.source.stop()
-    XCTAssertEqual(observed.failures.count, 1)
-    XCTAssertTrue(observed.failures.first?.contains("paired") == true)
+    XCTAssertTrue(observed.failures.isEmpty)
+    XCTAssertTrue(observed.audioTimes.isEmpty, "No frame yet to place it by")
     XCTAssertTrue(fixture.controller.hasActiveFeed)
     fixture.stop()
   }
@@ -149,7 +151,7 @@ import XCTest
     }
   }
 
-  func testEveryTypedPairedFormatRefusesMissingStaleOrInvalidFrameReferencesBeforeAudioCallbacks() throws {
+  func testEveryTypedPairedFormatPlacesAudioWithoutItsFrameFromTheLastPairing() throws {
     for sample in [AudioSampleType.int32, .float32] {
       for reference in ["missing", "stale", "invalid"] {
         let audio = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: sample,
@@ -157,21 +159,25 @@ import XCTest
         let fixture = try AuditCaptureFixture(audio: .present(audio))
         let observed = AuditObservation()
         var callbacks = fixture.callbacks(failure: { observed.failure($0) }, audio: { observed.audio($0) })
-        callbacks.sourceAudioWithAdmission = { _, _, _, time, _, _, _ in observed.audio(time); return true }
+        callbacks.sourceAudioWithAdmission = { _, _, _, _, _, _, video in observed.audio(video ?? .invalid); return true }
         fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: callbacks)
         try fixture.start(self)
         try fixture.frame(time: CMTime(value: 20, timescale: 1))
+        try fixture.packet(audio, time: CMTime(value: 48000, timescale: 48000),
+          pairedFrameSequence: fixture.source.context.nextSequence - 1)
         var sequence: UInt64?
         if reference == "stale" { sequence = UInt64.max - 1 }
         if reference == "invalid" {
           try fixture.frame(time: CMTime(value: 21, timescale: 1), signalValid: false)
           sequence = fixture.source.context.nextSequence - 1
         }
-        try fixture.packet(audio, time: CMTime(value: 48000, timescale: 48000), pairedFrameSequence: sequence)
+        // A frame's worth of audio later, with no delivered frame to pair with.
+        try fixture.packet(audio, time: CMTime(value: 48800, timescale: 48000), pairedFrameSequence: sequence)
         fixture.source.stop()
-        XCTAssertTrue(observed.audioTimes.isEmpty, "\(sample), \(reference) must not reach either audio callback")
-        XCTAssertEqual(observed.failures.count, 1)
-        XCTAssertTrue(observed.failures.first?.contains("matching video frame") == true)
+        XCTAssertTrue(observed.failures.isEmpty, "\(sample), \(reference): audio without its frame must not fail the take")
+        XCTAssertEqual(observed.audioTimes.count, 2, "\(sample), \(reference)")
+        XCTAssertEqual(observed.audioTimes.last.map { CMTimeCompare($0, CMTimeAdd(CMTime(value: 20, timescale: 1),
+          CMTime(value: 800, timescale: 48000))) }, 0, "\(sample), \(reference) keeps its offset from the last pairing")
         fixture.stop()
       }
     }
