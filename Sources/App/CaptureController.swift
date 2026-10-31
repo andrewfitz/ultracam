@@ -250,9 +250,13 @@ final class CaptureController: @unchecked Sendable {
   private var gpuStallReported = false
   private var rawAudioProvidesStats = false
   private var processedFrameHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
+  private var observedFrameHandler: ((CMTime, CMTime, UInt64) -> Void)?
+  // Someone wants Program's pixels, so this camera renders for it.
+  private var programPictureWanted = false
   private let media = MediaState()
   private let camera = CameraLink()
   private let services: CaptureServices
+  private let gpuIdleRelease: TimeInterval
   private let recordingDiscoveryPolicy: CaptureRecordingDiscoveryPolicy
   private let retentionBudget: CaptureAdmissionBudget
   // Driver-stream state under `lock`; declarations apply before recording callbacks.
@@ -309,6 +313,8 @@ final class CaptureController: @unchecked Sendable {
   private var lastMappedSourceTime: CMTime?
   private var lastMappedHostTime: CMTime?
   private var lastDeliveredSourceTime: CMTime?
+  // Capture queue: when a frame last rendered. Idle this long, the GPU's memory goes back.
+  private var lastRenderAt: Double = 0
   private var rateStart: Double = 0
   private var rateFrames: UInt64 = 0
   private var outputFPS: Double = 0
@@ -366,9 +372,8 @@ final class CaptureController: @unchecked Sendable {
   private var cameraFirstFrameSeconds: Double?
   private var cameraFramesBeforeSink: UInt64 = 0
   private var cameraLabel: String { activeFeed?.rawValue ?? "an idle controller" }
-  // Program output consumes processed frames through FeedCoordinator. When it
-  // is enabled, this controller keeps capture and GPU work alive without
-  // opening a per-feed CMIO sink; the Program bridge owns that sink.
+  // Whether this camera's own sink should be open. Program has a sink of its
+  // own, in the bridge, and never needs this one.
   private var cameraOutputEnabled = true
   // Capture queue. False only with a sink held open for nobody (see
   // `FeedLifecycleDemandPolicy.sinkOpensWithCamera`): no frame goes to it.
@@ -385,6 +390,18 @@ final class CaptureController: @unchecked Sendable {
     get { lock.withLock { processedFrameHandler } }
     set { lock.withLock { processedFrameHandler = newValue } }
   }
+
+  /// A frame that skipped the GPU: its presentation time, duration and generation. Called
+  /// on the delivery queue, in capture order with `onProcessedFrame`, so the Program
+  /// scheduler sees one unbroken stream. Set from any thread, like that one.
+  var onObservedFrame: ((CMTime, CMTime, UInt64) -> Void)? {
+    get { lock.withLock { observedFrameHandler } }
+    set { lock.withLock { observedFrameHandler = newValue } }
+  }
+
+  /// Render for Program from the next frame. Set on every camera before Program's client
+  /// connects, so a cut lands on a rendered frame. Thread-safe, read per frame.
+  func setProgramPictureWanted(_ wanted: Bool) { lock.withLock { programPictureWanted = wanted } }
 
   var activeFeed: FeedID? { lock.withLock { activeFeedID } }
 
@@ -408,6 +425,8 @@ final class CaptureController: @unchecked Sendable {
     lock.withLock { recordingCallbacks[feedID]?.discovery.budget.snapshot }
   }
   var sourceSignalTimeoutForTesting: TimeInterval { lock.withLock { sourceSignalTimeout } }
+  var processorBuiltForTesting: Bool { syncOnQueue { processor != nil } }
+  var gpuPreparedForTesting: Bool { syncOnQueue { preparedConfiguration != nil } }
   #endif
 
   #if ULTRACAM_TEST_SUPPORT
@@ -419,8 +438,9 @@ final class CaptureController: @unchecked Sendable {
 
   init(services: CaptureServices, retentionBudget: CaptureAdmissionBudget = CaptureAdmissionBudget(
     maximumSlots: 12, maximumBytes: 384 * 1024 * 1024, maximumDuration: 0.25, minimumSlots: 3),
-    recordingDiscoveryPolicy: CaptureRecordingDiscoveryPolicy = .standard) {
+    recordingDiscoveryPolicy: CaptureRecordingDiscoveryPolicy = .standard, gpuIdleRelease: TimeInterval = 30) {
     self.services = services
+    self.gpuIdleRelease = gpuIdleRelease
     self.recordingDiscoveryPolicy = recordingDiscoveryPolicy
     self.retentionBudget = retentionBudget
     queue.setSpecific(key: queueKey, value: 1)
@@ -589,6 +609,7 @@ final class CaptureController: @unchecked Sendable {
         self.lastMappedSourceTime = nil
         self.lastMappedHostTime = nil
         self.lastDeliveredSourceTime = nil
+        self.lastRenderAt = ProcessInfo.processInfo.systemUptime
         self.rateStart = 0
         self.rateFrames = 0
         self.outputFPS = 0
@@ -639,12 +660,12 @@ final class CaptureController: @unchecked Sendable {
           return
         }
         let hasPreview = previewEnabled && self.services.preview != nil
-        // Every consumer that makes the first frame do GPU work, including a
-        // headless Program source. The monitor is not one: it shows the source
-        // (and the burn-in LUT in its own shader), so it never forces processing.
-        let hasProgram = self.lock.withLock { self.processedFrameHandler != nil }
-        if self.cameraConnected || hasPreview || hasProgram {
-          if !warm.untouched { _ = try self.makeProcessor() }
+        // Built with no consumer too: first demand must not compile on the capture
+        // queue under load. The warm frames are the part that waits for a consumer.
+        // The monitor is not one: it shows the source (and the burn-in LUT in its
+        // own shader), so it never forces processing.
+        if !warm.untouched { _ = try self.makeProcessor() }
+        if self.cameraConnected || hasPreview || self.lock.withLock({ self.programPictureWanted }) {
           try self.ensurePrepared(warm, wait: true)
         }
         guard self.isCurrent(token) else {
@@ -2284,29 +2305,25 @@ final class CaptureController: @unchecked Sendable {
       // monitor never keeps processing alive on its own.
       let sink = monitorSink
       let hasPreview = previewEnabled && services.preview != nil
-      let processedHandler = lock.withLock { processedFrameHandler }
+      let (processedHandler, programPicture) = lock.withLock { (processedFrameHandler, programPictureWanted) }
       // Temporal selection happens before any GPU work or buffer allocation;
       // complete bypass keeps the source duration and so every frame. The
       // monitor shows the output's frames only, so with a lower output rate
       // (59.94 to 29.97) the picture runs at that rate too.
       let selected = frameRateGate.shouldDeliver(frame.pts, duration: effective.duration)
-      // No downstream demand: keep metadata/detection alive without allocating,
-      // submitting GPU work or staging raw buffers that nobody can consume.
-      guard cameraConnected || cameraConnecting || hasPreview || processedHandler != nil else {
-        if let sink, selected { offerSourceOnlyInOrder(sink, frame: frame, token: token, untouched: effective.untouched) }
-        if preparedConfiguration != nil {
-          processor?.releaseIdleResources()
-          preparedConfiguration = nil
+      // No downstream demand: metadata and detection stay alive with no allocation,
+      // GPU work or staged buffer nobody can consume. The monitor still gets every
+      // frame (it draws the LUT itself), recording took its frame on the driver
+      // thread, and the Program scheduler sees this one in order.
+      guard ((cameraConnected || cameraConnecting) && cameraFramesWanted) || hasPreview || programPicture else {
+        if selected {
+          offerSourceOnlyInOrder(sink, frame: frame, duration: effective.duration, token: token, untouched: effective.untouched)
+          noteSourceOnly(effective, inputType: actual.type, pts: frame.pts, metadataChanged: metadataChanged, token: token)
         }
-        applied = nil
-        outputLabel = ""
-        processingMS = 0
-        outputFPS = 0
-        message = "Camera ready — no active video destination."
-        publishIfDue(token: token, force: metadataChanged)
         return
       }
       guard selected else { return }
+      lastRenderAt = entryTime
       // Created on first demand; a complete bypass still uses it for the owned GPU copy.
       let processor = try makeProcessor()
       try ensurePrepared(effective, wait: false)
@@ -2360,18 +2377,51 @@ final class CaptureController: @unchecked Sendable {
     } catch { fail(error.localizedDescription, token: token) }
   }
 
-  /// A monitor offer for a frame that skips the GPU (no other consumer).
-  /// Ordered behind every frame already on the GPU, whose offers are made
-  /// when they complete.
+  /// Capture queue: a frame that skipped the GPU reads the same as one that didn't. Applied
+  /// state and timing describe what the output would be, so an idle camera doesn't sit on
+  /// "Updating output…" and the director's clock keeps moving. GPU memory goes back only
+  /// after a while without a render: a client that joins soon shouldn't pay to rebuild it.
+  private func noteSourceOnly(_ effective: PipelineConfiguration, inputType: OSType, pts: CMTime,
+    metadataChanged: Bool, token: UInt64) {
+    let now = ProcessInfo.processInfo.systemUptime
+    if preparedConfiguration != nil, now - lastRenderAt >= gpuIdleRelease {
+      processor?.releaseIdleResources()
+      preparedConfiguration = nil
+    }
+    let output = InputFormat(width: effective.width, height: effective.height,
+      type: effective.untouched ? inputType : effective.pixelFormat, duration: effective.duration)
+    var changed = metadataChanged || applied != pipelineEnabled
+    if renderedFormat != output || outputLabel.isEmpty {
+      changed = true
+      renderedFormat = output
+      outputLabel = output.label
+    }
+    applied = pipelineEnabled
+    frames &+= 1
+    lastDeliveredSourceTime = pts
+    processingMS = 0
+    gpuMS = 0
+    message = deliveredMessage(pipelineEnabled: pipelineEnabled, applyLUT: effective.applyLUT)
+    publishIfDue(token: token, force: frames == 1 || changed)
+  }
+
+  private func deliveredMessage(pipelineEnabled: Bool, applyLUT: Bool) -> String {
+    pipelineEnabled ? (applyLUT ? "Processing enabled — LUT applied" : "Processing enabled — LUT off") : "Complete bypass — original camera signal"
+  }
+
+  /// The monitor's offer and the Program scheduler's sight of a frame that skips the GPU.
+  /// Ordered behind every frame already on the GPU, whose own are made when they complete.
   private func offerSourceOnlyInOrder(
-    _ sink: any MonitorFrameSink, frame: CapturedFrame, token: UInt64, untouched: Bool
+    _ sink: (any MonitorFrameSink)?, frame: CapturedFrame, duration: CMTime, token: UInt64, untouched: Bool
   ) {
     let offer: @Sendable () -> Void = { [self, deliveryQueue] in
       deliveryQueue.async {
         defer { withExtendedLifetime(frame.retention) {} }
         guard self.isAccepting(token, epochRevision: frame.epochRevision) else { return }
-        sink.offer(frame.image, pts: frame.pts, captureGeneration: token, sequence: frame.sequence,
+        sink?.offer(frame.image, pts: frame.pts, captureGeneration: token, sequence: frame.sequence,
           untouched: untouched, sourceFormat: frame.sourceAdmission?.format)
+        guard self.isAccepting(token, epochRevision: frame.epochRevision) else { return }
+        self.lock.withLock { self.observedFrameHandler }?(frame.pts, duration, token)
       }
     }
     if let processor { processor.afterCommittedFrames(offer) } else { offer() }
@@ -2500,7 +2550,7 @@ final class CaptureController: @unchecked Sendable {
       renderedFormat = report.output
       outputLabel = report.output.label
     }
-    message = item.pipelineEnabled ? (item.applyLUT ? "Processing enabled — LUT applied" : "Processing enabled — LUT off") : "Complete bypass — original camera signal"
+    message = deliveredMessage(pipelineEnabled: item.pipelineEnabled, applyLUT: item.applyLUT)
     publishIfDue(token: item.token, force: frames == 1 || metadataChanged)
   }
 

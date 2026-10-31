@@ -275,6 +275,16 @@ final class FeedCoordinator {
         controller.generationToken == generation else { return }
       route.ingest(fromCapture: feedID, frame: frame)
     }
+    controller.onObservedFrame = { [weak controller] time, duration, generation in
+      guard let controller, controller.isAccepting(feedID: feedID),
+        controller.generationToken == generation else { return }
+      route.observe(fromCapture: feedID, presentationTime: time, duration: duration)
+    }
+  }
+
+  /// Whether every camera renders for Program, from its next frame.
+  func setProgramPictureWanted(_ wanted: Bool) {
+    for descriptor in descriptors { capture(for: descriptor.id).setProgramPictureWanted(wanted) }
   }
 
   /// Opens or closes one camera's sink without waiting. Capture never stops for it.

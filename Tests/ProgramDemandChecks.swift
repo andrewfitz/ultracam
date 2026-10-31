@@ -164,6 +164,29 @@ import XCTest
     XCTAssertEqual(model.programMoved?.cause, .notReady)
   }
 
+  // MARK: Idle
+
+  /// The source-only path, in the app: nobody watching, and every surface reads it as a
+  /// healthy running camera, not one forever updating its output.
+  func testAnIdleCameraReadsAsLiveAndCutsStillLand() throws {
+    try prepare()
+    defer { finish() }
+    try allProducing()
+    let bridge = UISessionBridge(model: model, interface: UIInterfaceState(defaults: UserDefaults(suiteName: "org.ultracam.tests.demand.ui.\(UUID().uuidString)")!))
+    try emitUntil("Status arrives") {
+      let camera = bridge.snapshot().cameras[0]
+      return !camera.applying && camera.outputFormat != nil
+    }
+    let shown = bridge.presentation().cameras[0]
+    XCTAssertEqual(shown.tileState, .live)
+    XCTAssertEqual(model.cameraUpdate(ids[0])?.gpuMS, 0, "Nothing rendered")
+    XCTAssertEqual(model.cameraUpdate(ids[0])?.processingMS, 0)
+    _ = model.requestProgramCut(to: ids[1])
+    try emitUntil("The cut lands on a frame nothing rendered") { model.switcherSelectedFeedID == ids[1] }
+    XCTAssertEqual(model.programOutputDiagnostics.route.published, 0)
+    XCTAssertGreaterThan(model.programOutputDiagnostics.route.withoutConsumer, 0)
+  }
+
   // MARK: Both routes
 
   /// One frame, two clients, no copy: every frame reaches the camera's own sink and Program.

@@ -831,6 +831,7 @@ final class AppModel {
     let source = feedCoordinator.selectedDescriptor
     let id = feedCoordinator.add(name: name)
     wireCamera(id)
+    feedCoordinator.capture(for: id).setProgramPictureWanted(programPictureWanted)
     synchronizeProcessing(from: source)
     synchronizeMonitoring(from: MonitorTargetID(source.id.rawValue), preferences: source.monitor)
     syncRecordingFeeds()
@@ -1596,6 +1597,8 @@ final class AppModel {
       }
     }
     if programRequested, !programPictureWanted { moveProgramToProducingCamera(.notReady) }
+    // Before the transport: the picture has to be rendering when the contract lands.
+    if programRequested != programPictureWanted { feedCoordinator.setProgramPictureWanted(programRequested) }
     programPictureWanted = programRequested
     reconcileAutoSwitcher()
     reconcileProgramTransportDemand()

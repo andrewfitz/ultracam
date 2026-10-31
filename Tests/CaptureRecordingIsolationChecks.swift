@@ -769,7 +769,12 @@ import Synchronization
       harness.emit(image, pts: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration)
     }
     pumpUntil { sink.offers.count == count / every }
-    pumpUntil { updates.contains { $0.message == "Camera ready — no active video destination." } }
+    // Nothing rendered, and it reads like a camera that did: not "Updating output…".
+    pumpUntil { updates.last?.pipelineEnabledApplied == pipelineEnabled }
+    XCTAssertFalse(updates.last?.output.isEmpty ?? true)
+    XCTAssertNotNil(updates.last?.mediaTime, "The director's clock keeps moving")
+    XCTAssertGreaterThan(updates.last?.frames ?? 0, 0)
+    XCTAssertEqual(updates.last?.processingMS, 0)
     let offers = sink.offers
     XCTAssertEqual(offers.count, count / every)
     for (index, offer) in offers.enumerated() {
@@ -785,6 +790,89 @@ import Synchronization
     XCTAssertEqual(sink.invalidations.first ?? nil, offers.first?.captureGeneration,
       "Stop rejects the stopped capture generation at the monitor")
     return offers
+  }
+
+  /// The gate itself: with no consumer a frame costs no render, and every frame still
+  /// reaches the monitor and the Program scheduler. Demand back, it renders from the next.
+  @MainActor func testNoConsumerRendersNothingUntilProgramWantsAPicture() throws {
+    let image = try syntheticRamp()
+    let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
+    var services = harness.services
+    services.preview = nil
+    let controller = CaptureController(services: services)
+    let sink = SourceOfferLog()
+    controller.setCameraOutputEnabled(false)
+    controller.setMonitorSink(sink)
+    final class Log: @unchecked Sendable {
+      let lock = NSLock()
+      var rendered = 0
+      var observed: [CMTime] = []
+    }
+    let log = Log()
+    controller.onProcessedFrame = { _, _ in log.lock.withLock { log.rendered += 1 } }
+    controller.onObservedFrame = { time, _, _ in log.lock.withLock { log.observed.append(time) } }
+    defer {
+      controller.onUpdate = nil
+      controller.onProcessedFrame = nil
+      controller.onObservedFrame = nil
+      controller.stop()
+    }
+    let started = expectation(description: "Started")
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
+    controller.start(feedID: FeedID(rawValue: "idle"), deviceID: "synthetic",
+      configuration: PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true))
+    wait(for: [started], timeout: 3)
+    controller.onUpdate = nil
+    XCTAssertTrue(controller.processorBuiltForTesting, "Built at start, not under load on first demand")
+    let duration = VideoContract.fastDuration
+    for frame in 0..<4 { harness.emit(image, pts: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration) }
+    pumpUntil { sink.offers.count == 4 && log.lock.withLock { log.observed.count } == 4 }
+    XCTAssertEqual(log.lock.withLock { log.rendered }, 0, "Nobody consumes it")
+    XCTAssertEqual(log.lock.withLock { log.observed }, (0..<4).map { CMTimeMultiply(duration, multiplier: Int32($0)) }, "In order")
+    controller.setProgramPictureWanted(true)
+    for frame in 4..<7 { harness.emit(image, pts: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration) }
+    pumpUntil { log.lock.withLock { log.rendered } == 3 }
+    pumpUntil { sink.offers.count == 7 }
+    XCTAssertEqual(log.lock.withLock { log.observed.count }, 4, "A rendered frame reaches the scheduler through the route")
+    XCTAssertEqual(sink.offers.map(\.pts), (0..<7).map { CMTimeMultiply(duration, multiplier: Int32($0)) },
+      "One unbroken picture across the change")
+    controller.setProgramPictureWanted(false)
+    harness.emit(image, pts: CMTimeMultiply(duration, multiplier: 7), duration: duration)
+    pumpUntil { log.lock.withLock { log.observed.count } == 5 }
+    XCTAssertTrue(controller.gpuPreparedForTesting, "Still warm: a client may be back in a moment")
+    XCTAssertEqual(log.lock.withLock { log.rendered }, 3)
+  }
+
+  @MainActor func testGPUMemoryGoesBackAfterTheIdleDelayNotOnTheFirstIdleFrame() throws {
+    let image = try syntheticRamp()
+    let harness = Harness(entered: XCTestExpectation(description: "Unused preview gate"))
+    var services = harness.services
+    services.preview = nil
+    let controller = CaptureController(services: services, gpuIdleRelease: 0.2)
+    let sink = SourceOfferLog()
+    controller.setCameraOutputEnabled(false)
+    controller.setMonitorSink(sink)
+    defer { controller.onUpdate = nil; controller.stop() }
+    let started = expectation(description: "Started")
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
+    controller.setProgramPictureWanted(true)
+    controller.start(feedID: FeedID(rawValue: "idle"), deviceID: "synthetic",
+      configuration: PipelineConfiguration(applyLUT: false, downscale: true, convertTo420: true))
+    wait(for: [started], timeout: 3)
+    controller.onUpdate = nil
+    let duration = VideoContract.fastDuration
+    harness.emit(image, pts: .zero, duration: duration)
+    pumpUntil { sink.offers.count == 1 }
+    controller.setProgramPictureWanted(false)
+    harness.emit(image, pts: duration, duration: duration)
+    pumpUntil { sink.offers.count == 2 }
+    XCTAssertTrue(controller.gpuPreparedForTesting, "One idle frame frees nothing")
+    Thread.sleep(forTimeInterval: 0.25)
+    harness.emit(image, pts: CMTimeMultiply(duration, multiplier: 2), duration: duration)
+    pumpUntil { sink.offers.count == 3 }
+    pumpUntil { !controller.gpuPreparedForTesting }
+    XCTAssertTrue(controller.processorBuiltForTesting, "Memory goes back; the processor stays")
+    XCTAssertNotNil(sink.offers.last, "The picture never stopped")
   }
 
   /// Program's monitor gets each Program frame once, as its only picture, and a
