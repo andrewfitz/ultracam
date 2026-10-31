@@ -148,7 +148,7 @@ struct UITallyBadge: View {
         .foregroundStyle(tally == .next || tally == .noPicture ? Color.black : .white)
         .background(background, in: Capsule())
         .overlay(Capsule().strokeBorder(tally == .program ? Color.white.opacity(0.6) : .clear, lineWidth: 1.5))
-        .accessibilityLabel(tally.label ?? text)
+        .accessibilityLabel(tally == .iso ? text : text.capitalized)
     }
   }
   private var background: Color {

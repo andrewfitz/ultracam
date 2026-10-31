@@ -22,24 +22,27 @@ struct UISessionSidebarViewContent: View {
     let _ = UIRenderProbe.count("UISessionSidebarViewContent")
     // Only the camera rows (shown with three or more cameras) are tagged, so only they select
     // through the list; other rows that name a camera are buttons that do the same.
-    VStack(spacing: 0) {
-      UIAttentionSection(context: context)
-      if presentation.offersAlerts {
-        UIAlertsPrompt(context: context).padding(.horizontal, 10).padding(.bottom, 8)
+    List(selection: selection) {
+      if let banner = UIExtensionBanner.state(session.install) {
+        Section { UIExtensionBannerView(state: banner, context: context) }
       }
-      List(selection: selection) {
-        if let banner = UIExtensionBanner.state(session.install) {
-          Section { UIExtensionBannerView(state: banner, context: context) }
+      camerasSection
+      outputSection
+      recordingSection
+      if !session.recentTakes.isEmpty { recentTakesSection }
+      if !session.interruptedTakes.isEmpty || session.recoveryMessage != nil { interruptedSection }
+      automationSection
+    }
+    .listStyle(.sidebar)
+    .accessibilityLabel("Session")
+    // An inset, not a stack: the list scrolls under it and the column keeps its own sizing.
+    .safeAreaInset(edge: .top, spacing: 0) {
+      VStack(spacing: 0) {
+        UIAttentionSection(context: context)
+        if presentation.offersAlerts {
+          UIAlertsPrompt(context: context).padding(.horizontal, 10).padding(.bottom, 8)
         }
-        camerasSection
-        outputSection
-        recordingSection
-        if !session.recentTakes.isEmpty { recentTakesSection }
-        if !session.interruptedTakes.isEmpty || session.recoveryMessage != nil { interruptedSection }
-        automationSection
       }
-      .listStyle(.sidebar)
-      .accessibilityLabel("Session")
     }
   }
 

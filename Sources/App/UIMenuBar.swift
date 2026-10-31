@@ -347,8 +347,11 @@ final class UIMenuCommandBox: NSObject {
 
     // Problems first, in orange, each one row that does its one action.
     for problem in presentation.problems {
-      let item = row(problem.title, problem.action.map { action($0.action) } ?? [], enabled: problem.action != nil,
-        symbol: "exclamationmark.triangle.fill", subtitle: problem.action?.title, target: target)
+      // Cuts only ever come from a "Cut to …" row (D1), and those are just below.
+      var offered = problem.action
+      if case .cut? = offered?.action { offered = UIProblemAction(title: "Details", action: .openDiagnostics) }
+      let item = row(problem.title, offered.map { action($0.action) } ?? [], enabled: offered != nil,
+        symbol: "exclamationmark.triangle.fill", subtitle: offered?.title, target: target)
       item.attributedTitle = NSAttributedString(string: problem.title,
         attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.menuFont(ofSize: 0)])
       items.append(item)

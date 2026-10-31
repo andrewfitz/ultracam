@@ -311,7 +311,7 @@ struct UIAlertsPrompt: View {
     VStack(alignment: .leading, spacing: 4) {
       Text("Turn on alerts").font(.uiRowEmphasis)
       Text("See a lost camera or an early take while another app is in front.")
-        .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        .font(.uiMeta).foregroundStyle(.secondary).lineLimit(3)
       HStack {
         Spacer(minLength: 0)
         Button("Not Now") { context.send(.dismissAlertsPrompt) }.controlSize(.small)

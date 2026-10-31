@@ -40,12 +40,12 @@ struct UIProblemRow: View {
       HStack(alignment: .firstTextBaseline, spacing: 6) {
         Image(systemName: "exclamationmark.triangle.fill").imageScale(.small).foregroundStyle(problem.level.glyph)
           .accessibilityHidden(true)
-        Text(problem.title).font(.uiRowEmphasis).foregroundStyle(problem.level.text)
-          .fixedSize(horizontal: false, vertical: true)
+        // Line limits, not fixedSize: the split view measures its columns at their narrowest,
+        // where a fixed height would be a word a line and push the window's minimum past the screen.
+        Text(problem.title).font(.uiRowEmphasis).foregroundStyle(problem.level.text).lineLimit(3)
       }
       if let detail = problem.detail {
-        Text(detail).font(.uiMeta).foregroundStyle(problem.level.secondaryText)
-          .fixedSize(horizontal: false, vertical: true)
+        Text(detail).font(.uiMeta).foregroundStyle(problem.level.secondaryText).lineLimit(3)
       }
       if let action = problem.action {
         HStack {
@@ -105,6 +105,7 @@ struct UIAttentionSection: View {
           }
         }
         .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(.bar)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Attention")
       }

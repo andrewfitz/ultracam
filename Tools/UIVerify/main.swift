@@ -494,7 +494,6 @@ extension UIVerify {
     let fixtures: [(String, UISessionSnapshot)] = [("program-meeting", UIFixtures.programMeeting()),
       ("single-meeting", UIFixtures.singleMeeting()), ("standalone", UIFixtures.standalone()),
       ("four-up", UIFixtures.fourUp()), ("stopped", UIFixtures.stopped()), ("problems", UIFixtures.problems())]
-      + UIFixtures.problemSessions()
     for (name, session) in fixtures {
       for size in [CGSize(width: 1320, height: 860), CGSize(width: 980, height: 680)] {
         // The smallest window is used without the sidebar. (A fixed-size offscreen window
@@ -545,26 +544,23 @@ extension UIVerify {
     render("component-sidebar", UISessionSidebarView(context: meeting), size: CGSize(width: 260, height: 860)).forEach { $0.close() }
     render("component-sidebar-problems", UISessionSidebarView(context: .fixture(UIFixtures.problems())),
       size: CGSize(width: 260, height: 860)).forEach { $0.close() }
-    // Attention, the bar, the list, the placeholder and the panel, in every state that changes them.
+    // Attention, the bar, the list, the placeholder and the panel, in every state that changes
+    // them. One appearance each: closed windows keep their SwiftUI graphs until the run ends,
+    // and the attribute table has a hard limit.
     for (name, session) in UIFixtures.problemSessions() {
       let context = UIContext.fixture(session)
-      render("component-sidebar-\(name)", UISessionSidebarView(context: context), size: CGSize(width: 260, height: 860))
-        .forEach { $0.close() }
-      render("component-status-bar-\(name)", UIStatusBarView(context: context), size: CGSize(width: 1320, height: 40))
+      render("main-\(name)", mainWindow(context), size: CGSize(width: 1320, height: 860), titled: true, both: false)
         .forEach { $0.close() }
       render("component-problem-list-\(name)", UIProblemList(problems: context.presentation.problems, context: context)
-        .padding(14).frame(width: 340, alignment: .leading), size: CGSize(width: 360, height: 480)).forEach { $0.close() }
-      render("component-program-view-\(name)", UIProgramView(context: context), size: CGSize(width: 1060, height: 800))
-        .forEach { $0.close() }
+        .padding(14).frame(width: 340, alignment: .leading), size: CGSize(width: 360, height: 480), both: false).forEach { $0.close() }
       if let camera = context.presentation.cameras.first {
-        render("strip-\(name)", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 280))
-          .forEach { $0.close() }
-      }
-      if let camera = context.presentation.cameras.last {
-        render("strip-\(name)-second", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 280))
+        render("strip-\(name)", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 280), both: false)
           .forEach { $0.close() }
       }
     }
+    let lost = UIContext.fixture(UIFixtures.signalLostOnAir())
+    render("component-program-view-signal-lost", UIProgramView(context: lost), size: CGSize(width: 1060, height: 800), both: false)
+      .forEach { $0.close() }
     // The strip never changes height: Cut stays where it was.
     let healthyStrip = UIContext.fixture(UIFixtures.standalone())
     let problemStrip = UIContext.fixture(UIFixtures.twoProblems())
