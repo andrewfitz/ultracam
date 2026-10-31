@@ -56,7 +56,7 @@ struct UIStripProblem: Sendable, Equatable {
 
 extension UIPresentationBuilder {
   /// How long a take survives a loss: a gap past this starts a new capture epoch,
-  /// which ends the take when frames return (`UCDeckLinkMaximumSourceGapSeconds`).
+  /// which ends the take when frames return. The capture backend sets the limit.
   static let takeGapLimit: TimeInterval = 10
 
   // MARK: Facts
