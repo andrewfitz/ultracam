@@ -1334,10 +1334,13 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     awaitCondition("The stall must be published") { statuses.last?.cameraQueueFullSince != nil }
     let since = statuses.last?.cameraQueueFullSince
     harness.emitAutomatic(source, at: VideoContract.fastDuration, duration: VideoContract.fastDuration)
-    awaitCondition("The second refusal must be counted") { statuses.last?.cameraDrops == 2 }
+    // Status publishes at 4 Hz between changes, so the next frame after that carries the count.
+    Thread.sleep(forTimeInterval: 0.3)
+    harness.emitAutomatic(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: 2), duration: VideoContract.fastDuration)
+    awaitCondition("Later refusals must be counted") { (statuses.last?.cameraDrops ?? 0) >= 2 }
     XCTAssertEqual(statuses.last?.cameraQueueFullSince, since, "It dates from the first refusal")
     refusing.refuses = false
-    harness.emitAutomatic(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: 2), duration: VideoContract.fastDuration)
+    harness.emitAutomatic(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: 3), duration: VideoContract.fastDuration)
     awaitCondition("An accepted frame ends the stall") { statuses.last?.cameraQueueFullSince == nil }
   }
 
