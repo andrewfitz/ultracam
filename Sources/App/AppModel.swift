@@ -1633,7 +1633,8 @@ final class AppModel {
       cameraRequested: routeHeld(VirtualCameraDescriptor.program().id),
       anyCameraRunning: feedDescriptors.contains { $0.enabled && feedCoordinator.isFeedRunning($0.id) })
     let contract = programContract(for: producer)
-    if !programInUse, let producerID, detectedSourceDurations[producerID] != nil, contract != programPreNegotiated {
+    if programAvailable, !programInUse, let producerID, detectedSourceDurations[producerID] != nil,
+      contract != programPreNegotiated {
       programPreNegotiated = contract
       feedCoordinator.requestProgramOutputPreNegotiation(configuration: contract,
         passthroughFormat: kCVPixelFormatType_422YpCbCr10)

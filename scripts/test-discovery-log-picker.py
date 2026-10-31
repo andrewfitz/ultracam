@@ -41,7 +41,7 @@ final class DemandFixture {func refresh() {}}
 @MainActor final class DiscoveryFixture {
  var devices:[InputDevice]=[];var lastInputNames:[String:String]=[:]
  var feedDescriptors:[FeedDescriptor]=[];var inputsClearedByChoice:Set<Int>=[]
- let vendorSettings=VendorSettingsFixture();let demandMonitor=DemandFixture()
+ let vendorSettings=VendorSettingsFixture();let demandMonitor=DemandFixture();let wantsDemandMonitor=true
  var bridgeInputs:[UIInput] {let model=self;return BRIDGE_EXPRESSION}
  func captureVendor(for id:String)->String? {nil}
  func inputShareable(_ id:String)->Bool {devices.first {$0.id==id}?.shareable == true}
