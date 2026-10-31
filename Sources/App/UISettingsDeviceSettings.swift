@@ -1,5 +1,13 @@
 import SwiftUI
 
+/// A live change that can drop the signal, waiting for its answer. Cancel is the default.
+struct UIDeviceSettingConfirmation {
+    var title: String
+    var message: String
+    var actionTitle: String
+    var action: @MainActor () -> Void
+}
+
 /// One capture device's own settings, as its vendor's plugin declares them (input connector,
 /// HDR advertisement and the like), on its Settings › Hardware row.
 ///
@@ -9,8 +17,8 @@ import SwiftUI
 struct UISettingsDeviceSettings: View {
     let model: AppModel
     let device: UIHardwareDevice
-    @State private var confirming: Pending?
-    private struct Pending { var setting: VendorSetting; var value: VendorSettingValue }
+    /// Asks before a live change. One dialog for the pane, so each device's settings hand it up.
+    var confirm: (UIDeviceSettingConfirmation) -> Void = { $0.action() }
 
     var body: some View {
         let state = model.vendorSettings.state(for: device.id)
@@ -48,14 +56,6 @@ struct UISettingsDeviceSettings: View {
                 Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange)
             }
         }
-        .confirmationDialog(confirmationTitle, isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
-            if let pending = confirming {
-                Button(pending.value == .boolean(false) ? "Turn Off" : "Turn On") { apply(pending.value, to: pending.setting); confirming = nil }
-            }
-            Button("Cancel", role: .cancel) { confirming = nil }.keyboardShortcut(.defaultAction)
-        } message: {
-            Text("\(cameraState(running)) Changing this setting may briefly interrupt the input signal.")
-        }
     }
 
     /// A choice that can drop the signal can't change during capture (the driver refuses it).
@@ -68,11 +68,6 @@ struct UISettingsDeviceSettings: View {
         ListFormatter.localizedString(byJoining: cameras.map(\.name))
     }
 
-    private var confirmationTitle: String {
-        guard let pending = confirming else { return "" }
-        let verb = pending.value == .boolean(false) ? "Turn off" : "Turn on"
-        return "\(verb) \(pending.setting.localizedLabel()) for \(device.name)?"
-    }
 
     private func cameraState(_ running: [UIHardwareDevice.Camera]) -> String {
         let recording = running.filter { camera in
@@ -83,8 +78,11 @@ struct UISettingsDeviceSettings: View {
     }
 
     private func request(_ setting: VendorSetting, _ value: VendorSettingValue, running: [UIHardwareDevice.Camera]) {
-        if case .boolean = value, setting.interruptsCapture, !running.isEmpty {
-            confirming = Pending(setting: setting, value: value)
+        if case .boolean(let on) = value, setting.interruptsCapture, !running.isEmpty {
+            confirm(UIDeviceSettingConfirmation(
+                title: "\(on ? "Turn on" : "Turn off") \(setting.localizedLabel()) for \(device.name)?",
+                message: "\(cameraState(running)) Changing this setting may briefly interrupt the input signal.",
+                actionTitle: on ? "Turn On" : "Turn Off", action: { apply(value, to: setting) }))
         } else { apply(value, to: setting) }
     }
 

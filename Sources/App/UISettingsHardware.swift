@@ -16,6 +16,8 @@ struct UISettingsHardwarePane: View {
   /// Control vendors whose Add by Address form is open.
   @State private var addingByAddress: Set<String> = []
   @State private var controlSheet: ControlSheet?
+  /// The one confirmation the pane shows (Advertise HDR while its camera runs).
+  @State private var confirmation: UIDeviceSettingConfirmation?
   private struct ControlSheet: Identifiable { var id: String; var name: String }
 
   var body: some View {
@@ -47,6 +49,14 @@ struct UISettingsHardwarePane: View {
     .onChange(of: interface.hardwareFocus) { _, _ in takeFocus() }
     .sheet(item: $controlSheet) { sheet in
       UICameraControlSettings(feedID: sheet.id, name: sheet.name, store: model.cameraControls, viewFactories: model.controlViewFactories)
+    }
+    .confirmationDialog(confirmation?.title ?? "", isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } })) {
+      if let confirmation {
+        Button(confirmation.actionTitle) { confirmation.action(); self.confirmation = nil }
+      }
+      Button("Cancel", role: .cancel) { confirmation = nil }.keyboardShortcut(.defaultAction)
+    } message: {
+      Text(confirmation?.message ?? "")
     }
   }
 
@@ -154,7 +164,7 @@ struct UISettingsHardwarePane: View {
     }
     let facts = (device.status?.facts ?? []).filter { $0.id != "model" }.sorted { $0.group < $1.group }
     ForEach(facts.filter { $0.group <= .connection }) { fact in factRow(fact) }
-    if device.present { UISettingsDeviceSettings(model: model, device: device) }
+    if device.present { UISettingsDeviceSettings(model: model, device: device) { confirmation = $0 } }
     ForEach(facts.filter { $0.group > .connection }) { fact in factRow(fact) }
     let formats = UIHardwareText.formatGroups(device.modes)
     if !formats.isEmpty {
@@ -210,6 +220,8 @@ struct UISettingsHardwarePane: View {
         if group.available {
           UIHardwareDisclosure(isExpanded: isExpanded(body.id), name: body.camera.name) {
             bodyRow(body, available: true, groups: groups)
+              // Paired by whichever path: the pending choice is done, so a later unassign starts clean.
+              .onChange(of: body.feedID) { _, feedID in if feedID != nil { pairing[body.id] = nil } }
           } content: {
             bodyDetails(body, vendor: group.vendor, groups: groups)
           }
@@ -339,7 +351,7 @@ struct UISettingsHardwarePane: View {
         HStack(spacing: 6) {
           Image(systemName: UISymbol.wifi(connected: body.connected)).imageScale(.small)
             .foregroundStyle(body.connected ? Color.secondary : .orange)
-          Text(body.connected ? "Wi-Fi" : body.connectionText)
+          Text(body.connected ? Self.transport(body.camera.transport) : body.connectionText)
           Text(body.camera.address).font(.uiValue).textSelection(.enabled)
         }
       }
@@ -393,13 +405,25 @@ struct UISettingsHardwarePane: View {
         if body.connected {
           Button("Disconnect") { Task { await store.disconnect(feedID) } }.disabled(state.busy)
         }
-        Button("Unassign") { Task { await store.disconnect(feedID, forget: true) } }.disabled(state.busy)
+        Button("Unassign") {
+          pairing[body.id] = nil
+          Task { await store.disconnect(feedID, forget: true) }
+        }.disabled(state.busy)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     } else {
       LabeledContent("Model") { Text(body.camera.model ?? body.camera.name) }
       LabeledContent("Address") { Text(body.camera.address).font(.uiValue).textSelection(.enabled) }
       Text("Choose a camera for this body to pair it.").font(.uiMeta).foregroundStyle(.secondary)
+    }
+  }
+
+  static func transport(_ transport: ControlTransport) -> String {
+    switch transport {
+    case .network: return "Wi-Fi"
+    case .usb: return "USB"
+    case .bluetooth: return "Bluetooth"
+    case .other: return "Connected"
     }
   }
 
