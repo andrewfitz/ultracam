@@ -495,6 +495,8 @@ enum UIDiagnosticsText {
         if let error = state.error { lines.append("Error: \(error)") }
       }
     }
+    lines.append("")
+    lines += UIHardwareDiagnostics.lines(UISettingsHardwareGroups(model: model))
     return lines.joined(separator: "\n")
   }
 

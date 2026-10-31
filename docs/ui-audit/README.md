@@ -365,6 +365,7 @@ The data mostly exists in `VendorRegistry`, but `AppHardware` flattens it to IDs
 - **Plugin API additions:** cached device status with an observer, typed facts and problems, device model, a missing-device hint, control property roles with severity and a suggested source profile, a notice event, and optional model and firmware on a camera body. The control snapshot, chips and action URLs are dropped as unneeded. Vendor names stay out of `Sources/App`, enforced by `scripts/check-vendor-boundaries.py`.
 - **Main window:** hardware shows in the left pane, plus problems. No extra strip row. The strip's logo stops hiding Blackmagic when Sony is assigned, and the signal badge's menu names both links.
 - **A build without the Sony SDK** must read as normal, with no warnings.
+- **Deep link (validation H N2, ruling J36).** The inspector's Camera Control section, an unpaired camera's Camera Control sheet, the strip's ⋯ menu and the signal badge's menu offer "Open Hardware…" or "Assign Camera Body…", which open Settings › Hardware, with the row expanded when there is one. A body's "not found" text is the Sony plugin's hint (N5).
 
 **Rig presets: not now.** One rig, one Mac, and everything a preset would hold persists once B1 lands.
 

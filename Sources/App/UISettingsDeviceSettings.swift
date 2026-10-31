@@ -1,39 +1,99 @@
 import SwiftUI
 
 /// One capture device's own settings, as its vendor's plugin declares them (input connector,
-/// HDR advertisement and the like). Settings › Hardware shows them under the device.
+/// HDR advertisement and the like), on its Settings › Hardware row.
+///
+/// A setting that can drop the signal is handled by kind while a camera uses the device (J 6):
+/// a choice (the connector) is read-only with its reason, since the driver refuses it during
+/// capture; a switch (Advertise HDR) works live, so it asks first, with Cancel as default.
 struct UISettingsDeviceSettings: View {
     let model: AppModel
-    let device: InputDevice
+    let device: UIHardwareDevice
+    @State private var confirming: Pending?
+    private struct Pending { var setting: VendorSetting; var value: VendorSettingValue }
+
     var body: some View {
         let state = model.vendorSettings.state(for: device.id)
-        if state.busy { ProgressView().controlSize(.small) }
-        ForEach(state.settings) { setting in
-            LabeledContent {
-                UIControlPropertyField(property: UIVendorSettingsPresentation.property(setting), connected: true, busy: state.busy) { value in
-                    guard let pluginID = try? VendorRegistry.pluginID(for: device.id), let value = vendorValue(value) else { return }
-                    Task { await model.vendorSettings.apply(value, to: setting.id, deviceID: device.id, pluginID: pluginID) }
-                }
-            } label: {
-                Text(setting.localizedLabel())
-                if setting.interruptsCapture { Text("Changing this may briefly interrupt the input signal.") }
-            }
-            if let error = setting.applicationError {
+        let running = device.runningCameras
+        Group {
+            ForEach(state.settings) { setting in
                 LabeledContent {
-                    Button("Retry") {
-                        guard let pluginID = try? VendorRegistry.pluginID(for: device.id) else { return }
-                        Task { await model.vendorSettings.apply(setting.value, to: setting.id, deviceID: device.id, pluginID: pluginID) }
-                    }.disabled(state.busy || !setting.mutable)
-                } label: {
-                    Label(error.localizedDescription, systemImage: UISymbol.warning).foregroundStyle(.orange)
+                    HStack(spacing: 8) {
+                        if Self.readOnlyWhileRunning(setting), !running.isEmpty {
+                            Text(UIControlPresentation.value(UIVendorSettingsPresentation.property(setting))).fontWeight(.semibold)
+                            Text("Stop \(Self.names(running)) to change").font(.uiMeta).foregroundStyle(.secondary)
+                        } else {
+                            UIControlPropertyField(property: UIVendorSettingsPresentation.property(setting), connected: true, busy: state.busy) { value in
+                                guard let value = Self.vendorValue(value) else { return }
+                                request(setting, value, running: running)
+                            }
+                            .fixedSize()
+                            if setting.interruptsCapture {
+                                Text("Briefly interrupts \(device.status?.connector.map(UIHardwareText.connector) ?? "the signal")")
+                                    .font(.uiMeta).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } label: { Text(setting.localizedLabel()) }
+                if let error = setting.applicationError {
+                    LabeledContent {
+                        Button("Retry") { apply(setting.value, to: setting) }.disabled(state.busy || !setting.mutable)
+                    } label: {
+                        Label(error.localizedDescription, systemImage: UISymbol.warning).foregroundStyle(.orange)
+                    }
                 }
+            }
+            if state.busy && state.settings.isEmpty { ProgressView().controlSize(.small) }
+            if let message = state.message {
+                Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange)
             }
         }
-        if let message = state.message {
-            Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange)
+        .confirmationDialog(confirmationTitle, isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            if let pending = confirming {
+                Button(pending.value == .boolean(false) ? "Turn Off" : "Turn On") { apply(pending.value, to: pending.setting); confirming = nil }
+            }
+            Button("Cancel", role: .cancel) { confirming = nil }.keyboardShortcut(.defaultAction)
+        } message: {
+            Text("\(cameraState(running)) Changing this setting may briefly interrupt the input signal.")
         }
     }
-    private func vendorValue(_ value: ControlValue) -> VendorSettingValue? {
+
+    /// A choice that can drop the signal can't change during capture (the driver refuses it).
+    static func readOnlyWhileRunning(_ setting: VendorSetting) -> Bool {
+        guard setting.interruptsCapture, case .choices = setting.allowedValues else { return false }
+        return true
+    }
+
+    static func names(_ cameras: [UIHardwareDevice.Camera]) -> String {
+        ListFormatter.localizedString(byJoining: cameras.map(\.name))
+    }
+
+    private var confirmationTitle: String {
+        guard let pending = confirming else { return "" }
+        let verb = pending.value == .boolean(false) ? "Turn off" : "Turn on"
+        return "\(verb) \(pending.setting.localizedLabel()) for \(device.name)?"
+    }
+
+    private func cameraState(_ running: [UIHardwareDevice.Camera]) -> String {
+        let recording = running.filter { camera in
+            model.recordingModel.feeds.first { $0.id.rawValue == camera.id }.map { $0.status == .recording || $0.status == .paused } == true
+        }
+        if !recording.isEmpty { return "\(Self.names(recording)) \(recording.count == 1 ? "is" : "are") recording." }
+        return "\(Self.names(running)) \(running.count == 1 ? "is" : "are") running."
+    }
+
+    private func request(_ setting: VendorSetting, _ value: VendorSettingValue, running: [UIHardwareDevice.Camera]) {
+        if case .boolean = value, setting.interruptsCapture, !running.isEmpty {
+            confirming = Pending(setting: setting, value: value)
+        } else { apply(value, to: setting) }
+    }
+
+    private func apply(_ value: VendorSettingValue, to setting: VendorSetting) {
+        guard let pluginID = try? VendorRegistry.pluginID(for: device.id) else { return }
+        Task { await model.vendorSettings.apply(value, to: setting.id, deviceID: device.id, pluginID: pluginID) }
+    }
+
+    static func vendorValue(_ value: ControlValue) -> VendorSettingValue? {
         switch value {
         case .boolean(let value): return .boolean(value)
         case .integer(let value): return .signed(value)

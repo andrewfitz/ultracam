@@ -7,6 +7,8 @@ struct UIFeedSettingsMenu: View {
     let snapshot: UICameraSnapshot?
     let controlStore: CameraControlStore?
     var viewFactories: [String: ControlViewFactory] = [:]
+    /// Settings › Hardware, at a device's or body's row.
+    var openHardware: (String?) -> Void = { _ in }
     @State private var showingSettings = false
     private var state: CameraControlFeedState? {
         guard let controlStore, controlStore.assignment(for: camera.id) != nil else { return nil }
@@ -15,7 +17,10 @@ struct UIFeedSettingsMenu: View {
     private var live: Bool { camera.statusTone == .positive }
     var body: some View {
         Menu {
-            Label(camera.inputName, systemImage: UISymbol.input)
+            Button { openHardware(snapshot?.inputID) } label: {
+                Label(camera.inputName, systemImage: UISymbol.input)
+            }
+            .badge(snapshot?.inputConnector.map { Text($0) })
             if let format = snapshot?.outputFormat {
                 Label("Ultracam · \(camera.name)", systemImage: UISymbol.virtualCamera(inUse: camera.outputInUse)).badge(Text(format))
             }
@@ -43,8 +48,12 @@ struct UIFeedSettingsMenu: View {
             } else {
                 Label("Output timing is controlled by the source", systemImage: UISymbol.information)
             }
-            if controlStore != nil {
-                Button("Camera Control…", systemImage: UISymbol.cameraControl) { showingSettings = true }
+            if let controlStore, controlStore.available {
+                if controlStore.assignment(for: camera.id) != nil {
+                    Button("Camera Control…", systemImage: UISymbol.cameraControl) { showingSettings = true }
+                } else {
+                    Button("Assign Camera Body…", systemImage: UISymbol.cameraBody) { openHardware(nil) }
+                }
             }
         } label: {
             HStack(spacing: 4) {
@@ -69,7 +78,10 @@ struct UIFeedSettingsMenu: View {
         .accessibilityLabel("\(camera.name) signal, \(camera.statusBadge)")
         .accessibilityValue(camera.signalDropouts > 0 ? "\(camera.signalDropouts) signal dropouts since Start" : "")
         .sheet(isPresented: $showingSettings) {
-            if let controlStore { UICameraControlSettings(feedID: camera.id, name: camera.name, store: controlStore, viewFactories: viewFactories) }
+            if let controlStore {
+                UICameraControlSettings(feedID: camera.id, name: camera.name, store: controlStore, viewFactories: viewFactories,
+                    openHardware: { openHardware(nil) })
+            }
         }
     }
 

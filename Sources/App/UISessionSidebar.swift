@@ -238,8 +238,12 @@ struct UISidebarCameraRow: View {
       UIStateGlyph(state: camera.state).frame(width: 12)
       VStack(alignment: .leading, spacing: 1) {
         Text(camera.name).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
-        Text(camera.inputName).font(.uiMeta).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-          .help(camera.inputName)
+        HStack(spacing: 6) {
+          Text(camera.inputName).lineLimit(1).truncationMode(.middle).help(camera.inputName)
+          // The connector only when it isn't HDMI (ruling 23).
+          if let connector = snapshot?.inputConnector { Text(connector).fixedSize() }
+        }
+        .font(.uiMeta).foregroundStyle(.secondary)
         if let body = snapshot?.body {
           HStack(spacing: 6) {
             Label { Text(body.name).lineLimit(1) } icon: { Image(systemName: UISymbol.cameraBody).imageScale(.small) }

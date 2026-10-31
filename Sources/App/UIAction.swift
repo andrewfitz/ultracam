@@ -112,6 +112,10 @@ enum UIAction: Sendable, Equatable {
   case setChannelsShown(cameraID: String, UIChannelsShown)
   /// Settings at one tab: what a "Settings › Recording" link does.
   case openSettingsTab(UISettingsTab)
+  /// Settings › Hardware with one row expanded: a capture device ID, a camera body ID, or nil.
+  case openHardware(itemID: String?)
+  /// Connects a camera's paired body again with its saved sign-in (Attention, inspector, sheet).
+  case reconnectCameraBody(cameraID: String)
   case openDiagnostics
   case openMainWindow
   /// System Settings at Camera Extensions, where macOS waits for an approval.

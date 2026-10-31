@@ -785,7 +785,8 @@ struct UIChannelStripView: View {
     .accessibilityLabel("\(camera.name) controls")
     .sheet(isPresented: $controlOpen) {
       if let store = context.cameraControls {
-        UICameraControlSettings(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
+        UICameraControlSettings(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories,
+          openHardware: { context.send(.openHardware(itemID: nil)) })
       }
     }
   }
@@ -863,13 +864,11 @@ struct UIChannelStripView: View {
   private var header: some View {
     HStack(spacing: 8) {
       chevron
-      if let brand = feedBrand {
-        UIFeedBrandMark(descriptor: brand)
-      }
+      ForEach(feedBrands) { UIFeedBrandMark(descriptor: $0) }
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
         .help("\(camera.name) · \(camera.inputName)")
       UIFeedSettingsMenu(camera: camera, snapshot: snapshot, controlStore: context.cameraControls,
-        viewFactories: context.controlViewFactories)
+        viewFactories: context.controlViewFactories, openHardware: { context.send(.openHardware(itemID: $0)) })
       Spacer(minLength: 4)
       cameraButton
       overflowMenu
@@ -877,11 +876,16 @@ struct UIChannelStripView: View {
     .frame(height: 24)
   }
 
-  private var feedBrand: VendorDescriptor? {
-    if let store = context.cameraControls, let assignment = store.assignment(for: camera.id) {
-      return store.descriptor(for: assignment.camera.pluginID)
+  /// Both links' marks: the capture device's, then the paired body's. A body never hides the
+  /// capture vendor, and a build without the body's SDK shows only the capture mark.
+  private var feedBrands: [VendorDescriptor] {
+    var brands = snapshot?.inputID.flatMap { context.captureVendors[$0] }.map { [$0] } ?? []
+    if let store = context.cameraControls, let assignment = store.assignment(for: camera.id),
+      let control = store.descriptor(for: assignment.camera.pluginID), control.sdkPresent,
+      !brands.contains(where: { $0.id == control.id }) {
+      brands.append(control)
     }
-    return snapshot?.inputID.flatMap { context.captureVendors[$0] }
+    return brands
   }
 
   private var chevron: some View {
@@ -941,8 +945,12 @@ struct UIChannelStripView: View {
       }
       Divider()
       UICopySettingsMenu(camera: camera, context: context, title: "Copy Monitor Settings To")
-      if context.cameraControls != nil {
-        Button("Camera Control…") { controlOpen = true }
+      if let store = context.cameraControls, store.available {
+        if store.assignment(for: camera.id) != nil {
+          Button("Camera Control…") { controlOpen = true }
+        } else {
+          Button("Assign Camera Body…") { context.send(.openHardware(itemID: nil)) }
+        }
       }
       Divider()
       // The one rename alert lives on the main window; this only asks for it.

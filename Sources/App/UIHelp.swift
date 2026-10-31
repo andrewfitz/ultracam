@@ -67,7 +67,7 @@ struct UIHelpView: View {
         Text("Record › Pause All pauses every take. When every take is paused, it becomes Resume All.")
         Text("LUT On and LUT Off change the picture only, so meeting apps keep their format. Everything in a strip's Effects menu changes the format they receive, so the meeting's video updates briefly.")
         Text("Every camera records one format, chosen in the sidebar or Record › Format. A camera whose source can't use it records the nearest format, and its strip says so in orange.")
-        Text("Timecode and folders are in [Settings › Recording](ultracam-settings:recording). Input connectors are in [Settings › Hardware](ultracam-settings:hardware). Channels Shown is in [Settings › Audio](ultracam-settings:audio).")
+        Text("Timecode and folders are in [Settings › Recording](ultracam-settings:recording). Capture devices, their names and connectors, and camera body pairing are in [Settings › Hardware](ultracam-settings:hardware). Channels Shown is in [Settings › Audio](ultracam-settings:audio).")
       }
       Section("Recording") {
         Text("Program is not recorded. A session leaves each camera's original and a list of the cuts.")

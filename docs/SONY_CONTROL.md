@@ -1,22 +1,23 @@
 # Sony Wi-Fi camera control
 
-Open **Camera Control** in an expanded camera strip, or **Inspector → Camera
-Control**. Sony is the current control plugin. Enable Remote Shoot Function on
+Pair a body in **Settings › Hardware**: its row's camera pop-up is the pairing
+control, and sign-in opens in the row. **Camera Control** (the strip's ⋯ menu,
+the signal badge's menu, or **Inspector → Camera Control**) then operates the
+paired body and keeps **Reconnect**. Sony is the current control plugin. Enable Remote Shoot Function on
 each FX3 and put the Mac and cameras
 on the same Wi-Fi network. For several cameras, use a shared access point;
 joining one camera's Wi-Fi Direct network only reaches cameras on that network.
 Camera menu names and authentication requirements depend on firmware.
 
-Opening the pop-up automatically detects cameras and shows their friendly names,
-such as **ILME-FX3:A** and **ILME-FX3:B**. Select the matching camera,
-enter its camera access-authentication credentials if requested, and press
-**Connect and Assign**. Verify that the selected physical camera matches the
+**Find Camera Bodies** detects cameras and lists them by friendly name, such as
+**ILME-FX3:A** and **ILME-FX3:B**; opening Settings never scans. Choose the
+matching Ultracam camera in the body's pop-up, enter its camera
+access-authentication credentials if requested, and press **Connect and Assign**. Verify that the selected physical camera matches the
 HDMI picture. Network control cannot determine which HDMI cable it feeds.
 Allow Ultracam's macOS local network access when prompted.
 
-Press **Rescan** to detect newly powered cameras immediately. Recent successful
-scan results are shared across camera pop-ups for 30 seconds. There is no
-periodic scan. **Add camera by address** remains a secondary recovery option if the
+Press **Find Camera Bodies** again to detect newly powered cameras. There is no
+periodic scan. **Add by Address** remains a secondary recovery option if the
 network blocks discovery; ordinary setup does not require typing IP or MAC
 addresses. After the first successful connection, the camera login is stored in
 macOS Keychain and used to reconnect its saved HDMI assignment on app launch.
@@ -87,8 +88,9 @@ remain in the Sony settings panel. No camera values are saved across launches.
 
 ## Activity and threading
 
-- Opening Camera Control starts one discovery when its cache is stale. Concurrent
-  pop-ups share the same in-flight scan. Rescan requests a fresh scan. No scan
+- Discovery runs only when **Find Camera Bodies** is pressed, or when a pairing
+  or Reconnect verifies a body's identity; opening Settings or Camera Control
+  never scans. Concurrent requests share the same in-flight scan. No scan
   runs on a repeating timer. Startup performs one shared scan only when saved
   assignments have remembered credentials (or do not require authentication).
 - Discovery reads Sony's SSDP advertisements and camera descriptions, then uses

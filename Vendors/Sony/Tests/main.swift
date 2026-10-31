@@ -690,33 +690,31 @@ private final class SonyStub: UCSonyCameraControl {
     let manualBackend = SonyStub()
     let manualStore = CameraControlStore(defaults: manualDefaults, backend: manualBackend, credentials: MemoryCredentials())
     for dark in [false, true] {
-      let host = HostedView(UICameraControlSettings(feedID: "new-feed", name: "Camera 2", store: manualStore),
+      // Pairing lives in Settings › Hardware: an unpaired camera's sheet points there and never scans.
+      let host = HostedView(UICameraControlSettings(feedID: "new-feed", name: "Camera 2", store: manualStore, openHardware: {}),
         size: CGSize(width: 640, height: 690), dark: dark)
       await drain()
-      let nodes = Accessibility.nodes(in: host.host)
-      expect(manualBackend.discoveryCalls <= (dark ? 4 : 2) && manualBackend.discoveryCalls > 0,
-        "settings sheets bound detection and identity verification before saved-sign-in lookup")
-      let scansAfterOpening = manualBackend.discoveryCalls
       await pause(0.1)
-      expect(manualBackend.discoveryCalls == scansAfterOpening && manualBackend.connectCalls == 0 && manualBackend.refreshCalls == 0 && manualBackend.setCalls == 0,
-        "an idle settings sheet does not poll, connect or read camera settings")
-      expect(nodes.contains { $0.text.contains("Rescan") }, "automatic detection retains an explicit Rescan control")
-      if let picker = nodes.first(where: { $0.text.contains("Control camera") }) {
-        expect(!picker.text.contains(camera.address) && !picker.text.contains(camera.id),
-          "uniquely named camera selection keeps IP and MAC out of the primary label")
-      } else { fatalError("Detected camera picker is missing") }
+      let nodes = Accessibility.nodes(in: host.host)
+      expect(manualBackend.discoveryCalls == 0 && manualBackend.connectCalls == 0 && manualBackend.refreshCalls == 0 && manualBackend.setCalls == 0,
+        "opening the camera control sheet does not scan, connect or read camera settings")
+      expect(nodes.contains { $0.text.contains("Settings › Hardware") } && nodes.contains { $0.text.contains("Open Hardware") },
+        "an unpaired camera's sheet points to Settings › Hardware")
       if let rep = host.render(), let png = rep.representation(using: .png, properties: [:]) {
-        try! png.write(to: output.appendingPathComponent("sony-detection-\(dark ? "dark" : "light").png"))
+        try! png.write(to: output.appendingPathComponent("sony-unpaired-\(dark ? "dark" : "light").png"))
       }
-      guard let disclosure = nodes.first(where: { $0.text.contains("Add camera by address") }) else { fatalError("Manual IP disclosure is missing") }
-      expect(Accessibility.press(disclosure), "manual IP disclosure opens through accessibility")
-      guard let rep = host.render(), let png = rep.representation(using: .png, properties: [:]) else { fatalError("Could not render manual IP controls") }
-      let expanded = Accessibility.nodes(in: host.host)
+      host.close()
+      let manual = HostedView(Form { UICameraBodyAddByAddress(pluginID: "sony", store: manualStore, cameras: [("new-feed", "Camera 2")]) }.formStyle(.grouped),
+        size: CGSize(width: 640, height: 360), dark: dark)
+      await drain()
+      let expanded = Accessibility.nodes(in: manual.host)
+      expect(manualBackend.discoveryCalls == 0, "the add-by-address form does nothing until Check Camera")
       expect(expanded.contains { $0.text.contains("Camera IP address") }, "manual IP address field has an accessible label")
       expect(expanded.contains { $0.text.contains("Camera stable identity") }, "manual MAC address field has an accessible label")
       expect(expanded.contains { $0.text.contains("Check Camera") }, "manual identity check is available")
+      guard let rep = manual.render(), let png = rep.representation(using: .png, properties: [:]) else { fatalError("Could not render manual IP controls") }
       try! png.write(to: output.appendingPathComponent("sony-manual-ip-\(dark ? "dark" : "light").png"))
-      host.close()
+      manual.close()
     }
     let overlay = HostedView(
       Color.gray.overlay(alignment: .bottomLeading) { UICameraSettingsOverlay(feedID: "hdmi-a", store: store).padding() },

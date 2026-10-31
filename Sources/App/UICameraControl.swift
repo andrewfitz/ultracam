@@ -1,38 +1,38 @@
 import SwiftUI
 
+// Vendor test groups compile this file on its own, without the shared components, so it
+// uses plain SwiftUI and system symbol names only.
+
 struct UICameraControlButton: View {
     let feedID: String
     let name: String
     let store: CameraControlStore
     var viewFactories: [String: ControlViewFactory] = [:]
+    /// Settings › Hardware, where pairing lives.
+    var openHardware: (() -> Void)? = nil
     @State private var presented = false
     var body: some View {
         Button { presented = true } label: { Label("Camera Control…", systemImage: "camera.aperture") }
-            .help("Assign a control camera to \(name) and change its settings")
+            .help("Change the settings of \(name)'s camera body")
             .accessibilityLabel("Camera Control for \(name)")
-            .sheet(isPresented: $presented) { UICameraControlSettings(feedID: feedID, name: name, store: store, viewFactories: viewFactories) }
+            .sheet(isPresented: $presented) {
+                UICameraControlSettings(feedID: feedID, name: name, store: store, viewFactories: viewFactories, openHardware: openHardware)
+            }
     }
 }
 
+/// Operates a camera's paired body: its settings, Reconnect, Disconnect, Unassign and its saved
+/// sign-in. Pairing lives in Settings › Hardware, so opening this never scans the network.
 struct UICameraControlSettings: View {
     let feedID: String
     let name: String
     let store: CameraControlStore
     var viewFactories: [String: ControlViewFactory] = [:]
+    var openHardware: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
-    @State private var pluginID = ""
-    @State private var selectedID = ""
-    @State private var user = ""
-    @State private var password = ""
-    @State private var manualAddress = ""
-    @State private var manualIdentity = ""
-    @State private var manualAuthentication = true
     private var state: CameraControlFeedState { store.state(for: feedID) }
     private var assignment: CameraControlAssignment? { store.assignment(for: feedID) }
-    private var candidates: [ControlCamera] { store.cameras[pluginID] ?? [] }
-    private var selectedCamera: ControlCamera? { candidates.first { $0.id == selectedID } }
-    private var selectedIdentity: String { pluginID + "|" + selectedID + "|" + (selectedCamera?.fingerprint ?? "") }
-    private var scanning: Bool { store.scanning.contains(pluginID) }
+    private var pluginID: String { assignment?.camera.pluginID ?? "" }
     private var vendor: VendorDescriptor? { store.descriptor(for: pluginID) }
 
     var body: some View {
@@ -48,46 +48,30 @@ struct UICameraControlSettings: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    if store.descriptors.isEmpty {
-                        Label("No camera-control plugins are available.", systemImage: "exclamationmark.triangle")
-                    } else {
-                        if store.descriptors.count > 1 {
-                            Picker("Control vendor", selection: $pluginID) {
-                                ForEach(store.descriptors) { Text($0.localizedDisplayName()).tag($0.id) }
-                            }.disabled(assignment != nil || state.busy)
-                        }
+                    if let assignment {
                         if vendor?.sdkPresent == false {
-                            Label("\(vendor?.localizedDisplayName() ?? "Camera control") is unavailable in this build.", systemImage: "exclamationmark.triangle")
-                        } else { connection }
+                            Label("\(vendor?.localizedDisplayName() ?? "Camera control") is not included in this build.", systemImage: "info.circle")
+                        } else { connection(assignment) }
                         if let message = state.message {
                             Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
                         }
-                        if assignment != nil {
-                            if let factory = viewFactories[pluginID] { factory(vendorContext) }
-                            else { properties }
+                        if let factory = viewFactories[pluginID] { factory(vendorContext) }
+                        else { properties }
+                    } else {
+                        Text("No camera body is paired with \(name). Pair one in Settings › Hardware, then its settings appear here.")
+                            .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        if let openHardware {
+                            Button("Open Hardware…") { dismiss(); openHardware() }
                         }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(.trailing, 6)
             }
-            if state.busy || scanning {
-                HStack { ProgressView().controlSize(.small); Text(scanning ? "Finding cameras…" : "Contacting camera…") }
+            if state.busy {
+                HStack { ProgressView().controlSize(.small); Text("Contacting camera…") }
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(24).frame(width: 640, height: 690)
-        .onAppear {
-            pluginID = assignment?.camera.pluginID ?? store.descriptors.first?.id ?? ""
-            selectedID = assignment?.camera.id ?? ""
-            if let camera = assignment?.camera {
-                manualAddress = camera.address; manualIdentity = camera.id
-                manualAuthentication = camera.authenticationMode == .usernamePassword
-            }
-        }
-        .task(id: pluginID) { guard !pluginID.isEmpty, !state.connected else { return }; await detect(force: false) }
-        .onChange(of: selectedIdentity) { _, _ in user = ""; password = "" }
-        .task(id: selectedIdentity) {
-            if let camera = selectedCamera { await store.checkSavedCredentials(for: camera, feedID: feedID) }
-        }
     }
     private var vendorContext: ControlViewContext {
         ControlViewContext(feedID: feedID, pluginID: pluginID, properties: state.properties,
@@ -112,7 +96,7 @@ struct UICameraControlSettings: View {
             Text("Connect and read settings to see the values available in the camera’s current mode.").foregroundStyle(.secondary)
         } else {
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 12) {
-                ForEach(state.properties.filter { $0.role != .hidden && $0.role != .cameraDisplay }) { property in
+                ForEach(state.properties.filter { $0.role != .hidden && $0.role != .cameraDisplay && $0.role != .firmware }) { property in
                     GridRow { Text(property.localizedLabel()); UIControlPropertyField(property: property, connected: state.connected, busy: state.busy) { value in
                         Task { await store.set(property, value: value, feedID: feedID) }
                     } }
@@ -122,90 +106,126 @@ struct UICameraControlSettings: View {
         Text("Settings update when the camera reports a change. Refresh is available if needed. Unavailable settings are read-only; camera mode or physical control priority may prevent editing.")
             .font(.caption).foregroundStyle(.secondary)
     }
-    @ViewBuilder private var connection: some View {
-        if let assignment {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Label(assignment.camera.name, systemImage: state.connected ? "wifi" : "wifi.slash").font(.headline)
-                    Text("Assigned to \(name)").font(.caption).foregroundStyle(.secondary)
-                }.help(detail(assignment.camera))
-                Spacer()
-                if state.connected {
-                    Button("Disconnect") { Task { await store.disconnect(feedID) } }
-                } else {
-                    Button("Reconnect") { Task { await store.reconnect(feedID) } }.disabled(state.busy || scanning)
-                }
-                Button("Unassign") { Task { await store.disconnect(feedID, forget: true) } }.disabled(state.busy)
+    @ViewBuilder private func connection(_ assignment: CameraControlAssignment) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                Label(assignment.camera.name, systemImage: state.connected ? "wifi" : "wifi.slash").font(.headline)
+                Text("Assigned to \(name)").font(.caption).foregroundStyle(.secondary)
+            }.help("\(assignment.camera.name) · \(assignment.camera.address) · \(assignment.camera.id)")
+            Spacer()
+            if state.connected {
+                Button("Disconnect") { Task { await store.disconnect(feedID) } }
+            } else {
+                // Reconnect uses the saved sign-in: a body dropping mid-show never sends anyone to Settings.
+                Button("Reconnect") { Task { await store.reconnect(feedID) } }.disabled(state.busy)
             }
-            if state.hasSavedCredentials {
-                HStack {
-                    Label("Camera sign-in saved in macOS Keychain", systemImage: "key.fill").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Forget Saved Sign-In", role: .destructive) { Task { await store.forgetCredentials(feedID) } }.disabled(state.busy)
-                }
-            }
+            Button("Unassign") { Task { await store.disconnect(feedID, forget: true) } }.disabled(state.busy)
         }
-        if !state.connected {
+        if state.hasSavedCredentials {
             HStack {
-                Button("Rescan", systemImage: "arrow.clockwise") { Task { await detect(force: true) } }.disabled(scanning || state.busy)
-                if !candidates.isEmpty {
-                    Picker("Camera", selection: $selectedID) {
-                        Text("Choose a camera").tag("")
-                        ForEach(candidates) { camera in Text(title(camera)).tag(camera.id).help(detail(camera)) }
-                    }.labelsHidden().accessibilityLabel("Control camera").disabled(scanning || state.busy)
-                }
-            }
-            DisclosureGroup("Add camera by address") {
-                VStack(alignment: .leading, spacing: 10) {
-                    TextField("Camera network address", text: $manualAddress).textFieldStyle(.roundedBorder).accessibilityLabel("Camera IP address")
-                    TextField("Expected stable identity (for example MAC address)", text: $manualIdentity).textFieldStyle(.roundedBorder).accessibilityLabel("Camera stable identity")
-                    Toggle("Camera access authentication is enabled", isOn: $manualAuthentication)
-                    Text("Check Camera resolves its identity before connecting. Sign-in is sent when you press Connect.").font(.caption).foregroundStyle(.secondary)
-                    Button("Check Camera") { Task {
-                        let identity = manualIdentity.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let request = ControlPreparationRequest.endpoint(.init(address: manualAddress.trimmingCharacters(in: .whitespacesAndNewlines), expectedIdentity: identity.isEmpty ? nil : identity, authenticationMode: manualAuthentication ? .usernamePassword : .none))
-                        if let prepared = await store.prepare(pluginID: pluginID, request: request, feedID: feedID) { selectedID = prepared.camera.id }
-                    } }.disabled(scanning || state.busy || manualAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }.padding(.top, 8)
-            }
-            if let message = store.discoveryMessages[pluginID] { Text(message).foregroundStyle(.secondary) }
-            if let camera = selectedCamera {
-                if store.holder(of: camera.id, pluginID: camera.pluginID, excluding: feedID) != nil {
-                    // Vendor test groups compile this file on its own, without the shared components.
-                    Label { Text("This control camera is assigned to another Ultracam camera. Unassign it there first.") } icon: {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    }
-                } else {
-                    if store.hasSavedCredentials(for: camera) {
-                        Button("Connect Using Saved Sign-In") { Task { await store.connectUsingSavedCredentials(camera, to: feedID) } }.disabled(state.busy || scanning)
-                        DisclosureGroup("Change camera sign-in") { signIn(camera) }
-                    } else { signIn(camera) }
-                }
+                Label("Camera sign-in saved in macOS Keychain", systemImage: "key.fill").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Forget Saved Sign-In", role: .destructive) { Task { await store.forgetCredentials(feedID) } }.disabled(state.busy)
             }
         }
     }
-    @ViewBuilder private func signIn(_ camera: ControlCamera) -> some View {
+}
+
+/// Sign-in for pairing one body with one camera, inline in its Settings › Hardware row: the
+/// saved sign-in when there is one, otherwise user name, password and the fingerprint.
+struct UICameraBodySignIn: View {
+    let camera: ControlCamera
+    let feedID: String
+    let cameraName: String
+    let store: CameraControlStore
+    /// The capture device the camera uses, so the person checks the cable before signing in.
+    var captureName: String? = nil
+    @State private var user = ""
+    @State private var password = ""
+    private var state: CameraControlFeedState { store.state(for: feedID) }
+
+    var body: some View {
+        Group {
+            if store.hasSavedCredentials(for: camera) {
+                Button("Connect Using Saved Sign-In") { Task { await store.connectUsingSavedCredentials(camera, to: feedID) } }
+                    .buttonStyle(.borderedProminent).disabled(state.busy)
+                DisclosureGroup("Change camera sign-in") { fields }
+            } else { fields }
+            if let message = state.message {
+                Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+            }
+        }
+        // Only after a camera was chosen for this body: the check re-verifies the body's identity.
+        .task(id: camera.id + "|" + feedID) { await store.checkSavedCredentials(for: camera, feedID: feedID) }
+    }
+
+    @ViewBuilder private var fields: some View {
         if camera.authenticationMode == .usernamePassword {
             TextField("Camera user name", text: $user).textContentType(.username)
             SecureField("Camera password", text: $password).textContentType(.password)
-            if let fingerprint = camera.fingerprint { Text("Camera fingerprint: \(fingerprint)").font(.caption.monospaced()).textSelection(.enabled) }
-            Text("Successful sign-in is saved in macOS Keychain. Unassigning keeps it; Forget Saved Sign-In removes it.").font(.caption).foregroundStyle(.secondary)
+            if let fingerprint = camera.fingerprint {
+                LabeledContent("Camera fingerprint") { Text(fingerprint).font(.caption.monospaced()).textSelection(.enabled) }
+            }
         }
-        Button(assignment == nil ? "Connect and Assign to \(name)" : "Connect Assigned Camera") {
+        Text(["\(captureName.map { "Check that this body’s HDMI goes to \($0)." } ?? "")",
+              camera.authenticationMode == .usernamePassword
+                ? "A successful sign-in is saved in macOS Keychain. Unassigning keeps it; Forget Saved Sign-In removes it." : ""]
+            .filter { !$0.isEmpty }.joined(separator: " "))
+            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        Button("Connect and Assign to \(cameraName)") {
             let credential: ControlCredentials? = camera.authenticationMode == .usernamePassword ? .usernamePassword(username: user, password: password) : nil
             password = ""
             Task { await store.connect(camera: camera, to: feedID, credentials: credential) }
-        }.disabled(scanning || state.busy || (assignment != nil && assignment?.camera.id != camera.id) || (camera.authenticationMode == .usernamePassword && (user.isEmpty || password.isEmpty)))
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(state.busy || (camera.authenticationMode == .usernamePassword && (user.isEmpty || password.isEmpty)))
     }
-    private func detect(force: Bool) async {
-        if force { await store.discover(pluginID: pluginID) } else { await store.discoverIfNeeded(pluginID: pluginID) }
-        if let saved = assignment?.camera.id, candidates.contains(where: { $0.id == saved }) { selectedID = saved }
-        else if !candidates.contains(where: { $0.id == selectedID }) { selectedID = candidates.count == 1 ? candidates[0].id : "" }
+}
+
+/// Adds a body that a scan can't find, by its address, for one camera. The identity is
+/// checked before anything is sent; sign-in follows in the body's row.
+struct UICameraBodyAddByAddress: View {
+    let pluginID: String
+    let store: CameraControlStore
+    /// The cameras a body can be added for, by ID and name.
+    let cameras: [(id: String, name: String)]
+    var initialAddress = ""
+    var initialFeedID: String? = nil
+    var onPrepared: (ControlCamera, String) -> Void = { _, _ in }
+    @State private var address = ""
+    @State private var identity = ""
+    @State private var authentication = true
+    @State private var feedID = ""
+
+    var body: some View {
+        Group {
+            if initialFeedID == nil {
+                Picker("For", selection: $feedID) {
+                    ForEach(cameras, id: \.id) { Text($0.name).tag($0.id) }
+                }
+            }
+            TextField("Camera network address", text: $address).textFieldStyle(.roundedBorder).accessibilityLabel("Camera IP address")
+            TextField("Expected stable identity (for example MAC address)", text: $identity).textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Camera stable identity")
+            Toggle("Camera access authentication is enabled", isOn: $authentication)
+            Text("Check Camera resolves its identity before connecting. Sign-in is sent when you press Connect.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Check Camera") { Task {
+                let trimmed = identity.trimmingCharacters(in: .whitespacesAndNewlines)
+                let request = ControlPreparationRequest.endpoint(.init(address: address.trimmingCharacters(in: .whitespacesAndNewlines),
+                    expectedIdentity: trimmed.isEmpty ? nil : trimmed, authenticationMode: authentication ? .usernamePassword : .none))
+                if let prepared = await store.prepare(pluginID: pluginID, request: request, feedID: feedID) { onPrepared(prepared.camera, feedID) }
+            } }
+            .disabled(feedID.isEmpty || store.state(for: feedID).busy || address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            if let message = store.state(for: feedID).message, !feedID.isEmpty {
+                Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+            }
+        }
+        .onAppear {
+            if address.isEmpty { address = initialAddress }
+            if feedID.isEmpty { feedID = initialFeedID ?? cameras.first?.id ?? "" }
+        }
     }
-    private func title(_ camera: ControlCamera) -> String {
-        candidates.filter { $0.name == camera.name }.count > 1 ? "\(camera.name) · \(camera.address)" : camera.name
-    }
-    private func detail(_ camera: ControlCamera) -> String { "\(camera.name) · \(camera.address) · \(camera.id)" }
 }
 
 struct UIControlPropertyField: View {

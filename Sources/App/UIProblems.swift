@@ -280,6 +280,26 @@ extension UIPresentationBuilder {
         action: UIProblemAction(title: "Locate…", action: .chooseLUT(cameraID: id)),
         stripText: "LUT unavailable", stripShort: "LUT missing", rank: 170))
     }
+    if let body = camera.body {
+      let hardware = UIProblemAction(title: "Details", action: .openHardware(itemID: body.id))
+      if body.lost {
+        // Control only: the picture comes over HDMI, so a lost body is a notice, never damage.
+        list.append(UIProblem(id: "body.\(id)", title: "\(body.name) disconnected", detail: "\(name)'s camera control. The picture isn't affected.",
+          level: .notice, cameraID: id, action: UIProblemAction(title: "Reconnect", action: .reconnectCameraBody(cameraID: id)),
+          symbol: UISymbol.wifi(connected: false), rank: 175))
+      }
+      if let warning = body.warning {
+        // Overheating or an empty battery ends the picture: damage while it's on air or rolling.
+        let live = rolling || (onAirHere && session.programInUse)
+        list.append(UIProblem(id: "bodywarn.\(id)", title: "\(body.name): \(warning.text)", detail: "\(name)'s camera body",
+          level: live ? .damage : .notice, cameraID: id, action: hardware,
+          stripText: "\(body.name): \(warning.text)", stripShort: warning.short, rank: live ? 40 : 125))
+      }
+      if let notice = body.notice {
+        list.append(UIProblem(id: "bodynotice.\(id)", title: "\(body.name): \(notice)", level: .notice, cameraID: id,
+          action: hardware, rank: 178))
+      }
+    }
     let format = format(of: camera, in: session)
     if let fallback = format.fallback {
       let rate = UIFormat.bitrate(estimateMegabits(format.actual, camera))

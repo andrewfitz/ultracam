@@ -67,7 +67,7 @@ struct UISettingsView: View {
   @ViewBuilder private func pane(_ tab: UISettingsTab) -> some View {
     switch tab {
     case .general: UISettingsGeneralPane(model: model, interface: interface, shortcuts: shortcuts)
-    case .hardware: UISettingsHardwarePane(model: model)
+    case .hardware: UISettingsHardwarePane(model: model, interface: interface)
     case .virtualCameras: UISettingsVirtualCamerasPane(model: model)
     case .recording: UISettingsRecordingPane(model: model)
     case .audio: UISettingsAudioPane(model: model, interface: interface)

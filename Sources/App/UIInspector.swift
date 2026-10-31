@@ -31,7 +31,8 @@ struct UIInspectorViewContent: View {
       }
       // Signal order: what comes in, what controls it, what's done to it, what's kept.
       inputSection(camera: camera, snapshot: snapshot)
-      if let store = context.cameraControls {
+      // A build without any camera-control SDK has no section: it reads as a normal build.
+      if let store = context.cameraControls, store.available {
         Section {
           if let assignment = store.assignment(for: camera.id) {
             let state = store.state(for: camera.id)
@@ -43,10 +44,19 @@ struct UIInspectorViewContent: View {
                 .symbolRenderingMode(.palette).tint(state.connected ? .secondary : .orange)
             }
             LabeledContent(state.cacheStatus) {
-              UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
+              HStack(spacing: 6) {
+                // Reconnect stays near the camera; it uses the saved sign-in.
+                if !state.connected {
+                  Button("Reconnect") { context.send(.reconnectCameraBody(cameraID: camera.id)) }.disabled(state.busy)
+                }
+                UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories,
+                  openHardware: { context.send(.openHardware(itemID: assignment.camera.id)) })
+              }
             }
           } else {
-            UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories)
+            LabeledContent("Pairing is in Settings") {
+              Button("Open Hardware…") { context.send(.openHardware(itemID: nil)) }
+            }
           }
         } header: {
           UIInspectorHeader(title: "Camera Control", symbol: UISymbol.cameraControl)
@@ -167,11 +177,10 @@ struct UIInspectorViewContent: View {
     } footer: {
       if snapshot.running {
         Text("Stop the camera to change its input.").font(.uiMeta).foregroundStyle(.secondary)
-      } else if let input = context.inputs.first(where: { $0.id == snapshot.inputID }),
-        !input.supportedModes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        // A device that reports nothing gets no row: the list goes here only when there is one.
-        Text("Supported formats: \(input.supportedModes)").font(.uiMeta).foregroundStyle(.secondary)
-          .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+      } else if let inputID = snapshot.inputID {
+        // Supported formats, connector and the device's name live on its Hardware row.
+        Button("Supported formats and settings…") { context.send(.openHardware(itemID: inputID)) }
+          .buttonStyle(.link).font(.uiMeta)
       }
     }
   }

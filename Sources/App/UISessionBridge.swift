@@ -40,6 +40,8 @@ final class UIInterfaceState {
   var offerAlerts = false
   @ObservationIgnored var turnOnAlerts: (@MainActor () -> Void)?
   @ObservationIgnored var dismissAlertsPrompt: (@MainActor () -> Void)?
+  /// The row Settings › Hardware expands when it next appears (`openHardware`); it clears it.
+  var hardwareFocus: String?
   /// Settings' tab. Settings reopens on it, and a "Settings › Audio" link sets it before opening.
   var settingsTab: UISettingsTab { didSet { defaults.set(settingsTab.rawValue, forKey: Self.settingsTabKey) } }
   /// Settings › Audio: how many channels each camera's strip meters show, by camera ID.
@@ -181,9 +183,10 @@ struct UISessionBridge {
       camera.sinkConnected = update?.cameraOutputActive == true
       camera.clientWaiting = model.waitingClients.contains(id)
       camera.queueStalled = model.stalledCameras.contains(id)
-      if let assignment = model.cameraControls.assignment(for: id.rawValue) {
-        camera.body = UICameraBody(name: assignment.camera.name, connected: model.cameraControls.state(for: id.rawValue).connected)
+      if let connector = model.hardwareInventory.status(for: descriptor.selectedDevice)?.connector, connector != .hdmi {
+        camera.inputConnector = UIHardwareText.connector(connector)
       }
+      camera.body = Self.body(model: model, cameraID: id.rawValue)
       camera.sinkFailure = running ? update?.cameraConnectError : nil
       camera.canRemove = model.canRemoveCamera(id)
       camera.unexpectedStop = model.unexpectedStops[id].map(Self.unexpectedStop)
@@ -297,6 +300,30 @@ struct UISessionBridge {
     session.narrowWindow = interface.narrowWindow
     session.askBeforeEnding = interface.askBeforeEnding
     return session
+  }
+
+  /// The camera's paired body, as the left pane and the problem list read it. A build without
+  /// its vendor's SDK shows none: a saved pairing there is kept, never a problem.
+  static func body(model: AppModel, cameraID: String) -> UICameraBody? {
+    let controls = model.cameraControls
+    guard let assignment = controls.assignment(for: cameraID),
+      controls.descriptor(for: assignment.camera.pluginID)?.sdkPresent == true else { return nil }
+    let state = controls.state(for: cameraID)
+    let properties = state.connected ? state.properties : []
+    var body = UICameraBody(name: assignment.camera.name, connected: state.connected,
+      battery: UIHardwareText.battery(properties), id: assignment.camera.id, lost: !state.connected && state.lostAt != nil,
+      notice: state.notice)
+    let worst = properties.filter { [.thermal, .power, .media].contains($0.role) && ($0.severity ?? .info) >= .warning }
+      .max { ($0.severity ?? .info) < ($1.severity ?? .info) }
+    if let worst {
+      let value = UIControlPresentation.value(worst)
+      switch worst.role {
+      case .thermal: body.warning = .init(text: value, short: value)
+      case .power: body.warning = .init(text: "battery \(value)", short: "Battery \(value)")
+      default: body.warning = .init(text: "\(worst.localizedLabel()) \(value)", short: value)
+      }
+    }
+    return body
   }
 
   static func unexpectedStop(_ stop: UnexpectedStop) -> UIUnexpectedStop {
@@ -542,6 +569,12 @@ struct UISessionBridge {
     case .openSettingsTab(let tab):
       interface.settingsTab = tab
       openSettings()
+    case .openHardware(let itemID):
+      interface.hardwareFocus = itemID
+      interface.settingsTab = .hardware
+      openSettings()
+    case .reconnectCameraBody(let id):
+      Task { await model.cameraControls.reconnect(id) }
     case .openDiagnostics: openWindow("diagnostics")
     case .openExtensionApproval:
       if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {

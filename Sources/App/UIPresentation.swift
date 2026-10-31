@@ -129,6 +129,8 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var inputID: String?
   /// The assigned input's label (`UIInputLabels.label`), also while it's unplugged; nil with none.
   var inputName: String?
+  /// The input's connector when it isn't HDMI, the usual one (ruling 23): "SDI".
+  var inputConnector: String?
   var deviceAvailable = true
   var running = false
   var signal: UISignal = .none
@@ -207,10 +209,20 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
 
 /// The camera body behind a capture device, as the left pane shows it.
 struct UICameraBody: Sendable, Equatable {
+  /// What the body reports about itself that can end the picture.
+  struct Warning: Sendable, Equatable { var text: String; var short: String }
   var name: String
   var connected = true
   /// Nil until its control plugin reports one with a known unit.
   var battery: UIBattery? = nil
+  /// The body's ID, for a link to its Settings › Hardware row.
+  var id = ""
+  /// It dropped on its own; Reconnect uses the saved sign-in.
+  var lost = false
+  /// Overheating, a low battery in a known unit, a card error: the worst one.
+  var warning: Warning? = nil
+  /// The body's latest notice that still matters (reconnecting, card full).
+  var notice: String? = nil
 }
 
 struct UIUnexpectedStop: Sendable, Equatable {

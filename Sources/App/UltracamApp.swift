@@ -112,6 +112,7 @@ struct UltracamApp: App {
       UILiveRoot(model: model, interface: interface) { context in
         UIMainWindowView(context: context)
           .toolbar { UIToolbarContent(context: context) }
+          .uiWatchesHardware(model.hardwareInventory)
       }
     }
     .defaultSize(width: 1320, height: 860)

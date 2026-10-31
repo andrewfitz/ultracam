@@ -410,7 +410,8 @@ struct DeckLinkCapturePlugin: CaptureSourcePlugin {
   }
   func driverStatus() -> DriverStatus {
     let info = DeckLinkBackend.driverInfo()
-    return DriverStatus(installed: info.installed, supported: info.supported, version: info.version, reason: info.message)
+    return DriverStatus(installed: info.installed, supported: info.supported, version: info.version, reason: info.message,
+      title: info.installed ? "Desktop Video \(info.version)" : "Not installed")
   }
   private static func device(_ value: UltracamDevice) -> CaptureDeviceInfo {
     let modes = value.modes.compactMap { try? activeFormat(width: $0.width, height: $0.height, duration: $0.frameDuration) }
