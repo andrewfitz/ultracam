@@ -625,7 +625,7 @@ enum UIPresentationBuilder {
       if case .noSignal = camera.signal { return .recordingNoSignal }
       return camera.applying ? .updating : .recording
     case .idle:
-      if recording.failed || recording.error != nil { return .failed }
+      if recording.failed || recording.error != nil || camera.unexpectedStop?.take == true { return .failed }
       if !camera.running { return .stopped }
       switch camera.signal {
       case .noSignal, .unsupported, .connecting, .none, .deviceMissing: return .waiting
@@ -683,7 +683,8 @@ enum UIPresentationBuilder {
         recordTitle = "Disk full"
         recordDetail = "Free space on \(drive(for: camera, in: session)?.name ?? "the drive") or choose another folder"
       } else {
-        recordTitle = "Recording failed"; recordDetail = rec.error ?? "The recording ended with an error."
+        recordTitle = "Take ended early"
+        recordDetail = takeSavedLine(camera) ?? rec.error ?? "The take ended with an error."
       }
     case .stopped: recordTitle = "Not recording"; recordDetail = "Start the camera to record"
     case .waiting:

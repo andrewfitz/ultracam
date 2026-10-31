@@ -133,6 +133,8 @@ struct UISessionBridge {
       camera.clientUnknown = ownDevice && model.cameraClientUnknown(id)
       camera.sinkConnected = update?.cameraOutputActive == true
       camera.clientWaiting = model.waitingClients.contains(id)
+      camera.sinkFailure = running ? update?.cameraConnectError : nil
+      camera.unexpectedStop = model.unexpectedStops[id].map(Self.unexpectedStop)
       camera.processing = descriptor.pipelineEnabled
       camera.resizeTarget = descriptor.configuration.resizeTarget
       camera.scalingMode = descriptor.scalingMode
@@ -167,8 +169,10 @@ struct UISessionBridge {
       case .finishing: rec.status = .finishing
       }
       rec.note = stats?.warning
-      rec.failed = stats?.failed == true
-      rec.error = state?.error ?? stats?.lastError
+      // Once someone has seen an early take, its strip goes back to the take's result.
+      let acknowledged = model.acknowledgedTakes.contains(id)
+      rec.failed = !acknowledged && stats?.failed == true
+      rec.error = acknowledged ? nil : state?.error ?? stats?.lastError
       rec.savedURL = state?.savedURL
       rec.savedFileName = state?.savedURL?.lastPathComponent
       rec.folderPath = folder?.path
@@ -224,6 +228,16 @@ struct UISessionBridge {
     session.inspectorOpen = interface.inspectorOpen
     session.renamingCameraID = interface.renamingCameraID
     return session
+  }
+
+  static func unexpectedStop(_ stop: UnexpectedStop) -> UIUnexpectedStop {
+    var shown = UIUnexpectedStop(reason: stop.cameraStopped ? stop.reason : nil, wasOnAir: stop.wasOnAir)
+    switch stop.take {
+    case .saved(_, let duration, _): shown.take = true; shown.savedDuration = duration
+    case .interrupted: shown.take = true
+    case nil: break
+    }
+    return shown
   }
 
   func presentation() -> UISessionPresentation { UIPresentationBuilder.session(snapshot()) }

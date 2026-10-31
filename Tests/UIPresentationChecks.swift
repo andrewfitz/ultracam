@@ -183,7 +183,7 @@ import XCTest
     failedOnScreen.cameras[0].recording.failed = true
     failedOnScreen.selectedID = failedOnScreen.cameras[0].id
     let failedRow = UIPresentationBuilder.session(failedOnScreen).cameras[0]
-    XCTAssertEqual(failedRow.recordTitle, "Recording failed")
+    XCTAssertEqual(failedRow.recordTitle, "Take ended early")
     XCTAssertEqual(failedRow.recordTone, .warning, "Red means recording or on air")
     XCTAssertEqual(UIPresentationBuilder.stripState(for: camera(1, running: false)), .stopped)
     for signal: UISignal in [.noSignal, .connecting, .unsupported("1080i"), .deviceMissing] {
@@ -637,12 +637,12 @@ import XCTest
     var failed = camera(1, inUse: true)
     failed.recording.error = "The drive was disconnected."
     let presentation = presented(separate([failed]))
-    XCTAssertEqual(presentation.recordTitle, "Recording failed")
+    XCTAssertEqual(presentation.recordTitle, "Take ended early")
     XCTAssertEqual(presentation.recordDetail, "The drive was disconnected.")
     XCTAssertEqual(presentation.recordTone, .warning, "Red is only for recording and on air (D8)")
     var flagged = camera(1)
     flagged.recording.failed = true
-    XCTAssertEqual(presented(separate([flagged])).recordDetail, "The recording ended with an error.")
+    XCTAssertEqual(presented(separate([flagged])).recordDetail, "The take ended with an error.")
     XCTAssertEqual(presented(separate([camera(1, recording: .recording)])).recordTone, .critical)
   }
 
@@ -760,12 +760,12 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Camera 1: disk full")
     // The same error with room left on the drive is an ordinary failure.
     session.drives = [roomy]
-    XCTAssertEqual(presented(session).recordTitle, "Recording failed")
+    XCTAssertEqual(presented(session).recordTitle, "Take ended early")
     XCTAssertEqual(presented(session).recordDetail, "Recording writer failed: AVAssetWriter finish failed.")
     XCTAssertEqual(UIPresentationBuilder.warning(session), "Take ended early")
     // A drive that can't be read (zero size) says nothing about space.
     session.drives = [UIDrive(name: "8TB", availableBytes: 0, totalBytes: 0, secondsLeft: nil)]
-    XCTAssertEqual(presented(session).recordTitle, "Recording failed")
+    XCTAssertEqual(presented(session).recordTitle, "Take ended early")
   }
 
   func testDiskFullNamesTheTakesDrive() {
@@ -793,7 +793,7 @@ import XCTest
       failed.recording.error = error
       var session = separate([failed])
       session.drives = [roomy]
-      XCTAssertEqual(presented(session).recordTitle, "Recording failed", error)
+      XCTAssertEqual(presented(session).recordTitle, "Take ended early", error)
       XCTAssertEqual(UIPresentationBuilder.warning(session), "Take ended early", error)
     }
   }

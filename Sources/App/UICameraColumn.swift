@@ -141,6 +141,19 @@ struct UICameraPictureView: View {
         detail: "Reconnect \(camera.inputName) or choose another input.") {
         Button("Refresh Inputs") { context.send(.refreshInputs) }
       }
+    case .stopped where snapshot?.unexpectedStop?.reason != nil:
+      // Over an expanded strip the reason is enough: Start and the take are on the strip.
+      let stop = snapshot?.unexpectedStop
+      if camera.collapsed {
+        UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "\(camera.name) stopped", compact: compact,
+          detail: [stop?.reason, snapshot.flatMap(UIPresentationBuilder.takeSavedLine)].compactMap { $0 }.joined(separator: ". ")) {
+          Button("Start", systemImage: "play.fill") { context.send(.startCamera(cameraID: camera.id)) }
+            .disabled(!camera.canStart)
+        }
+      } else {
+        UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "\(camera.name) stopped", compact: compact,
+          detail: stop?.reason ?? "")
+      }
     case .stopped where camera.automaticStartFailed:
       UIPicturePlaceholder(symbol: "exclamationmark.triangle", title: "Couldn't start \(camera.name)", compact: compact,
         detail: startFailureDetail) {
@@ -974,17 +987,13 @@ struct UIChannelStripView: View {
     case .noFolder:
       Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
     case .failed:
-      HStack(spacing: 6) {
-        // Out of space: the next take needs another folder (or room on this drive).
-        if camera.diskFull {
-          Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }
-        }
-        Button("Show in Finder", systemImage: "folder") {
-          if let url = snapshot?.recording.savedURL { context.send(.revealInFinder(url)) } else { context.send(.revealRecordings) }
-        }
-        Button("Details") { context.send(.openDiagnostics) }
+      // One action. Out of space, the next take needs another folder (or room on this
+      // drive); otherwise Details shows why, and acknowledges the take.
+      if camera.diskFull {
+        Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
+      } else {
+        Button("Details") { context.send(.acknowledgeStop(cameraID: camera.id)) }.controlSize(.small)
       }
-      .controlSize(.small)
     case .stopped:
       EmptyView()
     case .finishing:

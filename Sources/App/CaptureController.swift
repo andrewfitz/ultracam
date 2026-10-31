@@ -16,6 +16,9 @@ enum CaptureSignal: Sendable, Equatable {
   case unsupported(String)
 }
 
+/// Why a capture stopped: someone asked, or it failed. A stop looks the same otherwise.
+enum CaptureStopCause: Sendable, Equatable { case requested, failed(String) }
+
 struct CaptureUpdate: @unchecked Sendable {
   var message: String
   var signal: CaptureSignal = .waiting
@@ -88,7 +91,12 @@ struct CaptureUpdate: @unchecked Sendable {
   var videoDrops: UInt64 = 0
   var cameraOutputActive = false
   var cameraMessage = "Ultracam camera not connected"
+  /// Why the virtual camera couldn't connect or lost its connection, while it's down.
+  var cameraConnectError: String?
+  /// The extension has refused every frame since this `systemUptime`.
+  var cameraQueueFullSince: TimeInterval?
   var stopped = false
+  var stopCause: CaptureStopCause?
 }
 
 struct CaptureMediaStats: @unchecked Sendable {
@@ -323,6 +331,8 @@ final class CaptureController: @unchecked Sendable {
   private var reconnectRequested = false
   private var reconnectAfter: Double = 0
   private var cameraMessage = "Ultracam camera not connected"
+  private var cameraConnectError: String?
+  private var cameraQueueFullSince: TimeInterval?
   private var message = "Stopped"
   private var frameRateGate = FrameRateGate()
   private var watchdog: DispatchSourceTimer?
@@ -863,7 +873,7 @@ final class CaptureController: @unchecked Sendable {
     outputLabel = ""
     applied = nil
     message = "Stopped"
-    publishCurrent(token: request.token, stopped: true)
+    publishCurrent(token: request.token, stopped: true, cause: .requested)
   }
 
   /// Finishes `stopResources` before returning when called off the capture
@@ -1147,6 +1157,8 @@ final class CaptureController: @unchecked Sendable {
     cameraAttempt = camera.currentAttempt
     cameraConnected = false
     cameraConnecting = false
+    cameraConnectError = nil
+    cameraQueueFullSince = nil
     let services = self.services
     controlQueue.async { services.disconnect() }
   }
@@ -1244,7 +1256,7 @@ final class CaptureController: @unchecked Sendable {
     outputLabel = ""
     message = value
     logger.error("Capture stopped: \(value, privacy: .public)")
-    publishCurrent(token: token, stopped: true)
+    publishCurrent(token: token, stopped: true, cause: .failed(value))
   }
 
   private func effectiveConfiguration(source: SourceAdmissionSnapshot? = nil,
@@ -1410,6 +1422,7 @@ final class CaptureController: @unchecked Sendable {
     cameraConnecting = false
     if let error {
       cameraMessage = "Camera output unavailable — \(error.localizedDescription)"
+      cameraConnectError = error.localizedDescription
       // Only a lost connection retries; a camera that never connected
       // (extension not running) stays quiet until the user reconfigures.
       if wasConnected { beginCameraRecovery() }
@@ -1417,6 +1430,7 @@ final class CaptureController: @unchecked Sendable {
     } else {
       cameraConnected = true
       cameraFirstSendPending = true
+      cameraConnectError = nil
       cameraMessage = "Ultracam camera connected. Choose it in your meeting app."
     }
   }
@@ -2374,11 +2388,19 @@ final class CaptureController: @unchecked Sendable {
         // send ends the outage and permits a fresh retry budget.
         cameraOutage = false
         reconnectAttempts = 0
+        if cameraQueueFullSince != nil {
+          cameraQueueFullSince = nil
+          metadataChanged = true
+        }
       }
     case .full:
       // The extension's queue is full: it has stalled. Counted and shown.
       cameraDrops &+= 1
       cameraWindowFull &+= 1
+      if cameraQueueFullSince == nil {
+        cameraQueueFullSince = ProcessInfo.processInfo.systemUptime
+        metadataChanged = true
+      }
       if !cameraWasStalled {
         cameraWasStalled = true
         cameraOutputLog.error("Camera queue full: \(self.cameraLabel, privacy: .public); the camera extension is not taking frames")
@@ -2392,6 +2414,7 @@ final class CaptureController: @unchecked Sendable {
         reconnectRequested = false
         reconnectAfter = ProcessInfo.processInfo.systemUptime + max(0, services.cameraRetryInterval)
         cameraMessage = "Camera output disconnected — \(description)"
+        cameraConnectError = description
         scheduleReconnect()
         metadataChanged = true
       }
@@ -2487,7 +2510,7 @@ final class CaptureController: @unchecked Sendable {
     publishCurrent(token: token)
   }
 
-  private func publishCurrent(token: UInt64, stopped: Bool = false) {
+  private func publishCurrent(token: UInt64, stopped: Bool = false, cause: CaptureStopCause? = nil) {
     let gpu = processor?.inFlight
     let depth = lock.withLock {
       (sourceDrops: sourceDrops, inFlight: gpu?.count ?? 0, maxInFlight: gpu?.peak ?? 0,
@@ -2528,7 +2551,9 @@ final class CaptureController: @unchecked Sendable {
       audioMeterCoalesced: stopped ? 0 : audioMeterTap.counters.coalesced &- audioMeterCoalescedAtStart,
       videoBitrateMbps: stopped ? 0 : videoBitrateMbps,
       videoDrops: stopped ? 0 : videoLosses,
-      cameraOutputActive: cameraConnected, cameraMessage: cameraMessage, stopped: stopped)
+      cameraOutputActive: cameraConnected, cameraMessage: cameraMessage,
+      cameraConnectError: cameraConnectError, cameraQueueFullSince: cameraQueueFullSince,
+      stopped: stopped, stopCause: cause)
     DispatchQueue.main.async { [weak self] in
       guard let self, self.isCurrent(token) else { return }
       self.onUpdate?(update)

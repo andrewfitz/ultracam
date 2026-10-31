@@ -53,7 +53,10 @@ struct CaptureUpdateState: Equatable {
   var audioPresent: Bool
   var cameraOutputActive: Bool
   var cameraMessage: String
+  var cameraConnectError: String?
+  var cameraQueueFull: Bool
   var stopped: Bool
+  var stopCause: CaptureStopCause?
 
   init(_ update: CaptureUpdate) {
     message = update.message
@@ -67,7 +70,10 @@ struct CaptureUpdateState: Equatable {
     audioPresent = update.audioPresent
     cameraOutputActive = update.cameraOutputActive
     cameraMessage = update.cameraMessage
+    cameraConnectError = update.cameraConnectError
+    cameraQueueFull = update.cameraQueueFullSince != nil
     stopped = update.stopped
+    stopCause = update.stopCause
   }
 }
 

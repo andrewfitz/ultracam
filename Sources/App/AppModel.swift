@@ -468,6 +468,8 @@ final class AppModel {
     }
     recordingModel.onRecordingStarted = { [weak self] feedID, url in
       guard let self else { return }
+      self.acknowledgedTakes.remove(feedID)
+      if self.unexpectedStops[feedID]?.cameraStopped == false { self.unexpectedStops[feedID] = nil }
       self.beginTakeAudio(feedID)
       self.reconcileAutomaticFeed()
       guard let timeline = self.autoSwitcherTimeline else { return }
@@ -476,6 +478,7 @@ final class AppModel {
     }
     recordingModel.onRecordingFinished = { [weak self] feedID, url in
       guard let self else { return }
+      self.noteTakeFinished(feedID, saved: url)
       self.endTakeAudio(feedID)
       self.reconcileAutomaticFeed()
       guard let timeline = self.recordingTimelines.removeValue(forKey: feedID) else { return }
@@ -795,6 +798,27 @@ final class AppModel {
     guard let tap = audioMeterTap(for: id) else { return }
     takeTaps[id] = tap
     tap.beginTake()
+  }
+
+  /// A take that ended by itself stays on the list until someone has seen it, as does one
+  /// a stopped camera took with it. A take stopped by hand needs nothing.
+  private func noteTakeFinished(_ id: FeedID, saved url: URL?) {
+    let state = recordingModel.feeds.first { $0.id == id }
+    let statistics = state?.statistics
+    let failed = statistics?.failed == true || state?.error != nil
+    guard failed || unexpectedStops[id] != nil else { return }
+    var result: UnexpectedTakeResult?
+    if let url {
+      result = .saved(url, duration: statistics?.elapsed ?? 0, lostFrames: statistics?.droppedVideoFrames ?? 0)
+    } else if statistics?.encodedFrames ?? 0 > 0 {
+      result = .interrupted
+    }
+    if unexpectedStops[id] != nil {
+      unexpectedStops[id]?.take = result
+    } else {
+      unexpectedStops[id] = UnexpectedStop(reason: state?.error ?? statistics?.lastError ?? "The take ended early.",
+        at: Date(), cameraStopped: false, take: result)
+    }
   }
 
   /// A take finished (saved, failed or stopped while starting): keep its audio for the strip, and log it.
@@ -1209,6 +1233,10 @@ final class AppModel {
     if update.stopped {
       captureLog.notice("Stopped \(feedID.rawValue, privacy: .public): \(update.message, privacy: .public)")
       cameraStateRevision &+= 1
+      if case .failed(let reason)? = update.stopCause {
+        unexpectedStops[feedID] = UnexpectedStop(reason: reason, at: Date(), cameraStopped: true,
+          wasOnAir: outputMode == .program && programInUse && switcherSelectedFeedID == feedID)
+      }
       monitorCoordinator.sourceStateChanged(target: MonitorTargetID(feedID.rawValue), running: false, message: update.message)
       detectedSourceDurations[feedID] = nil
       appliedPipelines[feedID] = nil
@@ -1247,6 +1275,11 @@ final class AppModel {
     // A source retired after a failure must become eligible again only after
     // its next capture actually starts.
     feedCoordinator.setProgramSourceHealth(id, healthy: true)
+    // A restart clears the camera's half of an unexpected stop; the take's stays until seen.
+    if var stop = unexpectedStops[id] {
+      stop.cameraStopped = false
+      unexpectedStops[id] = stop.take == nil ? nil : stop
+    }
     appliedPipelines[id] = pipeline(for: id)
     cameraUpdates[id] = CaptureUpdate(message: "Opening input device…")
     cameraStateRevision &+= 1

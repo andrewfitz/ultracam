@@ -99,6 +99,46 @@ private final class SignalLog: @unchecked Sendable {
     XCTAssertNotEqual(CaptureUpdateState(first), CaptureUpdateState(second), "A loss has to tell observers")
   }
 
+  // MARK: Why it stopped
+
+  func testAUserStopIsToldApartFromAFailure() throws {
+    let (_, controller, feed) = try harness("stop-requested")
+    let ready = expectation(description: "Started")
+    ready.assertForOverFulfill = false
+    let stopped = expectation(description: "Stopped")
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if update.stopped {
+        XCTAssertEqual(update.stopCause, .requested)
+        stopped.fulfill()
+      }
+    }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    controller.stop()
+    wait(for: [stopped], timeout: 2)
+    controller.onUpdate = nil
+  }
+
+  func testAFailureSaysWhy() throws {
+    let (source, controller, feed) = try harness("stop-failed")
+    let ready = expectation(description: "Started")
+    ready.assertForOverFulfill = false
+    let stopped = expectation(description: "Stopped")
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if update.stopped {
+        XCTAssertEqual(update.stopCause, .failed("The capture device stopped responding."))
+        stopped.fulfill()
+      }
+    }
+    defer { controller.onUpdate = nil; controller.stop() }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    XCTAssertTrue(source.submit(.event(.fatal("The capture device stopped responding."))))
+    wait(for: [stopped], timeout: 2)
+  }
+
   // MARK: Publishing it
 
   func testEachTransitionPublishes() throws {
