@@ -2,7 +2,7 @@
 
 ## Goal
 
-Extend Ultracam from one Blackmagic input and one virtual camera to a reusable multi-feed system. Each feed can have its own LUT, effects, preview, audio/video telemetry, and saved settings. Feeds can be exposed as separate virtual cameras or routed through one Program virtual camera with manual or fixed-interval switching.
+Extend Ultracam from one Blackmagic input and one virtual camera to a reusable multi-feed system. Each feed can have its own LUT, effects, preview, audio/video telemetry, and saved settings. Every feed is published as its own virtual camera, and with two or more feeds Ultracam · Program is published too, with manual or fixed-interval switching. There is no output mode: demand decides all work (see Demand and lifecycle).
 
 The design stores an arbitrary number of feed descriptors. It does not impose a four-feed limit. The UI can recommend four active feeds for the intended Mac Studio workflow, while the runtime resource governor reports when the hardware cannot sustain the requested active pipelines.
 
@@ -49,7 +49,7 @@ Introduce stable `FeedID` values and versioned `FeedDescriptor` records containi
 Global settings contain:
 
 - selected feed ID
-- output mode: separate cameras or Program
+- `outputMode`: retired. Decoded, kept and written back unread, so an older build finds a valid value after a downgrade
 - switcher configuration
 - virtual-camera registry version
 
@@ -103,25 +103,44 @@ When a feed is removed while an application is using it, mark it unavailable, st
 
 ## Demand and lifecycle
 
-Demand is route-aware. A feed remains active when any of these needs it:
+Demand is route-aware, and the demand monitor runs for the app's whole life. Nothing depends on a mode:
 
-- its dedicated virtual camera has a consumer
-- the Program camera selects it
-- an explicitly requested manual output route needs it
+```text
+programClient    = Program has a client (released after a 5 s hold)
+programPicture   = programClient || Program monitor visible
+cameraClient(c)  = c's virtual camera has a client (released after a 5 s hold)
+autoTake         = automatic strategy && a take is active
 
-Capture stops only when all routes release demand. Preview alone does not create automatic camera demand. Automatic mode continues to use event-driven source-stream notifications rather than polling.
+scheduler        = always, on metadata, so a cut lands in every layout
+source wanted(c) = automatic cameras only: cameraClient(c) || programPicture
+                   || autoTake || c records || c's preview is visible
+sink open(c)     = cameraClient(c) && c running
+GPU render(c)    = sink open(c) || sink connecting(c) || (programPicture && c running)
+Program sink     = programClient && any enabled camera running
+monitor(c)       = every output-cadence source frame, always
+recording(c)     = every source frame, always
+```
+
+Rising edges act at once. A falling client edge takes effect after 5 s, so a meeting app probing a camera doesn't restart capture or the director. A user Stop ignores the hold.
+
+A client can arrive before its sink. The closed sink's contract is written to the device whenever it changes, so the client finds the right format. If it holds device control on another format, the sink connects anyway and its first sample renegotiates inside the extension. A failed connect tries again every second while a client waits, and raises a problem. If meeting apps won't take that format change, `FeedLifecycleDemandPolicy.sinkOpensWithCamera` is the one-constant fallback: each sink opens with its camera and takes no frames until a client comes.
+
+Automatic start continues to use event-driven source-stream notifications rather than polling.
 
 The idle path must release capture timers, working GPU resources, processing queues, preview queues, and DeckLink resources. The app may retain ordinary process state and the persisted LUT.
 
-## Separate-camera mode
+## Published cameras
 
-In Separate Cameras mode, each enabled feed publishes its own virtual camera, for example:
+Each enabled feed publishes its own virtual camera, for example:
 
 ```text
 Ultracam · Camera 1
 Ultracam · Camera 2
 Ultracam · Camera N
+Ultracam · Program   (with two or more)
 ```
+
+One function, `VirtualCameraRegistrySnapshot.devices(for:)`, builds the list. Only adding, removing or renaming a camera changes it, so meeting apps, which cache it, rarely have to look again. The extension's limit of 32 devices means at most 31 cameras. Removing a camera needs only that camera stopped; adding and renaming are always live. Reset All Settings alone needs the whole app idle.
 
 Each feed independently reports:
 
@@ -180,8 +199,8 @@ The main window becomes a feed-oriented workspace:
 - per-feed name, input, live/idle state, signal state, audio meter, and drop warning
 - selected-feed preview and effects/LUT controls
 - detected metadata and diagnostics for the selected feed
-- Separate Cameras / Program output selector
-- Program preview and switcher controls in Program mode
+- every published camera with its In use state
+- Program preview and switcher controls with two or more feeds
 
 The tray uses the same parameterized views in compact form:
 
@@ -199,7 +218,7 @@ The UI must use collections and scrolling rather than assuming two or four feeds
 3. Introduce the ownership-safe `ProcessedFrame`/output-route abstraction while retaining the current dedicated camera route.
 4. Add physical-device reservation and runtime resource-governor states.
 5. Refactor the camera extension around a descriptor-driven virtual-device collection and transactional shared registry.
-6. Add Separate Cameras mode with independent demand and telemetry.
+6. Publish a camera per feed with independent demand and telemetry.
 7. Add the Program route and manual frame-boundary switching.
 8. Add fixed-interval auto-switching.
 9. Add the disabled dynamic-analysis strategy stub and future Program audio-policy model.

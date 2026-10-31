@@ -183,9 +183,9 @@ Every item above that was MISSING, NOT WIRED or WRONG has been either fixed or d
 | 12 | The inspector's Signal row sets its accessibility value explicitly. The live self-test checks the picture's own label. |
 | 19 | Clean View hides the camera name, tally, REC pill and tool chips (`UICleanViewState`). |
 | 21 | Preview error card with Retry Preview on the picture. |
-| 23 | In Program mode the narrow output row says On air or In Program. |
+| 23 | On Program the narrow output row says On air or In Program. |
 | 26 | Remove Camera always asks first (one bridge confirmation, from the ⋯ menu, the Camera menu and the inspector). |
-| 27 | Copy Settings To includes Program in Program mode. |
+| 27 | Copy Settings To includes Program with two or more cameras. |
 | 33 | Selecting a camera while a LUT restores works; the stale load is invalidated. |
 | 39 | Program picture has the monitor tool split buttons; source-only tools are disabled with the reason. |
 | 40 | Anchor and Emphasis pickers in the Program menu and the Program View cut bar. |

@@ -100,14 +100,13 @@ visible. Each value has a long help string explaining what it measures. Scope G.
 |---|---|---|---|---|
 | Add feed | Borderless "+ Add" | `canEditFeedTopology` | G | |
 | Selected feed | Pop-up picker | `canEditFeedTopology` | G | **Picks which feed all of §2.1–2.3, §2.8, §2.9 edit** |
-| Remove feed | Trash icon | Needs ≥ 2 feeds, `canEditFeedTopology` | G | |
-| Feed name | Text field, commits on Return | `canEditFeedTopology` | F | |
-| Output mode | Picker: Separate cameras / Program / switcher | Disabled while running | G | |
-| Automatic switching | Mini switch | Program mode only | G | |
+| Remove feed | Trash icon | Needs ≥ 2 feeds, and that feed stopped with no take or LUT load (`canRemoveCamera`) | G | |
+| Feed name | Text field, commits on Return | Always, live | F | |
+| Automatic switching | Mini switch | Two or more feeds | G | |
 | Strategy | Picker: Manual, Fixed interval, Natural talking head, Dynamic analysis (later) | Needs automatic switching | G | |
 | Interval | Slider 1–30 s, step 0.5 | Fixed interval only | G | |
 | Anchor / Emphasis | Pickers (Automatic or a feed) | Natural talking head only | G | Director status caption |
-| Program cut buttons | One bordered button per enabled feed, accent tint = on air | Program mode | G | Manual cut |
+| Program cut buttons | One bordered button per enabled feed, accent tint = on air | Two or more feeds, every layout | G | Manual cut |
 
 ### 2.8 Effects (`PipelineControls`), ordered
 
@@ -223,8 +222,10 @@ There is no Settings scene, no toolbar, and no Recording/View/Window menu comman
    visibility with `MonitorCoordinator`; hidden or occluded views do no GPU work.
    Collapsed or hidden UI should actually hide (unmount or report not visible), not
    just shrink.
-3. **Gating rules (keep all):** device picker and output mode locked while running;
-   add/remove/rename behind `canEditFeedTopology`; Start disabled with no device or
+3. **Gating rules (keep all):** device picker locked while running; there is no
+   output mode to lock (retired, see `docs/ui-audit/01-output-mode-architecture.md`);
+   add stops at 31 cameras, remove needs that camera idle, rename is always live, and
+   Reset alone needs everything idle (`canResetSettings`); Start disabled with no device or
    while the LUT loads; Install/Remove gated by signing, pending state and running;
    Record needs a folder; Finishing blocks duplicate actions; Quit waits on recordings;
    Source analysis tools unavailable for Program.

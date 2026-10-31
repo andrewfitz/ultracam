@@ -30,11 +30,11 @@ Line numbers are approximate; re-check them before editing.
 | `hideFromDock` | 21 | global |
 | `devices: [InputDevice]`, `refresh()` | 28, 329 | global |
 | `feedDescriptors`, `selectedFeedID`, `selectedFeedName` | 31–32, 94 | global |
-| `outputMode`, `setOutputMode(_:)` (guarded by topology) | 37, 496 | global |
+| `programAvailable` (two or more enabled cameras) | | global. There is no output mode: `outputMode` survives only as an unread saved value |
 | `switcherSettings`, `updateSwitcher(_:)` (recreates the Rust bridge) | 45, 507 | global |
 | `switcherSelectedFeedID` (on air), `switcherPendingFeedID` (pending cut), `switcherStatus` | 46–48 | Program |
 | `naturalTalkingHeadEnabled`, `naturalAnchorFeedID`, `naturalEmphasisFeedID`, `naturalDirectorStatus` | 50–84 | Program |
-| `canEditFeedTopology` | 87 | false while any source is active OR any recording is active |
+| `canResetSettings`, `canAddCamera`, `canRemoveCamera(_:)` | | one rule per operation. Reset needs everything idle, remove needs that camera idle, add needs a free device, rename needs nothing |
 | **`selectedDevice`, `configuration`, `gamut`, `pipelineEnabled`, `previewEnabled`, `automaticFeedEnabled`** | 98–133 | **selected feed only.** `didSet` saves and `reconfigure()`s the selected capture. |
 | `cameraDemandError`, `lutTitle`, `lutFileName`, `lutError`, `lutLoaded`, `loading` | 135–142 | selected feed only |
 | `running`, `previewReady`, `update: CaptureUpdate` | 140–143 | **selected feed only** |
@@ -43,7 +43,7 @@ Line numbers are approximate; re-check them before editing.
 | `monitorCoordinator`, `recordingModel` | 151, 160 | global |
 | `chooseLUT()` | 342 | NSOpenPanel → selected feed |
 | `selectFeed(_:)` | 422 | rebinds renderers, `capture`, handlers; reapplies the descriptor; restores the LUT |
-| `addFeed`, `removeFeed`, `renameFeed` | 445–494 | topology-locked |
+| `addFeed`, `removeFeed`, `renameFeed` | 445–494 | live, per the rules above |
 | `requestProgramCut(to:)` | 519 | sends a manual override to the director |
 | `saveSettings()` | 582 | writes the *selected* descriptor from app bindings |
 | `canStartFeed`, `start()`, `stop()` | 644, 648, 701 | selected feed |
@@ -71,10 +71,9 @@ Line numbers are approximate; re-check them before editing.
     asynchronously.
   - There is no UI path to choose a LUT for a non-selected feed without selecting it.
 - **Start:**
-  - **Separate mode:** starts only the selected feed (`startFeed` ~654).
-  - **Program mode:** starts the selected feed plus every enabled, device-assigned, not manually
-    stopped descriptor, headless with `previewEnabled:false` (~656–684).
-  - **Automatic policy:** can start any feed (`reconcileAutomaticFeed` ~983).
+  - **Manual:** a Start starts that camera only. Start All covers the rest.
+  - **Automatic policy:** starts any automatic feed a client of its own, Program's picture, a
+    take under automatic switching, or its visible preview wants (`reconcileAutomaticFeed`).
 - **Stop:** `stop()` (701) inserts the selected feed into `manuallyStoppedFeeds`, stops only the
   selected feed **and calls `recordingModel.stop(feedID:)`** (707). Program headless sources keep
   running.
@@ -103,8 +102,8 @@ Line numbers are approximate; re-check them before editing.
   `monitorWorkspace` and `virtualCameraRegistryVersion`. `hideFromDock` is a separate key.
 - **Virtual camera registry.** `VirtualCameraRegistrySnapshot.forFeeds`
   (`VirtualCameraRegistryPublishing.swift:14`):
-  - Separate mode: one camera per *enabled* feed, "Ultracam · <name>".
-  - Program mode: "Ultracam · Program".
+  - One camera per *enabled* feed, "Ultracam · <name>", then "Ultracam · Program" with two or more
+    (`devices(for:)`, the one projection, which the demand monitor reads too).
   - Published on every `saveSettings`.
 
 ### `CaptureUpdate` fields (CaptureController.swift ~7–47)

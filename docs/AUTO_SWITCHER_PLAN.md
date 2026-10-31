@@ -32,8 +32,12 @@ cues and emits timestamped, acknowledged camera-cut requests. It does not
 own media buffers, render video, run LUT/effects processing, or publish a
 virtual camera.
 
-The profile operates only on a Program output route. Separate-camera mode
-continues to publish each feed independently and does not run the director.
+The profile cuts only the Program route, which is always there with two cameras.
+The director runs when the strategy is automatic, two or more cameras run, and
+Program has a picture (a client or its monitor) or a take is active: with neither,
+its cuts would reach nobody. Each feed's own virtual camera is unaffected. Its
+audio and clock come from the anchor while it runs, otherwise the emphasis
+camera, never the UI selection.
 
 The first release assumes one editorial subject and two stable roles:
 

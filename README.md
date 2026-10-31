@@ -128,9 +128,10 @@ The main window is a native macOS window in light or dark appearance:
     and output (cut, effects, Processing, audio).
   - Each strip collapses to one line; collapse all with ⌥⌘S.
 - **Selection:** clicking a picture selects that camera (blue ring); it never cuts.
-- **Program mode tally:** the camera on Program shows a red ON AIR ring once a
-  meeting app is using "Ultracam · Program" (PROGRAM before that), and NEXT while
-  a cut is pending.
+- **Tally:** with two or more cameras, the camera on Program shows a red ON AIR
+  ring once a meeting app is receiving "Ultracam · Program" (PROGRAM before that), and
+  NEXT while a cut is pending. A camera seen only through its own virtual camera
+  shows a red ISO ring. Red means frames are arriving, not just that a client exists.
 - **Inspector (⌥⌘I):** deeper per-camera settings, opened on demand.
 - **Status bar:** output, Program, recording, audio and resources.
 - **Settings (⌘,):** General, Recording, Camera, Switcher, Monitor and Advanced.
@@ -435,7 +436,7 @@ and frame rate from its own supported features, settings, and meeting conditions
 
 ## Natural talking-head auto-switcher
 
-Program mode includes a **Natural talking head** strategy. When enabled, the
+Program includes a **Natural talking head** strategy. When enabled, the
 app feeds live audio cues to the Rust director in `Tools/auto-switcher`, queues
 decisions at Program frame boundaries, and acknowledges them only after the
 target frame is applied. The hard shot maximum forces a bounded cut, preferring

@@ -879,3 +879,34 @@ No real recording was started, and existing user recordings were not modified.
 
 Detailed measurements, limitations, signing/installation receipts and cleanup:
 `/Volumes/8TB/cinesomatic-build/ultracam-monitor-upgrade-20261021/FINAL_VERIFICATION.md`.
+
+## 2026-10-31: output mode retired, unqualified with real clients
+
+The output mode is gone from the app. Every enabled camera is published, plus
+Ultracam · Program with two or more, and demand decides all work. Built, unit
+tested and checked offscreen only. Nothing here ran against a real meeting app,
+the installed extension or a live virtual camera, and the installed build was not
+touched. The camera extension did not change and needs no approval.
+
+Treat all of this as **unqualified** until it has run with a real client:
+
+- `Camera connect failed` 12 of 12 on the installed build. It failed at
+  `providerID()` with builds 7 to 9 still awaiting removal and no extension
+  process running, so a restart is the likely cure. Unconfirmed: the Mac had not
+  restarted when this was written. Everything below depends on it.
+- Whether a meeting app holds device control when a late sink connects, and what
+  format it chooses, with and without pre-negotiation.
+- How it takes a format change from the first sample under its lease, on a camera
+  already mid-stream (`connect-then-renegotiate`). If it fails, set
+  `FeedLifecycleDemandPolicy.sinkOpensWithCamera` and measure the extension's
+  polling cost per running camera.
+- Time to first live frame on ISO and Program joins at 4K, now in Diagnostics and
+  logged as `Camera first frame`.
+- Whether apps open streams while probing, and whether 5 s is enough. Each client
+  edge is logged as `Client in` or `Client out`.
+- Upgrade with a client holding a camera, whether Program appears without
+  restarting the app, what it does on a rename or when a device goes away.
+- Program in one app and an ISO camera in another at once, at 4K, including the
+  route lock shared between them (`lastStageMilliseconds`).
+- The first frames after 30 s idle, when the GPU has to rebuild.
+- Two inputs' audio clocks when the director's clock moves from anchor to emphasis.
