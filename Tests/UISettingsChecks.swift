@@ -106,8 +106,45 @@ import XCTest
     tap.ingest(try packet([0.25, 0.25, 0, 0, 0, 0, 0, 0]))
     tap.waitUntilMetered()
     XCTAssertEqual(tap.detectedChannels, 6, "As Detected only grows")
+    try tap.configure(format: format)
+    XCTAssertEqual(tap.detectedChannels, 6, "Declaring the same format again is the same capture")
     tap.noteGap()
     XCTAssertEqual(tap.detectedChannels, 0, "A new capture starts it over")
+    // The meter's maximum still holds channel 5's peak; the new capture's packets don't.
+    tap.ingest(try packet([0.25, 0.25, 0, 0, 0, 0, 0, 0]))
+    tap.waitUntilMetered()
+    XCTAssertEqual(tap.detectedChannels, 2, "Only the new capture's signal counts")
+    tap.ingest(try packet([0.25, 0.25, 0.1, 0, 0, 0, 0, 0]))
+    tap.waitUntilMetered()
+    XCTAssertEqual(tap.detectedChannels, 4)
+  }
+
+  /// A take starts the peaks over on the strip's own meter too, when it shows 2 of 8.
+  func testTakeStartsTheShownSubsetsPeaksOver() throws {
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 8, sample: .float32,
+      interleaved: false, layout: AudioChannelMap(), clock: .hostTime)
+    func packet(_ level: Float) throws -> CaptureAudioPacket {
+      let planes = (0..<8).map { _ in Array(repeating: level, count: 480).withUnsafeBytes { Data($0) } }
+      return try CaptureAudioPacket(planes: planes, sampleFrameCount: 480, format: format, packetTime: .zero)
+    }
+    let tap = AudioMeterTap()
+    try tap.configure(format: format)
+    tap.attach()
+    defer { tap.detach() }
+    let shown = try XCTUnwrap(tap.displayMeter(channels: 2))
+    tap.ingest(try packet(0.99))
+    tap.waitUntilMetered()
+    shown.flush()
+    XCTAssertGreaterThan(shown.snapshot().channels[0].truePeakMax, -1, "The strip latched an over")
+    // Quiet before the take, so its first samples don't interpolate across the step down.
+    tap.ingest(try packet(0.01))
+    tap.waitUntilMetered()
+    tap.beginTake()
+    tap.ingest(try packet(0.01))
+    tap.waitUntilMetered()
+    shown.flush()
+    XCTAssertLessThan(shown.snapshot().channels[0].truePeakMax, -30, "The take's strip starts without the old maximum")
+    _ = tap.endTake()
   }
 #endif
 

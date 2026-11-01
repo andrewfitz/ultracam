@@ -112,6 +112,8 @@ final class AudioMeterTap: @unchecked Sendable {
     var session: UInt64 = 0
     var takeNumber: UInt64 = 0
     var followsGap = false
+    /// The capture the packet belongs to, for As Detected (`detected`'s generation).
+    var capture: UInt64 = 0
     var nanoseconds = 0
     var retainedBytes = 0
   }
@@ -183,10 +185,12 @@ final class AudioMeterTap: @unchecked Sendable {
   private let stale = Atomic<UInt64>(0)
   private let maxQueued = Atomic<Int>(0)
 
-  /// The channels the highest pair that has carried signal covers, since the capture
-  /// started (`channelsWithSignal`). Only grows; `noteGap` starts it over. Written on the
-  /// meter queue, read by views and Settings › Audio.
-  private let detected = Atomic<Int>(0)
+  /// As Detected: the channels the highest pair that has carried signal covers since the
+  /// capture started, in the low byte, read from each packet's own samples (a meter's
+  /// maximum outlives a restart). The capture's generation is above it, so a packet of
+  /// the capture before is never counted. Only grows; `noteGap` starts it over. Written
+  /// on the meter queue, read by views and Settings › Audio.
+  private let detected = Atomic<UInt64>(0)
   /// Meters for strips that show fewer channels than the source (Settings › Audio). Each
   /// reads the first channels of the same packets, in place. They belong to one session's
   /// meter, so a new session starts new ones.
@@ -251,13 +255,14 @@ final class AudioMeterTap: @unchecked Sendable {
   /// the capture control queue, never the driver thread.
   func configure(format: SourceAudioFormat) throws {
     let candidate = try AudioMeter(configuration: Self.configuration(for: format, take: false))
-    sessions.withLock { state in
-      guard state.format != format else { return }
+    let changed = sessions.withLock { state -> Bool in
+      guard state.format != format else { return false }
       state.format = format
-      guard viewers.load(ordering: .relaxed) > 0 else { return }
-      requestSession(candidate, state: &state)
+      if viewers.load(ordering: .relaxed) > 0 { requestSession(candidate, state: &state) }
+      return true
     }
-    noteGap()
+    // A redeclaration of the same format is the same stream: As Detected stays.
+    if changed { noteGap() } else { gapPending.store(true, ordering: .relaxed) }
   }
 
   private static func configuration(for format: SourceAudioFormat, take: Bool) throws -> AudioMeterConfiguration {
@@ -322,6 +327,7 @@ final class AudioMeterTap: @unchecked Sendable {
       slot.pointee.session = session.load(ordering: .acquiring)
       slot.pointee.takeNumber = measuringTake.load(ordering: .acquiring)
       slot.pointee.followsGap = gapPending.exchange(false, ordering: .relaxed)
+      slot.pointee.capture = detected.load(ordering: .relaxed) >> 8
       // Releasing: the slot's contents before the meter queue can see it.
       head.store(next &+ 1, ordering: .releasing)
       if queued + 1 > maxQueued.load(ordering: .relaxed) { maxQueued.store(queued + 1, ordering: .relaxed) }
@@ -370,8 +376,9 @@ final class AudioMeterTap: @unchecked Sendable {
           meter.noteDiscontinuity()
           shown.forEach { $0.noteDiscontinuity() }
         }
-        if Self.process(slot.pointee, with: meter, displays: shown) {
+        if let covered = Self.process(slot.pointee, with: meter, displays: shown, detecting: true) {
           metered.add(1, ordering: .relaxed)
+          noteDetected(covered, capture: slot.pointee.capture)
           watchForOvers(meter)
         } else {
           rejected.add(1, ordering: .relaxed)
@@ -408,11 +415,14 @@ final class AudioMeterTap: @unchecked Sendable {
   }
 
   /// Meters one packet. `displays` read the first channels of each frame of the same samples
-  /// (`frameStride`), so a strip showing fewer channels costs no copy.
-  private static func process(_ slot: Slot, with meter: AudioMeter, displays: [AudioMeter] = []) -> Bool {
+  /// (`frameStride`), so a strip showing fewer channels costs no copy. Nil when refused;
+  /// otherwise, when `detecting`, the channels this packet's highest pair with signal covers.
+  private static func process(_ slot: Slot, with meter: AudioMeter, displays: [AudioMeter] = [],
+    detecting: Bool = false) -> Int? {
+    var covered = 0
     if let packet = slot.packet {
       guard packet.format.channels == meter.configuration.channelCount,
-        packet.format.sampleRate == meter.configuration.sampleRate else { return false }
+        packet.format.sampleRate == meter.configuration.sampleRate else { return nil }
       let samples = SourceAudioMeterInput.interleavedSamples(packet)
       samples.withUnsafeBufferPointer { buffer in
         guard let base = buffer.baseAddress else { return }
@@ -420,6 +430,10 @@ final class AudioMeterTap: @unchecked Sendable {
         for display in displays where display.configuration.channelCount <= packet.format.channels
           && display.configuration.sampleRate == packet.format.sampleRate {
           display.process(interleaved: base, frameCount: packet.sampleFrameCount, frameStride: packet.format.channels)
+        }
+        if detecting {
+          covered = channelsWithSignal(base, frames: packet.sampleFrameCount, channels: packet.format.channels,
+            stride: packet.format.channels, threshold: signalAmplitude)
         }
       }
     } else if let samples = slot.samples {
@@ -430,11 +444,42 @@ final class AudioMeterTap: @unchecked Sendable {
         for display in displays where display.configuration.channelCount <= slot.stride {
           display.process(interleaved: pcm, frameCount: slot.frames, frameStride: slot.stride)
         }
+        if detecting {
+          covered = channelsWithSignal(pcm, frames: slot.frames, channels: meter.configuration.channelCount,
+            stride: slot.stride, threshold: Int32(Double(signalAmplitude) * 2_147_483_648))
+        }
       }
     } else {
-      return false
+      return nil
     }
-    return true
+    return covered
+  }
+
+  /// `signalThreshold` as a full-scale amplitude.
+  private static let signalAmplitude = Float(pow(10, Double(signalThreshold) / 20))
+
+  /// The channels the highest pair with a sample above `threshold` covers (as
+  /// `channelsWithSignal(_:)`), from the highest channel down.
+  private static func channelsWithSignal<Sample: SignedNumeric & Comparable>(_ base: UnsafePointer<Sample>,
+    frames: Int, channels: Int, stride: Int, threshold: Sample) -> Int {
+    for c in Swift.stride(from: min(channels, OverWatch.channels) - 1, through: 0, by: -1) {
+      for frame in 0..<frames {
+        let sample = base[frame * stride + c]
+        if sample > threshold || sample < -threshold { return (c / 2 + 1) * 2 }
+      }
+    }
+    return 0
+  }
+
+  /// Raises As Detected to `covered`, unless the packet is from a capture before. Meter queue.
+  private func noteDetected(_ covered: Int, capture: UInt64) {
+    var current = detected.load(ordering: .relaxed)
+    while current >> 8 == capture, covered > Int(current & 0xFF) {
+      let (exchanged, original) = detected.compareExchange(expected: current,
+        desired: capture << 8 | UInt64(covered), ordering: .relaxed)
+      if exchanged { return }
+      current = original
+    }
   }
 
   /// Takes the current session's meter for the packets of that session; any
@@ -460,9 +505,6 @@ final class AudioMeterTap: @unchecked Sendable {
   /// of their own a second after the last if no other over follows. Meter queue only.
   private func watchForOvers(_ meter: AudioMeter) {
     let snapshot = meter.snapshot()
-    // As Detected: the highest pair with signal, which only grows.
-    let covered = Self.channelsWithSignal(snapshot)
-    if covered > detected.load(ordering: .relaxed) { detected.store(covered, ordering: .relaxed) }
     guard let event = overWatch.observe(snapshot, source: consumerSession, sampleRate: meter.configuration.sampleRate,
       level: Self.warningLevel) else { return }
     overEvents.add(1, ordering: .relaxed)
@@ -651,15 +693,21 @@ final class AudioMeterTap: @unchecked Sendable {
   /// interpolating across the gap. Any thread.
   func noteGap() {
     gapPending.store(true, ordering: .relaxed)
-    // A new capture: As Detected starts over.
-    detected.store(0, ordering: .relaxed)
+    // A new capture: As Detected starts over, and the last capture's queued packets don't count.
+    var current = detected.load(ordering: .relaxed)
+    while true {
+      let (exchanged, original) = detected.compareExchange(expected: current,
+        desired: ((current >> 8) &+ 1) << 8, ordering: .relaxed)
+      if exchanged { return }
+      current = original
+    }
   }
 
   // MARK: Channels shown
 
   /// The channels the highest pair that has carried signal covers since the capture started,
   /// while metered; 0 before any. Any thread.
-  var detectedChannels: Int { detected.load(ordering: .relaxed) }
+  var detectedChannels: Int { Int(detected.load(ordering: .relaxed) & 0xFF) }
 
   /// A meter for a strip that shows only the first `channels` channels of the current
   /// session, made on first use and fed from the same packets. Nil before the first attach,
@@ -677,7 +725,7 @@ final class AudioMeterTap: @unchecked Sendable {
     }
   }
 
-  /// The display meters fed alongside `meter`. Meter queue.
+  /// The display meters fed alongside `meter`. Any thread.
   private func displayMeters(of meter: AudioMeter) -> [AudioMeter] {
     displays.withLock { $0.owner === meter ? Array($0.meters.values) : [] }
   }
@@ -717,6 +765,8 @@ final class AudioMeterTap: @unchecked Sendable {
     let live = restarted ? self.meter : attach()
     live?.resetPeaks()
     live?.resetLoudness()
+    // A strip showing fewer channels reads its own meter: its OVER latch and maximum start over too.
+    if let live { displayMeters(of: live).forEach { $0.resetPeaks() } }
   }
 
   /// Leaves the audio out of the take while it is paused (`true`) and takes it
