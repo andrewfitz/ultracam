@@ -640,9 +640,11 @@ private struct UIHardwareWatching: ViewModifier {
 /// Reports whether its window can be seen, from the window's occlusion state (which also
 /// covers a minimized window and a hidden app), as it changes.
 struct UIWindowVisibilityReader: NSViewRepresentable {
+  #if UI_VERIFY
   /// Verification hook: an offscreen, transparent window is never unoccluded, so offscreen
-  /// runs count a presented window as seen.
+  /// runs count a presented window as seen. Only UI_VERIFY builds have it.
   @MainActor static var treatsPresentedWindowsAsVisible = false
+  #endif
   let changed: @MainActor (Bool) -> Void
   func makeNSView(context: Context) -> ReaderView { ReaderView(changed: changed) }
   func updateNSView(_ view: ReaderView, context: Context) { view.changed = changed }
@@ -684,8 +686,12 @@ struct UIWindowVisibilityReader: NSViewRepresentable {
 
     private func report() {
       guard let window else { return changed(false) }
-      changed(window.isVisible && !window.isMiniaturized && !NSApp.isHidden
-        && (UIWindowVisibilityReader.treatsPresentedWindowsAsVisible || window.occlusionState.contains(.visible)))
+      #if UI_VERIFY
+      let unoccluded = UIWindowVisibilityReader.treatsPresentedWindowsAsVisible || window.occlusionState.contains(.visible)
+      #else
+      let unoccluded = window.occlusionState.contains(.visible)
+      #endif
+      changed(window.isVisible && !window.isMiniaturized && !NSApp.isHidden && unoccluded)
     }
   }
 }
