@@ -16,6 +16,10 @@
   <key>com.apple.security.files.bookmarks.app-scope</key><true/>
   <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
   <array><string>com.blackmagic-design.desktopvideo.DeckLinkHardwareXPCService</string></array>
+  <!-- Signal dropouts go to a plain log the unified log can't age out
+       (SignalLogFile). This folder only, so Console and scripts can read it. -->
+  <key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+  <array><string>/Library/Logs/Ultracam/</string></array>
   <key>com.apple.security.temporary-exception.shared-preference.read-only</key>
   <array><string>com.blackmagic-design.desktopvideo.prefspanel</string></array>
   <key>com.apple.developer.system-extension.install</key><true/>

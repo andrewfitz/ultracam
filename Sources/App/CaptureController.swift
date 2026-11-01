@@ -631,6 +631,7 @@ final class CaptureController: @unchecked Sendable {
         self.signalLossLog = LossLogLimiter()
         self.runLabel = self.cameraLabel
         self.runStarted = ProcessInfo.processInfo.systemUptime
+        SignalLogFile.shared?.record("Capture started \(self.runLabel)")
         self.frameRateGate = FrameRateGate()
         self.resetSampleFormat()
         self.cameraConnected = false
@@ -981,6 +982,8 @@ final class CaptureController: @unchecked Sendable {
         route.sourceAdmissionAccepted = snapshot == nil || callbacks.sourceAdmission == nil
         route.takeContextAccepted = snapshot == nil || callbacks.takeContext == nil
         recordingCallbacks[feedID] = route
+        // A new take places its unpaired audio from its own first pairing.
+        audioPairAnchor = nil
         if let snapshot { return (snapshot, recordingCallbackGeneration, generation) }
       } else {
         recordingCallbacks.removeValue(forKey: feedID)
@@ -1283,12 +1286,16 @@ final class CaptureController: @unchecked Sendable {
     case .log, .logLast:
       // Over 10 s is an outage, not a dropout: its frames aren't counted.
       let lost = recovered.seconds < 10 ? "\(recovered.frames) frames lost" : "frames not counted"
-      logger.notice("Signal back on \(self.runLabel, privacy: .public) after a dropout: \(lost, privacy: .public) (\(ms) ms without video). This run: \(self.signalLossLog.events) dropouts, \(self.signalLossLog.frames) frames.")
+      let line = "Signal back on \(runLabel) after a dropout: \(lost) (\(ms) ms without video). This run: \(signalLossLog.events) dropouts, \(signalLossLog.frames) frames."
+      logger.notice("\(line, privacy: .public)")
+      SignalLogFile.shared?.record(line)
       if decision == .logLast {
         logger.notice("Further signal dropouts on \(self.runLabel, privacy: .public) are summarized at most once a minute.")
       }
     case .summary(let events, let frames):
-      logger.notice("Signal dropouts on \(self.runLabel, privacy: .public): \(events) more, \(frames) frames lost. This run: \(self.signalLossLog.events) dropouts, \(self.signalLossLog.frames) frames.")
+      let line = "Signal dropouts on \(runLabel): \(events) more, \(frames) frames lost. This run: \(signalLossLog.events) dropouts, \(signalLossLog.frames) frames."
+      logger.notice("\(line, privacy: .public)")
+      SignalLogFile.shared?.record(line)
     case .quiet:
       break
     }
@@ -1303,7 +1310,10 @@ final class CaptureController: @unchecked Sendable {
     let counts = lock.withLock { (sourceDrops, signalDropouts, signalLostFrames, coreRejectedFrames) }
     let deviceDrops = services.deviceDroppedFrames()
     let unlogged = signalLossLog.flush()
-    logger.notice("Capture summary \(self.runLabel, privacy: .public): \(String(format: "%.1f", minutes), privacy: .public) min, delivered=\(self.frames) signalDropouts=\(counts.1) signalLostFrames=\(counts.2) sourceDrops=\(counts.0) deviceDrops=\(deviceDrops) coreRefusals=\(counts.3) outputStalls=\(self.poolDrops) cameraStalls=\(self.cameraDrops) lateFrames=\(self.lateFrames)\(unlogged.map { " (\($0.events) dropouts not logged one by one)" } ?? "", privacy: .public)")
+    let line = "Capture summary \(runLabel): \(String(format: "%.1f", minutes)) min, delivered=\(frames) signalDropouts=\(counts.1) signalLostFrames=\(counts.2) sourceDrops=\(counts.0) deviceDrops=\(deviceDrops) coreRefusals=\(counts.3) outputStalls=\(poolDrops) cameraStalls=\(cameraDrops) lateFrames=\(lateFrames)\(unlogged.map { " (\($0.events) dropouts not logged one by one)" } ?? "")"
+    logger.notice("\(line, privacy: .public)")
+    // The file says when capture ran, so a quiet stretch reads as no dropouts.
+    SignalLogFile.shared?.record(line)
   }
 
   private func fail(_ value: String, token: UInt64) {
@@ -1601,6 +1611,12 @@ final class CaptureController: @unchecked Sendable {
           return
         }
       } else if carriesMedia {
+        // Desktop Video forwards audio while the input is still locking, before
+        // the first frame declares the format. It has nothing to belong to yet.
+        switch delivery.payload {
+        case .media, .rawAudio: return
+        default: break
+        }
         refuseSourceContract(SourceAdmissionRefusal(stage: .capture, formatDescription: "undeclared source",
           reason: "matching source declarations are required before media"), token: token)
         return
