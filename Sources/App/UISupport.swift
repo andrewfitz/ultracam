@@ -3,6 +3,7 @@ import AVFoundation
 import CoreMediaIO
 import MonitorKitCore
 import os
+import Synchronization
 
 /// Recording destinations: free space, time left and recent takes.
 enum UIRecordingLibrary {
@@ -44,14 +45,40 @@ enum UIRecordingLibrary {
     return measuredVideo + pcmMegabits(channels: audioChannels)
   }
 
-  /// What tells a folder's volume apart from every other: its UUID, else its mount point,
-  /// else (unreadable) its name. Names repeat; a second "8TB" mounts at "/Volumes/8TB 1".
+  /// What a volume read found: its UUID, mount point and name, each if it said.
+  typealias VolumeFacts = (uuid: String?, mount: String?, name: String?)
+
+  /// What tells a folder's volume apart from every other: its UUID, else its mount point.
+  /// Names repeat; a second "8TB" mounts at "/Volumes/8TB 1". A folder that can't be read
+  /// (its drive unmounted, no grant, not made yet) keeps the volume it last resolved to,
+  /// so a brief unmount doesn't make it another drive; never read, it's on the volume its
+  /// path names: `/Volumes/<name>`, or the startup volume.
   /// The caller holds the folder's security scope: sandboxed, the read fails without it.
   static func volume(for url: URL) -> (id: String, name: String) {
-    let values = try? url.resourceValues(forKeys: [.volumeUUIDStringKey, .volumeURLKey, .volumeNameKey])
-    let name = values?.volumeName ?? url.pathComponents.dropFirst().first ?? "Disk"
-    return (values?.volumeUUIDString ?? values?.volume?.path ?? name, name)
+    volume(for: url) { candidate in
+      (try? candidate.resourceValues(forKeys: [.volumeUUIDStringKey, .volumeURLKey, .volumeNameKey]))
+        .map { (uuid: $0.volumeUUIDString, mount: $0.volume?.path, name: $0.volumeName) }
+    }
   }
+
+  static func volume(for url: URL, read: (URL) -> VolumeFacts?) -> (id: String, name: String) {
+    let parts = url.standardizedFileURL.pathComponents
+    let external = parts.count >= 3 && parts[1] == "Volumes"
+    let mount = external ? "/Volumes/" + parts[2] : "/"
+    let pathName = external ? parts[2] : nil
+    // The folder, else its mount point (a folder not made yet), if that's the volume's own.
+    let facts = read(url) ?? read(URL(fileURLWithPath: mount, isDirectory: true)).flatMap { $0.mount == mount ? $0 : nil }
+    if let facts, let id = facts.uuid ?? facts.mount {
+      let found = (id: id, name: facts.name ?? pathName ?? "Disk")
+      resolvedVolumes.withLock { $0[url.path] = found; $0[facts.mount ?? mount] = found }
+      return found
+    }
+    if let known = resolvedVolumes.withLock({ $0[url.path] ?? $0[mount] }) { return known }
+    return (mount, pathName ?? "Disk")
+  }
+
+  /// Each folder's and mount point's last resolved volume.
+  private static let resolvedVolumes = Mutex<[String: (id: String, name: String)]>([:])
 
   /// One entry per destination volume. Time left divides free space by the combined
   /// rate of the takes recording to that volume, or with none, of every camera assigned

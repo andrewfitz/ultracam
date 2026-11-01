@@ -66,6 +66,51 @@ import XCTest
     XCTAssertEqual(drive.id, drive.volumeID, "Known by its volume, not its name")
   }
 
+  /// Folders on external drives that can't be read (unmounted, no grant) are each their own
+  /// drive, by mount point and name, not one "Volumes".
+  func testUnreadableExternalFoldersStayOnTheirOwnDrives() {
+    let tag = UUID().uuidString
+    let first = URL(fileURLWithPath: "/Volumes/Ultracam Test A \(tag)/Takes")
+    let second = URL(fileURLWithPath: "/Volumes/Ultracam Test B \(tag)/Takes")
+    let drives = UIRecordingLibrary.drives(for: [first, second], recordingRates: [])
+    XCTAssertEqual(drives.map(\.id), ["/Volumes/Ultracam Test A \(tag)", "/Volumes/Ultracam Test B \(tag)"])
+    XCTAssertEqual(drives.map(\.name), ["Ultracam Test A \(tag)", "Ultracam Test B \(tag)"])
+    XCTAssertEqual(drives.map(\.availableBytes), [0, 0], "Unknown, not full")
+  }
+
+  /// A drive that unmounts for a moment keeps its id, so its alert doesn't post again; a
+  /// folder not made yet is on its mount point's volume; one never read is on the volume
+  /// its path names, or the startup volume.
+  func testAFolderKeepsTheVolumeItLastResolvedTo() {
+    let tag = UUID().uuidString
+    let mount = "/Volumes/Ultracam Test \(tag)"
+    let folder = URL(fileURLWithPath: mount + "/Takes")
+    var mounted = true
+    let read: (URL) -> UIRecordingLibrary.VolumeFacts? = { url in
+      mounted && url.path.hasPrefix(mount) ? (uuid: "UUID-\(tag)", mount: mount, name: "Ultracam Test") : nil
+    }
+    XCTAssertEqual(UIRecordingLibrary.volume(for: folder, read: read).id, "UUID-\(tag)")
+    mounted = false
+    let unmounted = UIRecordingLibrary.volume(for: folder, read: read)
+    XCTAssertEqual(unmounted.id, "UUID-\(tag)", "Unmounted, it's the drive it was")
+    XCTAssertEqual(unmounted.name, "Ultracam Test")
+    XCTAssertEqual(UIRecordingLibrary.volume(for: URL(fileURLWithPath: mount + "/Later"), read: read).id, "UUID-\(tag)",
+      "Another folder on that mount point")
+    mounted = true
+    let notMade: (URL) -> UIRecordingLibrary.VolumeFacts? = { url in
+      url.path == mount ? (uuid: "UUID-\(tag)-2", mount: mount, name: "Ultracam Test") : nil
+    }
+    XCTAssertEqual(UIRecordingLibrary.volume(for: URL(fileURLWithPath: mount + "/New"), read: notMade).id, "UUID-\(tag)-2",
+      "Its mount point says")
+    let stale: (URL) -> UIRecordingLibrary.VolumeFacts? = { url in
+      url.path == "/Volumes/Gone \(tag)" ? (uuid: "startup", mount: "/", name: "Macintosh HD") : nil
+    }
+    XCTAssertEqual(UIRecordingLibrary.volume(for: URL(fileURLWithPath: "/Volumes/Gone \(tag)/Takes"), read: stale).id,
+      "/Volumes/Gone \(tag)", "A leftover mount-point folder on the startup volume isn't that drive")
+    let home = UIRecordingLibrary.volume(for: URL(fileURLWithPath: "/Users/nobody-\(tag)/Movies"), read: { _ in nil })
+    XCTAssertEqual(home.id, "/")
+  }
+
   /// The drive is the folder's volume as the drive read found it: ~/Movies with an external
   /// drive in use, and two volumes that share a name ("8TB" mounted again at "/Volumes/8TB 1").
   func testACameraIsOnItsVolumeNotItsPathsWords() {
