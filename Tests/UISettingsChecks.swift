@@ -35,6 +35,35 @@ import XCTest
     XCTAssertNil(UISettingsTab.linked(try XCTUnwrap(URL(string: "ultracam-settings:monitor"))))
   }
 
+  /// A pane's height feeds the window's size, and the window's size feeds the form's geometry.
+  /// Build 43 crashed in that loop. Whether the form reports its true content or stretches to
+  /// fill its container, and whatever its insets, the adopted height must settle in a few passes.
+  func testAPaneHeightSettlesWhateverTheFormReports() {
+    for stretches in [false, true] {
+      for insets in [CGFloat(0), 28, 52] {
+        for real in [CGFloat(180), 420, 900, 2400] {
+          var current: CGFloat?
+          var changes = 0
+          var container: CGFloat = 460
+          for _ in 0 ..< 50 {
+            let visible = container - insets
+            let measure = UISettingsLayout.Measure(
+              content: stretches ? max(real, visible) : real, container: container, insets: insets)
+            if let next = UISettingsLayout.adopted(measure, current: current) {
+              current = next
+              changes += 1
+            }
+            container = min(current ?? container, 1200)
+          }
+          XCTAssertLessThanOrEqual(changes, 3, "stretches \(stretches), insets \(insets), content \(real)")
+          if !stretches, real + insets <= 1200 {
+            XCTAssertEqual(current, real + insets, "A form that reports its content gets all of it")
+          }
+        }
+      }
+    }
+  }
+
   // MARK: Channels Shown
 
   func testAsDetectedIsTheSmallestTierCoveringTheHighestPair() {

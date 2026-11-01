@@ -87,6 +87,40 @@ enum UISettingsLayout {
   /// Room for the title bar, the tabs and the Dock.
   @MainActor static var maximumHeight: CGFloat { max(minimumHeight, (NSScreen.main?.visibleFrame.height ?? 900) - 120) }
 
+  /// What a pane's form reports about itself, in whole points.
+  struct Measure: Equatable {
+    var content: CGFloat
+    var container: CGFloat
+    var insets: CGFloat
+
+    init(content: CGFloat, container: CGFloat, insets: CGFloat) {
+      self.content = content.rounded(.up)
+      self.container = container.rounded(.up)
+      self.insets = insets.rounded(.up)
+    }
+
+    init(_ geometry: ScrollGeometry) {
+      self.init(
+        content: geometry.contentSize.height,
+        container: geometry.containerSize.height,
+        insets: geometry.contentInsets.top + geometry.contentInsets.bottom)
+    }
+  }
+
+  /// The content height to adopt, or nil to keep the current one. A form whose content fills
+  /// its container says nothing about its true height (a form may stretch to fill), so only
+  /// overflow grows the pane and only visible slack shrinks it. Changes under 2 pt are noise.
+  static func adopted(_ measure: Measure, current: CGFloat?) -> CGFloat? {
+    guard measure.content > 0, measure.container > 0 else { return nil }
+    let wanted = measure.content + measure.insets
+    let visible = measure.container - measure.insets
+    let overflows = measure.content > visible + 1
+    let slack = measure.content < visible - 2
+    guard current == nil || overflows || slack else { return nil }
+    if let current, abs(current - wanted) < 2 { return nil }
+    return wanted
+  }
+
   /// A pane's height for its measured content: all of it, up to the screen.
   @MainActor static func height(content: CGFloat?, extra: CGFloat = 0) -> CGFloat {
     guard let content, content > 0 else { return initialHeight }
@@ -118,10 +152,14 @@ struct UISettingsPane<Content: View, Trailing: View>: View {
       Form { content }
         .formStyle(.grouped)
         .scrollBounceBehavior(.basedOnSize)
-        .onScrollGeometryChange(for: CGFloat.self) { geometry in
-          geometry.contentSize.height + geometry.contentInsets.top + geometry.contentInsets.bottom
-        } action: { _, height in
-          if height != contentHeight { contentHeight = height }
+        .onScrollGeometryChange(for: UISettingsLayout.Measure.self) { geometry in
+          UISettingsLayout.Measure(geometry)
+        } action: { _, measure in
+          // Resizing the window changes the form's geometry, so a height taken on every change
+          // fed back into the window's own resize until AppKit's layout limit ended the app.
+          // Adopt a height only once, a frame later, and only for real overflow or slack.
+          guard let next = UISettingsLayout.adopted(measure, current: contentHeight) else { return }
+          DispatchQueue.main.async { if next != contentHeight { contentHeight = next } }
         }
       if hasTrailing {
         HStack {
