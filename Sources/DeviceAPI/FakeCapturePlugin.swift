@@ -44,7 +44,8 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   func refreshIdleStatus() { pluginLock.withLock { idleRefreshCount += 1 } }
   var sessions: [FakeCaptureSession] { pluginLock.withLock { createdSessions } }
   @MainActor func setConnected(_ connected: Bool) {
-    pluginLock.withLock { self.connected = connected }
+    // A real plugin's cache forgets a device that leaves.
+    pluginLock.withLock { self.connected = connected; if !connected { statuses = [:] } }
     let snapshot = CaptureDeviceSnapshot(status: driverStatus(), devices: (try? devices()) ?? [], error: nil)
     observers = observers.filter { $0.value != nil }
     observers.compactMap(\.value).forEach { $0.deliver(snapshot) }

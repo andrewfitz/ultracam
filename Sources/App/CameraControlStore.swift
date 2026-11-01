@@ -272,13 +272,12 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     }
     func hasSavedCredentials(for camera: ControlCamera) -> Bool { savedCredentialIdentities.contains(credentialKey(camera)) }
     private func credentialKey(_ camera: ControlCamera) -> String { cameraKey(camera) + "|" + (camera.fingerprint ?? "") }
+    /// The Keychain only: showing the sign-in row never contacts the body or scans (only
+    /// Find Camera Bodies does). Connecting re-verifies the body's identity before the
+    /// saved sign-in is read or sent.
     func checkSavedCredentials(for camera: ControlCamera, feedID: String) async {
         guard camera.authenticationMode == .usernamePassword, !shuttingDown,
-            let plugin = plugins[camera.pluginID] else { return }
-        guard let prepared = await prepare(pluginID: camera.pluginID,
-            request: preparedRequests[cameraKey(camera)] ?? .camera(camera), feedID: feedID),
-            prepared.camera.id == camera.id, prepared.camera.fingerprint == camera.fingerprint,
-            let fingerprint = camera.fingerprint else { return }
+            let plugin = plugins[camera.pluginID], let fingerprint = camera.fingerprint else { return }
         let generation = state(for: feedID).generation
         do {
             let saved = try await credentials.load(service: plugin.credentialService,

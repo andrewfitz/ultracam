@@ -134,6 +134,18 @@ import XCTest
 
   // MARK: Bodies
 
+  /// The name field keeps a name typed when its row collapses, and shows a name changed
+  /// elsewhere unless it is being typed over.
+  func testNicknameDraftCommitsOnLeavingAndFollowsOutsideChanges() {
+    XCTAssertTrue(UIHardwareNicknameField.commits(draft: "Left Recorder", saved: nil), "Typed, then the row collapsed")
+    XCTAssertTrue(UIHardwareNicknameField.commits(draft: "", saved: "Left Recorder"), "Cleared, then collapsed")
+    XCTAssertFalse(UIHardwareNicknameField.commits(draft: "Left Recorder ", saved: "Left Recorder"))
+    XCTAssertFalse(UIHardwareNicknameField.commits(draft: "", saved: nil), "Untouched after Reset writes nothing back")
+    XCTAssertEqual(UIHardwareNicknameField.resynced(draft: "Old", saved: "New", editing: false), "New")
+    XCTAssertEqual(UIHardwareNicknameField.resynced(draft: "Old", saved: nil, editing: false), "", "Reset clears the field")
+    XCTAssertEqual(UIHardwareNicknameField.resynced(draft: "Typing", saved: "New", editing: true), "Typing")
+  }
+
   func testBatteryUnitDecidesTheGlyphAndOnlyAKnownUnitWarns() {
     func power(_ value: UInt64, _ unit: ControlValueUnit?, _ severity: DeviceSeverity? = nil) -> [ControlProperty] {
       [ControlProperty(id: "battery", label: "Battery", writable: false, value: .unsignedInteger(value), role: .power,
@@ -238,6 +250,31 @@ import XCTest
     XCTAssertTrue(UIBodySetup.same("rec709-video", "unspecified"))
   }
 
+  // MARK: Device settings
+
+  /// Retry after a failed write is a change like any other: while a camera runs it asks before
+  /// Advertise HDR rewrites the EDID, and a connector that can't change then offers no Retry.
+  func testRetryAsksFirstWhileRunningAndIsHiddenForReadOnlySettings() throws {
+    let rig = try rig()
+    let failure = PluginError.failed("Synthetic EDID application failed")
+    let hdr = VendorSetting(id: "fake:advertiseHDR", labelKey: "Advertise HDR", value: .boolean(true),
+      allowedValues: .unrestricted, mutable: true, availabilityReason: nil, interruptsCapture: true, applicationError: failure)
+    let connector = VendorSetting(id: "fake:connector", labelKey: "Input", value: .choice("hdmi"),
+      allowedValues: .choices([.init(id: "hdmi", label: "HDMI"), .init(id: "sdi", label: "SDI")]), mutable: true,
+      availabilityReason: nil, interruptsCapture: true, applicationError: failure)
+    let running = [UIHardwareDevice.Camera(id: "camera", name: "Camera 1", running: true)]
+    let device = UIHardwareDevice(id: "fake:left", name: "Recorder", present: true, cameras: running)
+    var asked: [UIDeviceSettingConfirmation] = []
+    let view = UISettingsDeviceSettings(model: rig.model, device: device) { asked.append($0) }
+    view.retry(hdr, running: running)
+    XCTAssertEqual(asked.map(\.actionTitle), ["Turn On"], "A live EDID rewrite asks first")
+    XCTAssertTrue(UISettingsDeviceSettings.offersRetry(hdr, running: running))
+    XCTAssertFalse(UISettingsDeviceSettings.offersRetry(connector, running: running), "Read-only while running")
+    XCTAssertTrue(UISettingsDeviceSettings.offersRetry(connector, running: []))
+    view.retry(connector, running: running)
+    XCTAssertEqual(asked.count, 1, "No Retry, no write")
+  }
+
   // MARK: Idle reader and diagnostics
 
   func testIdleStatusIsReadOnlyWhileSomeoneIsLooking() async throws {
@@ -269,6 +306,52 @@ import XCTest
     await settle { rig.capture.idleRefreshes > 0 }
     XCTAssertGreaterThan(rig.capture.idleRefreshes, 0)
     rig.model.hardwareInventory.endWatching()
+  }
+
+  /// An unplugged input takes its status with it: no old connector chip, and plugged back
+  /// in it reads as unknown until the reader reports it again.
+  func testADeviceThatLeavesTakesItsStatusWithIt() throws {
+    let rig = try rig()
+    let feed = rig.model.selectedFeedID
+    rig.model.updateCamera(feed) { $0.selectedDevice = "fake:left" }
+    rig.capture.setStatus(CaptureDeviceStatus(availability: .free, link: .thunderbolt, connector: .sdi), for: "fake:left")
+    XCTAssertEqual(rig.model.hardwareInventory.statuses["fake:left"]?.connector, .sdi)
+    rig.capture.setConnected(false)
+    rig.model.refresh()
+    XCTAssertNil(rig.model.hardwareInventory.statuses["fake:left"])
+    XCTAssertNil(rig.model.hardwareInventory.status(for: "fake:left"))
+    let chip = UISessionBridge.live(model: rig.model, interface: UIInterfaceState(defaults: rig.defaults)).context()
+      .session.cameras.first { $0.id == feed.rawValue }?.inputConnector
+    XCTAssertNil(chip, "No connector chip for an unplugged input")
+    rig.capture.setConnected(true)
+    rig.model.refresh()
+    XCTAssertNil(rig.model.hardwareInventory.status(for: "fake:left"), "Plugged back in: unknown until read")
+  }
+
+  /// A shown view whose window is minimized, hidden with the app or fully covered stops the
+  /// idle reader; it reads again once the window can be seen.
+  func testIdleStatusStopsWhileTheWatchingWindowCannotBeSeen() throws {
+    let rig = try rig()
+    var hardware = AppHardware.offline
+    hardware.refreshIdleStatus = {}
+    let inventory = HardwareInventory(defaults: rig.defaults, hardware: hardware, interval: .milliseconds(10))
+    let watch = UIHardwareWatch()
+    watch.inventory = inventory
+    watch.setVisible(true)
+    XCTAssertFalse(inventory.polling, "Not shown yet")
+    watch.setAppeared(true)
+    XCTAssertTrue(inventory.polling)
+    watch.setVisible(false)
+    XCTAssertFalse(inventory.polling, "Minimized, hidden or covered: no reads")
+    watch.setVisible(false)
+    watch.setVisible(true)
+    XCTAssertTrue(inventory.polling)
+    watch.setVisible(true)
+    inventory.beginWatching()
+    watch.setAppeared(false)
+    XCTAssertTrue(inventory.polling, "Another viewer still holds it: each watch ends only its own")
+    inventory.endWatching()
+    XCTAssertFalse(inventory.polling)
   }
 
   func testStatusUpdatesReachTheInventoryAndCopyDiagnosticsNamesTheHardware() async throws {

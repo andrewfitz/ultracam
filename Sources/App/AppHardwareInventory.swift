@@ -53,6 +53,14 @@ import Observation
     defaults.set(nicknames, forKey: Self.nicknamesKey)
   }
 
+  /// The driver listed these devices: a device that left takes its status with it, so an
+  /// unplugged input shows no old connector, and one plugged back in starts unknown.
+  func devicesListed(_ ids: [String]) {
+    let listed = Set(ids)
+    guard statuses.keys.contains(where: { !listed.contains($0) }) else { return }
+    statuses = statuses.filter { listed.contains($0.key) }
+  }
+
   /// Saves names that changed; called whenever the driver lists devices.
   func recordNames(_ names: [String: String]) {
     let merged = lastKnownNames.merging(names) { _, new in new }

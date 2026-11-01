@@ -400,6 +400,27 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         XCTAssertEqual(plugin.setCalls, 0)
         _ = await store.shutdown()
     }
+    /// Showing the sign-in row (a tab switch back, a row expanded again) reads the Keychain
+    /// only: it never prepares, so it never scans or contacts the body.
+    func testSavedSignInCheckReadsTheKeychainWithoutContactingTheBody() async throws {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
+        try await credentials.save(.usernamePassword(username: "user", password: "secret"), service: "test", account: "camerapin")
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        for _ in 0..<3 { await store.checkSavedCredentials(for: plugin.camera, feedID: "feed") }
+        XCTAssertTrue(plugin.requests.isEmpty, "No preparation, so no scan")
+        XCTAssertEqual(plugin.connectCount, 0)
+        XCTAssertTrue(store.hasSavedCredentials(for: plugin.camera))
+        XCTAssertTrue(store.state(for: "feed").hasSavedCredentials)
+        try await credentials.delete(service: "test", account: "camerapin")
+        await store.checkSavedCredentials(for: plugin.camera, feedID: "feed")
+        XCTAssertFalse(store.hasSavedCredentials(for: plugin.camera))
+        // Connecting is the explicit action: it prepares, verifying the body, before the sign-in is read.
+        try await credentials.save(.usernamePassword(username: "user", password: "secret"), service: "test", account: "camerapin")
+        await store.connectUsingSavedCredentials(plugin.camera, to: "feed")
+        XCTAssertEqual(plugin.requests.count, 1)
+        XCTAssertTrue(store.state(for: "feed").connected)
+        _ = await store.shutdown()
+    }
     func testCredentialSaveFailureDoesNotPreventPropertySnapshot() async throws {
         let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
         plugin.propertyValues = [.init(id: "test:iso", label: "ISO", writable: false, value: .unsignedInteger(800))]

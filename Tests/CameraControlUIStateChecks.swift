@@ -23,6 +23,15 @@ import XCTest
         XCTAssertNil(store.assignment(for: "feed"))
         guard count == 0, plugin.connectCount == 0 else { throw UIControlFailure.identityWasNotPinned }
     }
+    /// J 22: the sheet's title and the body's help read as words, not dot-joined pieces.
+    func testSheetTitleAndBodyHelpHaveNoDotJoins() {
+        let body = ControlCamera(pluginID: "test", id: "aa:bb", name: "Body A", transport: .network, address: "192.0.2.10")
+        XCTAssertEqual(UICameraControlSettings.title("Camera 1"), "Camera Control — Camera 1")
+        XCTAssertEqual(UICameraControlSettings.bodyHelp(body), "Body A at 192.0.2.10, ID aa:bb")
+        var direct = body
+        direct.address = ""
+        XCTAssertEqual(UICameraControlSettings.bodyHelp(direct), "Body A, ID aa:bb")
+    }
 }
 private enum UIControlFailure: Error { case identityWasNotPinned }
 @MainActor private final class UIControlPersistence: CameraControlAssignmentPersisting {

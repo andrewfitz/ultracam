@@ -35,11 +35,18 @@ struct UICameraControlSettings: View {
     private var pluginID: String { assignment?.camera.pluginID ?? "" }
     private var vendor: VendorDescriptor? { store.descriptor(for: pluginID) }
 
+    /// Titled like a macOS window: what it is, an em dash, then whose.
+    static func title(_ name: String) -> String { "Camera Control — \(name)" }
+    /// The paired body in words, not dot-joined pieces (J 22).
+    static func bodyHelp(_ camera: ControlCamera) -> String {
+        camera.address.isEmpty ? "\(camera.name), ID \(camera.id)" : "\(camera.name) at \(camera.address), ID \(camera.id)"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Camera Control · \(name)").font(.title2.weight(.semibold))
+                    Text(Self.title(name)).font(.title2.weight(.semibold))
                     Text("Camera controls are separate from the captured picture.").foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -111,7 +118,7 @@ struct UICameraControlSettings: View {
             VStack(alignment: .leading, spacing: 4) {
                 Label(assignment.camera.name, systemImage: state.connected ? "wifi" : "wifi.slash").font(.headline)
                 Text("Assigned to \(name)").font(.caption).foregroundStyle(.secondary)
-            }.help("\(assignment.camera.name) · \(assignment.camera.address) · \(assignment.camera.id)")
+            }.help(Self.bodyHelp(assignment.camera))
             Spacer()
             if state.connected {
                 Button("Disconnect") { Task { await store.disconnect(feedID) } }
@@ -155,7 +162,7 @@ struct UICameraBodySignIn: View {
                 Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
             }
         }
-        // Only after a camera was chosen for this body: the check re-verifies the body's identity.
+        // The Keychain only; the body is contacted when Connect is pressed.
         .task(id: camera.id + "|" + feedID) { await store.checkSavedCredentials(for: camera, feedID: feedID) }
     }
 

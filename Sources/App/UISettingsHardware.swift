@@ -535,7 +535,19 @@ struct UIHardwareNicknameField: View {
       }
     }
     .onAppear { draft = inventory.nickname(for: deviceID) ?? "" }
+    // Collapsing the row while typing keeps the name typed.
+    .onDisappear { if Self.commits(draft: draft, saved: inventory.nickname(for: deviceID)) { inventory.setNickname(draft, for: deviceID) } }
+    // A name changed elsewhere (the other window, Reset) shows here unless it's being typed over.
+    .onChange(of: inventory.nickname(for: deviceID)) { _, saved in draft = Self.resynced(draft: draft, saved: saved, editing: focused) }
   }
+
+  /// Whether leaving saves the draft: only an edit, so a field that never changed can't
+  /// write a name back after Reset.
+  static func commits(draft: String, saved: String?) -> Bool {
+    draft.trimmingCharacters(in: .whitespacesAndNewlines) != (saved ?? "")
+  }
+  /// The draft after the saved name changed: the new name, unless the person is typing.
+  static func resynced(draft: String, saved: String?, editing: Bool) -> String { editing ? draft : saved ?? "" }
 }
 
 /// How a paired body meets its capture device: read-only rows, and one advisory with one
@@ -586,9 +598,90 @@ struct UIBodySetupView: View {
 }
 
 extension View {
-  /// Idle hardware status is read only while a view that shows it is on screen: the main
-  /// window and Settings › Hardware.
+  /// Idle hardware status is read only while a view that shows it can be seen: the main
+  /// window and Settings › Hardware, shown, in a window that is neither minimized, hidden
+  /// with the app, nor fully covered.
   func uiWatchesHardware(_ inventory: HardwareInventory) -> some View {
-    onAppear { inventory.beginWatching() }.onDisappear { inventory.endWatching() }
+    modifier(UIHardwareWatching(inventory: inventory))
+  }
+}
+
+private struct UIHardwareWatching: ViewModifier {
+  let inventory: HardwareInventory
+  @State private var watch = UIHardwareWatch()
+
+  func body(content: Content) -> some View {
+    content
+      .background(UIWindowVisibilityReader { watch.setVisible($0) })
+      .onAppear { watch.inventory = inventory; watch.setAppeared(true) }
+      .onDisappear { watch.setAppeared(false) }
+  }
+}
+
+/// One view's hold on the idle reader: held while the view is shown and its window can be
+/// seen, so its begin and end always pair.
+@MainActor final class UIHardwareWatch {
+  var inventory: HardwareInventory?
+  private var appeared = false
+  private var visible = false
+  private(set) var watching = false
+
+  func setAppeared(_ value: Bool) { appeared = value; update() }
+  func setVisible(_ value: Bool) { visible = value; update() }
+
+  private func update() {
+    let wanted = appeared && visible && inventory != nil
+    guard wanted != watching else { return }
+    watching = wanted
+    if wanted { inventory?.beginWatching() } else { inventory?.endWatching() }
+  }
+}
+
+/// Reports whether its window can be seen, from the window's occlusion state (which also
+/// covers a minimized window and a hidden app), as it changes.
+private struct UIWindowVisibilityReader: NSViewRepresentable {
+  let changed: @MainActor (Bool) -> Void
+  func makeNSView(context: Context) -> ReaderView { ReaderView(changed: changed) }
+  func updateNSView(_ view: ReaderView, context: Context) { view.changed = changed }
+
+  /// Removes its observers when the view goes, from any thread.
+  final class Observations: @unchecked Sendable {
+    var tokens: [NSObjectProtocol] = []
+    func clear() { tokens.forEach { NotificationCenter.default.removeObserver($0) }; tokens = [] }
+    deinit { clear() }
+  }
+
+  final class ReaderView: NSView {
+    var changed: @MainActor (Bool) -> Void
+    private let observations = Observations()
+    init(changed: @escaping @MainActor (Bool) -> Void) {
+      self.changed = changed
+      super.init(frame: .zero)
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      observations.clear()
+      if let window {
+        for name in [NSWindow.didChangeOcclusionStateNotification, NSWindow.didMiniaturizeNotification,
+          NSWindow.didDeminiaturizeNotification] {
+          observations.tokens.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.report() }
+          })
+        }
+        for name in [NSApplication.didHideNotification, NSApplication.didUnhideNotification] {
+          observations.tokens.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.report() }
+          })
+        }
+      }
+      report()
+    }
+
+    private func report() {
+      guard let window else { return changed(false) }
+      changed(window.isVisible && !window.isMiniaturized && !NSApp.isHidden && window.occlusionState.contains(.visible))
+    }
   }
 }

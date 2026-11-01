@@ -669,6 +669,7 @@ final class AppModel {
     if fromDiscovery, next == devices { return }
     for device in next { lastInputNames[device.id] = device.name }
     devices = next
+    hardwareInventory.devicesListed(next.map(\.id))
     for device in next {
       guard let pluginID = try? VendorRegistry.pluginID(for: device.id) else { continue }
       Task { await vendorSettings.restore(deviceID: device.id, pluginID: pluginID) }

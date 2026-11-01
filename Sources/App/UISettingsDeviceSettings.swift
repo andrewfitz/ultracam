@@ -45,7 +45,9 @@ struct UISettingsDeviceSettings: View {
                 } label: { Text(setting.localizedLabel()) }
                 if let error = setting.applicationError {
                     LabeledContent {
-                        Button("Retry") { apply(setting.value, to: setting) }.disabled(state.busy || !setting.mutable)
+                        if Self.offersRetry(setting, running: running) {
+                            Button("Retry") { retry(setting, running: running) }.disabled(state.busy || !setting.mutable)
+                        }
                     } label: {
                         Label(error.localizedDescription, systemImage: UISymbol.warning).foregroundStyle(.orange)
                     }
@@ -62,6 +64,18 @@ struct UISettingsDeviceSettings: View {
     static func readOnlyWhileRunning(_ setting: VendorSetting) -> Bool {
         guard setting.interruptsCapture, case .choices = setting.allowedValues else { return false }
         return true
+    }
+
+    /// Retry is a change like any other: hidden where the setting is read-only, and asking
+    /// first where it can drop a running camera's signal.
+    static func offersRetry(_ setting: VendorSetting, running: [UIHardwareDevice.Camera]) -> Bool {
+        !(readOnlyWhileRunning(setting) && !running.isEmpty)
+    }
+
+    /// The Retry button's action.
+    func retry(_ setting: VendorSetting, running: [UIHardwareDevice.Camera]) {
+        guard Self.offersRetry(setting, running: running) else { return }
+        request(setting, setting.value, running: running)
     }
 
     static func names(_ cameras: [UIHardwareDevice.Camera]) -> String {
