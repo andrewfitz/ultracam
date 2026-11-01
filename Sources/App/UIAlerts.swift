@@ -161,6 +161,11 @@ extension UIAlertDelivering {
   private let panel: any UIAlertPanelPresenting
   private var tracker = UIAlertTracker()
   private var updateScheduled = false
+  /// Re-reads free space while a take rolls. Nothing else does with every window closed: free
+  /// space isn't observable, and a take's clock bypasses observers.
+  private var driveWatch: Timer?
+  /// How often, rolling. Low Space is 15 minutes at least.
+  static let driveWatchInterval: TimeInterval = 30
 
   init(model: AppModel, interface: UIInterfaceState, preferences: UIAlertPreferences,
     delivery: any UIAlertDelivering, panel: any UIAlertPanelPresenting) {
@@ -223,12 +228,27 @@ extension UIAlertDelivering {
       events: preferences.events)
     plan.post.forEach(delivery.post)
     if !plan.remove.isEmpty { delivery.remove(plan.remove) }
+    watchDrives(presentation.canPauseAll)
     if let alert = plan.panel {
       let bridge = bridge()
       panel.show(alert) { bridge.send($0) }
     } else {
       panel.hide()
     }
+  }
+
+  /// While any take is rolling or paused, a look at the problems every `driveWatchInterval`:
+  /// the snapshot reads the drives again, so a drive crossing Low Space raises its alert.
+  private func watchDrives(_ rolling: Bool) {
+    guard rolling != (driveWatch != nil) else { return }
+    driveWatch?.invalidate()
+    driveWatch = nil
+    guard rolling else { return }
+    let timer = Timer(timeInterval: Self.driveWatchInterval, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.scheduleUpdate() }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    driveWatch = timer
   }
 
   private func turnOn() {

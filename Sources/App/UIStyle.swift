@@ -70,6 +70,8 @@ enum UIPictureSpacing {
   static let ringOutset: CGFloat = 6
   /// Fixed, not the system accent: a Red or Orange accent would read as on air or a warning.
   static let selectionRing = Color.blue
+  /// Keyboard focus's dashed ring, just outside the selection ring and still inside half the gutter.
+  static let focusRingOutset: CGFloat = 9
 }
 
 extension View {
@@ -248,6 +250,8 @@ struct UIFirstFitting<Content: View>: View {
             ZStack(alignment: .topLeading) {
               ForEach(candidates.indices, id: \.self) { candidate in
                 candidates[candidate].fixedSize().hidden()
+                  // Measured, never seen: its popovers stay with the copy on screen.
+                  .environment(\.uiMeasuring, true)
                   .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { ideal[candidate] = $0 }
               }
             }
@@ -262,6 +266,11 @@ struct UIFirstFitting<Content: View>: View {
     }
   }
 
+}
+
+extension EnvironmentValues {
+  /// Inside `UIFirstFitting`'s hidden copies, laid out only to measure them.
+  @Entry var uiMeasuring = false
 }
 
 enum UIFitting {

@@ -1524,11 +1524,11 @@ extension UIVerify {
     verifier.check("adoption: every empty camera takes the first free input, selected or not",
       device(beta) == b.id && model.selectedFeedID == alpha, device(beta))
     verifier.check("adoption: two inputs with one name get their ID digits",
-      model.inputLabel(a.id) == "UltraStudio Mini Recorder 12G · 0AB8" &&
-        model.inputLabel(b.id) == "UltraStudio Mini Recorder 12G · 46B8", model.inputLabel(a.id) ?? "nil")
+      model.inputLabel(a.id) == "UltraStudio Mini Recorder 12G (0AB8)" &&
+        model.inputLabel(b.id) == "UltraStudio Mini Recorder 12G (46B8)", model.inputLabel(a.id) ?? "nil")
     verifier.check("adoption: a unique name has no suffix", model.inputLabel(c.id) == c.name, model.inputLabel(c.id) ?? "nil")
     verifier.check("adoption: the camera's input name is its label",
-      bridge.snapshot().cameras.first { $0.id == alpha.rawValue }?.inputName == "UltraStudio Mini Recorder 12G · 0AB8",
+      bridge.snapshot().cameras.first { $0.id == alpha.rawValue }?.inputName == "UltraStudio Mini Recorder 12G (0AB8)",
       bridge.snapshot().cameras.first { $0.id == alpha.rawValue }?.inputName ?? "nil")
 
     _ = model.selectFeed(beta)
@@ -1568,7 +1568,7 @@ extension UIVerify {
     inputs.publish([c])
     verifier.check("adoption: an unplugged input stays assigned", device(beta) == a.id, device(beta))
     verifier.check("adoption: an unplugged input keeps its label",
-      bridge.snapshot().cameras.first { $0.id == beta.rawValue }?.inputName == "UltraStudio Mini Recorder 12G · 0AB8",
+      bridge.snapshot().cameras.first { $0.id == beta.rawValue }?.inputName == "UltraStudio Mini Recorder 12G (0AB8)",
       bridge.snapshot().cameras.first { $0.id == beta.rawValue }?.inputName ?? "nil")
     _ = model.selectFeed(alpha)
     model.refresh()

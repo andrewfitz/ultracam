@@ -151,9 +151,18 @@ struct UIToolbarCutGroup: View {
     }
     .buttonStyle(UIToolbarPillStyle(selected: button.onAir, outline: button.pending ? .green : nil))
     .disabled(!button.enabled)
-    .help(button.onAir ? "\(button.name) is on Program"
+    .help(button.onAir ? "\(button.name) is \(Self.programWords(button))"
       : button.help ?? (button.pending ? "Cut to \(button.name) is pending" : "Cut to \(button.name) (⌃\(button.number))"))
-    .accessibilityLabel(button.onAir ? "\(button.name), on Program" : button.pending ? "\(button.name), cut pending" : "Cut to \(button.name)")
+    .accessibilityLabel(button.onAir ? "\(button.name), \(Self.programWords(button))" : button.pending ? "\(button.name), cut pending" : "Cut to \(button.name)")
+  }
+
+  /// What the dot says about the camera on Program.
+  static func programWords(_ button: UICutButton) -> String {
+    switch button.tally {
+    case .onAir: return "on air"
+    case .noPicture: return "on Program with no picture"
+    default: return "on Program"
+    }
   }
 
   /// "Auto On" or "Auto Off" at one width. With Manual chosen, Auto asks how to switch first.
@@ -250,17 +259,30 @@ struct UICameraPickerMenu: View {
   }
 }
 
-/// A cut button's number and name, with a tally dot: red on Program, green while a cut is
+/// A cut button's number and name, with a tally dot: on Program, red only while frames reach
+/// a meeting (J 13), orange while it waits on a picture, gray otherwise; green while a cut is
 /// pending. The dot is drawn, so it holds its color in a window that isn't key.
 struct UICutButtonLabel: View {
   let button: UICutButton
   var numberOnly = false
   var showsNext = false
 
+  /// The dot's color, nil for none.
+  static func dot(_ button: UICutButton) -> Color? {
+    if button.onAir {
+      switch button.tally {
+      case .onAir: return .red
+      case .noPicture: return .orange
+      default: return .secondary
+      }
+    }
+    return button.pending ? .green : nil
+  }
+
   var body: some View {
     HStack(spacing: 5) {
-      if button.onAir || button.pending {
-        Circle().fill(button.onAir ? Color.red : .green)
+      if let dot = Self.dot(button) {
+        Circle().fill(dot)
           .frame(width: 7, height: 7)
           .accessibilityHidden(true)
       }

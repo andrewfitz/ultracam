@@ -54,6 +54,8 @@ struct UICameraPictureView: View {
   let context: UIContext
   var compact = false
   @State private var hovering = false
+  /// The monitor tool popover open from this picture's bar: it keeps the bar where it is.
+  @State private var toolPanel: UIMonitorPanel?
   @State private var zoom = 1.0
   /// Narrow enough that the name row can't hold the full tool bar: it takes its own row.
   @State private var narrow = false
@@ -74,6 +76,9 @@ struct UICameraPictureView: View {
   /// Clean View hides the overlays, pills included; the tally ring stays, and hover still
   /// brings the tools and view controls back so Clean View can be turned off again.
   private var isClean: Bool { !compact && UICleanViewState.shared.clean.contains(camera.id) }
+  private var toolPlacement: UIMonitorToolButtons.Placement {
+    UIMonitorToolButtons.Placement(hovering: hovering, panelOpen: toolPanel != nil, narrow: narrow, clean: isClean)
+  }
 
   private static let cornerRadius: CGFloat = 14
 
@@ -116,6 +121,19 @@ struct UICameraPictureView: View {
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
+    .overlay {
+      // Keyboard focus, which no longer selects (D7), has its own ring: dashed, just outside the
+      // selection ring's, so the two read apart and both can show. Drawn here because the
+      // system's focus ring is off (it would hug the picture, over the tally ring).
+      let outset = UIPictureSpacing.focusRingOutset
+      RoundedRectangle(cornerRadius: radius + outset)
+        .strokeBorder(UIPictureSpacing.selectionRing, style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+        .padding(-outset)
+        .opacity(focused && !compact ? 1 : 0)
+        .transaction { $0.animation = nil }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
     .contentShape(Rectangle())
     .onTapGesture { context.send(.select(cameraID: camera.id)) }
     .onHover { hovering = $0 }
@@ -124,7 +142,8 @@ struct UICameraPictureView: View {
     // Only Full Keyboard Access focuses a picture: a click or window activation doesn't, so it
     // can't silently move the target of ⌘R. Focus reveals the controls and never selects.
     .focusable(!compact, interactions: .activate)
-    // The selection ring is the focus ring (D7); the system ring would draw a second one.
+    // The picture draws its own focus ring, apart from selection (above): the system's would sit
+    // on the tally ring.
     .focusEffectDisabled()
     .focused($focused)
     .onKeyPress(.space) { context.send(.select(cameraID: camera.id)); return .handled }
@@ -230,19 +249,20 @@ struct UICameraPictureView: View {
   // MARK: Overlays
 
   private var overlays: some View {
-    VStack(spacing: 6) {
+    let placement = toolPlacement
+    return VStack(spacing: 6) {
       HStack(alignment: .center, spacing: 6) {
         if !isClean {
           identity
         }
         Spacer(minLength: 4)
-        if !(narrow && hovering) { tools }
+        if !placement.ownRow { tools(placement) }
       }
       // Too narrow for the bar beside the name: on hover it takes its own row, right aligned.
-      if narrow && hovering {
+      if placement.ownRow {
         HStack {
           Spacer(minLength: 0)
-          tools
+          tools(placement)
         }
       }
       Spacer(minLength: 0)
@@ -302,11 +322,11 @@ struct UICameraPictureView: View {
     }
   }
 
-  /// The tools button and enabled tools at rest; the full bar on hover. Clean View shows
-  /// none at rest.
-  @ViewBuilder private var tools: some View {
-    if !isClean || hovering {
-      UIMonitorToolButtons(camera: camera, context: context, expanded: hovering)
+  /// The tools button and enabled tools at rest; the full bar on hover and while one of its
+  /// popovers is open. Clean View shows none at rest.
+  @ViewBuilder private func tools(_ placement: UIMonitorToolButtons.Placement) -> some View {
+    if placement.shown {
+      UIMonitorToolButtons(camera: camera, context: context, openPanel: $toolPanel, expanded: placement.expanded)
     }
   }
 
@@ -850,8 +870,11 @@ struct UIChannelStripView: View {
       .buttonStyle(.plain).font(font).foregroundStyle(short ? .primary : problem.level.text)
       .help("Show \(camera.name)'s problems")
       .popover(isPresented: $problemsOpen, arrowEdge: .bottom) {
-        UIProblemList(problems: context.presentation.problems.filter { $0.cameraID == camera.id }, context: context)
-          .padding(12).frame(width: 340, alignment: .leading)
+        // Its countdowns ("Take ends in 40 s") and clocks tick while it's open.
+        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(strip problems)") { _, presentation in
+          UIProblemList(problems: presentation.problems.filter { $0.cameraID == camera.id }, context: context)
+        }
+        .padding(12).frame(width: 340, alignment: .leading)
       }
     } else {
       Text(short ? problem.short : problem.text).font(font).foregroundStyle(short ? .primary : problem.level.text)
@@ -866,7 +889,7 @@ struct UIChannelStripView: View {
       chevron
       ForEach(feedBrands) { UIFeedBrandMark(descriptor: $0) }
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
-        .help("\(camera.name) · \(camera.inputName)")
+        .help("\(camera.name), from \(camera.inputName)")
       UIFeedSettingsMenu(camera: camera, snapshot: snapshot, controlStore: context.cameraControls,
         viewFactories: context.controlViewFactories, openHardware: { context.send(.openHardware(itemID: $0)) })
       Spacer(minLength: 4)

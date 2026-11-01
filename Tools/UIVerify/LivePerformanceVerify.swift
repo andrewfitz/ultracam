@@ -405,6 +405,17 @@ struct LivePerformanceSample {
     }
     // Opening the inspector builds its form, once: the longest pass, 50–120 ms unoptimized.
     verifier.check("\(name), \(step): no run loop stall past 250 ms", value.longest < 250, value.summary)
+    statusBarBuildsOneLiveSession(value, step, name: name, verifier: verifier)
+  }
+
+  /// The status bar brings the session up to date once per evaluation of the bar (plus its own
+  /// refresh), not once per density it measures: each hidden copy wrapped its segments in its own
+  /// live session, so a statistics tick built the presentation (problems and all) 12 times.
+  static func statusBarBuildsOneLiveSession(_ value: LivePerformanceSample, _ step: String, name: String, verifier: Verifier) {
+    let bar = value.rate("UIStatusBarView") * value.seconds
+    let live = value.rate("UILiveSession(status)") * value.seconds
+    verifier.check("\(name), \(step): the status bar builds one live session, not one per measured copy",
+      live <= bar + 2, String(format: "%.0f live sessions for %.0f bars", live, bar))
   }
 }
 

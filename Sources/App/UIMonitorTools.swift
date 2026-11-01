@@ -32,6 +32,9 @@ enum UIMonitorPanel: Hashable {
 /// the brightest thing on the picture, and one click turns it off. On hover: the full bar of
 /// split buttons, the icon toggling the tool and the chevron opening its settings, enabled
 /// tools filled white. Settings are remembered per camera.
+///
+/// The open popover belongs to the picture (`panel`), not to this bar: opening one moves the
+/// pointer off the picture, and the picture keeps this bar, in the same place, while it's open.
 struct UIMonitorToolButtons: View {
   let targetID: String
   let name: String
@@ -40,18 +43,36 @@ struct UIMonitorToolButtons: View {
   let isProgram: Bool
   let toggle: @MainActor (UIMonitorTool) -> Void
   let monitor: any UIMonitorSettingsProviding
+  /// The popover open from this bar, owned by the picture.
+  @Binding var openPanel: UIMonitorPanel?
   /// The pointer is over the picture: the full bar.
   var expanded = false
 
   /// A picture narrower than this can't hold the bar beside its name, so the bar takes its
   /// own row under it, right aligned.
   nonisolated static let ownRowBelow: CGFloat = 560
-  @State private var openPanel: UIMonitorPanel?
-  /// The popover opened from the collapsed menu's Settings items.
-  @State private var menuPanel: UIMonitorPanel?
+
+  /// Where a picture puts its tools. The full bar shows on hover and while one of its popovers
+  /// is open, and keeps its row until that closes: the popover hangs from a chevron in it, so
+  /// moving or removing the bar would close it under the pointer on its way there.
+  struct Placement: Equatable {
+    /// The tools are on the picture at all (Clean View hides them at rest).
+    var shown: Bool
+    /// The full bar, not the rest-state glyphs.
+    var expanded: Bool
+    /// A row of their own under the name.
+    var ownRow: Bool
+
+    init(hovering: Bool, panelOpen: Bool, narrow: Bool, clean: Bool) {
+      expanded = hovering || panelOpen
+      shown = !clean || expanded
+      ownRow = narrow && expanded
+    }
+  }
 
   /// A camera's tools; toggles go through the interface's actions.
-  init(camera: UICameraPresentation, context: UIContext, expanded: Bool = false) {
+  init(camera: UICameraPresentation, context: UIContext, openPanel: Binding<UIMonitorPanel?>, expanded: Bool = false) {
+    _openPanel = openPanel
     self.expanded = expanded
     targetID = camera.id
     name = camera.name
@@ -65,7 +86,9 @@ struct UIMonitorToolButtons: View {
 
   /// Any monitor target, for example "program".
   init(targetID: String, name: String, activeTools: [UIMonitorTool], isProgram: Bool,
-    toggle: @escaping @MainActor (UIMonitorTool) -> Void, monitor: any UIMonitorSettingsProviding, expanded: Bool = false) {
+    toggle: @escaping @MainActor (UIMonitorTool) -> Void, monitor: any UIMonitorSettingsProviding,
+    openPanel: Binding<UIMonitorPanel?>, expanded: Bool = false) {
+    _openPanel = openPanel
     self.expanded = expanded
     self.targetID = targetID
     self.name = name
@@ -89,7 +112,7 @@ struct UIMonitorToolButtons: View {
   }
 
   var body: some View {
-    // A popover open from the bar keeps the bar, so it doesn't collapse under its own popover.
+    // An open popover keeps the bar it hangs from, whatever the pointer does.
     if expanded || openPanel != nil { bar } else { rest }
   }
 
@@ -126,11 +149,11 @@ struct UIMonitorToolButtons: View {
       }
       Toggle(UIMonitorPanel.clipIndicators.title, isOn: Binding(get: { clipOn }, set: { _ in toggleClip() }))
       Divider()
-      // A menu can't hold the settings, so these open the same popover the
-      // bar's chevrons do, from this button.
+      // A menu can't hold the settings, so these open the same popover the bar's chevrons
+      // do: the full bar comes up with it, from its own chevron.
       Menu("Settings") {
         ForEach(Self.panels, id: \.self) { panel in
-          Button("\(panel.title)\u{2026}") { menuPanel = panel }
+          Button("\(panel.title)\u{2026}") { openPanel = panel }
         }
       }
     } label: {
@@ -146,10 +169,6 @@ struct UIMonitorToolButtons: View {
     .fixedSize()
     .help(activeTitles.isEmpty ? "Monitor tools" : "Monitor tools: " + activeTitles.joined(separator: ", "))
     .accessibilityLabel("Monitor tools for \(name)")
-    .popover(isPresented: Binding(get: { menuPanel != nil }, set: { if !$0 { menuPanel = nil } }),
-      arrowEdge: .bottom) {
-      if let menuPanel { settings(menuPanel) }
-    }
   }
 
   /// Every popover of the bar, in its order.
@@ -292,22 +311,21 @@ struct UIMonitorToolSettingsView: View {
 
   /// What the popover's header names beside the camera: the signal the tool reads.
   private var subtitle: String {
-    Self.subtitle(panel, cameraName: cameraName, isProgram: isProgram, preferences: preferences)
+    Self.subtitle(panel, isProgram: isProgram, preferences: preferences)
   }
 
-  /// The header's camera and the signal `panel` measures. Log false color reads
-  /// the source; six band and custom bands, clip indicators and focus peaking
-  /// read their own stage, as does each zebra set that is on; guides and the
+  /// The signal `panel` measures, which the header shows after the camera, spaced (J 22: no
+  /// " · " join). Log false color reads the source; six band and custom bands, clip indicators
+  /// and focus peaking read their own stage, as does each zebra set that is on; guides and the
   /// picture follow the picture.
   /// Off, false color names the signal its toggle would read.
-  static func subtitle(_ panel: UIMonitorPanel, cameraName: String, isProgram: Bool,
-    preferences: MonitorFeedPreferences) -> String {
+  static func subtitle(_ panel: UIMonitorPanel, isProgram: Bool, preferences: MonitorFeedPreferences) -> String {
     let state = preferences.state
-    func on(_ stage: SignalStage) -> String { "\(cameraName) · \(UIMonitorToolText.stage(stage))" }
-    func analysis(_ stage: SignalStage) -> String { "\(cameraName) · analysis on \(UIMonitorToolText.stage(stage))" }
+    func on(_ stage: SignalStage) -> String { UIMonitorToolText.stage(stage) }
+    func analysis(_ stage: SignalStage) -> String { "analysis on \(UIMonitorToolText.stage(stage))" }
     switch panel {
-    case .tool(.scopes): return "\(cameraName) · below the picture"
-    case _ where isProgram: return "\(cameraName) · Program Output"
+    case .tool(.scopes): return "below the picture"
+    case _ where isProgram: return "Program Output"
     case .tool(.falseColor):
       let mode = state.falseColor.mode == .off
         ? UIFalseColorChoices.suggestedMode(profile: preferences.signal.logProfileID) : state.falseColor.mode
@@ -319,7 +337,7 @@ struct UIMonitorToolSettingsView: View {
       var stages: [SignalStage] = []
       for zebra in state.zebras where zebra.enabled && !stages.contains(zebra.stage) { stages.append(zebra.stage) }
       if stages.isEmpty { stages = [state.pictureStage] }
-      return "\(cameraName) · " + stages.map(UIMonitorToolText.stage).joined(separator: " + ")
+      return stages.map(UIMonitorToolText.stage).joined(separator: " + ")
     case .tool(.guides), .picture: return on(state.pictureStage)
     }
   }
@@ -346,7 +364,13 @@ struct UIMonitorToolSettingsView: View {
           .accessibilityHidden(true)
         VStack(alignment: .leading, spacing: 1) {
           Text(panel.title).font(.headline).accessibilityAddTraits(.isHeader)
-          Text(subtitle).font(.uiMeta).foregroundStyle(.secondary).lineLimit(1)
+          HStack(spacing: 6) {
+            Text(cameraName).foregroundStyle(.primary)
+            Text(subtitle).foregroundStyle(.secondary)
+          }
+          .font(.uiMeta).lineLimit(1)
+          .accessibilityElement(children: .ignore)
+          .accessibilityLabel("\(cameraName), \(subtitle)")
         }
         Spacer(minLength: 12)
         if let toggle = headerSwitch {

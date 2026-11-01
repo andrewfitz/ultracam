@@ -40,18 +40,22 @@ extension UISessionBridge {
     // The running take's audio so far, then the finished take's (cleared when the next starts).
     rec.audio = model.takeAudioSoFar(id) ?? model.takeAudio[id]
     rec.savedDuration = rec.savedURL != nil ? stats?.elapsed : nil
-    let folder = model.recordingModel.outputFolder(for: id)
-    rec.secondsLeft = folder.flatMap { url in drives.first { $0.name == UIRecordingLibrary.volumeName(for: url) }?.secondsLeft }
+    // The drive read found each folder's volume (inside its security scope); the path can't say.
+    let folder = model.recordingModel.outputFolder(for: id)?.path
+    let drive = folder.flatMap { path in drives.first { $0.folders.contains(path) } }
+    rec.volumeID = drive?.id
+    rec.secondsLeft = drive?.secondsLeft
   }
 
-  /// Free space and recording time left on every camera's drive, read at most every two seconds.
+  /// Free space and recording time left on every camera's drive, read at most every two seconds,
+  /// each judged low by Settings › Alerts' Low Space.
   func currentDrives() -> [UIDrive] {
     // Free space isn't observable: views follow a drive becoming low or full (`UIDriveLevels`),
     // and the views that show the figures re-read them on a timer.
     _ = UIDriveLevels.shared.revision
     let recording = model.recordingModel
     let folders = model.feedDescriptors.map { recording.outputFolder(for: $0.id) }
-    return Self.cachedDrives(for: folders) {
+    return Self.cachedDrives(for: folders, lowSeconds: interface.lowSpaceSeconds) {
       var rolling: [(URL, Double)] = []
       var assigned: [(URL, Double)] = []
       for descriptor in model.feedDescriptors {
@@ -222,14 +226,35 @@ struct UILiveCameraAccessibilityLabel: ViewModifier {
 
 /// Shows session values that run (the takes' clocks, the drives' free space, the shot clock)
 /// from a session and presentation brought up to date in this view's body. `refresh` also
-/// re-reads them on a timer, for free space that changes while nothing records.
+/// re-reads them on a timer, for free space that changes while nothing records. A content
+/// that takes the session alone builds no presentation (with `problems()`, the costly part).
 struct UILiveSession<Content: View>: View {
   let context: UIContext
   var refresh: TimeInterval? = nil
   /// The name the offscreen performance check counts this view's evaluations under.
   var probe = "UILiveSession"
-  @ViewBuilder let content: (UISessionSnapshot, UISessionPresentation) -> Content
+  private let presents: Bool
+  private let content: (UISessionSnapshot, UISessionPresentation?) -> Content
   @Environment(\.uiLive) private var live
+
+  init(context: UIContext, refresh: TimeInterval? = nil, probe: String = "UILiveSession",
+    @ViewBuilder content: @escaping (UISessionSnapshot, UISessionPresentation) -> Content) {
+    self.context = context
+    self.refresh = refresh
+    self.probe = probe
+    presents = true
+    self.content = { session, presentation in content(session, presentation ?? UIPresentationBuilder.session(session)) }
+  }
+
+  /// The session alone: nothing here builds a presentation.
+  init(context: UIContext, refresh: TimeInterval? = nil, probe: String = "UILiveSession",
+    @ViewBuilder content: @escaping (UISessionSnapshot) -> Content) {
+    self.context = context
+    self.refresh = refresh
+    self.probe = probe
+    presents = false
+    self.content = { session, _ in content(session) }
+  }
 
   var body: some View {
     let _ = UIRenderProbe.count(probe)
@@ -246,10 +271,10 @@ struct UILiveSession<Content: View>: View {
 
   @ViewBuilder private var current: some View {
     if live == nil {
-      content(context.session, context.presentation)
+      content(context.session, presents ? context.presentation : nil)
     } else {
       let session = context.liveSession(live, follows: .take)
-      content(session, UIPresentationBuilder.session(session))
+      content(session, presents ? UIPresentationBuilder.session(session) : nil)
     }
   }
 }
@@ -266,24 +291,27 @@ struct UILiveDriveRow: View {
   let context: UIContext
 
   var body: some View {
-    UILiveSession(context: context, refresh: 5, probe: "UILiveSession(drive)") { session, _ in
+    UILiveSession(context: context, refresh: 5, probe: "UILiveSession(drive)") { (session: UISessionSnapshot) in
       UIDriveRow(drive: session.drives.first { $0.id == drive.id } ?? drive, cameras: cameras)
     }
   }
 }
 
-/// Which drives are full or have under 30 minutes left: what the session shows as state
-/// (a warning, the disk-full strip). Bumped only when a drive crosses one of those, so the
-/// window follows that and not the free space itself.
+/// Which drives are full or low (under Settings › Alerts' Low Space): what the session shows as
+/// state (a warning, the disk-full strip, the alert). Bumped only when a drive crosses one of
+/// those, so the window and the alerts follow that and not the free space itself.
 @MainActor @Observable final class UIDriveLevels {
   static let shared = UIDriveLevels()
   private(set) var revision = 0
   @ObservationIgnored private var levels: [String: Int] = [:]
 
+  /// 2 full, 1 low, 0 neither: the drive's own `isFull` and `isLow`, so its Low Space level.
+  nonisolated static func level(_ drive: UIDrive) -> Int {
+    UIPresentationBuilder.isFull(drive) ? 2 : UIPresentationBuilder.isLow(drive) ? 1 : 0
+  }
+
   func update(_ drives: [UIDrive]) {
-    let next = Dictionary(drives.map { drive in
-      (drive.name, UIPresentationBuilder.isFull(drive) ? 2 : (drive.secondsLeft ?? .infinity) < 30 * 60 ? 1 : 0)
-    }, uniquingKeysWith: { first, _ in first })
+    let next = Dictionary(drives.map { ($0.id, Self.level($0)) }, uniquingKeysWith: { first, _ in first })
     guard next != levels else { return }
     levels = next
     // Read while a view's body builds its snapshot: tell its observers after this update.

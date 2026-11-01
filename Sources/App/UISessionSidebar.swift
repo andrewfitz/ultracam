@@ -61,7 +61,7 @@ struct UISessionSidebarViewContent: View {
   private var camerasSection: some View {
     Section {
       ForEach(presentation.cameras) { camera in
-        UISidebarCameraRow(camera: camera, snapshot: context.snapshot(camera.id))
+        UISidebarCameraRow(camera: camera, snapshot: context.snapshot(camera.id), context: context)
           .tag(camera.id)
           .accessibilityHint("Shows \(camera.name) in the inspector")
       }
@@ -232,6 +232,7 @@ extension View {
 struct UISidebarCameraRow: View {
   let camera: UICameraPresentation
   let snapshot: UICameraSnapshot?
+  let context: UIContext
 
   var body: some View {
     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -260,7 +261,8 @@ struct UISidebarCameraRow: View {
       }
     }
     .accessibilityElement(children: .combine)
-    .accessibilityLabel(camera.accessibilityLabel)
+    // It names the take's clock, which ticks without the row: brought up to date in the modifier.
+    .modifier(UILiveCameraAccessibilityLabel(camera: camera, context: context))
   }
 }
 

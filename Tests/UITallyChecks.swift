@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import XCTest
 
 /// README section 4's tally: red needs frames arriving, not just a client, and the
@@ -105,6 +106,60 @@ import XCTest
     programUnknown.programClientUnknown = true
     XCTAssertEqual(programUnknown.programClientLine, "Use unknown")
     XCTAssertEqual(UIPresentationBuilder.session(programUnknown).outputSummary, "Ultracam cameras: use unknown")
+  }
+
+  /// The Program picture's tally is Program's: a client of the on-air camera's own device
+  /// isn't watching Program, so it's never red "ISO" there (it was the camera's own tally).
+  @MainActor func testProgramTallyIsProgramsNeverISO() {
+    let iso = program([camera(1, client: true, sink: true), camera(2)], client: false)
+    XCTAssertEqual(tally(iso), .iso, "The camera's own picture says ISO")
+    XCTAssertEqual(UIPresentationBuilder.programTally(iso), .program)
+    XCTAssertEqual(UIPresentationBuilder.session(iso).programTally, .program)
+    XCTAssertEqual(UIPresentationBuilder.programTally(program([camera(1), camera(2)])), .onAir)
+    XCTAssertEqual(UIPresentationBuilder.programTally(program([camera(1, signal: .noSignal), camera(2)])), .noPicture)
+    let waiting = program([camera(1, signal: .noSignal, client: true, sink: true), camera(2)])
+    XCTAssertEqual(UIPresentationBuilder.programTally(waiting), .noPicture)
+    var none = program([camera(1), camera(2)])
+    none.onAirID = nil
+    XCTAssertEqual(UIPresentationBuilder.programTally(none), .none)
+    XCTAssertEqual(UIProgramPictureView.accessibilityLabel(onAir: "Camera 1", tally: .program), "Program, Camera 1 in Program",
+      "Not \"selected\": selection isn't Program's")
+    XCTAssertEqual(UIProgramPictureView.accessibilityLabel(onAir: "Camera 1", tally: .noPicture), "Program, Camera 1, no picture")
+    XCTAssertEqual(UIProgramPictureView.accessibilityLabel(onAir: "Camera 1", tally: .onAir), "Program, Camera 1 on air")
+  }
+
+  /// J 13: the toolbar's dot is red only while frames reach Program's clients, not for being on Program.
+  @MainActor func testCutButtonDotIsRedOnlyOnAir() {
+    func dot(_ session: UISessionSnapshot, _ index: Int = 0) -> Color? {
+      UICutButtonLabel.dot(UIPresentationBuilder.session(session).cutButtons[index])
+    }
+    XCTAssertEqual(dot(program([camera(1), camera(2)])), .red)
+    XCTAssertEqual(dot(program([camera(1), camera(2)], client: false)), .secondary, "On Program, nobody watching: gray")
+    XCTAssertEqual(dot(program([camera(1, client: true, sink: true), camera(2)], client: false)), .secondary,
+      "An ISO client isn't Program's")
+    XCTAssertEqual(dot(program([camera(1, signal: .noSignal), camera(2)])), .orange, "A meeting waiting on a picture")
+    XCTAssertNil(dot(program([camera(1), camera(2)]), 1))
+    XCTAssertEqual(dot(program([camera(1), camera(2)], pending: "camera-2"), 1), .green)
+    XCTAssertEqual(UIToolbarCutGroup.programWords(UIPresentationBuilder.session(program([camera(1), camera(2)], client: false))
+      .cutButtons[0]), "on Program")
+  }
+
+  /// D7: the menu bar's icon is about the camera a meeting sees, never the window's selection.
+  func testMenuBarIconFollowsTheCameraAMeetingSees() {
+    var bypassed = camera(1)
+    bypassed.processing = false
+    var session = program([bypassed, camera(2)])
+    session.defaultFolderPath = "/Volumes/8TB/Takes"
+    XCTAssertEqual(UIPresentationBuilder.problems(session).map(\.id), [])
+    session.selectedID = "camera-2"
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .bypass, "Program's camera has its effects off")
+    session.selectedID = "camera-1"
+    session.onAirID = "camera-2"
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(session), .live, "Selecting the bypassed camera changes nothing")
+    var iso = separate([camera(1), { var c = camera(2, client: true, sink: true); c.processing = false; return c }()])
+    iso.selectedID = "camera-1"
+    iso.defaultFolderPath = "/Volumes/8TB/Takes"
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(iso), .bypass, "The meeting's camera, not the selected one")
   }
 
   func testPreviewPrefersOnAirThenISO() {

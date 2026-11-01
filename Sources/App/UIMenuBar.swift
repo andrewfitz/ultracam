@@ -410,11 +410,12 @@ final class UIMenuCommandBox: NSObject {
     let formatItem = row("Format", [], symbol: UISymbol.format, badge: session.codec.title, target: target)
     formatItem.submenu = format
     items.append(formatItem)
-    // All drives share one row: the one that runs out first.
-    let worst = session.drives.filter { $0.secondsLeft != nil }.min { ($0.secondsLeft ?? 0) < ($1.secondsLeft ?? 0) }
-    let low = worst.map { UIPresentationBuilder.isLow($0) } ?? false
+    // All drives share one row: the one that runs out first, a full one before any.
+    let worst = UIPresentationBuilder.worstDrive(session.drives)
+    let low = worst.map { UIPresentationBuilder.isLow($0) || UIPresentationBuilder.isFull($0) } ?? false
     items.append(row("Time left", [], enabled: worst != nil, symbol: UISymbol.drive(low: low), tint: low ? .systemOrange : nil,
-      badge: worst.map { "\($0.name) \(UIFormat.duration($0.secondsLeft ?? 0))" } ?? "—", target: target))
+      badge: worst.map { UIPresentationBuilder.isFull($0) ? "\($0.name) full" : "\($0.name) \(UIFormat.duration($0.secondsLeft ?? 0))" } ?? "—",
+      target: target))
 
     if !presentation.cameras.isEmpty {
       items.append(.separator())
@@ -536,9 +537,10 @@ struct UIMenuPreviewContent: View {
   /// The card's width when the menu's rows are narrower.
   static let minimumWidth: CGFloat = 340
 
-  private var waiting: Bool {
-    !presentation.camerasRunning && session.cameras.first { $0.id == session.selectedID }?.automaticStart == true
-  }
+  /// Nothing runs and a camera starts with meeting apps: the menu's own "waiting" (D7: never the selection).
+  private var waiting: Bool { !presentation.camerasRunning && session.cameras.contains(where: \.automaticStart) }
+  /// The cameras that start with meeting apps: Show Live Preview shows one of them while waiting.
+  private var autoStarted: Set<String> { Set(session.cameras.filter(\.automaticStart).map(\.id)) }
   private var recordingCameras: [UICameraSnapshot] {
     session.cameras.filter { $0.recording.status == .recording || $0.recording.status == .paused }
   }
@@ -554,7 +556,7 @@ struct UIMenuPreviewContent: View {
           HStack(spacing: 6) {
             ForEach(presentation.cameras.prefix(2)) { camera in miniPicture(camera) }
           }
-        } else if let shown = presentation.previewCamera {
+        } else if let shown = waiting ? presentation.cameras.first(where: { autoStarted.contains($0.id) }) : presentation.previewCamera {
           cameraPicture(shown)
         }
       }
@@ -621,9 +623,7 @@ struct UIMenuPreviewContent: View {
       .overlay(alignment: .bottomTrailing) { recPill(for: recordingCameras).padding(7) }
   }
 
-  private var programTally: UITally {
-    session.cameras.first { $0.id == session.onAirID }.map { UIPresentationBuilder.tally(for: $0, in: session) } ?? .none
-  }
+  private var programTally: UITally { presentation.programTally }
 
   private func cameraPicture(_ camera: UICameraPresentation) -> some View {
     UIColumnPictureLayout { pictures.picture(cameraID: camera.id, compact: true) }

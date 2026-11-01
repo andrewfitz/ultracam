@@ -21,12 +21,20 @@ struct UIStatusBarView: View {
     // readout, then without it, then shorter pieces with and without, and finally only the
     // problem, Program and recording. The bar sits in the detail column, so its width
     // depends on the side columns, not just the window.
-    UIFirstFitting {
-      bar(.full, readout: true)
-      bar(.full, readout: false)
-      bar(.compact, readout: true)
-      bar(.compact, readout: false)
-      bar(.essential, readout: false)
+    // The recording segment's clock and the drives' free space (in it and in a low-space
+    // warning) follow the takes here, not in the bar: one session brought up to date for the
+    // bar and every density it measures. A lost signal's clock ticks; free space only needs a
+    // look now and then.
+    UILiveSession(context: context, refresh: context.session.cameras.contains { $0.signalLostFor != nil } ? 1 : 5,
+      probe: "UILiveSession(status)") { _, presentation in
+      let segments = presentation.statusSegments
+      UIFirstFitting {
+        bar(.full, readout: true, segments: segments)
+        bar(.full, readout: false, segments: segments)
+        bar(.compact, readout: true, segments: segments)
+        bar(.compact, readout: false, segments: segments)
+        bar(.essential, readout: false, segments: segments)
+      }
     }
     .padding(.horizontal, 8)
     .frame(maxWidth: .infinity)
@@ -45,9 +53,9 @@ struct UIStatusBarView: View {
     }
   }
 
-  private func bar(_ density: Density, readout: Bool) -> some View {
+  private func bar(_ density: Density, readout: Bool, segments: [UIStatusSegment]) -> some View {
     HStack(spacing: 2) {
-      segmentsRow(density)
+      segmentsRow(density, segments: segments)
         .layoutPriority(1)
       Spacer(minLength: 8)
       if readout {
@@ -56,10 +64,10 @@ struct UIStatusBarView: View {
     }
   }
 
-  private func segmentsRow(_ density: Density) -> some View {
+  private func segmentsRow(_ density: Density, segments: [UIStatusSegment]) -> some View {
     HStack(spacing: 4) {
-      ForEach(visibleSegments(density)) { segment in
-        liveSegmentButton(segment, density: density)
+      ForEach(visibleSegments(density, segments: segments)) { segment in
+        segmentButton(segment, density: density)
           .layoutPriority(priority(segment.kind))
       }
     }
@@ -75,24 +83,9 @@ struct UIStatusBarView: View {
     }
   }
 
-  private func visibleSegments(_ density: Density) -> [UIStatusSegment] {
-    let segments = context.presentation.statusSegments
+  private func visibleSegments(_ density: Density, segments: [UIStatusSegment]) -> [UIStatusSegment] {
     guard density == .essential else { return segments }
     return segments.filter { $0.kind == .warning || $0.kind == .recording || $0.kind == .program || $0.kind == .output }
-  }
-
-  /// The recording segment's clock and the drives' free space (in it and in a low-space
-  /// warning) follow the takes here, not in the bar.
-  @ViewBuilder private func liveSegmentButton(_ segment: UIStatusSegment, density: Density) -> some View {
-    if segment.kind == .recording || segment.kind == .warning {
-      // A lost signal's clock ticks; free space only needs a look now and then.
-      UILiveSession(context: context, refresh: context.session.cameras.contains { $0.signalLostFor != nil } ? 1 : 5,
-        probe: "UILiveSession(status)") { _, presentation in
-        segmentButton(presentation.statusSegments.first { $0.kind == segment.kind } ?? segment, density: density)
-      }
-    } else {
-      segmentButton(segment, density: density)
-    }
   }
 
   @ViewBuilder private func segmentButton(_ segment: UIStatusSegment, density: Density) -> some View {
@@ -128,8 +121,26 @@ struct UIStatusBarView: View {
     .help(segment.text)
     .accessibilityLabel(segment.text)
     .accessibilityHint("Shows details")
-    .popover(isPresented: Binding(get: { open == segment.kind }, set: { if !$0 { open = nil } }), arrowEdge: .top) {
+    .modifier(UIMeasuredPopover(isPresented: Binding(get: { open == segment.kind }, set: { if !$0 { open = nil } }),
+      arrowEdge: .top) {
       UIStatusPopover(kind: segment.kind, segment: segment, context: context)
+    })
+  }
+}
+
+/// A popover on a control that `UIFirstFitting` also lays out hidden, to measure it: only the
+/// copy on screen presents it, not every measured copy bound to the same state.
+struct UIMeasuredPopover<Popover: View>: ViewModifier {
+  @Binding var isPresented: Bool
+  var arrowEdge: Edge = .top
+  @ViewBuilder var popover: () -> Popover
+  @Environment(\.uiMeasuring) private var measuring
+
+  func body(content: Content) -> some View {
+    if measuring {
+      content
+    } else {
+      content.popover(isPresented: $isPresented, arrowEdge: arrowEdge, content: popover)
     }
   }
 }
@@ -221,7 +232,7 @@ struct UIResourceReadout: View {
     .help("Total Ultracam process CPU across all threads (100% is one core). GPU is the combined busy time of Ultracam's Metal video processing and copy queues; it excludes the hardware media encoder and the system display compositor.")
     .accessibilityLabel("Ultracam resources")
     .accessibilityValue("CPU \(cpu), GPU \(String(format: "%.1f%%", usage.gpuPercent)), memory \(memory)")
-    .popover(isPresented: $open, arrowEdge: .top) {
+    .modifier(UIMeasuredPopover(isPresented: $open, arrowEdge: .top) {
       VStack(alignment: .leading, spacing: 10) {
         Text("Ultracam total").font(.uiTitle)
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
@@ -241,7 +252,7 @@ struct UIResourceReadout: View {
       }
       .padding(12)
       .frame(width: 320)
-    }
+    })
   }
 
   private var usage: AppResourceUsage { resources.usage }
@@ -331,10 +342,7 @@ struct UIStatusPopover: View {
           Text(auto ? "Auto" : "Manual").font(.uiMeta).foregroundStyle(.secondary)
         }
       }
-      if holding, let started = session.shot.anchor, Date().timeIntervalSince(started) >= session.shot.softMaximum {
-        Label("Past the soft maximum. Hold stays on until you turn it off.", systemImage: UISymbol.information)
-          .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-      }
+      if holding { UIPastSoftMaximumNote(shot: session.shot) }
       if session.programFormatMismatch {
         Label {
           VStack(alignment: .leading, spacing: 2) {
@@ -493,6 +501,20 @@ struct UIStatusPopover: View {
       }
       Text("Not sent through the Ultracam cameras.")
         .font(.uiMeta).foregroundStyle(.secondary)
+    }
+  }
+}
+
+/// Under Hold, once the shot passes the soft maximum: it appears as the shot clock above it
+/// ticks, on the same shared ticker (which that clock keeps running while it's shown).
+private struct UIPastSoftMaximumNote: View {
+  let shot: UIShotTiming
+  @State private var ticker = UISecondTicker.shared
+
+  var body: some View {
+    if let started = shot.anchor, ticker.now.timeIntervalSince(started) >= shot.softMaximum {
+      Label("Past the soft maximum. Hold stays on until you turn it off.", systemImage: UISymbol.information)
+        .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
   }
 }

@@ -132,12 +132,12 @@ import SwiftUI
     let tools = UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(camera).contains($0) }
     screens.append(Screen(name: "monitor-tool-bar",
       view: AnyView(UIMonitorToolButtons(targetID: cameraID, name: name, activeTools: tools, isProgram: false,
-        toggle: { _ in }, monitor: provider).padding(8).background(Color.black)),
+        toggle: { _ in }, monitor: provider, openPanel: .constant(nil)).padding(8).background(Color.black)),
       size: CGSize(width: 360, height: 48)))
     // A narrow picture's bar: one menu button (its Settings items open the popovers).
     screens.append(Screen(name: "monitor-tool-bar-collapsed",
       view: AnyView(UIMonitorToolButtons(targetID: cameraID, name: name, activeTools: tools, isProgram: false,
-        toggle: { _ in }, monitor: provider).frame(width: 120).padding(8).background(Color.black)),
+        toggle: { _ in }, monitor: provider, openPanel: .constant(nil)).frame(width: 120).padding(8).background(Color.black)),
       size: CGSize(width: 136, height: 48)))
     return screens
   }

@@ -106,7 +106,7 @@ import XCTest
     XCTAssertEqual(onAir.cameras[1].outputLine, "Next", "The pending camera reads \"Next\" everywhere")
     XCTAssertEqual(onAir.cameras[2].outputLine, "Ultracam · Camera 3, not in use",
       "Every camera is its own published device too")
-    XCTAssertEqual(UIPresentationBuilder.session(program(cams, inUse: false)).cameras[0].outputLine, "In Program · no viewer yet")
+    XCTAssertEqual(UIPresentationBuilder.session(program(cams, inUse: false)).cameras[0].outputLine, "In Program, no viewer yet")
   }
 
   // MARK: Tile states
@@ -722,7 +722,12 @@ import XCTest
     session.selectedID = "camera-1"
     XCTAssertEqual(UIPresentationBuilder.session(session).previewCamera?.id, "camera-2")
     session.cameras[1].inUse = false
-    XCTAssertEqual(UIPresentationBuilder.session(session).previewCamera?.id, "camera-1", "Nothing on air: the selected camera")
+    XCTAssertEqual(UIPresentationBuilder.session(session).previewCamera?.id, "camera-1", "Nothing on air: the first running camera")
+    // Never the window's selection (D7).
+    session.selectedID = "camera-2"
+    XCTAssertEqual(UIPresentationBuilder.session(session).previewCamera?.id, "camera-1", "The selection doesn't choose it")
+    session.cameras[0].running = false
+    XCTAssertEqual(UIPresentationBuilder.session(session).previewCamera?.id, "camera-2", "The first camera that runs")
   }
 
   func testConfirmationTitlesAndButtons() {
@@ -804,11 +809,13 @@ import XCTest
     var session = separate([failed, camera(2)])
     session.drives = [roomy, UIDrive(name: "Archive", availableBytes: 0, totalBytes: 4_000_000_000_000, secondsLeft: nil)]
     XCTAssertEqual(presented(session).recordDetail, "Free space on Archive or choose another folder")
-    // A folder on the startup disk: the only drive is that disk.
+    // A folder on the startup disk: the drive read names its volume, which the path doesn't.
     var home = camera(1, folder: "/Users/andrew/Movies")
     home.recording.error = "No space left on device"
+    home.recording.volumeID = "startup"
     var startup = separate([home])
-    startup.drives = [UIDrive(name: "Macintosh HD", availableBytes: 0, totalBytes: 1_000_000_000_000, secondsLeft: nil)]
+    startup.drives = [UIDrive(name: "Macintosh HD", availableBytes: 0, totalBytes: 1_000_000_000_000, secondsLeft: nil,
+      volumeID: "startup")]
     XCTAssertEqual(presented(startup).recordDetail, "Free space on Macintosh HD or choose another folder")
     // Unknown drive: generic wording, still a next step.
     startup.drives = []
@@ -933,20 +940,20 @@ import XCTest
     let inputs: [(id: String, name: String)] = [("decklink:00000000a1850ab8", "UltraStudio Mini Recorder 12G"),
       ("decklink:00000000a29246b8", "UltraStudio Mini Recorder 12G"), ("decklink:00000000c0ffee01", "UltraStudio 4K Mini")]
     XCTAssertEqual(UIInputLabels.suffix("decklink:00000000a1850ab8"), "0AB8")
-    XCTAssertEqual(UIInputLabels.label(id: inputs[0].id, name: inputs[0].name, among: inputs), "UltraStudio Mini Recorder 12G · 0AB8")
-    XCTAssertEqual(UIInputLabels.label(id: inputs[1].id, name: inputs[1].name, among: inputs), "UltraStudio Mini Recorder 12G · 46B8")
+    XCTAssertEqual(UIInputLabels.label(id: inputs[0].id, name: inputs[0].name, among: inputs), "UltraStudio Mini Recorder 12G (0AB8)")
+    XCTAssertEqual(UIInputLabels.label(id: inputs[1].id, name: inputs[1].name, among: inputs), "UltraStudio Mini Recorder 12G (46B8)")
     XCTAssertEqual(UIInputLabels.label(id: inputs[2].id, name: inputs[2].name, among: inputs), "UltraStudio 4K Mini",
       "A name no other input has stays as the driver gives it")
     XCTAssertEqual(UIInputLabels.label(id: inputs[0].id, name: inputs[0].name, among: [inputs[0]]), "UltraStudio Mini Recorder 12G",
       "With its twin unplugged there is nothing to tell apart")
-    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: inputs[1].name), "UltraStudio Mini Recorder 12G · 46B8")
-    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: nil), "Input device · 46B8")
+    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: inputs[1].name), "UltraStudio Mini Recorder 12G (46B8)")
+    XCTAssertEqual(UIInputLabels.missingLabel(id: inputs[1].id, lastName: nil), "Input device (46B8)")
   }
 
   func testMissingInputFallbackDoesNotAssumeAVendor() {
     for id in ["vendor:000000000000abcd", "other:000000000000abcd", "legacy:device:name:abcd"] {
-      XCTAssertEqual(UIInputLabels.missingLabel(id: id, lastName: nil), "Input device · ABCD")
-      XCTAssertEqual(UIInputLabels.missingLabel(id: id, lastName: "Saved input"), "Saved input · ABCD")
+      XCTAssertEqual(UIInputLabels.missingLabel(id: id, lastName: nil), "Input device (ABCD)")
+      XCTAssertEqual(UIInputLabels.missingLabel(id: id, lastName: "Saved input"), "Saved input (ABCD)")
     }
   }
 

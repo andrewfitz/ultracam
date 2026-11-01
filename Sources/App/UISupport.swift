@@ -44,8 +44,13 @@ enum UIRecordingLibrary {
     return measuredVideo + pcmMegabits(channels: audioChannels)
   }
 
-  static func volumeName(for url: URL) -> String {
-    (try? url.resourceValues(forKeys: [.volumeNameKey]).volumeName) ?? url.pathComponents.dropFirst().first ?? "Disk"
+  /// What tells a folder's volume apart from every other: its UUID, else its mount point,
+  /// else (unreadable) its name. Names repeat; a second "8TB" mounts at "/Volumes/8TB 1".
+  /// The caller holds the folder's security scope: sandboxed, the read fails without it.
+  static func volume(for url: URL) -> (id: String, name: String) {
+    let values = try? url.resourceValues(forKeys: [.volumeUUIDStringKey, .volumeURLKey, .volumeNameKey])
+    let name = values?.volumeName ?? url.pathComponents.dropFirst().first ?? "Disk"
+    return (values?.volumeUUIDString ?? values?.volume?.path ?? name, name)
   }
 
   /// One entry per destination volume. Time left divides free space by the combined
@@ -64,13 +69,25 @@ enum UIRecordingLibrary {
 
   static func drives(for folders: [URL?], recordingRates: [(URL, Double)], assignedRates: [(URL, Double)] = [],
     fallbackMegabits: Double = displayMegabits(codec: .proRes42210Bit)) -> [UIDrive] {
+    // Each folder's volume, read once inside its security scope: the folders come from
+    // security-scoped bookmarks, and a sandboxed read of a volume needs the grant held.
+    var volumes: [String: (id: String, name: String)] = [:]
+    for case let folder? in folders where volumes[folder.path] == nil {
+      let accessed = folder.startAccessingSecurityScopedResource()
+      volumes[folder.path] = volume(for: folder)
+      if accessed { folder.stopAccessingSecurityScopedResource() }
+    }
+    func volumeID(_ url: URL) -> String? { volumes[url.path]?.id }
     var seen: [String: UIDrive] = [:]
     var order: [String] = []
     for case let folder? in folders {
-      let name = volumeName(for: folder)
-      guard seen[name] == nil else { continue }
-      // The folder comes from a security-scoped bookmark: a sandboxed read of its
-      // volume's capacity needs the grant held, or it fails and the drive read as empty.
+      guard let volume = volumes[folder.path] else { continue }
+      let (id, name) = (volume.id, volume.name)
+      guard seen[id] == nil else {
+        if seen[id]?.folders.contains(folder.path) == false { seen[id]?.folders.append(folder.path) }
+        continue
+      }
+      // Its capacity, too, needs the grant held, or it fails and the drive reads as empty.
       let accessed = folder.startAccessingSecurityScopedResource()
       defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
       var reported: Int64?
@@ -87,13 +104,14 @@ enum UIRecordingLibrary {
       let available = reported ?? 0
       // An unreadable free figure leaves the size unknown too, so the drive isn't shown as full.
       let total = reported == nil ? 0 : Int64(values?.volumeTotalCapacity ?? 0)
-      func sum(_ rates: [(URL, Double)]) -> Double { rates.filter { volumeName(for: $0.0) == name }.map(\.1).reduce(0, +) }
+      func sum(_ rates: [(URL, Double)]) -> Double { rates.filter { volumeID($0.0) == id }.map(\.1).reduce(0, +) }
       let rate = sum(recordingRates)
       let assigned = sum(assignedRates)
       let megabits = rate > 0 ? rate : assigned > 0 ? assigned : fallbackMegabits
       let seconds = available > 0 ? Double(available) * 8 / (megabits * 1_000_000) : nil
-      seen[name] = UIDrive(name: name, availableBytes: available, totalBytes: total, secondsLeft: seconds)
-      order.append(name)
+      seen[id] = UIDrive(name: name, availableBytes: available, totalBytes: total, secondsLeft: seconds, volumeID: id,
+        folders: [folder.path])
+      order.append(id)
     }
     return order.compactMap { seen[$0] }
   }

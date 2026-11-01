@@ -115,6 +115,8 @@ struct UICameraRecording: Sendable, Equatable {
   var savedURL: URL?
   var savedDuration: TimeInterval?
   var folderPath: String?
+  /// The volume `folderPath` is on: its drive's `UIDrive.id`. Nil when no drive read names it.
+  var volumeID: String?
   var folderIsCustom = false
   /// Seconds of recording left on this camera's destination volume, if known.
   var secondsLeft: TimeInterval?
@@ -279,13 +281,20 @@ struct UICutRecord: Sendable, Equatable, Identifiable {
 }
 
 struct UIDrive: Sendable, Equatable, Identifiable {
-  var id: String { name }
+  /// The volume, which its name can't be: two volumes can share one ("8TB" and a mount named "8TB 1").
+  var id: String { volumeID ?? name }
+  /// The volume's display name.
   var name: String
   var availableBytes: Int64
   var totalBytes: Int64
+  /// Nil when unknown, and on a full drive (`isFull`).
   var secondsLeft: TimeInterval?
   /// Less time left than this is low (Settings › Alerts, Low Space).
   var lowSeconds: TimeInterval = UIPresentationBuilder.defaultLowDriveSeconds
+  /// Its volume UUID, else its mount point. Nil for a drive known only by name (fixtures).
+  var volumeID: String? = nil
+  /// The recording folders on it.
+  var folders: [String] = []
 }
 
 struct UITake: Sendable, Equatable, Identifiable {
@@ -549,13 +558,14 @@ enum UIInputLabels {
   }
 
   /// The name, with the ID's last four digits when another input in `inputs` has the same name.
+  /// "Recorder (0AB8)": a plain string, so no " · " join (J 22).
   static func label(id: String, name: String, among inputs: [(id: String, name: String)]) -> String {
-    inputs.contains { $0.id != id && $0.name == name } ? "\(name) · \(suffix(id))" : name
+    inputs.contains { $0.id != id && $0.name == name } ? "\(name) (\(suffix(id)))" : name
   }
 
   /// An assigned input that isn't listed. The last name seen this session when there is one.
   static func missingLabel(id: String, lastName: String?) -> String {
-    "\(lastName ?? "Input device") · \(suffix(id))"
+    "\(lastName ?? "Input device") (\(suffix(id)))"
   }
 
   /// The picker rows for one camera: every listed input, labelled, with the camera that holds it.
@@ -598,11 +608,14 @@ struct UICutButton: Sendable, Equatable, Identifiable {
   var id: String
   var number: Int
   var name: String
+  /// Its camera is on Program. Whether that's on air is `tally`'s to say.
   var onAir: Bool
   var pending: Bool
   var enabled: Bool
   /// Why it's off, when it's off.
   var help: String? = nil
+  /// Program's tally while its camera is on Program (`.onAir`, `.noPicture` or `.program`), else none.
+  var tally: UITally = .none
 }
 
 /// One typed piece of a status segment. Pieces are separated by spacing, never " · ":
@@ -687,6 +700,8 @@ struct UISessionPresentation: Sendable, Equatable {
   var statusSegments: [UIStatusSegment]
   /// Every problem, worst first: the one list all surfaces render.
   var problems: [UIProblem]
+  /// The Program picture's own tally (`UIPresentationBuilder.programTally`).
+  var programTally: UITally = .none
   /// Attention offers to turn alerts on: before a session, never while live.
   var offersAlerts = false
   /// Attention's rows after the problems, where nothing is wrong yet: an extension to install
@@ -707,10 +722,14 @@ struct UISessionPresentation: Sendable, Equatable {
 }
 
 extension UISessionPresentation {
-  /// The camera the menu bar preview shows: the one a meeting sees, if any, otherwise the selected one.
   /// A camera is on air or rolling: no time to ask anyone anything.
   var isLive: Bool { cameras.contains { $0.tally.isRed || $0.pauseTitle != nil } }
-  var previewCamera: UICameraPresentation? { cameras.first { $0.tally == .onAir } ?? cameras.first { $0.tally == .iso } ?? selected }
+  /// The camera the menu bar preview shows: the one a meeting sees, then one a meeting has open,
+  /// then the first running. Never the window's selection (D7): the menu has none.
+  var previewCamera: UICameraPresentation? {
+    cameras.first { $0.tally == .onAir } ?? cameras.first { $0.tally == .iso } ?? cameras.first(where: \.outputInUse)
+      ?? cameras.first(where: \.canStop) ?? cameras.first
+  }
 }
 
 enum UIMenuBarIcon: String, Sendable, Equatable {
@@ -810,15 +829,34 @@ enum UIPresentationBuilder {
   static let effectLongTitles = ["LUT", "Resize", "Color format", "Frame-rate cap"]
 
   static func tally(for camera: UICameraSnapshot, in session: UISessionSnapshot) -> UITally {
-    let live: Bool = { if case .live = camera.signal { return camera.running }; return false }()
     let onAir = session.onAirID == camera.id
-    // Red needs frames arriving, not just a client.
-    if onAir, session.programInUse, session.programSinkConnected, live { return .onAir }
-    if camera.inUse, camera.sinkConnected, live { return .iso }
-    if onAir, session.programInUse, hasNoPicture(camera) { return .noPicture }
+    let program = onAir ? programTally(camera, in: session) : .none
+    if program == .onAir { return .onAir }
+    // A client of the camera's own device: red, as frames reach it.
+    if camera.inUse, camera.sinkConnected, sendsFrames(camera) { return .iso }
+    if program == .noPicture { return .noPicture }
     if session.pendingCutID == camera.id, !onAir { return .next }
-    if onAir, session.cameras.count > 1 { return .program }
-    return .none
+    return program
+  }
+
+  /// Program's own tally: the Program picture's, and the cut button's of the camera on it.
+  /// `.onAir`, `.noPicture` or `.program`, never `.iso`: a client of the on-air camera's own
+  /// device isn't watching Program.
+  static func programTally(_ session: UISessionSnapshot) -> UITally {
+    session.cameras.first { $0.id == session.onAirID }.map { programTally($0, in: session) } ?? .none
+  }
+
+  private static func programTally(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> UITally {
+    // Red needs frames arriving, not just a client.
+    if session.programInUse, session.programSinkConnected, sendsFrames(camera) { return .onAir }
+    if session.programInUse, hasNoPicture(camera) { return .noPicture }
+    return session.cameras.count > 1 ? .program : .none
+  }
+
+  /// Running with a picture: frames leave it.
+  private static func sendsFrames(_ camera: UICameraSnapshot) -> Bool {
+    if case .live = camera.signal { return camera.running }
+    return false
   }
 
   static func tileState(for camera: UICameraSnapshot) -> UITileState {
@@ -944,7 +982,7 @@ enum UIPresentationBuilder {
     if tally == .onAir {
       outputLine = "On air"
     } else if session.onAirID == camera.id, tally != .iso {
-      outputLine = "In Program · no viewer yet"
+      outputLine = "In Program, no viewer yet"
     } else if session.pendingCutID == camera.id {
       outputLine = "Next"
     } else {
@@ -1132,8 +1170,10 @@ enum UIPresentationBuilder {
     }
 
     // The worst drive here, every drive in the sidebar.
-    let worstDrive = session.drives.filter { $0.secondsLeft != nil }.min { ($0.secondsLeft ?? 0) < ($1.secondsLeft ?? 0) }
-    let drivesLine = session.drives.compactMap { drive in drive.secondsLeft.map { "\(drive.name) \(UIFormat.duration($0)) left" } }
+    let worstDrive = worstDrive(session.drives)
+    let drivesLine = session.drives.compactMap { drive in
+      isFull(drive) ? "\(drive.name) full" : drive.secondsLeft.map { "\(drive.name) \(UIFormat.duration($0)) left" }
+    }
       .joined(separator: ", ")
     let paused = recording.filter { $0.recording.status == .paused }.count
     let rollingCount = recording.count - paused
@@ -1180,9 +1220,11 @@ enum UIPresentationBuilder {
         pieces: pieces, compactPieces: pieces, essentialPieces: pieces))
     }
 
+    let programTally = programTally(session)
     let cutButtons = session.programAvailable ? cameras.map {
       UICutButton(id: $0.id, number: $0.number, name: $0.name, onAir: session.onAirID == $0.id,
-        pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || session.onAirID == $0.id, help: $0.cutHelp)
+        pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || session.onAirID == $0.id, help: $0.cutHelp,
+        tally: session.onAirID == $0.id ? programTally : .none)
     } : []
 
     // One camera has one picture: every grid layout is the single layout.
@@ -1205,6 +1247,7 @@ enum UIPresentationBuilder {
       statusSegments: segments, problems: problems, outputSummary: outputSummary, outputInUse: outputInUse,
       recordingSummary: recordingSummary, menuBarIcon: menuBarIcon(session, problems: problems))
     presentation.offersAlerts = session.offerAlerts && !presentation.isLive
+    presentation.programTally = programTally
     presentation.autoHoldOn = canHoldShot && session.autoHold
     presentation.setupRows = setupRows(session)
     presentation.virtualCameras = virtualCameras
@@ -1289,19 +1332,35 @@ enum UIPresentationBuilder {
       state = rolling > 0 ? [.recordingDot, .dim(rolling > 1 ? "REC \(rolling)" : "REC"), clock] : [clock]
       if paused > 0 { state += [.pausedGlyph, .strong("\(paused)")] }
     }
+    // A full drive says so: it has no time to show.
+    if let full = worstDrive, isFull(full) {
+      let driveName: [UIStatusPiece] = [.dim(full.name), .strong("full")]
+      return UIStatusSegment(kind: .recording, text: summary, tone: recording == 0 ? .neutral : .critical,
+        pieces: state + driveName, compactPieces: state + driveName, essentialPieces: state)
+    }
     let drive = worstDrive.flatMap { drive in drive.secondsLeft.map { (drive.name, UIFormat.durationParts($0)) } }
     let driveName: [UIStatusPiece] = drive.map { [.dim($0.0), .value($0.1)] } ?? []
     return UIStatusSegment(kind: .recording, text: summary, tone: recording == 0 ? .neutral : .critical,
       pieces: state + driveName + (drive == nil ? [] : [.dim("left")]), compactPieces: state + driveName, essentialPieces: state)
   }
 
-  /// The drive a camera records to: the volume its /Volumes folder names, or the
-  /// only drive when the folder is elsewhere (every folder is then on that drive).
+  /// The drive that runs out first: a full one before any, then the least time left. A drive
+  /// whose free space can't be read has no time left and isn't full, so it's never the worst.
+  static func worstDrive(_ drives: [UIDrive]) -> UIDrive? {
+    func left(_ drive: UIDrive) -> TimeInterval? { isFull(drive) ? 0 : drive.secondsLeft }
+    return drives.filter { left($0) != nil }.min { (left($0) ?? 0) < (left($1) ?? 0) }
+  }
+
+  /// The drive a camera records to: the volume its folder is on, as the drive read found it.
+  /// A folder's path doesn't say: ~/Movies is on the startup volume, and a "/Volumes/8TB 1"
+  /// mount is a volume named "8TB".
   static func drive(for camera: UICameraSnapshot, in session: UISessionSnapshot) -> UIDrive? {
     guard let path = camera.recording.folderPath else { return nil }
+    if let volume = camera.recording.volumeID { return session.drives.first { $0.id == volume } }
+    // Fixtures name no volume, and their drives none: their folders' /Volumes/<name> is the drive.
     let parts = (path as NSString).pathComponents
-    if parts.count >= 3, parts[1] == "Volumes" { return session.drives.first { $0.name == parts[2] } }
-    return session.drives.count == 1 ? session.drives[0] : nil
+    guard parts.count >= 3, parts[1] == "Volumes" else { return nil }
+    return session.drives.first { $0.volumeID == nil && $0.name == parts[2] }
   }
 
   /// The cameras a drive's row names by number.
@@ -1349,7 +1408,9 @@ enum UIPresentationBuilder {
     guard !running.isEmpty else {
       return session.cameras.contains(where: \.automaticStart) ? .waiting : .stopped
     }
-    let selected = running.first { $0.id == session.selectedID } ?? running[0]
-    return selected.processing ? .live : .bypass
+    // The camera a meeting sees, not the window's selection (D7): Program's, then one in use.
+    let shown = running.first { $0.id == session.onAirID && session.programInUse } ?? running.first(where: \.inUse)
+      ?? running.first { $0.id == session.onAirID } ?? running[0]
+    return shown.processing ? .live : .bypass
   }
 }

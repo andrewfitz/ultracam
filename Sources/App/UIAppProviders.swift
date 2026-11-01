@@ -91,7 +91,6 @@ private struct UIAppSurfacePicture: View {
   let target: MonitorTargetID
   let compact: Bool
   let zoom: Double
-  @State private var hovering = false
 
   private var isProgram: Bool { target.isProgram }
   private var preferences: MonitorFeedPreferences { coordinator.preferences(for: target) }
@@ -125,20 +124,8 @@ private struct UIAppSurfacePicture: View {
         }
       }
     }
-    .overlay(alignment: .topTrailing) {
-      // Program's tool bar lives with its picture (camera pictures draw theirs in the overlay).
-      // Always shown, so the tools can be found; Clean View hides it until hover.
-      if isProgram && !compact && previewEnabled && (hovering || !presenter.isClean) {
-        UIMonitorToolButtons(targetID: target.rawValue, name: "Program",
-          activeTools: UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(preferences).contains($0) },
-          isProgram: true,
-          toggle: { [coordinator, target] tool in UIMonitorBridge.toggle(tool, for: target.rawValue, coordinator: coordinator) },
-          monitor: UIAppMonitorSettings(model: model))
-          .padding(10)
-      }
-    }
+    // Every picture's tool bar is in its overlays (Program's in UIProgramPictureView), not here.
     .clipped()
-    .onHover { hovering = $0 }
     .onAppear {
       presenter.setMagnification(.centered(zoom: zoom))
       register()

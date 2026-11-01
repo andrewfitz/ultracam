@@ -7,14 +7,11 @@ import SwiftUI
 struct UIProgramView: View {
   let context: UIContext
 
-  private var session: UISessionSnapshot { context.session }
-  private var onAir: UICameraSnapshot? { session.cameras.first { $0.id == session.onAirID } }
-
   var body: some View {
     let _ = UIRenderProbe.count("UIProgramView")
     VStack(alignment: .leading, spacing: UIPictureSpacing.gutter) {
       UIProgramRowLayout(gutter: UIPictureSpacing.gutter) {
-        programPicture
+        UIProgramPictureView(context: context)
         VStack(spacing: 12) {
           ForEach(context.presentation.cameras) { camera in
             source(camera)
@@ -32,12 +29,42 @@ struct UIProgramView: View {
     .padding(UIPictureSpacing.margin)
   }
 
-  private var programTally: UITally {
-    context.presentation.cameras.first { $0.id == session.onAirID }?.tally ?? .none
+  /// A source's picture and its Cut. The camera on Program keeps the slot's height with
+  /// nothing in it: its ring says it, and nothing moves.
+  private func source(_ camera: UICameraPresentation) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      UIColumnPictureLayout {
+        UICameraPictureView(camera: camera, context: context, compact: true)
+      }
+      if let cut = context.presentation.cutButtons.first(where: { $0.id == camera.id }), !cut.onAir {
+        UIWideCutButton(cut: cut, context: context)
+      } else {
+        Color.clear.frame(height: 36).accessibilityHidden(true)
+      }
+    }
   }
+}
 
-  private var programPicture: some View {
-    let tally = programTally
+/// The Program picture: what the meeting has, with its own tally (never a camera's ISO), its
+/// tool bar (the full bar on hover and while one of its popovers is open, as on the cameras'
+/// pictures), and the camera on it. Clean View hides the tools until hover.
+struct UIProgramPictureView: View {
+  let context: UIContext
+  @State private var hovering = false
+  /// The monitor tool popover open from the bar: it keeps the bar while the pointer is on it.
+  @State private var toolPanel: UIMonitorPanel?
+  /// Narrow enough that the label row can't hold the full tool bar: it takes its own row.
+  @State private var narrow = false
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  private var session: UISessionSnapshot { context.session }
+  private var onAir: UICameraSnapshot? { session.cameras.first { $0.id == session.onAirID } }
+  private var target: String { MonitorFeedHost.programTarget }
+
+  var body: some View {
+    let tally = context.presentation.programTally
+    let placement = UIMonitorToolButtons.Placement(hovering: hovering, panelOpen: toolPanel != nil, narrow: narrow,
+      clean: UICleanViewState.shared.clean.contains(target))
     return context.pictures.programPicture()
       .aspectRatio(16 / 9, contentMode: .fit)
       .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -57,20 +84,26 @@ struct UIProgramView: View {
         }
       }
       .overlay(alignment: .top) {
-        HStack(spacing: 6) {
-          HStack(spacing: 4) {
-            Image(systemName: UISymbol.program).imageScale(.small)
-            Text("Ultracam").foregroundStyle(.white.opacity(0.7)).fontWeight(.regular)
-            Text("Program")
+        VStack(spacing: 6) {
+          HStack(spacing: 6) {
+            HStack(spacing: 4) {
+              Image(systemName: UISymbol.program).imageScale(.small)
+              Text("Ultracam").foregroundStyle(.white.opacity(0.7)).fontWeight(.regular)
+              Text("Program")
+            }
+            .font(.uiOverlay).uiPictureOverlay()
+            .accessibilityElement(children: .combine)
+            UITallyBadge(tally: tally)
+            Spacer(minLength: 4)
+            if !placement.ownRow { tools(placement) }
           }
-          .font(.uiOverlay).uiPictureOverlay()
-          .accessibilityElement(children: .combine)
-          UITallyBadge(tally: tally)
-          Spacer(minLength: 4)
-          UIMonitorToolButtons(targetID: MonitorFeedHost.programTarget, name: "Program",
-            activeTools: UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(context.monitor.preferences(for: MonitorFeedHost.programTarget)).contains($0) },
-            isProgram: true, toggle: { context.send(.toggleTool(cameraID: MonitorFeedHost.programTarget, $0)) },
-            monitor: context.monitor)
+          // Too narrow for the bar beside the name: on hover it takes its own row, right aligned.
+          if placement.ownRow {
+            HStack {
+              Spacer(minLength: 0)
+              tools(placement)
+            }
+          }
         }
         .padding(10)
       }
@@ -91,22 +124,29 @@ struct UIProgramView: View {
         }
         .padding(10)
       }
+      .onHover { hovering = $0 }
+      .onGeometryChange(for: Bool.self) { $0.size.width < UIMonitorToolButtons.ownRowBelow } action: { narrow = $0 }
+      .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovering)
       .accessibilityElement(children: .contain)
-      .accessibilityLabel("Program, \(onAir?.name ?? "no camera") \(tally == .onAir ? "on air" : "selected")")
+      .accessibilityLabel(Self.accessibilityLabel(onAir: onAir?.name, tally: tally))
   }
 
-  /// A source's picture and its Cut. The camera on Program keeps the slot's height with
-  /// nothing in it: its ring says it, and nothing moves.
-  private func source(_ camera: UICameraPresentation) -> some View {
-    VStack(alignment: .leading, spacing: 6) {
-      UIColumnPictureLayout {
-        UICameraPictureView(camera: camera, context: context, compact: true)
-      }
-      if let cut = context.presentation.cutButtons.first(where: { $0.id == camera.id }), !cut.onAir {
-        UIWideCutButton(cut: cut, context: context)
-      } else {
-        Color.clear.frame(height: 36).accessibilityHidden(true)
-      }
+  @ViewBuilder private func tools(_ placement: UIMonitorToolButtons.Placement) -> some View {
+    if placement.shown {
+      UIMonitorToolButtons(targetID: target, name: "Program",
+        activeTools: UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(context.monitor.preferences(for: target)).contains($0) },
+        isProgram: true, toggle: { [context] in context.send(.toggleTool(cameraID: MonitorFeedHost.programTarget, $0)) },
+        monitor: context.monitor, openPanel: $toolPanel, expanded: placement.expanded)
+    }
+  }
+
+  /// "Program, Camera 1 on air"; off air, "in Program", or "no picture" while a meeting waits on one.
+  static func accessibilityLabel(onAir: String?, tally: UITally) -> String {
+    guard let onAir else { return "Program, no camera" }
+    switch tally {
+    case .onAir: return "Program, \(onAir) on air"
+    case .noPicture: return "Program, \(onAir), no picture"
+    default: return "Program, \(onAir) in Program"
     }
   }
 }

@@ -52,6 +52,71 @@ import XCTest
     XCTAssertEqual(rolling, one, accuracy: one * 0.01, "A rolling take measures what's really being written")
   }
 
+  /// Folders on one volume make one drive, however their paths read, and it knows its folders.
+  func testOneDrivePerVolumeWithItsFolders() throws {
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let first = base.appendingPathComponent("A"), second = base.appendingPathComponent("B")
+    for folder in [first, second] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+    defer { try? FileManager.default.removeItem(at: base) }
+    let drives = UIRecordingLibrary.drives(for: [first, second], recordingRates: [], assignedRates: [(first, 60), (second, 60)])
+    XCTAssertEqual(drives.count, 1)
+    let drive = try XCTUnwrap(drives.first)
+    XCTAssertEqual(drive.folders, [first.path, second.path])
+    XCTAssertNotNil(drive.volumeID)
+    XCTAssertEqual(drive.id, drive.volumeID, "Known by its volume, not its name")
+  }
+
+  /// The drive is the folder's volume as the drive read found it: ~/Movies with an external
+  /// drive in use, and two volumes that share a name ("8TB" mounted again at "/Volumes/8TB 1").
+  func testACameraIsOnItsVolumeNotItsPathsWords() {
+    var home = UICameraSnapshot(id: "camera-1", name: "Camera 1")
+    home.running = true
+    home.signal = .live(format: "2160p 59.94")
+    home.recording.status = .recording
+    home.recording.folderPath = "/Users/me/Movies"
+    home.recording.volumeID = "startup"
+    var second = UICameraSnapshot(id: "camera-2", name: "Camera 2")
+    second.recording.folderPath = "/Volumes/8TB 1/Takes"
+    second.recording.volumeID = "uuid-b"
+    var session = UISessionSnapshot()
+    session.cameras = [home, second]
+    session.defaultFolderPath = "/Users/me/Movies"
+    session.drives = [
+      UIDrive(name: "Macintosh HD", availableBytes: 100_000_000_000, totalBytes: 2_000_000_000_000, secondsLeft: 600,
+        volumeID: "startup"),
+      UIDrive(name: "8TB", availableBytes: 7_000_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 90_000, volumeID: "uuid-a"),
+      UIDrive(name: "8TB", availableBytes: 6_000_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 80_000, volumeID: "uuid-b")]
+    XCTAssertEqual(UIPresentationBuilder.drive(for: home, in: session)?.id, "startup", "Two drives in use: ~/Movies was lost")
+    XCTAssertEqual(UIPresentationBuilder.drive(for: second, in: session)?.id, "uuid-b", "The second 8TB, not the first")
+    XCTAssertEqual(UIPresentationBuilder.cameras(on: session.drives[0], in: session).map(\.id), ["camera-1"])
+    XCTAssertEqual(UIPresentationBuilder.cameras(on: session.drives[1], in: session).map(\.id), [])
+    XCTAssertEqual(UIPresentationBuilder.cameras(on: session.drives[2], in: session).map(\.id), ["camera-2"])
+    // The rolling take's drive is low: damage, not a notice.
+    let low = UIPresentationBuilder.problems(session).first { $0.id == "drive.startup" }
+    XCTAssertEqual(low?.level, .damage)
+    XCTAssertEqual(low?.detail, "Camera 1 records here.")
+    // The Format menus' time left counts the startup drive, the one that runs out first.
+    let left = UIPresentationBuilder.formatChoices(session).first { $0.codec == .proRes42210Bit }?.left
+    let rate = UIPresentationBuilder.estimateMegabits(.proRes42210Bit, home)
+    XCTAssertEqual(left, "\(UIFormat.duration(100_000_000_000 * 8 / (rate * 1_000_000))) left")
+  }
+
+  /// A full drive has no time left to show, and is still the one that runs out first.
+  func testAFullDriveIsTheWorst() {
+    let full = UIDrive(name: "Card", availableBytes: 0, totalBytes: 500_000_000_000, secondsLeft: nil, volumeID: "card")
+    let roomy = UIDrive(name: "8TB", availableBytes: 7_000_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 9000,
+      volumeID: "8tb")
+    let unknown = UIDrive(name: "Share", availableBytes: 0, totalBytes: 0, secondsLeft: nil, volumeID: "share")
+    XCTAssertEqual(UIPresentationBuilder.worstDrive([roomy, unknown, full])?.id, "card")
+    XCTAssertEqual(UIPresentationBuilder.worstDrive([roomy, unknown])?.id, "8tb", "Unreadable is unknown, not full")
+    var session = UISessionSnapshot()
+    session.cameras = [UICameraSnapshot(id: "camera-1", name: "Camera 1")]
+    session.drives = [roomy, full]
+    let segment = UIPresentationBuilder.session(session).statusSegments.first { $0.kind == .recording }
+    XCTAssertEqual(segment?.pieces.suffix(2), [.dim("Card"), .strong("full")])
+    XCTAssertTrue(segment?.text.contains("Card full") == true, segment?.text ?? "")
+  }
+
   // MARK: B12
 
   private func camera(running: Bool = true, signal: UISignal = .live(format: "2160p 59.94"), dropped: Int = 0, gaps: Int = 0) -> UICameraSnapshot {

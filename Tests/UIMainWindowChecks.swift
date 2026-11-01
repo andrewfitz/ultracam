@@ -128,6 +128,39 @@ import XCTest
     XCTAssertEqual(presentation.statusSegments[2].text, "Audio 2 of 2")
   }
 
+  /// J 22 in the strings that help and VoiceOver read, and the labels pickers show.
+  func testPlainStringsHaveNoDotJoins() {
+    var state = session([camera(1), camera(2)])
+    state.programSinkConnected = true
+    let line = UIPresentationBuilder.session(state).cameras[0].outputLine
+    XCTAssertEqual(line, "In Program, no viewer yet")
+    let inputs = [(id: "input:00000000a1850ab8", name: "Recorder"), (id: "input:0000000046b8", name: "Recorder")]
+    XCTAssertEqual(UIInputLabels.label(id: inputs[0].id, name: "Recorder", among: inputs), "Recorder (0AB8)")
+    XCTAssertFalse(UIInputLabels.missingLabel(id: inputs[1].id, lastName: nil).contains(" · "))
+  }
+
+  // MARK: Picture tools
+
+  /// The full bar stays, in the same row, while one of its popovers is open: the pointer leaves
+  /// the picture on its way to the popover. It used to move back beside the name on a narrow
+  /// picture, or leave altogether in Clean View, and the popover closed under the pointer.
+  @MainActor func testAnOpenToolPopoverKeepsItsBarWhereItIs() {
+    typealias Placement = UIMonitorToolButtons.Placement
+    for narrow in [false, true] {
+      for clean in [false, true] {
+        let hovered = Placement(hovering: true, panelOpen: false, narrow: narrow, clean: clean)
+        let opened = Placement(hovering: false, panelOpen: true, narrow: narrow, clean: clean)
+        XCTAssertEqual(opened, hovered, "narrow \(narrow), clean \(clean)")
+        XCTAssertTrue(opened.shown && opened.expanded)
+        XCTAssertEqual(opened.ownRow, narrow)
+      }
+    }
+    let rest = Placement(hovering: false, panelOpen: false, narrow: true, clean: false)
+    XCTAssertEqual(rest, Placement(hovering: false, panelOpen: false, narrow: false, clean: false), "At rest, beside the name")
+    XCTAssertFalse(rest.expanded || rest.ownRow)
+    XCTAssertFalse(Placement(hovering: false, panelOpen: false, narrow: false, clean: true).shown, "Clean View at rest")
+  }
+
   func testDurationIsOneFormEverywhere() {
     XCTAssertEqual(UIFormat.duration(6720), "1 h 52 m")
     XCTAssertEqual(UIFormat.duration(1320), "22 min")

@@ -189,49 +189,51 @@ import SwiftUI
 
   static func subtitles(_ verifier: Verifier) {
     func subtitle(_ panel: UIMonitorPanel, _ preferences: MonitorFeedPreferences, program: Bool = false) -> String {
-      UIMonitorToolSettingsView.subtitle(panel, cameraName: "Camera 1", isProgram: program, preferences: preferences)
+      UIMonitorToolSettingsView.subtitle(panel, isProgram: program, preferences: preferences)
     }
     func expect(_ name: String, _ panel: UIMonitorPanel, _ preferences: MonitorFeedPreferences, _ expected: String,
       program: Bool = false) {
       let value = subtitle(panel, preferences, program: program)
       verifier.check("header: \(name)", value == expected, "\(value), expected \(expected)")
+      // The camera is its own piece beside it, spaced (J 22).
+      verifier.check("header: \(name) has no dot join", !value.contains(" · ") && !value.contains("Camera 1"), value)
     }
     var value = MonitorFeedPreferences()
     value.signal.logProfileID = sony
     value.state.falseColor.mode = .sonySLog3
-    expect("log false color reads the source", .tool(.falseColor), value, "Camera 1 · analysis on Source")
+    expect("log false color reads the source", .tool(.falseColor), value, "analysis on Source")
     value.state.falseColor.mode = .sixBand
-    expect("six band reads its stage", .tool(.falseColor), value, "Camera 1 · analysis on Output (LUT)")
+    expect("six band reads its stage", .tool(.falseColor), value, "analysis on Output (LUT)")
     value.state.falseColor.stage = .source
     value.state.falseColor.mode = .custom
-    expect("custom bands read their stage", .tool(.falseColor), value, "Camera 1 · analysis on Source")
+    expect("custom bands read their stage", .tool(.falseColor), value, "analysis on Source")
     var off = MonitorFeedPreferences()
-    expect("off, undeclared: the six-band toggle's stage", .tool(.falseColor), off, "Camera 1 · analysis on Output (LUT)")
+    expect("off, undeclared: the six-band toggle's stage", .tool(.falseColor), off, "analysis on Output (LUT)")
     off.signal.logProfileID = arri
-    expect("off, declared log: the source", .tool(.falseColor), off, "Camera 1 · analysis on Source")
-    expect("false color on Program", .tool(.falseColor), off, "Camera 1 · Program Output", program: true)
+    expect("off, declared log: the source", .tool(.falseColor), off, "analysis on Source")
+    expect("false color on Program", .tool(.falseColor), off, "Program Output", program: true)
 
     var clip = MonitorFeedPreferences()
     clip.setPictureStage(.source)
-    expect("clip reads its own stage", .clipIndicators, clip, "Camera 1 · Output (LUT)")
-    expect("picture names the picture stage", .picture, clip, "Camera 1 · Source")
-    expect("guides name the picture stage", .tool(.guides), clip, "Camera 1 · Source")
-    expect("focus reads its stage", .tool(.focus), clip, "Camera 1 · analysis on Source")
+    expect("clip reads its own stage", .clipIndicators, clip, "Output (LUT)")
+    expect("picture names the picture stage", .picture, clip, "Source")
+    expect("guides name the picture stage", .tool(.guides), clip, "Source")
+    expect("focus reads its stage", .tool(.focus), clip, "analysis on Source")
     clip.state.focus.stage = .output
-    expect("focus on output", .tool(.focus), clip, "Camera 1 · analysis on Output (LUT)")
-    expect("scopes", .tool(.scopes), clip, "Camera 1 · below the picture")
-    expect("scopes on Program", .tool(.scopes), clip, "Camera 1 · below the picture", program: true)
+    expect("focus on output", .tool(.focus), clip, "analysis on Output (LUT)")
+    expect("scopes", .tool(.scopes), clip, "below the picture")
+    expect("scopes on Program", .tool(.scopes), clip, "below the picture", program: true)
 
     var zebra = MonitorFeedPreferences()
-    expect("zebra off names the picture", .tool(.zebra), zebra, "Camera 1 · Output (LUT)")
+    expect("zebra off names the picture", .tool(.zebra), zebra, "Output (LUT)")
     zebra.state.zebras[1].enabled = true
     zebra.state.zebras[1].stage = .source
-    expect("zebra 2 alone names its stage", .tool(.zebra), zebra, "Camera 1 · Source")
+    expect("zebra 2 alone names its stage", .tool(.zebra), zebra, "Source")
     zebra.state.zebras[0].enabled = true
-    expect("both zebras name both stages", .tool(.zebra), zebra, "Camera 1 · Output (LUT) + Source")
+    expect("both zebras name both stages", .tool(.zebra), zebra, "Output (LUT) + Source")
     zebra.state.zebras[1].stage = .output
-    expect("both zebras on one stage name it once", .tool(.zebra), zebra, "Camera 1 · Output (LUT)")
-    expect("zebra on Program", .tool(.zebra), zebra, "Camera 1 · Program Output", program: true)
+    expect("both zebras on one stage name it once", .tool(.zebra), zebra, "Output (LUT)")
+    expect("zebra on Program", .tool(.zebra), zebra, "Program Output", program: true)
   }
 }
 #endif

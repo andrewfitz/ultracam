@@ -35,6 +35,42 @@ import XCTest
     XCTAssertTrue(model.demandMonitorIsRunning, "Turning automatic start off must not stop it")
   }
 
+  /// Settings › Alerts' Low Space reaches every drive figure: the snapshot's, the live views'
+  /// (status bar, Attention, drive rows, which re-read the drives themselves) and the levels
+  /// that wake the alerts. The live ones used to keep the default 30 minutes.
+  func testLowSpaceReachesTheLiveDrivesAndTheirLevels() throws {
+    let model = appModel()
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    model.recordingModel.outputFolder = folder
+    let defaults = self.defaults()
+    defaults.set(120, forKey: UIAlertPreferences.lowSpaceMinutesKey)
+    let interface = UIInterfaceState(defaults: defaults)
+    let bridge = UISessionBridge(model: model, interface: interface)
+    XCTAssertEqual(bridge.snapshot().drives.map(\.lowSeconds), [7200])
+    XCTAssertEqual(UILiveSource(model: model, interface: interface).drives().map(\.lowSeconds), [7200])
+    defaults.set(15, forKey: UIAlertPreferences.lowSpaceMinutesKey)
+    XCTAssertEqual(UILiveSource(model: model, interface: interface).drives().map(\.lowSeconds), [900],
+      "A new level applies at once, not when the cached free space expires")
+
+    // The camera is on its folder's volume, found by the drive read, though its path names none.
+    let snapshot = bridge.snapshot()
+    let drive = try XCTUnwrap(UIPresentationBuilder.drive(for: snapshot.cameras[0], in: snapshot))
+    XCTAssertNotNil(snapshot.cameras[0].recording.volumeID)
+    XCTAssertEqual(drive.id, snapshot.cameras[0].recording.volumeID)
+    XCTAssertFalse(drive.folders.isEmpty)
+
+    var low = UIDrive(name: "8TB", availableBytes: 1, totalBytes: 2, secondsLeft: 20 * 60)
+    low.lowSeconds = 15 * 60
+    XCTAssertEqual(UIDriveLevels.level(low), 0)
+    low.lowSeconds = 30 * 60
+    XCTAssertEqual(UIDriveLevels.level(low), 1, "The drive's own level, so the alert fires where Settings says")
+    low.availableBytes = 0
+    low.secondsLeft = nil
+    XCTAssertEqual(UIDriveLevels.level(low), 2)
+  }
+
   func testHarnessesStayOutOfCMIO() {
     XCTAssertFalse(appModel().demandMonitorIsRunning)
   }

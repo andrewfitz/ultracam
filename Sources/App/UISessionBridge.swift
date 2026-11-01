@@ -276,11 +276,7 @@ struct UISessionBridge {
     session.codec = recording.codec
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
     session.defaultFolderPath = recording.outputFolder?.path
-    session.drives = drives.map { drive in
-      var drive = drive
-      drive.lowSeconds = interface.lowSpaceSeconds
-      return drive
-    }
+    session.drives = drives
     session.recentTakes = UIRecordingLibrary.cachedRecentTakes(in: model.feedDescriptors.compactMap { recording.outputFolder(for: $0.id) })
     session.interruptedTakes = recording.interruptedRecordings.map { UIInterruptedTake(id: $0.id.path, title: $0.title) }
     session.recoveringID = recording.recoveringID?.path
@@ -343,13 +339,20 @@ struct UISessionBridge {
   /// context (window, sidebar, inspector, their bindings) read it on each capture update,
   /// 4 Hz per running camera: main-thread time taken from scrolling. The figures are
   /// reused for two seconds.
-  private static var driveCache: (folders: [String?], date: Date, drives: [UIDrive])?
+  /// Each drive carries `lowSeconds` (Settings › Alerts, Low Space), so every surface and the
+  /// drive levels that wake the alerts judge "low" the same way.
+  private static var driveCache: (folders: [String?], lowSeconds: TimeInterval, date: Date, drives: [UIDrive])?
 
-  static func cachedDrives(for folders: [URL?], read: () -> [UIDrive]) -> [UIDrive] {
+  static func cachedDrives(for folders: [URL?], lowSeconds: TimeInterval, read: () -> [UIDrive]) -> [UIDrive] {
     let key = folders.map { $0?.path }
-    if let cache = driveCache, cache.folders == key, Date().timeIntervalSince(cache.date) < 2 { return cache.drives }
-    let drives = read()
-    driveCache = (key, Date(), drives)
+    if let cache = driveCache, cache.folders == key, cache.lowSeconds == lowSeconds,
+      Date().timeIntervalSince(cache.date) < 2 { return cache.drives }
+    let drives = read().map { drive in
+      var drive = drive
+      drive.lowSeconds = lowSeconds
+      return drive
+    }
+    driveCache = (key, lowSeconds, Date(), drives)
     UIDriveLevels.shared.update(drives)
     return drives
   }
