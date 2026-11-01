@@ -76,7 +76,10 @@ import SwiftUI
     render("settings-hardware-absent", AnyView(pane()), CGSize(width: width, height: SettingsVerify.measure(pane())))
     model.updateCamera(camera2) { $0.selectedDevice = "fake:right" }
 
-    // The idle reader runs only while the pane is on screen.
+    // The idle reader runs only while the pane is on screen. Offscreen windows are never
+    // unoccluded, so this one counts as seen while it's presented.
+    UIWindowVisibilityReader.treatsPresentedWindowsAsVisible = true
+    defer { UIWindowVisibilityReader.treatsPresentedWindowsAsVisible = false }
     let shown = HostedView(pane(), size: CGSize(width: width, height: 900), dark: false)
     shown.settle(0.3)
     verifier.check("hardware: the idle reader runs while Hardware is visible", model.hardwareInventory.polling, viewDependent: true)
