@@ -453,6 +453,20 @@ Sizes are estimates. In phase 2, test the late-sink change against real Zoom bef
 7. Not included: starting a new take automatically after a failed one.
 8. Resize, Color, Frame rate and Effects Off move into a menu, one click further away.
 9. Stop Camera moves into ⋯, one click further away.
+10. A Program client that connects while the on-air camera has no signal doesn't move Program. A lost signal only blocks cuts to that camera, so the cut stays yours.
+11. Keyboard focus on a picture draws a dashed blue ring just outside the selection ring. It isn't in the mockups.
+12. Input labels read `Name (0AB8)`, and the Camera Control sheet is titled `Camera Control — Camera 1`, replacing the dot joins.
+13. In light mode, Auto and Hold on use a dark fill with a white glyph, the inverse of J 25's white fill. Unanswered.
+
+**Built short of the plan:**
+
+1. Channels Shown at 8 and 16: the meter block grows past 44 pt and there's no single "Highest 3–4" line, because both need a MonitorKit change.
+2. Right-click on a meter is an app-side overlay on live expanded strips only, because MonitorKit's meter owns its menu and has no hook.
+3. The true-peak warning level moves the app's own over counting and take notes. MonitorKit's OVER latch stays at −1 dBTP.
+4. File names still end with the take's ID, so two recordings sharing a folder can't collide.
+5. Restore Defaults sets the fixed interval to 5 s, the first-run default, not the mockup's 8 s.
+6. The Diagnostics window's Device section still shows driver names. Only Copy Diagnostics uses nicknames.
+7. The Sony battery warns at 0 minutes. The SDK's "not read yet" value shows "—" and doesn't warn.
 
 **Live checks only you can run,** with Ultracam not serving a meeting:
 
