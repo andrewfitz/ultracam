@@ -302,8 +302,11 @@ final class SonyControlPlugin: CameraControlPlugin {
     }
   }
   /// The battery's reading in the unit the body reports. Only a known unit can warn:
-  /// under 20% or under 15 minutes. Volts and a missing unit show the number alone.
+  /// under 20% or under 15 minutes. Volts and a missing unit show the number alone. The
+  /// SDK's "untaken" value (CrBatteryRemain_Untaken, all ones), a reading the body hasn't
+  /// made yet, is no number and never warns.
   nonisolated static func battery(value: UInt64, unitLabel: String?) -> (label: String, unit: ControlValueUnit?, severity: DeviceSeverity?) {
+    if value == 0xFFFF || value == 0xFFFF_FFFF { return ("—", nil, nil) }
     switch unitLabel {
     case "Percent" where value <= 100: return ("\(value)%", .percent, value < 20 ? .warning : nil)
     case "Minutes": return ("\(value) min", .minutes, value < 15 ? .warning : nil)

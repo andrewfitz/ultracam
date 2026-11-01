@@ -1702,6 +1702,19 @@ class DeviceRegistry {
     applyAdvertisement();
     return S_OK;
   }
+  // A capture start owns the device from before it selects the connector until its
+  // session attaches: the driver reports the device capture-busy in between, and
+  // the idle reader must not call that another app.
+  void beginStart(NSString *identifier) {
+    std::lock_guard<std::mutex> guard(mutex);
+    ++starting[std::string(identifier.UTF8String ?: "")];
+  }
+  void endStart(NSString *identifier) {
+    std::lock_guard<std::mutex> guard(mutex);
+    auto found = starting.find(std::string(identifier.UTF8String ?: ""));
+    if (found != starting.end() && --found->second <= 0) starting.erase(found);
+  }
+
   void detachSession(CaptureCallback *capture) {
     CaptureCallback *released = nullptr;
     {
@@ -1830,6 +1843,8 @@ class DeviceRegistry {
       std::lock_guard<std::mutex> guard(mutex);
       for (auto &entry : entries) {
         const std::string key(entry.description.identifier.UTF8String ?: "");
+        // Ours while it starts: keep its last status until the session reports.
+        if (starting.count(key)) continue;
         auto policy = connectorPolicies.find(key);
         auto stats = statsByDevice.find(key);
         entry.device->AddRef();
@@ -2047,6 +2062,7 @@ class DeviceRegistry {
   std::vector<DeviceEntry> entries;
   std::vector<Session> sessions;
   std::map<std::string, std::shared_ptr<SessionStats>> statsByDevice;
+  std::map<std::string, int> starting; // mutex; see beginStart
   NSMutableDictionary<NSUUID *, id> *observerBlocks;
   NSMutableDictionary<NSUUID *, id> *statusObserverBlocks; // mutex
   NSMutableDictionary<NSString *, UCDeckLinkDeviceStatus *> *statuses; // mutex
@@ -2476,6 +2492,12 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   BMDVideoInputFlags inputFlags = capabilities.formatDetection ? bmdVideoInputEnableFormatDetection : bmdVideoInputFlagDefault;
   if (autoFrameHandler && !capabilities.formatDetection)
     return fail(error, @"This Blackmagic device/driver does not support automatic HDMI format detection.");
+  // From here the driver may report the device capture-busy because of this start.
+  _registry->beginStart(deviceID);
+  struct Starting {
+    DeviceRegistry *registry; NSString *identifier;
+    ~Starting() { registry->endStart(identifier); }
+  } starting{_registry, deviceID};
   auto connection = std::make_unique<HDMILease>();
   // Every failure from here on restores the connector it changed, while
   // `input` is still held (this guard is destroyed before it).
@@ -3125,11 +3147,24 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 
   __block BOOL started = NO;
   __block NSError *startError = nil;
+  // The driver reports the device capture-busy as soon as this start opens it; a poll
+  // before the session attaches must not call our own camera in use by another app.
+  __block bool polledWhileStarting = false;
+  device->input.onStart = ^{
+    device->status.busy = bmdDeviceCaptureBusy;
+    registry->refreshStatus();
+    registry->drain();
+    polledWhileStarting = true;
+  };
   [self onControlQueue:^{
     started = [self startOnQueue:identifier inputFast:YES frameHandler:nil autoFrameHandler:frameBlock
       mediaHandler:nil rawAudioHandler:rawBlock eventHandler:eventBlock error:&startError];
   }];
+  device->input.onStart = nil;
+  device->status.busy = 0;
   if (!started) return fail(error, [@"SDK 16 start failed: " stringByAppendingString:startError.localizedDescription ?: @"?"]);
+  if (!polledWhileStarting || [registry->status(identifier).busyElsewhere isEqual:@YES])
+    return fail(error, @"A poll during our own capture start reported the device in use by another app.");
   // The held device opened the detected 29.97 mode directly: no reconfiguration cycle.
   if (device->input.calls != std::vector<std::string>{"support", "enable", "callback", "start"} ||
       device->input.enabledMode != bmdMode4K2160p2997 || device->input.enabledAudioType != bmdAudioSampleType32bitInteger)

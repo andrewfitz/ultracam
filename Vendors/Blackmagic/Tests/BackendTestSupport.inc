@@ -243,6 +243,7 @@ class FakeInput final : public IDeckLinkInput {
   BMDPixelFormat enabledPixel = bmdFormat10BitYUV;
   IDeckLinkInputCallback *callback = nullptr;
   void (^onPause)(void) = nil;
+  void (^onStart)(void) = nil;
   ~FakeInput() override { if (callback) callback->Release(); }
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
   ULONG AddRef() override { return ++references; }
@@ -285,7 +286,12 @@ class FakeInput final : public IDeckLinkInput {
   }
   HRESULT DisableAudioInput() override { return E_NOTIMPL; }
   HRESULT GetAvailableAudioSampleFrameCount(uint32_t *) override { return E_NOTIMPL; }
-  HRESULT StartStreams() override { calls.push_back("start"); return startResult; }
+  HRESULT StartStreams() override {
+    calls.push_back("start");
+    void (^action)(void) = [onStart copy];
+    if (action) action();
+    return startResult;
+  }
   HRESULT StopStreams() override { calls.push_back("stop"); return S_OK; }
   HRESULT PauseStreams() override {
     calls.push_back("pause"); reconfiguredOnMainThread = [NSThread isMainThread];

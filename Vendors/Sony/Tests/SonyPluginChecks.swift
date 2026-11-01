@@ -206,6 +206,10 @@ struct SonyPluginChecks {
     precondition(SonyControlPlugin.battery(value: 10, unitLabel: "Minutes").severity == .warning)
     precondition(SonyControlPlugin.battery(value: 12, unitLabel: nil) == ("12", nil, nil), "No unit: raw, no warning")
     precondition(SonyControlPlugin.battery(value: 7, unitLabel: "Voltage").severity == nil)
+    // Not read yet (the SDK's untaken value): no number and no warning, in any unit.
+    for unit in ["Minutes", "Percent", nil] {
+      precondition(SonyControlPlugin.battery(value: 0xFFFF, unitLabel: unit) == ("—", nil, nil), "Untaken battery read as a number")
+    }
     // OnWarning: known keys become notices, recoveries are info, anything else is dropped.
     precondition(SonyControlPlugin.notice(forWarning: "storageFull")?.severity == .warning)
     precondition(SonyControlPlugin.notice(forWarning: "reconnecting")?.severity == .notice)

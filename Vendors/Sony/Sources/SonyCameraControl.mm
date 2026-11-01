@@ -413,6 +413,11 @@ static NSString *sonyText(const CrInt16u *text) {
   for (NSUInteger i = 1; i <= length; ++i) if (text[i] < 0x20 || text[i] > 0x7e) return nil;
   return [NSString stringWithCharacters:(const unichar *)(text + 1) length:length];
 }
+// Only a string property's current string is one; any other type's is not read.
+// The SDK states no length for it, so sonyText keeps its own bound.
+static NSString *sonyStringProperty(CrDataType type, const CrInt16u *text) {
+  return type == CrDataType_STR ? sonyText(text) : nil;
+}
 static size_t sonyWidth(CrDataType type) {
   switch (type & 0xFFF) { case 1: return 1; case 2: return 2; case 3: return 4; case 4: return 8; default: return 0; }
 }
@@ -717,7 +722,7 @@ static SonyRuntime &sonyRuntime() {
   for (CrInt32 i = 0; properties && i < count; ++i) {
     const auto &p = properties[i];
     if (p.GetCode() != CrDeviceProperty_SoftwareVersion || !p.IsGetEnableCurrentValue()) continue;
-    if (NSString *version = sonyText(p.GetCurrentStr()))
+    if (NSString *version = sonyStringProperty(p.GetValueType(), p.GetCurrentStr()))
       [fields addObject:@{@"id": @"firmware", @"title": @"Firmware", @"code": @(CrDeviceProperty_SoftwareVersion),
         @"value": @0, @"label": version, @"writable": @NO, @"choices": @[]}];
     break;

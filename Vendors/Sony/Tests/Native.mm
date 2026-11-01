@@ -28,6 +28,14 @@ int main() {
       CrHDMIOutputRawSettingMovie_23_98p) isEqualToString:@"23.98p"]);
     assert([sonyLabel(CrDeviceProperty_ExposureProgramMode,
       CrExposure_MemoryRecall) isEqualToString:@"Memory recall"]);
+    // Firmware: a string property only, within its own length bound.
+    const CrInt16u version[] = {5, '7', '.', '0', '2', 0};
+    assert([sonyStringProperty(CrDataType_STR, version) isEqualToString:@"7.02"]);
+    assert(!sonyStringProperty(CrDataType_UInt16Array, version));
+    assert(!sonyStringProperty(CrDataType_UInt32, version));
+    const CrInt16u overlong[] = {65, '7'};
+    assert(!sonyStringProperty(CrDataType_STR, overlong));
+    assert(!sonyStringProperty(CrDataType_STR, nullptr));
     uint32_t parsedAddress = 0;
     assert(sonyParseIPv4(@"192.168.1.160", parsedAddress) && parsedAddress == 0xA001A8C0);
     assert(sonyParseIPv4(@"169.254.1.1", parsedAddress));
