@@ -11,23 +11,43 @@ import Metal
 /// stride. That covers 1:1 counters, counters that hold each label for two frames
 /// (stride 2, the start value) and a held label (stride 0). A label's next record
 /// gives its run's length, so nothing between two records is lost.
+///
+/// A raw source label (hours, minutes, seconds, frames) runs the same way,
+/// counted as `((h * 60 + m) * 60 + s) * base + f` at the take's `base` frames
+/// a second, which its record states. A drop-frame skip or a second's rollover
+/// that the count doesn't predict is a break like any other.
 struct NativeLabelRun {
-  private var last: (label: TimecodeMetadata, end: CMTime)?
+  private struct Identity: Equatable {
+    var rate: RecordingFrameRate?
+    var epoch: CMTimeEpoch
+    var dropFrame: Bool
+    var fieldMark: Bool?
+  }
+  private var last: (identity: Identity, frame: Int64, end: CMTime)?
   private var older: Int64?
   private var stride: Int64 = 2
 
   mutating func breaks(_ value: TimecodeMetadata, pts: CMTime, duration: CMTime) -> Bool {
+    breaks(frame: value.frameNumber, identity: .init(rate: value.frameRate, epoch: value.epoch, dropFrame: value.dropFrame),
+      pts: pts, duration: duration)
+  }
+  mutating func breaks(_ value: Timecode, base: Int64, pts: CMTime, duration: CMTime) -> Bool {
+    let frame = ((Int64(value.hours) * 60 + Int64(value.minutes)) * 60 + Int64(value.seconds)) * base + Int64(value.frames)
+    let broke = breaks(frame: frame, identity: .init(epoch: 0, dropFrame: value.dropFrame, fieldMark: value.fieldMark),
+      pts: pts, duration: duration)
+    // A frame number the base can't hold has no unambiguous count.
+    return broke || Int64(value.frames) >= base
+  }
+  private mutating func breaks(frame: Int64, identity: Identity, pts: CMTime, duration: CMTime) -> Bool {
     let contiguous = last.map { CMTimeCompare($0.end, pts) == 0 } ?? false
-    let same = last.map {
-      $0.label.frameRate == value.frameRate && $0.label.epoch == value.epoch && $0.label.dropFrame == value.dropFrame
-    } ?? false
+    let same = last.map { $0.identity == identity } ?? false
     var broke = !contiguous || !same || older == nil
-    if !broke, let older, value.frameNumber - older != stride {
-      stride = value.frameNumber - older
+    if !broke, let older, frame - older != stride {
+      stride = frame - older
       broke = true
     }
-    older = contiguous ? last?.label.frameNumber : nil
-    last = (value, CMTimeAdd(pts, duration))
+    older = contiguous ? last?.frame : nil
+    last = (identity, frame, CMTimeAdd(pts, duration))
     return broke
   }
 }
@@ -67,11 +87,14 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private var lastNativeFieldMark: Bool?
   private var hadNativeFieldMark = false
   private var nativeLabelRun = NativeLabelRun()
+  private var sourceTimecodeRun = NativeLabelRun()
+  private var sourceTimecodeBase: Int64?
   private var lastCadenceSource: (duration: CMTime, end: CMTime)?
   private var nativeTimecodeIdentityChanged = false
   private var lastOriginalSourceEpoch: CaptureEpochID?
   private var lastOriginalAudioEpoch: CaptureEpochID?
   private var takeSidecar: RecordingTakeSidecar?
+  private var journalFullNoted = false
   private var lastSidecarCounterUpdate: TimeInterval = 0
   private var recordingTimebase: RecordingTimebase?
   private var variableFrameTimeline: VariableFrameTimeline?
@@ -385,10 +408,25 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     return RecordingFrameRate(numerator: Int64(duration.timescale), denominator: duration.value)
   }
 
+  /// Frames a second a raw source label counts to: the rate rounded up, as
+  /// `Timecode.validate` bounds its frame number.
+  static func timecodeBase(_ frameDuration: CMTime) -> Int64 {
+    guard frameDuration.isNumeric, frameDuration.value > 0, frameDuration.timescale > 0 else { return 1 }
+    let timescale = Int64(frameDuration.timescale)
+    return min(max(1, (timescale + frameDuration.value - 1) / frameDuration.value), 1000)
+  }
+
   /// Metadata never ends a take. The first record the journal can't keep puts a
   /// note on the take; the sidecar already holds the detail.
   private func journal(_ event: RecordingTakeSidecar.Event, reserved: Bool = false) {
-    guard let takeSidecar, !takeSidecar.journal(event, reserved: reserved), takeSidecar.suppressedRecords == 1 else { return }
+    guard let takeSidecar, !takeSidecar.journal(event, reserved: reserved) else { return }
+    noteJournalFull()
+  }
+  /// Once per take, whenever the sidecar first refused a record, including
+  /// one it refused itself while finishing.
+  private func noteJournalFull() {
+    guard !journalFullNoted, let takeSidecar, takeSidecar.suppressedRecords > 0 else { return }
+    journalFullNoted = true
     let note = RecordingTakeSidecar.Failure.journalFull.errorDescription ?? ""
     telemetryLock.withLock { telemetryValue.warning = telemetryValue.warning.map { "\($0) \(note)" } ?? note }
   }
@@ -743,8 +781,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       guard data.count <= 4096 else { throw SourceRecordingError.unsupportedSample("Source timecode metadata exceeds its bound.") }
       let raw = try JSONDecoder().decode(Timecode.self, from: data)
       let fieldMarkChanged = raw.fieldMark != lastNativeFieldMark && (raw.fieldMark != nil || hadNativeFieldMark)
-      if declaredRate?.isVariable == true || Self.matchingFrameRate(duration) == nil || fieldMarkChanged {
-        journal(.init(kind: "nativeTimecode", detail: "Original source timecode",
+      // Labels the movie's track can't carry. Like native labels below, only
+      // where the run breaks: one line per frame filled the journal in 19 minutes.
+      let base = sourceTimecodeBase ?? Self.timecodeBase(declaredRate?.nominal ?? duration)
+      sourceTimecodeBase = base
+      let broke = sourceTimecodeRun.breaks(raw, base: base, pts: pts, duration: duration)
+      if fieldMarkChanged || (declaredRate?.isVariable == true || Self.matchingFrameRate(duration) == nil) && broke {
+        journal(.init(kind: "nativeTimecode", detail: "Original source timecode, counted at \(base) frames a second",
           originalValue: pts.value, originalTimescale: pts.timescale, nativeSourceTimecode: raw))
       }
       lastNativeFieldMark = raw.fieldMark
@@ -764,10 +807,11 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     } else { nativeValue = nil; nativeData = nil }
     if sourceNativeTrackExpected == nil { sourceNativeTrackExpected = configuration.timecodePolicy == .source && nativeData != nil && declaredRate?.isVariable != true }
     if let value = nativeValue, declaredRate?.isVariable == true || sourceNativeTrackExpected == false {
-      // Constant rate keeps only the labels the run can't predict, and the next
-      // record's time gives its length. One line per frame filled the journal,
-      // and failed the take, after 19 minutes. Variable-rate labels stay per frame.
-      if nativeLabelRun.breaks(value, pts: pts, duration: duration) || declaredRate?.isVariable == true {
+      // Only the labels the run can't predict, and the next record's time gives
+      // its length. One line per frame filled the journal, and failed the take,
+      // after 19 minutes. A variable-rate run breaks wherever a frame's duration
+      // doesn't reach the next one.
+      if nativeLabelRun.breaks(value, pts: pts, duration: duration) {
         journal(.init(kind: "nativeTimecode", detail: value.label,
           originalValue: pts.value, originalTimescale: pts.timescale, nativeTimecodeMetadata: value))
       }
@@ -998,7 +1042,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         telemetryValue.gpuConversionFailures &+= 1; telemetryValue.droppedGPUFrames &+= 1
         telemetryValue.warning = "Recording dropped a raw UYVA frame after a GPU error: " + String(describing: error)
       }
-      try updateSidecarCounters()
+      // Metadata never ends a take.
+      try? updateSidecarCounters()
       return .dropped
     }
     var description: CMVideoFormatDescription?
@@ -1111,7 +1156,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       telemetryValue.droppedGPUFrames &+= 1
       telemetryValue.warning = "Recording dropped a frame after a GPU conversion failure: \(error.localizedDescription)"
     }
-    try updateSidecarCounters()
+    // Metadata never ends a take.
+    try? updateSidecarCounters()
     return nil
   }
 
@@ -2140,9 +2186,12 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         telemetryLock.withLock { telemetryValue.mappedAudioFrames = bridge.convertedFrames }
       }
       try finishMedia()
-      try updateSidecarCounters(force: true)
-      if let diagnostics = recordingTimebase?.diagnostics { try takeSidecar?.updateTimebaseDiagnostics(diagnostics) }
+      // The movie is complete. Counters and diagnostics are metadata, which
+      // never ends a take; only the finished mark gates publication.
+      try? updateSidecarCounters(force: true)
+      if let diagnostics = recordingTimebase?.diagnostics { try? takeSidecar?.updateTimebaseDiagnostics(diagnostics) }
       try takeSidecar?.finish(finalError: finalError ?? telemetry.lastError)
+      noteJournalFull()
     } catch {
       try? updateSidecarCounters(force: true)
       if let diagnostics = recordingTimebase?.diagnostics { try? takeSidecar?.updateTimebaseDiagnostics(diagnostics) }

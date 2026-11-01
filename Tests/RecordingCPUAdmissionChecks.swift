@@ -100,6 +100,44 @@ import XCTest
     XCTAssertEqual(core.telemetry.deviceSkippedFrames, 0)
     XCTAssertEqual(core.telemetry.writerErrors, 0)
   }
+  func testDroppedGPUFrameWhoseCounterSaveFailsKeepsRecording() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let metadataFolder = folder.appendingPathComponent("metadata")
+    try FileManager.default.createDirectory(at: metadataFolder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: metadataFolder.path)
+      try? FileManager.default.removeItem(at: folder)
+    }
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210,
+      rate: .constant(RecordingFrameRate.fps5994.frameDuration)), epochID: .init(sessionID: UUID(), epoch: 0),
+      clockBindings: .init(video: .init(), audio: nil), stage: .recordingSource)
+    var shouldFail = true
+    let operations = AVAssetSourceRecordingWriter.ConversionOperations(convert: { converter, source, destination in
+      if shouldFail { shouldFail = false; throw Injected.gpu }
+      return try converter.convert(source, into: destination)
+    })
+    let configuration = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("counter-save"),
+      outputURL: folder.appendingPathComponent("partial.mov"), width: 1920, height: 1080,
+      videoCodec: kCMVideoCodecType_AppleProRes422HQ, sourceAdmission: source,
+      sidecarMovieURL: metadataFolder.appendingPathComponent("final.mov"))
+    let writer = try AVAssetSourceRecordingWriter(configuration: configuration,
+      encodeFrame: { _, _, _, _ in noErr }, conversionOperations: operations)
+    try writer.start()
+    try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    // The sidecar can't be rewritten while its folder is read-only.
+    try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: metadataFolder.path)
+    XCTAssertEqual(try writer.appendVideoOutcome(sample()), .dropped, "Metadata never ends a take")
+    XCTAssertFalse(writer.hasFailed)
+    let movie = try XCTUnwrap(configuration.sidecarMovieURL)
+    XCTAssertNil(try RecordingTakeSidecar.readSnapshot(for: movie).counters["recording.droppedGPUFrames"], "The counter save was refused")
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: metadataFolder.path)
+    XCTAssertEqual(try writer.appendVideoOutcome(sample(index: 1)), .appended)
+    XCTAssertEqual(writer.telemetry.droppedGPUFrames, 1)
+    try writer.finish()
+    let metadata = try RecordingTakeSidecar.readSnapshot(for: movie)
+    XCTAssertTrue(metadata.finished)
+    XCTAssertEqual(metadata.counters["recording.droppedGPUFrames"], 1)
+  }
   private func config(allow: Bool = false) throws -> SourceRecordingConfiguration {
     try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("cpu-policy"),
       outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("unused-cpu-\(UUID().uuidString).mov"),

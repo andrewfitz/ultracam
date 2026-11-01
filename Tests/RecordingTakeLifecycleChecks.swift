@@ -105,6 +105,38 @@ import XCTest
       try Data(contentsOf: RecordingTakeSidecar.url(for: output.finalURL)))
     XCTAssertTrue(FileManager.default.fileExists(atPath: output.temporaryURL.path))
   }
+  func testRealMovieWithoutCameraSubfoldersRecoversFromTheRoot() throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let naming = RecordingFileNaming(tokens: [.camera, .take], cameraSubfolders: false)
+    let manager = try RecordingOutputManager(rootDirectory: folder, minimumFreeBytes: 0, naming: naming)
+    let output = try manager.beginExternalWriterSession(feedID: "camera")
+    XCTAssertEqual(output.temporaryURL.deletingLastPathComponent().resolvingSymlinksInPath().path,
+      folder.resolvingSymlinksInPath().path)
+    let source = try snapshot()
+    let config = try SourceRecordingConfiguration(feedID: .init("root-take"), outputURL: output.temporaryURL,
+      width: 3840, height: 2160, videoCodec: kCMVideoCodecType_AppleProRes422HQ,
+      sourceAdmission: source, sidecarMovieURL: output.finalURL, sidecarCreated: { try output.claimSidecar() })
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    try writer.start()
+    try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    try writer.appendVideo(sample())
+    try writer.finish()
+    output.preserveForRecovery()
+    let interrupted = try XCTUnwrap(RecordingRecovery.scan(root: folder).first)
+    let result = Mutex<Result<URL, Error>?>(nil)
+    let done = DispatchSemaphore(value: 0)
+    Task.detached {
+      let recovered: Result<URL, Error>
+      do { recovered = .success(try await RecordingRecovery.recover(interrupted, root: folder)) }
+      catch { recovered = .failure(error) }
+      result.withLock { $0 = recovered }; done.signal()
+    }
+    XCTAssertEqual(done.wait(timeout: .now() + 15), .success)
+    let recovered = try XCTUnwrap(result.withLock { $0 }).get()
+    XCTAssertTrue(FileManager.default.fileExists(atPath: recovered.path))
+    XCTAssertEqual(recovered.deletingLastPathComponent().resolvingSymlinksInPath().path, folder.resolvingSymlinksInPath().path)
+  }
   func testOwnedCancellationDeletesPairAndPreservesUnrelatedOccupiedMetadata() throws {
     let folder = try temporaryFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -172,6 +204,7 @@ import XCTest
     XCTAssertEqual(core.state, .finished)
     XCTAssertNil(core.telemetry.lastError)
     XCTAssertTrue(core.telemetry.warning?.contains("reached its limit") == true, core.telemetry.warning ?? "no note")
+    XCTAssertEqual(core.telemetry.warning?.components(separatedBy: "reached its limit").count, 2, "One note per take")
     let metadata = try RecordingTakeSidecar.readSnapshot(for: final)
     XCTAssertTrue(metadata.finished)
     XCTAssertNil(metadata.finalError)

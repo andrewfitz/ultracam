@@ -591,6 +591,15 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     let found = try RecordingRecovery.scan(root: root)
     XCTAssertEqual(found.count, 1)
     XCTAssertEqual(found.first?.finalURL.lastPathComponent, session.finalURL.lastPathComponent)
+    let take = try XCTUnwrap(found.first)
+    let done = expectation(description: "A take in the root passes containment; invalid media is refused")
+    Task {
+      do { _ = try await RecordingRecovery.recover(take, root: root); XCTFail("Invalid media recovered") }
+      catch RecordingOutputError.unsafePath { XCTFail("A take in the recording folder itself must be recoverable") }
+      catch { }
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 5)
     let subfolders = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
     let other = try subfolders.makeSession(feedID: "Tight")
     XCTAssertEqual(other.paths.feedDirectory.lastPathComponent, "Tight", "The standard naming keeps a folder per camera")

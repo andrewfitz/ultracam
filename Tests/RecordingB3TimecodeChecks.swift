@@ -546,6 +546,56 @@ import XCTest
       "One journal line per frame filled the journal in 19 minutes")
   }
 
+  func testVariableRateSourceTimecodeIsJournaledOnlyWhereItsRunBreaks() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("vfr-source-timecode-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("take.mov")
+    let duration = RecordingFrameRate.fps2997.frameDuration
+    let rate = FrameRate.variable(nominal: duration, shortest: CMTimeMultiplyByRatio(duration, multiplier: 1, divisor: 2),
+      longest: CMTimeMultiply(duration, multiplier: 2))
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: rate),
+      epochID: .init(sessionID: UUID(), epoch: 1), clockBindings: .init(video: .init()), stage: .recordingSource)
+    let config = try SourceRecordingConfiguration(feedID: .init("vfr-source-timecode"), outputURL: movie, width: 1920, height: 1080,
+      declaredTimebases: [30000], sourceFrameRate: rate, sourceAdmission: source, sidecarMovieURL: movie)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    // A 1:1 counter at 29.97, rolling over each second; frame 100 lasts two
+    // frames and the label skips one with it.
+    var frames: [(pts: CMTime, duration: CMTime, count: Int64)] = []
+    var pts = CMTime.zero, count: Int64 = 0
+    for index in 0..<300 {
+      let length = index == 100 ? CMTimeMultiply(duration, multiplier: 2) : duration
+      frames.append((pts, length, count))
+      let label = try Timecode(hours: 1, minutes: Int(count / 1800), seconds: Int(count / 30 % 60), frames: Int(count % 30), dropFrame: false)
+      let frame = try sample(pts: pts, duration: length)
+      CMSetAttachment(frame, key: SourceRecordingConfiguration.sourceTimecodeAttachmentKey as CFString,
+        value: try JSONEncoder().encode(label) as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+      try writer.appendVideo(frame)
+      pts = CMTimeAdd(pts, length); count += index == 100 ? 2 : 1
+    }
+    try writer.finish()
+    let lines = try String(contentsOf: RecordingTakeSidecar.url(for: movie).appendingPathExtension("journal"), encoding: .utf8)
+    let records = try lines.split(separator: "\n").map { try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data($0.utf8)) }
+      .filter { $0.nativeSourceTimecode != nil }
+    XCTAssertLessThanOrEqual(records.count, 8, "One journal line per frame filled the journal in 19 minutes")
+    XCTAssertTrue(records.allSatisfy { $0.detail.contains("counted at 30 frames a second") }, records.first?.detail ?? "no records")
+    // A reader rebuilds every label from the records: a frame without one is the
+    // count two frames back plus the stride the last contiguous record set.
+    var kept: [Int64: Int64] = [:]
+    for record in records {
+      let label = try XCTUnwrap(record.nativeSourceTimecode)
+      kept[try XCTUnwrap(record.originalValue)] = ((Int64(label.hours) * 60 + Int64(label.minutes)) * 60 + Int64(label.seconds)) * 30 + Int64(label.frames) - 3600 * 30
+    }
+    var rebuilt: [Int64] = [], stride: Int64 = 2
+    for (index, frame) in frames.enumerated() {
+      guard let value = kept[frame.pts.value] else { rebuilt.append(rebuilt[index - 2] + stride); continue }
+      if index >= 2 { stride = value - rebuilt[index - 2] }
+      rebuilt.append(value)
+    }
+    XCTAssertEqual(rebuilt, frames.map(\.count))
+  }
+
   /// One frame of a replayed run: its source time and the label on it.
   private struct LabeledFrame {
     var pts: CMTime

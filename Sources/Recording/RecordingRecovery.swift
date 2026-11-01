@@ -143,6 +143,9 @@ enum RecordingRecovery {
       for url in files where url.pathExtension == "ultracam-recovery" {
         hasJournal = true
         guard let journal = try? RecordingRecoveryJournal(opening: url) else { continue }
+        // Named from the journal's own folder, as `recover` does. The root's
+        // spelling can differ from its listing's (/var against /private/var).
+        let folder = url.deletingLastPathComponent()
         let source = folder.appendingPathComponent(journal.entry.temporaryName)
         // The journal lock also covers export. Only reclaim its staging file
         // after a crashed exporter has released that lock.
@@ -170,8 +173,11 @@ enum RecordingRecovery {
     defer { withExtendedLifetime(access) {} }
     let folder = take.journalURL.deletingLastPathComponent()
     let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
-    guard folder.standardizedFileURL.deletingLastPathComponent().path == canonicalRoot.path,
-      folder.resolvingSymlinksInPath().path == folder.standardizedFileURL.path else { throw RecordingOutputError.unsafePath }
+    // As in the scan: a take sits in a feed folder or, without camera
+    // subfolders, in the root itself.
+    let standardized = folder.standardizedFileURL
+    guard standardized.path == canonicalRoot.path || standardized.deletingLastPathComponent().path == canonicalRoot.path,
+      folder.resolvingSymlinksInPath().path == standardized.path else { throw RecordingOutputError.unsafePath }
     let journal = try RecordingRecoveryJournal(opening: take.journalURL)
     guard folder.appendingPathComponent(journal.entry.temporaryName) == take.temporaryURL,
       folder.appendingPathComponent(journal.entry.finalName) == take.finalURL,
