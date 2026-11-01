@@ -1869,6 +1869,13 @@ class DeviceRegistry {
       } else readIdleStatus(item.device, next);
       item.device->Release();
       std::lock_guard<std::mutex> guard(mutex);
+      if (!session) {
+        // A start that began during the read, or the session it attached, made the
+        // device busy for us: that read isn't another app's.
+        const std::string key(item.identifier.UTF8String ?: "");
+        auto stats = statsByDevice.find(key);
+        if (starting.count(key) || (stats != statsByDevice.end() && stats->second && stats->second->active.load())) continue;
+      }
       UCDeckLinkDeviceStatus *previous = statuses[item.identifier];
       if (session && previous) { next.pcieWidth = previous.pcieWidth; next.pcieGeneration = previous.pcieGeneration; }
       if ([next isEqual:previous]) continue;
@@ -3144,6 +3151,21 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   device->status.busy = 0;
   registry->refreshStatus();
   registry->drain();
+  // Our own start beginning while the reader is mid-read: what it read is ours, not another app's.
+  __block bool startedMidRead = false;
+  device->status.onBusyRead = ^{
+    if (startedMidRead) return;
+    startedMidRead = true;
+    registry->beginStart(identifier);
+    device->status.busy = bmdDeviceCaptureBusy;
+  };
+  registry->refreshStatus();
+  registry->drain();
+  device->status.onBusyRead = nil;
+  registry->endStart(identifier);
+  device->status.busy = 0;
+  if (!startedMidRead || ![registry->status(identifier).busyElsewhere isEqual:@NO])
+    return fail(error, @"A start that began during an idle read was stored as another app holding the device.");
 
   __block BOOL started = NO;
   __block NSError *startError = nil;

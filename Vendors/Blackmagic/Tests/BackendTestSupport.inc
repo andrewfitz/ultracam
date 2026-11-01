@@ -680,6 +680,8 @@ class FakeStatus final : public IDeckLinkStatus {
   int64_t formatFlags = bmdDetectedVideoInputYCbCr422 | bmdDetectedVideoInput10BitDepth;
   int64_t colorspace = bmdColorspaceRec709, dynamicRange = bmdDynamicRangeSDR;
   int64_t busy = 0;  // BMDDeviceBusyState
+  // Runs as the busy state is read, before it's returned.
+  void (^onBusyRead)(void) = nil;
   bool locked = true;
   FakeStatus() { detectedMode.mode = bmdMode4K2160p2997; }
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
@@ -696,7 +698,11 @@ class FakeStatus final : public IDeckLinkStatus {
       case bmdDeckLinkStatusDetectedVideoInputFormatFlags: *value = formatFlags; return S_OK;
       case bmdDeckLinkStatusDetectedVideoInputColorspace: *value = colorspace; return S_OK;
       case bmdDeckLinkStatusDetectedVideoInputDynamicRange: *value = dynamicRange; return S_OK;
-      case bmdDeckLinkStatusBusy: *value = busy; return S_OK;
+      case bmdDeckLinkStatusBusy: {
+        void (^action)(void) = [onBusyRead copy];
+        if (action) action();
+        *value = busy; return S_OK;
+      }
       default: return E_INVALIDARG;
     }
   }
