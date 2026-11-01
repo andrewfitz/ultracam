@@ -325,6 +325,9 @@ struct UISessionBridge {
   static func unexpectedStop(_ stop: UnexpectedStop) -> UIUnexpectedStop {
     var shown = UIUnexpectedStop(reason: stop.cameraStopped ? stop.reason : nil, wasOnAir: stop.wasOnAir,
       restarted: stop.restarted)
+    // Only a camera's stop starts an incident; a take ending alone keeps the one its
+    // failed recording showed before the stop record existed.
+    if stop.cameraStopped || stop.restarted { shown.incident = Int64((stop.at.timeIntervalSinceReferenceDate * 1000).rounded()) }
     switch stop.take {
     case .saved(_, let duration, _): shown.take = true; shown.savedDuration = duration
     case .interrupted: shown.take = true

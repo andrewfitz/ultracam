@@ -1383,8 +1383,12 @@ final class AppModel {
       signalHealth.remove(feedID)
       let failed: Bool
       if case .failed(let reason)? = update.stopCause {
-        unexpectedStops[feedID] = UnexpectedStop(reason: reason, at: Date(), cameraStopped: true,
-          wasOnAir: programInUse && switcherSelectedFeedID == feedID)
+        // Each stop is its own incident and notification, but only a Start lets it stop
+        // again: another report before one is the same stop.
+        if unexpectedStops[feedID]?.cameraStopped != true {
+          unexpectedStops[feedID] = UnexpectedStop(reason: reason, at: Date(), cameraStopped: true,
+            wasOnAir: programInUse && switcherSelectedFeedID == feedID)
+        }
         failed = true
       } else {
         failed = false

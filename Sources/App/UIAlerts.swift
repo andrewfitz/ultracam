@@ -105,7 +105,9 @@ struct UIAlertPlan: Sendable, Equatable {
 
 /// One request per problem, so a repeat replaces it, and a clear removes the notification.
 struct UIAlertTracker {
-  private var active: Set<String> = []
+  /// Keys a notification went out for, while their problem lasts. One whose event was off
+  /// sent nothing, so a row that takes it over with its event on still posts.
+  private var posted: Set<String> = []
 
   /// `events` are the ones Settings › Alerts leaves on for notifications; the panel ignores it.
   mutating func plan(problems: [UIProblem], live: Bool, notifications: Bool, panel: Bool, sound: Bool,
@@ -116,7 +118,7 @@ struct UIAlertTracker {
       guard let alert = problem.alert else { continue }
       let key = alert.key ?? problem.id
       guard current.insert(key).inserted else { continue }
-      if notifications, events.contains(alert.event), !active.contains(key) {
+      if notifications, events.contains(alert.event), posted.insert(key).inserted {
         plan.post.append(UIAlertRequest(id: key, title: alert.title, body: alert.body,
           timeSensitive: timeSensitiveEntitled && live, sound: sound))
       }
@@ -124,8 +126,8 @@ struct UIAlertTracker {
         plan.panel = UIPanelAlert(id: key, title: alert.title, body: alert.body, action: problem.action)
       }
     }
-    plan.remove = active.subtracting(current).sorted()
-    active = current
+    plan.remove = posted.subtracting(current).sorted()
+    posted.formIntersection(current)
     return plan
   }
 }

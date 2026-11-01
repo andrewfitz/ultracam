@@ -54,6 +54,19 @@ import XCTest
     XCTAssertFalse(model.acknowledgedTakes.contains(id), "A new take starts clean")
   }
 
+  /// A stop is a notification of its own, so a second report of it, with no Start between,
+  /// mustn't make it a new one.
+  func testAnotherReportBeforeAStartIsTheSameStop() throws {
+    let model = appModel()
+    let id = model.selectedFeedID
+    model.deliverCaptureUpdateForTesting(id, stopped(.failed("input disconnected")))
+    let first = try XCTUnwrap(model.unexpectedStops[id])
+    model.deliverCaptureUpdateForTesting(id, stopped(.failed("the session ended")))
+    XCTAssertEqual(model.unexpectedStops[id], first)
+    XCTAssertEqual(UISessionBridge.unexpectedStop(try XCTUnwrap(model.unexpectedStops[id])).incident,
+      UISessionBridge.unexpectedStop(first).incident)
+  }
+
   func testAStoppedCameraWithNoTakeHasNoTakeResult() {
     let model = appModel()
     let id = model.selectedFeedID

@@ -178,6 +178,67 @@ import XCTest
       sound: false, timeSensitiveEntitled: false).panel?.title, "Camera 1 take ended", "A take that ended on its own still gets it")
   }
 
+  /// An early take nobody has looked at yet doesn't swallow a stop that comes after it.
+  func testALaterStopIsANewNotification() {
+    var tracker = UIAlertTracker()
+    var camera = UICameraSnapshot(id: "a", name: "Camera 1")
+    camera.unexpectedStop = UIUnexpectedStop(take: true, savedDuration: 751)
+    var session = UISessionSnapshot()
+    session.cameras = [camera]
+    func plan() -> UIAlertPlan {
+      tracker.plan(problems: UIPresentationBuilder.problems(session), live: false, notifications: true, panel: true,
+        sound: false, timeSensitiveEntitled: false)
+    }
+    XCTAssertEqual(plan().post.map(\.title), ["Camera 1 take ended"])
+    session.cameras[0].unexpectedStop = UIUnexpectedStop(reason: "input disconnected", incident: 1)
+    XCTAssertEqual(plan().post.map(\.title), ["Camera 1 stopped"], "A new stop is a new incident")
+    session.cameras[0].running = true
+    session.cameras[0].unexpectedStop = UIUnexpectedStop(take: true, savedDuration: 20, restarted: true, incident: 1)
+    XCTAssertTrue(plan().post.isEmpty, "Its take after Start is still the stop's")
+    session.cameras[0].running = false
+    session.cameras[0].unexpectedStop = UIUnexpectedStop(reason: "input disconnected", take: true, savedDuration: 20, incident: 2)
+    XCTAssertEqual(plan().post.map(\.title), ["Camera 1 stopped"], "Stopping again, before the last take was seen")
+  }
+
+  /// With Camera stopped off, the stop sends nothing; its take after Start, with Take ended
+  /// early on, is the first notification the incident has, so it goes.
+  func testAStopWhoseEventIsOffLeavesItsTakeToNotify() {
+    var tracker = UIAlertTracker()
+    var camera = UICameraSnapshot(id: "a", name: "Camera 1")
+    camera.unexpectedStop = UIUnexpectedStop(reason: "input disconnected", take: true, savedDuration: 751, incident: 1)
+    var session = UISessionSnapshot()
+    session.cameras = [camera]
+    func plan() -> UIAlertPlan {
+      tracker.plan(problems: UIPresentationBuilder.problems(session), live: false, notifications: true, panel: true,
+        sound: false, timeSensitiveEntitled: false, events: [.takeEndedEarly])
+    }
+    let stopped = plan()
+    XCTAssertTrue(stopped.post.isEmpty, "Camera stopped is off")
+    XCTAssertTrue(stopped.remove.isEmpty)
+    session.cameras[0].running = true
+    session.cameras[0].unexpectedStop = UIUnexpectedStop(take: true, savedDuration: 751, restarted: true, incident: 1)
+    XCTAssertEqual(plan().post.map(\.title), ["Camera 1 take ended"], "Take ended early is on")
+    XCTAssertTrue(plan().post.isEmpty, "Once")
+    session.cameras[0].unexpectedStop = nil
+    XCTAssertEqual(plan().remove, ["incident.a.1"], "Seen: it's taken back")
+  }
+
+  /// The model's stop is the incident: a stop and its take after Start share it, a new stop
+  /// doesn't, and a take that ended alone has none to lose when its record appears.
+  func testTheBridgeStampsEachStop() {
+    let at = Date(timeIntervalSinceReferenceDate: 1_000)
+    var stop = UnexpectedStop(reason: "x", at: at, cameraStopped: true)
+    let first = UISessionBridge.unexpectedStop(stop).incident
+    XCTAssertEqual(first, 1_000_000)
+    stop.cameraStopped = false
+    stop.restarted = true
+    stop.take = .interrupted
+    XCTAssertEqual(UISessionBridge.unexpectedStop(stop).incident, first, "Started again: the same incident")
+    XCTAssertNotEqual(UISessionBridge.unexpectedStop(UnexpectedStop(reason: "x", at: at.addingTimeInterval(5), cameraStopped: true)).incident,
+      first)
+    XCTAssertNil(UISessionBridge.unexpectedStop(UnexpectedStop(reason: "x", at: at, cameraStopped: false, take: .interrupted)).incident)
+  }
+
   /// Live is a meeting app taking frames from a camera, on a real model with fake capture.
   func testCoordinatorSendsNewProblemsAndNeverAsksWhileLive() throws {
     let suite = "org.ultracam.tests.alerts.\(UUID().uuidString)"
