@@ -9,8 +9,9 @@ import Metal
 /// two frames, any gap or pause, any change of rate, epoch or drop-frame flag, and
 /// any frame whose label minus the label two frames back differs from the current
 /// stride. That covers 1:1 counters, counters that hold each label for two frames
-/// (stride 2, the start value) and a held label (stride 0). A label's next record
-/// gives its run's length, so nothing between two records is lost.
+/// (stride 2, the start value) and a held label (stride 0). A label's next record,
+/// or the gap record at the first frame without one, gives its run's length, so
+/// nothing between two records is lost and nothing past a gap is made up.
 ///
 /// A raw source label (hours, minutes, seconds, frames) runs the same way,
 /// counted as `((h * 60 + m) * 60 + s) * base + f` at the take's `base` frames
@@ -89,6 +90,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private var nativeLabelRun = NativeLabelRun()
   private var sourceTimecodeRun = NativeLabelRun()
   private var sourceTimecodeBase: Int64?
+  /// A run record is in the journal and no unlabelled frame has ended it yet.
+  private var nativeLabelRunOpen = false
+  private var sourceTimecodeRunOpen = false
   private var lastCadenceSource: (duration: CMTime, end: CMTime)?
   private var nativeTimecodeIdentityChanged = false
   private var lastOriginalSourceEpoch: CaptureEpochID?
@@ -421,6 +425,12 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private func journal(_ event: RecordingTakeSidecar.Event, reserved: Bool = false) {
     guard let takeSidecar, !takeSidecar.journal(event, reserved: reserved) else { return }
     noteJournalFull()
+  }
+  /// Where a run of `label` labels meets a frame without one. Its next label is a record
+  /// of its own, so the run starts over there.
+  private func journalLabelGap(_ label: String, pts: CMTime) {
+    journal(.init(kind: "nativeTimecodeGap", detail: "No \(label) timecode label from this frame",
+      originalValue: pts.value, originalTimescale: pts.timescale, labelEncoding: "run", labelSource: label))
   }
   /// Once per take, whenever the sidecar first refused a record, including
   /// one it refused itself while finishing.
@@ -786,12 +796,20 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       let base = sourceTimecodeBase ?? Self.timecodeBase(declaredRate?.nominal ?? duration)
       sourceTimecodeBase = base
       let broke = sourceTimecodeRun.breaks(raw, base: base, pts: pts, duration: duration)
-      if fieldMarkChanged || (declaredRate?.isVariable == true || Self.matchingFrameRate(duration) == nil) && broke {
+      let runs = declaredRate?.isVariable == true || Self.matchingFrameRate(duration) == nil
+      if fieldMarkChanged || runs && broke {
         journal(.init(kind: "nativeTimecode", detail: "Original source timecode, counted at \(base) frames a second",
-          originalValue: pts.value, originalTimescale: pts.timescale, nativeSourceTimecode: raw))
+          originalValue: pts.value, originalTimescale: pts.timescale, nativeSourceTimecode: raw,
+          labelEncoding: runs ? "run" : nil, timecodeBase: base))
+        sourceTimecodeRunOpen = sourceTimecodeRunOpen || runs
       }
       lastNativeFieldMark = raw.fieldMark
       hadNativeFieldMark = hadNativeFieldMark || raw.fieldMark != nil
+    } else if sourceTimecodeRunOpen {
+      // A frame with no label ends the run: never extrapolate native source timecode.
+      journalLabelGap("source", pts: pts)
+      sourceTimecodeRunOpen = false
+      sourceTimecodeRun = NativeLabelRun()
     }
     let nativeData: Data?
     let nativeValue: TimecodeMetadata?
@@ -813,8 +831,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       // doesn't reach the next one.
       if nativeLabelRun.breaks(value, pts: pts, duration: duration) {
         journal(.init(kind: "nativeTimecode", detail: value.label,
-          originalValue: pts.value, originalTimescale: pts.timescale, nativeTimecodeMetadata: value))
+          originalValue: pts.value, originalTimescale: pts.timescale, nativeTimecodeMetadata: value, labelEncoding: "run"))
+        nativeLabelRunOpen = true
       }
+    } else if nativeValue == nil, nativeLabelRunOpen {
+      journalLabelGap("native", pts: pts)
+      nativeLabelRunOpen = false
+      nativeLabelRun = NativeLabelRun()
     }
     if var conformer = cadenceConformer {
       // Native VFR labels describe source observations. They stay in the

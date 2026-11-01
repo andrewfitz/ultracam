@@ -156,6 +156,16 @@ final class RecordingTakeSidecar {
     var sourceDurationValue: Int64? = nil
     var sourceDurationTimescale: Int32? = nil
     var sourceProvenance: RecordingSourceProvenance? = nil
+    /// `run` on a `nativeTimecode` record kept only where its run breaks: the frames after
+    /// it count on from its label at the run's stride, up to the next record for the same
+    /// label or a `nativeTimecodeGap`. Nil in journals from before it was written.
+    var labelEncoding: String? = nil
+    /// The frames a second a raw label (`nativeSourceTimecode`) counts to.
+    var timecodeBase: Int64? = nil
+    /// Which label a `nativeTimecodeGap` ends: `source` (`nativeSourceTimecode`) or
+    /// `native` (`nativeTimecodeMetadata`). The frame it's at has none, and no reader
+    /// counts a run across it.
+    var labelSource: String? = nil
   }
   /// Where the journal stopped keeping records, and how many it didn't keep.
   struct JournalTruncation: Codable, Equatable {

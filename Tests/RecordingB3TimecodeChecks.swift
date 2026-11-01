@@ -596,6 +596,73 @@ import XCTest
     XCTAssertEqual(rebuilt, frames.map(\.count))
   }
 
+  /// Frames with no label after a run end it in the journal, so a reader counting the run
+  /// on doesn't label them; each record says how it's encoded, without parsing its words.
+  func testAnUnlabelledFrameEndsATimecodeRunInTheJournal() throws {
+    for source in [false, true] {
+      let folder = FileManager.default.temporaryDirectory.appendingPathComponent("timecode-gap-\(UUID().uuidString)")
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: folder) }
+      let movie = folder.appendingPathComponent("take.mov")
+      let duration = RecordingFrameRate.fps2997.frameDuration
+      // Variable rate: the movie's track can't carry either label, so the journal does.
+      let rate = FrameRate.variable(nominal: duration, shortest: CMTimeMultiplyByRatio(duration, multiplier: 1, divisor: 2),
+        longest: CMTimeMultiply(duration, multiplier: 2))
+      let admission = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: rate),
+        epochID: .init(sessionID: UUID(), epoch: 1), clockBindings: .init(video: .init()), stage: .recordingSource)
+      let config = try SourceRecordingConfiguration(feedID: .init("timecode-gap"), outputURL: movie, width: 1920, height: 1080,
+        declaredTimebases: [30000], sourceFrameRate: rate, sourceAdmission: admission, sidecarMovieURL: movie)
+      let writer = try AVAssetSourceRecordingWriter(configuration: config)
+      try writer.start(); try writer.bindTakeContext(.init(sourceAdmission: admission, audioDeclaration: .absent))
+      // A 1:1 counter that's missing from frames 10 to 14.
+      let unlabelled = 10..<15
+      for index in 0..<20 {
+        let frame = try sample(pts: CMTimeMultiply(duration, multiplier: Int32(index)), duration: duration)
+        if !unlabelled.contains(index) {
+          let data = source
+            ? try JSONEncoder().encode(Timecode(hours: 1, minutes: 0, seconds: 0, frames: index, dropFrame: false))
+            : try JSONEncoder().encode(XCTUnwrap(TimecodeMetadata.native(label: String(format: "01:00:00:%02d", index), frameRate: .fps2997)))
+          CMSetAttachment(frame, key: (source ? SourceRecordingConfiguration.sourceTimecodeAttachmentKey : SourceRecordingConfiguration.nativeTimecodeAttachmentKey) as CFString,
+            value: data as CFData, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+        }
+        try writer.appendVideo(frame)
+      }
+      try writer.finish()
+      let lines = try String(contentsOf: RecordingTakeSidecar.url(for: movie).appendingPathExtension("journal"), encoding: .utf8)
+      let events = try lines.split(separator: "\n").map { try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data($0.utf8)) }
+      let labels = events.filter { $0.kind == "nativeTimecode" }
+      let gaps = events.filter { $0.kind == "nativeTimecodeGap" }
+      let frameAt = { (event: RecordingTakeSidecar.Event) in (event.originalValue ?? -1) / duration.value }
+      XCTAssertEqual(labels.map(frameAt), [0, 1, 15, 16], "The run, and after the gap the run started over")
+      XCTAssertTrue(labels.allSatisfy { $0.labelEncoding == "run" })
+      XCTAssertEqual(labels.map(\.timecodeBase), source ? [30, 30, 30, 30] : [nil, nil, nil, nil])
+      XCTAssertEqual(gaps.map(frameAt), [10], "Where the labels stop")
+      XCTAssertEqual(gaps.first?.labelSource, source ? "source" : "native")
+      XCTAssertNil(gaps.first?.nativeSourceTimecode)
+      XCTAssertNil(gaps.first?.nativeTimecodeMetadata)
+    }
+  }
+
+  /// Sidecars and journal lines written before the encoding fields still load, as version 1.
+  func testAVersionOneSidecarAndItsJournalStillDecode() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("sidecar-v1-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("take.mov")
+    try Data(#"{"version":1,"metadata":{"sourceSignature":"s","outputSignature":"o"},"finished":true,"journalBytes":120}"#.utf8)
+      .write(to: RecordingTakeSidecar.url(for: movie))
+    let snapshot = try RecordingTakeSidecar.readSnapshot(for: movie)
+    XCTAssertEqual(snapshot.version, 1)
+    XCTAssertTrue(snapshot.finished)
+    XCTAssertEqual(snapshot.metadata.sourceSignature, "s")
+    let line = #"{"kind":"nativeTimecode","detail":"Original source timecode, counted at 30 frames a second","originalValue":1001,"originalTimescale":30000}"#
+    let event = try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data(line.utf8))
+    XCTAssertEqual(event.originalValue, 1001)
+    XCTAssertNil(event.labelEncoding)
+    XCTAssertNil(event.timecodeBase)
+    XCTAssertNil(event.labelSource)
+  }
+
   /// One frame of a replayed run: its source time and the label on it.
   private struct LabeledFrame {
     var pts: CMTime
