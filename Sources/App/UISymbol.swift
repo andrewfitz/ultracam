@@ -7,7 +7,7 @@ enum UISymbol {
   static let camera = "video"
   static let cameraOnAir = "video.fill"
   static let noCameras = "video.badge.plus"
-  /// No signal, and a dropout count. It means nothing else.
+  /// No signal. It means nothing else.
   static let noSignal = "video.slash"
   static func virtualCamera(inUse: Bool) -> String { inUse ? "video.badge.checkmark" : "video.badge.ellipsis" }
   static let waitingCamera = "video.badge.ellipsis"

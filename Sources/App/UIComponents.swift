@@ -77,18 +77,19 @@ struct UIIconValue: View {
   }
 }
 
-/// A symbol and a count, shown only above zero.
+/// A count in words ("2 drops"), in orange, shown only above zero. Words, not a glyph: a lone
+/// symbol and a number didn't say what was counted.
 struct UICountChip: View {
-  let symbol: String
   let count: Int
+  let one: String
+  let many: String
   let help: String
+
+  static func text(_ count: Int, one: String, many: String) -> String { "\(count) \(count == 1 ? one : many)" }
 
   var body: some View {
     if count > 0 {
-      HStack(spacing: 3) {
-        Image(systemName: symbol).imageScale(.small).foregroundStyle(.orange)
-        Text("\(count)").monospacedDigit()
-      }
+      Text(Self.text(count, one: one, many: many)).monospacedDigit().foregroundStyle(.orange)
       .font(.uiBadge)
       .help(help)
       .accessibilityElement(children: .ignore)

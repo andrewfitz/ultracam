@@ -258,7 +258,7 @@ File: `UICameraColumn.swift`. Rows follow the plan: header, record, folder or pr
 
 | Tier | Element | Today | Change |
 |---|---|---|---|
-| A | Signal badge, live | Green dot, format, chevron (`UIFeedSettingsMenu.swift:37-43`) | Same, with `UICountChip` (`video.slash` and count) when dropouts are above zero, at `uiBadge`. Help says "5 signal dropouts since Start" |
+| A | Signal badge, live | Green dot, format, chevron (`UIFeedSettingsMenu.swift:37-43`) | Same, with `UICountChip` ("5 drops" in orange; a lone `video.slash` and number was unclear, 2026-11-02) when dropouts are above zero, at `uiBadge`. Help says "The signal dropped 5 times since Start" |
 | A | Signal badge, problem | Orange dot and words | Orange triangle and words. Dot and triangle mean different things now |
 | A | Signal badge, stopped | Gray dot, "Stopped" | `UIStateGlyph` inactive. Secondary words |
 | A | Record state word | Red text (`:896`) | Red dot plus "Recording" in primary (06 V6), on expanded strips. Collapsed strips drop it, because the REC pill says it (J18) |

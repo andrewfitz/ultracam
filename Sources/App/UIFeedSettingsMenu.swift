@@ -65,8 +65,8 @@ struct UIFeedSettingsMenu: View {
                     UIStateGlyph(state: .inactive, size: 6)
                 }
                 Text(camera.statusBadge)
-                UICountChip(symbol: UISymbol.noSignal, count: camera.signalDropouts,
-                    help: "\(camera.signalDropouts) signal dropouts since Start")
+                UICountChip(count: camera.signalDropouts, one: "drop", many: "drops",
+                    help: "The signal dropped \(camera.signalDropouts == 1 ? "once" : "\(camera.signalDropouts) times") since Start")
                 Image(systemName: "chevron.down").font(.caption2.weight(.bold))
             }
             .font(.uiBadge).lineLimit(1).padding(.horizontal, 6).frame(height: 18)
