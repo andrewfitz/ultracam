@@ -61,8 +61,9 @@ struct UISettingsView: View {
           .tag(tab)
       }
     }
-    .frame(minWidth: UISettingsLayout.minimumWidth, maxWidth: .infinity,
-      minHeight: UISettingsLayout.minimumHeight, maxHeight: .infinity)
+    .frame(minWidth: UISettingsLayout.minimumWidth, idealWidth: UISettingsLayout.defaultSize.width, maxWidth: .infinity,
+      minHeight: UISettingsLayout.minimumHeight, idealHeight: UISettingsLayout.defaultSize.height,
+      maxHeight: .infinity)
   }
 
   @ViewBuilder private func pane(_ tab: UISettingsTab) -> some View {
