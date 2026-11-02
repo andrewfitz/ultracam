@@ -1023,7 +1023,10 @@ final class AppModel {
     case .ignoredSameSource, .rejectedMissingSource:
       break
     }
-    saveSettings()
+    // The selection alone, as a landed cut saves it: a cut changes no camera, route or
+    // device, and a full save walks CMIO's devices and the extension's registry on the
+    // main thread, between the click and the cut.
+    persistProgramSelection()
     return result
   }
 

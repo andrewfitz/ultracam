@@ -314,6 +314,30 @@ struct LivePerformanceSample {
       _ = bridge.context()
     } onChange: { rebuilt.withLock { $0 = true } }
 
+    /// Selecting another camera and cutting to one: the click's own main-thread time, then the
+    /// longest stall while the window catches up. Both are the wait before the click shows.
+    func react(_ where: String) {
+      let other = ids[1]
+      let back = ids[0]
+      for (step, action) in [("select another camera", UIAction.select(cameraID: other.rawValue)),
+        ("select back", .select(cameraID: back.rawValue)),
+        ("cut to another camera", .cut(cameraID: other.rawValue)), ("cut back", .cut(cameraID: back.rawValue))] {
+        var clickMS = 0.0
+        let value = sample(1.0) {
+          let start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+          bridge.send(action)
+          clickMS = Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1e6
+        }
+        print(String(format: "PERF \(name) \(step) \(`where`): click %.1f ms | ", clickMS) + value.summary)
+        verifier.check("\(name), \(step) \(`where`): the click takes under 50 ms", clickMS < 50, String(format: "%.1f ms", clickMS))
+        verifier.check("\(name), \(step) \(`where`): no run loop stall past 250 ms", value.longest < 250, value.summary)
+        if case .cut(let id) = action {
+          verifier.check("\(name), \(step) \(`where`): the cut lands", model.switcherSelectedFeedID?.rawValue == id,
+            model.switcherSelectedFeedID?.rawValue ?? "nil")
+        }
+      }
+    }
+
     let before = ids.map { model.cameraUpdate($0)?.frames ?? 0 }
     // UI_PERF_IDLE stretches the idle interval, e.g. to attach Instruments to this process.
     let meterTicks = MeterDiagnostics.displayTicks
@@ -378,12 +402,14 @@ struct LivePerformanceSample {
     // The leaves still follow: the inspector's timecode with the selected camera's updates (4 Hz).
     verifier.check("\(name): the inspector's timecode follows capture updates",
       inspecting.rate("UILiveCamera(capture)") >= 3, inspecting.summary)
+    react("with the inspector open")
     let close = sample(1.2) { bridge.send(.toggleInspector) }
     print("PERF \(name) inspector close: \(close.summary)")
     checkToggle(close, "inspector close", name: name, verifier: verifier, liveMeters: liveMeters)
     let afterToggles = sample(3)
     print("PERF \(name) idle after toggles: \(afterToggles.summary)")
     check(afterToggles, "idle after toggles", name: name, verifier: verifier, liveMeters: liveMeters)
+    react("with the inspector closed")
   }
 
 

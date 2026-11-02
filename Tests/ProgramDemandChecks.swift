@@ -10,6 +10,8 @@ import XCTest
   private var model: AppModel!
   private var ids: [FeedID] = []
   private var index: Int32 = 0
+  private var publisher: DemandRegistryPublisher!
+  private var defaults: UserDefaults!
 
   private func prepare(cameras: Int = 2) throws {
     let devices = (1...cameras).map { "fake:\($0)" }
@@ -24,9 +26,11 @@ import XCTest
       makeRequest: { _ in fatalError("No installer requests in this fixture") },
       submit: { _ in XCTFail("No installer submissions in this fixture") },
       queryProperties: { $0([]) }))
+    self.defaults = defaults
+    publisher = DemandRegistryPublisher()
     model = AppModel(settingsStore: AppSettingsStore(defaults: defaults),
       registryStore: VirtualCameraRegistryStore(defaults: defaults),
-      registryPublisher: DemandRegistryPublisher(),
+      registryPublisher: publisher,
       recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer,
       hardware: fixture.hardware)
     model.refresh()
@@ -149,6 +153,21 @@ import XCTest
     spin("And counts like any cut") { model.recentCuts.count == 1 }
     XCTAssertEqual(model.recentCuts.first?.cameraID, ids[1].rawValue)
     XCTAssertNotNil(model.programShotStartedAt)
+  }
+
+  /// A cut saves the selection alone. The full save walked CMIO's devices and the extension's
+  /// registry on the main thread before the cut was queued: the lag between click and cut.
+  func testACutSavesTheSelectionWithoutPublishingTheCameras() throws {
+    try prepare()
+    defer { finish() }
+    try allProducing()
+    let published = publisher.published
+    guard case .queued = model.requestProgramCut(to: ids[1]) else { return XCTFail("A cut") }
+    try emitUntil("It lands") { model.switcherSelectedFeedID == ids[1] }
+    settle()
+    XCTAssertEqual(publisher.published, published, "No camera changed: nothing to publish")
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot().switcher.selectedFeedID, ids[1],
+      "What is on air is saved")
   }
 
   func testACutThatMissesAnISOClientSaysSoUntilProgramHasOne() throws {
@@ -343,7 +362,8 @@ import XCTest
   }
 }
 
-private final class DemandRegistryPublisher: AppVirtualCameraRegistryPublishing {
-  func publish(_ snapshot: VirtualCameraRegistrySnapshot) {}
+@MainActor private final class DemandRegistryPublisher: AppVirtualCameraRegistryPublishing {
+  private(set) var published = 0
+  func publish(_ snapshot: VirtualCameraRegistrySnapshot) { published += 1 }
 }
 #endif
