@@ -567,6 +567,7 @@ final class AppSettingsStore {
   static let recordingCodecKey = "ultracam.recordingCodec"
   static let recordingTimecodeModeKey = "ultracam.recordingTimecodeMode"
   static let recordingNamingKey = "ultracam.recordingNaming"
+  static let recordingBurnInLUTKey = "ultracam.recordingBurnInLUT"
   static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
   static let snapshotKey = "ultracam.settings.v2"
@@ -584,6 +585,7 @@ final class AppSettingsStore {
   func resetAll() {
     let names = defaults.dictionaryRepresentation().keys.filter {
       $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.recordingCodecKey || $0 == Self.recordingTimecodeModeKey || $0 == Self.recordingNamingKey ||
+        $0 == Self.recordingBurnInLUTKey ||
         $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
         $0 == VendorSettingsKeys.preferences || $0 == "ultracam.settings.pre-b1d.backup" || $0 == Self.lutInputRepairedKey ||
         $0.hasPrefix("ui.") || $0.hasPrefix("recordingFolderBookmark")
@@ -616,6 +618,12 @@ final class AppSettingsStore {
         .flatMap { try? JSONDecoder().decode(RecordingFileNaming.self, from: $0) } ?? .standard
     }
     set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Self.recordingNamingKey) }
+  }
+
+  /// Burn LUT into recordings. Off when never saved.
+  var recordingBurnInLUT: Bool {
+    get { defaults.bool(forKey: Self.recordingBurnInLUTKey) }
+    set { defaults.set(newValue, forKey: Self.recordingBurnInLUTKey) }
   }
 
   var hideFromDock: Bool {

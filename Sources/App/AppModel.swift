@@ -478,11 +478,17 @@ final class AppModel {
     recordingModel.codec = store.recordingCodec
     recordingModel.timecodeMode = store.recordingTimecodeMode
     recordingModel.naming = store.recordingNaming
+    recordingModel.burnInLUT = store.recordingBurnInLUT
     recordingModel.onRecordingChoicesChanged = { [weak self] in
       guard let self else { return }
       self.settingsStore.recordingCodec = self.recordingModel.codec
       self.settingsStore.recordingTimecodeMode = self.recordingModel.timecodeMode
       self.settingsStore.recordingNaming = self.recordingModel.naming
+      self.settingsStore.recordingBurnInLUT = self.recordingModel.burnInLUT
+    }
+    recordingModel.lutFile = { [weak self] id in
+      guard let state = self?.cameraLUTs[id], let title = state.title, let fileName = state.fileName else { return nil }
+      return RecordingLUTFile(title: title, fileName: fileName)
     }
     recordingModel.compatibilityPolicy = sampledRecordingCompatibilityPolicy
     recordingModel.sourceFormat = { [weak self] id in self?.cameraUpdate(id)?.sourceFormat }

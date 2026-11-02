@@ -584,6 +584,36 @@ final class LUTProcessor: @unchecked Sendable {
     try waitFor { try submitPassthrough(input, completion: $0) }
   }
 
+  /// Recording burn-in: one frame decoded, through the loaded LUT and encoded
+  /// into `destination` (an IOSurface buffer from the encoder's pool, in
+  /// `configuration`'s output layout), waiting for the GPU. GPU milliseconds.
+  func render(_ input: CVPixelBuffer, configuration: PipelineConfiguration, declaredSourceColorimetry: Colorimetry?,
+    into destination: CVPixelBuffer) throws -> Double {
+    let waiter = RenderWaiter()
+    try submit(input, configuration: configuration, declaredSourceColorimetry: declaredSourceColorimetry,
+      into: destination) { completed in
+      waiter.result = completed.result.map { _ in completed.timing.gpuMS }
+      waiter.done.signal()
+    }
+    guard waiter.done.wait(timeout: .now() + 2) == .success, let result = waiter.result else {
+      throw VideoError.message("GPU processing timed out.")
+    }
+    return try result.get()
+  }
+
+  private final class RenderWaiter: @unchecked Sendable {
+    let done = DispatchSemaphore(value: 0)
+    var result: Result<Double, Error>?
+  }
+
+  private static func validateRenderTarget(_ buffer: CVPixelBuffer, configuration: PipelineConfiguration,
+    width: Int, height: Int) throws {
+    guard CVPixelBufferGetIOSurface(buffer) != nil, CVPixelBufferGetPixelFormatType(buffer) == configuration.pixelFormat,
+      CVPixelBufferGetWidth(buffer) == width, CVPixelBufferGetHeight(buffer) == height else {
+      throw VideoError.message("The render target is not an IOSurface \(VideoContract.fourCC(configuration.pixelFormat)) buffer of \(width) × \(height).")
+    }
+  }
+
   private final class Waiter: @unchecked Sendable {
     let done = DispatchSemaphore(value: 0)
     var result: Result<CVPixelBuffer, Error>?
@@ -683,9 +713,12 @@ final class LUTProcessor: @unchecked Sendable {
   /// Encodes and commits one processed frame. `completion` runs on the
   /// processor's completion queue after the GPU finished, in submission order.
   /// `isCurrent` lets a caller abandon a frame waiting for a GPU slot.
+  /// `renderTarget`: render into this caller-owned IOSurface buffer (the
+  /// recording encoder's pool) instead of one from this processor's pool.
   func submit(_ input: CVPixelBuffer, configuration: PipelineConfiguration,
     colorConversion: LUTColorSpaceConversion = .none,
     destinationColorimetry: Colorimetry? = nil, declaredSourceColorimetry: Colorimetry? = nil,
+    into renderTarget: CVPixelBuffer? = nil,
     isCurrent: () -> Bool = { true }, completion: @escaping Completion) throws {
     let preparedSequence = submitted
     defer { if submitted == preparedSequence { discardUnsubmittedOutputTextures(sequence: preparedSequence) } }
@@ -762,9 +795,10 @@ final class LUTProcessor: @unchecked Sendable {
     guard !configuration.outputColor.is420 || (outputWidth.isMultiple(of: 2) && outputHeight.isMultiple(of: 2)) else {
       throw VideoError.message("The selected YUV output requires even chroma geometry; choose a resized output.")
     }
-    let pool = try preparePool(configuration, width: outputWidth, height: outputHeight)
-    var created: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, allocationLimit(slotBytes: outputSlotBytes), &created)
+    if let renderTarget { try Self.validateRenderTarget(renderTarget, configuration: configuration, width: outputWidth, height: outputHeight) }
+    let pool = try renderTarget == nil ? preparePool(configuration, width: outputWidth, height: outputHeight) : nil
+    var created: CVPixelBuffer? = renderTarget
+    let status = pool.map { CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, $0, allocationLimit(slotBytes: outputSlotBytes), &created) } ?? kCVReturnSuccess
     if status == kCVReturnWouldExceedAllocationThreshold { throw VideoError.outputBackPressure }
     guard status == kCVReturnSuccess, let output = created else {
       throw VideoError.message("Output buffers are unavailable (\(status)).")

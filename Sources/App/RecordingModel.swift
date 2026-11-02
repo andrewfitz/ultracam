@@ -95,6 +95,11 @@ struct RecordingConfiguration: Equatable, Sendable {
   var recordingConstantFrameRate = false
   /// Explicit bounded rounding for variable source timestamps; sampled per take.
   var variableRateQuantizationPolicy: RecordingTimebase.QuantizationPolicy = .nearest240000
+  /// Settings › Recording › Burn LUT into recordings, sampled per take: the
+  /// take burns in the LUT its camera burns in at the start, if any.
+  var burnInLUT = false
+  /// The camera's LUT file as the app last loaded it, to name it in the take's sidecar.
+  var lutFile: RecordingLUTFile?
 
   init(codec: RecordingCodec = .proRes42210Bit, outputFolder: URL? = nil,
     timecodeMode: RecordingTimecodeMode = .wallClock, feedName: String? = nil,
@@ -109,6 +114,12 @@ struct RecordingConfiguration: Equatable, Sendable {
     self.feedName = feedName
     self.compatibilityPolicy = compatibilityPolicy
   }
+}
+
+/// A camera's loaded LUT file: `CameraLUTState`'s "Title · size" and file name.
+struct RecordingLUTFile: Equatable, Sendable {
+  var title: String
+  var fileName: String
 }
 
 struct RecordingFeedDescriptor: Identifiable, Hashable, Sendable {
@@ -330,6 +341,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     let takeContext: RecordingTakeContext?
     let videoFormat: SourceFormat?
     let nativeTimecode: Timecode?
+    /// The LUT this take burns in, sampled with the take context; nil records clean.
+    let lutSnapshot: RecordingLUTSnapshot?
   }
 
   /// Synchronous start, for callers that may block (tests, tools).
@@ -384,7 +397,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     return StartRequest(feedID: feedID, configuration: configuration, folder: folder, capture: capture,
       sourceTimecode: configuration.timecodeMode == .recordStart ? capture.latestSourceTimecode : nil,
       takeContext: capture.recordingTakeContext, videoFormat: capture.recordingVideoFormat,
-      nativeTimecode: capture.latestNativeTimecode)
+      nativeTimecode: capture.latestNativeTimecode,
+      lutSnapshot: configuration.burnInLUT ? capture.recordingLUTSnapshot : nil)
   }
 
   /// Worker: builds and starts the session, then publishes it. A stop that
@@ -441,6 +455,13 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     let output = try outputManager.beginExternalWriterSession(
       feedID: Self.safeComponent(request.configuration.feedName ?? "Camera"))
     do {
+      // Its own GPU processor, built here off the main actor, before the encoder.
+      let burnIn = try request.lutSnapshot.map { snapshot in
+        let file = request.configuration.lutFile.flatMap {
+          $0.title.hasPrefix(snapshot.lut.cube.title + " · ") ? $0.fileName : nil
+        }
+        return try RecordingLUTRenderer(snapshot: snapshot, fileName: file)
+      }
       let sourceConfiguration = try SourceRecordingConfiguration(
         feedID: SourceRecordingFeedID(request.feedID.rawValue), outputURL: output.temporaryURL,
         width: request.videoFormat?.width ?? 3840,
@@ -461,7 +482,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
         sourceAdmission: request.takeContext?.sourceAdmission,
         expectedSourceFormat: request.videoFormat,
         compatibilityPolicy: request.configuration.compatibilityPolicy, formatNote: request.configuration.formatNote,
-        sidecarMovieURL: output.finalURL, sidecarCreated: { try output.claimSidecar() })
+        sidecarMovieURL: output.finalURL, sidecarCreated: { try output.claimSidecar() },
+        lutBurnIn: burnIn, lutBurnInRequested: request.configuration.burnInLUT)
       let recorder = try recorderFactory(sourceConfiguration)
       let adapter = SourceRecordingCallbackAdapter(feedID: sourceConfiguration.feedID, recorder: recorder)
       try adapter.start()
@@ -697,6 +719,13 @@ final class RecordingModel {
   var naming: RecordingFileNaming = .standard {
     didSet { if naming != oldValue { onRecordingChoicesChanged?() } }
   }
+  /// Burn LUT into recordings (Settings › Recording), for the next take. Every
+  /// camera burns in its own LUT; one with none records clean.
+  var burnInLUT = false {
+    didSet { if burnInLUT != oldValue { onRecordingChoicesChanged?() } }
+  }
+  /// A camera's loaded LUT file, for a burned-in take's sidecar.
+  var lutFile: ((FeedID) -> RecordingLUTFile?)?
   /// Copied into RecordingConfiguration before asynchronous take preparation.
   var compatibilityPolicy = RecordingCompatibilityPolicy()
   /// Observers are told when a take's state changes; its running statistics (2 Hz) are
@@ -819,6 +848,7 @@ final class RecordingModel {
     var configuration = RecordingConfiguration(codec: codec, outputFolder: outputFolder, timecodeMode: timecodeMode,
       compatibilityPolicy: compatibilityPolicy)
     configuration.naming = naming
+    configuration.burnInLUT = burnInLUT
     return configuration
   }
 
@@ -920,6 +950,7 @@ final class RecordingModel {
     feeds[index].takeCodec = take.codec
     feeds[index].takeFallbackFrom = take.codec != codec ? codec : nil
     take.recordingConstantFrameRate = feedConstantFrameRate[feedID] ?? false
+    if take.burnInLUT { take.lutFile = lutFile?(feedID) }
     recordingGenerations[feedID, default: 0] &+= 1
     let generation = recordingGenerations[feedID, default: 0]
     let previous = (savedURL: feeds[index].savedURL, statistics: feeds[index].statistics)

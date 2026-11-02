@@ -247,6 +247,10 @@ final class CaptureController: @unchecked Sendable {
   private var loadedLUT: MonitorLUT?
   private var loadedLUTColorSpace = LUTColorSpaceContract.rec709Video
   private var burnInActive = false
+  // The source interpretation and LUT output the burned-in frames use, for a
+  // take that burns the LUT into its recording.
+  private var burnInSourceOverride: Colorimetry?
+  private var burnInLUTOutput: Colorimetry?
   private var gpuStallReported = false
   private var rawAudioProvidesStats = false
   private var processedFrameHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
@@ -525,15 +529,29 @@ final class CaptureController: @unchecked Sendable {
   /// LUT forgotten, complete bypass, nothing loaded): the same immutable
   /// `MonitorLUT` the app built for the load, so the monitor's output stage
   /// (`MonitorFeed.burnInLUT`) shows exactly what Program and the virtual camera
-  /// get. Recording never does: it takes the camera original. Follows each
-  /// configuration change. Thread-safe.
+  /// get. Recording takes the camera original, unless Burn LUT into
+  /// recordings is on (`recordingLUTSnapshot`). Follows each configuration
+  /// change. Thread-safe.
   var burnInLUT: MonitorLUT? { lock.withLock { burnInActive ? loadedLUT : nil } }
 
   /// Capture queue: publishes whether frames burn the loaded LUT in, as
   /// `effectiveConfiguration` decides for each frame.
   private func publishBurnIn() {
     let active = pipelineEnabled && configuration.applyLUT
-    lock.withLock { burnInActive = active }
+    let (override, output) = (configuration.sourceColorimetryOverride, configuration.lutOutputColorimetry)
+    lock.withLock { burnInActive = active; burnInSourceOverride = override; burnInLUTOutput = output }
+  }
+
+  /// What a take starting now burns into its recording when Burn LUT into
+  /// recordings is on: `burnInLUT` with its colour contract and the colour
+  /// settings Program's burned-in frames use. Nil while this camera burns no
+  /// LUT in. The take keeps it to the end. Thread-safe.
+  var recordingLUTSnapshot: RecordingLUTSnapshot? {
+    lock.withLock {
+      guard burnInActive, let loadedLUT else { return nil }
+      return RecordingLUTSnapshot(lut: loadedLUT, colorSpace: loadedLUTColorSpace,
+        sourceColorimetryOverride: burnInSourceOverride, lutOutputColorimetry: burnInLUTOutput)
+    }
   }
 
   /// Burns `lut` in from the next frame (no wait for frames in flight).

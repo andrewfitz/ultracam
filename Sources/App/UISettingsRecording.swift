@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// Settings › Recording: timecode, where takes go and what they're called. Format lives in the
-/// main window (sidebar, Record menus), because it is chosen per session.
+/// Settings › Recording: timecode, the burned-in LUT, where takes go and what they're called.
+/// Format lives in the main window (sidebar, Record menus), because it is chosen per session.
 struct UISettingsRecordingPane: View {
   let model: AppModel
   var interface: UIInterfaceState = UIAppEnvironment.interface
@@ -11,6 +11,7 @@ struct UISettingsRecordingPane: View {
     let recording = model.recordingModel
     let timecode = Binding(get: { recording.timecodeMode }, set: { recording.timecodeMode = $0 })
     let naming = Binding(get: { recording.naming }, set: { recording.naming = $0 })
+    let burnInLUT = Binding(get: { recording.burnInLUT }, set: { recording.burnInLUT = $0 })
     let cameras = interface.ordered(model.feedDescriptors, id: \.id.rawValue)
     UISettingsPane {
       Section {
@@ -19,6 +20,15 @@ struct UISettingsRecordingPane: View {
         }
       } footer: {
         UISettingsFootnote(Self.firstSentence(recording.timecodeMode.help))
+      }
+
+      Section {
+        Toggle(isOn: burnInLUT) {
+          Text("Burn LUT into recordings")
+          Text("Each camera records with the LUT it burns in, as Program shows it")
+        }
+      } footer: {
+        UISettingsFootnote(Self.burnInLUTHelp)
       }
 
       Section {
@@ -89,6 +99,8 @@ struct UISettingsRecordingPane: View {
       }
     }
   }
+
+  static let burnInLUTHelp = "Applies to the next take, which keeps the LUT it starts with. A camera with no LUT records unchanged. ProRes 4444 can’t burn a LUT in."
 
   /// `Choose…` with no folder, `Change…` when idle and `Folder for Next Take…` during a take,
   /// which keeps the folder it started in.
