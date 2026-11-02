@@ -489,13 +489,13 @@ private final class SonyStub: UCSonyCameraControl {
       await store.restoreConnections()
       await store.restoreConnections()
       await drain()
-      expect(backend.discoveryCalls == 1 && backend.connectCalls == 0 && sleeper.requested == [.seconds(2)] &&
+      expect(backend.discoveryCalls == 1 && backend.connectCalls == 0 && sleeper.requested == [.seconds(10)] &&
         store.state(for: "saved-feed").retryAt != nil && store.state(for: "saved-feed").lostAt != nil,
-        "an offline saved camera receives one startup scan, then waits 2 s to try again and reads as lost")
+        "an offline saved camera receives one startup scan, then waits 10 s to try again and reads as lost")
       sleeper.release()
       await eventually("a retry while still offline rescans once and backs off") { backend.discoveryCalls == 2 && sleeper.pending == 1 }
-      expect(sleeper.requested == [.seconds(2), .seconds(4)] && !store.state(for: "saved-feed").connected,
-        "each failed retry doubles the wait")
+      expect(sleeper.requested == [.seconds(10), .seconds(20)] && !store.state(for: "saved-feed").connected,
+        "each failed retry waits longer")
       backend.discoveredCameras = [camera]
       sleeper.release()
       await eventually("the retry reconnects once the camera is reachable") { store.state(for: "saved-feed").connected }

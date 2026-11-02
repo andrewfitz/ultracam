@@ -23,8 +23,14 @@ extension CameraControlAssignment {
 /// When a paired body that dropped, or didn't answer at launch, is tried again. Pure, so
 /// the store's tests never sleep.
 enum CameraControlReconnectPolicy {
-    /// Seconds before each try: 2, 4, 8, 16, then every 30.
-    static let delays: [Double] = [2, 4, 8, 16, 30]
+    /// Seconds before each try: 10, 20, 30, then once a minute. Each try itself waits up to
+    /// 15 s for the body to answer.
+    static let delays: [Double] = [10, 20, 30, 60]
+    /// How long a body is tried for before it waits for the operator's Reconnect (or the
+    /// Mac waking, or the network coming back, which start another round).
+    static let giveUpAfter: TimeInterval = 10 * 60
+    static func givesUp(startedAt: Date, now: Date) -> Bool { now.timeIntervalSince(startedAt) >= giveUpAfter }
+    static let gaveUpMessage = "No answer for 10 minutes. Reconnect to try again."
     /// `jitter` in 0...1 adds up to a tenth, so bodies that dropped together don't retry in step.
     static func delay(step: Int, jitter: Double) -> Duration {
         let base = delays[min(max(step, 0), delays.count - 1)]
@@ -168,6 +174,9 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     /// two bodies never scan or connect at once.
     @ObservationIgnored private var retryTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var retrySteps: [String: Int] = [:]
+    /// When each body's current round of tries started, and the bodies whose round ran out.
+    @ObservationIgnored private var retryStarted: [String: Date] = [:]
+    @ObservationIgnored private var gaveUp: Set<String> = []
     @ObservationIgnored private var retryChain: Task<Void, Never>?
     @ObservationIgnored private var queuedRetries: Set<String> = []
     @ObservationIgnored private var connectFailures: [String: any Error] = [:]
@@ -416,8 +425,10 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     /// backoff reset.
     func retryPendingReconnects() {
         guard !shuttingDown else { return }
-        for feed in Array(retryTasks.keys) {
+        for feed in Set(retryTasks.keys).union(gaveUp).sorted() {
             retrySteps.removeValue(forKey: feed)
+            retryStarted.removeValue(forKey: feed)
+            gaveUp.remove(feed)
             scheduleRetry(feed, after: .zero)
         }
     }
@@ -603,6 +614,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             }
             if reason.code != .manual, CameraControlReconnectPolicy.retries(code: reason.code, retryable: reason.retryable) {
                 retrySteps.removeValue(forKey: feed)
+                retryStarted.removeValue(forKey: feed)
                 scheduleRetry(feed)
             }
         case .error(_, _, let error): state.message = error.message
@@ -659,11 +671,26 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     private func clearRetry(_ feed: String) {
         retryTasks.removeValue(forKey: feed)?.cancel()
         retrySteps.removeValue(forKey: feed)
+        retryStarted.removeValue(forKey: feed)
+        gaveUp.remove(feed)
         if let state = states[feed], state.retryAt != nil { state.retryAt = nil }
+    }
+    /// The round ran out: no more tries until the operator's Reconnect, a wake or the network
+    /// coming back. The body still reads as lost, so Problems offers Reconnect.
+    private func giveUp(_ feed: String) {
+        clearRetry(feed)
+        gaveUp.insert(feed)
+        state(for: feed).message = CameraControlReconnectPolicy.gaveUpMessage
     }
     private func scheduleRetry(_ feed: String, after override: Duration? = nil) {
         retryTasks.removeValue(forKey: feed)?.cancel()
         guard retryDecision(feed) != .stop else { clearRetry(feed); return }
+        let started = retryStarted[feed] ?? now()
+        retryStarted[feed] = started
+        if override == nil, CameraControlReconnectPolicy.givesUp(startedAt: started, now: now()) {
+            giveUp(feed)
+            return
+        }
         let delay: Duration
         if let override { delay = override } else {
             delay = CameraControlReconnectPolicy.delay(step: retrySteps[feed, default: 0], jitter: jitter())

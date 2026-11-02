@@ -456,11 +456,14 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         for _ in 0..<1000 where !condition() { await Task.yield() }
     }
 
-    func testReconnectBackoffDoublesToAThirtySecondCapWithSmallJitter() {
-        let steps = (0..<7).map { CameraControlReconnectPolicy.delay(step: $0, jitter: 0) }
-        XCTAssertEqual(steps, [.seconds(2), .seconds(4), .seconds(8), .seconds(16), .seconds(30), .seconds(30), .seconds(30)])
-        XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 0, jitter: 1), .milliseconds(2200), "Jitter adds at most a tenth")
-        XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 99, jitter: 5), .seconds(33), "Jitter is clamped")
+    func testReconnectWaitsGrowToAMinuteWithSmallJitterAndStopAfterTenMinutes() {
+        let steps = (0..<6).map { CameraControlReconnectPolicy.delay(step: $0, jitter: 0) }
+        XCTAssertEqual(steps, [.seconds(10), .seconds(20), .seconds(30), .seconds(60), .seconds(60), .seconds(60)])
+        XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 0, jitter: 1), .seconds(11), "Jitter adds at most a tenth")
+        XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 99, jitter: 5), .seconds(66), "Jitter is clamped")
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        XCTAssertFalse(CameraControlReconnectPolicy.givesUp(startedAt: start, now: start.addingTimeInterval(599)))
+        XCTAssertTrue(CameraControlReconnectPolicy.givesUp(startedAt: start, now: start.addingTimeInterval(600)))
     }
 
     func testOnlyPassingFailuresAreRetried() {
@@ -511,13 +514,13 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         let state = store.state(for: "feed")
         XCTAssertFalse(state.connected)
         await settle { sleeper.pending == 1 }
-        XCTAssertEqual(sleeper.requested, [.seconds(2)])
+        XCTAssertEqual(sleeper.requested, [.seconds(10)])
         XCTAssertNotNil(state.retryAt)
         XCTAssertNotNil(state.lostAt, "A body that didn't answer at launch reads as lost, so Problems lists it")
         XCTAssertEqual(state.reconnectStatus(at: state.retryAt!.addingTimeInterval(-1.5)), "Trying again in 2 s")
         sleeper.release()
         await settle { sleeper.pending == 1 }
-        XCTAssertEqual(sleeper.requested, [.seconds(2), .seconds(4)], "Still away: the wait doubles")
+        XCTAssertEqual(sleeper.requested, [.seconds(10), .seconds(20)], "Still away: the wait grows")
         plugin.replaceCameras([Self.fakeCamera])
         sleeper.release()
         await settle { state.connected }
@@ -540,7 +543,7 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         plugin.handler?(.disconnected(feedID: "feed", generation: state.generation, reason: .init(code: .transport, retryable: true, message: "Lost camera")))
         XCTAssertTrue(state.retrying)
         await settle { sleeper.pending == 1 }
-        XCTAssertEqual(sleeper.requested, [.seconds(2)], "A body that drops on its own is tried again")
+        XCTAssertEqual(sleeper.requested, [.seconds(10)], "A body that drops on its own is tried again")
         await settle { plugin.connectedGeneration == nil }
         sleeper.release()
         await settle { state.connected }
@@ -603,13 +606,48 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         await settle { sleeper.pending == 1 }
         sleeper.release()
         await settle { sleeper.requested.count == 2 }
-        XCTAssertEqual(sleeper.requested.last, .seconds(4))
+        XCTAssertEqual(sleeper.requested.last, .seconds(20))
         store.retryPendingReconnects()
         await settle { sleeper.requested.count == 3 }
         XCTAssertEqual(sleeper.requested.last, .zero, "A wake tries now")
         sleeper.release()
         await settle { sleeper.pending == 1 && sleeper.requested.count == 4 }
-        XCTAssertEqual(sleeper.requested.last, .seconds(2), "and starts the backoff over")
+        XCTAssertEqual(sleeper.requested.last, .seconds(10), "and starts the backoff over")
+        _ = await store.shutdown()
+    }
+
+    func testABodyThatStaysAwayIsTriedForTenMinutesThenWaitsForReconnectOrAWake() async throws {
+        let persistence = MemoryControlAssignments()
+        persistence.value.plugins = ["fake": ["feed": .init(camera: Self.fakeCamera)]]
+        let plugin = FakeControlPlugin(descriptor: Self.fakeDescriptor, cameras: [])
+        let sleeper = RetrySleeper()
+        final class Clock { var date = Date(timeIntervalSinceReferenceDate: 0) }
+        let clock = Clock()
+        let store = CameraControlStore(plugins: ["fake": plugin], credentials: MemoryControlCredentials(), persistence: persistence,
+            now: { clock.date }, sleep: { try await sleeper.sleep($0) }, jitter: { 0 })
+        await store.restoreConnections()
+        let state = store.state(for: "feed")
+        await settle { sleeper.pending == 1 }
+        clock.date = clock.date.addingTimeInterval(9 * 60)
+        sleeper.release()
+        await settle { sleeper.pending == 1 && sleeper.requested.count == 2 }
+        XCTAssertTrue(state.retrying, "Nine minutes in: still trying")
+        clock.date = clock.date.addingTimeInterval(60)
+        sleeper.release()
+        await settle { !state.retrying }
+        XCTAssertFalse(state.retrying, "Ten minutes in: it stops")
+        XCTAssertEqual(sleeper.pending, 0)
+        XCTAssertNil(state.retryAt)
+        XCTAssertNotNil(state.lostAt, "Still lost, so Problems offers Reconnect")
+        XCTAssertEqual(state.message, CameraControlReconnectPolicy.gaveUpMessage)
+        // A wake (or the network coming back) starts a new round.
+        store.retryPendingReconnects()
+        await settle { sleeper.requested.count == 3 }
+        XCTAssertEqual(sleeper.requested.last, .zero)
+        plugin.replaceCameras([Self.fakeCamera])
+        sleeper.release()
+        await settle { state.connected }
+        XCTAssertTrue(state.connected)
         _ = await store.shutdown()
     }
 }
