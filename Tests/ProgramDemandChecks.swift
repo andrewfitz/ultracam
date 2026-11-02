@@ -1,6 +1,8 @@
 #if ULTRACAM_TEST_SUPPORT
 import CoreMedia
 import Foundation
+import Observation
+import Synchronization
 import XCTest
 
 /// Demand decides all work: a real model, the real switcher and fake capture. Nothing here
@@ -168,6 +170,24 @@ import XCTest
     XCTAssertEqual(publisher.published, published, "No camera changed: nothing to publish")
     XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot().switcher.selectedFeedID, ids[1],
       "What is on air is saved")
+  }
+
+  /// The window follows the selection and a requested cut the moment they change. Both live
+  /// in the capture coordinator, which SwiftUI can't observe, so a click on another camera
+  /// showed only once something else in the window changed.
+  func testSelectingAndCuttingTellTheWindowAtOnce() throws {
+    try prepare()
+    defer { finish() }
+    func changes(_ read: () -> Void, when change: () -> Void) -> Bool {
+      let fired = Mutex(false)
+      withObservationTracking(read) { fired.withLock { $0 = true } }
+      change()
+      return fired.withLock { $0 }
+    }
+    XCTAssertTrue(changes({ _ = model.selectedFeedID }) { _ = model.selectFeed(ids[1]) }, "Selection")
+    try allProducing()
+    XCTAssertTrue(changes({ _ = model.switcherPendingFeedID }) { _ = model.requestProgramCut(to: ids[1]) }, "NEXT")
+    try emitUntil("It lands") { model.switcherSelectedFeedID == ids[1] }
   }
 
   func testACutThatMissesAnISOClientSaysSoUntilProgramHasOne() throws {

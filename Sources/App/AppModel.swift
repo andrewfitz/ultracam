@@ -100,7 +100,14 @@ final class AppModel {
     return tap
   }
   /// The camera the inspector edits and shortcuts target. UI state only.
-  var selectedFeedID: FeedID { feedCoordinator.selectedFeedID }
+  var selectedFeedID: FeedID {
+    _ = switchingRevision
+    return feedCoordinator.selectedFeedID
+  }
+  /// Bumped when the selection or a requested cut changes. Both live in the capture
+  /// coordinator, which SwiftUI can't observe: without it a click on another camera showed
+  /// only once something else in the window changed.
+  private var switchingRevision = 0
 
   /// Switching exists with two cameras: Program is published and cuts are offered.
   var programAvailable: Bool {
@@ -111,8 +118,14 @@ final class AppModel {
   /// value is exposed as a snapshot for SwiftUI bindings; mutations should go
   /// through `updateSwitcher` to keep the frame route and disk state aligned.
   var switcherSettings: SwitcherSettings { feedCoordinator.switcher }
-  var switcherSelectedFeedID: FeedID? { feedCoordinator.switcher.selectedFeedID }
-  var switcherPendingFeedID: FeedID? { feedCoordinator.programOutput.pendingFeedID }
+  var switcherSelectedFeedID: FeedID? {
+    _ = switchingRevision
+    return feedCoordinator.switcher.selectedFeedID
+  }
+  var switcherPendingFeedID: FeedID? {
+    _ = switchingRevision
+    return feedCoordinator.programOutput.pendingFeedID
+  }
   var switcherStatus: String { feedCoordinator.switcherCoordinator.statusMessage }
 
   var naturalTalkingHeadEnabled: Bool {
@@ -559,6 +572,7 @@ final class AppModel {
       self?.showStatus(message)
     }
     feedCoordinator.onProgramCutApplied = { [weak self] feedID, sourceTime, programTime in
+      self?.switchingRevision &+= 1
       self?.programCutIssue = nil
       self?.noteCutReach()
       self?.reconcileProgramTransportDemand()
@@ -863,6 +877,7 @@ final class AppModel {
   func selectFeed(_ id: FeedID) -> Bool {
     let previous = selectedFeedID
     guard feedCoordinator.select(id) else { return false }
+    switchingRevision &+= 1
     captureLog.notice("Selection: \(previous.rawValue, privacy: .public) → \(id.rawValue, privacy: .public)")
     persistProgramSelection()
     return true
@@ -1011,6 +1026,8 @@ final class AppModel {
     let oldDecisionID = pendingAutoDecisionID
     let result = feedCoordinator.requestProgramCut(to: feedID)
     if case .rejectedMissingSource = result { return result }
+    // NEXT, or the new camera when nothing was on air, shows with the click.
+    switchingRevision &+= 1
     if let oldDecisionID {
       pendingAutoDecisionID = nil
       pendingAutoTargetFeedID = nil
@@ -1034,6 +1051,7 @@ final class AppModel {
   /// UI already shows what is on air; say why the requested camera did not
   /// take, and release the director's decision so it can decide again.
   private func programCutAbandoned(_ feedID: FeedID, reason: ProgramCutAbandonReason) {
+    switchingRevision &+= 1
     let name = feedDescriptors.first { $0.id == feedID }?.name ?? feedID.rawValue
     let message: String
     switch reason {
