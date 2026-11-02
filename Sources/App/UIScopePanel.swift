@@ -50,23 +50,18 @@ struct UIScopeLabelsView: View {
   }
 }
 
-/// A scope image with its labels. The image is 768 × 256 and stretched to the
-/// view, so a waveform or histogram fills the width; a vectorscope keeps the
-/// image's 3:1 shape, so its round plot in the middle stays round.
+/// A scope image with its labels, filling the view. The scope draws at the view's own
+/// pixel size with bins to match (`MonitorScopeNSView`, `ScopeSettings.atNativeResolution`),
+/// so nothing is stretched: a waveform or histogram fills it, and a vectorscope's round
+/// plot sits square in the middle.
 struct UIScopeImage<Scope: View>: View {
   let description: UIScopeDescription
   var showsLabels = true
   @ViewBuilder var scope: () -> Scope
 
   var body: some View {
-    let image = scope()
+    scope()
       .overlay { if showsLabels { UIScopeLabelsView(description: description) } }
-    if description.settings.kind == .vectorscope {
-      image.aspectRatio(UIScopeDescription.imageAspectRatio, contentMode: .fit)
-        .frame(maxWidth: .infinity)
-    } else {
-      image
-    }
   }
 }
 

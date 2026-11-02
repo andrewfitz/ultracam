@@ -737,6 +737,12 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   @MainActor func makeScopeView() -> NSView {
     let view = MonitorScopeNSView(gpu: gpu)
     view.removedFromPresenter = { [weak self] layer in self?.scopeViewRemoved(layer) }
+    // A resized scope is drawn again at its new size, though the picture is unchanged.
+    view.drawableSizeChanged = { [weak self] in
+      guard let self else { return }
+      self.lock.withLock { self.stateVersion &+= 1 }
+      self.refresh(force: true)
+    }
     // The render thread draws scopes only while the view is in a window, so it
     // never waits on drawables nobody will display.
     view.windowChanged = { [weak self, weak view] inWindow in
@@ -1158,17 +1164,27 @@ private final class MonitorWindowObservations: @unchecked Sendable {
   func tearDown() { renderLoop.stop() }
 }
 
-/// The scope picture: MonitorKit's scope image (MonitorTools' look: 768 × 256,
-/// −10…110 IRE) in a `framebufferOnly` layer of its own. The picture's render
-/// loop draws it with a second display link, one scope per drawn picture frame,
-/// so the picture never waits for a scope drawable.
+/// The scope picture in a `framebufferOnly` layer of its own, drawn at the view's own
+/// pixel size: the render loop sizes the scope's bins from the drawable
+/// (`ScopeSettings.atNativeResolution`), so a scope of any size or shape is drawn at
+/// native resolution, never a fixed image stretched. The picture's render loop draws
+/// it with a second display link, one scope per drawn picture frame, so the picture
+/// never waits for a scope drawable.
 @MainActor final class MonitorScopeNSView: NSView {
   let metalLayer = CAMetalLayer()
   var removedFromPresenter: ((CAMetalLayer) -> Void)?
   var windowChanged: ((Bool) -> Void)?
+  /// The drawables took a new size: the scope is drawn again at it (a frozen scope too).
+  var drawableSizeChanged: (() -> Void)?
   private let gpu: MonitorGPUContext
   /// The layer's drawable residency set; nil until the layer has a device.
   nonisolated(unsafe) private let drawableSet: MTLResidencySet?
+  /// How long the view's size must hold still before the drawables follow it; meanwhile
+  /// the compositor scales the last scope to the layer (as `MonitorPictureNSView`).
+  static let drawableSettleDelay: TimeInterval = 0.12
+  /// Drawable sizes committed so far (tests and diagnostics).
+  private(set) var drawableResizes = 0
+  private var sized = false
 
   init(gpu: MonitorGPUContext) {
     let device = gpu.layerDevice
@@ -1189,7 +1205,8 @@ private final class MonitorWindowObservations: @unchecked Sendable {
       width: ScopeSettings.plainWaveformImageWidth, height: ScopeSettings.plainWaveformImageHeight)
     metalLayer.contentsGravity = .resize
     metalLayer.isOpaque = false
-    metalLayer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]
+    metalLayer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull(), "contents": NSNull(),
+      "drawableSize": NSNull()]
     layer?.addSublayer(metalLayer)
     if let drawableSet { gpu.attachDrawables(drawableSet) }
   }
@@ -1200,11 +1217,54 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     CATransaction.setDisableActions(true)
     if metalLayer.frame != bounds { metalLayer.frame = bounds }
     CATransaction.commit()
+    followSize()
   }
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     windowChanged?(window != nil)
+    followSize()
   }
+  override func viewDidChangeBackingProperties() {
+    super.viewDidChangeBackingProperties()
+    followSize()
+  }
+
+  /// The view's size in pixels; nil while it has no real size.
+  var targetDrawableSize: CGSize? {
+    let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    let width = (bounds.width * scale).rounded(), height = (bounds.height * scale).rounded()
+    guard width.isFinite, height.isFinite, width >= 2, height >= 2 else { return nil }
+    return CGSize(width: min(width, 8192), height: min(height, 8192))
+  }
+
+  /// The first real size is taken at once (nothing is shown yet); later ones once the
+  /// size settles, since every change allocates new drawables and new bins.
+  private func followSize() {
+    NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(sizeSettled), object: nil)
+    guard let target = targetDrawableSize, target != metalLayer.drawableSize else { return }
+    if sized {
+      perform(#selector(sizeSettled), with: nil, afterDelay: Self.drawableSettleDelay)
+    } else {
+      commitDrawableSize(target)
+    }
+  }
+
+  @objc private func sizeSettled() {
+    if let target = targetDrawableSize { commitDrawableSize(target) }
+  }
+
+  private func commitDrawableSize(_ size: CGSize) {
+    sized = true
+    guard metalLayer.drawableSize != size else { return }
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    metalLayer.contentsScale = window?.backingScaleFactor ?? metalLayer.contentsScale
+    metalLayer.drawableSize = size
+    CATransaction.commit()
+    drawableResizes += 1
+    drawableSizeChanged?()
+  }
+
   deinit {
     // Detaching is thread-safe; never through a render-thread block, which a stop drops.
     if let drawableSet { gpu.detachDrawables(drawableSet) }
@@ -1433,7 +1493,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     guard let scopeSource, let stamp = work.stamp, Self.wantsScopes(work), let scopeLinkLayer else { return }
     let key = ScopeKey(
       stamp: stamp, frozenToken: work.frozenToken, layer: ObjectIdentifier(scopeLinkLayer),
-      scopes: work.preferences.scopes, monitorLUT: work.state.monitorLUT)
+      scopes: work.preferences.scopes, monitorLUT: work.state.monitorLUT, size: scopeLinkLayer.drawableSize)
     guard key != scopedKey else { return }
     let now = update.targetTimestamp
     // Keep the newest picture while waiting for the saved scope-rate ceiling.
@@ -1589,6 +1649,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let layer: ObjectIdentifier?
     let scopes: MonitorScopePreferences
     let monitorLUT: Bool
+    /// The scope drawables' size: a resize draws the scope again, frozen or not.
+    var size: CGSize = .zero
   }
 
   private static func wantsScopes(_ work: MonitorSurfacePresenter.RenderWork) -> Bool {
@@ -1688,7 +1750,10 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       }
       context.keep(frame)
       context.retain(feed)
-      let (accumulator, renderer) = try scopeObjects(core, settings: key.scopes.settings)
+      // Bins at the drawable's pixels, so the scope is accurate at whatever size it is shown.
+      let settings = key.scopes.settings.atNativeResolution(
+        viewportWidth: drawable.texture.width, viewportHeight: drawable.texture.height)
+      let (accumulator, renderer) = try scopeObjects(core, settings: settings)
       try accumulator.accumulate(frame, feed: feed, monitorLUTEnabled: key.monitorLUT, into: context.submission)
       try renderer.render(accumulator, target: drawable.texture, clear: true, into: context.submission)
       #if ULTRACAM_TEST_SUPPORT

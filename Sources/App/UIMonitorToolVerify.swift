@@ -221,8 +221,8 @@ import SwiftUI
     expect("focus reads its stage", .tool(.focus), clip, "analysis on Source")
     clip.state.focus.stage = .output
     expect("focus on output", .tool(.focus), clip, "analysis on Output (LUT)")
-    expect("scopes", .tool(.scopes), clip, "below the picture")
-    expect("scopes on Program", .tool(.scopes), clip, "below the picture", program: true)
+    expect("scopes", .tool(.scopes), clip, "over the picture")
+    expect("scopes on Program", .tool(.scopes), clip, "over the picture", program: true)
 
     var zebra = MonitorFeedPreferences()
     expect("zebra off names the picture", .tool(.zebra), zebra, "Output (LUT)")

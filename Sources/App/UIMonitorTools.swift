@@ -324,7 +324,7 @@ struct UIMonitorToolSettingsView: View {
     func on(_ stage: SignalStage) -> String { UIMonitorToolText.stage(stage) }
     func analysis(_ stage: SignalStage) -> String { "analysis on \(UIMonitorToolText.stage(stage))" }
     switch panel {
-    case .tool(.scopes): return "below the picture"
+    case .tool(.scopes): return "over the picture"
     case _ where isProgram: return "Program Output"
     case .tool(.falseColor):
       let mode = state.falseColor.mode == .off

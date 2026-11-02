@@ -728,9 +728,10 @@ extension MonitorCoordinatorChecks {
     XCTAssertEqual(first.statistics.failures + second.statistics.failures, 0)
   }
 
-  /// MonitorToolsUITests:514. The scope layer keeps MonitorTools' 768 × 256
-  /// drawable and three drawables, and a drawn scope reports its GPU interval to
-  /// the context's timing hook and to the surface statistics.
+  /// MonitorToolsUITests:514, with the scope drawn at its own size: the scope layer's
+  /// drawable is the view's pixel size (not a fixed 768 × 256 image), with three
+  /// drawables, and a drawn scope reports its GPU interval to the context's timing
+  /// hook and to the surface statistics.
   func testScopePresentationReportsItsGPUInterval() throws {
     guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
     MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
@@ -757,10 +758,10 @@ extension MonitorCoordinatorChecks {
       window.contentView = nil
     }
     XCTAssertEqual(scope.metalLayer.maximumDrawableCount, 3)
-    XCTAssertEqual(
-      scope.metalLayer.drawableSize,
-      CGSize(width: ScopeSettings.plainWaveformImageWidth, height: ScopeSettings.plainWaveformImageHeight))
-    XCTAssertEqual(scope.metalLayer.drawableSize, CGSize(width: 768, height: 256))
+    let scale = window.backingScaleFactor
+    XCTAssertEqual(scope.metalLayer.drawableSize, CGSize(width: 320 * scale, height: 160 * scale),
+      "The scope draws at its view's pixel size")
+    XCTAssertGreaterThanOrEqual(scope.drawableResizes, 1, "Its first real size is taken at once")
     portedOffer(host, 1, try monitorPixelBuffer(width: 64, height: 36))
     presenter.setClean(false)
     guard portedWait(until: { presenter.statistics.scopeUpdates > 0 }) else {

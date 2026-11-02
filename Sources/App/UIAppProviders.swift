@@ -91,6 +91,7 @@ private struct UIAppSurfacePicture: View {
   let target: MonitorTargetID
   let compact: Bool
   let zoom: Double
+  @Environment(\.openWindow) private var openWindow
 
   private var isProgram: Bool { target.isProgram }
   private var preferences: MonitorFeedPreferences { coordinator.preferences(for: target) }
@@ -107,20 +108,20 @@ private struct UIAppSurfacePicture: View {
       } else {
         MonitorNativePicture(presenter: presenter)
       }
-      if scopesShown && !compact && !presenter.isClean {
-        VStack {
-          Spacer(minLength: 0)
-          // MonitorKit draws the scope and its graticule; the labels are SwiftUI.
-          // UIScopeImage keeps a vectorscope's aspect ratio itself.
-          UIScopeImage(description: UIScopeDescription(scopes: displayed.scopes, signal: presenter.shownSignal,
-            stageLUT: presenter.scopeMeasuresLUT(displayed), isProgram: isProgram)) {
+      if scopesShown && !compact && !presenter.isClean && !UIScopePopOuts.shared.open.contains(target.rawValue) {
+        // MonitorKit draws the scope and its graticule at the card's size; the labels are SwiftUI.
+        GeometryReader { geometry in
+          UIScopeCard(description: UIScopeDescription(scopes: displayed.scopes, signal: presenter.shownSignal,
+            stageLUT: presenter.scopeMeasuresLUT(displayed), isProgram: isProgram),
+            size: geometry.size,
+            onPopOut: { openWindow(id: UIScopeWindow.id, value: target.rawValue) },
+            onHide: {
+              coordinator.setPreferences(UIMonitorBridge.toggled(.scopes, in: preferences, isProgram: isProgram),
+                for: target)
+            }
+          ) {
             MonitorNativeScope(presenter: presenter)
           }
-            .frame(height: 96)
-            .background(Color.black.opacity(0.55))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 10).padding(.bottom, 40)
-            .accessibilityLabel(displayed.scopes.title)
         }
       }
     }
@@ -129,7 +130,7 @@ private struct UIAppSurfacePicture: View {
     .onAppear {
       presenter.setMagnification(.centered(zoom: zoom))
       register()
-      if !isProgram && !compact { UIMonitorBridge.register(presenter, cameraID: target.rawValue) }
+      if !compact { UIMonitorBridge.register(presenter, cameraID: target.rawValue) }
       if !compact { UICleanViewState.shared.set(presenter.isClean, for: target.rawValue) }
     }
     .onDisappear {

@@ -128,6 +128,17 @@ struct UltracamApp: App {
     }
     .defaultSize(width: 1100, height: 760)
 
+    // A picture's scope in its own window (the card's Pop Out): one per camera or Program,
+    // resizable, at native resolution. Closing it puts the card back on the picture.
+    WindowGroup("Scope", id: UIScopeWindow.id, for: String.self) { $target in
+      if let target {
+        UIScopeWindowView(model: model, target: target, coordinator: model.monitorCoordinator)
+      }
+    }
+    .defaultSize(UIScopeWindow.defaultSize(.wide))
+    .windowToolbarStyle(.unifiedCompact)
+    .restorationBehavior(.disabled)
+
     Window("Ultracam Help", id: "help") {
       UIHelpView()
     }

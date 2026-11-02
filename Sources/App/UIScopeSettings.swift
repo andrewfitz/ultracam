@@ -26,7 +26,7 @@ struct UIScopeSettingsView: View {
   var layout: Layout = .stacked
 
   /// Whether the menus offer every MonitorKit scope and scale. The main
-  /// window's scope strip draws and labels every scope (`UIScopeImage`) and
+  /// window's scope card draws and labels every scope (`UIScopeImage`) and
   /// its camera Scopes popover is these same settings, so they do. With false
   /// only the waveforms and the IRE scale would be offered (a setting already
   /// saved is still listed, so it can be changed back).

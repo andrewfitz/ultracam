@@ -68,6 +68,11 @@ enum UISymbol {
   static let focusPeaking = "scope"
   static let guides = "squareshape.split.3x3"
   static let scopes = "waveform.path.ecg"
+  /// A scope card's Pop Out (its own window), Hide, corner grip and the window's settings.
+  static let scopePopOut = "macwindow.badge.plus"
+  static let close = "xmark"
+  static let resizeGrip = "arrow.up.left.and.arrow.down.right"
+  static let scopeSettings = "slider.horizontal.3"
 
   // Hardware
   static let input = "cable.connector"

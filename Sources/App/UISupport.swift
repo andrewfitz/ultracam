@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import CoreMediaIO
 import MonitorKitCore
+import Observation
 import os
 import Synchronization
 
@@ -185,17 +186,27 @@ enum UIRecordingLibrary {
   }
 }
 
+/// `UIMonitorBridge`'s presenters, observed.
+@MainActor @Observable final class UIMonitorPresenterRegistry {
+  var presenters: [String: MonitorSurfacePresenter] = [:]
+}
+
 /// Bridges the interface to the monitor tools, which are per camera.
 @MainActor
 enum UIMonitorBridge {
-  /// Presenters of the pictures currently on screen, so menu commands can act on the selected camera.
-  private static var presenters: [String: MonitorSurfacePresenter] = [:]
+  /// Presenters of the main window's pictures currently on screen (cameras and Program), so
+  /// menu commands act on the selected camera and a Scopes window finds its picture's scope.
+  /// Observed: a view that reads one updates when its picture appears or goes.
+  private static let registry = UIMonitorPresenterRegistry()
+  private static var presenters: [String: MonitorSurfacePresenter] { registry.presenters }
 
-  static func register(_ presenter: MonitorSurfacePresenter, cameraID: String) { presenters[cameraID] = presenter }
-  static func unregister(cameraID: String, presenter: MonitorSurfacePresenter) {
-    if presenters[cameraID] === presenter { presenters[cameraID] = nil }
+  static func register(_ presenter: MonitorSurfacePresenter, cameraID: String) {
+    if registry.presenters[cameraID] !== presenter { registry.presenters[cameraID] = presenter }
   }
-  static func presenter(for cameraID: String) -> MonitorSurfacePresenter? { presenters[cameraID] }
+  static func unregister(cameraID: String, presenter: MonitorSurfacePresenter) {
+    if registry.presenters[cameraID] === presenter { registry.presenters[cameraID] = nil }
+  }
+  static func presenter(for cameraID: String) -> MonitorSurfacePresenter? { registry.presenters[cameraID] }
 
   /// The tools shown as on: none while the master switch is off.
   static func activeTools(_ preferences: MonitorFeedPreferences) -> Set<UIMonitorTool> {

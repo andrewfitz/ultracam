@@ -279,11 +279,15 @@ struct UIScopeDescription: Equatable, Sendable {
     }
   }
 
-  /// The graticule's labels, in normalized coordinates of the scope image:
-  /// the same `ScopeGraticule` MonitorKit draws the lines from, on the same image.
-  var labels: [ScopeLabel] {
+  /// The graticule's labels, in normalized coordinates of a 768 × 256 scope image.
+  var labels: [ScopeLabel] { labels(width: Self.imageWidth, height: Self.imageHeight) }
+
+  /// The graticule's labels, in normalized coordinates of a scope drawn `width` × `height`:
+  /// the same `ScopeGraticule` MonitorKit draws the lines from, at the same shape (a
+  /// vectorscope's square plot sits in the middle of whatever it is drawn into).
+  func labels(width: Double, height: Double) -> [ScopeLabel] {
     var labels = ScopeGraticule(
-      settings: settings, context: context, viewportWidth: Self.imageWidth, viewportHeight: Self.imageHeight
+      settings: settings, context: context, viewportWidth: max(1, width), viewportHeight: max(1, height)
     ).labels
     // Targets are labelled only where their boxes are drawn.
     if !settings.display.showsGraticule { labels.removeAll { $0.role == .target } }
@@ -298,7 +302,7 @@ struct UIScopeDescription: Equatable, Sendable {
   /// unlabelled. Measured where the labels are drawn (kept inside the image),
   /// per parade panel.
   func visibleLabels(width: Double, height: Double, spacing: Double = 11) -> [ScopeLabel] {
-    let all = labels
+    let all = labels(width: width, height: height)
     let ticks = all.filter { $0.role == .tick }
     guard !ticks.isEmpty else { return all }
     let horizontal = settings.kind == .histogram
