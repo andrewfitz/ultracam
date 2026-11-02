@@ -165,6 +165,12 @@ struct SourceRecordingConfiguration {
   let compatibilityPolicy: RecordingCompatibilityPolicy
   /// Why the take isn't in the chosen format; it goes in the sidecar's notes.
   let formatNote: String?
+  /// The camera LUT this take burns in on the GPU, fixed at take start; nil
+  /// records the clean source. See `RecordingLUTBurnIn`.
+  let lutBurnIn: (any RecordingLUTBurnIn)?
+  /// Burn LUT into recordings was on for this take. With no `lutBurnIn` the
+  /// camera had no burn-in LUT, so the take is clean; the sidecar says so.
+  let lutBurnInRequested: Bool
   let sidecarMovieURL: URL?
   let sidecarCreated: (() throws -> Void)?
   let videoRetentionPolicy: MediaRetentionPolicy
@@ -223,6 +229,20 @@ struct SourceRecordingConfiguration {
   static let sourceTimecodeAttachmentKey = "UltracamSourceTimecode"
   static let nativeTimecodeAttachmentKey = "UltracamNativeTimecodeMetadata"
   static let captureHostTimeAttachmentKey = "UltracamCaptureHostTime"
+
+  /// Why `burnIn` can't burn this take in on the GPU, or nil. ProRes 4444 takes
+  /// RGB the LUT pass doesn't write; raw NDI UYVA reaches the recorder as a GPU
+  /// buffer the LUT pass doesn't read. The implementation names any other gap.
+  static func lutBurnInRefusal(_ burnIn: any RecordingLUTBurnIn, sourcePixelFormat: OSType,
+    encoderPixelFormat: OSType, profileName: String) -> String? {
+    if encoderPixelFormat == kCVPixelFormatType_64RGBALE {
+      return "\(profileName) records RGB, and the LUT pass writes only Y′CbCr. Choose a ProRes 422 or HEVC format."
+    }
+    if sourcePixelFormat == PixelFormatID.uyva.rawValue {
+      return "this camera’s NDI picture with alpha (UYVA) reaches the recorder in a form the LUT pass can’t read."
+    }
+    return burnIn.refusal(sourcePixelFormat: sourcePixelFormat, encoderPixelFormat: encoderPixelFormat)
+  }
 
   func keyframeDuration(for rate: RecordingFrameRate) -> TimeInterval {
     guard let maxKeyFrameInterval else { return maxKeyFrameIntervalDuration }
@@ -285,7 +305,8 @@ struct SourceRecordingConfiguration {
     sourceAdmission: SourceAdmissionSnapshot? = nil, expectedSourceFormat: SourceFormat? = nil,
     compatibilityPolicy: RecordingCompatibilityPolicy = .init(), formatNote: String? = nil, sidecarMovieURL: URL? = nil,
     sidecarCreated: (() throws -> Void)? = nil,
-    videoRetentionPolicy: MediaRetentionPolicy? = nil, audioRetentionPolicy: MediaRetentionPolicy? = nil) throws {
+    videoRetentionPolicy: MediaRetentionPolicy? = nil, audioRetentionPolicy: MediaRetentionPolicy? = nil,
+    lutBurnIn: (any RecordingLUTBurnIn)? = nil, lutBurnInRequested: Bool? = nil) throws {
     guard !feedID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       throw SourceRecordingError.invalidConfiguration("A feed ID is required.")
     }
@@ -340,6 +361,15 @@ struct SourceRecordingConfiguration {
         }
       }
     }
+    if let lutBurnIn {
+      let pixel = sourceAdmission?.format.pixel.rawValue ?? expectedSourceFormat?.pixel.rawValue ?? selectedProfile.sourcePixelFormat
+      if let reason = Self.lutBurnInRefusal(lutBurnIn, sourcePixelFormat: pixel,
+        encoderPixelFormat: selectedProfile.encoderPixelFormat, profileName: selectedProfile.displayName) {
+        throw RecordingLUTBurnInError.unsupported(reason)
+      }
+    }
+    self.lutBurnIn = lutBurnIn
+    self.lutBurnInRequested = lutBurnInRequested ?? (lutBurnIn != nil)
     self.compatibilityPolicy = compatibilityPolicy
     self.formatNote = formatNote
     self.sidecarMovieURL = sidecarMovieURL

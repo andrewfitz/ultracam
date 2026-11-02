@@ -17,7 +17,10 @@ struct RecordingOutputContract: Codable {
   let codec: UInt32
   let outputColour: Colorimetry
 
-  init(sourceFormat: SourceFormat, outputRate: FrameRate? = nil, encoderInputPixelFormat: UInt32, codec: UInt32) {
+  /// `burnedInColour`: a take with its camera LUT burned in is encoded in the
+  /// LUT's output colour (`RecordingLUTBurnIn.outputColour`), not the source's.
+  init(sourceFormat: SourceFormat, outputRate: FrameRate? = nil, encoderInputPixelFormat: UInt32, codec: UInt32,
+    burnedInColour: Colorimetry? = nil) {
     width = sourceFormat.width; height = sourceFormat.height
     pixelAspect = sourceFormat.pixelAspect; scan = sourceFormat.scan
     rate = outputRate ?? sourceFormat.rate; clock = sourceFormat.clock
@@ -27,6 +30,10 @@ struct RecordingOutputContract: Codable {
     let video = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
       kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
       kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange].contains(encoderInputPixelFormat)
+    if let burnedInColour {
+      outputColour = burnedInColour
+      return
+    }
     outputColour = Colorimetry(primaries: source.primaries, transfer: source.transfer,
       matrix: rgb ? .identity : source.matrix, range: rgb ? .full : (video ? .video : source.range),
       horizontalChromaSiting: rgb ? .unspecified : source.horizontalChromaSiting,
@@ -91,6 +98,20 @@ struct RecordingTakeContext: Sendable {
 /// timing and mapping records go to a capped on-disk JSON-lines journal. The
 /// journal is forensic: nothing reads it back, so it never gets to end a take.
 final class RecordingTakeSidecar: @unchecked Sendable {
+  /// The camera LUT a take burned in (Settings › Recording › Burn LUT into
+  /// recordings), fixed at take start. A sidecar without one is the clean
+  /// camera picture, as every take before the setting existed.
+  struct BurnedInLUT: Codable, Equatable {
+    /// The LUT's title, as the camera's LUT menu names it.
+    var name: String
+    /// The `.cube` file it was read from, when known.
+    var fileName: String?
+    /// The LUT's declared colour-space contract.
+    var inputColour: Colorimetry
+    var outputColour: Colorimetry
+    /// What the movie's colour tags say: the LUT's output, video range, centred chroma.
+    var recordedColour: Colorimetry
+  }
   struct Metadata: Codable {
     var sourceSignature: String
     var outputSignature: String
@@ -108,9 +129,12 @@ final class RecordingTakeSidecar: @unchecked Sendable {
     var mappingRevision: UInt64? = nil
     var videoMapping: ClockMapping? = nil
     var audioMapping: ClockMapping? = nil
+    /// The LUT burned into the take; nil when it is the clean camera picture.
+    var burnedInLUT: BurnedInLUT? = nil
     private enum CodingKeys: String, CodingKey {
       case sourceSignature, outputSignature, epoch, clockBindings, audioDeclaration, policy, timestampTimescale
       case videoClockDomain, outputContract, sourceFormat, keyframeIntervalDuration, conversionNotes, mappingRevision, videoMapping, audioMapping, audioOutputSampleRate
+      case burnedInLUT
     }
     init(sourceSignature: String, outputSignature: String) {
       self.sourceSignature = sourceSignature; self.outputSignature = outputSignature
@@ -135,6 +159,7 @@ final class RecordingTakeSidecar: @unchecked Sendable {
       videoMapping = try? c.decodeIfPresent(ClockMapping.self, forKey: .videoMapping)
       audioMapping = try? c.decodeIfPresent(ClockMapping.self, forKey: .audioMapping)
       audioOutputSampleRate = try? c.decodeIfPresent(Double.self, forKey: .audioOutputSampleRate)
+      burnedInLUT = try? c.decodeIfPresent(BurnedInLUT.self, forKey: .burnedInLUT)
     }
   }
   struct Event: Codable {

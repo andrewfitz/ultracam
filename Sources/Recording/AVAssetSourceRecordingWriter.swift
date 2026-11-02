@@ -164,6 +164,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     case gpuRGB(RecordingRGBPixelConverter, CVPixelBufferPool, RGBFormat)
     case gpuPlanar(PlanarRecordingConverter, CVPixelBufferPool)
     case gpuPacked422(Packed422RecordingConverter, CVPixelBufferPool)
+    /// The take's camera LUT, decoded, applied and encoded in one GPU pass
+    /// from the capture buffer into the encoder's own native pool.
+    case gpuLUT(any RecordingLUTBurnIn, CVPixelBufferPool)
     /// No native route: compatibility mode permits opaque system conversion.
     case videoToolboxConverts(String)
   }
@@ -530,7 +533,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     if let movieURL = configuration.sidecarMovieURL {
       let source = context.sourceAdmission
       let output = RecordingOutputContract(sourceFormat: source.format, outputRate: configuration.recordingConstantFrameRate && source.format.rate.isVariable ? .constant((Self.matchingFrameRate(source.format.rate.nominal) ?? configuration.frameRate).frameDuration) : source.format.rate,
-        encoderInputPixelFormat: configuration.videoProfile.encoderPixelFormat, codec: configuration.videoCodec)
+        encoderInputPixelFormat: configuration.videoProfile.encoderPixelFormat, codec: configuration.videoCodec,
+        burnedInColour: configuration.lutBurnIn?.outputColour)
       var metadata = RecordingTakeSidecar.Metadata(sourceSignature: source.formatSignature, outputSignature: output.signature)
       metadata.epoch = source.epochID; metadata.clockBindings = source.clockBindings
       metadata.audioDeclaration = context.audioDeclaration; metadata.policy = configuration.compatibilityPolicy
@@ -568,6 +572,12 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       if source.format.pixel == .r210, source.format.colour.range == .video,
         configuration.videoProfile.encoderPixelFormat == kCVPixelFormatType_64RGBALE {
         metadata.conversionNotes.append("Video-range RGB is expanded to unsigned full-range RGBA16; out-of-range values clamp to the encoder input range.")
+      }
+      if let burnIn = configuration.lutBurnIn {
+        metadata.burnedInLUT = burnIn.sidecarRecord
+        metadata.conversionNotes.append("The camera LUT \u{201C}\(burnIn.lutName)\u{201D} is burned in on the GPU, as at take start; the movie's colour tags describe the LUT's output (outputContract.outputColour), and sourceFormat keeps the camera's own colour.")
+      } else if configuration.lutBurnInRequested {
+        metadata.conversionNotes.append("Burn LUT into recordings was on, but this camera burned no LUT in at take start, so the take is the clean camera picture.")
       }
       metadata.outputContract = output
       metadata.videoClockDomain = source.format.clock
@@ -956,6 +966,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     switch input {
     case .passThrough:
       return (source, .passThrough)
+    case let .gpuLUT(burnIn, pool):
+      return (try burnInImage(source, burnIn: burnIn, pool: pool), .gpu)
     case let .videoToolboxConverts(reason):
       return (try CPUCompatibilityConverter(policy: configuration.compatibilityPolicy).authorize(source, reason: reason), .systemCompatibility(reason))
     case let .gpuPacked422(converter, pool):
@@ -1028,6 +1040,38 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     }
   }
 
+  /// One frame through the take's LUT into a buffer from the encoder's pool.
+  /// A failure ends the take: handing VideoToolbox the clean frame instead
+  /// would mix ungraded frames into a graded take, and there is no CPU route.
+  private func burnInImage(_ source: CVPixelBuffer, burnIn: any RecordingLUTBurnIn,
+    pool: CVPixelBufferPool) throws -> CVPixelBuffer {
+    guard CVPixelBufferGetIOSurface(source) != nil else {
+      telemetryLock.withLock { telemetryValue.gpuConversionFailures &+= 1 }
+      throw RecordingLUTBurnInError.renderFailed("the capture buffer is not IOSurface-backed")
+    }
+    let destination = try conversionOperations.allocateBuffer?(pool) ?? makeEncoderBuffer(from: pool)
+    let gpuMS: Double
+    do { gpuMS = try burnIn.render(source, sourceColour: recordingSourceFormat?.colour, into: destination) }
+    catch {
+      telemetryLock.withLock { telemetryValue.gpuConversionFailures &+= 1 }
+      throw RecordingLUTBurnInError.renderFailed(error.localizedDescription)
+    }
+    Self.copyImageAttachments(from: source, to: destination)
+    // The source's HDR mastering metadata and the app's own colour label
+    // describe the camera picture, not the graded one.
+    for key in [kCVImageBufferMasteringDisplayColorVolumeKey, kCVImageBufferContentLightLevelInfoKey,
+      Self.declaredColorimetryAttachmentKey as CFString] { CVBufferRemoveAttachment(destination, key) }
+    applyEncoderColour(to: destination)
+    telemetryLock.withLock {
+      telemetryValue.gpuConvertedFrames &+= 1
+      telemetryValue.gpuConversionMS = telemetryValue.gpuConversionMS.map { $0 * 0.9 + gpuMS * 0.1 } ?? gpuMS
+    }
+    return destination
+  }
+
+  /// `LUTProcessor.declaredColorimetryAttachmentKey`, which this module can't name.
+  private static let declaredColorimetryAttachmentKey = "UltracamColorimetryContract"
+
   /// Raw NDI UYVA retains its backing owner until the asynchronous GPU helper
   /// completes. It never manufactures a CVPixelBuffer view over raw bytes.
   func appendUYVAVideo(_ source: MTLBuffer, owner: AnyObject, width: Int, height: Int,
@@ -1050,6 +1094,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
           .init(width: width, height: height, rowBytes: alphaRowBytes)])
       do { try admission.validate(metadata, stage: .recordingSource) }
       catch { throw SourceRecordingError.unsupportedSample(String(describing: error)) }
+    }
+    if configuration.lutBurnIn != nil {
+      throw RecordingLUTBurnInError.unsupported("this camera’s NDI picture with alpha (UYVA) reaches the recorder in a form the LUT pass can’t read.")
     }
     let input = try encoderLock.withLock { try ensureCanAppend(); return encoderInput }
     guard case let .gpuPacked422(converter, pool) = input else {
@@ -1113,10 +1160,16 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     return (primaries, transfer, matrix)
   }
 
+  /// The colour the encoded frames are in: the source's, or with a burned-in
+  /// LUT the LUT's output (the sidecar's `outputContract` says the same).
+  private func encoderOutputColour(_ source: SourceFormat) -> Colorimetry {
+    RecordingOutputContract(sourceFormat: source, encoderInputPixelFormat: configuration.videoProfile.encoderPixelFormat,
+      codec: configuration.videoCodec, burnedInColour: configuration.lutBurnIn?.outputColour).outputColour
+  }
+
   private func configureEncoderColour(_ session: VTCompressionSession) throws {
     guard let source = recordingSourceFormat else { return }
-    let colour = RecordingOutputContract(sourceFormat: source, encoderInputPixelFormat: configuration.videoProfile.encoderPixelFormat,
-      codec: configuration.videoCodec).outputColour
+    let colour = encoderOutputColour(source)
     let (primaries, transfer, matrix) = Self.encoderColourValues(colour)
     for (key, value) in [(kVTCompressionPropertyKey_ColorPrimaries, primaries),
       (kVTCompressionPropertyKey_TransferFunction, transfer), (kVTCompressionPropertyKey_YCbCrMatrix, matrix)] {
@@ -1129,8 +1182,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
 
   private func applyEncoderColour(to image: CVPixelBuffer) {
     guard let source = recordingSourceFormat else { return }
-    let colour = RecordingOutputContract(sourceFormat: source, encoderInputPixelFormat: configuration.videoProfile.encoderPixelFormat,
-      codec: configuration.videoCodec).outputColour
+    let colour = encoderOutputColour(source)
     func attach(_ key: CFString, _ value: CFString?) {
       if let value { CVBufferSetAttachment(image, key, value, .shouldPropagate) }
       else { CVBufferRemoveAttachment(image, key) }
@@ -1433,6 +1485,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     case .gpuRGB: inputDescription = "l64r (GPU repack from original RGB)"
     case .gpuPlanar: inputDescription = "Native planar input (GPU range/depth repack)"
     case .gpuPacked422: inputDescription = "x422 (GPU repack from packed 8-bit 4:2:2)"
+    case let .gpuLUT(burnIn, _):
+      inputDescription = "\(Self.fourCC(configuration.videoProfile.encoderPixelFormat)) (GPU LUT burn-in: \(burnIn.lutName))"
     case let .videoToolboxConverts(reason): inputDescription = "v210 (VideoToolbox compatibility conversion: \(reason))"
     }
     return PreparedEncoder(session: session, input: input, hardware: hardwareValue,
@@ -1443,6 +1497,10 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private func chooseEncoderInput(session: VTCompressionSession, converter: RecordingPixelConverter, sourceFormat: OSType,
     nativeFormat: OSType) throws -> EncoderInput {
     let supported = conversionOperations.supportedPixelFormats?(session) ?? Self.encoderPixelFormats(session)
+    if let burnIn = configuration.lutBurnIn {
+      return try lutBurnInInput(session: session, burnIn: burnIn, supported: supported, sourceFormat: sourceFormat,
+        nativeFormat: nativeFormat)
+    }
     let nativeVideoRange = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
       kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange].contains(nativeFormat)
     let needsRangeConversion = recordingSourceFormat?.colour.range == .full && nativeVideoRange
@@ -1495,6 +1553,33 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       return try compatibilityInput("the encoder pool is not IOSurface x422")
     }
     return .gpu(converter, pool)
+  }
+
+  /// A take that burns its LUT in always renders into the encoder's own
+  /// IOSurface pool on the GPU, also where the source is already the encoder's
+  /// layout. Without that pool it refuses: there is no CPU or VideoToolbox
+  /// conversion that applies a LUT, and the clean picture is not a substitute.
+  private func lutBurnInInput(session: VTCompressionSession, burnIn: any RecordingLUTBurnIn, supported: [OSType],
+    sourceFormat: OSType, nativeFormat: OSType) throws -> EncoderInput {
+    if let reason = SourceRecordingConfiguration.lutBurnInRefusal(burnIn, sourcePixelFormat: sourceFormat,
+      encoderPixelFormat: nativeFormat, profileName: configuration.videoProfile.displayName) {
+      throw RecordingLUTBurnInError.unsupported(reason)
+    }
+    guard supported.isEmpty || supported.contains(nativeFormat), let pool = VTCompressionSessionGetPixelBufferPool(session) else {
+      throw RecordingLUTBurnInError.unsupported("the \(configuration.videoProfile.displayName) encoder offers no \(Self.fourCC(nativeFormat)) buffer pool for the LUT pass to write into.")
+    }
+    let attributes = CVPixelBufferPoolGetPixelBufferAttributes(pool) as? [String: Any]
+    guard Self.formats(in: attributes) == [nativeFormat],
+      attributes?[kCVPixelBufferIOSurfacePropertiesKey as String] != nil else {
+      throw RecordingLUTBurnInError.unsupported("the \(configuration.videoProfile.displayName) encoder’s buffer pool is not IOSurface \(Self.fourCC(nativeFormat)), so the LUT pass can’t write into it on the GPU.")
+    }
+    return .gpuLUT(burnIn, pool)
+  }
+
+  private static func fourCC(_ value: OSType) -> String {
+    let bytes = [24, 16, 8, 0].map { UInt8((value >> $0) & 255) }
+    guard bytes.allSatisfy({ (32...126).contains($0) }) else { return String(format: "0x%08X", value) }
+    return String(bytes: bytes, encoding: .ascii) ?? String(value)
   }
 
   private func compatibilityInput(_ reason: String) throws -> EncoderInput {
