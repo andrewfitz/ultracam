@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// The camera's signal badge: its state, the dropouts since Start when there are any, and a
-/// menu naming both links (capture device and camera body) with the body's output properties.
+/// The camera's signal badge: its state, and a menu naming both links (capture device and
+/// camera body) with the body's output properties. Dropped frames are a stat in the inspector,
+/// not a warning beside the format.
 struct UIFeedSettingsMenu: View {
     let camera: UICameraPresentation
     let snapshot: UICameraSnapshot?
@@ -65,8 +66,6 @@ struct UIFeedSettingsMenu: View {
                     UIStateGlyph(state: .inactive, size: 6)
                 }
                 Text(camera.statusBadge)
-                UICountChip(count: camera.signalDropouts, one: "drop", many: "drops",
-                    help: "The signal dropped \(camera.signalDropouts == 1 ? "once" : "\(camera.signalDropouts) times") since Start")
                 Image(systemName: "chevron.down").font(.caption2.weight(.bold))
             }
             .font(.uiBadge).lineLimit(1).padding(.horizontal, 6).frame(height: 18)
@@ -76,7 +75,6 @@ struct UIFeedSettingsMenu: View {
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .help(help)
         .accessibilityLabel("\(camera.name) signal, \(camera.statusBadge)")
-        .accessibilityValue(camera.signalDropouts > 0 ? "\(camera.signalDropouts) signal dropouts since Start" : "")
         .sheet(isPresented: $showingSettings) {
             if let controlStore {
                 UICameraControlSettings(feedID: camera.id, name: camera.name, store: controlStore, viewFactories: viewFactories,
@@ -85,13 +83,7 @@ struct UIFeedSettingsMenu: View {
         }
     }
 
-    private var help: String {
-        var help = live ? "Signal arriving from \(camera.inputName)" : camera.statusBadge
-        if camera.signalDropouts > 0 {
-            help += ". \(camera.signalDropouts) signal dropout\(camera.signalDropouts == 1 ? "" : "s") since Start"
-        }
-        return help
-    }
+    private var help: String { live ? "Signal arriving from \(camera.inputName)" : camera.statusBadge }
 }
 
 struct UIFeedBrandMark: View {

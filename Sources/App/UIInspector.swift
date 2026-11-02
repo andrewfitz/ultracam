@@ -143,6 +143,13 @@ struct UIInspectorViewContent: View {
       .accessibilityElement(children: .ignore)
       .accessibilityLabel("Signal")
       .accessibilityValue(Self.signalText(snapshot))
+      // A plain stat like Timecode: always present, "—" while stopped, never a warning.
+      LabeledContent("Dropped frames") {
+        UILiveCamera(camera: camera, context: context, follows: .capture) { live in
+          Text(Self.droppedFramesText(live.snapshot)).monospacedDigit()
+            .help(Self.droppedFramesHelp(live.snapshot))
+        }
+      }
       // Always present ("—" while stopped): a row that comes and goes with Start and Stop
       // moved everything below it under the pointer.
       LabeledContent("Timecode") {
@@ -379,6 +386,18 @@ struct UIInspectorViewContent: View {
           .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
       }
     }
+  }
+
+  /// Video frames lost since Start, from any cause: "0", "14", or "—" while stopped.
+  nonisolated static func droppedFramesText(_ snapshot: UICameraSnapshot?) -> String {
+    snapshot?.droppedFrames.map { $0.formatted() } ?? "—"
+  }
+
+  nonisolated static func droppedFramesHelp(_ snapshot: UICameraSnapshot?) -> String {
+    guard let snapshot, snapshot.droppedFrames != nil else { return "Video frames lost since Start, counted while the camera runs." }
+    let dropouts = snapshot.signalDropouts
+    let signal = dropouts == 0 ? "" : ", including the signal dropping \(dropouts == 1 ? "once" : "\(dropouts) times")"
+    return "Video frames lost since Start, from any cause\(signal). Diagnostics lists each cause."
   }
 
   nonisolated static func signalText(_ snapshot: UICameraSnapshot) -> String {

@@ -140,6 +140,26 @@ import XCTest
     XCTAssertEqual(UIInspectorViewContent.signalText(camera), "2160p 59.94", "Nothing is claimed before a format is known")
   }
 
+  /// Dropped frames are a plain inspector stat, from the capture's frame count, not the signal badge.
+  @MainActor func testInspectorCountsDroppedFramesSinceStart() {
+    var camera = UICameraSnapshot(id: "a", name: "A")
+    var update = CaptureUpdate(message: "")
+    update.videoDrops = 14
+    update.signalDropouts = 2
+    UISessionBridge.applyCapture(update, to: &camera)
+    XCTAssertEqual(UIInspectorViewContent.droppedFramesText(camera), "—", "A stopped camera counts nothing")
+    camera.running = true
+    UISessionBridge.applyCapture(update, to: &camera)
+    XCTAssertEqual(UIInspectorViewContent.droppedFramesText(camera), "14")
+    XCTAssertEqual(UIInspectorViewContent.droppedFramesHelp(camera),
+      "Video frames lost since Start, from any cause, including the signal dropping 2 times. Diagnostics lists each cause.")
+    update.videoDrops = 0
+    update.signalDropouts = 0
+    UISessionBridge.applyCapture(update, to: &camera)
+    XCTAssertEqual(UIInspectorViewContent.droppedFramesText(camera), "0", "Zero is shown, so the row never comes and goes")
+    XCTAssertEqual(UIInspectorViewContent.droppedFramesHelp(camera), "Video frames lost since Start, from any cause. Diagnostics lists each cause.")
+  }
+
   func testSelectionRingIsFixedBlueNotTheSystemAccent() {
     XCTAssertEqual(UIPictureSpacing.selectionRing, Color.blue)
     XCTAssertNotEqual(UIPictureSpacing.selectionRing, Color.accentColor)

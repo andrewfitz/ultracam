@@ -7,9 +7,11 @@ import Observation
 // MARK: - Running values in the session snapshot
 
 extension UISessionBridge {
-  /// A camera's running capture values: timecode and audio levels.
+  /// A camera's running capture values: timecode, dropped frames and audio levels.
   static func applyCapture(_ update: CaptureUpdate?, withinLossHold: Bool = false, to camera: inout UICameraSnapshot) {
     camera.timecode = update?.timecode
+    camera.droppedFrames = camera.running ? update.map { Int(clamping: $0.videoDrops) } : nil
+    camera.signalDropouts = Int(clamping: update?.signalDropouts ?? 0)
     camera.signal = UIFormatLabels.signal(running: camera.running, deviceAvailable: camera.deviceAvailable,
       update: update, withinLossHold: withinLossHold)
     // Only a camera that had a picture has lost one.

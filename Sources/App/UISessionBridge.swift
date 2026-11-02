@@ -208,7 +208,6 @@ struct UISessionBridge {
       camera.recordingConstantFrameRate = descriptor.recordingConstantFrameRate
       camera.sourceFrameRate = update?.sourceFormat?.rate
       camera.sourceFormat = update?.sourceFormat
-      camera.signalDropouts = Int(clamping: update?.signalDropouts ?? 0)
       camera.sourcePixel = update?.sourceFormat.map { FormatDisplayIdentity($0).sampling }
       camera.previewEnabled = descriptor.previewEnabled
       camera.automaticStart = descriptor.automaticFeed

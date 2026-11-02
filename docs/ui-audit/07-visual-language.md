@@ -164,7 +164,7 @@ The scale in `UIStyle.swift:34-53` stands. Two tokens are new, and the scale now
 | **`UIValue`** | Value plus unit on one baseline, with one accessibility label. Takes parts, not a joined string. Use `HStack(alignment: .firstTextBaseline, spacing: 2)` | Time left, shot time, clocks with units, sizes, rates, `UIMonitorSlider`, `UISettingsSlider`, Resources |
 | **`UIIconValue`** | Symbol, then `UIValue`, with `.help` and an accessibility label always required. The value keeps its width and the label truncates first | Replaces `collapsedLabel` (`UICameraColumn.swift:1171`), `noteLine` (`:933`) and the drop line (`:916`). Sidebar rows, status bar pieces, recording popover, Takes row |
 | **`UIValueChip`** | A read-only capsule: `UIBadge` plus an optional leading symbol. Extend `UIBadge` rather than adding a type | Format on the folder row, output values, Auto and Manual on cut rows, assigned camera on Hardware rows |
-| **`UICountChip`** | Symbol plus a count, shown only above zero | Dropouts on the signal badge and sidebar row |
+| ~~`UICountChip`~~ | Removed 2026-11-02. Dropped frames are a plain stat, not a chip | Inspector › Input, "Dropped frames" (`UIInspector.swift`) |
 | **`UILevelBar`** | A 4 pt capsule, two sizes: 28 pt mini and full width. Gray fill, orange when low, and always next to a number | `UIDriveRow` (`UISessionSidebar.swift:328`), strip folder row, shot time in the status bar, full width in the Recording section |
 | **`UIBatteryGlyph`** | Picks the level symbol by bucket (88, 63, 38, 13) and shows the percent. With a minutes unit, shows `minus.plus.batteryblock` and "78 min". With no known unit, shows the raw value and no warning. Orange below the warning level | Sidebar camera row, Hardware row, Camera Control sheet, camera submenu |
 | **`UIProblemRow`** | Triangle, title at `uiRowEmphasis`, reason at `uiMeta`, one action button. Two levels (J26): on air or rolling damage is solid amber with dark text, everything else a 0.08 wash with a 0.5 border. One view, same height everywhere the strip needs | Replaces `UICameraColumn.swift:688-707`, `UISessionSidebar.swift:207-219`, `UIInspector.swift:240-246`, `:316-325`, `UIStatusBar.swift:330-335`. Attention, strip problem row, inspector |
@@ -258,7 +258,7 @@ File: `UICameraColumn.swift`. Rows follow the plan: header, record, folder or pr
 
 | Tier | Element | Today | Change |
 |---|---|---|---|
-| A | Signal badge, live | Green dot, format, chevron (`UIFeedSettingsMenu.swift:37-43`) | Same, with `UICountChip` ("5 drops" in orange; a lone `video.slash` and number was unclear, 2026-11-02) when dropouts are above zero, at `uiBadge`. Help says "The signal dropped 5 times since Start" |
+| A | Signal badge, live | Green dot, format, chevron (`UIFeedSettingsMenu.swift:37-43`) | Same: state, format and chevron only. Dropped frames left the badge (2026-11-02; first a `video.slash` and number, then an orange "5 drops" chip) and are a plain "Dropped frames" row under Signal in Inspector › Input, "—" while stopped. Help says "Signal arriving from …" |
 | A | Signal badge, problem | Orange dot and words | Orange triangle and words. Dot and triangle mean different things now |
 | A | Signal badge, stopped | Gray dot, "Stopped" | `UIStateGlyph` inactive. Secondary words |
 | A | Record state word | Red text (`:896`) | Red dot plus "Recording" in primary (06 V6), on expanded strips. Collapsed strips drop it, because the REC pill says it (J18) |

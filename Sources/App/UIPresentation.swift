@@ -185,7 +185,9 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   /// What the camera is sending, nil before a format is known. It decides what a take can
   /// record, and sizes the estimates.
   var sourceFormat: SourceFormat? = nil
-  /// Dropouts since Start, kept on the signal badge once there are any.
+  /// Video frames lost since Start from any cause, signal dropouts included. Nil while stopped.
+  var droppedFrames: Int? = nil
+  /// Times the signal went and came back since Start, for the dropped-frames help.
   var signalDropouts = 0
   /// The source's depth and chroma ("10-bit 4:2:2"), nil before a format is known.
   var sourcePixel: String? = nil
@@ -526,7 +528,6 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var collapsedWord: String? = nil
   /// That word is a problem: a triangle, and words in primary.
   var collapsedWarns = false
-  var signalDropouts = 0
   /// The sidebar's glyph for this camera.
   var state: UIState = .inactive
   /// "Signal lost 0:06", from a camera that had a picture.
@@ -1050,7 +1051,6 @@ enum UIPresentationBuilder {
       formatTitle: format.title, formatFallback: format.fallback, formatHelp: format.help,
       collapsedWord: collapsedWord(camera, strip: strip, badge: statusBadge, in: session),
       collapsedWarns: strip == .noFolder || strip == .failed || statusTone == .warning || format.fallback != nil,
-      signalDropouts: camera.signalDropouts,
       state: state(camera, strip: strip, tone: statusTone),
       lostTitle: lostClock(camera).map { "Signal lost \($0)" },
       lostDetail: lostDetail(camera, in: session),
