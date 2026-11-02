@@ -32,6 +32,13 @@ import XCTest
         direct.address = ""
         XCTAssertEqual(UICameraControlSettings.bodyHelp(direct), "Body A, ID aa:bb")
     }
+    /// The sheet says how its values keep up, and never claims a notice updates them.
+    func testRefreshNoteFollowsTheChosenInterval() {
+        XCTAssertEqual(UICameraControlSettings.refreshNote(.seconds30),
+            "Settings are read at most every 30 s while the camera reports changes, and right after you change one here. Change how often in Settings › Hardware.")
+        XCTAssertEqual(UICameraControlSettings.refreshNote(.never),
+            "Settings are read on connecting, right after you change one here, and when you press Refresh. Change how often in Settings › Hardware.")
+    }
 }
 private enum UIControlFailure: Error { case identityWasNotPinned }
 @MainActor private final class UIControlPersistence: CameraControlAssignmentPersisting {

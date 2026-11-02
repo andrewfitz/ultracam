@@ -37,6 +37,7 @@ struct UISettingsHardwarePane: View {
         }
       }
       ForEach(groups.bodies, id: \.vendor.id) { group in bodySection(group, groups: groups) }
+      if model.cameraControls.available { refreshSection }
       ForEach([model.vendorSettings.persistenceMessage, model.cameraControls.discoveryMessages["persistence"]].compactMap { $0 }, id: \.self) { message in
         Section { Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange) }
       }
@@ -248,6 +249,18 @@ struct UISettingsHardwarePane: View {
         }
       }
       .controlSize(.small)
+    }
+  }
+
+  /// Every paired body, not one: how often its settings are read again after it reports a change.
+  private var refreshSection: some View {
+    let store = model.cameraControls
+    return Section {
+      Picker("Refresh camera settings", selection: Binding(get: { store.refreshInterval }, set: { store.refreshInterval = $0 })) {
+        ForEach(CameraControlRefreshInterval.allCases) { Text($0.title).tag($0) }
+      }
+    } header: { Text("Camera Control") } footer: {
+      UISettingsFootnote("Camera bodies report changes all the time; their settings are read at most this often. A body is always read on connecting and right after you change a setting. Refresh in Camera Control reads it now.")
     }
   }
 

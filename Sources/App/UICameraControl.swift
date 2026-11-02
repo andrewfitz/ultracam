@@ -110,10 +110,8 @@ struct UICameraControlSettings: View {
             Spacer()
             Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh(feedID) } }.disabled(!state.connected || state.busy)
         }
-        HStack {
-            Label(state.cacheStatus, systemImage: state.connected ? "wifi" : "wifi.slash")
-            if let date = state.lastRefresh { Text("Read \(date.formatted(date: .omitted, time: .standard))") }
-        }.font(.caption).foregroundStyle(.secondary)
+        Label(state.cacheStatus, systemImage: state.connected ? "wifi" : "wifi.slash")
+            .font(.caption).foregroundStyle(.secondary)
         if state.properties.isEmpty {
             Text("Connect and read settings to see the values available in the camera’s current mode.").foregroundStyle(.secondary)
         } else {
@@ -125,8 +123,15 @@ struct UICameraControlSettings: View {
                 }
             }
         }
-        Text("Settings update when the camera reports a change. Refresh is available if needed. Unavailable settings are read-only; camera mode or physical control priority may prevent editing.")
+        Text(Self.refreshNote(store.refreshInterval) + " Unavailable settings are read-only; camera mode or physical control priority may prevent editing.")
             .font(.caption).foregroundStyle(.secondary)
+    }
+    /// How the shown values keep up with the body, in words.
+    static func refreshNote(_ interval: CameraControlRefreshInterval) -> String {
+        let when = interval.seconds == nil
+            ? "Settings are read on connecting, right after you change one here, and when you press Refresh."
+            : "Settings are read at most \(interval.title.lowercased()) while the camera reports changes, and right after you change one here."
+        return when + " Change how often in Settings › Hardware."
     }
     @ViewBuilder private func connection(_ assignment: CameraControlAssignment) -> some View {
         HStack {

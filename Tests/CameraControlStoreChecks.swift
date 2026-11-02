@@ -650,5 +650,146 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         XCTAssertTrue(state.connected)
         _ = await store.shutdown()
     }
+
+    // MARK: Settings refresh
+
+    private static let iso = ControlProperty(id: "iso", label: "ISO", writable: true, value: .unsignedInteger(800))
+    private static let secret = ControlCredentials.usernamePassword(username: "user", password: "secret")
+    private final class RefreshClock { var date = Date(timeIntervalSinceReferenceDate: 1_000) }
+
+    func testRefreshIntervalWaitsOutTheRestOfItsIntervalAndNeverWaits() {
+        typealias Interval = CameraControlRefreshInterval
+        let read = Date(timeIntervalSinceReferenceDate: 1_000)
+        XCTAssertEqual(Interval.allCases.map(\.seconds), [15, 30, 60, 120, 300, nil])
+        XCTAssertEqual(Interval.allCases.map(\.title),
+            ["Every 15 s", "Every 30 s", "Every 60 s", "Every 2 min", "Every 5 min", "Never (only when you press Refresh)"])
+        XCTAssertEqual(Interval.standard, .seconds60)
+        XCTAssertEqual(Interval.seconds60.delay(lastRefresh: read, now: read.addingTimeInterval(20)), 40, "The rest of the minute")
+        XCTAssertEqual(Interval.seconds15.delay(lastRefresh: read, now: read.addingTimeInterval(90)), 0, "Stale for longer: read now")
+        XCTAssertEqual(Interval.minutes5.delay(lastRefresh: read, now: read.addingTimeInterval(-30)), 300, "A clock that went back waits one interval, no more")
+        XCTAssertEqual(Interval.seconds30.delay(lastRefresh: nil, now: read), 0)
+        XCTAssertNil(Interval.never.delay(lastRefresh: read, now: read.addingTimeInterval(3_600)))
+        XCTAssertNil(Interval.never.delay(lastRefresh: nil, now: read))
+    }
+
+    func testChangeNoticesOnlyMarkSettingsStaleAndOneReadFollowsAtTheInterval() async {
+        let plugin = SuspendedControlPlugin(), sleeper = RetrySleeper(), clock = RefreshClock()
+        plugin.propertyValues = [Self.iso]
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(), persistence: MemoryControlAssignments(),
+            now: { clock.date }, refreshSleep: { try await sleeper.sleep($0) })
+        await store.connect(camera: plugin.camera, to: "feed", credentials: Self.secret, saveCredentials: false)
+        let state = store.state(for: "feed")
+        XCTAssertEqual(plugin.propertyCalls, 1, "Read on connecting")
+        XCTAssertFalse(state.dirty)
+        XCTAssertEqual(state.cacheStatus, "Updated \(clock.date.formatted(date: .omitted, time: .standard))")
+        clock.date = clock.date.addingTimeInterval(20)
+        for _ in 0..<5 { plugin.handler?(.changed(feedID: "feed", generation: state.generation)) }
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(plugin.propertyCalls, 1, "A notice never reads on its own")
+        XCTAssertTrue(state.dirty)
+        XCTAssertFalse(state.busy)
+        XCTAssertNotEqual(state.cacheStatus, "Updating settings…", "Stale isn't updating")
+        XCTAssertEqual(sleeper.requested, [.seconds(40)], "Five notices, one read, the rest of the minute away")
+        sleeper.release()
+        await settle { plugin.propertyCalls == 2 && !state.busy }
+        XCTAssertEqual(plugin.propertyCalls, 2)
+        XCTAssertFalse(state.dirty)
+        XCTAssertEqual(sleeper.pending, 0, "Nothing new: no further read waits")
+        // A read that fails still counts: a failing body isn't read on every notice.
+        plugin.propertyFailures = 1
+        clock.date = clock.date.addingTimeInterval(90)
+        plugin.handler?(.changed(feedID: "feed", generation: state.generation))
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.requested.last, .zero, "Stale for longer than the interval: read now")
+        sleeper.release()
+        await settle { plugin.propertyCalls == 3 && !state.busy }
+        XCTAssertEqual(state.cacheStatus, "Settings update failed")
+        plugin.handler?(.changed(feedID: "feed", generation: state.generation))
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.requested.last, .seconds(60), "The next read waits a whole interval after the failed one")
+        _ = await store.shutdown()
+    }
+
+    func testUpdatingShowsOnlyWhileTheBodyIsRead() async {
+        let plugin = SuspendedControlPlugin()
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(), persistence: MemoryControlAssignments())
+        await store.connect(camera: plugin.camera, to: "feed", credentials: Self.secret, saveCredentials: false)
+        let state = store.state(for: "feed")
+        XCTAssertTrue(state.cacheStatus.hasPrefix("Updated "))
+        plugin.holdRead = true
+        let reading = Task { await store.refresh("feed") }
+        await settle { plugin.read != nil }
+        XCTAssertEqual(state.cacheStatus, "Updating settings…")
+        plugin.read?.resume(returning: []); plugin.read = nil
+        await reading.value
+        plugin.holdRead = false
+        XCTAssertTrue(state.cacheStatus.hasPrefix("Updated "))
+        plugin.propertyFailures = 1
+        await store.refresh("feed")
+        XCTAssertEqual(state.cacheStatus, "Settings update failed")
+        _ = await store.shutdown()
+        XCTAssertEqual(state.cacheStatus, "Disconnected · cached values")
+    }
+
+    func testNeverReadsOnlyOnConnectRefreshAndAfterAChangeMadeHereAndIsSaved() async {
+        let suite = "org.ultracam.tests.control-refresh.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let plugin = SuspendedControlPlugin(), sleeper = RetrySleeper()
+        plugin.propertyValues = [Self.iso]
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(),
+            persistence: CameraControlPreferences(defaults: defaults), refreshSleep: { try await sleeper.sleep($0) })
+        XCTAssertEqual(store.refreshInterval, .seconds60, "Unset reads as the standard minute")
+        store.refreshInterval = .never
+        XCTAssertEqual(defaults.string(forKey: CameraControlPreferences.refreshIntervalKey), "never")
+        XCTAssertEqual(CameraControlStore(plugins: [:], credentials: MemoryControlCredentials(),
+            persistence: CameraControlPreferences(defaults: defaults)).refreshInterval, .never, "Kept across launches")
+        defaults.set("fortnightly", forKey: CameraControlPreferences.refreshIntervalKey)
+        XCTAssertNil(CameraControlPreferences(defaults: defaults).loadRefreshInterval(), "An unknown choice reads as unset")
+        await store.connect(camera: plugin.camera, to: "feed", credentials: Self.secret, saveCredentials: false)
+        let state = store.state(for: "feed")
+        XCTAssertEqual(plugin.propertyCalls, 1, "Still read on connecting")
+        for _ in 0..<3 { plugin.handler?(.changed(feedID: "feed", generation: state.generation)) }
+        await settle { false }
+        XCTAssertTrue(sleeper.requested.isEmpty, "Never: no read waits")
+        XCTAssertEqual(plugin.propertyCalls, 1)
+        XCTAssertTrue(state.dirty)
+        await store.set(Self.iso, value: .unsignedInteger(1_600), feedID: "feed")
+        XCTAssertEqual(plugin.setCalls, 1)
+        XCTAssertEqual(plugin.propertyCalls, 2, "Read right after a change made here")
+        plugin.handler?(.changed(feedID: "feed", generation: state.generation))
+        await store.refresh("feed")
+        XCTAssertEqual(plugin.propertyCalls, 3, "Refresh reads")
+        XCTAssertFalse(state.dirty)
+        XCTAssertTrue(sleeper.requested.isEmpty)
+        _ = await store.shutdown()
+    }
+
+    func testChangingTheIntervalRetimesAWaitingReadAndRefreshReplacesIt() async {
+        let plugin = SuspendedControlPlugin(), sleeper = RetrySleeper(), clock = RefreshClock()
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(), persistence: MemoryControlAssignments(),
+            now: { clock.date }, refreshSleep: { try await sleeper.sleep($0) })
+        await store.connect(camera: plugin.camera, to: "feed", credentials: Self.secret, saveCredentials: false)
+        let state = store.state(for: "feed")
+        plugin.handler?(.changed(feedID: "feed", generation: state.generation))
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.requested, [.seconds(60)])
+        store.refreshInterval = .seconds15
+        await settle { sleeper.requested.count == 2 }
+        XCTAssertEqual(sleeper.requested.last, .seconds(15), "A shorter interval shortens the wait")
+        store.refreshInterval = .never
+        sleeper.release()
+        await settle { false }
+        XCTAssertEqual(plugin.propertyCalls, 1, "Never cancels the waiting read")
+        store.refreshInterval = .minutes5
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.requested.last, .seconds(300), "Still stale: a longer interval waits again")
+        await store.refresh("feed")
+        XCTAssertEqual(plugin.propertyCalls, 2)
+        sleeper.release()
+        await settle { false }
+        XCTAssertEqual(plugin.propertyCalls, 2, "Refresh stands in for the read that was waiting")
+        _ = await store.shutdown()
+    }
 }
 #endif

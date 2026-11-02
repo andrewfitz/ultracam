@@ -58,6 +58,43 @@ enum CameraControlReconnectPolicy {
         return busy ? .wait : .attempt
     }
 }
+/// How often a connected body's settings are read again. A body's change notice only marks
+/// the cached values stale; they're read at most once per interval after one. Never reads
+/// only on Refresh, on connecting and right after a change made here.
+enum CameraControlRefreshInterval: String, CaseIterable, Codable, Identifiable, Sendable {
+    case seconds15 = "15s", seconds30 = "30s", seconds60 = "60s", minutes2 = "2m", minutes5 = "5m", never
+    /// Camera bodies send frequent notices (battery, remaining recording time, auto
+    /// exposure); once a minute keeps the overlay and battery current without constant reads.
+    static let standard = CameraControlRefreshInterval.seconds60
+    var id: String { rawValue }
+    var seconds: TimeInterval? {
+        switch self {
+        case .seconds15: 15
+        case .seconds30: 30
+        case .seconds60: 60
+        case .minutes2: 120
+        case .minutes5: 300
+        case .never: nil
+        }
+    }
+    var title: String {
+        switch self {
+        case .seconds15: "Every 15 s"
+        case .seconds30: "Every 30 s"
+        case .seconds60: "Every 60 s"
+        case .minutes2: "Every 2 min"
+        case .minutes5: "Every 5 min"
+        case .never: "Never (only when you press Refresh)"
+        }
+    }
+    /// The wait before stale settings are read again: the rest of the interval since the
+    /// last read, nil for Never. Pure, so the store's tests never sleep.
+    func delay(lastRefresh: Date?, now: Date) -> TimeInterval? {
+        guard let seconds else { return nil }
+        guard let lastRefresh else { return 0 }
+        return min(max(seconds - now.timeIntervalSince(lastRefresh), 0), seconds)
+    }
+}
 struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     var version = 1
     var plugins: [String: [String: CameraControlAssignment]] = [:]
@@ -65,6 +102,13 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
 @MainActor protocol CameraControlAssignmentPersisting {
     func load() throws -> CameraControlAssignmentSnapshot
     func save(_ snapshot: CameraControlAssignmentSnapshot) throws
+    func loadRefreshInterval() -> CameraControlRefreshInterval?
+    func saveRefreshInterval(_ interval: CameraControlRefreshInterval)
+}
+extension CameraControlAssignmentPersisting {
+    /// Fixtures that keep no preferences read the standard interval.
+    func loadRefreshInterval() -> CameraControlRefreshInterval? { nil }
+    func saveRefreshInterval(_ interval: CameraControlRefreshInterval) {}
 }
 
 /// A verified write precedes the migration marker; legacy data remains recoverable.
@@ -100,6 +144,15 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     func save(_ snapshot: CameraControlAssignmentSnapshot) throws {
         defaults.set(try JSONEncoder().encode(snapshot), forKey: Self.preferencesKey)
     }
+    /// Under "ui.", so Reset All Settings clears it with the pairings.
+    static let refreshIntervalKey = "ui.camera.controls.refresh-interval.v1"
+    /// Unknown (a newer build's choice) reads as unset, so the standard interval applies.
+    func loadRefreshInterval() -> CameraControlRefreshInterval? {
+        defaults.string(forKey: Self.refreshIntervalKey).flatMap(CameraControlRefreshInterval.init(rawValue:))
+    }
+    func saveRefreshInterval(_ interval: CameraControlRefreshInterval) {
+        defaults.set(interval.rawValue, forKey: Self.refreshIntervalKey)
+    }
 }
 
 @MainActor @Observable final class CameraControlFeedState {
@@ -129,10 +182,14 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         let seconds = Int(retryAt.timeIntervalSince(date).rounded(.up))
         return seconds > 0 ? "Trying again in \(seconds) s" : "Reconnecting…"
     }
+    /// "Updating settings…" only while the body is being read or written. A body's change
+    /// notice just makes the cache stale, which reads as when it was last read.
     var cacheStatus: String {
         if !connected { return "Disconnected · cached values" }
-        if dirty { return message == nil ? "Updating settings…" : "Settings update failed" }
-        return "Settings up to date"
+        if busy { return "Updating settings…" }
+        if dirty, message != nil { return "Settings update failed" }
+        guard let lastRefresh else { return "Settings not read yet" }
+        return "Updated \(lastRefresh.formatted(date: .omitted, time: .standard))"
     }
 }
 
@@ -142,12 +199,24 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     private(set) var discoveryMessages: [String: String] = [:]
     private(set) var scanning: Set<String> = []
     private(set) var shuttingDown = false
+    /// Settings › Hardware › Refresh camera settings. Changing it re-times any waiting read.
+    var refreshInterval: CameraControlRefreshInterval = .standard {
+        didSet {
+            guard refreshInterval != oldValue else { return }
+            persistence.saveRefreshInterval(refreshInterval)
+            for feed in Array(refreshTasks.keys) { refreshTasks.removeValue(forKey: feed)?.cancel() }
+            for feed in states.keys.sorted() { scheduleRefresh(feed) }
+        }
+    }
     @ObservationIgnored private let plugins: [String: any CameraControlPlugin]
     @ObservationIgnored private let credentials: any CameraControlCredentialStoring
     @ObservationIgnored private let persistence: any CameraControlAssignmentPersisting
     @ObservationIgnored private let now: @MainActor () -> Date
     @ObservationIgnored private let sleep: @MainActor (Duration) async throws -> Void
     @ObservationIgnored private let jitter: @MainActor () -> Double
+    /// The wait before a scheduled settings read; apart from `sleep` so reconnect waits and
+    /// refresh waits are released separately in tests.
+    @ObservationIgnored private let refreshSleep: @MainActor (Duration) async throws -> Void
     private var states: [String: CameraControlFeedState] = [:]
     private var routes: [String: String] = [:]
     private var preparedRequests: [String: ControlPreparationRequest] = [:]
@@ -166,6 +235,9 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     }
     @ObservationIgnored private var pendingCleanup: [String: [UInt64: PendingCleanup]] = [:]
     @ObservationIgnored private var refreshTasks: [String: Task<Void, Never>] = [:]
+    /// When each body's latest settings read began, failed or not, so a body that keeps
+    /// failing is still read only once per interval.
+    @ObservationIgnored private var readStarted: [String: Date] = [:]
     @ObservationIgnored private var discoveryTasks: [String: Task<Void, Never>] = [:]
     private var lastSuccessfulDiscovery: [String: Date] = [:]
     @ObservationIgnored private var restoreTask: Task<Void, Never>?
@@ -188,9 +260,11 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         persistence: any CameraControlAssignmentPersisting = CameraControlPreferences(),
         now: @escaping @MainActor () -> Date = { Date() },
         sleep: @escaping @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
-        jitter: @escaping @MainActor () -> Double = { Double.random(in: 0...1) }) {
+        jitter: @escaping @MainActor () -> Double = { Double.random(in: 0...1) },
+        refreshSleep: @escaping @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
         self.plugins = plugins; self.credentials = credentials; self.persistence = persistence; self.now = now
-        self.sleep = sleep; self.jitter = jitter
+        self.sleep = sleep; self.jitter = jitter; self.refreshSleep = refreshSleep
+        refreshInterval = persistence.loadRefreshInterval() ?? .standard
         do { assignments = try persistence.load().plugins }
         catch { persistenceWritable = false; discoveryMessages["persistence"] = error.localizedDescription }
         for (id, plugin) in plugins {
@@ -346,6 +420,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
                 }
             }
             let revision = state.invalidationRevision
+            readStarted[feedID] = now()
             let properties = try await plugin.properties(feedID: feedID, generation: generation)
             guard current(feedID, generation) else { return }
             apply(properties, state: state, revision: revision)
@@ -437,6 +512,9 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         guard state.connected, !state.busy, !shuttingDown, let plugin = plugin(for: feedID) else { return }
         let generation = state.generation, revision = state.invalidationRevision
         state.busy = true; state.message = nil
+        // This read stands in for any that was waiting; the next notice schedules afresh.
+        refreshTasks.removeValue(forKey: feedID)?.cancel()
+        readStarted[feedID] = now()
         defer { finish(feedID, generation) }
         do {
             let properties = try await plugin.properties(feedID: feedID, generation: generation)
@@ -463,8 +541,9 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             report(error, feedID, generation)
             return
         }
-        // Read once after a successful write. Failed writes keep the last confirmed
-        // snapshot stale until a later camera notification or explicit refresh.
+        // Read once after a successful write, whatever the interval, so the value just set
+        // shows. Failed writes keep the last confirmed snapshot stale until the next
+        // scheduled read or an explicit Refresh.
         if current(feedID, generation) { state.busy = false; await refresh(feedID) }
     }
     func disconnect(_ feedID: String, forget: Bool = false) async {
@@ -604,6 +683,8 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         guard !shuttingDown, !removed.contains(feed), routes[feed] == pluginID, state(for: feed).generation == generation else { return }
         let state = state(for: feed); state.invalidationRevision &+= 1; state.dirty = true
         switch event {
+        // Stale, not re-read now: the read waits for the chosen interval (or Refresh). The
+        // notice names no property, so there's no single value to fetch instead.
         case .changed: scheduleRefresh(feed)
         case .disconnected(_, _, let reason):
             retire(feed); state.message = reason.message
@@ -741,11 +822,15 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         if state.lostAt == nil { state.lostAt = now() }
         scheduleRetry(feed)
     }
+    /// A stale cache is read once the interval since the last read has passed; every notice
+    /// in between joins that one read. Never schedules nothing.
     private func scheduleRefresh(_ feed: String) {
         let state = state(for: feed)
-        guard state.connected, !state.busy, !shuttingDown, refreshTasks[feed] == nil else { return }
+        guard state.connected, state.dirty, !state.busy, !shuttingDown, refreshTasks[feed] == nil,
+            let wait = refreshInterval.delay(lastRefresh: readStarted[feed] ?? state.lastRefresh, now: now()) else { return }
+        let sleep = refreshSleep
         refreshTasks[feed] = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
+            do { try await sleep(.milliseconds(Int((wait * 1000).rounded()))) } catch { return }
             guard let self, !Task.isCancelled else { return }
             self.refreshTasks.removeValue(forKey: feed)
             await self.refresh(feed)

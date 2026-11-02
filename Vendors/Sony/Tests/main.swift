@@ -511,8 +511,12 @@ private final class SonyStub: UCSonyCameraControl {
     }
     do {
       let defaults = freshDefaults(), backend = SonyStub(), vault = MemoryCredentials()
-      let store = CameraControlStore(defaults: defaults, backend: backend, credentials: vault)
+      var clock = Date(timeIntervalSince1970: 1000)
+      let store = CameraControlStore(defaults: defaults, backend: backend, credentials: vault, now: { clock })
       await store.connect(camera, to: "delete-failure-feed", user: secret.user, password: secret.password)
+      // The refresh interval since the connect read has passed, so a held notice reads as
+      // soon as the busy operation ends rather than waiting out the minute.
+      clock.addTimeInterval(CameraControlRefreshInterval.standard.seconds ?? 0)
       let refreshBeforeDeletion = backend.refreshCalls
       await vault.holdNextDeletion()
       let forgetting = Task { await store.forgetCredentials("delete-failure-feed") }
