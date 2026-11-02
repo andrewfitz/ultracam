@@ -124,7 +124,7 @@ struct UIScopeSettingsView: View {
     Picker("Refresh", selection: $scopes.refreshHz) {
       ForEach(MonitorScopePreferences.refreshRates, id: \.self) { Text("\($0) Hz").tag($0) }
     }
-    .help("How often the scope redraws. The picture shows every frame whatever this is.")
+    .help("How often the scope redraws, up to the picture's own frame rate. The picture shows every frame whatever this is.")
   }
 
   private var matrixPicker: some View {

@@ -472,9 +472,9 @@ struct MonitorSignalDeclaration: Codable, Equatable, Sendable {
 
 /// Scope scheduling and look for one target. MonitorKit leaves scheduling to the host.
 struct MonitorScopePreferences: Codable, Equatable, Sendable {
-  static let refreshRates = [10, 15, 30]
+  static let refreshRates = [10, 15, 30, 60, 120]
   var enabled = false
-  /// Scope redraws per second: 10, 15 or 30.
+  /// Scope redraws per second: 10, 15, 30, 60 or 120, never more often than the picture.
   var refreshHz = 15
   /// MonitorTools' look by default: an RGB parade of the output, 768 × 256, −10…110 IRE.
   var settings = ScopeSettings.plainWaveform()
@@ -756,7 +756,7 @@ struct LegacyMonitorConfiguration: Codable, Equatable, Sendable {
     value.focus.noiseRejection = bounded(focus.noiseRejection, 0...1, fallback: 0.02)
     value.focus.opacity = bounded(focus.opacity, 0...1, fallback: 0.85)
     value.scopes.gain = bounded(scopes.gain, 0.25...4, fallback: 1)
-    value.scopes.refreshHz = [10, 15, 30].contains(scopes.refreshHz) ? scopes.refreshHz : 15
+    value.scopes.refreshHz = MonitorScopePreferences.refreshRates.contains(scopes.refreshHz) ? scopes.refreshHz : 15
     value.falseColor.referenceOffsetStops = bounded(
       falseColor.referenceOffsetStops, -10...10, fallback: 0)
     value.falseColor.exposureIndex = min(12800, max(100, falseColor.exposureIndex))

@@ -393,6 +393,10 @@ extension MonitorLifecycleChecks {
     XCTAssertEqual(scopes.refreshHz, 30)
     XCTAssertEqual(try migrated(#"{"scopes":{"refreshHz":20}}"#).scopes.refreshHz, 15)
     XCTAssertEqual(try migrated(#"{"scopes":{"refreshHz":10}}"#).scopes.refreshHz, 10)
+    XCTAssertEqual(try migrated(#"{"scopes":{"refreshHz":60}}"#).scopes.refreshHz, 60)
+    XCTAssertEqual(try migrated(#"{"scopes":{"refreshHz":120}}"#).scopes.refreshHz, 120)
+    XCTAssertEqual(try migrated(#"{"scopes":{"refreshHz":240}}"#).scopes.refreshHz, 15, "Not a choice")
+    XCTAssertEqual(MonitorScopePreferences(refreshHz: 120).refreshHz, 120)
     XCTAssertFalse(try migrated("{}").scopes.enabled)
   }
 
