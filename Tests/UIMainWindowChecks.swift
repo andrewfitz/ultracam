@@ -300,4 +300,21 @@ import XCTest
       XCTAssertTrue(items.first { $0.title == name }?.submenu?.items.contains { $0.title == "LUT" } == true)
     }
   }
+
+  // MARK: Detail size
+
+  /// At startup the split view reports zero or a sliver before its real size; cells fitted to
+  /// that were about 1 pt wide and scaled up, a flash of garble before the window settled.
+  @MainActor func testSettledSizeIgnoresDegenerateSizes() {
+    let settled = UISettledSize()
+    settled.changed(to: .zero)
+    settled.changed(to: CGSize(width: 50, height: 700))
+    settled.changed(to: CGSize(width: 1200, height: 40))
+    XCTAssertNil(settled.value, "A degenerate size is never the first size")
+    settled.changed(to: CGSize(width: 1200, height: 800))
+    XCTAssertEqual(settled.value, CGSize(width: 1200, height: 800), "The first real size applies at once")
+    settled.changed(to: .zero)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    XCTAssertEqual(settled.value, CGSize(width: 1200, height: 800), "A later degenerate size changes nothing")
+  }
 }

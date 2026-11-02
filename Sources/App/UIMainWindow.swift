@@ -11,6 +11,9 @@ struct UIMainWindowView: View {
   @State private var columns = UIColumnState()
   /// The detail's size once it stops changing (see `UISettledSize`).
   @State private var settled = UISettledSize()
+  /// Whether the cells have been shown: once the detail's size has settled and every shown
+  /// strip has been measured, so the first layout seen is the real one (see `revealIfMeasured`).
+  @State private var revealed = false
 
   /// Space between a picture and its strip (`UICameraColumnView`), between grid cells,
   /// and around the pictures (clear of the sidebar, inspector and window edges).
@@ -108,6 +111,7 @@ struct UIMainWindowView: View {
   /// out again until the size settles (`UISettledSize`), and then at the size they were shown at.
   private func cells(_ fit: UIDetailFit, @ViewBuilder content: (CGFloat) -> some View) -> some View {
     let width = fit.width(in: settled.size)
+    let ready = settled.value != nil
     // In an overlay, so the cells' width never becomes the detail's ideal size (the split view
     // turns that into constraints, and changing it from its own size loops).
     return Color.clear.overlay {
@@ -124,12 +128,37 @@ struct UIMainWindowView: View {
       // cells inside instead cost more: the scroll view's visible bounds lag the animation.
       .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
       .visualEffect { content, proxy in
-        let scale = fit.scale(laidOut: width, live: proxy.size)
+        // Before the first settled size the cells are hidden, at their own size.
+        let scale = ready ? fit.scale(laidOut: width, live: proxy.size) : 1
         UIRenderProbe.sample("cells scale", scale)
         return content.scaleEffect(scale, anchor: .top)
       }
     }
-    .onGeometryChange(for: CGSize.self) { $0.size } action: { settled.changed(to: $0) }
+    .onGeometryChange(for: CGSize.self) { $0.size } action: {
+      settled.changed(to: $0)
+      revealIfMeasured()
+    }
+    // Hidden until laid out at the real size and strip heights: at startup they were first
+    // fitted to a placeholder size and guessed strips, scaled, then refitted, a flash of garble.
+    .opacity(revealed ? 1 : 0)
+    .task {
+      // Never hidden for long, whatever the measurements do.
+      try? await Task.sleep(for: .milliseconds(500))
+      revealed = true
+    }
+  }
+
+  /// Shows the cells once the size has settled and every shown camera's strip is measured.
+  private func revealIfMeasured() {
+    guard !revealed, settled.value != nil else { return }
+    let cameras = context.presentation.cameras
+    let shown: [UICameraPresentation]
+    switch context.presentation.layout {
+    case .programView: shown = []
+    case .single: shown = (context.presentation.selected ?? cameras.first).map { [$0] } ?? []
+    case .sideBySide, .fourUp: shown = cameras
+    }
+    if shown.allSatisfy({ stripHeights[$0.id] != nil }) { revealed = true }
   }
 
   // MARK: Fitting
@@ -141,6 +170,7 @@ struct UIMainWindowView: View {
         // Round and ignore sub-point changes so fitting the width to the strip can't oscillate.
         let rounded = max(0, (size.height - size.width * 9 / 16 - columnSpacing).rounded())
         if abs((stripHeights[camera.id] ?? -1) - rounded) >= 1 { stripHeights[camera.id] = rounded }
+        revealIfMeasured()
       }
   }
 
@@ -221,9 +251,14 @@ struct UIMainWindowView: View {
   /// The size to lay out at: the settled one, or a typical one before the first.
   var size: CGSize { value ?? CGSize(width: 1000, height: 700) }
 
+  /// Under this the size is the split view still setting up (zero, or a sliver), never one to
+  /// lay out at: cells fitted to it were about 1 pt wide and then scaled up.
+  static let smallest: CGFloat = 100
+
   func changed(to size: CGSize) {
+    guard size.width >= Self.smallest, size.height >= Self.smallest else { return }
     pending?.cancel()
-    // The first size is adopted at once, so the first layout is the real one.
+    // The first real size is adopted at once, so the first layout is the real one.
     guard value != nil else { value = size; return }
     let work = DispatchWorkItem { [weak self] in
       guard let self, self.value != size else { return }
