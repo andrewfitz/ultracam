@@ -20,12 +20,39 @@ enum UIControlPresentation {
         }
     }
     /// The picture's camera-settings overlay: one typed piece per field, set apart by spacing, never joined with dots.
+    /// A value in camera notation stands alone ("ƒ/2.8", "1/50"); any other keeps its label ("ISO 800").
     static func overlayPieces(_ properties: [ControlProperty], compact: Bool = false, in bundle: Bundle = .main) -> [String] {
-        let fields = properties.filter { $0.overlayOrder != nil }.sorted { $0.overlayOrder! < $1.overlayOrder! }
-        return (compact ? Array(fields.prefix(3)) : fields).map { "\($0.localizedLabel(in: bundle)) \(value($0, in: bundle))" }
+        overlayFields(properties, compact: compact).map { property in
+            let shown = value(property, in: bundle)
+            return notation(shown) ?? "\(property.localizedLabel(in: bundle)) \(shown)"
+        }
     }
-    /// The pieces as one line, for VoiceOver and help.
+    /// The overlay as one line with every field's full name, for VoiceOver and help.
     static func overlay(_ properties: [ControlProperty], compact: Bool = false, in bundle: Bundle = .main) -> String {
-        overlayPieces(properties, compact: compact, in: bundle).joined(separator: ", ")
+        overlayFields(properties, compact: compact).map { "\($0.localizedLabel(in: bundle)) \(value($0, in: bundle))" }
+            .joined(separator: ", ")
+    }
+    private static func overlayFields(_ properties: [ControlProperty], compact: Bool) -> [ControlProperty] {
+        let fields = properties.filter { $0.overlayOrder != nil }.sorted { $0.overlayOrder! < $1.overlayOrder! }
+        return compact ? Array(fields.prefix(3)) : fields
+    }
+    /// A value that already says what it measures, as a camera's own display writes it, or nil.
+    /// Read from the value's notation, never a vendor's IDs: aperture "ƒ/2.8", shutter "1/50"
+    /// (its " s" dropped) or "0.5 s", shutter angle "180°", color temperature "5600 K", and
+    /// focus modes "AF-C", "MF". ISO 800, Auto or Daylight alone wouldn't say what they are.
+    static func notation(_ value: String) -> String? {
+        func number(_ text: Substring) -> Bool {
+            !text.isEmpty && text.allSatisfy { $0.isASCII && ($0.isNumber || $0 == ".") } && Double(text) != nil
+        }
+        if value.hasPrefix("ƒ/") || value.hasPrefix("f/") { return number(value.dropFirst(2)) ? value : nil }
+        if value.hasPrefix("1/") {
+            let denominator = value.hasSuffix(" s") ? value.dropFirst(2).dropLast(2) : value.dropFirst(2)
+            return number(denominator) ? "1/\(denominator)" : nil
+        }
+        if value.hasSuffix(" s"), number(value.dropLast(2)) { return value }
+        if value.hasSuffix("°"), number(value.dropLast()) { return value }
+        if value.hasSuffix(" K"), number(value.dropLast(2)) { return value }
+        if ["MF", "DMF"].contains(value) || value.hasPrefix("AF-") && value.count == 4 { return value }
+        return nil
     }
 }

@@ -232,7 +232,7 @@ File: `UICameraColumn.swift`.
 | B | CPU copy pill | "CPU copy · Ingest · 1234" (`:247`) | Orange triangle, "CPU copy", mono count. It's a warning, so it should look like one. The stage name moves to help (I P12) |
 | B | Compatibility pill | "Compatibility conversion · Recording · 1234" (`UIPresentation.swift:82`) | Leaves the picture for the Recording popover (I P12). The CPU copy pill sits beside REC, which must not truncate, so it yields first |
 | B | Signal menu | "Output · 1080p 29.97" (`:360`) | "Output" dim, value strong |
-| B | Camera settings overlay | "ISO 800 · 1/60 · f/2.8", one string (`UIControlPresentation.swift:24`) | One cell per field: small dim label, mono value. The compact three-field fallback stays |
+| B | Camera settings overlay | "ISO 800 · 1/60 · f/2.8", one string (`UIControlPresentation.swift:24`) | One cell per field, mono. A value in camera notation stands alone, with no label and no symbol: "ƒ/2.8", "1/50", "180°", "5600 K", "AF-C" (2026-11-02; full names wasted the picture). Others keep a short label: "ISO 800", "White balance Daylight". VoiceOver reads every full name. The compact three-field fallback stays |
 | C | Timecode | Mono text on hover (`:227`) | Same. It reads as timecode without help |
 | C | View controls | Icon-only (`:367-389`) | Same. Each has help and a label |
 
