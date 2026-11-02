@@ -318,7 +318,10 @@ struct UIScopeWindowView: View {
         coordinator.setPreferences(UIMonitorBridge.toggled(.scopes, in: preferences, isProgram: isProgram), for: targetID)
       }
     } else if let presenter {
+      // Remade per presenter: a picture recreated in the main window (a layout change, a
+      // camera added again) has a new presenter, and the scope view belongs to one.
       UIScopeWindowScope(presenter: presenter, preferences: preferences, isProgram: isProgram)
+        .id(ObjectIdentifier(presenter))
     } else {
       placeholder("Show \(name) in the main window to see its scope", action: nil) {}
     }
