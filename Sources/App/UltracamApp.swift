@@ -131,10 +131,11 @@ struct UltracamApp: App {
     .defaultSize(width: 560, height: 640)
     .windowResizability(.contentSize)
 
-    // Eight toolbar tabs; the window takes each tab's height, so it resizes between them.
+    // Eight toolbar tabs in an ordinary resizable window; a long tab scrolls.
     Settings {
       UISettingsView(model: model, interface: interface)
     }
-    .windowResizability(.contentSize)
+    .defaultSize(UISettingsLayout.defaultSize)
+    .windowResizability(.contentMinSize)
   }
 }

@@ -45,8 +45,8 @@ enum UISettingsTab: String, CaseIterable, Identifiable, Sendable {
 }
 
 /// Settings window (⌘,). Settings change app-wide state, so the panes work on the models
-/// directly. Each pane is as tall as its content, up to the screen, so the window resizes
-/// between tabs and a long pane scrolls.
+/// directly. An ordinary resizable window: it keeps its size between tabs, the user sizes it
+/// with the window edges, and a pane longer than the window scrolls.
 struct UISettingsView: View {
   let model: AppModel
   @Bindable var interface: UIInterfaceState
@@ -61,7 +61,8 @@ struct UISettingsView: View {
           .tag(tab)
       }
     }
-    .frame(width: UISettingsLayout.width)
+    .frame(minWidth: UISettingsLayout.minimumWidth, maxWidth: .infinity,
+      minHeight: UISettingsLayout.minimumHeight, maxHeight: .infinity)
   }
 
   @ViewBuilder private func pane(_ tab: UISettingsTab) -> some View {
@@ -80,60 +81,17 @@ struct UISettingsView: View {
 
 enum UISettingsLayout {
   /// Wide enough for the eight tabs.
-  static let width: CGFloat = 820
-  static let minimumHeight: CGFloat = 200
-  /// Until a pane has measured its content.
-  static let initialHeight: CGFloat = 460
-  /// Room for the title bar, the tabs and the Dock.
-  @MainActor static var maximumHeight: CGFloat { max(minimumHeight, (NSScreen.main?.visibleFrame.height ?? 900) - 120) }
-
-  /// What a pane's form reports about itself, in whole points.
-  struct Measure: Equatable {
-    var content: CGFloat
-    var container: CGFloat
-    var insets: CGFloat
-
-    init(content: CGFloat, container: CGFloat, insets: CGFloat) {
-      self.content = content.rounded(.up)
-      self.container = container.rounded(.up)
-      self.insets = insets.rounded(.up)
-    }
-
-    init(_ geometry: ScrollGeometry) {
-      self.init(
-        content: geometry.contentSize.height,
-        container: geometry.containerSize.height,
-        insets: geometry.contentInsets.top + geometry.contentInsets.bottom)
-    }
-  }
-
-  /// The content height to adopt, or nil to keep the current one. A form whose content fills
-  /// its container says nothing about its true height (a form may stretch to fill), so only
-  /// overflow grows the pane and only visible slack shrinks it. Changes under 2 pt are noise.
-  static func adopted(_ measure: Measure, current: CGFloat?) -> CGFloat? {
-    guard measure.content > 0, measure.container > 0 else { return nil }
-    let wanted = measure.content + measure.insets
-    let visible = measure.container - measure.insets
-    let overflows = measure.content > visible + 1
-    let slack = measure.content < visible - 2
-    guard current == nil || overflows || slack else { return nil }
-    if let current, abs(current - wanted) < 2 { return nil }
-    return wanted
-  }
-
-  /// A pane's height for its measured content: all of it, up to the screen.
-  @MainActor static func height(content: CGFloat?, extra: CGFloat = 0) -> CGFloat {
-    guard let content, content > 0 else { return initialHeight }
-    return min(max((content + extra).rounded(.up), minimumHeight), maximumHeight)
-  }
+  static let minimumWidth: CGFloat = 820
+  static let minimumHeight: CGFloat = 320
+  /// The window's size the first time it opens; after that it keeps the user's.
+  static let defaultSize = CGSize(width: 820, height: 600)
 }
 
-/// One tab: a grouped form, as tall as what it holds. A pane may end with one action at the
-/// bottom trailing edge, outside any section (Restore Defaults).
+/// One tab: a grouped form filling the window, scrolling when it is longer. A pane may end
+/// with one action at the bottom trailing edge, outside any section (Restore Defaults).
 struct UISettingsPane<Content: View, Trailing: View>: View {
   let content: Content
   let trailing: Trailing
-  @State private var contentHeight: CGFloat?
 
   init(@ViewBuilder content: () -> Content) where Trailing == EmptyView {
     self.content = content()
@@ -152,15 +110,6 @@ struct UISettingsPane<Content: View, Trailing: View>: View {
       Form { content }
         .formStyle(.grouped)
         .scrollBounceBehavior(.basedOnSize)
-        .onScrollGeometryChange(for: UISettingsLayout.Measure.self) { geometry in
-          UISettingsLayout.Measure(geometry)
-        } action: { _, measure in
-          // Resizing the window changes the form's geometry, so a height taken on every change
-          // fed back into the window's own resize until AppKit's layout limit ended the app.
-          // Adopt a height only once, a frame later, and only for real overflow or slack.
-          guard let next = UISettingsLayout.adopted(measure, current: contentHeight) else { return }
-          DispatchQueue.main.async { if next != contentHeight { contentHeight = next } }
-        }
       if hasTrailing {
         HStack {
           Spacer()
@@ -170,7 +119,6 @@ struct UISettingsPane<Content: View, Trailing: View>: View {
         .padding(.bottom, 16)
       }
     }
-    .frame(height: UISettingsLayout.height(content: contentHeight, extra: hasTrailing ? 36 : 0))
   }
 }
 
