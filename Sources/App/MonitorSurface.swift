@@ -1025,7 +1025,11 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     metalLayer.contentsGravity = .resize
     metalLayer.actions = [
       "bounds": NSNull(), "position": NSNull(), "frame": NSNull(), "contents": NSNull(), "drawableSize": NSNull(),
+      "opacity": NSNull(),
     ]
+    // Transparent (the view's black shows) until the render loop presents its first picture,
+    // so nothing the layer holds before then is ever composited. Frames still render meanwhile.
+    metalLayer.opacity = 0
     layer?.addSublayer(metalLayer)
     aspectObservation = presenter.$pictureAspectRatio.sink { [weak self] _ in
       MainActor.assumeIsolated { self?.needsLayout = true }
@@ -1064,6 +1068,13 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     let scaleChanged = metalLayer.contentsScale != scale
     if scaleChanged { metalLayer.contentsScale = scale }
     CATransaction.commit()
+    // An empty frame (a view that has just appeared) gets no drawable size: a 1×1 drawable
+    // presented there was stretched over the picture once it had its size.
+    if metalLayer.frame.width < 1 || metalLayer.frame.height < 1 {
+      NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(drawableSizeSettled), object: nil)
+      drawableResizePending = false
+      return
+    }
     // The first real size (a view that just appeared, or one laid out at zero size first) and
     // a new display's scale apply at once; any other change waits to settle.
     let degenerate = metalLayer.drawableSize.width <= 1 || metalLayer.drawableSize.height <= 1
@@ -1218,6 +1229,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private var paused = false
   private var versions: (UInt64, UInt64) = (UInt64.max, UInt64.max)
   private var drawnSize = (width: 0, height: 0)
+  /// Whether the first picture has been presented and the layer shown (see `MonitorPictureNSView`).
+  private var revealed = false
   private var attached = false
   private var drawableSet: MTLResidencySet?
   private var pass: MonitorPass?
@@ -1393,6 +1406,16 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let submitted = pictureSubmission
     let completion = submissionCompletion(core: core, kind: Self.pictureKind, serial: submitted)
     core.commit(context, drawable: drawable, completion: completion, kind: Self.pictureKind)
+    if !revealed {
+      revealed = true
+      nonisolated(unsafe) let layer = layer
+      DispatchQueue.main.async {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = 1
+        CATransaction.commit()
+      }
+    }
     presenter.recordPresented(work.stamp)
     if let pass, scopeSource != nil { presenter.recordStatus(pass.status) }
     guard let scopeSource, let stamp = work.stamp, Self.wantsScopes(work), let scopeLinkLayer else { return }

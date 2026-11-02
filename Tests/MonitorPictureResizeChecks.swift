@@ -48,6 +48,9 @@ extension MonitorCoordinatorChecks {
     let picture = try resizePicture()
     // Laid out at zero size first (a view that has just appeared), then given its size.
     resize(picture, width: 0)
+    XCTAssertEqual(picture.metalLayer.drawableSize, .zero, "An empty frame gets no drawable, not a 1×1 one")
+    XCTAssertEqual(picture.drawableResizes, 0)
+    XCTAssertEqual(picture.metalLayer.opacity, 0, "Nothing is composited before the first present")
     resize(picture, width: 480)
     XCTAssertEqual(picture.metalLayer.drawableSize, CGSize(width: 960, height: 540),
       "A picture that has just appeared draws at its size at once, never into a 1×1 drawable")
