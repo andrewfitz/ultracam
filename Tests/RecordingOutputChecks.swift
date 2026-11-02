@@ -554,6 +554,32 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try Data(contentsOf: session.temporaryURL), original)
   }
 
+  func testRecoveryScanKeepsOtherTakesWhenStagingCleanupFails() throws {
+    let root = try makeRoot()
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let blocked = try manager.beginExternalWriterSession(feedID: "Blocked")
+    let healthy = try manager.beginExternalWriterSession(feedID: "Healthy")
+    let folder = blocked.temporaryURL.deletingLastPathComponent()
+    defer {
+      try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path)
+      try? FileManager.default.removeItem(at: root)
+    }
+    for take in [blocked, healthy] {
+      try Data([1, 2, 3]).write(to: take.temporaryURL)
+      take.preserveForRecovery()
+    }
+    let staging = blocked.temporaryURL.appendingPathExtension("export.ultracam-recovery")
+    try Data([4, 5]).write(to: staging)
+    try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folder.path)
+    let report = try RecordingRecovery.scanReport(root: root)
+    XCTAssertTrue(report.takes.contains {
+      $0.temporaryURL.resolvingSymlinksInPath().path == healthy.temporaryURL.resolvingSymlinksInPath().path
+        && $0.finalURL.lastPathComponent == healthy.finalURL.lastPathComponent
+    })
+    XCTAssertFalse(report.mayPruneRoot)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: staging.path))
+  }
+
   /// Settings › Recording's name pattern: its pieces in order, then the session ID, which keeps
   /// two takes from ever sharing a path.
   func testNamePatternOrdersItsPiecesAndKeepsTheSessionID() throws {

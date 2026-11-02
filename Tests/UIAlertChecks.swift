@@ -264,8 +264,10 @@ import XCTest
     interface.alertsDisabled = true
     let delivery = FakeAlertDelivery()
     let panel = FakeAlertPanel()
+    let preferences = UIAlertPreferences(defaults: defaults)
+    preferences.notificationsEnabled = false
     let coordinator = UIAlertCoordinator(model: model, interface: interface,
-      preferences: UIAlertPreferences(defaults: defaults), delivery: delivery, panel: panel)
+      preferences: preferences, delivery: delivery, panel: panel)
     XCTAssertTrue(interface.offerAlerts, "Undecided, and nothing is live")
     let bridge = UISessionBridge(model: model, interface: interface)
     XCTAssertTrue(bridge.presentation().offersAlerts)
@@ -290,7 +292,11 @@ import XCTest
     update.stopCause = .failed("x")
     model.deliverCaptureUpdateForTesting(id, update)
     RunLoop.main.run(until: Date().addingTimeInterval(0.6))
-    XCTAssertEqual(delivery.posted.map(\.title), ["\(model.feedDescriptors[0].name) stopped"], "A new problem is sent")
+    XCTAssertTrue(delivery.posted.isEmpty, "Notifications are off when the problem starts")
+    preferences.notificationsEnabled = true
+    RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+    XCTAssertEqual(delivery.posted.map(\.title), ["\(model.feedDescriptors[0].name) stopped"],
+      "Enabling notifications sends an existing problem without a model change")
     XCTAssertFalse(bridge.presentation().isLive)
     bridge.perform(.turnOnAlerts)
     XCTAssertEqual(delivery.requested, 1, "Off air it asks")

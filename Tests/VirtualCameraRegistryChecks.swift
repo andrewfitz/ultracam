@@ -2,6 +2,26 @@ import Foundation
 import XCTest
 
 @objcMembers final class VirtualCameraRegistryChecks: XCTestCase {
+  func testStoreRecoversFromReservedGenerationInPrimary() throws {
+    let suite = "org.ultracam.tests.registry.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = VirtualCameraRegistryStore(defaults: defaults)
+    let valid = VirtualCameraRegistrySnapshot(generation: 7, devices: [.program()])
+    for generation in [UInt64(0), UInt64.max] {
+      var invalid = valid
+      invalid.generation = generation
+      defaults.set(try JSONEncoder().encode(invalid), forKey: VirtualCameraRegistryStore.key)
+      defaults.set(try JSONEncoder().encode(valid), forKey: VirtualCameraRegistryStore.backupKey)
+      XCTAssertEqual(store.load(), valid)
+      try store.save(valid.advancing(to: [.feed(feedID: "next")]))
+      defaults.set(try JSONEncoder().encode(invalid), forKey: VirtualCameraRegistryStore.key)
+      defaults.removeObject(forKey: VirtualCameraRegistryStore.backupKey)
+      XCTAssertNil(store.load(), "Reserved generations are never persisted state")
+      try store.save(valid)
+    }
+  }
+
   func testDescriptorIDsAreDeterministicAndSeparateFeedFromProgram() throws {
     let first = VirtualCameraDescriptor.feed(feedID: "feed-1")
     let second = VirtualCameraDescriptor.feed(feedID: "feed-1")

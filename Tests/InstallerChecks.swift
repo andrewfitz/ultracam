@@ -349,4 +349,18 @@ import XCTest
     callbacks()
     XCTAssertNil(installer.system)
   }
+
+  func testOlderSystemQueryCannotOverwriteNewerReply() {
+    let harness = InstallerHarness()
+    var services = harness.services()
+    var replies: [@Sendable ([ExtensionSystemRecord]?) -> Void] = []
+    services.queryProperties = { replies.append($0) }
+    let installer = ExtensionInstaller(services: services)
+    installer.refreshSystemState()
+    replies[1]([record("9")])
+    callbacks()
+    replies[0]([record("8")])
+    callbacks()
+    XCTAssertEqual(installer.system?.enabledVersion, "9")
+  }
 }

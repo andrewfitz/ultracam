@@ -204,6 +204,12 @@ extension UIAlertDelivering {
   private func track() {
     withObservationTracking {
       _ = bridge().presentation().problems.map(\.id)
+      // Preferences can change while the problem list stays the same.
+      _ = preferences.notificationsEnabled
+      _ = preferences.panelEnabled
+      _ = preferences.soundEnabled
+      _ = preferences.events
+      _ = preferences.lowSpaceMinutes
     } onChange: { [weak self] in
       Task { @MainActor [weak self] in self?.scheduleUpdate() }
     }

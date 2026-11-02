@@ -245,5 +245,87 @@ private final class SignalLog: @unchecked Sendable {
     wait(for: [live], timeout: 1)
     wait(for: [lost], timeout: 6)
   }
+
+  func testResumedFrameRetiresQueuedWatchdogTimeout() throws {
+    let (source, controller, feed) = try harness("signal-watchdog-resumed")
+    let buffer = try image()
+    let ready = expectation(description: "Started")
+    ready.assertForOverFulfill = false
+    let live = expectation(description: "Live")
+    live.assertForOverFulfill = false
+    let resumed = expectation(description: "Frame resumed after timeout snapshot")
+    let resumedFrameDelivered = DispatchSemaphore(value: 0)
+    let staleLoss = expectation(description: "Stale watchdog must not clear the resumed input")
+    staleLoss.isInverted = true
+    controller.onObservedFrame = { pts, _, _ in
+      if pts == CMTime(value: 1, timescale: 25) { resumedFrameDelivered.signal() }
+    }
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if update.signal == .live { live.fulfill() }
+      if update.message == "No video signal — waiting for source." { staleLoss.fulfill() }
+    }
+    controller.setAuditHooksForTesting(CaptureController.AuditHooks(watchdogSignalTimeoutObserved: {
+      let context = source.context
+      let info = CaptureFrameInfo(epochID: context.epochID, formatSignature: context.formatSignature,
+        presentationTime: CMTime(value: 1, timescale: 25), duration: CMTime(value: 1, timescale: 25),
+        signalValid: true, timecode: nil)
+      XCTAssertTrue(source.submit(.frame(buffer, info)))
+      XCTAssertEqual(resumedFrameDelivered.wait(timeout: .now() + 1), .success)
+      resumed.fulfill()
+    }))
+    defer { controller.onUpdate = nil; controller.stop() }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    frame(0, source, buffer)
+    wait(for: [live], timeout: 1)
+    wait(for: [resumed], timeout: 6)
+    // Synchronize with capture work, including the watchdog action queued after
+    // the hook's resumed frame delivery, before checking its publication.
+    _ = controller.gpuPreparedForTesting
+    wait(for: [staleLoss], timeout: 0.1)
+  }
+
+  func testFrameAfterWatchdogClaimKeepsItsSourceClockBaseline() throws {
+    let (source, controller, feed) = try harness("signal-watchdog-claimed")
+    let buffer = try image()
+    let ready = expectation(description: "Started")
+    ready.assertForOverFulfill = false
+    let live = expectation(description: "Live")
+    live.assertForOverFulfill = false
+    let claimed = expectation(description: "Watchdog claimed timeout")
+    let received = DispatchSemaphore(value: 0)
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if update.signal == .live { live.fulfill() }
+    }
+    defer { controller.onUpdate = nil; controller.stop() }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    frame(0, source, buffer)
+    wait(for: [live], timeout: 1)
+    controller.setAuditHooksForTesting(CaptureController.AuditHooks(watchdogSignalTimeoutClaimed: {
+      let context = source.context
+      // Resume after the timeout claim but before capture-side signal clearing.
+      // The second frame skips one source interval and establishes a baseline
+      // that must survive the remainder of timeout handling.
+      for index: Int64 in [1, 3] {
+        let info = CaptureFrameInfo(epochID: context.epochID, formatSignature: context.formatSignature,
+          presentationTime: CMTime(value: index, timescale: 25), duration: CMTime(value: 1, timescale: 25),
+          signalValid: true, timecode: nil)
+        XCTAssertTrue(source.submit(.frame(buffer, info)))
+      }
+      XCTAssertEqual(received.wait(timeout: .now() + 1), .success)
+      XCTAssertEqual(received.wait(timeout: .now() + 1), .success)
+      claimed.fulfill()
+    }, sourceFrameReceived: { received.signal() }))
+    wait(for: [claimed], timeout: 6)
+    _ = controller.gpuPreparedForTesting
+    // A second one-frame skip must still compare with frame 3, even though
+    // watchdog cleanup ran after that frame arrived on the driver thread.
+    frame(5, source, buffer)
+    XCTAssertEqual(received.wait(timeout: .now() + 1), .success)
+    XCTAssertEqual(controller.sourceDropsForTesting, 2)
+  }
 }
 #endif

@@ -26,17 +26,32 @@ export MACOSX_DEPLOYMENT_TARGET=26.0
 test_root="$smoke_root"
 source "$task_root/scripts/monitor-kit-package.sh"
 monitor_kit_package_build >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
+# PipelineConfiguration's production settings declarations depend on the recording
+# model. Use the same complete app source set as the standalone UI verifier.
+rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
+rustc_path="$(rustup which --toolchain stable rustc)"
+rustdoc_path="$(rustup which --toolchain stable rustdoc)"
+RUSTC="$rustc_path" RUSTDOC="$rustdoc_path" rustup run stable cargo build \
+  --manifest-path "$rust_manifest" --release --locked >> "$compile_log" 2>&1
+source "$task_root/scripts/vendor-build.sh"
+vendor_configure test "" "" app
+vendor_compile_native "$smoke_root/native-compile.log"
+app_sources=()
+for source_file in "$task_root"/Sources/App/*.swift; do
+  if [[ "$source_file" != */UltracamApp.swift ]]; then app_sources+=("$source_file"); fi
+done
 xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors \
   -target arm64-apple-macos26.0 -module-cache-path "$smoke_root/modules" "${monitor_kit_link_args[@]}" \
-  "$task_root/Sources/DeviceAPI/VendorSettingsKeys.swift" "$task_root/Sources/Shared/SourceFormat.swift" "$task_root/Sources/Shared/SourceAdmission.swift" "$task_root/Sources/Shared/DerivedOutputAdmission.swift" "$task_root/Sources/Shared/VideoContract.swift" "$task_root/Sources/Shared/VideoBufferLayout.swift" \
-  "$task_root/Sources/Shared/VirtualCameraRegistry.swift" \
-  "$task_root/Sources/Shared/VirtualCameraRegistryTransport.swift" \
-  "$task_root/Sources/Shared/NaturalTalkingHeadAutoSwitcher.swift" \
-  "$task_root/Sources/App/AppSettingsStore.swift" "$task_root/Sources/Shared/MonitorWorkspace.swift" \
-  "$task_root/Sources/App/LUTProcessor.swift" "$task_root/Sources/App/AppResourceUsage.swift" \
-  "$task_root/Sources/App/MonitorGPUContext.swift" \
-  "$task_root/Sources/App/CameraSink.swift" "$task_root/Tools/CameraSmoke/main.swift" \
-  -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Metal \
+  ${vendor_swift_native_args[@]+"${vendor_swift_native_args[@]}"} \
+  -import-objc-header "$vendor_bridge" \
+  "$task_root"/Sources/Shared/*.swift "$task_root"/Sources/DeviceAPI/*.swift \
+  ${vendor_swift_sources[@]+"${vendor_swift_sources[@]}"} \
+  "$task_root"/Sources/Recording/*.swift "$task_root"/Sources/Program/*.swift \
+  "${app_sources[@]}" "$task_root/Tools/CameraSmoke/main.swift" \
+  ${vendor_native_objects[@]+"${vendor_native_objects[@]}"} ${vendor_link_args[@]+"${vendor_link_args[@]}"} \
+  -L "$CARGO_TARGET_DIR/release" -lauto_switcher \
+  -framework Security -framework CoreFoundation -framework SystemConfiguration -lz -liconv -lc++ \
   -o "$smoke_root/camera-smoke" >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
 if ! codesign --force --sign "${SIGNING_IDENTITY:--}" --identifier org.ultracam.app "$smoke_root/camera-smoke" >> "$compile_log" 2>&1; then
   cat "$compile_log" >&2

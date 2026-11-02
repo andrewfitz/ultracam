@@ -129,6 +129,11 @@ enum RecordingProfileMatrix {
     if sourcePixel.rawValue == profile.encoderPixelFormat { return .native }
     if sourcePixel == .v210, profile.requires422 { return .v210To422 }
     if profile.requires422 {
+      // Packed 8-bit 422 repacks preserve code values. The writer cannot
+      // map declared full range into its video-range x422 encoder input.
+      if sourceRange == .full, [.twoVuy, .yuvs, .uyva].contains(sourcePixel) {
+        throw RecordingProfileMatrixError.unsupportedRepack(profile: profile, source: sourcePixel)
+      }
       switch sourcePixel {
       case .twoVuy: return .packed422(.twoVuy)
       case .yuvs: return .packed422(.yuvs)

@@ -52,7 +52,10 @@ public struct ResourceEstimator: Sendable {
   @discardableResult public mutating func admit(_ demand: ResourceDemand) -> Result<ResourceEstimate, ResourceRejection> {
     do { try Self.validate(demand) } catch let error as ResourceRejection { return .failure(error) } catch { return .failure(.invalid(String(describing: error))) }
     var next = demands; next[demand.owner] = demand
-    let total = Self.aggregate(next.values)
+    let total: ResourceEstimate
+    do { total = try Self.estimate(next.values) }
+    catch let error as ResourceRejection { return .failure(error) }
+    catch { return .failure(.invalid(String(describing: error))) }
     if total.bytes > limits.bytes { return .failure(.bytes(required: total.bytes, limit: limits.bytes)) }
     if total.duration > limits.duration { return .failure(.duration(required: total.duration, limit: limits.duration)) }
     if total.slots > limits.slots { return .failure(.slots(required: total.slots, limit: limits.slots)) }

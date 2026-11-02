@@ -611,6 +611,8 @@ final class LUTProcessor: @unchecked Sendable {
     }
     let supported: Set<OSType> = Set(VideoContract.tenBit422).union([
       kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+      kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+      kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
       0x50323136, 0x32767579, 0x79757673, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA,
       0x72323130, 0x5231324c, 0x55595641, 0x49343230, 0x50413136])
     guard supported.contains(CVPixelBufferGetPixelFormatType(input)) else {
@@ -912,7 +914,7 @@ final class LUTProcessor: @unchecked Sendable {
     default: throw VideoError.message("Unsupported source chroma location attachment.")
     }
     return Colorimetry(primaries: primaries, transfer: transfer, matrix: matrix,
-      range: [kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA, OSType(0x5231324c)].contains(CVPixelBufferGetPixelFormatType(image)) ? .full : .video,
+      range: [kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA, OSType(0x5231324c)].contains(CVPixelBufferGetPixelFormatType(image)) ? .full : .video,
       horizontalChromaSiting: horizontal, verticalChromaSiting: vertical)
   }
 

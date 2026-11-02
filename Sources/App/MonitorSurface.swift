@@ -33,6 +33,8 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     var live: MonitorFeedHost.Delivery?
     var owned: MonitorFrame?
     var feed: MonitorFeed?
+    /// The owned feed's LUTs, read on the render thread when its copy is adopted.
+    var lutPresence: (burnIn: Bool, monitor: Bool)? = nil
     let stamp: MonitorFeedHost.Stamp
     /// Both readings (`Delivery.signal`), which the owned copy carries too.
     let signal: SignalDescription
@@ -323,7 +325,8 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   /// hold keeps the capture frame and the failure is counted.
   func makeFreezeCopy(token: UInt64) {
     let source: MonitorFeedHost.Delivery? = lock.withLock {
-      guard let value = frozen, value.token == token, value.owned == nil, freezeCopyInFlight != token else { return nil }
+      let held = frozen?.token == token ? frozen : lingering
+      guard let value = held, value.token == token, value.owned == nil, freezeCopyInFlight != token else { return nil }
       freezeCopyInFlight = token
       return value.live
     }
@@ -375,21 +378,23 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   }
 
   func retryFreezeCopy() {
-    let token = lock.withLock { frozen.flatMap { $0.owned == nil ? $0.token : nil } }
+    let token = lock.withLock { (frozen ?? lingering).flatMap { $0.owned == nil ? $0.token : nil } }
     if let token { makeFreezeCopy(token: token) }
   }
 
   /// Replaces the held capture frame with its owned GPU copy. Returns false if
-  /// the freeze ended meanwhile.
+  /// both the freeze and its lingering picture ended meanwhile.
   private func adoptOwnedFreeze(_ frame: MonitorFrame, feed: MonitorFeed, token: UInt64) -> Bool {
     var released: MonitorFeedHost.Delivery?
     let adopted: Bool = lock.withLock {
-      guard var value = frozen, value.token == token, value.owned == nil else { return false }
+      let isFrozen = frozen?.token == token
+      guard var value = isFrozen ? frozen : lingering, value.token == token, value.owned == nil else { return false }
       released = value.live
       value.live = nil
       value.owned = frame
       value.feed = feed
-      frozen = value
+      value.lutPresence = (feed.burnInLUT != nil, feed.monitorLUT != nil)
+      if isFrozen { frozen = value } else { lingering = value }
       stateVersion &+= 1
       return true
     }
@@ -460,7 +465,10 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   func scopeMeasuresLUT(_ preferences: MonitorFeedPreferences) -> Bool {
     var state = preferences.state
     state.pictureStage = preferences.scopes.settings.stage
-    return state.pictureHasLUT(burnInLUT: host.burnInLUT != nil, monitorLUT: host.monitorLUT != nil)
+    let heldLUTs = lock.withLock { (frozen ?? (latest == nil ? lingering : nil))?.lutPresence }
+    return state.pictureHasLUT(
+      burnInLUT: heldLUTs?.burnIn ?? (host.burnInLUT != nil),
+      monitorLUT: heldLUTs?.monitor ?? (host.monitorLUT != nil))
   }
 
   /// A scope display link callback (render thread).

@@ -285,7 +285,7 @@ struct UISessionBridge {
     session.interruptedTakesOpen = interface.interruptedTakesOpen
     session.install = UIInstallState(canRequestChanges: model.installer.canRequestChanges, pending: model.installer.pending,
       status: model.installer.status, unavailableReason: model.installer.unavailableReason,
-      installed: UIExtensionDetector.isInstalled())
+      installed: UIExtensionDetector.isInstalled(), system: model.installer.system)
     session.canAddCamera = model.canAddCamera
     session.layout = model.programAvailable || interface.layout != .programView ? interface.layout : .sideBySide
     session.collapsed = interface.collapsed

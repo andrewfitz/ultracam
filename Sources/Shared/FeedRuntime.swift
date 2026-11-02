@@ -593,7 +593,8 @@ final class FeedCoordinator {
       let generation = virtualCameraRegistrySnapshot.generation == UInt64.max
         ? UInt64.max
         : max(virtualCameraRegistrySnapshot.generation + 1, 1)
-      next = VirtualCameraRegistrySnapshot(generation: generation, devices: devices)
+      next = VirtualCameraRegistrySnapshot(generation: generation,
+        appGroupIdentifier: virtualCameraRegistrySnapshot.appGroupIdentifier, devices: devices)
     }
     virtualCameraRegistrySnapshot = next
     virtualCameraRegistryVersion = Int(min(next.generation, UInt64(Int.max)))

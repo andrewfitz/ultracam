@@ -85,12 +85,14 @@ func parent(root: URL) async throws {
 
 Task {
   do {
-    if CommandLine.arguments.count > 2 && CommandLine.arguments[1] == "--child" {
+    if CommandLine.arguments.count == 5 && CommandLine.arguments[1] == "--child" {
       try child(root: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true),
         codecName: CommandLine.arguments[3], timecode: CommandLine.arguments[4] == "timecode")
     } else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--recover" {
       let root = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-      let take = try RecordingRecovery.scan(root: root).first!
+      guard let take = try RecordingRecovery.scan(root: root).first else {
+        throw RecordingOutputError.ioFailure("No interrupted recording was found.")
+      }
       print(try await RecordingRecovery.recover(take, root: root).path)
     } else {
       guard CommandLine.arguments.count == 2 else { throw RecordingOutputError.invalidRoot }

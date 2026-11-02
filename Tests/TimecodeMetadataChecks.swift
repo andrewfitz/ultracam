@@ -55,4 +55,16 @@ import XCTest
     XCTAssertNil(value?.label(at: CMTime(value: 1, timescale: 1)))
     XCTAssertEqual(value?.label(at: CMTime(value: 2002, timescale: 30000, flags: .valid, epoch: 2)), "00:01:00;02")
   }
+
+  func testLargeOffsetsRetainExactFramesAndRejectOverflow() throws {
+    let rate = try XCTUnwrap(RecordingFrameRate(numerator: 1, denominator: 1))
+    let zero = try XCTUnwrap(TimecodeMetadata(label: "00:00:00:00", frameRate: rate))
+    XCTAssertEqual(zero.frameNumber(at: CMTime(value: Int64.max, timescale: 1)), Int64.max % 86400)
+    XCTAssertEqual(zero.frameNumber(at: CMTime(value: 9_007_199_254_740_993, timescale: 1)),
+      9_007_199_254_740_993 % 86400)
+    let one = try XCTUnwrap(TimecodeMetadata(label: "00:00:01:00", frameRate: rate))
+    XCTAssertNil(one.frameNumber(at: CMTime(value: Int64.max, timescale: 1)))
+    XCTAssertEqual(zero.frameNumber(at: CMTime(value: -1, timescale: 2)), 86399)
+    XCTAssertEqual(zero.frameNumber(at: CMTime(value: 1, timescale: 2)), 1)
+  }
 }

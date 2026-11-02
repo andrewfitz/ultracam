@@ -159,6 +159,8 @@ enum UIRecordingLibrary {
     var visited = Set<String>()
     let manager = FileManager.default
     for folder in folders where visited.insert(folder.path).inserted {
+      let accessed = folder.startAccessingSecurityScopedResource()
+      defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
       var candidates: [URL] = []
       let entries = (try? manager.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
         options: [.skipsHiddenFiles])) ?? []
@@ -172,7 +174,7 @@ enum UIRecordingLibrary {
       }
       for url in candidates where url.pathExtension.lowercased() == "mov" {
         let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-        takes.append(UITake(url: url, name: url.lastPathComponent, date: date, duration: UITakeDurations.duration(for: url)))
+        takes.append(UITake(url: url, name: url.lastPathComponent, date: date, duration: UITakeDurations.duration(for: url, scope: folder)))
       }
     }
     return takes.sorted { $0.date > $1.date }.prefix(limit).map { take in
@@ -355,7 +357,7 @@ enum UITakeDurations {
   nonisolated(unsafe) private static var lost: [URL: UInt64] = [:]
   static let retryInterval: TimeInterval = 30
 
-  static func duration(for url: URL) -> TimeInterval? {
+  static func duration(for url: URL, scope: URL? = nil) -> TimeInterval? {
     lock.lock()
     if let value = known[url] { lock.unlock(); return value }
     if let failed = failedAt[url], ProcessInfo.processInfo.systemUptime - failed < retryInterval { lock.unlock(); return nil }
@@ -363,6 +365,9 @@ enum UITakeDurations {
     lock.unlock()
     if start {
       Task.detached(priority: .utility) {
+        // Keep the bookmarked parent grant for the entire asynchronous movie/sidecar read.
+        let accessed = scope?.startAccessingSecurityScopedResource() ?? false
+        defer { if accessed { scope?.stopAccessingSecurityScopedResource() } }
         let seconds = try? await AVURLAsset(url: url).load(.duration).seconds
         let frames = lostFrames(sidecarOf: url)
         lock.withLock {

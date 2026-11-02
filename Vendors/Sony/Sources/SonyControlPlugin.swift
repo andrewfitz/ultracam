@@ -164,11 +164,12 @@ final class SonyControlPlugin: CameraControlPlugin {
           let display = properties.first(where: { $0.id == "monitoringDisplayHDMI" }), display.writable else {
           throw Self.failure("Camera display control is unavailable.", .invalidRequest)
         }
-        for field in properties where ["monitoringDisplayHDMI", "faceEyeFrameDisplay"].contains(field.id) && field.writable {
-          let raw: UInt64 = enabled ? 2 : 1
-          guard field.choices.contains(where: { $0.value == raw }) else {
-            throw Self.failure("The camera no longer allows this display value.", .invalidRequest)
-          }
+        let fields = properties.filter { ["monitoringDisplayHDMI", "faceEyeFrameDisplay"].contains($0.id) && $0.writable }
+        let raw: UInt64 = enabled ? 2 : 1
+        guard fields.allSatisfy({ $0.choices.contains(where: { $0.value == raw }) }) else {
+          throw Self.failure("The camera no longer allows this display value.", .invalidRequest)
+        }
+        for field in fields {
           try self.current(feedID, generation)
           let _: [Property] = try await self.request {
             self.backend.setFeed(session.key, code: field.code, value: raw, completion: $0)
@@ -320,7 +321,7 @@ final class SonyControlPlugin: CameraControlPlugin {
     switch (gamma, gamut) {
     case ("S-Log3", "S-Gamut3.Cine"): return "sony-slog3-sgamut3cine"
     case ("S-Log3", "S-Gamut3"): return "sony-slog3-sgamut3"
-    case ("ITU709", _): return "rec709-video"
+    case ("ITU709", "709"), ("ITU709", "ITU709 Matrix"): return "rec709-video"
     case ("HLG", "BT.2020"), ("HLG1", "BT.2020"), ("HLG2", "BT.2020"), ("HLG3", "BT.2020"): return "rec2020-hlg-video"
     default: return nil
     }

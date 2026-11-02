@@ -417,6 +417,9 @@ final class CaptureController: @unchecked Sendable {
     var discoveryDeadlineFinished: (@Sendable () -> Void)? = nil
     var pendingAudioDequeued: (@Sendable () -> Void)? = nil
     var deliveryFinished: (@Sendable () -> Void)? = nil
+    var watchdogSignalTimeoutObserved: (@Sendable () -> Void)? = nil
+    var watchdogSignalTimeoutClaimed: (@Sendable () -> Void)? = nil
+    var sourceFrameReceived: (@Sendable () -> Void)? = nil
   }
   private var auditHooks = AuditHooks()
   func setAuditHooksForTesting(_ hooks: AuditHooks) { lock.withLock { auditHooks = hooks } }
@@ -425,6 +428,7 @@ final class CaptureController: @unchecked Sendable {
     lock.withLock { recordingCallbacks[feedID]?.discovery.budget.snapshot }
   }
   var sourceSignalTimeoutForTesting: TimeInterval { lock.withLock { sourceSignalTimeout } }
+  var sourceDropsForTesting: UInt64 { lock.withLock { sourceDrops } }
   var processorBuiltForTesting: Bool { syncOnQueue { processor != nil } }
   var gpuPreparedForTesting: Bool { syncOnQueue { preparedConfiguration != nil } }
   #endif
@@ -818,18 +822,44 @@ final class CaptureController: @unchecked Sendable {
         return
       }
       guard now - state.last > state.timeout else { return }
+      #if ULTRACAM_TEST_SUPPORT
+      self.lock.withLock { self.auditHooks.watchdogSignalTimeoutObserved }?()
+      #endif
       self.queue.async {
-        guard self.isAccepting(token) else { return }
+        let followsSourceTiming = self.services.followsSourceTiming
+        guard !followsSourceTiming || self.detected != nil || self.message == "Waiting for signal…" else { return }
+        // Claim the timeout and reset driver-owned state together. A frame
+        // arriving after this claim recovers the loss and establishes the next
+        // source-clock baseline; capture-queue cleanup must not erase it.
+        let claimed = self.lock.withLock { () -> Bool in
+          guard self.generation == token, self.accepting, self.lastReceived == state.last else { return false }
+          if followsSourceTiming {
+            if self.signalLostAt == nil, self.lastValidSourcePTS != nil {
+              self.signalLostAt = state.last
+              self.signalDropouts &+= 1
+            }
+            self.lastSourcePTS = nil
+          } else {
+            // A legacy source fails on timeout. Close admission at the claim
+            // so it cannot resume between the decision and failure teardown.
+            self.accepting = false
+            self.pendingAudioAdmission = nil
+          }
+          return true
+        }
+        guard claimed else { return }
+        #if ULTRACAM_TEST_SUPPORT
+        self.lock.withLock { self.auditHooks.watchdogSignalTimeoutClaimed }?()
+        #endif
         if self.services.followsSourceTiming {
           if self.detected != nil || self.message == "Waiting for signal…" {
             // Once per outage: `clearSignal` forgets the detected input.
             if self.detected != nil {
               self.logger.notice("No video from \(self.runLabel, privacy: .public) for \(String(format: "%.1f", now - state.last), privacy: .public) s; waiting for the source.")
             }
-            // Frames stopped with no report from the source: the same loss, from
-            // the last frame. A frame that beat this hop has already ended it.
-            self.noteSignalLost(token: token, since: state.last)
-            self.clearSignal()
+            // Driver-owned loss and clock state were claimed above. A frame
+            // that resumed afterward must keep its new source-clock baseline.
+            self.clearSignal(resetSourceClock: false)
             self.noteNoSignal(at: state.last)
             self.message = "No video signal — waiting for source."
             self.publishCurrent(token: token)
@@ -2201,6 +2231,9 @@ final class CaptureController: @unchecked Sendable {
     }
     if let recovered { queue.async { self.logSignalReturn(recovered, token: token) } }
     guard let admitted else { return }
+    #if ULTRACAM_TEST_SUPPORT
+    if signalValid { lock.withLock { auditHooks.sourceFrameReceived }?() }
+    #endif
     // Recording takes every valid source frame directly on the driver thread,
     // independent of processing. Metadata-only checks: no pixel scan,
     // conversion or waiting. Malformed inputs stay out of the recorder while

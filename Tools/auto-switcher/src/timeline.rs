@@ -14,12 +14,15 @@ pub struct TimelineRecorder {
     pub timeline: SessionTimeline,
     next_sequence: u64,
     current_camera_id: String,
+    session_generation: u64,
+    last_media_time: Option<MediaTime>,
     pending: HashMap<Uuid, usize>,
 }
 
 impl TimelineRecorder {
     pub fn new(mut config: SwitcherConfig, mode: impl Into<String>, session_id: Uuid) -> Self {
         config.session_generation = config.session_generation.max(1);
+        let session_generation = config.session_generation;
         let current_camera_id = config.anchor_camera_id.clone();
         let anchor_camera_id = config.anchor_camera_id.clone();
         let emphasis_camera_id = config.emphasis_camera_id.clone();
@@ -63,6 +66,8 @@ impl TimelineRecorder {
             },
             next_sequence: 1,
             current_camera_id,
+            session_generation,
+            last_media_time: None,
             pending: HashMap::new(),
         }
     }
@@ -245,6 +250,7 @@ impl TimelineRecorder {
                             cut.applied_program_time_ticks = applied
                                 .map(|time| to_ticks(time, self.timeline.timebase.timescale));
                             self.current_camera_id = cut.target_camera_id.clone();
+                            if self.last_media_time.is_none() { self.last_media_time = applied; }
                         }
                     }
                 }
@@ -270,10 +276,11 @@ impl TimelineRecorder {
                 }) else {
                     return;
                 };
+                self.last_media_time = Some(time);
                 self.cancel_pending();
                 self.timeline.cuts.push(CutRecord {
                     decision_id: None,
-                    session_generation: self.timeline.config.session_generation.max(1),
+                    session_generation: self.session_generation,
                     from_camera_id: Some(self.current_camera_id.clone()),
                     target_camera_id: camera_id.clone(),
                     requested_cut_time: Some(time),
@@ -299,13 +306,29 @@ impl TimelineRecorder {
                 });
                 self.current_camera_id = camera_id.clone();
             }
+            StreamEvent::Tick { time } => {
+                if self.last_media_time.is_some_and(|last| time + 1e-6 < last) {
+                    self.session_generation = self.session_generation.saturating_add(1);
+                }
+                self.last_media_time = Some(*time);
+            }
+            StreamEvent::Video { observation } => {
+                if (observation.session_generation == 0 || observation.session_generation == self.session_generation)
+                    && !observation.camera_id.is_empty()
+                    && self.last_media_time.is_none_or(|last| observation.time >= last)
+                {
+                    self.last_media_time = Some(observation.time);
+                }
+            }
             StreamEvent::Reset { generation } => {
+                self.last_media_time = None;
                 self.current_camera_id = self.timeline.config.anchor_camera_id.clone();
                 let requested = generation
-                    .unwrap_or(self.timeline.config.session_generation.saturating_add(1))
+                    .unwrap_or(self.session_generation.saturating_add(1))
                     .max(1);
-                self.timeline.config.session_generation =
-                    requested.max(self.timeline.config.session_generation);
+                // The durable config is the initial state for replay. Keep
+                // the current generation separately as resets are recorded.
+                self.session_generation = requested.max(self.session_generation);
                 self.cancel_pending();
             }
             _ => {}

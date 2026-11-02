@@ -150,7 +150,14 @@ enum RecordingRecovery {
         // The journal lock also covers export. Only reclaim its staging file
         // after a crashed exporter has released that lock.
         let staging = source.appendingPathExtension("export.ultracam-recovery")
-        if fm.fileExists(atPath: staging.path) { try fm.removeItem(at: staging) }
+        if fm.fileExists(atPath: staging.path) {
+          do { try fm.removeItem(at: staging) }
+          catch {
+            // A read-only or unavailable take must not hide recordings in
+            // other folders. Its journal still retains the original root.
+            continue
+          }
+        }
         let final = folder.appendingPathComponent(journal.entry.finalName)
         if let recovered = journal.entry.recoveredName,
           fm.fileExists(atPath: folder.appendingPathComponent(recovered).path) { continue }

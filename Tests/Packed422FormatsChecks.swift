@@ -10,6 +10,15 @@ import XCTest
     XCTAssertEqual(try Packed422Format.p216.minimumRowBytes(width: 5), 10)
   }
 
+  func testP216SharedStrideFitsOddWidthChroma() {
+    XCTAssertThrowsError(try Packed422Format.p216.validate(width: 5, height: 3,
+      rowBytes: 10, dataSize: 60, planeCount: 2))
+    XCTAssertNoThrow(try Packed422Format.p216.validate(width: 5, height: 3,
+      rowBytes: 12, dataSize: 72, planeCount: 2))
+    XCTAssertThrowsError(try Packed422Format.p216.validate(width: 5, height: 3,
+      rowBytes: 12, dataSize: 71, planeCount: 2))
+  }
+
   func testAdmissionRejectsShortRowsAndWrongPlanes() {
     XCTAssertThrowsError(try Packed422Format.twoVuy.validate(width: 4, height: 2, rowBytes: 7))
     XCTAssertThrowsError(try Packed422Format.twoVuy.validate(width: 4, height: 2, rowBytes: 8, planeCount: 2))

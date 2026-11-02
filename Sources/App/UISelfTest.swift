@@ -207,7 +207,7 @@ import AppKit
 
   private static func openWindows() {
     if !appWindows().contains(where: { identifier(of: $0).hasPrefix("main") }) {
-      _ = performMenuItem { $0.title == "Ultracam" && $0.keyEquivalent == "0" }
+      _ = performMenuItem { $0.keyEquivalent == "0" && $0.keyEquivalentModifierMask.contains(.command) }
     }
     // SwiftUI's Settings scene opens from the app menu's Settings… item (⌘,); the old
     // showSettingsWindow: action is a no-op for it on current macOS.

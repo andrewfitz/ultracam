@@ -211,6 +211,7 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   @ObservationIgnored private let services: Services
   @ObservationIgnored private var activeRequest: OSSystemExtensionRequest?
   @ObservationIgnored private var activeChange: Change?
+  @ObservationIgnored private var systemQueryID: UUID?
   private nonisolated let requestIdentity = ExtensionRequestIdentity()
 
   override convenience init() { self.init(services: .live()) }
@@ -228,10 +229,15 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   /// Its cameras alone can't tell "not installed" from "enabled, not started yet".
   func refreshSystemState() {
     guard canRequestChanges else { return }
+    let queryID = UUID()
+    systemQueryID = queryID
     let bundled = services.bundledVersion()
     services.queryProperties { [weak self] records in
       guard let records else { return }
-      Task { @MainActor [weak self] in self?.system = ExtensionSystemState(records: records, bundledVersion: bundled) }
+      Task { @MainActor [weak self] in
+        guard let self, self.systemQueryID == queryID else { return }
+        self.system = ExtensionSystemState(records: records, bundledVersion: bundled)
+      }
     }
   }
 

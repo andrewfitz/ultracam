@@ -450,6 +450,52 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     }
   }
 
+  @MainActor func testUnfreezeBeforeCopyFeedbackReleasesLingeringCaptureFrame() throws {
+    let (gpu, core) = try gpuCore()
+    let mailbox = MonitorFeedbackMailbox()
+    core.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    let host = MonitorFeedHost(target: "lingering-copy", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("lingering-copy"), host: host, gpu: gpu)
+    host.setConsumers([presenter])
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 1)
+    presenter.toggleFreeze()
+    let completed = try mailbox.take(MonitorSurfaceRenderLoop.freezeKind)
+    presenter.toggleFreeze()
+    XCTAssertFalse(presenter.holdsFreeze)
+    XCTAssertTrue(presenter.holdsProducerFrame)
+    completed(false)
+    try monitorOnRender(gpu) {}
+    XCTAssertFalse(presenter.holdsProducerFrame,
+      "A released hold waiting for live capture must adopt its finished GPU copy too")
+    guard case .frozenOwned = presenter.renderWork(after: (.max, .max), force: true)?.content else {
+      return XCTFail("The lingering picture must remain drawable without pinning the capture source")
+    }
+  }
+
+  @MainActor func testFrozenScopeDescriptionKeepsItsCopiedLUT() throws {
+    let (gpu, core) = try gpuCore()
+    let mailbox = MonitorFeedbackMailbox()
+    core.deferCompletionForTesting = { mailbox.accept($0, $1) }
+    let host = MonitorFeedHost(target: "frozen-scope-label", gpu: gpu)
+    host.burnInLUT = try LUTProcessor.makeLUT(try CubeLUT(text:
+      "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"), device: core.device)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("frozen-scope-label"), host: host, gpu: gpu)
+    var preferences = MonitorFeedPreferences()
+    preferences.scopes.settings.stage = .output
+    presenter.setPreferences(preferences)
+    host.setConsumers([presenter])
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 1)
+    presenter.toggleFreeze()
+    try mailbox.take(MonitorSurfaceRenderLoop.freezeKind)(false)
+    try monitorOnRender(gpu) {}
+    host.burnInLUT = nil
+    XCTAssertTrue(presenter.scopeMeasuresLUT(preferences),
+      "The frozen scope still measures the copied feed's LUT after the live LUT is removed")
+    presenter.toggleFreeze()
+    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 2)
+    XCTAssertFalse(presenter.scopeMeasuresLUT(preferences), "New live pictures use the live feed's LUT state")
+  }
+
   @MainActor func testFrozenOwnerPlanesBecomeResidentOnReplacementCore() throws {
     let (gpu, old) = try gpuCore()
     let (host, slot) = host("freeze-residency", gpu: gpu)
@@ -799,6 +845,9 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     // must not replace the slot or inflate accepted-frame diagnostics.
     offer(host, image, generation: 2, sequence: 1)
     XCTAssertEqual(slot.accepted, 2, "Duplicate source sequence is ignored")
+    offer(host, image, generation: 1, sequence: 99)
+    XCTAssertEqual(slot.accepted, 2, "A late older capture generation cannot roll back a running host")
+    XCTAssertEqual(slot.latest?.stamp, second)
     host.invalidate(rejectingCaptureGeneration: 2)
     offer(host, image, generation: 2, sequence: 2)
     offer(host, image, generation: 1, sequence: 3)

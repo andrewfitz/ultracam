@@ -87,10 +87,10 @@ struct RecordingTakeContext: Sendable {
   }
 }
 
-/// Serialized on the writer queue. No sample arrays are retained: exceptional
+/// Synchronized across recorder and writer queues. No sample arrays are retained: exceptional
 /// timing and mapping records go to a capped on-disk JSON-lines journal. The
 /// journal is forensic: nothing reads it back, so it never gets to end a take.
-final class RecordingTakeSidecar {
+final class RecordingTakeSidecar: @unchecked Sendable {
   struct Metadata: Codable {
     var sourceSignature: String
     var outputSignature: String
@@ -215,7 +215,14 @@ final class RecordingTakeSidecar {
   let url: URL
   let journalURL: URL
   let maximumJournalBytes: Int
-  private(set) var snapshot: Snapshot
+  // Recorder admission and writer-queue native timecode can journal together.
+  // Hold one lock across the journal write and its snapshot publication.
+  private let lock = NSRecursiveLock()
+  private var snapshotValue: Snapshot
+  private(set) var snapshot: Snapshot {
+    get { lock.withLock { snapshotValue } }
+    set { lock.withLock { snapshotValue = newValue } }
+  }
   private let journal: FileHandle
   private var journalFailed = false
   init(movieURL: URL, metadata: Metadata, maximumJournalBytes: Int = 16 * 1024 * 1024) throws {
@@ -223,7 +230,7 @@ final class RecordingTakeSidecar {
     url = Self.url(for: movieURL)
     journalURL = url.appendingPathExtension("journal")
     self.maximumJournalBytes = max(0, maximumJournalBytes)
-    snapshot = Snapshot(metadata: metadata)
+    snapshotValue = Snapshot(metadata: metadata)
     // Exclusive journal creation reserves this pair, including concurrent starts.
     let descriptor = open(journalURL.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard descriptor >= 0 else { throw Failure.occupied }
@@ -242,6 +249,8 @@ final class RecordingTakeSidecar {
     guard !snapshot.finished else { throw Failure.closed }
   }
   func append(_ event: Event) throws {
+    lock.lock()
+    defer { lock.unlock() }
     try ensureWritable()
     var data = try JSONEncoder().encode(event); data.append(0x0A)
     guard data.count <= maximumJournalBytes - snapshot.journalBytes else { throw Failure.journalFull }
@@ -251,6 +260,8 @@ final class RecordingTakeSidecar {
   /// budget, or one the disk refused, is counted and dropped. False when it
   /// wasn't kept. Creating the sidecar at take start stays fatal.
   @discardableResult func journal(_ event: Event, reserved: Bool = false) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
     let budget = reserved ? maximumJournalBytes : maximumJournalBytes - Self.reservedJournalBytes
     do {
       try ensureWritable()
@@ -304,6 +315,8 @@ final class RecordingTakeSidecar {
     }
   }
   func updateTimebaseDiagnostics(_ diagnostics: RecordingTimebase.Diagnostics) throws {
+    lock.lock()
+    defer { lock.unlock() }
     guard !snapshot.finished else { throw Failure.closed }
     var candidate = snapshot
     candidate.timebaseDiagnostics = diagnostics
@@ -312,6 +325,8 @@ final class RecordingTakeSidecar {
   }
 
   func updateCounters(_ counters: [String: UInt64]) throws {
+    lock.lock()
+    defer { lock.unlock() }
     guard !snapshot.finished else { throw Failure.closed }
     var candidate = snapshot
     candidate.counters = counters
@@ -321,6 +336,8 @@ final class RecordingTakeSidecar {
   /// A journal that failed doesn't stop this: the sidecar is its own file, and
   /// a movie can't be published until it reads finished.
   func finish(finalError: String? = nil) throws {
+    lock.lock()
+    defer { lock.unlock() }
     guard !snapshot.finished else { throw Failure.closed }
     if !journalFailed {
       do { try journal.synchronize() }
@@ -334,6 +351,8 @@ final class RecordingTakeSidecar {
   /// Caller holds the movie recovery lock. Original metadata stays in place.
   /// Exclusive copies never overwrite an unrelated destination.
   func copyForRecoveredMovie(_ movie: URL) throws {
+    lock.lock()
+    defer { lock.unlock() }
     try Self.copyPairedMetadata(from: url, toMovie: movie)
   }
   static func copyPairedMetadata(from source: URL, toMovie movie: URL) throws {
@@ -374,6 +393,8 @@ final class RecordingTakeSidecar {
 
   /// Called only for this already-owned take after movie deletion succeeds.
   func removePairMetadata() throws {
+    lock.lock()
+    defer { lock.unlock() }
     try FileManager.default.removeItem(at: url)
     try FileManager.default.removeItem(at: journalURL)
   }

@@ -188,6 +188,7 @@ struct SwitcherCoordinator {
     if let (target, reason) = programOutput.takeAbandonedCut() {
       abandonedCut = (target, reason)
       if pendingDirectorDecision?.targetCameraID == target.rawValue {
+        director.cancelPendingOutput()
         pendingDirectorDecision = nil
       }
     }
@@ -199,6 +200,7 @@ struct SwitcherCoordinator {
   mutating func selectImmediately(_ feedID: FeedID) -> ProgramCutRequestResult<FeedID> {
     guard feedIDs.contains(feedID) else { return .rejectedMissingSource }
     programOutput.select(feedID)
+    director.cancelPendingOutput()
     selectedFeedID = feedID
     settings.selectedFeedID = feedID
     automaticRequestPending = false
@@ -240,6 +242,7 @@ struct SwitcherCoordinator {
     if let target = programOutput.pendingCut {
       automaticRequestPending = previous.automaticRequestPending
       if previous.pendingDirectorDecision?.targetCameraID == target.rawValue {
+        director = previous.director
         pendingDirectorDecision = previous.pendingDirectorDecision
       }
     }
@@ -286,6 +289,8 @@ struct SwitcherCoordinator {
       return .rejectedMissingSource
     }
     automaticRequestPending = false
+    director.cancelPendingOutput()
+    pendingDirectorDecision = nil
     let result = programOutput.requestCut(to: feedID, noEarlierThan: at)
     reconcilePendingState()
     return result
@@ -479,7 +484,8 @@ struct SwitcherCoordinator {
     selectedFeedID = feedID
     settings.selectedFeedID = feedID
     automaticRequestPending = false
-    if pendingDirectorDecision?.targetCameraID == feedID.rawValue {
+    if let decision = pendingDirectorDecision, decision.targetCameraID == feedID.rawValue {
+      _ = director.acknowledgeOutput(decision, appliedAt: appliedAt)
       pendingDirectorDecision = nil
     }
     return true
@@ -513,6 +519,7 @@ struct SwitcherCoordinator {
       abandonedCut = (target, .targetUnavailable)
     }
     programOutput.cancelPendingCut()
+    director.cancelPendingOutput()
     pendingDirectorDecision = nil
     automaticRequestPending = false
   }

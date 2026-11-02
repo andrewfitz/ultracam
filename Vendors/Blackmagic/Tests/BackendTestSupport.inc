@@ -131,6 +131,7 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   bool hdrFlag = false;
   int64_t metadataColorspace = 0, metadataEOTF = -1;
   bool metadataAvailable = false;
+  NSNumber *sdkCaptureHostTime = nil;   // Simulates an attachment retained by a reused SDK buffer.
   CFStringRef sdkTransfer = nullptr;     // An attachment the SDK sets itself.
   long width = 3840;
   long height = 2160;
@@ -201,6 +202,8 @@ HRESULT FakeMacVideoBuffer::CreateCVPixelBufferRef(void **result) {
   CVBufferSetAttachment(buffer, CFSTR("UltracamTestFrameLifetime"), (__bridge CFTypeRef)holder, kCVAttachmentMode_ShouldNotPropagate);
   if (frame->sdkTransfer)
     CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, frame->sdkTransfer, kCVAttachmentMode_ShouldPropagate);
+  if (frame->sdkCaptureHostTime)
+    CVBufferSetAttachment(buffer, CFSTR("UltracamCaptureHostTime"), (__bridge CFTypeRef)frame->sdkCaptureHostTime, kCVAttachmentMode_ShouldPropagate);
   *result = buffer;
   return S_OK;
 }
@@ -590,8 +593,13 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
       if (audioRequested && (input.enabledAudioType != bmdAudioSampleType32bitInteger || input.enabledAudioChannels != 2))
         return fail(error, @"Stats startup did not request 32-bit stereo embedded audio.");
       if (scenario == 0) stopInput(&input, callback);
-      if (input.callback || callback->accepting || callback->references != 1 || input.calls.size() < 4 ||
-        input.calls[input.calls.size() - 3] != "stop" || input.calls[input.calls.size() - 2] != "clear" || input.calls.back() != "disable")
+      const std::vector<std::string> expectedCalls[] = {
+        {"enable", "callback", "start", "stop", "clear", "disable"},
+        {"enable", "callback", "disable"},
+        {"enable"},
+        {"enable", "callback", "start", "clear", "disable"},
+      };
+      if (input.callback || callback->accepting || callback->references != 1 || input.calls != expectedCalls[scenario])
         return fail(error, @"SDK teardown order or callback references failed.");
       callback->Release();
     }
@@ -609,14 +617,14 @@ BOOL UltracamRunSyntheticChecks(NSError **error) {
     FakeConfiguration configuration;
     {
       HDMILease lease; lease.configuration.value = &configuration; configuration.AddRef();
-      lease.previous = bmdVideoConnectionSDI; lease.changed = true;
+      lease.previous = bmdVideoConnectionSDI; lease.changed = true; lease.started = true;
       configuration.connection = bmdVideoConnectionHDMI;
     }
     if (configuration.connection != bmdVideoConnectionSDI || configuration.writes != 1 || configuration.references != 1)
       return fail(error, @"HDMI lease failed to restore the original connection.");
     {
       HDMILease lease; lease.configuration.value = &configuration; configuration.AddRef();
-      lease.previous = bmdVideoConnectionSDI; lease.changed = true;
+      lease.previous = bmdVideoConnectionSDI; lease.changed = true; lease.started = true;
       configuration.connection = bmdVideoConnectionOpticalSDI;
     }
     if (configuration.connection != bmdVideoConnectionOpticalSDI || configuration.writes != 1 || configuration.persistentWrites != 0)
@@ -997,6 +1005,7 @@ static BOOL runFrameFeatureChecks(NSError **error) {
       bool destroyed = false;
       auto frame = new FakeFrame(&destroyed);
       frame->hardwareTime = 42000000;
+      frame->sdkCaptureHostTime = @12.0;
       auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, framesBlock, eventsBlock);
       callback->VideoInputFrameArrived(frame, nullptr);
       if (!retained || CVBufferCopyAttachment(retained, CFSTR("UltracamCaptureHostTime"), nullptr))
@@ -1007,6 +1016,7 @@ static BOOL runFrameFeatureChecks(NSError **error) {
       if (![host isKindOfClass:[NSNumber class]] || CFNumberGetType((__bridge CFNumberRef)host) != kCFNumberFloat64Type ||
           std::abs(host.doubleValue - 47.0) > 1e-9)
         return fail(error, @"Host capture time attachment was missing or not a Float64 in host seconds.");
+      frame->sdkCaptureHostTime = @47.0;
       frame->hardwareTime = 0;
       callback->VideoInputFrameArrived(frame, nullptr);
       if (CVBufferCopyAttachment(retained, CFSTR("UltracamCaptureHostTime"), nullptr))

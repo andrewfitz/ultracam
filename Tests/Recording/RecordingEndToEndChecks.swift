@@ -62,6 +62,28 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
       maxKeyFrameInterval: maxKeyFrameInterval)
   }
 
+  func testWriterFIFOReleasesConsumedSamplesBeforeCompaction() throws {
+    var fifo = AVAssetSourceRecordingWriter.SampleQueue()
+    weak var consumed: CMSampleBuffer?
+    try autoreleasepool {
+      let first = try audioSample(at: CMTime(value: 0, timescale: 48_000))
+      consumed = first
+      fifo.append(first)
+    }
+    let second = try audioSample(at: CMTime(value: 800, timescale: 48_000))
+    fifo.append(second)
+    XCTAssertNotNil(consumed)
+    fifo.removeFirst()
+    XCTAssertNil(consumed, "A consumed sample must release its media while later samples remain queued")
+    XCTAssertEqual(fifo.count, 1)
+    XCTAssertTrue(fifo.first === second)
+    XCTAssertEqual(fifo.retainedBytes, CMSampleBufferGetTotalSampleSize(second))
+    fifo.removeFirst()
+    XCTAssertTrue(fifo.isEmpty)
+    XCTAssertEqual(fifo.retainedBytes, 0)
+    XCTAssertEqual(fifo.retainedDuration, 0)
+  }
+
   func testTwoFeedsRecordSimultaneouslyAndFinalizeAfterPauseResume() throws {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("ultracam-recording-e2e-\(UUID().uuidString)")

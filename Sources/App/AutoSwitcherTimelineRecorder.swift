@@ -149,10 +149,20 @@ private struct AutoSwitcherTimelineOutput: Codable {
   }
 }
 
+private struct AutoSwitcherTimelineObservation: Codable {
+  let time: Double
+  let camera_id: String
+  let healthy: Bool
+  var motion: Double = 0
+  var scene_change: Double = 0
+  var session_generation: UInt64 = 0
+}
+
 private struct AutoSwitcherTimelineEvent: Codable {
   let type: String
   let cue: AutoSwitcherAudioCue?
   let transcript: AutoSwitcherTranscriptCue?
+  let observation: AutoSwitcherTimelineObservation?
   let time: Double?
   let timeTicks: Int64?
   let decisionID: UUID?
@@ -161,7 +171,7 @@ private struct AutoSwitcherTimelineEvent: Codable {
   let cameraID: String?
 
   enum CodingKeys: String, CodingKey {
-    case type, cue, transcript, time
+    case type, cue, transcript, observation, time
     case timeTicks = "time_ticks"
     case decisionID = "decision_id"
     case appliedAt = "applied_at"
@@ -174,6 +184,7 @@ private struct AutoSwitcherTimelineEvent: Codable {
     type = try c.decode(String.self, forKey: .type)
     cue = type == "audio" ? try c.decodeIfPresent(AutoSwitcherAudioCue.self, forKey: .cue) : nil
     transcript = type == "transcript" ? try c.decodeIfPresent(AutoSwitcherTranscriptCue.self, forKey: .cue) : nil
+    observation = try c.decodeIfPresent(AutoSwitcherTimelineObservation.self, forKey: .observation)
     time = try c.decodeIfPresent(Double.self, forKey: .time)
     timeTicks = try c.decodeIfPresent(Int64.self, forKey: .timeTicks)
     decisionID = try c.decodeIfPresent(UUID.self, forKey: .decisionID)
@@ -185,6 +196,7 @@ private struct AutoSwitcherTimelineEvent: Codable {
   func encode(to encoder: Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
     try c.encode(type, forKey: .type)
+    try c.encodeIfPresent(observation, forKey: .observation)
     if let transcript { try c.encode(transcript, forKey: .cue) }
     else { try c.encodeIfPresent(cue, forKey: .cue) }
     try c.encodeIfPresent(time, forKey: .time)
@@ -196,12 +208,13 @@ private struct AutoSwitcherTimelineEvent: Codable {
   }
 
   init(type: String, cue: AutoSwitcherAudioCue? = nil,
-       transcript: AutoSwitcherTranscriptCue? = nil, time: Double? = nil,
+       transcript: AutoSwitcherTranscriptCue? = nil, observation: AutoSwitcherTimelineObservation? = nil, time: Double? = nil,
        timeTicks: Int64? = nil, decisionID: UUID? = nil, appliedAt: Double? = nil,
        appliedAtTicks: Int64? = nil, cameraID: String? = nil) {
     self.type = type
     self.cue = cue
     self.transcript = transcript
+    self.observation = observation
     self.time = time
     self.timeTicks = timeTicks
     self.decisionID = decisionID
@@ -345,6 +358,30 @@ final class AutoSwitcherTimelineRecorder {
     persist(force: true)
     outputURL = nextURL
     persist(force: true)
+  }
+
+  func recordControlEvent(_ input: AutoSwitcherControlEvent) {
+    let event: AutoSwitcherTimelineEvent
+    let time: Double?
+    switch input {
+    case .reset:
+      for index in pending.values where document.cuts.indices.contains(index) {
+        document.cuts[index].status = "cancelled"
+      }
+      pending.removeAll()
+      currentCameraID = FeedID(rawValue: document.config.anchorCameraID)
+      event = AutoSwitcherTimelineEvent(type: "reset")
+      time = nil
+    case let .manualOverride(cameraID, seconds):
+      event = AutoSwitcherTimelineEvent(type: "manualOverride", time: seconds, cameraID: cameraID)
+      time = seconds
+    case let .health(cameraID, healthy, seconds):
+      event = AutoSwitcherTimelineEvent(type: "video", observation:
+        AutoSwitcherTimelineObservation(time: seconds, camera_id: cameraID, healthy: healthy))
+      time = seconds
+    }
+    let timestamp = time.flatMap { Self.timestamp(CMTime(seconds: $0, preferredTimescale: 240_000)) }
+    append(event: event, mediaTime: timestamp, outputs: [])
   }
 
   func recordAudioCue(_ cue: AutoSwitcherAudioCue) {

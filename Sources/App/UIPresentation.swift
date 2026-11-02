@@ -1010,7 +1010,8 @@ enum UIPresentationBuilder {
       id: camera.id, number: index + 1, name: camera.name,
       inputName: camera.inputName ?? "No input",
       selected: camera.id == session.selectedID,
-      collapsed: session.collapsed.contains(camera.id) || session.layout == .fourUp || session.layout == .programView,
+      collapsed: session.collapsed.contains(camera.id) ||
+        (session.cameras.count > 1 && (session.layout == .fourUp || session.layout == .programView)),
       tally: tally, tileState: tile, stripState: strip,
       statusBadge: statusBadge, statusTone: statusTone,
       recordTitle: recordTitle, recordDetail: recordDetail, recordTone: recordTone,

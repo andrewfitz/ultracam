@@ -429,6 +429,21 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.session(session).layout, .sideBySide)
   }
 
+  func testSingleCameraRestoredGridDoesNotForceCollapsedStrip() {
+    for layout in [UILayout.fourUp, .programView] {
+      var session = separate([camera(1)])
+      session.layout = layout
+      let single = UIPresentationBuilder.session(session)
+      XCTAssertEqual(single.layout, .single)
+      XCTAssertFalse(single.cameras[0].collapsed, "The effective Single layout keeps the expanded controls")
+      session.collapsed.insert("camera-1")
+      XCTAssertTrue(UIPresentationBuilder.session(session).cameras[0].collapsed, "Explicit collapse still applies")
+      session.collapsed.removeAll()
+      session.cameras.append(camera(2))
+      XCTAssertTrue(UIPresentationBuilder.session(session).cameras.allSatisfy(\.collapsed), "The saved grid returns with another camera")
+    }
+  }
+
   func testMixedPausedRecordingSummary() {
     let mixed = UIPresentationBuilder.session(separate([camera(1, recording: .recording), camera(2, recording: .paused, elapsed: 252)]))
     XCTAssertEqual(mixed.recordingSummary, "REC 1, 1 paused 12:31")

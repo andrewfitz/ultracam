@@ -217,12 +217,17 @@ struct UICameraBodyAddByAddress: View {
             Toggle("Camera access authentication is enabled", isOn: $authentication)
             Text("Check Camera resolves its identity before connecting. Sign-in is sent when you press Connect.")
                 .font(.caption).foregroundStyle(.secondary)
-            Button("Check Camera") { Task {
-                let trimmed = identity.trimmingCharacters(in: .whitespacesAndNewlines)
-                let request = ControlPreparationRequest.endpoint(.init(address: address.trimmingCharacters(in: .whitespacesAndNewlines),
-                    expectedIdentity: trimmed.isEmpty ? nil : trimmed, authenticationMode: authentication ? .usernamePassword : .none))
-                if let prepared = await store.prepare(pluginID: pluginID, request: request, feedID: feedID) { onPrepared(prepared.camera, feedID) }
-            } }
+            Button("Check Camera") {
+                // Keep the result attached to the camera chosen when the check began.
+                // The picker can change while preparation awaits the network.
+                let requestedFeedID = feedID
+                Task {
+                    let trimmed = identity.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let request = ControlPreparationRequest.endpoint(.init(address: address.trimmingCharacters(in: .whitespacesAndNewlines),
+                        expectedIdentity: trimmed.isEmpty ? nil : trimmed, authenticationMode: authentication ? .usernamePassword : .none))
+                    if let prepared = await store.prepare(pluginID: pluginID, request: request, feedID: requestedFeedID) { onPrepared(prepared.camera, requestedFeedID) }
+                }
+            }
             .disabled(feedID.isEmpty || store.state(for: feedID).busy || address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if let message = store.state(for: feedID).message, !feedID.isEmpty {
                 Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)

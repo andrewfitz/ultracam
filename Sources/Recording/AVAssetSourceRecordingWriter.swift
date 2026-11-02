@@ -178,8 +178,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   }
 
   /// A FIFO with amortized O(1) removal from the front.
-  private struct SampleQueue {
-    private(set) var items: [CMSampleBuffer] = []
+  struct SampleQueue {
+    private var items: [CMSampleBuffer?] = []
     private var head = 0
     private(set) var retainedDuration: Double = 0
     private(set) var retainedBytes: Int = 0
@@ -193,7 +193,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       let pts = CMSampleBufferGetPresentationTimeStamp(sample)
       var index = items.count
       while index > head,
-        CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(items[index - 1]), pts) > 0 {
+        CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(items[index - 1]!), pts) > 0 {
         index -= 1
       }
       items.insert(sample, at: index)
@@ -201,11 +201,14 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       retainedDuration += CMSampleBufferGetDuration(sample).seconds
     }
     mutating func removeFirst() {
-      guard !isEmpty else { return }
-      retainedBytes = max(0, retainedBytes - CMSampleBufferGetTotalSampleSize(items[head]))
-      retainedDuration = max(0, retainedDuration - CMSampleBufferGetDuration(items[head]).seconds)
+      guard let sample = first else { return }
+      retainedBytes = max(0, retainedBytes - CMSampleBufferGetTotalSampleSize(sample))
+      retainedDuration = max(0, retainedDuration - CMSampleBufferGetDuration(sample).seconds)
+      // Accounting and ownership must end together, even while the FIFO has
+      // a backlog and its consumed prefix has not been compacted yet.
+      items[head] = nil
       head += 1
-      if head == items.count { items.removeAll(keepingCapacity: true); head = 0 }
+      if head == items.count { items.removeAll(keepingCapacity: true); head = 0; retainedDuration = 0; retainedBytes = 0 }
       else if head >= 256, head * 2 >= items.count { items.removeFirst(head); head = 0 }
     }
     mutating func removeAll() { items.removeAll(); head = 0; retainedDuration = 0; retainedBytes = 0 }
@@ -435,10 +438,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   /// Once per take, whenever the sidecar first refused a record, including
   /// one it refused itself while finishing.
   private func noteJournalFull() {
-    guard !journalFullNoted, let takeSidecar, takeSidecar.suppressedRecords > 0 else { return }
-    journalFullNoted = true
+    guard let takeSidecar, takeSidecar.suppressedRecords > 0 else { return }
     let note = RecordingTakeSidecar.Failure.journalFull.errorDescription ?? ""
-    telemetryLock.withLock { telemetryValue.warning = telemetryValue.warning.map { "\($0) \(note)" } ?? note }
+    telemetryLock.withLock {
+      guard !journalFullNoted else { return }
+      journalFullNoted = true
+      telemetryValue.warning = telemetryValue.warning.map { "\($0) \(note)" } ?? note
+    }
   }
 
   var telemetry: SourceRecordingWriterTelemetry {

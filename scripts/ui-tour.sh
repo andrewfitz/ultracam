@@ -212,7 +212,7 @@ ui "key code 53" >/dev/null
 # Settings, every pane.
 ui "keystroke \",\" using command down" >/dev/null
 sleep 1
-for pane in General Recording Camera Switcher Monitor Advanced; do
+for pane in General Hardware "Virtual Cameras" Recording Audio Switching Alerts Advanced; do
   ui "click button \"$pane\" of toolbar 1 of window 1" >/dev/null || echo "missing settings pane: $pane" | tee -a "$out/missing.txt"
   capture "11-settings-$pane" "$pane"
 done

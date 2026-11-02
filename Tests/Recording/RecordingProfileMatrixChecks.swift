@@ -111,6 +111,24 @@ import XCTest
       sourceRange: .video), .native)
   }
 
+  func testFullRangePacked422DoesNotAdvertiseUnimplementedGPUConversion() throws {
+    let full = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .full,
+      horizontalChromaSiting: .left, verticalChromaSiting: .center)
+    for pixel in [PixelFormatID.twoVuy, .yuvs, .uyva] {
+      let declaration = try SourceFormat(width: 320, height: 64, pixel: pixel, colour: full,
+        rate: .constant(CMTime(value: 1, timescale: 30)))
+      for profile in [.proResLT, .proRes422, .proRes422HQ, .hevcMain10_422] as [RecordingProfileMatrixProfile] {
+        XCTAssertFalse(RecordingProfileMatrix.supports(profile, source: declaration))
+        XCTAssertThrowsError(try RecordingProfileMatrix.validate(profile, source: declaration))
+      }
+    }
+    // These full-range routes do perform the required physical range mapping.
+    XCTAssertEqual(try RecordingProfileMatrix.repackRoute(.proRes422, sourcePixel: .v210,
+      sourceRange: .full), .v210To422)
+    XCTAssertEqual(try RecordingProfileMatrix.repackRoute(.proRes422, sourcePixel: .p216,
+      sourceRange: .full), .p216To422)
+  }
+
   func testProfileMatrixEnumeratesSupportedAndPlannedProfiles() {
     XCTAssertEqual(RecordingProfileMatrixProfile.allCases.count, 7)
     XCTAssertEqual(RecordingProfileMatrixProfile.hevcMain10_422.codec, kCMVideoCodecType_HEVC)

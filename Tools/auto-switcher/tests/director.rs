@@ -637,8 +637,8 @@ fn offline_sorts_untimed_events_after_timed_events_and_preserves_time_zero() {
         .iter()
         .all(|event| event.media_time_ticks.is_none()));
     assert_eq!(
-        timeline.config.session_generation, 8,
-        "both resets must execute"
+        timeline.config.session_generation, 1,
+        "the replay configuration must remain the initial generation"
     );
 }
 
@@ -663,7 +663,7 @@ fn reset_at_clock_zero_still_resets_the_director_and_recorder() {
     );
     assert_eq!(director.current_camera_id(), "A");
     assert_eq!(director.session_generation(), 2);
-    assert_eq!(recorder.timeline.config.session_generation, 2);
+    assert_eq!(recorder.timeline.config.session_generation, 1);
     let reset = recorder.timeline.events.last().unwrap();
     assert!(matches!(reset.event, StreamEvent::Reset { .. }));
     assert_eq!(reset.media_time, None);
@@ -731,4 +731,59 @@ fn late_forced_cut_discards_expired_boundary_and_uses_current_time() {
     );
     assert_eq!(instruction.cut_time, 5.2);
     assert_eq!(instruction.expires_at, 6.2);
+}
+
+#[test]
+fn reset_preserves_initial_generation_for_durable_replay() {
+    let cfg = config();
+    let mut live = Director::new(cfg.clone()).unwrap();
+    let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+    let mut tagged_audio = audio(1.0, 1.0, 0.0);
+    if let StreamEvent::Audio { cue } = &mut tagged_audio { cue.session_generation = 1; }
+    for event in [tagged_audio, StreamEvent::Transcript { cue: TranscriptCue {
+        segment_id: "first".into(), revision: 1, start: 0.8, end: 1.0,
+        kind: CueKind::SentenceEnd, confidence: 0.95, is_final: true, session_generation: 1,
+    } }, StreamEvent::Tick { time: 1.0 }, StreamEvent::Reset { generation: None }] {
+        record_with_director(&mut live, &mut recorder, event);
+    }
+    assert_eq!(recorder.timeline.instructions.len(), 1);
+    let ledger: auto_switcher::model::SessionTimeline = serde_json::from_str(
+        &serde_json::to_string(&recorder.timeline).unwrap()).unwrap();
+    let mut replay = Director::new(ledger.config).unwrap();
+    let mut cuts = 0;
+    for record in ledger.events {
+        cuts += replay.process_event(record.event).iter()
+            .filter(|output| matches!(output, SwitcherOutput::Cut { .. })).count();
+    }
+    assert_eq!(cuts, 1, "initial session cues must still be accepted when replayed");
+    assert_eq!(replay.session_generation(), live.session_generation());
+}
+
+#[test]
+fn coincident_transcript_boundaries_choose_strongest_evidence_deterministically() {
+    for _ in 0..32 {
+        let mut director = Director::new(config()).unwrap();
+        director.process_event(audio(1.0, 1.0, 0.0));
+        for (segment, confidence) in [("weak", 0.73), ("strong", 0.99)] {
+            director.ingest_transcript(TranscriptCue {
+                segment_id: segment.into(), revision: 1, start: 0.8, end: 1.0,
+                kind: CueKind::SentenceEnd, confidence, is_final: true, session_generation: 0,
+            });
+        }
+        let cut = director.tick(1.0).expect("strong coincident boundary must allow the cut");
+        assert!((cut.confidence - (0.99 * 0.48 + 0.4)).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn recorder_manual_cut_uses_generation_after_implicit_clock_reset() {
+    let cfg = SwitcherConfig::default();
+    let mut director = Director::new(cfg.clone()).unwrap();
+    let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+    for event in [StreamEvent::Tick { time: 10.0 }, StreamEvent::Tick { time: 5.0 },
+        StreamEvent::ManualOverride { camera_id: "B".into(), time: 5.0 }] {
+        record_with_director(&mut director, &mut recorder, event);
+    }
+    assert_eq!(recorder.timeline.cuts.last().unwrap().session_generation, director.session_generation());
+    assert_eq!(recorder.timeline.config.session_generation, 1);
 }

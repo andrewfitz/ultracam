@@ -192,6 +192,14 @@ struct NaturalTalkingHeadDirector {
     return true
   }
 
+  /// Releases a decision that the output route abandoned. Keep the clock and
+  /// committed boundary history so cancellation cannot replay the same edit.
+  mutating func cancelPendingOutput() {
+    pendingOutput = nil
+    candidate = nil
+    state = .holdCurrent
+  }
+
   /// Short alias for callers that use the output-coordinator vocabulary.
   @discardableResult
   mutating func acknowledge(_ decision: CutDecision, appliedAt: CMTime? = nil) -> Bool {

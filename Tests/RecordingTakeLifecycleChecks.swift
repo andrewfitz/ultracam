@@ -4,6 +4,27 @@ import Synchronization
 import XCTest
 
 @objcMembers final class RecordingTakeLifecycleChecks: XCTestCase {
+  func testConcurrentSidecarJournalingPublishesEveryRecord() throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("concurrent.mov")
+    let sidecar = try RecordingTakeSidecar(movieURL: movie,
+      metadata: .init(sourceSignature: "source", outputSignature: "output"))
+    // Recorder admission and writer timecode each publish exceptional records.
+    DispatchQueue.concurrentPerform(iterations: 32) { index in
+      _ = sidecar.journal(.init(kind: "clockMapping", detail: String(index)), reserved: true)
+    }
+    try sidecar.finish()
+    let journal = try Data(contentsOf: sidecar.journalURL)
+    let events = try journal.split(separator: 0x0A).map {
+      try JSONDecoder().decode(RecordingTakeSidecar.Event.self, from: Data($0))
+    }
+    XCTAssertEqual(events.count, 32)
+    XCTAssertEqual(Set(events.map(\.detail)), Set((0..<32).map(String.init)))
+    XCTAssertEqual(try RecordingTakeSidecar.readSnapshot(for: movie).journalBytes, journal.count)
+    XCTAssertEqual(sidecar.suppressedRecords, 0)
+  }
+
   private enum Injected: Error { case metadata }
   func testResolvedAudioAdmissionDoesNotFabricateAbsenceOrUnsupportedTracks() throws {
     let source = try snapshot()

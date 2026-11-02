@@ -13,6 +13,29 @@ import XCTest
     func get() -> CVPixelBuffer? { lock.lock(); defer { lock.unlock() }; return value }
   }
 
+  func testInFlightCommandRetainsNormalizerUntilGPUFeedback() throws {
+    let device = try XCTUnwrap(LUTProcessor.sharedDevice)
+    let gate = try XCTUnwrap(device.makeSharedEvent())
+    defer { gate.signaledValue = 1 }
+    let source = try chromaFixture(width: 16, height: 16, colour: .rec709Video, cb: { _, _ in 128 })
+    var normalizer: ProgramNormalizer? = try ProgramNormalizer()
+    let owner = { [weak normalizer] in normalizer }
+    normalizer?.waitForTesting(gate, value: 1)
+    let done = DispatchSemaphore(value: 0)
+    let result = Output()
+    try normalizer?.normalize(source, to: ProgramOutputFormat(width: 16, height: 16,
+      pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      duration: CMTime(value: 1, timescale: 30))) {
+      if case let .success(output) = $0 { result.set(output) }
+      done.signal()
+    }
+    normalizer = nil
+    XCTAssertNotNil(owner(), "Pending GPU commands must retain their allocators, tables and residency owner")
+    gate.signaledValue = 1
+    XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+    XCTAssertNotNil(result.get())
+  }
+
   func testRGBSourceAndProgramPQTargetConvertPixelsOnGPU() throws {
     var source: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 32, 32, kCVPixelFormatType_32BGRA,

@@ -92,4 +92,26 @@ import XCTest
     XCTAssertEqual(events.compactMap { $0["media_time_ticks"] as? Int64 }, [10_010, 20_020, 10_010_000_000])
   }
 
+  func testClockRebaseControlInputsArePersistedInOrder() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B"), outputFolder: folder)
+    recorder.recordControlEvent(.reset)
+    recorder.recordControlEvent(.health(cameraID: "A", healthy: false, time: 600))
+    recorder.recordControlEvent(.health(cameraID: "B", healthy: true, time: 600))
+    recorder.recordControlEvent(.manualOverride(cameraID: "B", time: 600))
+    recorder.finish()
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
+    let records = try XCTUnwrap(object["events"] as? [[String: Any]])
+    let events = records.compactMap { $0["event"] as? [String: Any] }
+    XCTAssertEqual(events.compactMap { $0["type"] as? String }, ["reset", "video", "video", "manualOverride"])
+    let observation = try XCTUnwrap(events[1]["observation"] as? [String: Any])
+    XCTAssertEqual(observation["camera_id"] as? String, "A")
+    XCTAssertEqual(observation["healthy"] as? Bool, false)
+    XCTAssertEqual(observation["time"] as? Double, 600)
+    XCTAssertEqual(events[3]["camera_id"] as? String, "B")
+    XCTAssertEqual(events[3]["time"] as? Double, 600)
+  }
+
 }

@@ -4,10 +4,14 @@ import Foundation
 @MainActor
 private final class ReadingsBridge: UCSonyCameraControl {
   nonisolated(unsafe) var json = "[]"
+  nonisolated(unsafe) var setCalls = 0
   override var available: Bool { false }
   override func connectFeed(_ feedID: String, camera: String, address: String, authentication: Bool, user: String, password: String,
     fingerprint: String, completion: @escaping UCSonyReply) { completion("[]", nil) }
   override func refreshFeed(_ feedID: String, completion: @escaping UCSonyReply) { completion(json, nil) }
+  override func setFeed(_ feedID: String, code: UInt32, value: UInt64, completion: @escaping UCSonyReply) {
+    setCalls += 1; completion("[]", nil)
+  }
   override func disconnectFeed(_ feedID: String, completion: @escaping UCSonyReply) { completion("[]", nil) }
 }
 
@@ -219,6 +223,10 @@ struct SonyPluginChecks {
     precondition(SonyControlPlugin.sourceProfile(gamma: "S-Log3", gamut: "S-Gamut3.Cine") == "sony-slog3-sgamut3cine")
     precondition(SonyControlPlugin.sourceProfile(gamma: "S-Log3", gamut: "S-Gamut3") == "sony-slog3-sgamut3")
     precondition(SonyControlPlugin.sourceProfile(gamma: "ITU709", gamut: "709") == "rec709-video")
+    precondition(SonyControlPlugin.sourceProfile(gamma: "ITU709", gamut: "ITU709 Matrix") == "rec709-video")
+    precondition(SonyControlPlugin.sourceProfile(gamma: "ITU709", gamut: "S-Gamut3") == nil)
+    precondition(SonyControlPlugin.sourceProfile(gamma: "ITU709", gamut: "Black & White") == nil)
+    precondition(SonyControlPlugin.sourceProfile(gamma: "ITU709", gamut: nil) == nil)
     precondition(SonyControlPlugin.sourceProfile(gamma: "S-Cinetone", gamut: "S-Cinetone") == nil)
     precondition(SonyControlPlugin.sourceProfile(gamma: "S-Log3", gamut: "S-Gamut") == nil)
     precondition(plugin.descriptor.localizedMissingDeviceHint()?.contains("Remote Shoot Function") == true)
@@ -242,6 +250,15 @@ struct SonyPluginChecks {
     precondition(read.first { $0.id == "gamma" }?.suggestedSourceProfileID == "sony-slog3-sgamut3cine")
     precondition(read.first { $0.id == "colorMode" }?.role == .colorProfile)
     precondition(read.first { $0.id == "firmware" }?.role == .firmware)
+    readings.json = """
+    [{"id":"monitoringDisplayHDMI","title":"HDMI","code":2,"value":2,"writable":true,"choices":[{"value":1,"label":"Off"}]},
+    {"id":"faceEyeFrameDisplay","title":"Frames","code":3,"value":2,"writable":true,"choices":[{"value":2,"label":"On"}]}]
+    """
+    do {
+      try await readingsPlugin.set("cameraDisplay", value: .boolean(false), feedID: "readings", generation: 1)
+      preconditionFailure("Unavailable grouped display value was accepted")
+    } catch let error as ControlError { precondition(error.code == .invalidRequest) }
+    precondition(readings.setCalls == 0, "Validate the entire grouped display change before writing any setting")
     try await readingsPlugin.disconnect(feedID: "readings", generation: 1)
     print("Sony plugin checks passed")
   }

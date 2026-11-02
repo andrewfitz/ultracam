@@ -33,7 +33,8 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.write('bin/xcrun', '#!/usr/bin/env python3\nimport pathlib, sys\nout = pathlib.Path(sys.argv[sys.argv.index("-o") + 1])\nout.write_text(' + repr(executable) + ')\nout.chmod(0o755)\n', True)
         self.env = dict(os.environ, PATH=str(self.root / 'bin') + ':' + os.environ['PATH'],
                         RUN_RECEIPT=str(self.root / 'receipt'), FAKE_TEST_OUTPUT='PASS', FORCE='0',
-                        UI_PERF_ONLY='0', ULTRACAM_REQUIRE_GPU_PROOFS='0')
+                        UI_PERF_ONLY='0', UI_PERF_CAMERAS='2,4', UI_PERF_METERS='live,fixed',
+                        ULTRACAM_REQUIRE_GPU_PROOFS='0')
 
     def write(self, name, text, executable=False):
         path = self.root / name
@@ -58,6 +59,17 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.assertEqual(self.count(), 2)
         self.passes(UI_PERF_ONLY='1')
         self.assertEqual(self.count(), 3)
+
+    def test_reduced_performance_selections_do_not_share_full_cache(self):
+        for override in ({'UI_PERF_CAMERAS': '2'}, {'UI_PERF_METERS': 'fixed'}):
+            with self.subTest(override=override):
+                self.passes(**override)
+                before = self.count()
+                self.passes()
+                self.assertEqual(self.count(), before + 1)
+                self.passes(**override)
+                self.assertEqual(self.count(), before + 2)
+                (self.root / 'work/agent-work/build/ultracam/ui-verify/last-pass').unlink()
 
     def test_rust_production_inputs_invalidate_full_cache(self):
         self.passes()

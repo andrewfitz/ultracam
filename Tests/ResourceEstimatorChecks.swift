@@ -23,5 +23,14 @@ import XCTest
     var estimator = ResourceEstimator(limits: .init(bytes: 10, duration: 1, slots: 1))
     if case .failure(.invalid) = estimator.admit(.init(owner: "", stage: .capture, bytes: 1, duration: 1)) {} else { XCTFail("expected invalid demand") }
   }
+  func testAdmissionRejectsOverflowWithoutChangingReservations() {
+    var estimator = ResourceEstimator(limits: .init(bytes: Int.max, duration: .greatestFiniteMagnitude, slots: Int.max))
+    XCTAssertTrue(estimator.admit(owner: "first", stage: .capture, bytes: Int.max, duration: 0, slots: Int.max).isSuccess)
+    XCTAssertEqual(estimator.admit(owner: "bytes", stage: .gpu, bytes: 1, duration: 0, slots: 0), .failure(.overflow("bytes")))
+    XCTAssertEqual(estimator.admit(owner: "slots", stage: .gpu, bytes: 0, duration: 0, slots: 1), .failure(.overflow("slots")))
+    XCTAssertEqual(estimator.activeOwners, ["first"])
+    XCTAssertEqual(estimator.estimate, .init(bytes: Int.max, duration: 0, slots: Int.max))
+  }
+
 }
 private extension Result { var isSuccess: Bool { if case .success = self { return true }; return false } }

@@ -115,6 +115,32 @@ import XCTest
     XCTAssertFalse(coordinator.acknowledgeCut(decision))
   }
 
+  func testCancelledDirectorDecisionDoesNotLatchFutureDecisions() {
+    let a = feed("A"), b = feed("B")
+    var directorSettings = NaturalTalkingHeadDirectorSettings()
+    directorSettings.minimumShotDuration = 0
+    directorSettings.candidateDwell = 0
+    directorSettings.boundaryWindow = 0.3
+    var coordinator = SwitcherCoordinator(feedIDs: [a, b], directorSettings: directorSettings)
+    func input(_ seconds: Double) -> NaturalTalkingHeadDirectorInput {
+      NaturalTalkingHeadDirectorInput(mediaTime: time(seconds), currentCameraID: a.rawValue,
+        anchorCameraID: a.rawValue, emphasisCameraID: b.rawValue,
+        audioCues: [AudioCue(time: time(seconds), speechEnergy: 1, pauseDuration: 0, emphasis: 1, laughter: 0)],
+        transcriptCues: [TranscriptCue(timeRange: CMTimeRange(start: time(seconds - 0.2), end: time(seconds)),
+          kind: .sentenceEnd, confidence: 1, isFinal: true)])
+    }
+    XCTAssertNotNil(coordinator.evaluateDirector(input(1)))
+    coordinator.cancelPendingCut()
+    let next = coordinator.evaluateDirector(input(4))
+    XCTAssertNotNil(next, "An abandoned edit must release the director's output latch")
+    var rebuilt = SwitcherCoordinator(settings: coordinator.settings, feedIDs: [a, b, feed("C")],
+      directorSettings: directorSettings)
+    rebuilt.carryProgramTimeline(from: coordinator)
+    if let next {
+      XCTAssertTrue(rebuilt.acknowledgeCut(next), "A carried pending edit must retain its director acknowledgment state")
+    }
+  }
+
   /// PROG-2: a fixed-interval cut that expires (or is cancelled by health)
   /// must release the automatic latch, or every later tick stays idle.
   func testExpiredAutomaticCutReleasesTheFixedIntervalLatch() {

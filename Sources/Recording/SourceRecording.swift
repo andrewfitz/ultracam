@@ -914,6 +914,10 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   func resume() throws {
+    // A pre-pause callback may have passed admission but not submitted its
+    // queue work yet. Keep the resume marker behind that accepted media;
+    // otherwise it removes the pause at a frame captured before the pause.
+    admission.wait()
     try stateLock.withLock {
       guard telemetryValue.state == .paused else {
         throw SourceRecordingError.invalidState(telemetryValue.state, operation: "resume")

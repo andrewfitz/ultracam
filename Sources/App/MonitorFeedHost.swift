@@ -471,6 +471,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     defer { lock.unlock() }
     guard !consumers.isEmpty else { return }
     if let rejectedCaptureGeneration, captureGeneration <= rejectedCaptureGeneration { return }
+    if let current = self.captureGeneration, captureGeneration < current { return }
     if self.captureGeneration != captureGeneration {
       generation = Self.counterLock.withLock {
         Self.nextGeneration &+= 1

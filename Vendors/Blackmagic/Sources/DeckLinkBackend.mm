@@ -1205,7 +1205,12 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   }
   void attachHostTime(CVPixelBufferRef buffer, IDeckLinkVideoInputFrame *frame) {
     NSNumber *number = captureHostTime(frame);
-    if (!number) return;
+    if (!number) {
+      // SDK buffers may carry attachments from a previous use. An unavailable
+      // reference timestamp must never inherit another frame's host time.
+      CVBufferRemoveAttachment(buffer, (__bridge CFStringRef)UltracamCaptureHostTimeAttachmentKey);
+      return;
+    }
     CVBufferSetAttachment(buffer, (__bridge CFStringRef)UltracamCaptureHostTimeAttachmentKey, (__bridge CFTypeRef)number,
       kCVAttachmentMode_ShouldPropagate);
   }
@@ -2689,7 +2694,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   _lastColorimetry = colorimetryText(detected.colorspace, detected.eotf);
   _stats->setSignal(detected.fullDescription());
   if (_callback && _callback->accepting)
-    _callback->eventHandler([NSString stringWithFormat:@"Detected HDMI input: %@ — capturing 10-bit YUV 4:2:2.",
+    _callback->eventHandler([NSString stringWithFormat:@"Detected HDMI input: %@.",
       detected.fullDescription()]);
 }
 
@@ -2723,7 +2728,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (_status) readStatusColorimetry(_status, &current.colorspace, &current.eotf);
   if (!current.supported) {
     if (mailbox->isCurrent(current.sequence))
-      callback->eventHandler([NSString stringWithFormat:@"Unsupported HDMI input: %@. Requires a supported progressive HDMI mode, YUV 4:2:2, and at least 10-bit source precision.", current.fullDescription()]);
+      callback->eventHandler([NSString stringWithFormat:@"Unsupported HDMI input: %@. Requires a supported progressive HDMI mode and supported pixel format.", current.fullDescription()]);
   } else {
     // The streams already run in this mode, and every mode is captured as
     // 10-bit YUV: only format flags changed (or a mode came back after an
@@ -4117,9 +4122,10 @@ BOOL UltracamRunNativeAuditSyntheticChecks(NSError **error) {
   auto rgb = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
   rgb->setActiveContract(NativeFrameContract{64, 16, CMTimeMake(1001, 60000), bmdFormat10BitRGB});
   rgb->stats->hostOffsetValid = true; rgb->stats->hostOffsetMicros = 5000000;
+  bool rgbDestroyed = false; // Must outlive the retained frame in owned.
   __block UCDeckLinkOwnedMemoryFrame *owned = nil;
   rgb->cpuMemoryFrameHandler = ^(UCDeckLinkOwnedMemoryFrame *value, CMTime, CMTime) { owned = value; };
-  bool rgbDestroyed = false; auto rgbFrame = new FakeFrame(&rgbDestroyed);
+  auto rgbFrame = new FakeFrame(&rgbDestroyed);
   rgbFrame->width = 64; rgbFrame->height = 16; rgbFrame->rowBytes = 256; rgbFrame->pixel = bmdFormat10BitRGB;
   rgbFrame->ownedBuffer = new OwnedCaptureBuffer(4096); rgbFrame->hardwareTime = 42000000;
   rgb->VideoInputFrameArrived(rgbFrame, nullptr); rgbFrame->Release(); rgb->Release();

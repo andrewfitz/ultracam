@@ -37,7 +37,13 @@ while kill -0 "$pid" 2>/dev/null; do
   fi
   sleep 1
 done
-wait "$pid" || true
+app_status=0
+wait "$pid" || app_status=$?
+if [[ "$app_status" -ne 0 ]]; then
+  echo "Self-test app exited with status $app_status; app log: $out/app.log" >&2
+  tail -20 "$out/app.log" >&2 || true
+  exit "$app_status"
+fi
 report="$out/report.json"
 if [[ ! -f "$report" ]]; then
   echo "No report written (the app may have crashed); app log: $out/app.log" >&2

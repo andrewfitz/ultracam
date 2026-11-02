@@ -33,6 +33,12 @@ struct AutoSwitcherTranscriptCue: Codable, Equatable, Sendable {
   }
 }
 
+enum AutoSwitcherControlEvent: Equatable, Sendable {
+  case health(cameraID: String, healthy: Bool, time: Double)
+  case manualOverride(cameraID: String, time: Double)
+  case reset
+}
+
 /// Serializes the Rust director behind a small C ABI. The bridge owns no
 /// frames and never applies a cut itself; the host acknowledges a cut after
 /// ProgramOutputRoute applies the target frame.
@@ -41,6 +47,7 @@ final class AutoSwitcherBridge: @unchecked Sendable {
   typealias ErrorHandler = @Sendable (String) -> Void
   typealias ExpiredHandler = @Sendable (UUID) -> Void
   typealias AudioCueHandler = @Sendable (AutoSwitcherAudioCue) -> Void
+  typealias ControlEventHandler = @Sendable (AutoSwitcherControlEvent) -> Void
   typealias TranscriptCueHandler = @Sendable (AutoSwitcherTranscriptCue) -> Void
 
   private let queue = DispatchQueue(label: "org.ultracam.auto-switcher",
@@ -57,6 +64,7 @@ final class AutoSwitcherBridge: @unchecked Sendable {
   private var _onError: ErrorHandler?
   private var _onDecisionExpired: ExpiredHandler?
   private var _onAudioCue: AudioCueHandler?
+  private var _onControlEvent: ControlEventHandler?
   private var _onTranscriptCue: TranscriptCueHandler?
 
   private(set) var lastError: String? {
@@ -78,6 +86,10 @@ final class AutoSwitcherBridge: @unchecked Sendable {
   var onAudioCue: AudioCueHandler? {
     get { stateLock.withLock { _onAudioCue } }
     set { stateLock.withLock { _onAudioCue = newValue } }
+  }
+  var onControlEvent: ControlEventHandler? {
+    get { stateLock.withLock { _onControlEvent } }
+    set { stateLock.withLock { _onControlEvent = newValue } }
   }
   var onTranscriptCue: TranscriptCueHandler? {
     get { stateLock.withLock { _onTranscriptCue } }
@@ -304,6 +316,22 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     guard let outputPointer else { return }
     let output = String(cString: outputPointer)
     auto_switcher_free_string(outputPointer)
+    // Capture control inputs on the same serialized path as audio. In
+    // particular, a clock rebase is reset + health + manual override.
+    switch event["type"] as? String {
+    case "reset": onControlEvent?(.reset)
+    case "manualOverride":
+      if let camera = event["camera_id"] as? String, let time = event["time"] as? Double {
+        onControlEvent?(.manualOverride(cameraID: camera, time: time))
+      }
+    case "video":
+      if let observation = event["observation"] as? [String: Any],
+        let camera = observation["camera_id"] as? String,
+        let healthy = observation["healthy"] as? Bool, let time = observation["time"] as? Double {
+        onControlEvent?(.health(cameraID: camera, healthy: healthy, time: time))
+      }
+    default: break
+    }
     guard let data = output.data(using: .utf8),
       let values = try? JSONDecoder().decode([RustOutput].self, from: data) else {
       report("Rust auto-switcher returned invalid JSON")

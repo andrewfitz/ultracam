@@ -341,8 +341,11 @@ final class VirtualCameraRegistryStore {
   }
 
   private func decode(data: Data?) -> VirtualCameraRegistrySnapshot? {
+    // Persistence is a publication boundary too. A reserved generation must
+    // not outrank a valid backup and poison every subsequent save.
     guard let data,
       let snapshot = try? JSONDecoder().decode(VirtualCameraRegistrySnapshot.self, from: data),
+      snapshot.generation > 0, snapshot.generation < UInt64.max,
       snapshot.appGroupIdentifier == appGroupIdentifier,
       (try? snapshot.validate()) != nil else { return nil }
     return snapshot

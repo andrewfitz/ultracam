@@ -39,7 +39,9 @@ enum Packed422Format: String, CaseIterable, Sendable {
 
   func validate(width: Int, height: Int, rowBytes: Int, dataSize: Int = 0, planeCount: Int = 0, alphaRowBytes: Int? = nil) throws {
     guard width > 0, height > 0 else { throw Packed422AdmissionError.invalidDimensions }
-    let minimum = try minimumRowBytes(width: width)
+    // A shared P216 stride must fit both planes. At odd widths the
+    // interleaved chroma row has one more 16-bit component than luma.
+    let minimum = try (self == .p216 ? Packed422Format.twoVuy : self).minimumRowBytes(width: width)
     guard rowBytes >= minimum, rowBytes.isMultiple(of: isPlanar ? 2 : 1) else { throw Packed422AdmissionError.invalidStride(minimum: minimum) }
     let (length, overflow) = rowBytes.multipliedReportingOverflow(by: height)
     guard !overflow, length > 0 else { throw Packed422AdmissionError.overflow }

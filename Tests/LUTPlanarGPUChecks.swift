@@ -4,9 +4,13 @@ import XCTest
 @objcMembers final class LUTPlanarGPUChecks: XCTestCase {
   func testPlanarFormatsExecuteThroughNonlinearLUTWithNativeRanges() throws {
     for type: OSType in [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-      kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, 0x50323136] {
+      kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+      kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+      kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange, 0x50323136] {
       let source = try graySource(type: type)
       let sourceColour = try LUTProcessor.sourceColorimetry(source)
+      XCTAssertEqual(sourceColour.range,
+        [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange].contains(type) ? .full : .video)
       let processor = try LUTProcessor()
       try processor.load(CubeLUT(text: cubeText(size: 17, transform: { $0 * $0 })),
         colorSpace: LUTColorSpaceContract(input: sourceColour, output: .rec709Video))
@@ -19,6 +23,8 @@ import XCTest
   }
 
   func testDeclaredPlanarRangeAndSitingConfigureDecodeBeforeAllocation() throws {
+    let fullTenBit = try graySource(type: kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+    XCTAssertEqual(try LUTProcessor.sourceColorimetry(fullTenBit).range, .full)
     let source = try graySource(type: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
     var parameters = LUTProcessor.parameters(for: source, matrix: nil, lut: nil)
     let colour = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709,
@@ -78,6 +84,11 @@ import XCTest
       if type == 0x50323136 {
         let p = base.assumingMemoryBound(to: UInt16.self)
         for i in 0..<count / 2 { p[i] = plane == 0 ? 32128 : 32768 }
+      } else if [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange].contains(type) {
+        let p = base.assumingMemoryBound(to: UInt16.self)
+        for i in 0..<count / 2 {
+          p[i] = (plane == 0 ? (type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ? 512 : 504) : 512) << 6
+        }
       } else {
         let p = base.assumingMemoryBound(to: UInt8.self)
         for i in 0..<count { p[i] = plane == 0 ? (type == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 128 : 126) : 128 }

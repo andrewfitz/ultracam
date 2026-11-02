@@ -428,18 +428,21 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     // The feedback handler owns the only references the completion needs:
     // the source and output CVPixelBuffers stay alive until the GPU is done.
     let retained = RetainedBuffers(source: source, output: output)
-    options.addFeedbackHandler { [weak self] feedback in
+    // Metal 4 does not retain allocators, argument tables or residency sets.
+    // Keep their owner alive until feedback, even if a caller tears down while
+    // the GPU is stalled longer than the bounded deinit wait.
+    options.addFeedbackHandler { [self] feedback in
       let milliseconds = max(0, (feedback.gpuEndTime - feedback.gpuStartTime) * 1_000)
       if let error = feedback.error {
-        self?.recordFailure()
+        recordFailure()
         completion(.failure(error))
       } else {
-        self?.recordFrame(milliseconds: milliseconds)
+        recordFrame(milliseconds: milliseconds)
         completion(.success(retained.output))
       }
       // After `completion`, which takes the route lock: the route calls
       // `normalize` under its lock, so this lock is never held across it.
-      self?.scheduleIdleSweep()
+      scheduleIdleSweep()
     }
     queue.commit([command], options: options)
     queue.signalEvent(event, value: sequence)

@@ -12,6 +12,24 @@ struct Boundary {
     kind: Option<CueKind>,
 }
 
+// Transcript storage is a HashMap: iteration order must not choose the
+// evidence (and therefore the cut score or return reason) for tied boundaries.
+fn boundary_order(a: &Boundary, b: &Boundary, origin: MediaTime) -> std::cmp::Ordering {
+    fn kind_rank(kind: &Option<CueKind>) -> u8 {
+        match kind {
+            Some(CueKind::SentenceEnd) => 0,
+            Some(CueKind::Transition) => 1,
+            Some(CueKind::Question) => 2,
+            Some(CueKind::PhraseEnd) => 3,
+            None => 4,
+        }
+    }
+    (a.time - origin).abs().total_cmp(&(b.time - origin).abs())
+        .then_with(|| b.confidence.total_cmp(&a.confidence))
+        .then_with(|| a.time.total_cmp(&b.time))
+        .then_with(|| kind_rank(&a.kind).cmp(&kind_rank(&b.kind)))
+}
+
 #[derive(Debug, Clone)]
 struct Candidate {
     target: String,
@@ -563,11 +581,7 @@ impl Director {
                     // would expire. Let the absolute-cap fallback cut at now.
                     && now <= grace_deadline.max(b.time.max(self.shot_started_at)) + 1.0
             })
-            .min_by(|a, b| {
-                (a.time - deadline)
-                    .abs()
-                    .total_cmp(&(b.time - deadline).abs())
-            });
+            .min_by(|a, b| boundary_order(a, b, deadline));
         let (cut_time, confidence) = match boundary {
             Some(boundary) if boundary.time <= now + self.config.boundary_window => {
                 (boundary.time.max(self.shot_started_at), boundary.confidence)
@@ -702,7 +716,7 @@ impl Director {
                 };
                 (b.time - now).abs() <= window && now <= b.time + 1.0
             })
-            .min_by(|a, b| (a.time - now).abs().total_cmp(&(b.time - now).abs()))
+            .min_by(|a, b| boundary_order(a, b, now))
     }
 
     fn boundaries(&self) -> Vec<Boundary> {

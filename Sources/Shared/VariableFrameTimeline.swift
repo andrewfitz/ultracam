@@ -48,25 +48,26 @@ struct VariableFrameTimeline: Sendable {
     if !paused, let previous = lastSourcePTS, CMTimeCompare(pts, previous) <= 0 {
       throw Failure.timestampRegression
     }
-    if paused || sourceOrigin == nil {
-      sourceOrigin = pts
-      lastSourcePTS = nil
+    // Prepare a new epoch locally: a rejected sample must not consume pause
+    // or anchor subsequent timestamps to media that was never emitted.
+    let startsEpoch = paused || sourceOrigin == nil
+    let origin = startsEpoch ? pts : sourceOrigin!
+    var base = outputBase
+    if startsEpoch {
       if let last = lastSample {
-        let (base, overflow) = last.presentationTime.value.addingReportingOverflow(last.duration.value)
+        let (nextBase, overflow) = last.presentationTime.value.addingReportingOverflow(last.duration.value)
         guard !overflow else { throw Failure.overflow }
-        outputBase = base
-      } else { outputBase = 0 }
-      paused = false
+        base = nextBase
+      } else { base = 0 }
     }
-    guard let origin = sourceOrigin else { throw Failure.invalidTime }
     let outputValue: Int64
     if lastSample != nil {
       let offset = try quantizedOffset(pts, from: origin)
-      let candidate = Int128(outputBase) + Int128(offset)
+      let candidate = Int128(base) + Int128(offset)
       guard let value = Int64(exactly: candidate) else { throw Failure.overflow }
       outputValue = value
     } else {
-      outputValue = outputBase
+      outputValue = base
     }
     let d = try quantize(value: Int128(duration.value) * Int128(timescale), denominator: Int128(duration.timescale))
     guard d > 0, let durationValue = Int64(exactly: d) else { throw Failure.overflow }
@@ -74,6 +75,9 @@ struct VariableFrameTimeline: Sendable {
     let sample = Sample(presentationTime: CMTime(value: outputValue, timescale: timescale),
       duration: CMTime(value: durationValue, timescale: timescale),
       sourcePresentationTime: pts, sourceDuration: duration)
+    sourceOrigin = origin
+    outputBase = base
+    paused = false
     lastSample = sample
     lastSourcePTS = pts
     return sample

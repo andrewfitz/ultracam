@@ -27,7 +27,12 @@ inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify Packages/MonitorKi
   Vendors Config/Assets.xcassets scripts/ui-verify.sh scripts/monitor-kit-package.sh scripts/vendor-build.sh scripts/vendors.py \
   -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.msl' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' -o -name '*.py' -o -name '*.json' -o -name '*.svg' -o -name '*.png' \) \
   -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-rust${rust_inputs_hash}-strict${STRICT:-1}-vendors$(python3 "$task_root/scripts/vendors.py" digest)"
-if [[ "${UI_PERF_ONLY:-0}" != 1 && "${FORCE:-0}" != 1 && -f "$build_root/last-pass" && "$(cat "$build_root/last-pass")" == "$inputs_hash" ]]; then
+# Reduced camera/meter selections cannot stand in for the default performance cases.
+full_proof=true
+if [[ "${UI_PERF_ONLY:-0}" == 1 || "${UI_PERF_CAMERAS-2,4}" != 2,4 || "${UI_PERF_METERS-live,fixed}" != live,fixed ]]; then
+  full_proof=false
+fi
+if [[ "$full_proof" == true && "${FORCE:-0}" != 1 && -f "$build_root/last-pass" && "$(cat "$build_root/last-pass")" == "$inputs_hash" ]]; then
   echo "UI verify: unchanged since the last passing run ($build_root/latest). FORCE=1 to rerun."
   exit 0
 fi
@@ -75,5 +80,5 @@ status=0
 "$test_root/ui-verify" "$test_root" > "$test_root/ui-verify.log" 2>&1 || status=$?
 grep -E '^(FAIL|PENDING)' "$test_root/ui-verify.log" | head -80 || true
 tail -4 "$test_root/ui-verify.log"
-if [[ "$status" == 0 && "${UI_PERF_ONLY:-0}" != 1 ]]; then printf '%s\n' "$inputs_hash" > "$build_root/last-pass"; fi
+if [[ "$status" == 0 && "$full_proof" == true ]]; then printf '%s\n' "$inputs_hash" > "$build_root/last-pass"; fi
 exit "$status"

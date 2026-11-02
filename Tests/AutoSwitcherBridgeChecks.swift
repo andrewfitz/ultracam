@@ -81,6 +81,18 @@ import XCTest
     XCTAssertFalse(try cuts(rebasing: false).isEmpty, "The hazard: a forced cut on the first tick of the new clock")
     XCTAssertEqual(try cuts(rebasing: true), [], "The shot on air starts over at the handoff")
   }
+  func testClockRebaseReportsEveryControlInputInDirectorOrder() throws {
+    let anchor = FeedID(rawValue: "A"), emphasis = FeedID(rawValue: "B")
+    let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: NaturalTalkingHeadSettings(), anchor: anchor, emphasis: emphasis))
+    let log = ControlInputLog()
+    bridge.onControlEvent = { log.append($0) }
+    bridge.rebaseClock(at: CMTime(value: 600, timescale: 1), onAir: emphasis,
+      health: [(anchor, false), (emphasis, true)])
+    bridge.stop()
+    XCTAssertEqual(log.events, [.reset, .health(cameraID: "A", healthy: false, time: 600),
+      .health(cameraID: "B", healthy: true, time: 600), .manualOverride(cameraID: "B", time: 600)])
+  }
+
 }
 
 private final class InstructionLog: @unchecked Sendable {
@@ -88,4 +100,11 @@ private final class InstructionLog: @unchecked Sendable {
   private var stored: [AutoSwitcherInstruction] = []
   func append(_ instruction: AutoSwitcherInstruction) { lock.withLock { stored.append(instruction) } }
   var instructions: [AutoSwitcherInstruction] { lock.withLock { stored } }
+}
+
+private final class ControlInputLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored: [AutoSwitcherControlEvent] = []
+  func append(_ event: AutoSwitcherControlEvent) { lock.withLock { stored.append(event) } }
+  var events: [AutoSwitcherControlEvent] { lock.withLock { stored } }
 }

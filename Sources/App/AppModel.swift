@@ -1115,6 +1115,12 @@ final class AppModel {
     timeline.onError = { [weak self] message in
       self?.reportProblem("Auto-switcher timeline: \(message)", key: "timeline")
     }
+    bridge.onControlEvent = { [weak self, weak timeline, weak bridge] event in
+      Task { @MainActor in
+        guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
+        timeline?.recordControlEvent(event)
+      }
+    }
     bridge.onAudioCue = { [weak self, weak timeline, weak bridge] cue in
       Task { @MainActor in
         guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }

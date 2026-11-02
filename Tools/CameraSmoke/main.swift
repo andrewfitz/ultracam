@@ -219,7 +219,22 @@ final class SourceQueue {
     }, refCon, &copied), "Copy source queue")
     guard let copied else { throw VideoError.message("Source queue is unavailable.") }
     queue = copied.takeRetainedValue()
-    try check(CMIODeviceStartStream(device, stream), "Start installed camera source")
+    let startStatus = CMIODeviceStartStream(device, stream)
+    if startStatus != noErr {
+      // A throwing initializer does not run deinit. Undo the notification
+      // registration and release queued payloads even when start is refused.
+      var unregisterCopy: Unmanaged<CMSimpleQueue>?
+      let unregisterStatus = CMIOStreamCopyBufferQueue(stream, nil, nil, &unregisterCopy)
+      log("CMIO_SMOKE failedStartUnregister=\(unregisterStatus)")
+      if let unregisterCopy { _ = unregisterCopy.takeRetainedValue() }
+      arrivals?.close()
+      for _ in 0..<CMSimpleQueueGetCapacity(queue) {
+        guard let token = CMSimpleQueueDequeue(queue) else { break }
+        let sample = Unmanaged<CMSampleBuffer>.fromOpaque(token).takeRetainedValue()
+        withExtendedLifetime(sample) {}
+      }
+      try check(startStatus, "Start installed camera source")
+    }
     started = true
     negotiatedFormat = currentStreamFormat(stream)
     let formatText = negotiatedFormat.map { " negotiated=\($0)" } ?? " negotiated=unavailable"
@@ -854,7 +869,7 @@ func runCase(fast: Bool, pool: CVPixelBufferPool, mode: SyntheticMode,
   let sink = CameraSink(route: route, registrySnapshot: { nil })
   defer { sink.disconnect(); log("CMIO_SMOKE producerDisconnected") }
   var configuration = PipelineConfiguration()
-  configuration.inputFast = fast
+  configuration.sourceDuration = duration
   configuration.downscale = mode.width == 1920
   configuration.convertTo420 = mode.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
   let discoveryDeadline = now() + 5
@@ -925,6 +940,7 @@ func runCase(fast: Bool, pool: CVPixelBufferPool, mode: SyntheticMode,
     try require(p95 <= baseline95 + 2 && p99 <= baseline99 + 5,
       "Receiver callback latency regression: p95=\(p95) baseline=\(baseline95)+2ms p99=\(p99) baseline=\(baseline99)+5ms.")
     try require(enabled.retries <= baseline.retries, "Monitoring increased producer queue-full retries.")
+    try check(source.stop(), "Stop and unregister synthetic consumer")
     log("CMIO_MONITOR_COMPARISON PASS requested=\(mode.summary(duration: duration)) exactPixelsPTSCountsCadence=true physicalCapture=false")
     return enabled
   }

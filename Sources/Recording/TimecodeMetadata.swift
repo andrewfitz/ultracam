@@ -62,10 +62,18 @@ public struct TimecodeMetadata: Equatable, Codable, Sendable {
   public func frameNumber(at offset: CMTime) -> Int64? {
     guard offset.isValid, offset.isNumeric, offset.epoch == epoch,
       offset.timescale > 0 else { return nil }
-    let frames = (Double(offset.value) * Double(frameRate.rateNumerator) /
-      Double(offset.timescale) / Double(frameRate.rateDenominator)).rounded()
-    guard frames.isFinite, abs(frames) <= Double(Int64.max - abs(frameNumber)) else { return nil }
-    return RecordingTimecode(frameNumber: frameNumber + Int64(frames),
+    // Keep the rational exact: Double loses whole frames above 2^53, and
+    // Double(Int64.max) rounds up to an unrepresentable Int64 conversion.
+    let numerator = Int128(offset.value) * Int128(frameRate.rateNumerator)
+    let denominator = Int128(offset.timescale) * Int128(frameRate.rateDenominator)
+    var frames = numerator / denominator
+    if abs(numerator % denominator) * 2 >= denominator {
+      frames += numerator < 0 ? -1 : 1
+    }
+    guard let delta = Int64(exactly: frames) else { return nil }
+    let (advanced, overflow) = frameNumber.addingReportingOverflow(delta)
+    guard !overflow else { return nil }
+    return RecordingTimecode(frameNumber: advanced,
       frameRate: frameRate, dropFrame: dropFrame).frameNumber
   }
 

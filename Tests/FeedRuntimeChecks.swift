@@ -150,4 +150,20 @@ import XCTest
     XCTAssertFalse(coordinator.select(disabled.id))
   }
 
+  func testFirstRegistryPublicationPreservesCustomStoreGroup() throws {
+    let group = "org.ultracam.tests.feed-runtime.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: group))
+    defer { defaults.removePersistentDomain(forName: group) }
+    let store = VirtualCameraRegistryStore(appGroupIdentifier: group, defaults: defaults)
+    let coordinator = FeedCoordinator(registryStore: store)
+    let initial = try XCTUnwrap(store.load())
+    XCTAssertEqual(initial.appGroupIdentifier, group)
+    XCTAssertEqual(initial.devices, coordinator.virtualCameraDescriptors)
+    _ = coordinator.add(name: "Second camera")
+    let updated = try XCTUnwrap(store.load())
+    XCTAssertEqual(updated.appGroupIdentifier, group)
+    XCTAssertGreaterThan(updated.generation, initial.generation)
+    XCTAssertEqual(updated.devices, coordinator.virtualCameraDescriptors)
+  }
+
 }
