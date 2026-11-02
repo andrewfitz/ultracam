@@ -222,11 +222,19 @@ struct LivePerformanceSample {
 
   static func run(verifier: Verifier) {
     nativeViewsScaleWithVisualEffect(verifier: verifier)
-    let counts = (ProcessInfo.processInfo.environment["UI_PERF_CAMERAS"] ?? "2,4").split(separator: ",").compactMap { Int($0) }
+    let requestedCounts = (ProcessInfo.processInfo.environment["UI_PERF_CAMERAS"] ?? "2,4").split(separator: ",", omittingEmptySubsequences: false)
+    let counts = requestedCounts.compactMap { Int($0) }
+    guard counts.count == requestedCounts.count, !counts.isEmpty,
+      counts.allSatisfy({ $0 > 0 && $0 <= FeedLifecycleDemandPolicy.maximumCameras }) else {
+      return verifier.check("perf: UI_PERF_CAMERAS contains supported positive camera counts", false)
+    }
+    let meters = (ProcessInfo.processInfo.environment["UI_PERF_METERS"] ?? "live,fixed").split(separator: ",", omittingEmptySubsequences: false)
+    guard !meters.isEmpty, meters.allSatisfy({ $0 == "live" || $0 == "fixed" }) else {
+      return verifier.check("perf: UI_PERF_METERS contains live or fixed", false)
+    }
     for cameras in counts {
       // With live meters (as in the app), then with the meters showing fixed readings, which never
       // tick: the difference is what the meters' display-rate drawing costs the window.
-      let meters = ProcessInfo.processInfo.environment["UI_PERF_METERS"] ?? "live,fixed"
       if meters.contains("live") { measure(cameras: cameras, liveMeters: true, verifier: verifier) }
       if meters.contains("fixed") { measure(cameras: cameras, liveMeters: false, verifier: verifier) }
     }

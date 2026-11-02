@@ -1660,7 +1660,12 @@ class DeviceRegistry {
   }
   HRESULT setDeviceConnector(NSString *identifier, BMDVideoConnection connection) {
     __block HRESULT result = E_FAIL;
-    dispatch_sync(queue, ^{ result = applyConnectorOnQueue(identifier, connection); });
+    dispatch_sync(queue, ^{
+      result = applyConnectorOnQueue(identifier, connection);
+      // Connector-specific mode capabilities changed with the selection.
+      // Publish on the discovery queue so observers receive the new catalog.
+      if (result == S_OK) publish();
+    });
     return result;
   }
   static BMDVideoConnection defaultConnector(BMDVideoConnection supported) {
@@ -4062,9 +4067,21 @@ BOOL UltracamRunConnectorSyntheticChecks(NSError **error) {
   first.attributes.videoInputConnections = bmdVideoConnectionHDMI | bmdVideoConnectionSDI | bmdVideoConnectionOpticalSDI;
   second.attributes.videoInputConnections = bmdVideoConnectionHDMI;
   DeviceRegistry registry(observers); registry.arrived(&first); registry.arrived(&second); registry.drain();
+  __block NSUInteger publications = 0;
+  __block UltracamDevice *publishedDevice = nil;
+  id observation = registry.addObserver(^(NSArray<UltracamDevice *> *devices) {
+    ++publications;
+    publishedDevice = devices.firstObject;
+  });
+  dispatch_sync(observers, ^{});
+  UltracamDevice *initialDevice = publishedDevice;
   if (registry.setDeviceConnector(@"decklink:00000000000000a1", bmdVideoConnectionOpticalSDI) != S_OK ||
       first.configuration.connection != bmdVideoConnectionOpticalSDI || second.configuration.connection != bmdVideoConnectionSDI)
     return fail(error, @"Per-device optical connector selection changed another device.");
+  dispatch_sync(observers, ^{});
+  registry.removeObserver(observation);
+  if (publications != 2 || publishedDevice == initialDevice || publishedDevice != registry.snapshot().firstObject)
+    return fail(error, @"Connector selection did not publish its refreshed device mode catalog.");
   if (first.configuration.audioConnection != bmdAudioConnectionEmbedded)
     return fail(error, @"Per-device connector preference did not select embedded audio.");
   const int writes = first.configuration.writes;

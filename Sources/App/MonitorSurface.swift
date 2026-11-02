@@ -1511,6 +1511,14 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     _ work: MonitorSurfacePresenter.RenderWork, feed: MonitorFeed, target: MTLTexture,
     core: MonitorGPUContext.Core, context: MonitorGPUContext.EncodeContext
   ) throws -> ScopeSource? {
+    // A scope waiting for its own display link belongs to the previous picture.
+    // Once the picture is cleared or tools are hidden it must not draw later,
+    // nor be restored by delayed failure feedback from an earlier scope.
+    if !Self.wantsScopes(work) || work.stamp == nil {
+      scopePending = nil
+      lastScope = nil
+      scopedKey = nil
+    }
     switch work.content {
     case .none:
       try encodeClear(target, into: context)

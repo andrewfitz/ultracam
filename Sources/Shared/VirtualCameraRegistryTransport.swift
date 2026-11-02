@@ -45,7 +45,7 @@ enum VirtualCameraRegistryWire {
         actual: current.appGroupIdentifier)
     }
     if desired.devices == current.devices { return nil }
-    guard current.generation < UInt64.max else {
+    guard current.generation < UInt64.max - 1 else {
       throw VideoError.message("Virtual-camera registry generation is exhausted.")
     }
     var candidate = desired

@@ -274,6 +274,41 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     gpu.detachDrawables(pictureSet)
   }
 
+  @MainActor func testClearingPictureOrHidingToolsDropsPendingScope() throws {
+    let (gpu, core) = try gpuCore()
+    let (host, slot) = host("scope-cancel", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("scope-cancel"), host: host, gpu: gpu)
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    offer(host, try greyV210(), sequence: 1)
+    let delivery = try XCTUnwrap(slot.latest)
+    let output = try target(core, width: 48, height: 16)
+    let scopeLayer = CAMetalLayer()
+    var preferences = MonitorFeedPreferences()
+    preferences.toolsEnabled = true
+    preferences.scopes.enabled = true
+    for mode in 0..<3 {
+      var settings = preferences
+      var state = preferences.surfaceState(isProgram: false)
+      if mode == 1 { state.clean = true }
+      if mode == 2 { settings.toolsEnabled = false }
+      let work = MonitorSurfacePresenter.RenderWork(
+        content: mode == 0 ? .none : .live(delivery), stamp: mode == 0 ? nil : delivery.stamp,
+        state: state, preferences: settings, latestVersion: 1, stateVersion: 1)
+      let done = Completion()
+      try monitorOnRender(gpu) {
+        loop.holdScopeForTesting(delivery, layer: scopeLayer, settings: preferences.scopes)
+        XCTAssertTrue(loop.hasPendingScopeForTesting)
+        try core.submit(completion: done) { context in
+          _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: output,
+            core: core, context: context)
+        }
+        XCTAssertFalse(loop.hasPendingScopeForTesting,
+          "No signal, Clean View and the tools master switch each cancel old scope work")
+      }
+      XCTAssertTrue(done.wait())
+    }
+  }
+
   @MainActor func testHeldScopeRetriesTransientSetupFailureWithoutNewPicture() throws {
     guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else {
       throw XCTSkip("No Metal 4 device")

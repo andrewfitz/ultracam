@@ -286,6 +286,49 @@ private final class SignalLog: @unchecked Sendable {
     wait(for: [staleLoss], timeout: 0.1)
   }
 
+  func testFrameBeforeQueuedEpochCleanupKeepsItsSourceClockBaseline() throws {
+    let (source, controller, feed) = try harness("epoch-baseline")
+    let buffer = try image()
+    let ready = expectation(description: "Started")
+    ready.assertForOverFulfill = false
+    let initial = expectation(description: "Initial declarations processed")
+    let blocked = expectation(description: "Capture queue held before new epoch")
+    let release = DispatchSemaphore(value: 0)
+    let received = DispatchSemaphore(value: 0)
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if update.message == "epoch initial barrier" { initial.fulfill() }
+    }
+    defer { release.signal(); controller.onUpdate = nil; controller.stop() }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    XCTAssertTrue(source.submit(.event(.info("epoch initial barrier"))))
+    wait(for: [initial], timeout: 1)
+    controller.setAuditHooksForTesting(CaptureController.AuditHooks(sourceFrameReceived: { received.signal() },
+      epochSignalCleanup: {
+        blocked.fulfill()
+        XCTAssertEqual(release.wait(timeout: .now() + 3), .success)
+      }))
+    let nextDuration = CMTime(value: 1, timescale: 50)
+    let changed = try SourceFormat(width: 128, height: 72, pixel: .v210, rate: .constant(nextDuration))
+    XCTAssertTrue(source.submit(.event(.formatChanged(changed))))
+    wait(for: [blocked], timeout: 1)
+    func submit(_ index: Int64) {
+      let context = source.context
+      let info = CaptureFrameInfo(epochID: context.epochID, formatSignature: context.formatSignature,
+        presentationTime: CMTime(value: index, timescale: 50), duration: nextDuration,
+        signalValid: true, timecode: nil)
+      XCTAssertTrue(source.submit(.frame(buffer, info)))
+      XCTAssertEqual(received.wait(timeout: .now() + 1), .success)
+    }
+    submit(0)
+    release.signal()
+    _ = controller.gpuPreparedForTesting
+    submit(2)
+    XCTAssertEqual(controller.sourceDropsForTesting, 1,
+      "Queued epoch cleanup must preserve the first new frame as the source-drop baseline")
+  }
+
   func testFrameAfterWatchdogClaimKeepsItsSourceClockBaseline() throws {
     let (source, controller, feed) = try harness("signal-watchdog-claimed")
     let buffer = try image()

@@ -256,7 +256,9 @@ final class UIMenuCommandBox: NSObject {
       if old.keyEquivalentModifierMask != new.keyEquivalentModifierMask {
         old.keyEquivalentModifierMask = new.keyEquivalentModifierMask
       }
-      if old.image?.name() != new.image?.name() || (old.image == nil) != (new.image == nil) { old.image = new.image }
+      // SF Symbol images are unnamed, and a tint can change without changing the symbol.
+      // Copy the fresh image so live tally, warning and control icons follow the row.
+      old.image = new.image
       old.action = new.action
       old.target = new.target
       old.representedObject = new.representedObject

@@ -112,6 +112,40 @@ import XCTest
     XCTAssertEqual(observation["time"] as? Double, 600)
     XCTAssertEqual(events[3]["camera_id"] as? String, "B")
     XCTAssertEqual(events[3]["time"] as? Double, 600)
+    let cuts = try XCTUnwrap(object["cuts"] as? [[String: Any]])
+    XCTAssertEqual(cuts.last?["session_generation"] as? Int, 2)
+  }
+
+  func testManualOverrideCancelsPendingCutAndBecomesNextCutOrigin() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B"), outputFolder: folder)
+    func instruction(_ target: String) -> AutoSwitcherInstruction {
+      AutoSwitcherInstruction(decisionID: UUID(), sessionGeneration: 1,
+        targetCameraID: FeedID(rawValue: target), cutTime: CMTime(value: 20, timescale: 1),
+        expiresAt: CMTime(value: 21, timescale: 1), confidence: 1,
+        reason: "emphasisBoundary", forced: false)
+    }
+    let pending = instruction("B")
+    recorder.recordInstruction(pending, from: nil)
+    recorder.recordControlEvent(.manualOverride(cameraID: "B", time: 20))
+    recorder.recordApplied(decisionID: pending.decisionID, target: FeedID(rawValue: "B"),
+      sourceTime: CMTime(value: 20, timescale: 1), programTime: CMTime(value: 20, timescale: 1))
+    recorder.recordInstruction(instruction("A"), from: nil)
+    recorder.recordTick(time: CMTime(value: 20, timescale: 1))
+    recorder.recordTick(time: CMTime(value: 10, timescale: 1))
+    recorder.recordControlEvent(.manualOverride(cameraID: "B", time: 10))
+    recorder.finish()
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
+    let cuts = try XCTUnwrap(object["cuts"] as? [[String: Any]])
+    XCTAssertEqual(cuts.count, 4)
+    XCTAssertEqual(cuts[0]["status"] as? String, "cancelled")
+    XCTAssertEqual(cuts[1]["reason"] as? String, "manualOverride")
+    XCTAssertEqual(cuts[1]["status"] as? String, "applied")
+    XCTAssertEqual(cuts[1]["applied_source_time_ticks"] as? Int, 4_800_000)
+    XCTAssertEqual(cuts[2]["from_camera_id"] as? String, "B")
+    XCTAssertEqual(cuts[3]["session_generation"] as? Int, 2)
   }
 
 }

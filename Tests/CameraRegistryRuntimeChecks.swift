@@ -78,8 +78,32 @@ import XCTest
     XCTAssertEqual(update.generation, 21)
     XCTAssertEqual(update.devices, desired.devices)
     XCTAssertNil(try VirtualCameraRegistryWire.update(desired, after: update))
-    XCTAssertThrowsError(try VirtualCameraRegistryWire.update(desired,
-      after: snapshot(current.devices, generation: UInt64.max)))
+    for exhausted in [UInt64.max - 1, UInt64.max] {
+      XCTAssertThrowsError(try VirtualCameraRegistryWire.update(desired,
+        after: snapshot(current.devices, generation: exhausted)))
+    }
+  }
+
+  func testFailedNativeRemovalRetainsRuntimeUntilRegistryRetry() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "removal-failure")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let retainedRuntime = { [weak runtime = camera.runtime(for: feed.id)] in runtime }
+    var attempts = 0
+    camera.removeDeviceForTesting = { _ in
+      attempts += 1
+      if attempts == 1 { throw VideoError.message("Native removal failed") }
+    }
+    let removed = snapshot([], generation: 2)
+    try camera.reconcile(removed)
+    XCTAssertNotNil(retainedRuntime(), "Published sources still require their unowned runtime")
+    XCTAssertNotNil(camera.runtime(for: feed.id))
+    XCTAssertEqual(camera.devices.count, 1)
+    try camera.reconcile(removed)
+    XCTAssertEqual(attempts, 2)
+    XCTAssertNil(camera.runtime(for: feed.id))
+    XCTAssertNil(retainedRuntime())
+    XCTAssertTrue(camera.devices.isEmpty)
   }
 
   private func snapshot(_ devices: [VirtualCameraDescriptor], generation: UInt64 = 1)

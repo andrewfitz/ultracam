@@ -421,7 +421,10 @@ extension UIVerify {
         verifier.savedImage()
         let colors = UISelfTest.distinctColors(rep)
         let dominant = Images.dominantFraction(rep)
-        verifier.check("render \(file) is not blank", colors > 12 && dominant < 0.97,
+        // The no-device Hardware pane contains only a heading and one text
+        // row; its native grayscale form has fewer quantized colors.
+        let emptyHardware = file.hasPrefix("settings-hardware-default-") || file.hasPrefix("settings-hardware-minimum-")
+        verifier.check("render \(file) is not blank", colors > (emptyHardware ? 7 : 12) && dominant < 0.97,
           "\(colors) colors, dominant \(String(format: "%.2f", dominant))", viewDependent: viewDependent)
         if titled {
           // The window chrome alone must not pass: the content area has to draw too.

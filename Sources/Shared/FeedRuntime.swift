@@ -171,7 +171,10 @@ final class FeedCoordinator {
       // A→B cut; changing it here makes status callbacks and persisted device
       // settings switch to the wrong source.
       if programConsumerActive {
-        demandCoordinator.selectProgram(feedID: feedID.rawValue)
+        // Delivery hops to the main actor after the route unlocks. A newer
+        // cut or topology edit may already have changed the on-air source;
+        // demand follows the live route, not this historical notification.
+        demandCoordinator.selectProgram(feedID: programOutput.selectedFeedID?.rawValue)
         _ = demandCoordinator.drainTransitions()
       }
       onProgramCutApplied?(feedID, sourceTime, programTime)

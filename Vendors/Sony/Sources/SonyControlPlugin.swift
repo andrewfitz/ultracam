@@ -31,7 +31,8 @@ final class SonyControlPlugin: CameraControlPlugin {
         switch kind {
         case "changed": self.handler?(.changed(feedID: feed, generation: session.generation))
         case "disconnected": self.handler?(.disconnected(feedID: feed, generation: session.generation,
-          reason: ControlDisconnectReason(code: .transport, retryable: true, message: message)))
+          reason: ControlDisconnectReason(code: Self.isAuthenticationFailure(message) ? .authentication : .transport,
+            retryable: !Self.isAuthenticationFailure(message), message: message)))
         case "warning":
           guard let notice = Self.notice(forWarning: message) else { return }
           let text = VendorDisplayLocalization.resolve(key: "sony.notice.\(message)", fallback: notice.message, table: "SonyControl")
@@ -250,7 +251,10 @@ final class SonyControlPlugin: CameraControlPlugin {
     try checkOpen()
   }
   nonisolated private static func failure(_ message: String, _ code: ControlReasonCode = .sdkFailure) -> ControlError {
-    ControlError(code: code, retryable: code != .invalidRequest && code != .changedIdentity, message: message)
+    ControlError(code: code, retryable: code != .invalidRequest && code != .changedIdentity && code != .authentication, message: message)
+  }
+  nonisolated private static func isAuthenticationFailure(_ message: String) -> Bool {
+    message.contains("(0x00008215)") || message.contains("(0x00008216)")
   }
   nonisolated private static func identity(_ value: String) throws -> String {
     let compact = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -272,7 +276,7 @@ final class SonyControlPlugin: CameraControlPlugin {
           else if message.contains("cannot mix") || message.contains("before adding a camera by IP") { code = .unsupported }
           // CrError_Connect_SSH_ServerAuthenticationFailed and _UserAuthenticationFailed: a
           // rejected sign-in, which an automatic reconnect must never repeat.
-          else if message.contains("(0x00008215)") || message.contains("(0x00008216)") { code = .authentication }
+          else if Self.isAuthenticationFailure(message) { code = .authentication }
           else { code = .sdkFailure }
           continuation.resume(throwing: Self.failure(message, code)); return
         }

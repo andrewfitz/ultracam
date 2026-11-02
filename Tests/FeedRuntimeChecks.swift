@@ -139,6 +139,28 @@ import XCTest
     XCTAssertTrue(coordinator.activeDemandFeedIDs.isEmpty)
   }
 
+  func testDelayedCutEventKeepsDemandOnCurrentProgramSelection() async throws {
+    let first = FeedDescriptor(id: FeedID(rawValue: "feed-a"), name: "Wide")
+    var second = FeedDescriptor(id: FeedID(rawValue: "feed-b"), name: "Tight")
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [first, second]))
+    _ = coordinator.setProgramConsumer(true)
+    _ = coordinator.ingestProgramFrame(feedID: first.id, frame: try frame(0))
+    _ = coordinator.requestProgramCut(to: second.id)
+    let delivered = expectation(description: "Deferred cut event delivered")
+    coordinator.onProgramCutApplied = { feedID, _, _ in
+      XCTAssertEqual(feedID, second.id)
+      delivered.fulfill()
+    }
+    _ = coordinator.ingestProgramFrame(feedID: second.id, frame: try frame(0))
+    // The cut event is queued to this actor. Remove its target before letting
+    // that notification run; topology has already put the first feed on air.
+    second.enabled = false
+    coordinator.update(second)
+    XCTAssertEqual(coordinator.programOutput.selectedFeedID, first.id)
+    await fulfillment(of: [delivered], timeout: 2)
+    XCTAssertEqual(coordinator.activeDemandFeedIDs, Set([first.id.rawValue]))
+  }
+
   func testDisabledPersistedSelectionFallsBackToEnabledFeed() {
     let disabled = FeedDescriptor(id: FeedID(rawValue: "disabled"), name: "Disabled", enabled: false)
     let enabled = FeedDescriptor(id: FeedID(rawValue: "enabled"), name: "Enabled")

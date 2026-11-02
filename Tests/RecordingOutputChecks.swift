@@ -136,6 +136,27 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertFalse(FileManager.default.fileExists(atPath: second.finalURL.path))
   }
 
+  func testByteWriterConsumesReservationAsDiskSpaceIsUsed() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let disk = ChangingRecordingOutputDiskSpace(bytes: 200)
+    let volumes = RecordingVolumeSpaceRegistry()
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100,
+      diskSpace: disk, volumes: volumes)
+    let session = try manager.beginSession(feedID: "Wide", expectedBytes: 80)
+    try session.append(Data(repeating: 1, count: 40))
+    disk.bytes = 160
+    XCTAssertEqual(volumes.usage(for: root).reserved, 40)
+    try session.append(Data(repeating: 2, count: 40))
+    disk.bytes = 120
+    XCTAssertEqual(volumes.usage(for: root).reserved, 0)
+    // Growth past the estimate still checks the remaining physical space.
+    XCTAssertThrowsError(try session.append(Data(count: 21)))
+    try session.append(Data(count: 20))
+    XCTAssertEqual(volumes.usage(for: root).reserved, 0)
+    XCTAssertEqual(try Data(contentsOf: session.finish()).count, 100)
+  }
+
   func testExternalWriterSessionLeavesPathForContainerAndFinalizesAtomically() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

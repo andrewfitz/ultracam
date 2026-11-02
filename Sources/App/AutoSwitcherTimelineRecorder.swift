@@ -312,6 +312,8 @@ final class AutoSwitcherTimelineRecorder {
   var outputFileURL: URL { outputURL }
   private var document: AutoSwitcherTimelineDocument
   private var outputURL: URL
+  private var lastDirectorMediaTime: Double?
+  private var sessionGeneration: UInt64 = 1
   private var nextSequence: UInt64 = 1
   private var pending: [UUID: Int] = [:]
   private var recordingIDs: [FeedID: UUID] = [:]
@@ -365,6 +367,8 @@ final class AutoSwitcherTimelineRecorder {
     let time: Double?
     switch input {
     case .reset:
+      lastDirectorMediaTime = nil
+      sessionGeneration = sessionGeneration == .max ? .max : sessionGeneration + 1
       for index in pending.values where document.cuts.indices.contains(index) {
         document.cuts[index].status = "cancelled"
       }
@@ -373,6 +377,21 @@ final class AutoSwitcherTimelineRecorder {
       event = AutoSwitcherTimelineEvent(type: "reset")
       time = nil
     case let .manualOverride(cameraID, seconds):
+      guard let timestamp = Self.timestamp(CMTime(seconds: seconds, preferredTimescale: 240_000)) else { return }
+      for index in pending.values where document.cuts.indices.contains(index) {
+        document.cuts[index].status = "cancelled"
+      }
+      pending.removeAll()
+      document.cuts.append(AutoSwitcherTimelineCut(decisionID: nil,
+        sessionGeneration: sessionGeneration,
+        fromCameraID: currentCameraID.rawValue, targetCameraID: cameraID,
+        requestedCutTime: timestamp.seconds, requestedCutTimeTicks: timestamp.ticks,
+        appliedSourceTime: timestamp.seconds, appliedSourceTimeTicks: timestamp.ticks,
+        appliedProgramTime: timestamp.seconds, appliedProgramTimeTicks: timestamp.ticks,
+        expiresAt: nil, expiresAtTicks: nil, confidence: nil, reason: "manualOverride",
+        forced: false, status: "applied"))
+      currentCameraID = FeedID(rawValue: cameraID)
+      lastDirectorMediaTime = seconds
       event = AutoSwitcherTimelineEvent(type: "manualOverride", time: seconds, cameraID: cameraID)
       time = seconds
     case let .health(cameraID, healthy, seconds):
@@ -424,6 +443,7 @@ final class AutoSwitcherTimelineRecorder {
       !document.instructions.contains(where: { $0.decisionID == instruction.decisionID }) else { return }
     guard let cut = Self.cutRecord(instruction: instruction, from: source ?? currentCameraID,
       timebase: document.timebase) else { return }
+    sessionGeneration = instruction.sessionGeneration
     pending[instruction.decisionID] = document.cuts.count
     document.cuts.append(cut)
     document.instructions.append(Self.instruction(instruction, timebase: document.timebase))
@@ -531,6 +551,14 @@ final class AutoSwitcherTimelineRecorder {
   }
 
   private func append(event: AutoSwitcherTimelineEvent, mediaTime: (seconds: Double, ticks: Int64)?, outputs: [AutoSwitcherTimelineOutput]) {
+    if event.type == "tick", let time = mediaTime?.seconds {
+      if let last = lastDirectorMediaTime, time + 1e-6 < last {
+        sessionGeneration = sessionGeneration == .max ? .max : sessionGeneration + 1
+      }
+      lastDirectorMediaTime = time
+    } else if event.type == "video", let time = mediaTime?.seconds {
+      lastDirectorMediaTime = max(lastDirectorMediaTime ?? time, time)
+    }
     document.duration = max(document.duration, mediaTime?.seconds ?? 0)
     document.events.append(AutoSwitcherTimelineEventRecord(sequence: nextSequence,
       mediaTime: mediaTime?.seconds, mediaTimeTicks: mediaTime?.ticks, event: event, outputs: outputs))

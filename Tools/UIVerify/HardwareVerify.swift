@@ -30,7 +30,7 @@ import SwiftUI
     model.startCamera(camera1)
     settle("hardware: camera 1 runs on its fixture session") { model.isCameraRunning(camera1) }
     let interface = UIInterfaceState(defaults: defaults)
-    let width = UISettingsLayout.width
+    let width = UISettingsLayout.defaultSize.width
 
     func pane(_ expanded: Set<String> = []) -> some View {
       UISettingsHardwarePane(model: model, interface: interface, initiallyExpanded: expanded).frame(width: width)
@@ -52,7 +52,7 @@ import SwiftUI
       "missing \(presentMissing.joined(separator: ", "))", viewDependent: true)
     verifier.check("hardware: opening Settings never scans for bodies",
       rig.control.discoveries == 0 && model.cameraControls.scanning.isEmpty, "\(rig.control.discoveries) scans")
-    render("settings-hardware-present", AnyView(pane()), CGSize(width: width, height: SettingsVerify.measure(pane())))
+    render("settings-hardware-present", AnyView(pane()), CGSize(width: width, height: UISettingsLayout.defaultSize.height))
 
     // Expanded: the device's name, settings, signal and formats; the body's Setup and advisory.
     let open: Set<String> = ["fake:left", Rig.bodyB.id]
@@ -64,7 +64,7 @@ import SwiftUI
       "missing \(expandedMissing.joined(separator: ", "))", viewDependent: true)
     verifier.check("hardware: formats use human names, never frame durations", !expanded.contains { $0.contains("1001/") },
       viewDependent: true)
-    render("settings-hardware-expanded", AnyView(pane(open)), CGSize(width: width, height: SettingsVerify.measure(pane(open))))
+    render("settings-hardware-expanded", AnyView(pane(open)), CGSize(width: width, height: UISettingsLayout.defaultSize.height))
 
     // Absent: Camera 2's device isn't listed; it keeps its last known name and the plugin's hint.
     let camera2 = model.feedDescriptors[1].id
@@ -73,7 +73,7 @@ import SwiftUI
     let absentMissing = missing(["Spare Recorder", "Not connected", hint], in: absent)
     verifier.check("hardware: an absent assigned device keeps its name and its plugin's hint", absentMissing.isEmpty,
       "missing \(absentMissing.joined(separator: ", "))", viewDependent: true)
-    render("settings-hardware-absent", AnyView(pane()), CGSize(width: width, height: SettingsVerify.measure(pane())))
+    render("settings-hardware-absent", AnyView(pane()), CGSize(width: width, height: UISettingsLayout.defaultSize.height))
     model.updateCamera(camera2) { $0.selectedDevice = "fake:right" }
 
     // The idle reader runs only while the pane is on screen. Offscreen windows are never

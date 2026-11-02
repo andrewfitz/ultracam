@@ -130,7 +130,10 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
     let chars = Array(string)
     let expectedSeparator: Character = dropFrame ? ";" : ":"
     guard (11...12).contains(chars.count), chars[2] == ":",
-      chars[5] == ":", chars[8] == expectedSeparator else { return nil }
+      chars[5] == ":", chars[8] == expectedSeparator,
+      chars.enumerated().allSatisfy({ index, character in
+        [2, 5, 8].contains(index) || ("0"..."9").contains(character)
+      }) else { return nil }
     let normalized = string.replacingOccurrences(of: ";", with: ":")
     let fields = normalized.split(separator: ":", omittingEmptySubsequences: false)
     guard fields.count == 4,

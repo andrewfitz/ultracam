@@ -648,11 +648,11 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     let size = UInt64(data.count)
     let target = RecordingOutputManager.saturatingAdd(bytesWrittenValue, size)
-    if target > reservedBytes {
-      let extra = target - reservedBytes
+    if size > reservedBytes {
+      let extra = size - reservedBytes
       do {
         try manager.reserveAdditional(extra)
-        reservedBytes = target
+        reservedBytes = size
       } catch {
         throw error
       }
@@ -662,6 +662,10 @@ public final class RecordingOutputSession: @unchecked Sendable {
     do {
       try handle.write(contentsOf: data)
       bytesWrittenValue = target
+      // The filesystem now accounts for these bytes in its free-space
+      // figure. Only the unwritten portion remains a reservation.
+      manager.release(reserved: size)
+      reservedBytes -= size
     } catch {
       stateValue = .failed
       releaseReservationLocked()

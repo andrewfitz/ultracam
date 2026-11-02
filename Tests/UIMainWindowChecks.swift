@@ -301,6 +301,21 @@ import XCTest
     }
   }
 
+  @MainActor func testMenuRefreshReplacesUnnamedSymbolsAndTheirTint() throws {
+    let old = NSMenuItem(title: "Camera", action: nil, keyEquivalent: "")
+    let fresh = NSMenuItem(title: "Camera", action: nil, keyEquivalent: "")
+    old.image = try XCTUnwrap(NSImage(systemSymbolName: "video", accessibilityDescription: nil))
+    fresh.image = try XCTUnwrap(NSImage(systemSymbolName: "video.fill", accessibilityDescription: nil))
+    XCTAssertTrue(UIMenuBarController.refresh([old], with: [fresh]))
+    XCTAssertTrue(old.image === fresh.image, "Unnamed symbols must follow a live state change")
+    fresh.image = try XCTUnwrap(fresh.image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.systemOrange])))
+    XCTAssertTrue(UIMenuBarController.refresh([old], with: [fresh]))
+    XCTAssertTrue(old.image === fresh.image, "A warning tint must update even with the same symbol")
+    fresh.image = nil
+    XCTAssertTrue(UIMenuBarController.refresh([old], with: [fresh]))
+    XCTAssertNil(old.image)
+  }
+
   // MARK: Detail size
 
   /// At startup the split view reports zero or a sliver before its real size; cells fitted to

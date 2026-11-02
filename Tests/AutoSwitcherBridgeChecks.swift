@@ -93,6 +93,19 @@ import XCTest
       .health(cameraID: "B", healthy: true, time: 600), .manualOverride(cameraID: "B", time: 600)])
   }
 
+  func testManualControlReportsAcceptedDirectorTimeAndOmitsRejectedOverrides() throws {
+    let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B")))
+    let log = ControlInputLog()
+    bridge.onControlEvent = { log.append($0) }
+    bridge.tick(time: CMTime(value: 100, timescale: 1))
+    bridge.manualOverride(cameraID: FeedID(rawValue: "B"), at: CMTime(value: 99, timescale: 1))
+    bridge.manualOverride(cameraID: FeedID(rawValue: "A"), at: .zero)
+    bridge.manualOverride(cameraID: FeedID(rawValue: "unknown"), at: CMTime(value: 101, timescale: 1))
+    bridge.stop()
+    XCTAssertEqual(log.events, [.manualOverride(cameraID: "B", time: 100)])
+  }
+
 }
 
 private final class InstructionLog: @unchecked Sendable {

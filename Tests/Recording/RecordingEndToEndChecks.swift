@@ -62,6 +62,25 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
       maxKeyFrameInterval: maxKeyFrameInterval)
   }
 
+  func testPairedAudioDuringPauseIsAcceptedWithoutWritingOrFailingTheTake() throws {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("paired-pause-\(UUID().uuidString).mov")
+    let config = try configuration(feed: "paired-pause", url: url)
+    let writer = SyntheticSourceWriter()
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    try recorder.start()
+    try recorder.pause()
+    XCTAssertTrue(recorder.appendPairedSourceAudio(try audioSample(at: CMTime(value: 0, timescale: 48000)), videoTime: .zero),
+      "Capture must not interpret an intentional pause as refused audio admission")
+    XCTAssertEqual(recorder.state, .paused)
+    try recorder.resume()
+    XCTAssertTrue(recorder.appendPairedSourceAudio(try audioSample(at: CMTime(value: 801, timescale: 48000)),
+      videoTime: VideoContract.fastDuration))
+    try recorder.stop()
+    XCTAssertEqual(recorder.state, .finished)
+    XCTAssertEqual(writer.audioSamples.count, 1, "Paused audio must never reach the writer")
+    XCTAssertEqual(recorder.telemetry.droppedPaused, 1)
+  }
+
   func testWriterFIFOReleasesConsumedSamplesBeforeCompaction() throws {
     var fifo = AVAssetSourceRecordingWriter.SampleQueue()
     weak var consumed: CMSampleBuffer?
@@ -1021,8 +1040,14 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     let duration = VideoContract.fastDuration
     func offer(_ frames: Range<Int>) throws {
       for frame in frames {
-        XCTAssertTrue(recorder.appendAudio(try audioSample(at: CMTime(value: Int64(frame) * 801, timescale: 48_000),
-          frameCount: 801)))
+        let audioStart = Int64((Double(frame) * duration.seconds * 48_000).rounded())
+        let audioEnd = Int64((Double(frame + 1) * duration.seconds * 48_000).rounded())
+        let format = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: .int32,
+          interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+        let sample = try makePaired24BitSample(sourcePCM32: Data(count: Int(audioEnd - audioStart) * 8),
+          sampleFrameCount: Int(audioEnd - audioStart), format: format,
+          presentationTime: CMTimeMultiply(duration, multiplier: Int32(frame)))
+        XCTAssertTrue(recorder.appendAudio(sample))
         XCTAssertTrue(recorder.appendVideo(try VideoContract.sample(image,
           at: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration)),
           recorder.telemetry.lastError ?? "")
@@ -1041,8 +1066,9 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertEqual(recorder.telemetry.encodedVideo, 60)
     XCTAssertEqual(try videoFrameCount(url, frameDuration: duration), 60, accuracy: 0.5,
       "The movie holds the 60 recorded frames back to back, not the 5 s pause")
+    XCTAssertEqual(writer.telemetry.pauseTrimmedAudio, 0, "Sub-sample overlap must not discard an entire PCM packet")
     let audio = try trackDuration(url, .audio)
-    XCTAssertEqual(audio, 60 * 801 / 48_000, accuracy: 0.03, "Audio continues without a silent gap")
+    XCTAssertEqual(audio, 60 * duration.seconds, accuracy: 0.03, "Audio continues without a silent gap")
     XCTAssertEqual(writer.telemetry.droppedAudio, 0)
   }
 

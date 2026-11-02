@@ -463,6 +463,9 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
   private(set) var descriptors: [VirtualCameraDescriptor]
   private var runtimes: [String: CameraDeviceRuntime] = [:]
   private var pendingRemoval: Set<String> = []
+#if ULTRACAM_TEST_SUPPORT
+  var removeDeviceForTesting: ((CMIOExtensionDevice) throws -> Void)?
+#endif
   private let automaticTimers: Bool
   private let clock: () -> CMTime
   private let output: ((CMSampleBuffer, CMIOExtensionStream.DiscontinuityFlags, UInt64) -> Void)?
@@ -563,8 +566,20 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
 
   private func removeIfReleased(_ runtime: CameraDeviceRuntime) {
     guard pendingRemoval.contains(runtime.descriptor.id), !runtime.inUse else { return }
+    do {
+#if ULTRACAM_TEST_SUPPORT
+      if let removeDeviceForTesting { try removeDeviceForTesting(runtime.device) }
+      else if let provider { try provider.removeDevice(runtime.device) }
+#else
+      if let provider { try provider.removeDevice(runtime.device) }
+#endif
+    } catch {
+      // CMIO can still call the published stream sources. Their owner is
+      // unowned, so retain the runtime until native removal succeeds.
+      logger.error("Cannot remove virtual camera: \(error.localizedDescription, privacy: .public)")
+      return
+    }
     pendingRemoval.remove(runtime.descriptor.id)
-    if let provider { try? provider.removeDevice(runtime.device) }
     runtimes.removeValue(forKey: runtime.descriptor.id)
     descriptors.removeAll { $0.id == runtime.descriptor.id }
   }
@@ -583,7 +598,10 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
   @discardableResult
   private func reconcileOnQueue(_ candidate: VirtualCameraRegistrySnapshot) throws -> VirtualCameraRegistrySnapshot {
     // A property retry may arrive after the acknowledgement was lost.
-    if candidate == snapshot { return snapshot }
+    if candidate == snapshot {
+      for runtime in Array(runtimes.values) { removeIfReleased(runtime) }
+      return snapshot
+    }
     let next = try snapshot.applying(candidate)
     let nextDescriptors = next.devices.filter(\.enabled)
     let nextIDs = Set(nextDescriptors.map(\.id))

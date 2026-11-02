@@ -1803,9 +1803,16 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       // Whole audio samples, so a pause never splits a sample period.
       let offset = timeline.offset == .zero ? CMTime.zero
         : CMTimeConvertScale(timeline.offset, timescale: pts.timescale, method: .roundHalfAwayFromZero)
-      let output = CMTimeSubtract(pts, offset)
+      var output = CMTimeSubtract(pts, offset)
       if timeline.offset != .zero, let end = timeline.lastAudioOutputEnd, CMTimeCompare(output, end) < 0 {
-        return .overlap
+        // Fractional video cadence places paired PCM between whole audio
+        // samples. Preserve a packet whose overlap is only sample rounding;
+        // dropping it discards ~800 samples for a sub-sample difference.
+        let overlap = CMTimeSubtract(end, output)
+        let rate = CMSampleBufferGetFormatDescription(sample)
+          .flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee.mSampleRate } ?? 48000
+        if rate > 0, overlap.seconds <= 1 / rate + 1e-9 { output = end }
+        else { return .overlap }
       }
       timeline.lastAudioEnd = CMTimeAdd(pts, duration)
       timeline.lastAudioOutputEnd = CMTimeAdd(output, duration)

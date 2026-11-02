@@ -119,6 +119,18 @@ struct SonyPluginChecks {
     bridge.expectedConnection = (camera.address, camera.authenticationMode == .usernamePassword)
     try await plugin.connect(feedID: "feed", generation: 1, camera: camera, credentials: nil)
     let firstKey = bridge.lastKey
+    var disconnectReasons: [ControlDisconnectReason] = []
+    plugin.setEventHandler { event in
+      if case .disconnected(_, _, let reason) = event { disconnectReasons.append(reason) }
+    }
+    for code in ["0x00008215", "0x00008216"] {
+      bridge.eventHandler?(firstKey, "disconnected", "Sony connection failed (\(code)).")
+    }
+    bridge.eventHandler?(firstKey, "disconnected", "Disconnected")
+    precondition(disconnectReasons.count == 3)
+    precondition(disconnectReasons.prefix(2).allSatisfy { $0.code == .authentication && !$0.retryable },
+      "Authentication disconnects must not automatically retry rejected credentials")
+    precondition(disconnectReasons.last?.code == .transport && disconnectReasons.last?.retryable == true)
     let properties = try await plugin.properties(feedID: "feed", generation: 1)
     precondition(properties.first?.value == .unsignedInteger(UInt64.max))
     let mappedOn = properties.first(where: { $0.id == "monitoringDisplayHDMI" })!.options.last!

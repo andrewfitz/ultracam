@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Synchronization
 
 /// Collects check results. With STRICT=0, failures of view-dependent checks
 /// are reported as pending instead of failing the run (useful while views
@@ -193,13 +194,28 @@ struct AXNode {
   private static let writes = DispatchGroup()
   // One encoder thread: it overlaps rendering without competing with it for every core.
   private static let encoder = DispatchQueue(label: "ui-verify.png", qos: .utility)
+  nonisolated private static let writeFailures = Mutex<[String]>([])
   static func write(_ rep: NSBitmapImageRep, to url: URL) {
     nonisolated(unsafe) let image = rep
     encoder.async(group: writes) {
-      if let data = image.representation(using: .png, properties: [:]) { try? data.write(to: url) }
+      do {
+        guard let data = image.representation(using: .png, properties: [:]) else {
+          throw CocoaError(.fileWriteUnknown)
+        }
+        try data.write(to: url)
+      } catch {
+        writeFailures.withLock { $0.append("\(url.path): \(error)") }
+      }
     }
   }
-  static func waitForWrites() { writes.wait() }
+  static func waitForWrites() {
+    writes.wait()
+    let failures = writeFailures.withLock { $0 }
+    guard failures.isEmpty else {
+      for failure in failures { print("FAIL PNG write: \(failure)") }
+      exit(1)
+    }
+  }
 
   /// Fraction of sampled pixels equal to the most common color, optionally within a
   /// centered region (a fraction of width and height).

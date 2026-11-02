@@ -1010,12 +1010,17 @@ final class SourceRecorderCore: @unchecked Sendable {
     // Observe asynchronous writer failures before admitting media.
     if writer.hasFailed { observeWriterFailure() }
     var retained: MediaRetentionLedger.Lease?
+    var intentionallyPaused = false
     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
     let duration = CMSampleBufferGetDuration(sample)
     let admitted = stateLock.withLock { () -> Bool in
       guard telemetryValue.state == .recording else {
         switch telemetryValue.state {
-        case .paused: telemetryValue.droppedPaused &+= 1
+        case .paused:
+          telemetryValue.droppedPaused &+= 1
+          // Declared audio callbacks report contract acceptance, including an
+          // intentional pause. A false result tells capture to fail the take.
+          intentionallyPaused = kind == .audio && (audioMapping != nil || pairedVideoTime != nil)
         case .failed:
           // Media the take can no longer record is lost media: count it.
           telemetryValue.droppedNotRecording &+= 1
@@ -1088,7 +1093,7 @@ final class SourceRecorderCore: @unchecked Sendable {
       admission.enter()
       return true
     }
-    guard admitted, let retained else { return false }
+    guard admitted, let retained else { return intentionallyPaused }
     let queuedSample = QueuedSample(value: sample, retention: retained)
     defer { admission.leave() }
     queue.async { [weak self] in

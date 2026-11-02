@@ -2,6 +2,15 @@ import CoreMedia
 import XCTest
 
 @objcMembers final class TimecodeMetadataChecks: XCTestCase {
+  func testNativeLabelsRejectSignedAndNonDigitComponents() {
+    for label in ["+1:02:03:04", "01:+2:03:04", "01:02:+3:04", "01:02:03:+4",
+      "-0:02:03:04", "01:02:03: 4"] {
+      XCTAssertNil(TimecodeMetadata.native(label: label, frameRate: .fps2997), label)
+    }
+    XCTAssertEqual(TimecodeMetadata.native(label: "01:02:03:104", frameRate: .fps120)?.label,
+      "01:02:03:104")
+  }
+
   func testNativeDropFrameLabelAndEpochArePreserved() {
     let value = TimecodeMetadata.native(label: "01:02:03;04", frameRate: .fps2997, epoch: 7)
     XCTAssertEqual(value?.label, "01:02:03;04")

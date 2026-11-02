@@ -1,13 +1,16 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import os
+
+let cameraOutputLog = Logger(subsystem: "org.ultracam.tests", category: "camera")
 
 // Only app-settings, installed CMIO and monitor/GPU boundaries are replaced.
 // The route, mapper, switcher, fan-out, retention, sample factory and bridge
 // are compiled unchanged from their production files by the CPU runner.
 struct FeedID: RawRepresentable, Hashable, Sendable { let rawValue: String }
 enum SwitcherStrategy: Equatable { case manual, fixedInterval, naturalTalkingHead, dynamicAnalysis }
-struct NaturalTalkingHeadSettings: Equatable { var anchorFeedID: FeedID?; var emphasisFeedID: FeedID? }
+struct NaturalTalkingHeadSettings: Equatable { var anchorFeedID: FeedID?; var emphasisFeedID: FeedID?; var manualHold = false }
 struct SwitcherSettings: Equatable {
   var selectedFeedID: FeedID?
   var automatic = false
@@ -23,6 +26,7 @@ struct CameraSinkRoute {
 final class CameraSink {
   init(route: CameraSinkRoute) {}
   func connect(configuration: PipelineConfiguration, passthroughFormat: OSType) throws { fatalError("Injected sink required") }
+  func preNegotiate(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat?) throws { fatalError("Injected sink required") }
   func disconnect() {}
   func send(_ sample: CMSampleBuffer) throws -> Bool { fatalError("Injected sink required") }
 }

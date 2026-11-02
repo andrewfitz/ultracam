@@ -320,10 +320,6 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     // particular, a clock rebase is reset + health + manual override.
     switch event["type"] as? String {
     case "reset": onControlEvent?(.reset)
-    case "manualOverride":
-      if let camera = event["camera_id"] as? String, let time = event["time"] as? Double {
-        onControlEvent?(.manualOverride(cameraID: camera, time: time))
-      }
     case "video":
       if let observation = event["observation"] as? [String: Any],
         let camera = observation["camera_id"] as? String,
@@ -351,6 +347,14 @@ final class AutoSwitcherBridge: @unchecked Sendable {
           targetCameraID: FeedID(rawValue: target), cutTime: cutTime,
           expiresAt: expiresAt, confidence: instruction.confidence,
           reason: instruction.reason, forced: instruction.forced))
+      case "status":
+        // An override can be rejected or snapped forward by the director.
+        // Persist its accepted clock and camera, rather than the raw request.
+        if event["type"] as? String == "manualOverride",
+          let camera = value.currentCameraID, let time = value.time,
+          value.pendingDecisionID == nil {
+          onControlEvent?(.manualOverride(cameraID: camera, time: time))
+        }
       case "error": report(value.message ?? "Rust auto-switcher error")
       case "decisionExpired":
         if let decisionID = value.decisionID.flatMap(UUID.init(uuidString:)) {
@@ -382,10 +386,16 @@ private struct RustOutput: Decodable {
   let instruction: RustInstruction?
   let decisionID: String?
   let message: String?
+  let time: Double?
+  let currentCameraID: String?
+  let pendingDecisionID: UUID?
 
   enum CodingKeys: String, CodingKey {
     case type, instruction, message
     case decisionID = "decision_id"
+    case time
+    case currentCameraID = "current_camera_id"
+    case pendingDecisionID = "pending_decision_id"
   }
 }
 

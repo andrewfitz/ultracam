@@ -420,6 +420,7 @@ final class CaptureController: @unchecked Sendable {
     var watchdogSignalTimeoutObserved: (@Sendable () -> Void)? = nil
     var watchdogSignalTimeoutClaimed: (@Sendable () -> Void)? = nil
     var sourceFrameReceived: (@Sendable () -> Void)? = nil
+    var epochSignalCleanup: (@Sendable () -> Void)? = nil
   }
   private var auditHooks = AuditHooks()
   func setAuditHooksForTesting(_ hooks: AuditHooks) { lock.withLock { auditHooks = hooks } }
@@ -1736,7 +1737,12 @@ final class CaptureController: @unchecked Sendable {
           queue.async {
             guard self.isAccepting(token), self.lock.withLock({ self.declaredAdmission?.epochID == snapshot.epochID }) else { return }
             if prior?.epochID != snapshot.epochID {
-              self.clearSignal()
+              #if ULTRACAM_TEST_SUPPORT
+              self.lock.withLock { self.auditHooks.epochSignalCleanup }?()
+              #endif
+              // The declaration already reset the driver-owned baseline. A
+              // new-epoch frame may have arrived before this queued cleanup.
+              self.clearSignal(resetSourceClock: false)
               self.lastDeliveredSourceTime = nil
               self.lastMappedSourceTime = nil
             }
@@ -1782,7 +1788,7 @@ final class CaptureController: @unchecked Sendable {
             reason: "a discontinuity requires a new capture epoch"), token: token)
           return
         }
-        queue.async { if self.isAccepting(token) { self.clearSignal() } }
+        queue.async { if self.isAccepting(token) { self.clearSignal(resetSourceClock: false) } }
       case .clockMappingChanged(let update):
         let (nextSequence, overflow) = delivery.sequence.addingReportingOverflow(1)
         guard !overflow, update.effectiveSequence == nextSequence else {
