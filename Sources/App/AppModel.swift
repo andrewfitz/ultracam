@@ -1170,6 +1170,7 @@ final class AppModel {
         // the target will never reach and drops the current program source.
         let result = self.feedCoordinator.requestProgramCut(to: instruction.targetCameraID,
           noEarlierThan: nil)
+        self.switchingRevision &+= 1
         switch result {
         case .queued, .coalesced:
           self.pendingAutoDecisionID = instruction.decisionID
