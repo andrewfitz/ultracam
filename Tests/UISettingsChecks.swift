@@ -223,7 +223,7 @@ import XCTest
     store.resetAll()
     XCTAssertEqual(AppSettingsStore(defaults: defaults).recordingNaming, .standard)
     let preview = UISettingsRecordingPane.preview(naming: naming, camera: "Camera 1")
-    XCTAssertTrue(preview.hasSuffix("_Camera 1_9F2C41D0-5B7E-4E0A-8C3D-2A61F0B7C9E4.mov"), preview)
+    XCTAssertTrue(preview.hasSuffix("_Camera 1.mov"), preview)
     XCTAssertFalse(preview.contains("/"), "No camera subfolder")
   }
 

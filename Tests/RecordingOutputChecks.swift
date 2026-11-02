@@ -42,7 +42,7 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(session.paths.feedDirectory.lastPathComponent, "camera-a")
     XCTAssertEqual(session.paths.finalFile.pathExtension, "mov")
     XCTAssertNotNil(session.paths.finalFile.lastPathComponent.range(
-      of: #"^camera-a_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{3}_AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE(?:-\d+)?\.mov$"#, options: .regularExpression))
+      of: #"^camera-a_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{3}(?:-\d+)?\.mov$"#, options: .regularExpression))
     XCTAssertTrue(FileManager.default.fileExists(atPath: session.temporaryURL.path))
     XCTAssertFalse(FileManager.default.fileExists(atPath: session.finalURL.path))
 
@@ -523,18 +523,29 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     try session.cancel()
   }
 
-  func testSessionIDSeparatesUncreatedPathsAcrossManagers() throws {
+  /// Names carry no session ID. Two managers on one folder name the same camera's first take
+  /// in the same second alike, before either writer has made its file; the second gets "-2".
+  func testTwoManagersInOneFolderNeverShareAnUncreatedPath() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
-    let firstManager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
-    let secondManager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
-    let firstID = UUID()
-    let secondID = UUID()
-    let first = try firstManager.makeSession(feedID: "Wide", sessionID: firstID)
-    let second = try secondManager.makeSession(feedID: "Wide", sessionID: secondID)
-    XCTAssertTrue(first.finalURL.lastPathComponent.contains(firstID.uuidString))
-    XCTAssertTrue(second.finalURL.lastPathComponent.contains(secondID.uuidString))
+    let naming = RecordingFileNaming(tokens: [.camera, .take], cameraSubfolders: true)
+    let firstManager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0, naming: naming)
+    let secondManager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0, naming: naming)
+    let first = try firstManager.makeSession(feedID: "Wide", sessionID: UUID())
+    let second = try secondManager.makeSession(feedID: "Wide", sessionID: UUID())
+    XCTAssertEqual(first.finalURL.lastPathComponent, "Wide_001.mov")
+    XCTAssertEqual(second.finalURL.lastPathComponent, "Wide_001-2.mov")
     XCTAssertNotEqual(first.temporaryURL, second.temporaryURL)
+  }
+
+  /// A name already on disk from an earlier run gets the next free suffix.
+  func testANameAlreadyOnDiskGetsASuffix() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let naming = RecordingFileNaming(tokens: [.take], cameraSubfolders: false)
+    try Data([1]).write(to: root.appendingPathComponent("001.mov"))
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0, naming: naming)
+    XCTAssertEqual(try manager.makeSession(feedID: "Wide").finalURL.lastPathComponent, "001-2.mov")
   }
 
   func testRecoveryScanReclaimsInterruptedExportAndKeepsOriginal() throws {
@@ -580,9 +591,8 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertTrue(FileManager.default.fileExists(atPath: staging.path))
   }
 
-  /// Settings › Recording's name pattern: its pieces in order, then the session ID, which keeps
-  /// two takes from ever sharing a path.
-  func testNamePatternOrdersItsPiecesAndKeepsTheSessionID() throws {
+  /// Settings › Recording's name pattern: its pieces in order, and nothing after them.
+  func testNamePatternOrdersItsPiecesWithNoSessionID() throws {
     let date = Date(timeIntervalSince1970: 1_793_370_151)  // 2026-10-30 14:22:31 UTC
     let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
     XCTAssertEqual(RecordingFileNaming.standard.stem(camera: "Camera 1", date: date, take: 1, timeZone: utc),
@@ -592,10 +602,9 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(naming.stem(camera: "Wide", date: date, take: 12, timeZone: utc), "012_Wide")
     naming.tokens = []
     XCTAssertEqual(naming.stem(camera: "Wide", date: date, take: 3), "003", "No pieces names the take by its number")
-    let id = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"))
-    XCTAssertTrue(RecordingFileNaming.standard.relativePath(camera: "Wide", date: date, take: 1, sessionID: id)
-      .hasPrefix("Wide/Wide_"))
-    XCTAssertEqual(naming.relativePath(camera: "Wide", date: date, take: 3, sessionID: id), "003_\(id.uuidString).mov")
+    XCTAssertEqual(RecordingFileNaming.standard.relativePath(camera: "Wide", date: date, take: 1)
+      .hasPrefix("Wide/Wide_"), true)
+    XCTAssertEqual(naming.relativePath(camera: "Wide", date: date, take: 3), "003.mov")
     let decoded = try JSONDecoder().decode(RecordingFileNaming.self, from: JSONEncoder().encode(naming))
     XCTAssertEqual(decoded, naming)
   }
@@ -611,7 +620,7 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     let session = try manager.beginExternalWriterSession(feedID: "Wide", sessionID: id)
     XCTAssertEqual(session.paths.feedDirectory.standardizedFileURL.resolvingSymlinksInPath().path,
       root.standardizedFileURL.resolvingSymlinksInPath().path)
-    XCTAssertEqual(session.finalURL.lastPathComponent, "Wide_001_\(id.uuidString).mov")
+    XCTAssertEqual(session.finalURL.lastPathComponent, "Wide_001.mov")
     try Data([1, 2, 3]).write(to: session.temporaryURL)
     session.preserveForRecovery()
     let found = try RecordingRecovery.scan(root: root)

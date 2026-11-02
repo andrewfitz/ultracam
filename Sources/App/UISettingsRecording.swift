@@ -102,10 +102,9 @@ struct UISettingsRecordingPane: View {
     return String(text[..<end.lowerBound]) + "."
   }
 
-  /// What the next take of the first camera will be called. The ID is an example: each take gets its own.
+  /// What the next take of the first camera will be called.
   static func preview(naming: RecordingFileNaming, camera: String, date: Date = Date()) -> String {
-    naming.relativePath(camera: NativeRecordingSessionDriver.safeComponent(camera), date: date, take: 1,
-      sessionID: UUID(uuidString: "9F2C41D0-5B7E-4E0A-8C3D-2A61F0B7C9E4")!)
+    naming.relativePath(camera: NativeRecordingSessionDriver.safeComponent(camera), date: date, take: 1)
   }
 }
 

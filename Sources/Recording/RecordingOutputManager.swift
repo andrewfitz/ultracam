@@ -96,8 +96,9 @@ public enum RecordingOutputError: Error, Equatable, LocalizedError, Sendable {
   }
 }
 
-/// How a take's file is named: the pieces in order, joined by "_", then the take's session ID,
-/// which keeps two takes from ever sharing a path (two managers may share a folder). With
+/// How a take's file is named: the pieces in order, joined by "_". Two takes never share a
+/// path: a name already on disk, or already handed out in this run by any manager (two may
+/// share a folder), gets "-2", "-3" and so on. With
 /// camera subfolders each camera's takes go in a folder with its name; without, they sit in
 /// the recording folder itself. Settings › Recording edits it; it applies to the next take.
 public struct RecordingFileNaming: Codable, Equatable, Hashable, Sendable {
@@ -132,7 +133,7 @@ public struct RecordingFileNaming: Codable, Equatable, Hashable, Sendable {
     return tokens.filter { seen.insert($0).inserted }
   }
 
-  /// The name before the session ID: "Camera 1_2026-10-30_14-22-31_001".
+  /// The name without its extension: "Camera 1_2026-10-30_14-22-31_001".
   public func stem(camera: String, date: Date, take: UInt64, timeZone: TimeZone = .current) -> String {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -154,8 +155,8 @@ public struct RecordingFileNaming: Codable, Equatable, Hashable, Sendable {
   }
 
   /// Where a take lands under the recording folder, as Settings previews it.
-  public func relativePath(camera: String, date: Date, take: UInt64, sessionID: UUID, fileExtension: String = "mov") -> String {
-    let name = "\(stem(camera: camera, date: date, take: take))_\(sessionID.uuidString).\(fileExtension)"
+  public func relativePath(camera: String, date: Date, take: UInt64, fileExtension: String = "mov") -> String {
+    let name = "\(stem(camera: camera, date: date, take: take)).\(fileExtension)"
     return cameraSubfolders ? "\(camera)/\(name)" : name
   }
 }
@@ -265,6 +266,10 @@ public final class RecordingOutputManager: @unchecked Sendable {
   private let lock = NSLock()
   private let volume: RecordingVolumeSpaceRegistry.Volume
   private var pathNonce: UInt64 = 0
+  /// Every take path handed out in this run, by any manager. A writer creates its file after
+  /// `makePaths` returns, so the disk alone can't keep two managers in one folder apart.
+  private static let issuedLock = NSLock()
+  nonisolated(unsafe) private static var issuedPaths = Set<String>()
 
   public init(configuration: RecordingOutputConfiguration,
               diskSpace: any RecordingOutputDiskSpaceProviding = FileManagerRecordingOutputDiskSpaceProvider(),
@@ -292,7 +297,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
   public func makeSession(feedID: String, sessionID: UUID = UUID(),
                           expectedBytes: UInt64 = 0) throws -> RecordingOutputSession {
     let safeFeedID = try Self.validateFeedID(feedID)
-    let paths = try makePaths(feedID: safeFeedID, sessionID: sessionID)
+    let paths = try makePaths(feedID: safeFeedID)
     try reserve(expectedBytes: expectedBytes)
     return RecordingOutputSession(manager: self, paths: paths, expectedBytes: expectedBytes)
   }
@@ -405,7 +410,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
     volume.reservedBytes = Self.saturatingAdd(volume.reservedBytes, additional)
   }
 
-  private func makePaths(feedID: String, sessionID: UUID) throws -> RecordingOutputPaths {
+  private func makePaths(feedID: String) throws -> RecordingOutputPaths {
     // Path allocation is performed under the same lock as reservations. This
     // manager is used by multiple feed starts, and an external AVAssetWriter
     // does not create its temporary file until after this method returns.
@@ -427,15 +432,22 @@ public final class RecordingOutputManager: @unchecked Sendable {
     }
     let nonce = pathNonce
     pathNonce &+= 1
-    let stemBase = "\(configuration.naming.stem(camera: feedID, date: Date(), take: nonce + 1))_\(sessionID.uuidString)"
+    let stemBase = configuration.naming.stem(camera: feedID, date: Date(), take: nonce + 1)
     var stem = stemBase
     var suffix = 2
-    while fileManager.fileExists(atPath: feedDirectory.appendingPathComponent(".\(stem).partial").path)
+    Self.issuedLock.lock()
+    defer { Self.issuedLock.unlock() }
+    func issuedKey(_ stem: String) -> String {
+      feedDirectory.appendingPathComponent(stem).resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
+    }
+    while Self.issuedPaths.contains(issuedKey(stem))
+      || fileManager.fileExists(atPath: feedDirectory.appendingPathComponent(".\(stem).partial").path)
       || fileManager.fileExists(atPath: feedDirectory.appendingPathComponent("\(stem).\(configuration.fileExtension)").path)
       || fileManager.fileExists(atPath: feedDirectory.appendingPathComponent(".\(stem).partial.ultracam-recovery").path) {
       stem = "\(stemBase)-\(suffix)"
       suffix += 1
     }
+    Self.issuedPaths.insert(issuedKey(stem))
     let temporary = feedDirectory.appendingPathComponent(".\(stem).partial", isDirectory: false)
     let final = feedDirectory.appendingPathComponent("\(stem).\(configuration.fileExtension)", isDirectory: false)
     guard Self.isDescendant(temporary, of: configuration.rootDirectory),
