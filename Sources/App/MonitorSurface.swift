@@ -1025,11 +1025,16 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     metalLayer.contentsGravity = .resize
     metalLayer.actions = [
       "bounds": NSNull(), "position": NSNull(), "frame": NSNull(), "contents": NSNull(), "drawableSize": NSNull(),
-      "opacity": NSNull(),
     ]
-    // Transparent (the view's black shows) until the render loop presents its first picture,
-    // so nothing the layer holds before then is ever composited. Frames still render meanwhile.
-    metalLayer.opacity = 0
+    // Covered in black until the render loop presents its first picture, so nothing the layer
+    // holds before then is ever seen. A cover rather than a hidden or transparent layer: the
+    // layer stays visible to its display link, so frames render and present meanwhile.
+    let cover = CALayer()
+    cover.name = MonitorSurfaceRenderLoop.coverName
+    cover.backgroundColor = NSColor.black.cgColor
+    cover.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+    cover.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull(), "hidden": NSNull()]
+    metalLayer.addSublayer(cover)
     layer?.addSublayer(metalLayer)
     aspectObservation = presenter.$pictureAspectRatio.sink { [weak self] _ in
       MainActor.assumeIsolated { self?.needsLayout = true }
@@ -1065,6 +1070,11 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     CATransaction.setDisableActions(true)
     // Only a real change: an unchanged frame still re-sent the layer in every commit.
     if metalLayer.frame != frame.integral { metalLayer.frame = frame.integral }
+    if let cover = metalLayer.sublayers?.first(where: { $0.name == MonitorSurfaceRenderLoop.coverName }),
+      cover.frame != metalLayer.bounds
+    {
+      cover.frame = metalLayer.bounds
+    }
     let scaleChanged = metalLayer.contentsScale != scale
     if scaleChanged { metalLayer.contentsScale = scale }
     CATransaction.commit()
@@ -1229,8 +1239,10 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private var paused = false
   private var versions: (UInt64, UInt64) = (UInt64.max, UInt64.max)
   private var drawnSize = (width: 0, height: 0)
-  /// Whether the first picture has been presented and the layer shown (see `MonitorPictureNSView`).
+  /// Whether the first picture has been presented and the layer's cover taken off (see `MonitorPictureNSView`).
   private var revealed = false
+  /// The black cover over a picture layer until its first present.
+  static let coverName = "org.ultracam.picture-cover"
   private var attached = false
   private var drawableSet: MTLResidencySet?
   private var pass: MonitorPass?
@@ -1412,7 +1424,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       DispatchQueue.main.async {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.opacity = 1
+        layer.sublayers?.first { $0.name == MonitorSurfaceRenderLoop.coverName }?.removeFromSuperlayer()
         CATransaction.commit()
       }
     }

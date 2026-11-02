@@ -50,8 +50,10 @@ extension MonitorCoordinatorChecks {
     resize(picture, width: 0)
     XCTAssertEqual(picture.metalLayer.drawableSize, .zero, "An empty frame gets no drawable, not a 1×1 one")
     XCTAssertEqual(picture.drawableResizes, 0)
-    XCTAssertEqual(picture.metalLayer.opacity, 0, "Nothing is composited before the first present")
+    XCTAssertEqual(picture.metalLayer.opacity, 1, "The layer stays visible to its display link")
     resize(picture, width: 480)
+    let cover = picture.metalLayer.sublayers?.first { $0.name == MonitorSurfaceRenderLoop.coverName }
+    XCTAssertEqual(cover?.frame, picture.metalLayer.bounds, "Covered in black until the first present")
     XCTAssertEqual(picture.metalLayer.drawableSize, CGSize(width: 960, height: 540),
       "A picture that has just appeared draws at its size at once, never into a 1×1 drawable")
   }
