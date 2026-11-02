@@ -280,7 +280,7 @@ struct UISettingsHardwarePane: View {
             }
             if conflict { Text("Setup conflict").foregroundStyle(.primary) }
           } else if body.lost {
-            Label { Text("Disconnected").foregroundStyle(.primary) } icon: {
+            Label { Text(body.connectionText).foregroundStyle(.primary) } icon: {
               Image(systemName: UISymbol.wifi(connected: false)).imageScale(.small).foregroundStyle(.orange)
             }
           } else {
@@ -391,7 +391,9 @@ struct UISettingsHardwarePane: View {
         if body.lost || (body.scanned && !body.found), let hint = vendor.localizedMissingDeviceHint() {
           Text(hint).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
-        if let message = state.message {
+        if state.retrying {
+          UICameraControlReconnectStatus(state: state)
+        } else if let message = state.message {
           Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
         }
         DisclosureGroup("Add camera by address") {

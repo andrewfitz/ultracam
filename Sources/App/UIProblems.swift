@@ -291,7 +291,7 @@ extension UIPresentationBuilder {
       let hardware = UIProblemAction(title: "Details", action: .openHardware(itemID: body.id))
       if body.lost {
         // Control only: the picture comes over HDMI, so a lost body is a notice, never damage.
-        list.append(UIProblem(id: "body.\(id)", title: "\(body.name) disconnected", detail: "\(name)'s camera control. The picture isn't affected.",
+        list.append(UIProblem(id: "body.\(id)", title: "\(body.name) disconnected", detail: body.retrying ? "\(name)'s camera control is reconnecting. The picture isn't affected." : "\(name)'s camera control. The picture isn't affected.",
           level: .notice, cameraID: id, action: UIProblemAction(title: "Reconnect", action: .reconnectCameraBody(cameraID: id)),
           symbol: UISymbol.wifi(connected: false), rank: 175))
       }

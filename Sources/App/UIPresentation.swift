@@ -221,6 +221,8 @@ struct UICameraBody: Sendable, Equatable {
   var id = ""
   /// It dropped on its own; Reconnect uses the saved sign-in.
   var lost = false
+  /// It's reconnecting on its own.
+  var retrying = false
   /// Overheating, a low battery in a known unit, a card error: the worst one.
   var warning: Warning? = nil
   /// The body's latest notice that still matters (reconnecting, card full).

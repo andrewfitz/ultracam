@@ -64,9 +64,10 @@ extension ControlCamera { var displayName: String { name } }
 @MainActor extension CameraControlStore {
   static var preferencesKey: String { CameraControlPreferences.preferencesKey }
   convenience init(defaults: UserDefaults, backend: UCSonyCameraControl,
-    credentials: any CameraControlCredentialStoring, now: @escaping @MainActor () -> Date = { Date() }) {
+    credentials: any CameraControlCredentialStoring, now: @escaping @MainActor () -> Date = { Date() },
+    sleep: @escaping @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
     self.init(plugins: ["sony": SonyControlPlugin(backend: backend)], credentials: credentials,
-      persistence: CameraControlPreferences(defaults: defaults), now: now)
+      persistence: CameraControlPreferences(defaults: defaults), now: now, sleep: sleep, jitter: { 0 })
   }
   func discover() async { await discover(pluginID: "sony") }
   func discoverIfNeeded() async { await discoverIfNeeded(pluginID: "sony") }

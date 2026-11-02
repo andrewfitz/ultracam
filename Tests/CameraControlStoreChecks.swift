@@ -89,6 +89,19 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
     func setEventHandler(_ handler: @escaping @MainActor @Sendable (ControlEvent) -> Void) { self.handler = handler }
 }
 
+/// Automatic reconnection's waits, released by the test instead of the clock.
+@MainActor private final class RetrySleeper {
+    private(set) var requested: [Duration] = []
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    var pending: Int { waiting.count }
+    func sleep(_ duration: Duration) async throws {
+        requested.append(duration)
+        await withCheckedContinuation { waiting.append($0) }
+        try Task.checkCancellation()
+    }
+    func release() { let resumed = waiting; waiting = []; resumed.forEach { $0.resume() } }
+}
+
 @MainActor @objcMembers final class CameraControlStoreChecks: XCTestCase {
     func testCredentialAwaitRetainsPreparedEndpointAndAuthentication() async throws {
         let plugin = SuspendedControlPlugin()
@@ -435,5 +448,169 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         _ = await store.shutdown()
     }
 
+    // MARK: Automatic reconnection
+
+    private static let fakeDescriptor = VendorDescriptor(id: "fake", displayName: "Fake", badgeText: "FAKE", signalHint: nil, sdkVersion: nil, sdkPresent: true)
+    private static let fakeCamera = ControlCamera(pluginID: "fake", id: "camera", name: "Camera", transport: .usb, address: "usb", fingerprint: nil)
+    private func settle(_ condition: @MainActor () -> Bool) async {
+        for _ in 0..<1000 where !condition() { await Task.yield() }
+    }
+
+    func testReconnectBackoffDoublesToAThirtySecondCapWithSmallJitter() {
+        let steps = (0..<7).map { CameraControlReconnectPolicy.delay(step: $0, jitter: 0) }
+        XCTAssertEqual(steps, [.seconds(2), .seconds(4), .seconds(8), .seconds(16), .seconds(30), .seconds(30), .seconds(30)])
+        XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 0, jitter: 1), .milliseconds(2200), "Jitter adds at most a tenth")
+        XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 99, jitter: 5), .seconds(33), "Jitter is clamped")
+    }
+
+    func testOnlyPassingFailuresAreRetried() {
+        func error(_ code: ControlReasonCode, _ retryable: Bool = true) -> ControlError { .init(code: code, retryable: retryable, message: "") }
+        for code in [ControlReasonCode.transport, .removed, .unavailable, .sdkFailure, .cleanupPending] {
+            XCTAssertTrue(CameraControlReconnectPolicy.retries(after: error(code)), "\(code)")
+            XCTAssertFalse(CameraControlReconnectPolicy.retries(after: error(code, false)), "\(code) marked final")
+        }
+        for code in [ControlReasonCode.authentication, .changedIdentity, .unsupported, .invalidRequest, .busy, .manual, .staleGeneration] {
+            XCTAssertFalse(CameraControlReconnectPolicy.retries(after: error(code)), "\(code) waits for the operator")
+        }
+        XCTAssertFalse(CameraControlReconnectPolicy.retries(after: CameraControlCredentialError(action: "load", status: -25308)),
+            "A Keychain error waits for the operator")
+    }
+
+    func testReconnectDecisionStopsForTheOperatorAndWaitsWhileBusy() {
+        typealias Policy = CameraControlReconnectPolicy
+        func decide(shuttingDown: Bool = false, assigned: Bool = true, autoReconnect: Bool = true, manual: Bool = false,
+            removed: Bool = false, connected: Bool = false, busy: Bool = false) -> Policy.Decision {
+            Policy.decision(shuttingDown: shuttingDown, assigned: assigned, autoReconnect: autoReconnect, manuallyDisconnected: manual,
+                removed: removed, connected: connected, busy: busy)
+        }
+        XCTAssertEqual(decide(), .attempt)
+        XCTAssertEqual(decide(busy: true), .wait)
+        for stopped in [decide(shuttingDown: true), decide(assigned: false), decide(autoReconnect: false), decide(manual: true),
+            decide(removed: true), decide(connected: true), decide(connected: true, busy: true)] {
+            XCTAssertEqual(stopped, .stop)
+        }
+    }
+
+    func testSavedPairingsWithoutTheFlagReconnectAndDisconnectIsSaved() throws {
+        let old = Data(#"{"version":1,"plugins":{"fake":{"feed":{"camera":{"pluginID":"fake","id":"camera","name":"Camera","transport":"usb","address":"usb","authenticationMode":"none"},"showOverlay":true}}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(CameraControlAssignmentSnapshot.self, from: old)
+        XCTAssertEqual(decoded.plugins["fake"]?["feed"]?.autoReconnect, true, "Saved before the flag: reconnects")
+        XCTAssertEqual(decoded.plugins["fake"]?["feed"]?.showOverlay, true)
+        var off = try XCTUnwrap(decoded.plugins["fake"]?["feed"]); off.autoReconnect = false
+        XCTAssertEqual(try JSONDecoder().decode(CameraControlAssignment.self, from: JSONEncoder().encode(off)), off)
+    }
+
+    func testFailedLaunchRestoreRetriesWithBackoffUntilTheBodyAnswers() async throws {
+        let persistence = MemoryControlAssignments()
+        persistence.value.plugins = ["fake": ["feed": .init(camera: Self.fakeCamera)]]
+        let plugin = FakeControlPlugin(descriptor: Self.fakeDescriptor, cameras: [])
+        let sleeper = RetrySleeper()
+        let store = CameraControlStore(plugins: ["fake": plugin], credentials: MemoryControlCredentials(), persistence: persistence,
+            sleep: { try await sleeper.sleep($0) }, jitter: { 0 })
+        await store.restoreConnections()
+        let state = store.state(for: "feed")
+        XCTAssertFalse(state.connected)
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.requested, [.seconds(2)])
+        XCTAssertNotNil(state.retryAt)
+        XCTAssertNotNil(state.lostAt, "A body that didn't answer at launch reads as lost, so Problems lists it")
+        XCTAssertEqual(state.reconnectStatus(at: state.retryAt!.addingTimeInterval(-1.5)), "Trying again in 2 s")
+        sleeper.release()
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.requested, [.seconds(2), .seconds(4)], "Still away: the wait doubles")
+        plugin.replaceCameras([Self.fakeCamera])
+        sleeper.release()
+        await settle { state.connected }
+        XCTAssertTrue(state.connected, "Back: the retry connects with no button pressed")
+        XCTAssertNil(state.retryAt); XCTAssertNil(state.lostAt); XCTAssertFalse(state.retrying)
+        XCTAssertEqual(sleeper.pending, 0)
+        _ = await store.shutdown()
+    }
+
+    func testDroppedBodyRetriesAndAnOperatorDisconnectCancelsIt() async throws {
+        let plugin = SuspendedControlPlugin(), sleeper = RetrySleeper()
+        let secret = ControlCredentials.usernamePassword(username: "user", password: "secret")
+        let credentials = MemoryControlCredentials()
+        try await credentials.save(secret, service: "test", account: "test")
+        let persistence = MemoryControlAssignments()
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: persistence,
+            sleep: { try await sleeper.sleep($0) }, jitter: { 0 })
+        await store.connect(camera: plugin.camera, to: "feed", credentials: secret, saveCredentials: false)
+        let state = store.state(for: "feed")
+        plugin.handler?(.disconnected(feedID: "feed", generation: state.generation, reason: .init(code: .transport, retryable: true, message: "Lost camera")))
+        XCTAssertTrue(state.retrying)
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.requested, [.seconds(2)], "A body that drops on its own is tried again")
+        await settle { plugin.connectedGeneration == nil }
+        sleeper.release()
+        await settle { state.connected }
+        XCTAssertTrue(state.connected)
+        XCTAssertEqual(plugin.connectCount, 2)
+        // The operator's Disconnect: no retry now, and none on the next launch.
+        plugin.handler?(.disconnected(feedID: "feed", generation: state.generation, reason: .init(code: .transport, retryable: true, message: "Lost camera")))
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.pending, 1)
+        await store.disconnect("feed")
+        XCTAssertNil(state.retryAt)
+        sleeper.release()
+        await settle { false }
+        XCTAssertEqual(plugin.connectCount, 2, "A cancelled retry never connects")
+        XCTAssertEqual(persistence.value.plugins["test"]?["feed"]?.autoReconnect, false)
+        let relaunchPlugin = SuspendedControlPlugin()
+        let relaunched = CameraControlStore(plugins: ["test": relaunchPlugin], credentials: credentials, persistence: persistence,
+            sleep: { try await sleeper.sleep($0) })
+        await relaunched.restoreConnections()
+        XCTAssertTrue(relaunchPlugin.requests.isEmpty, "A manual Disconnect stays off across launches")
+        await relaunched.reconnect("feed")
+        XCTAssertTrue(relaunched.state(for: "feed").connected)
+        XCTAssertEqual(persistence.value.plugins["test"]?["feed"]?.autoReconnect, true, "Reconnect turns it back on")
+        _ = await relaunched.shutdown()
+        _ = await store.shutdown()
+    }
+
+    func testMissingSignInStopsWithItsMessageAndShutdownCancelsAWaitingRetry() async throws {
+        let plugin = SuspendedControlPlugin(), sleeper = RetrySleeper()
+        let persistence = MemoryControlAssignments()
+        persistence.value.plugins = ["test": ["feed": .init(camera: plugin.camera)]]
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(), persistence: persistence,
+            sleep: { try await sleeper.sleep($0) })
+        await store.restoreConnections()
+        XCTAssertTrue(sleeper.requested.isEmpty, "No saved sign-in: nothing to retry")
+        XCTAssertFalse(store.state(for: "feed").retrying)
+        XCTAssertNotNil(store.state(for: "feed").message)
+        XCTAssertNil(store.state(for: "feed").lostAt)
+        let requests = plugin.requests.count
+        await store.connect(camera: plugin.camera, to: "feed", credentials: .usernamePassword(username: "user", password: "secret"), saveCredentials: false)
+        plugin.handler?(.disconnected(feedID: "feed", generation: store.state(for: "feed").generation,
+            reason: .init(code: .transport, retryable: true, message: "Lost camera")))
+        await settle { sleeper.pending == 1 }
+        XCTAssertEqual(sleeper.pending, 1)
+        _ = await store.shutdown()
+        XCTAssertNil(store.state(for: "feed").retryAt)
+        sleeper.release()
+        await settle { false }
+        XCTAssertEqual(plugin.requests.count, requests + 1, "Quitting cancels the waiting retry")
+    }
+
+    func testWakeRetriesAWaitingBodyNowWithItsBackoffReset() async throws {
+        let persistence = MemoryControlAssignments()
+        persistence.value.plugins = ["fake": ["feed": .init(camera: Self.fakeCamera)]]
+        let plugin = FakeControlPlugin(descriptor: Self.fakeDescriptor, cameras: [])
+        let sleeper = RetrySleeper()
+        let store = CameraControlStore(plugins: ["fake": plugin], credentials: MemoryControlCredentials(), persistence: persistence,
+            sleep: { try await sleeper.sleep($0) }, jitter: { 0 })
+        await store.restoreConnections()
+        await settle { sleeper.pending == 1 }
+        sleeper.release()
+        await settle { sleeper.requested.count == 2 }
+        XCTAssertEqual(sleeper.requested.last, .seconds(4))
+        store.retryPendingReconnects()
+        await settle { sleeper.requested.count == 3 }
+        XCTAssertEqual(sleeper.requested.last, .zero, "A wake tries now")
+        sleeper.release()
+        await settle { sleeper.pending == 1 && sleeper.requested.count == 4 }
+        XCTAssertEqual(sleeper.requested.last, .seconds(2), "and starts the backoff over")
+        _ = await store.shutdown()
+    }
 }
 #endif

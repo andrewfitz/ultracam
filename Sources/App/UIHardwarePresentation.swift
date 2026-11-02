@@ -52,6 +52,8 @@ struct UIHardwareBody: Identifiable, Equatable {
   var connected = false
   /// It dropped on its own; Reconnect uses the saved sign-in.
   var lost = false
+  /// It's reconnecting on its own.
+  var retrying = false
   /// Listed by the latest scan, or connected.
   var found = false
   /// A scan has run since launch, so "not found" means something.
@@ -70,9 +72,11 @@ struct UIHardwareBody: Identifiable, Equatable {
     if !connected { return lost ? .attention : .absent }
     return warnings.isEmpty && (noticeSeverity ?? .info) < .warning ? .healthy : .attention
   }
-  /// "Disconnected", "Not found on the network" or "Not connected", while it isn't connected.
+  /// "Reconnecting…", "Disconnected", "Not found on the network" or "Not connected", while it
+  /// isn't connected.
   var connectionText: String {
     if connected { return "Connected" }
+    if retrying { return "Reconnecting…" }
     if lost { return "Disconnected" }
     if feedID != nil && scanned && !found { return "Not found on the network" }
     return feedID == nil ? camera.address : "Not connected"
@@ -281,6 +285,7 @@ enum UIHardwareText {
         let state = controls.state(for: feedID)
         return UIHardwareBody(camera: assignment.camera, feedID: feedID, cameraName: names[feedID],
           connected: vendor.sdkPresent && state.connected, lost: vendor.sdkPresent && state.lostAt != nil,
+          retrying: vendor.sdkPresent && !state.connected && state.retrying,
           found: state.connected || scanned?.contains { $0.id == assignment.camera.id } == true,
           scanned: scanned != nil, properties: state.connected ? state.properties : [],
           notice: state.notice, noticeSeverity: state.noticeSeverity)

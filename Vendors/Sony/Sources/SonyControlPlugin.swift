@@ -270,6 +270,9 @@ final class SonyControlPlugin: CameraControlPlugin {
           if message.contains("unavailable in this build") { code = .unavailable }
           else if message.contains("fingerprint changed") || message.contains("fingerprint differs") || message.contains("changed after preparation") { code = .changedIdentity }
           else if message.contains("cannot mix") || message.contains("before adding a camera by IP") { code = .unsupported }
+          // CrError_Connect_SSH_ServerAuthenticationFailed and _UserAuthenticationFailed: a
+          // rejected sign-in, which an automatic reconnect must never repeat.
+          else if message.contains("(0x00008215)") || message.contains("(0x00008216)") { code = .authentication }
           else { code = .sdkFailure }
           continuation.resume(throwing: Self.failure(message, code)); return
         }

@@ -5,6 +5,52 @@ struct CameraControlAssignment: Codable, Equatable, Sendable {
     var camera: ControlCamera
     var showOverlay = false
     var preparationRequest: ControlPreparationRequest? = nil
+    /// Off after the operator's Disconnect, so a launch leaves the body alone; Connect or
+    /// Reconnect turns it back on.
+    var autoReconnect = true
+    private enum CodingKeys: String, CodingKey { case camera, showOverlay, preparationRequest, autoReconnect }
+}
+extension CameraControlAssignment {
+    /// Lenient, so a pairing saved before a field existed keeps its default: it reconnects.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        camera = try container.decode(ControlCamera.self, forKey: .camera)
+        showOverlay = try container.decodeIfPresent(Bool.self, forKey: .showOverlay) ?? false
+        preparationRequest = try container.decodeIfPresent(ControlPreparationRequest.self, forKey: .preparationRequest)
+        autoReconnect = try container.decodeIfPresent(Bool.self, forKey: .autoReconnect) ?? true
+    }
+}
+/// When a paired body that dropped, or didn't answer at launch, is tried again. Pure, so
+/// the store's tests never sleep.
+enum CameraControlReconnectPolicy {
+    /// Seconds before each try: 2, 4, 8, 16, then every 30.
+    static let delays: [Double] = [2, 4, 8, 16, 30]
+    /// `jitter` in 0...1 adds up to a tenth, so bodies that dropped together don't retry in step.
+    static func delay(step: Int, jitter: Double) -> Duration {
+        let base = delays[min(max(step, 0), delays.count - 1)]
+        return .milliseconds(Int((base * (1 + 0.1 * min(max(jitter, 0), 1)) * 1000).rounded()))
+    }
+    /// Only a passing failure is tried again. A changed identity, a rejected or missing
+    /// sign-in, an unsupported body or a Keychain error waits for the operator.
+    static func retries(after error: any Error) -> Bool {
+        guard let error = error as? ControlError else { return false }
+        return retries(code: error.code, retryable: error.retryable)
+    }
+    static func retries(code: ControlReasonCode, retryable: Bool) -> Bool {
+        switch code {
+        case .removed, .transport, .unavailable, .sdkFailure, .cleanupPending: return retryable
+        case .manual, .authentication, .changedIdentity, .invalidRequest, .invalidState, .staleGeneration,
+            .cancelled, .unsupported, .busy: return false
+        }
+    }
+    enum Decision: Equatable, Sendable { case attempt, wait, stop }
+    /// Before each try: stop once the body is connected, unpaired, disconnected by the
+    /// operator or the app is quitting; wait while another operation has the body.
+    static func decision(shuttingDown: Bool, assigned: Bool, autoReconnect: Bool, manuallyDisconnected: Bool,
+        removed: Bool, connected: Bool, busy: Bool) -> Decision {
+        if shuttingDown || !assigned || !autoReconnect || manuallyDisconnected || removed || connected { return .stop }
+        return busy ? .wait : .attempt
+    }
 }
 struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     var version = 1
@@ -65,6 +111,18 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     /// The body's latest notice that still matters (reconnecting, card full); recoveries clear it.
     var notice: String?
     var noticeSeverity: DeviceSeverity?
+    /// When the next automatic reconnect starts; nil when none is waiting.
+    var retryAt: Date?
+    /// An automatic reconnect is contacting the body.
+    var reconnecting = false
+    /// Trying again on its own, so its status says so instead of showing a dead error.
+    var retrying: Bool { reconnecting || retryAt != nil }
+    func reconnectStatus(at date: Date) -> String? {
+        if reconnecting { return "Reconnecting…" }
+        guard let retryAt else { return nil }
+        let seconds = Int(retryAt.timeIntervalSince(date).rounded(.up))
+        return seconds > 0 ? "Trying again in \(seconds) s" : "Reconnecting…"
+    }
     var cacheStatus: String {
         if !connected { return "Disconnected · cached values" }
         if dirty { return message == nil ? "Updating settings…" : "Settings update failed" }
@@ -82,6 +140,8 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     @ObservationIgnored private let credentials: any CameraControlCredentialStoring
     @ObservationIgnored private let persistence: any CameraControlAssignmentPersisting
     @ObservationIgnored private let now: @MainActor () -> Date
+    @ObservationIgnored private let sleep: @MainActor (Duration) async throws -> Void
+    @ObservationIgnored private let jitter: @MainActor () -> Double
     private var states: [String: CameraControlFeedState] = [:]
     private var routes: [String: String] = [:]
     private var preparedRequests: [String: ControlPreparationRequest] = [:]
@@ -104,14 +164,24 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     private var lastSuccessfulDiscovery: [String: Date] = [:]
     @ObservationIgnored private var restoreTask: Task<Void, Never>?
     @ObservationIgnored private var shutdownTask: Task<String?, Never>?
+    /// Automatic reconnection: one waiting timer per feed, and every attempt in one chain so
+    /// two bodies never scan or connect at once.
+    @ObservationIgnored private var retryTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var retrySteps: [String: Int] = [:]
+    @ObservationIgnored private var retryChain: Task<Void, Never>?
+    @ObservationIgnored private var queuedRetries: Set<String> = []
+    @ObservationIgnored private var connectFailures: [String: any Error] = [:]
     var needsShutdown: Bool { requestedWork }
     var available: Bool { plugins.values.contains { $0.descriptor.sdkPresent } }
     var descriptors: [VendorDescriptor] { plugins.values.map(\.descriptor).sorted { $0.localizedDisplayName() < $1.localizedDisplayName() } }
 
     init(plugins: [String: any CameraControlPlugin], credentials: any CameraControlCredentialStoring = CameraControlKeychain(),
         persistence: any CameraControlAssignmentPersisting = CameraControlPreferences(),
-        now: @escaping @MainActor () -> Date = { Date() }) {
+        now: @escaping @MainActor () -> Date = { Date() },
+        sleep: @escaping @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        jitter: @escaping @MainActor () -> Double = { Double.random(in: 0...1) }) {
         self.plugins = plugins; self.credentials = credentials; self.persistence = persistence; self.now = now
+        self.sleep = sleep; self.jitter = jitter
         do { assignments = try persistence.load().plugins }
         catch { persistenceWritable = false; discoveryMessages["persistence"] = error.localizedDescription }
         for (id, plugin) in plugins {
@@ -181,10 +251,15 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             return result
         } catch { report(error, feedID, generation); return nil }
     }
-    func connect(camera: ControlCamera, to feedID: String, credentials supplied: ControlCredentials? = nil, saveCredentials: Bool = true) async {
+    /// `automatic` is a reconnect the store started itself; any other is the operator's, and
+    /// turns automatic reconnection back on for the feed.
+    func connect(camera: ControlCamera, to feedID: String, credentials supplied: ControlCredentials? = nil, saveCredentials: Bool = true,
+        automatic: Bool = false) async {
         let state = state(for: feedID)
         guard !state.busy, !state.connected, !shuttingDown, !removed.contains(feedID), let plugin = plugins[camera.pluginID] else { return }
         manuallyDisconnected.remove(feedID)
+        if !automatic { setAutoReconnect(true, for: feedID) }
+        connectFailures.removeValue(forKey: feedID)
         let generation = begin(feedID, camera.pluginID)
         defer {
             if state.generation == generation { pendingCameras.removeValue(forKey: feedID) }
@@ -241,9 +316,11 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             guard current(feedID, generation) else {
                 _ = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin); return
             }
-            assignments[resolved.pluginID, default: [:]][feedID] = .init(camera: resolved, showOverlay: assignment(for: feedID)?.showOverlay ?? false, preparationRequest: request)
+            assignments[resolved.pluginID, default: [:]][feedID] = .init(camera: resolved, showOverlay: assignment(for: feedID)?.showOverlay ?? false,
+                preparationRequest: request, autoReconnect: true)
             persist(); addCamera(resolved)
             state.connected = true; state.dirty = true; state.lostAt = nil; state.notice = nil; state.noticeSeverity = nil
+            clearRetry(feedID)
             // Pairing succeeded independently of whether the camera can read
             // properties right now. Save only after confirmed connect, and do
             // not let a vault failure prevent the initial settings read.
@@ -265,6 +342,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             apply(properties, state: state, revision: revision)
         } catch {
             if !current(feedID, generation) { _ = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin); return }
+            if !state.connected { connectFailures[feedID] = error }
             state.message = [state.message, error.localizedDescription].compactMap { $0 }.joined(separator: "\n")
             state.dirty = true
             if !state.connected { _ = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin) }
@@ -292,6 +370,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         await connect(camera: camera, to: feedID, saveCredentials: false)
     }
     func reset() {
+        for feed in Array(states.keys) { clearRetry(feed) }
         let cleanup = states.map { feed, state in (feed, state.generation, plugin(for: feed)) }
         for feed in Array(states.keys) {
             retire(feed); manuallyDisconnected.insert(feed)
@@ -312,10 +391,13 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             }
         }
     }
+    /// The operator's Reconnect: it turns automatic reconnection back on.
     func reconnect(_ feedID: String) async {
         guard let assignment = assignment(for: feedID) else { return }
         await connect(camera: assignment.camera, to: feedID, saveCredentials: false)
     }
+    /// Once per launch, one body at a time. A body that doesn't answer is tried again on
+    /// its own with backoff; one the operator disconnected stays disconnected.
     func restoreConnections() async {
         if let restoreTask { await restoreTask.value; return }
         guard !restored, !shuttingDown else { return }
@@ -323,12 +405,21 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         let feeds = Set(assignments.values.flatMap { $0.keys }).sorted()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            for feed in feeds where !self.manuallyDisconnected.contains(feed) {
+            for feed in feeds where !self.manuallyDisconnected.contains(feed) && self.assignment(for: feed)?.autoReconnect != false {
                 guard !self.shuttingDown, !Task.isCancelled else { return }
-                await self.reconnect(feed)
+                await self.attemptReconnect(feed)
             }
         }
         restoreTask = task; await task.value; restoreTask = nil
+    }
+    /// The Mac woke or the network came back: a body waiting to reconnect tries now, its
+    /// backoff reset.
+    func retryPendingReconnects() {
+        guard !shuttingDown else { return }
+        for feed in Array(retryTasks.keys) {
+            retrySteps.removeValue(forKey: feed)
+            scheduleRetry(feed, after: .zero)
+        }
     }
     func refresh(_ feedID: String) async {
         let state = state(for: feedID)
@@ -370,6 +461,9 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
         let generation = state.generation
         let plugin = plugin(for: feedID)
         manuallyDisconnected.insert(feedID)
+        clearRetry(feedID)
+        // Sticky across launches: the next launch leaves this body alone until Connect.
+        if !forget { setAutoReconnect(false, for: feedID) }
         retire(feedID)
         state.lostAt = nil; state.notice = nil; state.noticeSeverity = nil
         if forget {
@@ -392,6 +486,7 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
             let plugin = plugins[camera.pluginID], !shuttingDown, !state.busy else { return }
         let generation = state.generation, revision = state.invalidationRevision
         manuallyDisconnected.insert(feedID)
+        clearRetry(feedID)
         state.busy = true; state.message = nil
         refreshTasks.removeValue(forKey: feedID)?.cancel()
         defer {
@@ -409,6 +504,8 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
     func shutdown() async -> String? {
         if let shutdownTask { return await shutdownTask.value }
         shuttingDown = true; restoreTask?.cancel()
+        for feed in Array(states.keys) { clearRetry(feed) }
+        retryChain?.cancel()
         for task in discoveryTasks.values { task.cancel() }
         for feed in Array(states.keys) { retire(feed) }
         guard requestedWork else { return nil }
@@ -504,6 +601,10 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
                 enqueueCleanup(feedID: feed, generation: generation, plugin: plugin)
                 Task { _ = await self.cleanupConnection(feedID: feed, generation: generation, plugin: plugin) }
             }
+            if reason.code != .manual, CameraControlReconnectPolicy.retries(code: reason.code, retryable: reason.retryable) {
+                retrySteps.removeValue(forKey: feed)
+                scheduleRetry(feed)
+            }
         case .error(_, _, let error): state.message = error.message
         case .notice(_, _, let message, let severity):
             state.notice = severity > .info ? message : nil
@@ -543,6 +644,75 @@ struct CameraControlAssignmentSnapshot: Codable, Equatable, Sendable {
                 if pendingCleanup[feedID]?.isEmpty == true { pendingCleanup.removeValue(forKey: feedID) }
             }
         }
+    }
+    private func setAutoReconnect(_ on: Bool, for feed: String) {
+        guard let pluginID = assignment(for: feed)?.camera.pluginID, assignments[pluginID]?[feed]?.autoReconnect != on else { return }
+        assignments[pluginID]?[feed]?.autoReconnect = on
+        persist()
+    }
+    private func retryDecision(_ feed: String) -> CameraControlReconnectPolicy.Decision {
+        let assignment = assignment(for: feed), state = state(for: feed)
+        return CameraControlReconnectPolicy.decision(shuttingDown: shuttingDown, assigned: assignment != nil,
+            autoReconnect: assignment?.autoReconnect ?? false, manuallyDisconnected: manuallyDisconnected.contains(feed),
+            removed: removed.contains(feed), connected: state.connected, busy: state.busy)
+    }
+    private func clearRetry(_ feed: String) {
+        retryTasks.removeValue(forKey: feed)?.cancel()
+        retrySteps.removeValue(forKey: feed)
+        if let state = states[feed], state.retryAt != nil { state.retryAt = nil }
+    }
+    private func scheduleRetry(_ feed: String, after override: Duration? = nil) {
+        retryTasks.removeValue(forKey: feed)?.cancel()
+        guard retryDecision(feed) != .stop else { clearRetry(feed); return }
+        let delay: Duration
+        if let override { delay = override } else {
+            delay = CameraControlReconnectPolicy.delay(step: retrySteps[feed, default: 0], jitter: jitter())
+            retrySteps[feed, default: 0] += 1
+        }
+        let parts = delay.components
+        state(for: feed).retryAt = now().addingTimeInterval(Double(parts.seconds) + Double(parts.attoseconds) / 1e18)
+        let sleep = self.sleep
+        retryTasks[feed] = Task { @MainActor [weak self] in
+            do { try await sleep(delay) } catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.retryTasks.removeValue(forKey: feed)
+            await self.queueRetry(feed)
+        }
+    }
+    /// Behind any attempt already running, and behind launch restoration.
+    private func queueRetry(_ feed: String) async {
+        guard queuedRetries.insert(feed).inserted else { return }
+        let previous = retryChain
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            if let restoring = self.restoreTask { await restoring.value }
+            self.queuedRetries.remove(feed)
+            await self.attemptReconnect(feed)
+        }
+        retryChain = task
+        await task.value
+    }
+    /// One automatic try. A passing failure waits for the next; any other stops, its
+    /// message left for the operator.
+    private func attemptReconnect(_ feed: String) async {
+        let state = state(for: feed)
+        state.retryAt = nil
+        switch retryDecision(feed) {
+        case .stop: clearRetry(feed); return
+        case .wait: scheduleRetry(feed); return
+        case .attempt: break
+        }
+        guard let camera = assignment(for: feed)?.camera else { return }
+        state.reconnecting = true
+        await connect(camera: camera, to: feed, saveCredentials: false, automatic: true)
+        state.reconnecting = false
+        // No failure of its own: superseded (a disconnect, a drop that scheduled its own retry, quitting).
+        guard !state.connected, let error = connectFailures.removeValue(forKey: feed) else { return }
+        guard CameraControlReconnectPolicy.retries(after: error), retryDecision(feed) != .stop else { clearRetry(feed); return }
+        // Not answering at launch reads like a body that dropped: Problems lists it.
+        if state.lostAt == nil { state.lostAt = now() }
+        scheduleRetry(feed)
     }
     private func scheduleRefresh(_ feed: String) {
         let state = state(for: feed)

@@ -39,7 +39,7 @@ struct UIInspectorViewContent: View {
             HStack(spacing: 6) {
               Label(assignment.camera.name, systemImage: UISymbol.cameraBody)
               Spacer(minLength: 4)
-              Label(state.connected ? "Connected" : "Disconnected", systemImage: UISymbol.wifi(connected: state.connected))
+              Label(state.connected ? "Connected" : state.retrying ? "Reconnecting…" : "Disconnected", systemImage: UISymbol.wifi(connected: state.connected))
                 .font(.uiMeta).foregroundStyle(state.connected ? .secondary : .primary)
                 .symbolRenderingMode(.palette).tint(state.connected ? .secondary : .orange)
             }

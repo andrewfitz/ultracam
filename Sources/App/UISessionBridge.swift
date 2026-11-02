@@ -308,7 +308,7 @@ struct UISessionBridge {
     let properties = state.connected ? state.properties : []
     var body = UICameraBody(name: assignment.camera.name, connected: state.connected,
       battery: UIHardwareText.battery(properties), id: assignment.camera.id, lost: !state.connected && state.lostAt != nil,
-      notice: state.notice)
+      retrying: !state.connected && state.retrying, notice: state.notice)
     let worst = properties.filter { [.thermal, .power, .media].contains($0.role) && ($0.severity ?? .info) >= .warning }
       .max { ($0.severity ?? .info) < ($1.severity ?? .info) }
     if let worst {

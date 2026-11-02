@@ -369,16 +369,26 @@ private final class SonyStub: UCSonyCameraControl {
       expect(next.assignment(for: "saved-feed")?.camera.address == movedCamera.address,
         "saved reconnection matches stable MAC and fingerprint while accepting DHCP address changes")
       await next.restoreConnections()
-      expect(nextBackend.discoveryCalls == 1 && nextBackend.connectCalls == 1,
-        "startup restoration runs once without polling or repeated connection attempts")
+      expect(nextBackend.discoveryCalls == 1 && nextBackend.connectCalls == 1 && next.state(for: "saved-feed").retryAt == nil,
+        "startup restoration runs once per launch, and a body that answered waits for no retry")
       await next.disconnect("saved-feed")
       await next.restoreConnections()
       let retained = await vault.stored(for: camera)
-      expect(retained == secret && !next.state(for: "saved-feed").connected && nextBackend.connectCalls == 1,
-        "manual disconnect retains the secret and suppresses automatic reconnection for this session")
+      expect(retained == secret && !next.state(for: "saved-feed").connected && nextBackend.connectCalls == 1 &&
+        next.state(for: "saved-feed").retryAt == nil,
+        "manual disconnect retains the secret and suppresses automatic reconnection")
+      let relaunchBackend = SonyStub()
+      relaunchBackend.discoveredCameras = [movedCamera]
+      let relaunched = CameraControlStore(defaults: defaults, backend: relaunchBackend, credentials: vault)
+      await relaunched.restoreConnections()
+      expect(relaunchBackend.discoveryCalls == 0 && relaunchBackend.connectCalls == 0 &&
+        relaunched.assignment(for: "saved-feed")?.autoReconnect == false,
+        "a manual Disconnect stays off across launches")
+      _ = await relaunched.shutdown()
       await next.reconnect("saved-feed")
-      expect(next.state(for: "saved-feed").connected && nextBackend.connectCalls == 2,
-        "explicit reconnect consumes saved credentials without username/password reentry")
+      expect(next.state(for: "saved-feed").connected && nextBackend.connectCalls == 2 &&
+        next.assignment(for: "saved-feed")?.autoReconnect == true,
+        "explicit reconnect consumes saved credentials without username/password reentry and turns automatic reconnection back on")
       await next.disconnect("saved-feed", forget: true)
       let retainedAfterUnassign = await vault.stored(for: camera)
       expect(retainedAfterUnassign == secret && next.assignment(for: "saved-feed") == nil,
@@ -474,16 +484,24 @@ private final class SonyStub: UCSonyCameraControl {
       saveAssignment(defaults)
       await vault.seed(secret, for: camera)
       backend.discoveredCameras = []
-      let store = CameraControlStore(defaults: defaults, backend: backend, credentials: vault)
+      let sleeper = RetrySleeper()
+      let store = CameraControlStore(defaults: defaults, backend: backend, credentials: vault, sleep: { try await sleeper.sleep($0) })
       await store.restoreConnections()
       await store.restoreConnections()
-      await pause(0.1)
-      expect(backend.discoveryCalls == 1 && backend.connectCalls == 0,
-        "an offline saved camera receives one startup scan with no automatic retry")
+      await drain()
+      expect(backend.discoveryCalls == 1 && backend.connectCalls == 0 && sleeper.requested == [.seconds(2)] &&
+        store.state(for: "saved-feed").retryAt != nil && store.state(for: "saved-feed").lostAt != nil,
+        "an offline saved camera receives one startup scan, then waits 2 s to try again and reads as lost")
+      sleeper.release()
+      await eventually("a retry while still offline rescans once and backs off") { backend.discoveryCalls == 2 && sleeper.pending == 1 }
+      expect(sleeper.requested == [.seconds(2), .seconds(4)] && !store.state(for: "saved-feed").connected,
+        "each failed retry doubles the wait")
       backend.discoveredCameras = [camera]
-      await store.reconnect("saved-feed")
-      expect(backend.discoveryCalls == 2 && store.state(for: "saved-feed").connected,
-        "explicit reconnect rescans after the camera becomes reachable")
+      sleeper.release()
+      await eventually("the retry reconnects once the camera is reachable") { store.state(for: "saved-feed").connected }
+      expect(backend.discoveryCalls == 3 && backend.connectCalls == 1 && store.state(for: "saved-feed").retryAt == nil &&
+        store.state(for: "saved-feed").lostAt == nil && sleeper.pending == 0,
+        "automatic reconnection needs no button once the camera becomes reachable")
       await vault.failures(delete: true)
       await store.forgetCredentials("saved-feed")
       let retained = await vault.stored(for: camera)
@@ -526,6 +544,18 @@ private final class SonyStub: UCSonyCameraControl {
     print("Sony credential checks passed: isolated vault persistence, startup restoration, pinning, explicit reconnect/forget and failure handling.")
   }
 
+  /// Automatic reconnection's waits, released by the test instead of the clock.
+  @MainActor private final class RetrySleeper {
+    private(set) var requested: [Duration] = []
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    var pending: Int { waiting.count }
+    func sleep(_ duration: Duration) async throws {
+      requested.append(duration)
+      await withCheckedContinuation { waiting.append($0) }
+      try Task.checkCancellation()
+    }
+    func release() { let resumed = waiting; waiting = []; resumed.forEach { $0.resume() } }
+  }
   @MainActor private static func pause(_ seconds: Double = 0.65) async {
     try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
   }

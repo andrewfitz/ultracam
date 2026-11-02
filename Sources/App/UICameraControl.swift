@@ -21,6 +21,19 @@ struct UICameraControlButton: View {
     }
 }
 
+/// While a body reconnects on its own: "Reconnecting…" or "Trying again in 8 s", its last
+/// error as help rather than a dead warning.
+struct UICameraControlReconnectStatus: View {
+    let state: CameraControlFeedState
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Label(state.reconnectStatus(at: context.date) ?? "Reconnecting…", systemImage: "arrow.clockwise")
+                .foregroundStyle(.secondary)
+        }
+        .help(state.message ?? "")
+    }
+}
+
 /// Operates a camera's paired body: its settings, Reconnect, Disconnect, Unassign and its saved
 /// sign-in. Pairing lives in Settings › Hardware, so opening this never scans the network.
 struct UICameraControlSettings: View {
@@ -59,7 +72,9 @@ struct UICameraControlSettings: View {
                         if vendor?.sdkPresent == false {
                             Label("\(vendor?.localizedDisplayName() ?? "Camera control") is not included in this build.", systemImage: "info.circle")
                         } else { connection(assignment) }
-                        if let message = state.message {
+                        if state.retrying {
+                            UICameraControlReconnectStatus(state: state)
+                        } else if let message = state.message {
                             Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
                         }
                         if let factory = viewFactories[pluginID] { factory(vendorContext) }

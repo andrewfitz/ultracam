@@ -1,10 +1,12 @@
 import AppKit
+import Network
 import SwiftUI
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
   weak var model: AppModel?
   private var menuBar: UIMenuBarController?
   private var alerts: UIAlertCoordinator?
+  private var cameraControlRetries: CameraControlRetryTriggers?
   private var terminationPending = false
   /// A Quit the operator has confirmed, so the second pass through here doesn't ask again.
   private var quitConfirmed = false
@@ -29,6 +31,7 @@ import SwiftUI
     menuBar = UIMenuBarController(model: model, interface: UIAppEnvironment.interface)
     if !CommandLine.arguments.contains("--ui-self-test") {
       Task { @MainActor in await model.cameraControls.restoreConnections() }
+      cameraControlRetries = CameraControlRetryTriggers(store: model.cameraControls)
       // Here, before launch finishes: the system asks for the delegate that early.
       let notifications = UIUserNotifications()
       notifications.opened = { [weak self] in self?.showMainWindow() }
@@ -137,5 +140,28 @@ struct UltracamApp: App {
     }
     .defaultSize(UISettingsLayout.defaultSize)
     .windowResizability(.contentMinSize)
+  }
+}
+
+/// A wake, or the network coming back, retries camera bodies waiting to reconnect now rather
+/// than after their backoff.
+@MainActor private final class CameraControlRetryTriggers {
+  private let path = NWPathMonitor()
+  private var satisfied: Bool?
+
+  init(store: CameraControlStore) {
+    NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak store] _ in
+      MainActor.assumeIsolated { store?.retryPendingReconnects() }
+    }
+    path.pathUpdateHandler = { [weak self, weak store] update in
+      let now = update.status == .satisfied
+      MainActor.assumeIsolated {
+        guard let self else { return }
+        // The first report is the current state, not a change.
+        if now, self.satisfied == false { store?.retryPendingReconnects() }
+        self.satisfied = now
+      }
+    }
+    path.start(queue: .main)
   }
 }
