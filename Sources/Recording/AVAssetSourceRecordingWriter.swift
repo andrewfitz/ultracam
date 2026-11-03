@@ -1057,9 +1057,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       throw RecordingLUTBurnInError.renderFailed(error.localizedDescription)
     }
     Self.copyImageAttachments(from: source, to: destination)
-    // The source's HDR mastering metadata and the app's own colour label
-    // describe the camera picture, not the graded one.
-    for key in [kCVImageBufferMasteringDisplayColorVolumeKey, kCVImageBufferContentLightLevelInfoKey,
+    // The source's colour space, ICC profile, gamma, log curve, HDR metadata
+    // and the app's own colour label describe the camera picture, not the
+    // graded one; `applyEncoderColour` rewrites only primaries, transfer,
+    // matrix and siting, so any of these left on the frame would contradict it.
+    for key in [kCVImageBufferCGColorSpaceKey, kCVImageBufferICCProfileKey, kCVImageBufferGammaLevelKey,
+      kCVImageBufferLogTransferFunctionKey, kCVImageBufferMasteringDisplayColorVolumeKey,
+      kCVImageBufferContentLightLevelInfoKey, kCVImageBufferAmbientViewingEnvironmentKey,
       Self.declaredColorimetryAttachmentKey as CFString] { CVBufferRemoveAttachment(destination, key) }
     applyEncoderColour(to: destination)
     telemetryLock.withLock {

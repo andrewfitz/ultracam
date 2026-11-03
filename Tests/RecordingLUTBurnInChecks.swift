@@ -182,6 +182,51 @@ import XCTest
       "\(clean.sidecar.metadata.conversionNotes)")
   }
 
+  /// The camera's own colour interpretation (colour space, ICC, gamma, log
+  /// curve, HDR metadata, the app's colour label) never reaches the encoder on
+  /// a graded frame, where it would contradict the LUT output's tags. The
+  /// clean take keeps it, as before.
+  func testBurnedInFrameDropsTheCamerasColourInterpretation() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("Metal 4 required") }
+    let source = try declaration()
+    let interpretation: [CFString] = [kCVImageBufferGammaLevelKey, kCVImageBufferLogTransferFunctionKey,
+      kCVImageBufferICCProfileKey, kCVImageBufferAmbientViewingEnvironmentKey,
+      LUTProcessor.declaredColorimetryAttachmentKey]
+    func tagged() throws -> CVPixelBuffer {
+      let frame = try v210Frame()
+      LUTProcessor.stampDeclaredColorimetry(.rec709Video, on: frame)
+      CVBufferSetAttachment(frame, kCVImageBufferGammaLevelKey, NSNumber(value: 2.4), .shouldPropagate)
+      CVBufferSetAttachment(frame, kCVImageBufferLogTransferFunctionKey, kCVImageBufferLogTransferFunction_AppleLog, .shouldPropagate)
+      CVBufferSetAttachment(frame, kCVImageBufferICCProfileKey, Data([0, 1, 2, 3]) as CFData, .shouldPropagate)
+      CVBufferSetAttachment(frame, kCVImageBufferAmbientViewingEnvironmentKey, Data(repeating: 1, count: 8) as CFData, .shouldPropagate)
+      for key in interpretation { XCTAssertNotNil(CVBufferCopyAttachment(frame, key, nil), "\(key)") }
+      return frame
+    }
+    func handed(_ burnIn: (any RecordingLUTBurnIn)?) throws -> Set<String> {
+      let folder = try temporaryFolder(); defer { try? FileManager.default.removeItem(at: folder) }
+      let movie = folder.appendingPathComponent("tags.mov")
+      let config = try configuration(source: source, movie: movie, profile: .proRes422HQ, burnIn: burnIn)
+      let seen = Handed()
+      var keys = Set<String>()
+      let writer = try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { session, image, pts, duration in
+        let present = interpretation.filter { CVBufferCopyAttachment(image, $0, nil) != nil }.map { $0 as String }
+        seen.lock.withLock { keys = Set(present) }
+        var flags = VTEncodeInfoFlags()
+        return VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration,
+          frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
+      })
+      try writer.start()
+      try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+      XCTAssertEqual(try writer.appendVideoOutcome(sample(tagged())), .appended)
+      try writer.finish()
+      return seen.lock.withLock { keys }
+    }
+    let renderer = try RecordingLUTRenderer(snapshot: snapshot(cube: cubeText(transform: { 1 - $0 }), colour: .rec709Video))
+    XCTAssertEqual(try handed(renderer), [], "Only the LUT output's tags describe the graded frame")
+    XCTAssertTrue(try handed(nil).isSuperset(of: [kCVImageBufferGammaLevelKey as String,
+      kCVImageBufferLogTransferFunctionKey as String]), "The clean take keeps the camera's tags")
+  }
+
   // MARK: Fixtures
 
   private struct Recorded {
