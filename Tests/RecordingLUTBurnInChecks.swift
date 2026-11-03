@@ -182,6 +182,165 @@ import XCTest
       "\(clean.sidecar.metadata.conversionNotes)")
   }
 
+  // MARK: A take's frames and its processor
+
+  /// A take of many frames: every frame is burned in and encoded, the LUT pass
+  /// writes into the encoder pool's recycled buffers (never more than the
+  /// pool's bound), and the take's own LUT processor goes away with the take.
+  func testEveryFrameRecyclesTheEncoderPoolAndTheProcessorEndsWithTheTake() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("Metal 4 required") }
+    let source = try declaration()
+    weak var weakRenderer: RecordingLUTRenderer?
+    var surfaces = Set<IOSurfaceID>()
+    var appended = 0
+    try autoreleasepool {
+      let renderer = try RecordingLUTRenderer(snapshot: snapshot(cube: cubeText(transform: { 1 - $0 }), colour: .rec709Video))
+      weakRenderer = renderer
+      let folder = try temporaryFolder(); defer { try? FileManager.default.removeItem(at: folder) }
+      let movie = folder.appendingPathComponent("many.mov")
+      let config = try configuration(source: source, movie: movie, profile: .proRes422HQ, burnIn: renderer)
+      let ids = Inspected()
+      var seen = Set<IOSurfaceID>()
+      let writer = try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { session, image, pts, duration in
+        if let s = CVPixelBufferGetIOSurface(image)?.takeUnretainedValue() { ids.lock.withLock { _ = seen.insert(IOSurfaceGetID(s)) } }
+        var flags = VTEncodeInfoFlags()
+        return VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration,
+          frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
+      })
+      try writer.start()
+      try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+      let frame = try v210Frame()
+      for index in 0..<120 {
+        let outcome = try writer.appendVideoOutcome(sample(frame, index: index))
+        if outcome == .appended { appended += 1 }
+      }
+      try writer.finish()
+      surfaces = ids.lock.withLock { seen }
+      XCTAssertEqual(writer.telemetry.gpuConvertedFrames, 120)
+      XCTAssertEqual(writer.telemetry.encodedVideo, 120)
+      XCTAssertEqual(writer.telemetry.passThroughFrames, 0)
+    }
+    XCTAssertEqual(appended, 120, "Every frame, none dropped")
+    XCTAssertLessThanOrEqual(surfaces.count, AVAssetSourceRecordingWriter.encoderPoolThreshold,
+      "The LUT pass writes into the encoder pool's own recycled buffers")
+    XCTAssertNil(weakRenderer, "The take's LUTProcessor is released when the take's writer is")
+  }
+
+  /// HEVC Main: an 8-bit 4:2:0 camera through the LUT straight into the
+  /// encoder's 420v pool (8-bit encode, 2×2 chroma blocks).
+  func testBurnInIntoHEVCMain420() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("Metal 4 required") }
+    let source = try declaration(pixel: .video420)
+    let renderer = try RecordingLUTRenderer(snapshot: snapshot(cube: cubeText(transform: { 1 - $0 }), colour: .rec709Video))
+    let folder = try temporaryFolder(); defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("hevc.mov")
+    let config = try configuration(source: source, movie: movie, profile: .hevcMain, burnIn: renderer)
+    let inspected = Inspected()
+    let writer = try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { session, image, pts, duration in
+      CVPixelBufferLockBaseAddress(image, .readOnly)
+      let y = CVPixelBufferGetBaseAddressOfPlane(image, 0)!.assumingMemoryBound(to: UInt8.self)
+      let uv = CVPixelBufferGetBaseAddressOfPlane(image, 1)!.assumingMemoryBound(to: UInt8.self)
+      let middle = Self.height / 2 * CVPixelBufferGetBytesPerRowOfPlane(image, 0) + Self.width / 2
+      let chromaMiddle = Self.height / 4 * CVPixelBufferGetBytesPerRowOfPlane(image, 1) + Self.width / 2
+      var value = Recorded()
+      value.luma = Int(y[middle])
+      value.chroma = [Int(uv[chromaMiddle]), Int(uv[chromaMiddle + 1])]
+      CVPixelBufferUnlockBaseAddress(image, .readOnly)
+      value.format = CVPixelBufferGetPixelFormatType(image)
+      inspected.lock.withLock { inspected.value = value }
+      var flags = VTEncodeInfoFlags()
+      return VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration,
+        frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
+    })
+    try writer.start()
+    try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    XCTAssertEqual(try writer.appendVideoOutcome(sample(nv12Frame(luma: 71))), .appended)
+    try writer.finish()
+    let burned = inspected.lock.withLock { inspected.value }
+    XCTAssertEqual(burned.format, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    // 8-bit video range: 71 is (71 − 16) / 219, so 1 − x encodes as 180.
+    XCTAssertEqual(Double(burned.luma), 180, accuracy: 1)
+    XCTAssertEqual(Double(burned.chroma[0]), 128, accuracy: 1)
+    XCTAssertEqual(Double(burned.chroma[1]), 128, accuracy: 1)
+    XCTAssertEqual(writer.telemetry.gpuConvertedFrames, 1)
+    XCTAssertEqual(writer.telemetry.encodedVideo, 1)
+  }
+
+  /// Neutral grey 420v: every luma `luma`, every chroma 128.
+  private func nv12Frame(luma: UInt8) throws -> CVPixelBuffer {
+    var buffer: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, Self.width, Self.height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer), kCVReturnSuccess)
+    let image = try XCTUnwrap(buffer)
+    CVPixelBufferLockBaseAddress(image, [])
+    for plane in 0..<2 {
+      let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(image, plane)).assumingMemoryBound(to: UInt8.self)
+      let bytes = CVPixelBufferGetBytesPerRowOfPlane(image, plane) * CVPixelBufferGetHeightOfPlane(image, plane)
+      base.update(repeating: plane == 0 ? luma : 128, count: bytes)
+    }
+    CVPixelBufferUnlockBaseAddress(image, [])
+    return image
+  }
+
+  // MARK: Take start snapshot
+
+  /// What a take starting now burns in: the camera's burn-in LUT with its
+  /// contract and colour settings while Apply LUT and processing are on, nil
+  /// otherwise; a snapshot already taken keeps its LUT when the camera's changes.
+  func testSnapshotFollowsTheCamerasBurnInAndKeepsItsLUT() throws {
+    let services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
+      send: { _ in true })
+    let controller = CaptureController(services: services)
+    defer { controller.onUpdate = nil; controller.stop() }
+    let started = expectation(description: "Capture start completed")
+    started.assertForOverFulfill = false
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
+    var off = PipelineConfiguration(applyLUT: false, downscale: false, convertTo420: false)
+    off.sourceDuration = VideoContract.fastDuration
+    let hlg = Colorimetry(primaries: .rec2020, transfer: .hlg, matrix: .rec2020, range: .video,
+      horizontalChromaSiting: .left, verticalChromaSiting: .center)
+    off.sourceColorimetryOverride = hlg
+    off.lutOutputColorimetry = .rec709Video
+    var on = off
+    on.applyLUT = true
+    controller.start(feedID: FeedID(rawValue: "snapshot"), deviceID: "synthetic", configuration: off)
+    wait(for: [started], timeout: 5)
+    XCTAssertNil(controller.recordingLUTSnapshot, "Nothing loaded: the take records clean")
+    let first = try LUTProcessor.makeLUT(CubeLUT(text: cubeText(transform: { 1 - $0 })))
+    let contract = LUTColorSpaceContract(input: hlg, output: .rec709Video)
+    func load(_ lut: MonitorLUT) {
+      let loaded = expectation(description: "LUT loaded")
+      controller.load(lut, colorSpace: contract) { result in
+        if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+        loaded.fulfill()
+      }
+      wait(for: [loaded], timeout: 5)
+    }
+    func settle(_ label: String, _ condition: () -> Bool) {
+      let deadline = Date().addingTimeInterval(5)
+      while !condition(), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+      XCTAssertTrue(condition(), label)
+    }
+    load(first)
+    XCTAssertNil(controller.recordingLUTSnapshot, "Loaded with Apply LUT off: the take records clean")
+    controller.reconfigure(configuration: on, pipelineEnabled: true)
+    settle("Apply LUT on: the take burns the loaded LUT in") { controller.recordingLUTSnapshot != nil }
+    let snapshot = try XCTUnwrap(controller.recordingLUTSnapshot)
+    XCTAssertTrue(snapshot.lut === first)
+    XCTAssertEqual(snapshot.colorSpace, contract)
+    XCTAssertEqual(snapshot.sourceColorimetryOverride, hlg)
+    XCTAssertEqual(snapshot.lutOutputColorimetry, .rec709Video)
+    controller.reconfigure(configuration: off, pipelineEnabled: true)
+    settle("Apply LUT off: a new take records clean") { controller.recordingLUTSnapshot == nil }
+    controller.reconfigure(configuration: on, pipelineEnabled: false)
+    settle("Complete bypass: a new take records clean") { controller.recordingLUTSnapshot == nil }
+    controller.reconfigure(configuration: on, pipelineEnabled: true)
+    settle("Back on") { controller.recordingLUTSnapshot?.lut === first }
+    load(try LUTProcessor.makeLUT(CubeLUT(text: cubeText())))
+    XCTAssertFalse(controller.recordingLUTSnapshot?.lut === first, "The next take gets the new LUT")
+    XCTAssertTrue(snapshot.lut === first, "The rolling take keeps the LUT it started with")
+  }
+
   /// The camera's own colour interpretation (colour space, ICC, gamma, log
   /// curve, HDR metadata, the app's colour label) never reaches the encoder on
   /// a graded frame, where it would contradict the LUT output's tags. The
@@ -225,6 +384,33 @@ import XCTest
     XCTAssertEqual(try handed(renderer), [], "Only the LUT output's tags describe the graded frame")
     XCTAssertTrue(try handed(nil).isSuperset(of: [kCVImageBufferGammaLevelKey as String,
       kCVImageBufferLogTransferFunctionKey as String]), "The clean take keeps the camera's tags")
+  }
+
+  /// Through the recorder: the first frame that fails to burn in fails the
+  /// take, and the frames after it are not handed to the encoder clean.
+  func testFailedBurnInFailsTheTakeInTheRecorder() throws {
+    let folder = try temporaryFolder(); defer { try? FileManager.default.removeItem(at: folder) }
+    let source = try declaration()
+    let movie = folder.appendingPathComponent("failed-recorder.mov")
+    let config = try configuration(source: source, movie: movie, profile: .proRes422HQ, burnIn: FailingBurnIn(),
+      policy: RecordingCompatibilityPolicy(allowCPUConversion: true))
+    let handed = Handed()
+    let writer = try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { session, image, pts, duration in
+      handed.lock.withLock { handed.count += 1 }
+      var flags = VTEncodeInfoFlags()
+      return VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration,
+        frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
+    })
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    try recorder.start()
+    try recorder.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .absent))
+    let frame = try v210Frame()
+    for index in 0..<3 { _ = recorder.appendVideo(try sample(frame, index: index)) }
+    try? recorder.stop()
+    XCTAssertEqual(recorder.state, .failed)
+    XCTAssertEqual(recorder.telemetry.appendedVideo, 0)
+    XCTAssertEqual(handed.lock.withLock { handed.count }, 0, "No clean frame reached the encoder")
+    XCTAssertTrue(recorder.telemetry.lastError?.contains("burning the LUT") == true, recorder.telemetry.lastError ?? "")
   }
 
   // MARK: Fixtures
@@ -349,10 +535,12 @@ import XCTest
     return image
   }
 
-  private func sample(_ image: CVPixelBuffer) throws -> CMSampleBuffer {
+  private func sample(_ image: CVPixelBuffer, index: Int = 0) throws -> CMSampleBuffer {
     var format: CMVideoFormatDescription?
     XCTAssertEqual(CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image, formatDescriptionOut: &format), noErr)
-    var timing = CMSampleTimingInfo(duration: RecordingFrameRate.fps2997.frameDuration, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+    let duration = RecordingFrameRate.fps2997.frameDuration
+    var timing = CMSampleTimingInfo(duration: duration,
+      presentationTimeStamp: CMTimeMultiply(duration, multiplier: Int32(index)), decodeTimeStamp: .invalid)
     var sample: CMSampleBuffer?
     XCTAssertEqual(CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image,
       formatDescription: try XCTUnwrap(format), sampleTiming: &timing, sampleBufferOut: &sample), noErr)
