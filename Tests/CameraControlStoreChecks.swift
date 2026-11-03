@@ -68,7 +68,11 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         if holdRead { return await withCheckedContinuation { read = $0 } }
         return propertyValues
     }
-    func set(_ property: String, value: ControlValue, feedID: String, generation: UInt64) async throws { setCalls += 1 }
+    var setFailures = 0
+    func set(_ property: String, value: ControlValue, feedID: String, generation: UInt64) async throws {
+        setCalls += 1
+        if setFailures > 0 { setFailures -= 1; throw ControlError(code: .sdkFailure, retryable: false, message: "Synthetic write failed") }
+    }
     func disconnect(feedID: String, generation: UInt64) async throws {
         disconnects.append(generation)
         if disconnectFailures > 0 {
@@ -811,6 +815,38 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         XCTAssertEqual(state.cacheStatus, "Settings update failed")
         await store.refresh("feed")
         XCTAssertTrue(state.cacheStatus.hasPrefix("Updated "), "A read that works clears it")
+        _ = await store.shutdown()
+    }
+
+    /// A write that fails doesn't take the waiting read with it: it follows on the interval,
+    /// and Never still waits for Refresh.
+    func testAFailedWriteKeepsTheWaitingRead() async {
+        let plugin = SuspendedControlPlugin(), sleeper = RetrySleeper(), clock = RefreshClock()
+        plugin.propertyValues = [Self.iso]
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(), persistence: MemoryControlAssignments(),
+            now: { clock.date }, refreshSleep: { try await sleeper.sleep($0) })
+        await store.connect(camera: plugin.camera, to: "feed", credentials: Self.secret, saveCredentials: false)
+        let state = store.state(for: "feed")
+        clock.date = clock.date.addingTimeInterval(20)
+        plugin.handler?(.changed(feedID: "feed", generation: state.generation))
+        await settle { sleeper.requested.count == 1 }
+        XCTAssertEqual(sleeper.requested, [.seconds(40)])
+        plugin.setFailures = 1
+        await store.set(Self.iso, value: .unsignedInteger(1_600), feedID: "feed")
+        XCTAssertEqual(plugin.setCalls, 1)
+        XCTAssertNotNil(state.message)
+        await settle { sleeper.requested.count == 2 }
+        XCTAssertEqual(sleeper.requested, [.seconds(40), .seconds(40)], "Waits again, the rest of the minute since the last read")
+        sleeper.release()
+        await settle { plugin.propertyCalls == 2 && !state.busy }
+        XCTAssertEqual(plugin.propertyCalls, 2, "The stale values are read")
+        store.refreshInterval = .never
+        plugin.handler?(.changed(feedID: "feed", generation: state.generation))
+        plugin.setFailures = 1
+        await store.set(Self.iso, value: .unsignedInteger(1_600), feedID: "feed")
+        await settle { false }
+        XCTAssertEqual(sleeper.requested.count, 2, "Never: nothing waits")
+        XCTAssertEqual(plugin.propertyCalls, 2)
         _ = await store.shutdown()
     }
 }

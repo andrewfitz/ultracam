@@ -540,12 +540,19 @@ extension CameraControlAssignmentPersisting {
         let generation = state.generation
         state.busy = true; state.message = nil
         refreshTasks.removeValue(forKey: feedID)?.cancel()
-        defer { finish(feedID, generation) }
+        var failed = false
+        defer {
+            finish(feedID, generation)
+            // A failed write leaves its message, so `finish` schedules nothing. The read this
+            // write cancelled still follows on the interval (none for Never).
+            if failed, state.generation == generation, !Task.isCancelled { scheduleRefresh(feedID) }
+        }
         do {
             try await plugin.set(property.id, value: value, feedID: feedID, generation: generation)
             guard current(feedID, generation) else { return }
             state.dirty = true
         } catch {
+            failed = true
             report(error, feedID, generation)
             return
         }
