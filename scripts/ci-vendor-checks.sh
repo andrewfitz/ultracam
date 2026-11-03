@@ -21,5 +21,4 @@ if [[ "$mode" == --hardware ]]; then
   bash "$task_root/scripts/ui-typecheck.sh"
   STRICT=1 bash "$task_root/scripts/ui-verify.sh"
   bash "$task_root/scripts/monitor-app-integration.sh"
-  bash "$task_root/scripts/monitor-feed-host-checks.sh"
 fi

@@ -19,16 +19,3 @@ struct RecordingCompatibilityPolicy: Codable, Equatable, Sendable {
     "\(stage) has no usable GPU route for \(format). Enable Allow CPU conversion (compatibility) for the next take to permit system conversion."
   }
 }
-
-struct RecordingConversionCounters: Codable, Equatable, Sendable {
-  var gpuUnavailable: UInt64 = 0
-  var gpuFailures: UInt64 = 0
-  var systemCompatibilityFrames: UInt64 = 0
-  var refusedFrames: UInt64 = 0
-  mutating func record(route: RecordingCompatibilityPolicy.Route, gpuAvailable: Bool, gpuFailed: Bool) {
-    if !gpuAvailable { gpuUnavailable &+= 1 }
-    if gpuFailed { gpuFailures &+= 1 }
-    if route == .systemCompatibility { systemCompatibilityFrames &+= 1 }
-    if route == .refused { refusedFrames &+= 1 }
-  }
-}

@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
-"""Check runtime discovery for the explicitly registered new contract suites."""
+"""Verify registration and runtime discovery for every compiled app XCTest suite."""
 import argparse
+import os
+import subprocess
+import sys
 import re
 from pathlib import Path
-
-# These classes are explicitly registered under ULTRACAM_TEST_SUPPORT in main.
-NEW_SUITES = (
-    'SourceFormatContractChecks', 'SourceAdmissionChecks', 'DerivedOutputAdmissionChecks', 'RecordingTimebaseChecks', 'DeviceAPIConformance',
-    'CameraControlContractChecks', 'CameraControlStoreChecks',
-    'DeckLinkAdapterContractChecks', 'VendorRegistryChecks',
-    'CapturePluginBridgeChecks', 'GPUStandbyChecks', 'GPUStandbyLifecycleChecks', 'CameraGPUStandbyChecks', 'RecordingPolicyChecks', 'RecordingSourceAdmissionChecks',
-    'ExtensionFormatCatalogChecks', 'CameraControlUIStateChecks', 'VendorHardwareChecks',
-    'VendorSettingsStoreChecks', 'VendorSettingsBootstrapChecks',
-    'CaptureAdmissionChecks', 'CaptureTypedAdmissionChecks', 'CaptureSourceAdmissionChecks', 'CaptureTakeContextChecks',
-    'LUTPassthroughOwnershipChecks', 'LUTSourceAdmissionChecks', 'SyntheticCaptureFixtureChecks', 'VendorSettingsHardwareChecks',
-    'CPUCompatibilitySettingsChecks', 'CPUCompatibilityActivityChecks',
-    'RecordingCPUAdmissionChecks', 'RecordingTakeLifecycleChecks',
-)
 
 def class_test_methods(source, name):
     # Strip comments and Swift string literals before balancing class braces.
@@ -36,14 +25,6 @@ def class_test_methods(source, name):
         raise ValueError(f'{name}: no methods or duplicate method names')
     return methods
 
-def expected_counts(root):
-    result = {}
-    for name in NEW_SUITES:
-        relative = ('Vendors/Blackmagic/Tests/' if name == 'DeckLinkAdapterContractChecks' else 'Tests/') + name + '.swift'
-        source = (Path(root) / relative).read_text()
-        result[name] = len(class_test_methods(source, name))
-    return result
-
 def verify_coverage(log, expected):
     failures = []
     for name, count in expected.items():
@@ -56,6 +37,62 @@ def verify_coverage(log, expected):
     if failures:
         raise ValueError('; '.join(failures))
 
+def expected_counts(root):
+    root = Path(root)
+    registered = re.findall(r"forTestCaseClass: (\w+)\.self", (root / "Tests/main.swift").read_text())
+    if len(registered) != len(set(registered)):
+        raise ValueError("Duplicate XCTest suite registration")
+    sources = list((root / "Tests").glob("*.swift"))
+    sources += list((root / "Tests/Recording").glob("*.swift"))
+    sources += list((root / "Tests/CameraProvider").glob("*.swift"))
+    sources += [root / "Tests/MonitorKitHost/MonitorFeedHostChecks.swift"]
+    vendor_sources = subprocess.check_output(
+        [sys.executable, str(root / "scripts/vendors.py"), "query", "--root", str(root),
+         "--membership", "test", "--kind", "swift-sources"], text=True)
+    sources += [Path(path) for path in vendor_sources.splitlines() if path]
+    sources = list(dict.fromkeys(sources))
+    expected = {}
+    for path in sources:
+        source = path.read_text()
+        for name in re.findall(r"\bclass\s+(\w+)\s*:\s*XCTestCase\b", source):
+            if name not in registered:
+                raise ValueError(f"{path}: unregistered XCTest suite {name}")
+            if name in expected:
+                raise ValueError(f"Duplicate XCTest suite declaration: {name}")
+            expected[name] = len(class_test_methods(source, name))
+    missing = set(registered) - expected.keys()
+    if missing:
+        raise ValueError("Registered XCTest suite missing from compiled sources: " + ", ".join(sorted(missing)))
+    # Count extensions separately, including several in the same file.
+    for path in sources:
+        source = path.read_text()
+        literals = r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/'
+        source = re.sub(literals, lambda match: "\n" * match.group().count("\n"), source)
+        for declaration in re.finditer(r"\bextension\s+(\w+)\s*\{", source):
+            name = declaration.group(1)
+            if name not in expected:
+                continue
+            depth, index = 1, declaration.end()
+            while depth and index < len(source):
+                depth += (source[index] == "{") - (source[index] == "}")
+                index += 1
+            body = source[declaration.end():index-1]
+            expected[name] += len(re.findall(r"^\s*(?:@\w+(?:\([^\n]*\))?\s+)*func\s+(test\w+)\s*\(", body, re.MULTILINE))
+    return expected
+
+
+def verify_skips(log, required=False):
+    skipped = re.findall(r"Test Case '([^']+)' skipped[^\n]*", log)
+    if skipped:
+        print(f"App runtime: {len(skipped)} skipped; coverage is incomplete:")
+        for identity in skipped:
+            print("  " + identity)
+        if required:
+            raise ValueError("Required GPU proof lane refuses skipped app tests")
+    else:
+        print("App runtime: no skipped tests")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('log', type=Path)
@@ -63,10 +100,13 @@ def main():
     args = parser.parse_args()
     try:
         expected = expected_counts(args.root)
-        verify_coverage(args.log.read_text(), expected)
-    except (OSError, ValueError) as error:
-        parser.exit(1, f'Contract suite coverage FAILED: {error}\n')
-    print('Contract suite coverage: ' + ', '.join(f'{name}={count}' for name, count in expected.items()))
+        log = args.log.read_text()
+        verify_coverage(log, expected)
+        print("All app suite discovery: " + ", ".join(f"{name}={count}" for name, count in expected.items()))
+        verify_skips(log, required=os.environ.get("ULTRACAM_REQUIRE_GPU_PROOFS") == "1")
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f'App suite coverage FAILED: {error}\n')
+
 
 if __name__ == '__main__':
     main()

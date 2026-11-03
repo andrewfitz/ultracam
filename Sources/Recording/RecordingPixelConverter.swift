@@ -55,10 +55,6 @@ final class RecordingPixelConverter: @unchecked Sendable {
   /// Conversions in flight across every recorder. Each caller waits for its
   /// own, so this only matters with several feeds recording at once.
   static let slotCount = 8
-  /// A cached surface idle this many conversions (about 2 s for four 59.94
-  /// feeds) is released; the pools in use rotate far faster than that.
-  static let idleConversions: UInt64 = 480
-  static let maxCachedTextures = 384
   private let cacheByteLimit: Int
   private let cacheIdleAge: TimeInterval
   private let monotonicNow: () -> TimeInterval
@@ -66,7 +62,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
 #if ULTRACAM_TEST_SUPPORT
   var cachedAllocationBytesForTesting: Int { lock.withLock { allocationBudget.snapshot().bytes } }
   func evictExpiredCacheForTesting() {
-    lock.withLock { if evictIdleTextures(sequence: sequence) { residency.commit() } }
+    lock.withLock { if evictIdleTextures() { residency.commit() } }
   }
 #endif
   private static let gpuTimeout: TimeInterval = 2
@@ -300,7 +296,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
       height: height, usage: .shaderWrite, sequence: sequence, changed: &residencyChanged)
     let chromaTexture = try texture(destination, plane: 1, format: .rg16Uint, width: (width + 1) / 2,
       height: height, usage: .shaderWrite, sequence: sequence, changed: &residencyChanged)
-    residencyChanged = evictIdleTextures(sequence: sequence) || residencyChanged
+    residencyChanged = evictIdleTextures() || residencyChanged
     if residencyChanged { residency.commit() }
 
     var pixelWidth = UInt32(width)
@@ -372,7 +368,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
         generation: 0, owner: surface)
     } catch {
       // Pressure can evict completed cache entries, never pending GPU work.
-      _ = evictIdleTextures(sequence: sequence, pressure: true)
+      _ = evictIdleTextures(pressure: true)
       lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: bytes,
         generation: 0, owner: surface)
     }
@@ -385,7 +381,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
 
   /// Under `lock`: drops surfaces idle long enough whose last GPU use has
   /// completed.
-  private func evictIdleTextures(sequence: UInt64, pressure: Bool = false) -> Bool {
+  private func evictIdleTextures(pressure: Bool = false) -> Bool {
     let completed = event.signaledValue
     let now = monotonicNow()
     var removed = false
@@ -407,7 +403,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
       guard let self else { return }
       self.lock.withLock {
         self.ageSweepScheduled = false
-        if self.evictIdleTextures(sequence: self.sequence) { self.residency.commit() }
+        if self.evictIdleTextures() { self.residency.commit() }
         self.scheduleAgeSweepLocked()
       }
     }

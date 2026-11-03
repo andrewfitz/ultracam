@@ -1,5 +1,9 @@
 # Implementation map: round-3 UI → existing code
 
+> Historical survey. The implementation and test harness have since changed; use
+> [README.md](../README.md) and [VALIDATION.md](../VALIDATION.md) for current build
+> and verification guidance. The dated observations below are preserved.
+
 Read-only mapping, written 2026-10-21 against the working tree on `main`. It lists every API the
 new SwiftUI UI needs, what's per-feed vs selected-only today, the build and test hooks, and a gap
 list.

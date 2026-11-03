@@ -45,6 +45,27 @@ import XCTest
     XCTAssertFalse(coordinator.hasPendingCut)
   }
 
+  func testFeedAcknowledgementBeforeFrameClearsPendingCutAndAutomaticLatch() {
+    let a = feed("A"), b = feed("B")
+    let settings = SwitcherSettings(selectedFeedID: a, automatic: true,
+      intervalSeconds: 2, strategy: .fixedInterval)
+    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b])
+    _ = coordinator.ingest(frame(a, 0))
+    XCTAssertEqual(coordinator.evaluate(at: time(0)), .idle)
+    XCTAssertEqual(coordinator.evaluate(at: time(2)), .cutQueued(b))
+    XCTAssertTrue(coordinator.isAutomaticRequestPending)
+    XCTAssertTrue(coordinator.acknowledgeCut(to: b))
+    XCTAssertEqual(coordinator.selectedFeedID, b)
+    XCTAssertEqual(coordinator.settings.selectedFeedID, b)
+    XCTAssertFalse(coordinator.hasPendingCut)
+    XCTAssertFalse(coordinator.isAutomaticRequestPending)
+    XCTAssertNil(coordinator.takeAbandonedCut())
+    guard case .accepted = coordinator.ingest(frame(b, 0)) else {
+      return XCTFail("The acknowledged cut must not apply again at its next frame")
+    }
+    XCTAssertEqual(coordinator.evaluate(at: time(4)), .cutQueued(a))
+  }
+
   func testFixedIntervalAdvancesInStableOrderAndSkipsUnhealthyFeed() {
     let a = feed("A")
     let b = feed("B")
@@ -86,59 +107,6 @@ import XCTest
     XCTAssertEqual(coordinator.statusMessage, "Coming later.")
     XCTAssertEqual(coordinator.evaluate(at: time(10)), .dynamicAnalysisUnavailable)
     XCTAssertNil(coordinator.pendingCut)
-  }
-
-  func testNaturalDirectorDecisionRequiresExactAcknowledgement() {
-    let a = feed("A")
-    let b = feed("B")
-    let settings = SwitcherSettings(selectedFeedID: a, automatic: true,
-      intervalSeconds: 5, strategy: .manual)
-    var directorSettings = NaturalTalkingHeadDirectorSettings()
-    directorSettings.minimumShotDuration = 0
-    directorSettings.candidateDwell = 0
-    directorSettings.boundaryWindow = 0.3
-    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b],
-      directorSettings: directorSettings)
-    let cue = TranscriptCue(timeRange: CMTimeRange(start: time(0.8), end: time(1)),
-      kind: .sentenceEnd, confidence: 1, isFinal: true)
-    let input = NaturalTalkingHeadDirectorInput(mediaTime: time(1),
-      currentCameraID: a.rawValue, anchorCameraID: a.rawValue,
-      emphasisCameraID: b.rawValue, cameraHealth: [a.rawValue: true, b.rawValue: true],
-      audioCues: [AudioCue(time: time(1), speechEnergy: 1, pauseDuration: 0,
-        emphasis: 1, laughter: 0)], transcriptCues: [cue])
-    guard let decision = coordinator.evaluateDirector(input) else {
-      return XCTFail("director should emit a deterministic decision")
-    }
-    XCTAssertFalse(coordinator.acknowledgeCut(CutDecision(targetCameraID: b.rawValue,
-      cutTime: time(1), confidence: decision.confidence, reason: "wrong")))
-    XCTAssertTrue(coordinator.acknowledgeCut(decision))
-    XCTAssertFalse(coordinator.acknowledgeCut(decision))
-  }
-
-  func testCancelledDirectorDecisionDoesNotLatchFutureDecisions() {
-    let a = feed("A"), b = feed("B")
-    var directorSettings = NaturalTalkingHeadDirectorSettings()
-    directorSettings.minimumShotDuration = 0
-    directorSettings.candidateDwell = 0
-    directorSettings.boundaryWindow = 0.3
-    var coordinator = SwitcherCoordinator(feedIDs: [a, b], directorSettings: directorSettings)
-    func input(_ seconds: Double) -> NaturalTalkingHeadDirectorInput {
-      NaturalTalkingHeadDirectorInput(mediaTime: time(seconds), currentCameraID: a.rawValue,
-        anchorCameraID: a.rawValue, emphasisCameraID: b.rawValue,
-        audioCues: [AudioCue(time: time(seconds), speechEnergy: 1, pauseDuration: 0, emphasis: 1, laughter: 0)],
-        transcriptCues: [TranscriptCue(timeRange: CMTimeRange(start: time(seconds - 0.2), end: time(seconds)),
-          kind: .sentenceEnd, confidence: 1, isFinal: true)])
-    }
-    XCTAssertNotNil(coordinator.evaluateDirector(input(1)))
-    coordinator.cancelPendingCut()
-    let next = coordinator.evaluateDirector(input(4))
-    XCTAssertNotNil(next, "An abandoned edit must release the director's output latch")
-    var rebuilt = SwitcherCoordinator(settings: coordinator.settings, feedIDs: [a, b, feed("C")],
-      directorSettings: directorSettings)
-    rebuilt.carryProgramTimeline(from: coordinator)
-    if let next {
-      XCTAssertTrue(rebuilt.acknowledgeCut(next), "A carried pending edit must retain its director acknowledgment state")
-    }
   }
 
   /// PROG-2: a fixed-interval cut that expires (or is cancelled by health)

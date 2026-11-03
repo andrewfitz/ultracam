@@ -1,6 +1,11 @@
 import CoreMedia
 import Foundation
 
+enum TalkingHeadDirectorMode: String, Codable, Equatable, Sendable {
+  case lowLatency
+  case transcriptAssisted
+}
+
 /// The state returned by a switcher evaluation. The coordinator never owns a
 /// timer; callers provide the media clock when they evaluate it.
 enum SwitcherEvaluation: Equatable {
@@ -110,19 +115,13 @@ struct SwitcherCoordinator {
   private(set) var selectedFeedID: FeedID?
   private(set) var programOutput: ProgramOutput<FeedID>
 
-  private var director: NaturalTalkingHeadDirector
-  private var pendingDirectorDecision: CutDecision?
   private var fixedIntervalOrigin: TimeInterval?
   private var automaticRequestPending = false
-  private var anchorFeedID: FeedID?
-  private var emphasisFeedID: FeedID?
   /// The most recent cut dropped without landing, kept until the route
   /// reports it. The scheduler reports each one once.
   private var abandonedCut: (FeedID, ProgramCutAbandonReason)?
 
-  init(settings: SwitcherSettings = .init(), feedIDs: [FeedID] = [],
-    anchorFeedID: FeedID? = nil, emphasisFeedID: FeedID? = nil,
-    directorSettings: NaturalTalkingHeadDirectorSettings = .init()) {
+  init(settings: SwitcherSettings = .init(), feedIDs: [FeedID] = []) {
     let ids = Self.unique(feedIDs)
     let initial = settings.selectedFeedID.flatMap { ids.contains($0) ? $0 : nil }
       ?? ids.first
@@ -133,19 +132,10 @@ struct SwitcherCoordinator {
     self.feedHealth = Dictionary(uniqueKeysWithValues: self.feedIDs.map { ($0, true) })
     self.selectedFeedID = initial
     self.programOutput = ProgramOutput(selectedSource: initial)
-    self.director = NaturalTalkingHeadDirector(settings: directorSettings)
-    self.anchorFeedID = anchorFeedID ?? settings.naturalTalkingHead.anchorFeedID
-      ?? self.feedIDs.first
-    self.emphasisFeedID = emphasisFeedID ?? settings.naturalTalkingHead.emphasisFeedID
-      ?? self.feedIDs.dropFirst().first
   }
 
-  init(settings: SwitcherSettings = .init(), feeds: [FeedDescriptor],
-    anchorFeedID: FeedID? = nil, emphasisFeedID: FeedID? = nil,
-    directorSettings: NaturalTalkingHeadDirectorSettings = .init()) {
-    self.init(settings: settings,
-      feedIDs: feeds.filter(\.enabled).map(\.id), anchorFeedID: anchorFeedID,
-      emphasisFeedID: emphasisFeedID, directorSettings: directorSettings)
+  init(settings: SwitcherSettings = .init(), feeds: [FeedDescriptor]) {
+    self.init(settings: settings, feedIDs: feeds.filter(\.enabled).map(\.id))
   }
 
   /// The UI can use this message without presenting dynamic analysis as an
@@ -153,9 +143,6 @@ struct SwitcherCoordinator {
   var statusMessage: String {
     settings.strategy == .dynamicAnalysis ? "Coming later." : "Ready"
   }
-
-  var anchorID: FeedID? { anchorFeedID }
-  var emphasisID: FeedID? { emphasisFeedID }
 
   var pendingCut: FeedID? { programOutput.pendingCut }
   var pendingCutTime: CMTime? { programOutput.pendingCutTime }
@@ -180,17 +167,12 @@ struct SwitcherCoordinator {
     if let startingTimeout { programOutput.startingCutTimeout = startingTimeout }
   }
 
-  /// Keeps the automatic latch and the director decision in step with the
-  /// scheduler. Any pending cut that disappears without landing (expiry,
+  /// Keeps the automatic latch in step with the scheduler. Any pending cut that disappears without landing (expiry,
   /// health, cancel) must release `automaticRequestPending`; otherwise the
   /// fixed-interval policy stays idle forever (PROG-2).
   private mutating func reconcilePendingState() {
     if let (target, reason) = programOutput.takeAbandonedCut() {
       abandonedCut = (target, reason)
-      if pendingDirectorDecision?.targetCameraID == target.rawValue {
-        director.cancelPendingOutput()
-        pendingDirectorDecision = nil
-      }
     }
     if !programOutput.hasPendingCut { automaticRequestPending = false }
   }
@@ -200,11 +182,9 @@ struct SwitcherCoordinator {
   mutating func selectImmediately(_ feedID: FeedID) -> ProgramCutRequestResult<FeedID> {
     guard feedIDs.contains(feedID) else { return .rejectedMissingSource }
     programOutput.select(feedID)
-    director.cancelPendingOutput()
     selectedFeedID = feedID
     settings.selectedFeedID = feedID
     automaticRequestPending = false
-    pendingDirectorDecision = nil
     return .selectedImmediately
   }
 
@@ -239,12 +219,8 @@ struct SwitcherCoordinator {
       programOutput.setSourceHealth(id, healthy: healthy)
     }
     cutIneligible = previous.cutIneligible.intersection(feedIDs)
-    if let target = programOutput.pendingCut {
+    if programOutput.hasPendingCut {
       automaticRequestPending = previous.automaticRequestPending
-      if previous.pendingDirectorDecision?.targetCameraID == target.rawValue {
-        director = previous.director
-        pendingDirectorDecision = previous.pendingDirectorDecision
-      }
     }
     reconcilePendingState()
   }
@@ -262,12 +238,6 @@ struct SwitcherCoordinator {
     let changed = self.settings != settings
     self.settings = settings
     if changed {
-      anchorFeedID = settings.naturalTalkingHead.anchorFeedID
-        .flatMap { feedIDs.contains($0) ? $0 : nil } ?? feedIDs.first
-      emphasisFeedID = settings.naturalTalkingHead.emphasisFeedID
-        .flatMap { feedIDs.contains($0) ? $0 : nil } ?? feedIDs.dropFirst().first
-      director.reset()
-      pendingDirectorDecision = nil
       cancelPendingCut()
     }
     fixedIntervalOrigin = nil
@@ -289,8 +259,6 @@ struct SwitcherCoordinator {
       return .rejectedMissingSource
     }
     automaticRequestPending = false
-    director.cancelPendingOutput()
-    pendingDirectorDecision = nil
     let result = programOutput.requestCut(to: feedID, noEarlierThan: at)
     reconcilePendingState()
     return result
@@ -299,13 +267,7 @@ struct SwitcherCoordinator {
   @discardableResult
   mutating func manualOverride(to feedID: FeedID, at time: CMTime)
     -> ProgramCutRequestResult<FeedID> {
-    let result = requestManualCut(to: feedID, at: time)
-    if case .queued = result {
-      director.manualOverride(cameraID: feedID.rawValue, at: time)
-    } else if case .coalesced = result {
-      director.manualOverride(cameraID: feedID.rawValue, at: time)
-    }
-    return result
+    requestManualCut(to: feedID, at: time)
   }
 
   @discardableResult
@@ -353,67 +315,12 @@ struct SwitcherCoordinator {
     evaluate(at: CMTime(seconds: seconds, preferredTimescale: 240_000))
   }
 
-  mutating func evaluate(at mediaTime: CMTime, audioCues: [AudioCue],
-    transcriptCues: [TranscriptCue]) -> SwitcherEvaluation {
-    _ = audioCues
-    _ = transcriptCues
-    return evaluate(at: mediaTime)
-  }
-
-  /// Evaluate the natural director with the coordinator's feed IDs and health
-  /// map. Dynamic analysis remains an explicit disabled strategy; this method
-  /// is for callers that opt into the already implemented director directly.
-  mutating func evaluateDirector(at mediaTime: CMTime, currentFeedID: FeedID,
-    audioCues: [AudioCue] = [], transcriptCues: [TranscriptCue] = [])
-    -> SwitcherEvaluation {
-    guard settings.strategy != .dynamicAnalysis else {
-      return .dynamicAnalysisUnavailable
-    }
-    guard let anchorFeedID, let emphasisFeedID else { return .idle }
-    let input = NaturalTalkingHeadDirectorInput(mediaTime: mediaTime,
-      currentCameraID: currentFeedID.rawValue, anchorCameraID: anchorFeedID.rawValue,
-      emphasisCameraID: emphasisFeedID.rawValue,
-      cameraHealth: Dictionary(uniqueKeysWithValues: feedHealth.map { ($0.key.rawValue, $0.value) }),
-      audioCues: audioCues, transcriptCues: transcriptCues)
-    guard let decision = evaluateDirector(input) else { return .idle }
-    return .cutQueued(FeedID(rawValue: decision.targetCameraID))
-  }
-
-  mutating func evaluate(at mediaTime: CMTime, currentFeedID: FeedID,
-    audioCues: [AudioCue] = [], transcriptCues: [TranscriptCue] = [])
-    -> SwitcherEvaluation {
-    evaluateDirector(at: mediaTime, currentFeedID: currentFeedID,
-      audioCues: audioCues, transcriptCues: transcriptCues)
-  }
-
   mutating func tick(at mediaTime: CMTime) -> SwitcherEvaluation {
     evaluate(at: mediaTime)
   }
 
   mutating func tick(at seconds: TimeInterval) -> SwitcherEvaluation {
     evaluate(at: seconds)
-  }
-
-  /// Runs the existing natural director when an integration explicitly opts
-  /// into it. Persisted dynamicAnalysis still reports its disabled stub above.
-  mutating func evaluateDirector(_ input: NaturalTalkingHeadDirectorInput)
-    -> CutDecision? {
-    guard settings.strategy != .dynamicAnalysis else { return nil }
-    guard let decision = director.evaluate(input) else { return nil }
-    let target = FeedID(rawValue: decision.targetCameraID)
-    guard feedIDs.contains(target), isFeedHealthy(target) else { return nil }
-    // Test-only path: `cutTime` is the director's clock, and the scheduler
-    // compares the bound with the target's own video PTS. It is a valid bound
-    // only when the two share one clock, as in these checks. The live director
-    // (AutoSwitcherBridge via AppModel) requests its cuts with no bound.
-    let result = programOutput.requestCut(to: target, noEarlierThan: decision.cutTime)
-    switch result {
-    case .queued, .coalesced:
-      pendingDirectorDecision = decision
-      return decision
-    case .ignoredSameSource, .rejectedMissingSource, .selectedImmediately:
-      return nil
-    }
   }
 
   /// Forward one source frame to the Program scheduler. A cut is applied only
@@ -428,39 +335,6 @@ struct SwitcherCoordinator {
     }
     reconcilePendingState()
     return decision
-  }
-
-  /// Acknowledges the natural director's exact decision after the output route
-  /// applies it. Replaying the same decision returns false.
-  @discardableResult
-  mutating func acknowledgeCut(_ decision: CutDecision, appliedAt: CMTime? = nil) -> Bool {
-    guard pendingDirectorDecision == decision else { return false }
-    guard director.acknowledgeOutput(decision, appliedAt: appliedAt) else { return false }
-    pendingDirectorDecision = nil
-    let target = FeedID(rawValue: decision.targetCameraID)
-    if programOutput.pendingCut == target {
-      // The bridge can acknowledge before the target frame is ingested.
-      // Reconcile the scheduler now so the acknowledged cut cannot land a
-      // second time when that frame eventually arrives.
-      programOutput.select(target)
-      _ = programOutput.takeAbandonedCut()
-    }
-    if programOutput.selectedSource == target {
-      selectedFeedID = target
-      settings.selectedFeedID = target
-    }
-    automaticRequestPending = false
-    return true
-  }
-
-  @discardableResult
-  mutating func acknowledgeOutput(_ decision: CutDecision, appliedAt: CMTime? = nil) -> Bool {
-    acknowledgeCut(decision, appliedAt: appliedAt)
-  }
-
-  @discardableResult
-  mutating func acknowledge(_ decision: CutDecision, appliedAt: CMTime? = nil) -> Bool {
-    acknowledgeCut(decision, appliedAt: appliedAt)
   }
 
   /// Acknowledges a manual or fixed-interval cut by feed ID. The route should
@@ -484,10 +358,6 @@ struct SwitcherCoordinator {
     selectedFeedID = feedID
     settings.selectedFeedID = feedID
     automaticRequestPending = false
-    if let decision = pendingDirectorDecision, decision.targetCameraID == feedID.rawValue {
-      _ = director.acknowledgeOutput(decision, appliedAt: appliedAt)
-      pendingDirectorDecision = nil
-    }
     return true
   }
 
@@ -505,8 +375,6 @@ struct SwitcherCoordinator {
     }
     abandonedCut = nil
     _ = programOutput.takeAbandonedCut()
-    director.reset()
-    pendingDirectorDecision = nil
     fixedIntervalOrigin = nil
     automaticRequestPending = false
   }
@@ -522,8 +390,6 @@ struct SwitcherCoordinator {
       abandonedCut = (target, reason)
     }
     programOutput.cancelPendingCut()
-    director.cancelPendingOutput()
-    pendingDirectorDecision = nil
     automaticRequestPending = false
   }
 

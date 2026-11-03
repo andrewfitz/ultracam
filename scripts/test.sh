@@ -43,7 +43,6 @@ monitor_kit_test_log="$logs_root/monitor-kit-package-tests-$run_id.log"
 if [[ "$compile_only" == false ]]; then
   monitor_kit_package_test "$monitor_kit_test_log" || { monitor_kit_test_report "$monitor_kit_test_log"; exit 1; }
 fi
-python3 "$task_root/scripts/test-source-declarations.py"
 rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
@@ -103,66 +102,6 @@ fi
   exit 1
 }
 python3 "$task_root/scripts/check-test-coverage.py" "$test_log"
-# Verify every registered suite, including additions outside the historical contract list.
-python3 - "$task_root" "$test_log" <<'PY_COVERAGE'
-import importlib.util
-import os
-import re
-import subprocess
-import sys
-from pathlib import Path
-root, log = Path(sys.argv[1]), Path(sys.argv[2])
-spec = importlib.util.spec_from_file_location("coverage", root / "scripts/check-test-coverage.py")
-coverage = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(coverage)
-registered = re.findall(r"forTestCaseClass: (\w+)\.self", (root / "Tests/main.swift").read_text())
-if len(registered) != len(set(registered)):
-    raise SystemExit("Duplicate XCTest suite registration")
-sources = list((root / "Tests").glob("*.swift"))
-sources += list((root / "Tests/Recording").glob("*.swift"))
-sources += list((root / "Tests/CameraProvider").glob("*.swift"))
-sources += [root / "Tests/MonitorKitHost/MonitorFeedHostChecks.swift"]
-vendor_sources = subprocess.check_output(
-    [sys.executable, str(root / "scripts/vendors.py"), "query", "--root", str(root),
-     "--membership", "test", "--kind", "swift-sources"], text=True)
-sources += [Path(path) for path in vendor_sources.splitlines() if path]
-sources = list(dict.fromkeys(sources))
-# This file runs separately with SOURCE_DECLARATION_CHECKS, before the app compile.
-sources = [p for p in sources if p.name != "SourceDeclarationChecks.swift"]
-expected = {}
-for path in sources:
-    source = path.read_text()
-    for name in re.findall(r"\bclass\s+(\w+)\s*:\s*XCTestCase\b", source):
-        if name not in registered:
-            raise SystemExit(f"{path}: unregistered XCTest suite {name}")
-        expected[name] = len(coverage.class_test_methods(source, name))
-# Count each extension body separately, including several in the same file.
-for path in sources:
-    source = path.read_text()
-    literals = r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/'
-    source = re.sub(literals, lambda match: "\n" * match.group().count("\n"), source)
-    for declaration in re.finditer(r"\bextension\s+(\w+)\s*\{", source):
-        name = declaration.group(1)
-        if name not in expected:
-            continue
-        depth, index = 1, declaration.end()
-        while depth and index < len(source):
-            depth += (source[index] == "{") - (source[index] == "}")
-            index += 1
-        body = source[declaration.end():index-1]
-        expected[name] += len(re.findall(r"^\s*(?:@\w+(?:\([^\n]*\))?\s+)*func\s+(test\w+)\s*\(", body, re.MULTILINE))
-coverage.verify_coverage(log.read_text(), expected)
-print("All app suite discovery: " + ", ".join(f"{name}={count}" for name, count in expected.items()))
-skipped = re.findall(r"Test Case '([^']+)' skipped[^\n]*", log.read_text())
-if skipped:
-    print(f"App runtime: {len(skipped)} skipped; coverage is incomplete:")
-    for identity in skipped:
-        print("  " + identity)
-    if os.environ.get("ULTRACAM_REQUIRE_GPU_PROOFS") == "1":
-        raise SystemExit("Required GPU proof lane refuses skipped app tests")
-else:
-    print("App runtime: no skipped tests")
-PY_COVERAGE
 python3 "$task_root/scripts/check-gpu-proof-skips.py" --app "$test_log"
 python3 "$task_root/scripts/check-gpu-proof-skips.py" --package "$monitor_kit_test_log"
 python3 "$task_root/scripts/vendors.py" run-tests

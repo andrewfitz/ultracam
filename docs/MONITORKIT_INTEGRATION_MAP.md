@@ -1,5 +1,10 @@
 # MonitorKit integration map
 
+> Historical transition survey. For current integration and verification, use
+> [MonitorKit's README](../Packages/MonitorKit/README.md), [the app README](../README.md),
+> and [VALIDATION.md](../VALIDATION.md). The package build helper is now
+> `scripts/monitor-kit-package.sh`; dated instructions below describe the transition.
+
 Date: 2026-10-22. A read-only survey for two goals:
 - (a) design MonitorKit's Metal 4 encode path so it drops into the app's monitor seam with zero overhead;
 - (b) let W4 replace `Packages/MonitorTools` with `Packages/MonitorKit` without regressions.

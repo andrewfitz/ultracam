@@ -152,6 +152,19 @@ extension EnvironmentValues {
 }
 
 extension UIContext {
+  /// One leaf's snapshot. Keep the drive read even for capture-only leaves: it
+  /// also refreshes the low-space levels that wake the session's alerts.
+  func liveCameraSnapshot(_ id: String, live: UILiveSource?, follows: UILiveSource.Follows) -> UICameraSnapshot? {
+    guard let live else { return snapshot(id) }
+    let drives = live.drives()
+    guard let original = snapshot(id) else { return nil }
+    var camera = live.camera(original, follows: follows, drives: drives)
+    if let since = camera.signalLostSince {
+      camera.signalLostFor = ProcessInfo.processInfo.systemUptime - since
+    }
+    return camera
+  }
+
   /// The session with running values brought up to date: one camera's (`only`), or every
   /// camera's take values and the drives (`only: nil`).
   func liveSession(_ live: UILiveSource?, only cameraID: String? = nil, follows: UILiveSource.Follows) -> UISessionSnapshot {
@@ -185,18 +198,40 @@ struct UILiveCamera<Content: View>: View {
   var follows: UILiveSource.Follows = .all
   /// Also re-read on a timer: free space changes while nothing records.
   var refresh: TimeInterval? = nil
-  @ViewBuilder let content: (UILiveCameraValues) -> Content
+  private let content: (UILiveSource?) -> Content
   @Environment(\.uiLive) private var live
+
+  init(camera: UICameraPresentation, context: UIContext, follows: UILiveSource.Follows = .all,
+    refresh: TimeInterval? = nil, @ViewBuilder content: @escaping (UILiveCameraValues) -> Content) {
+    self.camera = camera
+    self.context = context
+    self.follows = follows
+    self.refresh = refresh
+    self.content = { live in content(Self.values(camera, context: context, live: live, follows: follows)) }
+  }
+
+  /// Raw running values, without deriving all the camera's presentation labels.
+  init(snapshotFor camera: UICameraPresentation, context: UIContext, follows: UILiveSource.Follows = .all,
+    refresh: TimeInterval? = nil, @ViewBuilder content: @escaping (UICameraSnapshot?) -> Content) {
+    self.camera = camera
+    self.context = context
+    self.follows = follows
+    self.refresh = refresh
+    self.content = { live in
+      UIRenderProbe.count("UILiveCamera(snapshot)")
+      return content(context.liveCameraSnapshot(camera.id, live: live, follows: follows))
+    }
+  }
 
   var body: some View {
     let _ = UIRenderProbe.count(follows == .take ? "UILiveCamera(take)" : follows == .capture ? "UILiveCamera(capture)" : "UILiveCamera")
     Group {
       if let refresh, live != nil {
         TimelineView(.periodic(from: .now, by: refresh)) { _ in
-          content(Self.values(camera, context: context, live: live, follows: follows))
+          content(live)
         }
       } else {
-        content(Self.values(camera, context: context, live: live, follows: follows))
+        content(live)
       }
     }
     // Running values never animate, even inside an animated container.

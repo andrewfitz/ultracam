@@ -115,18 +115,11 @@ import XCTest
     XCTAssertEqual(consumer.pendingCount, 0)
   }
 
-  func testFeedCoordinatorPublishesEveryCameraAndProgramAndFollowsProgramDemand() throws {
+  func testFeedCoordinatorPublishesEveryCameraAndProgram() {
     let a = FeedDescriptor(id: feed("alpha"), name: "Wide")
     let b = FeedDescriptor(id: feed("beta"), name: "Tight")
     let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [a, b]))
     XCTAssertEqual(coordinator.virtualCameraDescriptors.map(\.kind), [.feed, .feed, .program])
-
-    let start = coordinator.setProgramConsumer(true, at: 0)
-    XCTAssertEqual(start, [.start(feedID: "alpha")])
-    XCTAssertEqual(coordinator.activeDemandFeedIDs, Set(["alpha"]))
-    let stop = coordinator.setProgramConsumer(false, at: 1)
-    XCTAssertEqual(stop, [.stop(feedID: "alpha")])
-    XCTAssertTrue(coordinator.activeDemandFeedIDs.isEmpty)
   }
 
   func testSelectionWithNothingOnAirChangesAtOnce() {

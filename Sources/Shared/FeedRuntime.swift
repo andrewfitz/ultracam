@@ -9,29 +9,20 @@ enum FeedSessionState: Equatable, Sendable {
   case idle
   case running
   case unavailable(String)
-  case failed(String)
 }
 
-/// Runtime state and output ownership for one feed descriptor.
-///
-/// A session owns its fan-out instance so stopping one feed drains only that
-/// feed's pending leases. The capture implementation can publish processed
-/// frames here when the descriptor-driven output routes are integrated.
+/// Lifecycle state for one configured feed. Capture owns frame delivery.
 @MainActor
 final class FeedSession: Identifiable {
   let id: FeedID
   private(set) var descriptor: FeedDescriptor
   private(set) var state: FeedSessionState = .idle
-  private(set) var generation: UInt64 = 0
-  let frameFanOut: FrameFanOut<CVPixelBuffer>
 
   var isRunning: Bool { state == .running }
 
-  init(descriptor: FeedDescriptor,
-       frameFanOut: FrameFanOut<CVPixelBuffer> = FrameFanOut()) {
+  init(descriptor: FeedDescriptor) {
     id = descriptor.id
     self.descriptor = descriptor
-    self.frameFanOut = frameFanOut
   }
 
   func update(descriptor: FeedDescriptor) {
@@ -49,36 +40,14 @@ final class FeedSession: Identifiable {
       return false
     }
     guard !isRunning else { return false }
-    generation &+= 1
     state = .running
     return true
   }
 
-  /// Stops this feed and drains queued route leases while leaving route
-  /// registration intact for a later start.
+  /// Stops this feed.
   func stop() {
     guard state != .idle else { return }
-    generation &+= 1
-    frameFanOut.drain()
     state = .idle
-  }
-
-  func fail(_ message: String) {
-    generation &+= 1
-    frameFanOut.drain()
-    state = .failed(message)
-  }
-
-  func publish(_ frame: ProcessedFrame<CVPixelBuffer>) -> FrameFanOutReport {
-    guard isRunning else {
-      return FrameFanOutReport(outcomes: [:], routerClosed: false)
-    }
-    return frameFanOut.publish(frame)
-  }
-
-  func addRoute(id: String, capacity: Int,
-                policy: FrameQueueOverflowPolicy) throws -> FrameRoute<CVPixelBuffer> {
-    try frameFanOut.addRoute(id: id, capacity: capacity, policy: policy)
   }
 }
 
@@ -106,8 +75,6 @@ final class FeedCoordinator {
   let capturePool: FeedCapturePool
   let programOutput: ProgramOutputRoute
   private var programBridge: ProgramOutputBridge?
-  private var demandCoordinator: RouteDemandCoordinator
-  private var programConsumerActive = false
   private let programNormalizer = ProgramNormalizerLoader()
   /// Harnesses replace this: the production bridge opens the Mac's real Program camera.
   var makeProgramBridge: (FrameRoute<CVPixelBuffer>) -> ProgramOutputBridge = { route in
@@ -137,7 +104,6 @@ final class FeedCoordinator {
     virtualCameraRegistryVersion = safe.virtualCameraRegistryVersion
     programOutput = ProgramOutputRoute(settings: safe.switcher,
       feedIDs: safe.feeds.filter(\.enabled).map(\.id))
-    demandCoordinator = RouteDemandCoordinator()
     self.registryStore = registryStore
     self.capturePool = capturePool
     let initialDevices = VirtualCameraRegistrySnapshot.devices(for: safe.feeds)
@@ -170,13 +136,6 @@ final class FeedCoordinator {
       // app's selected feed/UI editing identity stable across an automatic
       // A→B cut; changing it here makes status callbacks and persisted device
       // settings switch to the wrong source.
-      if programConsumerActive {
-        // Delivery hops to the main actor after the route unlocks. A newer
-        // cut or topology edit may already have changed the on-air source;
-        // demand follows the live route, not this historical notification.
-        demandCoordinator.selectProgram(feedID: programOutput.selectedFeedID?.rawValue)
-        _ = demandCoordinator.drainTransitions()
-      }
       onProgramCutApplied?(feedID, sourceTime, programTime)
     case let .cutAbandoned(feedID, reason):
       onProgramCutAbandoned?(feedID, reason)
@@ -357,10 +316,6 @@ final class FeedCoordinator {
     }
     sessions[descriptor.id]?.update(descriptor: descriptor)
     programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
-    if programConsumerActive {
-      demandCoordinator.selectProgram(feedID: programOutput.selectedFeedID?.rawValue)
-      _ = demandCoordinator.drainTransitions()
-    }
     publishVirtualCameraRegistry()
   }
 
@@ -383,11 +338,6 @@ final class FeedCoordinator {
       return false
     }
     guard sessions[id]?.isRunning != true else { return false }
-    // Dedicated/manual consumers represent external owners of this feed. A
-    // topology removal must wait until those owners release their demand;
-    // otherwise the demand coordinator retains an orphaned source ID.
-    let demand = demandCoordinator.snapshot(for: id.rawValue)
-    guard !demand.dedicatedCamera, !demand.manualOutput else { return false }
     guard capturePool.remove(id) else { return false }
     sessions.removeValue(forKey: id)?.stop()
     descriptors.remove(at: index)
@@ -395,10 +345,6 @@ final class FeedCoordinator {
       selectedFeedID = descriptors.first(where: \.enabled)?.id ?? descriptors[0].id
     }
     programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
-    if programConsumerActive {
-      demandCoordinator.selectProgram(feedID: programOutput.selectedFeedID?.rawValue)
-      _ = demandCoordinator.drainTransitions()
-    }
     publishVirtualCameraRegistry()
     return true
   }
@@ -456,19 +402,6 @@ final class FeedCoordinator {
   func setRecordingCallbacks(feedID: FeedID,
                              callbacks: SourceRecordingCallbackAdapter.Callbacks?) {
     capture(for: feedID).setRecordingCallbacks(feedID: feedID, callbacks: callbacks)
-  }
-
-  func addOutputRoute(feedID: FeedID, routeID: String, capacity: Int,
-                      policy: FrameQueueOverflowPolicy) throws -> FrameRoute<CVPixelBuffer> {
-    try session(for: feedID).addRoute(id: routeID, capacity: capacity, policy: policy)
-  }
-
-  func publish(_ frame: ProcessedFrame<CVPixelBuffer>, to feedID: FeedID)
-    -> FrameFanOutReport {
-    let feedSession = session(for: feedID)
-    let report = feedSession.publish(frame)
-    if feedSession.isRunning { _ = ingestProgramFrame(feedID: feedID, frame: frame) }
-    return report
   }
 
   func setSwitcher(_ settings: SwitcherSettings) {
@@ -536,42 +469,6 @@ final class FeedCoordinator {
     throws -> FrameRoute<CVPixelBuffer> {
     try programOutput.addConsumerRoute(id: id, capacity: capacity, policy: policy)
   }
-
-  /// Ties source demand to the Program camera's consumer lifecycle. The
-  /// caller executes returned start/stop transitions against its capture pool.
-  @discardableResult
-  func setProgramConsumer(_ active: Bool, at time: TimeInterval? = nil)
-    -> [SourceDemandTransition] {
-    programConsumerActive = active
-    let selected = active ? programOutput.selectedFeedID?.rawValue : nil
-    demandCoordinator.selectProgram(feedID: selected,
-      at: time)
-    return demandCoordinator.drainTransitions()
-  }
-
-  @discardableResult
-  func setDedicatedCameraConsumer(feedID: FeedID, active: Bool,
-                                  ownerID: String? = nil, at time: TimeInterval? = nil)
-    -> [SourceDemandTransition] {
-    // Releases must remain possible after a descriptor is disabled so an
-    // existing consumer can relinquish its lease before topology removal.
-    let known = descriptors.contains(where: { $0.id == feedID })
-    guard known && (!active || descriptors.contains(where: { $0.id == feedID && $0.enabled })) else {
-      return []
-    }
-    if active {
-      _ = demandCoordinator.acquire(feedID: feedID.rawValue, route: .dedicatedCamera,
-        ownerID: ownerID, at: time)
-    } else {
-      _ = demandCoordinator.release(feedID: feedID.rawValue, route: .dedicatedCamera,
-        ownerID: ownerID, at: time)
-    }
-    return demandCoordinator.drainTransitions()
-  }
-
-  /// Feed IDs that currently keep a source capture demanded. Preview-only
-  /// leases are intentionally omitted from this runtime-facing view.
-  var activeDemandFeedIDs: Set<String> { demandCoordinator.activeSourceFeedIDs }
 
   /// Complete registry state published to the camera extension.
   var virtualCameraDescriptors: [VirtualCameraDescriptor] {

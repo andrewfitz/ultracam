@@ -418,8 +418,11 @@ final class AppModel {
   private(set) var takeAudio: [FeedID: AudioTakeSummary] = [:]
   /// The running take's audio so far; nil without a take on a meter.
   func takeAudioSoFar(_ id: FeedID) -> AudioTakeSummary? { takeTaps[id]?.takeSummarySoFar() }
-  private var pendingAutoDecisionID: UUID?
-  private var pendingAutoTargetFeedID: FeedID?
+  private struct PendingAutoDecision {
+    let id: UUID
+    let targetFeedID: FeedID
+  }
+  private var pendingAutoDecision: PendingAutoDecision?
   private var programMonitorTap: ProgramMonitorTap?
   /// A requested cut that did not land; cleared by the next cut.
   private var programCutIssue: String?
@@ -586,17 +589,16 @@ final class AppModel {
       // snapshot: a cut changes no device, so the camera registry is untouched.
       self?.persistProgramSelection()
       if let self {
-        let automatic = self.pendingAutoDecisionID != nil && self.pendingAutoTargetFeedID == feedID
+        let automatic = self.pendingAutoDecision?.targetFeedID == feedID
         let name = self.feedDescriptors.first { $0.id == feedID }?.name ?? feedID.rawValue
         self.recentCuts.insert(UICutRecord(at: Date(), cameraID: feedID.rawValue, cameraName: name,
           automatic: automatic), at: 0)
         if self.recentCuts.count > 20 { self.recentCuts.removeLast(self.recentCuts.count - 20) }
         self.programShotStartedAt = Date()
       }
-      guard let self, let decisionID = self.pendingAutoDecisionID,
-        self.pendingAutoTargetFeedID == feedID else { return }
-      self.pendingAutoDecisionID = nil
-      self.pendingAutoTargetFeedID = nil
+      guard let self, let decisionID = self.pendingAutoDecision?.id,
+        self.pendingAutoDecision?.targetFeedID == feedID else { return }
+      self.pendingAutoDecision = nil
       self.autoSwitcherTimeline?.recordApplied(decisionID: decisionID, target: feedID,
         sourceTime: sourceTime, programTime: programTime, directorAppliedAt: nil)
       // The director clock is one camera's audio time. The frame that
@@ -1032,14 +1034,13 @@ final class AppModel {
     defer { reconcileProgramTransportDemand() }
     // Also with nothing on air, where the switcher would just select it.
     guard !signalHealth.isUnhealthy(feedID) else { return .rejectedMissingSource }
-    let oldDecisionID = pendingAutoDecisionID
+    let oldDecisionID = pendingAutoDecision?.id
     let result = feedCoordinator.requestProgramCut(to: feedID)
     if case .rejectedMissingSource = result { return result }
     // NEXT, or the new camera when nothing was on air, shows with the click.
     switchingRevision &+= 1
     if let oldDecisionID {
-      pendingAutoDecisionID = nil
-      pendingAutoTargetFeedID = nil
+      pendingAutoDecision = nil
       autoSwitcherTimeline?.recordRejected(decisionID: oldDecisionID)
       autoSwitcherBridge?.reject(decisionID: oldDecisionID)
     }
@@ -1078,9 +1079,8 @@ final class AppModel {
       programCutIssue = message
       showStatus(message)
     }
-    if let decisionID = pendingAutoDecisionID, pendingAutoTargetFeedID == feedID {
-      pendingAutoDecisionID = nil
-      pendingAutoTargetFeedID = nil
+    if let decisionID = pendingAutoDecision?.id, pendingAutoDecision?.targetFeedID == feedID {
+      pendingAutoDecision = nil
       if reason == .expired { autoSwitcherTimeline?.recordExpired(decisionID: decisionID) }
       else { autoSwitcherTimeline?.recordRejected(decisionID: decisionID) }
       autoSwitcherBridge?.reject(decisionID: decisionID)
@@ -1182,8 +1182,8 @@ final class AppModel {
         self.switchingRevision &+= 1
         switch result {
         case .queued, .coalesced:
-          self.pendingAutoDecisionID = instruction.decisionID
-          self.pendingAutoTargetFeedID = instruction.targetCameraID
+          self.pendingAutoDecision = PendingAutoDecision(id: instruction.decisionID,
+            targetFeedID: instruction.targetCameraID)
         case .ignoredSameSource, .rejectedMissingSource, .selectedImmediately:
           self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
           bridge?.reject(decisionID: instruction.decisionID)
@@ -1200,9 +1200,8 @@ final class AppModel {
     bridge.onDecisionExpired = { [weak self, weak bridge] decisionID in
       Task { @MainActor [weak self] in
         guard let self, let bridge, self.autoSwitcherBridge === bridge,
-          self.pendingAutoDecisionID == decisionID else { return }
-        self.pendingAutoDecisionID = nil
-        self.pendingAutoTargetFeedID = nil
+          self.pendingAutoDecision?.id == decisionID else { return }
+        self.pendingAutoDecision = nil
         self.autoSwitcherTimeline?.recordExpired(decisionID: decisionID)
         self.feedCoordinator.cancelProgramCut()
       }
@@ -1217,9 +1216,8 @@ final class AppModel {
   }
 
   private func stopAutoSwitcher() {
-    let directorCutPending = pendingAutoDecisionID != nil
-    pendingAutoDecisionID = nil
-    pendingAutoTargetFeedID = nil
+    let directorCutPending = pendingAutoDecision != nil
+    pendingAutoDecision = nil
     // Stopping or reconfiguring the director must not leave its queued target
     // in the Program scheduler to switch after the UI has disabled automation.
     // A cut the operator asked for isn't the director's to cancel.
@@ -1473,9 +1471,8 @@ final class AppModel {
       let time = update.audioPacketTime ?? update.mediaTime else { return }
     captureLog.notice("Director clock: \(self.directorClockOwner?.rawValue ?? "none", privacy: .public) → \(feedID.rawValue, privacy: .public)")
     directorClockOwner = feedID
-    if let decisionID = pendingAutoDecisionID {
-      pendingAutoDecisionID = nil
-      pendingAutoTargetFeedID = nil
+    if let decisionID = pendingAutoDecision?.id {
+      pendingAutoDecision = nil
       autoSwitcherTimeline?.recordRejected(decisionID: decisionID)
       feedCoordinator.cancelProgramCut()
     }

@@ -35,6 +35,50 @@ import XCTest
     XCTAssertTrue(model.demandMonitorIsRunning, "Turning automatic start off must not stop it")
   }
 
+  func testSingleLiveCameraSnapshotPreservesFollowModesAndFixtures() throws {
+    let model = appModel()
+    let id = model.selectedFeedID
+    var update = CaptureUpdate(message: "Capturing")
+    update.timecode = "01:02:03:04"
+    model.deliverCaptureUpdateForTesting(id, update)
+    var camera = UICameraSnapshot(id: id.rawValue, name: "Camera")
+    camera.running = true
+    camera.timecode = "fixture timecode"
+    camera.recording.elapsed = 123
+    camera.signalLostSince = ProcessInfo.processInfo.systemUptime - 10
+    camera.signalLostFor = 99
+    var session = UISessionSnapshot()
+    session.cameras = [camera, UICameraSnapshot(id: "other", name: "Other")]
+    let context = UIContext.fixture(session)
+    let live = UILiveSource(model: model, interface: UIInterfaceState(defaults: defaults()))
+
+    XCTAssertEqual(context.liveCameraSnapshot(camera.id, live: nil, follows: .all), camera,
+      "Fixtures retain their supplied values, including loss age")
+    XCTAssertNil(context.liveCameraSnapshot("missing", live: nil, follows: .all))
+    XCTAssertNil(context.liveCameraSnapshot("missing", live: live, follows: .all))
+    let capture = try XCTUnwrap(context.liveCameraSnapshot(camera.id, live: live, follows: .capture))
+    XCTAssertEqual(capture.timecode, "01:02:03:04")
+    XCTAssertEqual(capture.recording.elapsed, 123, "Capture-only reads preserve the take snapshot")
+    let take = try XCTUnwrap(context.liveCameraSnapshot(camera.id, live: live, follows: .take))
+    XCTAssertEqual(take.timecode, "fixture timecode", "Take-only reads preserve capture values")
+    XCTAssertEqual(take.recording.elapsed, 0, "Absent live take statistics clear the stale take clock")
+    XCTAssertEqual(try XCTUnwrap(take.signalLostFor), 10, accuracy: 1,
+      "Loss age still advances when capture telemetry is not followed")
+    for follows: UILiveSource.Follows in [.capture, .take, .all, []] {
+      var expected = try XCTUnwrap(context.liveSession(live, only: camera.id, follows: follows).cameras.first)
+      var actual = try XCTUnwrap(context.liveCameraSnapshot(camera.id, live: live, follows: follows))
+      if let age = expected.signalLostFor {
+        XCTAssertEqual(try XCTUnwrap(actual.signalLostFor), age, accuracy: 0.1)
+      } else {
+        XCTAssertNil(actual.signalLostFor)
+      }
+      expected.signalLostFor = nil
+      actual.signalLostFor = nil
+      XCTAssertEqual(actual, expected, "Single-camera values preserve the session path's follow mode")
+    }
+    XCTAssertEqual(context.session, session, "Reading live values leaves fixture/session state unchanged")
+  }
+
   /// Settings › Alerts' Low Space reaches every drive figure: the snapshot's, the live views'
   /// (status bar, Attention, drive rows, which re-read the drives themselves) and the levels
   /// that wake the alerts. The live ones used to keep the default 30 minutes.

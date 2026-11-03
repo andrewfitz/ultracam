@@ -34,47 +34,73 @@ import XCTest
   func testClaimsSharingFailureAndStop() throws {
     let claims = CaptureDeviceClaims()
     let exclusive = Self.device("a:x")
-    try claims.claim(device: exclusive, ownerID: "one")
-    XCTAssertThrowsError(try claims.claim(device: exclusive, ownerID: "two"))
-    claims.releaseAll(ownerID: "one")
-    try claims.claim(device: exclusive, ownerID: "two")
-    claims.releaseAll(ownerID: "two")
+    let first = claimedSession(claims, device: exclusive, owner: "one")
+    let second = claimedSession(claims, device: exclusive, owner: "two")
+    try start(first, device: exclusive)
+    try start(first, device: exclusive) // Same-session start is idempotent.
+    XCTAssertThrowsError(try start(second, device: exclusive))
+    first.stop()
+    first.stop()
+    try start(second, device: exclusive)
+    second.stop()
+
     let shared = Self.device("a:shared", shareable: true)
-    try claims.claim(device: shared, ownerID: "one")
-    try claims.claim(device: shared, ownerID: "two")
+    let sharedFirst = claimedSession(claims, device: shared, owner: "one")
+    let sharedSecond = claimedSession(claims, device: shared, owner: "two")
+    try start(sharedFirst, device: shared)
+    try start(sharedSecond, device: shared)
+    sharedFirst.stop()
+    sharedSecond.stop()
+
     let plugin = RegistryFixture(id: "a", devices: [exclusive])
     plugin.session.fail = true
     let failed = claims.makeSession(plugin: plugin, device: exclusive, ownerID: "one")
-    XCTAssertThrowsError(try failed.start(deviceID: exclusive.id, timing: .automatic, handlers: CaptureHandlers(deliver: { _ in })))
-    try claims.claim(device: exclusive, ownerID: "two")
-    claims.releaseAll(ownerID: "two")
-    plugin.session.fail = false
-    let running = claims.makeSession(plugin: plugin, device: exclusive, ownerID: "one")
-    try running.start(deviceID: exclusive.id, timing: .automatic, handlers: CaptureHandlers(deliver: { _ in }))
-    XCTAssertThrowsError(try claims.claim(device: exclusive, ownerID: "two"))
-    running.stop()
-    try claims.claim(device: exclusive, ownerID: "two")
+    XCTAssertThrowsError(try start(failed, device: exclusive))
+    let recovered = claimedSession(claims, device: exclusive, owner: "two")
+    try start(recovered, device: exclusive)
+    recovered.stop()
   }
   func testSameOwnerCannotOpenTwoExclusiveSessions() throws {
     let claims = CaptureDeviceClaims()
     let device = Self.device("a:x")
-    let plugin = RegistryFixture(id: "a", devices: [device])
-    let first = claims.makeSession(plugin: plugin, device: device, ownerID: "feed")
-    let second = claims.makeSession(plugin: plugin, device: device, ownerID: "feed")
-    try first.start(deviceID: device.id, timing: .automatic, handlers: CaptureHandlers(deliver: { _ in }))
-    let neverStarted = claims.makeSession(plugin: plugin, device: device, ownerID: "feed")
+    let first = claimedSession(claims, device: device, owner: "feed")
+    let second = claimedSession(claims, device: device, owner: "feed")
+    let other = claimedSession(claims, device: device, owner: "other")
+    try start(first, device: device)
+    let neverStarted = claimedSession(claims, device: device, owner: "feed")
     neverStarted.stop()
-    XCTAssertThrowsError(try claims.claim(device: device, ownerID: "other"))
+    XCTAssertThrowsError(try start(other, device: device))
     do {
-      let abandoned = claims.makeSession(plugin: plugin, device: device, ownerID: "feed")
+      let abandoned = claimedSession(claims, device: device, owner: "feed")
       withExtendedLifetime(abandoned) {}
     }
-    XCTAssertThrowsError(try claims.claim(device: device, ownerID: "other"))
-    XCTAssertThrowsError(try second.start(deviceID: device.id, timing: .automatic, handlers: CaptureHandlers(deliver: { _ in })))
+    XCTAssertThrowsError(try start(other, device: device))
+    XCTAssertThrowsError(try start(second, device: device))
     second.stop()
-    XCTAssertThrowsError(try claims.claim(device: device, ownerID: "other"))
+    XCTAssertThrowsError(try start(other, device: device))
     first.stop()
-    try claims.claim(device: device, ownerID: "other")
+    try start(other, device: device)
+    other.stop()
+  }
+  func testSessionDeinitReleasesItsClaim() throws {
+    let claims = CaptureDeviceClaims()
+    let device = Self.device("a:x")
+    let next = claimedSession(claims, device: device, owner: "next")
+    do {
+      let current = claimedSession(claims, device: device, owner: "current")
+      try start(current, device: device)
+      XCTAssertThrowsError(try start(next, device: device))
+      withExtendedLifetime(current) {}
+    }
+    try start(next, device: device)
+    next.stop()
+  }
+  private func claimedSession(_ claims: CaptureDeviceClaims, device: CaptureDeviceInfo,
+                              owner: String) -> any CaptureSession {
+    claims.makeSession(plugin: RegistryFixture(id: "a", devices: [device]), device: device, ownerID: owner)
+  }
+  private func start(_ session: any CaptureSession, device: CaptureDeviceInfo) throws {
+    try session.start(deviceID: device.id, timing: .automatic, handlers: CaptureHandlers(deliver: { _ in }))
   }
   static func device(_ id: String, shareable: Bool = false) -> CaptureDeviceInfo {
     CaptureDeviceInfo(id: id, name: id, connectors: [], shareable: shareable, mayPause: nil, supportedModes: "")

@@ -3,12 +3,9 @@ import Foundation
 /// Shared across feeds. Membership and exclusivity are serialized under lock.
 final class CaptureDeviceClaims: @unchecked Sendable {
   private let lock = NSLock()
-  private struct Claim { var owners: [String: Set<UUID?>]; let shareable: Bool }
+  private struct Claim { var owners: [String: Set<UUID>]; let shareable: Bool }
   private var claims: [String: Claim] = [:]
-  func claim(device: CaptureDeviceInfo, ownerID: String) throws {
-    try claim(device: device, ownerID: ownerID, token: nil)
-  }
-  fileprivate func claim(device: CaptureDeviceInfo, ownerID: String, token: UUID?) throws {
+  fileprivate func claim(device: CaptureDeviceInfo, ownerID: String, token: UUID) throws {
     _ = try VendorRegistry.pluginID(for: device.id)
     try lock.withLock {
       if var claim = claims[device.id] {
@@ -17,27 +14,12 @@ final class CaptureDeviceClaims: @unchecked Sendable {
       } else { claims[device.id] = Claim(owners: [ownerID: [token]], shareable: device.shareable) }
     }
   }
-  func release(deviceID: String, ownerID: String) {
-    lock.withLock {
-      guard var claim = claims[deviceID] else { return }
-      claim.owners.removeValue(forKey: ownerID)
-      claims[deviceID] = claim.owners.isEmpty ? nil : claim
-    }
-  }
   fileprivate func release(deviceID: String, ownerID: String, token: UUID) {
     lock.withLock {
       guard var claim = claims[deviceID] else { return }
       claim.owners[ownerID]?.remove(token)
       if claim.owners[ownerID]?.isEmpty == true { claim.owners[ownerID] = nil }
       claims[deviceID] = claim.owners.isEmpty ? nil : claim
-    }
-  }
-  func releaseAll(ownerID: String) {
-    lock.withLock {
-      for id in Array(claims.keys) {
-        claims[id]?.owners.removeValue(forKey: ownerID)
-        if claims[id]?.owners.isEmpty == true { claims[id] = nil }
-      }
     }
   }
   func makeSession(plugin: any CaptureSourcePlugin, device: CaptureDeviceInfo, ownerID: String) -> any CaptureSession {

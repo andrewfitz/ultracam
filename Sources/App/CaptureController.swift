@@ -410,8 +410,8 @@ final class CaptureController: @unchecked Sendable {
   var activeFeed: FeedID? { lock.withLock { activeFeedID } }
 
   /// Identifies the latest start/stop generation for lifecycle consumers.
-  /// This is separate from FeedSession's state generation because callers may
-  /// stop the native controller more than once during one session teardown.
+  /// Callers may stop the native controller more than once during one session
+  /// teardown; queued deliveries must match this native lifecycle token.
   var generationToken: UInt64 { lock.withLock { generation } }
 
   #if ULTRACAM_TEST_SUPPORT

@@ -633,19 +633,20 @@ final class LUTProcessor: @unchecked Sendable {
 
   // MARK: - Pipelined submission
 
+  private static let supportedInputFormats: Set<OSType> = Set(VideoContract.tenBit422).union([
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+    kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
+    0x50323136, 0x32767579, 0x79757673, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA,
+    0x72323130, 0x5231324c, 0x55595641, 0x49343230, 0x50413136])
+
   /// Returns true for an untouched configuration (the input is the output).
   private func validate(_ input: CVPixelBuffer, untouched: Bool) throws -> Bool {
     let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
     guard width > 0, height > 0 else {
       throw VideoError.message("LUT input dimensions must be positive.")
     }
-    let supported: Set<OSType> = Set(VideoContract.tenBit422).union([
-      kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-      kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-      kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
-      0x50323136, 0x32767579, 0x79757673, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA,
-      0x72323130, 0x5231324c, 0x55595641, 0x49343230, 0x50413136])
-    guard supported.contains(CVPixelBufferGetPixelFormatType(input)) else {
+    guard Self.supportedInputFormats.contains(CVPixelBufferGetPixelFormatType(input)) else {
       throw VideoError.message("Expected 10-bit 4:2:2 input.")
     }
     try VideoBufferLayout.validate(input)

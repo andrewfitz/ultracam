@@ -35,33 +35,15 @@ import XCTest
     XCTAssertEqual(coordinator.snapshot.virtualCameraRegistryVersion, 7)
   }
 
-  func testSessionsHaveIndependentLifecycleAndRouteQueues() throws {
+  func testSessionsHaveIndependentLifecycle() {
     let first = FeedDescriptor(id: FeedID(rawValue: "feed-a"), name: "Wide")
     let second = FeedDescriptor(id: FeedID(rawValue: "feed-b"), name: "Tight")
     let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [first, second]))
-    let left = coordinator.session(for: first.id)
-    let right = coordinator.session(for: second.id)
-    let leftRoute = try coordinator.addOutputRoute(feedID: first.id, routeID: "camera",
-      capacity: 2, policy: .reject)
-    let rightRoute = try coordinator.addOutputRoute(feedID: second.id, routeID: "camera",
-      capacity: 2, policy: .reject)
-
     XCTAssertTrue(coordinator.start(first.id))
     XCTAssertTrue(coordinator.start(second.id))
-    XCTAssertEqual(left.state, .running)
-    XCTAssertEqual(right.state, .running)
-
-    XCTAssertEqual(coordinator.publish(try frame(1), to: first.id)["camera"], .enqueued)
-    XCTAssertEqual(coordinator.publish(try frame(2), to: second.id)["camera"], .enqueued)
-    XCTAssertEqual(leftRoute.pendingCount, 1)
-    XCTAssertEqual(rightRoute.pendingCount, 1)
-
     coordinator.stop(first.id)
-    XCTAssertEqual(left.state, .idle)
-    XCTAssertEqual(leftRoute.pendingCount, 0)
-    XCTAssertEqual(right.state, .running)
-    XCTAssertEqual(rightRoute.pendingCount, 1)
-    XCTAssertFalse(left.publish(try frame(3)).outcomes.keys.contains("camera"))
+    XCTAssertFalse(coordinator.isFeedRunning(first.id))
+    XCTAssertTrue(coordinator.isFeedRunning(second.id))
   }
 
   func testDisabledOrRunningFeedsCannotBeStartedOrRemoved() {
@@ -116,34 +98,10 @@ import XCTest
     XCTAssertNotNil(pool.existingController(for: second))
   }
 
-  func testProgramDemandIsReleasedWithItsConsumer() {
-    let first = FeedDescriptor(id: FeedID(rawValue: "feed-a"), name: "Wide")
-    let second = FeedDescriptor(id: FeedID(rawValue: "feed-b"), name: "Tight")
-    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [first, second]))
-
-    XCTAssertEqual(coordinator.setProgramConsumer(true, at: 0), [.start(feedID: "feed-a")])
-    XCTAssertEqual(coordinator.activeDemandFeedIDs, Set(["feed-a"]))
-    _ = coordinator.setProgramConsumer(false, at: 1)
-    XCTAssertTrue(coordinator.activeDemandFeedIDs.isEmpty)
-  }
-
-  func testDedicatedDemandRejectsDisabledAndUnknownFeeds() {
-    let enabled = FeedDescriptor(id: FeedID(rawValue: "enabled"), name: "Enabled")
-    let disabled = FeedDescriptor(id: FeedID(rawValue: "disabled"), name: "Disabled", enabled: false)
-    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [enabled, disabled]))
-
-    XCTAssertTrue(coordinator.setDedicatedCameraConsumer(
-      feedID: disabled.id, active: true).isEmpty)
-    XCTAssertTrue(coordinator.setDedicatedCameraConsumer(
-      feedID: FeedID(rawValue: "missing"), active: true).isEmpty)
-    XCTAssertTrue(coordinator.activeDemandFeedIDs.isEmpty)
-  }
-
-  func testDelayedCutEventKeepsDemandOnCurrentProgramSelection() async throws {
+  func testDelayedCutEventPreservesCurrentProgramSelection() async throws {
     let first = FeedDescriptor(id: FeedID(rawValue: "feed-a"), name: "Wide")
     var second = FeedDescriptor(id: FeedID(rawValue: "feed-b"), name: "Tight")
     let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [first, second]))
-    _ = coordinator.setProgramConsumer(true)
     _ = coordinator.ingestProgramFrame(feedID: first.id, frame: try frame(0))
     _ = coordinator.requestProgramCut(to: second.id)
     let delivered = expectation(description: "Deferred cut event delivered")
@@ -158,7 +116,7 @@ import XCTest
     coordinator.update(second)
     XCTAssertEqual(coordinator.programOutput.selectedFeedID, first.id)
     await fulfillment(of: [delivered], timeout: 2)
-    XCTAssertEqual(coordinator.activeDemandFeedIDs, Set([first.id.rawValue]))
+    XCTAssertEqual(coordinator.programOutput.selectedFeedID, first.id)
   }
 
   func testDisabledPersistedSelectionFallsBackToEnabledFeed() {

@@ -1,8 +1,8 @@
-#if SOURCE_DECLARATION_CHECKS
+#if ULTRACAM_TEST_SUPPORT
 import XCTest
 
-/// Compiled with the actual UISupport declaration by test-source-declarations.py.
-@objcMembers final class SourceDeclarationChecks: XCTestCase {
+/// Exercises the real UISupport declaration in the app test executable.
+@MainActor @objcMembers final class SourceDeclarationChecks: XCTestCase {
   func testSupportedSonyDeclarations() {
     XCTAssertEqual(UIMonitorBridge.sourceProfile(forGamut: "S-Gamut3.Cine / S-Log3"),
       "sony-slog3-sgamut3cine")
