@@ -569,6 +569,21 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try manager.makeSession(feedID: "Wide").finalURL.lastPathComponent, "001-2.mov")
   }
 
+  /// A take's metadata left behind without its movie (the movie deleted in Finder) still holds
+  /// the name: the take sidecar is created exclusively, so reusing the name would fail the take.
+  func testLeftoverTakeMetadataHoldsItsName() throws {
+    for leftover in ["001.mov.ultracam.json", "001.mov.ultracam.json.journal"] {
+      let root = try makeRoot()
+      defer { try? FileManager.default.removeItem(at: root) }
+      let naming = RecordingFileNaming(tokens: [.take], cameraSubfolders: false)
+      try Data([1]).write(to: root.appendingPathComponent(leftover))
+      let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0, naming: naming)
+      let session = try manager.makeSession(feedID: "Wide")
+      XCTAssertEqual(session.finalURL.lastPathComponent, "001-2.mov", leftover)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: RecordingTakeSidecar.url(for: session.finalURL).path), leftover)
+    }
+  }
+
   func testRecoveryScanReclaimsInterruptedExportAndKeepsOriginal() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

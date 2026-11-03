@@ -440,10 +440,17 @@ public final class RecordingOutputManager: @unchecked Sendable {
     func issuedKey(_ stem: String) -> String {
       feedDirectory.appendingPathComponent(stem).resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
     }
-    while Self.issuedPaths.contains(issuedKey(stem))
-      || fileManager.fileExists(atPath: feedDirectory.appendingPathComponent(".\(stem).partial").path)
-      || fileManager.fileExists(atPath: feedDirectory.appendingPathComponent("\(stem).\(configuration.fileExtension)").path)
-      || fileManager.fileExists(atPath: feedDirectory.appendingPathComponent(".\(stem).partial.ultracam-recovery").path) {
+    // Everything a take leaves holds its name: the movie, its partial and recovery journal, and
+    // its metadata pair, which a take creates exclusively and could not start beside.
+    func onDisk(_ stem: String) -> Bool {
+      let movie = feedDirectory.appendingPathComponent("\(stem).\(configuration.fileExtension)")
+      let sidecar = RecordingTakeSidecar.url(for: movie)
+      return [movie, sidecar, sidecar.appendingPathExtension("journal"),
+        feedDirectory.appendingPathComponent(".\(stem).partial"),
+        feedDirectory.appendingPathComponent(".\(stem).partial.ultracam-recovery")]
+        .contains { fileManager.fileExists(atPath: $0.path) }
+    }
+    while Self.issuedPaths.contains(issuedKey(stem)) || onDisk(stem) {
       stem = "\(stemBase)-\(suffix)"
       suffix += 1
     }
