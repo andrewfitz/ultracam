@@ -190,6 +190,21 @@ import XCTest
     try emitUntil("It lands") { model.switcherSelectedFeedID == ids[1] }
   }
 
+  /// Removing the selected camera, the one on air, moves the selection and Program to the
+  /// camera left. Nothing else tells the window: no cut lands, so no event follows.
+  func testRemovingTheSelectedCameraTellsTheWindow() throws {
+    try prepare()
+    defer { finish() }
+    XCTAssertEqual(model.switcherSelectedFeedID, ids[0])
+    let fired = Mutex(false)
+    withObservationTracking { _ = model.selectedFeedID } onChange: { fired.withLock { $0 = true } }
+    XCTAssertTrue(model.removeFeed(ids[0]))
+    settle()
+    XCTAssertEqual(model.selectedFeedID, ids[1])
+    XCTAssertEqual(model.switcherSelectedFeedID, ids[1])
+    XCTAssertTrue(fired.withLock { $0 }, "The selection and Program moved")
+  }
+
   func testACutThatMissesAnISOClientSaysSoUntilProgramHasOne() throws {
     try prepare()
     defer { finish() }

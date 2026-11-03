@@ -962,6 +962,9 @@ final class AppModel {
   func removeFeed(_ id: FeedID) -> Bool {
     guard canRemoveCamera(id) else { return false }
     guard feedCoordinator.remove(id) else { return false }
+    // The selection moves off a removed camera, and Program off it if it was on air, with
+    // no cut and so no event: the window hears of it here.
+    switchingRevision &+= 1
     let route = feedRouteID(id)
     routeDemand[route] = nil
     routeReleaseAt[route] = nil
