@@ -2528,16 +2528,21 @@ final class CaptureController: @unchecked Sendable {
     let processingMS = (timing.completed - item.encodeStart) * 1000
     services.didProcess(processingMS, (item.encodeStart - item.receivedAt) * 1000)
     guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
-    let sample: CMSampleBuffer
-    do { sample = try sampleFactory.sample(rendered, at: item.hostTime, duration: item.duration) }
-    catch {
-      queue.async { self.fail(error.localizedDescription, token: item.token) }
-      return
+    var outcome: CameraLink.Outcome = .notSent
+    // Program consumes the pixel buffer directly. Build a Core Media sample
+    // only for the preview or this camera's sink, when either needs it.
+    if item.preview != nil || item.sendsToCamera {
+      let sample: CMSampleBuffer
+      do { sample = try sampleFactory.sample(rendered, at: item.hostTime, duration: item.duration) }
+      catch {
+        queue.async { self.fail(error.localizedDescription, token: item.token) }
+        return
+      }
+      guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
+      item.preview?(sample)
+      guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
+      outcome = item.sendsToCamera ? camera.send(sample, attempt: item.cameraAttempt, using: services.send) : .notSent
     }
-    guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
-    item.preview?(sample)
-    guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
-    let outcome = item.sendsToCamera ? camera.send(sample, attempt: item.cameraAttempt, using: services.send) : .notSent
     guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
     if let handler = item.processedHandler {
       let metadata = ProcessedFrameMetadata(

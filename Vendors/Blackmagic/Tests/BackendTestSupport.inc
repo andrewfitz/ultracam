@@ -140,10 +140,12 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   long wrappedHeight = 2160;
   BMDPixelFormat pixel = bmdFormat10BitYUV;
   IDeckLinkVideoBuffer *ownedBuffer = nullptr;
+  unsigned videoBufferQueries = 0;
   FakeFrame(bool *result) : destroyed(result) {}
   ~FakeFrame() override { if (ownedBuffer) ownedBuffer->Release(); *destroyed = true; }
   HRESULT QueryInterface(REFIID iid, LPVOID *result) override {
     *result = nullptr;
+    if (sameIID(iid, IID_IDeckLinkVideoBuffer)) ++videoBufferQueries;
     if (sameIID(iid, IID_IDeckLinkVideoBuffer) && ownedBuffer) {
       ownedBuffer->AddRef(); *result = ownedBuffer; return S_OK;
     }

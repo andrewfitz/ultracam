@@ -296,8 +296,8 @@ struct UIStatusPopover: View {
       case .recording: recording
       case .audio: audio
       case .warning:
-        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(problems)") { _, presentation in
-          UIProblemList(problems: presentation.problems, context: context)
+        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(problems)") { (session: UISessionSnapshot) in
+          UIProblemList(problems: UIPresentationBuilder.problems(session), context: context)
         }
       }
     }

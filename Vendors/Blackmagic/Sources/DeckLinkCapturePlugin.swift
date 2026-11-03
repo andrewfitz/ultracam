@@ -182,9 +182,9 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
       let fieldDetail = CVBufferCopyAttachment(buffer, kCVImageBufferFieldDetailKey, nil)
       let scan: Scan = fields?.intValue == 2 || fieldDetail != nil ? .interlaced : .progressive
       if let fields, fields.doubleValue != 1 && fields.doubleValue != 2 { throw PluginError.unsupported("Invalid DeckLink field count") }
-      let next = try SourceFormat(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer),
+      let next = try sourceFormat(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer),
         pixelAspect: Self.pixelAspect(buffer), scan: scan, pixel: PixelFormatID(rawValue: CVPixelBufferGetPixelFormatType(buffer)),
-        colour: Self.colour(buffer), rate: .constant(duration))
+        colour: Self.colour(buffer), duration: duration)
       let clockReset = sourceClockDiscontinuous(at: pts)
       let formatChanged = next != format
       let boundary = clockReset || (formatChanged && format != nil)
@@ -239,12 +239,16 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
           owner.transferFunction == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String ? .hlg : .unspecified,
         matrix: .identity, range: owner.fullRange ? .full : .video,
         horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
-      let next = try SourceFormat(width: owner.width, height: owner.height,
-        pixel: PixelFormatID(rawValue: owner.pixelFormat), colour: colour, rate: .constant(duration))
-      let boundary = sourceClockDiscontinuous(at: pts) || (format != nil && format != next)
+      let next = try sourceFormat(width: owner.width, height: owner.height,
+        pixel: PixelFormatID(rawValue: owner.pixelFormat), colour: colour, duration: duration)
+      let clockReset = sourceClockDiscontinuous(at: pts)
+      let formatChanged = next != format
+      let boundary = clockReset || (format != nil && formatChanged)
       let nextEpoch = boundary ? CaptureEpochID(sessionID: epoch.sessionID, epoch: epoch.epoch + 1) : epoch
       let nextBindings = boundary ? Self.pairedBindings() : bindings
-      let snapshot = try SourceAdmissionSnapshot(format: next, epochID: nextEpoch, clockBindings: nextBindings, stage: .capture)
+      let snapshot: SourceAdmissionSnapshot
+      if !formatChanged, !clockReset, let admission { snapshot = admission }
+      else { snapshot = try SourceAdmissionSnapshot(format: next, epochID: nextEpoch, clockBindings: nextBindings, stage: .capture) }
       try snapshot.validate(SourceAdmissionMetadata(width: owner.width, height: owner.height,
         pixel: PixelFormatID(rawValue: owner.pixelFormat), isPlanar: false, planeCount: 0,
         rowBytes: owner.rowBytes, dataSize: allocationLength, presentationTime: pts, duration: duration,
@@ -252,7 +256,7 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
       let memory = try Self.ownedMemoryFrame(owner)
       epoch = nextEpoch; bindings = nextBindings; admission = snapshot
       if boundary { emit(.event(.discontinuity)) }
-      if format != next || boundary {
+      if formatChanged || clockReset {
         format = next; emit(.event(.formatChanged(next))); emit(.event(.audioFormatChanged(sessionAudioDeclaration)))
       }
       let info = CaptureFrameInfo(epochID: epoch, formatSignature: next.signature, presentationTime: pts,
@@ -312,6 +316,20 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
     let parts = labels.compactMap { Int($0) }
     guard labels.count == 4, parts.count == 4 else { return nil }
     return try? Timecode(hours: parts[0], minutes: parts[1], seconds: parts[2], frames: parts[3], dropFrame: text.contains(";"))
+  }
+  // SourceFormat computes its canonical JSON/SHA signature at construction.
+  // Reuse it only after checking every physical declaration field; layout and
+  // timestamp admission still run against each individual frame below.
+  private func sourceFormat(width: Int, height: Int, pixelAspect: Rational = .one, scan: Scan = .progressive,
+    pixel: PixelFormatID, colour: Colorimetry, duration: CMTime) throws -> SourceFormat {
+    if let format, format.width == width, format.height == height, format.pixelAspect == pixelAspect,
+      format.scan == scan, format.pixel == pixel, format.colour == colour, format.clock == .deviceClock,
+      duration.isNumeric, duration.timescale > 0, duration.epoch == 0, duration.value > 0,
+      case .constant(let currentDuration) = format.rate, CMTimeCompare(currentDuration, duration) == 0 {
+      return format
+    }
+    return try SourceFormat(width: width, height: height, pixelAspect: pixelAspect, scan: scan,
+      pixel: pixel, colour: colour, rate: .constant(duration))
   }
   private static func pixelAspect(_ buffer: CVPixelBuffer) throws -> Rational {
     guard let attachment = CVBufferCopyAttachment(buffer, kCVImageBufferPixelAspectRatioKey, nil) else { return .one }

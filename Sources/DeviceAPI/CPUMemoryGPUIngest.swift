@@ -8,11 +8,15 @@ import Foundation
 final class CPUMemoryGPUIngest: @unchecked Sendable {
   private let device: MTLDevice
   private let pipeline: MTLComputePipelineState
+  // Submissions share ordering; their allocators, residency and leases remain
+  // independent until each command's feedback has completed.
+  private let queue: MTL4CommandQueue
   private let serial = DispatchQueue(label: "org.ultracam.cpu-memory-ingest")
 
   init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
     guard let device, device.supportsFamily(.metal4) else { throw Self.failure("CPU-memory ingest requires Metal 4") }
     self.device = device
+    queue = try device.makeMTL4CommandQueue(descriptor: MTL4CommandQueueDescriptor())
     let compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
     let libraryDescriptor = MTL4LibraryDescriptor()
     libraryDescriptor.source = """
@@ -64,7 +68,6 @@ final class CPUMemoryGPUIngest: @unchecked Sendable {
     guard status == kCVReturnSuccess, let image, let surface = CVPixelBufferGetIOSurface(image)?.takeUnretainedValue() else { throw Self.failure("Cannot allocate ingest IOSurface") }
     let planar = layouts.count > 1
     guard CVPixelBufferGetPlaneCount(image) == (planar ? layouts.count : 0) else { throw NoCopyIngestError.invalidLength }
-    let queue = try device.makeMTL4CommandQueue(descriptor: MTL4CommandQueueDescriptor())
     let residency = try device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
     guard let allocator = device.makeCommandAllocator(), let command = device.makeCommandBuffer() else { throw Self.failure("Cannot create ingest command") }
     var textures: [MTLTexture] = [], parameters: [MTLBuffer] = [], tables: [MTL4ArgumentTable] = []
@@ -112,7 +115,9 @@ final class CPUMemoryGPUIngest: @unchecked Sendable {
         textures.append(texture); parameters.append(params); tables.append(table)
       }
     } catch { command.endCommandBuffer(); throw error }
-    command.endCommandBuffer(); residency.commit(); queue.addResidencySet(residency)
+    // Per-command residency avoids the shared queue's 32-set limit when many
+    // independent frames have been submitted before feedback retires them.
+    residency.commit(); command.useResidencySet(residency); command.endCommandBuffer()
     let resources = Submission(lease: lease, buffer: buffer, parameters: parameters, textures: textures,
       allocator: allocator, command: command, tables: tables, queue: queue, residency: residency)
     let options = MTL4CommitOptions()
@@ -145,7 +150,6 @@ final class CPUMemoryGPUIngest: @unchecked Sendable {
       self.allocator = allocator; self.command = command; self.tables = tables; self.queue = queue; self.residency = residency
     }
     func retire() {
-      queue.removeResidencySet(residency)
       if let buffer { residency.removeAllocation(buffer) }; residency.commit()
       buffer = nil
       lease.completeGPU()

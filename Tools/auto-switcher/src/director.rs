@@ -573,7 +573,6 @@ impl Director {
         let grace_deadline = deadline + self.config.forced_cut_grace_period;
         let boundary = self
             .boundaries()
-            .into_iter()
             .filter(|b| {
                 b.time >= deadline - self.config.forced_boundary_lookback
                     && b.time <= grace_deadline + self.config.boundary_window
@@ -707,7 +706,6 @@ impl Director {
 
     fn nearest_boundary(&self, now: MediaTime) -> Option<Boundary> {
         self.boundaries()
-            .into_iter()
             .filter(|b| {
                 let window = if b.kind.is_some() && self.config.mode == "transcriptAssisted" {
                     self.config.boundary_window + self.config.transcript_output_delay
@@ -719,7 +717,7 @@ impl Director {
             .min_by(|a, b| boundary_order(a, b, now))
     }
 
-    fn boundaries(&self) -> Vec<Boundary> {
+    fn boundaries(&self) -> impl Iterator<Item = Boundary> + '_ {
         let transcripts = self
             .transcripts
             .values()
@@ -740,7 +738,7 @@ impl Director {
                 confidence: (cue.pause_duration / 0.5).clamp(0.0, 1.0) as f32,
                 kind: None,
             });
-        transcripts.chain(pauses).collect()
+        transcripts.chain(pauses)
     }
 
     fn is_healthy(&self, camera_id: &str) -> bool {

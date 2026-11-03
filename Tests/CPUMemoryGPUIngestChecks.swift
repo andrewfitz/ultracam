@@ -4,6 +4,43 @@ import Metal
 import XCTest
 
 @objcMembers final class CPUMemoryGPUIngestChecks: XCTestCase {
+  func testSharedQueuePreservesConcurrentFramesAfterIngesterRelease() throws {
+    guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else { throw XCTSkip("Metal 4 GPU required") }
+    let page = Int(getpagesize())
+    var allocations: [UnsafeMutableRawPointer] = []
+    defer { allocations.forEach { $0.deallocate() } }
+    var ingester: CPUMemoryGPUIngest? = try CPUMemoryGPUIngest(device: device)
+    var completions: [XCTestExpectation] = []
+    for index in 0..<64 {
+      let raw = UnsafeMutableRawPointer.allocate(byteCount: page, alignment: page)
+      allocations.append(raw)
+      let expected = UInt8((index * 13) % 251)
+      raw.initializeMemory(as: UInt8.self, repeating: expected, count: page)
+      let frame = CapturedCPUMemoryFrame(pointer: raw, width: 2, height: 2, bytesPerRow: 8,
+        allocation: NoCopyIngestAllocation(baseAddress: raw, length: page, generation: 33),
+        inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 33) }, frameOwner: NSObject())
+      let done = expectation(description: "Concurrent native frame \(index)")
+      completions.append(done)
+      ingester?.ingest(frame) { result in
+        switch result {
+        case .failure(let error): XCTFail(String(describing: error))
+        case .success(let output):
+          CVPixelBufferLockBaseAddress(output.value, .readOnly)
+          if let pointer = CVPixelBufferGetBaseAddress(output.value)?.assumingMemoryBound(to: UInt8.self) {
+            let stride = CVPixelBufferGetBytesPerRow(output.value)
+            for row in 0..<2 {
+              XCTAssertEqual(Array(UnsafeBufferPointer(start: pointer.advanced(by: row * stride), count: 8)), Array(repeating: expected, count: 8))
+            }
+          } else { XCTFail("Missing concurrent output pixels") }
+          CVPixelBufferUnlockBaseAddress(output.value, .readOnly)
+        }
+        done.fulfill()
+      }
+    }
+    ingester = nil
+    wait(for: completions, timeout: 10)
+  }
+
   func testNDIPlanarStorageAndAlphaArePreservedOnGPU() throws { try checkNDIStorage(useCPU: false) }
   func testNDIPlanarCPUFallbackPreservesAllPlanesAndCounts() throws { try checkNDIStorage(useCPU: true) }
 

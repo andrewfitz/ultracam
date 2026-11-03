@@ -145,17 +145,17 @@ struct UIInspectorViewContent: View {
       .accessibilityValue(Self.signalText(snapshot))
       // A plain stat like Timecode: always present, "—" while stopped, never a warning.
       LabeledContent("Dropped frames") {
-        UILiveCamera(camera: camera, context: context, follows: .capture) { live in
-          Text(Self.droppedFramesText(live.snapshot)).monospacedDigit()
-            .help(Self.droppedFramesHelp(live.snapshot))
+        UILiveCamera(snapshotFor: camera, context: context, follows: .capture) { snapshot in
+          Text(Self.droppedFramesText(snapshot)).monospacedDigit()
+            .help(Self.droppedFramesHelp(snapshot))
         }
       }
       // Always present ("—" while stopped): a row that comes and goes with Start and Stop
       // moved everything below it under the pointer.
       LabeledContent("Timecode") {
         // Follows the camera's updates here, not in the inspector.
-        UILiveCamera(camera: camera, context: context, follows: .capture) { live in
-          Text(live.camera.timecode).monospacedDigit().textSelection(.enabled)
+        UILiveCamera(snapshotFor: camera, context: context, follows: .capture) { snapshot in
+          Text(snapshot.map { $0.timecode ?? "—" } ?? camera.timecode).monospacedDigit().textSelection(.enabled)
         }
       }
       Picker("Camera log", selection: Binding(get: { snapshot.sourceProfileID }, set: { context.send(.setSourceProfile(cameraID: camera.id, $0)) })) {
@@ -352,8 +352,8 @@ struct UIInspectorViewContent: View {
           : folder.folderIsCustom ? "This camera's folder" : "Default folder")
       }
       .help(folder.folderPath ?? "")
-      UILiveCamera(camera: camera, context: context, follows: .take, refresh: 5) { live in
-        if let seconds = live.snapshot?.recording.secondsLeft {
+      UILiveCamera(snapshotFor: camera, context: context, follows: .take, refresh: 5) { snapshot in
+        if let seconds = snapshot?.recording.secondsLeft {
           LabeledContent("Time left") { UIValue(parts: UIFormat.durationParts(seconds)) }
         }
       }

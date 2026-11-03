@@ -264,6 +264,34 @@ import CoreVideo
     XCTAssertEqual(declaration.signature, frame.formatSignature)
     XCTAssertEqual(info.hostTimeReference, .presentationEnd)
   }
+  func testUnchangedFramesReuseDeclarationAndStillReadChangedPhysicalMetadata() throws {
+    let recorder = AdapterDeliveryRecorder(), session = DeckLinkCaptureSession()
+    session.startFixture(handlers: CaptureHandlers(deliver: { recorder.append($0) }))
+    defer { session.stop() }
+    let initial = try fixtureBuffer()
+    session.deliverFixtureFrame(initial, at: .zero)
+    session.deliverFixtureFrame(initial, at: VideoContract.slowDuration)
+    let changed = try fixtureBuffer()
+    CVBufferSetAttachment(changed, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG, .shouldPropagate)
+    session.deliverFixtureFrame(changed, at: CMTimeMultiply(VideoContract.slowDuration, multiplier: 2))
+    let malformed = try fixtureBuffer()
+    CVBufferSetAttachment(malformed, kCVImageBufferFieldCountKey, NSNumber(value: 1.5), .shouldPropagate)
+    session.deliverFixtureFrame(malformed, at: CMTimeMultiply(VideoContract.slowDuration, multiplier: 3))
+    let values = recorder.values
+    let frames = values.filter { if case .frame = $0.payload { true } else { false } }
+    let declarations = values.compactMap { value -> SourceFormat? in
+      if case .event(.formatChanged(let format)) = value.payload { return format }; return nil
+    }
+    XCTAssertEqual(frames.count, 3)
+    XCTAssertEqual(declarations.count, 2)
+    guard frames.count == 3, declarations.count == 2 else { return }
+    XCTAssertEqual(frames[0].epochID, frames[1].epochID)
+    XCTAssertEqual(frames[0].formatSignature, frames[1].formatSignature)
+    XCTAssertNotEqual(frames[1].epochID, frames[2].epochID)
+    XCTAssertNotEqual(frames[1].formatSignature, frames[2].formatSignature)
+    XCTAssertEqual(declarations[1].colour.transfer, .hlg)
+    XCTAssertEqual(session.counters.conversionFailures, 1)
+  }
   func testWholeNativeCallbackGroupIncludingAudioOnlyAndEvents() {
     var error: NSError?
     XCTAssertTrue(UltracamRunCallbackGroupSyntheticChecks(&error), error?.localizedDescription ?? "Native callback group boundary failed")

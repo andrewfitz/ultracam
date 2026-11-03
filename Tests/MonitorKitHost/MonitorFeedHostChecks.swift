@@ -345,6 +345,42 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     XCTAssertTrue(completion.wait())
   }
 
+  @MainActor func testSuccessfulPictureFeedbackRecordsTimingWithoutRenderThreadWork() throws {
+    let (gpu, core) = try gpuCore()
+    let (host, _) = host("picture-feedback", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("picture-feedback"), host: host, gpu: gpu)
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    let completion = try monitorOnRender(gpu) { loop.pictureCompletionForTesting(core: core) }
+    // Initialize the reporting window before feedback arrives.
+    presenter.setClean(false)
+    let blocked = DispatchSemaphore(value: 0)
+    let resume = DispatchSemaphore(value: 0)
+    gpu.renderThread.perform {
+      blocked.signal()
+      _ = resume.wait(timeout: .now() + 10)
+    }
+    defer { resume.signal() }
+    XCTAssertEqual(blocked.wait(timeout: .now() + 2), .success)
+    // A busy render thread must not delay picture timing or make every successful
+    // feedback allocate a run-loop block. Reuse the suite's allocation logger.
+    for _ in 0..<20 {
+      completion.gpuCompleted(kind: MonitorSurfaceRenderLoop.pictureKind, gpuStart: 1, gpuEnd: 1.002, failed: false)
+    }
+    guard let allocations = countingAllocations({
+      for _ in 0..<200 {
+        completion.gpuCompleted(kind: MonitorSurfaceRenderLoop.pictureKind, gpuStart: 1, gpuEnd: 1.002, failed: false)
+      }
+    }) else { throw XCTSkip("malloc_logger unavailable") }
+    XCTAssertEqual(allocations, 0, "Successful picture feedback allocates before recording timing")
+    let deadline = Date().addingTimeInterval(3)
+    while presenter.statistics.pictureGPUMilliseconds == nil && Date() < deadline {
+      RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    XCTAssertEqual(try XCTUnwrap(presenter.statistics.pictureGPUMilliseconds), 2, accuracy: 1e-8)
+    XCTAssertEqual(presenter.statistics.failures, 0)
+    XCTAssertTrue(gpu.builtCore === core)
+  }
+
   @MainActor func testFailedGPUFeedbackRearmsUnchangedPictureAndHeldScope() throws {
     let (gpu, core) = try gpuCore()
     let mailbox = MonitorFeedbackMailbox()

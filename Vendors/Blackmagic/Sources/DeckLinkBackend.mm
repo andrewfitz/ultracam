@@ -1039,11 +1039,13 @@ class CaptureCallback final : public IDeckLinkInputCallback {
     }
     // SDK 16 reports the buffer length (IDeckLinkVideoBuffer::GetSize, manual
     // 2.5.53.2). A short buffer would let GPU readers run past the image.
+    ComRef<IDeckLinkVideoBuffer> videoBuffer;
+    HRESULT videoBufferStatus = E_NOINTERFACE;
     {
-      ComRef<IDeckLinkVideoBuffer> videoBuffer;
       uint64_t size = 0;
       const long rowBytes = frame->GetRowBytes();
-      const bool sizeKnown = frame->QueryInterface(IID_IDeckLinkVideoBuffer, reinterpret_cast<void **>(videoBuffer.out())) == S_OK &&
+      videoBufferStatus = frame->QueryInterface(IID_IDeckLinkVideoBuffer, reinterpret_cast<void **>(videoBuffer.out()));
+      const bool sizeKnown = videoBufferStatus == S_OK &&
           videoBuffer && videoBuffer->GetSize(&size) == S_OK;
       if (rowBytes <= 0 || !validPackedExtent(contract->width, contract->height, uint64_t(rowBytes), size, sizeKnown, contract->pixel)) {
         reportFatal(sizeKnown ? [NSString stringWithFormat:@"Desktop Video supplied a %llu-byte frame buffer with an invalid packed v210 stride or allocation extent.", (unsigned long long)size] :
@@ -1051,11 +1053,12 @@ class CaptureCallback final : public IDeckLinkInputCallback {
       }
     }
     if (contract->pixel == bmdFormat10BitRGB || contract->pixel == bmdFormat12BitRGBLE) {
-      ComRef<IDeckLinkVideoBuffer> storage;
-      if (!cpuMemoryFrameHandler || frame->QueryInterface(IID_IDeckLinkVideoBuffer, reinterpret_cast<void **>(storage.out())) != S_OK) {
+      if (!cpuMemoryFrameHandler || videoBufferStatus != S_OK || !videoBuffer) {
         reportFatal(@"The RGB input requires the owned GPU memory capture path."); return;
       }
-      UCDeckLinkOwnedMemoryFrame *owned = [[UCDeckLinkOwnedMemoryFrame alloc] initWithFrame:frame buffer:storage.value];
+      // Reuse the interface retained for extent validation. The owned frame
+      // acquires its own reference and access lease before this one expires.
+      UCDeckLinkOwnedMemoryFrame *owned = [[UCDeckLinkOwnedMemoryFrame alloc] initWithFrame:frame buffer:videoBuffer.value];
       if (!owned || !validPackedExtent(contract->width, contract->height, frame->GetRowBytes(), owned.allocationLength, true, contract->pixel)) {
         reportFatal(@"The RGB input did not use the plugin-owned SDK allocation."); return;
       }
@@ -1065,6 +1068,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
       if (accepting && framesEnabled) cpuMemoryFrameHandler(owned, CMTimeMake(timestamp, timeScale), CMTimeMake(duration, timeScale));
       return;
     }
+    videoBuffer.reset();
     CVPixelBufferRef buffer = nullptr;
     ComRef<IDeckLinkMacVideoBuffer> macBuffer;
     if (frame->QueryInterface(IID_IDeckLinkMacVideoBuffer,
@@ -3918,6 +3922,8 @@ BOOL UltracamRunOwnedAllocatorSyntheticChecks(NSError **error) {
   __block UCDeckLinkOwnedMemoryFrame *held = nil;
   callback->cpuMemoryFrameHandler = ^(UCDeckLinkOwnedMemoryFrame *value, CMTime, CMTime) { held = value; };
   callback->VideoInputFrameArrived(frame, nullptr);
+  if (frame->videoBufferQueries != 1)
+    return fail(error, @"Owned RGB delivery reacquired the buffer interface after extent validation.");
   frame->Release(); callback->accepting = false; callback->Release();
   if (!held || destroyed || static_cast<const uint8_t *>(held.pointer)[0] != 71)
     return fail(error, @"Owned RGB frame did not survive SDK stop/release with identical storage.");

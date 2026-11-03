@@ -346,6 +346,100 @@ import XCTest
     }
   }
 
+  func testNativeIntegerPacketsMatchConvertedMetersDisplaysAndTakes() throws {
+    let frames = 19_200
+    for sample in [AudioSampleType.int16, .int32] {
+      let format = try SourceAudioFormat(sampleRate: 48_000, channels: 4, sample: sample,
+        interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+      let tap = AudioMeterTap()
+      try tap.configure(format: format)
+      let meter = tap.attach()
+      let display = try XCTUnwrap(tap.displayMeter(channels: 2))
+      let reference = try AudioMeter(configuration: meter.configuration)
+      let displayReference = try AudioMeter(configuration: display.configuration)
+      let takeReference = try AudioMeter(configuration: AudioMeterConfiguration(
+        sampleRate: 48_000, channelCount: 4, meters: [.samplePeak, .truePeak, .loudness],
+        loudnessChannels: meter.configuration.loudnessChannels))
+      tap.beginTake()
+      var bits: UInt32 = 0
+      let values = (0..<(frames * 4)).map { _ -> Int32 in
+        bits = bits &* 1_664_525 &+ 1_013_904_223
+        return sample == .int16 ? Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: bits)))
+          : Int32(bitPattern: bits)
+      }
+      let bytes = sample == .int16 ? values.map { Int16($0) }.withUnsafeBytes { Data($0) }
+        : values.withUnsafeBytes { Data($0) }
+      let packet = try CaptureAudioPacket(planes: [bytes], sampleFrameCount: frames,
+        format: format, packetTime: .zero)
+      let converted = SourceAudioMeterInput.interleavedSamples(packet)
+      // The declaration starts a new source, so the tap primes its filters.
+      for m in [reference, displayReference, takeReference] { m.noteDiscontinuity() }
+      converted.withUnsafeBufferPointer { buffer in
+        reference.process(interleaved: buffer.baseAddress!, frameCount: frames)
+        displayReference.process(interleaved: buffer.baseAddress!, frameCount: frames, frameStride: 4)
+        takeReference.process(interleaved: buffer.baseAddress!, frameCount: frames)
+      }
+      tap.ingest(packet)
+      tap.waitUntilMetered()
+      for m in [meter, display, reference, displayReference, takeReference] { m.flush() }
+      for (actual, expected) in [(meter.snapshot(), reference.snapshot()),
+        (display.snapshot(), displayReference.snapshot())] {
+        XCTAssertEqual(actual.frameCount, expected.frameCount)
+        XCTAssertEqual(actual.loudness, expected.loudness)
+        for channel in 0..<actual.channelCount { XCTAssertEqual(actual[channel], expected[channel]) }
+      }
+      XCTAssertEqual(tap.detectedChannels, 4)
+      let take = try XCTUnwrap(tap.endTake())
+      XCTAssertEqual(take.maximumTruePeak, Double(takeReference.snapshot().programmeMaximumTruePeak))
+      XCTAssertEqual(take.integrated, Double(takeReference.snapshot().loudness.integrated))
+      XCTAssertEqual(take.duration, takeReference.snapshot().loudness.duration)
+      XCTAssertEqual(tap.counters.rejected, 0)
+      tap.detach()
+    }
+  }
+
+  func testIntegerSignalDetectionRetainsStrictThreshold() throws {
+    let threshold = Float(pow(10, Double(AudioMeterTap.signalThreshold) / 20))
+    for sample in [AudioSampleType.int16, .int32] {
+      let scale = sample == .int16 ? 32_768.0 : 2_147_483_648.0
+      let boundary = Int32(Double(threshold) * scale)
+      for value in [boundary, boundary + 1, -boundary, -boundary - 1] {
+        let format = try SourceAudioFormat(sampleRate: 48_000, channels: 4, sample: sample,
+          interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+        let tap = AudioMeterTap()
+        try tap.configure(format: format)
+        tap.attach()
+        let values: [Int32] = [0, 0, 0, value]
+        let bytes = sample == .int16 ? values.map { Int16($0) }.withUnsafeBytes { Data($0) }
+          : values.withUnsafeBytes { Data($0) }
+        let packet = try CaptureAudioPacket(planes: [bytes], sampleFrameCount: 1,
+          format: format, packetTime: .zero)
+        let normalized = SourceAudioMeterInput.interleavedSamples(packet)[3]
+        tap.ingest(packet)
+        tap.waitUntilMetered()
+        XCTAssertEqual(tap.detectedChannels, abs(normalized) > threshold ? 4 : 0)
+        tap.detach()
+      }
+    }
+  }
+
+  func testDeclaredFloatNonfiniteSamplesRemainSilent() throws {
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    let tap = AudioMeterTap()
+    try tap.configure(format: format)
+    let meter = tap.attach()
+    let bytes = [Float.nan, .infinity, -.infinity, .nan].withUnsafeBytes { Data($0) }
+    tap.ingest(try CaptureAudioPacket(planes: [bytes], sampleFrameCount: 2,
+      format: format, packetTime: .zero))
+    tap.waitUntilMetered()
+    meter.flush()
+    XCTAssertEqual(meter.snapshot()[0].samplePeak, -.infinity)
+    XCTAssertEqual(meter.snapshot()[1].samplePeak, -.infinity)
+    XCTAssertEqual(tap.detectedChannels, 0)
+    tap.detach()
+  }
+
   func testAutoSwitchActivityIncludesChannelsBeyondStereo() {
     let result = SourceAudioMeterInput.activity(peaks: [0, 0, 0.8], rms: [0, 0, 0.4])
     XCTAssertEqual(result.peak, 0.8, accuracy: 0.0001)

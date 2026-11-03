@@ -4,13 +4,15 @@ import IOSurface
 import Metal
 
 /// Asynchronous, code-exact 8-bit packed input -> encoder-native x422. No
-/// allocation cache: every budget lease ends at GPU feedback. Each submission
-/// owns its command memory and retains the original capture allocation.
+/// allocation cache: every budget lease ends at GPU feedback. One command
+/// queue serves the converter; each submission owns its command memory and
+/// residency set and retains the original capture allocation.
 final class Packed422RecordingConverter: @unchecked Sendable {
   enum Failure: Error { case unavailable, unsupportedSource, invalidOutput, capacity, gpu(String) }
   typealias Completion = @Sendable (Result<CVPixelBuffer, Error>) -> Void
   static let outputPixelFormat = kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
   private let device: MTLDevice
+  private let queue: MTL4CommandQueue
   private let decoder: Packed422GPU4
   private let budget: GPUAllocationBudget
   private let maximumInFlight: Int
@@ -20,6 +22,7 @@ final class Packed422RecordingConverter: @unchecked Sendable {
   init(device: MTLDevice? = MTLCreateSystemDefaultDevice(), maximumBytes: Int = 256 * 1024 * 1024, maximumInFlight: Int = 3) throws {
     guard let device, device.supportsFamily(.metal4), maximumInFlight > 0 else { throw Failure.unavailable }
     self.device = device; self.maximumInFlight = maximumInFlight
+    queue = try device.makeMTL4CommandQueue(descriptor: MTL4CommandQueueDescriptor())
     decoder = try Packed422GPU4(device: device)
     budget = GPUAllocationBudget(policy: try GPUAllocationBudgetPolicy(maximumBytes: maximumBytes, minimumSlots: 1))
   }
@@ -92,16 +95,18 @@ final class Packed422RecordingConverter: @unchecked Sendable {
       planes.append(t)
     }
     let outputLease = try budget.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: IOSurfaceGetAllocSize(surface), generation: 0, owner: surface)
-    let queue = try device.makeMTL4CommandQueue(descriptor: MTL4CommandQueueDescriptor())
     guard let allocator = device.makeCommandAllocator(), let command = device.makeCommandBuffer(),
       let parameters = device.makeBuffer(length: 16, options: .storageModeShared) else { throw Failure.unavailable }
     let residency = try device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
     residency.addAllocation(parameters); planes.forEach { residency.addAllocation($0) }
     if let texture { residency.addAllocation(texture) }; if let buffer { residency.addAllocation(buffer) }
-    residency.commit(); queue.addResidencySet(residency)
+    residency.commit()
     let td = MTL4ArgumentTableDescriptor(); td.maxBufferBindCount = 2; td.maxTextureBindCount = 3
     let table = try device.makeArgumentTable(descriptor: td)
     command.beginCommandBuffer(allocator: allocator)
+    // Residency belongs to this command, so concurrent submissions do not
+    // mutate shared queue residency or consume its 32-set limit.
+    command.useResidencySet(residency)
     guard let encoder = command.makeComputeCommandEncoder() else { command.endCommandBuffer(); throw Failure.unavailable }
     do {
       if let texture {
@@ -112,9 +117,9 @@ final class Packed422RecordingConverter: @unchecked Sendable {
           source: buffer, rowBytes: rowBytes, width: width, height: height, format: format,
           alphaRowBytes: alphaRowBytes, luma: planes[0], chroma: planes[1])
       }
-    } catch { encoder.endEncoding(); command.endCommandBuffer(); queue.removeResidencySet(residency); throw error }
+    } catch { encoder.endEncoding(); command.endCommandBuffer(); throw error }
     encoder.endEncoding(); command.endCommandBuffer()
-    let retained = Submission(converter: self, owner: owner, output: output, queue: queue, residency: residency,
+    let retained = Submission(converter: self, owner: owner, output: output, residency: residency,
       resources: [queue, allocator, command, parameters, table, residency] + planes.map { $0 as AnyObject } + (texture.map { [$0 as AnyObject] } ?? []) + (buffer.map { [$0 as AnyObject] } ?? []),
       leases: [sourceLease, outputLease])
     let options = MTL4CommitOptions()
@@ -131,13 +136,12 @@ final class Packed422RecordingConverter: @unchecked Sendable {
     let converter: Packed422RecordingConverter
     let owner: AnyObject
     let output: CVPixelBuffer
-    let queue: MTL4CommandQueue
     let residency: MTLResidencySet
     let resources: [AnyObject]
     let leases: [GPUAllocationBudget.Lease]
-    init(converter: Packed422RecordingConverter, owner: AnyObject, output: CVPixelBuffer, queue: MTL4CommandQueue, residency: MTLResidencySet, resources: [AnyObject], leases: [GPUAllocationBudget.Lease]) {
-      self.converter = converter; self.owner = owner; self.output = output; self.resources = resources; self.leases = leases; self.queue = queue; self.residency = residency
+    init(converter: Packed422RecordingConverter, owner: AnyObject, output: CVPixelBuffer, residency: MTLResidencySet, resources: [AnyObject], leases: [GPUAllocationBudget.Lease]) {
+      self.converter = converter; self.owner = owner; self.output = output; self.resources = resources; self.leases = leases; self.residency = residency
     }
-    func finish() { queue.removeResidencySet(residency); leases.forEach { $0.release() }; converter.lock.withLock { converter.active -= 1 } }
+    func finish() { leases.forEach { $0.release() }; converter.lock.withLock { converter.active -= 1 } }
   }
 }

@@ -314,7 +314,10 @@ final class AutoSwitcherBridge: @unchecked Sendable {
       auto_switcher_process_json(handle, $0)
     }
     guard let outputPointer else { return }
-    let output = String(cString: outputPointer)
+    // Most events produce the canonical empty array. Avoid constructing a
+    // String, Data and JSON decoder for that response on every audio/tick.
+    let isEmpty = outputPointer[0] == 91 && outputPointer[1] == 93 && outputPointer[2] == 0
+    let output = isEmpty ? nil : String(cString: outputPointer)
     auto_switcher_free_string(outputPointer)
     // Capture control inputs on the same serialized path as audio. In
     // particular, a clock rebase is reset + health + manual override.
@@ -328,6 +331,7 @@ final class AutoSwitcherBridge: @unchecked Sendable {
       }
     default: break
     }
+    guard let output else { return }
     guard let data = output.data(using: .utf8),
       let values = try? JSONDecoder().decode([RustOutput].self, from: data) else {
       report("Rust auto-switcher returned invalid JSON")

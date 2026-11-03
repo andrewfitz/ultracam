@@ -277,9 +277,10 @@ struct UICameraPictureView: View {
         if revealed {
           if showsTimecode {
             // The timecode alone follows the camera's updates (4 Hz), not the picture.
-            UILiveCamera(camera: camera, context: context, follows: .capture) { live in
-              Text(live.camera.timecode).font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
-                .accessibilityLabel("Timecode \(live.camera.timecode)")
+            UILiveCamera(snapshotFor: camera, context: context, follows: .capture) { snapshot in
+              let timecode = snapshot.map { $0.timecode ?? "—" } ?? camera.timecode
+              Text(timecode).font(.uiOverlay.monospacedDigit()).uiPictureOverlay()
+                .accessibilityLabel("Timecode \(timecode)")
             }
             .layoutPriority(-1)
           }
@@ -334,21 +335,21 @@ struct UICameraPictureView: View {
   /// the digits show here only while the strip is collapsed. The CPU copy pill yields first,
   /// so REC never truncates.
   private var recordingPill: some View {
-    UILiveCamera(camera: camera, context: context, follows: .all) { live in
+    UILiveCamera(snapshotFor: camera, context: context, follows: .all) { snapshot in
       HStack(spacing: 6) {
-        if live.snapshot?.ingestCPUCopyActive == true {
+        if snapshot?.ingestCPUCopyActive == true {
           HStack(spacing: 4) {
             UIStateGlyph(state: .warning)
             Text("CPU copy")
-            Text("\(live.snapshot?.ingestCPUCopyFrames ?? 0)").monospacedDigit()
+            Text("\(snapshot?.ingestCPUCopyFrames ?? 0)").monospacedDigit()
           }
           .font(.uiOverlay).lineLimit(1).uiPictureOverlay()
           .layoutPriority(-1)
-          .help("Ingest is copying frames on the CPU: \(live.snapshot?.ingestCPUCopyFrames ?? 0) so far. Diagnostics has the route.")
+          .help("Ingest is copying frames on the CPU: \(snapshot?.ingestCPUCopyFrames ?? 0) so far. Diagnostics has the route.")
           .accessibilityElement(children: .ignore)
           .accessibilityLabel("CPU copy for ingest")
         }
-        recordingPill(live.snapshot)
+        recordingPill(snapshot)
       }
     }
   }
@@ -871,8 +872,8 @@ struct UIChannelStripView: View {
       .help("Show \(camera.name)'s problems")
       .popover(isPresented: $problemsOpen, arrowEdge: .bottom) {
         // Its countdowns ("Take ends in 40 s") and clocks tick while it's open.
-        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(strip problems)") { _, presentation in
-          UIProblemList(problems: presentation.problems.filter { $0.cameraID == camera.id }, context: context)
+        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(strip problems)") { (session: UISessionSnapshot) in
+          UIProblemList(problems: UIPresentationBuilder.problems(session).filter { $0.cameraID == camera.id }, context: context)
         }
         .padding(12).frame(width: 340, alignment: .leading)
       }
@@ -1328,13 +1329,13 @@ struct UIChannelStripView: View {
         }
       }
     } else if isClean, isRecordingOrPaused {
-      UILiveCamera(camera: camera, context: context, follows: .take) { live in
+      UILiveCamera(snapshotFor: camera, context: context, follows: .take) { snapshot in
         HStack(spacing: 4) {
           UIStateGlyph(state: camera.stripState == .paused ? .paused : .recording, size: 7)
-          Text(UIFormat.shortElapsed(live.snapshot?.recording.elapsed ?? 0)).font(.uiValueStrong)
+          Text(UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0)).font(.uiValueStrong)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Recording \(UIFormat.shortElapsed(live.snapshot?.recording.elapsed ?? 0))")
+        .accessibilityLabel("Recording \(UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0))")
       }
     } else if let word = camera.collapsedWord {
       HStack(spacing: 4) {

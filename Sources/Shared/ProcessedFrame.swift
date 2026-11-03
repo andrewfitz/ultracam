@@ -48,11 +48,8 @@ public final class ProcessedFrame<Payload>: @unchecked Sendable {
   /// Retains one independent route reference. The returned lease must be
   /// released by the consumer; deinitialization is an idempotent safety net.
   public func retainLease() -> FrameLease<Payload> {
-    storage.retainReference()
     return FrameLease(storage: storage)
   }
-
-  deinit { storage.releaseReference() }
 }
 
 /// One route's explicit ownership of a processed frame.
@@ -90,7 +87,9 @@ public final class FrameLease<Payload>: @unchecked Sendable {
     retained = storage
     storage = nil
     lock.unlock()
-    retained?.releaseReference()
+    // The last storage owner may run user code in deinit. Keep it alive until
+    // after unlocking so that callback can safely inspect or release a lease.
+    withExtendedLifetime(retained) {}
   }
 
   deinit { release() }
@@ -365,9 +364,7 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
 private final class FrameStorage<Payload>: @unchecked Sendable {
   let payload: Payload
   let metadata: ProcessedFrameMetadata
-  private let lock = NSLock()
   private let onReleased: (() -> Void)?
-  private var references = 1
 
   init(payload: Payload, metadata: ProcessedFrameMetadata, onReleased: (() -> Void)?) {
     self.payload = payload
@@ -375,20 +372,7 @@ private final class FrameStorage<Payload>: @unchecked Sendable {
     self.onReleased = onReleased
   }
 
-  func retainReference() {
-    lock.lock()
-    references += 1
-    lock.unlock()
-  }
-
-  func releaseReference() {
-    var callback: (() -> Void)?
-    lock.lock()
-    if references > 0 {
-      references -= 1
-      if references == 0 { callback = onReleased }
-    }
-    lock.unlock()
-    callback?()
-  }
+  // ARC tracks the producer and each unreleased lease directly. A second
+  // reference counter would duplicate that ownership with a lock per access.
+  deinit { onReleased?() }
 }

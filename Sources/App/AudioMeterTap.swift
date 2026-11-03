@@ -423,6 +423,42 @@ final class AudioMeterTap: @unchecked Sendable {
     if let packet = slot.packet {
       guard packet.format.channels == meter.configuration.channelCount,
         packet.format.sampleRate == meter.configuration.sampleRate else { return nil }
+      // Integer interleaved PCM already has a native, vectorized meter input.
+      // Keep its Data alive while every meter reads it, avoiding a whole-packet
+      // Float copy for the session and another for the take. The fallback also
+      // preserves declared Float PCM's nonfinite-to-zero policy.
+      if packet.format.interleaved, packet.format.sample == .int16 || packet.format.sample == .int32 {
+        let native: Int? = packet.planes[0].withUnsafeBytes { raw in
+          guard let base = raw.baseAddress,
+            Int(bitPattern: base) % packet.format.sample.bytesPerSample == 0 else { return nil }
+          let frames = packet.sampleFrameCount
+          let channels = packet.format.channels
+          switch packet.format.sample {
+          case .int16:
+            let pcm = base.assumingMemoryBound(to: Int16.self)
+            meter.process(interleaved: pcm, frameCount: frames)
+            for display in displays where display.configuration.channelCount <= channels
+              && display.configuration.sampleRate == packet.format.sampleRate {
+              display.process(interleaved: pcm, frameCount: frames, frameStride: channels)
+            }
+            return detecting ? channelsWithSignal(pcm, frames: frames, channels: channels,
+              stride: channels, threshold: Int16(Double(signalAmplitude) * 32_768)) : 0
+          case .int32:
+            let pcm = base.assumingMemoryBound(to: Int32.self)
+            meter.process(interleaved: pcm, frameCount: frames)
+            for display in displays where display.configuration.channelCount <= channels
+              && display.configuration.sampleRate == packet.format.sampleRate {
+              display.process(interleaved: pcm, frameCount: frames, frameStride: channels)
+            }
+            // At -90 dBFS the integer boundary is below 2^24, where conversion
+            // to Float is exact, so this keeps the previous strict comparison.
+            return detecting ? channelsWithSignal(pcm, frames: frames, channels: channels,
+              stride: channels, threshold: Int32(Double(signalAmplitude) * 2_147_483_648)) : 0
+          default: return nil
+          }
+        }
+        if let native { return native }
+      }
       let samples = SourceAudioMeterInput.interleavedSamples(packet)
       samples.withUnsafeBufferPointer { buffer in
         guard let base = buffer.baseAddress else { return }

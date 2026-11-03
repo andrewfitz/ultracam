@@ -806,16 +806,26 @@ final class LUTProcessor: @unchecked Sendable {
     }
     outputSlotBytes = CVPixelBufferGetIOSurface(output).map { IOSurfaceGetAllocSize($0.takeUnretainedValue()) } ?? 0
     flushTextureCache()
-    let y = try outputTexture(output, plane: 0, format: configuration.outputColor.isEightBit ? .r8Unorm : .r16Unorm)
-    let uv = try outputTexture(output, plane: 1, format: configuration.outputColor.isEightBit ? .rg8Unorm : .rg16Unorm)
+    let yEntry = try outputTexture(output, plane: 0, format: configuration.outputColor.isEightBit ? .r8Unorm : .r16Unorm)
+    let uvEntry = try outputTexture(output, plane: 1, format: configuration.outputColor.isEightBit ? .rg8Unorm : .rg16Unorm)
+    let y = yEntry.texture, uv = uvEntry.texture
     var inputs: [MTLTexture] = []
-    var wrappers: [AnyObject] = []
-    let rgbTypes: [OSType: UInt32] = [kCVPixelFormatType_32BGRA: 1, kCVPixelFormatType_32RGBA: 2, 0x72323130: 3, 0x5231324c: 4]
-    let rgbInput = rgbTypes[type] != nil
+    // Keep the output views and their budget leases with this frame, alongside
+    // its input wrappers; no search through the whole output cache is needed.
+    var wrappers: [AnyObject] = [yEntry, uvEntry]
+    let rgbKind: UInt32?
+    switch type {
+    case kCVPixelFormatType_32BGRA: rgbKind = 1
+    case kCVPixelFormatType_32RGBA: rgbKind = 2
+    case 0x72323130: rgbKind = 3
+    case 0x5231324c: rgbKind = 4
+    default: rgbKind = nil
+    }
+    let rgbInput = rgbKind != nil
     let packed = type == kCVPixelFormatType_422YpCbCr10
     let i420 = type == 0x49343230
     let packed8 = type == kCVPixelFormatType_422YpCbCr8 || type == kCVPixelFormatType_422YpCbCr8_yuvs || type == 0x55595641
-    if let rgbKind = rgbTypes[type] {
+    if let rgbKind {
       parameters.chroma.w = Float(rgbKind)
       let textureWidth = rgbKind == 4 ? (width * 36 + 7) / 8 : width
       let (wrapper, rgb) = try view(input, plane: 0, format: rgbKind == 4 ? .r8Uint : .rgba8Uint,
@@ -866,7 +876,8 @@ final class LUTProcessor: @unchecked Sendable {
     // The frame retains its LUT and keeps its texture resident until it completes.
     let lutTexture = applied?.texture ?? placeholderLUT
     try encode(output: output, retained: wrappers + [input] + (applied.map { [$0] } ?? []) + (horizontal.map { [$0] } ?? []),
-      inputResidency: inputs + (applied.map { [$0.texture] } ?? []), timing: FrameTiming(submitted: submittedAt), isCurrent: isCurrent,
+      inputResidency: inputs + (applied.map { [$0.texture] } ?? []),
+      usesIntermediate: horizontal != nil, timing: FrameTiming(submitted: submittedAt), isCurrent: isCurrent,
       label: "LUT → Lanczos → output format", completion: completion) { encoder, slot in
       withUnsafeBytes(of: &parameters) { bytes in
         parameterBuffer.contents().advanced(by: slot.parameterOffset)
@@ -1074,8 +1085,9 @@ final class LUTProcessor: @unchecked Sendable {
       let (wrapper, source) = try view(input, plane: plane.index, format: plane.format, width: plane.width, height: plane.height)
       let target = try outputTexture(output, plane: plane.index, format: plane.format, width: plane.width, height: plane.height)
       wrappers.append(wrapper)
+      wrappers.append(target)
       inputs.append(source)
-      copies.append((source, target, plane))
+      copies.append((source, target.texture, plane))
     }
     CVBufferRemoveAllAttachments(output)
     CVBufferPropagateAttachments(input, output)
@@ -1097,7 +1109,8 @@ final class LUTProcessor: @unchecked Sendable {
         CVBufferSetAttachment(output, key, value, mode)
       }
     }
-    try encode(output: output, retained: wrappers + [input], inputResidency: inputs, timing: FrameTiming(submitted: submittedAt),
+    try encode(output: output, retained: wrappers + [input], inputResidency: inputs,
+      usesIntermediate: false, timing: FrameTiming(submitted: submittedAt),
       isCurrent: isCurrent, label: "Passthrough", completion: completion) { encoder, _ in
       for (source, target, plane) in copies {
         encoder.copy(sourceTexture: source, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
@@ -1113,6 +1126,7 @@ final class LUTProcessor: @unchecked Sendable {
   /// except encoder creation happened before, so a sequence number is always
   /// committed once taken.
   private func encode(output: CVPixelBuffer, retained: [AnyObject], inputResidency inputs: [MTLTexture],
+    usesIntermediate: Bool,
     timing: FrameTiming, isCurrent: () -> Bool, label: String, completion: @escaping Completion,
     body: (MTL4ComputeCommandEncoder, Slot) -> Bool) throws {
     try acquireSlot(isCurrent: isCurrent)
@@ -1138,9 +1152,11 @@ final class LUTProcessor: @unchecked Sendable {
       throw VideoError.message("Cannot create GPU encoder.")
     }
     encoder.label = label
-    // Frames share the intermediate texture: order this frame after earlier
-    // frames' GPU work. Encoding and committing still overlap the GPU.
-    encoder.barrier(afterQueueStages: [.dispatch, .blit], beforeStages: [.dispatch, .blit], visibilityOptions: .device)
+    // Resized frames share the intermediate texture. Full-resolution and
+    // passthrough frames own separate pool outputs and can overlap earlier work.
+    if usesIntermediate {
+      encoder.barrier(afterQueueStages: [.dispatch, .blit], beforeStages: [.dispatch, .blit], visibilityOptions: .device)
+    }
     let encoded = body(encoder, slot)
     encoder.endEncoding()
     commandBuffer.endCommandBuffer()
@@ -1151,10 +1167,7 @@ final class LUTProcessor: @unchecked Sendable {
     submitted &+= 1
     var timing = timing
     timing.committed = ProcessInfo.processInfo.systemUptime
-    let cacheRetained: [AnyObject] = outputCacheLock.withLock {
-      outputTextures.values.filter { $0.lastUsed == sequence }.map { $0 as AnyObject }
-    }
-    let record = InFlight(output: output, retained: retained + cacheRetained, completion: completion, timing: timing,
+    let record = InFlight(output: output, retained: retained, completion: completion, timing: timing,
       slotIndex: Int(sequence % UInt64(slots.count)))
     stateLock.withLock {
       pending[sequence] = record
@@ -1306,7 +1319,7 @@ final class LUTProcessor: @unchecked Sendable {
     throw VideoError.message("Cannot map frame plane \(plane) for the GPU (\(status)).")
   }
 
-  private func outputTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) throws -> MTLTexture {
+  private func outputTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) throws -> SurfaceEntry {
     try outputTexture(buffer, plane: plane, format: format,
       width: CVPixelBufferGetWidthOfPlane(buffer, plane), height: CVPixelBufferGetHeightOfPlane(buffer, plane))
   }
@@ -1316,7 +1329,7 @@ final class LUTProcessor: @unchecked Sendable {
   /// The entry retains its surface, so the ID cannot be reused while cached;
   /// identity is still checked.
   private func outputTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat,
-    width: Int, height: Int) throws -> MTLTexture {
+    width: Int, height: Int) throws -> SurfaceEntry {
     outputCacheLock.lock(); defer { outputCacheLock.unlock() }
     guard let surface = CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue() else {
       throw VideoError.message("Output frame is not IOSurface-backed.")
@@ -1325,7 +1338,7 @@ final class LUTProcessor: @unchecked Sendable {
     if let entry = outputTextures[key], entry.surface === surface {
       entry.lastUsed = submitted
       entry.lastUsedTime = monotonicNow()
-      return entry.texture
+      return entry
     }
     if let stale = outputTextures.removeValue(forKey: key) {
       guard waitUntilIdle(timeout: 2) else { throw VideoError.message("The GPU stopped responding.") }
@@ -1347,11 +1360,12 @@ final class LUTProcessor: @unchecked Sendable {
       evictIdleOutputTextures(pressure: true)
       lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: bytes, generation: 0, owner: surface)
     }
-    outputTextures[key] = SurfaceEntry(surface: surface, texture: texture, lastUsed: submitted, time: monotonicNow(), lease: lease)
+    let entry = SurfaceEntry(surface: surface, texture: texture, lastUsed: submitted, time: monotonicNow(), lease: lease)
+    outputTextures[key] = entry
     scheduleAgeSweepLocked()
     outputResidency.addAllocation(texture)
     outputResidencyDirty = true
-    return texture
+    return entry
   }
 
   /// Preparing a frame may fail before a command is committed. Those views

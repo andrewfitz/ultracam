@@ -120,8 +120,7 @@ struct ClockMappedPCMConverter {
       }
     }
     let outputCapacity = try preflight(sampleFrameCount: sampleFrameCount, mapping: mapping)
-    let decoded = try decode(planes, frames: sampleFrameCount)
-    let frames = pending + decoded
+    let frames = try decode(planes, frames: sampleFrameCount)
     var cursor = phase
     let step = format.sampleRate / (outputSampleRate * ratio)
     var output = [Float]()
@@ -189,26 +188,32 @@ struct ClockMappedPCMConverter {
     let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: format.sample.bytesPerSample)
     guard !overflow, !byteOverflow, planes.count == (format.interleaved ? 1 : format.channels),
       planes.allSatisfy({ $0.count == bytes }) else { throw ClockMappedPCMError.invalidPacket }
-    var output = [Float]()
-    output.reserveCapacity(frames * format.channels)
-    for frame in 0..<frames {
-      for channel in 0..<format.channels {
-        let plane = planes[format.interleaved ? 0 : channel]
-        let index = (format.interleaved ? frame * format.channels + channel : frame) * format.sample.bytesPerSample
-        let value: Float = plane.withUnsafeBytes { raw in
+    // Decode directly after the retained interpolation frame. Borrow each
+    // plane once, rather than once per sample, and avoid a second full-packet
+    // Float array when joining the decoded samples to that retained frame.
+    let prefix = pending.count
+    var output = [Float](repeating: 0, count: prefix + frames * format.channels)
+    output.replaceSubrange(0..<prefix, with: pending)
+    for (plane, data) in planes.enumerated() {
+      try data.withUnsafeBytes { raw in
+        for sample in 0..<samples {
+          let index = sample * format.sample.bytesPerSample
+          let value: Float
           if format.sample == .int16 {
-            return Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: index, as: Int16.self))) / 32768
+            value = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: index, as: Int16.self))) / 32768
+          } else {
+            let bits = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: index, as: UInt32.self))
+            switch format.sample {
+            case .float32: value = Float(bitPattern: bits)
+            case .int24in32: value = Float(Int32(bitPattern: bits)) / 8_388_608
+            case .int32: value = Float(Int32(bitPattern: bits)) / 2_147_483_648
+            case .int16: value = 0
+            }
           }
-          let bits = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: index, as: UInt32.self))
-          switch format.sample {
-          case .float32: return Float(bitPattern: bits)
-          case .int24in32: return Float(Int32(bitPattern: bits)) / 8_388_608
-          case .int32: return Float(Int32(bitPattern: bits)) / 2_147_483_648
-          case .int16: return 0
-          }
+          guard value.isFinite else { throw ClockMappedPCMError.nonFiniteSample }
+          let destination = format.interleaved ? sample : sample * format.channels + plane
+          output[prefix + destination] = value
         }
-        guard value.isFinite else { throw ClockMappedPCMError.nonFiniteSample }
-        output.append(value)
       }
     }
     return output

@@ -19,6 +19,10 @@ private final class FrameReleaseCounter: @unchecked Sendable {
   }
 }
 
+private final class WeakFrameLease {
+  weak var value: FrameLease<Int>?
+}
+
 @objcMembers final class ProcessedFrameChecks: XCTestCase {
   private func metadata(_ value: Int64) -> ProcessedFrameMetadata {
     ProcessedFrameMetadata(presentationTime: CMTime(value: value, timescale: 60_000),
@@ -57,6 +61,24 @@ private final class FrameReleaseCounter: @unchecked Sendable {
     cameraLease.release()
     XCTAssertEqual(counter.count, 1, "Release is idempotent")
     fanOut.close()
+  }
+
+  func testConcurrentReleaseRunsCallbackOnceAfterUnlockingLease() throws {
+    let counter = FrameReleaseCounter()
+    let observed = WeakFrameLease()
+    var source: ProcessedFrame<Int>? = ProcessedFrame(payload: 7, metadata: metadata(7), onReleased: {
+      XCTAssertEqual(observed.value?.isReleased, true)
+      observed.value?.release()
+      counter.increment()
+    })
+    let lease = try XCTUnwrap(source).retainLease()
+    observed.value = lease
+    source = nil
+    XCTAssertEqual(counter.count, 0)
+    DispatchQueue.concurrentPerform(iterations: 64) { _ in lease.release() }
+    XCTAssertEqual(counter.count, 1)
+    XCTAssertNil(lease.payload)
+    XCTAssertNil(lease.metadata)
   }
 
   func testRejectPreservesPendingFrame() throws {

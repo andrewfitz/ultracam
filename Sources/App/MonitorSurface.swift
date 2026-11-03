@@ -1273,6 +1273,7 @@ private final class MonitorWindowObservations: @unchecked Sendable {
 
 /// Render-thread side of one picture surface and its scope. Confined to the
 /// render thread except `start`, `stop` and `setPaused`, which hop onto it.
+/// Successful picture feedback only updates the presenter's locked counters.
 ///
 /// Per refresh with something new: wrap the frame (resident texture cache, no
 /// allocation), analyse focus once per frame per feed, and render one MonitorKit
@@ -1807,6 +1808,13 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private func submissionCompletion(core: MonitorGPUContext.Core, kind: Int, serial: UInt64) -> MonitorGPUCompletion {
     MonitorGPUTransaction { [weak self, core] failed, milliseconds in
       guard let self else { return }
+      // Successful pictures only update the presenter's locked timing counters.
+      // Keep that on the feedback queue instead of waking the render thread for
+      // every picture. Scope retirement and failure recovery stay confined there.
+      if !failed, kind == Self.pictureKind {
+        self.presenter?.recordGPU(kind: kind, milliseconds: milliseconds, failed: false)
+        return
+      }
       self.gpu.renderThread.perform { [self, core] in
         if failed {
           self.gpu.invalidate(ifCurrent: core)

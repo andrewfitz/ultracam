@@ -92,8 +92,8 @@ struct UIAttentionSection: View {
   }
 
   var body: some View {
-    UILiveSession(context: context, refresh: refresh, probe: "UILiveSession(attention)") { _, presentation in
-      let rows = presentation.problems + presentation.setupRows
+    UILiveSession(context: context, refresh: refresh, probe: "UILiveSession(attention)") { (session: UISessionSnapshot) in
+      let rows = UIPresentationBuilder.problems(session) + UIPresentationBuilder.setupRows(session)
       if !rows.isEmpty {
         VStack(alignment: .leading, spacing: 6) {
           Text("ATTENTION").font(.uiBadge).foregroundStyle(.secondary)
