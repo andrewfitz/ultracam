@@ -150,6 +150,32 @@ import XCTest
   }
   #endif
 
+  /// The model keeps what each take's driver decided at its start about
+  /// burning the camera's LUT in, for the window to describe the take.
+  func testEachTakeKeepsWhetherItBurnsTheLUTIn() {
+    final class BurnInDriver: RecordingSessionDriver, RecordingSessionDriverLUTBurnIn {
+      var graded = Set<FeedID>()
+      func startRecording(feedID: FeedID, configuration: RecordingConfiguration) throws {}
+      func pauseRecording(feedID: FeedID) throws {}
+      func resumeRecording(feedID: FeedID) throws {}
+      func stopRecording(feedID: FeedID) throws {}
+      func takeBurnsInLUT(feedID: FeedID) -> Bool { graded.contains(feedID) }
+    }
+    let driver = BurnInDriver()
+    driver.graded = [first]
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide"),
+      RecordingFeedDescriptor(id: second, name: "Tight")], driver: driver)
+    model.outputFolder = URL(fileURLWithPath: "/tmp/recording-burn-in")
+    model.burnInLUT = true
+    model.recordAll()
+    XCTAssertEqual(model.feeds.map(\.takeBurnsInLUT), [true, false])
+    driver.graded = [second]
+    XCTAssertEqual(model.feeds.map(\.takeBurnsInLUT), [true, false], "A rolling take keeps what it started with")
+    model.stop(feedID: first)
+    model.record(feedID: first)
+    XCTAssertEqual(model.feeds.first?.takeBurnsInLUT, false, "The next take decides again")
+  }
+
   func testPerCameraConstantRatePreferenceIsImmutableForEachTake() {
     let driver = Driver()
     let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide", recordingConstantFrameRate: true),

@@ -438,7 +438,7 @@ struct UIStatusPopover: View {
       Divider()
       HStack(spacing: 8) {
         UIBadge(text: session.codec.title, symbol: UISymbol.format).fixedSize()
-        Text("Camera original").font(.uiMeta).foregroundStyle(.secondary)
+        Text(UIPresentationBuilder.recordingLook(session)).font(.uiMeta).foregroundStyle(.secondary)
         Label(session.timecodeTitle, systemImage: UISymbol.timecode).font(.uiMeta).foregroundStyle(.secondary)
       }
       if takes.isEmpty, let camera = session.cameras.first {

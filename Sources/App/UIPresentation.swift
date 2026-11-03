@@ -103,6 +103,8 @@ struct UICameraRecording: Sendable, Equatable {
   var takeCodec: RecordingCodec?
   /// What was chosen, when the source couldn't use it and `takeCodec` is the fallback.
   var takeFallbackFrom: RecordingCodec?
+  /// The rolling take burns the camera's LUT in, as decided at its start. Stale while idle.
+  var takeBurnsInLUT = false
   var failed = false
   var error: String?
   /// A note on the take that isn't an error, such as audio re-synced to the picture.
@@ -173,6 +175,8 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var colorTarget: ColorTarget = .yuv4208
   var frameRateTarget: FrameRateTarget = .fps2997
   var lutName: String?
+  /// It burns a LUT into its output now: processing and Apply LUT on, a LUT loaded.
+  var burnsInLUT = false
   var lutLoading = false
   var lutError: String?
   var gamut = "Unspecified / custom LUT"
@@ -372,6 +376,8 @@ struct UISessionSnapshot: Sendable, Equatable {
   var recentCuts: [UICutRecord] = []
   /// The format chosen for every camera, applied to the next take.
   var codec: RecordingCodec = .proRes42210Bit
+  /// Settings › Recording › Burn LUT into recordings, for the next take.
+  var burnInLUT = false
   var timecodeTitle = "Mac Clock"
   var defaultFolderPath: String?
   var drives: [UIDrive] = []
@@ -834,6 +840,23 @@ enum UIFormat {
 enum UIPresentationBuilder {
   static let effectLongTitles = ["LUT", "Resize", "Color format", "Frame-rate cap"]
 
+  /// What this camera records: a rolling take what it started with, otherwise
+  /// what the next take gets (the setting on and the camera burning a LUT in).
+  static func recordsLUT(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> Bool {
+    switch camera.recording.status {
+    case .recording, .paused, .finishing: return camera.recording.takeBurnsInLUT
+    case .idle: return session.burnInLUT && camera.burnsInLUT
+    }
+  }
+
+  /// The recording line beside the format: what the cameras record.
+  static func recordingLook(_ session: UISessionSnapshot) -> String {
+    let graded = session.cameras.filter { recordsLUT($0, in: session) }.count
+    if graded == 0 { return "Camera original" }
+    if graded == session.cameras.count { return "LUT burned in" }
+    return "LUT burned in on \(graded) of \(session.cameras.count) cameras"
+  }
+
   static func tally(for camera: UICameraSnapshot, in session: UISessionSnapshot) -> UITally {
     let onAir = session.onAirID == camera.id
     let program = onAir ? programTally(camera, in: session) : .none
@@ -960,7 +983,9 @@ enum UIPresentationBuilder {
       // Name what is actually missing; the badge and picture already say which signal problem it is.
       recordTitle = "Can't record yet"
       recordDetail = rec.folderPath == nil ? "Needs a supported signal and a recording folder" : "Needs a supported signal"
-    case .ready: recordTitle = "Ready to record"; recordDetail = "Camera original, no LUT or effects"
+    case .ready:
+      recordTitle = "Ready to record"
+      recordDetail = recordsLUT(camera, in: session) ? "Camera original, LUT burned in" : "Camera original, no LUT or effects"
     }
 
     let canRecordNow = camera.running && liveFormat != nil && rec.folderPath != nil && rec.status == .idle

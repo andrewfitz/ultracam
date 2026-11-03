@@ -132,7 +132,7 @@ struct UISessionSidebarViewContent: View {
       UIFormatMenu(context: context)
         .selectionDisabled()
       HStack(spacing: 8) {
-        Text("Camera original")
+        Text(UIPresentationBuilder.recordingLook(session))
         // Timecode is set once per rig: the caption opens Settings › Recording.
         Button { context.send(.openSettingsTab(.recording)) } label: {
           Label { Text(session.timecodeTitle) } icon: { Image(systemName: UISymbol.timecode) }

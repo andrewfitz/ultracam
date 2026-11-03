@@ -212,6 +212,36 @@ import XCTest
     }
   }
 
+  /// Burn LUT into recordings: the recording copy says the camera's LUT is
+  /// burned in only where a take records it. A rolling take is described by
+  /// what it started with, whatever the setting or the camera's LUT is now.
+  func testRecordingCopySaysWhereTheLUTIsBurnedIn() {
+    var graded = camera(1)
+    graded.burnsInLUT = true
+    var session = separate([graded, camera(2)])
+    XCTAssertEqual(presented(session, 0).recordDetail, "Camera original, no LUT or effects", "Setting off")
+    XCTAssertEqual(UIPresentationBuilder.recordingLook(session), "Camera original")
+    session.burnInLUT = true
+    XCTAssertEqual(presented(session, 0).recordTitle, "Ready to record")
+    XCTAssertEqual(presented(session, 0).recordDetail, "Camera original, LUT burned in")
+    XCTAssertEqual(presented(session, 1).recordDetail, "Camera original, no LUT or effects", "A camera with no LUT records unchanged")
+    XCTAssertEqual(UIPresentationBuilder.recordingLook(session), "LUT burned in on 1 of 2 cameras")
+    session.cameras[1].burnsInLUT = true
+    XCTAssertEqual(UIPresentationBuilder.recordingLook(session), "LUT burned in")
+
+    // A take that started clean stays clean; one that started graded stays graded.
+    session.cameras[0].recording.status = .recording
+    session.cameras[0].recording.takeBurnsInLUT = false
+    XCTAssertEqual(UIPresentationBuilder.recordingLook(session), "LUT burned in on 1 of 2 cameras")
+    session.burnInLUT = false
+    session.cameras[0].recording.takeBurnsInLUT = true
+    session.cameras[0].burnsInLUT = false
+    XCTAssertEqual(UIPresentationBuilder.recordingLook(session), "LUT burned in on 1 of 2 cameras",
+      "The rolling take keeps its LUT; the idle camera's next take is clean")
+    session.cameras[0].recording.status = .idle
+    XCTAssertEqual(UIPresentationBuilder.recordingLook(session), "Camera original")
+  }
+
   func testStripTitlesAndDetails() {
     var saved = camera(1)
     saved.recording.savedFileName = "Camera 1_001.mov"

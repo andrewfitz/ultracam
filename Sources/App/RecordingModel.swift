@@ -168,6 +168,8 @@ struct RecordingFeedState: Identifiable, Equatable, Sendable {
   var takeCodec: RecordingCodec?
   /// The format that was chosen, when the source couldn't use it and `takeCodec` is the fallback.
   var takeFallbackFrom: RecordingCodec?
+  /// This take burns its camera's LUT in, as decided at its start. Stale once the take is idle.
+  var takeBurnsInLUT = false
   var isActive: Bool { status != .idle }
   var displayStatus: String {
     if statistics?.failed == true { return "Failed" }
@@ -231,6 +233,13 @@ protocol RecordingSessionDriverDiagnostics: AnyObject {
   var startWarning: RecordingUIError? { get }
 }
 
+/// Whether the take a driver last started for a feed burns its camera's LUT
+/// in (Settings › Recording › Burn LUT into recordings), as it decided at the
+/// take's start. The take keeps that to its end.
+protocol RecordingSessionDriverLUTBurnIn: AnyObject {
+  func takeBurnsInLUT(feedID: FeedID) -> Bool
+}
+
 protocol RecordingSessionDriverStatistics: AnyObject {
   @MainActor func recordingStatistics() async -> [FeedID: RecordingStatistics]
 }
@@ -250,7 +259,7 @@ extension RecordingSessionDriverArtifacts {
 /// and one `SourceRecorderCore`, so pause/stop on one feed cannot affect any
 /// other feed. Capture callbacks are connected only after the adapter starts.
 final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessionDriverDiagnostics,
-  RecordingSessionDriverArtifacts, RecordingSessionDriverStatistics, @unchecked Sendable {
+  RecordingSessionDriverArtifacts, RecordingSessionDriverStatistics, RecordingSessionDriverLUTBurnIn, @unchecked Sendable {
   typealias RecorderFactory = (SourceRecordingConfiguration) throws -> SourceRecorderCore
 
   // The immutable session crosses to a finalization worker. Its recorder and
@@ -304,6 +313,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
   private var stopsAfterStart: [FeedID: [StopCompletion]] = [:]
   private var completedStatistics: [FeedID: RecordingStatistics] = [:]
   private var finishedOutputs: [FeedID: URL] = [:]
+  /// Feeds whose last started take burns the camera's LUT in.
+  private var lutBurnInTakes = Set<FeedID>()
   private var outputManagers: [String: RecordingOutputManager] = [:]
 
   init(captureForFeed: @escaping (FeedID) -> CaptureController, rawAudioCallbackAvailable: Bool = false,
@@ -325,6 +336,10 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
 
   func finishedOutputURL(feedID: FeedID) -> URL? {
     sessionLock.withLock { finishedOutputs[feedID] }
+  }
+
+  func takeBurnsInLUT(feedID: FeedID) -> Bool {
+    sessionLock.withLock { lutBurnInTakes.contains(feedID) }
   }
 
   // MARK: Start
@@ -393,12 +408,16 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
       completedStatistics.removeValue(forKey: feedID)
       finishedOutputs.removeValue(forKey: feedID)
     }
+    let lutSnapshot = configuration.burnInLUT ? capture.recordingLUTSnapshot : nil
+    sessionLock.withLock {
+      if lutSnapshot != nil { lutBurnInTakes.insert(feedID) } else { lutBurnInTakes.remove(feedID) }
+    }
     // Only record-start timecode follows the camera's drop-frame flag.
     return StartRequest(feedID: feedID, configuration: configuration, folder: folder, capture: capture,
       sourceTimecode: configuration.timecodeMode == .recordStart ? capture.latestSourceTimecode : nil,
       takeContext: capture.recordingTakeContext, videoFormat: capture.recordingVideoFormat,
       nativeTimecode: capture.latestNativeTimecode,
-      lutSnapshot: configuration.burnInLUT ? capture.recordingLUTSnapshot : nil)
+      lutSnapshot: lutSnapshot)
   }
 
   /// Worker: builds and starts the session, then publishes it. A stop that
@@ -962,6 +981,10 @@ final class RecordingModel {
     driver.startRecording(feedID: feedID, configuration: take) { [weak self] result in
       self?.finishStart(feedID: feedID, generation: generation, result: result,
         previousSavedURL: previous.savedURL, previousStatistics: previous.statistics)
+    }
+    // The driver decides at the start, on this actor, what the take burns in.
+    if let index = self.index(of: feedID) {
+      feeds[index].takeBurnsInLUT = (driver as? RecordingSessionDriverLUTBurnIn)?.takeBurnsInLUT(feedID: feedID) ?? false
     }
   }
 

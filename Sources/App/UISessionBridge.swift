@@ -197,6 +197,7 @@ struct UISessionBridge {
       camera.frameRateTarget = descriptor.configuration.frameRateTarget
       camera.effects = [descriptor.applyLUT, descriptor.downscale, descriptor.convertTo420, descriptor.reduceFrameRate]
       camera.lutName = lut.loaded ? lut.fileName ?? lut.displayTitle : nil
+      camera.burnsInLUT = descriptor.pipelineEnabled && descriptor.applyLUT && lut.loaded
       camera.lutLoading = model.isLUTLoading(id)
       camera.lutError = lut.error
       camera.gamut = descriptor.gamut
@@ -230,6 +231,7 @@ struct UISessionBridge {
       rec.note = stats?.warning
       rec.takeCodec = state?.takeCodec
       rec.takeFallbackFrom = state?.takeFallbackFrom
+      rec.takeBurnsInLUT = state?.takeBurnsInLUT ?? false
       // Once someone has seen an early take, its strip goes back to the take's result.
       let acknowledged = model.acknowledgedTakes.contains(id)
       rec.failed = !acknowledged && stats?.failed == true
@@ -273,6 +275,7 @@ struct UISessionBridge {
     session.offerAlerts = interface.offerAlerts
     session.recentCuts = model.recentCuts
     session.codec = recording.codec
+    session.burnInLUT = recording.burnInLUT
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
     session.defaultFolderPath = recording.outputFolder?.path
     session.drives = drives
