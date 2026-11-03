@@ -223,7 +223,7 @@ struct SwitcherCoordinator {
     guard feedIDs.contains(feedID) else { return }
     guard !eligible else { cutIneligible.remove(feedID); return }
     cutIneligible.insert(feedID)
-    if programOutput.pendingCut == feedID { cancelPendingCut() }
+    if programOutput.pendingCut == feedID { dropPendingCut(.targetUnavailable) }
   }
 
   /// Copies the Program clock, remaining source health and readiness, and a
@@ -511,12 +511,15 @@ struct SwitcherCoordinator {
     automaticRequestPending = false
   }
 
-  mutating func cancelPendingCut() {
-    // Cancellation is still an outcome for whoever requested the cut. The
+  /// Withdraws a pending cut. Its requester still hears of it, as cancelled: nothing failed.
+  mutating func cancelPendingCut() { dropPendingCut(.cancelled) }
+
+  private mutating func dropPendingCut(_ reason: ProgramCutAbandonReason) {
+    // Dropping is still an outcome for whoever requested the cut. The
     // scheduler's public cancellation API clears silently, so preserve the
     // target here and report it through the coordinator's one-shot channel.
     if let target = programOutput.pendingCut {
-      abandonedCut = (target, .targetUnavailable)
+      abandonedCut = (target, reason)
     }
     programOutput.cancelPendingCut()
     director.cancelPendingOutput()

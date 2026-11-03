@@ -1058,20 +1058,26 @@ final class AppModel {
 
   /// A requested cut that will not land. The selection never changed, so the
   /// UI already shows what is on air; say why the requested camera did not
-  /// take, and release the director's decision so it can decide again.
+  /// take, unless it was withdrawn, and release the director's decision so it
+  /// can decide again.
   private func programCutAbandoned(_ feedID: FeedID, reason: ProgramCutAbandonReason) {
     switchingRevision &+= 1
     let name = feedDescriptors.first { $0.id == feedID }?.name ?? feedID.rawValue
-    let message: String
+    let message: String?
     switch reason {
     case .targetUnavailable:
       message = "Couldn't cut to \(name): it stopped or failed to start. Program stays on the current camera."
     case .expired:
       // Also a camera that opened but has no signal (bounded starting wait).
       message = "Couldn't cut to \(name): it sent no usable frame in time. Check its signal. Program stays on the current camera."
+    case .cancelled:
+      // Auto turned off, the director's decision lapsed or its clock moved: NEXT just goes.
+      message = nil
     }
-    programCutIssue = message
-    showStatus(message)
+    if let message {
+      programCutIssue = message
+      showStatus(message)
+    }
     if let decisionID = pendingAutoDecisionID, pendingAutoTargetFeedID == feedID {
       pendingAutoDecisionID = nil
       pendingAutoTargetFeedID = nil
@@ -2240,6 +2246,11 @@ final class AppModel {
     routeDemandChanged(VirtualCameraDescriptor.program().id, requested: requested, error: requested == nil ? "unreadable" : nil)
   }
   func deliverCaptureUpdateForTesting(_ id: FeedID, _ update: CaptureUpdate) { cameraDidUpdate(id, update) }
+  /// What the running director sends, without the audio it decides on.
+  func deliverDirectorInstructionForTesting(_ instruction: AutoSwitcherInstruction) {
+    autoSwitcherBridge?.onInstruction?(instruction)
+  }
+  func expireDirectorDecisionForTesting(_ decisionID: UUID) { autoSwitcherBridge?.onDecisionExpired?(decisionID) }
   #endif
 
   /// True when running Program sources deliver different camera formats. Cuts

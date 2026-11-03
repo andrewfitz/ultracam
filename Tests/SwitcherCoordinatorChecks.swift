@@ -173,6 +173,23 @@ import XCTest
     XCTAssertEqual(coordinator.takeAbandonedCut()?.1, .targetUnavailable)
   }
 
+  /// A cut withdrawn by its requester is reported as cancelled, not as a failure; one whose
+  /// target may no longer take a cut still is.
+  func testAWithdrawnCutIsCancelledAndALostTargetIsUnavailable() {
+    let a = feed("A")
+    let b = feed("B")
+    var coordinator = SwitcherCoordinator(feedIDs: [a, b])
+    _ = coordinator.ingest(frame(a, 0))
+    guard case .queued = coordinator.requestManualCut(to: b) else { return XCTFail("A cut") }
+    coordinator.cancelPendingCut()
+    XCTAssertFalse(coordinator.hasPendingCut)
+    XCTAssertEqual(coordinator.takeAbandonedCut()?.1, .cancelled)
+    guard case .queued = coordinator.requestManualCut(to: b) else { return XCTFail("A cut") }
+    coordinator.setCutEligible(b, eligible: false)
+    XCTAssertFalse(coordinator.hasPendingCut)
+    XCTAssertEqual(coordinator.takeAbandonedCut()?.1, .targetUnavailable, "Its signal went: a failure")
+  }
+
   /// A camera that started but has no signal never sends a frame. A cut to
   /// it is bounded by the starting timeout, then the latch releases.
   func testCutToStartedCameraWithNoSignalExpiresAndReleasesTheLatch() {

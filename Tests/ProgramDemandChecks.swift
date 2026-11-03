@@ -378,6 +378,39 @@ import XCTest
     XCTAssertFalse(model.directorRunningForTesting, "One camera: nothing to cut to")
   }
 
+  /// A director's cut withdrawn before it lands, its decision lapsed or Auto turned off, is no
+  /// failure: NEXT goes and nothing is reported. A cut whose camera stops still says so.
+  func testAWithdrawnDirectorCutIsQuietAndAStoppedTargetIsNot() throws {
+    try prepare()
+    defer { finish() }
+    natural(true)
+    try allProducing()
+    model.setProgramDemandForTesting(requested: true)
+    XCTAssertTrue(model.directorRunningForTesting)
+    func ask() -> UUID {
+      let decision = UUID()
+      model.deliverDirectorInstructionForTesting(AutoSwitcherInstruction(decisionID: decision, sessionGeneration: 1,
+        targetCameraID: ids[1], cutTime: .zero, expiresAt: .zero, confidence: 1, reason: "test", forced: false))
+      spin("The director's cut waits") { model.switcherPendingFeedID == ids[1] }
+      return decision
+    }
+    model.expireDirectorDecisionForTesting(ask())
+    spin("Its decision lapsed") { model.switcherPendingFeedID == nil }
+    settle()
+    XCTAssertEqual(model.switcherSelectedFeedID, ids[0], "Dropped, not landed")
+    XCTAssertNil(model.programIssue, "A lapsed decision is no failure")
+    _ = ask()
+    natural(false)
+    settle()
+    XCTAssertNil(model.switcherPendingFeedID)
+    XCTAssertNil(model.programIssue, "Turning Auto off is no failure")
+    guard case .queued = model.requestProgramCut(to: ids[1]) else { return XCTFail("A cut") }
+    model.stopCamera(ids[1])
+    settle()
+    XCTAssertNil(model.switcherPendingFeedID)
+    XCTAssertNotNil(model.programIssue, "A camera that stopped under its cut still says so")
+  }
+
   func testATakeStartsTheDirectorAndBindsToItsTimeline() throws {
     try prepare()
     defer { finish() }

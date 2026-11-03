@@ -216,8 +216,11 @@ public enum ProgramCutAbandonReason: Equatable, Sendable {
   /// within `pendingCutTimeout`, or a starting one (opened but no signal)
   /// within `startingCutTimeout`.
   case expired
-  /// The target stopped or failed to start.
+  /// The target stopped or failed to start, or may no longer take a cut.
   case targetUnavailable
+  /// Withdrawn by its requester before it landed (the director stood down or let its
+  /// decision lapse, or the switch policy changed). Nothing failed.
+  case cancelled
 }
 
 /// Decides when a pending cut can land at a valid frame boundary.
