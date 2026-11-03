@@ -162,6 +162,9 @@ extension CameraControlAssignmentPersisting {
     var properties: [ControlProperty] = []
     var message: String?
     var lastRefresh: Date?
+    /// The latest read of the body's settings failed; cleared by one that works. Apart from
+    /// `message`, which also carries other news (a sign-in that couldn't be saved, a write).
+    var readFailed = false
     var hasSavedCredentials = false
     var generation: UInt64 = 0
     var invalidationRevision: UInt64 = 0
@@ -187,7 +190,7 @@ extension CameraControlAssignmentPersisting {
     var cacheStatus: String {
         if !connected { return "Disconnected · cached values" }
         if busy { return "Updating settings…" }
-        if dirty, message != nil { return "Settings update failed" }
+        if readFailed { return "Settings update failed" }
         guard let lastRefresh else { return "Settings not read yet" }
         return "Updated \(lastRefresh.formatted(date: .omitted, time: .standard))"
     }
@@ -426,6 +429,8 @@ extension CameraControlAssignmentPersisting {
             apply(properties, state: state, revision: revision)
         } catch {
             if !current(feedID, generation) { _ = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin); return }
+            // Connected, so what failed was the first read.
+            if state.connected { state.readFailed = true }
             if !state.connected { connectFailures[feedID] = error }
             state.message = [state.message, error.localizedDescription].compactMap { $0 }.joined(separator: "\n")
             state.dirty = true
@@ -520,7 +525,10 @@ extension CameraControlAssignmentPersisting {
             let properties = try await plugin.properties(feedID: feedID, generation: generation)
             guard current(feedID, generation) else { return }
             apply(properties, state: state, revision: revision)
-        } catch { report(error, feedID, generation) }
+        } catch {
+            if current(feedID, generation) { state.readFailed = true }
+            report(error, feedID, generation)
+        }
     }
     func set(_ property: ControlProperty, value: ControlValue, feedID: String) async {
         let state = state(for: feedID)
@@ -657,6 +665,7 @@ extension CameraControlAssignmentPersisting {
     }
     private func apply(_ properties: [ControlProperty], state: CameraControlFeedState, revision: UInt64) {
         state.properties = properties; state.lastRefresh = now(); state.dirty = state.invalidationRevision != revision
+        state.readFailed = false
         // A body reports its firmware once connected; keep it on the assignment for the rig's record.
         guard let firmware = properties.first(where: { $0.role == .firmware })?.currentValueLabel, !firmware.isEmpty,
             let feed = states.first(where: { $0.value === state })?.key, let pluginID = routes[feed],

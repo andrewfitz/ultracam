@@ -791,5 +791,27 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         XCTAssertEqual(plugin.propertyCalls, 2, "Refresh stands in for the read that was waiting")
         _ = await store.shutdown()
     }
+
+    /// "Settings update failed" is about the last read. A sign-in that couldn't be saved is its
+    /// own message, and a notice after a good read only makes the values stale.
+    func testOnlyAFailedReadSaysTheSettingsUpdateFailed() async {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials(), sleeper = RetrySleeper()
+        await credentials.setSaveFailure(true)
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments(),
+            refreshSleep: { try await sleeper.sleep($0) })
+        await store.connect(camera: plugin.camera, to: "feed", credentials: Self.secret)
+        let state = store.state(for: "feed")
+        XCTAssertTrue(state.connected)
+        XCTAssertNotNil(state.message, "The sign-in that couldn't be saved says so")
+        plugin.handler?(.changed(feedID: "feed", generation: state.generation))
+        XCTAssertTrue(state.dirty)
+        XCTAssertTrue(state.cacheStatus.hasPrefix("Updated "), "The read worked: stale isn't failed")
+        plugin.propertyFailures = 1
+        await store.refresh("feed")
+        XCTAssertEqual(state.cacheStatus, "Settings update failed")
+        await store.refresh("feed")
+        XCTAssertTrue(state.cacheStatus.hasPrefix("Updated "), "A read that works clears it")
+        _ = await store.shutdown()
+    }
 }
 #endif
