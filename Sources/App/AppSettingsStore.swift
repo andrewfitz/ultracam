@@ -153,6 +153,7 @@ extension NaturalTalkingHeadSettings {
     maximumShotDuration = max(maximumShotDuration,
       max(minimumShotDuration + 0.001, cooldown + 0.001))
     softMaximumShotDuration = min(softMaximumShotDuration, maximumShotDuration)
+    softMaximumShotDuration = max(softMaximumShotDuration, minimumShotDuration)
     forcedCutGracePeriod = nonNegative(forcedCutGracePeriod, 2)
     forcedBoundaryLookback = nonNegative(forcedBoundaryLookback, 1)
     boundaryWindow = nonNegative(boundaryWindow, 0.24)

@@ -434,17 +434,29 @@ static void applyColorimetry(CVPixelBufferRef buffer, BMDColorspace colorspace, 
     case kEOTFHLG: transfer = kCVImageBufferTransferFunction_ITU_R_2100_HLG; break;
     default: break;
   }
-  auto set = [buffer](CFStringRef key, CFStringRef value, bool authoritative) {
-    if (!value) return;
+  // Capture buffers are reused, and a reused buffer still carries what this function wrote
+  // on its last frame. The marker records that value, so a later signal change replaces our
+  // own stale write while an attachment the SDK set is still left alone.
+  auto set = [buffer](CFStringRef key, CFStringRef marker, CFStringRef value, bool authoritative) {
     if (!authoritative) {
       CFTypeRef existing = CVBufferCopyAttachment(buffer, key, nullptr);
-      if (existing) { CFRelease(existing); return; }
+      CFTypeRef written = CVBufferCopyAttachment(buffer, marker, nullptr);
+      const bool ours = existing && written && CFEqual(existing, written);
+      if (existing) CFRelease(existing);
+      if (written) CFRelease(written);
+      if (existing && !ours) return;
+      if (!value) {
+        if (ours) { CVBufferRemoveAttachment(buffer, key); CVBufferRemoveAttachment(buffer, marker); }
+        return;
+      }
     }
+    if (!value) return;
     CVBufferSetAttachment(buffer, key, value, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(buffer, marker, value, kCVAttachmentMode_ShouldNotPropagate);
   };
-  set(kCVImageBufferColorPrimariesKey, primaries, colorspaceFromFrame);
-  set(kCVImageBufferYCbCrMatrixKey, matrix, colorspaceFromFrame);
-  set(kCVImageBufferTransferFunctionKey, transfer, eotfFromFrame);
+  set(kCVImageBufferColorPrimariesKey, CFSTR("UltracamWrittenColorPrimaries"), primaries, colorspaceFromFrame);
+  set(kCVImageBufferYCbCrMatrixKey, CFSTR("UltracamWrittenYCbCrMatrix"), matrix, colorspaceFromFrame);
+  set(kCVImageBufferTransferFunctionKey, CFSTR("UltracamWrittenTransferFunction"), transfer, eotfFromFrame);
 }
 
 // MARK: Host clock
@@ -959,6 +971,10 @@ class CaptureCallback final : public IDeckLinkInputCallback {
             framesEnabled = false;
           }
           if (colorspace) signalColorspace = colorspace;
+          // An explicit colorspace notification with no mode flag means the
+          // driver no longer reports a colorspace. Do not carry the previous
+          // signal into the next refresh as if it were still authoritative.
+          else if (events & bmdVideoInputColorspaceChanged) signalColorspace = 0;
           modeHandler(detection, keepFrames);
         } else if ((colorspace && signalColorspace.exchange(colorspace) != colorspace) ||
             (events & bmdVideoInputColorspaceChanged)) {
@@ -969,6 +985,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
         return S_OK;
       }
       if (colorspace) signalColorspace = colorspace;
+      else if (events & bmdVideoInputColorspaceChanged) signalColorspace = 0;
       if (!mode || mode->GetDisplayMode() != requestedMode.load()) {
         reportFatal(@"Input changed from the selected HDMI 10-bit YUV mode. Check the FX3 HDMI output and selected frame rate, then restart.");
       }

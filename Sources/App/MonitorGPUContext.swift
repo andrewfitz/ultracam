@@ -95,13 +95,17 @@ final class MonitorGPUContext: @unchecked Sendable {
 
   deinit { renderThread.stop() }
 
+  /// Thrown by `core(nonblocking: true)` while another thread builds the core: not ready
+  /// yet, which is not a GPU failure.
+  struct Preparing: Error {}
+
   /// The GPU core, built once on first use. Concurrent callers wait for the one build.
   /// A failure is kept and rethrown until its retry delay (1 s, doubling to 30 s) runs out.
   func core(nonblocking: Bool = false) throws -> Core {
     if let ready = try readyCore() { return ready }
     if nonblocking {
       guard buildLock.try() else {
-        throw MonitorKitError.gpu("Monitor GPU is preparing asynchronously.")
+        throw Preparing()
       }
     } else {
       buildLock.lock()

@@ -279,6 +279,16 @@ struct UIScopeDescription: Equatable, Sendable {
     }
   }
 
+  /// The graticule labels' point size on a scope drawn `height` points tall: 9 pt in the
+  /// smallest cards, growing with the scope to 13 pt in a tall card or the Scopes window,
+  /// which is read from further away. Whole points, so a resize doesn't redraw every step.
+  static func labelFontSize(height: Double) -> Double {
+    min(13, max(9, (height / 18).rounded()))
+  }
+
+  /// The room `visibleLabels` keeps between tick labels drawn at `fontSize`.
+  static func labelSpacing(fontSize: Double) -> Double { fontSize + 3 }
+
   /// The graticule's labels, in normalized coordinates of a 768 × 256 scope image.
   var labels: [ScopeLabel] { labels(width: Self.imageWidth, height: Self.imageHeight) }
 
@@ -300,16 +310,18 @@ struct UIScopeDescription: Equatable, Sendable {
   /// scale always labels only its majors and ends (−10, 0, 50, 100, 110 on the
   /// classic axis, as Ultracam's scopes always have); its 10% lines go
   /// unlabelled. Measured where the labels are drawn (kept inside the image),
-  /// per parade panel.
-  func visibleLabels(width: Double, height: Double, spacing: Double = 11) -> [ScopeLabel] {
+  /// per parade panel. `fontSize` is the labels' size, which their margins and widths follow.
+  func visibleLabels(width: Double, height: Double, spacing: Double = 11, fontSize: Double = 8) -> [ScopeLabel] {
     let all = labels(width: width, height: height)
     let ticks = all.filter { $0.role == .tick }
     guard !ticks.isEmpty else { return all }
     let horizontal = settings.kind == .histogram
     let length = horizontal ? width : height
-    let margin = horizontal ? 8.0 : 5.0
+    // The margins and widths below are for 8 pt labels; larger labels scale them.
+    let scale = max(1, fontSize / 8)
+    let margin = (horizontal ? 8.0 : 5.0) * scale
     // Side by side, labels need room for their width (up to five characters).
-    let spacing = horizontal ? max(spacing, 26) : spacing
+    let spacing = horizontal ? max(spacing, 26 * scale) : spacing
     func drawn(_ label: ScopeLabel) -> Double {
       let v = (horizontal ? label.position.x : label.position.y) * length
       return min(max(margin, length - margin), max(margin, v))

@@ -49,7 +49,9 @@ enum CPUMemoryPixelFormatRegistration {
       var expected = base
       expected[kCVPixelFormatConstant as String] = type
       if type == 0x50413136 {
-        var planes = base[kCVPixelFormatPlanes as String] as! [[String: Any]]
+        guard var planes = base[kCVPixelFormatPlanes as String] as? [[String: Any]] else {
+          throw NoCopyIngestError.unsupportedPixelFormat
+        }
         planes.append([kCVPixelFormatBitsPerBlock as String: 16,
           kCVPixelFormatBlackBlock as String: Data([255, 255])])
         expected[kCVPixelFormatPlanes as String] = planes

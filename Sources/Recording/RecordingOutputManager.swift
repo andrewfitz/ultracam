@@ -335,6 +335,15 @@ public final class RecordingOutputManager: @unchecked Sendable {
   fileprivate var minimumFreeBytes: UInt64 { configuration.minimumFreeBytes }
   fileprivate var fileExtension: String { configuration.fileExtension }
   fileprivate var fileManagerRef: FileManager { fileManager }
+
+  /// Only unlink a regular partial file created by this process. Never
+  /// recursively remove a directory or follow an attacker-created symlink.
+  fileprivate func safeTemporaryFileExists(at url: URL) -> Bool {
+    guard fileManager.fileExists(atPath: url.path),
+      let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+      (attributes[.type] as? FileAttributeType) == .typeRegular else { return false }
+    return (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) == nil
+  }
   fileprivate var namingRef: RecordingFileNaming { configuration.naming }
 
   fileprivate func release(reserved: UInt64) {
@@ -780,11 +789,25 @@ public final class RecordingOutputSession: @unchecked Sendable {
   }
 
   /// Stop owning a failed take without deleting its media or recovery journal.
-  public func preserveForRecovery() {
+  /// `discardingEmptyTake` is for a take that never gave its writer a frame: with no file,
+  /// or an empty one, recovery never offers it, so its journal and the metadata it owns go,
+  /// as on cancel.
+  public func preserveForRecovery(discardingEmptyTake: Bool = false) {
     lock.lock(); defer { lock.unlock() }
     handle?.synchronizeFile()
     handle?.closeFile()
     handle = nil
+    let attributes = try? manager.fileManagerRef.attributesOfItem(atPath: paths.temporaryFile.path)
+    let regular = (attributes?[.type] as? FileAttributeType) == .typeRegular
+    let empty = regular && ((attributes?[.size] as? NSNumber)?.uint64Value ?? 0) == 0
+    // Anything else at the path (a directory, a link) is not this take's to judge or remove.
+    if discardingEmptyTake, attributes == nil || empty {
+      if empty, ownsTemporaryFile, manager.safeTemporaryFileExists(at: paths.temporaryFile) {
+        try? manager.fileManagerRef.removeItem(at: paths.temporaryFile)
+      }
+      if recoveryJournal?.entry.sidecarOwned == true { try? RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
+      recoveryJournal?.remove()
+    }
     recoveryJournal = nil
     stateValue = .failed
     releaseReservationLocked()
@@ -798,7 +821,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     handle?.synchronizeFile()
     handle?.closeFile()
     handle = nil
-    if ownsTemporaryFile && manager.fileManagerRef.fileExists(atPath: paths.temporaryFile.path) {
+    if ownsTemporaryFile && manager.safeTemporaryFileExists(at: paths.temporaryFile) {
       do { try manager.fileManagerRef.removeItem(at: paths.temporaryFile) }
       catch {
         stateValue = .failed
@@ -818,7 +841,9 @@ public final class RecordingOutputSession: @unchecked Sendable {
     guard stateValue != .finished && stateValue != .cancelled else { return }
     handle?.closeFile()
     handle = nil
-    if ownsTemporaryFile { try? manager.fileManagerRef.removeItem(at: paths.temporaryFile) }
+    if ownsTemporaryFile, manager.safeTemporaryFileExists(at: paths.temporaryFile) {
+      try? manager.fileManagerRef.removeItem(at: paths.temporaryFile)
+    }
     if recoveryJournal?.entry.sidecarOwned == true { try? RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
     recoveryJournal?.remove()
     recoveryJournal = nil

@@ -412,12 +412,24 @@ final class UIMenuCommandBox: NSObject {
     let formatItem = row("Format", [], symbol: UISymbol.format, badge: session.codec.title, target: target)
     formatItem.submenu = format
     items.append(formatItem)
-    // All drives share one row: the one that runs out first, a full one before any.
+    // All drives share one row: the one that runs out first, a full one before any. With no
+    // estimate yet it says the free space, as the sidebar does. It shows the recordings in Finder.
     let worst = UIPresentationBuilder.worstDrive(session.drives)
     let low = worst.map { UIPresentationBuilder.isLow($0) || UIPresentationBuilder.isFull($0) } ?? false
-    items.append(row("Time left", [], enabled: worst != nil, symbol: UISymbol.drive(low: low), tint: low ? .systemOrange : nil,
-      badge: worst.map { UIPresentationBuilder.isFull($0) ? "\($0.name) full" : "\($0.name) \(UIFormat.duration($0.secondsLeft ?? 0))" } ?? "—",
-      target: target))
+    let unestimated = worst == nil
+      ? session.drives.filter { $0.totalBytes > 0 }.min { $0.availableBytes < $1.availableBytes } ?? session.drives.first : nil
+    let driveBadge: String
+    if let worst {
+      driveBadge = UIPresentationBuilder.isFull(worst) ? "\(worst.name) full"
+        : worst.secondsLeft.map { "\(worst.name) \(UIFormat.duration($0))" } ?? "\(worst.name) \(UIPresentationBuilder.freeSpaceText(worst))"
+    } else {
+      driveBadge = unestimated.map { "\($0.name) \(UIPresentationBuilder.freeSpaceText($0))" } ?? "—"
+    }
+    let drive = row(worst == nil && unestimated != nil ? "Free space" : "Time left",
+      presentation.canRevealRecordings ? action(.revealRecordings) : [], enabled: presentation.canRevealRecordings,
+      symbol: UISymbol.drive(low: low), tint: low ? .systemOrange : nil, badge: driveBadge, target: target)
+    drive.toolTip = presentation.canRevealRecordings ? "Show Recordings in Finder" : nil
+    items.append(drive)
 
     if !presentation.cameras.isEmpty {
       items.append(.separator())
@@ -673,8 +685,9 @@ struct UIMenuPreviewContent: View {
   @ViewBuilder private func recPill(for cameras: [UICameraSnapshot]) -> some View {
     if !cameras.isEmpty {
       let paused = cameras.allSatisfy { $0.recording.status == .paused }
+      let longest = cameras.map(\.recording.elapsed).max() ?? 0
       UIPictureStatePill(style: paused ? .paused : .recording, count: cameras.count,
-        elapsed: UIFormat.shortElapsed(cameras.map(\.recording.elapsed).max() ?? 0), compact: true)
+        elapsed: UIFormat.shortElapsed(longest), compact: true, spokenElapsed: UIFormat.spokenElapsed(longest))
     }
   }
 }

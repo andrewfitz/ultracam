@@ -743,7 +743,7 @@ private final class SonyStub: UCSonyCameraControl {
       await drain()
       let expanded = Accessibility.nodes(in: manual.host)
       expect(manualBackend.discoveryCalls == 0, "the add-by-address form does nothing until Check Camera")
-      expect(expanded.contains { $0.text.contains("Camera IP address") }, "manual IP address field has an accessible label")
+      expect(expanded.contains { $0.text.contains("Camera network address") }, "manual address field has an accessible label")
       expect(expanded.contains { $0.text.contains("Camera stable identity") }, "manual MAC address field has an accessible label")
       expect(expanded.contains { $0.text.contains("Check Camera") }, "manual identity check is available")
       guard let rep = manual.render(), let png = rep.representation(using: .png, properties: [:]) else { fatalError("Could not render manual IP controls") }

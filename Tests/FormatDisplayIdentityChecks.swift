@@ -31,6 +31,18 @@ import XCTest
     XCTAssertEqual(FormatDisplayIdentity(source).short, "1080p VFR")
   }
 
+  func testDCISizesAreNotFoldedIntoUHDAndHD() throws {
+    let rate = FrameRate.constant(CMTime(value: 1001, timescale: 24000))
+    let modes = try [(3840, 2160), (4096, 2160), (1920, 1080), (2048, 1080)].map {
+      try SourceFormat(width: $0.0, height: $0.1, pixel: .v210, rate: rate)
+    }
+    XCTAssertEqual(modes.map { FormatDisplayIdentity($0).short },
+      ["2160p 23.976", "2160p DCI 23.976", "1080p 23.976", "1080p DCI 23.976"])
+    let groups = UIHardwareText.formatGroups(modes)
+    XCTAssertEqual(groups.map(\.size), ["2160p", "2160p DCI", "1080p", "1080p DCI"])
+    XCTAssertEqual(groups.map(\.rates), Array(repeating: ["23.976"], count: 4))
+  }
+
   func testUYVAHasPacked422SignalSampling() throws {
     let format = try SourceFormat(width: 1920, height: 1080, pixel: .uyva,
       rate: .constant(CMTime(value: 1, timescale: 30)))

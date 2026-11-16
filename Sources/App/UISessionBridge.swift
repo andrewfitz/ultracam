@@ -261,10 +261,13 @@ struct UISessionBridge {
     session.emphasisID = switcher.naturalTalkingHead.emphasisFeedID?.rawValue
     session.expandedFrom = interface.expandedFrom
     session.strategyTitle = UIStrategy.title(switcher.strategy)
+    // Fixed Interval cuts on its interval alone; the director's shot limits don't apply to it.
+    let fixedInterval = switcher.strategy == .fixedInterval
+      ? max(switcher.intervalSeconds.isFinite ? switcher.intervalSeconds : 0, 0.001) : nil
     session.shot = UIShotTiming(startedAt: model.programShotStartedAt, currentShot: model.programShotStartedAt.map { Date().timeIntervalSince($0) },
-      minimum: switcher.naturalTalkingHead.minimumShotDuration,
-      softMaximum: switcher.naturalTalkingHead.softMaximumShotDuration,
-      maximum: switcher.naturalTalkingHead.maximumShotDuration)
+      minimum: fixedInterval ?? switcher.naturalTalkingHead.minimumShotDuration,
+      softMaximum: fixedInterval ?? switcher.naturalTalkingHead.softMaximumShotDuration,
+      maximum: fixedInterval ?? switcher.naturalTalkingHead.maximumShotDuration)
     session.programFormatMismatch = model.programFormatMismatch
     session.programIssue = model.programIssue
     session.programMoved = model.programMoved
@@ -287,7 +290,8 @@ struct UISessionBridge {
     session.interruptedTakesOpen = interface.interruptedTakesOpen
     session.install = UIInstallState(canRequestChanges: model.installer.canRequestChanges, pending: model.installer.pending,
       status: model.installer.status, unavailableReason: model.installer.unavailableReason,
-      installed: UIExtensionDetector.isInstalled(), system: model.installer.system)
+      installed: UIExtensionDetector.isInstalled(), system: model.installer.system,
+      needsApproval: model.installer.needsApproval)
     session.canAddCamera = model.canAddCamera
     session.layout = model.programAvailable || interface.layout != .programView ? interface.layout : .sideBySide
     session.collapsed = interface.collapsed
@@ -502,15 +506,10 @@ struct UISessionBridge {
       // A refused Start retries as Start; a failed automatic start retries the automatic start.
       if model.startRefusal(feedID(id)) != nil { model.startCamera(feedID(id)) } else { model.retryAutomaticFeed(feedID: feedID(id)) }
     case .restartCamera(let id): model.restartCamera(feedID(id))
-    case .acknowledgeStop(let id):
-      model.acknowledgeUnexpectedStop(feedID(id))
-      openWindow("diagnostics")
-    case .acknowledgeProgramMove:
-      model.acknowledgeProgramMove()
-      openWindow("diagnostics")
-    case .acknowledgeProblem(let id):
-      model.acknowledgeProblem(id)
-      openWindow("diagnostics")
+    // Dismiss only: Details opens Diagnostics on its own and never clears what it explains.
+    case .acknowledgeStop(let id): model.acknowledgeUnexpectedStop(feedID(id))
+    case .acknowledgeProgramMove: model.acknowledgeProgramMove()
+    case .acknowledgeProblem(let id): model.acknowledgeProblem(id)
     case .addCamera:
       _ = model.addFeed()
     case .removeCamera(let id):

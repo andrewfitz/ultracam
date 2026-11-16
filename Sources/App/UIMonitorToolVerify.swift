@@ -30,6 +30,13 @@ import SwiftUI
       // The 356-point columns intentionally keep sliders and readouts stable
       // while dragging. Check their actual panel width so unexpected horizontal
       // growth fails, rather than imposing the former 320-point layout's cap.
+      if screen.singleColumn {
+        // One column is taller by design; it scrolls only past the screen's height.
+        verifier.check("\(screen.name) is one column wide",
+          abs(size.width - UIToolLayout.singleColumnPanelWidth) < 0.5 && size.height >= 120,
+          "\(Int(size.width))×\(Int(size.height)) pt")
+        continue
+      }
       verifier.check("\(screen.name) fits without scrolling",
         abs(size.width - UIToolLayout.panelWidth) < 0.5 && size.height <= 560 && size.height >= 120,
         "\(Int(size.width))×\(Int(size.height)) pt")

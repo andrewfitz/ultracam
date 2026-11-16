@@ -47,6 +47,8 @@ struct UIProblem: Sendable, Equatable, Identifiable {
   var symbol: String? = nil
   /// You're looking at the picture for this one, so Attention leaves its big Cut to it.
   var attentionOmitsAction = false
+  /// Takes the row off the list once it's been seen, apart from the action: Details only looks.
+  var dismiss: UIProblemAction? = nil
   /// Lower is worse. Internal to the ordering.
   fileprivate var rank = 0
 }
@@ -194,10 +196,10 @@ extension UIPresentationBuilder {
         alert: UIProblemAlert(key: incident, event: .cameraStopped, title: "\(name) stopped",
           body: wasOnAir ? "Was on Program" : "Stopped on its own", showsPanel: wasOnAir), rank: wasOnAir ? 30 : 60))
     } else if camera.recording.failed || camera.recording.error != nil || camera.unexpectedStop?.take == true {
-      // `failed` closes the take; a saved movie is still safe, and Details acknowledges it.
-      // After a stop and a Start it's the same incident as the stop: one notification, and
-      // the panel only if the stop had it.
-      let acknowledge = UIProblemAction(title: "Details", action: .acknowledgeStop(cameraID: id))
+      // `failed` closes the take; a saved movie is still safe. Details shows why, and Dismiss
+      // acknowledges it: looking never clears the row. After a stop and a Start it's the same
+      // incident as the stop: one notification, and the panel only if the stop had it.
+      let acknowledge = UIProblemAction(title: "Dismiss", action: .acknowledgeStop(cameraID: id))
       let restarted = camera.unexpectedStop?.restarted == true
       if diskFull(camera, in: session) {
         list.append(UIProblem(id: "take.\(id)", title: "\(name): disk full", detail: saved.map { "Take ended early, \($0)" },
@@ -207,10 +209,10 @@ extension UIPresentationBuilder {
             body: "\(name) has no space left"), rank: 50))
       } else {
         list.append(UIProblem(id: "take.\(id)", title: "Take ended early", detail: [name, saved].compactMap { $0 }.joined(separator: ", "),
-          level: .damage, cameraID: id, action: acknowledge,
+          level: .damage, cameraID: id, action: details,
           alert: UIProblemAlert(key: incident, event: .takeEndedEarly, title: "\(name) take ended",
             body: saved.map { "\($0.prefix(1).uppercased())\($0.dropFirst())" } ?? "Stopped early",
-            showsPanel: !restarted || camera.unexpectedStop?.wasOnAir == true), rank: 50))
+            showsPanel: !restarted || camera.unexpectedStop?.wasOnAir == true), dismiss: acknowledge, rank: 50))
       }
     }
 
@@ -288,7 +290,7 @@ extension UIPresentationBuilder {
         stripText: "LUT unavailable", stripShort: "LUT missing", rank: 170))
     }
     if let body = camera.body {
-      let hardware = UIProblemAction(title: "Details", action: .openHardware(itemID: body.id))
+      let hardware = UIProblemAction(title: "Open Hardware…", action: .openHardware(itemID: body.id))
       if body.lost {
         // Control only: the picture comes over HDMI, so a lost body is a notice, never damage.
         list.append(UIProblem(id: "body.\(id)", title: "\(body.name) disconnected", detail: body.retrying ? "\(name)'s camera control is reconnecting. The picture isn't affected." : "\(name)'s camera control. The picture isn't affected.",
@@ -348,7 +350,9 @@ extension UIPresentationBuilder {
       let title = moved.title
       list.append(UIProblem(id: "program.moved", title: title,
         detail: "Program moved to \(moved.to).\(moved.heldShot ? " Hold stays on." : "")", level: .damage,
-        action: UIProblemAction(title: "Details", action: .acknowledgeProgramMove),
+        // The row says what happened and where Program went; seen, it goes. Diagnostics'
+        // Program tab (recent cuts) stays a click away in the status bar.
+        action: UIProblemAction(title: "Dismiss", action: .acknowledgeProgramMove),
         alert: UIProblemAlert(key: "onair.\(moved.from)", event: .onAirLost, title: title,
           body: "Program moved to \(moved.to)", showsPanel: true), rank: 14))
     }
@@ -401,9 +405,10 @@ extension UIPresentationBuilder {
         detail: session.recoveryMessage, level: .notice,
         action: UIProblemAction(title: "Recover", action: .showInterruptedTakes), rank: 145))
     }
+    // The message is the whole of it (Diagnostics doesn't list these), so its action is Dismiss.
     for message in session.appProblems {
       list.append(UIProblem(id: "app.\(message.id)", title: message.text, level: .notice,
-        action: UIProblemAction(title: "Details", action: .acknowledgeProblem(id: message.id)), rank: 190))
+        action: UIProblemAction(title: "Dismiss", action: .acknowledgeProblem(id: message.id)), rank: 190))
     }
     return list
   }

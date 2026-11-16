@@ -1,5 +1,6 @@
 #if ULTRACAM_TEST_SUPPORT
 import Foundation
+import MonitorKit
 import XCTest
 
 /// B1d regression contract: unknown append-only enum values must not discard
@@ -110,6 +111,41 @@ import XCTest
         model.monitorCoordinator.setPreferences(peerTools, for: betaTarget)
         XCTAssertTrue(model.monitorCoordinator.preferences(for: alphaTarget).falseColorDeclared)
         XCTAssertEqual(model.descriptor(for: alpha.id)?.sourceProfileID, "sony-slog3-sgamut3cine")
+    }
+
+    func testPictureStagesAndMonitorLUTVisibilityPreserveActualModelPipeline() throws {
+        let suite = "B1dMonitorIsolation." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var feed = FeedDescriptor(id: .primary, sourceProfileID: "sony-slog3-sgamut3cine")
+        feed.pipelineEnabled = true
+        feed.applyLUT = true
+        feed.downscale = true
+        feed.convertTo420 = true
+        feed.reduceFrameRate = true
+        AppSettingsStore(defaults: defaults).saveSnapshot(AppSettingsSnapshot(feeds: [feed]))
+        let model = intentModel(defaults: defaults, inputs: [])
+        let target = MonitorTargetID(feed.id.rawValue)
+        let before = try XCTUnwrap(model.descriptor(for: feed.id))
+        let configuration = before.configuration
+        for stage in [SignalStage.source, .output, .monitor] {
+            for shown in [false, true] {
+                var preferences = model.monitorCoordinator.preferences(for: target)
+                preferences.setPictureStage(stage)
+                preferences.monitorLUTEnabled = shown
+                model.monitorCoordinator.setPreferences(preferences, for: target)
+                let current = try XCTUnwrap(model.descriptor(for: feed.id))
+                let saved = try XCTUnwrap(AppSettingsStore(defaults: defaults).loadSnapshot().feeds.first)
+                for value in [current, saved] {
+                    XCTAssertEqual(value.configuration, configuration, "Monitor selection must not alter camera processing")
+                    XCTAssertEqual(value.pipelineEnabled, before.pipelineEnabled)
+                    XCTAssertEqual(value.applyLUT, before.applyLUT)
+                    XCTAssertEqual(value.sourceProfileID, before.sourceProfileID)
+                    XCTAssertEqual(value.monitor.state.pictureStage, stage)
+                    XCTAssertEqual(value.monitor.monitorLUTEnabled, shown)
+                }
+            }
+        }
     }
 
     private func intentModel(defaults: UserDefaults, inputs: [InputDevice]) -> AppModel {

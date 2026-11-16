@@ -17,13 +17,14 @@ import XCTest
     let wrongDuration = CMTime(value: 1, timescale: 27)
     XCTAssertNil(OutputFormatCatalog.matchingIndex(entry, duration: wrongDuration))
     let wrongColour = try! ExtensionFormatContract(width: entry.width, height: entry.height, pixel: entry.pixel,
-      colour: .rec709Video, allowedDurations: entry.allowedDurations)
+      colour: Colorimetry(primaries: .rec709, transfer: .pq, matrix: .rec709, range: .video,
+        horizontalChromaSiting: .left, verticalChromaSiting: .center), allowedDurations: entry.allowedDurations)
     XCTAssertNil(OutputFormatCatalog.matchingIndex(wrongColour, duration: CMTime(value: 1, timescale: 30)))
   }
 
   func testDescriptionsPreserveLegacyAndExposeNativeRangeHDRAndDCI() throws {
     let descriptions = try OutputFormatCatalog.descriptions()
-    XCTAssertEqual(descriptions.count, 144)
+    XCTAssertEqual(descriptions.count, 216)
     for (index, entry) in OutputFormatCatalog.published.enumerated() {
       let description = descriptions[index]
       XCTAssertEqual(CMVideoFormatDescriptionGetDimensions(description).width, Int32(entry.width))
@@ -97,5 +98,41 @@ import XCTest
     XCTAssertTrue(OutputFormatCatalog.validateAppendOnly(previous: Array(catalog.prefix(18)), proposed: catalog))
     XCTAssertFalse(OutputFormatCatalog.validateAppendOnly(previous: catalog, proposed: Array(catalog.dropLast())))
     XCTAssertFalse(OutputFormatCatalog.validateAppendOnly(previous: catalog, proposed: Array(catalog.reversed())))
+  }
+
+  func testNativeLeftChromaAppendsTruthfulModesWithoutChangingExistingIdentities() throws {
+    let catalog = OutputFormatCatalog.published
+    let descriptions = try OutputFormatCatalog.descriptions()
+    let unsited = Array(catalog.prefix(72))
+    let priorCentered = try unsited.map { entry in
+      try ExtensionFormatContract(width: entry.width, height: entry.height, pixel: entry.pixel,
+        colour: Colorimetry(primaries: entry.colour.primaries, transfer: entry.colour.transfer,
+          matrix: entry.colour.matrix, range: entry.colour.range,
+          horizontalChromaSiting: .center, verticalChromaSiting: .center),
+        allowedDurations: entry.allowedDurations)
+    }
+    XCTAssertEqual(Array(catalog.prefix(144)), unsited + priorCentered)
+    let nativeSources = Array(unsited.enumerated())
+    XCTAssertEqual(nativeSources.count, 72)
+    for (offset, original) in nativeSources.enumerated() {
+      let index = 144 + offset
+      let entry = catalog[index]
+      XCTAssertEqual(entry.width, original.element.width)
+      XCTAssertEqual(entry.height, original.element.height)
+      XCTAssertEqual(entry.pixel, original.element.pixel)
+      XCTAssertEqual(entry.colour.transfer, original.element.colour.transfer)
+      XCTAssertEqual(entry.colour.range, original.element.colour.range)
+      XCTAssertEqual(entry.allowedDurations, original.element.allowedDurations)
+      XCTAssertEqual(entry.colour.horizontalChromaSiting, .left)
+      XCTAssertEqual(entry.colour.verticalChromaSiting, .center)
+      let location = CMFormatDescriptionGetExtension(descriptions[index],
+        extensionKey: kCMFormatDescriptionExtension_ChromaLocationTopField)
+      XCTAssertTrue(CFEqual(try XCTUnwrap(location), kCVImageBufferChromaLocation_Left))
+      XCTAssertFalse(DerivedOutputContract.matchesFormat(descriptions[index], descriptions[original.offset]))
+      XCTAssertFalse(DerivedOutputContract.matchesFormat(descriptions[index], descriptions[72 + original.offset]))
+      XCTAssertNil(OutputFormatCatalog.matchingIndex(entry, duration: VideoContract.fastDuration,
+        installed: Array(catalog.prefix(144))), "A local addition cannot stand in for an installed extension update")
+      XCTAssertEqual(OutputFormatCatalog.matchingIndex(entry, duration: VideoContract.fastDuration), index)
+    }
   }
 }

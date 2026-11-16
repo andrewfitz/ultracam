@@ -411,6 +411,8 @@ final class AppModel {
   @ObservationIgnored private var directorClockOwner: FeedID?
   private var autoSwitcherTimeline: AutoSwitcherTimelineRecorder?
   private var recordingTimelines: [FeedID: AutoSwitcherTimelineRecorder] = [:]
+  /// Each rolling take's file and start, for the timeline of a director recreated under it.
+  @ObservationIgnored private var rollingTakes: [FeedID: (url: URL, mediaStart: CMTime?)] = [:]
   /// The tap each running take measures its audio on: the one it started on,
   /// so a capture replaced mid-take still gets its take ended (and its viewer released).
   @ObservationIgnored private var takeTaps: [FeedID: AudioMeterTap] = [:]
@@ -558,14 +560,18 @@ final class AppModel {
       self.beginTakeAudio(feedID)
       // A take can be what starts the director, and it binds to that director's timeline.
       self.reconcileAutomaticFeed()
+      // Noted after the director this take may have started: that one binds just below.
+      let mediaStart = self.directorUpdate?.mediaTime
+      self.rollingTakes[feedID] = (url, mediaStart)
       guard let timeline = self.autoSwitcherTimeline else { return }
       self.recordingTimelines[feedID] = timeline
-      timeline.recordingStarted(feedID: feedID, url: url, mediaStart: self.directorUpdate?.mediaTime)
+      timeline.recordingStarted(feedID: feedID, url: url, mediaStart: mediaStart)
     }
     recordingModel.onRecordingFinished = { [weak self] feedID, url in
       guard let self else { return }
       self.noteTakeFinished(feedID, saved: url)
       self.endTakeAudio(feedID)
+      self.rollingTakes[feedID] = nil
       self.reconcileAutomaticFeed()
       guard let timeline = self.recordingTimelines.removeValue(forKey: feedID) else { return }
       timeline.recordingFinished(feedID: feedID, url: url, mediaEnd: self.directorUpdate?.mediaTime)
@@ -1151,6 +1157,12 @@ final class AppModel {
     timeline.onError = { [weak self] message in
       self?.reportProblem("Auto-switcher timeline: \(message)", key: "timeline")
     }
+    // A director recreated under a rolling take (Hold, a setting) writes a new timeline.
+    // The take goes with it, or the file holding its later cuts would name no movie.
+    for (feedID, take) in rollingTakes {
+      recordingTimelines[feedID] = timeline
+      timeline.recordingStarted(feedID: feedID, url: take.url, mediaStart: take.mediaStart)
+    }
     bridge.onControlEvent = { [weak self, weak timeline, weak bridge] event in
       Task { @MainActor in
         guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
@@ -1184,7 +1196,16 @@ final class AppModel {
         case .queued, .coalesced:
           self.pendingAutoDecision = PendingAutoDecision(id: instruction.decisionID,
             targetFeedID: instruction.targetCameraID)
-        case .ignoredSameSource, .rejectedMissingSource, .selectedImmediately:
+        case .selectedImmediately:
+          // Nothing was on air, so the selection moved at once and no cut lands to
+          // acknowledge. The director hears it as it hears an operator's selection, or it
+          // would go on asking for the camera Program already shows.
+          self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
+          bridge?.reject(decisionID: instruction.decisionID)
+          bridge?.manualOverride(cameraID: instruction.targetCameraID, at: self.directorClock())
+          self.persistProgramSelection()
+          self.reconcileProgramTransportDemand()
+        case .ignoredSameSource, .rejectedMissingSource:
           self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
           bridge?.reject(decisionID: instruction.decisionID)
         }
@@ -1208,11 +1229,32 @@ final class AppModel {
     }
     autoSwitcherBridge = bridge
     directorCameras = (anchor, emphasis)
-    directorClockOwner = directorClockFeedID
-    if let current = feedCoordinator.programOutput.selectedFeedID,
-      (current == anchor || current == emphasis) {
-      bridge.manualOverride(cameraID: current, at: directorUpdate?.mediaTime ?? .zero)
+    // Opening captures have no PTS yet. Let their first update establish the
+    // clock through the existing rebase path, instead of aging a shot from zero.
+    let initialClock = directorUpdate?.audioPacketTime ?? directorUpdate?.mediaTime
+    directorClockOwner = initialClock?.isNumeric == true ? directorClockFeedID : nil
+    // A new director takes every camera for healthy. One already past its signal hold says
+    // nothing more until its signal returns. Without a clock yet, the rebase tells it.
+    if directorClockOwner != nil {
+      for id in [anchor, emphasis] where signalHealth.isUnhealthy(id) {
+        bridge.setCameraHealth(cameraID: id, healthy: false, at: directorClock())
+      }
     }
+    // The director runs on the selected clock camera's audio timeline. A
+    // video PTS can differ from its audio packet PTS (especially while a
+    // stream is opening), so seeding the override with `mediaTime` would
+    // give the director a shot origin on a different clock than subsequent
+    // audio/tick events.
+    bridge.manualOverride(cameraID: directorShotSeed(anchor: anchor, emphasis: emphasis), at: directorClock())
+  }
+
+  /// The camera the director's shot starts on. It knows only its two: with a third on
+  /// Program it starts on its anchor, as it would anyway, but from now. An override naming
+  /// the third is ignored and leaves the shot starting at zero on a stream clock that may
+  /// read hours, which forces a cut on the first tick.
+  private func directorShotSeed(anchor: FeedID, emphasis: FeedID) -> FeedID {
+    let current = feedCoordinator.programOutput.selectedFeedID
+    return current == anchor || current == emphasis ? current ?? anchor : anchor
   }
 
   private func stopAutoSwitcher() {
@@ -1451,6 +1493,12 @@ final class AppModel {
       return
     }
     signalHealth.note(feedID, signal: update.signal, now: ProcessInfo.processInfo.systemUptime)
+    // Demand can rise before the camera started for it has a picture, finding nothing to
+    // move to. Asked again here, while Program still sits on a camera that isn't running.
+    if programPictureWanted, update.signal == .live, let onAir = switcherSelectedFeedID, onAir != feedID,
+      !feedCoordinator.isFeedRunning(onAir) {
+      moveProgramToProducingCamera(.notReady)
+    }
     if let duration = update.sourceDuration, duration.isNumeric, duration.epoch == 0, duration.value > 0,
       detectedSourceDurations[feedID] != duration {
       lastSourceDurations[feedID] = duration
@@ -1476,7 +1524,8 @@ final class AppModel {
       autoSwitcherTimeline?.recordRejected(decisionID: decisionID)
       feedCoordinator.cancelProgramCut()
     }
-    bridge.rebaseClock(at: time, onAir: switcherSelectedFeedID, health: [cameras.anchor, cameras.emphasis].map {
+    bridge.rebaseClock(at: time, onAir: directorShotSeed(anchor: cameras.anchor, emphasis: cameras.emphasis),
+      health: [cameras.anchor, cameras.emphasis].map {
       ($0, feedCoordinator.isFeedRunning($0) && !signalHealth.isUnhealthy($0))
     })
   }
@@ -1499,6 +1548,11 @@ final class AppModel {
     // its next capture actually starts. Its signal starts over with it.
     feedCoordinator.setProgramSourceHealth(id, healthy: true)
     feedCoordinator.setProgramSourceCutEligible(id, eligible: true)
+    // A director that kept running through this camera's stop heard it retire, and nothing
+    // else tells it the camera is back: its signal history went with the stop.
+    if let cameras = directorCameras, id == cameras.anchor || id == cameras.emphasis {
+      autoSwitcherBridge?.setCameraHealth(cameraID: id, healthy: true, at: directorClock())
+    }
     // A restart clears the camera's half of an unexpected stop; the take's stays until seen.
     if var stop = unexpectedStops[id] {
       if stop.cameraStopped { stop.restarted = true }
@@ -2162,6 +2216,10 @@ final class AppModel {
       lutLog.notice("Apply LUT \(descriptor.applyLUT ? "on" : "off", privacy: .public): \(id.rawValue, privacy: .public), running: \(self.isCameraRunning(id), privacy: .public), saved LUT: \(descriptor.lutBookmark != nil, privacy: .public)")
     }
     feedCoordinator.update(descriptor)
+    // The monitor keeps its own copy of these, and reports that copy on the next tool edit.
+    if descriptor.monitor != before.monitor, descriptor.selectedDevice == before.selectedDevice {
+      monitorCoordinator.adopt(descriptor.monitor, for: MonitorTargetID(id.rawValue))
+    }
     if descriptor.recordingConstantFrameRate != before.recordingConstantFrameRate { syncRecordingFeeds() }
     if shareProcessing && descriptor.processingChoicesDiffer(from: before) { synchronizeProcessing(from: descriptor) }
     saveSettings(reason: "camera settings changed")
@@ -2232,6 +2290,7 @@ final class AppModel {
   var directorClockFeedIDForTesting: FeedID? { directorClockFeedID }
   var directorRunningForTesting: Bool { autoSwitcherBridge != nil }
   func timelineBoundForTesting(_ id: FeedID) -> Bool { recordingTimelines[id] != nil }
+  func timelineFileForTesting(_ id: FeedID) -> URL? { recordingTimelines[id]?.outputFileURL }
   func isProgramSourceProducingForTesting(_ id: FeedID) -> Bool { feedCoordinator.programOutput.isProducing(id) }
   func isSignalUnhealthy(_ id: FeedID) -> Bool { signalHealth.isUnhealthy(id) }
   var demandMonitorIsRunning: Bool { demandMonitor.isRunning }

@@ -186,6 +186,8 @@ import XCTest
     var packed = Data(count: 32 * 3)
     XCTAssertEqual(packed.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0,
       dataLength: $0.count, destination: $0.baseAddress!) }, noErr)
+    XCTAssertEqual(packed, try EmbeddedAudioConverter.convert32BitIntegerPCMTo24BitPacked(source,
+      channelCount: f.channels))
     for channel in 0..<16 { XCTAssertEqual(packed[channel * 3], UInt8(channel + 1)) }
     XCTAssertEqual(source, values.withUnsafeBytes { Data($0) })
 

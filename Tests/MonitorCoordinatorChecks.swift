@@ -259,6 +259,47 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertEqual(demand, [])
   }
 
+  /// A popped-out scope is drawn by its picture's surface: while the picture's window is
+  /// minimized or covered, the surface stays a consumer as long as the scope can be seen
+  /// in a window of its own, and is dropped as before once neither can be seen.
+  func testScopeSeenInItsOwnWindowKeepsAnUnseenPictureLive() {
+    let value = coordinator()
+    var demand: Set<MonitorTargetID> = []
+    value.onDemandChange = { demand = $0 }
+    let id = UUID()
+    let presenter = value.surface(id: id, target: alpha)
+    let sink = value.captureSink(for: alpha)
+    value.registerSurface(id: id, target: alpha, isVisible: true, scopeVisible: true)
+    presenter.reportVisibility(presented: true, drawable: true)
+    XCTAssertTrue(sink.hasConsumers)
+    // No pop-out: an unseen picture is dropped, exactly as before.
+    presenter.reportVisibility(presented: true, drawable: false)
+    XCTAssertFalse(sink.hasConsumers)
+    XCTAssertEqual(presenter.status, "Occluded")
+    XCTAssertEqual(value.diagnostics(for: alpha).availability, .paused)
+    // The scope's own window can be seen: live again, for the scope.
+    presenter.reportScopeVisibility(alone: true)
+    XCTAssertTrue(sink.hasConsumers, "A visible popped-out scope keeps its unseen picture's frames")
+    XCTAssertNotEqual(value.diagnostics(for: alpha).availability, .paused)
+    XCTAssertNotEqual(presenter.status, "Occluded")
+    // The scope window is minimized, covered or closed too: dropped.
+    presenter.reportScopeVisibility(alone: false)
+    XCTAssertFalse(sink.hasConsumers, "With neither picture nor scope seen the surface takes no frames")
+    XCTAssertEqual(presenter.status, "Occluded")
+    XCTAssertEqual(demand, [alpha], "Occlusion never changed capture demand")
+    // A visible picture does not depend on the scope either way.
+    presenter.reportVisibility(presented: true, drawable: true)
+    presenter.reportScopeVisibility(alone: true)
+    presenter.reportScopeVisibility(alone: false)
+    XCTAssertTrue(sink.hasConsumers)
+    // A picture that is not presented at all is not kept by a scope window.
+    presenter.reportScopeVisibility(alone: true)
+    presenter.reportVisibility(presented: false, drawable: false)
+    XCTAssertFalse(sink.hasConsumers)
+    XCTAssertEqual(demand, [])
+    XCTAssertEqual(presenter.status, "Paused / hidden")
+  }
+
   func testExplicitlyEmptyWorkspaceIsNotRepopulatedByPreferenceUpdates() {
     let value = coordinator()
     value.workspace.tileBindings = [nil, nil, nil, nil]

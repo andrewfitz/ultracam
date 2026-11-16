@@ -79,12 +79,17 @@ import SwiftUI
     if !quitConfirmed, presentation.askBeforeEnding, let message = UIAction.endingMessage(in: presentation) {
       let alert = UISessionBridge.confirmationAlert(for: .quit, message: message, in: presentation)
       NSApplication.shared.activate(ignoringOtherApps: true)
-      guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
+      let escape = UISessionBridge.cancelOnEscape(alert)
+      let response = alert.runModal()
+      if let escape { NSEvent.removeMonitor(escape) }
+      guard response == .alertSecondButtonReturn else { return .terminateCancel }
       quitConfirmed = true
     }
     let recording = model.recordingModel.hasActiveRecordings
     guard recording || model.cameraControls.needsShutdown else { return .terminateNow }
     terminationPending = true
+    // Finishing a take can take a while; without this the app would look hung.
+    let progress = recording ? UIQuitProgressPanel.show() : nil
     if recording {
       model.saveSettings()
       model.stopAllCameras()
@@ -97,9 +102,46 @@ import SwiftUI
         }
       }
       if let message = await controlCleanup { NSLog("Camera control cleanup on quit: %@", message) }
+      progress?.close()
       sender.reply(toApplicationShouldTerminate: true)
     }
     return .terminateLater
+  }
+}
+
+/// "Finishing recordings…" with a spinner while Quit waits for takes to finish. Nothing in it
+/// can be clicked: the wait ends on its own.
+@MainActor private enum UIQuitProgressPanel {
+  static func show() -> NSPanel {
+    let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 260, height: 64),
+      styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+    panel.title = "Quitting Ultracam"
+    panel.titleVisibility = .hidden
+    panel.titlebarAppearsTransparent = true
+    panel.isMovableByWindowBackground = true
+    panel.isReleasedWhenClosed = false
+    panel.hidesOnDeactivate = false
+    panel.level = .floating
+    let spinner = NSProgressIndicator()
+    spinner.style = .spinning
+    spinner.controlSize = .small
+    spinner.isIndeterminate = true
+    spinner.startAnimation(nil)
+    let label = NSTextField(labelWithString: "Finishing recordings…")
+    let stack = NSStackView(views: [spinner, label])
+    stack.orientation = .horizontal
+    stack.spacing = 10
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    let content = NSView()
+    content.addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+      stack.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+    ])
+    panel.contentView = content
+    panel.center()
+    panel.orderFrontRegardless()
+    return panel
   }
 }
 
@@ -118,15 +160,20 @@ struct UltracamApp: App {
           .uiWatchesHardware(model.hardwareInventory)
       }
     }
+    // The Window menu's Show Main Window (⌘0) and Diagnostics (⌃⌥D) items are UICommands', so
+    // these scenes drop their own Window menu items, which would list each window twice.
+    // UICommands sits outside this, so it stays.
+    .commandsRemoved()
     .defaultSize(width: 1320, height: 860)
     .windowToolbarStyle(.unified)
-    // Window › Ultracam (⌘0) brings the main window back.
     .commands { UICommands(model: model, interface: interface) }
 
     Window("Diagnostics", id: "diagnostics") {
       UIDiagnosticsView(model: model)
     }
+    .commandsRemoved()
     .defaultSize(width: 1100, height: 760)
+    .restorationBehavior(.disabled)
 
     // A picture's scope in its own window (the card's Pop Out): one per camera or Program,
     // resizable, at native resolution. Closing it puts the card back on the picture.
@@ -139,11 +186,14 @@ struct UltracamApp: App {
     .windowToolbarStyle(.unifiedCompact)
     .restorationBehavior(.disabled)
 
+    // Help › Ultracam Help (⌘?) opens it.
     Window("Ultracam Help", id: "help") {
       UIHelpView()
     }
+    .commandsRemoved()
     .defaultSize(width: 560, height: 640)
     .windowResizability(.contentSize)
+    .restorationBehavior(.disabled)
 
     // Eight toolbar tabs in an ordinary resizable window; a long tab scrolls.
     Settings {

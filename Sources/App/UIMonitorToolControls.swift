@@ -251,8 +251,9 @@ struct UIMonitorStatusNote: View {
         UIMonitorToolCaption(MonitorStatus.codeValueViewNote)
       }
       ForEach(UIMonitorStatusNote.reasons(presenter.shownStatus, tools: tools), id: \.self) { reason in
-        Label(reason, systemImage: "exclamationmark.triangle")
-          .font(.uiMeta).foregroundStyle(.orange)
+        // The tone goes on the symbol; small orange text is hard to read in light mode.
+        Label { Text(reason) } icon: { UIStateGlyph(state: .warning) }
+          .font(.uiMeta)
           .fixedSize(horizontal: false, vertical: true)
           .accessibilityLabel("Unavailable: \(reason)")
       }

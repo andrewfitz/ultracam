@@ -226,6 +226,49 @@ import XCTest
     }
   }
 
+  func testMissingPairedPCMPacketsAreFilledWithSilenceAndCleanCadenceIsLeftAlone() throws {
+    let duration = RecordingFrameRate.fps2997.frameDuration
+    let cadence = [1602, 1601, 1602, 1602, 1601]
+    for missing in [[Int](), [4, 5]] {
+      let format = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: .int32, interleaved: true, layout: .init(), clock: .pairedWithFrames)
+      let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(duration)), epochID: .init(sessionID: UUID(), epoch: 0), clockBindings: .init(video: .init(), audio: nil), stage: .recordingSource)
+      let config = try SourceRecordingConfiguration(feedID: .init("paired-hole"), outputURL: URL(fileURLWithPath: "/tmp/paired-hole-\(UUID().uuidString).mov"), width: 1920, height: 1080, videoCodec: kCMVideoCodecType_AppleProRes422HQ, sourceAdmission: source)
+      let values = RecordingNativeValues()
+      let writer = try AVAssetSourceRecordingWriter(configuration: config, inputReady: { _ in true }, appendSample: { sample, input in
+        if input.mediaType == .audio {
+          values.lock.lock(); values.audioPTS.append(CMSampleBufferGetPresentationTimeStamp(sample)); values.audioBytes.append(CMSampleBufferGetTotalSampleSize(sample)); values.lock.unlock()
+        }
+        return true
+      })
+      try writer.start()
+      try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .present(format)))
+      var fed = 0
+      for index in 0..<12 {
+        let time = CMTimeMultiply(duration, multiplier: Int32(index))
+        try writer.appendVideo(sample(pts: time, duration: duration))
+        if missing.contains(index) { continue }
+        let frames = cadence[index % cadence.count]
+        fed += frames
+        let packet = try makeSourceSample(planes: [Data(count: frames * 8)], sampleFrameCount: frames, format: format, presentationTime: time)
+        try writer.appendPairedSourceAudio(packet, videoTime: time)
+      }
+      let telemetry = writer.telemetry
+      try? writer.finish()
+      values.lock.lock(); let times = values.audioPTS; let bytes = values.audioBytes; values.lock.unlock()
+      XCTAssertEqual(telemetry.pairedAudioUnfilledHoles, 0)
+      XCTAssertEqual(times, times.sorted { CMTimeCompare($0, $1) < 0 }, "Silence lands before the packet it precedes")
+      if missing.isEmpty {
+        XCTAssertEqual(telemetry.pairedAudioSilenceFrames, 0, "A 1601/1602 cadence is not a hole")
+        XCTAssertEqual(bytes.reduce(0, +), fed * 6)
+      } else {
+        let lost = missing.reduce(0) { $0 + cadence[$1 % cadence.count] }
+        XCTAssertEqual(Double(telemetry.pairedAudioSilenceFrames), Double(lost), accuracy: 2, "Two missing packets are one hole of their length")
+        XCTAssertEqual(bytes.reduce(0, +), (fed + Int(telemetry.pairedAudioSilenceFrames)) * 6)
+        XCTAssertEqual(bytes.count, 12 - missing.count + 1)
+      }
+    }
+  }
+
   func testActualEncoderUsesOneSecondKeyframePolicyAt25And120() throws {
     for rate in [RecordingFrameRate.fps25, .fps120] {
       let config = try SourceRecordingConfiguration(feedID: .init("keyframe-seconds"), outputURL: URL(fileURLWithPath: "/tmp/keyframe-seconds-\(UUID().uuidString).mov"), width: 1920, height: 1080,

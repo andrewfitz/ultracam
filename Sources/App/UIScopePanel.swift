@@ -11,13 +11,16 @@ struct UIScopeLabelsView: View {
 
   var body: some View {
     Canvas { context, size in
-      let labels = description.visibleLabels(width: size.width, height: size.height)
+      // Sized to the scope: legible in the smallest card, larger in the Scopes window.
+      let fontSize = UIScopeDescription.labelFontSize(height: size.height)
+      let labels = description.visibleLabels(width: size.width, height: size.height,
+        spacing: UIScopeDescription.labelSpacing(fontSize: fontSize), fontSize: fontSize)
       for label in labels {
         let text = Text(label.text)
-          .font(.system(size: label.role == .channel ? 9 : 8, weight: label.role == .channel ? .semibold : .regular,
-            design: .monospaced))
+          .font(.system(size: label.role == .channel ? fontSize + 1 : fontSize,
+            weight: label.role == .channel ? .semibold : .regular, design: .monospaced))
           .foregroundStyle(Color.white.opacity(label.isMajor ? 0.85 : 0.6))
-        let (point, anchor) = Self.placement(label, in: size)
+        let (point, anchor) = Self.placement(label, in: size, fontSize: fontSize)
         context.draw(text, at: point, anchor: anchor)
       }
     }
@@ -27,12 +30,15 @@ struct UIScopeLabelsView: View {
   }
 
   /// Where a label is drawn: its anchor point, kept inside the image so the end
-  /// labels (and targets just outside the plot) are not cut off.
-  static func placement(_ label: ScopeLabel, in size: CGSize) -> (CGPoint, UnitPoint) {
+  /// labels (and targets just outside the plot) are not cut off. The margins are for
+  /// 8 pt labels and grow with `fontSize`.
+  static func placement(_ label: ScopeLabel, in size: CGSize, fontSize: Double = 8) -> (CGPoint, UnitPoint) {
     let x = label.position.x * size.width
     let y = label.position.y * size.height
+    // The same scale `visibleLabels` measures with, so its kept labels are the ones drawn.
+    let scale = max(1, fontSize / 8)
     func inside(_ v: Double, _ limit: Double, margin: Double) -> Double {
-      min(max(margin, limit - margin), max(margin, v))
+      min(max(margin * scale, limit - margin * scale), max(margin * scale, v))
     }
     switch label.anchor {
     case .leading: return (CGPoint(x: x + 2, y: inside(y, size.height, margin: 5)), .leading)

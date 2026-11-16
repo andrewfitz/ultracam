@@ -231,7 +231,8 @@ import SwiftUI
   }
 }
 
-/// The scope settings at popover width with their own state.
+/// The scope settings at popover width with their own state, laid out as the Scopes
+/// window's settings popover (`UIScopeWindowView`) lays them out.
 private struct UIScopeSettingsPreview: View {
   @State var scopes: MonitorScopePreferences
   let signal: SignalDescription?
@@ -239,7 +240,7 @@ private struct UIScopeSettingsPreview: View {
     VStack(alignment: .leading, spacing: 8) {
       UIScopeSettingsView(scopes: $scopes, isProgram: false, signal: signal, stageLUT: false)
     }
-    .padding(12).frame(width: 320, alignment: .topLeading).controlSize(.small)
+    .padding(16).frame(width: 320, alignment: .topLeading).controlSize(.small)
     .frame(maxHeight: .infinity, alignment: .top)
   }
 }

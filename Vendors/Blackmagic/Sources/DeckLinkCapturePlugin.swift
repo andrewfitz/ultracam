@@ -509,7 +509,8 @@ struct DeckLinkCapturePlugin: CaptureSourcePlugin {
         labelKey: "decklink.fact.connection", localizationTable: localizationTable))
     }
     if let detected = status.detected {
-      let pieces = FormatDisplayIdentity(detected).short.split(separator: " ").map(String.init)
+      let identity = FormatDisplayIdentity(detected)
+      let pieces = [identity.shortSize, identity.shortRate]
         + [value.detectedSampling, value.detectedColorspace, value.detectedDynamicRange].compactMap { $0 }
       facts.append(DeviceFact(id: "signal", group: .signal, label: "Signal", values: pieces,
         labelKey: "decklink.fact.signal", localizationTable: localizationTable))

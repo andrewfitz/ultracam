@@ -20,6 +20,8 @@ enum OutputFormatCatalog {
       }
       if entry.colour.horizontalChromaSiting == .center && entry.colour.verticalChromaSiting == .center {
         extensions[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Center
+      } else if entry.colour.horizontalChromaSiting == .left && entry.colour.verticalChromaSiting == .center {
+        extensions[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Left
       }
       var result: CMVideoFormatDescription?
       let status = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,
@@ -43,7 +45,8 @@ enum OutputFormatCatalog {
   static func matchingIndex(_ requested: ExtensionFormatContract,
                             duration: CMTime,
                             installed: [ExtensionFormatContract] = published) -> Int? {
-    guard requested.allows(duration: duration), let index = installed.firstIndex(of: requested),
+    guard requested.allows(duration: duration), ExtensionFormatCatalog.installedPrefixMatchesPublished(installed),
+      let index = installed.firstIndex(of: requested),
       published.contains(requested) else { return nil }
     return index
   }

@@ -13,6 +13,8 @@ import SwiftUI
     let size: CGSize
     /// A settings popover's own size, sized to its content; nil for the bar.
     var popover: CGSize?
+    /// The popover's one-column layout, over a narrow picture.
+    var singleColumn = false
   }
 
   /// The margin around a popover in its render.
@@ -90,11 +92,11 @@ import SwiftUI
     let cameraID = session.cameras.first?.id ?? "camera-1"
     let name = session.cameras.first?.name ?? "Camera 1"
     func panel(_ label: String, _ panel: UIMonitorPanel, _ preferences: MonitorFeedPreferences,
-      target: String, title: String, program: Bool) {
+      target: String, title: String, program: Bool, singleColumn: Bool = false) {
       let provider = UIFixtureMonitorSettings(session: session)
       provider.setPreferences(preferences, for: target)
       let settings = UIMonitorToolSettingsView(panel: panel, cameraID: target, cameraName: title, isProgram: program,
-        provider: provider)
+        provider: provider, singleColumn: singleColumn)
       let size = fittingSize(settings)
       // Drawn on a popover-like card so the render shows the popover's bounds.
       let card = settings
@@ -103,7 +105,8 @@ import SwiftUI
         .padding(margin)
         .background(Color(nsColor: .underPageBackgroundColor))
       screens.append(Screen(name: "monitor-tool-\(label)", view: AnyView(card),
-        size: CGSize(width: ceil(size.width) + margin * 2, height: ceil(size.height) + margin * 2), popover: size))
+        size: CGSize(width: ceil(size.width) + margin * 2, height: ceil(size.height) + margin * 2), popover: size,
+        singleColumn: singleColumn))
     }
     let camera = cameraPreferences()
     panel("guides", .tool(.guides), camera, target: cameraID, title: name, program: false)
@@ -116,6 +119,13 @@ import SwiftUI
     panel("scopes", .tool(.scopes), camera, target: cameraID, title: name, program: false)
     panel("clip", .clipIndicators, camera, target: cameraID, title: name, program: false)
     panel("picture", .picture, camera, target: cameraID, title: name, program: false)
+    // Over a narrow picture (Side by Side, Four Up, a small window): one column.
+    panel("zebra-single-column", .tool(.zebra), camera, target: cameraID, title: name, program: false,
+      singleColumn: true)
+    if let log = falseColorVariants().first {
+      panel("false-color-\(log.name)-single-column", .tool(.falseColor), log.preferences, target: cameraID, title: name,
+        program: false, singleColumn: true)
+    }
     var program = MonitorFeedPreferences()
     program.toolsEnabled = true
     program.state.zebras[0].enabled = true

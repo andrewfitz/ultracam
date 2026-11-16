@@ -196,9 +196,13 @@ struct UISettingsGeneralPane: View {
           Text("Menu bar when closed").tag(false)
         }
         .help("Menu bar when closed: Ultracam is in the Dock while a window is open, and only in the menu bar once you close them. Closing the window never stops capture, camera output or recording.")
-        Toggle("Open Ultracam at login", isOn: Binding(
+        Toggle(isOn: Binding(
           get: { loginStatus == .enabled || loginStatus == .requiresApproval },
-          set: { setOpenAtLogin($0) }))
+          set: { setOpenAtLogin($0) })) {
+          Text("Open Ultracam at login")
+          // On here means asked for: macOS doesn't open it at login until it's approved.
+          if loginStatus == .requiresApproval { Text("Not active until approved in System Settings") }
+        }
         .help("Starts Ultracam in the menu bar when you log in, so automatic start can work.")
         if loginStatus == .requiresApproval {
           LabeledContent {
@@ -266,6 +270,12 @@ struct UISettingsGeneralPane: View {
       loginError = "Couldn't change Open at login: \(error.localizedDescription)"
     }
     loginStatus = SMAppService.mainApp.status
+    // Asked to turn on, no error, yet macOS reports it neither on nor waiting for approval.
+    if enabled, loginError == nil, loginStatus != .enabled, loginStatus != .requiresApproval {
+      loginError = loginStatus == .notFound
+        ? "macOS couldn't find Ultracam's login item. Open Ultracam from the Applications folder and try again."
+        : "macOS didn't turn on Open at login. Try again, or add Ultracam in System Settings › General › Login Items & Extensions."
+    }
   }
 }
 
@@ -310,7 +320,7 @@ struct UISettingsVirtualCamerasPane: View {
             Image(systemName: state.symbol).foregroundStyle(state.color)
           }
           // A request's result sits beside the control until the state changes, never in the footer.
-          if let result = requestResult(needsApproval: state.needsApproval) { Text(result) }
+          if let result = requestResult(state) { Text(result) }
         }
         if state.needsApproval {
           LabeledContent {
@@ -341,15 +351,18 @@ struct UISettingsVirtualCamerasPane: View {
           Text("Program color")
           Text("The color space Ultracam · Program sends")
         }
-      } header: { Text("Program") }
+      } header: { Text("Program") } footer: {
+        UISettingsFootnote("Applies at once, even on air. A meeting app showing Ultracam · Program sees its format change.")
+      }
     }
   }
 
   /// The last request's result, while it says something the status line doesn't.
-  private func requestResult(needsApproval: Bool) -> String? {
+  /// A completed install says nothing more once the status line shows the extension installed.
+  private func requestResult(_ state: UISettingsExtensionState) -> String? {
     let installer = model.installer
-    guard installer.unavailableReason == nil, !needsApproval, !installer.pending,
-      installer.status != Self.readyStatus else { return nil }
+    guard installer.unavailableReason == nil, !state.needsApproval, !installer.pending,
+      installer.status != Self.readyStatus, !(installer.installCompleted && state.removable) else { return nil }
     return installer.status
   }
 
@@ -388,7 +401,7 @@ struct UISettingsExtensionState: Equatable {
 
   @MainActor init(installer: ExtensionInstaller, published: Bool) {
     let system = installer.system
-    needsApproval = installer.status.localizedCaseInsensitiveContains("approve")
+    needsApproval = installer.needsApproval
       || (system?.awaitingApproval == true && system?.enabled == false)
     version = system?.enabledVersion ?? system?.bundledVersion
     if installer.unavailableReason != nil {
@@ -426,6 +439,7 @@ struct UISettingsSwitchingPane: View {
   @State private var interval = UISettingsSwitchingPane.defaultInterval
   @State private var loaded = false
   @State private var advancedOpen = false
+  @State private var confirmRestore = false
   /// What Restore Defaults puts the fixed interval back to: what a first run has.
   static let defaultInterval = SwitcherSettings().intervalSeconds
 
@@ -438,9 +452,10 @@ struct UISettingsSwitchingPane: View {
       Section {
         UISettingsShotTimeline(minimum: draft.minimumShotDuration, softMaximum: draft.softMaximumShotDuration,
           maximum: draft.maximumShotDuration, grace: draft.forcedCutGracePeriod)
-        UISettingsNumberRow(title: "Minimum shot", value: $draft.minimumShotDuration, range: 10...60, step: 1, unit: "s") { commitDirector() }
-        UISettingsNumberRow(title: "Soft maximum", value: $draft.softMaximumShotDuration, range: 10...120, step: 1, unit: "s") { commitDirector() }
-        UISettingsNumberRow(title: "Maximum shot", value: $draft.maximumShotDuration, range: 10...180, step: 1, unit: "s") { commitDirector() }
+        UISettingsNumberRow(title: "Minimum shot", value: $draft.minimumShotDuration, range: 10...60, step: 1, unit: "s") { commitShotLimit(.minimum) }
+        UISettingsNumberRow(title: "Soft maximum", value: $draft.softMaximumShotDuration, range: 10...120, step: 1, unit: "s") { commitShotLimit(.softMaximum) }
+        // At least 11: the maximum stays above the minimum, which is at least 10.
+        UISettingsNumberRow(title: "Maximum shot", value: $draft.maximumShotDuration, range: 11...180, step: 1, unit: "s") { commitShotLimit(.maximum) }
         UISettingsNumberRow(title: "Cooldown", value: $draft.cooldown, range: 0...10, step: 0.5, unit: "s") { commitDirector() }
         UISettingsNumberRow(title: "Emphasis hold", value: $draft.emphasisHold, range: 0...30, step: 0.5, unit: "s") { commitDirector() }
         UISettingsNumberRow(title: "Forced-cut grace", value: $draft.forcedCutGracePeriod, range: 0...10, step: 0.5, unit: "s") { commitDirector() }
@@ -467,7 +482,7 @@ struct UISettingsSwitchingPane: View {
       }
     } trailing: {
       // Restores the fixed interval too.
-      Button("Restore Defaults") { restoreDefaults() }
+      Button("Restore Defaults…") { confirmRestore = true }
     }
     .onAppear {
       guard !loaded else { return }
@@ -475,6 +490,32 @@ struct UISettingsSwitchingPane: View {
       draft = model.switcherSettings.naturalTalkingHead
       interval = model.switcherSettings.intervalSeconds
     }
+    .confirmationDialog("Restore switching defaults?", isPresented: $confirmRestore) {
+      Button("Restore Defaults", role: .destructive) { restoreDefaults() }
+      Button("Cancel", role: .cancel) {}
+        .keyboardShortcut(.defaultAction)
+    } message: {
+      Text("The fixed interval and every Natural Talking Head setting on this tab go back to their defaults. Auto uses them right away, even on air.")
+    }
+  }
+
+  private enum ShotLimit { case minimum, softMaximum, maximum }
+
+  /// Keeps minimum ≤ soft maximum ≤ maximum by moving the other limits out of the way of
+  /// the one just set, so a limit can't be set past its neighbors.
+  private func commitShotLimit(_ edited: ShotLimit) {
+    switch edited {
+    case .minimum:
+      draft.softMaximumShotDuration = max(draft.softMaximumShotDuration, draft.minimumShotDuration)
+      draft.maximumShotDuration = max(draft.maximumShotDuration, draft.softMaximumShotDuration, draft.minimumShotDuration + 1)
+    case .softMaximum:
+      draft.minimumShotDuration = min(draft.minimumShotDuration, draft.softMaximumShotDuration)
+      draft.maximumShotDuration = max(draft.maximumShotDuration, draft.softMaximumShotDuration, draft.minimumShotDuration + 1)
+    case .maximum:
+      draft.softMaximumShotDuration = min(draft.softMaximumShotDuration, draft.maximumShotDuration)
+      draft.minimumShotDuration = min(draft.minimumShotDuration, draft.softMaximumShotDuration, draft.maximumShotDuration - 1)
+    }
+    commitDirector()
   }
 
   private func floatBinding(_ keyPath: WritableKeyPath<NaturalTalkingHeadSettings, Float>) -> Binding<Double> {
@@ -485,6 +526,10 @@ struct UISettingsSwitchingPane: View {
   private func commitDirector() {
     var settings = model.switcherSettings
     let current = settings.naturalTalkingHead
+    // Keep the limits ordered as the director will run them, so what is shown is what runs.
+    draft.maximumShotDuration = max(draft.maximumShotDuration, draft.minimumShotDuration + 1)
+    draft.softMaximumShotDuration = min(draft.softMaximumShotDuration, draft.maximumShotDuration)
+    draft.softMaximumShotDuration = max(draft.softMaximumShotDuration, draft.minimumShotDuration)
     var next = draft
     next.enabled = current.enabled
     next.anchorFeedID = current.anchorFeedID

@@ -585,7 +585,7 @@ import XCTest
 
   func testCamerasControlTitle() {
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1)])).camerasControlTitle, "Stop Camera 1")
-    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, running: false)])).camerasControlTitle, "Start Camera")
+    XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, running: false)])).camerasControlTitle, "Start Camera 1")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1), camera(2)])).camerasControlTitle, "Stop All Cameras")
     XCTAssertEqual(UIPresentationBuilder.session(separate([camera(1, running: false), camera(2, running: false)])).camerasControlTitle,
       "Start Cameras")

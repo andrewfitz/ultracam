@@ -2,9 +2,90 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import Metal
 import XCTest
 
 @objcMembers final class CaptureSourceMetadataChecks: XCTestCase {
+  func testLUTAndEffectsTogglesRestoreNativeColourAndRecoverFromUnsupportedOutput() throws {
+    guard MTLCreateSystemDefaultDevice()?.supportsFamily(.metal4) == true else { throw XCTSkip("Metal 4 required") }
+    final class Connections: @unchecked Sendable {
+      let lock = NSLock()
+      let attempted = DispatchSemaphore(value: 0)
+      var colours: [Colorimetry] = []
+      var configurations: [PipelineConfiguration] = []
+      var refused = 0
+    }
+    let observed = Connections()
+    let pq = Colorimetry(primaries: .rec2020, transfer: .pq, matrix: .rec2020,
+      range: .video, horizontalChromaSiting: .center, verticalChromaSiting: .center)
+    let format = try SourceFormat(width: 128, height: 72, pixel: .v210, colour: pq,
+      rate: .constant(VideoContract.fastDuration))
+    let source = FakeCaptureSession(format: format, audio: .absent)
+    let feed = FeedID(rawValue: "colour-contract-transition")
+    var services = CaptureServices.registryBridge(feedID: feed, makeSession: { _ in source })
+    services.disconnect = {}
+    services.connectWithSource = { configuration, type, sourceFormat in
+      defer { observed.attempted.signal() }
+      let colour = try CameraSink.resolvedOutputColour(configuration: configuration, sourceFormat: sourceFormat)
+      observed.lock.withLock {
+        observed.colours.append(colour)
+        observed.configurations.append(configuration)
+      }
+      do { _ = try CameraSink.requestedFormat(configuration: configuration, passthroughFormat: type, sourceFormat: sourceFormat) }
+      catch { observed.lock.withLock { observed.refused += 1 }; throw error }
+    }
+    let controller = CaptureController(services: services)
+    controller.requestCameraOutputEnabled(true, framesWanted: false)
+    defer { controller.onUpdate = nil; controller.stop() }
+    let ready = expectation(description: "Source ready")
+    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { ready.fulfill() } }
+    var configuration = PipelineConfiguration(applyLUT: false, downscale: false,
+      convertTo420: true, reduceFrameRate: false)
+    let sony = Colorimetry(primaries: .sGamut3Cine, transfer: .sLog3, matrix: .rec709,
+      range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
+    configuration.sourceColorimetryOverride = sony
+    controller.start(feedID: feed, deviceID: "fake:fixture", configuration: configuration,
+      previewEnabled: false)
+    wait(for: [ready], timeout: 3)
+    controller.onUpdate = nil
+    var image: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 128, 72, kCVPixelFormatType_422YpCbCr10,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferBytesPerRowAlignmentKey: 128] as CFDictionary,
+      &image), kCVReturnSuccess)
+    let buffer = CapturedPixelBuffer(immutable: try XCTUnwrap(image))
+    for index in 0..<8 {
+      if index == 1 { configuration.applyLUT = true; configuration.lutOutputColorimetry = .rec709Video }
+      if index == 2 { configuration.lutOutputColorimetry = pq }
+      if index == 3 {
+        configuration.lutOutputColorimetry = sony
+      }
+      if index == 4 {
+        configuration.lutOutputColorimetry = .rec709Video
+      }
+      if index == 5 { configuration.applyLUT = false }
+      controller.reconfigure(configuration: configuration, pipelineEnabled: index != 6)
+      let context = source.context
+      XCTAssertTrue(source.submit(.frame(buffer, CaptureFrameInfo(epochID: context.epochID,
+        formatSignature: context.formatSignature, presentationTime: CMTime(value: Int64(index), timescale: 1),
+        duration: VideoContract.fastDuration, signalValid: true, timecode: nil))))
+      XCTAssertEqual(observed.attempted.wait(timeout: .now() + 3), .success,
+        "Colour-only change must replace the previous camera contract")
+    }
+    let colours = observed.lock.withLock { observed.colours }
+    XCTAssertEqual(colours.map(\.transfer), [.pq, .rec709, .pq, .sLog3, .rec709, .pq, .pq, .pq],
+      "Returning from unsupported output must establish a supported contract again")
+    let configurations = observed.lock.withLock { observed.configurations }
+    XCTAssertEqual(configurations.map(\.sourceColorimetryOverride),
+      [nil, sony, sony, sony, sony, nil, nil, nil],
+      "LUT-off and Effects-off must use native encoding, preserving the configured profile for LUT-on")
+    XCTAssertEqual(configurations.map(\.convertTo420), [true, true, true, true, true, true, false, true],
+      "LUT-off retains selected processing; Effects-off bypasses it and Effects-on restores it")
+    XCTAssertEqual(configuration.sourceColorimetryOverride, sony,
+      "Deriving output policy must not erase the configured source profile")
+    XCTAssertEqual(observed.lock.withLock { observed.refused }, 1,
+      "Unsupported log output must be refused, never mislabeled as the previous supported output")
+  }
+
   func testVideoPreflightRemainsAvailableWhileAudioIsUnknown() throws {
     let format = try SourceFormat(width: 1280, height: 720, pixel: .v210, rate: .constant(CMTime(value: 1, timescale: 25)))
     let source = FakeCaptureSession(format: format, audio: .unknown)

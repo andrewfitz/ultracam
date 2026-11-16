@@ -297,7 +297,7 @@ struct UIFalseColorLegendGrid: View {
     VStack(alignment: .leading, spacing: 6) {
       Text(legend.headline).font(.caption.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
       if let reason = unavailableText {
-        Label(reason, systemImage: "exclamationmark.triangle")
+        Label(reason, systemImage: UISymbol.warning)
           .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       } else {
         ForEach(Array(legend.captions.enumerated()), id: \.offset) { _, line in

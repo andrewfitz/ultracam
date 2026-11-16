@@ -28,7 +28,7 @@ def class_test_methods(source, name):
 def verify_coverage(log, expected):
     failures = []
     for name, count in expected.items():
-        pattern = r"Test Suite '" + re.escape(name) + r"' (?:passed|failed)[^\n]*\n\s*Executed (\d+) tests?\b"
+        pattern = r"Test Suite '" + re.escape(name) + r"' passed[^\n]*\n\s*Executed (\d+) tests?\b"
         found = re.findall(pattern, log)
         if len(found) != 1:
             failures.append(f'{name}: expected one completed runtime suite, found {len(found)}')

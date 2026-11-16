@@ -662,7 +662,8 @@ extension UIVerify {
       "Output 1080p 29.97", "Cut to Camera 2"] {
       verifier.check("accessibility contains \"\(label)\"", contains(nodes, label), "", viewDependent: true)
     }
-    // A take that ended early keeps Details on a collapsed strip: it acknowledges the take (J34).
+    // A take that ended early keeps Details on a collapsed strip: it opens Diagnostics and leaves
+    // the result showing until it is dismissed.
     do {
       var failed = stripFixture(.failed)
       failed.collapsed = Set(failed.cameras.map(\.id))
@@ -674,8 +675,9 @@ extension UIVerify {
       verifier.check("a collapsed strip whose take ended early offers Details", !details.isEmpty, "", viewDependent: true)
       if let first = details.first, Accessibility.press(first) {
         hosted.settle()
-        verifier.check("collapsed Details acknowledges the take",
-          collapsedLog.actions.contains { if case .acknowledgeStop = $0 { return true }; return false }, "", viewDependent: true)
+        verifier.check("collapsed Details opens Diagnostics without acknowledging the take",
+          collapsedLog.actions.contains { if case .openDiagnostics = $0 { return true }; return false }
+            && !collapsedLog.actions.contains { if case .acknowledgeStop = $0 { return true }; return false }, "", viewDependent: true)
       }
     }
     // The Effects menu is named by its words alone: its symbol is an attachment in the label.
@@ -826,19 +828,8 @@ extension UIVerify {
     // LUT is one click, on and off; the rest of the effects are in a menu.
     pressInStrip(one, "LUT for Camera 1", expect: .setEffect(cameraID: one.id, index: 0, false))
     pressInStrip(two, "Cut to Camera 2", expect: .cut(cameraID: two.id))
-    // Camera 2 has no LUT loaded, so its LUT toggle is disabled and must not act.
-    do {
-      let hosted = HostedView(UIChannelStripView(camera: two, context: context), size: CGSize(width: 560, height: 230), dark: false)
-      let lut = Accessibility.nodes(in: hosted.host).first { $0.label == "LUT for Camera 2" }
-      verifier.check("Camera 2 LUT toggle is disabled without a LUT", lut?.enabled == false, "", viewDependent: true)
-      if let lut {
-        log.clear()
-        _ = Accessibility.press(lut)
-        hosted.settle()
-        verifier.check("disabled LUT toggle sends nothing", log.actions.isEmpty, "\(log.actions)")
-      }
-      hosted.close()
-    }
+    // Camera 2 has no LUT loaded, so its LUT slot asks for one.
+    pressInStrip(two, "Load LUT for Camera 2", expect: .chooseLUT(cameraID: two.id))
     pressInStrip(two, "Collapse Camera 2", expect: .toggleCollapsed(cameraID: two.id))
 
     // The ⋯ menu shows ⌃1 beside Cut to Camera 1 as a label only: the Program menu owns the key.

@@ -18,6 +18,11 @@ import SwiftUI
   /// Two columns and the space between them.
   static let contentWidth = columnWidth * 2 + columnSpacing
   static let panelWidth = contentWidth + padding * 2
+  /// One column: the popover over a picture too narrow for two, so it doesn't cover the
+  /// picture whose zebra, false color or peaking is being adjusted.
+  static let singleColumnPanelWidth = columnWidth + padding * 2
+
+  static func popoverWidth(singleColumn: Bool) -> CGFloat { singleColumn ? singleColumnPanelWidth : panelWidth }
 
   /// The tallest a popover's settings get before they scroll: the screen's
   /// visible height, less room for the tool bar, the arrow and the header.
@@ -26,11 +31,18 @@ import SwiftUI
   }
 }
 
-/// Two top-aligned columns of groups, then full-width notes under both.
+extension EnvironmentValues {
+  /// The tool popover is over a narrow picture: `UIToolColumns` stacks its two columns in one.
+  @Entry var uiToolSingleColumn = false
+}
+
+/// Two top-aligned columns of groups, then full-width notes under both. In a
+/// single-column popover (`uiToolSingleColumn`) the trailing groups follow the leading ones.
 struct UIToolColumns<Leading: View, Trailing: View, Footer: View>: View {
   let leading: Leading
   let trailing: Trailing
   let footer: Footer
+  @Environment(\.uiToolSingleColumn) private var singleColumn
 
   init(@ViewBuilder leading: () -> Leading, @ViewBuilder trailing: () -> Trailing,
     @ViewBuilder footer: () -> Footer) {
@@ -41,16 +53,24 @@ struct UIToolColumns<Leading: View, Trailing: View, Footer: View>: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
-      HStack(alignment: .top, spacing: UIToolLayout.columnSpacing) {
-        VStack(alignment: .leading, spacing: UIToolLayout.columnSpacing) { leading }
-          .frame(width: UIToolLayout.columnWidth, alignment: .topLeading)
-        VStack(alignment: .leading, spacing: UIToolLayout.columnSpacing) { trailing }
-          .frame(width: UIToolLayout.columnWidth, alignment: .topLeading)
+      if singleColumn {
+        VStack(alignment: .leading, spacing: UIToolLayout.columnSpacing) {
+          leading
+          trailing
+        }
+        .frame(width: UIToolLayout.columnWidth, alignment: .topLeading)
+      } else {
+        HStack(alignment: .top, spacing: UIToolLayout.columnSpacing) {
+          VStack(alignment: .leading, spacing: UIToolLayout.columnSpacing) { leading }
+            .frame(width: UIToolLayout.columnWidth, alignment: .topLeading)
+          VStack(alignment: .leading, spacing: UIToolLayout.columnSpacing) { trailing }
+            .frame(width: UIToolLayout.columnWidth, alignment: .topLeading)
+        }
       }
       VStack(alignment: .leading, spacing: 4) { footer }
         .padding(.horizontal, 4)
     }
-    .frame(width: UIToolLayout.contentWidth, alignment: .leading)
+    .frame(width: singleColumn ? UIToolLayout.columnWidth : UIToolLayout.contentWidth, alignment: .leading)
   }
 }
 

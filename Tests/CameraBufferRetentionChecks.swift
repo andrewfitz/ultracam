@@ -40,4 +40,33 @@ import XCTest
     queue.close()
     XCTAssertThrowsError(try queue.send(sample()))
   }
+
+  func testTransportLeaseStaysOutOfSerializedSampleMetadata() throws {
+    var raw: CMSimpleQueue?
+    XCTAssertEqual(CMSimpleQueueCreate(allocator: nil, capacity: 8, queueOut: &raw), noErr)
+    let queue = CameraBufferQueue(try XCTUnwrap(raw))
+    let input = try sample()
+    XCTAssertTrue(try queue.send(input, pauseAllowanceAttachment: NSNumber(value: 0.5)))
+    let token = try XCTUnwrap(CMSimpleQueueDequeue(queue.queue))
+    let owner = Unmanaged<CMSampleBuffer>.fromOpaque(token)
+    autoreleasepool {
+      let transport = owner.takeUnretainedValue()
+      XCTAssertEqual((CMGetAttachment(transport, key: VideoContract.sourcePauseAllowanceAttachmentKey,
+        attachmentModeOut: nil) as? NSNumber)?.doubleValue, 0.5)
+      XCTAssertNil(CMGetAttachment(input, key: VideoContract.sourcePauseAllowanceAttachmentKey,
+        attachmentModeOut: nil))
+      for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+        let attachments = CMCopyDictionaryOfAttachments(allocator: nil, target: transport, attachmentMode: mode)
+        if let attachments {
+          XCTAssertTrue(PropertyListSerialization.propertyList(attachments, isValidFor: .binary),
+            "CMIO serializes sample attachments even when marked ShouldNotPropagate")
+          XCTAssertNil((attachments as NSDictionary)["org.ultracam.camera.transport-retention"])
+        }
+      }
+    }
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 1,
+      "The local lease must remain alive while CMIO owns the dequeued sample")
+    owner.release()
+    XCTAssertEqual(queue.retentionSnapshot.currentSlots, 0)
+  }
 }

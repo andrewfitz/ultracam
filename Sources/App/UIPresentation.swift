@@ -332,7 +332,8 @@ struct UIInstallState: Sendable, Equatable {
   var installed = true
   /// What macOS says about the extension (versions, enabled, approval); nil until it answers.
   var system: ExtensionSystemState?
-  var needsApproval: Bool { status.localizedCaseInsensitiveContains("approve") }
+  /// The installer is waiting for the user to approve the extension in System Settings.
+  var needsApproval = false
 }
 
 struct UISessionSnapshot: Sendable, Equatable {
@@ -806,6 +807,17 @@ enum UIFormat {
     return [UIValuePart(number: "\(minutes)", unit: "min")]
   }
 
+  /// A clock as VoiceOver should say it: "12 minutes 31 seconds", "1 hour 2 minutes 47 seconds".
+  static func spokenElapsed(_ seconds: TimeInterval) -> String {
+    let total = max(0, Int(seconds.rounded(.down)))
+    func part(_ value: Int, _ unit: String) -> String { "\(value) \(unit)\(value == 1 ? "" : "s")" }
+    var parts: [String] = []
+    if total >= 3600 { parts.append(part(total / 3600, "hour")) }
+    if total >= 60 { parts.append(part((total / 60) % 60, "minute")) }
+    parts.append(part(total % 60, "second"))
+    return parts.joined(separator: " ")
+  }
+
   /// "capture" for "/Volumes/8TB/capture".
   static func folderName(_ path: String) -> String {
     let name = (path as NSString).lastPathComponent
@@ -1013,7 +1025,8 @@ enum UIPresentationBuilder {
     if tally == .onAir {
       outputLine = "On air"
     } else if session.onAirID == camera.id, tally != .iso {
-      outputLine = "In Program, no viewer yet"
+      outputLine = tally == .noPicture ? "In Program, no picture"
+        : session.programInUse ? "In Program, viewer waiting" : "In Program, no viewer yet"
     } else if session.pendingCutID == camera.id {
       outputLine = "Next"
     } else {
@@ -1290,8 +1303,28 @@ enum UIPresentationBuilder {
 
   /// The menus' Start or Stop row. One camera says which; several say "All" when it stops them.
   static func camerasControlTitle(_ session: UISessionSnapshot, running: Bool) -> String {
-    if session.cameras.count == 1 { return running ? "Stop \(session.cameras[0].name)" : "Start Camera" }
+    if session.cameras.count == 1 { return (running ? "Stop " : "Start ") + session.cameras[0].name }
     return running ? "Stop All Cameras" : "Start Cameras"
+  }
+
+  /// The toolbar's cut pills: every camera up to six, else the first five and a More menu
+  /// for the rest. `cutButtons` keeps every camera for the menus.
+  static let toolbarCutLimit = 6
+  static func toolbarCuts(_ buttons: [UICutButton]) -> (shown: [UICutButton], more: [UICutButton]) {
+    guard buttons.count > toolbarCutLimit else { return (buttons, []) }
+    return (Array(buttons.prefix(toolbarCutLimit - 1)), Array(buttons.dropFirst(toolbarCutLimit - 1)))
+  }
+
+  /// Whether the pills keep their digits only: in a narrow window, with a More menu, with
+  /// four or more pills, or when their names (each drawn at most about 18 characters wide)
+  /// add up to more than four "Camera 1"s and a little: a toolbar item has no width to ask.
+  static func toolbarCutsNumberOnly(_ shown: [UICutButton], hasMore: Bool, narrowWindow: Bool) -> Bool {
+    narrowWindow || hasMore || shown.count > 3 || shown.reduce(0) { $0 + min($1.name.count, 18) } > 40
+  }
+
+  /// A drive's free space as the sidebar words it when there's no time to estimate.
+  static func freeSpaceText(_ drive: UIDrive) -> String {
+    drive.totalBytes == 0 && drive.availableBytes == 0 ? "Free space unknown" : "\(UIFormat.bytes(drive.availableBytes)) free"
   }
 
   /// "Start Cameras" with every camera stopped, "Start Camera 2" with one of several.

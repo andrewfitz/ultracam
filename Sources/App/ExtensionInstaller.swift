@@ -203,6 +203,10 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
 
   private(set) var status: String
   private(set) var pending = false
+  /// The request in flight is waiting for the person to approve it in System Settings.
+  private(set) var needsApproval = false
+  /// The last request finished by installing the extension. Cleared when another starts.
+  private(set) var installCompleted = false
   private(set) var unavailableReason: String?
   var canRequestChanges: Bool { unavailableReason == nil }
   /// What macOS last said about the extension; nil until it answers (or when it can't be asked).
@@ -246,6 +250,8 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
 
   private func requestChange(_ change: Change) {
     guard !pending else { return }
+    needsApproval = false
+    installCompleted = false
     let preflight = services.preflight()
     unavailableReason = preflight.unavailableReason
     guard canRequestChanges else { status = unavailableReason!; return }
@@ -266,13 +272,15 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     activeRequest === request
   }
 
-  private func finish(_ request: OSSystemExtensionRequest, message: String) {
+  private func finish(_ request: OSSystemExtensionRequest, message: String, installed: Bool = false) {
     guard isCurrentRequest(request) else { return }
     requestIdentity.clear()
     activeRequest?.delegate = nil
     activeRequest = nil
     activeChange = nil
     pending = false
+    needsApproval = false
+    installCompleted = installed
     status = message
     refreshSystemState()
   }
@@ -285,6 +293,7 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     guard let identity = requestIdentity.token(for: request) else { return }
     Task { @MainActor in
       guard self.requestIdentity.matches(identity) else { return }
+      self.needsApproval = true
       self.status = "Approve Ultracam in System Settings › General › Login Items & Extensions › Camera Extensions."
     }
   }
@@ -296,8 +305,8 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
       guard self.isCurrentRequest(reference.request) else { return }
       let removed = self.activeChange == .remove
       self.finish(reference.request, message: completed ? (removed ? "Camera extension removed." :
-        "Camera extension request completed. Refresh inputs, then choose Ultracam in your meeting app.") :
-        "Camera extension change requires a restart.")
+        "Camera extension request completed. Choose Ultracam in your meeting app.") :
+        "Camera extension change requires a restart.", installed: completed && !removed)
     }
   }
 

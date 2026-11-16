@@ -16,7 +16,8 @@ struct UISettingsHardwarePane: View {
   /// Control vendors whose Add by Address form is open.
   @State private var addingByAddress: Set<String> = []
   @State private var controlSheet: ControlSheet?
-  /// The one confirmation the pane shows (Advertise HDR while its camera runs).
+  /// The one confirmation the pane shows: Advertise HDR or unpairing a connected body while its
+  /// camera runs, and Forget Saved Sign-In.
   @State private var confirmation: UIDeviceSettingConfirmation?
   private struct ControlSheet: Identifiable { var id: String; var name: String }
 
@@ -53,7 +54,7 @@ struct UISettingsHardwarePane: View {
     }
     .confirmationDialog(confirmation?.title ?? "", isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } })) {
       if let confirmation {
-        Button(confirmation.actionTitle) { confirmation.action(); self.confirmation = nil }
+        Button(confirmation.actionTitle, role: confirmation.role) { confirmation.action(); self.confirmation = nil }
       }
       Button("Cancel", role: .cancel) { confirmation = nil }.keyboardShortcut(.defaultAction)
     } message: {
@@ -335,15 +336,28 @@ struct UISettingsHardwarePane: View {
     let store = model.cameraControls
     let previous = body.feedID
     guard previous != feedID else { return }
-    pairing[body.id] = feedID.isEmpty ? nil : feedID
-    if !feedID.isEmpty { expanded.insert(body.id) }
-    Task {
-      if let previous { await store.disconnect(previous, forget: true) }
-      // A body with no sign-in pairs at once; one with sign-in waits for it in its row.
-      if !feedID.isEmpty, body.camera.authenticationMode == .none {
-        await store.connect(camera: body.camera, to: feedID)
+    confirmingUnpair(body, actionTitle: feedID.isEmpty ? "Unassign" : "Change Camera") {
+      pairing[body.id] = feedID.isEmpty ? nil : feedID
+      if !feedID.isEmpty { expanded.insert(body.id) }
+      Task {
+        if let previous { await store.disconnect(previous, forget: true) }
+        // A body with no sign-in pairs at once; one with sign-in waits for it in its row.
+        if !feedID.isEmpty, body.camera.authenticationMode == .none {
+          await store.connect(camera: body.camera, to: feedID)
+        }
       }
     }
+  }
+
+  /// Unpairing a connected body whose camera is running drops its control mid-show, so that
+  /// asks first; anything else goes ahead. The picture keeps coming from the capture device.
+  private func confirmingUnpair(_ body: UIHardwareBody, actionTitle: String, then action: @escaping @MainActor () -> Void) {
+    guard let feedID = body.feedID, body.connected,
+      let descriptor = model.feedDescriptors.first(where: { $0.id.rawValue == feedID }),
+      model.isCameraRunning(descriptor.id) else { return action() }
+    confirmation = UIDeviceSettingConfirmation(title: "Unpair \(body.camera.name) from \(descriptor.name)?",
+      message: "\(descriptor.name) is running. Its picture keeps going, but it loses camera control from \(body.camera.name).",
+      actionTitle: actionTitle, action: action)
   }
 
   @ViewBuilder private func bodyDetails(_ body: UIHardwareBody, vendor: VendorDescriptor, groups: UISettingsHardwareGroups) -> some View {
@@ -372,7 +386,11 @@ struct UISettingsHardwarePane: View {
         LabeledContent("Sign-in") {
           HStack(spacing: 8) {
             Label("Saved in Keychain", systemImage: "key.fill").labelStyle(.titleAndIcon)
-            Button("Forget Saved Sign-In") { Task { await store.forgetCredentials(feedID) } }.disabled(state.busy)
+            Button("Forget Saved Sign-In…") {
+              confirmation = UIDeviceSettingConfirmation(title: "Forget the saved sign-in for \(body.camera.name)?",
+                message: "Its sign-in is deleted from your Keychain and the camera body disconnects. You’ll need to sign in again to control it.",
+                actionTitle: "Forget Saved Sign-In", action: { Task { await store.forgetCredentials(feedID) } }, role: .destructive)
+            }.disabled(state.busy)
           }
         }
       }
@@ -421,8 +439,10 @@ struct UISettingsHardwarePane: View {
           Button("Disconnect") { Task { await store.disconnect(feedID) } }.disabled(state.busy)
         }
         Button("Unassign") {
-          pairing[body.id] = nil
-          Task { await store.disconnect(feedID, forget: true) }
+          confirmingUnpair(body, actionTitle: "Unassign") {
+            pairing[body.id] = nil
+            Task { await store.disconnect(feedID, forget: true) }
+          }
         }.disabled(state.busy)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
@@ -466,8 +486,8 @@ struct UIHardwareDisclosure<Label: View, Content: View>: View {
   var body: some View {
     HStack(spacing: 6) {
       Button { isExpanded.toggle() } label: {
-        Image(systemName: "chevron.right")
-          .font(.caption.weight(.semibold))
+        Image(systemName: UISymbol.expandStrip)
+          .font(.uiBadge)
           .rotationEffect(.degrees(isExpanded ? 90 : 0))
           .frame(width: 16, height: 22).contentShape(Rectangle())
       }

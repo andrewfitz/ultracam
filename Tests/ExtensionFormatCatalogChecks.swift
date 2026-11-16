@@ -51,6 +51,18 @@ import XCTest
     XCTAssertThrowsError(try ExtensionFormatCatalog.negotiate(requested: requested,
       duration: .invalid, installed: ExtensionFormatCatalog.published))
   }
+
+  func testInstalledCatalogReorderingCannotRemapPublishedIndices() throws {
+    let requested = ExtensionFormatCatalog.published[17]
+    var reordered = ExtensionFormatCatalog.published
+    reordered.swapAt(0, 1)
+    XCTAssertThrowsError(try ExtensionFormatCatalog.negotiate(requested: requested,
+      duration: VideoContract.fastDuration, installed: reordered))
+    XCTAssertNil(OutputFormatCatalog.matchingIndex(requested, duration: VideoContract.fastDuration,
+      installed: reordered))
+    XCTAssertThrowsError(try ExtensionFormatCatalog.negotiate(requested: requested,
+      duration: VideoContract.fastDuration, installed: [requested]))
+  }
   func testCanonicalIdentityAndSchemaValidation() throws {
     let original = ExtensionFormatCatalog.published[0]
     let reordered = try ExtensionFormatContract(width: original.width, height: original.height, pixel: original.pixel,

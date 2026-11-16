@@ -15,8 +15,14 @@ struct UIDiagnosticsView: View {
       + (model.programAvailable ? [("program", "Program")] : []) + [("app", "App")]
   }
 
+  /// Until a section is chosen, a camera that stopped or ended a take early: a problem's Details
+  /// opens this window, and the reason is on that camera's tab.
+  private var incidentTab: String? {
+    model.feedDescriptors.first { model.unexpectedStops[$0.id] != nil }?.id.rawValue
+  }
+
   var body: some View {
-    let selected = tabs.contains { $0.id == tab } ? tab : (tabs.first?.id ?? "app")
+    let selected = tabs.contains { $0.id == tab } ? tab : (incidentTab ?? tabs.first?.id ?? "app")
     Group {
       switch selected {
       case "app": UIDiagnosticsAppTab()
@@ -29,12 +35,13 @@ struct UIDiagnosticsView: View {
     // The section picker and Copy live in the window toolbar, like other Mac windows.
     .toolbar {
       ToolbarItem(placement: .principal) {
-        Picker("Section", selection: Binding(get: { selected }, set: { tab = $0 })) {
-          ForEach(tabs, id: \.id) { Text($0.title).tag($0.id) }
+        // A segment per camera runs past the window's minimum width with many cameras or long
+        // names: then a pop-up menu.
+        if tabs.count > 5 || tabs.reduce(0, { $0 + $1.title.count }) > 60 {
+          sectionPicker(selected).pickerStyle(.menu).fixedSize()
+        } else {
+          sectionPicker(selected).pickerStyle(.segmented).fixedSize()
         }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .fixedSize()
       }
       ToolbarItem(placement: .primaryAction) {
         Button(copied ? "Copied" : "Copy Diagnostics", systemImage: copied ? "checkmark" : "doc.on.doc") {
@@ -51,6 +58,13 @@ struct UIDiagnosticsView: View {
       try? await Task.sleep(for: .seconds(2))
       copied = false
     }
+  }
+
+  private func sectionPicker(_ selected: String) -> some View {
+    Picker("Section", selection: Binding(get: { selected }, set: { tab = $0 })) {
+      ForEach(tabs, id: \.id) { Text($0.title).tag($0.id) }
+    }
+    .labelsHidden()
   }
 }
 
@@ -106,11 +120,23 @@ private struct UIDiagnosticsCameraTab: View {
     let target = MonitorTargetID(cameraID.rawValue)
     Form {
       if !running {
-        // Values from a stopped camera would be stale, so only the last take's encoder details stay.
+        // Values from a stopped camera would be stale, so only the last take's encoder details stay,
+        // with why it stopped and its last messages, said as the last known.
         Section {
           ContentUnavailableView("Camera Stopped", systemImage: "video.slash",
             description: Text("Live capture, drops, audio and monitoring details appear while this camera runs."))
             .frame(maxWidth: .infinity)
+        }
+        let stop = model.unexpectedStops[cameraID].flatMap { $0.cameraStopped ? $0.reason : nil }
+        let last = model.cameraUpdate(cameraID)
+        let capture = last?.message ?? ""
+        let camera = last?.cameraMessage ?? ""
+        if stop != nil || !capture.isEmpty || !camera.isEmpty {
+          Section("Last Known") {
+            if let stop { UIDiagnosticsRow("Stopped because", stop, warning: true) }
+            if !capture.isEmpty { UIDiagnosticsRow("Capture", capture) }
+            if !camera.isEmpty { UIDiagnosticsRow("Camera", camera) }
+          }
         }
       }
       if running, let update {
@@ -161,6 +187,11 @@ private struct UIDiagnosticsCameraTab: View {
       }
       UIDiagnosticsDeviceSection(device: model.deviceDiagnostics(cameraID), driverWarning: model.driverWarning)
       Section("Recording · Encoder") {
+        // Why the last take ended early, until it's dismissed: also once the camera runs again.
+        if let stop = model.unexpectedStops[cameraID], stop.take != nil || !stop.cameraStopped,
+          stop.reason != state?.statistics?.lastError, stop.reason != state?.error {
+          UIDiagnosticsRow("Take ended because", stop.reason, warning: true)
+        }
         if let stats = state?.statistics {
           UIDiagnosticsRow("Status", state?.displayStatus ?? "Idle")
           UIDiagnosticsRow("Elapsed · size", "\(stats.elapsedText) · \(stats.sizeText)")
@@ -183,6 +214,10 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("File", stats.fileURL?.lastPathComponent ?? "—")
           if let warning = stats.warning { UIDiagnosticsRow("Warning", warning, warning: true) }
           if let error = stats.lastError { UIDiagnosticsRow("Last error", error, warning: true) }
+          // Why the take ended, when the recorder said so and not the encoder.
+          if let error = state?.error, error != stats.lastError { UIDiagnosticsRow("Take error", error, warning: true) }
+        } else if let error = state?.error {
+          UIDiagnosticsRow("Take error", error, warning: true)
         } else {
           Text("No take yet.").foregroundStyle(.secondary)
         }

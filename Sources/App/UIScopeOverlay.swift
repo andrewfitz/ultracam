@@ -269,7 +269,9 @@ struct UIScopeCard<Scope: View>: View {
 
 /// A camera's (or Program's) scope in its own window, sized and placed like any window,
 /// at native resolution. It shows the main window's picture's scope, so it needs that
-/// picture on screen; while it is open the picture shows no card.
+/// picture in the main window (its presenter); the scope keeps drawing while that window
+/// is minimized or covered (`MonitorSurfacePresenter.reportScopeVisibility`). While it is
+/// open the picture shows no card.
 struct UIScopeWindowView: View {
   let model: AppModel
   let target: String
@@ -295,16 +297,21 @@ struct UIScopeWindowView: View {
           Button { settingsShown.toggle() } label: { Label("Scope Settings", systemImage: UISymbol.scopeSettings) }
             .help("Choose the scope and how it reads")
             .popover(isPresented: $settingsShown, arrowEdge: .bottom) {
-              UIScopeSettingsView(
-                scopes: Binding(get: { preferences.scopes }, set: { value in
-                  var next = preferences
-                  next.scopes = value
-                  coordinator.setPreferences(next, for: targetID)
-                }),
-                isProgram: isProgram, signal: presenter?.shownSignal,
-                stageLUT: presenter?.scopeMeasuresLUT(preferences) == true)
+              // `.stacked` is bare controls: one column holds them, so the padding and width
+              // apply to the column, as in the ui-verify render (`UIScopeSettingsPreview`).
+              VStack(alignment: .leading, spacing: 8) {
+                UIScopeSettingsView(
+                  scopes: Binding(get: { preferences.scopes }, set: { value in
+                    var next = preferences
+                    next.scopes = value
+                    coordinator.setPreferences(next, for: targetID)
+                  }),
+                  isProgram: isProgram, signal: presenter?.shownSignal,
+                  stageLUT: presenter?.scopeMeasuresLUT(preferences) == true)
+              }
               .padding(16)
-              .frame(width: 320)
+              .frame(width: 320, alignment: .topLeading)
+              .controlSize(.small)
             }
         }
       }

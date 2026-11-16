@@ -178,6 +178,11 @@ import MonitorKit
     onConfigurationChange?(target, value)
   }
 
+  /// Takes preferences the owner changed itself (the Inspector's camera log, Sync Cameras).
+  /// Not reported back. Without it the next tool edit would report this stale copy and
+  /// undo the owner's change.
+  func adopt(_ value: MonitorFeedPreferences, for target: MonitorTargetID) { show(value, for: target) }
+
   /// Shows `value` on the target's surfaces and feed host (already saved, or about to be).
   private func show(_ value: MonitorFeedPreferences, for target: MonitorTargetID) {
     guard preferences[target] != value else { return }

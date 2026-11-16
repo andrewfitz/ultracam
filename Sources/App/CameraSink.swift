@@ -1,6 +1,7 @@
 import CoreMediaIO
 import Foundation
 import IOSurface
+import ObjectiveC
 import os
 
 /// Virtual camera output: connects, negotiated formats, send failures, queue state.
@@ -35,7 +36,10 @@ final class CameraBufferQueue {
   private let lock = NSLock()
   private var closed = false
   private let retention: MediaRetentionLedger
-  private static var retentionKey: CFString { "org.ultracam.camera.transport-retention" as CFString }
+  // Only the address identifies this process-local association; its value is
+  // never read or written. Core Media attachments are serialized by CMIO,
+  // including ShouldNotPropagate attachments, and cannot carry this lease.
+  nonisolated(unsafe) private static var retentionKey: UInt8 = 0
   private final class RetainedMedia: NSObject {
     let lease: MediaRetentionLedger.Lease
     init(_ lease: MediaRetentionLedger.Lease) { self.lease = lease }
@@ -49,7 +53,7 @@ final class CameraBufferQueue {
   var retentionSnapshot: MediaRetentionLedger.Snapshot { retention.snapshot }
   deinit { drain() }
 
-  func send(_ sample: CMSampleBuffer) throws -> Bool {
+  func send(_ sample: CMSampleBuffer, pauseAllowanceAttachment: NSNumber? = nil) throws -> Bool {
     lock.lock()
     defer { lock.unlock() }
     guard !closed else { throw VideoError.message("Virtual camera queue is closed.") }
@@ -66,12 +70,18 @@ final class CameraBufferQueue {
     catch MediaRetentionFailure.byteLimit { return false }
     catch MediaRetentionFailure.durationLimit { return false }
     catch MediaRetentionFailure.slotLimit { return false }
-    // A metadata copy shares the IOSurface, but has its own lifetime. Attaching
+    // A metadata copy shares the IOSurface, but has its own lifetime. Anchoring
     // to the caller's sample would let an unrelated preview hold this budget.
     var copy: CMSampleBuffer?
     let copyStatus = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sample, sampleBufferOut: &copy)
     guard copyStatus == noErr, let copy else { lease.release(); throw VideoError.message("Copy camera sample metadata failed (\(copyStatus)).") }
-    CMSetAttachment(copy, key: Self.retentionKey, value: RetainedMedia(lease), attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+    if let pauseAllowanceAttachment {
+      CMSetAttachment(copy, key: VideoContract.sourcePauseAllowanceAttachmentKey,
+        value: pauseAllowanceAttachment, attachmentMode: kCMAttachmentMode_ShouldPropagate)
+    }
+    // An Objective-C association follows final release of this local sample,
+    // without putting a nonserializable object in CMIO's wire metadata.
+    objc_setAssociatedObject(copy, &Self.retentionKey, RetainedMedia(lease), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
     // Do not use a count-then-enqueue check. CMIO can dequeue concurrently,
     // so the count is only a hint and creates a race at the capacity edge.
     // CMSimpleQueueEnqueue is the ownership and backpressure boundary.
@@ -134,10 +144,13 @@ final class CameraStreamStopRecovery: @unchecked Sendable {
   private let lock = NSRecursiveLock()
   private let capacity: Int
   private let schedule: (@escaping () -> Void) -> Void
+  private let deviceExists: (CMIODeviceID) -> Bool
   private var entries: [UUID: Entry] = [:]
 
-  init(capacity: Int, schedule: ((@escaping () -> Void) -> Void)? = nil) {
+  init(capacity: Int, schedule: ((@escaping () -> Void) -> Void)? = nil,
+       deviceExists: ((CMIODeviceID) -> Bool)? = nil) {
     self.capacity = capacity
+    self.deviceExists = deviceExists ?? Self.isListed
     self.schedule = schedule ?? { action in
       DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1, execute: DispatchWorkItem(block: action))
     }
@@ -157,6 +170,24 @@ final class CameraStreamStopRecovery: @unchecked Sendable {
 
   var retainedStreams: Int { lock.withLock { entries.count } }
 
+  /// Whether CMIO still lists the device. An unreadable list counts as listed, so only a
+  /// clear answer ends a retry.
+  private static func isListed(_ device: CMIODeviceID) -> Bool {
+    let system = CMIOObjectID(kCMIOObjectSystemObject)
+    var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOHardwarePropertyDevices),
+      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
+    var size: UInt32 = 0
+    guard CMIOObjectGetPropertyDataSize(system, &address, 0, nil, &size) == noErr,
+          size % UInt32(MemoryLayout<CMIODeviceID>.size) == 0, size <= 64 * 1024 else { return true }
+    var values = [CMIODeviceID](repeating: 0, count: Int(size) / MemoryLayout<CMIODeviceID>.size)
+    if values.isEmpty { return false }
+    let status = values.withUnsafeMutableBytes { bytes in
+      CMIOObjectGetPropertyData(system, &address, 0, nil, size, &size, bytes.baseAddress!)
+    }
+    guard status == noErr else { return true }
+    return values.prefix(Int(size) / MemoryLayout<CMIODeviceID>.size).contains(device)
+  }
+
   func attach(_ queue: CameraBufferQueue, to token: UUID) {
     lock.withLock { precondition(entries[token] != nil); entries[token]?.queue = queue }
   }
@@ -171,6 +202,11 @@ final class CameraStreamStopRecovery: @unchecked Sendable {
       entry.queue?.close()
       let status = entry.stop()
       if status == noErr {
+        entry.queue?.drain()
+        entries.removeValue(forKey: token)
+      } else if !deviceExists(entry.deviceID) {
+        // The device is gone, and its consumer with it: nothing is left to stop or to read the queue.
+        cameraOutputLog.notice("Virtual camera stop failed (\(status, privacy: .public)) for a device that is no longer listed; releasing its queue.")
         entry.queue?.drain()
         entries.removeValue(forKey: token)
       } else {
@@ -403,6 +439,8 @@ final class CameraSink {
       tags[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Center
     } else if colour.horizontalChromaSiting == .center && colour.verticalChromaSiting == .center {
       tags[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Center
+    } else if colour.horizontalChromaSiting == .left && colour.verticalChromaSiting == .center {
+      tags[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Left
     } else if colour.horizontalChromaSiting != .unspecified || colour.verticalChromaSiting != .unspecified {
       throw VideoError.message("The virtual camera does not publish this untouched chroma siting; use GPU processing into a published output contract.")
     }
@@ -576,8 +614,8 @@ final class CameraSink {
       cameraOutputLog.error("Camera frame refused before sending (\(self.route.feedID ?? "Program", privacy: .public)): \(mismatch, privacy: .public)")
       throw VideoError.message("Frame does not match the virtual camera's negotiated format and timing (\(mismatch)).")
     }
-    let outgoing = try Self.transportSample(sample, pauseAllowance: sourcePauseAllowanceSeconds)
-    return try queue.send(try stager.stage(outgoing))
+    return try queue.send(try stager.stage(sample), pauseAllowanceAttachment:
+      NSNumber(value: CameraStandbyTimingPolicy.clampedPauseAllowance(sourcePauseAllowanceSeconds)))
   }
 
   /// Copy metadata only: a transport attachment must not alter preview/recording's sample.

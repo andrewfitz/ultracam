@@ -312,6 +312,9 @@ final class AutoSwitcherTimelineRecorder {
   var outputFileURL: URL { outputURL }
   private var document: AutoSwitcherTimelineDocument
   private var outputURL: URL
+  /// The folder as it was chosen. A file URL made from it carries no sandbox grant, so
+  /// every write starts access on this one.
+  private var folder: URL?
   private var lastDirectorMediaTime: Double?
   private var sessionGeneration: UInt64 = 1
   private var nextSequence: UInt64 = 1
@@ -350,16 +353,26 @@ final class AutoSwitcherTimelineRecorder {
           mediaFile: nil, mediaStart: nil, mediaEnd: nil, timebase: timebase),
       ], recordings: [], events: [], eventsProcessed: 0, cuts: [], instructions: [],
       statuses: [], metadata: ["clock": "source_pts"])
-    outputURL = Self.makeOutputURL(folder: outputFolder, sessionID: sessionID)
+    folder = outputFolder
+    let session = sessionID
+    outputURL = Self.scoped(outputFolder) { Self.makeOutputURL(folder: outputFolder, sessionID: session) }
     persist(force: true)
   }
 
   func setOutputFolder(_ folder: URL?) {
-    let nextURL = Self.makeOutputURL(folder: folder, sessionID: sessionID)
+    let nextURL = Self.scoped(folder) { Self.makeOutputURL(folder: folder, sessionID: sessionID) }
     guard nextURL != outputURL else { return }
     persist(force: true)
+    self.folder = folder
     outputURL = nextURL
     persist(force: true)
+  }
+
+  /// A recording folder restored from its bookmark grants nothing until access starts.
+  private static func scoped<T>(_ folder: URL?, _ body: () throws -> T) rethrows -> T {
+    let accessed = folder?.startAccessingSecurityScopedResource() ?? false
+    defer { if accessed { folder?.stopAccessingSecurityScopedResource() } }
+    return try body()
   }
 
   func recordControlEvent(_ input: AutoSwitcherControlEvent) {
@@ -578,9 +591,11 @@ final class AutoSwitcherTimelineRecorder {
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
       let data = try encoder.encode(document)
-      try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true)
-      try data.write(to: outputURL, options: .atomic)
+      try Self.scoped(folder) {
+        try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(),
+          withIntermediateDirectories: true)
+        try data.write(to: outputURL, options: .atomic)
+      }
       lastPersistedEventCount = document.events.count
     } catch {
       // Recording remains usable if the optional sidecar cannot be written.

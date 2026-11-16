@@ -66,7 +66,7 @@ struct UIFeedSettingsMenu: View {
                     UIStateGlyph(state: .inactive, size: 6)
                 }
                 Text(camera.statusBadge)
-                Image(systemName: "chevron.down").font(.caption2.weight(.bold))
+                Image(systemName: UISymbol.menuIndicator).font(.caption2.weight(.bold))
             }
             .font(.uiBadge).lineLimit(1).padding(.horizontal, 6).frame(height: 18)
             .foregroundStyle(camera.statusTone == .neutral ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
@@ -94,7 +94,7 @@ struct UIFeedBrandMark: View {
             case .asset(let name):
                 Image(name).resizable().renderingMode(.template).scaledToFit().frame(width: 18, height: 18)
             case .text(let text):
-                Text(text).font(.system(size: 8, weight: .bold)).lineLimit(1)
+                Text(text).font(.uiBadge).lineLimit(1)
             }
         }.foregroundStyle(.secondary).accessibilityLabel(descriptor.localizedDisplayName())
     }

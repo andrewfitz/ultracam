@@ -170,6 +170,8 @@ struct UIPictureStatePill: View {
   var elapsed: String? = nil
   /// The menu bar card's smaller scale.
   var compact = false
+  /// `elapsed` as VoiceOver says it ("12 minutes 31 seconds"), when the caller has it.
+  var spokenElapsed: String? = nil
 
   var body: some View {
     HStack(spacing: 4) {
@@ -187,12 +189,30 @@ struct UIPictureStatePill: View {
     .accessibilityLabel(label)
   }
 
+  /// "REC 12:31" for one camera; "REC ×2 · 12:31" for several, so the count can't read as
+  /// part of the clock.
   private var words: String {
     let name = style == .paused ? "Paused" : "REC"
-    return [name, count > 1 ? "\(count)" : nil, elapsed].compactMap { $0 }.joined(separator: " ")
+    guard count > 1 else { return [name, elapsed].compactMap { $0 }.joined(separator: " ") }
+    return ["\(name) ×\(count)", elapsed].compactMap { $0 }.joined(separator: " · ")
   }
 
   private var label: String {
+    if count > 1 {
+      let clock = (spokenElapsed ?? elapsed).map { ", \($0)" } ?? ""
+      switch style {
+      case .recording: return "\(count) cameras recording\(clock)"
+      case .paused: return "\(count) cameras paused\(clock)"
+      case .noSignal: return "\(count) cameras recording\(clock), no signal"
+      }
+    }
+    if let spokenElapsed {
+      switch style {
+      case .recording: return "Recording, \(spokenElapsed)"
+      case .paused: return "Recording paused, \(spokenElapsed)"
+      case .noSignal: return "Recording, \(spokenElapsed), no signal"
+      }
+    }
     let clock = elapsed.map { " \($0)" } ?? ""
     switch style {
     case .recording: return "Recording\(clock)"

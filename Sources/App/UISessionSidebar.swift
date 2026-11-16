@@ -48,10 +48,14 @@ struct UISessionSidebarViewContent: View {
   }
 
   /// A click on a row that names a camera selects it and shows it in the inspector.
-  /// (The bridge ignores selecting the camera that's already selected.)
+  /// (The bridge ignores selecting the camera that's already selected.) Under 1100 pt the
+  /// inspector opening beside this column would squeeze the pictures, and making room for them
+  /// would close this column, the one just clicked: there the click only selects.
   private func inspect(_ cameraID: String) {
     context.send(.select(cameraID: cameraID))
-    context.send(.showInspector(cameraID: cameraID))
+    if session.inspectorOpen || !session.narrowWindow {
+      context.send(.showInspector(cameraID: cameraID))
+    }
   }
 
   // MARK: Cameras
@@ -144,14 +148,17 @@ struct UISessionSidebarViewContent: View {
         .accessibilityHint("Opens Settings › Recording")
       }
       .font(.uiMeta).foregroundStyle(.secondary)
-      .help("Records the camera original, without LUT or effects. Timecode is set in Settings › Recording.")
+      .help((UIPresentationBuilder.recordingLook(session) == "Camera original"
+        ? "Records the camera original, without LUT or effects."
+        : "Records the camera original; a camera's LUT is burned in where Burn LUT into recordings applies.")
+        + " Timecode is set in Settings › Recording.")
       .selectionDisabled()
       ForEach(session.drives) { drive in
         UILiveDriveRow(drive: drive, cameras: UIPresentationBuilder.cameras(on: drive, in: session), context: context)
           .selectionDisabled()
       }
       if session.drives.isEmpty {
-        Text("—").font(.uiRow).foregroundStyle(.secondary)
+        Text("No drive").font(.uiMeta).foregroundStyle(.secondary)
           .accessibilityLabel("No recording drive")
           .selectionDisabled()
       }
@@ -169,12 +176,10 @@ struct UISessionSidebarViewContent: View {
         .lineLimit(1).truncationMode(.middle)
         .help(session.defaultFolderPath ?? "Choose where takes are saved.")
       Spacer(minLength: 4)
-      if presentation.canPauseAll || session.defaultFolderPath != nil {
-        Button(UIPresentationBuilder.folderAction(session)) { context.send(.chooseRecordingFolder(cameraID: nil)) }
-          .controlSize(.small)
-          .fixedSize()
-          .help("Choose the default recording folder. Changes apply to the next take.")
-      }
+      Button(UIPresentationBuilder.folderAction(session)) { context.send(.chooseRecordingFolder(cameraID: nil)) }
+        .controlSize(.small)
+        .fixedSize()
+        .help("Choose the default recording folder. Changes apply to the next take.")
     }
   }
 

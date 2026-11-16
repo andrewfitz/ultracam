@@ -46,9 +46,22 @@ struct UIProblemRow: View {
         // Line limits, not fixedSize: the split view measures its columns at their narrowest,
         // where a fixed height would be a word a line and push the window's minimum past the screen.
         Text(problem.title).font(.uiRowEmphasis).foregroundStyle(problem.level.text).lineLimit(3)
+        if let dismiss = problem.dismiss {
+          // Apart from the one action: Details only looks, and this takes the row off the list.
+          Spacer(minLength: 4)
+          Button { context.send(dismiss.action) } label: {
+            Image(systemName: UISymbol.close).font(.uiMeta.weight(.semibold))
+              .frame(width: 18, height: 18).contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .foregroundStyle(problem.level.secondaryText)
+          .help(dismiss.title)
+          .accessibilityLabel(dismiss.title)
+        }
       }
       if let detail = problem.detail {
         Text(detail).font(.uiMeta).foregroundStyle(problem.level.secondaryText).lineLimit(3)
+          .help(detail)
       }
       if showsAction, let action = problem.action {
         HStack {
@@ -69,11 +82,23 @@ struct UIProblemRow: View {
 struct UIProblemList: View {
   let problems: [UIProblem]
   let context: UIContext
+  /// Attention's list also holds setup rows, which aren't problems: it's titled for itself.
+  var title: String? = nil
+  /// Past this the rows scroll, so a long list never runs off the screen.
+  private static let maxListHeight: CGFloat = 420
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      Text(problems.count == 1 ? "1 problem" : "\(problems.count) problems").font(.headline)
-      ForEach(problems) { UIProblemRow(problem: $0, context: context) }
+      Text(title ?? (problems.count == 1 ? "1 problem" : "\(problems.count) problems")).font(.uiTitle)
+      ScrollView {
+        VStack(alignment: .leading, spacing: 8) {
+          ForEach(problems) { UIProblemRow(problem: $0, context: context) }
+        }
+      }
+      .scrollBounceBehavior(.basedOnSize)
+      // As tall as the rows up to the limit: the popover takes the list's ideal height.
+      .frame(maxHeight: Self.maxListHeight)
+      .fixedSize(horizontal: false, vertical: true)
     }
   }
 }
@@ -103,7 +128,7 @@ struct UIAttentionSection: View {
             Button("\(rows.count - Self.shown) more") { listOpen = true }
               .buttonStyle(.link).font(.uiMeta)
               .popover(isPresented: $listOpen, arrowEdge: .trailing) {
-                UIProblemList(problems: rows, context: context)
+                UIProblemList(problems: rows, context: context, title: "Attention")
                   .padding(12).frame(width: 340, alignment: .leading)
               }
           }

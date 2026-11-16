@@ -293,6 +293,9 @@ struct SwitcherCoordinator {
     }
     guard !automaticRequestPending, !programOutput.hasPendingCut else { return .idle }
 
+    // The media clock starts over when its camera's stream restarts or the clock moves to
+    // another camera. An origin ahead of now would hold every cut until the new clock caught up.
+    if let origin = fixedIntervalOrigin, now < origin { fixedIntervalOrigin = nil }
     if fixedIntervalOrigin == nil {
       fixedIntervalOrigin = now
       return .idle

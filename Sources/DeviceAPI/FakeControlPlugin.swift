@@ -85,7 +85,7 @@ import Foundation
             throw ControlError(code: .invalidRequest, retryable: false, message: "Invalid camera identity.")
         }
         guard retired[feedID].map({ generation > $0 }) ?? true,
-              connections[feedID].map({ generation >= $0.generation }) ?? true else { throw stale() }
+              connections[feedID].map({ generation > $0.generation }) ?? true else { throw stale() }
         if camera.authenticationMode == .usernamePassword && credentials == nil {
             throw ControlError(code: .authentication, retryable: false, message: "Credentials required.")
         }

@@ -71,6 +71,10 @@ typealias CameraSampleRequest = (@escaping CameraSampleCompletion) -> Void
 // Transport injection permits the actual stream lifecycle to run in-process;
 // tests never register or install the unsigned system extension.
 final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @unchecked Sendable {
+  // Queue labels are diagnostic strings and are not unique. Stream callbacks
+  // can arrive on an unrelated queue with the same label, so use queue
+  // specific data for affinity checks instead of comparing labels.
+  fileprivate static let queueKey = DispatchSpecificKey<ObjectIdentifier>()
   let queue: DispatchQueue
   private(set) var descriptor: VirtualCameraDescriptor
   var onDemandChange: (() -> Void)?
@@ -165,6 +169,7 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     self.clock = clock
     self.output = output
     super.init()
+    self.queue.setSpecific(key: Self.queueKey, value: ObjectIdentifier(self.queue))
     do {
       formats = try OutputFormatCatalog.descriptions().map { description in
         CMIOExtensionStreamFormat(formatDescription: description,
@@ -695,17 +700,25 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
   private var timer: DispatchSourceTimer?
   private var request: CameraSampleRequest?
   private var authorizationRejections = 0
-  // CMIO's stream start/stop callbacks do not carry the client argument.  The
-  // authorization callback immediately preceding a start gives us the stable
-  // client ID to associate with that start, allowing provider disconnect to
-  // release only the departed source client's demand.
+  // CMIO's stream start/stop callbacks do not carry the client argument, and
+  // it is not established whether they arrive once per client or once per
+  // stream (first client in, last client out). The authorization callback
+  // preceding a start supplies a client ID for that start; the stream's
+  // streamingClients list then decides which lease a stop releases and
+  // whether a disconnect leaves another viewer without one. The list only
+  // ever selects or adds a lease. Absence from it never releases one, so an
+  // empty or late list degrades to counting starts against stops.
   private var pendingSourceClientIDs: [UUID] = []
-  // CMIO does not pass a client to stopStream(). Keep start order so an
-  // unqualified stop removes the oldest outstanding lease deterministically.
-  // A Set made this choice random, which could release the wrong client's
-  // demand and leave a different client pinned until provider teardown.
+  // Leases in start order. With no evidence from streamingClients, an
+  // unqualified stop removes the oldest one deterministically.
   private var activeSourceClientIDs: [UUID] = []
+  // Active leases granted from streamingClients before any start callback
+  // named them. A later unattributed start confirms one, not adds a lease.
+  private var adoptedSourceClientIDs: Set<UUID> = []
   private var anonymousSourceStarts = 0
+  // A disconnect that released demand may be followed by a stop callback for
+  // the same client. That stop must not take a remaining viewer's lease.
+  private var disconnectedSourceStopCredits = 0
 
   var hasPendingStart: Bool { !pendingSourceClientIDs.isEmpty }
 
@@ -780,9 +793,17 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
       pendingSourceClientIDs.append(clientID)
     }
   }
+  private var streamingSourceClientIDs: [UUID] {
+#if ULTRACAM_TEST_SUPPORT
+    if let streamingSourceClientIDsForTesting { return streamingSourceClientIDsForTesting }
+#endif
+    return stream.streamingClients.map(\.clientID)
+  }
 #if ULTRACAM_TEST_SUPPORT
   // CMIOExtensionClient has no public initializer. Exercise the exact native
   // callback's UUID bookkeeping without constructing a fake framework object.
+  // Non-nil replaces CMIOExtensionStream.streamingClients for this stream.
+  var streamingSourceClientIDsForTesting: [UUID]?
   func authorizeSourceForTesting(clientID: UUID) {
     dispatchPrecondition(condition: .onQueue(owner.queue))
     precondition(!isSink)
@@ -801,7 +822,7 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
     owner.logger.error("Camera producer rejected: pid=\(client.pid, privacy: .public), signingID=\(client.signingID ?? "<nil>", privacy: .public), reason=\(reason, privacy: .public)")
   }
   func startStream() throws {
-    if String(cString: __dispatch_queue_get_label(nil)) != owner.queue.label {
+    if DispatchQueue.getSpecific(key: CameraDeviceRuntime.queueKey) != ObjectIdentifier(owner.queue) {
       return try owner.queue.sync { try self.startStream() }
     }
     if isSink {
@@ -823,22 +844,38 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
         }
         throw error
       }
-      if let clientID = pendingSourceClientIDs.first {
-        pendingSourceClientIDs.removeFirst()
-        activeSourceClientIDs.append(clientID)
+      let previous = owner.consumers
+      let streaming = streamingSourceClientIDs
+      // Prefer the authorization of a client CMIO already lists as streaming;
+      // otherwise the oldest authorization, as before.
+      if let index = (pendingSourceClientIDs.firstIndex(where: { streaming.contains($0) })
+        ?? pendingSourceClientIDs.indices.first) {
+        activeSourceClientIDs.append(pendingSourceClientIDs.remove(at: index))
+        owner.consumers += 1
+      } else if let adopted = activeSourceClientIDs.first(where: { adoptedSourceClientIDs.contains($0) }) {
+        // This client's lease was already granted from streamingClients
+        // before its start callback arrived. Counting it again would pin
+        // demand after it stops.
+        adoptedSourceClientIDs.remove(adopted)
       } else {
         // Keep direct in-process test/control calls balanced even though
         // native CMIO starts are normally preceded by authorization.
         anonymousSourceStarts += 1
+        owner.consumers += 1
       }
-      owner.consumers += 1
-      // An additional viewer does not reset the clock of existing viewers.
-      if owner.consumers == 1 { owner.restartTimer(); publishDemand() }
-      owner.onDemandChange?()
+      settleSourceDemand(from: previous)
     }
   }
+  // Restart the output clock and publish demand only when demand appears or
+  // disappears: an additional viewer does not reset the clock of existing
+  // viewers, and a lease handed from one viewer to another is not a gap.
+  private func settleSourceDemand(from previous: Int) {
+    if (previous == 0) != (owner.consumers == 0) { owner.restartTimer(); publishDemand() }
+    if owner.consumers == 0 { disconnectedSourceStopCredits = 0 }
+    owner.onDemandChange?()
+  }
   func stopStream() throws {
-    if String(cString: __dispatch_queue_get_label(nil)) != owner.queue.label {
+    if DispatchQueue.getSpecific(key: CameraDeviceRuntime.queueKey) != ObjectIdentifier(owner.queue) {
       return try owner.queue.sync { try self.stopStream() }
     }
     if isSink { stopConsumption() }
@@ -856,14 +893,31 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
       // CMIO's stop callback has no client/cancellation identity. When starts
       // are active, balance a completed start; a pending client's cancellation
       // is correlated by disconnect(clientID:), never guessed from this stop.
+      let previous = owner.consumers
+      let streaming = streamingSourceClientIDs
       if anonymousSourceStarts > 0 {
         anonymousSourceStarts -= 1
-      } else if !activeSourceClientIDs.isEmpty {
-        activeSourceClientIDs.removeFirst()
+        owner.consumers = max(0, owner.consumers - 1)
+      } else if let index = activeSourceClientIDs.firstIndex(where: { !streaming.contains($0) }) {
+        // A lease whose client CMIO no longer lists as streaming is the one
+        // this stop ends. With an empty list this is the oldest lease.
+        adoptedSourceClientIDs.remove(activeSourceClientIDs.remove(at: index))
+        owner.consumers = max(0, owner.consumers - 1)
+      } else if disconnectedSourceStopCredits > 0 {
+        // Every lease belongs to a client still listed as streaming and a
+        // disconnect has already released demand: this stop trails that
+        // disconnect, so no remaining viewer's lease is taken.
+        disconnectedSourceStopCredits -= 1
+      } else {
+        // Every lease holder is still listed, so the list has not caught up
+        // with this stop. Release the oldest lease; if that guess is wrong,
+        // disconnect(clientID:) hands the lease back to the listed viewer.
+        if !activeSourceClientIDs.isEmpty {
+          adoptedSourceClientIDs.remove(activeSourceClientIDs.removeFirst())
+        }
+        owner.consumers = max(0, owner.consumers - 1)
       }
-      owner.consumers = max(0, owner.consumers - 1)
-      if owner.consumers == 0 { owner.restartTimer(); publishDemand() }
-      owner.onDemandChange?()
+      settleSourceDemand(from: previous)
     }
   }
 
@@ -877,19 +931,38 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
       stopConsumption()
       return
     }
+    let previous = owner.consumers
     let hadPendingLease = pendingSourceClientIDs.contains(clientID)
     pendingSourceClientIDs.removeAll { $0 == clientID }
     let removed = activeSourceClientIDs.reduce(into: 0) { count, activeID in
       if activeID == clientID { count += 1 }
     }
-    guard removed > 0 else {
-      if hadPendingLease { owner.onDemandChange?() }
-      return
-    }
     activeSourceClientIDs.removeAll { $0 == clientID }
-    owner.consumers = max(0, owner.consumers - removed)
-    if owner.consumers == 0 { owner.restartTimer(); publishDemand() }
-    owner.onDemandChange?()
+    adoptedSourceClientIDs.remove(clientID)
+    // Every other client CMIO lists as streaming must hold a lease. One can
+    // lack it because CMIO sent no start callback for it, or because an
+    // earlier unqualified stop released its lease in place of this client's.
+    // The departed client is excluded here in case the list still names it.
+    var adopted = 0
+    for streamingID in streamingSourceClientIDs
+    where streamingID != clientID && !activeSourceClientIDs.contains(streamingID) {
+      // A viewer adopted with nothing else active needs the standby pipeline
+      // its missing start callback would have prepared. Preparation asserts
+      // the runtime queue, which provider callbacks are delivered on.
+      if owner.consumers - removed + adopted <= 0,
+        DispatchQueue.getSpecific(key: CameraDeviceRuntime.queueKey) != ObjectIdentifier(owner.queue)
+          || (try? owner.prepareGPUStandby()) == nil { break }
+      pendingSourceClientIDs.removeAll { $0 == streamingID }
+      activeSourceClientIDs.append(streamingID)
+      adoptedSourceClientIDs.insert(streamingID)
+      adopted += 1
+    }
+    // Assign once: a transient zero would stop the timer and publish no
+    // demand while a viewer is still streaming.
+    owner.consumers = max(0, owner.consumers - removed) + adopted
+    guard removed > 0 || adopted > 0 || hadPendingLease else { return }
+    if owner.consumers < previous { disconnectedSourceStopCredits += 1 }
+    settleSourceDemand(from: previous)
   }
 
   func beginConsumption(_ request: @escaping CameraSampleRequest) {

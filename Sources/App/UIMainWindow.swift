@@ -183,9 +183,11 @@ struct UIMainWindowView: View {
   /// The widest cell that fits two columns across and every row (picture and strip) down.
   private func gridFit(_ cameras: [UICameraPresentation]) -> UIDetailFit {
     // A short window scrolls rather than shrinking cells below what their strips need
-    // (an expanded strip's controls don't fit under about 400 pt and would spill out of the cell).
-    UIDetailFit(columns: 2, rows: (cameras.count + 1) / 2, strip: cameras.map(stripHeight).max() ?? 0,
-      narrowest: cameras.contains { !$0.collapsed } ? 400 : 260, margin: margin, cellSpacing: cellSpacing,
+    // (an expanded strip's controls don't fit under about 400 pt and would spill out of the cell;
+    // a collapsed one carrying Four Up's 64 pt Cut slot needs about 340 pt for its name and state).
+    let cutSlot = context.presentation.layout == .fourUp && context.presentation.programAvailable
+    return UIDetailFit(columns: 2, rows: (cameras.count + 1) / 2, strip: cameras.map(stripHeight).max() ?? 0,
+      narrowest: cameras.contains { !$0.collapsed } ? 400 : cutSlot ? 340 : 260, margin: margin, cellSpacing: cellSpacing,
       columnSpacing: columnSpacing)
   }
 

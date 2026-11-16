@@ -1,5 +1,7 @@
 import CoreMedia
 import CoreVideo
+import Metal
+import Synchronization
 import XCTest
 
 @objcMembers final class DerivedOutputAdmissionChecks: XCTestCase {
@@ -21,6 +23,167 @@ import XCTest
     }
     return image
   }
+  /// The live feed route: physical 2160p59.94 v210, Sony interpretation,
+  /// LUT to Rec.709, 1080 Fit, 420v and a 29.97 output cadence.
+  func testSonyLUTResizedOutputMatchesNegotiatedCameraWithSourceGeometryTags() throws {
+    guard let device = LUTProcessor.sharedDevice, device.supportsFamily(.metal4) else {
+      throw XCTSkip("Metal 4 required")
+    }
+    let processor = try LUTProcessor()
+    defer { processor.releaseIdleResources() }
+    let sony = Colorimetry(primaries: .sGamut3Cine, transfer: .sLog3, matrix: .rec709,
+      range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
+    var cube = "TITLE \"Identity transport probe\"\nLUT_3D_SIZE 2\n"
+    for blue in 0...1 { for green in 0...1 { for red in 0...1 {
+      cube += "\(red) \(green) \(blue)\n"
+    } } }
+    try processor.load(LUTProcessor.makeLUT(CubeLUT(text: cube)),
+      colorSpace: LUTColorSpaceContract(input: sony, output: .rec709Video))
+    let source = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
+      colour: .rec709Video, rate: .constant(VideoContract.fastDuration))
+    var configuration = PipelineConfiguration(applyLUT: true, downscale: true,
+      convertTo420: true, reduceFrameRate: true)
+    configuration.resizeTarget = .hd1080
+    configuration.colorTarget = .yuv4208
+    configuration.frameRateTarget = .fps2997
+    configuration.sourceWidth = 3840
+    configuration.sourceHeight = 2160
+    configuration.sourceDuration = VideoContract.fastDuration
+    configuration.sourceColorimetryOverride = sony
+    configuration.lutOutputColorimetry = .rec709Video
+    configuration.scalingMode = .fit
+    let negotiated = try CameraSink.requestedFormat(configuration: configuration,
+      passthroughFormat: source.pixel.rawValue, sourceFormat: source)
+    let factory = VideoSampleFactory()
+    for (squareAspect, fieldCount, fieldDetail) in [
+      (false, 0, false), (true, 0, false), (false, 1, false), (true, 1, false),
+      (false, 2, false), (false, 1, true)
+    ] {
+      let input = try image(width: 3840, height: 2160, pixel: kCVPixelFormatType_422YpCbCr10)
+      CVPixelBufferLockBaseAddress(input, [])
+      memset(CVPixelBufferGetBaseAddress(input)!, 0, CVPixelBufferGetBytesPerRow(input) * 2160)
+      CVPixelBufferUnlockBaseAddress(input, [])
+      if squareAspect {
+        CVBufferSetAttachment(input, kCVImageBufferPixelAspectRatioKey,
+          [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 1,
+           kCVImageBufferPixelAspectRatioVerticalSpacingKey: 1] as CFDictionary, .shouldPropagate)
+      }
+      if fieldCount > 0 {
+        CVBufferSetAttachment(input, kCVImageBufferFieldCountKey, NSNumber(value: fieldCount), .shouldPropagate)
+      }
+      if fieldDetail {
+        CVBufferSetAttachment(input, kCVImageBufferFieldDetailKey,
+          kCVImageBufferFieldDetailTemporalTopFirst, .shouldPropagate)
+      }
+      let output = try processor.process(input, configuration: configuration,
+        declaredSourceColorimetry: source.colour)
+      let sample = try factory.sample(output, at: CMTime(value: 1, timescale: 1), duration: VideoContract.slowDuration)
+      let actual = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+      let diagnostic = "PAR=\(squareAspect), fields=\(fieldCount), detail=\(fieldDetail); negotiated=\(String(describing: CMFormatDescriptionGetExtensions(negotiated))); actual=\(String(describing: CMFormatDescriptionGetExtensions(actual)))"
+      let mismatch = CameraSink.mismatch(sample, format: negotiated, duration: VideoContract.slowDuration)
+      if fieldCount == 2 || fieldDetail {
+        XCTAssertNotNil(mismatch, diagnostic)
+      } else {
+        XCTAssertNil(mismatch, diagnostic)
+      }
+      if fieldCount > 0 {
+        XCTAssertEqual(CVBufferCopyAttachment(input, kCVImageBufferFieldCountKey, nil) as? NSNumber,
+          NSNumber(value: fieldCount), "Processing must not modify the capture frame")
+      }
+    }
+  }
+
+  func testOriginalFlatAndLUTCameraRoutesAcrossRepresentativeEffects() throws {
+    guard let device = LUTProcessor.sharedDevice, device.supportsFamily(.metal4) else { throw XCTSkip("Metal 4 required") }
+    let processor = try LUTProcessor()
+    defer { processor.releaseIdleResources() }
+    let sony = Colorimetry(primaries: .sGamut3Cine, transfer: .sLog3, matrix: .rec709,
+      range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
+    let cube = try CubeLUT(text: "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n")
+    try processor.load(cube, colorSpace: LUTColorSpaceContract(input: sony, output: .rec709Video))
+    let source = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
+      colour: .rec709Video, rate: .constant(VideoContract.fastDuration))
+    // Effects off ignores the saved LUT switch. Effects on retains each
+    // geometry/cadence/layout choice independently of the main LUT switch.
+    let cases = [(false, false, false, false, false), (false, true, true, true, true),
+      (true, false, false, false, false), (true, false, true, true, true),
+      (true, false, false, true, false), (true, false, true, false, false),
+      (true, true, true, true, true), (true, true, false, false, false)]
+    for (effects, savedLUT, resize, color, cap) in cases {
+      var configuration = PipelineConfiguration(applyLUT: effects && savedLUT,
+        downscale: effects && resize, convertTo420: effects && color, reduceFrameRate: effects && cap)
+      configuration.resizeTarget = .hd1080
+      configuration.colorTarget = .yuv4208
+      configuration.frameRateTarget = .fps2997
+      configuration.sourceWidth = 3840; configuration.sourceHeight = 2160
+      configuration.sourceDuration = VideoContract.fastDuration
+      // Mirrors the controller's effective policy; the saved Sony profile is
+      // retained separately and applies when the burn-in LUT is enabled.
+      configuration.sourceColorimetryOverride = configuration.applyLUT ? sony : nil
+      configuration.lutOutputColorimetry = configuration.applyLUT ? .rec709Video : nil
+      let input = try image(width: 3840, height: 2160, pixel: kCVPixelFormatType_422YpCbCr10)
+      CVBufferSetAttachment(input, kCVImageBufferPixelAspectRatioKey,
+        [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 1,
+         kCVImageBufferPixelAspectRatioVerticalSpacingKey: 1] as CFDictionary, .shouldPropagate)
+      CVBufferSetAttachment(input, kCVImageBufferFieldCountKey, NSNumber(value: 1), .shouldPropagate)
+      CVPixelBufferLockBaseAddress(input, [])
+      let stride = CVPixelBufferGetBytesPerRow(input)
+      let words: [UInt32] = [512 | (400 << 10) | (512 << 20), 400 | (512 << 10) | (400 << 20),
+        512 | (400 << 10) | (512 << 20), 400 | (512 << 10) | (400 << 20)]
+      for y in 0..<2160 {
+        let row = CVPixelBufferGetBaseAddress(input)!.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
+        for x in 0..<(3840 / 6) { for word in 0..<4 { row[x * 4 + word] = words[word] } }
+      }
+      CVPixelBufferUnlockBaseAddress(input, [])
+      let output: CVPixelBuffer
+      if configuration.untouched {
+        let admission = try SourceAdmissionSnapshot(format: source,
+          epochID: CaptureEpochID(sessionID: UUID(), epoch: 0),
+          clockBindings: CaptureClockBindings(video: ClockInstanceID()), stage: .lut)
+        let metadata = SourceAdmissionMetadata(width: 3840, height: 2160, pixel: .v210,
+          isPlanar: false, planeCount: 0, rowBytes: CVPixelBufferGetBytesPerRow(input),
+          dataSize: CVPixelBufferGetDataSize(input), presentationTime: CMTime(value: 1, timescale: 1),
+          duration: VideoContract.fastDuration, epochID: admission.epochID, formatSignature: admission.formatSignature)
+        let done = expectation(description: "typed native camera output")
+        let result = Mutex<LUTProcessor.Completed?>(nil)
+        try processor.submitPassthrough(input, source: admission, metadata: metadata) { completed in
+          result.withLock { $0 = completed }
+          done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+        output = try XCTUnwrap(result.withLock { $0 }).result.get()
+      } else {
+        output = try processor.process(input, configuration: configuration, declaredSourceColorimetry: source.colour)
+      }
+      let expected = try CameraSink.requestedFormat(configuration: configuration,
+        passthroughFormat: source.pixel.rawValue, sourceFormat: source)
+      let sample = try VideoContract.sample(output, at: CMTime(value: 1, timescale: 1), duration: configuration.duration)
+      let actual = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+      let diagnostic = "effects=\(effects) LUT=\(savedLUT) resize=\(resize) color=\(color) cap=\(cap); actual=\(String(describing: CMFormatDescriptionGetExtensions(actual))); expected=\(String(describing: CMFormatDescriptionGetExtensions(expected)))"
+      XCTAssertNil(CameraSink.mismatch(sample, format: expected, duration: configuration.duration), diagnostic)
+      XCTAssertEqual(source.colour, .rec709Video)
+      if !configuration.applyLUT {
+        XCTAssertEqual(CMFormatDescriptionGetExtension(actual, extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String,
+          kCVImageBufferColorPrimaries_ITU_R_709_2 as String, diagnostic)
+        CVPixelBufferLockBaseAddress(output, .readOnly)
+        if configuration.untouched {
+          let row = CVPixelBufferGetBaseAddress(output)!.assumingMemoryBound(to: UInt32.self)
+          for i in 0..<4 { XCTAssertEqual(row[i], words[i], diagnostic) }
+        } else if CVPixelBufferGetPixelFormatType(output) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+          let y = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt8.self)
+          let uv = CVPixelBufferGetBaseAddressOfPlane(output, 1)!.assumingMemoryBound(to: UInt8.self)
+          XCTAssertEqual(Double(y[0]), 100, accuracy: 1, diagnostic)
+          XCTAssertEqual(Double(uv[0]), 128, accuracy: 1, diagnostic)
+          XCTAssertEqual(Double(uv[1]), 128, accuracy: 1, diagnostic)
+        } else {
+          let y = CVPixelBufferGetBaseAddressOfPlane(output, 0)!.assumingMemoryBound(to: UInt16.self)
+          XCTAssertEqual(Double(y[0] >> 6), 400, accuracy: 1, diagnostic)
+        }
+        CVPixelBufferUnlockBaseAddress(output, .readOnly)
+      }
+    }
+  }
+
   func testFeedCameraExplicitlyRefusesVFRBeforeDeviceDiscovery() throws {
     let source = try SourceFormat(width: 1920, height: 1080,
       pixel: PixelFormatID(rawValue: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),

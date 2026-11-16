@@ -623,7 +623,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     // take: that one is published, and the failure is still reported below.
     do {
       if stopError != nil || (session.adapter.state == .failed && !hadVideo) {
-        session.output.preserveForRecovery()
+        session.output.preserveForRecovery(discardingEmptyTake: !hadVideo)
       } else if hadVideo {
         _ = try session.output.finish()
       } else {

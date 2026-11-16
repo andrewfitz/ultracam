@@ -354,6 +354,26 @@ import XCTest
 
   // MARK: Director
 
+  func testDirectorWaitsForItsFirstCaptureClockBeforeAgingTheShot() throws {
+    try prepare()
+    defer { finish() }
+    natural(true)
+    model.startAllCameras()
+    model.setProgramDemandForTesting(requested: true)
+    XCTAssertTrue(model.directorRunningForTesting)
+    let clock = try XCTUnwrap(model.directorClockFeedIDForTesting)
+    XCTAssertNil(model.cameraUpdate(clock)?.mediaTime, "Capture is opening, without a clock sample")
+    let onAir = model.switcherSelectedFeedID
+    var update = CaptureUpdate(message: "First capture clock")
+    update.mediaTime = CMTime(seconds: 1000, preferredTimescale: 240_000)
+    update.audioPacketTime = update.mediaTime
+    model.deliverCaptureUpdateForTesting(clock, update)
+    settle()
+    XCTAssertEqual(model.switcherSelectedFeedID, onAir,
+      "An absolute source PTS is the start of the shot, not a thousand-second shot")
+    XCTAssertNil(model.switcherPendingFeedID)
+  }
+
   private func natural(_ on: Bool) {
     model.naturalTalkingHeadEnabled = on
   }

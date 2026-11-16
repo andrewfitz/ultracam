@@ -269,6 +269,10 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     var lastAudioEnd: CMTime?
     /// Output end of the last audio packet accepted.
     var lastAudioOutputEnd: CMTime?
+    /// Where the paired PCM written so far ends when its packets are laid back to back,
+    /// which is how the movie stores them, and the pause offset that applied to the last one.
+    var pairedAudioWrittenEnd: CMTime?
+    var pairedAudioOffset = CMTime.zero
     /// Post-resume audio that arrived before the first post-resume frame.
     var heldAudio: [CMSampleBuffer] = []
     /// Output time each pause offset starts at, oldest first.
@@ -280,6 +284,10 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   }
 
   private static let maximumHeldAudio = 64
+  /// Marks packed paired PCM, whose packets carry their frames' video times.
+  private static let pairedPCMAttachmentKey = "UltracamPairedPCM"
+  /// The longest hole in paired PCM filled with silence. A longer one is recorded and left.
+  private static let maximumPairedSilence = 2.0
   private static let maximumPendingTimecode = 64
 
   private let configuration: SourceRecordingConfiguration
@@ -1699,6 +1707,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       guard status == noErr else { throw ClockMappedPCMError.invalidPacket }
       let packed = try makePaired24BitSample(sourcePCM32: bytes, sampleFrameCount: CMSampleBufferGetNumSamples(sample),
         format: format, presentationTime: videoTime)
+      CMSetAttachment(packed, key: Self.pairedPCMAttachmentKey as CFString, value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldPropagate)
       try appendAudio(packed)
     } else {
       try appendConvertedSourceAudio(sample, transform: .paired(audioAnchor: CMSampleBufferGetPresentationTimeStamp(sample), videoAnchor: videoTime))
@@ -1888,6 +1897,10 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
     let duration = CMSampleBufferGetDuration(sample)
     enum Placement { case write(CMTime), overlap }
+    let paired = CMGetAttachment(sample, key: Self.pairedPCMAttachmentKey as CFString, attachmentModeOut: nil) != nil
+    // Silence is queued like any packet, so it needs room in the same budget.
+    let room = paired ? fifoLock.withLock { configuration.audioRetentionPolicy.maximumDuration / 2 - pendingAudio.retainedDuration } : 0
+    var hole: (start: CMTime, frames: Int, filled: Bool)?
     let placement = timelineLock.withLock { () -> Placement in
       // Whole audio samples, so a pause never splits a sample period.
       let offset = timeline.offset == .zero ? CMTime.zero
@@ -1903,6 +1916,25 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         if rate > 0, overlap.seconds <= 1 / rate + 1e-9 { output = end }
         else { return .overlap }
       }
+      if paired {
+        // The movie stores LPCM back to back whatever its timestamps, so audio after a
+        // missing packet would play early for the rest of the take. A hole shows as a
+        // jump both from the previous packet's end and from where the written audio
+        // ends; ordinary cadence moves either by about a sample, and drift moves only
+        // the second. Nothing is judged across a pause.
+        if let previous = timeline.lastAudioOutputEnd, let written = timeline.pairedAudioWrittenEnd,
+          timeline.pairedAudioOffset == timeline.offset {
+          let gap = min(CMTimeSubtract(output, previous).seconds, CMTimeSubtract(output, written).seconds)
+          if gap.isFinite, gap > max(duration.seconds / 2, 0.002) {
+            let frames = Int((gap * 48000).rounded())
+            let fills = gap <= min(Self.maximumPairedSilence, room - duration.seconds)
+            hole = (CMTimeSubtract(output, CMTime(value: Int64(frames), timescale: 48000)), frames, fills)
+            timeline.pairedAudioWrittenEnd = fills ? CMTimeAdd(written, CMTime(value: Int64(frames), timescale: 48000)) : output
+          }
+        } else { timeline.pairedAudioWrittenEnd = output }
+        timeline.pairedAudioWrittenEnd = CMTimeAdd(timeline.pairedAudioWrittenEnd ?? output, duration)
+        timeline.pairedAudioOffset = timeline.offset
+      }
       timeline.lastAudioEnd = CMTimeAdd(pts, duration)
       timeline.lastAudioOutputEnd = CMTimeAdd(output, duration)
       return .write(output)
@@ -1910,6 +1942,17 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     guard case let .write(output) = placement else {
       telemetryLock.withLock { telemetryValue.pauseTrimmedAudio &+= 1 }
       return
+    }
+    if let hole {
+      let seconds = String(format: "%.3f", output.seconds)
+      if hole.filled, let silence = try? Self.silence(like: sample, frames: hole.frames, at: hole.start) {
+        telemetryLock.withLock { telemetryValue.pairedAudioSilenceFrames &+= UInt64(hole.frames) }
+        journal(.init(kind: "audioSilenceFill", detail: "\(hole.frames) frames of silence before \(seconds) s"))
+        enqueue(silence, video: false)
+      } else {
+        telemetryLock.withLock { telemetryValue.pairedAudioUnfilledHoles &+= 1 }
+        journal(.init(kind: "audioHole", detail: "\(hole.frames) frames missing before \(seconds) s were not filled; later audio is early by that much"))
+      }
     }
     let timed = output == pts ? sample : try Self.retimed(sample, at: output)
     let late = fifoLock.withLock { () -> Bool in
@@ -1919,6 +1962,29 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       throw SourceRecordingError.writerNotReady("The late audio sample was rejected because its timestamp moved backwards.")
     }
     enqueue(timed, video: false)
+  }
+
+  /// Zeroed PCM in the sample's own format: `frames` sample frames starting at `time`.
+  private static func silence(like sample: CMSampleBuffer, frames: Int, at time: CMTime) throws -> CMSampleBuffer {
+    guard frames > 0, let description = CMSampleBufferGetFormatDescription(sample),
+      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee, asbd.mBytesPerFrame > 0 else {
+      throw SourceRecordingError.unsupportedSample("Silence needs a packed PCM format.")
+    }
+    let bytes = frames * Int(asbd.mBytesPerFrame)
+    var block: CMBlockBuffer?
+    guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes,
+      blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: bytes,
+      flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block) == noErr, let block,
+      CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0, dataLength: bytes) == noErr else {
+      throw SourceRecordingError.writerFailure("Silence could not be allocated.")
+    }
+    var silence: CMSampleBuffer?
+    guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault, dataBuffer: block,
+      formatDescription: description, sampleCount: frames, presentationTimeStamp: time, packetDescriptions: nil,
+      sampleBufferOut: &silence) == noErr, let silence else {
+      throw SourceRecordingError.writerFailure("Silence could not be packaged.")
+    }
+    return silence
   }
 
   /// A copy of the sample moved to start at `time`; the audio bytes are
@@ -2053,6 +2119,11 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     while true {
       var progressed = false
       do {
+        // A writer that failed on its own stops asking for media, so no append would ever
+        // report it: the queue would fill for minutes and blame the disk for being slow.
+        if let writer, writer.status == .failed {
+          throw Self.writerError(writer, fallback: "AVAssetWriter failed.")
+        }
         // Peek only to open the file (it needs the first format hint) and to
         // start the session; a sample is popped under the lock right before
         // it is appended, so a concurrent failure or an early audio packet
@@ -2293,6 +2364,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
 
   func finish(finalError: String?, sourceCounters: [String: UInt64]) throws {
     finalSourceCounters = sourceCounters
+    let silence = telemetryLock.withLock { telemetryValue.pairedAudioSilenceFrames }
+    if silence > 0 { finalSourceCounters["audio.silenceFilledFrames", default: 0] &+= silence }
     try finish(finalError: finalError)
   }
   func finish() throws { try finish(finalError: nil) }

@@ -127,6 +127,10 @@ int main() {
     int16_t compensation[] = {-2000, 2000, 1000};
     choices = sonyDecodeChoices(CrDataType_Int16Range, (uint8_t *)compensation, sizeof(compensation));
     assert(choices.size() == 5 && (int64_t)choices.front() == -2000 && choices.back() == 2000);
+    // A current value the SDK reports zero-extended matches the choice it came from.
+    assert(sonySignExtended(CrDataType_Int16Range, (uint16_t)-2000) == choices.front());
+    assert(sonySignExtended(CrDataType_Int16Range, 2000) == choices.back());
+    assert(sonySignExtended(CrDataType_UInt16Range, 0xFC18) == 0xFC18);
     uint32_t giant[] = {0, UINT32_MAX, 1};
     assert(sonyDecodeChoices(CrDataType_UInt32Range, (uint8_t *)giant, sizeof(giant)).empty());
     uint32_t zeroStep[] = {100, 800, 0};

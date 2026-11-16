@@ -551,6 +551,10 @@ struct SourceRecordingWriterTelemetry: Equatable, Sendable {
   /// Audio packets left out at a resume because they overlapped audio
   /// already written before the pause (at most about one per resume).
   var pauseTrimmedAudio: UInt64 = 0
+  /// Silence written where paired PCM packets went missing, in sample frames, and holes
+  /// left unfilled because they were too long or the audio queue had no room.
+  var pairedAudioSilenceFrames: UInt64 = 0
+  var pairedAudioUnfilledHoles: UInt64 = 0
   var warning: String?
   var lastError: String?
 }

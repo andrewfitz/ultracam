@@ -28,8 +28,8 @@ enum MonitorDetachedRules {
   }
 
   /// Whether a tile registers its scope as visible: the feed's tools show
-  /// scopes, this tile has not hidden them locally ("Hide scopes in this
-  /// view", which never changes the feed's tools), the picture is not held and
+  /// scopes, this tile has not hidden them locally ("Hide Scopes in This
+  /// View", which never changes the feed's tools), the picture is not held and
   /// the preview is shown.
   static func registersScope(preferences: MonitorFeedPreferences, locallyVisible: Bool, frozen: Bool,
     previewEnabled: Bool) -> Bool {
@@ -85,33 +85,39 @@ private struct MonitorBoundTile: View {
       }
       ViewThatFits(in: .horizontal) {
         HStack(spacing: 8) {
-          Button(previewEnabled ? "Hide preview" : "Show preview") {
+          Button(previewEnabled ? "Hide Preview" : "Show Preview") {
             coordinator.setPreviewEnabled(!previewEnabled, for: target)
           }
           Button(presenter.isFreezePending ? "Cancel Freeze" : presenter.isFrozen ? "Unfreeze" : "Freeze") {
             toggleFreeze()
           }
           .disabled(!previewEnabled)
-          .keyboardShortcut(focused ? KeyboardShortcut("f", modifiers: [.control, .option]) : nil)
-          Button(presenter.isClean ? "Decorated view" : "Clean view") { presenter.toggleClean() }
-            .keyboardShortcut(focused ? KeyboardShortcut("c", modifiers: [.control, .option]) : nil)
+          Button(presenter.isClean ? "Show Overlays" : "Clean View") { presenter.toggleClean() }
           Menu("View") { surfaceViewActions }
           if !compact {
+            // Press and hold, with the pointer or Space once focused. VoiceOver can't hold, so
+            // its press turns Clean View on or off.
             Text("Hold Clean").padding(.horizontal, 4).padding(.vertical, 2)
               .background(.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
+              .contentShape(Rectangle())
               .gesture(
-                DragGesture(minimumDistance: 0).onChanged { _ in
-                  if cleanBeforeHold == nil { cleanBeforeHold = presenter.isClean }
-                  presenter.setClean(true)
-                }.onEnded { _ in
-                  presenter.setClean(cleanBeforeHold ?? false)
-                  cleanBeforeHold = nil
-                }
+                DragGesture(minimumDistance: 0).onChanged { _ in beginHoldClean() }.onEnded { _ in endHoldClean() }
               )
-              .accessibilityLabel("Hold for clean view; Control Option C toggles clean view")
+              .focusable(interactions: .activate)
+              .onKeyPress(.space, phases: .all) { press in
+                switch press.phase {
+                case .down: beginHoldClean()
+                case .up: endHoldClean()
+                default: break
+                }
+                return .handled
+              }
+              .accessibilityAddTraits(.isButton)
+              .accessibilityHint("Shows Clean View while held. Control-Option-C turns Clean View on or off.")
+              .accessibilityAction { presenter.toggleClean() }
           }
           if !compact {
-            Button("Detach") { MonitorDetachedWindows.open(coordinator: coordinator, target: target, cameraControls: cameraControls) }
+            Button("Detach to Window") { MonitorDetachedWindows.open(coordinator: coordinator, target: target, cameraControls: cameraControls) }
           }
         }.fixedSize(horizontal: true, vertical: false)
         HStack(spacing: 8) {
@@ -121,22 +127,35 @@ private struct MonitorBoundTile: View {
           }.disabled(!previewEnabled)
           Menu("View") {
             surfaceViewActions
-            Button(presenter.isClean ? "Decorated view" : "Clean view") { presenter.toggleClean() }
+            Button(presenter.isClean ? "Show Overlays" : "Clean View") { presenter.toggleClean() }
             if !compact {
-              Button("Detach") { MonitorDetachedWindows.open(coordinator: coordinator, target: target, cameraControls: cameraControls) }
+              Button("Detach to Window") { MonitorDetachedWindows.open(coordinator: coordinator, target: target, cameraControls: cameraControls) }
             }
           }.menuStyle(.borderlessButton).fixedSize()
           Spacer(minLength: 0)
         }
       }.font(.caption).controlSize(.mini)
+        .background {
+          // ⌃⌥F and ⌃⌥C for this window while it is key, whichever row fits, and taken even
+          // with the preview hidden, so they never reach the main window's selected camera.
+          if focused {
+            Group {
+              Button("Freeze") { if previewEnabled { toggleFreeze() } }
+                .keyboardShortcut("f", modifiers: [.control, .option])
+              Button("Clean View") { presenter.toggleClean() }
+                .keyboardShortcut("c", modifiers: [.control, .option])
+            }
+            .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
+          }
+        }
         .contextMenu {
           Button(presenter.isFreezePending ? "Cancel Freeze" : presenter.isFrozen ? "Unfreeze" : "Freeze") {
             toggleFreeze()
           }
           .disabled(!previewEnabled)
-          Button(presenter.isClean ? "Decorated view" : "Clean view") { presenter.toggleClean() }
-          Button("Reset monitor tools") { coordinator.resetSettings(for: target) }
-          Menu("Copy settings to") {
+          Button(presenter.isClean ? "Show Overlays" : "Clean View") { presenter.toggleClean() }
+          Button("Reset Monitor Tools") { coordinator.resetSettings(for: target) }
+          Menu("Copy Monitor Settings To") {
             ForEach(coordinator.targets.filter { $0.id != target }) { choice in
               Button(choice.title) { coordinator.copySettings(from: target, to: choice.id) }
             }
@@ -174,14 +193,23 @@ private struct MonitorBoundTile: View {
   }
   @ViewBuilder private var surfaceViewActions: some View {
     if displayed.scopes.enabled {
-      Button(scopesVisible ? "Hide scopes in this view" : "Show scopes in this view") { scopesVisible.toggle() }
+      Button(scopesVisible ? "Hide Scopes in This View" : "Show Scopes in This View") { scopesVisible.toggle() }
     }
-    Picker("Picture zoom (center crop)", selection: $zoom) {
+    Picker("Zoom (Center Crop)", selection: $zoom) {
       Text("Fit").tag(1.0)
       Text("150%").tag(1.5)
       Text("200%").tag(2.0)
       Text("400%").tag(4.0)
     }
+  }
+  private func beginHoldClean() {
+    if cleanBeforeHold == nil { cleanBeforeHold = presenter.isClean }
+    presenter.setClean(true)
+  }
+  private func endHoldClean() {
+    guard let before = cleanBeforeHold else { return }
+    presenter.setClean(before)
+    cleanBeforeHold = nil
   }
   private func toggleFreeze() {
     if presenter.isFreezePending {
@@ -278,9 +306,10 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
           Text("Monitor").tag(SignalStage.monitor)
         }.controlSize(.mini)
       }
-      Text(pictureCaption).font(.caption2)
       if frozenPreferences != nil {
         Text("Frozen · " + pictureCaption).font(.caption)
+      } else {
+        Text(pictureCaption).font(.caption2)
       }
       MonitorTileToolbar(
         state: toolState, name: target.flatMap { id in choices.first { $0.id == id }?.title } ?? "Monitor",
@@ -306,7 +335,8 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
       }
       if displayed.toolsEnabled && displayed.state.falseColor.mode != .off {
         if isProgram && displayed.state.falseColor.mode.needsLogSource {
-          Text("False Color unavailable for Program: source Log provenance is required").font(.caption2)
+          Text("Program is not a camera signal, so log false color is off. Six band and custom bands work on Program.")
+            .font(.caption2)
         } else if let legend = FalseColorLegend(settings: displayed.state.falseColor, signal: presenter?.shownSignal,
           layout: presenter?.shownLayout) {
           FalseColorLegendView(
@@ -378,9 +408,18 @@ private struct MonitorDiagnosticsDisclosure: View {
     }
     window.contentView = NSHostingView(
       rootView: DetachedMonitorContent(coordinator: coordinator, owner: owner, cameraControls: cameraControls).padding(12))
+    // A camera's window opens where it was last left. A second window on the same camera
+    // can't take the name (AppKit refuses a name in use), so it opens centred.
+    let autosaveName = "Monitor Window \(target.rawValue)"
+    let restored = window.setFrameAutosaveName(autosaveName) && window.setFrameUsingName(autosaveName)
+    if !restored { window.center() }
+    // Never exactly on top of another detached window: step down and right, as AppKit cascades.
+    let taken = Set(windows.values.map { [$0.window.frame.minX, $0.window.frame.maxY] })
+    for _ in 0..<windows.count where taken.contains([window.frame.minX, window.frame.maxY]) {
+      window.setFrameTopLeftPoint(NSPoint(x: window.frame.minX + 22, y: window.frame.maxY - 22))
+    }
     windows[id] = owner
     window.delegate = owner
-    window.center()
     window.makeKeyAndOrderFront(nil)
     return owner
   }
@@ -389,12 +428,17 @@ private struct MonitorDiagnosticsDisclosure: View {
 @MainActor final class MonitorWindowOwner: NSObject, NSWindowDelegate, ObservableObject {
   let window: NSWindow
   @Published var target: MonitorTargetID?
+  /// While this window is key, its Freeze and Clean View take ⌃⌥F and ⌃⌥C, which otherwise
+  /// reach the View menu and the main window's selected camera.
+  @Published private(set) var isKey = false
   let close: () -> Void
   init(window: NSWindow, target: MonitorTargetID, close: @escaping () -> Void) {
     self.window = window
     self.target = target
     self.close = close
   }
+  func windowDidBecomeKey(_ notification: Notification) { isKey = true }
+  func windowDidResignKey(_ notification: Notification) { isKey = false }
   func windowWillClose(_ notification: Notification) {
     window.contentView = nil
     close()
@@ -413,7 +457,8 @@ private struct DetachedMonitorContent: View {
         surfaceID: surfaceID, target: target, targetBinding: $owner.target,
         preferences: Binding(
           get: { coordinator.preferences(for: target) },
-          set: { coordinator.setPreferences($0, for: target) }), cameraControls: cameraControls, compact: false
+          set: { coordinator.setPreferences($0, for: target) }), cameraControls: cameraControls, compact: false,
+        focused: owner.isKey
       ).id(target)
         .background(
           MonitorWindowTitle(

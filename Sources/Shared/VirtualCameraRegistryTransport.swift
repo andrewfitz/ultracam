@@ -56,6 +56,37 @@ enum VirtualCameraRegistryWire {
 
 enum VirtualCameraRegistryTransport {
   private static let lock = NSLock()
+  private final class Intent: @unchecked Sendable {
+    private let lock = NSLock()
+    private var desired: VirtualCameraRegistrySnapshot?
+
+    func record(_ snapshot: VirtualCameraRegistrySnapshot) {
+      lock.lock()
+      defer { lock.unlock() }
+      if let desired, desired.appGroupIdentifier == snapshot.appGroupIdentifier,
+        desired.generation > snapshot.generation { return }
+      desired = snapshot
+    }
+
+    func isCurrent(_ snapshot: VirtualCameraRegistrySnapshot) -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      return desired == snapshot
+    }
+  }
+  private static let intent = Intent()
+
+  // This short, separate lock never waits on CMIO, so publication can record
+  // new intent on the main actor even while an acknowledgement is outstanding.
+  static func recordIntent(_ desired: VirtualCameraRegistrySnapshot) {
+    intent.record(desired)
+  }
+
+  static func publicationUpdate(_ desired: VirtualCameraRegistrySnapshot,
+    after current: VirtualCameraRegistrySnapshot) throws -> VirtualCameraRegistrySnapshot? {
+    guard intent.isCurrent(desired) else { return nil }
+    return try VirtualCameraRegistryWire.update(desired, after: current)
+  }
 
   private static func address(_ selector: UInt32) -> CMIOObjectPropertyAddress {
     CMIOObjectPropertyAddress(mSelector: selector,
@@ -107,12 +138,18 @@ enum VirtualCameraRegistryTransport {
   /// Synchronous read/write/read acknowledgement. Called before sink discovery
   /// as well as on topology changes, so capture never targets a stale registry.
   @discardableResult
-  static func synchronize(_ desired: VirtualCameraRegistrySnapshot) throws -> VirtualCameraRegistrySnapshot {
+  static func synchronize(_ desired: VirtualCameraRegistrySnapshot,
+    onlyIfCurrent: Bool = false) throws -> VirtualCameraRegistrySnapshot {
+    if !onlyIfCurrent { recordIntent(desired) }
     lock.lock()
     defer { lock.unlock() }
     let provider = try providerID()
     let current = try read(provider)
-    guard let candidate = try VirtualCameraRegistryWire.update(desired, after: current) else { return current }
+    // A synchronous capture handshake may have installed newer intent while
+    // a background publication waited for this lock. Never rebase stale intent
+    // onto that newer provider generation.
+    let update = try publicationUpdate(desired, after: current)
+    guard let candidate = update else { return current }
     let text = try VirtualCameraRegistryWire.encode(candidate) as CFString
     var reference = Unmanaged.passUnretained(text).toOpaque()
     var property = address(VirtualCameraRegistryWire.selector)
@@ -145,8 +182,17 @@ final class VirtualCameraRegistryPublisher {
   }
   private var desired: VirtualCameraRegistrySnapshot?
   private var listener: Listener?
+  private let queue = DispatchQueue(label: "org.ultracam.registry-publication", qos: .utility)
+  private let apply: @Sendable (VirtualCameraRegistrySnapshot) -> Void
+  private var synchronizing = false
+  private var synchronizationRequested = false
 
-  init() {
+  init(observeTopology: Bool = true,
+    apply: @escaping @Sendable (VirtualCameraRegistrySnapshot) -> Void = {
+      _ = try? VirtualCameraRegistryTransport.synchronize($0, onlyIfCurrent: true)
+    }) {
+    self.apply = apply
+    guard observeTopology else { return }
     let block: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
       MainActor.assumeIsolated { self?.synchronize() }
     }
@@ -158,14 +204,34 @@ final class VirtualCameraRegistryPublisher {
   }
 
   func publish(_ snapshot: VirtualCameraRegistrySnapshot) {
+    VirtualCameraRegistryTransport.recordIntent(snapshot)
     desired = snapshot
     synchronize()
   }
 
   private func synchronize() {
-    guard let desired else { return }
-    // Absence before installation is expected. A capture attempt performs the
-    // same handshake and surfaces any error in its camera-output status.
-    _ = try? VirtualCameraRegistryTransport.synchronize(desired)
+    guard desired != nil else { return }
+    synchronizationRequested = true
+    startSynchronizationIfNeeded()
+  }
+
+  private func startSynchronizationIfNeeded() {
+    guard !synchronizing, synchronizationRequested, let desired else { return }
+    synchronizing = true
+    synchronizationRequested = false
+    let apply = apply
+    queue.async { [weak self] in
+      // CMIO discovery and the read/write/acknowledgement handshake can block
+      // for seconds. Keep them off the main actor, including topology retries.
+      // Absence before installation is expected; capture surfaces its own error.
+      apply(desired)
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.synchronizing = false
+        // Read the latest intent here rather than queueing every publication:
+        // intermediate snapshots must never replay after a newer request.
+        self.startSynchronizationIfNeeded()
+      }
+    }
   }
 }

@@ -393,7 +393,12 @@ final class AudioMeterTap: @unchecked Sendable {
         let takeMeter = currentTake.meter
         // A gap in the stream, or audio left out while the take was paused.
         if slot.pointee.followsGap || (lastTakePacket.map { $0 != next &- 1 } ?? false) { takeMeter.noteDiscontinuity() }
-        _ = Self.process(slot.pointee, with: takeMeter)
+        if Self.process(slot.pointee, with: takeMeter) == nil {
+          // A packet can be admitted before its declared format is checked.
+          // It must not leave the take meter's filter history connected to
+          // the next valid packet after a format transition.
+          takeMeter.noteDiscontinuity()
+        }
         lastTakePacket = next
         if takeWatch.observe(takeMeter.snapshot(), source: currentTake.number, sampleRate: takeMeter.configuration.sampleRate,
           level: Self.warningLevel) != nil {

@@ -59,6 +59,8 @@ struct UICameraPictureView: View {
   @State private var zoom = 1.0
   /// Narrow enough that the name row can't hold the full tool bar: it takes its own row.
   @State private var narrow = false
+  /// Narrower than the two-column tool popover: the popover takes one column.
+  @State private var singleColumnTools = false
   /// Under 480 pt the timecode yields, so the REC pill never truncates.
   @State private var showsTimecode = true
   @FocusState private var focused: Bool
@@ -139,6 +141,7 @@ struct UICameraPictureView: View {
     .onHover { hovering = $0 }
     .onGeometryChange(for: Bool.self) { $0.size.width < UIMonitorToolButtons.ownRowBelow } action: { narrow = $0 }
     .onGeometryChange(for: Bool.self) { $0.size.width >= 480 } action: { showsTimecode = $0 }
+    .onGeometryChange(for: Bool.self) { $0.size.width < UIMonitorToolButtons.singleColumnPanelsBelow } action: { singleColumnTools = $0 }
     // Only Full Keyboard Access focuses a picture: a click or window activation doesn't, so it
     // can't silently move the target of ⌘R. Focus reveals the controls and never selects.
     .focusable(!compact, interactions: .activate)
@@ -327,7 +330,8 @@ struct UICameraPictureView: View {
   /// popovers is open. Clean View shows none at rest.
   @ViewBuilder private func tools(_ placement: UIMonitorToolButtons.Placement) -> some View {
     if placement.shown {
-      UIMonitorToolButtons(camera: camera, context: context, openPanel: $toolPanel, expanded: placement.expanded)
+      UIMonitorToolButtons(camera: camera, context: context, openPanel: $toolPanel, expanded: placement.expanded,
+        singleColumnPanels: singleColumnTools)
     }
   }
 
@@ -386,7 +390,7 @@ struct UICameraPictureView: View {
       HStack(spacing: 4) {
         Text(Self.stageName(stage)).foregroundStyle(.white.opacity(0.7))
         if stage == .output, let output { Text(output).monospacedDigit() }
-        Image(systemName: "chevron.down").font(.caption2.weight(.bold)).imageScale(.small)
+        Image(systemName: UISymbol.menuIndicator).font(.caption2.weight(.bold)).imageScale(.small)
       }
       .foregroundStyle(.white)
       .contentShape(Rectangle())
@@ -499,18 +503,26 @@ struct UICameraPictureView: View {
 
   @ViewBuilder private var pictureMenu: some View {
     // A checkmark item, like View › Freeze; the menu is built on open, so it reads the current state.
-    Toggle("Freeze", isOn: Binding(get: { UIMonitorBridge.presenter(for: camera.id)?.isFrozen == true },
-      set: { _ in context.send(.freeze(cameraID: camera.id)) }))
-    Button(isClean ? "Show Overlays" : "Clean View") { context.send(.toggleClean(cameraID: camera.id)) }
+    // A compact tile registers no presenter, so it has nothing to freeze or clean.
+    // As in the View menu: only while the picture shows video.
+    if !compact {
+      Toggle("Freeze", isOn: Binding(get: { UIMonitorBridge.presenter(for: camera.id)?.isFrozen == true },
+        set: { _ in context.send(.freeze(cameraID: camera.id)) }))
+        .disabled(!camera.tileState.showsPicture)
+      Button(isClean ? "Show Overlays" : "Clean View") { context.send(.toggleClean(cameraID: camera.id)) }
+        .disabled(!camera.tileState.showsPicture)
+    }
     Button("Reset Monitor Tools") { context.send(.resetMonitorTools(cameraID: camera.id)) }
     UICopySettingsMenu(camera: camera, context: context, title: "Copy Monitor Settings To")
     Divider()
+    // The View menu's conditions: Single has nothing to expand or swap, and Program View no swap.
+    let layout = context.presentation.layout
     if context.session.expandedFrom != nil {
       Button("Restore Layout") { context.send(.restoreLayout) }
-    } else if context.presentation.cameras.count > 1 {
+    } else if context.presentation.cameras.count > 1 && layout != .single {
       Button("Expand Picture") { context.send(.expandPicture(cameraID: camera.id)) }
     }
-    if context.presentation.cameras.count > 1 {
+    if context.presentation.cameras.count > 1 && layout != .single && layout != .programView {
       Button("Swap Pictures") { context.send(.swapPictures) }
     }
     Divider()
@@ -967,6 +979,10 @@ struct UIChannelStripView: View {
       if let pause = camera.pauseTitle {
         Button(pause == "Pause" ? "Pause Recording" : "Resume Recording") { context.send(.pauseOrResume(cameraID: camera.id)) }
       }
+      // Details only looks: this is where an ended take is put away, collapsed or not.
+      if camera.stripState == .failed {
+        Button("Dismiss Ended Take") { context.send(.acknowledgeStop(cameraID: camera.id)) }
+      }
       Divider()
       UICopySettingsMenu(camera: camera, context: context, title: "Copy Monitor Settings To")
       if let store = context.cameraControls, store.available {
@@ -1008,8 +1024,10 @@ struct UIChannelStripView: View {
 
   /// The camera-original note is on the Ready line, and always in the record button's help.
   private var recordHelp: String {
+    let burnsInLUT = context.snapshot(camera.id).map { UIPresentationBuilder.recordsLUT($0, in: context.session) } ?? false
     var help = camera.recordButtonActive || isRecordingOrPaused ? camera.recordButtonHelp
-      : camera.recordButtonHelp + " Records the camera original, without LUT or effects."
+      : camera.recordButtonHelp + (burnsInLUT ? " Records the camera original with its LUT burned in."
+        : " Records the camera original, without LUT or effects.")
     if let fallback = camera.formatFallback { help += " \(fallback): \(camera.formatHelp)" }
     return help
   }
@@ -1087,7 +1105,7 @@ struct UIChannelStripView: View {
         .foregroundStyle(warning ? .orange : .green).imageScale(.small)
         .accessibilityHidden(true)
       if let space = text.firstIndex(of: " "), text.first?.isNumber == true {
-        Text(text[..<space]).font(.uiValueStrong).foregroundStyle(warning ? .primary : .primary)
+        Text(text[..<space]).font(.uiValueStrong).foregroundStyle(.primary)
         Text(text[text.index(after: space)...]).font(.uiMeta).foregroundStyle(warning ? .primary : .secondary)
       } else {
         Text(text).font(.uiRow).foregroundStyle(.primary)
@@ -1126,11 +1144,19 @@ struct UIChannelStripView: View {
       Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
     case .failed:
       // One action. Out of space, the next take needs another folder (or room on this
-      // drive); otherwise Details shows why, and acknowledges the take.
+      // drive); otherwise Details shows why. Looking never clears the row: × does (and ⋯).
       if camera.diskFull {
         Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small)
       } else {
-        Button("Details") { context.send(.acknowledgeStop(cameraID: camera.id)) }.controlSize(.small)
+        Button("Details") { context.send(.openDiagnostics) }.controlSize(.small)
+        Button { context.send(.acknowledgeStop(cameraID: camera.id)) } label: {
+          Image(systemName: UISymbol.close).font(.uiMeta.weight(.semibold))
+            .frame(width: 20, height: 20).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Dismiss. The strip goes back to the take's result.")
+        .accessibilityLabel("Dismiss \(camera.name)'s ended take")
       }
     case .waiting:
       // The strip says a folder is also needed; offer it now rather than after the signal arrives.
@@ -1157,8 +1183,9 @@ struct UIChannelStripView: View {
         Self.folderText(path).lineLimit(1).truncationMode(.head)
           .help(path)
       } else {
-        Text("—").font(.uiRow).foregroundStyle(.secondary).frame(width: Self.gutter)
-          .accessibilityLabel("No recording folder")
+        Image(systemName: UISymbol.folder).foregroundStyle(.secondary).imageScale(.small)
+          .frame(width: Self.gutter).accessibilityHidden(true)
+        Text("No folder chosen").foregroundStyle(.secondary).lineLimit(1)
       }
       Spacer(minLength: 4)
       formatChip
@@ -1256,9 +1283,25 @@ struct UIChannelStripView: View {
   }
 
   /// `LUT On` or `LUT Off`, one click, fixed width. With Sync cameras on it changes every camera.
-  private var lutToggle: some View {
+  /// With no LUT loaded (and none loading) it's `Load LUT…`, which asks for one, in the same slot.
+  @ViewBuilder private var lutToggle: some View {
     let on = camera.lutIsOn
-    return Button { context.send(.setEffect(cameraID: camera.id, index: 0, !on)) } label: {
+    if camera.lutChip?.enabled != true && snapshot?.lutLoading != true {
+      Button { context.send(.chooseLUT(cameraID: camera.id)) } label: {
+        Text("Load LUT…").lineLimit(1).minimumScaleFactor(0.85)
+          .frame(width: Self.lutWidth, height: 24)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(UISlotButtonStyle())
+      .help("Choose a .cube LUT for \(camera.name).")
+      .accessibilityLabel("Load LUT for \(camera.name)")
+    } else {
+      lutOnOff(on)
+    }
+  }
+
+  private func lutOnOff(_ on: Bool) -> some View {
+    Button { context.send(.setEffect(cameraID: camera.id, index: 0, !on)) } label: {
       Label(on ? "LUT On" : "LUT Off", systemImage: UISymbol.lut(on: on))
         .labelStyle(.titleAndIcon)
         .frame(width: Self.lutWidth, height: 24)
@@ -1273,7 +1316,8 @@ struct UIChannelStripView: View {
 
   private var lutHelp: String {
     if !camera.processing { return "Effects are off: the camera original goes out unchanged." }
-    guard camera.lutChip?.enabled == true else { return "Load a .cube LUT in the inspector to use this." }
+    // Without a LUT the slot is Load LUT…, unless one is still loading.
+    guard camera.lutChip?.enabled == true else { return "\(camera.name)'s LUT is loading." }
     var help = camera.lutIsOn ? "Turn the LUT off. Meeting apps keep their format." : "Turn the LUT on. Meeting apps keep their format."
     if context.session.syncCameras { help += " Sync cameras is on, so this changes every camera." }
     return help
@@ -1282,11 +1326,16 @@ struct UIChannelStripView: View {
   // MARK: Collapsed
 
   /// Name · state · LUT · ⋯ · meter · Stop: the meter keeps ⋯ away from Stop, so a miss can't
-  /// end a take. Four Up has no tile Cut, so its strips carry the Cut slot.
+  /// end a take. Four Up has no tile Cut, so its strips carry the Cut slot. Short of room the
+  /// name keeps its own, and the rest yield in turn: the meter, the LUT slot (the inspector loads one),
+  /// then the problem's button (expanded, the strip's problem row keeps it).
   private var collapsed: some View {
     HStack(spacing: 8) {
       chevron
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
+        .frame(minWidth: 48, alignment: .leading)
+        .layoutPriority(1)
+        .help(camera.name)
       if isClean && camera.tally != .none {
         // Clean View hides the picture's pill, so the tally is said here.
         UIBadge(text: camera.tally.label ?? "", tone: camera.tally.isRed ? .onAir : camera.tally == .next ? .positive : .neutral)
@@ -1294,12 +1343,17 @@ struct UIChannelStripView: View {
       collapsedState
       Spacer(minLength: 4)
       if context.presentation.layout == .fourUp && context.presentation.programAvailable { cutSlot }
-      lutToggle
+      // Whole or not at all, after the meter.
+      ViewThatFits(in: .horizontal) {
+        lutToggle
+        Color.clear.frame(width: 0, height: 0)
+      }
+      .layoutPriority(-1)
       overflowMenu
       // One meter, outside ViewThatFits: each candidate would run its own display-rate meter,
       // and a swap between candidates (a column animating) restarted its ballistics. It yields first.
       Color.clear.frame(minWidth: 0, idealWidth: Self.compactMeterWidth, maxWidth: Self.compactMeterWidth, maxHeight: 1)
-        .layoutPriority(-1)
+        .layoutPriority(-2)
         .onGeometryChange(for: Bool.self) { $0.size.width >= Self.compactMeterWidth } action: { compactMeterFits = $0 }
         .overlay(alignment: .trailing) {
           if compactMeterFits {
@@ -1325,7 +1379,13 @@ struct UIChannelStripView: View {
         UIStateGlyph(state: .warning)
         problemWords(problem, font: .uiRow, short: true)
         if problem.count == 1, let action = problem.action {
-          Button(action.title) { context.send(action.action) }.controlSize(.small).fixedSize()
+          // The expanded row's button, in label colors: there's no amber behind it here. Whole or
+          // not at all, after the meter and the LUT slot.
+          ViewThatFits(in: .horizontal) {
+            UIProblemButton(action: action, level: .notice, context: context)
+            Color.clear.frame(width: 0, height: 0)
+          }
+          .layoutPriority(-1)
         }
       }
     } else if isClean, isRecordingOrPaused {
@@ -1349,9 +1409,10 @@ struct UIChannelStripView: View {
       .font(.uiRow)
       .accessibilityElement(children: .combine)
       .help(camera.formatFallback.map { "\($0). \(camera.formatHelp)" } ?? word)
-      // A take that ended early keeps Details collapsed too: it says why and acknowledges the take (J34).
+      // A take that ended early keeps Details collapsed too: it says why. Looking doesn't put the
+      // take away: ⋯ › Dismiss Ended Take does.
       if camera.stripState == .failed, !camera.diskFull {
-        Button("Details") { context.send(.acknowledgeStop(cameraID: camera.id)) }
+        Button("Details") { context.send(.openDiagnostics) }
           .controlSize(.small).fixedSize()
           .accessibilityLabel("Details for \(camera.name)")
       }

@@ -43,6 +43,7 @@ struct UICameraControlSettings: View {
     var viewFactories: [String: ControlViewFactory] = [:]
     var openHardware: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmForget = false
     private var state: CameraControlFeedState { store.state(for: feedID) }
     private var assignment: CameraControlAssignment? { store.assignment(for: feedID) }
     private var pluginID: String { assignment?.camera.pluginID ?? "" }
@@ -152,7 +153,14 @@ struct UICameraControlSettings: View {
             HStack {
                 Label("Camera sign-in saved in macOS Keychain", systemImage: "key.fill").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Forget Saved Sign-In", role: .destructive) { Task { await store.forgetCredentials(feedID) } }.disabled(state.busy)
+                Button("Forget Saved Sign-In…", role: .destructive) { confirmForget = true }.disabled(state.busy)
+            }
+            .confirmationDialog("Forget the saved sign-in for \(assignment.camera.name)?", isPresented: $confirmForget) {
+                Button("Forget Saved Sign-In", role: .destructive) { Task { await store.forgetCredentials(feedID) } }
+                Button("Cancel", role: .cancel) {}
+                    .keyboardShortcut(.defaultAction)
+            } message: {
+                Text("Its sign-in is deleted from your Keychain and the camera body disconnects. You’ll need to sign in again to control it.")
             }
         }
     }
@@ -231,7 +239,7 @@ struct UICameraBodyAddByAddress: View {
                     ForEach(cameras, id: \.id) { Text($0.name).tag($0.id) }
                 }
             }
-            TextField("Camera network address", text: $address).textFieldStyle(.roundedBorder).accessibilityLabel("Camera IP address")
+            TextField("Camera network address", text: $address).textFieldStyle(.roundedBorder).accessibilityLabel("Camera network address")
             TextField("Expected stable identity (for example MAC address)", text: $identity).textFieldStyle(.roundedBorder)
                 .accessibilityLabel("Camera stable identity")
             Toggle("Camera access authentication is enabled", isOn: $authentication)

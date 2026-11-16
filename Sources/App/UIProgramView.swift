@@ -9,22 +9,29 @@ struct UIProgramView: View {
 
   var body: some View {
     let _ = UIRenderProbe.count("UIProgramView")
-    VStack(alignment: .leading, spacing: UIPictureSpacing.gutter) {
+    // The height left over goes to Program; the strips stay anchored at the bottom.
+    UIProgramColumnLayout(gutter: UIPictureSpacing.gutter) {
       UIProgramRowLayout(gutter: UIPictureSpacing.gutter) {
         UIProgramPictureView(context: context)
-        VStack(spacing: 12) {
+        // More sources than the row is tall scroll in their column; Program keeps its size.
+        ScrollView {
+          VStack(spacing: 12) {
+            ForEach(context.presentation.cameras) { camera in
+              source(camera)
+            }
+          }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+      }
+      // More strips than leave Program its shortest scroll in their own space.
+      ScrollView {
+        VStack(spacing: 8) {
           ForEach(context.presentation.cameras) { camera in
-            source(camera)
+            UIChannelStripView(camera: camera, context: context)
           }
         }
       }
-      // The height left over goes to Program; the strips stay anchored at the bottom.
-      .frame(maxHeight: .infinity, alignment: .top)
-      VStack(spacing: 8) {
-        ForEach(context.presentation.cameras) { camera in
-          UIChannelStripView(camera: camera, context: context)
-        }
-      }
+      .scrollBounceBehavior(.basedOnSize)
     }
     .padding(UIPictureSpacing.margin)
   }
@@ -55,6 +62,7 @@ struct UIProgramPictureView: View {
   @State private var toolPanel: UIMonitorPanel?
   /// Narrow enough that the label row can't hold the full tool bar: it takes its own row.
   @State private var narrow = false
+  @State private var singleColumnTools = false
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   private var session: UISessionSnapshot { context.session }
@@ -126,6 +134,7 @@ struct UIProgramPictureView: View {
       }
       .onHover { hovering = $0 }
       .onGeometryChange(for: Bool.self) { $0.size.width < UIMonitorToolButtons.ownRowBelow } action: { narrow = $0 }
+      .onGeometryChange(for: Bool.self) { $0.size.width < UIMonitorToolButtons.singleColumnPanelsBelow } action: { singleColumnTools = $0 }
       .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovering)
       .accessibilityElement(children: .contain)
       .accessibilityLabel(Self.accessibilityLabel(onAir: onAir?.name, tally: tally))
@@ -136,7 +145,8 @@ struct UIProgramPictureView: View {
       UIMonitorToolButtons(targetID: target, name: "Program",
         activeTools: UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(context.monitor.preferences(for: target)).contains($0) },
         isProgram: true, toggle: { [context] in context.send(.toggleTool(cameraID: MonitorFeedHost.programTarget, $0)) },
-        monitor: context.monitor, openPanel: $toolPanel, expanded: placement.expanded)
+        monitor: context.monitor, openPanel: $toolPanel, expanded: placement.expanded,
+        singleColumnPanels: singleColumnTools)
     }
   }
 
@@ -151,8 +161,45 @@ struct UIProgramPictureView: View {
   }
 }
 
+/// The Program row above the strips. The strips take their own height, unless that leaves the
+/// row shorter than Program at its narrowest: then they get the rest, and scroll. The row takes
+/// what's left. Given no height, both at their own.
+struct UIProgramColumnLayout: Layout {
+  var gutter: CGFloat
+  /// Program at its narrowest (320 pt) is 180 pt tall.
+  static let shortestRow: CGFloat = 180
+
+  private func strips(_ subviews: Subviews, width: CGFloat) -> CGFloat {
+    subviews[1].sizeThatFits(ProposedViewSize(width: width, height: nil)).height
+  }
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    let width = proposal.width ?? 1000
+    guard subviews.count == 2 else { return CGSize(width: width, height: proposal.height ?? 0) }
+    if let height = proposal.height { return CGSize(width: width, height: height) }
+    let row = subviews[0].sizeThatFits(ProposedViewSize(width: width, height: nil)).height
+    return CGSize(width: width, height: row + gutter + strips(subviews, width: width))
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    guard subviews.count == 2 else { return }
+    let shown = min(strips(subviews, width: bounds.width), max(0, bounds.height - gutter - Self.shortestRow))
+    let row = max(0, bounds.height - gutter - shown)
+    subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: row))
+    subviews[1].place(at: CGPoint(x: bounds.minX, y: bounds.maxY - shown),
+      proposal: ProposedViewSize(width: bounds.width, height: shown))
+  }
+
+  func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+  func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+    subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+}
+
 /// Program and its sources side by side. Program is as large as the height allows; the source
-/// column takes the rest of the width, between its narrowest and widest.
+/// column takes the rest of the width, between its narrowest and widest. Given a height, the
+/// source column is that tall (it scrolls); given none, as tall as its sources.
 struct UIProgramRowLayout: Layout {
   var gutter: CGFloat
   static let sourceWidth: ClosedRange<CGFloat> = 220...320
@@ -167,6 +214,7 @@ struct UIProgramRowLayout: Layout {
   func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
     let width = proposal.width ?? 1000
     let split = widths(width, height: proposal.height)
+    if let height = proposal.height { return CGSize(width: width, height: max(split.program * 9 / 16, height)) }
     let sources = subviews.count > 1 ? subviews[1].sizeThatFits(ProposedViewSize(width: split.sources, height: nil)).height : 0
     return CGSize(width: width, height: max(split.program * 9 / 16, sources))
   }
@@ -176,7 +224,7 @@ struct UIProgramRowLayout: Layout {
     guard subviews.count == 2 else { return }
     subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: split.program, height: split.program * 9 / 16))
     subviews[1].place(at: CGPoint(x: bounds.maxX - split.sources, y: bounds.minY),
-      proposal: ProposedViewSize(width: split.sources, height: nil))
+      proposal: ProposedViewSize(width: split.sources, height: proposal.height == nil ? nil : bounds.height))
   }
 
   func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,

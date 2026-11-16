@@ -109,16 +109,35 @@ enum ExtensionFormatCatalog {
     }
     // GPU resampling produces centered chroma. Preserve the original nil-siting
     // contracts while giving accurately tagged processed frames distinct modes.
-    return unsited + unsited.map { entry in
+    let centered = unsited.map { entry in
       try! ExtensionFormatContract(width: entry.width, height: entry.height, pixel: entry.pixel,
         colour: Colorimetry(primaries: entry.colour.primaries, transfer: entry.colour.transfer,
           matrix: entry.colour.matrix, range: entry.colour.range,
           horizontalChromaSiting: .center, verticalChromaSiting: .center),
         allowedDurations: entry.allowedDurations)
     }
+    // Native capture copies can retain left-cosited chroma. Append
+    // truthful identities without changing any previously published index.
+    let nativeLeft = unsited.map { entry in
+      try! ExtensionFormatContract(width: entry.width, height: entry.height, pixel: entry.pixel,
+        colour: Colorimetry(primaries: entry.colour.primaries, transfer: entry.colour.transfer,
+          matrix: entry.colour.matrix, range: entry.colour.range,
+          horizontalChromaSiting: .left, verticalChromaSiting: .center),
+        allowedDurations: entry.allowedDurations)
+    }
+    return unsited + centered + nativeLeft
   }()
 
   static let candidates = published.filter { $0.colour.transfer == .pq }
+
+  /// Format indices are part of the extension ABI. An installed catalog may
+  /// be an older prefix or append newer entries, but it must never reorder or
+  /// replace an existing entry. Keep admission from returning an index that
+  /// only happens to contain the requested identity in a malformed catalog.
+  static func installedPrefixMatchesPublished(_ installed: [ExtensionFormatContract]) -> Bool {
+    let count = min(installed.count, published.count)
+    return Array(installed.prefix(count)) == Array(published.prefix(count))
+  }
 
   static func validateAppendOnly(previous: [ExtensionFormatContract], proposed: [ExtensionFormatContract]) throws {
     guard proposed.count >= previous.count, Array(proposed.prefix(previous.count)) == previous,
@@ -131,6 +150,7 @@ enum ExtensionFormatCatalog {
   static func negotiate(requested: ExtensionFormatContract, duration: CMTime,
                         installed: [ExtensionFormatContract]) throws -> Int {
     guard published.contains(requested) else { throw ExtensionFormatCatalogError.unsupportedLocalContract }
+    guard installedPrefixMatchesPublished(installed) else { throw ExtensionFormatCatalogError.unavailableInstalledContract }
     guard let index = installed.firstIndex(of: requested) else { throw ExtensionFormatCatalogError.unavailableInstalledContract }
     guard requested.allows(duration: duration) else { throw ExtensionFormatCatalogError.unsupportedDuration }
     return index

@@ -12,7 +12,9 @@ struct UIInspectorView: View {
 
 struct UIInspectorViewContent: View {
   let context: UIContext
-
+  /// The camera whose live LUT is waiting on the Remove LUT confirmation. By ID, so a
+  /// selection change while it's up can't move the removal to another camera.
+  @State private var confirmingLUTRemoval: String?
 
   var body: some View {
     let _ = UIRenderProbe.count("UIInspectorViewContent")
@@ -87,12 +89,15 @@ struct UIInspectorViewContent: View {
   }
 
   /// The camera's name and state, in place of a "Camera" row. The Input picker
-  /// and Signal row below say which device it uses and what arrives.
+  /// and Signal row below say which device it uses and what arrives, so while a
+  /// signal is live the badge (which would only repeat its format) is left out.
   private func header(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     HStack(alignment: .firstTextBaseline, spacing: 8) {
       Text(camera.name).font(.uiTitle).lineLimit(1).truncationMode(.middle)
       Spacer(minLength: 4)
-      UIBadge(text: camera.statusBadge, tone: camera.statusTone)
+      if !Self.signalIsLive(snapshot) {
+        UIBadge(text: camera.statusBadge, tone: camera.statusTone)
+      }
     }
     .accessibilityElement(children: .combine)
   }
@@ -128,11 +133,10 @@ struct UIInspectorViewContent: View {
         }
         if let missingID { Text("\(snapshot.inputName ?? missingID) (disconnected)").tag(missingID) }
       }
-      // One row: a long device name truncates instead of widening the inspector.
+      // One row: a long device name truncates instead of widening the inspector. Help names it in full.
       .lineLimit(1)
       .disabled(snapshot.running)
-      .help(snapshot.running ? "Stop the camera to change its input."
-        : "Choose an input device. Shared inputs may serve more than one camera.")
+      .help(Self.deviceHelp(snapshot))
       LabeledContent("Signal") {
         // The tone goes on the symbol; small orange text is hard to read in light mode.
         HStack(spacing: 4) {
@@ -143,6 +147,12 @@ struct UIInspectorViewContent: View {
       .accessibilityElement(children: .ignore)
       .accessibilityLabel("Signal")
       .accessibilityValue(Self.signalText(snapshot))
+      .help(Self.signalDetail(snapshot) ?? "")
+      // Why a format is unsupported, in the backend's words, wrapped on its own line.
+      if let detail = Self.signalDetail(snapshot) {
+        Text(detail).font(.uiMeta).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+      }
       // A plain stat like Timecode: always present, "—" while stopped, never a warning.
       LabeledContent("Dropped frames") {
         UILiveCamera(snapshotFor: camera, context: context, follows: .capture) { snapshot in
@@ -201,9 +211,9 @@ struct UIInspectorViewContent: View {
         if context.session.syncCameras { Text("Editing all cameras") }
       }
       .help("Copies this camera's effects, LUT, monitor tools, source declarations and preview setting to every camera, then keeps edits in sync. Input devices and recording folders stay separate.")
+      // The file is named in the LUT section above, in full; here only whether there is one.
       effectRow(camera, index: 0, title: "LUT", enabled: snapshot.lutName != nil) {
-        Text(snapshot.lutName.map { ($0 as NSString).deletingPathExtension } ?? "None").foregroundStyle(.secondary)
-          .lineLimit(1).truncationMode(.middle)
+        if snapshot.lutName == nil { Text("None").foregroundStyle(.secondary) }
       }
       effectRow(camera, index: 1, title: "Output size") {
         HStack(spacing: 4) {
@@ -276,19 +286,21 @@ struct UIInspectorViewContent: View {
 
   private func lutSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
-      // One row whatever the file name's length: the name gives way (truncating in the middle)
-      // before the label or the button. LabeledContent would drop a long name onto a second line.
-      HStack(spacing: 6) {
-        Text("File").layoutPriority(2)
-        Spacer(minLength: 8)
-        if snapshot.lutLoading { ProgressView().controlSize(.small) }
+      // The label and the button on one line, the file's name on its own full-width line under
+      // them, wrapping: a long name is read whole instead of truncated at 320 pt.
+      VStack(alignment: .leading, spacing: 4) {
+        HStack(spacing: 6) {
+          Text("File")
+          Spacer(minLength: 8)
+          if snapshot.lutLoading { ProgressView().controlSize(.small) }
+          Button(snapshot.lutName == nil ? "Load…" : "Change…") { context.send(.chooseLUT(cameraID: camera.id)) }
+            .disabled(snapshot.lutLoading)
+            .help("Choose a .cube LUT. Your selection is remembered between launches. ⌘O")
+        }
         Text(snapshot.lutLoading ? "Loading…" : snapshot.lutName.map { ($0 as NSString).deletingPathExtension } ?? "None")
-          .lineLimit(1).truncationMode(.middle).fontWeight(.semibold)
+          .fontWeight(.semibold)
+          .fixedSize(horizontal: false, vertical: true)
           .help(snapshot.lutName ?? "")
-        Button(snapshot.lutName == nil ? "Load…" : "Change…") { context.send(.chooseLUT(cameraID: camera.id)) }
-          .layoutPriority(2)
-          .disabled(snapshot.lutLoading)
-          .help("Choose a .cube LUT. Your selection is remembered between launches. ⌘O")
       }
       .accessibilityElement(children: .contain)
       .accessibilityLabel("LUT file")
@@ -306,8 +318,26 @@ struct UIInspectorViewContent: View {
       if snapshot.lutName != nil || snapshot.lutError != nil {
         HStack {
           Spacer()
-          Button("Remove LUT") { context.send(.forgetLUT(cameraID: camera.id)) }
-            .help("Stop applying a LUT to \(camera.name). The file on disk is kept.")
+          // Asks first only while the LUT is in live use: on air, or burned into a take.
+          Button("Remove LUT") {
+            if !liveLUTCameras(camera, snapshot: snapshot).isEmpty {
+              confirmingLUTRemoval = camera.id
+            } else {
+              context.send(.forgetLUT(cameraID: camera.id))
+            }
+          }
+          .help("Stop applying a LUT to \(camera.name). The file on disk is kept.")
+          .confirmationDialog("Remove the LUT from \(camera.name)?",
+            isPresented: Binding(get: { confirmingLUTRemoval == camera.id }, set: { if !$0 { confirmingLUTRemoval = nil } }),
+            titleVisibility: .visible) {
+            Button("Remove LUT", role: .destructive) {
+              confirmingLUTRemoval = nil
+              context.send(.forgetLUT(cameraID: camera.id))
+            }
+            Button("Cancel", role: .cancel) { confirmingLUTRemoval = nil }
+          } message: {
+            Text(lutRemovalMessage(camera: camera, snapshot: snapshot))
+          }
         }
       }
     } header: {
@@ -360,7 +390,9 @@ struct UIInspectorViewContent: View {
     } header: {
       UIInspectorHeader(title: "Recording", symbol: UISymbol.record)
     } footer: {
-      Text("Records the camera original with embedded audio: no LUT or effects.")
+      Text(UIPresentationBuilder.recordsLUT(snapshot, in: context.session)
+        ? "Records the camera original with embedded audio and its LUT burned in."
+        : "Records the camera original with embedded audio: no LUT or effects.")
         .font(.uiMeta).foregroundStyle(.secondary)
     }
   }
@@ -406,9 +438,63 @@ struct UIInspectorViewContent: View {
     case .connecting: return "Starting…"
     case .live(let format): return [format, snapshot.sourcePixel].compactMap { $0 }.joined(separator: "  ")
     case .noSignal: return "No signal"
-    case .unsupported(let mode): return mode
+    // The backend's reason is a sentence; the row says what it is, and `signalDetail` why.
+    case .unsupported: return "Unsupported format"
     case .deviceMissing: return "Input disconnected"
     }
+  }
+
+  /// The Device picker's help: the input's full name, which the picker may truncate, then what to do.
+  nonisolated static func deviceHelp(_ snapshot: UICameraSnapshot) -> String {
+    let action = snapshot.running ? "Stop the camera to change its input."
+      : "Choose an input device. Shared inputs may serve more than one camera."
+    guard snapshot.inputID != nil, let name = snapshot.inputName, !name.isEmpty else { return action }
+    return "\(name). \(action)"
+  }
+
+  /// The backend's reason a format is unsupported, for the line under the Signal row.
+  nonisolated static func signalDetail(_ snapshot: UICameraSnapshot) -> String? {
+    guard case .unsupported(let reason) = snapshot.signal, !reason.isEmpty else { return nil }
+    return reason
+  }
+
+  /// A signal is arriving, so the Signal row already names its format.
+  nonisolated static func signalIsLive(_ snapshot: UICameraSnapshot) -> Bool {
+    guard snapshot.running, case .live = snapshot.signal else { return false }
+    return true
+  }
+
+  /// The LUT is changing a picture someone is receiving: the LUT is on, and the camera is
+  /// on air or ISO, or the LUT is burned into the take being recorded.
+  static func lutInLiveUse(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> Bool {
+    camera.lutIsOn && (camera.tally.isRed || burnsIntoTake(snapshot))
+  }
+
+  private static func burnsIntoTake(_ snapshot: UICameraSnapshot) -> Bool {
+    (snapshot.recording.status == .recording || snapshot.recording.status == .paused) && snapshot.recording.takeBurnsInLUT
+  }
+
+  /// The cameras Remove LUT would change live: this one, or with Sync cameras on (which
+  /// removes the LUT from every camera) each camera whose LUT is in live use.
+  private func liveLUTCameras(_ camera: UICameraPresentation, snapshot: UICameraSnapshot)
+    -> [(camera: UICameraPresentation, snapshot: UICameraSnapshot)] {
+    let candidates = context.session.syncCameras ? context.presentation.cameras : [camera]
+    return candidates.compactMap { candidate -> (camera: UICameraPresentation, snapshot: UICameraSnapshot)? in
+      let found: UICameraSnapshot? = candidate.id == camera.id ? snapshot : context.snapshot(candidate.id)
+      guard let current = found,
+        Self.lutInLiveUse(camera: candidate, snapshot: current) else { return nil }
+      return (camera: candidate, snapshot: current)
+    }
+  }
+
+  private func lutRemovalMessage(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> String {
+    let lines = liveLUTCameras(camera, snapshot: snapshot).map { live -> String in
+      let onAir = live.camera.tally.isRed
+      let uses = [onAir ? "on air" : nil, Self.burnsIntoTake(live.snapshot) ? "burned into the recording" : nil]
+        .compactMap { $0 }
+      return "\(live.camera.name)'s LUT is \(uses.joined(separator: " and "))."
+    }
+    return (lines + ["The picture changes at once. The file on disk is kept."]).joined(separator: " ")
   }
 }
 

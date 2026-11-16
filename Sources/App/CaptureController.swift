@@ -1097,6 +1097,7 @@ final class CaptureController: @unchecked Sendable {
   /// Capture-side work binds immutable actual declarations and enqueues metadata
   /// before media. JSON/file operations stay on the recorder's private queue.
   private func bindRecordingTakeContext(feedID: FeedID, install: UInt64, token: UInt64) {
+    var replay = false
     let pending = lock.withLock { () -> (SourceRecordingCallbackAdapter.Callbacks, RecordingTakeContext)? in
       guard generation == token, accepting, let route = recordingCallbacks[feedID], route.install == install,
         !route.takeContextBinding, !route.takeContextRejected else { return nil }
@@ -1113,7 +1114,12 @@ final class CaptureController: @unchecked Sendable {
         mappingRevision: declaredMappingRevision, videoMapping: videoClockMapping, audioMapping: audioClockMapping)
       if let prior = route.boundTakeContext, route.takeContextAccepted, prior.sameContract(as: context),
         prior.mappingRevision == context.mappingRevision, prior.videoMapping == context.videoMapping,
-        prior.audioMapping == context.audioMapping { return nil }
+        prior.audioMapping == context.audioMapping {
+        // A second admission of the same source (the installing thread after the driver
+        // thread) can park media while its flag is down. Nothing rebinds, so replay it here.
+        replay = !route.discovery.pending.isEmpty && !route.discovery.draining
+        return nil
+      }
       if route.boundTakeContext == nil, route.callbacks.clockMapping != nil {
         // A take joining between an update and its next effective delivery must
         // preserve that already-known event after its initial context metadata.
@@ -1130,7 +1136,10 @@ final class CaptureController: @unchecked Sendable {
       recordingCallbacks[feedID]?.takeContextAccepted = false
       return (route.callbacks, context)
     }
-    guard let pending else { return }
+    guard let pending else {
+      if replay { drainRecordingDiscovery(feedID: feedID, install: install, token: token) }
+      return
+    }
     guard pending.0.takeContext?(pending.1) ?? true else {
       rejectRecordingMetadata(feedID: feedID, install: install, token: token)
       return
@@ -1384,6 +1393,10 @@ final class CaptureController: @unchecked Sendable {
     duration: CMTime? = nil) -> PipelineConfiguration {
     var result = pipelineEnabled ? configuration : PipelineConfiguration(
       applyLUT: false, downscale: false, convertTo420: false, reduceFrameRate: false)
+    // A manual RGB profile interprets pixels for the LUT. Without that LUT,
+    // camera output carries the source's original declared encoding instead.
+    // Keep the saved profile intact for the monitor and the next LUT toggle.
+    if !result.applyLUT { result.sourceColorimetryOverride = nil }
     result.sourceDuration = duration ?? source?.format.rate.nominal ?? configuration.resolvedSourceDuration
     if let source {
       result.sourceWidth = source.sourceSize.width
@@ -1428,10 +1441,20 @@ final class CaptureController: @unchecked Sendable {
     sourceFormat: SourceFormat? = nil) {
     let prior = activeConfiguration
     let priorType = activeInputType
+    // Geometry alone cannot identify a camera contract: LUT and source-profile
+    // changes can alter its encoded colour while retaining size and cadence.
+    let priorColour = prior.flatMap {
+      try? CameraSink.resolvedOutputColour(configuration: $0, sourceFormat: activeSourceFormat)
+    }
+    let nextColour = try? CameraSink.resolvedOutputColour(configuration: next, sourceFormat: sourceFormat)
+    let sameColour = priorColour == nextColour && (priorColour != nil || prior.map {
+      $0.applyLUT == next.applyLUT && $0.sourceColorimetryOverride == next.sourceColorimetryOverride &&
+        $0.lutOutputColorimetry == next.lutOutputColorimetry
+    } == true)
     let sameContract = prior.map {
       $0.width == next.width && $0.height == next.height &&
         $0.pixelFormat == next.pixelFormat && $0.duration == next.duration &&
-        $0.untouched == next.untouched && activeInputType == inputType && activeSourceFormat == sourceFormat
+        $0.untouched == next.untouched && activeInputType == inputType && activeSourceFormat == sourceFormat && sameColour
     } ?? false
     activeConfiguration = next
     activeInputType = inputType
@@ -1547,13 +1570,21 @@ final class CaptureController: @unchecked Sendable {
     } else {
       controlQueue.async {
         let error = work()
-        self.queue.async { self.finishConnect(attempt, error: error, wasConnected: wasConnected) }
+        self.queue.async {
+          guard self.finishConnect(attempt, error: error, wasConnected: wasConnected) else { return }
+          // During a signal outage no frame arrives to publish the result. Otherwise the
+          // next frame does, as it always has.
+          let (token, lost) = self.lock.withLock { (self.generation, self.signalLostAt != nil) }
+          if lost, self.isAccepting(token) { self.publishCurrent(token: token) }
+        }
       }
     }
   }
 
-  private func finishConnect(_ attempt: UInt64, error: Error?, wasConnected: Bool) {
-    guard attempt == cameraAttempt, cameraConnecting else { return }
+  /// False when the attempt is no longer the current one.
+  @discardableResult
+  private func finishConnect(_ attempt: UInt64, error: Error?, wasConnected: Bool) -> Bool {
+    guard attempt == cameraAttempt, cameraConnecting else { return false }
     cameraConnecting = false
     if let error {
       cameraMessage = "Camera output unavailable — \(error.localizedDescription)"
@@ -1569,6 +1600,7 @@ final class CaptureController: @unchecked Sendable {
       cameraConnectError = nil
       cameraMessage = "Ultracam camera connected. Choose it in your meeting app."
     }
+    return true
   }
 
   /// Capture queue, per delivered frame: at most every five seconds while the
@@ -2136,15 +2168,21 @@ final class CaptureController: @unchecked Sendable {
     }
   }
 
-  /// Returns true when the frame is retained or the pending take was refused.
+  /// `held` is true when the frame is retained or the pending take was refused. Otherwise
+  /// `route` is the take as it is now: the caller's copy predates this check, and a bind
+  /// that finished in between would have the frame skipped as not yet accepted.
   private func retainRecordingDiscovery(_ route: RecordingRoute, image: CVPixelBuffer,
     source: SourceAdmissionSnapshot, metadata: SourceAdmissionMetadata, timecode: Timecode?,
-    feed: FeedID, token: UInt64) -> Bool {
+    feed: FeedID, token: UInt64) -> (held: Bool, route: RecordingRoute) {
+    var latest = route
     let outcome = lock.withLock { () -> Int in
       guard generation == token, accepting, let current = recordingCallbacks[feed],
         current.install == route.install, !current.takeContextRejected else { return 1 }
       let state = current.discovery
-      guard !current.sourceAdmissionAccepted || !current.takeContextAccepted || state.draining || !state.pending.isEmpty else { return 0 }
+      guard !current.sourceAdmissionAccepted || !current.takeContextAccepted || state.draining || !state.pending.isEmpty else {
+        latest = current
+        return 0
+      }
       do {
         let lease = try state.budget.admit(bytes: Self.storageBytes(image), duration: metadata.duration.seconds)
         state.pending.append(.video(PendingRecordingVideo(image: image, source: source, metadata: metadata,
@@ -2156,7 +2194,7 @@ final class CaptureController: @unchecked Sendable {
       rejectRecordingMetadata(feedID: feed, install: route.install, token: token,
         message: "Recording audio discovery pending-media limit exceeded; start a new take after the source resolves.")
     }
-    return outcome != 0
+    return (outcome != 0, latest)
   }
 
   private func drainRecordingDiscovery(feedID: FeedID, install: UInt64, token: UInt64) {
@@ -2262,12 +2300,14 @@ final class CaptureController: @unchecked Sendable {
     // independent of processing. Metadata-only checks: no pixel scan,
     // conversion or waiting. Malformed inputs stay out of the recorder while
     // its invalid-sample telemetry and processing's error reporting remain.
-    if let route = admitted.0 {
-      let pending: Bool
+    if var route = admitted.0 {
+      var pending = false
       if signalValid, recordingFormatValid, let sourceAdmission, let sourceMetadata, let feed = admitted.3 {
-        pending = retainRecordingDiscovery(route, image: image, source: sourceAdmission,
+        let checked = retainRecordingDiscovery(route, image: image, source: sourceAdmission,
           metadata: sourceMetadata, timecode: nativeTimecode, feed: feed, token: token)
-      } else { pending = false }
+        pending = checked.held
+        route = checked.route
+      }
       if !pending {
         appendRecordingVideo(route, image: image, pts: pts, duration: admitted.1, signalValid: signalValid,
           recordingFormatValid: recordingFormatValid, sourceAdmission: sourceAdmission,
@@ -2325,10 +2365,11 @@ final class CaptureController: @unchecked Sendable {
         audio.channels, audio.bytesPerSample)
     }
     if state.1 {
+      let audioPresent = audio.samples != nil && audio.sampleFrames > 0 && audio.channels > 0 && validRawFormat
       receiveMedia(CaptureMediaStats(timecode: nil, audioPacketTime: audio.packetTime,
         audioSampleFrames: audio.sampleFrames, audioChannels: audio.channels,
         leftPeak: 0, rightPeak: 0, leftRMS: 0, rightRMS: 0,
-        audioBytes: UInt64(audio.samples?.count ?? 0), audioPresent: audio.samples != nil), token: token)
+        audioBytes: UInt64(audio.samples?.count ?? 0), audioPresent: audioPresent), token: token)
     }
     // Last, after the generation guard: recording admission never waits on the
     // meters, and a stopped stream's packets are never metered. The tap only
@@ -2678,10 +2719,17 @@ final class CaptureController: @unchecked Sendable {
   private func publishIfDue(token: UInt64, force: Bool = false) {
     let now = ProcessInfo.processInfo.systemUptime
     guard force || now - lastPublished >= 0.25 else { return }
-    let elapsed = now - rateStart
-    outputFPS = rateStart == 0 ? 0 : Double(frames - rateFrames) / elapsed
-    rateStart = now
-    rateFrames = frames
+    // A forced publish can follow the last one by milliseconds: too short a window to
+    // measure a rate over, so the previous figure stands until a quarter second has passed.
+    if rateStart == 0 {
+      outputFPS = 0
+      rateStart = now
+      rateFrames = frames
+    } else if now - rateStart >= 0.25 {
+      outputFPS = Double(frames - rateFrames) / (now - rateStart)
+      rateStart = now
+      rateFrames = frames
+    }
     if videoRateStart == 0 { videoRateStart = now }
     if now - videoRateStart >= 0.25 {
       videoBitrateMbps = Double(videoRateBytes) * 8 / (now - videoRateStart) / 1_000_000

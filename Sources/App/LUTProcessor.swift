@@ -674,9 +674,14 @@ final class LUTProcessor: @unchecked Sendable {
     try submitPassthrough(input, isCurrent: isCurrent) { completed in
       if case .success(let output) = completed.result {
         Self.stampDeclaredColorimetry(colour, on: output)
-        CVBufferSetAttachment(output, kCVImageBufferPixelAspectRatioKey,
-          [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: NSNumber(value: aspect.numerator),
-           kCVImageBufferPixelAspectRatioVerticalSpacingKey: NSNumber(value: aspect.denominator)] as CFDictionary, .shouldPropagate)
+        if aspect == .one {
+          CVBufferRemoveAttachment(output, kCVImageBufferPixelAspectRatioKey)
+        } else {
+          CVBufferSetAttachment(output, kCVImageBufferPixelAspectRatioKey,
+            [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: NSNumber(value: aspect.numerator),
+             kCVImageBufferPixelAspectRatioVerticalSpacingKey: NSNumber(value: aspect.denominator)] as CFDictionary, .shouldPropagate)
+        }
+        Self.canonicalizeOutputGeometry(output)
       }
       completion(completed)
     }
@@ -796,7 +801,19 @@ final class LUTProcessor: @unchecked Sendable {
     guard !configuration.outputColor.is420 || (outputWidth.isMultiple(of: 2) && outputHeight.isMultiple(of: 2)) else {
       throw VideoError.message("The selected YUV output requires even chroma geometry; choose a resized output.")
     }
-    if let renderTarget { try Self.validateRenderTarget(renderTarget, configuration: configuration, width: outputWidth, height: outputHeight) }
+    if let renderTarget {
+      try Self.validateRenderTarget(renderTarget, configuration: configuration, width: outputWidth, height: outputHeight)
+      // A render target is written by the same command buffer that reads the
+      // capture frame. Mapping one IOSurface for both roles would make the
+      // compute pass read and write aliased textures with no defined ordering.
+      // This can happen when a caller reuses an encoder buffer as its source,
+      // even though the pixel-buffer objects themselves are distinct.
+      if let sourceSurface = CVPixelBufferGetIOSurface(input)?.takeUnretainedValue(),
+         let targetSurface = CVPixelBufferGetIOSurface(renderTarget)?.takeUnretainedValue(),
+         IOSurfaceGetID(sourceSurface) == IOSurfaceGetID(targetSurface) {
+        throw VideoError.message("The render target aliases the input IOSurface.")
+      }
+    }
     let pool = try renderTarget == nil ? preparePool(configuration, width: outputWidth, height: outputHeight) : nil
     var created: CVPixelBuffer? = renderTarget
     let status = pool.map { CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, $0, allocationLimit(slotBytes: outputSlotBytes), &created) } ?? kCVReturnSuccess
@@ -1340,8 +1357,12 @@ final class LUTProcessor: @unchecked Sendable {
       entry.lastUsedTime = monotonicNow()
       return entry
     }
-    if let stale = outputTextures.removeValue(forKey: key) {
+    if let stale = outputTextures[key], stale.surface !== surface {
+      // Do not drop the cache lease before the idle wait. If the watchdog
+      // expires, the GPU may still reference this texture; removing the entry
+      // first would release its budget reservation while that use is live.
       guard waitUntilIdle(timeout: 2) else { throw VideoError.message("The GPU stopped responding.") }
+      outputTextures.removeValue(forKey: key)
       outputResidency.removeAllocation(stale.texture)
     }
     let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height,
@@ -1427,6 +1448,24 @@ final class LUTProcessor: @unchecked Sendable {
 
   // MARK: - Metadata
 
+  private static func canonicalizeOutputGeometry(_ output: CVPixelBuffer) {
+    // Square pixels are the default in the published formats, regardless of
+    // whether the capture SDK explicitly attached a 1:1 ratio.
+    if let aspect = CVBufferCopyAttachment(output, kCVImageBufferPixelAspectRatioKey, nil) as? [String: NSNumber],
+       let horizontal = aspect[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String]?.doubleValue,
+       let vertical = aspect[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String]?.doubleValue,
+       horizontal.isFinite, horizontal > 0, horizontal == vertical {
+      CVBufferRemoveAttachment(output, kCVImageBufferPixelAspectRatioKey)
+    }
+    // Published progressive camera modes omit FieldCount. A source's explicit
+    // single-field tag means the same thing, but fails exact format admission.
+    // Keep interlaced/field-detail metadata so it cannot masquerade as progressive.
+    if CVBufferCopyAttachment(output, kCVImageBufferFieldCountKey, nil) as? NSNumber == 1,
+       CVBufferCopyAttachment(output, kCVImageBufferFieldDetailKey, nil) == nil {
+      CVBufferRemoveAttachment(output, kCVImageBufferFieldCountKey)
+    }
+  }
+
   /// A bit-exact typed copy inherits the immutable source declaration, even
   /// when raw CPU ingest supplied no Core Video colour attachments. Preserve
   /// the complete contract for spaces Core Video cannot represent directly.
@@ -1437,18 +1476,38 @@ final class LUTProcessor: @unchecked Sendable {
       kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocationBottomFieldKey] {
       CVBufferRemoveAttachment(output, key)
     }
-    let primaries: [Colorimetry.Primaries: CFString] = [.rec709: kCVImageBufferColorPrimaries_ITU_R_709_2,
-      .rec2020: kCVImageBufferColorPrimaries_ITU_R_2020, .p3D65: kCVImageBufferColorPrimaries_P3_D65]
-    let transfers: [Colorimetry.Transfer: CFString] = [.rec709: kCVImageBufferTransferFunction_ITU_R_709_2,
-      .sRGB: kCVImageBufferTransferFunction_sRGB, .linear: kCVImageBufferTransferFunction_Linear,
-      .pq: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .hlg: kCVImageBufferTransferFunction_ITU_R_2100_HLG]
-    let matrices: [Colorimetry.Matrix: CFString] = [.rec709: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-      .rec2020: kCVImageBufferYCbCrMatrix_ITU_R_2020, .rec601: kCVImageBufferYCbCrMatrix_ITU_R_601_4]
-    for (key, value) in [(kCVImageBufferColorPrimariesKey, primaries[colour.primaries]),
-      (kCVImageBufferTransferFunctionKey, transfers[colour.transfer]),
-      (kCVImageBufferYCbCrMatrixKey, matrices[colour.matrix])] {
-      if let value { CVBufferSetAttachment(output, key, value, .shouldPropagate) }
+    // Full-range is part of the transport declaration for untouched copies
+    // (packed formats have no range in their FourCC). Remove any stale pool
+    // value, then stamp the source contract explicitly.
+    CVBufferRemoveAttachment(output, kCMFormatDescriptionExtension_FullRangeVideo)
+    CVBufferSetAttachment(output, kCMFormatDescriptionExtension_FullRangeVideo,
+      (colour.range == .full ? kCFBooleanTrue : kCFBooleanFalse), .shouldPropagate)
+    let primaries: CFString?
+    switch colour.primaries {
+    case .rec709: primaries = kCVImageBufferColorPrimaries_ITU_R_709_2
+    case .rec2020: primaries = kCVImageBufferColorPrimaries_ITU_R_2020
+    case .p3D65: primaries = kCVImageBufferColorPrimaries_P3_D65
+    default: primaries = nil
     }
+    if let primaries { CVBufferSetAttachment(output, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate) }
+    let transfer: CFString?
+    switch colour.transfer {
+    case .rec709: transfer = kCVImageBufferTransferFunction_ITU_R_709_2
+    case .sRGB: transfer = kCVImageBufferTransferFunction_sRGB
+    case .linear: transfer = kCVImageBufferTransferFunction_Linear
+    case .pq: transfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+    case .hlg: transfer = kCVImageBufferTransferFunction_ITU_R_2100_HLG
+    default: transfer = nil
+    }
+    if let transfer { CVBufferSetAttachment(output, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate) }
+    let matrix: CFString?
+    switch colour.matrix {
+    case .rec709: matrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+    case .rec2020: matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
+    case .rec601: matrix = kCVImageBufferYCbCrMatrix_ITU_R_601_4
+    default: matrix = nil
+    }
+    if let matrix { CVBufferSetAttachment(output, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate) }
     let location: CFString?
     switch (colour.horizontalChromaSiting, colour.verticalChromaSiting) {
     case (.left, .top): location = kCVImageBufferChromaLocation_TopLeft
@@ -1475,6 +1534,7 @@ final class LUTProcessor: @unchecked Sendable {
     CVBufferRemoveAllAttachments(output)
     CVBufferPropagateAttachments(input, output)
     CVBufferRemoveAttachment(output, Self.declaredColorimetryAttachmentKey)
+    Self.canonicalizeOutputGeometry(output)
     // Encoders average each pair/block, producing centered chroma even if input
     // samples were left-cosited. Never carry the source's location onto output.
     CVBufferSetAttachment(output, kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Center, .shouldPropagate)

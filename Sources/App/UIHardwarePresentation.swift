@@ -211,9 +211,8 @@ enum UIHardwareText {
   static func formatGroups(_ modes: [SourceFormat]) -> [(size: String, rates: [String])] {
     var groups: [(size: String, rates: [String])] = []
     for mode in modes {
-      let parts = FormatDisplayIdentity(mode).short.split(separator: " ").map(String.init)
-      guard let size = parts.first else { continue }
-      let rate = parts.dropFirst().joined(separator: " ")
+      let identity = FormatDisplayIdentity(mode)
+      let size = identity.shortSize, rate = identity.shortRate
       if let index = groups.firstIndex(where: { $0.size == size }) {
         if !groups[index].rates.contains(rate) { groups[index].rates.append(rate) }
       } else { groups.append((size, [rate])) }

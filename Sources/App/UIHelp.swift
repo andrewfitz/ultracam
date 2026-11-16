@@ -20,10 +20,10 @@ struct UIHelpView: View {
     ("⇧⌘R", "Pause or resume the selected camera's recording"),
     ("⌥⌘R", "Record all or stop all recordings"),
     ("⌥⌘P", "Pause All, or Resume All when every take is paused"),
-    ("⌃1–⌃4", "Cut Program to a camera"),
+    ("⌃1–⌃4", "Cut Program to camera 1 to 4"),
     ("⌃⌥A", "Automatic switching"),
     ("⌃⌥H", "Hold the current shot: Auto stays on and makes no cuts"),
-    ("⌘1–⌘4", "Select a camera"),
+    ("⌘1–⌘4", "Select camera 1 to 4"),
     ("⌥⌘1–⌥⌘4", "Layout: Single, Side by Side, Program View, Four Up"),
     ("⌃⌘S", "Show or hide the sidebar"),
     ("⌥⌘S", "Collapse or expand all strips"),
@@ -44,7 +44,7 @@ struct UIHelpView: View {
 
   /// Work while a meeting app is in front, once turned on in Settings › General.
   private let backgroundShortcuts: [(String, String)] = [
-    ("⌃⌥⌘1–⌃⌥⌘7", "Cut Program to a camera"),
+    ("⌃⌥⌘1–⌃⌥⌘7", "Cut Program to camera 1 to 7"),
     ("⌃⌥⌘A", "Automatic switching"),
     ("⌃⌥⌘H", "Hold the current shot"),
     ("⌃⌥⌘R", "Record every camera that can. It never stops a take"),
@@ -84,7 +84,7 @@ struct UIHelpView: View {
       } header: {
         Text("Keyboard Shortcuts")
       } footer: {
-        Text("⌃1–⌃4 are also Mission Control's Switch to Desktop shortcuts. If a cut does nothing, turn those off in System Settings › Keyboard › Keyboard Shortcuts › Mission Control, or cut with the toolbar.")
+        Text("The keys and the Camera and Program menus cover cameras 1 to 4. Cut a higher-numbered camera with the toolbar or its strip's Cut button, and click its picture or its sidebar row to select it. ⌃1–⌃4 are also Mission Control's Switch to Desktop shortcuts, and macOS takes them first while those are on. If a cut does nothing, turn them off in System Settings › Keyboard › Keyboard Shortcuts › Mission Control, or cut with the toolbar.")
           .font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -93,7 +93,7 @@ struct UIHelpView: View {
       } header: {
         Text("Background Shortcuts")
       } footer: {
-        Text("Off until you turn them on in [Settings › General](ultracam-settings:general). They reach Ultracam while a meeting app is in front, and the meeting app doesn't get the key.")
+        Text("Off until you turn them on in [Settings › General](ultracam-settings:general). They reach Ultracam while a meeting app is in front, and the meeting app doesn't get the key. Cuts cover cameras 1 to 7, numbered as in the toolbar.")
           .font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }

@@ -17,6 +17,10 @@ struct FormatDisplayIdentity: Hashable, Sendable {
   let frameRate: String
   /// The signal's short label in the camera strip and its badge: "2160p 59.94".
   let short: String
+  /// The two halves of `short`: "2160p" ("2160p DCI" for the 17:9 sizes, which share a
+  /// height with UHD and HD) and "59.94".
+  let shortSize: String
+  let shortRate: String
 
   init(_ format: SourceFormat) {
     resolution = Self.resolution(width: format.width, height: format.height)
@@ -28,8 +32,10 @@ struct FormatDisplayIdentity: Hashable, Sendable {
     pixel = sampling + (PixelFormatTable.entry(for: format.pixel)?.packed == true ? " packed" : "")
     scan = format.scan == .progressive ? "Progressive" : (format.scan == .interlaced ? "Interlaced" : "Progressive segmented frame")
     frameRate = Self.rate(format.rate)
-    short = "\(format.height)\(format.scan == .interlaced ? "i" : "p") "
-      + (frameRate.hasSuffix(" fps") ? String(frameRate.dropLast(4)) : "VFR")
+    let dci = (format.width, format.height) == (4096, 2160) || (format.width, format.height) == (2048, 1080)
+    shortSize = "\(format.height)\(format.scan == .interlaced ? "i" : "p")" + (dci ? " DCI" : "")
+    shortRate = frameRate.hasSuffix(" fps") ? String(frameRate.dropLast(4)) : "VFR"
+    short = "\(shortSize) \(shortRate)"
   }
 
   /// A compact, stable label suitable for menus and signal chips.

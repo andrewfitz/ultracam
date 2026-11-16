@@ -17,7 +17,7 @@ class CompleteGateTests(unittest.TestCase):
 
     def fixture(self, *, register_vendor=True, skipped=False, required=False,
                 missing_source=False, duplicate_registration=False, extension=False,
-                runtime_count=1):
+                runtime_count=1, failed=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'scripts').mkdir()
@@ -38,7 +38,7 @@ class CompleteGateTests(unittest.TestCase):
             log = root / 'runtime.log'
             log.write_text(("Test Case '-[main.VendorChecks testProof]' skipped (0.0 seconds).\n"
                             if skipped else '') +
-                           f"Test Suite 'VendorChecks' passed\n Executed {runtime_count} tests\n")
+                           f"Test Suite 'VendorChecks' {'failed' if failed else 'passed'}\n Executed {runtime_count} tests\n")
             env = dict(os.environ, ULTRACAM_REQUIRE_GPU_PROOFS='1' if required else '0')
             return subprocess.run([sys.executable, str(root / 'scripts/check-test-coverage.py'),
                                    str(log), '--root', str(root)],
@@ -72,6 +72,9 @@ class CompleteGateTests(unittest.TestCase):
 
     def test_partial_runtime_suite_is_rejected(self):
         self.assertNotEqual(self.fixture(runtime_count=0).returncode, 0)
+
+    def test_failed_runtime_suite_is_rejected(self):
+        self.assertNotEqual(self.fixture(failed=True).returncode, 0)
 
     def test_skipped_proof_is_qualified_and_required_lane_refuses(self):
         result = self.fixture(skipped=True)

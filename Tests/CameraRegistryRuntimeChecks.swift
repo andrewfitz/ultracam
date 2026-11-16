@@ -4,6 +4,53 @@ import CoreVideo
 import XCTest
 
 @objcMembers final class CameraRegistryRuntimeChecks: XCTestCase {
+  @MainActor
+  func testRegistryPublisherDoesNotBlockMainActorAndCoalescesPendingIntent() {
+    let started = expectation(description: "First publication started")
+    let latest = expectation(description: "Latest publication applied")
+    let release = DispatchSemaphore(value: 0)
+    let publisher = VirtualCameraRegistryPublisher(observeTopology: false) { snapshot in
+      XCTAssertFalse(Thread.isMainThread)
+      if snapshot.generation == 1 {
+        started.fulfill()
+        XCTAssertEqual(release.wait(timeout: .now() + 3), .success)
+      } else {
+        XCTAssertEqual(snapshot.generation, 3, "Superseded intent must not replay")
+        latest.fulfill()
+      }
+    }
+    let begin = ProcessInfo.processInfo.systemUptime
+    publisher.publish(VirtualCameraRegistrySnapshot(generation: 1))
+    XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - begin, 0.5)
+    wait(for: [started], timeout: 2)
+    publisher.publish(VirtualCameraRegistrySnapshot(generation: 2))
+    publisher.publish(VirtualCameraRegistrySnapshot(generation: 3))
+    release.signal()
+    wait(for: [latest], timeout: 2)
+    withExtendedLifetime(publisher) {}
+  }
+
+  func testQueuedPublicationCannotRebaseIntentSupersededByCapture() throws {
+    let old = VirtualCameraRegistrySnapshot(generation: 1, devices: [
+      .feed(feedID: FeedID.primary.rawValue, displayName: "Old")])
+    let newest = VirtualCameraRegistrySnapshot(generation: 2, devices: [
+      .feed(feedID: FeedID.primary.rawValue, displayName: "Newest")])
+    VirtualCameraRegistryTransport.recordIntent(old)
+    // Capture records its current intent before acquiring the transport lock.
+    VirtualCameraRegistryTransport.recordIntent(newest)
+    // A capture that obtained its snapshot before the edit cannot replace the
+    // newer local intent when it eventually reaches transport admission.
+    VirtualCameraRegistryTransport.recordIntent(old)
+    var provider = newest
+    provider.generation = 40
+    XCTAssertNil(try VirtualCameraRegistryTransport.publicationUpdate(old, after: provider))
+    XCTAssertNil(try VirtualCameraRegistryTransport.publicationUpdate(newest, after: provider))
+    provider.devices = old.devices
+    let update = try VirtualCameraRegistryTransport.publicationUpdate(newest, after: provider)
+    XCTAssertEqual(update?.devices, newest.devices)
+    XCTAssertEqual(update?.generation, 41)
+  }
+
   private func applyControl(_ snapshot: VirtualCameraRegistrySnapshot, to camera: CameraProvider) throws {
     let properties = CMIOExtensionProviderProperties(dictionary: [:])
     properties.setPropertyState(CMIOExtensionPropertyState(
@@ -11,6 +58,41 @@ import XCTest
       attributes: nil), forProperty: VirtualCameraRegistryWire.property)
     try camera.setProviderProperties(properties)
   }
+
+#if ULTRACAM_TEST_SUPPORT
+  func testStreamLifecycleUsesOwningQueueAcrossIndependentRuntimes() throws {
+    let first = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let second = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let secondQueue = second.queue
+    second.queue.sync {
+      second.makeGPUStandbyProducerForTesting = {
+        dispatchPrecondition(condition: .onQueue(secondQueue))
+        throw VideoError.message("Injected preparation refusal")
+      }
+      second.source.authorizeSourceForTesting(clientID: UUID())
+      second.onDemandChange = { dispatchPrecondition(condition: .onQueue(secondQueue)) }
+    }
+    try first.queue.sync {
+      XCTAssertThrowsError(try second.source.startStream())
+    }
+    second.queue.sync { second.source.authorizeSourceForTesting(clientID: UUID()) }
+    try first.queue.sync { try second.source.stopStream() }
+    XCTAssertEqual(second.consumers, 0)
+  }
+
+  func testStreamLifecycleAllowsRuntimesSharingOneQueue() throws {
+    let queue = DispatchQueue(label: "org.ultracam.shared-runtime-test")
+    let first = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false, queue: queue)
+    let second = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false, queue: queue)
+    try queue.sync {
+      XCTAssertThrowsError(try first.sink.startStream())
+      try first.source.stopStream()
+      XCTAssertThrowsError(try second.sink.startStream())
+      try second.source.stopStream()
+    }
+  }
+
+#endif
 
   func testLiveRegistryControlReplacesBootstrapWithoutSharedPreferences() throws {
     // The system service has no access to the host user's defaults. Start it
@@ -433,6 +515,120 @@ import XCTest
     camera.queue.sync { runtime.source.disconnectSourceForTesting(clientID: second) }
     camera.queue.sync {}
     XCTAssertNil(camera.runtime(for: feed.id))
+  }
+
+  // CMIO may call start/stop once per client. The second viewer stops and
+  // then disconnects; the first viewer is still streaming throughout.
+  func testSecondViewerStopThenDisconnectKeepsFirstViewerDemand() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "second-viewer-stop-disconnect")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let first = UUID(), second = UUID()
+    try camera.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.streamingSourceClientIDsForTesting = [first]
+      runtime.source.authorizeSourceForTesting(clientID: first)
+      try runtime.source.startStream()
+      runtime.source.streamingSourceClientIDsForTesting = [first, second]
+      runtime.source.authorizeSourceForTesting(clientID: second)
+      try runtime.source.startStream()
+      XCTAssertEqual(runtime.consumers, 2)
+      // CMIO has already dropped the stopping client from streamingClients.
+      runtime.source.streamingSourceClientIDsForTesting = [first]
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 1, "The stop releases the client that left the streaming list")
+      runtime.source.disconnectSourceForTesting(clientID: second)
+      XCTAssertEqual(runtime.consumers, 1, "A lease released by stop must not be released again by disconnect")
+      runtime.source.streamingSourceClientIDsForTesting = []
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 0)
+      runtime.source.disconnectSourceForTesting(clientID: first)
+      XCTAssertEqual(runtime.consumers, 0)
+      XCTAssertFalse(runtime.inUse)
+    }
+  }
+
+  // The same sequence when streamingClients has not caught up with the stop:
+  // the stop cannot tell which viewer left, so the disconnect must repair it.
+  func testSecondViewerStopWithStaleStreamingListKeepsFirstViewerDemand() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "second-viewer-stale-list")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let first = UUID(), second = UUID()
+    try camera.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.streamingSourceClientIDsForTesting = [first, second]
+      runtime.source.authorizeSourceForTesting(clientID: first)
+      try runtime.source.startStream()
+      runtime.source.authorizeSourceForTesting(clientID: second)
+      try runtime.source.startStream()
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 1)
+      runtime.source.streamingSourceClientIDsForTesting = [first]
+      runtime.source.disconnectSourceForTesting(clientID: second)
+      XCTAssertEqual(runtime.consumers, 1, "The viewer still listed as streaming keeps demand")
+      runtime.source.streamingSourceClientIDsForTesting = []
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 0)
+      runtime.source.disconnectSourceForTesting(clientID: first)
+      XCTAssertEqual(runtime.consumers, 0)
+      XCTAssertFalse(runtime.inUse)
+    }
+  }
+
+  // CMIO may call start only for the first client and stop only for the last.
+  // The second viewer is then authorized and streaming without a start.
+  func testStartedViewerDisconnectKeepsDemandForStreamingViewerWithoutStart() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "streaming-without-start")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let started = UUID(), joined = UUID()
+    try camera.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.streamingSourceClientIDsForTesting = [started]
+      runtime.source.authorizeSourceForTesting(clientID: started)
+      try runtime.source.startStream()
+      runtime.source.authorizeSourceForTesting(clientID: joined)
+      // The list still names the departing client when its disconnect arrives.
+      runtime.source.streamingSourceClientIDsForTesting = [started, joined]
+      runtime.source.disconnectSourceForTesting(clientID: started)
+      XCTAssertEqual(runtime.consumers, 1, "A viewer that is still streaming keeps demand")
+      XCTAssertFalse(runtime.source.hasPendingStart)
+      // The last client stopping is the one stop callback CMIO delivers.
+      runtime.source.streamingSourceClientIDsForTesting = []
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 0)
+      runtime.source.disconnectSourceForTesting(clientID: joined)
+      XCTAssertEqual(runtime.consumers, 0)
+      XCTAssertFalse(runtime.inUse)
+    }
+  }
+
+  func testStopTrailingDisconnectDoesNotReleaseRemainingViewer() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "stop-after-disconnect")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let runtime = try XCTUnwrap(camera.runtime(for: feed.id))
+    let departed = UUID(), remaining = UUID()
+    try camera.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.streamingSourceClientIDsForTesting = [departed, remaining]
+      runtime.source.authorizeSourceForTesting(clientID: departed)
+      try runtime.source.startStream()
+      runtime.source.authorizeSourceForTesting(clientID: remaining)
+      try runtime.source.startStream()
+      runtime.source.streamingSourceClientIDsForTesting = [remaining]
+      runtime.source.disconnectSourceForTesting(clientID: departed)
+      XCTAssertEqual(runtime.consumers, 1)
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 1, "A stop for the disconnected client must not take the remaining viewer's lease")
+      runtime.source.streamingSourceClientIDsForTesting = []
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 0)
+    }
   }
 
   func testFailedPreparationReleasesPendingLeaseWithoutAdmittingDemand() throws {

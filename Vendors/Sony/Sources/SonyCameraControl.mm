@@ -421,6 +421,13 @@ static NSString *sonyStringProperty(CrDataType type, const CrInt16u *text) {
 static size_t sonyWidth(CrDataType type) {
   switch (type & 0xFFF) { case 1: return 1; case 2: return 2; case 3: return 4; case 4: return 8; default: return 0; }
 }
+// A signed value narrower than 64 bits, widened the same way wherever it is read, so a
+// current value compares equal to the choice it came from.
+static uint64_t sonySignExtended(CrDataType type, uint64_t value) {
+  size_t width = sonyWidth(type);
+  if ((type & CrDataType_SignBit) && width && width < 8 && (value & (1ULL << (width * 8 - 1)))) value |= (~0ULL << (width * 8));
+  return value;
+}
 static std::vector<uint64_t> sonyDecodeChoices(CrDataType type, const uint8_t *bytes, size_t size) {
   std::vector<uint64_t> result;
   size_t width = sonyWidth(type);
@@ -428,8 +435,7 @@ static std::vector<uint64_t> sonyDecodeChoices(CrDataType type, const uint8_t *b
   if (!bytes || size > 65536 || size % width) return result;
   for (size_t i = 0; i < size; i += width) {
     uint64_t value = 0; memcpy(&value, bytes + i, width);
-    if ((type & CrDataType_SignBit) && width < 8 && (value & (1ULL << (width * 8 - 1)))) value |= (~0ULL << (width * 8));
-    result.push_back(value);
+    result.push_back(sonySignExtended(type, value));
   }
   if (type & CrDataType_RangeBit) {
     if (result.size() != 3 || !result[2]) return {};
@@ -713,7 +719,7 @@ static SonyRuntime &sonyRuntime() {
         for (auto value : sonyChoices(p)) [choices addObject:@{@"value": @(value), @"label": sonyLabel(field.code, value)}];
       }
       [fields addObject:@{@"id": sonyString(field.key), @"title": sonyString(field.title), @"code": @(field.code),
-        @"value": @(p.GetCurrentValue()), @"label": sonyLabel(field.code, p.GetCurrentValue()),
+        @"value": @(sonySignExtended(p.GetValueType(), p.GetCurrentValue())), @"label": sonyLabel(field.code, p.GetCurrentValue()),
         @"writable": @(field.editable && p.IsSetEnableCurrentValue() && choices.count > 0), @"choices": choices}];
       break;
     }

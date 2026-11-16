@@ -23,6 +23,8 @@ enum UISymbol {
   static let startWithApps = "bolt.badge.automatic"
   static func hold(on: Bool) -> String { on ? "pin.fill" : "pin" }
   static let shotTime = "timer"
+  /// A pending cut (Next): a shape of its own, so it never rests on green alone.
+  static let nextCut = "arrowtriangle.right.fill"
 
   // Layout and window
   static let inspector = "sidebar.trailing"
@@ -33,6 +35,8 @@ enum UISymbol {
   static let restoreLayout = "arrow.down.right.and.arrow.up.left"
   static let more = "ellipsis.circle"
   static let add = "plus"
+  /// The chevron a hand-drawn menu label or split button opens with (not a strip's collapse).
+  static let menuIndicator = "chevron.down"
 
   // Recording
   static let record = "record.circle"

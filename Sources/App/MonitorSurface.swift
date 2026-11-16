@@ -113,6 +113,10 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   @MainActor private weak var visibilityView: MonitorVisibilityNSView?
   @MainActor private var visibility = (presented: false, drawable: false)
   @MainActor private var visibilityReported = false
+  @MainActor private weak var scopeView: MonitorScopeNSView?
+  /// The scope can be seen in a window that is not the picture's (a popped-out scope).
+  /// While the picture itself cannot be seen, that keeps the surface live for its scope.
+  @MainActor private var scopeAlone = false
 
   init(target: MonitorTargetID, host: MonitorFeedHost, gpu: MonitorGPUContext) {
     self.target = target
@@ -338,6 +342,8 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     do {
       core = try gpu.core(nonblocking: true)
       context = try core.begin()
+    } catch is MonitorGPUContext.Preparing {
+      return  // Not a failure: the core is still being built.
     } catch {
       recordFailure(error)
       return
@@ -566,11 +572,35 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     // A first "not presented" report arrives before the view reaches its window.
     // Passing it on drops monitor demand, which stops and restarts automatic capture.
     let beforeWindow = first && !presented && !drawable
+    // A presented picture nobody can see stays live while its scope is seen elsewhere.
+    let live = drawable || (presented && scopeAlone)
     // The owner stops offering frames first (synchronously), so nothing new lands
     // in the slot after it is dropped.
-    if !beforeWindow { onVisibilityChange?(presented, drawable) }
-    setHidden(!drawable && !beforeWindow)
+    if !beforeWindow { onVisibilityChange?(presented, live) }
+    setHidden(!live && !beforeWindow)
     refresh(force: true)
+  }
+
+  /// Whether the scope can be seen in a window other than the picture's. It matters only
+  /// while the picture is presented but cannot be seen (its window minimized or covered):
+  /// the surface then stays a consumer and keeps its frame, for the scope alone.
+  @MainActor func reportScopeVisibility(alone: Bool) {
+    guard scopeAlone != alone else { return }
+    scopeAlone = alone
+    renderLoop?.setScopeAlone(alone)
+    guard visibilityReported, visibility.presented, !visibility.drawable else { return }
+    onVisibilityChange?(true, alone)
+    setHidden(!alone)
+    refresh(force: true)
+  }
+
+  /// Reads the scope view's visibility again (its window's, or the picture's, changed).
+  @MainActor private func refreshScopeVisibility() {
+    guard let scopeView, let pictureWindow = visibilityView?.window else {
+      reportScopeVisibility(alone: false)
+      return
+    }
+    reportScopeVisibility(alone: scopeView.isDrawable && scopeView.window !== pictureWindow)
   }
 
   /// A surface that cannot be seen keeps no capture frame: its slot and any
@@ -718,8 +748,10 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     view.visibilityChanged = { [weak self, weak view] presented, drawable in
       guard let self, self.visibilityView === view else { return }
       self.reportVisibility(presented: presented, drawable: drawable)
+      self.refreshScopeVisibility()
     }
     visibilityView = view
+    view.renderLoop.setScopeAlone(scopeAlone)
     refresh(force: true)
     return view
   }
@@ -755,6 +787,12 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
           self.scopeLayer = nil
         }
       }
+    }
+    // A scope in a window of its own (popped out) keeps the surface live while it can be seen.
+    view.visibilityChanged = { [weak self, weak view] _, _ in
+      guard let self, let view else { return }
+      if view.window != nil { self.scopeView = view } else if self.scopeView === view { self.scopeView = nil }
+      self.refreshScopeVisibility()
     }
     refresh(force: true)
     return view
@@ -842,7 +880,9 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let shownTools = shown?.preferences ?? currentPreferences
     if shownPreferences != shownTools { shownPreferences = shownTools }
     if shownStatus != drawnStatus { shownStatus = drawnStatus }
+    // A picture kept live for its popped-out scope still publishes what that scope reads.
     let occluded = !frozenNow && visibilityReported && !visibility.drawable
+      && !(visibility.presented && scopeAlone)
     if pending {
       setStatus("Waiting to freeze next picture")
       readout.setDetail(status)
@@ -1169,8 +1209,9 @@ private final class MonitorWindowObservations: @unchecked Sendable {
 /// (`ScopeSettings.atNativeResolution`), so a scope of any size or shape is drawn at
 /// native resolution, never a fixed image stretched. The picture's render loop draws
 /// it with a second display link, one scope per drawn picture frame, so the picture
-/// never waits for a scope drawable.
-@MainActor final class MonitorScopeNSView: NSView {
+/// never waits for a scope drawable. It reports its own visibility (`MonitorVisibilityNSView`):
+/// a scope in a window of its own is drawn while the picture's window cannot be seen.
+@MainActor final class MonitorScopeNSView: MonitorVisibilityNSView {
   let metalLayer = CAMetalLayer()
   var removedFromPresenter: ((CAMetalLayer) -> Void)?
   var windowChanged: ((Bool) -> Void)?
@@ -1220,8 +1261,9 @@ private final class MonitorWindowObservations: @unchecked Sendable {
     followSize()
   }
   override func viewDidMoveToWindow() {
-    super.viewDidMoveToWindow()
+    // The presenter has the layer before the visibility report that may start drawing it.
     windowChanged?(window != nil)
+    super.viewDidMoveToWindow()
     followSize()
   }
   override func viewDidChangeBackingProperties() {
@@ -1298,6 +1340,9 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private var scopeLink: CAMetalDisplayLink?
   private var scopeLinkLayer: CAMetalLayer?
   private var paused = false
+  /// The scope can be seen in a window that is not the picture's: while the picture is
+  /// paused, the scope link keeps running and takes the frames itself.
+  private var scopeAlone = false
   private var versions: (UInt64, UInt64) = (UInt64.max, UInt64.max)
   private var drawnSize = (width: 0, height: 0)
   /// Whether the first picture has been presented and the layer's cover taken off (see `MonitorPictureNSView`).
@@ -1388,6 +1433,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       link.add(to: runLoop, forMode: .default)
       self.link = link
       versions = (UInt64.max, UInt64.max)
+      // No picture tick follows the scope layer while paused.
+      if paused, scopeAlone, let presenter { setScopeLayer(presenter.currentScopeLayer) }
     }
   }
 
@@ -1404,14 +1451,37 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     gpu.renderThread.perform { [self] in
       self.paused = paused
       link?.isPaused = paused
-      scopeLink?.isPaused = paused
+      // No picture tick follows the scope layer while paused.
+      if paused, scopeAlone, link != nil, let presenter { setScopeLayer(presenter.currentScopeLayer) }
+      scopeLink?.isPaused = paused && !scopeAlone
       if paused {
         // A surface nobody can see holds no frame for a scope.
-        scopePending = nil
-        lastScope = nil
+        if !scopeAlone {
+          scopePending = nil
+          lastScope = nil
+        }
       } else {
         // Redraw on resume: the layer may have been cleared while hidden.
         versions = (UInt64.max, UInt64.max)
+      }
+    }
+  }
+
+  /// Whether the scope is on screen in a window other than the picture's (main thread;
+  /// the presenter's `reportScopeVisibility`). It changes nothing while the picture draws.
+  func setScopeAlone(_ alone: Bool) {
+    gpu.renderThread.perform { [self] in
+      guard scopeAlone != alone else { return }
+      scopeAlone = alone
+      // Only a started loop draws; the picture's tick follows the layer otherwise.
+      guard paused, link != nil else { return }
+      if alone {
+        if let presenter { setScopeLayer(presenter.currentScopeLayer) }
+        scopeLink?.isPaused = false
+      } else {
+        scopeLink?.isPaused = true
+        scopePending = nil
+        lastScope = nil
       }
     }
   }
@@ -1430,6 +1500,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
 
   func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
     if link === scopeLink {
+      if paused, scopeAlone { queueScopeWithoutPicture(at: update.targetTimestamp) }
       drawScope(update)
       return
     }
@@ -1444,6 +1515,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let core: MonitorGPUContext.Core
     do {
       core = try gpu.core(nonblocking: true)
+    } catch is MonitorGPUContext.Preparing {
+      return  // Not a failure: the next tick tries again.
     } catch {
       presenter.recordFailure(error)
       return
@@ -1491,18 +1564,46 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     }
     presenter.recordPresented(work.stamp)
     if let pass, scopeSource != nil { presenter.recordStatus(pass.status) }
+    queueScope(scopeSource, for: work, at: update.targetTimestamp)
+  }
+
+  /// Makes `source` the scope link's next scope, unless that scope is already drawn.
+  private func queueScope(_ scopeSource: ScopeSource?, for work: MonitorSurfacePresenter.RenderWork, at now: Double) {
     guard let scopeSource, let stamp = work.stamp, Self.wantsScopes(work), let scopeLinkLayer else { return }
     let key = ScopeKey(
       stamp: stamp, frozenToken: work.frozenToken, layer: ObjectIdentifier(scopeLinkLayer),
       scopes: work.preferences.scopes, monitorLUT: work.state.monitorLUT, size: scopeLinkLayer.drawableSize)
     guard key != scopedKey else { return }
-    let now = update.targetTimestamp
     // Keep the newest picture while waiting for the saved scope-rate ceiling.
     if scopePending == nil {
       scopeDueAt = scopeCadence.nextRefresh(at: now, maximumHz: key.scopes.refreshHz)
     }
     scopePending = (scopeSource, key)
     scopePendingAt = now
+  }
+
+  /// The scope tick while the picture is paused but the scope is seen in a window of its
+  /// own: takes the surface's newest work as the picture's tick would, and queues its
+  /// scope without encoding a picture nobody can see.
+  private func queueScopeWithoutPicture(at now: Double) {
+    guard let presenter else { return }
+    presenter.retryFreezeCopy()
+    guard let work = presenter.renderWork(after: versions, force: false) else { return }
+    versions = (work.latestVersion, work.stateVersion)
+    // As `encode`: a cleared picture or hidden tools leave no scope to draw later.
+    if !Self.wantsScopes(work) || work.stamp == nil {
+      scopePending = nil
+      lastScope = nil
+      scopedKey = nil
+    }
+    let source: ScopeSource?
+    switch work.content {
+    case .none: source = nil
+    case .live(let delivery), .frozenLive(let delivery, _): source = .live(delivery)
+    case .frozenOwned(let owned, let owner, _): source = .frozen(owned, owner)
+    }
+    presenter.refreshBurnInLUT()
+    queueScope(source, for: work, at: now)
   }
 
   /// Encodes `work`'s picture into `target` (a drawable, or an offscreen texture
@@ -1680,7 +1781,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let link = CAMetalDisplayLink(metalLayer: scopeLayer)
     link.delegate = self
     link.preferredFrameLatency = 2
-    link.isPaused = paused
+    link.isPaused = paused && !scopeAlone
     link.add(to: runLoop, forMode: .default)
     scopeLink = link
   }
@@ -1739,6 +1840,9 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       #endif
       core = try gpu.core(nonblocking: true)
       context = try core.begin()
+    } catch is MonitorGPUContext.Preparing {
+      presenter.cancelScope()
+      return  // Not a failure: the core is still being built.
     } catch {
       presenter.cancelScope()
       presenter.recordFailure(error)
@@ -1806,8 +1910,14 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   /// A failed obsolete submission may count a failure, but cannot invalidate a
   /// replacement core or consume the newer picture/scope's retry bookkeeping.
   private func submissionCompletion(core: MonitorGPUContext.Core, kind: Int, serial: UInt64) -> MonitorGPUCompletion {
-    MonitorGPUTransaction { [weak self, core] failed, milliseconds in
-      guard let self else { return }
+    MonitorGPUTransaction { [weak self, weak presenter = self.presenter, gpu = self.gpu, core] failed, milliseconds in
+      guard let self else {
+        // The view went away with this work on the GPU. The presenter outlives it (hide and
+        // show preview), so its scope slot is still released and a lost core still retired.
+        if failed { gpu.invalidate(ifCurrent: core) }
+        presenter?.recordGPU(kind: kind, milliseconds: milliseconds, failed: failed)
+        return
+      }
       // Successful pictures only update the presenter's locked timing counters.
       // Keep that on the feedback queue instead of waking the render thread for
       // every picture. Scope retirement and failure recovery stay confined there.
@@ -1832,7 +1942,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private func recoverFailedSubmission() {
     versions = (.max, .max)
     scopedKey = nil
-    if !paused, scopePending == nil { scopePending = lastScope }
+    if !paused || scopeAlone, scopePending == nil { scopePending = lastScope }
   }
 
   #if ULTRACAM_TEST_SUPPORT

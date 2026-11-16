@@ -1,11 +1,14 @@
 import SwiftUI
 
-/// A live change that can drop the signal, waiting for its answer. Cancel is the default.
+/// A change that asks first (one that can drop a live signal or lose something), waiting for
+/// its answer. Cancel is the default.
 struct UIDeviceSettingConfirmation {
     var title: String
     var message: String
     var actionTitle: String
     var action: @MainActor () -> Void
+    /// Destructive for an action that loses something, as Forget Saved Sign-In does.
+    var role: ButtonRole? = nil
 }
 
 /// One capture device's own settings, as its vendor's plugin declares them (input connector,

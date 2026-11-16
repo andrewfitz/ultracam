@@ -18,16 +18,12 @@ struct UIToolbarContent: ToolbarContent {
 
     // Order matters: when the window narrows, macOS moves the trailing items into the
     // overflow menu first, so the record control stays visible; layout, collapse and the
-    // inspector are also in View.
-    ToolbarItemGroup(placement: .primaryAction) {
-      if let start = presentation.startControl {
-        Button { context.send(start.action) } label: {
-          Label(start.title, systemImage: UISymbol.start).labelStyle(.titleAndIcon)
-        }
-        .disabled(!start.enabled)
-        .help(start.help)
-      }
-      UIToolbarRecordControl(context: context)
+    // inspector are also in View. From macOS 26.1 the record control also has the highest
+    // priority, so it's the last thing to overflow whatever the cut pills take.
+    if #available(macOS 26.1, *) {
+      recordGroup.visibilityPriority(.high)
+    } else {
+      recordGroup
     }
 
     ToolbarSpacer(.fixed, placement: .primaryAction)
@@ -47,7 +43,10 @@ struct UIToolbarContent: ToolbarContent {
       if presentation.layouts.count > 1 {
         Picker("Layout", selection: layoutBinding) {
           ForEach(presentation.layouts, id: \.self) { layout in
-            Label(layout.title, systemImage: layout.symbol).tag(layout)
+            // Each segment names its layout and key, as the View menu does (⌥⌘ and its place there).
+            Label(layout.title, systemImage: layout.symbol)
+              .help("\(layout.title) (⌥⌘\((UILayout.allCases.firstIndex(of: layout) ?? 0) + 1))")
+              .tag(layout)
           }
         }
         .pickerStyle(.segmented)
@@ -74,6 +73,20 @@ struct UIToolbarContent: ToolbarContent {
         Label("Inspector", systemImage: UISymbol.inspector)
       }
       .help("Show or hide the inspector for the selected camera (⌥⌘I)")
+    }
+  }
+
+  /// Start, when a camera is stopped, and the record control.
+  @ToolbarContentBuilder private var recordGroup: some ToolbarContent {
+    ToolbarItemGroup(placement: .primaryAction) {
+      if let start = presentation.startControl {
+        Button { context.send(start.action) } label: {
+          Label(start.title, systemImage: UISymbol.start).labelStyle(.titleAndIcon)
+        }
+        .disabled(!start.enabled)
+        .help(start.help)
+      }
+      UIToolbarRecordControl(context: context)
     }
   }
 
@@ -129,13 +142,18 @@ struct UIToolbarCutGroup: View {
   private var session: UISessionSnapshot { context.session }
 
   var body: some View {
+    // Six pills at most, the rest in More; digits only when the names wouldn't fit.
+    let cuts = UIPresentationBuilder.toolbarCuts(presentation.cutButtons)
+    let numberOnly = UIPresentationBuilder.toolbarCutsNumberOnly(cuts.shown, hasMore: !cuts.more.isEmpty,
+      narrowWindow: session.narrowWindow)
     HStack(spacing: 4) {
       Image(systemName: UISymbol.cut).foregroundStyle(.secondary).padding(.horizontal, 4)
         .help("Cut: each button puts its camera on Program")
         .accessibilityHidden(true)
-      ForEach(presentation.cutButtons) { button in
-        cutButton(button)
+      ForEach(cuts.shown) { button in
+        cutButton(button, numberOnly: numberOnly)
       }
+      if !cuts.more.isEmpty { moreCuts(cuts.more) }
       Divider().frame(height: 18).padding(.horizontal, 2)
       auto
       autoOptions
@@ -145,15 +163,54 @@ struct UIToolbarCutGroup: View {
     .labelStyle(.titleAndIcon)
   }
 
-  @ViewBuilder private func cutButton(_ button: UICutButton) -> some View {
+  @ViewBuilder private func cutButton(_ button: UICutButton, numberOnly: Bool) -> some View {
     Button { context.send(.cut(cameraID: button.id)) } label: {
-      UICutButtonLabel(button: button, numberOnly: session.narrowWindow, showsNext: !session.narrowWindow)
+      UICutButtonLabel(button: button, numberOnly: numberOnly, showsNext: !numberOnly)
     }
     .buttonStyle(UIToolbarPillStyle(selected: button.onAir, outline: button.pending ? .green : nil))
     .disabled(!button.enabled)
     .help(button.onAir ? "\(button.name) is \(Self.programWords(button))"
-      : button.help ?? (button.pending ? "Cut to \(button.name) is pending" : "Cut to \(button.name) (⌃\(button.number))"))
+      : button.help ?? (button.pending ? "Cut to \(button.name) is pending" : (button.number <= 4 ? "Cut to \(button.name) (⌃\(button.number))" : "Cut to \(button.name)")))
     .accessibilityLabel(button.onAir ? "\(button.name), \(Self.programWords(button))" : button.pending ? "\(button.name), cut pending" : "Cut to \(button.name)")
+  }
+
+  /// The cameras past the pills, in one menu at a fixed place. When the camera on Program or
+  /// a pending cut is among them, the More pill shows it, so that state never hides in a menu.
+  private func moreCuts(_ more: [UICutButton]) -> some View {
+    let shown = more.first(where: \.onAir) ?? more.first(where: \.pending)
+    let pending = more.contains(where: \.pending)
+    let label: String
+    if let shown, shown.onAir {
+      label = "More cameras, \(shown.name) \(Self.programWords(shown))" + (pending ? ", a cut pending" : "")
+    } else if let shown {
+      label = "More cameras, cut to \(shown.name) pending"
+    } else {
+      label = "More cameras"
+    }
+    return Menu {
+      // Only ⌃1–⌃4 are keys (the Program menu's), so these past the pills name none.
+      ForEach(more) { button in
+        Toggle("Cut to \(button.name)", isOn: Binding(get: { button.onAir }, set: { _ in context.send(.cut(cameraID: button.id)) }))
+          .badge(button.pending ? Text(UITally.next.label ?? "Next") : nil)
+          .disabled(!button.enabled)
+          .help(button.help ?? "Cut to \(button.name)")
+      }
+    } label: {
+      HStack(spacing: 4) {
+        if let shown {
+          UICutButtonLabel(button: shown, numberOnly: true)
+        } else {
+          Text("More")
+        }
+        Image(systemName: UISymbol.menuIndicator).font(.caption.weight(.bold))
+      }
+    }
+    .menuStyle(.button)
+    .buttonStyle(UIToolbarPillStyle(selected: shown?.onAir == true, outline: pending ? .green : nil))
+    .menuIndicator(.hidden)
+    .fixedSize()
+    .help("More cameras: \(more.map(\.name).joined(separator: ", "))")
+    .accessibilityLabel(label)
   }
 
   /// What the dot says about the camera on Program.
@@ -219,7 +276,7 @@ struct UIToolbarCutGroup: View {
         }
       }
     } label: {
-      Image(systemName: "chevron.down").font(.caption.weight(.bold)).frame(width: 16, height: 26).contentShape(Rectangle())
+      Image(systemName: UISymbol.menuIndicator).font(.caption.weight(.bold)).frame(width: 16, height: 26).contentShape(Rectangle())
     }
     .menuStyle(.button)
     .buttonStyle(.plain)
@@ -261,7 +318,8 @@ struct UICameraPickerMenu: View {
 
 /// A cut button's number and name, with a tally dot: on Program, red only while frames reach
 /// a meeting (J 13), orange while it waits on a picture, gray otherwise; green while a cut is
-/// pending. The dot is drawn, so it holds its color in a window that isn't key.
+/// pending, a green triangle where the word Next isn't shown. With Differentiate Without Color
+/// each state has its own shape. The dot is drawn, so it holds its color in a window that isn't key.
 struct UICutButtonLabel: View {
   let button: UICutButton
   var numberOnly = false
@@ -279,16 +337,56 @@ struct UICutButtonLabel: View {
     return button.pending ? .green : nil
   }
 
+  /// The widest a name draws before it truncates, so a long name can't push Record off the toolbar.
+  static let nameWidth: CGFloat = 120
+
+  @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
+
   var body: some View {
     HStack(spacing: 5) {
-      if let dot = Self.dot(button) {
+      if button.pending && !button.onAir && (!showsNext || differentiateWithoutColor) {
+        // Without the word Next, a shape of its own: the pending cut never rests on green alone.
+        Image(systemName: UISymbol.nextCut).font(.system(size: 8, weight: .bold)).foregroundStyle(.green)
+          .frame(width: 8, height: 8)
+          .accessibilityHidden(true)
+      } else if differentiateWithoutColor && button.onAir && button.tally == .noPicture {
+        Image(systemName: UISymbol.warning).font(.system(size: 8, weight: .bold)).foregroundStyle(.orange)
+          .frame(width: 8, height: 8)
+          .accessibilityHidden(true)
+      } else if differentiateWithoutColor && button.onAir && button.tally != .onAir {
+        // On Program with nobody watching: a ring, where on air is a filled dot.
+        Circle().strokeBorder(.secondary, lineWidth: 1.5)
+          .frame(width: 7, height: 7)
+          .accessibilityHidden(true)
+      } else if let dot = Self.dot(button) {
         Circle().fill(dot)
           .frame(width: 7, height: 7)
           .accessibilityHidden(true)
       }
       Text("\(button.number)").monospacedDigit().fontWeight(.bold)
-      if !numberOnly { Text(button.name).fontWeight(button.onAir ? .semibold : .regular) }
+      if !numberOnly {
+        UIMaxWidthLayout(maxWidth: Self.nameWidth) {
+          Text(button.name).fontWeight(button.onAir ? .semibold : .regular).truncationMode(.tail)
+        }
+      }
       if showsNext && button.pending { Text("Next").font(.uiMeta).foregroundStyle(.secondary) }
+    }
+  }
+}
+
+/// Its one subview at no more than `maxWidth`, even where the proposal is unbounded (a
+/// toolbar pill is laid out at its ideal size), so a long label truncates there.
+private struct UIMaxWidthLayout: Layout {
+  let maxWidth: CGFloat
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    let width = min(proposal.width ?? maxWidth, maxWidth)
+    return subviews.first?.sizeThatFits(ProposedViewSize(width: width, height: proposal.height)) ?? .zero
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    for subview in subviews {
+      subview.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
     }
   }
 }
@@ -333,7 +431,7 @@ struct UIToolbarRecordControl: View {
         Button(presentation.pauseAllTitle) { context.send(presentation.pauseAllTitle == "Resume All" ? .resumeAll : .pauseAll) }
           .disabled(!presentation.canPauseAll)
       } label: {
-        Image(systemName: "chevron.down").font(.caption.weight(.bold)).frame(width: 18, height: 26).contentShape(Rectangle())
+        Image(systemName: UISymbol.menuIndicator).font(.caption.weight(.bold)).frame(width: 18, height: 26).contentShape(Rectangle())
       }
       .menuStyle(.button)
       .buttonStyle(.plain)

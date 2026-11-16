@@ -12,7 +12,8 @@ func makePaired24BitSample(sourcePCM32: Data, sampleFrameCount: Int,
   let (sampleCount, overflow) = sampleFrameCount.multipliedReportingOverflow(by: format.channels)
   let (byteCount, byteOverflow) = sampleCount.multipliedReportingOverflow(by: 4)
   guard !overflow, !byteOverflow, sourcePCM32.count == byteCount else { throw ClockMappedPCMError.invalidPacket }
-  let bytes = try EmbeddedAudioConverter.convert32BitIntegerPCMTo24BitPacked(sourcePCM32, channelCount: format.channels)
+  let (packedBytes, packedOverflow) = sampleCount.multipliedReportingOverflow(by: 3)
+  guard !packedOverflow else { throw ClockMappedPCMError.invalidPacket }
   var asbd = AudioStreamBasicDescription(mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM,
     mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
     mBytesPerPacket: UInt32(format.channels * 3), mFramesPerPacket: 1,
@@ -28,12 +29,20 @@ func makePaired24BitSample(sourcePCM32: Data, sampleFrameCount: Int,
   guard status == noErr, let description else { throw ClockMappedPCMError.invalidPacket }
   var block: CMBlockBuffer?
   guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
-    blockLength: bytes.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-    offsetToData: 0, dataLength: bytes.count, flags: kCMBlockBufferAssureMemoryNowFlag,
+    blockLength: packedBytes, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+    offsetToData: 0, dataLength: packedBytes, flags: kCMBlockBufferAssureMemoryNowFlag,
     blockBufferOut: &block) == noErr, let block else { throw ClockMappedPCMError.invalidPacket }
-  let copied = bytes.withUnsafeBytes { CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
-    offsetIntoDestination: 0, dataLength: $0.count) }
-  guard copied == noErr else { throw ClockMappedPCMError.invalidPacket }
+  var length = 0
+  var totalLength = 0
+  var destination: UnsafeMutablePointer<CChar>?
+  let pointerStatus = CMBlockBufferGetDataPointer(block, atOffset: 0,
+    lengthAtOffsetOut: &length, totalLengthOut: &totalLength, dataPointerOut: &destination)
+  guard pointerStatus == noErr, let destination,
+    length >= packedBytes, totalLength >= packedBytes else { throw ClockMappedPCMError.invalidPacket }
+  sourcePCM32.withUnsafeBytes { raw in
+    EmbeddedAudioConverter.packSignificant24Bits(from: raw.baseAddress!,
+      to: UnsafeMutableRawPointer(destination), sampleCount: sampleCount)
+  }
   var sample: CMSampleBuffer?
   let creation = CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault,
     dataBuffer: block, formatDescription: description, sampleCount: sampleFrameCount,

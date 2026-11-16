@@ -150,7 +150,7 @@ struct UIScopeSettingsView: View {
             Text("Custom").tag(Optional<UIScopeLook>.none).disabled(true)
           }
         }
-        .help("Classic is the earlier Ultracam scope: −10…110 IRE with its trace colours.")
+        .help("Classic is the earlier Ultracam scope: −10…110 IRE with its trace colors.")
       }
       if scales.count > 1 {
         row("Scale") {

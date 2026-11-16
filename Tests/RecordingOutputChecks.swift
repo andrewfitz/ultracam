@@ -83,6 +83,98 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try Data(contentsOf: first.finalURL), Data([10, 11]))
   }
 
+  func testCancellationPreservesDirectoryAtExternalWriterPath() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0,
+      diskSpace: FixedRecordingOutputDiskSpace(bytes: 10_000))
+    let session = try manager.beginExternalWriterSession(feedID: "camera")
+    try FileManager.default.createDirectory(at: session.temporaryURL, withIntermediateDirectories: false)
+    let child = session.temporaryURL.appendingPathComponent("keep")
+    try Data([42]).write(to: child)
+
+    try session.cancel()
+
+    XCTAssertEqual(session.state, .cancelled)
+    XCTAssertEqual(try Data(contentsOf: child), Data([42]))
+  }
+
+  func testCancellationPreservesSymlinkAndItsTarget() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0,
+      diskSpace: FixedRecordingOutputDiskSpace(bytes: 10_000))
+    let session = try manager.beginExternalWriterSession(feedID: "camera")
+    let target = root.appendingPathComponent("keep")
+    try Data([42]).write(to: target)
+    try FileManager.default.createSymbolicLink(at: session.temporaryURL, withDestinationURL: target)
+
+    try session.cancel()
+
+    XCTAssertEqual(session.state, .cancelled)
+    XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: session.temporaryURL.path), target.path)
+    XCTAssertEqual(try Data(contentsOf: target), Data([42]))
+  }
+
+  private func recoveryJournals(under root: URL) -> [String] {
+    let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? []
+    return files.map(\.lastPathComponent).filter { $0.hasSuffix("ultracam-recovery") }
+  }
+
+  /// A take that failed before its writer had a frame leaves nothing recovery would offer.
+  func testEmptyFailedTakeLeavesNoRecoveryJournal() throws {
+    for makesEmptyFile in [false, true] {
+      let root = try makeRoot()
+      defer { try? FileManager.default.removeItem(at: root) }
+      let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0,
+        diskSpace: FixedRecordingOutputDiskSpace(bytes: 10_000))
+      let session = try manager.beginExternalWriterSession(feedID: "camera")
+      XCTAssertEqual(recoveryJournals(under: root).count, 1)
+      if makesEmptyFile { try Data().write(to: session.temporaryURL) }
+
+      session.preserveForRecovery(discardingEmptyTake: true)
+
+      XCTAssertEqual(session.state, .failed)
+      XCTAssertEqual(recoveryJournals(under: root), [])
+      XCTAssertFalse(FileManager.default.fileExists(atPath: session.temporaryURL.path))
+    }
+  }
+
+  func testFailedTakeWithMediaOrAForeignPathKeepsItsJournal() throws {
+    for kind in ["media", "directory", "not discarding"] {
+      let root = try makeRoot()
+      defer { try? FileManager.default.removeItem(at: root) }
+      let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0,
+        diskSpace: FixedRecordingOutputDiskSpace(bytes: 10_000))
+      let session = try manager.beginExternalWriterSession(feedID: "camera")
+      if kind == "media" { try Data([42]).write(to: session.temporaryURL) }
+      if kind == "directory" {
+        try FileManager.default.createDirectory(at: session.temporaryURL, withIntermediateDirectories: false)
+      }
+
+      session.preserveForRecovery(discardingEmptyTake: kind != "not discarding")
+
+      XCTAssertEqual(recoveryJournals(under: root).count, 1, kind)
+      if kind != "not discarding" { XCTAssertTrue(FileManager.default.fileExists(atPath: session.temporaryURL.path), kind) }
+    }
+  }
+
+  func testCancellationRemovesRegularPartialFile() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let volumes = RecordingVolumeSpaceRegistry()
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0,
+      diskSpace: FixedRecordingOutputDiskSpace(bytes: 10_000), volumes: volumes)
+    let session = try manager.beginSession(feedID: "camera", expectedBytes: 100)
+    try session.append(Data([42]))
+
+    try session.cancel()
+
+    XCTAssertEqual(session.state, .cancelled)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: session.temporaryURL.path))
+    XCTAssertEqual(volumes.usage(for: root).reserved, 0)
+  }
+
   func testRejectsTraversalAndEscapingSymlink() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

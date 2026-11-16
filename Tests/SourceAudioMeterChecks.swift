@@ -197,6 +197,47 @@ import XCTest
     tap.detach()
   }
 
+  func testTakeBreaksFilterHistoryAcrossRejectedFormatPacket() throws {
+    let frames = 1_600
+    let source = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .int32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    let other = try SourceAudioFormat(sampleRate: 44_100, channels: 2, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    let loud = [Int32](repeating: 1 << 30, count: frames * 2).withUnsafeBytes { Data($0) }
+    let silence = Data(count: frames * 2 * 4)
+    let rejected = Data(count: frames * 2 * 4)
+    let first = try CaptureAudioPacket(planes: [loud], sampleFrameCount: frames,
+      format: source, packetTime: .zero)
+    let wrong = try CaptureAudioPacket(planes: [rejected], sampleFrameCount: frames,
+      format: other, packetTime: .zero)
+    let last = try CaptureAudioPacket(planes: [silence], sampleFrameCount: frames,
+      format: source, packetTime: .zero)
+
+    let tap = AudioMeterTap()
+    tap.beginTake()
+    tap.ingest(first)
+    tap.ingest(wrong)
+    tap.ingest(last)
+    let summary = try XCTUnwrap(tap.endTake())
+
+    let reference = try AudioMeter(configuration: AudioMeterTap.takeConfiguration)
+    loud.withUnsafeBytes { raw in
+      reference.process(interleaved: raw.baseAddress!.assumingMemoryBound(to: Int32.self),
+        frameCount: frames, frameStride: 2)
+    }
+    reference.noteDiscontinuity()
+    silence.withUnsafeBytes { raw in
+      reference.process(interleaved: raw.baseAddress!.assumingMemoryBound(to: Int32.self),
+        frameCount: frames, frameStride: 2)
+    }
+    reference.flush()
+    let expected = reference.snapshot()
+    XCTAssertEqual(summary.duration, expected.loudness.duration, accuracy: 0.000001)
+    XCTAssertEqual(summary.maximumTruePeak, Double(expected.programmeMaximumTruePeak), accuracy: 0.000001)
+    XCTAssertEqual(summary.integrated, Double(expected.loudness.integrated), accuracy: 0.000001)
+    XCTAssertEqual(tap.counters.rejected, 1)
+  }
+
   func testSecondsBudgetRejectsOversizedPacketIndependentlyOfPacketCount() throws {
     let format = try SourceAudioFormat(sampleRate: 8_000, channels: 1, sample: .int16,
       interleaved: true, layout: AudioChannelMap(), clock: .hostTime)

@@ -219,14 +219,20 @@ struct UICommands: Commands {
       if let selected {
         // The picture only offers these tools while it shows video.
         let showsPicture = selected.tileState.showsPicture
-        Toggle("Freeze \(selected.name)", isOn: Binding(get: { UIMonitorBridge.presenter(for: selected.id)?.isFrozen == true },
+        // Program View's source tiles have no presenter, so there is nothing to freeze or clean.
+        let hasPresenter = UIMonitorBridge.presenter(for: selected.id) != nil
+        // Read here, from the observed mirror, so the checkmarks follow: the presenter itself
+        // isn't observed by the menus.
+        let frozen = UICleanViewState.shared.frozen.contains(selected.id)
+        let clean = UICleanViewState.shared.clean.contains(selected.id)
+        Toggle("Freeze \(selected.name)", isOn: Binding(get: { frozen },
           set: { _ in send(.freeze(cameraID: selected.id)) }))
           .keyboardShortcut("f", modifiers: [.control, .option])
-          .disabled(!showsPicture)
-        Toggle("Clean View", isOn: Binding(get: { UICleanViewState.shared.clean.contains(selected.id) },
+          .disabled(!showsPicture || !hasPresenter)
+        Toggle("Clean View", isOn: Binding(get: { clean },
           set: { _ in send(.toggleClean(cameraID: selected.id)) }))
           .keyboardShortcut("c", modifiers: [.control, .option])
-          .disabled(!showsPicture)
+          .disabled(!showsPicture || !hasPresenter)
         // Every tool, also with no picture yet: the choice is kept and applies when video arrives.
         // Every tool has a key, and each key has this item, the VoiceOver path.
         Menu("Monitor Tools") {
@@ -247,10 +253,8 @@ struct UICommands: Commands {
       Divider()
     }
 
-    // SwiftUI lists the Ultracam and Diagnostics windows in the Window menu itself;
-    // ⌘0 is attached to the main Window scene in UltracamApp.
-
-    // macOS lists every open window below; this one item brings back the main window with ⌘0.
+    // The only Window menu items for the main and Diagnostics windows: their scenes drop
+    // SwiftUI's own (`.commandsRemoved()` in UltracamApp). macOS lists open windows below.
     CommandGroup(before: .windowList) {
       Button("Show Main Window") {
         openWindow(id: "main")

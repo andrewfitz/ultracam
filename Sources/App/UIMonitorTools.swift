@@ -47,10 +47,16 @@ struct UIMonitorToolButtons: View {
   @Binding var openPanel: UIMonitorPanel?
   /// The pointer is over the picture: the full bar.
   var expanded = false
+  /// The picture is narrower than `singleColumnPanelsBelow`: its settings popovers lay
+  /// their groups out in one column, so they don't cover the picture being adjusted.
+  var singleColumnPanels = false
 
   /// A picture narrower than this can't hold the bar beside its name, so the bar takes its
   /// own row under it, right aligned.
   nonisolated static let ownRowBelow: CGFloat = 560
+  /// A picture narrower than this would sit under a two-column settings popover
+  /// (`UIToolLayout.panelWidth`, 756 pt, and room either side): its popovers use one column.
+  nonisolated static let singleColumnPanelsBelow: CGFloat = 800
 
   /// Where a picture puts its tools. The full bar shows on hover and while one of its popovers
   /// is open, and keeps its row until that closes: the popover hangs from a chevron in it, so
@@ -71,9 +77,13 @@ struct UIMonitorToolButtons: View {
   }
 
   /// A camera's tools; toggles go through the interface's actions.
-  init(camera: UICameraPresentation, context: UIContext, openPanel: Binding<UIMonitorPanel?>, expanded: Bool = false) {
+  /// `singleColumnPanels` is the picture's measured width against `singleColumnPanelsBelow`;
+  /// without it the layout and window decide (`narrowPictures`).
+  init(camera: UICameraPresentation, context: UIContext, openPanel: Binding<UIMonitorPanel?>, expanded: Bool = false,
+    singleColumnPanels: Bool? = nil) {
     _openPanel = openPanel
     self.expanded = expanded
+    self.singleColumnPanels = singleColumnPanels ?? Self.narrowPictures(context)
     targetID = camera.id
     name = camera.name
     activeTools = camera.activeTools
@@ -87,15 +97,22 @@ struct UIMonitorToolButtons: View {
   /// Any monitor target, for example "program".
   init(targetID: String, name: String, activeTools: [UIMonitorTool], isProgram: Bool,
     toggle: @escaping @MainActor (UIMonitorTool) -> Void, monitor: any UIMonitorSettingsProviding,
-    openPanel: Binding<UIMonitorPanel?>, expanded: Bool = false) {
+    openPanel: Binding<UIMonitorPanel?>, expanded: Bool = false, singleColumnPanels: Bool = false) {
     _openPanel = openPanel
     self.expanded = expanded
+    self.singleColumnPanels = singleColumnPanels
     self.targetID = targetID
     self.name = name
     self.activeTools = activeTools
     self.isProgram = isProgram
     self.toggle = toggle
     self.monitor = monitor
+  }
+
+  /// A camera's picture is narrower than two popover columns in every layout but Single
+  /// (Side by Side, Program View and Four Up share the width), and in a narrow window.
+  static func narrowPictures(_ context: UIContext) -> Bool {
+    context.presentation.layout != .single || context.session.narrowWindow
   }
 
   /// Clip indicators and the picture settings aren't interface tools; they are
@@ -157,7 +174,7 @@ struct UIMonitorToolButtons: View {
         }
       }
     } label: {
-      Image(systemName: activeTitles.isEmpty ? "slider.horizontal.3" : "slider.horizontal.below.square.filled.and.square")
+      Image(systemName: UISymbol.monitorTools(anyOn: !activeTitles.isEmpty))
         .font(.callout.weight(.medium))
         .foregroundStyle(.white)
         .frame(width: 28, height: 24)
@@ -199,7 +216,8 @@ struct UIMonitorToolButtons: View {
   }
 
   private func settings(_ panel: UIMonitorPanel) -> some View {
-    UIMonitorToolSettingsView(panel: panel, cameraID: targetID, cameraName: name, isProgram: isProgram, provider: monitor)
+    UIMonitorToolSettingsView(panel: panel, cameraID: targetID, cameraName: name, isProgram: isProgram, provider: monitor,
+      singleColumn: singleColumnPanels)
   }
 }
 
@@ -229,7 +247,7 @@ private struct UIMonitorToolSplitButton: View {
       // The settings half of the split button. A system split-button Menu can't
       // host the settings form, so this stays a button, wide enough to hit.
       Button(action: openSettings) {
-        Image(systemName: "chevron.down")
+        Image(systemName: UISymbol.menuIndicator)
           .font(.caption.weight(.bold)).imageScale(.small)
           .frame(width: 16, height: 24)
           .foregroundStyle(.white.opacity(0.75))
@@ -273,18 +291,21 @@ struct UIMonitorToolSettingsView: View {
   let cameraName: String
   let isProgram: Bool
   let provider: any UIMonitorSettingsProviding
+  /// Over a narrow picture: the groups in one column (`UIToolLayout.singleColumnPanelWidth`).
+  let singleColumn: Bool
   @State private var preferences: MonitorFeedPreferences
   /// The provider snapshot represented by `preferences` when the popover last synchronized.
   /// Keeping this separately lets us distinguish an external update from our own write.
   @State private var synchronizedPreferences: MonitorFeedPreferences
 
   init(panel: UIMonitorPanel, cameraID: String, cameraName: String, isProgram: Bool,
-    provider: any UIMonitorSettingsProviding) {
+    provider: any UIMonitorSettingsProviding, singleColumn: Bool = false) {
     self.panel = panel
     self.cameraID = cameraID
     self.cameraName = cameraName
     self.isProgram = isProgram
     self.provider = provider
+    self.singleColumn = singleColumn
     let initial = provider.preferences(for: cameraID)
     _preferences = State(initialValue: initial)
     _synchronizedPreferences = State(initialValue: initial)
@@ -381,7 +402,7 @@ struct UIMonitorToolSettingsView: View {
         }
       }
       if let reason {
-        Label(reason, systemImage: "info.circle")
+        Label(reason, systemImage: UISymbol.information)
           .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
       // Sized to the settings; they scroll only on a screen too short for them.
@@ -394,7 +415,9 @@ struct UIMonitorToolSettingsView: View {
       .fixedSize(horizontal: false, vertical: true)
     }
     .padding(UIToolLayout.padding)
-    .frame(width: UIToolLayout.panelWidth, alignment: .leading)
+    .frame(width: UIToolLayout.popoverWidth(singleColumn: singleColumn), alignment: .leading)
+    // Set here, inside the popover, so the forms' `UIToolColumns` see it.
+    .environment(\.uiToolSingleColumn, singleColumn)
     .controlSize(.small)
     .labeledContentStyle(UIToolLabeledContentStyle())
     // Slider updates should only redraw the value and monitor surface. Do not

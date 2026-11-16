@@ -111,7 +111,7 @@ struct UIPictureMenuLabel: View {
   var body: some View {
     HStack(spacing: 3) {
       Text(title)
-      Image(systemName: "chevron.down").font(.caption2.weight(.bold)).imageScale(.small)
+      Image(systemName: UISymbol.menuIndicator).font(.caption2.weight(.bold)).imageScale(.small)
     }
     .foregroundStyle(.white)
     .contentShape(Rectangle())
