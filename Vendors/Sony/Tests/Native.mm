@@ -84,7 +84,7 @@ int main() {
     assert(millisecondsLeft(Clock::now() - std::chrono::milliseconds(1)) == 0);
     assert(millisecondsLeft(Clock::now() + std::chrono::milliseconds(50)) <= 50);
     auto xmlData = [](NSString *text) { return [text dataUsingEncoding:NSUTF8StringEncoding]; };
-    NSDictionary *description = parseXML(xmlData(@"<root xmlns='urn:test'><device><friendlyName>ILME-FX3:A</friendlyName><manufacturer>Sony Corporation</manufacturer><serviceList><service><serviceType>urn:schemas-sony-com:service:DigitalImaging:1</serviceType><SCPDURL>/DigitalImagingDesc.xml</SCPDURL></service></serviceList></device></root>"));
+    NSDictionary *description = parseXML(xmlData(@"<root xmlns='urn:test'><device><friendlyName>ILME-<![CDATA[FX3:A]]></friendlyName><manufacturer>Sony Corporation</manufacturer><serviceList><service><serviceType>urn:schemas-sony-com:service:DigitalImaging:1</serviceType><SCPDURL>/DigitalImagingDesc.xml</SCPDURL></service></serviceList></device></root>"));
     assert([description[@"friendlyname"] isEqualToString:@"ILME-FX3:A"]);
     assert([description[@"digitalimagingpath"] isEqualToString:@"/DigitalImagingDesc.xml"]);
     NSDictionary *detail = parseXML(xmlData(@"<s:root xmlns:s='urn:test'><s:X_ModelName>ILME-FX3</s:X_ModelName><s:X_MacAddress>AA:BB:CC:DD:EE:FF</s:X_MacAddress><s:X_SSH_Support>Enable</s:X_SSH_Support></s:root>"));

@@ -89,6 +89,10 @@ enum UIBackgroundShortcut: Hashable, Sendable {
   private func register() {
     guard carbon.hotKeys.isEmpty else { return }
     carbon.installHandler()
+    guard carbon.handler != nil else {
+      unavailable = UIBackgroundShortcut.all
+      return
+    }
     var missing: [UIBackgroundShortcut] = []
     for (index, shortcut) in UIBackgroundShortcut.all.enumerated() {
       var ref: EventHotKeyRef?

@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: ultracam
+
 jobs:
   signed-release-validation:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && vars.ULTRACAM_SIGNED_CI == 'enabled'
@@ -15,14 +19,22 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     env:
-      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-signed-work
-      ULTRACAM_SDK_INVENTORY: ${{ runner.temp }}/ultracam-signed-inventory.json
       DEVELOPMENT_TEAM: ${{ vars.ULTRACAM_DEVELOPMENT_TEAM }}
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          path: ultracam
           persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: andrewfitz/MonitorKit
+          ref: main
+          path: MonitorKit
+          persist-credentials: false
+      - name: Configure runner work paths
+        run: |
+          echo "ULTRACAM_WORK_ROOT=$RUNNER_TEMP/ultracam-signed-work" >> "$GITHUB_ENV"
+          echo "ULTRACAM_SDK_INVENTORY=$RUNNER_TEMP/ultracam-signed-inventory.json" >> "$GITHUB_ENV"
       - name: Install owner-provisioned identity and provisioning profiles
         env:
           SIGNING_P12: ${{ secrets.ULTRACAM_SIGNING_P12_BASE64 }}

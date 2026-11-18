@@ -106,13 +106,16 @@ pub fn analyze_events(events: Vec<StreamEvent>, config: SwitcherConfig) -> Resul
         .then_with(|| event_rank(a).cmp(&event_rank(b)))
     });
 
-    for event in ordered {
+    let mut ordered = ordered.into_iter().peekable();
+    while let Some(event) = ordered.next() {
         let explicit_tick = matches!(event, StreamEvent::Tick { .. });
         let event_time = timeline_time(&event);
         let outputs = director.process_event(event.clone());
         timeline.record_event(event, outputs.clone());
         acknowledge_offline_cuts(&mut director, &mut timeline, &outputs);
-        if !explicit_tick {
+        // Wait for every observation at this time, including any explicit tick.
+        let next_time = ordered.peek().and_then(timeline_time);
+        if !explicit_tick && event_time != next_time {
             if let Some(time) = event_time {
                 let tick = StreamEvent::Tick { time };
                 let outputs = director.process_event(tick.clone());

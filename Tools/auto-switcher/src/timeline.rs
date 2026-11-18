@@ -131,10 +131,15 @@ impl TimelineRecorder {
             return;
         }
         let media_time = event_time(&event).filter(|time| time.is_finite() && *time >= 0.0);
+        let event_end = match &event {
+            StreamEvent::Audio { cue } => Some(cue.time + cue.duration),
+            _ => media_time,
+        };
         self.timeline.duration = self
             .timeline
             .duration
             .max(media_time.unwrap_or(0.0))
+            .max(event_end.filter(|time| time.is_finite()).unwrap_or(0.0))
             .max(outputs.iter().filter_map(output_time).fold(0.0, f64::max));
         let media_time_ticks =
             media_time.map(|time| to_ticks(time, self.timeline.timebase.timescale));

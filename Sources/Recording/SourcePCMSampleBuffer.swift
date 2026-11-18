@@ -13,14 +13,15 @@ func makeSourceSample(planes: [Data], sampleFrameCount: Int, format: SourceAudio
     planes.count == (format.interleaved ? 1 : format.channels),
     planes.allSatisfy({ $0.count == planeBytes }), presentationTime.isNumeric,
     presentationTime.epoch == 0, presentationTime >= .zero else { throw ClockMappedPCMError.invalidPacket }
-  var flags = kAudioFormatFlagIsPacked
+  // int24in32 stores its 24 significant bits at the low end of each four-byte word.
+  var flags: AudioFormatFlags = format.sample == .int24in32 ? 0 : kAudioFormatFlagIsPacked
   if format.sample == .float32 { flags |= kAudioFormatFlagIsFloat }
   else { flags |= kAudioFormatFlagIsSignedInteger }
   if !format.interleaved { flags |= kAudioFormatFlagIsNonInterleaved }
   var asbd = AudioStreamBasicDescription(mSampleRate: format.sampleRate, mFormatID: kAudioFormatLinearPCM,
     mFormatFlags: flags, mBytesPerPacket: UInt32(channelsPerPlane * format.sample.bytesPerSample),
     mFramesPerPacket: 1, mBytesPerFrame: UInt32(channelsPerPlane * format.sample.bytesPerSample),
-    mChannelsPerFrame: UInt32(format.channels), mBitsPerChannel: UInt32(format.sample.bytesPerSample * 8), mReserved: 0)
+    mChannelsPerFrame: UInt32(format.channels), mBitsPerChannel: format.sample == .int24in32 ? 24 : UInt32(format.sample.bytesPerSample * 8), mReserved: 0)
   // The channel descriptions array is variable length; serialize all labels.
   let offset = MemoryLayout<AudioChannelLayout>.offset(of: \AudioChannelLayout.mChannelDescriptions)!
   let labelCount = format.layout.labels.count

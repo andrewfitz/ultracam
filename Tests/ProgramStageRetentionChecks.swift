@@ -4,6 +4,21 @@ import IOSurface
 import XCTest
 
 @objcMembers final class ProgramStageRetentionChecks: XCTestCase {
+  func testProgramValidatesDeclaredPixelAspectBeforePassthrough() throws {
+    let (_, _, image) = try timingRoute()
+    let horizontal = kCVImageBufferPixelAspectRatioHorizontalSpacingKey
+    let vertical = kCVImageBufferPixelAspectRatioVerticalSpacingKey
+    XCTAssertEqual(try ProgramOutputFormat.pixelAspect(of: image), .one)
+    for fields: [CFString: NSNumber] in [[horizontal: 1.5, vertical: 1],
+                                         [horizontal: 0, vertical: 1]] {
+      CVBufferSetAttachment(image, kCVImageBufferPixelAspectRatioKey, fields as CFDictionary, .shouldPropagate)
+      XCTAssertThrowsError(try ProgramOutputFormat.pixelAspect(of: image), String(describing: fields))
+    }
+    CVBufferSetAttachment(image, kCVImageBufferPixelAspectRatioKey,
+      [horizontal: 4, vertical: 3] as CFDictionary, .shouldPropagate)
+    XCTAssertEqual(try ProgramOutputFormat.pixelAspect(of: image), try Rational(4, 3))
+  }
+
   func testStageAdmitsEquivalentTimeAt25And120HzAndKeepsLateWorkCharged() throws {
     for rate in [25, 120] {
       let id = FeedID(rawValue: "retention")

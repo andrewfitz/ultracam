@@ -76,6 +76,7 @@ public struct RecordingTimecode: Equatable, Sendable, CustomStringConvertible {
 
   public init(frameNumber: Int64, frameRate: RecordingFrameRate, dropFrame: Bool) {
     self.frameRate = frameRate
+    let dropFrame = dropFrame && frameRate.supportsDropFrame
     let dayFrames = Self.framesPerDay(frameRate: frameRate, dropFrame: dropFrame)
     let normalized = ((frameNumber % dayFrames) + dayFrames) % dayFrames
     self.frameNumber = normalized
@@ -217,6 +218,7 @@ public struct RecordingTimecodeSession: Sendable {
     calendar: Calendar = .autoupdatingCurrent
   ) {
     self.frameRate = frameRate
+    let dropFrame = dropFrame && frameRate.supportsDropFrame
     self.dropFrame = dropFrame
     self.policy = policy
     self.startDate = startDate

@@ -547,6 +547,15 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
     let values = try decoder.container(keyedBy: DecodingKeys.self)
     version = try values.decodeIfPresent(Int.self, forKey: .version) ?? Self.currentVersion
     feeds = try values.decodeIfPresent([FeedDescriptor].self, forKey: .feeds) ?? []
+    // Before the choice was saved, a blank input beside an assigned one meant None.
+    // Newer snapshots distinguish that choice from a camera still waiting for its first input.
+    if feeds.contains(where: { !$0.selectedDevice.isEmpty }) {
+      struct SavedIntent: Decodable { let inputClearedByChoice: Bool? }
+      let intents = try values.decode([SavedIntent].self, forKey: .feeds)
+      for index in feeds.indices where feeds[index].selectedDevice.isEmpty && intents[index].inputClearedByChoice == nil {
+        feeds[index].inputClearedByChoice = true
+      }
+    }
     selectedFeedID = try values.decodeIfPresent(FeedID.self, forKey: .selectedFeedID)
       ?? feeds.first?.id ?? .primary
     outputMode = (try? values.decodeIfPresent(FeedOutputMode.self, forKey: .outputMode)) ?? .separateCameras

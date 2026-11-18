@@ -513,7 +513,7 @@ struct UISessionBridge {
     case .addCamera:
       _ = model.addFeed()
     case .removeCamera(let id):
-      _ = model.removeFeed(feedID(id))
+      guard model.removeFeed(feedID(id)) else { return }
       interface.collapsed.remove(id)
       interface.order.removeAll { $0 == id }
     case .renameCamera(let id, let name):

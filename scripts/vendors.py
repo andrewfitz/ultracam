@@ -294,10 +294,10 @@ def render_bridge(manifests):
     lines += ['#include "../../Tools/auto-switcher/include/auto_switcher.h"', '#endif', '']
     return '\n'.join(lines)
 
-def generate_bridge(root=ROOT, manifests=None):
+def generate_bridge(root=ROOT, manifests=None, destination=None):
     if manifests is None:
         manifests, _ = read_inventory(root)
-    destination = Path(root) / BRIDGE
+    destination = destination if destination is not None else Path(root) / BRIDGE
     destination.parent.mkdir(parents=True, exist_ok=True)
     text = render_bridge(manifests)
     if not destination.exists() or destination.read_text() != text:

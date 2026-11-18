@@ -120,6 +120,9 @@ struct ClockMappedPCMConverter {
       }
     }
     let outputCapacity = try preflight(sampleFrameCount: sampleFrameCount, mapping: mapping)
+    let nextAudioTime = CMTimeAdd(audioTime, CMTime(seconds: Double(sampleFrameCount) / format.sampleRate,
+      preferredTimescale: 1_000_000_000))
+    let nextVideoTime = try mapping.videoTime(forAudioTime: nextAudioTime)
     let frames = try decode(planes, frames: sampleFrameCount)
     var cursor = phase
     let step = format.sampleRate / (outputSampleRate * ratio)
@@ -145,8 +148,8 @@ struct ClockMappedPCMConverter {
     previousRatio = ratio
     let count = output.count / format.channels
     emitted += Int64(count)
-    expectedAudioTime = CMTimeAdd(audioTime, CMTime(seconds: Double(sampleFrameCount) / format.sampleRate, preferredTimescale: 1_000_000_000))
-    expectedVideoTime = try mapping.videoTime(forAudioTime: expectedAudioTime!)
+    expectedAudioTime = nextAudioTime
+    expectedVideoTime = nextVideoTime
     return ClockMappedPCMChunk(samples: output.withUnsafeBytes { Data($0) }, presentationTime: start,
       sampleFrameCount: count, channels: format.channels, correctionRatio: ratio)
   }

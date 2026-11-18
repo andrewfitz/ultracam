@@ -1,7 +1,7 @@
 # MonitorKit integration map
 
 > Historical transition survey. For current integration and verification, use
-> [MonitorKit's README](../Packages/MonitorKit/README.md), [the app README](../README.md),
+> [MonitorKit's README](https://github.com/andrewfitz/MonitorKit), [the app README](../README.md),
 > and [VALIDATION.md](../VALIDATION.md). The package build helper is now
 > `scripts/monitor-kit-package.sh`; dated instructions below describe the transition.
 
@@ -20,7 +20,7 @@ It replaces the 2026-10-21 version, which predates the app's Metal 4 rewrite (`2
 > (`FalseColorMode.elZone`, `ELZoneProfile`, `ELZonePublicReference`, `ELZoneReferenceStatus`). The app
 > dropped EL Zone too: a saved EL Zone selection reads as off. EL Zone mentions below are history.
 
-Related: [Monitor library plan](MONITOR_LIBRARY_PLAN.md), [GPU pipeline plan](GPU_PIPELINE_PLAN.md), [MonitorKit architecture](../Packages/MonitorKit/Docs/ARCHITECTURE.md), [MonitorKit progress](monitorkit/PROGRESS.md).
+Related: [Monitor library plan](MONITOR_LIBRARY_PLAN.md), [GPU pipeline plan](GPU_PIPELINE_PLAN.md), [MonitorKit architecture](https://github.com/andrewfitz/MonitorKit/blob/main/Docs/ARCHITECTURE.md), [MonitorKit progress](monitorkit/PROGRESS.md).
 
 ## 0. Baseline
 

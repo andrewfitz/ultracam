@@ -755,7 +755,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
       }
       let temporaryAttributes = try manager.fileManagerRef.attributesOfItem(
         atPath: paths.temporaryFile.path)
-      guard (temporaryAttributes[.type] as? FileAttributeType) != .typeSymbolicLink else {
+      guard (temporaryAttributes[.type] as? FileAttributeType) == .typeRegular else {
         throw RecordingOutputError.unsafePath
       }
       if externalWriterOwnsFile {
@@ -794,6 +794,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
   /// as on cancel.
   public func preserveForRecovery(discardingEmptyTake: Bool = false) {
     lock.lock(); defer { lock.unlock() }
+    guard stateValue != .finished, stateValue != .cancelled else { return }
     handle?.synchronizeFile()
     handle?.closeFile()
     handle = nil
@@ -808,6 +809,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
       if recoveryJournal?.entry.sidecarOwned == true { try? RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
       recoveryJournal?.remove()
     }
+    ownsTemporaryFile = false
     recoveryJournal = nil
     stateValue = .failed
     releaseReservationLocked()

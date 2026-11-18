@@ -10,6 +10,9 @@ import XCTest
     let recorder = AutoSwitcherTimelineRecorder(settings: settings,
       anchor: FeedID(rawValue: "anchor"), emphasis: FeedID(rawValue: "emphasis"),
       outputFolder: folder)
+    let originalURL = recorder.outputFileURL
+    recorder.setOutputFolder(folder)
+    XCTAssertEqual(recorder.outputFileURL, originalURL)
     recorder.recordAudioCue(AutoSwitcherAudioCue(id: 1, time: 5.0, duration: 0.02,
       speechEnergy: 0.8, pauseDuration: 0.3, emphasis: 0.9, laughter: 0,
       speechStart: true, speechStop: false, sessionGeneration: 1))
@@ -47,6 +50,26 @@ import XCTest
     let cue = try XCTUnwrap((transcript["event"] as? [String: Any])?["cue"] as? [String: Any])
     XCTAssertEqual(cue["segment_id"] as? String, "segment-1")
     XCTAssertEqual(cue["kind"] as? String, "sentenceEnd")
+  }
+
+  func testNewTakeClearsPreviousSourceBounds() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let feed = FeedID(rawValue: "A")
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: feed, emphasis: FeedID(rawValue: "B"), outputFolder: folder)
+    let first = folder.appendingPathComponent("first.mov"), next = folder.appendingPathComponent("next.mov")
+    recorder.recordingStarted(feedID: feed, url: first, mediaStart: .zero)
+    recorder.recordingFinished(feedID: feed, url: first, mediaEnd: CMTime(value: 5, timescale: 1))
+    recorder.recordingStarted(feedID: feed, url: next, mediaStart: nil)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
+    let sources = try XCTUnwrap(object["sources"] as? [[String: Any]])
+    let source = try XCTUnwrap(sources.first { $0["camera_id"] as? String == feed.rawValue })
+    XCTAssertEqual(source["media_file"] as? String, next.path)
+    XCTAssertNil(source["media_start"])
+    XCTAssertNil(source["media_end"])
+    let recordings = try XCTUnwrap(object["recordings"] as? [[String: Any]])
+    XCTAssertEqual(recordings.first?["media_end"] as? Double, 5)
   }
 
   func testLedgerProtocolAndAcknowledgementUseDirectorClock() throws {

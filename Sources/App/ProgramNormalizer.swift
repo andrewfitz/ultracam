@@ -329,10 +329,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     }
     let width = CVPixelBufferGetWidth(source)
     let height = CVPixelBufferGetHeight(source)
-    let aspect = CVBufferCopyAttachment(source, kCVImageBufferPixelAspectRatioKey, nil) as? [String: Any]
-    let aspectH = (aspect?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String] as? NSNumber)?.int64Value ?? 1
-    let aspectV = (aspect?[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String] as? NSNumber)?.int64Value ?? 1
-    let pixelAspect = try Rational(aspectH, aspectV)
+    let pixelAspect = try ProgramOutputFormat.pixelAspect(of: source)
     let resized = width != contract.width || height != contract.height || pixelAspect != .one
     Self.stampAttachments(output, from: source, resized: resized,
       chromaResampled: resized || sourceCode.is420 != destinationCode.is420)
@@ -778,7 +775,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     float2 origin = float2(p.geometry.zw);
     float2 scaled = float2(p.geometry.xy);
     float2 cell = float2(float(dx) * 2.0f, float(dy) * vertical);
-    float2 extent = float2(2.0f, vertical);
+    // A partial pair at the right edge of packed v210 has only one visible luma sample.
+    float2 extent = min(float2(2.0f, vertical), float2(p.destination.xy) - cell);
     float2 covered = max(float2(0.0f), min(cell + extent, origin + scaled) - max(cell, origin));
     float coverage = (covered.x / extent.x) * (covered.y / extent.y);
     if (coverage == 0.0f) return float2(512.0f);

@@ -65,7 +65,12 @@ import XCTest
 
   private final class StatisticsDriver: RecordingSessionDriver, RecordingSessionDriverStatistics {
     var snapshots: [FeedID: RecordingStatistics] = [:]
-    func recordingStatistics() async -> [FeedID: RecordingStatistics] { snapshots }
+    var beforeReturn: (@MainActor () async -> Void)?
+    func recordingStatistics() async -> [FeedID: RecordingStatistics] {
+      let result = snapshots
+      await beforeReturn?()
+      return result
+    }
     func startRecording(feedID: FeedID, configuration: RecordingConfiguration) throws {}
     func pauseRecording(feedID: FeedID) throws {}
     func resumeRecording(feedID: FeedID) throws {}
@@ -979,6 +984,28 @@ import XCTest
       XCTAssertEqual(model.interruptedRecordings.count, 1)
       XCTAssertNil(model.recoveryMessage)
     }
+  }
+
+  func testLateStatisticsPollCannotOverwriteNewerFinalStatistics() async {
+    let driver = StatisticsDriver()
+    let model = RecordingModel(feeds: [.init(id: first, name: "Wide")], driver: driver)
+    let entered = expectation(description: "First poll captured its readings")
+    var release: CheckedContinuation<Void, Never>?
+    driver.snapshots = [first: RecordingStatistics(encodedFrames: 10)]
+    driver.beforeReturn = {
+      await withCheckedContinuation { continuation in
+        release = continuation
+        entered.fulfill()
+      }
+    }
+    let oldPoll = Task { await model.refreshStatistics() }
+    await fulfillment(of: [entered], timeout: 2)
+    driver.beforeReturn = nil
+    driver.snapshots = [first: RecordingStatistics(encodedFrames: 20)]
+    await model.refreshStatistics()
+    release?.resume()
+    await oldPoll.value
+    XCTAssertEqual(model.feeds.first?.statistics?.encodedFrames, 20)
   }
 
   func testPerFeedStatisticsRemainAfterStopAndResetForANewTake() {

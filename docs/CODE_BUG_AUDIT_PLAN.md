@@ -12,8 +12,8 @@ This is a bug audit, not only a test run. A passing test suite is evidence for t
 |---|---|---|
 | App and extension | `Sources/App`, `Sources/CameraExtension`, `Sources/Shared`, `Sources/Recording` | Full source review, build, unit/contract tests, race and failure testing, signed runtime checks |
 | Native capture | `Sources/DeckLinkBackend` and `Sources/DeckLinkBackend/*.inc` | Full C++/Objective-C++ review, callback/lifetime/thread checks, device and format matrix, hardware smoke tests |
-| GPU | `Sources/App/*.metal`, `Packages/MonitorKit/Sources/**/*.metal` | Shader compilation, bounds/format/math review, GPU validation, resource-pressure and device-loss tests |
-| External package boundary | `Packages/MonitorKit/Sources`, `Packages/MonitorKit/Tests` | Treat the pinned git submodule as external code: audit its implementation and integration, record upstream provenance, and keep upstream/package findings separate from Ultracam integration findings |
+| GPU | `Sources/App/*.metal`, `../MonitorKit/Sources/**/*.msl` | Shader compilation, bounds/format/math review, GPU validation, resource-pressure and device-loss tests |
+| MonitorKit package | `../MonitorKit/Sources`, `../MonitorKit/Tests` | Audit the implementation in the main MonitorKit repo and verify its integration with Ultracam. |
 | Rust tool | `Tools/auto-switcher` | `cargo test --locked`, clippy/audit checks, FFI/ABI and protocol review, fuzz/property tests, CLI failure tests |
 | Tools and scripts | `Tools`, `scripts`, `scripts/*.py`, shell entry points | Shell/Python safety, stale-path and exit-status checks, clean-machine execution, packaging/signing tests |
 | Project and release surface | `Ultracam.xcodeproj`, `Config`, entitlements, plists, generated project scripts | Build-graph completeness, target parity, signing, entitlements, hardened-runtime, release/debug differences |
@@ -26,7 +26,7 @@ The ownership ledger must label every source asset as **ours**, **vendor**, **ge
 
 ### Relationship to the MonitorKit plan
 
-[`MONITORKIT_FRESH_BUG_AUDIT_PLAN.md`](MONITORKIT_FRESH_BUG_AUDIT_PLAN.md) is the specialized workstream for the `Packages/MonitorKit` submodule and its app integration. It supplies deeper GPU, color, scope, audio, renderer, and Metal-lifetime invariants than this general plan. Both plans use the same starting status metadata, evidence directory, finding IDs, and final verification gate. The repo-wide plan remains the source of truth for ownership, vendor disposition, release packaging, and cross-subsystem findings.
+[`MONITORKIT_FRESH_BUG_AUDIT_PLAN.md`](MONITORKIT_FRESH_BUG_AUDIT_PLAN.md) is the specialized workstream for `../MonitorKit` and its app integration. It supplies deeper GPU, color, scope, audio, renderer, and Metal-lifetime invariants than this general plan. Both plans use the same starting status metadata, evidence directory, finding IDs, and final verification gate. The repo-wide plan remains the source of truth for ownership, vendor disposition, release packaging, and cross-subsystem findings.
 
 ## Phase 0: establish a trustworthy baseline
 

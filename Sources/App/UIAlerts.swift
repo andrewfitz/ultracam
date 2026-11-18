@@ -253,7 +253,7 @@ extension UIAlertDelivering {
     driveWatch = nil
     guard rolling else { return }
     let timer = Timer(timeInterval: Self.driveWatchInterval, repeats: true) { [weak self] _ in
-      MainActor.assumeIsolated { self?.scheduleUpdate() }
+      MainActor.assumeIsolated { self?.evaluate() }
     }
     RunLoop.main.add(timer, forMode: .common)
     driveWatch = timer
@@ -350,13 +350,18 @@ extension UIAlertDelivering {
   }
 
   /// Attention already shows it when the main window is key.
-  static func presentation(mainWindowKey: Bool) -> UNNotificationPresentationOptions {
-    mainWindowKey ? [.list] : [.banner, .list]
+  static func presentation(mainWindowKey: Bool, sound: Bool = false) -> UNNotificationPresentationOptions {
+    var options: UNNotificationPresentationOptions = mainWindowKey ? [.list] : [.banner, .list]
+    if sound { options.insert(.sound) }
+    return options
   }
 
   nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async
     -> UNNotificationPresentationOptions {
-    await MainActor.run { Self.presentation(mainWindowKey: NSApp.keyWindow?.identifier?.rawValue.hasPrefix("main") == true) }
+    let sound = notification.request.content.sound != nil
+    return await MainActor.run {
+      Self.presentation(mainWindowKey: NSApp.keyWindow?.identifier?.rawValue.hasPrefix("main") == true, sound: sound)
+    }
   }
 
   nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {

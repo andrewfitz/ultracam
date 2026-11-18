@@ -465,7 +465,7 @@ final class CameraSink {
     try check(CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &address,
       0, nil, UInt32(MemoryLayout.size(ofValue: allow)), &allow), "Enable software camera discovery")
     for id in try discoverDevices() {
-      guard try string(id, selector: kCMIODevicePropertyDeviceUID) == route.deviceUID else { continue }
+      guard (try? string(id, selector: kCMIODevicePropertyDeviceUID)) == route.deviceUID else { continue }
       let streams = try ids(id, selector: kCMIODevicePropertyStreams)
       let format = try outputFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
       let paired = try pairedStreams(streams)
@@ -536,13 +536,16 @@ final class CameraSink {
     try check(CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &address,
       0, nil, UInt32(MemoryLayout.size(ofValue: allow)), &allow), "Enable software camera discovery")
     let devices = try ids(CMIOObjectID(kCMIOObjectSystemObject), selector: kCMIOHardwarePropertyDevices)
-    guard let id = try devices.first(where: { try string($0, selector: kCMIODevicePropertyDeviceUID) == route.deviceUID }),
+    guard let id = devices.first(where: { (try? string($0, selector: kCMIODevicePropertyDeviceUID)) == route.deviceUID }),
       !controlledByAnotherProcess(id) else { return }
     let format = try outputFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
     let paired = try pairedStreams(try ids(id, selector: kCMIODevicePropertyStreams))
     let requested = DerivedOutputContract(format: format, duration: configuration.duration)
-    for stream in [paired.sink, paired.source] {
+    let streams = [paired.sink, paired.source]
+    for stream in streams {
       guard requested.matchingPublishedIndex(in: try publishedFormats(stream)) != nil else { return }
+    }
+    for stream in streams {
       try writeContract(stream, format: format, duration: configuration.duration)
     }
     cameraOutputLog.notice("Camera format prepared: \(self.route.feedID ?? "Program", privacy: .public), \(fourCC(CMFormatDescriptionGetMediaSubType(format)), privacy: .public)")
@@ -598,7 +601,7 @@ final class CameraSink {
     let deadline = DispatchTime.now() + .seconds(3)
     repeat {
       let devices = try ids(system, selector: kCMIOHardwarePropertyDevices)
-      if try devices.contains(where: { try string($0, selector: kCMIODevicePropertyDeviceUID) == route.deviceUID }) {
+      if devices.contains(where: { (try? string($0, selector: kCMIODevicePropertyDeviceUID)) == route.deviceUID }) {
         return devices
       }
       guard status == noErr, changed.wait(timeout: deadline) == .success else { return [] }
@@ -745,7 +748,7 @@ final class CameraSink {
     try values.withUnsafeMutableBytes { bytes in
       try check(CMIOObjectGetPropertyData(object, &address, 0, nil, size, &size, bytes.baseAddress!), "Read camera list")
     }
-    return values
+    return Array(values.prefix(Int(size) / MemoryLayout<UInt32>.size))
   }
 
   private func direction(_ object: CMIOObjectID) -> UInt32? {

@@ -148,6 +148,7 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
   func stop() {
     precondition(Thread.current.threadDictionary[callbackKey] == nil, "Never stop synchronously from capture delivery")
     control.sync {
+      guard state != .stopped else { return }
       delivery.lock(); accepting = false; delivery.unlock()
       backend.stop()
       delivery.lock(); handlers = nil; delivery.unlock()
@@ -312,10 +313,17 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
   }
   static func timecode(_ text: String?) -> Timecode? {
     guard let text else { return nil }
-    let labels = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == ":" || $0 == ";" })
+    let dropFrame = text.contains(";")
+    let fields = text.split(separator: ":", omittingEmptySubsequences: false)
+    let labels: [Substring]
+    if dropFrame {
+      guard fields.count == 3 else { return nil }
+      labels = Array(fields.prefix(2)) + fields[2].split(separator: ";", omittingEmptySubsequences: false)
+    } else { labels = fields }
+    guard labels.count == 4, labels.allSatisfy({ !$0.isEmpty && $0.utf8.allSatisfy { (48...57).contains($0) } }) else { return nil }
     let parts = labels.compactMap { Int($0) }
-    guard labels.count == 4, parts.count == 4 else { return nil }
-    return try? Timecode(hours: parts[0], minutes: parts[1], seconds: parts[2], frames: parts[3], dropFrame: text.contains(";"))
+    guard parts.count == 4 else { return nil }
+    return try? Timecode(hours: parts[0], minutes: parts[1], seconds: parts[2], frames: parts[3], dropFrame: dropFrame)
   }
   // SourceFormat computes its canonical JSON/SHA signature at construction.
   // Reuse it only after checking every physical declaration field; layout and

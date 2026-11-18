@@ -36,6 +36,11 @@
   if (_text.length + string.length > 1024) { [parser abortParsing]; return; }
   [_text appendString:string];
 }
+- (void)parser:(NSXMLParser *)parser foundCDATA:(NSData *)data {
+  NSString *value = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+  if (!value) { [parser abortParsing]; return; }
+  [self parser:parser foundCharacters:value];
+}
 - (void)parser:(NSXMLParser *)parser didEndElement:(NSString *)element namespaceURI:(NSString *)uri qualifiedName:(NSString *)qualified {
   (void)parser; (void)uri; (void)qualified;
   NSString *key = element.lowercaseString;

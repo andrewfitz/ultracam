@@ -14,19 +14,30 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: ultracam
+
 jobs:
   contracts-and-unsigned-build:
     # GitHub's standard macos-26 image is arm64; no paid larger runner required.
     # https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
     runs-on: macos-26
     timeout-minutes: 45
-    env:
-      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-work
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          path: ultracam
           persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: andrewfitz/MonitorKit
+          ref: main
+          path: MonitorKit
+          persist-credentials: false
+      - name: Configure runner work paths
+        run: |
+          echo "ULTRACAM_WORK_ROOT=$RUNNER_TEMP/ultracam-work" >> "$GITHUB_ENV"
       - name: Canonical SDK modes and boundary contracts
         run: bash scripts/ci-vendor-checks.sh --contracts-only
       - name: Strict shipping typecheck
@@ -40,14 +51,21 @@ jobs:
     if: vars.ULTRACAM_SONY_SDK_CI == 'enabled' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: macos-26
     timeout-minutes: 45
-    env:
-      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-sony-work
-      ULTRACAM_SDK_INVENTORY: ${{ runner.temp }}/ultracam-sony-inventory.json
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          path: ultracam
           persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: andrewfitz/MonitorKit
+          ref: main
+          path: MonitorKit
+          persist-credentials: false
+      - name: Configure runner work paths
+        run: |
+          echo "ULTRACAM_WORK_ROOT=$RUNNER_TEMP/ultracam-sony-work" >> "$GITHUB_ENV"
+          echo "ULTRACAM_SDK_INVENTORY=$RUNNER_TEMP/ultracam-sony-inventory.json" >> "$GITHUB_ENV"
       - name: Install licensed SDK and verify pinned payload
         env:
           SONY_SDK_ARCHIVE_URL: ${{ secrets.ULTRACAM_SONY_SDK_ARCHIVE_URL }}
@@ -70,13 +88,20 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.hardware
     runs-on: [self-hosted, macOS, ARM64, ultracam-metal4]
     timeout-minutes: 90
-    env:
-      ULTRACAM_WORK_ROOT: ${{ runner.temp }}/ultracam-work
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          path: ultracam
           persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: andrewfitz/MonitorKit
+          ref: main
+          path: MonitorKit
+          persist-credentials: false
+      - name: Configure runner work paths
+        run: |
+          echo "ULTRACAM_WORK_ROOT=$RUNNER_TEMP/ultracam-work" >> "$GITHUB_ENV"
       - name: Synthetic media and strict offscreen UI integration
         run: bash scripts/ci-vendor-checks.sh --hardware
 

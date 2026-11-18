@@ -32,6 +32,10 @@ import XCTest
     budget.releaseOne(bytes: 25)
     XCTAssertEqual(budget.currentBytes, 0)
   }
+  func testUnrepresentableQueueDurationIsRejected() {
+    XCTAssertThrowsError(try CMIOQueueBudget(queueSlots: 2,
+      frameDuration: CMTime(value: Int64.max, timescale: 1), maxBytes: 1))
+  }
   func testMinimumSlotsNeverOverridesHardByteLimit() throws {
     let budget = try CMIOQueueBudget(queueSlots: 8, frameDuration: CMTime(value: 1, timescale: 60), maxBytes: 10, minimumSlots: 2)
     XCTAssertTrue(try budget.admit(bytes: 10))

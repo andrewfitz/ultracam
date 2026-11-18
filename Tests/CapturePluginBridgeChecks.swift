@@ -32,6 +32,26 @@ import XCTest
     autoreleasepool { consumer.releaseImage() }
     XCTAssertNil(owner, "The lease must release when the final raw CV reference releases")
   }
+  func testFailedReplacementReleasesPriorDeliveryCallbacks() throws {
+    let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
+      rate: .constant(CMTime(value: 1001, timescale: 60000)))
+    let bridge = CaptureServicesBridge(makeSession: { id in
+      guard id == "fake:fixture" else { throw PluginError.invalidState("replacement unavailable") }
+      return FakeCaptureSession(format: format)
+    })
+    weak var retained: NSObject?
+    do {
+      let marker = NSObject()
+      retained = marker
+      try bridge.start(deviceID: "fake:fixture", timing: .automatic,
+        callbacks: CaptureLegacyCallbacks(typed: { _ in withExtendedLifetime(marker) {} }))
+    }
+    XCTAssertNotNil(retained)
+    XCTAssertThrowsError(try bridge.start(deviceID: "missing", timing: .automatic,
+      callbacks: CaptureLegacyCallbacks()))
+    XCTAssertNil(retained)
+  }
+
   func testSynchronousStartupCallbackCanReadCounters() throws {
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
       rate: .constant(CMTime(value: 1001, timescale: 60000)))

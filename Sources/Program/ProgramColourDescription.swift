@@ -10,12 +10,20 @@ extension ProgramOutputFormat {
       actual.primaries == colour.primaries, actual.transfer == colour.transfer,
       actual.matrix == colour.matrix, actual.range == colour.range,
       actual.horizontalChromaSiting == .center, actual.verticalChromaSiting == .center else { return false }
-    if let aspect = CVBufferCopyAttachment(image, kCVImageBufferPixelAspectRatioKey, nil) as? [String: Any] {
-      let h = (aspect[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String] as? NSNumber)?.int64Value ?? 1
-      let v = (aspect[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String] as? NSNumber)?.int64Value ?? 1
-      return h == v && h > 0
+    return (try? Self.pixelAspect(of: image)) == .one
+  }
+
+  static func pixelAspect(of image: CVPixelBuffer) throws -> Rational {
+    guard let attachment = CVBufferCopyAttachment(image, kCVImageBufferPixelAspectRatioKey, nil) else {
+      return .one
     }
-    return true
+    guard let aspect = attachment as? [String: Any],
+      let h = aspect[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String] as? NSNumber,
+      let v = aspect[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String] as? NSNumber,
+      CFGetTypeID(h) == CFNumberGetTypeID(), CFGetTypeID(v) == CFNumberGetTypeID(),
+      let horizontal = h as? Int64, let vertical = v as? Int64,
+      horizontal > 0, vertical > 0 else { throw VideoError.message("Invalid Program input pixel aspect ratio.") }
+    return try Rational(horizontal, vertical)
   }
 
   func stampColour(on image: CVPixelBuffer) throws {

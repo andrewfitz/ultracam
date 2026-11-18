@@ -11,15 +11,13 @@ from work_paths import work_paths
 from vendors import read_inventory, build_settings, source_paths, generate_bridge, input_digest, check_capabilities
 
 ROOT = Path(__file__).resolve().parents[1]
-# MonitorKit is a git submodule; a clone without it would generate a project
-# whose package reference points at an empty directory.
-if not (ROOT / "Packages/MonitorKit/Package.swift").is_file():
-    sys.exit("generate_project.py: Packages/MonitorKit/Package.swift is missing; "
-             "MonitorKit is a git submodule: run git submodule update --init")
+if not (ROOT.parent / "MonitorKit" / "Package.swift").is_file():
+    sys.exit("generate_project.py: clone the MonitorKit repository beside Ultracam at ../MonitorKit")
 objects = {}
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sdk-inventory', type=Path)
 parser.add_argument('--output-dir', type=Path)
+parser.add_argument('--bridge-output', type=Path)
 args = parser.parse_args()
 if args.sdk_inventory is not None:
     # Match vendors.read_inventory: relative selections belong to the checkout,
@@ -28,7 +26,7 @@ if args.sdk_inventory is not None:
 manifests, sdk_inventory = read_inventory(ROOT, args.sdk_inventory)
 vendor_settings = build_settings(manifests, sdk_inventory)
 vendor_digest = input_digest(manifests, sdk_inventory)
-generate_bridge(ROOT, manifests)
+generate_bridge(ROOT, manifests, args.bridge_output)
 check_capabilities(ROOT, manifests, sdk_inventory)
 
 
@@ -143,7 +141,7 @@ project_configs = configs("project", dict(SDKROOT="macosx", MACOSX_DEPLOYMENT_TA
 
 # MonitorKit, linked into the app only (never the camera extension). Xcode links package
 # products as object files, so all five products and both resource bundles ship in the app.
-monitor_kit_package = add("monitor-kit-package", "XCLocalSwiftPackageReference", relativePath="Packages/MonitorKit")
+monitor_kit_package = add("monitor-kit-package", "XCLocalSwiftPackageReference", relativePath="../MonitorKit")
 monitor_products = [add(f"monitor-kit-product-{name}", "XCSwiftPackageProductDependency", package=monitor_kit_package, productName=name)
                     for name in ("MonitorKitCore", "MonitorKit", "MonitorKitScopes", "MonitorKitAudio", "MonitorKitUI")]
 

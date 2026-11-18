@@ -54,5 +54,5 @@ private final class ClaimedCaptureSession: CaptureSession, @unchecked Sendable {
       stopped = true; session.stop(); claims.release(deviceID: device.id, ownerID: ownerID, token: token)
     }
   }
-  deinit { session.stop(); claims.release(deviceID: device.id, ownerID: ownerID, token: token) }
+  deinit { stop() }
 }

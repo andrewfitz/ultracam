@@ -178,6 +178,19 @@ import XCTest
     XCTAssertFalse(bridge.isConnected)
   }
 
+  func testProgramQueueStallEndsWhenSinkCloses() throws {
+    let source = feed("alpha")
+    let route = ProgramOutputRoute(feedIDs: [source])
+    let consumer = try route.addConsumerRoute(capacity: 4)
+    let bridge = ProgramOutputBridge(route: consumer, connect: { _, _ in }, disconnect: {}, send: { _ in false })
+    try bridge.setDemand(true, configuration: PipelineConfiguration(), passthroughFormat: kCVPixelFormatType_32BGRA)
+    _ = route.ingest(feedID: source, frame: try frame(source, at: 0))
+    bridge.pump()
+    XCTAssertNotNil(bridge.queueFullSince)
+    bridge.disconnect()
+    XCTAssertNil(bridge.queueFullSince)
+  }
+
   /// Host time keeps the Program clock's spacing through delivery jitter of up to
   /// two frames and through one late frame; after a short gap on air (Program time
   /// continues where it left off, real time moved on) frames that stay late for

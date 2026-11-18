@@ -33,7 +33,7 @@ class B1cResourceLintIntegrationChecks(unittest.TestCase):
         self.assertNotIn('SourceRecording.swift', checker_text)
 
     def test_budget_sources_are_on_the_production_scan_surfaces(self):
-        surfaces = ('Sources', 'Packages/MonitorKit/Sources', 'Vendors')
+        surfaces = ('Sources', '../MonitorKit/Sources', 'Vendors')
         self.assertTrue(all((ROOT / surface).exists() for surface in surfaces))
         for path in ('Sources/App/CaptureAdmissionBudget.swift',
                      'Sources/Recording/SourceRecording.swift'):
@@ -44,7 +44,7 @@ class B1cResourceLintIntegrationChecks(unittest.TestCase):
         # writing a synthetic B1c budget file into a scanned surface.
         import tempfile
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary) / "ultracam"
             source = root / 'Sources/Recording/NewRetentionBudget.swift'
             source.parent.mkdir(parents=True)
             source.write_text('func admit() { CVPixelBufferGetBaseAddress(image) }')

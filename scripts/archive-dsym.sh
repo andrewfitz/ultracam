@@ -29,12 +29,27 @@ if [[ ! "$keep" =~ ^[1-9][0-9]*$ ]]; then
   echo "keep must be a positive integer: $keep" >&2
   exit 2
 fi
+mkdir -p "$symbols"
+# Hold the archive lock across copying, index updates and retention. The
+# kernel releases the directory descriptor if this process is interrupted.
+if [[ "${ULTRACAM_DSYM_LOCK_PID:-}" != "$$" ]]; then
+  exec python3 - "$0" "$@" <<'PYTHON'
+import fcntl
+import os
+import sys
+
+directory = os.open(sys.argv[3], os.O_RDONLY)
+fcntl.flock(directory, fcntl.LOCK_EX)
+os.set_inheritable(directory, True)
+os.environ["ULTRACAM_DSYM_LOCK_PID"] = str(os.getpid())
+os.execv("/bin/bash", ["/bin/bash", *sys.argv[1:]])
+PYTHON
+fi
 uuids="$(/usr/bin/dwarfdump --uuid "$dsym" | /usr/bin/awk '$1 == "UUID:" { print $2 }')"
 if [[ -z "$uuids" ]]; then
   echo "dwarfdump found no UUID in $dsym" >&2
   exit 1
 fi
-mkdir -p "$symbols"
 copy="$symbols/$build_id"
 partial="$symbols/.$build_id.partial"
 # Also any copy an interrupted run left.
@@ -48,7 +63,11 @@ mv "$partial" "$copy"
 for uuid in $uuids; do
   link="$symbols/$uuid"
   # ln -sfn on a real directory would link inside it.
-  if [[ -d "$link" && ! -L "$link" ]]; then rm -rf "$link"; fi
+  if [[ -e "$link" && ! -L "$link" ]]; then
+    echo "Cannot index UUID over an existing archive entry: $link" >&2
+    exit 1
+  fi
+  if [[ -L "$link" && -d "$link" && "$(readlink "$link")" > "$build_id" ]]; then continue; fi
   ln -sfn "$build_id" "$link"
 done
 # Newest first: every real directory is one build's copy.

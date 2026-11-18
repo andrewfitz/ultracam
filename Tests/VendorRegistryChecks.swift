@@ -82,6 +82,17 @@ import XCTest
     try start(other, device: device)
     other.stop()
   }
+  func testStoppedClaimDoesNotStopPluginAgainAtDeinit() throws {
+    let claims = CaptureDeviceClaims()
+    let device = Self.device("a:x")
+    let plugin = RegistryFixture(id: "a", devices: [device])
+    do {
+      let current = claims.makeSession(plugin: plugin, device: device, ownerID: "feed")
+      try start(current, device: device)
+      current.stop()
+    }
+    XCTAssertEqual(plugin.session.stops, 1)
+  }
   func testSessionDeinitReleasesItsClaim() throws {
     let claims = CaptureDeviceClaims()
     let device = Self.device("a:x")
@@ -134,6 +145,7 @@ private final class RegistrySession: CaptureSession, @unchecked Sendable {
   var fail = false
   var counters: CaptureCounters { CaptureCounters() }
   func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws { if fail { throw PluginError.failed("start") } }
-  func stop() {}
+  var stops = 0
+  func stop() { stops += 1 }
 }
 #endif

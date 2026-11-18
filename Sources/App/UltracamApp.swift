@@ -198,6 +198,7 @@ struct UltracamApp: App {
     // Eight toolbar tabs in an ordinary resizable window; a long tab scrolls.
     Settings {
       UISettingsView(model: model, interface: interface)
+        .defaultAppStorage(UIAppEnvironment.defaults)
     }
     .defaultSize(UISettingsLayout.defaultSize)
     .windowResizability(.contentMinSize)

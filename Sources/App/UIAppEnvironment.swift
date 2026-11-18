@@ -4,11 +4,26 @@ import AppKit
 /// self-test. Created lazily on first use, so test harnesses that compile every
 /// app source don't create them.
 @MainActor enum UIAppEnvironment {
-  static let model = AppModel()
-  static let interface = UIInterfaceState()
-  static let alertPreferences = UIAlertPreferences()
+  private static let selfTestDomain: String? = {
+    let args = CommandLine.arguments
+    return args.contains("--ui-self-test") && !args.contains("--live")
+      ? "org.ultracam.ui-self-test.\(UUID().uuidString)" : nil
+  }()
+  static let defaults = selfTestDomain.flatMap(UserDefaults.init(suiteName:)) ?? .standard
+  static func clearSelfTestPreferences() {
+    if let selfTestDomain { defaults.removePersistentDomain(forName: selfTestDomain) }
+  }
+  static let model: AppModel = {
+    guard selfTestDomain != nil else { return AppModel() }
+    return AppModel(settingsStore: AppSettingsStore(defaults: defaults),
+      registryStore: VirtualCameraRegistryStore(defaults: defaults),
+      registryPublisher: VirtualCameraRegistryPublisher(observeTopology: false, apply: { _ in }),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults), hardware: .offline)
+  }()
+  static let interface = UIInterfaceState(defaults: defaults)
+  static let alertPreferences = UIAlertPreferences(defaults: defaults)
   /// Settings › General's switch binds this.
-  static let backgroundShortcuts = UIBackgroundShortcuts()
+  static let backgroundShortcuts = UIBackgroundShortcuts(defaults: defaults)
   /// SwiftUI's scene actions, for AppKit (the menu bar item, a Dock click). The app's menu
   /// commands set them at launch, before any window opens, and they keep working after
   /// every window has closed.

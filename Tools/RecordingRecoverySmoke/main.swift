@@ -54,6 +54,12 @@ func parent(root: URL) async throws {
       let pipe = Pipe()
       process.standardOutput = pipe
       try process.run()
+      defer {
+        if process.isRunning {
+          kill(process.processIdentifier, SIGKILL)
+          process.waitUntilExit()
+        }
+      }
       let ready = pipe.fileHandleForReading.availableData
       try require(String(data: ready, encoding: .utf8)?.contains("READY") == true, "Child did not start.")
       let live = try RecordingRecovery.scan(root: takeRoot)

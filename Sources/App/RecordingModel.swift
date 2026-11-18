@@ -768,6 +768,8 @@ final class RecordingModel {
   private let resolveFinishedFile: (URL?, URL?) -> URL?
   private var finishedCallbacks: [() -> Void] = []
   @ObservationIgnored private var statisticsTask: Task<Void, Never>?
+  @ObservationIgnored private var statisticsRequest: UInt64 = 0
+  @ObservationIgnored private var lastAppliedStatisticsRequest: UInt64 = 0
   private var recordingGenerations: [FeedID: UInt64] = [:]
 
   init(feeds: [RecordingFeedDescriptor] = [], driver: RecordingSessionDriver = UnavailableRecordingSessionDriver(),
@@ -1081,8 +1083,13 @@ final class RecordingModel {
 
   func refreshStatistics() async {
     guard let source = driver as? RecordingSessionDriverStatistics else { return }
+    statisticsRequest += 1
+    let request = statisticsRequest
     let generations = recordingGenerations
     let snapshots = await source.recordingStatistics()
+    // Stop also requests final statistics. A suspended poll can return after that final read.
+    guard request > lastAppliedStatisticsRequest else { return }
+    lastAppliedStatisticsRequest = request
     for (id, snapshot) in snapshots {
       guard generations[id] == recordingGenerations[id], let index = index(of: id) else { continue }
       let previous = _feeds[index].statistics

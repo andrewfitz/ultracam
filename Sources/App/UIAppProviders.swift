@@ -130,23 +130,30 @@ private struct UIAppSurfacePicture: View {
     .onAppear {
       presenter.setMagnification(.centered(zoom: zoom))
       register()
-      if !compact { UIMonitorBridge.register(presenter, cameraID: target.rawValue) }
-      if !compact { UICleanViewState.shared.set(presenter.isClean, for: target.rawValue) }
+      if !compact {
+        UIMonitorBridge.register(presenter, cameraID: target.rawValue)
+        UICleanViewState.shared.set(presenter.isClean, for: target.rawValue)
+        UICleanViewState.shared.setFrozen(presenter.isFrozen, for: target.rawValue)
+      }
     }
     .onDisappear {
       coordinator.unregisterSurface(id: surfaceID, target: target)
-      UIMonitorBridge.unregister(cameraID: target.rawValue, presenter: presenter)
-      if !compact {
+      if UIMonitorBridge.presenter(for: target.rawValue) === presenter {
+        UIMonitorBridge.unregister(cameraID: target.rawValue, presenter: presenter)
         UICleanViewState.shared.set(false, for: target.rawValue)
         UICleanViewState.shared.setFrozen(false, for: target.rawValue)
       }
     }
     .onChange(of: zoom) { _, value in presenter.setMagnification(.centered(zoom: value)) }
     .onChange(of: presenter.isClean) { _, isClean in
-      if !compact { UICleanViewState.shared.set(isClean, for: target.rawValue) }
+      if UIMonitorBridge.presenter(for: target.rawValue) === presenter {
+        UICleanViewState.shared.set(isClean, for: target.rawValue)
+      }
     }
     .onChange(of: presenter.isFrozen) { _, isFrozen in
-      if !compact { UICleanViewState.shared.setFrozen(isFrozen, for: target.rawValue) }
+      if UIMonitorBridge.presenter(for: target.rawValue) === presenter {
+        UICleanViewState.shared.setFrozen(isFrozen, for: target.rawValue)
+      }
     }
     .onChange(of: previewEnabled) { _, _ in register() }
     .onChange(of: presenter.isFreezePending) { _, _ in register() }

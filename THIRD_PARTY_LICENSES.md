@@ -8,8 +8,8 @@ This inventory records source evidence; it is not a completed release license bu
 
 ## MonitorKit
 
-`Packages/MonitorKit/` carries its own [Apache-2.0 license](Packages/MonitorKit/LICENSE)
-and [NOTICE](Packages/MonitorKit/NOTICE). Its notice reads:
+MonitorKit carries its own [Apache-2.0 license](https://github.com/andrewfitz/MonitorKit/blob/main/LICENSE)
+and [NOTICE](https://github.com/andrewfitz/MonitorKit/blob/main/NOTICE). Its notice reads:
 
 > MonitorKit  
 > Copyright 2026 Andrew Fitzgerald

@@ -787,3 +787,33 @@ fn recorder_manual_cut_uses_generation_after_implicit_clock_reset() {
     assert_eq!(recorder.timeline.cuts.last().unwrap().session_generation, director.session_generation());
     assert_eq!(recorder.timeline.config.session_generation, 1);
 }
+
+#[test]
+fn offline_evaluates_simultaneous_camera_health_before_cutting() {
+    for explicit_tick in [false, true] {
+        let mut events: Vec<_> = ["A", "B"].into_iter().map(|camera_id| StreamEvent::Video {
+            observation: auto_switcher::VideoObservation {
+                camera_id: camera_id.into(),
+                time: 1.0,
+                healthy: false,
+                motion: 0.0,
+                scene_change: 0.0,
+                session_generation: 0,
+            },
+        }).collect();
+        if explicit_tick {
+            events.insert(0, StreamEvent::Tick { time: 1.0 });
+        }
+        let timeline = auto_switcher::offline::analyze_events(events, config()).unwrap();
+        assert!(timeline.cuts.is_empty());
+        assert_eq!(timeline.events.len(), 3);
+        assert!(matches!(timeline.events[2].event, StreamEvent::Tick { .. }));
+    }
+}
+
+#[test]
+fn silent_pcm_timeline_includes_final_partial_audio_chunk() {
+    let events = auto_switcher::offline::events_from_pcm(&[0; 50], 1_000, 20, 0.5).unwrap();
+    let timeline = auto_switcher::offline::analyze_events(events, config()).unwrap();
+    assert!((timeline.duration - 0.025).abs() < 1e-9);
+}

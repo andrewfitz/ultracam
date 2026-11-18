@@ -150,9 +150,11 @@ import XCTest
     var now = CMTime(value: 60_000, timescale: 60_000)
     var emitted: [CMSampleBuffer] = []
     var flags: [CMIOExtensionStream.DiscontinuityFlags] = []
+    let outputEvent = DispatchSemaphore(value: 0)
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, clock: { now }, output: { sample, discontinuity, _ in
       emitted.append(sample)
       flags.append(discontinuity)
+      outputEvent.signal()
     })
     try camera.queue.sync {
       try camera.source.startStream()
@@ -170,7 +172,7 @@ import XCTest
       now = CMTime(value: 90_000, timescale: 60_000)
       camera.emitStandby()
     }
-    try awaitGPUOutput(camera) { emitted.count >= 2 }
+    try awaitGPUOutput(camera, outputEvent) { emitted.count >= 2 }
     try camera.queue.sync {
       XCTAssertEqual(emitted.count, 2)
       XCTAssertNil(camera.latest, "Discard the previous image on signal loss")
@@ -195,9 +197,11 @@ import XCTest
     var now = CMTime(value: 60_000, timescale: 60_000)
     var emitted: [CMSampleBuffer] = []
     var flags: [CMIOExtensionStream.DiscontinuityFlags] = []
+    let outputEvent = DispatchSemaphore(value: 0)
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, clock: { now }, output: { sample, discontinuity, _ in
       emitted.append(sample)
       flags.append(discontinuity)
+      outputEvent.signal()
     })
     try camera.queue.sync {
       try camera.source.startStream()
@@ -205,7 +209,7 @@ import XCTest
       now = CMTime(value: 90_000, timescale: 60_000)
       camera.emitStandby()
     }
-    try awaitGPUOutput(camera) { emitted.count >= 2 }
+    try awaitGPUOutput(camera, outputEvent) { emitted.count >= 2 }
     try camera.queue.sync {
       XCTAssertEqual(emitted.count, 2)
       now = CMTime(value: 90_001, timescale: 60_000)
@@ -264,7 +268,11 @@ import XCTest
   func testStandbyBlackAndFormatChangesAcrossAllModes() throws {
     var now = CMTime(value: 60_000, timescale: 60_000)
     var emitted: CMSampleBuffer?
-    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, clock: { now }, output: { sample, _, _ in emitted = sample })
+    let outputEvent = DispatchSemaphore(value: 0)
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, clock: { now }, output: { sample, _, _ in
+      emitted = sample
+      outputEvent.signal()
+    })
     try camera.queue.sync { try camera.source.startStream() }
     for index in camera.formats.indices {
       try camera.queue.sync {
@@ -273,7 +281,7 @@ import XCTest
         now = CMTimeAdd(now, VideoContract.fastDuration)
         camera.emitStandby()
       }
-      try awaitGPUOutput(camera) { emitted != nil }
+      try awaitGPUOutput(camera, outputEvent) { emitted != nil }
       try camera.queue.sync {
         let frame = try XCTUnwrap(emitted)
         let image = try XCTUnwrap(CMSampleBufferGetImageBuffer(frame))
@@ -291,13 +299,11 @@ import XCTest
   /// GPU completion re-enters the runtime queue. Wait for observed output only
   /// after leaving that queue, so tests exercise the production asynchronous
   /// path without blocking its completion or replacing it with a CPU fixture.
-  private func awaitGPUOutput(_ camera: CameraProvider, ready: @escaping () -> Bool) throws {
+  private func awaitGPUOutput(_ camera: CameraProvider, _ event: DispatchSemaphore, ready: () -> Bool) throws {
     dispatchPrecondition(condition: .notOnQueue(camera.queue))
-    let completed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-      camera.queue.sync { ready() }
-    }, object: nil)
-    let result = XCTWaiter.wait(for: [completed], timeout: 10)
-    guard result == .completed else {
+    let deadline = DispatchTime.now() + 10
+    while !camera.queue.sync(execute: ready) {
+      if event.wait(timeout: deadline) == .success { continue }
       let error = camera.queue.sync {
         camera.runtime(for: camera.descriptors[0].id)?.standbyError ?? "No GPU standby output was received"
       }
@@ -337,15 +343,17 @@ import XCTest
       try autoreleasepool {
         var now = CMTime(value: 60_000, timescale: 60_000)
         var timestamps: [CMTime] = []
+        let outputEvent = DispatchSemaphore(value: 0)
         let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, clock: { now }, output: { sample, _, _ in
           timestamps.append(CMSampleBufferGetPresentationTimeStamp(sample))
+          outputEvent.signal()
         })
         try camera.queue.sync {
           try camera.setProperties(index: nil, frameDuration: duration)
           try camera.source.startStream()
           camera.emitStandby()
         }
-        try awaitGPUOutput(camera) { !timestamps.isEmpty }
+        try awaitGPUOutput(camera, outputEvent) { !timestamps.isEmpty }
         try camera.queue.sync {
           for _ in 0..<6000 {
             now = CMTimeAdd(now, duration)
@@ -425,14 +433,18 @@ import XCTest
 
   func testViewerCountsAndNoOutputAfterStop() throws {
     var outputs = 0
-    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, output: { _, _, _ in outputs += 1 })
+    let outputEvent = DispatchSemaphore(value: 0)
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false, output: { _, _, _ in
+      outputs += 1
+      outputEvent.signal()
+    })
     try camera.queue.sync {
       try camera.source.startStream()
       try camera.source.startStream()
       XCTAssertEqual(camera.consumers, 2)
       camera.emitStandby()
     }
-    try awaitGPUOutput(camera) { outputs >= 1 }
+    try awaitGPUOutput(camera, outputEvent) { outputs >= 1 }
     try camera.queue.sync {
       XCTAssertEqual(outputs, 1)
       try camera.source.stopStream()

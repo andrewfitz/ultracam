@@ -155,6 +155,9 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
   /// not copied: the next frame establishes those against this Program time.
   public mutating func carryTimeline(from other: ProgramTimestampMapper<SourceID>) {
     guard programTimescale == other.programTimescale else { return }
+    sourceOrigin = nil
+    programOrigin = nil
+    lastSourceTime = nil
     lastProgramTime = other.lastProgramTime
     lastProgramDuration = other.lastProgramDuration
   }
@@ -170,7 +173,8 @@ public struct ProgramTimestampMapper<SourceID: Hashable> {
   private func nextProgramTime() -> CMTime {
     guard let lastProgramTime else { return .zero }
     guard let lastProgramDuration else { return lastProgramTime }
-    return CMTimeAdd(lastProgramTime, lastProgramDuration)
+    let (value, overflow) = lastProgramTime.value.addingReportingOverflow(lastProgramDuration.value)
+    return overflow ? .invalid : CMTime(value: value, timescale: programTimescale)
   }
 }
 
@@ -434,6 +438,11 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
     expirePendingCutIfNeeded()
     guard isSourceAvailable(frame.sourceID) else { return .skipped(.missingSource) }
     if readiness[frame.sourceID] != .producing {
+      // Only a usable first frame proves the source is producing. Trial it on
+      // a fresh origin before changing readiness or shortening the cut timeout.
+      var probe = mapper
+      probe.cut(to: frame.sourceID)
+      if case .failure(let error) = probe.map(frame) { return .skipped(.invalidTimestamp(error)) }
       readiness[frame.sourceID] = .producing
       // The target's first frame restarts its expiry clock: from here on it
       // is live and only needs a frame that qualifies.

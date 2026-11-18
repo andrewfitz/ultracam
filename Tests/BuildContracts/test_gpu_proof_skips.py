@@ -52,7 +52,7 @@ class GPUProofSkipChecks(unittest.TestCase):
         self.assertEqual(self.run_gate('MonitorKitUITests.DisplayLinkTests testNewRequiredGPUProof', package=True).returncode, 1)
 
     def test_shader_validation_request_matches_monitor_pipeline_predicate(self):
-        source = (ROOT / 'Packages/MonitorKit/Sources/MonitorKit/MonitorPipelineArchive.swift').read_text()
+        source = (ROOT / '../MonitorKit/Sources/MonitorKit/MonitorPipelineArchive.swift').read_text()
         self.assertIn('environment["MTL_SHADER_VALIDATION"].map { $0 != "0" } ?? false', source)
         case = 'MonitorKitTests.PipelineArchiveValidationTests testAValidatedSessionBuildsAndWritesNothing'
         for value in ('1', '2', 'true', 'nonzero', ''):

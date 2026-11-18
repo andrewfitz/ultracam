@@ -354,14 +354,16 @@ final class AutoSwitcherTimelineRecorder {
       ], recordings: [], events: [], eventsProcessed: 0, cuts: [], instructions: [],
       statuses: [], metadata: ["clock": "source_pts"])
     folder = outputFolder
-    let session = sessionID
-    outputURL = Self.scoped(outputFolder) { Self.makeOutputURL(folder: outputFolder, sessionID: session) }
+    outputURL = Self.scoped(outputFolder) { Self.makeOutputURL(folder: outputFolder) }
     persist(force: true)
   }
 
   func setOutputFolder(_ folder: URL?) {
-    let nextURL = Self.scoped(folder) { Self.makeOutputURL(folder: folder, sessionID: sessionID) }
-    guard nextURL != outputURL else { return }
+    if self.folder?.standardizedFileURL.path == folder?.standardizedFileURL.path {
+      self.folder = folder
+      return
+    }
+    let nextURL = Self.scoped(folder) { Self.makeOutputURL(folder: folder) }
     persist(force: true)
     self.folder = folder
     outputURL = nextURL
@@ -526,7 +528,10 @@ final class AutoSwitcherTimelineRecorder {
     document.recordings.append(AutoSwitcherTimelineRecording(
       recordingID: id, cameraID: feedID.rawValue, path: url.path,
       kind: "source", format: url.pathExtension, mediaStart: start?.seconds, mediaEnd: nil))
-    updateSource(feedID: feedID, url: url, start: start)
+    let index = sourceIndex(for: feedID)
+    document.sources[index].mediaFile = url.path
+    document.sources[index].mediaStart = start?.seconds
+    document.sources[index].mediaEnd = nil
     persist(force: true)
   }
 
@@ -534,7 +539,9 @@ final class AutoSwitcherTimelineRecorder {
     guard let id = recordingIDs[feedID],
       let index = document.recordings.firstIndex(where: { $0.recordingID == id }) else { return }
     document.recordings[index].mediaEnd = mediaEnd.flatMap(Self.timestamp)?.seconds
-    updateSource(feedID: feedID, url: url, start: nil, end: mediaEnd.flatMap(Self.timestamp))
+    let source = sourceIndex(for: feedID)
+    if let url { document.sources[source].mediaFile = url.path }
+    document.sources[source].mediaEnd = document.recordings[index].mediaEnd
     recordingIDs.removeValue(forKey: feedID)
     persist(force: true)
   }
@@ -548,19 +555,12 @@ final class AutoSwitcherTimelineRecorder {
     persist(force: true)
   }
 
-  private func updateSource(feedID: FeedID, url: URL?, start: (seconds: Double, ticks: Int64)?, end: (seconds: Double, ticks: Int64)? = nil) {
-    let index: Int
-    if let existing = document.sources.firstIndex(where: { $0.cameraID == feedID.rawValue }) {
-      index = existing
-    } else {
-      document.sources.append(AutoSwitcherTimelineSource(cameraID: feedID.rawValue,
-        role: "source", label: nil, mediaFile: nil, mediaStart: nil, mediaEnd: nil,
-        timebase: document.timebase))
-      index = document.sources.count - 1
-    }
-    if let url { document.sources[index].mediaFile = url.path }
-    if let start { document.sources[index].mediaStart = start.seconds }
-    if let end { document.sources[index].mediaEnd = end.seconds }
+  private func sourceIndex(for feedID: FeedID) -> Int {
+    if let index = document.sources.firstIndex(where: { $0.cameraID == feedID.rawValue }) { return index }
+    document.sources.append(AutoSwitcherTimelineSource(cameraID: feedID.rawValue,
+      role: "source", label: nil, mediaFile: nil, mediaStart: nil, mediaEnd: nil,
+      timebase: document.timebase))
+    return document.sources.count - 1
   }
 
   private func append(event: AutoSwitcherTimelineEvent, mediaTime: (seconds: Double, ticks: Int64)?, outputs: [AutoSwitcherTimelineOutput]) {
@@ -638,7 +638,7 @@ final class AutoSwitcherTimelineRecorder {
     return (seconds, projected.value)
   }
 
-  private static func makeOutputURL(folder: URL?, sessionID _: UUID) -> URL {
+  private static func makeOutputURL(folder: URL?) -> URL {
     let base = folder ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("Ultracam/Sessions", isDirectory: true)
     let formatter = DateFormatter()

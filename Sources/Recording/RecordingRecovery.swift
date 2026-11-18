@@ -132,7 +132,10 @@ enum RecordingRecovery {
     // recorded without camera subfolders sit in the root itself.
     for folder in [canonicalRoot] + folders where folder == canonicalRoot || !folder.lastPathComponent.hasPrefix(".") {
       if folder != canonicalRoot {
-        let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard let values = try? folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
+          unreadable = true
+          continue
+        }
         guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
       }
       // One folder it can't read must not hide the takes in the others.
@@ -151,8 +154,7 @@ enum RecordingRecovery {
         // after a crashed exporter has released that lock.
         let staging = source.appendingPathExtension("export.ultracam-recovery")
         if fm.fileExists(atPath: staging.path) {
-          do { try fm.removeItem(at: staging) }
-          catch {
+          if unlink(staging.path) != 0 {
             // A read-only or unavailable take must not hide recordings in
             // other folders. Its journal still retains the original root.
             continue
@@ -204,7 +206,8 @@ enum RecordingRecovery {
     }
     let fm = FileManager.default
     let staging = take.temporaryURL.appendingPathExtension("export.ultracam-recovery")
-    defer { try? fm.removeItem(at: staging) }
+    guard !fm.fileExists(atPath: staging.path) else { throw RecordingOutputError.destinationExists }
+    defer { _ = unlink(staging.path) }
     try await exporter.export(to: staging, as: .mov)
     // The staging name has no movie extension, so state the container type,
     // as for the source; otherwise AVFoundation cannot open the export.

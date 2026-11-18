@@ -7,9 +7,9 @@
 # Run directly, `monitor-kit-package.sh selftest` checks the test-log analysis and the
 # retry policy against fixture logs and a stub xcrun.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then task_root="$(cd "$(dirname "$0")/.." && pwd)"; fi
-monitor_kit_package="$task_root/Packages/MonitorKit"
+monitor_kit_package="$task_root/../MonitorKit"
 if [[ ! -f "$monitor_kit_package/Package.swift" ]]; then
-  echo "Packages/MonitorKit/Package.swift is missing: MonitorKit is a git submodule; run git submodule update --init" >&2
+  echo "Missing ../MonitorKit/Package.swift. Clone the MonitorKit repository beside Ultracam." >&2
   exit 1
 fi
 # The release products build incrementally in one shared scratch. Each run copies them out

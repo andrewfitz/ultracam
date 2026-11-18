@@ -4,8 +4,8 @@
 
 Audit the current MonitorKit implementation as if no prior review exists, find real defects, repair them, and leave a reproducible, tested commit. The audit target is the complete MonitorKit delivery surface:
 
-- `Packages/MonitorKit/Sources`, including Swift, Metal shader text, and all five products. This is a pinned git submodule, so its upstream implementation findings and Ultracam integration findings must be reported separately.
-- `Packages/MonitorKit/Tests`, with new tests added for every confirmed defect.
+- `../MonitorKit/Sources` in the main MonitorKit repository, including Swift, Metal shader text, and all five products.
+- `../MonitorKit/Tests`, with new tests added for every confirmed defect.
 - The app integration that owns MonitorKit behavior: `Sources/App/Monitor*.swift`, the MonitorKit host checks, `Tools/MonitorAppIntegration`, and build or validation scripts that package or exercise the monitor.
 
 Existing audit logs, changelogs, progress notes, and prior claims are context only. They are not evidence that a behavior is correct. The current branch and worktree are the live audit subject; record their starting status for traceability, but do not freeze development or require a separate checkout before auditing or repairing.

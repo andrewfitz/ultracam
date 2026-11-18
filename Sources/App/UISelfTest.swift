@@ -320,6 +320,7 @@ import AppKit
     if let data = try? encoder.encode(report) {
       try? data.write(to: output.appendingPathComponent("report.json"))
     }
+    UIAppEnvironment.clearSelfTestPreferences()
     NSApp.terminate(nil)
   }
 }

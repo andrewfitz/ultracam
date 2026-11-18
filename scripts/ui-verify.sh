@@ -10,8 +10,7 @@ if [[ $# -ne 0 ]]; then
 fi
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
 external_root="$(python3 "$task_root/scripts/work_paths.py" --path work_root)"
-# Before the inputs hash: it names the package's files, so a clone without the
-# submodule stops on its message, not on find's.
+# Check the sibling package before hashing its sources.
 source "$task_root/scripts/monitor-kit-package.sh"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 build_root="$external_root/agent-work/build/ultracam/ui-verify"
@@ -23,7 +22,7 @@ build_root="$external_root/agent-work/build/ultracam/ui-verify"
 rust_inputs_hash="$(cd "$task_root" && find Tools/auto-switcher \
   -type d \( -name target -o -name .git \) -prune -o -type f -print0 | \
   sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
-inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify Packages/MonitorKit/Sources Packages/MonitorKit/Package.swift \
+inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify ../MonitorKit/Sources ../MonitorKit/Package.swift \
   Vendors Config/Assets.xcassets scripts/ui-verify.sh scripts/monitor-kit-package.sh scripts/vendor-build.sh scripts/vendors.py \
   -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.msl' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' -o -name '*.py' -o -name '*.json' -o -name '*.svg' -o -name '*.png' \) \
   -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-rust${rust_inputs_hash}-strict${STRICT:-1}-vendors$(python3 "$task_root/scripts/vendors.py" digest)"

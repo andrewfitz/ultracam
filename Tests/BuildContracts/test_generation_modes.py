@@ -17,8 +17,8 @@ class GenerationModeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name).resolve()
-        for directory in ('scripts', 'Config/Assets.xcassets', 'Packages/MonitorKit',
+        self.root = Path(self.temp.name).resolve() / "ultracam"
+        for directory in ('scripts', 'Config/Assets.xcassets', '../MonitorKit',
                           'Sources/App', 'Sources/Shared', 'Sources/Recording',
                           'Sources/DeviceAPI', 'Sources/CameraExtension'):
             (self.root / directory).mkdir(parents=True)
@@ -26,7 +26,7 @@ class GenerationModeTests(unittest.TestCase):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         for name in ('App.entitlements', 'App-Info.plist'):
             shutil.copy2(ROOT / 'Config' / name, self.root / 'Config' / name)
-        self.write('Packages/MonitorKit/Package.swift')
+        self.write('../MonitorKit/Package.swift')
         self.write('Sources/App/App.swift')
         self.write('Sources/DeviceAPI/DeviceAPI.h')
         self.write('Sources/DeviceAPI/Neutral.swift')

@@ -45,6 +45,8 @@ import XCTest
     let published: [(id: UInt32, name: String)] = [(7, "Ultracam · Feed 1 Input"), (8, "Ultracam · Feed 1")]
     XCTAssertEqual(CameraDemandMonitor.sourceStream(published, named: "Ultracam · Camera 1"), 8)
     XCTAssertEqual(CameraDemandMonitor.sourceStream(published, named: "Ultracam · Feed 1"), 8)
+    XCTAssertEqual(CameraDemandMonitor.sourceStream(published, named: "Ultracam · Feed 1 Input"), 8,
+      "Renaming a camera to the old sink name must still monitor its source")
     XCTAssertNil(CameraDemandMonitor.sourceStream([(7, "Ultracam · Feed 1 Input")], named: "Ultracam · Camera 1"))
   }
 

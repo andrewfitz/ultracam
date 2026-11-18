@@ -21,7 +21,7 @@ warning=warning[:warning.index(' {')]
 field='  var inputClearedByChoice = false' if 'var inputClearedByChoice = false' in settings else ''
 decode='inputClearedByChoice = try values.decodeIfPresent(Bool.self, forKey: .inputClearedByChoice) ?? false' if 'inputClearedByChoice = try values.decodeIfPresent' in settings else ''
 intent_start=app.index('    inputsClearedByChoice = Set(snapshot.feeds.filter')
-initialization=app[intent_start:app.index('    }',intent_start)+5]
+initialization=app[intent_start:app.index('\n',intent_start)]
 discovery='    for descriptor in feedDescriptors where descriptor.enabled && descriptor.selectedDevice.isEmpty &&\n      !inputsClearedByChoice.contains(descriptor.id) && !cameraActive(descriptor.id) {\n      guard let free = devices.first(where: { inputHolder($0.id, excluding: descriptor.id) == nil }) else { break }\n      updateCamera(descriptor.id) { $0.selectedDevice = free.id }\n    }\n'
 availability=body(tools,'  static func unavailableReason(_ tool:')
 tile_tools=body(view,'  private var unavailableTools:')
@@ -29,7 +29,7 @@ toolbar_call=view[view.index('      MonitorTileToolbar('):view.index('      ) {'
 mode_argument='nil'
 if 'falseColorModes:' in toolbar_call:
     mode_argument=toolbar_call.split('falseColorModes:',1)[1].split(', layout:',1)[0].strip()
-toolbar=(root/'Packages/MonitorKit/Sources/MonitorKitUI/SwiftUI/TileToolbar.swift').read_text()
+toolbar=(root/'../MonitorKit/Sources/MonitorKitUI/SwiftUI/TileToolbar.swift').read_text()
 mode_allowed=body(toolbar,'  func isFalseColorModeAllowed(').strip()
 set_source=body(settings,'  mutating func setSourceProfile(')
 log_source=body(settings,'  private static func logProfileID(')
@@ -100,7 +100,7 @@ model.reconstruct([restoredNone,second]);check(model.inputsClearedByChoice == [1
 let legacy=try JSONDecoder().decode(FeedDescriptor.self,from:Data("{}".utf8))
 model.reconstruct([legacy]);check(model.inputsClearedByChoice.isEmpty,"legacy all-empty autoassignment preserved")
 var assigned=legacy;assigned.id=2;assigned.selectedDevice="camera"
-model.reconstruct([legacy,assigned]);check(model.inputsClearedByChoice == [1],"legacy mixed snapshot preserved")
+model.reconstruct([FeedDescriptor(),assigned]);check(model.inputsClearedByChoice.isEmpty,"modern mixed snapshot retains autoassignment")
 model.reconstruct([FeedDescriptor()]);check(model.inputsClearedByChoice.isEmpty,"fresh install autoassignment")
 model.feedCoordinator.saved=FeedDescriptor();model.discover();check(model.feedCoordinator.saved.selectedDevice == "available","fresh install discovers input")
 for prior in ["unspecified","sony-slog3"] {

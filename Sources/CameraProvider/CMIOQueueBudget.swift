@@ -13,10 +13,14 @@ final class CMIOQueueBudget: @unchecked Sendable {
   let maximumDuration: CMTime
   let maximumBytes: UInt64
   let minimumSlots: Int
-  private(set) var currentBytes: UInt64 = 0
-  private(set) var currentSlots = 0
-  private(set) var peakBytes: UInt64 = 0
-  private(set) var peakSlots = 0
+  private var _currentBytes: UInt64 = 0
+  var currentBytes: UInt64 { lock.withLock { _currentBytes } }
+  private var _currentSlots: Int = 0
+  var currentSlots: Int { lock.withLock { _currentSlots } }
+  private var _peakBytes: UInt64 = 0
+  var peakBytes: UInt64 { lock.withLock { _peakBytes } }
+  private var _peakSlots: Int = 0
+  var peakSlots: Int { lock.withLock { _peakSlots } }
   private var closed = false
   private let lock = NSLock()
   init(queueSlots: Int = 8, frameDuration: CMTime, maxBytes: UInt64, minimumSlots: Int = 0) throws {
@@ -24,17 +28,19 @@ final class CMIOQueueBudget: @unchecked Sendable {
       frameDuration.value > 0, frameDuration.timescale > 0, maxBytes > 0,
       minimumSlots >= 0, minimumSlots <= queueSlots else { throw CMIOQueueBudgetError.invalidPolicy }
     self.queueSlots = queueSlots; self.frameDuration = frameDuration
-    self.maximumDuration = CMTimeMultiply(frameDuration, multiplier: Int32(queueSlots))
+    let maximumDuration = CMTimeMultiply(frameDuration, multiplier: Int32(queueSlots))
+    guard maximumDuration.isNumeric else { throw CMIOQueueBudgetError.overflow }
+    self.maximumDuration = maximumDuration
     self.maximumBytes = maxBytes; self.minimumSlots = minimumSlots
   }
   @discardableResult func admit(bytes: UInt64) throws -> Bool {
     try lock.withLock {
       guard !closed else { throw CMIOQueueBudgetError.closed }
       guard bytes > 0 else { throw CMIOQueueBudgetError.overflow }
-      guard currentSlots < queueSlots else { throw CMIOQueueBudgetError.slotLimit }
-      let (sum, overflow) = currentBytes.addingReportingOverflow(bytes)
+      guard _currentSlots < queueSlots else { throw CMIOQueueBudgetError.slotLimit }
+      let (sum, overflow) = _currentBytes.addingReportingOverflow(bytes)
       guard !overflow, sum <= maximumBytes else { throw CMIOQueueBudgetError.byteLimit }
-      currentBytes = sum; currentSlots += 1; peakBytes = max(peakBytes, sum); peakSlots = max(peakSlots, currentSlots); return true
+      _currentBytes = sum; _currentSlots += 1; _peakBytes = max(_peakBytes, sum); _peakSlots = max(_peakSlots, _currentSlots); return true
     }
   }
   final class Lease: @unchecked Sendable {
@@ -44,7 +50,7 @@ final class CMIOQueueBudget: @unchecked Sendable {
     deinit { release() }
   }
   func admitLease(bytes: UInt64) throws -> Lease { _ = try admit(bytes: bytes); return Lease(self, bytes: bytes) }
-  func releaseOne(bytes: UInt64) { lock.withLock { currentBytes = currentBytes >= bytes ? currentBytes - bytes : 0; currentSlots = max(0, currentSlots - 1) } }
+  func releaseOne(bytes: UInt64) { lock.withLock { _currentBytes = _currentBytes >= bytes ? _currentBytes - bytes : 0; _currentSlots = max(0, _currentSlots - 1) } }
   func closeAdmission() { lock.withLock { closed = true } }
   static func allocationBytes(planes: [CMIOQueuePlane], pixelBufferDataSize: Int, ioSurfaceAllocationSize: Int) throws -> UInt64 {
     guard !planes.isEmpty, pixelBufferDataSize >= 0, ioSurfaceAllocationSize >= 0 else { throw CMIOQueueBudgetError.invalidPolicy }

@@ -47,7 +47,7 @@ private struct UIRenameAlert: ViewModifier {
             context.send(.endRename)
           }
         }
-        .disabled(duplicate)
+        .disabled(trimmed.isEmpty || duplicate)
         Button("Cancel", role: .cancel) { context.send(.endRename) }
       } message: {
         Text(message)

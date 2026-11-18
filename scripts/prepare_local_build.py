@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Stage an ad-hoc signed local camera build. Never install or change macOS policy."""
+import fcntl
 import os
 from pathlib import Path
 import plistlib
@@ -11,7 +12,7 @@ import time
 
 # Keep imports from creating cache files beside the project scripts.
 sys.dont_write_bytecode = True
-from validate_bundle import validate
+from validate_bundle import binary_uuids, validate
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_GROUP = "group.org.ultracam.local"
@@ -58,10 +59,40 @@ def main():
     # previous stage. Lexically different paths can name the same source app.
     destination = requested_destination.parent.resolve() / requested_destination.name
     validate(source)
-    if source == destination or destination.is_relative_to(source) or source.is_relative_to(destination):
-        raise SystemExit("Source and staging destination must be separate bundles.")
     if read_plist(source / "Contents/Info.plist").get("CFBundleIdentifier") != APP_ID:
         raise SystemExit("Input is not an Ultracam build.")
+    source_symbols = source.with_name(source.name + ".dSYM")
+    destination_symbols = destination.with_name(destination.name + ".dSYM")
+    for original in (source, source_symbols.resolve()):
+        for target in (destination, destination_symbols):
+            if overlap(original, target):
+                raise SystemExit("Source and staging destination must be separate bundles.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    directory = os.open(destination.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        publish_stage(source, source_symbols, destination, destination_symbols)
+    finally:
+        os.close(directory)
+    print(f"Local development build: {destination}")
+    print("Ad-hoc signed with embedded entitlements; not notarized. macOS must permit local system extensions.")
+
+
+def overlap(first, second):
+    # samefile also catches alternate casing on case-insensitive volumes.
+    for child, parent in ((first, second), (second, first)):
+        if child.is_relative_to(parent):
+            return True
+        if parent.exists() and any(path.exists() and path.samefile(parent)
+                                   for path in (child, *child.parents)):
+            return True
+    return False
+
+
+def publish_stage(source, source_symbols, destination, destination_symbols):
+    if destination.is_symlink() or destination_symbols.is_symlink():
+        raise SystemExit("Refusing to replace a symlink staging destination.")
+    executable = None
     if destination.exists():
         previous = read_plist(destination / "Contents/Info.plist")
         if previous.get("CFBundleIdentifier") != APP_ID or previous.get(LOCAL_MARKER) is not True:
@@ -70,20 +101,41 @@ def main():
         opened = subprocess.run(["/usr/sbin/lsof", "-t", str(executable)], capture_output=True)
         if opened.returncode != 1 or opened.stdout:
             raise SystemExit("Quit the staged local app before rebuilding it.")
-        shutil.rmtree(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination, symlinks=True)
-    # A stripped Release executable symbolicates only against the dSYM of its link
-    # (validate_bundle.validate_symbols); keep a copy beside the staged app. Signing
-    # does not change the executable's LC_UUID, so the copy still matches.
-    source_symbols = source.parent / (source.name + ".dSYM")
-    destination_symbols = destination.parent / (destination.name + ".dSYM")
-    if destination_symbols.is_symlink() or destination_symbols.is_file():
-        destination_symbols.unlink()
-    elif destination_symbols.exists():
-        shutil.rmtree(destination_symbols)
-    if source_symbols.is_dir():
-        shutil.copytree(source_symbols, destination_symbols, symlinks=True)
+    if destination_symbols.exists():
+        if executable is None or not destination_symbols.is_dir():
+            raise SystemExit("Refusing to replace symbols without their staged local app.")
+        if binary_uuids(destination_symbols) != binary_uuids(executable):
+            raise SystemExit("Refusing to replace symbols from another build.")
+    with tempfile.TemporaryDirectory(prefix=".ultracam-stage-", dir=destination.parent) as work:
+        staged = Path(work) / "new" / destination.name
+        staged_symbols = staged.with_name(staged.name + ".dSYM")
+        shutil.copytree(source, staged, symlinks=True)
+        if source_symbols.is_dir():
+            shutil.copytree(source_symbols, staged_symbols, symlinks=True)
+        sign_and_validate(staged)
+        backup_dir = Path(work) / "previous"
+        backup_dir.mkdir()
+        backups = []
+        installed = []
+        try:
+            for target in (destination, destination_symbols):
+                if target.exists():
+                    backup = backup_dir / target.name
+                    target.rename(backup)
+                    backups.append((backup, target))
+            for item, target in ((staged_symbols, destination_symbols), (staged, destination)):
+                if item.exists():
+                    item.rename(target)
+                    installed.append((target, item))
+        except OSError:
+            for target, item in reversed(installed):
+                target.rename(item)
+            for backup, target in reversed(backups):
+                backup.rename(target)
+            raise
+
+
+def sign_and_validate(destination):
     extension = destination / "Contents/Library/SystemExtensions" / (EXTENSION_ID + ".systemextension")
     version = str(int(time.time()))
     for bundle in (destination, extension):
@@ -116,8 +168,6 @@ def main():
     for bundle in (extension, destination):
         subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(bundle)], check=True)
     validate(destination)
-    print(f"Local development build: {destination}")
-    print("Ad-hoc signed with embedded entitlements; not notarized. macOS must permit local system extensions.")
 
 
 if __name__ == "__main__":

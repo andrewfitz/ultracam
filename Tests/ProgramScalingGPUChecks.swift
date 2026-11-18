@@ -375,6 +375,23 @@ import XCTest
     XCTAssertEqual(chroma(crop, x: 0, y: 0), 96, "Crop origin-1 retains the half-chroma phase")
   }
 
+  func testOddWidthV210PreservesChromaInFinalVisiblePixel() throws {
+    let source = try chromaFixture(width: 5, height: 4, colour: .rec709Video, cb: { _, _ in 64 })
+    let normalizer = try ProgramNormalizer()
+    let result = Output(), done = DispatchSemaphore(value: 0)
+    try normalizer.normalize(source, to: ProgramOutputFormat(width: 5, height: 4,
+      pixelFormat: kCVPixelFormatType_422YpCbCr10, duration: CMTime(value: 1, timescale: 30))) {
+      if case let .success(image) = $0 { result.set(image) }
+      done.signal()
+    }
+    XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+    let image = try XCTUnwrap(result.get())
+    CVPixelBufferLockBaseAddress(image, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+    let words = try XCTUnwrap(CVPixelBufferGetBaseAddress(image)).assumingMemoryBound(to: UInt32.self)
+    XCTAssertEqual((words[2] >> 20) & 1023, 256)
+  }
+
   func testOddSourceChromaUsesImageExtentRatherThanRoundedPlaneExtent() throws {
     for (horizontal, vertical) in [(Colorimetry.ChromaSiting.center, Colorimetry.ChromaSiting.center), (.left, .top)] {
       let colour = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .video,

@@ -110,7 +110,7 @@ struct UIFalseColorSettingsForm: View {
         .uiToolRow("Mode")
         if mode == .sixBand || mode == .custom {
           Picker("Signal", selection: fc.stage) {
-            Text("Source").tag(SignalStage.source)
+            Text("Source").tag(SignalStage.source).disabled(isProgram)
             Text("Output (LUT)").tag(SignalStage.output)
             if preferences.state.falseColor.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
           }

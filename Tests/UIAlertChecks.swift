@@ -104,6 +104,8 @@ import XCTest
   func testForegroundPresentation() {
     XCTAssertEqual(UIUserNotifications.presentation(mainWindowKey: true), [.list], "Attention already shows it")
     XCTAssertEqual(UIUserNotifications.presentation(mainWindowKey: false), [.banner, .list])
+    XCTAssertEqual(UIUserNotifications.presentation(mainWindowKey: false, sound: true), [.banner, .list, .sound])
+    XCTAssertEqual(UIUserNotifications.presentation(mainWindowKey: true, sound: true), [.list, .sound])
   }
 
   /// Created, inspected, never ordered in: test windows stay invisible.

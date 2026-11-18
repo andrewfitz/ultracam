@@ -12,9 +12,9 @@ class StandaloneVerifierGates(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name) / "ultracam"
         for folder in ('scripts', 'Sources/App', 'Tools/UIVerify', 'Tools/auto-switcher/src',
-                       'Packages/MonitorKit/Sources', 'Vendors', 'Config/Assets.xcassets', 'bin'):
+                       '../MonitorKit/Sources', 'Vendors', 'Config/Assets.xcassets', 'bin'):
             (self.root / folder).mkdir(parents=True)
         for name in ('ui-verify.sh', 'monitor-app-integration.sh', 'monitor-feed-host-checks.sh', 'check-gpu-proof-skips.py'):
             shutil.copyfile(ROOT / 'scripts' / name, self.root / 'scripts' / name)
@@ -23,7 +23,7 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.write('scripts/monitor-kit-package.sh', 'monitor_kit_link_args=(-I /fake); monitor_kit_package_build() { :; }')
         self.write('scripts/vendor-build.sh', 'vendor_configure() { :; }; vendor_compile_native() { :; }; vendor_bridge=/dev/null')
         self.write('Sources/App/Fixture.swift', '// fixture')
-        self.write('Packages/MonitorKit/Package.swift', '// fixture')
+        self.write('../MonitorKit/Package.swift', '// fixture')
         self.write('Tools/auto-switcher/src/lib.rs', '// fixture')
         self.write('Tools/auto-switcher/Cargo.toml', '# fixture')
         self.write('Tools/auto-switcher/Cargo.lock', '# fixture')

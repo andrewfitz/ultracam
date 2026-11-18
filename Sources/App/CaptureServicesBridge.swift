@@ -43,12 +43,7 @@ final class CaptureServicesBridge: @unchecked Sendable {
 
   func start(deviceID: String, timing: CaptureTiming, callbacks: CaptureLegacyCallbacks) throws {
     try control.withLock {
-      let prior = state.withLock { () -> (any CaptureSession)? in
-        defer { session = nil }
-        return session
-      }
-      prior?.stop()
-      state.withLock { orderedIngest }?.cancel()
+      stopCurrentSession()
       let next = try makeSession(deviceID)
       let sessionPolicy = compatibilityPolicy(deviceID)
       let generation = state.withLock { () -> UInt64 in
@@ -237,21 +232,24 @@ final class CaptureServicesBridge: @unchecked Sendable {
   var ingestCPUCopyFrames: UInt64 { state.withLock { copiedIngestFrames } }
 
   func stop() {
-    control.withLock {
-      let prior = state.withLock { session }
-      // The SDK barrier drains already accepted native deliveries. Keep this
-      // attempt's generation and counters live until that barrier completes.
-      prior?.stop()
-      let pending = state.withLock { () -> OrderedGPUIngestStage<CaptureDelivery, CaptureDelivery>? in
-        ingestGeneration &+= 1
-        session = nil
-        defer { orderedIngest = nil }
-        return orderedIngest
-      }
-      // GPU work can outlive the SDK barrier. Cancel publication synchronously
-      // before returning, while its completion retains committed resources.
-      pending?.cancel()
+    control.withLock { stopCurrentSession() }
+  }
+
+  /// Called with the lifecycle lock held for both explicit stops and replacement.
+  private func stopCurrentSession() {
+    let prior = state.withLock { session }
+    // The SDK barrier drains already accepted native deliveries. Keep this
+    // attempt's generation and counters live until that barrier completes.
+    prior?.stop()
+    let pending = state.withLock { () -> OrderedGPUIngestStage<CaptureDelivery, CaptureDelivery>? in
+      ingestGeneration &+= 1
+      session = nil
+      defer { orderedIngest = nil }
+      return orderedIngest
     }
+    // GPU work can outlive the SDK barrier. Cancel publication synchronously
+    // before returning, while its completion retains committed resources.
+    pending?.cancel()
   }
   var deviceDroppedFrames: UInt64 {
     let current = state.withLock { session }

@@ -61,6 +61,26 @@ import XCTest
     XCTAssertEqual(mapper.lastProgramTime, time(1))
   }
 
+  func testInvalidFirstFrameLeavesSourceStarting() {
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    scheduler.setSource("A", available: true)
+    guard case .skipped(.invalidTimestamp(.invalidSourceDuration)) = scheduler.ingest(frame("A", 0, duration: 0)) else {
+      return XCTFail("Expected invalid duration")
+    }
+    XCTAssertFalse(scheduler.isOnAir)
+    XCTAssertEqual(scheduler.readiness(of: "A"), .starting)
+  }
+
+  func testCarryingTimelineResetsExistingSourceOrigin() throws {
+    var donor = ProgramTimestampMapper<String>(selectedSource: "B")
+    let prior = try XCTUnwrap(mapped(donor.map(frame("B", 0))))
+    var receiver = ProgramTimestampMapper<String>(selectedSource: "A")
+    _ = try XCTUnwrap(mapped(receiver.map(frame("A", 100))))
+    receiver.carryTimeline(from: donor)
+    let next = try XCTUnwrap(mapped(receiver.map(frame("A", 0))))
+    XCTAssertEqual(next.programTime, prior.programDuration)
+  }
+
   func testCutResetsSourceOriginAtNextProgramBoundary() {
     var mapper = ProgramTimestampMapper<String>(programTimescale: 60_000, selectedSource: "A")
     _ = mapped(mapper.map(frame("A", 500)))

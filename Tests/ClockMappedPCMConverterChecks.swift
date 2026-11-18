@@ -249,6 +249,13 @@ import XCTest
         }
         let source = try makeSourceSample(planes: Array(repeating: plane, count: 6), sampleFrameCount: 120,
           format: f, presentationTime: CMTime(value: 100, timescale: 1))
+        if sampleType == .int24in32 {
+          let description = try XCTUnwrap(CMSampleBufferGetFormatDescription(source))
+          let asbd = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(description)).pointee
+          XCTAssertEqual(asbd.mBitsPerChannel, 24)
+          XCTAssertEqual(asbd.mBytesPerFrame, 4)
+          XCTAssertEqual(asbd.mFormatFlags & (kAudioFormatFlagIsPacked | kAudioFormatFlagIsAlignedHigh), 0)
+        }
         let outputRate = try recordingPCMOutputSampleRate(for: f)
         XCTAssertEqual(outputRate, rate.rounded())
         var bridge = try ClockMappedPCMBridge(format: f, outputSampleRate: outputRate)

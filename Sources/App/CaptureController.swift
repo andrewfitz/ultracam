@@ -692,11 +692,8 @@ final class CaptureController: @unchecked Sendable {
         if self.cameraConnected || hasPreview || self.lock.withLock({ self.programPictureWanted }) {
           try self.ensurePrepared(warm, wait: true)
         }
-        guard self.isCurrent(token) else {
-          self.stopResources(preserveRecordingCallbacks: true)
-          return
-        }
-        self.lock.withLock {
+        let admitted = self.lock.withLock { () -> Bool in
+          guard self.generation == token else { return false }
           self.accepting = true
           self.sourceDrops = 0
           self.lastSourcePTS = nil
@@ -723,6 +720,11 @@ final class CaptureController: @unchecked Sendable {
           self.pairedFrame = nil
           self.audioPairAnchor = nil
           self.coreRejectedFrames = 0
+          return true
+        }
+        guard admitted else {
+          self.stopResources(preserveRecordingCallbacks: true)
+          return
         }
         self.noSignalSince = nil
         self.unsupportedReason = nil
@@ -1375,13 +1377,18 @@ final class CaptureController: @unchecked Sendable {
   }
 
   private func fail(_ value: String, token: UInt64) {
-    guard isCurrent(token), !stopNotified else { return }
+    guard !stopNotified else { return }
+    let callbackGeneration = lock.withLock { () -> UInt64? in
+      guard generation == token else { return nil }
+      accepting = false
+      return recordingCallbackGeneration
+    }
+    guard let callbackGeneration else { return }
     stopNotified = true
-    lock.withLock { accepting = false }
     logRunSummary()
     let sink = lock.withLock { monitorLifecycleSink }
     sink?.invalidate(rejectingCaptureGeneration: token)
-    stopResources()
+    stopResources(callbackGeneration: callbackGeneration)
     applied = nil
     outputLabel = ""
     message = value

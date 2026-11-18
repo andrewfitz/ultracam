@@ -83,7 +83,7 @@ def main():
     args = parser.parse_args()
     try:
         paths = work_paths()
-        derived = derived_data_path(args.derived_data) if args.derived_data else None
+        derived = derived_data_path(args.derived_data) if args.derived_data is not None else None
     except (ValueError, OSError, RuntimeError) as error:
         parser.exit(2, f'work_paths: {error}\n')
     if derived is not None:

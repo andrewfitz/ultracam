@@ -166,6 +166,45 @@ import XCTest
     }
   }
 
+  func testFailedNativeAdditionRollsBackAndRetriesTheWholeUpdate() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "existing")
+    let initial = snapshot([feed])
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: initial)
+    let next = snapshot([feed, .feed(feedID: "added"), .program()], generation: 2)
+    var attempts = 0
+    camera.addDeviceForTesting = { _ in
+      attempts += 1
+      if attempts == 2 { throw VideoError.message("Native addition failed") }
+    }
+    XCTAssertThrowsError(try camera.reconcile(next))
+    XCTAssertEqual(camera.snapshot, initial)
+    XCTAssertEqual(camera.descriptors, [feed])
+    for descriptor in next.devices.dropFirst() { XCTAssertNil(camera.runtime(for: descriptor.id)) }
+    try camera.reconcile(next)
+    XCTAssertEqual(camera.descriptors, next.devices)
+    XCTAssertEqual(attempts, 4)
+  }
+
+  func testDelayedRemovalCallbackCannotRetireReplacementRuntime() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "republished")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let original = try XCTUnwrap(camera.runtime(for: feed.id))
+    let replacement = try camera.queue.sync {
+      original.onDemandChange?()
+      try camera.reconcile(snapshot([], generation: 2))
+      try camera.reconcile(snapshot([feed], generation: 3))
+      let replacement = try XCTUnwrap(camera.runtime(for: feed.id))
+      replacement.source.authorizeSourceForTesting(clientID: UUID())
+      try camera.reconcile(snapshot([], generation: 4))
+      return replacement
+    }
+    camera.queue.sync {}
+    XCTAssertTrue(camera.runtime(for: feed.id) === replacement)
+    XCTAssertFalse(original === replacement)
+  }
+
   func testFailedNativeRemovalRetainsRuntimeUntilRegistryRetry() throws {
     let feed = VirtualCameraDescriptor.feed(feedID: "removal-failure")
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,

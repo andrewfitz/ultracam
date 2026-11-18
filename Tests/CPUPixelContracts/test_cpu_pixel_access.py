@@ -13,7 +13,7 @@ class CPUPixelAccessChecks(unittest.TestCase):
         spec.loader.exec_module(self.checker)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name) / "ultracam"
 
     def write(self, path, text):
         dest = self.root / path
@@ -84,7 +84,7 @@ class CPUPixelAccessChecks(unittest.TestCase):
           CVPixelBufferCreateWithBytes(allocator, width, height, format, bytes, stride, release, owner, nil, &image);
           CVPixelBufferCreateWithPlanarBytes(allocator, width, height, format, bytes, size, planes, addresses, widths, heights, strides, release, owner, nil, &image);
         }''')
-        self.write('Packages/MonitorKit/Sources/MonitorKit/New.swift', 'func wrap() { device.makeBuffer(bytesNoCopy: pointer, length: count, options: []) }')
+        self.write('../MonitorKit/Sources/MonitorKit/New.swift', 'func wrap() { device.makeBuffer(bytesNoCopy: pointer, length: count, options: []) }')
         self.assertEqual(len(self.failures()), 6)
 
     def test_production_standby_and_converter_name_are_not_blanket_exempt(self):
@@ -96,7 +96,7 @@ class CPUPixelAccessChecks(unittest.TestCase):
         self.write('Tests/Video.swift', 'CVPixelBufferGetBaseAddress(image)')
         self.write('Vendors/Acme/Tests/Video.swift', 'CVPixelBufferGetBaseAddress(image)')
         self.write('Vendors/Acme/SDK/Video.h', 'CVPixelBufferGetBaseAddress(image)')
-        self.write('Packages/MonitorKit/Tests/Video.swift', 'CVPixelBufferGetBaseAddress(image)')
+        self.write('../MonitorKit/Tests/Video.swift', 'CVPixelBufferGetBaseAddress(image)')
         self.assertEqual(len(self.failures()), 1)
         self.assertEqual(self.failures()[0]['path'], 'Vendors/Acme/SDK/Video.h')
 
@@ -123,7 +123,7 @@ class CPUPixelAccessChecks(unittest.TestCase):
         self.assertEqual(len(self.failures()), 3)
 
     def test_statistics_exception_is_call_specific(self):
-        self.write('Packages/MonitorKit/Sources/MonitorKitScopes/ScopeAccumulator.swift', 'init() { memset(stats.contents(), 0, length); memset(frame, 0, bytes) }')
+        self.write('../MonitorKit/Sources/MonitorKitScopes/ScopeAccumulator.swift', 'init() { memset(stats.contents(), 0, length); memset(frame, 0, bytes) }')
         hits = self.checker.scan(self.root)
         self.assertEqual([h['classification'] for h in hits].count('statistics'), 2)
         self.assertEqual(len(self.failures()), 1)
@@ -180,7 +180,7 @@ class CPUPixelAccessChecks(unittest.TestCase):
     def test_new_planar_bounds_and_monitor_uniform_layout_are_narrow(self):
         self.write('Sources/Recording/PlanarRecordingConverter.swift', 'func convert() { IOSurfaceGetBaseAddress(inputSurface); IOSurfaceGetBaseAddressOfPlane(inputSurface, plane) }')
         self.write('Sources/Recording/RecordingRGBPixelConverter.swift', 'func submit() { IOSurfaceGetBaseAddress(sourceSurface) }')
-        self.write('Packages/MonitorKit/Sources/MonitorKit/MonitorRawFrameDecoder.swift', 'func encode() { device.makeBuffer(bytes: values, length: 48) }')
+        self.write('../MonitorKit/Sources/MonitorKit/MonitorRawFrameDecoder.swift', 'func encode() { device.makeBuffer(bytes: values, length: 48) }')
         self.assertEqual(self.failures(), [])
         self.write('Sources/Recording/PlanarRecordingConverter.swift', 'func convert() { CVPixelBufferGetBaseAddress(image) }')
         self.assertEqual(len(self.failures()), 1)

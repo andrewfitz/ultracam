@@ -469,6 +469,7 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
   private var runtimes: [String: CameraDeviceRuntime] = [:]
   private var pendingRemoval: Set<String> = []
 #if ULTRACAM_TEST_SUPPORT
+  var addDeviceForTesting: ((CMIOExtensionDevice) throws -> Void)?
   var removeDeviceForTesting: ((CMIOExtensionDevice) throws -> Void)?
 #endif
   private let automaticTimers: Bool
@@ -565,12 +566,17 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
       guard let self, let runtime else { return }
       self.queue.async { self.removeIfReleased(runtime) }
     }
-    runtimes[descriptor.id] = runtime
+#if ULTRACAM_TEST_SUPPORT
+    if let addDeviceForTesting { try addDeviceForTesting(runtime.device) }
+    else if let provider { try provider.addDevice(runtime.device) }
+#else
     if let provider { try provider.addDevice(runtime.device) }
+#endif
+    runtimes[descriptor.id] = runtime
   }
 
   private func removeIfReleased(_ runtime: CameraDeviceRuntime) {
-    guard pendingRemoval.contains(runtime.descriptor.id), !runtime.inUse else { return }
+    guard runtimes[runtime.descriptor.id] === runtime, pendingRemoval.contains(runtime.descriptor.id), !runtime.inUse else { return }
     do {
 #if ULTRACAM_TEST_SUPPORT
       if let removeDeviceForTesting { try removeDeviceForTesting(runtime.device) }
@@ -610,13 +616,24 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
     let next = try snapshot.applying(candidate)
     let nextDescriptors = next.devices.filter(\.enabled)
     let nextIDs = Set(nextDescriptors.map(\.id))
+    let encoded = try VirtualCameraRegistryWire.encode(next)
+    var added: [CameraDeviceRuntime] = []
+    do {
+      for descriptor in nextDescriptors where runtimes[descriptor.id] == nil {
+        try publish(descriptor)
+        if let runtime = runtimes[descriptor.id] { added.append(runtime) }
+      }
+    } catch {
+      for runtime in added {
+        pendingRemoval.insert(runtime.descriptor.id)
+        descriptors.append(runtime.descriptor)
+        removeIfReleased(runtime)
+      }
+      throw error
+    }
     for descriptor in nextDescriptors {
       pendingRemoval.remove(descriptor.id)
-      if let runtime = runtimes[descriptor.id] {
-        runtime.updateDescriptor(descriptor)
-      } else {
-        try publish(descriptor)
-      }
+      runtimes[descriptor.id]?.updateDescriptor(descriptor)
     }
     // Snapshot the dictionary before removeIfReleased mutates `runtimes`.
     // Iterating the live dictionary while removing an idle runtime is
@@ -630,7 +647,7 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
       pendingRemoval.contains(descriptor.id) && !nextIDs.contains(descriptor.id)
     }
     provider?.notifyPropertiesChanged([VirtualCameraRegistryWire.property:
-      CMIOExtensionPropertyState(value: try VirtualCameraRegistryWire.encode(next) as NSString,
+      CMIOExtensionPropertyState(value: encoded as NSString,
         attributes: nil)])
     return next
   }

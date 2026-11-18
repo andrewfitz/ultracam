@@ -51,6 +51,17 @@ import XCTest
     XCTAssertNil(TimecodeMetadata(label: "00:00:00:120", frameRate: .fps120))
   }
 
+  func testGeneratedTimecodeUsesNonDropLabelsAtUnsupportedDropRates() {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    let date = Date(timeIntervalSince1970: 86_399)
+    let session = RecordingTimecodeSession(frameRate: .fps11988, startDate: date, calendar: calendar)
+    XCTAssertFalse(session.dropFrame)
+    XCTAssertEqual(session.startTimecode.stringValue, "23:59:59:00")
+    XCTAssertEqual(RecordingTimecode(frameNumber: 1500, frameRate: .fps25, dropFrame: true).stringValue,
+      "00:01:00:00")
+  }
+
   func testExactRationalNormalizesAndLegacyMetadataDecodes() throws {
     XCTAssertEqual(RecordingFrameRate(numerator: 60000, denominator: 2002), .fps2997)
     let data = Data(#"{"label":"01:02:03;04","rateNumerator":30000,"rateDenominator":1001,"epoch":7,"frameNumber":0,"dropFrame":false}"#.utf8)

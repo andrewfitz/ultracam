@@ -6,7 +6,7 @@ import XCTest
   func testHDRAndSDRConversionsExecuteInLinearLightOnGPU() throws {
     guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else { throw XCTSkip("Metal 4 unavailable") }
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-    let lut = try String(contentsOf: root.appendingPathComponent("Packages/MonitorKit/Sources/MonitorKit/Shaders/MKLUT.msl"), encoding: .utf8)
+    let lut = try String(contentsOf: root.appendingPathComponent("../MonitorKit/Sources/MonitorKit/Shaders/MKLUT.msl"), encoding: .utf8)
     let shader = try String(contentsOf: root.appendingPathComponent("Sources/App/LUTShaders.metal"), encoding: .utf8)
     let test = """
     kernel void checkConversions(device float4 *out [[buffer(0)]], uint i [[thread_position_in_grid]]) {

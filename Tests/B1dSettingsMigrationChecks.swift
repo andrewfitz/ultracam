@@ -40,6 +40,23 @@ import XCTest
         }
     }
 
+    func testMixedSnapshotHonorsExplicitIntentAndMigratesOnlyLegacyBlanks() throws {
+        let suite = "MixedInputIntent." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let feeds = ["assigned", "waiting", "legacy"].map {
+            FeedDescriptor(id: FeedID(rawValue: $0), name: $0, selectedDevice: $0 == "assigned" ? "fixture:one" : "")
+        }
+        var raw = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(AppSettingsSnapshot(feeds: feeds))) as? [String: Any])
+        var rawFeeds = try XCTUnwrap(raw["feeds"] as? [[String: Any]])
+        rawFeeds[2].removeValue(forKey: "inputClearedByChoice")
+        raw["feeds"] = rawFeeds
+        defaults.set(try JSONSerialization.data(withJSONObject: raw), forKey: AppSettingsStore.snapshotKey)
+        let model = intentModel(defaults: defaults, inputs: ["one", "two", "three"].map { InputDevice(id: "fixture:\($0)", name: $0) })
+        XCTAssertEqual(model.feedDescriptors.map(\.selectedDevice), ["fixture:one", "fixture:two", ""])
+        XCTAssertEqual(model.feedDescriptors.map(\.inputClearedByChoice), [false, false, true])
+    }
+
     func testFreshOfflineModelStillAssignsAvailableInput() throws {
         let suite = "B1dFreshInput." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

@@ -41,6 +41,8 @@ struct ClockMappedPCMBridge {
         asbd.mBitsPerChannel == (format.sample == .int16 ? 16 : 32) ||
           (format.sample == .int24in32 && asbd.mBitsPerChannel == 24),
         (asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0) == (format.sample == .float32),
+        format.sample == .float32 || asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0,
+        format.sample != .int24in32 || asbd.mFormatFlags & kAudioFormatFlagIsAlignedHigh == 0,
         (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0) == format.interleaved,
         asbd.mFormatFlags & kAudioFormatFlagIsBigEndian == 0,
         asbd.mBytesPerFrame == UInt32((format.interleaved ? format.channels : 1) * format.sample.bytesPerSample) else {
@@ -58,8 +60,13 @@ struct ClockMappedPCMBridge {
         blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault,
         flags: 0, blockBufferOut: &retained)
       guard status == noErr else { throw ClockMappedPCMError.invalidPacket }
-      let planes = UnsafeMutableAudioBufferListPointer(list).map { audio -> Data in
-        guard let data = audio.mData else { return Data() }
+      let buffers = UnsafeMutableAudioBufferListPointer(list)
+      let channelsPerBuffer = format.interleaved ? format.channels : 1
+      let bytesPerBuffer = count * Int(asbd.mBytesPerFrame) // bounded by preflight
+      guard buffers.count == bufferCount else { throw ClockMappedPCMError.invalidPacket }
+      let planes = try buffers.map { audio -> Data in
+        guard Int(audio.mNumberChannels) == channelsPerBuffer, Int(audio.mDataByteSize) == bytesPerBuffer,
+          let data = audio.mData else { throw ClockMappedPCMError.invalidPacket }
         return Data(bytes: data, count: Int(audio.mDataByteSize))
       }
       if outputDescription == nil { outputDescription = try makeDescription(source: description) }

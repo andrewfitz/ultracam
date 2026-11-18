@@ -450,6 +450,8 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
         rejectedCaptureGeneration = max(rejectedCaptureGeneration ?? captureGeneration, captureGeneration)
       }
       captureGeneration = nil
+      lastSourcePTS = nil
+      sourceFrameHz = 0
       revision &+= 1
       geometries.removeAll(keepingCapacity: true)
     }
@@ -478,6 +480,8 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
         return Self.nextGeneration
       }
       self.captureGeneration = captureGeneration
+      lastSourcePTS = nil
+      sourceFrameHz = 0
       geometries.removeAll(keepingCapacity: true)
     }
     let format = CVPixelBufferGetPixelFormatType(image)

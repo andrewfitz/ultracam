@@ -284,6 +284,31 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertFalse(FileManager.default.fileExists(atPath: session.finalURL.path))
   }
 
+  func testExternalWriterRejectsDirectoryAsCompletedMovie() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let take = try manager.beginExternalWriterSession(feedID: "Wide")
+    try FileManager.default.createDirectory(at: take.temporaryURL, withIntermediateDirectories: false)
+    XCTAssertThrowsError(try take.finish()) { XCTAssertEqual($0 as? RecordingOutputError, .unsafePath) }
+    XCTAssertFalse(FileManager.default.fileExists(atPath: take.finalURL.path))
+  }
+
+  func testRecoveryScanPreservesDirectoryAtExportStagingPath() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let take = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1]).write(to: take.temporaryURL)
+    take.preserveForRecovery()
+    let staging = take.temporaryURL.appendingPathExtension("export.ultracam-recovery")
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+    let sibling = staging.appendingPathComponent("existing")
+    try Data([2]).write(to: sibling)
+    XCTAssertTrue(try RecordingRecovery.scan(root: root).isEmpty)
+    XCTAssertEqual(try Data(contentsOf: sibling), Data([2]))
+  }
+
   func testExternalWriterPauseAndResumePreservesSession() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -313,6 +338,9 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(found.first?.temporaryURL.resolvingSymlinksInPath().path, take.temporaryURL.resolvingSymlinksInPath().path)
     XCTAssertEqual(try Data(contentsOf: take.temporaryURL), media)
     XCTAssertFalse(FileManager.default.fileExists(atPath: take.finalURL.path))
+    try take.cancel()
+    XCTAssertEqual(try Data(contentsOf: take.temporaryURL), media, "Recovery now owns the partial")
+    XCTAssertEqual(try RecordingRecovery.scan(root: root).count, 1)
   }
 
   /// A drive's root as the folder: its system folders can't be opened, and

@@ -16,7 +16,7 @@ class SignedCILaneChecks(unittest.TestCase):
         self.assertNotIn('self-hosted', self.workflow)
 
     def test_actual_signed_build_and_explicit_signature_validation(self):
-        for text in ('vendor-sdk.py install sony', 'vendor-sdk.py verify sony', 'scripts/build.sh --signed --sdk-inventory', 'scripts/validate_bundle.py', 'codesign --verify --deep --strict', 'ULTRACAM_SDK_INVENTORY:', 'ULTRACAM_WORK_ROOT:'):
+        for text in ('vendor-sdk.py install sony', 'vendor-sdk.py verify sony', 'scripts/build.sh --signed --sdk-inventory', 'scripts/validate_bundle.py', 'codesign --verify --deep --strict', 'ULTRACAM_SDK_INVENTORY=$RUNNER_TEMP/', 'ULTRACAM_WORK_ROOT=$RUNNER_TEMP/'):
             self.assertIn(text, self.workflow)
         self.assertNotIn('--official-release', self.workflow)
         self.assertNotIn('/Volumes/', self.workflow)
@@ -39,7 +39,7 @@ class SignedCILaneChecks(unittest.TestCase):
                         break
                     body.append(following[10:])
                 scripts.append('\n'.join(body) + '\n')
-        self.assertEqual(len(scripts), 4)
+        self.assertEqual(len(scripts), 5)
         for script in scripts:
             result = subprocess.run(['/bin/bash', '-n'], input=script, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)

@@ -180,7 +180,7 @@ first two, or detach a camera into its own window. Tools are off by default, and
 each camera retains its own settings. Each tool is a split button on the picture:
 click it to toggle the tool, or use its chevron for settings.
 
-Monitor tools are drawn by [MonitorKit](Packages/MonitorKit/README.md) on the GPU,
+Monitor tools are drawn by [MonitorKit](https://github.com/andrewfitz/MonitorKit) on the GPU,
 for every camera frame, with no CPU pixel copies: thirds, center and safe-area
 guides, IRE zebras, focus peaking, false color, and RGB parade, luma waveform,
 vectorscope and histogram scopes. The **Picture** menu chooses what a view shows:
@@ -296,16 +296,15 @@ the bundled DeckLink plugin also requires Blackmagic Desktop Video with its
 camera extension enabled.
 
 ```sh
-git clone --recurse-submodules https://github.com/andrewfitz/blackmagic-lut-webcam.git
-# or, in an existing clone:
-git submodule update --init
+git clone https://github.com/andrewfitz/MonitorKit.git
+git clone https://github.com/andrewfitz/ultracam.git
+cd ultracam
 bash scripts/build.sh
 bash scripts/test.sh
 ```
 
-MonitorKit (`Packages/MonitorKit`) is a git submodule pinned to a tagged release
-of [github.com/andrewfitz/MonitorKit](https://github.com/andrewfitz/MonitorKit);
-run `git submodule update --init` after cloning or after a pull that moves it.
+Xcode and the command-line tools use the sibling checkout at `../MonitorKit`.
+If you already have MonitorKit, clone Ultracam beside it and reuse that checkout.
 Its development log is [docs/monitorkit/PROGRESS.md](docs/monitorkit/PROGRESS.md).
 
 The production camera extension generates standby black images through Metal 4,

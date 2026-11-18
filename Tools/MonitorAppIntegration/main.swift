@@ -75,7 +75,8 @@ import XCTest
       XCTAssertEqual(demand, [removedTarget, retainedTarget])
       XCTAssertTrue(removedSink.hasConsumers)
       let publishedBefore = try XCTUnwrap(publisher.snapshots.last)
-      XCTAssertEqual(publishedBefore.devices.count, 2)
+      XCTAssertEqual(publishedBefore.devices.map(\.kind), [.feed, .feed, .program])
+      XCTAssertEqual(publishedBefore.devices.compactMap(\.feedID), [alpha.rawValue, beta.rawValue])
       XCTAssertFalse(model.running)
       XCTAssertTrue(model.recordingModel.feeds.allSatisfy { $0.status == .idle })
 
@@ -94,6 +95,7 @@ import XCTest
       XCTAssertEqual(persisted.feeds.map(\.id), [retained])
       XCTAssertEqual(persisted.monitorWorkspacePreferences.tileBindings[0], removedTarget.rawValue)
       let publishedAfter = try XCTUnwrap(publisher.snapshots.last)
+      XCTAssertEqual(publishedAfter.devices.map(\.kind), [.feed])
       XCTAssertEqual(publishedAfter.devices.compactMap(\.feedID), [retained.rawValue],
         "AppModel must publish its new topology to the camera transport boundary")
       XCTAssertGreaterThan(publishedAfter.generation, publishedBefore.generation)

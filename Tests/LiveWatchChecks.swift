@@ -25,6 +25,22 @@ import XCTest
       hardware: hardware)
   }
 
+  func testFailedInputRefreshKeepsLastInventoryUntilEnumerationSucceeds() {
+    let input = InputDevice(id: "fake:camera", name: "Camera")
+    var result: Result<[InputDevice], CocoaError> = .success([input])
+    var hardware = AppHardware.offline
+    hardware.devices = { try result.get() }
+    let model = appModel(hardware: hardware)
+    model.refresh()
+    XCTAssertEqual(model.devices, [input])
+    result = .failure(CocoaError(.fileReadUnknown))
+    model.refresh()
+    XCTAssertEqual(model.devices, [input])
+    result = .success([])
+    model.refresh()
+    XCTAssertTrue(model.devices.isEmpty)
+  }
+
   func testDemandMonitorRunsFromLaunchAndStaysOn() {
     var hardware = AppHardware.offline
     hardware.observesCameraDemand = true

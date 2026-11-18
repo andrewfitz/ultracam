@@ -935,6 +935,21 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     XCTAssertEqual(host.observedSourceFrameHz, 0, "Equal timestamps give no rate")
   }
 
+  func testSourceCadenceStartsFreshForEachGeneration() throws {
+    let image = try greyV210()
+    let (host, slot) = host("cadence")
+    offer(host, image, generation: 1, sequence: 1)
+    offer(host, image, generation: 1, sequence: 2)
+    XCTAssertEqual(host.observedSourceFrameHz, 60, accuracy: 0.001)
+    offer(host, image, generation: 2, sequence: 100)
+    XCTAssertEqual(host.observedSourceFrameHz, 0)
+    offer(host, image, generation: 2, sequence: 101)
+    XCTAssertEqual(host.observedSourceFrameHz, 60, accuracy: 0.001)
+    host.invalidate(rejectingCaptureGeneration: 2)
+    XCTAssertEqual(host.observedSourceFrameHz, 0)
+    XCTAssertEqual(slot.accepted, 4)
+  }
+
   // MARK: - Render side
 
   /// A delivery wraps over the shared texture cache at encode time: resident, with

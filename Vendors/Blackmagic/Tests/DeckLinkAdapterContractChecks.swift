@@ -336,6 +336,8 @@ import CoreVideo
   func testTimecodePreservesDropFrameAndMissingValue() {
     XCTAssertNil(DeckLinkCaptureSession.timecode(nil))
     XCTAssertNil(DeckLinkCaptureSession.timecode("invalid"))
+    XCTAssertNil(DeckLinkCaptureSession.timecode("01;02:03:04"))
+    XCTAssertNil(DeckLinkCaptureSession.timecode("01:02:03:+04"))
     XCTAssertNil(DeckLinkCaptureSession.timecode("01:x:02:03:04"))
     XCTAssertEqual(DeckLinkCaptureSession.timecode("01:02:03;04"),
       try Timecode(hours: 1, minutes: 2, seconds: 3, frames: 4, dropFrame: true))

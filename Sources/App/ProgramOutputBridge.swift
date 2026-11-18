@@ -314,6 +314,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
       return linked
     }
     sendQueue.sync {}  // no send is in flight past this point
+    locked { fullSince = nil }
     if wasLinked {
       disconnectSink()
       locked { contractHandler }?(nil)
@@ -351,6 +352,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
     if wasLinked { disconnectSink() }
     let handler = locked { () -> (@Sendable (ProgramOutputFormat?) -> Void)? in
       link = .disconnected
+      fullSince = nil
       configuration = nil
       passthroughFormat = nil
       return contractHandler

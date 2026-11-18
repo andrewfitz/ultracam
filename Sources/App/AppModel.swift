@@ -165,7 +165,7 @@ final class AppModel {
 
   /// Nothing runs, stops, records or loads anywhere: settings can be wiped.
   var canResetSettings: Bool {
-    FeedLifecycleDemandPolicy.canResetSettings(loading: !lutLoadingFeeds.isEmpty,
+    FeedLifecycleDemandPolicy.canResetSettings(loading: !lutLoadingFeeds.isEmpty || recordingModel.recoveringID != nil,
       sourceActive: feedDescriptors.contains { cameraActive($0.id) },
       recordingActive: recordingModel.feeds.contains { $0.isActive })
   }
@@ -459,12 +459,7 @@ final class AppModel {
     self.virtualCameraRegistryStore = registryStore ?? VirtualCameraRegistryStore()
     let snapshot = store.loadSnapshot()
     persistedSnapshot = snapshot
-    // Saved without an input beside cameras that have one: that camera was set to None.
-    // Only a fresh setup, where no camera has an input yet, is filled in on its own.
     inputsClearedByChoice = Set(snapshot.feeds.filter(\.inputClearedByChoice).map(\.id))
-    if snapshot.feeds.contains(where: { !$0.selectedDevice.isEmpty }) {
-      inputsClearedByChoice.formUnion(snapshot.feeds.filter { $0.selectedDevice.isEmpty }.map(\.id))
-    }
     monitorCoordinator = MonitorCoordinator(feeds: snapshot.feeds, program: snapshot.programMonitor,
       workspace: snapshot.monitorWorkspacePreferences)
     let capturePool = FeedCapturePool(factory: { feedID in
@@ -686,7 +681,7 @@ final class AppModel {
     do {
       applyDevices(try hardware.devices(), fromDiscovery: false)
     } catch {
-      applyDevices([], fromDiscovery: false)
+      // Enumeration failed before it could report which inputs are present.
       reportProblem(error.localizedDescription, key: "inputs")
     }
     driverWarning = hardware.driverWarning()

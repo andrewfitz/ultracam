@@ -186,7 +186,7 @@ import XCTest
     shortcuts.enabled = true
     // A chord another app holds is reported, not lost: together they are all ten.
     XCTAssertEqual(shortcuts.registeredCount + shortcuts.unavailable.count, UIBackgroundShortcut.all.count)
-    XCTAssertTrue(shortcuts.handlerInstalled)
+    if shortcuts.registeredCount > 0 { XCTAssertTrue(shortcuts.handlerInstalled) }
     XCTAssertTrue(UIBackgroundShortcuts(defaults: defaults).enabled, "The switch is saved")
     shortcuts.enabled = false
     XCTAssertEqual(shortcuts.registeredCount, 0, "Off unregisters every chord")
