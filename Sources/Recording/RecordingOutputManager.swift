@@ -37,11 +37,46 @@ public protocol RecordingOutputDiskSpaceProviding: Sendable {
 /// "available for important usage" while their plain available capacity is
 /// terabytes, so the larger of the two is used. Nil when the volume reports neither.
 public enum VolumeFreeSpace {
+  /// How long a folder's "important usage" figure is reused. Reading it runs a
+  /// purgeable-space query (9–30 ms and about 100 system log lines), and the
+  /// recorder's once-a-second check and the UI asked for it one to four times
+  /// a second. The plain available figure costs a fraction of a millisecond
+  /// and is read fresh on every call, so a filling drive is seen at once.
+  static let importantUsageReuse: TimeInterval = 30
+
+  private struct Sample {
+    let at: TimeInterval
+    let important: Int64?
+    let available: Int64
+  }
+  private static let lock = RecordingLock()
+  nonisolated(unsafe) private static var samples: [String: Sample] = [:]
+
   public static func bytes(at directory: URL) throws -> Int64? {
+    let now = ProcessInfo.processInfo.systemUptime
+    let available = try read(directory, .volumeAvailableCapacityKey).volumeAvailableCapacity.map(Int64.init)
+    if let available, let sample = lock.withLock({ samples[directory.path] }), now - sample.at < importantUsageReuse {
+      return bytes(important: estimatedImportant(sample.important, readWith: sample.available, availableNow: available),
+        available: available)
+    }
+    let important = try read(directory, .volumeAvailableCapacityForImportantUsageKey).volumeAvailableCapacityForImportantUsage
+    lock.withLock {
+      if let available { samples[directory.path] = Sample(at: now, important: important, available: available) }
+      else { samples.removeValue(forKey: directory.path) }
+    }
+    return bytes(important: important, available: available)
+  }
+
+  /// A reused important figure, less what the volume has filled since it was read.
+  static func estimatedImportant(_ important: Int64?, readWith availableThen: Int64, availableNow: Int64) -> Int64? {
+    important.map { $0 - max(0, availableThen - availableNow) }
+  }
+
+  /// A URL caches resource values for its lifetime, so each read uses a fresh one.
+  private static func read(_ directory: URL, _ key: URLResourceKey) throws -> URLResourceValues {
     var fresh = URL(fileURLWithPath: directory.path, isDirectory: true)
     fresh.removeAllCachedResourceValues()
-    let values = try fresh.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
-    return bytes(important: values.volumeAvailableCapacityForImportantUsage, available: values.volumeAvailableCapacity.map(Int64.init))
+    return try fresh.resourceValues(forKeys: [key])
   }
 
   static func bytes(important: Int64?, available: Int64?) -> Int64? {

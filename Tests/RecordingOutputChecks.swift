@@ -24,6 +24,22 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertNil(VolumeFreeSpace.bytes(important: nil, available: nil))
   }
 
+  /// The purgeable-space figure is reused between reads; what the drive fills
+  /// meanwhile comes off it, and space freed meanwhile never inflates it.
+  func testReusedImportantFigureFollowsTheDriveFilling() throws {
+    XCTAssertEqual(VolumeFreeSpace.estimatedImportant(900, readWith: 500, availableNow: 400), 800)
+    XCTAssertEqual(VolumeFreeSpace.estimatedImportant(900, readWith: 500, availableNow: 600), 900)
+    XCTAssertNil(VolumeFreeSpace.estimatedImportant(nil, readWith: 500, availableNow: 400))
+    XCTAssertEqual(VolumeFreeSpace.bytes(important: VolumeFreeSpace.estimatedImportant(100, readWith: 500, availableNow: 50),
+      available: 50), 50)
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try XCTUnwrap(VolumeFreeSpace.bytes(at: root))
+    let second = try XCTUnwrap(VolumeFreeSpace.bytes(at: root))
+    XCTAssertGreaterThan(first, 0)
+    XCTAssertGreaterThan(second, 0)
+  }
+
   private func makeRoot() throws -> URL {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("ultracam-recording-output-\(UUID().uuidString)", isDirectory: true)
