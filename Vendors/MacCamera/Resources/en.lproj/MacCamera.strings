@@ -1,0 +1,7 @@
+"vendor.name" = "Mac Camera";
+"vendor.signalHint" = "Check that the camera is connected and Camera access is enabled.";
+"vendor.missingDeviceHint" = "Connect the assigned camera or select its current device in Input.";
+"capture.format" = "Capture Format";
+"capture.delivery" = "Input Delivery";
+"microphone.label" = "Microphone";
+"microphone.off" = "Off";

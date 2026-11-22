@@ -375,12 +375,20 @@ extension LUTDynamicSizeChecks {
   func testPhysicalPixelAspectFitRemovesNativePixelAspectMetadata() throws {
     guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
     let source = try graySource()
-    CVBufferSetAttachment(source, kCVImageBufferPixelAspectRatioKey,
-      [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 2,
-       kCVImageBufferPixelAspectRatioVerticalSpacingKey: 1] as CFDictionary, .shouldPropagate)
     var configuration = PipelineConfiguration(downscale: false)
     configuration.sourcePixelAspect = try Rational(2, 1)
     let processor = try LUTProcessor()
+    let native = try processor.process(source, configuration: configuration)
+    XCTAssertEqual(CVPixelBufferGetWidth(native), CVPixelBufferGetWidth(source))
+    XCTAssertEqual(CVPixelBufferGetHeight(native), CVPixelBufferGetHeight(source))
+    XCTAssertEqual(try ProgramOutputFormat.pixelAspect(of: native), try Rational(2, 1))
+    XCTAssertNil(CVBufferCopyAttachment(source, kCVImageBufferPixelAspectRatioKey, nil))
+
+    CVBufferSetAttachment(source, kCVImageBufferPixelAspectRatioKey,
+      [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 2,
+       kCVImageBufferPixelAspectRatioVerticalSpacingKey: 1] as CFDictionary, .shouldPropagate)
+    configuration.downscale = true
+    configuration.resizeTarget = .hd720
     let output = try processor.process(source, configuration: configuration)
     XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferPixelAspectRatioKey, nil),
       "Physical fitting produces square output pixels; native PAR would apply the correction twice")
@@ -389,7 +397,7 @@ extension LUTDynamicSizeChecks {
     defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
     let y = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 0)).assumingMemoryBound(to: UInt8.self)
     let stride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
-    XCTAssertEqual(Int(y[5 * stride + 64]), 16, accuracy: 1)
-    XCTAssertEqual(Int(y[32 * stride + 64]), 126, accuracy: 1)
+    XCTAssertEqual(Int(y[5 * stride + 640]), 16, accuracy: 1)
+    XCTAssertEqual(Int(y[360 * stride + 640]), 126, accuracy: 1)
   }
 }

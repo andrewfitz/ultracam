@@ -2,6 +2,33 @@ import Foundation
 import XCTest
 
 @objcMembers final class OrderedGPUIngestStageChecks: XCTestCase {
+  func testDrainedStageAcceptsFrameAtExactDurationLimit() {
+    let state = OrderedIngestTestState()
+    let drained = expectation(description: "both inputs emitted")
+    drained.expectedFulfillmentCount = 2
+    let stage = OrderedGPUIngestStage<Double, Int>(capacity: 2, maximumDuration: 0.2,
+      weight: { .init(bytes: 0, duration: $0) }, transform: { input, done in
+        if input == 0.05 {
+          state.lock.withLock { state.complete = done }
+        } else {
+          done(.success(input == 0.15 ? 1 : 2))
+        }
+      }, emit: { result in
+        if case .success(1) = result { drained.fulfill() }
+      })
+    XCTAssertTrue(stage.enqueue(0.05))
+    XCTAssertTrue(stage.enqueue(0.15))
+    let complete = state.lock.withLock {
+      let saved = state.complete
+      state.complete = nil
+      return saved
+    }
+    complete?(.success(1))
+    wait(for: [drained], timeout: 2)
+    XCTAssertTrue(stage.enqueue(0.2))
+    stage.cancel()
+  }
+
   func testMinimumSlotsRelaxesOnlyDurationForSlowSources() {
     let state = OrderedIngestTestState()
     let stage = OrderedGPUIngestStage<Int, Int>(capacity: 8, minimumSlots: 3, maximumBytes: 12,

@@ -24,6 +24,30 @@ import SystemExtensions
   }
 }
 
+/// Pushes typed frames while a verification waits for capture configuration and
+/// the matching monitor delivery. Each poll uses a new source timestamp.
+@MainActor private final class LUTVerificationFrames {
+  let fixture: AppHardwareSyntheticFixture
+  let picture: CVPixelBuffer
+  private var index: Int32 = 0
+
+  init(deviceIDs: [String]) throws {
+    fixture = try AppHardwareSyntheticFixture(duration: VideoContract.slowDuration, deviceIDs: deviceIDs)
+    picture = try fixture.makePattern()
+    fixture.connect()
+  }
+
+  func settle(_ seconds: Double, until condition: () -> Bool) {
+    let deadline = Date().addingTimeInterval(seconds)
+    while !condition(), Date() < deadline {
+      do { _ = try fixture.emit(picture, index: index) }
+      catch { preconditionFailure("Synthetic monitor frame failed: \(error)") }
+      index += 1
+      MainLoop.run(seconds: 1 / 30)
+    }
+  }
+}
+
 /// With Sync cameras on, one LUT edit reads each camera's file at most once,
 /// writes made by sync never trigger sync again, nothing reads while idle,
 /// and both monitors settle on the LUT. Scripted capture; no hardware.
@@ -50,17 +74,12 @@ extension UIVerify {
     let alpha = FeedID(rawValue: "ui-verify-sync-alpha"), beta = FeedID(rawValue: "ui-verify-sync-beta")
     let settings = AppSettingsStore(defaults: defaults)
     settings.saveSnapshot(AppSettingsSnapshot(feeds: [
-      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-a", applyLUT: false, automaticFeed: false),
-      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-b", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "fake:dev-a", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "fake:dev-b", applyLUT: false, automaticFeed: false),
     ], selectedFeedID: alpha, outputMode: .separateCameras))
-    var hardware = AppHardware.offline
-    hardware.devices = { [InputDevice(id: "dev-a", name: "UltraStudio A"), InputDevice(id: "dev-b", name: "UltraStudio B")] }
-    hardware.captureServices = { _ in
-      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
-        send: { _ in true })
-      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
-      return services
-    }
+    let frames = try LUTVerificationFrames(deviceIDs: ["fake:dev-a", "fake:dev-b"])
+    defer { frames.fixture.stop() }
+    let hardware = frames.fixture.hardware
     func makeModel() -> AppModel {
       AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
         registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
@@ -68,8 +87,7 @@ extension UIVerify {
         installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
     }
     func settle(_ seconds: Double = 5, until condition: () -> Bool) {
-      let deadline = Date().addingTimeInterval(seconds)
-      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+      frames.settle(seconds, until: condition)
     }
     do {
       let setup = makeModel()
@@ -87,7 +105,7 @@ extension UIVerify {
       return (id, surface)
     }
     defer {
-      model.setSyncCameras(false)
+      model.setSyncCameras(false, sourceID: alpha)
       for (_, surface) in surfaces { model.monitorCoordinator.unregisterSurface(id: surface) }
       model.stopCamera(alpha)
       model.stopCamera(beta)
@@ -95,14 +113,13 @@ extension UIVerify {
     func burns(_ id: FeedID) -> Bool {
       guard let (_, surface) = surfaces.first(where: { $0.0 == id }), let lut = model.burnInLUT(for: id) else { return false }
       let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
-      presenter.refreshBurnInLUT()
-      return presenter.host.burnInLUT === lut
+      return presenter.latestBurnInLUT === lut
     }
     settle { idle() && model.lutState(alpha).loaded && model.lutState(beta).loaded }
     model.startCamera(alpha)
     model.startCamera(beta)
     settle { burns(alpha) && burns(beta) }
-    model.setSyncCameras(true)
+    model.setSyncCameras(true, sourceID: alpha)
     settle(1) { !idle() }
     settle { idle() }
     verifier.check("lut sync: turning Sync on with one file under two bookmarks reads nothing",
@@ -163,17 +180,12 @@ extension UIVerify {
     let alpha = FeedID(rawValue: "ui-verify-reads-alpha"), beta = FeedID(rawValue: "ui-verify-reads-beta")
     let settings = AppSettingsStore(defaults: defaults)
     settings.saveSnapshot(AppSettingsSnapshot(feeds: [
-      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-a", applyLUT: false, automaticFeed: false),
-      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-b", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "fake:dev-a", applyLUT: false, automaticFeed: false),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "fake:dev-b", applyLUT: false, automaticFeed: false),
     ], selectedFeedID: alpha, outputMode: .separateCameras))
-    var hardware = AppHardware.offline
-    hardware.devices = { [InputDevice(id: "dev-a", name: "UltraStudio A"), InputDevice(id: "dev-b", name: "UltraStudio B")] }
-    hardware.captureServices = { _ in
-      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
-        send: { _ in true })
-      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
-      return services
-    }
+    let frames = try LUTVerificationFrames(deviceIDs: ["fake:dev-a", "fake:dev-b"])
+    defer { frames.fixture.stop() }
+    let hardware = frames.fixture.hardware
     func makeModel() -> AppModel {
       AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
         registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
@@ -181,8 +193,7 @@ extension UIVerify {
         installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
     }
     func settle(_ seconds: Double = 5, until condition: () -> Bool) {
-      let deadline = Date().addingTimeInterval(seconds)
-      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+      frames.settle(seconds, until: condition)
     }
     do {
       let setup = makeModel()
@@ -207,8 +218,7 @@ extension UIVerify {
     func monitorsBurnIn() -> Bool {
       surfaces.allSatisfy { id, surface in
         let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
-        presenter.refreshBurnInLUT()
-        return model.burnInLUT(for: id) != nil && presenter.host.burnInLUT === model.burnInLUT(for: id)
+        return model.burnInLUT(for: id) != nil && presenter.latestBurnInLUT === model.burnInLUT(for: id)
       }
     }
     settle { idle() && model.lutState(alpha).loaded && model.lutState(beta).loaded }
@@ -269,17 +279,12 @@ extension UIVerify {
     let ids = [1, 2, 3].map { FeedID(rawValue: "ui-verify-symmetry-\($0)") }
     let settings = AppSettingsStore(defaults: defaults)
     settings.saveSnapshot(AppSettingsSnapshot(feeds: ids.enumerated().map { index, id in
-      FeedDescriptor(id: id, name: "Camera \(index + 1)", selectedDevice: "dev-\(index + 1)", applyLUT: false,
+      FeedDescriptor(id: id, name: "Camera \(index + 1)", selectedDevice: "fake:dev-\(index + 1)", applyLUT: false,
         automaticFeed: false)
     }, selectedFeedID: ids[0], outputMode: .separateCameras))
-    var hardware = AppHardware.offline
-    hardware.devices = { (1...3).map { InputDevice(id: "dev-\($0)", name: "UltraStudio \($0)") } }
-    hardware.captureServices = { _ in
-      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
-        send: { _ in true })
-      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
-      return services
-    }
+    let frames = try LUTVerificationFrames(deviceIDs: (1...3).map { "fake:dev-\($0)" })
+    defer { frames.fixture.stop() }
+    let hardware = frames.fixture.hardware
     func makeModel() -> AppModel {
       AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
         registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
@@ -287,8 +292,7 @@ extension UIVerify {
         installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
     }
     func settle(_ seconds: Double = 5, until condition: () -> Bool) {
-      let deadline = Date().addingTimeInterval(seconds)
-      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+      frames.settle(seconds, until: condition)
     }
     func name(_ id: FeedID) -> String { "Camera \((ids.firstIndex(of: id) ?? 0) + 1)" }
 
@@ -331,8 +335,7 @@ extension UIVerify {
       func burns(_ id: FeedID) -> Bool {
         guard let lut = model.burnInLUT(for: id), let surface = surfaces[id] else { return false }
         let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
-        presenter.refreshBurnInLUT()
-        return presenter.host.burnInLUT === lut &&
+        return presenter.latestBurnInLUT === lut &&
           model.monitorCoordinator.preferences(for: MonitorTargetID(id.rawValue)).state.pictureStage == .output
       }
       func check(_ step: String, title: String) {
@@ -417,8 +420,6 @@ extension UIVerify {
       let hosted = HostedView(view, size: size, dark: dark, titled: titled)
       let file = "\(name)-\(dark ? "dark" : "light").png"
       if let rep = hosted.render() {
-        Images.write(rep, to: verifier.pngDirectory.appendingPathComponent(file))
-        verifier.savedImage()
         let colors = UISelfTest.distinctColors(rep)
         let dominant = Images.dominantFraction(rep)
         // The no-device Hardware pane contains only a heading and one text
@@ -434,6 +435,8 @@ extension UIVerify {
         }
         verifier.check("render \(file) has the requested size", rep.pixelsWide >= Int(size.width) && rep.pixelsHigh >= Int(size.height),
           "\(rep.pixelsWide)×\(rep.pixelsHigh)")
+        Images.write(rep, to: verifier.pngDirectory.appendingPathComponent(file))
+        verifier.savedImage()
       } else {
         verifier.check("render \(file)", false, "no bitmap", viewDependent: viewDependent)
       }
@@ -499,13 +502,16 @@ extension UIVerify {
       ("four-up", UIFixtures.fourUp()), ("stopped", UIFixtures.stopped()), ("problems", UIFixtures.problems())]
     for (name, session) in fixtures {
       for size in [CGSize(width: 1320, height: 860), CGSize(width: 980, height: 680)] {
-        // The smallest window is used without the sidebar. (A fixed-size offscreen window
-        // can't grow to fit both columns, so AppKit would loop on the split view's minimums.)
-        var session = session
-        if size.width < 1000 { session.sidebarVisible = false }
         let hosts = render("main-\(name)-\(Int(size.width))", mainWindow(.fixture(session)), size: size, titled: true)
         hosts.forEach { $0.close() }
       }
+    }
+    // The inspector is a panel of the content, so the window renders with it open: it starts
+    // under the toolbar and ends above the status bar, which runs the full width.
+    for size in [CGSize(width: 1320, height: 860), CGSize(width: 980, height: 680)] {
+      var session = UIFixtures.programMeeting()
+      session.inspectorOpen = true
+      render("main-inspector-\(Int(size.width))", mainWindow(.fixture(session)), size: size, titled: true).forEach { $0.close() }
     }
     for layout in UILayout.allCases {
       var session = UIFixtures.programMeeting()
@@ -544,10 +550,27 @@ extension UIVerify {
           size: CGSize(width: 560, height: collapsedStrip ? 52 : 230)).forEach { $0.close() }
       }
     }
-    render("component-sidebar", UISessionSidebarView(context: meeting), size: CGSize(width: 260, height: 860)).forEach { $0.close() }
-    render("component-sidebar-problems", UISessionSidebarView(context: .fixture(UIFixtures.problems())),
-      size: CGSize(width: 260, height: 860)).forEach { $0.close() }
-    // Attention, the bar, the list, the placeholder and the panel, in every state that changes
+    // The header's densities, with a Cut slot: at 400 pt the Effects menu is its glyph; at 360 and
+    // at 300 pt (the smallest window with the inspector open) the LUT toggle is too, and the
+    // chevron goes. Cut keeps its word and the name stays whole.
+    for camera in meeting.presentation.cameras.prefix(2) {
+      for width in [400, 360, 300] {
+        render("strip-narrow-\(width)-\(camera.number)", UIChannelStripView(camera: camera, context: meeting),
+          size: CGSize(width: CGFloat(width), height: 230), both: false).forEach { $0.close() }
+      }
+    }
+    verifier.check("strip header density follows width alone",
+      UIChannelStripView.headerDensity(width: 432, hasCut: true) == .full
+        && UIChannelStripView.headerDensity(width: 348, hasCut: true) == .effectsGlyph
+        && UIChannelStripView.headerDensity(width: 336, hasCut: true) == .glyphs
+        && UIChannelStripView.headerDensity(width: 360, hasCut: false) == .full)
+    // The status bar's list for the problems fixture: problems first, then the setup rows.
+    let listed = UIContext.fixture(UIFixtures.problems())
+    if let segment = listed.presentation.statusSegments.first(where: { $0.kind == .warning }) {
+      render("popover-status-warning", UIStatusPopover(kind: .warning, segment: segment, context: listed)
+        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 380, height: 560), both: false).forEach { $0.close() }
+    }
+    // The bar, the list, the placeholder and the panel, the list, the placeholder and the panel, in every state that changes
     // them. One appearance each: closed windows keep their SwiftUI graphs until the run ends,
     // and the attribute table has a hard limit.
     for (name, session) in UIFixtures.problemSessions() {
@@ -579,7 +602,7 @@ extension UIVerify {
     render("component-inspector", UIInspectorView(context: meeting), size: CGSize(width: 320, height: 860)).forEach { $0.close() }
     render("component-status-bar", UIStatusBarView(context: meeting), size: CGSize(width: 1320, height: 40)).forEach { $0.close() }
     render("component-program-view", UIProgramView(context: meeting), size: CGSize(width: 1060, height: 800)).forEach { $0.close() }
-    // The toolbar's controls in the states the drawn set has, on their own (the window toolbar hosts the same views).
+    // Program switching in each of its states, plus the separate recording control.
     var toolbarStates: [(String, UISessionSnapshot)] = []
     var manual = UIFixtures.standalone(); manual.strategy = .manual; manual.autoSwitching = false
     manual.cameras = manual.cameras.map { var c = $0; c.recording.status = .idle; return c }
@@ -591,11 +614,8 @@ extension UIVerify {
     toolbarStates.append(("pending", pending))
     for (name, session) in toolbarStates {
       let context = UIContext.fixture(session)
-      render("component-toolbar-\(name)", HStack(spacing: 20) {
-        UIToolbarCutGroup(context: context)
-        Spacer()
-        UIToolbarRecordControl(context: context)
-      }.padding(.horizontal, 12), size: CGSize(width: 900, height: 44), both: false).forEach { $0.close() }
+      render("component-switching-\(name)", UIProgramSwitchBar(context: context),
+        size: CGSize(width: 980, height: 44), both: false).forEach { $0.close() }
     }
     // The strip states that are new with the format and the LUT toggle.
     var fallback = UIFixtures.standalone()
@@ -621,9 +641,6 @@ extension UIVerify {
         size: CGSize(width: 560, height: 315), both: false).forEach { $0.close() }
     }
     UICleanViewState.shared.setFrozen(false, for: "camera-1")
-    var folded = UIFixtures.programMeeting(); folded.virtualCamerasCollapsed = true
-    render("component-sidebar-virtual-collapsed", UISessionSidebarView(context: .fixture(folded)), size: CGSize(width: 260, height: 860),
-      both: false).forEach { $0.close() }
     for kind in [UIStatusSegment.Kind.program, .recording, .output, .audio] {
       let segment = meeting.presentation.statusSegments.first { $0.kind == kind } ?? UIStatusSegment(kind: kind, text: "", tone: .neutral)
       let height: CGFloat = kind == .audio ? 640 : kind == .recording ? 420 : 300
@@ -659,7 +676,7 @@ extension UIVerify {
       atomically: true, encoding: .utf8)
     // The toolbar's controls aren't in an offscreen window's tree: they're pressed on their own below.
     for label in ["Camera 1", "Camera 2", "On air", "Stop Recording", "LUT for Camera 1", "Effects",
-      "Output 1080p 29.97", "Cut to Camera 2"] {
+      "Settings for Camera 1", "Cut to Camera 2"] {
       verifier.check("accessibility contains \"\(label)\"", contains(nodes, label), "", viewDependent: true)
     }
     // A take that ended early keeps Details on a collapsed strip: it opens Diagnostics and leaves
@@ -673,12 +690,14 @@ extension UIVerify {
       defer { hosted.close() }
       let details = Accessibility.nodes(in: hosted.host).filter { $0.text.hasPrefix("Details for") }
       verifier.check("a collapsed strip whose take ended early offers Details", !details.isEmpty, "", viewDependent: true)
-      if let first = details.first, Accessibility.press(first) {
-        hosted.settle()
-        verifier.check("collapsed Details opens Diagnostics without acknowledging the take",
-          collapsedLog.actions.contains { if case .openDiagnostics = $0 { return true }; return false }
-            && !collapsedLog.actions.contains { if case .acknowledgeStop = $0 { return true }; return false }, "", viewDependent: true)
-      }
+      let pressed = details.first.map(Accessibility.press) ?? false
+      hosted.settle()
+      let opened = failed.cameras.first.map {
+        collapsedLog.actions.contains(.openDiagnosticsSection(.camera($0.id)))
+      } == true
+      verifier.check("collapsed Details opens its Diagnostics section without acknowledging the take",
+        pressed && opened && !collapsedLog.actions.contains { if case .acknowledgeStop = $0 { return true }; return false },
+        "\(collapsedLog.actions)", viewDependent: true)
     }
     // The Effects menu is named by its words alone: its symbol is an attachment in the label.
     let effects = nodes.filter { $0.role == "AXMenuButton" && $0.text.contains("Effects") }
@@ -691,8 +710,23 @@ extension UIVerify {
     let stopped = HostedView(mainWindow(.fixture(UIFixtures.stopped())), size: CGSize(width: 1320, height: 860), dark: true, titled: true)
     defer { stopped.close() }
     let stoppedNodes = Accessibility.nodes(in: stopped.host)
-    verifier.check("stopped window offers Start Camera", contains(stoppedNodes, "Start Camera") || contains(stoppedNodes, "Start Camera 1"),
+    verifier.check("stopped window offers capture and preview controls", contains(stoppedNodes, "Start Capture")
+      && contains(stoppedNodes, "Hide Preview"),
       "", viewDependent: true)
+    var single = UIFixtures.standalone()
+    single.layout = .single
+    let singleContext = UIContext.fixture(single)
+    if let camera = singleContext.presentation.selected {
+      let strip = HostedView(UIChannelStripView(camera: camera, context: singleContext),
+        size: CGSize(width: 460, height: 230), dark: false)
+      let singleNodes = Accessibility.nodes(in: strip.host)
+      let menus = singleNodes.filter { $0.role == "AXMenuButton" || $0.role == "AXPopUpButton" }
+      // Offscreen AppKit exposes the menu's visible title, while the running app exposes its accessibility label.
+      verifier.check("Single layout exposes a displayed camera menu",
+        contains(menus, camera.name) || contains(menus, "Displayed Camera"), names(menus).joined(separator: ", "),
+        viewDependent: true)
+      strip.close()
+    }
 
     // Problem states offer their one recovery action, and pressing it sends the right action.
     let log = ActionLog()
@@ -727,37 +761,40 @@ extension UIVerify {
       verifier.check("picture: the stage label names Output as nothing to explain",
         UICameraPictureView.stageNotice(.output) == nil && UICameraPictureView.stageNotice(.source) == "Source before LUT")
     }
-    // Sidebar List rows aren't exposed to accessibility offscreen (the render
-    // component-sidebar-problems shows the banner), so check the banner's state and its view directly.
+    // The camera extension's setup state, and its row in the status bar's list.
     let problemsSession = UIFixtures.problems()
     if case .notInstalled? = UIExtensionBanner.state(problemsSession.install) {
-      verifier.check("sidebar shows the Install banner when the camera isn't installed", true)
+      verifier.check("setup state is Install when the camera isn't installed", true)
     } else {
-      verifier.check("sidebar shows the Install banner when the camera isn't installed", false,
+      verifier.check("setup state is Install when the camera isn't installed", false,
         "\(String(describing: UIExtensionBanner.state(problemsSession.install)))")
     }
-    // Attention's setup row keeps its noun: the install row has its own symbol and its one action.
+    // The setup row keeps its noun: the install row has its own symbol and its one action.
     let problemsContext = UIContext.fixture(problemsSession) { log.append($0) }
     let setup = problemsContext.presentation.setupRows
-    verifier.check("Attention offers the extension install as a setup row, not a problem",
+    verifier.check("the status bar's list offers the extension install as a setup row, not a problem",
       setup.first?.symbol == UISymbol.installExtension && setup.first?.action?.action == .installCameraExtension
         && !problemsContext.presentation.problems.contains { $0.id.hasPrefix("extension.") }, "\(setup.map(\.id))")
-    // On its own, as the drawn set has it: problems come first, and the rest are a click away.
+    // On its own, with nothing wrong: the bar's first segment is the setup row, with its button.
     var installOnly = UIFixtures.stopped()
     installOnly.install = problemsSession.install
-    let sidebar = HostedView(UIAttentionSection(context: .fixture(installOnly) { log.append($0) }),
-      size: CGSize(width: 260, height: 400), dark: false)
-    defer { sidebar.close() }
-    let sidebarNodes = Accessibility.nodes(in: sidebar.host)
-    try? sidebarNodes.map { "\($0.role)\t\($0.text)" }.joined(separator: "\n")
-      .write(to: verifier.pngDirectory.deletingLastPathComponent().appendingPathComponent("accessibility-sidebar-problems.tsv"), atomically: true, encoding: .utf8)
-    if let install = sidebarNodes.first(where: { $0.text == "Install Camera Extension…" && $0.enabled }) {
+    let installContext = UIContext.fixture(installOnly) { log.append($0) }
+    let installSegment = installContext.presentation.statusSegments.first
+    verifier.check("with nothing wrong, the status bar leads with the setup row as a notice",
+      installSegment?.kind == .warning && installSegment?.level == .notice && installSegment?.pieces.contains(.warningGlyph) == false
+        && installContext.presentation.problems.isEmpty, "\(String(describing: installSegment))")
+    let setupBar = HostedView(UIStatusBarView(context: installContext), size: CGSize(width: 1320, height: 40), dark: false)
+    defer { setupBar.close() }
+    let setupNodes = Accessibility.nodes(in: setupBar.host)
+    try? setupNodes.map { "\($0.role)\t\($0.text)" }.joined(separator: "\n")
+      .write(to: verifier.pngDirectory.deletingLastPathComponent().appendingPathComponent("accessibility-status-setup.tsv"), atomically: true, encoding: .utf8)
+    if let install = setupNodes.first(where: { $0.text == "Install Camera Extension…" && $0.enabled }) {
       log.clear()
       _ = Accessibility.press(install)
       verifier.check("pressing Install Camera Extension… sends its action", log.actions.contains(.installCameraExtension), "\(log.actions)",
         viewDependent: true)
     } else {
-      verifier.check("Attention offers \"Install Camera Extension…\"", false, names(sidebarNodes).prefix(20).joined(separator: "; "),
+      verifier.check("the status bar offers \"Install Camera Extension…\"", false, names(setupNodes).prefix(20).joined(separator: "; "),
         viewDependent: true)
     }
     verifier.check("problems window offers Retry for the failed start", problemNodes.contains { $0.text.hasPrefix("Retry") },
@@ -769,23 +806,6 @@ extension UIVerify {
     let session = UIFixtures.programMeeting()
     let context = UIContext.fixture(session) { log.append($0) }
     let presentation = context.presentation
-
-    // A sidebar row that names a camera is one button that shows it in the inspector. (A List's
-    // rows expose no text offscreen, so the row is hosted on its own.)
-    let outputRow = HostedView(UIVirtualCameraRow(row: UIVirtualCamera(id: "camera-2", name: "Ultracam · Camera 2", cameraID: "camera-2",
-      inUse: false, clientLine: "Not in use", format: nil))
-      .uiSidebarInspectButton(cameraName: "Camera 2") { log.append(.showInspector(cameraID: "camera-2")) },
-      size: CGSize(width: 260, height: 44), dark: false)
-    if let row = Accessibility.nodes(in: outputRow.host).first(where: { $0.text.contains("Camera 2") && $0.enabled }) {
-      log.clear()
-      _ = Accessibility.press(row)
-      verifier.check("a sidebar output row shows its camera in the inspector",
-        log.actions.contains(.showInspector(cameraID: "camera-2")), "\(log.actions)", viewDependent: true)
-    } else {
-      verifier.check("a sidebar output row is a button", false, names(Accessibility.nodes(in: outputRow.host)).joined(separator: "; "),
-        viewDependent: true)
-    }
-    outputRow.close()
 
     // Picture press selects and never cuts (D1).
     for camera in presentation.cameras {
@@ -831,8 +851,10 @@ extension UIVerify {
     // Camera 2 has no LUT loaded, so its LUT slot asks for one.
     pressInStrip(two, "Load LUT for Camera 2", expect: .chooseLUT(cameraID: two.id))
     pressInStrip(two, "Collapse Camera 2", expect: .toggleCollapsed(cameraID: two.id))
+    // The gear is the strip's one way into its camera's settings.
+    pressInStrip(two, "Settings for Camera 2", expect: .showInspector(cameraID: two.id))
 
-    // The ⋯ menu shows ⌃1 beside Cut to Camera 1 as a label only: the Program menu owns the key.
+    // The strip registers no ⌃1: the Program menu owns the key. It has no menu of its own.
     do {
       func isCut(_ action: UIAction) -> Bool { if case .cut = action { return true }; return false }
       // A shortcut in the window must be caught here, or the check below proves nothing.
@@ -847,14 +869,9 @@ extension UIVerify {
       log.clear()
       Keys.performKeyEquivalent("1", keyCode: 18, modifiers: .control, in: hosted.window)
       hosted.settle()
-      verifier.check("strip ⋯ menu has no ⌃1 handler", !log.actions.contains(where: isCut), "\(log.actions)")
-      let items = Menus.items(in: hosted.host, containing: "Cut to \(one.name)")
-      let cut = items.first { $0.title == "Cut to \(one.name)" }
-      verifier.check("strip ⋯ menu labels Cut to \(one.name) ⌃1 without a shortcut",
-        cut?.badge?.stringValue == "⌃1" && cut?.keyEquivalent.isEmpty == true,
-        cut.map { "badge \($0.badge?.stringValue ?? "none"), key \($0.keyEquivalent.debugDescription)" } ?? "no item", viewDependent: true)
-      verifier.check("strip ⋯ menu registers no shortcuts", !items.isEmpty && items.allSatisfy { $0.keyEquivalent.isEmpty },
-        items.filter { !$0.keyEquivalent.isEmpty }.map(\.title).joined(separator: ", "), viewDependent: true)
+      verifier.check("strip has no ⌃1 handler", !log.actions.contains(where: isCut), "\(log.actions)")
+      let items = Menus.items(in: hosted.host, containing: "Show Inspector")
+      verifier.check("strip has no overflow menu", items.isEmpty, items.map(\.title).joined(separator: ", "), viewDependent: true)
       hosted.close()
     }
 
@@ -872,15 +889,15 @@ extension UIVerify {
       hosted.settle()
       verifier.check("\(name) \"\(label)\" sends \(expect)", log.actions.contains(expect), "\(log.actions)", viewDependent: true)
     }
-    pressIn("toolbar cut group", UIToolbarCutGroup(context: context), "Cut to Camera 2", expect: .cut(cameraID: two.id))
+    pressIn("Program switch bar", UIProgramSwitchBar(context: context), "Cut to Camera 2", expect: .cut(cameraID: two.id))
     pressIn("toolbar record control", UIToolbarRecordControl(context: context), "Stop 2 Recordings", expect: .stopAllRecordings)
-    pressIn("toolbar Hold", UIToolbarCutGroup(context: context), "Hold Current Shot", expect: .setAutoHold(true))
-    pressIn("toolbar Auto", UIToolbarCutGroup(context: context), "Automatic switching", expect: .setAutoSwitching(false))
+    pressIn("switch bar Hold", UIProgramSwitchBar(context: context), "Hold Current Shot", expect: .setAutoHold(true))
+    pressIn("switch bar Auto", UIProgramSwitchBar(context: context), "Automatic switching", expect: .setAutoSwitching(false))
     let idle = UIContext.fixture(UIFixtures.stopped()) { log.append($0) }
     let idleCamera = idle.presentation.cameras[0]
     let hosted = HostedView(UIChannelStripView(camera: idleCamera, context: idle), size: CGSize(width: 560, height: 230), dark: false)
     let idleNodes = Accessibility.nodes(in: hosted.host)
-    if let start = idleNodes.first(where: { $0.label == "Start Camera 1" || $0.title == "Start Camera" }) {
+    if let start = idleNodes.first(where: { $0.label == "Start Capture for Camera 1" || $0.title == "Start Capture" }) {
       log.clear()
       _ = Accessibility.press(start)
       hosted.settle()
@@ -893,6 +910,8 @@ extension UIVerify {
       verifier.check("record is disabled when the camera is stopped", !record.enabled, "", viewDependent: true)
     }
     hosted.close()
+    pressIn("camera preview", UIChannelStripView(camera: idleCamera, context: idle), "Hide Preview",
+      expect: .setPreviewEnabled(cameraID: idleCamera.id, false))
   }
 
   // MARK: Real model bridge
@@ -946,7 +965,7 @@ extension UIVerify {
 
     let sharedBookmark = bookmark(alpha)
     model.loadLUT(url: cube1D, feedID: beta)
-    model.setSyncCameras(true)
+    model.setSyncCameras(true, sourceID: alpha)
     MainLoop.run(seconds: 0.25)
     settle { model.canResetSettings }
     verifier.check("sync regression: an earlier peer LUT load cannot overwrite shared settings",
@@ -957,7 +976,7 @@ extension UIVerify {
     settle { model.canResetSettings }
     verifier.check("sync regression: a newer effect edit supersedes a peer load even with the same saved LUT",
       bookmark(alpha) == sharedBookmark && bookmark(beta) == sharedBookmark, model.lutState(alpha).displayTitle)
-    model.setSyncCameras(false)
+    model.setSyncCameras(false, sourceID: alpha)
     model.forgetLUT(beta)
 
     model.loadLUT(url: cube1D, feedID: alpha)
@@ -1066,19 +1085,15 @@ extension UIVerify {
     verifier.check("bridge: toggle collapsed", interface.collapsed == [beta.rawValue])
     bridge.perform(.setAllCollapsed(false))
     verifier.check("bridge: expand all", interface.collapsed.isEmpty)
-    bridge.perform(.toggleSidebar)
-    verifier.check("bridge: toggle sidebar", interface.sidebarVisible == false)
     bridge.perform(.toggleInspector)
     verifier.check("bridge: toggle inspector", interface.inspectorOpen)
-    // Narrow window: the column opened last stays, the other closes.
-    bridge.perform(.setSidebarVisible(true))
-    bridge.perform(.makeRoomForPictures)
-    verifier.check("bridge: make room keeps the sidebar just opened", interface.sidebarVisible && !interface.inspectorOpen)
     bridge.perform(.setInspectorOpen(true))
-    bridge.perform(.makeRoomForPictures)
-    verifier.check("bridge: make room keeps the inspector just opened", interface.inspectorOpen && !interface.sidebarVisible)
-    bridge.perform(.makeRoomForPictures)
-    verifier.check("bridge: make room with one column open changes nothing", interface.inspectorOpen && !interface.sidebarVisible)
+    verifier.check("bridge: set inspector open keeps it open", interface.inspectorOpen)
+    // The menu bar's Attention row asks for the status bar's list; the bar clears the request.
+    bridge.perform(.showProblems)
+    verifier.check("bridge: Attention asks for the problem list", interface.problemsRequested && bridge.snapshot().problemsRequested)
+    bridge.perform(.problemsShown)
+    verifier.check("bridge: the shown list clears the request", !interface.problemsRequested)
 
     // Per-camera settings on the camera that isn't selected must persist without selecting it.
     let downscaleBefore = model.descriptor(for: beta)?.downscale ?? true
@@ -1099,7 +1114,7 @@ extension UIVerify {
     bridge.perform(.setGamut(cameraID: beta.rawValue, "S-Gamut3 / S-Log3"))
     verifier.check("bridge: gamut", model.descriptor(for: beta)?.gamut == "S-Gamut3 / S-Log3")
 
-    bridge.perform(.setSyncCameras(true))
+    bridge.perform(.setSyncCameras(true, sourceID: alpha.rawValue))
     bridge.perform(.setResizeTarget(cameraID: beta.rawValue, .hd720))
     bridge.perform(.setColorTarget(cameraID: beta.rawValue, .yuv42010))
     bridge.perform(.setFrameRateTarget(cameraID: beta.rawValue, .fps24))
@@ -1139,7 +1154,7 @@ extension UIVerify {
     })
     verifier.check("sync: recording destinations stay separate", foldersBefore == model.feedDescriptors.map { model.recordingModel.outputFolder(for: $0.id) })
     model.updateCamera(beta) { $0.enabled = true }
-    bridge.perform(.setSyncCameras(false))
+    bridge.perform(.setSyncCameras(false, sourceID: alpha.rawValue))
     bridge.perform(.setResizeTarget(cameraID: alpha.rawValue, .hd1080))
     verifier.check("sync: off restores independent editing", model.descriptor(for: beta)?.configuration.resizeTarget == .hd720)
     bridge.perform(.setColorTarget(cameraID: alpha.rawValue, .yuv4208))
@@ -1228,7 +1243,7 @@ extension UIVerify {
     bridge.perform(.setAutoSwitching(true))
     verifier.check("bridge: auto switching", model.switcherSettings.automatic && bridge.snapshot().autoSwitching)
     bridge.perform(.setStrategy(.naturalTalkingHead))
-    verifier.check("bridge: strategy", bridge.snapshot().strategyTitle == "Natural talking head")
+    verifier.check("bridge: strategy", bridge.snapshot().strategyTitle == "Natural Talking Head")
     bridge.perform(.setAutoSwitching(false))
 
     // Conformance-review additions: swap, expand/restore, anchor/emphasis, forget LUT,
@@ -1277,10 +1292,10 @@ extension UIVerify {
     }
     model.setProgramColorSpace("rec709-video")
 
-    // The sidebar's camera banner follows the installer: two failed removals, then an
+    // The status bar's setup row follows the installer: two failed removals, then an
     // install, leave no "Requesting … removal…" behind. List rows aren't exposed to
-    // accessibility offscreen, so this reads what the sidebar's body reads, and checks
-    // that each change notifies Observation, which is what redraws the sidebar.
+    // accessibility offscreen, so this reads what the status bar's list reads, and checks
+    // that each change notifies Observation, which is what redraws the bar.
     do {
       let live = UISessionBridge.live(model: model, interface: interface).context()
       final class Flag: @unchecked Sendable { var raised = false }
@@ -1299,29 +1314,28 @@ extension UIVerify {
         let requested = banner { model.installer.uninstall() }
         var removalText = false
         if case .pending(let text)? = requested.state { removalText = text.contains("Requesting camera extension removal") }
-        verifier.check("sidebar shows the removal request", removalText && requested.observed, "\(String(describing: requested.state))")
+        verifier.check("setup state shows the removal request", removalText && requested.observed, "\(String(describing: requested.state))")
         let failed = banner {
           if let removal = installerServices.submitted.last {
             model.installer.request(removal, didFailWithError: NSError(domain: OSSystemExtensionErrorDomain, code: code))
           }
         }
-        verifier.check("sidebar drops the removal request after error \(code)", !isPending(failed.state) && failed.observed
+        verifier.check("setup state drops the removal request after error \(code)", !isPending(failed.state) && failed.observed
           && !model.installer.status.contains("Requesting"), "\(String(describing: failed.state)) · \(model.installer.status)")
       }
       _ = banner { model.installer.install() }
       let installed = banner {
         if let activation = installerServices.submitted.last { model.installer.request(activation, didFinishWithResult: .completed) }
       }
-      verifier.check("sidebar shows no request after the install completes", !isPending(installed.state) && installed.observed
+      verifier.check("setup state shows no request after the install completes", !isPending(installed.state) && installed.observed
         && !model.installer.status.contains("removal"), "\(String(describing: installed.state)) · \(model.installer.status)")
       verifier.check("installer requests stay in the verifier", installerServices.submitted.count == 3, "\(installerServices.submitted.count)")
     }
 
     // Settings and Diagnostics with the real model.
     settingsWindow(model: model, interface: interface, defaults: defaults)
-    render("diagnostics", UIDiagnosticsView(model: model), size: CGSize(width: 1100, height: 760)).forEach { $0.close() }
+    render("diagnostics", UIDiagnosticsView(model: model, interface: interface), size: CGSize(width: 1100, height: 760)).forEach { $0.close() }
     interface.inspectorOpen = false
-    interface.sidebarVisible = true
     let live = UISessionBridge.live(model: model, interface: interface).context()
     render("main-live-model", mainWindow(live), size: CGSize(width: 1320, height: 860), titled: true).forEach { $0.close() }
   }
@@ -1377,10 +1391,12 @@ extension UIVerify {
     let settings = AppSettingsStore(defaults: defaults)
     let alpha = FeedID(rawValue: "ui-verify-alpha"), beta = FeedID(rawValue: "ui-verify-beta")
     let gamma = FeedID(rawValue: "ui-verify-gamma")
+    var unassigned = FeedDescriptor(id: gamma, name: "Camera 3")
+    unassigned.inputClearedByChoice = true
     settings.saveSnapshot(AppSettingsSnapshot(feeds: [
       FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-y", applyLUT: false, automaticFeed: false),
       FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-z", applyLUT: false, automaticFeed: false),
-      FeedDescriptor(id: gamma, name: "Camera 3", selectedDevice: "", applyLUT: false, automaticFeed: false),
+      unassigned,
     ], selectedFeedID: alpha, outputMode: .separateCameras))
     let x = InputDevice(id: "dev-x", name: "UltraStudio X"), y = InputDevice(id: "dev-y", name: "UltraStudio Y")
     let z = InputDevice(id: "dev-z", name: "UltraStudio Z")
@@ -1432,8 +1448,7 @@ extension UIVerify {
     model.startCamera(gamma)
     verifier.check("discovery: Start with no input chosen says to choose one",
       model.startRefusal(gamma) == "Choose an input for this camera.", model.startRefusal(gamma) ?? "nil")
-    // Saved with no input beside cameras that have one: that's None by choice, and an
-    // arriving input doesn't fill it (only a fresh setup is filled; see adoption()).
+    // Gamma explicitly saved None. A never-assigned camera is covered by adoption().
     _ = model.selectFeed(gamma)
     publish([x])
     verifier.check("discovery: a camera saved with None keeps None when an input arrives",
@@ -1616,17 +1631,12 @@ extension UIVerify {
     let settings = AppSettingsStore(defaults: defaults)
     let alpha = FeedID(rawValue: "ui-verify-auto-alpha"), beta = FeedID(rawValue: "ui-verify-auto-beta")
     settings.saveSnapshot(AppSettingsSnapshot(feeds: [
-      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "dev-a", applyLUT: false, automaticFeed: true),
-      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "dev-b", applyLUT: false, automaticFeed: true),
+      FeedDescriptor(id: alpha, name: "Camera 1", selectedDevice: "fake:dev-a", applyLUT: false, automaticFeed: true),
+      FeedDescriptor(id: beta, name: "Camera 2", selectedDevice: "fake:dev-b", applyLUT: false, automaticFeed: true),
     ], selectedFeedID: alpha, outputMode: .separateCameras))
-    var hardware = AppHardware.offline
-    hardware.devices = { [InputDevice(id: "dev-a", name: "UltraStudio A"), InputDevice(id: "dev-b", name: "UltraStudio B")] }
-    hardware.captureServices = { _ in
-      var services = CaptureServices(start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {},
-        send: { _ in true })
-      services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10
-      return services
-    }
+    let frames = try LUTVerificationFrames(deviceIDs: ["fake:dev-a", "fake:dev-b"])
+    defer { frames.fixture.stop() }
+    let hardware = frames.fixture.hardware
     func makeModel() -> AppModel {
       AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
         registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: CapturingRegistryPublisher(),
@@ -1634,8 +1644,7 @@ extension UIVerify {
         installer: ExtensionInstaller(services: RecordingInstallerServices().services()), hardware: hardware)
     }
     func settle(_ seconds: Double = 5, until condition: () -> Bool) {
-      let deadline = Date().addingTimeInterval(seconds)
-      while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
+      frames.settle(seconds, until: condition)
     }
     // Save both cameras' LUTs, as a previous session would have.
     do {
@@ -1661,9 +1670,9 @@ extension UIVerify {
     // The monitor's Output stage: what each surface's host hands its feed at encode.
     func monitorBurnsIn(_ surface: UUID, _ id: FeedID) -> Bool {
       let presenter = model.monitorCoordinator.surface(id: surface, target: MonitorTargetID(id.rawValue))
-      presenter.refreshBurnInLUT()
-      return presenter.host.burnInLUT != nil && presenter.host.burnInLUT === model.burnInLUT(for: id)
+      return presenter.latestBurnInLUT != nil && presenter.latestBurnInLUT === model.burnInLUT(for: id)
     }
+    settle { monitorBurnsIn(surfaceA, alpha) && monitorBurnsIn(surfaceB, beta) }
     verifier.check("lut auto: the selected camera's monitor Output stage has its LUT", monitorBurnsIn(surfaceA, alpha))
     verifier.check("lut auto: the other camera's monitor Output stage has its LUT", monitorBurnsIn(surfaceB, beta))
     // Running when selected: its restore completes after it started.
@@ -1763,7 +1772,7 @@ extension UIVerify {
     model.updateCamera(alpha) { $0.lutBookmark = goodBookmark }
     settle { !model.isLUTLoading(alpha) }
     both("after restoring the intended LUT")
-    model.setSyncCameras(true)
+    model.setSyncCameras(true, sourceID: alpha)
     model.stopCamera(beta)
     let temporarilyMissing = folder.appendingPathComponent("temporarily-missing.cube")
     try FileManager.default.copyItem(at: cube, to: temporarilyMissing)
@@ -1776,7 +1785,7 @@ extension UIVerify {
     verifier.check("sync regression: a peer restore failure keeps its saved choice for retry",
       model.descriptor(for: beta)?.applyLUT == true)
     try FileManager.default.copyItem(at: temporarilyMissing, to: cube)
-    model.setSyncCameras(false)
+    model.setSyncCameras(false, sourceID: alpha)
     model.stopCamera(beta)
     model.stopCamera(alpha)
 
@@ -1883,10 +1892,11 @@ extension UIVerify {
       try? titles.joined(separator: "\n").write(to: verifier.pngDirectory.deletingLastPathComponent()
         .appendingPathComponent("menubar-\(name).txt"), atomically: true, encoding: .utf8)
       verifier.check("menu bar \(name): has rows", items.count > 5, "\(items.count)")
-      if name == "problems" {
-        verifier.check("menu bar problems: couldn't start row", titles.contains { $0.contains("couldn't start") }, titles.joined(separator: " | "))
-        verifier.check("menu bar problems: warning banner", titles.contains { $0.contains("couldn't start") || $0.contains("LUT unavailable") }, titles.joined(separator: " | "))
-      }
+      let attention = topLevel.filter { $0.title == "Attention…" }
+      let problemCount = presentation.problems.count
+      verifier.check("menu bar \(name): one Attention row with the problem count",
+        attention.count == 1 && attention.first?.isEnabled == (problemCount > 0) &&
+          attention.first?.badge?.stringValue == (problemCount > 0 ? "\(problemCount)" : nil))
       for required in ["Settings…", "Quit Ultracam"] {
         verifier.check("menu bar \(name): \(required)", titles.contains { $0.hasPrefix(required) }, titles.joined(separator: " | "))
       }
@@ -1914,8 +1924,9 @@ extension UIVerify {
       } else if session.onAirID == "camera-1" {
         verifier.check("menu bar \(name): cut row for the off-air camera", topLevel.contains { $0.title == "Cut to Camera 2" },
           titles.joined(separator: " | "))
-        verifier.check("menu bar \(name): no cut row for the camera on Program", !topLevel.contains { $0.title == "Cut to Camera 1" },
-          topLevel.map(\.title).joined(separator: " | "))
+        let onAir = topLevel.first { $0.title == "Cut to Camera 1" }
+        verifier.check("menu bar \(name): checked and disabled Cut for the camera on Program",
+          onAir?.state == .on && onAir?.isEnabled == false)
       }
       // No row depends on the window's selection, and each camera's LUT is a direct row.
       let rows = topLevel.filter { !$0.isSeparatorItem && $0.view == nil }
@@ -1926,10 +1937,11 @@ extension UIVerify {
         let submenu = topLevel.first { $0.title == camera.name }?.submenu?.items.map(\.title) ?? []
         verifier.check("menu bar \(name): \(camera.name) has a LUT row", submenu.contains("LUT"), submenu.joined(separator: " | "))
       }
-      // Fourteen rows or fewer with two cameras, problem rows and Show Live Preview not counted.
-      let counted = rows.filter { row in !presentation.problems.contains { $0.title == row.title } && row.title != "Show Live Preview" }
+      let counted = rows.filter { $0.title != "Show Live Preview" }
       if session.cameras.count <= 2 {
-        verifier.check("menu bar \(name): at most 14 rows", counted.count <= 14, "\(counted.count): \(counted.map(\.title).joined(separator: " | "))")
+        let capacity = presentation.programAvailable ? 17 : 16
+        verifier.check("menu bar \(name): at most \(capacity) rows", counted.count <= capacity,
+          "\(counted.count): \(counted.map(\.title).joined(separator: " | "))")
       }
       let shortcuts = items.filter { !$0.keyEquivalent.isEmpty }.map {
         UISelfTest.shortcut(key: $0.keyEquivalent, modifiers: $0.keyEquivalentModifierMask)
@@ -1938,7 +1950,7 @@ extension UIVerify {
       verifier.check("menu bar \(name): no duplicate shortcuts", duplicates.isEmpty, duplicates.sorted().joined(separator: ", "))
       verifier.check("menu bar \(name): no consumer app names", !titles.contains { $0.contains("Zoom") || $0.contains("Teams") })
     }
-    let icons: [UIMenuBarIcon] = [.stopped, .waiting, .live, .bypass, .recording, .attention]
+    let icons: [UIMenuBarIcon] = [.stopped, .waiting, .noSignal, .live, .bypass, .recording, .attention]
     for icon in icons {
       let image = UIMenuBarController.image(for: icon)
       verifier.check("menu bar icon \(icon.rawValue) renders", image != nil)
@@ -1990,6 +2002,12 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   let verifier = Verifier(output: URL(fileURLWithPath: outputPath, isDirectory: true), strict: strict)
   let run = UIVerify(verifier: verifier)
   let started = Date()
+  if ProcessInfo.processInfo.environment["UI_MAC_CAMERA_ONLY"] == "1" {
+    MacCameraVerify.run(verifier: verifier) { name, view, size in run.render(name, view, size: size) }
+    Images.waitForWrites()
+    print("UI verify (Mac Camera only): \(verifier.passed) passed, \(verifier.failed) failed, \(verifier.images) images")
+    return verifier.failed == 0 ? 0 : 1
+  }
   // First, before other windows: closed windows keep some content ticking.
   LivePerformanceVerify.run(verifier: verifier)
   if ProcessInfo.processInfo.environment["UI_PERF_ONLY"] == "1" {
@@ -2031,6 +2049,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   SyntheticCaptureVerify.run(verifier: verifier)
   run.hdrAdvertisement()
   HardwareVerify.run(verifier: verifier) { name, view, size in run.render(name, view, size: size).forEach { $0.close() } }
+  MacCameraVerify.run(verifier: verifier) { name, view, size in run.render(name, view, size: size) }
   do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
   do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }
   do { try run.cameraSymmetry() } catch { verifier.check("camera symmetry tests threw", false, "\(error)") }

@@ -1,9 +1,9 @@
 import MonitorKitAudio
 import SwiftUI
 
-/// Bottom status bar. Fixed order: the worst problem with its action, Virtual Cameras,
-/// Program, Recording, Audio, then resources on the right. Each segment opens a popover with
-/// details. Segments are typed pieces separated by spacing, never " · ": the triangle, the REC
+/// Bottom status bar. Fixed order: the worst problem with its action (or, with nothing
+/// wrong, what still needs setting up), Virtual Cameras, Program, Recording, Audio, then
+/// resources on the right. Each segment opens a popover with details. Segments are typed pieces separated by spacing, never " · ": the triangle, the REC
 /// dot and the green virtual camera glyph are the only symbols beside a word.
 struct UIStatusBarView: View {
   let context: UIContext
@@ -43,6 +43,12 @@ struct UIStatusBarView: View {
     .overlay(alignment: .top) { Divider() }
     .accessibilityElement(children: .contain)
     .accessibilityLabel("Status")
+    // The menu bar's Attention row opens the list here, also when it had to open the window first.
+    .onChange(of: context.session.problemsRequested, initial: true) { _, requested in
+      guard requested else { return }
+      if context.presentation.statusSegments.contains(where: { $0.kind == .warning }) { open = .warning }
+      context.send(.problemsShown)
+    }
     .task {
       // Sampled here rather than in the readout, which UIFirstFitting may swap for another variant.
       var sampler = AppResourceSampler()
@@ -92,7 +98,7 @@ struct UIStatusBarView: View {
     if let level = segment.level {
       HStack(spacing: 4) {
         plainSegmentButton(segment, density: density)
-        // One click with the sidebar closed.
+        // One click, without opening the list.
         if let action = segment.action {
           UIProblemButton(action: action, level: level, context: context).padding(.trailing, 3)
         }
@@ -284,6 +290,7 @@ struct UIPopoverHeader: View {
 }
 
 struct UIStatusPopover: View {
+  @Environment(\.uiLive) private var live
   let kind: UIStatusSegment.Kind
   let segment: UIStatusSegment
   let context: UIContext
@@ -296,14 +303,18 @@ struct UIStatusPopover: View {
       case .recording: recording
       case .audio: audio
       case .warning:
-        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(problems)") { (session: UISessionSnapshot) in
-          UIProblemList(problems: UIPresentationBuilder.problems(session), context: context)
+        // Problems first, then what only needs setting up (the extension, the alerts offer).
+        UILiveSession(context: context, refresh: 1, probe: "UILiveSession(problems)") { _, presentation in
+          UIProblemList(problems: presentation.problems + presentation.setupRows, context: context,
+            title: presentation.setupRows.isEmpty ? nil : presentation.problems.isEmpty ? "Setup" : "Attention")
         }
       }
     }
     .padding(12)
-    // More than two channels keeps every maximum readable at 450 pt.
-    .frame(width: kind == .audio && context.session.cameras.contains { $0.audioChannels > 2 } ? 450 : 340, alignment: .leading)
+    // More than two channels keeps every maximum readable at 450 pt. Recording carries the
+    // take table and the next take's setup, so it's a little wider.
+    .frame(width: kind == .audio && context.session.cameras.contains { $0.audioChannels > 2 } ? 450
+      : kind == .recording ? 380 : 340, alignment: .leading)
   }
 
   private var output: some View {
@@ -312,16 +323,23 @@ struct UIStatusPopover: View {
     return Group {
       UIPopoverHeader(symbol: UISymbol.virtualCamera(inUse: using > 0), title: "Virtual Cameras",
         subtitle: using == 0 ? "None in use" : "\(using) of \(rows.count) in use", tint: using > 0 ? .green : .secondary)
-      ForEach(rows) { row in
-        HStack(spacing: 6) {
-          UIVirtualCameraRow(row: row)
-          if let format = row.format { UIBadge(text: format).fixedSize() }
-        }
+      virtualCameraRows(rows, using: using)
+    }
+  }
+
+  /// Every published device as a meeting app lists it, its format, and with none in use the
+  /// microphone reminder. The Virtual Cameras popover's rows; with Program, whose segment
+  /// stands in for that one, the Program popover's last rows too.
+  @ViewBuilder private func virtualCameraRows(_ rows: [UIVirtualCamera], using: Int) -> some View {
+    ForEach(rows) { row in
+      HStack(spacing: 6) {
+        UIVirtualCameraRow(row: row)
+        if let format = row.format { UIBadge(text: format).fixedSize() }
       }
-      if using == 0 {
-        Label { Text(UISessionSidebarViewContent.microphoneReminder) } icon: { Image(systemName: UISymbol.microphoneReminder) }
-          .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-      }
+    }
+    if using == 0 {
+      Label { Text(UIVirtualCameraRow.microphoneReminder) } icon: { Image(systemName: UISymbol.microphoneReminder) }
+        .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
   }
 
@@ -355,6 +373,10 @@ struct UIStatusPopover: View {
         }
         .fixedSize(horizontal: false, vertical: true)
       }
+      Divider()
+      if session.stream.active {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in streamSection(session, stream: live?.streamSnapshot ?? session.stream) }
+      } else { streamSection(session, stream: session.stream) }
       if !session.recentCuts.isEmpty {
         Divider()
         Text("Recent cuts").font(.uiMeta.weight(.semibold)).foregroundStyle(.secondary)
@@ -374,10 +396,52 @@ struct UIStatusPopover: View {
       }
       Label("Program isn't recorded. Each take keeps its camera original, plus this cut list.", systemImage: UISymbol.information)
         .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      // The Virtual Cameras segment shows only while a camera's own device is in use, so
+      // the list of published devices is here whenever Program is.
+      let rows = context.presentation.virtualCameras
+      Divider()
+      Text("Virtual cameras").font(.uiMeta.weight(.semibold)).foregroundStyle(.secondary)
+      virtualCameraRows(rows, using: rows.filter(\.inUse).count)
     }
   }
 
-  /// The takes' clocks, sizes and the drives follow their statistics while the popover is open.
+  @ViewBuilder private func streamSection(_ session: UISessionSnapshot, stream: ProgramStreamSnapshot) -> some View {
+    let command = session.streamCommand
+    HStack {
+      Label("Stream", systemImage: UISymbol.stream).font(.uiRowEmphasis)
+      Spacer()
+      if stream.active || stream.phase == .failed { Text(stream.phase.streamTitle).font(.uiMeta) }
+      if stream.active, let start = stream.startedAt { Text(start, style: .timer).font(.uiValue).fixedSize() }
+    }
+    if stream.configured || stream.active {
+      LabeledContent("Destination", value: stream.name).font(.uiRow)
+      LabeledContent("Video", value: stream.format.pictureDescription).font(.uiRow)
+      LabeledContent("Encoder", value: stream.format.encoderDescription).font(.uiRow)
+      LabeledContent("Audio", value: session.streamAudioName).font(.uiRow)
+      if stream.phase == .streaming, stream.audioFeedID != nil {
+        if stream.audioMissing { Text("Stream audio missing").foregroundStyle(.orange).font(.uiMeta) }
+        else { LabeledContent("Peak", value: UISettingsStreamingPane.level(stream.audioPeak)).font(.uiValue) }
+      }
+      if stream.phase == .streaming && !stream.pictureFresh {
+        Text("No Program picture").foregroundStyle(.orange).font(.uiMeta)
+      }
+    }
+    if stream.phase == .failed, let error = stream.lastError {
+      Text(error).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+    HStack {
+      Button(command.title) { context.send(command.action) }.disabled(!session.streamCommandEnabled)
+      if command.action != .openSettingsTab(.streaming) {
+        Button("Stream Settings…") { context.send(.openSettingsTab(.streaming)) }
+      }
+    }
+  }
+
+  /// Recording's one popover, from this bar's segment and from the toolbar's Record arrow:
+  /// the takes rolling, what starts, pauses and stops them, then the next take's format,
+  /// timecode, folder and drives, and last what's after the fact (the takes in Finder, an
+  /// interrupted take to recover). The takes' clocks, sizes and the drives follow their
+  /// statistics while it's open.
   private var recording: some View {
     UILiveSession(context: context, refresh: 2) { session, presentation in recording(session, presentation) }
   }
@@ -396,7 +460,7 @@ struct UIStatusPopover: View {
           GridRow {
             Text("Camera"); Text("Clock"); Text("Size"); Text("Rate"); Text("Drop"); Text("Left")
           }
-          .font(.uiBadge).foregroundStyle(.secondary)
+          .font(.uiMeta.weight(.semibold)).foregroundStyle(.secondary)
           ForEach(takes) { camera in
             let snapshot = session.cameras.first { $0.id == camera.id }
             GridRow {
@@ -435,31 +499,96 @@ struct UIStatusPopover: View {
           Text(camera.formatHelp).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
       }
+      recordingActions(presentation, rolling: !takes.isEmpty)
       Divider()
-      HStack(spacing: 8) {
-        UIBadge(text: session.codec.title, symbol: UISymbol.format).fixedSize()
-        Text(UIPresentationBuilder.recordingLook(session)).font(.uiMeta).foregroundStyle(.secondary)
-        Label(session.timecodeTitle, systemImage: UISymbol.timecode).font(.uiMeta).foregroundStyle(.secondary)
+      // What the next take records, and where: the session's one place to set it.
+      // Label at the leading edge, control at the trailing one: outside a Form a
+      // LabeledContent centers the pair.
+      HStack {
+        Text("Format")
+        Spacer(minLength: 8)
+        UIFormatMenu(context: context).fixedSize()
       }
-      if takes.isEmpty, let camera = session.cameras.first {
-        HStack {
+      .font(.uiRow)
+      HStack {
+        Text("Timecode")
+        Spacer(minLength: 8)
+        Button(session.timecodeTitle) { context.send(.openSettingsTab(.recording)) }
+          .buttonStyle(.link)
+          .help("Timecode is set in Settings › Recording. Click to open it.")
+          .accessibilityLabel("Timecode \(session.timecodeTitle)")
+          .accessibilityHint("Opens Settings › Recording")
+      }
+      .font(.uiRow)
+      HStack {
+        Label(session.defaultFolderPath.map(UIFormat.folderName) ?? "No folder", systemImage: UISymbol.folder)
+          .lineLimit(1).truncationMode(.middle)
+          .help(session.defaultFolderPath ?? "Choose where takes are saved.")
+        Spacer(minLength: 8)
+        Button(UIPresentationBuilder.folderAction(session)) { context.send(.chooseRecordingFolder(cameraID: nil)) }
+          .controlSize(.small).fixedSize()
+          .help("Choose the default recording folder. Changes apply to the next take.")
+      }
+      .font(.uiRow)
+      HStack {
+        Text(UIPresentationBuilder.recordingLook(session)).font(.uiMeta).foregroundStyle(.secondary)
+        Spacer()
+        if takes.isEmpty, let camera = session.cameras.first {
           Text("Estimated, per camera").font(.uiMeta).foregroundStyle(.secondary)
-          Spacer()
           Text("~\(UIFormat.bitrate(UIPresentationBuilder.estimateMegabits(session.codec.resolved(for: camera.sourceFormat), camera)))")
             .font(.uiValueStrong)
         }
       }
       ForEach(session.drives) { UIDriveRow(drive: $0, cameras: UIPresentationBuilder.cameras(on: $0, in: session)) }
+      if session.drives.isEmpty {
+        Text("No drive").font(.uiMeta).foregroundStyle(.secondary).accessibilityLabel("No recording drive")
+      }
+      Divider()
       HStack {
-        Button("Show in Finder", systemImage: UISymbol.folder) { context.send(.revealRecordings) }
+        Button("Show Recordings in Finder", systemImage: UISymbol.folder) { context.send(.revealRecordings) }
+          .controlSize(.small)
           .disabled(!context.presentation.canRevealRecordings)
           .help(context.presentation.canRevealRecordings ? "Open the recording folder in Finder." : "Choose a recording folder first.")
         Spacer()
-        if !takes.isEmpty {
-          Button("Stop All Recordings") { context.send(.stopAllRecordings) }
-            .help("Stop every recording (⌥⌘R)")
+        // After the fact, so it's the last thing here and nowhere else in the window.
+        if !session.interruptedTakes.isEmpty {
+          let count = session.interruptedTakes.count
+          Text(count == 1 ? "1 interrupted take" : "\(count) interrupted takes").font(.uiMeta).foregroundStyle(.secondary)
+          Button("Recover…") { context.send(.showInterruptedTakes) }
+            .controlSize(.small)
+            .help("Recovery copies complete fragments into a separate movie and keeps the original.")
         }
       }
+    }
+  }
+
+  /// What the toolbar's Record arrow used to list: a take for one camera, Pause All, Stop All.
+  /// The row is absent while there's nothing to start, pause or stop.
+  @ViewBuilder private func recordingActions(_ presentation: UISessionPresentation, rolling: Bool) -> some View {
+    let ready = presentation.cameras.count > 1
+      ? presentation.cameras.filter { $0.recordButtonEnabled && !$0.recordButtonActive && $0.pauseTitle == nil } : []
+    if !ready.isEmpty || presentation.canPauseAll || rolling {
+      // One row when it fits; with four cameras ready the buttons stack.
+      ViewThatFits(in: .horizontal) {
+        HStack(spacing: 6) { recordingActionButtons(presentation, ready: ready, rolling: rolling) }
+        VStack(alignment: .leading, spacing: 6) { recordingActionButtons(presentation, ready: ready, rolling: rolling) }
+      }
+      .controlSize(.small)
+    }
+  }
+
+  @ViewBuilder private func recordingActionButtons(_ presentation: UISessionPresentation, ready: [UICameraPresentation],
+    rolling: Bool) -> some View {
+    ForEach(ready) { camera in
+      Button("Record \(camera.name)") { context.send(.toggleRecording(cameraID: camera.id)) }
+    }
+    if presentation.canPauseAll {
+      Button(presentation.pauseAllTitle) { context.send(presentation.pauseAllTitle == "Resume All" ? .resumeAll : .pauseAll) }
+        .help("\(presentation.pauseAllTitle) (⌥⌘P)")
+    }
+    if rolling {
+      Button("Stop All Recordings") { context.send(.stopAllRecordings) }
+        .help("Stop every recording (⌥⌘R)")
     }
   }
 
@@ -481,15 +610,19 @@ struct UIStatusPopover: View {
   private var audio: some View {
     let live = context.presentation.cameras.filter { context.snapshot($0.id)?.running == true }
     let withAudio = live.filter(\.audio.present).count
+    let kinds = Set(live.map { context.snapshot($0.id)?.captureAudio ?? .embedded })
     return Group {
-      UIPopoverHeader(symbol: UISymbol.audio, title: "Embedded audio",
+      UIPopoverHeader(symbol: UISymbol.audio, title: kinds.count == 1 ? kinds.first?.title ?? "Audio" : "Audio",
         subtitle: live.isEmpty ? "No camera is running" : "\(withAudio) of \(live.count) cameras")
       ForEach(live) { camera in
         VStack(alignment: .leading, spacing: 4) {
           HStack(spacing: 6) {
             if !camera.audio.present { UIStateGlyph(state: .warning) }
             Text(camera.name).font(.uiRowEmphasis)
-            if !camera.audio.present { Text("No embedded audio").font(.uiMeta).foregroundStyle(.secondary) }
+            if !camera.audio.present {
+              Text((context.snapshot(camera.id)?.captureAudio ?? .embedded).missingLabel)
+                .font(.uiMeta).foregroundStyle(.secondary)
+            }
             Spacer()
             if let format = Self.audioFormat(context.snapshot(camera.id)) {
               UIBadge(text: format.rate).fixedSize()

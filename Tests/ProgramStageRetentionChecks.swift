@@ -19,6 +19,68 @@ import XCTest
     XCTAssertEqual(try ProgramOutputFormat.pixelAspect(of: image), try Rational(4, 3))
   }
 
+  func testProgramMonitorWaitsForPublishedPixelsWhenClientIsActive() throws {
+    let (route, consumer, normalized) = try timingRoute()
+    let id = FeedID(rawValue: "timing")
+    let step = CMTime(value: 1, timescale: 60)
+    var raw: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 4, 2, kCVPixelFormatType_32BGRA, nil, &raw), kCVReturnSuccess)
+    let source = try XCTUnwrap(raw)
+    var monitored: [CVPixelBuffer] = []
+    route.onMonitorFrame = { _, frame, _, _, _ in monitored.append(frame.payload) }
+    func offer(_ n: Int64) {
+      route.ingest(feedID: id, frame: ProcessedFrame(payload: source, metadata: ProcessedFrameMetadata(
+        presentationTime: CMTime(value: n, timescale: 60), duration: step,
+        width: 4, height: 2, pixelFormat: kCVPixelFormatType_32BGRA)))
+    }
+    offer(0)
+    XCTAssertTrue(monitored.isEmpty, "Unavailable normalizer")
+    let converter = RetentionPausedNormalizer()
+    route.setNormalizerProvider { converter }
+    offer(1)
+    XCTAssertTrue(monitored.isEmpty, "GPU still pending")
+    converter.finish(.success(normalized))
+    XCTAssertTrue(monitored.first === normalized)
+    XCTAssertTrue(consumer.dequeue()?.payload === normalized)
+    route.setOutput(contract: route.contract, active: false)
+    offer(2)
+    XCTAssertEqual(monitored.count, 2)
+    XCTAssertTrue(monitored.last === source)
+  }
+
+  func testProgramRetimingKeepsPassthroughProducerUntilConsumerRelease() throws {
+    let (route, consumer, image) = try timingRoute()
+    var released = 0
+    let id = FeedID(rawValue: "timing")
+    let contract = try XCTUnwrap(route.contract)
+    route.ingest(feedID: id, frame: ProcessedFrame(payload: image, metadata: .init(presentationTime: .zero,
+      duration: contract.duration, width: contract.width, height: contract.height, pixelFormat: contract.pixelFormat),
+      onReleased: { released += 1 }))
+    XCTAssertEqual(released, 0)
+    let lease = try XCTUnwrap(consumer.dequeue())
+    XCTAssertTrue(lease.payload === image)
+    lease.release()
+    XCTAssertEqual(released, 1)
+  }
+
+  func testProgramNormalizationKeepsProducerThroughGPUFeedbackAfterReset() throws {
+    let (route, _, image) = try timingRoute()
+    let converter = RetentionPausedNormalizer()
+    route.setNormalizerProvider { converter }
+    var source: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 4, 2, kCVPixelFormatType_32BGRA, nil, &source), kCVReturnSuccess)
+    var released = 0
+    let id = FeedID(rawValue: "timing")
+    route.ingest(feedID: id, frame: ProcessedFrame(payload: try XCTUnwrap(source), metadata: .init(presentationTime: .zero,
+      duration: CMTime(value: 1, timescale: 60), width: 4, height: 2, pixelFormat: kCVPixelFormatType_32BGRA),
+      onReleased: { released += 1 }))
+    XCTAssertEqual(released, 0)
+    route.reset()
+    XCTAssertEqual(released, 0, "Reset cannot return backing still read by the GPU")
+    converter.finish(.success(image))
+    XCTAssertEqual(released, 1)
+  }
+
   func testStageAdmitsEquivalentTimeAt25And120HzAndKeepsLateWorkCharged() throws {
     for rate in [25, 120] {
       let id = FeedID(rawValue: "retention")
@@ -198,10 +260,10 @@ private final class RetentionPausedNormalizer: ProgramFrameNormalizing, @uncheck
   func canNormalize(_ metadata: ProcessedFrameMetadata, to contract: ProgramOutputFormat) -> Bool { true }
   func normalize(_ source: CVPixelBuffer, to contract: ProgramOutputFormat,
     completion: @escaping @Sendable (Result<CVPixelBuffer, Error>) -> Void) throws { completions.append(completion) }
-  func finish() {
+  func finish(_ result: Result<CVPixelBuffer, Error> = .failure(VideoError.message("retired"))) {
     let pending = completions
     completions.removeAll()
-    pending.forEach { $0(.failure(VideoError.message("retired"))) }
+    pending.forEach { $0(result) }
   }
 }
 

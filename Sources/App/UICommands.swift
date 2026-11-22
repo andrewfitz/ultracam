@@ -64,6 +64,10 @@ struct UICommands: Commands {
                 .disabled(!selected.canStart)
             }
           }
+          // A hang is the reason to reach for this: it reopens the output and keeps the take.
+          Button("Restart \(selected.name)") { send(.restartCamera(cameraID: selected.id)) }
+            .disabled(selectedSnapshot?.running != true)
+            .help("Reopen \(selected.name)'s output. Capture and the take keep running.")
           Toggle("Effects", isOn: Binding(get: { selected.processing },
             set: { send(.setProcessing(cameraID: selected.id, $0)) }))
             .keyboardShortcut("b", modifiers: [.command, .shift])
@@ -80,16 +84,17 @@ struct UICommands: Commands {
       }
       Divider()
       Button(presentation.camerasControlTitle) {
-        send(presentation.camerasRunning ? .stopAllCameras : .startAllCameras)
+        send(presentation.cameras.contains(where: \.canStop) ? .stopAllCameras : .startAllCameras)
       }
       .keyboardShortcut(.return, modifiers: .command)
       .disabled(!presentation.canStartAny)
       if several {
         Divider()
         Section("Select Camera") {
-          ForEach(Array(presentation.cameras.prefix(4))) { camera in
+          // Every camera is listed; the keys cover the first four.
+          ForEach(presentation.cameras) { camera in
             Toggle(camera.name, isOn: Binding(get: { camera.selected }, set: { _ in send(.select(cameraID: camera.id)) }))
-              .keyboardShortcut(KeyEquivalent(Character("\(camera.number)")), modifiers: .command)
+              .keyboardShortcut(camera.number <= 4 ? KeyboardShortcut(KeyEquivalent(Character("\(camera.number)")), modifiers: .command) : nil)
           }
         }
       }
@@ -109,6 +114,14 @@ struct UICommands: Commands {
       Button(recordTitle(selectedSnapshot)) { send(.toggleRecordingSelected) }
         .keyboardShortcut("r")
         .disabled(!(selected?.recordButtonEnabled ?? false))
+      // Always present, so the key is discoverable while idle and the menu keeps its shape.
+      Button("\(selected?.pauseTitle == "Resume" ? "Resume" : "Pause") Recording\(selected.map { " \($0.name)" } ?? "")") {
+        if let selected { send(.pauseOrResume(cameraID: selected.id)) }
+      }
+      .keyboardShortcut("r", modifiers: [.command, .shift])
+      .disabled(selected?.pauseTitle == nil)
+      // The session's own pair, kept with one camera too so ⌥⌘R and ⌥⌘P always exist.
+      Divider()
       switch presentation.recordControl {
       case .record(_, let enabled, _, _):
         Button(presentation.recordControl.title) { send(.recordAll) }
@@ -118,16 +131,11 @@ struct UICommands: Commands {
         Button(presentation.recordControl.title) { send(.stopAllRecordings) }
           .keyboardShortcut("r", modifiers: [.command, .option])
       }
-      if let selected, selected.pauseTitle != nil {
-        Button("\(selected.pauseTitle == "Resume" ? "Resume" : "Pause") Recording \(selected.name)") {
-          send(.pauseOrResume(cameraID: selected.id))
-        }
-        .keyboardShortcut("r", modifiers: [.command, .shift])
-      }
       // Pause All turns into Resume All once every take is paused, on the same key.
       Button(presentation.pauseAllTitle) { send(presentation.pauseAllTitle == "Resume All" ? .resumeAll : .pauseAll) }
         .keyboardShortcut("p", modifiers: [.command, .option])
         .disabled(!presentation.canPauseAll)
+      Divider()
       Menu {
         UIFormatChoices(session: session, send: send)
       } label: {
@@ -147,11 +155,19 @@ struct UICommands: Commands {
     }
 
     CommandMenu("Program") {
+      let stream = session.streamCommand
+      Button(stream.title) { send(stream.action) }.disabled(!session.streamCommandEnabled)
+      Divider()
+      // One camera has nothing to switch: say why the menu is idle.
+      if !presentation.programAvailable {
+        Button("Add a Second Camera to Use Program") {}.disabled(true)
+        Divider()
+      }
       // The camera on Program is checked; cuts need a running camera with a picture.
-      ForEach(Array(presentation.cameras.prefix(4))) { camera in
+      ForEach(presentation.cameras) { camera in
         let onAir = session.onAirID == camera.id
         Toggle("Cut to \(camera.name)", isOn: Binding(get: { onAir }, set: { _ in send(.cut(cameraID: camera.id)) }))
-          .keyboardShortcut(KeyEquivalent(Character("\(camera.number)")), modifiers: .control)
+          .keyboardShortcut(camera.number <= 4 ? KeyboardShortcut(KeyEquivalent(Character("\(camera.number)")), modifiers: .control) : nil)
           .disabled(!camera.cutEnabled)
       }
       Divider()
@@ -176,8 +192,8 @@ struct UICommands: Commands {
       }
       .disabled(!presentation.programAvailable)
       if presentation.programAvailable && session.strategy == .naturalTalkingHead {
-        UICameraPickerMenu(title: "Anchor", selection: session.anchorID, cameras: presentation.cameras) { send(.setAnchor(cameraID: $0)) }
-        UICameraPickerMenu(title: "Emphasis", selection: session.emphasisID, cameras: presentation.cameras) {
+        UICameraPickerMenu(title: "Anchor", selection: session.anchorID, otherRole: session.emphasisID, cameras: presentation.cameras) { send(.setAnchor(cameraID: $0)) }
+        UICameraPickerMenu(title: "Emphasis", selection: session.emphasisID, otherRole: session.anchorID, cameras: presentation.cameras) {
           send(.setEmphasis(cameraID: $0))
         }
       }
@@ -191,8 +207,6 @@ struct UICommands: Commands {
             .disabled(!presentation.layouts.contains(layout))
         }
       }
-      Button(session.sidebarVisible ? "Hide Sidebar" : "Show Sidebar") { send(.toggleSidebar) }
-        .keyboardShortcut("s", modifiers: [.command, .control])
       Button(allCollapsed(session) ? "Expand All Strips" : "Collapse All Strips") {
         send(.setAllCollapsed(!allCollapsed(session)))
       }
@@ -225,7 +239,7 @@ struct UICommands: Commands {
         // isn't observed by the menus.
         let frozen = UICleanViewState.shared.frozen.contains(selected.id)
         let clean = UICleanViewState.shared.clean.contains(selected.id)
-        Toggle("Freeze \(selected.name)", isOn: Binding(get: { frozen },
+        Toggle("Freeze Picture", isOn: Binding(get: { frozen },
           set: { _ in send(.freeze(cameraID: selected.id)) }))
           .keyboardShortcut("f", modifiers: [.control, .option])
           .disabled(!showsPicture || !hasPresenter)

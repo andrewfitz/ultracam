@@ -41,16 +41,18 @@ extension UISessionBridge {
   }
 
   func context() -> UIContext {
-    var session = snapshot()
-    // Its cameras alone can't tell "not installed" from "enabled, not started yet".
-    session.install.system = model.installer.system
+    let session = snapshot()
     let bridge = self
+    let inputs = model.devices.map {
+      UIInput(id: $0.id, name: model.hardwareInventory.nickname(for: $0.id) ?? $0.name, vendor: model.captureVendor(for: $0.id),
+        shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes)
+    }
     return UIContext(session: session, presentation: UIPresentationBuilder.session(session),
-      inputs: model.devices.map { UIInput(id: $0.id, name: model.inputLabel($0.id) ?? $0.name, vendor: model.captureVendor(for: $0.id), shareable: model.inputShareable($0.id), supportedModes: $0.supportedModes) },
+      inputs: inputs,
       send: { bridge.send($0) },
       pictures: UIAppPictures(model: model), monitor: UIAppMonitorSettings(model: model),
       refreshed: { bridge.context() }, cameraControls: model.cameraControls,
-      captureVendors: Dictionary(uniqueKeysWithValues: model.devices.compactMap { device in model.captureVendor(for: device.id).map { (device.id, $0) } }),
+      captureVendors: Dictionary(uniqueKeysWithValues: inputs.compactMap { input in input.vendor.map { (input.id, $0) } }),
       controlViewFactories: model.controlViewFactories)
   }
 }

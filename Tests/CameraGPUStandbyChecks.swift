@@ -72,6 +72,38 @@ import XCTest
     }
   }
 
+  func testAlternatingEarlyAndLateTicksKeepStandbyCadence() throws {
+    let pending = Pending()
+    let start = CMTime(value: 240_000, timescale: 240_000)
+    let duration = VideoContract.fastDuration
+    var now = start
+    var times: [CMTime] = []
+    let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false,
+      clock: { now }, output: { sample, _, _ in times.append(CMSampleBufferGetPresentationTimeStamp(sample)) })
+    try runtime.queue.sync {
+      runtime.enableGPUStandbyForTesting(submit: pending.submit)
+      try runtime.source.startStream()
+      runtime.emitStandby()
+    }
+    pending.callbacks[0](.success(try image(pending.formats[0])))
+    try runtime.queue.sync {
+      for index in 1...60 {
+        let due = CMTimeAdd(start, CMTimeMultiply(duration, multiplier: Int32(index)))
+        now = CMTimeAdd(due, CMTime(value: index.isMultiple(of: 2) ? 48 : -48, timescale: 240_000))
+        runtime.emitStandby()
+        runtime.emitStandby()
+        XCTAssertEqual(times.last, due)
+      }
+      XCTAssertEqual(times.count, 61)
+      let late = CMTimeAdd(start, CMTimeMultiply(duration, multiplier: 66))
+      now = CMTimeSubtract(late, CMTime(value: 48, timescale: 240_000))
+      runtime.emitStandby()
+      XCTAssertEqual(times.count, 62)
+      XCTAssertEqual(times.last, late)
+      try runtime.source.stopStream()
+    }
+  }
+
   func testDefaultStandbyRouteIsAsynchronousGPUWithoutOptIn() throws {
     guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else { throw XCTSkip("Metal 4 required") }
     let completed = expectation(description: "default standby GPU completion")

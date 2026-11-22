@@ -1,5 +1,6 @@
 """Security and reproducibility constraints for the versioned vendor schema."""
 import importlib.util
+import plistlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,6 +59,30 @@ class VendorManifestTests(unittest.TestCase):
         (self.vendor / 'SDK/core.dylib').write_bytes(b'fixture')
         self.assertFalse(self.module.resolve_sdk_inventory([result], {}, self.root)['example']['available'])
         self.assertTrue(self.module.resolve_sdk_inventory([result], {'example': True}, self.root)['example']['available'])
+
+    def test_sdkless_vendor_capabilities_are_checked(self):
+        value = self.manifest()
+        key = 'NSCameraUseContinuityCameraDeviceType'
+        value['capabilities'] = {'entitlements': ['com.apple.security.device.camera'], 'infoPlist': [key]}
+        manifest = self.module.validate_manifest(value, self.vendor / 'vendor.json', self.root)
+        inventory = self.module.resolve_sdk_inventory([manifest], {}, self.root)
+        self.assertFalse(inventory['example']['available'])
+        config = self.root / 'Config'
+        config.mkdir()
+        entitlements = config / 'App.entitlements'
+        info = config / 'App-Info.plist'
+        entitlements.write_bytes(plistlib.dumps({}))
+        info.write_bytes(plistlib.dumps({key: True}))
+        with self.assertRaisesRegex(ValueError, 'com.apple.security.device.camera'):
+            self.module.check_capabilities(self.root, [manifest], inventory)
+        entitlements.write_bytes(plistlib.dumps({'com.apple.security.device.camera': True}))
+        for values in ({}, {key: False}, {key: 'true'}, {key: 1}):
+            with self.subTest(values=values):
+                info.write_bytes(plistlib.dumps(values))
+                with self.assertRaisesRegex(ValueError, key):
+                    self.module.check_capabilities(self.root, [manifest], inventory)
+        info.write_bytes(plistlib.dumps({key: True}))
+        self.module.check_capabilities(self.root, [manifest], inventory)
 
     def test_required_vendored_sdk_and_conditional_build_settings(self):
         (self.vendor / 'SDK').mkdir()

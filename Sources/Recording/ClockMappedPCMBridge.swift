@@ -91,6 +91,10 @@ struct ClockMappedPCMBridge {
     try converter.resume(audioTime: audioTime, mapping: mapping)
   }
 
+  mutating func restartSegment(audioTime: CMTime, mapping: PCMClockTransform) throws {
+    try converter.restartSegment(audioTime: audioTime, mapping: mapping)
+  }
+
   private func makeDescription(source: CMAudioFormatDescription) throws -> CMAudioFormatDescription {
     var asbd = AudioStreamBasicDescription(mSampleRate: outputSampleRate,
       mFormatID: kAudioFormatLinearPCM, mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,

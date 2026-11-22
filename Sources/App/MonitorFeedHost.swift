@@ -16,7 +16,7 @@ protocol MonitorFeedConsumer: AnyObject, Sendable {
 ///
 /// Delivery side (any thread, one short lock): every frame the capture delivery
 /// queue (or the Program route) offers is stamped, its colorimetry and geometry are
-/// read (cached per IOSurface, so a steady stream allocates nothing), and it goes
+/// read from that frame, and it goes
 /// straight into each live consumer's slot. Offers never visit the main actor, never
 /// copy pixels and never wait on the GPU. Only the source frame is offered: the
 /// Output stage is the source plus the burn-in LUT in MonitorKit's shader.
@@ -40,16 +40,20 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     /// Bumped when what the frames mean changes: their signal or geometry, the
     /// signal declaration, the consumer set coming or going, an invalidation.
     var revision: UInt64
+    var expectedPeriod: Double = 0
+
+    func isStale(at now: Double) -> Bool {
+      now - hostTime > max(0.25, 3 * expectedPeriod)
+    }
 
     /// Whether a consumer that last took `previous` should take this frame: same
-    /// target; a newer generation; or, within a generation, not an older revision
-    /// and, for the same revision, not an older sequence.
+    /// target; a newer generation; or, within a generation, a newer sequence
+    /// with a revision at least as recent as the previous frame.
     func follows(_ previous: Stamp?) -> Bool {
       guard let previous else { return true }
       guard target == previous.target, generation >= previous.generation else { return false }
       guard generation == previous.generation else { return true }
-      guard revision >= previous.revision else { return false }
-      return revision != previous.revision || sequence > previous.sequence
+      return revision >= previous.revision && sequence > previous.sequence
     }
   }
 
@@ -80,10 +84,12 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let frameID: UInt64
     /// Program's frames are a mix, not a camera's signal: no log false colour, no peaking.
     let isProcessed: Bool
+    /// The immutable LUT selected by capture for these pixels, including its output signal.
+    let burnIn: MonitorLUT?
 
     init(
       stamp: Stamp, pixelBuffer: CVPixelBuffer, layout: PixelLayout?, signal: SignalDescription,
-      geometry: MonitorFrameGeometry, frameID: UInt64, isProcessed: Bool
+      geometry: MonitorFrameGeometry, frameID: UInt64, isProcessed: Bool, burnIn: MonitorLUT? = nil
     ) {
       self.stamp = stamp
       self.pixelBuffer = pixelBuffer
@@ -92,6 +98,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       self.geometry = geometry
       self.frameID = frameID
       self.isProcessed = isProcessed
+      self.burnIn = burnIn
     }
 
     /// The Output and Monitor stages' reading as a signal of its own
@@ -167,24 +174,13 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// The last signal, reused while the buffer's colour tags, format and the
   /// declaration are unchanged.
   private var interpretation: Interpretation?
-  /// Geometry per pooled IOSurface. Core Video rebuilds a dictionary attachment
-  /// (clean aperture, pixel aspect) on every read, so they are read once per
-  /// surface, size and format, and again after the capture generation changes.
-  private struct GeometryKey: Hashable {
-    let surface: IOSurfaceID
-    let width: Int
-    let height: Int
-    let format: OSType
-  }
-  private var geometries: [GeometryKey: MonitorFrameGeometry] = [:]
-  private static let geometryCacheLimit = 32
   private var lastSourcePTS: CMTime?
   private var sourceFrameHz = 0.0
   private var offered: UInt64 = 0
   private var rateWindow = (start: 0.0, offered: UInt64(0))
   private var offeredFPS = 0.0
   /// The newest delivery sent to consumers. A producer retry with the same
-  /// generation, revision, and sequence is the same source frame and must not
+  /// generation and sequence is the same source frame and must not
   /// inflate offer statistics or make every consumer inspect it again.
   private var lastOfferedStamp: Stamp?
   private var burnIn: MonitorLUT?
@@ -221,6 +217,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   private var renderFeed: MonitorFeed?
   private var rawFrameDecoder: MonitorCVRawFrameDecoder?
   private var appliedLUTVersion: UInt64 = .max
+  private weak var appliedBurnIn: MonitorLUT?
 
   /// Why a LUT is not applied (made on another GPU than the monitor's); nil when
   /// they are. Set on the render thread, read anywhere.
@@ -243,7 +240,6 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       Self.nextOwner &+= 1
       return Self.nextOwner
     }
-    geometries.reserveCapacity(Self.geometryCacheLimit)
   }
 
   // MARK: - Control (any thread)
@@ -373,7 +369,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       let result: Result<(MonitorLUT, LoadedLUT), any Error>
       do {
         let file = try await loader.restore(bookmark: choice.bookmark)
-        result = .success((try LUTProcessor.makeLUT(file.cube), file))
+        result = .success((try LUTProcessor.makeLUT(file.cube, outputColorimetry: nil), file))
       } catch {
         result = .failure(error)
       }
@@ -453,7 +449,6 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       lastSourcePTS = nil
       sourceFrameHz = 0
       revision &+= 1
-      geometries.removeAll(keepingCapacity: true)
     }
     // The stopped generation's frames are gone; so are their textures.
     gpu?.flushFrames(owner: owner)
@@ -468,6 +463,12 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// Program and legacy producers may omit it and retain attachment interpretation.
   func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
              untouched: Bool, sourceFormat: SourceFormat?) {
+    offer(image, pts: pts, captureGeneration: captureGeneration, sequence: sequence,
+      untouched: untouched, sourceFormat: sourceFormat, duration: .invalid, burnIn: burnInLUT)
+  }
+
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
+             untouched: Bool, sourceFormat: SourceFormat?, duration: CMTime, burnIn: MonitorLUT?) {
     let now = ProcessInfo.processInfo.systemUptime
     lock.lock()
     defer { lock.unlock() }
@@ -482,18 +483,21 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       self.captureGeneration = captureGeneration
       lastSourcePTS = nil
       sourceFrameHz = 0
-      geometries.removeAll(keepingCapacity: true)
     }
+    if let lastOfferedStamp, lastOfferedStamp.generation == generation,
+      sequence <= lastOfferedStamp.sequence { return }
     let format = CVPixelBufferGetPixelFormatType(image)
     let layout = MonitorFrame.layout(for: format)
     let signal = Self.interpret(
       image, format: format, range: layout?.range ?? .legal, declaration: declaration, processed: isProgram,
       untouched: untouched, colour: sourceFormat?.colour, cache: &interpretation)
-    var geometry = cachedGeometry(image, format: format)
-    // The immutable declaration owns sample geometry. Apply it after the
-    // IOSurface cache so a reused buffer can carry a new declaration.
+    // A pool can change aperture attachments without changing surface ID, format or size.
+    let geometry: MonitorFrameGeometry
     if let aspect = sourceFormat?.pixelAspect {
-      geometry.pixelAspectRatio = Double(aspect.numerator) / Double(aspect.denominator)
+      geometry = MonitorFrameGeometry(width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image),
+        pixelAspectRatio: Double(aspect.numerator) / Double(aspect.denominator), cleanAperture: MonitorFrame.cleanAperture(of: image))
+    } else {
+      geometry = MonitorFrame.geometry(of: image)
     }
     let current = Identity(layout: layout?.layout, signal: signal, geometry: geometry)
     if identity != current {
@@ -502,8 +506,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     }
     let stamp = Stamp(
       target: target, generation: generation, sequence: sequence, sourcePTS: pts.seconds, hostTime: now,
-      revision: revision)
-    guard stamp.follows(lastOfferedStamp) else { return }
+      revision: revision, expectedPeriod: Self.expectedPeriod(rate: sourceFormat?.rate, duration: duration))
     lastOfferedStamp = stamp
     noteSourceFrameRate(pts)
     offered &+= 1
@@ -514,7 +517,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     let delivery = Delivery(
       stamp: stamp,
       pixelBuffer: image, layout: layout?.layout, signal: signal, geometry: geometry, frameID: frameID,
-      isProcessed: isProgram)
+      isProcessed: isProgram, burnIn: isProgram ? nil : burnIn)
     // Under the lock, so a setConsumers that removes a surface cannot race a frame
     // into it. accept() only swaps a slot; it never calls back here.
     for consumer in consumers { consumer.accept(delivery) }
@@ -530,19 +533,15 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
     lastSourcePTS = pts
   }
 
-  /// Called with the lock held.
-  private func cachedGeometry(_ image: CVPixelBuffer, format: OSType) -> MonitorFrameGeometry {
-    guard let surface = CVPixelBufferGetIOSurface(image)?.takeUnretainedValue() else {
-      return MonitorFrame.geometry(of: image)
+  static func expectedPeriod(rate: FrameRate?, duration: CMTime) -> Double {
+    let declared: CMTime?
+    switch rate {
+    case .constant(let period): declared = period
+    case .variable(_, _, let longest): declared = longest
+    case nil: declared = nil
     }
-    let key = GeometryKey(
-      surface: IOSurfaceGetID(surface), width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image),
-      format: format)
-    if let cached = geometries[key] { return cached }
-    let value = MonitorFrame.geometry(of: image)
-    if geometries.count >= Self.geometryCacheLimit { geometries.removeAll(keepingCapacity: true) }
-    geometries[key] = value
-    return value
+    let actual = duration.seconds
+    return max(declared?.seconds ?? 0, actual.isFinite ? actual : 0)
   }
 
   /// A buffer's colour tags. Core Video returns these as interned constant strings:
@@ -703,7 +702,7 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
   /// The feed's `MonitorFeed`, made on first use, with the LUTs set since the last
   /// call. Render thread only (`MonitorFeed` is confined). A LUT made on another
   /// device than `engine`'s is not applied and is reported in `lutMismatch`.
-  func feed(engine: MonitorEngine) -> MonitorFeed {
+  func feed(engine: MonitorEngine, for delivery: Delivery? = nil) -> MonitorFeed {
     let feed: MonitorFeed
     if let existing = renderFeed, existing.engine === engine {
       feed = existing
@@ -712,8 +711,10 @@ final class MonitorFeedHost: MonitorFrameSink, @unchecked Sendable {
       renderFeed = feed
       appliedLUTVersion = .max
     }
-    let (version, burn, monitor) = lock.withLock { (lutVersion, burnIn, monitorOnly) }
-    if version != appliedLUTVersion {
+    let (version, defaultBurn, monitor) = lock.withLock { (lutVersion, burnIn, monitorOnly) }
+    let burn = delivery.map { $0.burnIn } ?? defaultBurn
+    if version != appliedLUTVersion || appliedBurnIn !== burn {
+      appliedBurnIn = burn
       appliedLUTVersion = version
       let device = engine.device
       let usable = { (lut: MonitorLUT?) -> MonitorLUT? in

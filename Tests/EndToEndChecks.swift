@@ -768,15 +768,17 @@ private final class PacedDriverMetrics: @unchecked Sendable {
   }
 
   func testSameRateSourceClockResetReanchorsToCurrentHostClock() throws {
+    let source = try EndToEndChecks.source()
     let harness = CaptureHarness()
-    let controller = CaptureController(services: harness.services(automatic: true))
+    var services = harness.services(automatic: true)
+    services.capturePixelFormat = CVPixelBufferGetPixelFormatType(source)
+    let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop() }
     var bypass = config
     bypass.applyLUT = false
     bypass.downscale = false
     bypass.convertTo420 = false
     ready(controller, harness: harness, configuration: bypass, pipelineEnabled: false)
-    let source = try EndToEndChecks.source()
     let origin = CMTime(value: 100, timescale: 1)
     harness.emitAutomatic(source, at: origin, duration: VideoContract.fastDuration)
     awaitCondition("Initial clock anchor must deliver") { harness.sent == 1 }
@@ -1491,7 +1493,9 @@ private final class PacedDriverMetrics: @unchecked Sendable {
   func testSinkFollowsDemandBothWaysWhileFramesFlow() throws {
     let source = try EndToEndChecks.source()
     let harness = CaptureHarness()
-    let controller = CaptureController(services: harness.services(automatic: true))
+    var services = harness.services(automatic: true)
+    services.capturePixelFormat = CVPixelBufferGetPixelFormatType(source)
+    let controller = CaptureController(services: services)
     defer { controller.onUpdate = nil; controller.stop() }
     ready(controller, harness: harness, configuration: config)
     var time = CMTime.zero
@@ -1507,7 +1511,9 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     awaitCondition("Frames still reach the preview") { harness.previewed == 2 }
     XCTAssertEqual(harness.sent, 1)
     controller.requestCameraOutputEnabled(true)
-    awaitCondition("A client gets a sink without waiting for a frame") { harness.negotiated.count == opened + 1 }
+    awaitCondition("A client gets a sink without waiting for a frame") {
+      harness.negotiated.count == opened + 1 && controller.cameraConnectedForTesting
+    }
     emit()
     awaitCondition("And the next frame") { harness.sent == 2 }
     controller.requestCameraOutputEnabled(false)

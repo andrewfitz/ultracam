@@ -166,8 +166,11 @@ import SwiftUI
         recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer, hardware: hardware)
       let first = model.selectedFeedID
       let second = model.addFeed() ?? first
-      model.updateCamera(first) { $0.selectedDevice = "fake:left"; $0.sourceProfileID = "sony-slog3-sgamut3cine" }
-      model.updateCamera(second) { $0.selectedDevice = "fake:right"; $0.sourceProfileID = "rec709-video" }
+      // The input first: choosing an input resets the camera's source declaration.
+      model.updateCamera(first) { $0.selectedDevice = "fake:left" }
+      model.updateCamera(first) { $0.sourceProfileID = "sony-slog3-sgamut3cine" }
+      model.updateCamera(second) { $0.selectedDevice = "fake:right" }
+      model.updateCamera(second) { $0.sourceProfileID = "rec709-video" }
       model.hardwareInventory.setNickname("Left Recorder", for: "fake:left")
       model.hardwareInventory.setNickname("Right Recorder", for: "fake:right")
       model.hardwareInventory.setNickname("Spare Recorder", for: "fake:spare")

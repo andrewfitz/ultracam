@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ultracam-auto-switcher/llm-context",
+  "title": "Delayed LLM decision context",
+  "type": "object",
+  "required": ["request_id", "media_time", "current_camera_id", "anchor_camera_id", "emphasis_camera_id", "audio", "transcript", "video"],
+  "properties": {
+    "request_id": { "type": "string", "format": "uuid" },
+    "media_time": { "type": "number", "minimum": 0 },
+    "current_camera_id": { "type": "string" },
+    "anchor_camera_id": { "type": "string" },
+    "emphasis_camera_id": { "type": "string" },
+    "audio": { "type": "array", "items": { "$ref": "stream-event#/$defs/audio" } },
+    "transcript": { "type": "array", "items": { "$ref": "stream-event#/$defs/transcript" } },
+    "video": { "type": "array", "items": { "$ref": "stream-event#/$defs/video" } }
+  }
+}

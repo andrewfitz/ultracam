@@ -185,7 +185,7 @@ struct UIZebraSettingsForm: View {
       } else {
         Picker("Signal", selection: zebra.stage) {
           Text("Source").tag(SignalStage.source).disabled(isProgram)
-          Text("Output (LUT)").tag(SignalStage.output)
+          Text(isProgram ? "Program Output" : "Output (LUT)").tag(SignalStage.output)
           if zebra.wrappedValue.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
         }
         .fixedSize()
@@ -193,7 +193,7 @@ struct UIZebraSettingsForm: View {
       }
     } accessory: {
       Toggle("Zebra \(index + 1)", isOn: UIMonitorToolBindings.zebraEnabled($preferences, index))
-        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+        .toggleStyle(.switch).controlSize(.small).labelsHidden()
     }
   }
 }
@@ -253,7 +253,7 @@ struct UIClipIndicatorSettingsForm: View {
       UIToolGroup("Measure") {
         Picker("Signal", selection: clip.stage) {
           Text("Source").tag(SignalStage.source).disabled(isProgram)
-          Text("Output (LUT)").tag(SignalStage.output)
+          Text(isProgram ? "Program Output" : "Output (LUT)").tag(SignalStage.output)
           if c.stage == .monitor { Text("Monitor").tag(SignalStage.monitor) }
         }
         .fixedSize()
@@ -311,7 +311,7 @@ struct UIScopeSettingsForm: View {
   @Binding var preferences: MonitorFeedPreferences
   let isProgram: Bool
   /// The shown picture's signal and whether a LUT is on the scope's stage.
-  var measurement: (signal: SignalDescription?, stageLUT: Bool) = (nil, false)
+  var measurement: (signal: SignalDescription?, stageLUT: SignalDescription?) = (nil, nil)
 
   var body: some View {
     UIScopeSettingsView(scopes: $preferences.scopes, isProgram: isProgram, signal: measurement.signal,

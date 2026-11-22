@@ -18,11 +18,11 @@ struct UIScopeSettingsView: View {
 
   @Binding var scopes: MonitorScopePreferences
   var isProgram: Bool
-  /// The picture's signal and whether a LUT is on the scope's stage
-  /// (`MonitorSurfacePresenter.scopeMeasuresLUT`): they decide which stage
+  /// The picture's signal and the output signal of a LUT on the scope's stage
+  /// (`MonitorSurfacePresenter.scopeLUTSignal`): they decide which stage
   /// signal the scope measures, and so which scales fit it.
   var signal: SignalDescription?
-  var stageLUT: Bool
+  var stageLUT: SignalDescription?
   var layout: Layout = .stacked
 
   /// Whether the menus offer every MonitorKit scope and scale. The main

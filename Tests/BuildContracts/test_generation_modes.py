@@ -1,4 +1,5 @@
 """Generate against synthetic SDK files; no proprietary SDK or compiler needed."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -73,6 +74,16 @@ class GenerationModeTests(unittest.TestCase):
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return (self.root / 'Ultracam.xcodeproj/project.pbxproj').read_text()
 
+    def test_project_comparison_preserves_checkout_bridge(self):
+        bridge = 'Sources/DeviceAPI/GeneratedBridgingHeader.h'
+        self.write(bridge, 'existing bridge')
+        comparison = self.root.parent / 'comparison.xcodeproj'
+        subprocess.run([sys.executable, str(self.root / 'scripts/generate_project.py'),
+                        '--output-dir', str(comparison)], cwd=self.root,
+                       env=self.environment, check=True, capture_output=True)
+        self.assertTrue((comparison / 'project.pbxproj').is_file())
+        self.assertEqual((self.root / bridge).read_text(), 'existing bridge')
+
     def test_asset_catalogs_share_one_resources_phase(self):
         self.run_generator()
         objects = json.loads(subprocess.check_output(['plutil', '-convert', 'json', '-o', '-',
@@ -82,7 +93,15 @@ class GenerationModeTests(unittest.TestCase):
         phases = [objects[phase] for phase in target['buildPhases']
                   if objects[phase]['isa'] == 'PBXResourcesBuildPhase']
         self.assertEqual(len(phases), 1, 'Multiple resource phases duplicate asset compiler outputs')
-        self.assertEqual(len(phases[0]['files']), 3)
+        resource_paths = [objects[objects[build]['fileRef']]['path'] for build in phases[0]['files']]
+        self.assertCountEqual(resource_paths, [
+            'Config/Assets.xcassets', 'ThirdParty/ProgramStreaming-Licenses.txt',
+            'Vendors/Blackmagic/Resources/Assets.xcassets', 'Vendors/Sony/Resources/Assets.xcassets',
+        ])
+        for target in (value for value in objects.values() if value['isa'] == 'PBXNativeTarget'):
+            product_names = [objects[key]['productName'] for key in target['packageProductDependencies']]
+            for name in ('RTMPHaishinKit', 'ProgramAV1'):
+                self.assertEqual(name in product_names, target['name'] == 'Ultracam')
 
     def test_objective_c_implementation_is_compiled_only_in_app(self):
         self.write('Vendors/Sony/Sources/Native.m')
@@ -124,6 +143,31 @@ class GenerationModeTests(unittest.TestCase):
                 if objects[phase]['isa'] == 'PBXResourcesBuildPhase' for build in objects[phase]['files']]
         self.assertIn(identity, refs)
         self.assertNotIn(group['children'][0], refs)
+
+    def test_system_camera_membership_and_linkage_stay_in_the_host(self):
+        base = 'Vendors/MacCamera/'
+        source = 'Sources/MacCameraCapturePlugin.swift'
+        fixture = 'Tests/MacCameraChecks.swift'
+        self.write(base + source)
+        self.write(base + fixture)
+        self.write(base + 'vendor.json', json.dumps(dict(
+            schemaVersion=1, id='maccamera', kinds=['capture'], frameworks=['AVFoundation'],
+            sources=[dict(path=source, membership=['app', 'test']),
+                     dict(path=fixture, membership=['test'])],
+            capabilities=dict(infoPlist=['NSCameraUseContinuityCameraDeviceType']))))
+        self.run_generator()
+        objects = json.loads(subprocess.check_output(['plutil', '-convert', 'json', '-o', '-',
+            str(self.root / 'Ultracam.xcodeproj/project.pbxproj')]))['objects']
+        for target in (value for value in objects.values() if value['isa'] == 'PBXNativeTarget'):
+            is_host = target['name'] == 'Ultracam'
+            paths = [objects[objects[build]['fileRef']]['path']
+                     for phase in target['buildPhases'] if objects[phase]['isa'] == 'PBXSourcesBuildPhase'
+                     for build in objects[phase]['files']]
+            self.assertEqual(base + source in paths, is_host)
+            self.assertNotIn(base + fixture, paths)
+            for configuration in objects[target['buildConfigurationList']]['buildConfigurations']:
+                settings = objects[configuration]['buildSettings']
+                self.assertEqual('AVFoundation' in settings.get('OTHER_LDFLAGS', []), is_host)
 
     def test_optional_absence_is_canonical_even_if_files_exist_or_disappear(self):
         first = self.run_generator()
@@ -171,6 +215,59 @@ class GenerationModeTests(unittest.TestCase):
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('generate_project.py', result.stderr)
+
+    def test_concurrent_builds_keep_each_projects_profile_and_checkout_files(self):
+        shutil.copy2(ROOT / 'scripts/build.sh', self.root / 'scripts')
+        self.write('scripts/vendor-sdk.py', 'pass')
+        self.write('scripts/fetch-decklink-sdk.sh', 'exit 0')
+        self.write('scripts/validate_bundle.py', 'pass')
+        self.write('bin/rustup', '#!/bin/sh\nexit 0\n')
+        self.write('bin/xcodebuild', """#!/bin/bash
+set -eu
+test "$1" = -project
+echo "$2" > "$ULTRACAM_WORK_ROOT/project-path"
+case " $* " in
+  *' -onlyUsePackageVersionsFromResolvedFile '*) ;;
+  *) exit 1 ;;
+esac
+""")
+        for binary in ('xcodebuild', 'rustup'):
+            (self.root / 'bin' / binary).chmod(0o755)
+        lock = Path('project.xcworkspace/xcshareddata/swiftpm/Package.resolved')
+        self.write(Path('Ultracam.xcodeproj') / lock, 'fixture resolution')
+        self.write('Ultracam.xcodeproj/project.pbxproj', 'existing project')
+        self.write('Sources/DeviceAPI/GeneratedBridgingHeader.h', 'existing bridge')
+        self.write('inventory.json', json.dumps({'sony': True}))
+
+        def build(profile):
+            work = self.root.parent / profile
+            env = dict(self.environment, ULTRACAM_WORK_ROOT=str(work),
+                       PATH=str(self.root / 'bin') + os.pathsep + self.environment['PATH'])
+            env.pop('CARGO_TARGET_DIR', None)
+            env.pop('ULTRACAM_DERIVED_DATA_PATH', None)
+            if profile == 'present':
+                env['ULTRACAM_SDK_INVENTORY'] = 'inventory.json'
+            subprocess.run(['bash', str(self.root / 'scripts/build.sh'), '--debug'], cwd=self.root,
+                           env=env, check=True, capture_output=True)
+            project = Path((work / 'project-path').read_text().strip())
+            self.assertTrue(project.is_relative_to(work))
+            return project, env
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            builds = list(pool.map(build, ('absent', 'present')))
+        for (project, env), profile in zip(builds, ('absent', 'present')):
+            self.assertEqual((project / lock).read_text(), 'fixture resolution')
+            raw = (project / 'project.pbxproj').read_text()
+            self.assertEqual('ULTRACAM_SONY_SDK=1' in raw, profile == 'present')
+            self.assertIn(str(self.root.parent / profile / 'agent-work/build/ultracam/auto-switcher-target/release'), raw)
+            objects = json.loads(subprocess.check_output(['plutil', '-convert', 'json', '-o', '-',
+                                 str(project / 'project.pbxproj')]))['objects']
+            guard = next(value['shellScript'] for value in objects.values()
+                         if value.get('name') == 'Check Vendor Inputs')
+            subprocess.run(['/bin/sh', '-c', guard], cwd=project.parent,
+                           env=dict(env, SRCROOT=str(self.root)), check=True, capture_output=True)
+        self.assertEqual((self.root / 'Ultracam.xcodeproj/project.pbxproj').read_text(), 'existing project')
+        self.assertEqual((self.root / 'Sources/DeviceAPI/GeneratedBridgingHeader.h').read_text(), 'existing bridge')
 
     def test_relative_inventory_from_other_cwd_uses_checkout_path_in_guard(self):
         self.write('profiles/present.json', json.dumps({'sony': True}))

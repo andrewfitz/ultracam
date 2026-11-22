@@ -1,11 +1,20 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Settings › Recording: timecode, the burned-in LUT, where takes go and what they're called.
-/// Format lives in the main window (sidebar, Record menus), because it is chosen per session.
+/// Format lives in the main window (Record's popover, Record menus), because it is chosen per session.
 struct UISettingsRecordingPane: View {
   let model: AppModel
   var interface: UIInterfaceState = UIAppEnvironment.interface
+  @State private var folderErrors: [String: String] = [:]
+  @State private var confirmingRemoval: String?
+
+  func recordWithCameraApps(for camera: FeedID) -> Binding<Bool> {
+    Binding(get: { model.descriptor(for: camera)?.recordWithCameraApps ?? false }, set: { enabled in
+      model.updateCamera(camera, shareProcessing: false) { $0.recordWithCameraApps = enabled }
+    })
+  }
 
   var body: some View {
     let recording = model.recordingModel
@@ -18,7 +27,7 @@ struct UISettingsRecordingPane: View {
         Picker("Timecode", selection: timecode) {
           ForEach(RecordingTimecodeMode.allCases, id: \.self) { Text(UITimecode.title($0)).tag($0) }
         }
-      } footer: {
+      } header: { Text("Timecode") } footer: {
         UISettingsFootnote(Self.firstSentence(recording.timecodeMode.help))
       }
 
@@ -27,8 +36,29 @@ struct UISettingsRecordingPane: View {
           Text("Burn LUT into recordings")
           Text("Each camera records with the LUT it burns in, as Program shows it")
         }
-      } footer: {
+      } header: { Text("LUT") } footer: {
         UISettingsFootnote(Self.burnInLUTHelp)
+      }
+
+      Section {
+        ForEach(model.recordingApps.keys.sorted(), id: \.self) { id in
+          appSettings(id: id, name: model.recordingApps[id] ?? id)
+        }
+        Button("Add App…") { chooseRecordingApp() }
+      } header: { Text("Recording Triggers") } footer: {
+        if let system = model.installer.system, !system.enabled || system.outdated {
+          UISettingsFootnote("Install the current camera extension in Settings › Virtual Cameras to identify meeting apps.")
+        } else {
+          UISettingsFootnote("A selected app’s video preview can trigger recording. For web meetings, select the browser.")
+        }
+      }
+
+      Section {
+        ForEach(cameras) { camera in
+          Toggle(camera.name, isOn: recordWithCameraApps(for: camera.id))
+        }
+      } header: { Text("Record with Meeting Apps") } footer: {
+        UISettingsFootnote("Choose a camera folder below or a destination under Recording Triggers. Two seconds of use starts a take. Program records each enabled camera. Five seconds after the app stops using the camera, its take ends.")
       }
 
       Section {
@@ -64,6 +94,79 @@ struct UISettingsRecordingPane: View {
         UISettingsFootnote("Every name ends with the take’s ID, so two takes never share a name.")
       }
     }
+  }
+
+  private func appSettings(id: String, name: String) -> some View {
+    let profile = Binding(get: { model.recordingProfiles[id] ?? AppRecordingProfile() },
+      set: { model.recordingProfiles[id] = $0 })
+    let rate = profile.wrappedValue.videoMbps
+    let sample = AppRecordingTake(appID: id, appName: name, profile: profile.wrappedValue)
+    return DisclosureGroup(name) {
+      UISettingsVideoQuality(rate: profile.videoMbps)
+      Text("HEVC 4:2:0 MP4 · about \(String(format: "%.2f", (Double(rate) + 0.128) * 0.45)) GB/hour with stereo AAC")
+        .font(.uiMeta).foregroundStyle(.secondary)
+      LabeledContent("Save to") {
+        Text(profile.wrappedValue.folderPath.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "Camera folder / \(name)")
+          .lineLimit(1).truncationMode(.middle)
+        Button("Choose…") {
+          let panel = NSOpenPanel()
+          panel.canChooseFiles = false
+          panel.canChooseDirectories = true
+          panel.canCreateDirectories = true
+          guard panel.runModal() == .OK, let url = panel.url else { return }
+          do {
+            var next = profile.wrappedValue
+            try next.chooseFolder(url)
+            profile.wrappedValue = next
+            folderErrors[id] = nil
+          } catch { folderErrors[id] = "Could not save folder access for \(name): \(error.localizedDescription)" }
+        }
+        if profile.wrappedValue.folderBookmark != nil {
+          Button("Use Default Folder") {
+            var next = profile.wrappedValue
+            next.folderBookmark = nil
+            next.folderPath = nil
+            profile.wrappedValue = next
+          }
+        }
+      }
+      if let error = folderErrors[id] {
+        Label { Text(error) } icon: { Image(systemName: UISymbol.warning).foregroundStyle(.orange) }
+          .font(.uiMeta).fixedSize(horizontal: false, vertical: true)
+      }
+      TextField("Filename pattern", text: profile.pattern, prompt: Text(AppRecordingProfile.defaultPattern))
+      Text("Available fields: {date} {time} {session} {app} {camera}").font(.uiMeta).foregroundStyle(.secondary)
+      LabeledContent("Preview") { Text(sample.filename(camera: "Camera 1", session: "Meeting topic") + ".mp4").textSelection(.enabled) }
+      if id == "us.zoom.xos" {
+        Text("The session field uses \(name)’s meeting window title when available, otherwise a generic meeting name. Email addresses are removed.")
+          .font(.uiMeta).foregroundStyle(.secondary)
+        if !CGPreflightScreenCaptureAccess() {
+          Button("Allow Meeting Window Titles…") { _ = CGRequestScreenCaptureAccess() }
+            .help("macOS requires Screen Recording permission to read another app’s window title.")
+        }
+      }
+      Button("Remove \(name)…") { confirmingRemoval = id }
+        .confirmationDialog("Remove \(name) from Recording Triggers?",
+          isPresented: Binding(get: { confirmingRemoval == id }, set: { if !$0 { confirmingRemoval = nil } }),
+          titleVisibility: .visible) {
+          Button("Remove", role: .destructive) {
+            confirmingRemoval = nil
+            model.recordingApps.removeValue(forKey: id)
+          }
+          Button("Cancel", role: .cancel) { confirmingRemoval = nil }.keyboardShortcut(.defaultAction)
+        } message: {
+          Text("Its quality, folder and file name settings are kept in case you add it again. Recordings on disk are kept.")
+        }
+    }
+  }
+
+  private func chooseRecordingApp() {
+    let panel = NSOpenPanel()
+    panel.allowedContentTypes = [.applicationBundle]
+    panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+    panel.prompt = "Add App"
+    guard panel.runModal() == .OK, let url = panel.url, let id = Bundle(url: url)?.bundleIdentifier else { return }
+    model.recordingApps[id] = FileManager.default.displayName(atPath: url.path)
   }
 
   /// A folder: its path, one Choose or Change, and a menu with Show in Finder and Clear (or Use
@@ -161,5 +264,20 @@ struct UISettingsNamePattern: View {
     let target = index + offset
     guard naming.tokens.indices.contains(target) else { return }
     naming.tokens.swapAt(index, target)
+  }
+}
+
+struct UISettingsVideoQuality: View {
+  @Binding var rate: Int
+  var streaming = false
+
+  var body: some View {
+    Picker("Video quality", selection: $rate) {
+      Text(streaming ? "Low · 5 Mbps" : "Storage saver · 5 Mbps").tag(5)
+      Text("Standard · 10 Mbps").tag(AppRecordingProfile.defaultVideoMbps)
+      Text("High · 20 Mbps").tag(20)
+      if ![5, AppRecordingProfile.defaultVideoMbps, 20].contains(rate) { Text("Custom · \(rate) Mbps").tag(rate) }
+    }
+    Stepper(streaming ? "Target bitrate · \(rate) Mbps" : "Variable bitrate target · \(rate) Mbps", value: $rate, in: 1...50)
   }
 }

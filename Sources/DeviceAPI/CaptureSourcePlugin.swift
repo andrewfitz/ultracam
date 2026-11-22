@@ -24,11 +24,22 @@ struct CaptureDeviceSnapshot: Sendable {
   let error: PluginError?
 }
 enum CaptureTiming: Equatable, Sendable { case automatic, fixed(SourceFormat) }
+enum CaptureAuthorizationStatus: Equatable, Sendable {
+  case authorized
+  case requestable
+  case unavailable(PluginError)
+}
+
 protocol CaptureSourcePlugin: VendorSettingsProviding {
   /// Seeds desired policy before SDK discovery/EDID initialization. No capture-start writes.
   func configureSettings(_ policy: VendorSettingsPolicy) throws
   var descriptor: VendorDescriptor { get }
   func driverStatus() -> DriverStatus
+  /// Nil asks about access to the vendor's inventory, without a selected input.
+  func authorizationStatus(deviceID: String?) -> CaptureAuthorizationStatus
+  /// Called when status is requestable, before opening a session or to unlock
+  /// discovery. Implementations coalesce concurrent system prompts.
+  @MainActor func authorizeCapture(deviceID: String?) async throws
   func devices() throws -> [CaptureDeviceInfo]
   @MainActor func observeDevices(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) -> DeviceObservation
   func expectedFormat(deviceID: String, timing: CaptureTiming) -> SourceFormat?
@@ -50,8 +61,19 @@ protocol CaptureSession: AnyObject, Sendable {
   func stop()
   var counters: CaptureCounters { get }
 }
-struct CaptureHandlers: Sendable { let deliver: @Sendable (CaptureDelivery) -> Void }
+struct CaptureHandlers: Sendable {
+  let isRecording: @Sendable () -> Bool
+  let deliver: @Sendable (CaptureDelivery) -> Void
+
+  init(isRecording: @escaping @Sendable () -> Bool = { false },
+       deliver: @escaping @Sendable (CaptureDelivery) -> Void) {
+    self.isRecording = isRecording
+    self.deliver = deliver
+  }
+}
 
 extension CaptureSourcePlugin {
   func configureSettings(_ policy: VendorSettingsPolicy) throws {}
+  func authorizationStatus(deviceID: String?) -> CaptureAuthorizationStatus { .authorized }
+  @MainActor func authorizeCapture(deviceID: String?) async throws {}
 }

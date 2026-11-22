@@ -25,13 +25,14 @@ struct CameraSinkRoute {
 }
 final class CameraSink {
   init(route: CameraSinkRoute) {}
-  func connect(configuration: PipelineConfiguration, passthroughFormat: OSType) throws { fatalError("Injected sink required") }
-  func preNegotiate(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat?) throws { fatalError("Injected sink required") }
+  func connect(program: ProgramOutputFormat, sourcePauseAllowanceSeconds: Double?) throws { fatalError("Injected sink required") }
+  func preNegotiate(program: ProgramOutputFormat) throws { fatalError("Injected sink required") }
   func disconnect() {}
   func send(_ sample: CMSampleBuffer) throws -> Bool { fatalError("Injected sink required") }
 }
 protocol MonitorFrameSink: AnyObject, Sendable {
-  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64)
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
+    untouched: Bool, sourceFormat: SourceFormat?, duration: CMTime, burnIn: AnyObject?)
 }
 enum LUTProcessor {
   static func stampDeclaredColorimetry(_ colour: Colorimetry, on image: CVPixelBuffer) {

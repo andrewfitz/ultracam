@@ -45,9 +45,18 @@
       "type": "array",
       "items": { "$ref": "#/$defs/cut" }
     },
-    "instructions": { "type": "array", "items": { "type": "object" } },
-    "statuses": { "type": "array", "items": { "type": "object" } },
-    "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+    "instructions": { "type": "array", "items": { "$ref": "switcher-output#/$defs/instruction" } },
+    "statuses": { "type": "array", "items": { "$ref": "switcher-output" } },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "cut_application": {
+          "type": "string",
+          "description": "Offline analysis and realtime PCM use assumed_at_requested_time for simulated cut acknowledgements."
+        }
+      },
+      "additionalProperties": { "type": "string" }
+    }
   },
   "$defs": {
     "timebase": {
@@ -94,14 +103,8 @@
         "sequence": { "type": "integer", "minimum": 1 },
         "media_time": { "type": ["number", "null"] },
         "media_time_ticks": { "type": ["integer", "null"] },
-        "event": {
-          "description": "Director inputs plus the ledger-only directorOutput observation, which replay treats as a no-op.",
-          "oneOf": [
-            { "type": "object", "required": ["type", "cue"], "properties": { "type": { "enum": ["audio", "transcript"] }, "cue": { "type": "object" } } },
-            { "type": "object", "required": ["type"], "properties": { "type": { "enum": ["video", "tick", "acknowledge", "reject", "manualOverride", "reset", "directorOutput"] } } }
-          ]
-        },
-        "outputs": { "type": "array", "items": { "type": "object" } }
+        "event": { "$ref": "stream-event" },
+        "outputs": { "type": "array", "items": { "$ref": "switcher-output" } }
       }
     },
     "cut": {

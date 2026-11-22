@@ -2,7 +2,7 @@ import SwiftUI
 
 // Shared visual language for the new interface. System colors and materials
 // only, so light, dark and Increase Contrast work, and the system materials
-// (sidebar, inspector, bars, popovers) go opaque with Reduce Transparency.
+// (inspector, bars, popovers) go opaque with Reduce Transparency.
 // Overlays on video are dark capsules (black at 72%), not glass or blur, so
 // they need no Reduce Transparency fallback.
 
@@ -61,7 +61,7 @@ extension Font {
 
 /// Room around the camera pictures in the main window, in every layout.
 enum UIPictureSpacing {
-  /// From the sidebar, inspector, toolbar, status bar and window edges.
+  /// From the inspector, toolbar, status bar and window edges.
   static let margin: CGFloat = 20
   /// Between two cameras (side by side, four up, Program's sources).
   static let gutter: CGFloat = 20

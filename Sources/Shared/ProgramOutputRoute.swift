@@ -3,6 +3,13 @@ import CoreVideo
 import Foundation
 import IOSurface
 
+/// Offers happen under the scheduler lock after a cut commits. Implementations may only
+/// retain a bounded input and signal a worker; GPU, encoder and network calls belong off-path.
+protocol ProgramStreamFrameSink: AnyObject, Sendable {
+  func offer(_ frame: ProcessedFrame<CVPixelBuffer>, feedID: FeedID, programTime: CMTime, repeatWindow: Duration)
+  func discardPicture()
+}
+
 /// The result of routing one processed frame through the Program output.
 /// The scheduler decision remains available to diagnostics while the route
 /// itself owns the bounded queue and retains the frame for its consumers.
@@ -21,14 +28,17 @@ struct ProgramOutputFormat: Equatable, Sendable, CustomStringConvertible {
   let pixelFormat: OSType
   let duration: CMTime
   let scalingMode: ProgramScalingMode
+  let allowUpscale: Bool
   let colour: Colorimetry
 
-  init(width: Int, height: Int, pixelFormat: OSType, duration: CMTime, scalingMode: ProgramScalingMode = .fit, colour: Colorimetry = .rec709Video) {
+  init(width: Int, height: Int, pixelFormat: OSType, duration: CMTime, scalingMode: ProgramScalingMode = .fit,
+       allowUpscale: Bool = false, colour: Colorimetry = .rec709Video) {
     self.width = width
     self.height = height
     self.pixelFormat = pixelFormat
     self.duration = duration
     self.scalingMode = scalingMode
+    self.allowUpscale = allowUpscale
     self.colour = Colorimetry(primaries: colour.primaries, transfer: colour.transfer, matrix: colour.matrix,
       range: colour.range, horizontalChromaSiting: .center, verticalChromaSiting: .center)
   }
@@ -45,6 +55,7 @@ struct ProgramOutputFormat: Equatable, Sendable, CustomStringConvertible {
       ? passthroughFormat : configuration.pixelFormat
     duration = configuration.reduceFrameRate ? configuration.frameRateTarget.duration : configuration.duration
     scalingMode = configuration.scalingMode
+    allowUpscale = configuration.allowUpscale
     let target = configuration.programColorimetry
     colour = Colorimetry(primaries: target.primaries, transfer: target.transfer, matrix: target.matrix,
       range: target.range, horizontalChromaSiting: .center, verticalChromaSiting: .center)
@@ -177,14 +188,16 @@ final class ProgramOutputRoute: @unchecked Sendable {
     let timeline: UInt64
     /// The source it came from, so removing another camera leaves it staged.
     let feedID: FeedID
+    let sourceTime: CMTime
+    let cutGeneration: UInt64
     /// Timing of the first send; `sends` slots follow at the contract
     /// duration, all carrying the same image.
     let metadata: ProcessedFrameMetadata
     let sends: Int
     let acceptedAt: TimeInterval
-    /// The source frame stays retained until its conversion completes.
+    /// The source stays until conversion completes or a passthrough is published.
     var source: ProcessedFrame<CVPixelBuffer>?
-    var ready: ProcessedFrame<CVPixelBuffer>?
+    var ready: CVPixelBuffer?
     var retention: MediaRetentionLedger.Lease?
     var backing: GPUAllocationBudget.Lease?
     var failed = false
@@ -195,10 +208,13 @@ final class ProgramOutputRoute: @unchecked Sendable {
   private var monitorHandler: ((FeedID, ProcessedFrame<CVPixelBuffer>, CMTime, CMTime, Bool) -> Void)?
   private var eventHandler: (@Sendable (ProgramRouteEvent) -> Void)?
   private var publishedHandler: (@Sendable () -> Void)?
+  private var streamSink: ProgramStreamFrameSink?
   private var outputContract: ProgramOutputFormat?
   private var outputActive = true
   private var normalizerProvider: (@Sendable () -> ProgramFrameNormalizing?)?
   private var liveSources: Set<FeedID>?
+  private var cutGeneration: UInt64 = 0
+  private var monitoredCutGeneration: UInt64 = 0
   private var timeline: UInt64 = 0
   private var nextSequence: UInt64 = 0
   private var stage: [StageEntry] = []
@@ -254,7 +270,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
     locked { sourcePauseTolerances[feedID] = mayPause.map { max(.zero, $0) } }
   }
 
-  /// Called under the route lock, in Program order, from the ingesting thread.
+  /// Called under the route lock in publication order (capture or converter completion).
   var onMonitorFrame: ((FeedID, ProcessedFrame<CVPixelBuffer>, CMTime, CMTime, Bool) -> Void)? {
     get { locked { monitorHandler } }
     set { locked { monitorHandler = newValue } }
@@ -293,6 +309,10 @@ final class ProgramOutputRoute: @unchecked Sendable {
       // pool for the old one are done with once their GPU work completes.
       if changed { normalizerProvider?()?.releaseIdleResources() }
     }
+  }
+
+  func setStreamSink(_ sink: ProgramStreamFrameSink?) {
+    locked { streamSink = sink }
   }
 
   func setNormalizerProvider(_ provider: (@Sendable () -> ProgramFrameNormalizing?)?) {
@@ -334,6 +354,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
     var published = false
     let removed = Set(state.feedIDs).subtracting(valid)
     if let onAir = state.selectedFeedID, removed.contains(onAir) {
+      streamSink?.discardPicture()
       flushOutputLocked()
     } else if stage.contains(where: { removed.contains($0.feedID) }) {
       let staged = stage.count
@@ -458,6 +479,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
       stats.accepted &+= 1
       stats.withoutConsumer &+= 1
       if case .cutApplied = decision {
+        cutGeneration &+= 1
         events.append(.cutApplied(feedID: feedID, sourceTime: mapped.sourceTime, programTime: mapped.programTime))
       }
     case let .skipped(reason):
@@ -505,16 +527,30 @@ final class ProgramOutputRoute: @unchecked Sendable {
       let cut: Bool
       if case .cutApplied = decision { cut = true } else { cut = false }
       onAirSkips = 0
-      let mappedMetadata = ProcessedFrameMetadata(
-        presentationTime: mapped.programTime,
-        duration: mapped.programDuration,
-        width: metadata.width,
-        height: metadata.height,
-        pixelFormat: metadata.pixelFormat, processingRevision: metadata.processingRevision)
-      let programFrame = ProcessedFrame(payload: frame.payload, metadata: mappedMetadata)
       stats.accepted &+= 1
-      monitorHandler?(feedID, programFrame, mapped.sourceTime, mapped.programTime, cut)
-      (report, published) = enqueueLocked(programFrame, from: feedID, acceptedAt: acceptedAt, events: &events)
+      if cut { cutGeneration &+= 1 }
+      if let streamSink {
+        let repeatWindow = min(maximumRepeatDuration, sourcePauseTolerances[feedID] ?? maximumRepeatDuration)
+        streamSink.offer(frame, feedID: feedID, programTime: mapped.programTime, repeatWindow: repeatWindow)
+      }
+      if !outputActive || outputContract == nil {
+        if let monitorHandler {
+          let mappedMetadata = ProcessedFrameMetadata(
+            presentationTime: mapped.programTime, duration: mapped.programDuration,
+            width: metadata.width, height: metadata.height, pixelFormat: metadata.pixelFormat,
+            processingRevision: metadata.processingRevision, captureHostTime: metadata.captureHostTime)
+          let producer = frame.retainProducerLease()
+          let release: (() -> Void)? = producer.map { producer in { withExtendedLifetime(producer) {} } }
+          let programFrame = ProcessedFrame(payload: frame.payload, metadata: mappedMetadata, onReleased: release)
+          monitorHandler(feedID, programFrame, mapped.sourceTime, mapped.programTime, cutGeneration != monitoredCutGeneration)
+        }
+        monitoredCutGeneration = cutGeneration
+      }
+      if outputActive {
+        (report, published) = enqueueLocked(frame, from: feedID, mapped: mapped, acceptedAt: acceptedAt, events: &events)
+      } else {
+        stats.withoutConsumer &+= 1
+      }
       if cut {
         events.append(.cutApplied(feedID: feedID, sourceTime: mapped.sourceTime,
           programTime: mapped.programTime))
@@ -611,20 +647,17 @@ final class ProgramOutputRoute: @unchecked Sendable {
 
   /// Appends one accepted frame to the ordered stage. Lock held. Never waits:
   /// GPU conversion is encoded and committed here, and completes later.
-  private func enqueueLocked(_ frame: ProcessedFrame<CVPixelBuffer>, from feedID: FeedID, acceptedAt: TimeInterval,
+  private func enqueueLocked(_ frame: ProcessedFrame<CVPixelBuffer>, from feedID: FeedID, mapped: ProgramMappedFrame<FeedID>,
+                             acceptedAt: TimeInterval,
                              events: inout [ProgramRouteEvent]) -> (FrameFanOutSummary, Bool) {
-    guard outputActive else {
-      stats.withoutConsumer &+= 1
-      return (FrameFanOutSummary(), false)
-    }
     let contract = outputContract
     let source = frame.metadata
-    var sendTime = source.presentationTime
+    var sendTime = mapped.programTime
     var sends = 1
     if let contract {
-      let step = CMTimeConvertScale(contract.duration, timescale: source.presentationTime.timescale,
+      let step = CMTimeConvertScale(contract.duration, timescale: mapped.programTime.timescale,
         method: .roundHalfAwayFromZero)
-      (sendTime, sends) = cadenceSlotsLocked(start: source.presentationTime, duration: source.duration, step: step, events: &events)
+      (sendTime, sends) = cadenceSlotsLocked(start: mapped.programTime, duration: mapped.programDuration, step: step, events: &events)
       guard sends > 0 else {
         // Faster than the contract: this frame falls between two slots.
         stats.cadenceSkipped &+= 1
@@ -636,7 +669,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
     do {
       let bytes = try Self.storageBytes(frame.payload)
       try stageBacking.policy.validateMinimum(bytesPerSlot: bytes)
-      retention = try stageRetention.admit(bytes: bytes, duration: CMTimeGetSeconds(contract?.duration ?? source.duration) * Double(sends))
+      retention = try stageRetention.admit(bytes: bytes, duration: CMTimeGetSeconds(contract?.duration ?? mapped.programDuration) * Double(sends))
       backing = try retainBacking(frame.payload, bytes: bytes)
     } catch {
       stats.overflowRejected &+= 1
@@ -649,12 +682,14 @@ final class ProgramOutputRoute: @unchecked Sendable {
       maximumRepeatDuration).components
     let repeatSeconds = Double(pause.seconds) + Double(pause.attoseconds) / 1e18
     let metadata = ProcessedFrameMetadata(presentationTime: sendTime,
-      duration: contract?.duration ?? source.duration,
+      duration: contract?.duration ?? mapped.programDuration,
       width: contract?.width ?? source.width, height: contract?.height ?? source.height,
       pixelFormat: contract.map { UInt32($0.pixelFormat) } ?? source.pixelFormat,
-      processingRevision: source.processingRevision, maximumRepeatDuration: repeatSeconds)
-    var entry = StageEntry(sequence: nextSequence, timeline: timeline, feedID: feedID, metadata: metadata,
-      sends: sends, acceptedAt: acceptedAt, retention: retention, backing: backing)
+      processingRevision: source.processingRevision, repeatCount: sends, maximumRepeatDuration: repeatSeconds,
+      captureHostTime: source.captureHostTime)
+    var entry = StageEntry(sequence: nextSequence, timeline: timeline, feedID: feedID,
+      sourceTime: mapped.sourceTime, cutGeneration: cutGeneration, metadata: metadata,
+      sends: sends, acceptedAt: acceptedAt, source: frame, retention: retention, backing: backing)
     if let contract, !contract.matches(source) || !contract.matchesColourAndAspect(frame.payload) {
       guard let normalizer = normalizerProvider?() else {
         stats.normalizerNotReady &+= 1
@@ -669,13 +704,13 @@ final class ProgramOutputRoute: @unchecked Sendable {
           events: &events)
         return (FrameFanOutSummary(), false)
       }
-      entry.source = frame
       stage.append(entry)
       let sequence = entry.sequence
       let timeline = entry.timeline
+      let producer = frame.retainProducerLease()
       do {
-        try normalizer.normalize(frame.payload, to: contract) { [weak self, retention, backing] result in
-          defer { withExtendedLifetime((retention, backing)) {} }
+        try normalizer.normalize(frame.payload, to: contract) { [weak self, retention, backing, producer] result in
+          defer { withExtendedLifetime((retention, backing, producer)) {} }
           self?.completeNormalization(sequence: sequence, timeline: timeline, result: result)
         }
       } catch {
@@ -689,7 +724,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
       return (FrameFanOutSummary(), false)
     }
     stats.cadenceRepeats &+= UInt64(sends - 1)
-    entry.ready = ProcessedFrame(payload: frame.payload, metadata: metadata)
+    entry.ready = frame.payload
     stage.append(entry)
     stats.maxStageDepth = max(stats.maxStageDepth, stage.count)
     return flushStageLocked(events: &events)
@@ -729,7 +764,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
           // Acquire before releasing the source charge: both backings can coexist.
           let outputBacking = try retainBacking(output, bytes: bytes)
           stage[index].backing = outputBacking
-          stage[index].ready = ProcessedFrame(payload: output, metadata: stage[index].metadata)
+          stage[index].ready = output
         } catch {
           stage[index].failed = true
           stats.overflowRejected &+= 1
@@ -750,6 +785,14 @@ final class ProgramOutputRoute: @unchecked Sendable {
     if published { publishedHandler?() }
   }
 
+  /// A failed or cadence-skipped cut frame still starts a new monitor generation
+  /// when the first image from that selection actually reaches the client.
+  private func offerMonitorLocked(_ frame: ProcessedFrame<CVPixelBuffer>, from feedID: FeedID,
+    sourceTime: CMTime, cutGeneration: UInt64) {
+    monitorHandler?(feedID, frame, sourceTime, frame.metadata.presentationTime, cutGeneration != monitoredCutGeneration)
+    monitoredCutGeneration = cutGeneration
+  }
+
   /// Publishes every completed frame at the head of the stage, in order. A
   /// repeated frame is sent again with the next slot's time; same image.
   private func flushStageLocked(events: inout [ProgramRouteEvent]) -> (FrameFanOutSummary, Bool) {
@@ -758,8 +801,10 @@ final class ProgramOutputRoute: @unchecked Sendable {
     while let head = stage.first, head.ready != nil || head.failed {
       stage.removeFirst()
       guard let ready = head.ready else { continue }
-      let frame = ProcessedFrame(payload: ready.payload, metadata: ready.metadata,
-        onReleased: { withExtendedLifetime((head.retention, head.backing)) {} })
+      let frame = ProcessedFrame(payload: ready, metadata: head.metadata,
+        onReleased: { [retention = head.retention, backing = head.backing, producer = head.source?.retainProducerLease()] in
+          withExtendedLifetime((retention, backing, producer)) {}
+        })
       do {
         let summary = fanOut.publishRepeatedSummary(frame, count: head.sends)
         last = summary
@@ -769,6 +814,9 @@ final class ProgramOutputRoute: @unchecked Sendable {
             events: &events)
         }
         if summary.enqueued > 0 {
+          if outputContract != nil {
+            offerMonitorLocked(frame, from: head.feedID, sourceTime: head.sourceTime, cutGeneration: head.cutGeneration)
+          }
           stats.published &+= UInt64(summary.publishedSamples)
           published = true
           if summary.rejected == 0 {
@@ -824,6 +872,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
     // Resetting the scheduler starts a new Program timeline. Any queued
     // leases belong to the old timeline and must not be delivered afterward.
     locked {
+      streamSink?.discardPicture()
       flushOutputLocked()
       state.reset()
       nextSlot = nil

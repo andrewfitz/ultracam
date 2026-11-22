@@ -7,8 +7,24 @@ struct CaptureAudioPacket: Sendable {
   let format: SourceAudioFormat
   let packetTime: CMTime
   let pairedFrameSequence: UInt64?
+
   init(planes: [Data], sampleFrameCount: Int, format: SourceAudioFormat,
        packetTime: CMTime, pairedFrameSequence: UInt64? = nil) throws {
+    try self.init(planes: planes, sampleFrameCount: sampleFrameCount, format: format,
+      packetTime: packetTime, pairedFrameSequence: pairedFrameSequence, copyStorage: true)
+  }
+
+  /// The native producer has already copied PCM into independently owned,
+  /// immutable storage. Borrowed or mutable SDK bytes must use `init(planes:)`.
+  init(ownedInterleavedPCM data: Data, sampleFrameCount: Int, format: SourceAudioFormat,
+       packetTime: CMTime, pairedFrameSequence: UInt64? = nil) throws {
+    guard format.interleaved else { throw PluginError.unsupported("Invalid interleaved PCM packet") }
+    try self.init(planes: [data], sampleFrameCount: sampleFrameCount, format: format,
+      packetTime: packetTime, pairedFrameSequence: pairedFrameSequence, copyStorage: false)
+  }
+
+  private init(planes: [Data], sampleFrameCount: Int, format: SourceAudioFormat,
+               packetTime: CMTime, pairedFrameSequence: UInt64?, copyStorage: Bool) throws {
     let bytesPerSample: Int
     switch format.sample {
     case .int16: bytesPerSample = 2
@@ -20,8 +36,16 @@ struct CaptureAudioPacket: Sendable {
       planes.count == (format.interleaved ? 1 : format.channels),
       planes.allSatisfy({ $0.count == bytes }), packetTime.isNumeric,
       packetTime.epoch == 0, packetTime >= .zero else { throw PluginError.unsupported("Invalid PCM packet") }
-    // Force independent immutable storage; no SDK-backed no-copy Data escapes.
-    self.planes = planes.map { Data($0.map { $0 }) }
+    if copyStorage {
+      self.planes = planes.map { plane in
+        plane.withUnsafeBytes { bytes in
+          guard let base = bytes.baseAddress, !bytes.isEmpty else { return Data() }
+          return Data(bytes: base, count: bytes.count)
+        }
+      }
+    } else {
+      self.planes = planes
+    }
     self.sampleFrameCount = sampleFrameCount
     self.format = format
     self.packetTime = packetTime

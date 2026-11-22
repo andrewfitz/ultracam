@@ -51,11 +51,13 @@ vendor_configure() {
   done
   if [[ -n "$vendor_id" ]]; then
     vendor_load_list sdk-root || return $?
-    vendor_sdk_root="${vendor_values[0]}"
+    vendor_sdk_root="${vendor_values[0]:-}"
     vendor_load_list bridge-header || return $?
-    vendor_selected_bridge="${vendor_values[0]}"
+    vendor_selected_bridge="${vendor_values[0]:-}"
+    vendor_bridge="$vendor_selected_bridge"
+  else
+    vendor_bridge="$task_root/Sources/DeviceAPI/GeneratedBridgingHeader.h"
   fi
-  vendor_bridge="${vendor_selected_bridge:-$task_root/Sources/DeviceAPI/GeneratedBridgingHeader.h}"
 }
 
 vendor_compile_native() {

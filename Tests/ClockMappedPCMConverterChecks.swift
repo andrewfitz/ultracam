@@ -42,6 +42,25 @@ import XCTest
     let right = all.samples.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     for (a, b) in zip(left, right) { XCTAssertEqual(a, b, accuracy: 1e-6) }
   }
+  func testAudioSegmentRestartReanchorsFractionalPhaseAndRejectsClockRegression() throws {
+    let mic = try format(.float32, rate: 44100)
+    var converter = try ClockMappedPCMConverter(format: mic, outputSampleRate: 48000)
+    let clock = PCMClockTransform.mapped(try mapping())
+    let before = [Float](repeating: -0.5, count: 37).withUnsafeBytes { Data($0) }
+    _ = try converter.convert(planes: [before], sampleFrameCount: 37,
+      audioTime: CMTime(value: 100, timescale: 1), mapping: clock)
+    XCTAssertThrowsError(try converter.restartSegment(audioTime: CMTime(value: 99, timescale: 1), mapping: clock)) {
+      XCTAssertEqual($0 as? ClockMappedPCMError, .discontinuity)
+    }
+    let restart = CMTime(value: 105, timescale: 1)
+    try converter.restartSegment(audioTime: restart, mapping: clock)
+    let after = [Float](repeating: 0.5, count: 37).withUnsafeBytes { Data($0) }
+    let result = try converter.convert(planes: [after], sampleFrameCount: 37, audioTime: restart, mapping: clock)
+    XCTAssertEqual(result.presentationTime, CMTime(value: 505, timescale: 1))
+    XCTAssertGreaterThan(result.sampleFrameCount, 0)
+    XCTAssertTrue(result.samples.withUnsafeBytes { $0.bindMemory(to: Float.self).allSatisfy { $0 == 0.5 } })
+  }
+
   func testPlanarChannelsRemainDistinct() throws {
     var converter = try ClockMappedPCMConverter(format: format(.float32, channels: 2, interleaved: false), outputSampleRate: 48000)
     let chunk = try converter.convert(planes: [[Float](repeating: 0.25, count: 3).withUnsafeBytes { Data($0) },
@@ -49,6 +68,123 @@ import XCTest
       audioTime: CMTime(value: 100, timescale: 1), mapping: mapping())
     XCTAssertEqual(chunk.samples.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }, [0.25, -0.5, 0.25, -0.5])
   }
+
+  func testSelectedStereoMatchesFullConversionAcrossPacketsAndFinish() throws {
+    let clock = try mapping(Rational(1_000_047, 1_000_000))
+    for sample: AudioSampleType in [.int16, .int24in32, .int32, .float32] {
+      for isInterleaved in [true, false] {
+        for rate in [44_100.0, 48_000.5, 96_000.0] {
+          let f = try format(sample, channels: 16, interleaved: isInterleaved, rate: rate)
+          var full = try ClockMappedPCMConverter(format: f, outputSampleRate: 48_000)
+          var selected = try ClockMappedPCMConverter(format: f, outputSampleRate: 48_000, selectedChannels: 14..<16)
+          var start = 0
+          for count in [1, 3, 272, 2, 110, 20, 1] {
+            let planes = pcmPlanes(format: f, start: start, frames: count)
+            let time = CMTime(seconds: 100 + Double(start) / rate, preferredTimescale: 1_000_000_000)
+            let all = try full.convert(planes: planes, sampleFrameCount: count, audioTime: time, mapping: clock)
+            let pair = try selected.convert(planes: planes, sampleFrameCount: count, audioTime: time, mapping: clock)
+            assertSelectedStereo(pair, matches: all)
+            start += count
+          }
+          if let tail = full.finish() {
+            try assertSelectedStereo(XCTUnwrap(selected.finish()), matches: tail)
+          } else {
+            XCTAssertNil(selected.finish())
+          }
+          XCTAssertNil(selected.finish())
+        }
+      }
+    }
+  }
+
+  func testSelectionValidatesWholePacketShapeAndOnlyConsumedFloatSamples() throws {
+    let clock = try mapping()
+    let time = CMTime(value: 100, timescale: 1)
+    for isInterleaved in [true, false] {
+      let f = try format(.float32, channels: 4, interleaved: isInterleaved)
+      for invalid in [-1..<1, 2..<2, 3..<5] {
+        XCTAssertThrowsError(try ClockMappedPCMConverter(format: f, outputSampleRate: 48_000, selectedChannels: invalid)) {
+          XCTAssertEqual($0 as? ClockMappedPCMError, .invalidPacket)
+        }
+      }
+      let values: [Float] = [.nan, .infinity, 0.25, -0.5]
+      let planes = isInterleaved
+        ? [(values + values).withUnsafeBytes { Data($0) }]
+        : values.map { [$0, $0].withUnsafeBytes { Data($0) } }
+      var full = try ClockMappedPCMConverter(format: f, outputSampleRate: 48_000)
+      var selected = try ClockMappedPCMConverter(format: f, outputSampleRate: 48_000, selectedChannels: 2..<4)
+      var malformed = planes
+      malformed[0].removeLast()
+      XCTAssertThrowsError(try selected.convert(planes: malformed, sampleFrameCount: 2, audioTime: time, mapping: clock)) {
+        XCTAssertEqual($0 as? ClockMappedPCMError, .invalidPacket)
+      }
+      XCTAssertThrowsError(try full.convert(planes: planes, sampleFrameCount: 2, audioTime: time, mapping: clock)) {
+        XCTAssertEqual($0 as? ClockMappedPCMError, .nonFiniteSample)
+      }
+      var nonFiniteSelection = planes
+      let offset = isInterleaved ? 2 * MemoryLayout<Float>.size : 0
+      let nan = [Float.nan].withUnsafeBytes { Data($0) }
+      nonFiniteSelection[isInterleaved ? 0 : 2].replaceSubrange(offset..<(offset + nan.count), with: nan)
+      XCTAssertThrowsError(try selected.convert(planes: nonFiniteSelection, sampleFrameCount: 2, audioTime: time, mapping: clock)) {
+        XCTAssertEqual($0 as? ClockMappedPCMError, .nonFiniteSample)
+      }
+      let chunk = try selected.convert(planes: planes, sampleFrameCount: 2, audioTime: time, mapping: clock)
+      XCTAssertEqual(chunk.presentationTime.seconds, 500)
+      XCTAssertEqual(chunk.sampleFrameCount, 1)
+      XCTAssertEqual(chunk.samples, [Float(0.25), -0.5].withUnsafeBytes { Data($0) })
+    }
+  }
+
+  func testSelectedWorkspaceBudgetIncludesAllSourceBytes() throws {
+    let f = try format(.float32, channels: 16)
+    let clock = try mapping()
+    // 3 source frames, 3 decoded stereo frames, and 4 stereo output frames.
+    let exact = try ClockMappedPCMConverter(format: f, outputSampleRate: 48_000,
+      selectedChannels: 14..<16, maximumWorkspaceBytes: 360)
+    let below = try ClockMappedPCMConverter(format: f, outputSampleRate: 48_000,
+      selectedChannels: 14..<16, maximumWorkspaceBytes: 359)
+    XCTAssertEqual(try exact.preflight(sampleFrameCount: 3, mapping: clock), 4)
+    XCTAssertThrowsError(try below.preflight(sampleFrameCount: 3, mapping: clock)) {
+      XCTAssertEqual($0 as? ClockMappedPCMError, .workspaceLimit)
+    }
+  }
+
+  private func assertSelectedStereo(_ stereo: ClockMappedPCMChunk, matches full: ClockMappedPCMChunk,
+    file: StaticString = #filePath, line: UInt = #line) {
+    let expected = full.samples.withUnsafeBytes { raw in
+      let samples = raw.bindMemory(to: Float.self)
+      var selected = [Float]()
+      for frame in 0..<full.sampleFrameCount {
+        selected.append(samples[frame * full.channels + 14])
+        selected.append(samples[frame * full.channels + 15])
+      }
+      return selected.withUnsafeBytes { Data($0) }
+    }
+    XCTAssertEqual(stereo.samples, expected, file: file, line: line)
+    XCTAssertEqual(stereo.presentationTime, full.presentationTime, file: file, line: line)
+    XCTAssertEqual(stereo.correctionRatio, full.correctionRatio, file: file, line: line)
+    XCTAssertEqual(stereo.sampleFrameCount, full.sampleFrameCount, file: file, line: line)
+    XCTAssertEqual(stereo.channels, 2, file: file, line: line)
+  }
+
+  private func pcmPlanes(format: SourceAudioFormat, start: Int, frames: Int) -> [Data] {
+    let count = format.interleaved ? 1 : format.channels
+    return (0..<count).map { plane in
+      let span = format.interleaved ? format.channels : 1
+      let samples = (0..<(frames * span)).map { index in
+        let frame = start + index / span
+        let channel = format.interleaved ? index % span : plane
+        return (frame * 619 + channel * 4093) % 65_535 - 32_767
+      }
+      switch format.sample {
+      case .int16: return samples.map { Int16($0).littleEndian }.withUnsafeBytes { Data($0) }
+      case .int24in32: return samples.map { (Int32($0) << 8).littleEndian }.withUnsafeBytes { Data($0) }
+      case .int32: return samples.map { (Int32($0) << 16).littleEndian }.withUnsafeBytes { Data($0) }
+      case .float32: return samples.map { (Float($0) / 20011).bitPattern.littleEndian }.withUnsafeBytes { Data($0) }
+      }
+    }
+  }
+
   func testExcessiveDriftFailsBeforeConsumingPacket() throws {
     var converter = try ClockMappedPCMConverter(format: format(), outputSampleRate: 48000)
     let data = [Int16](repeating: 0, count: 10).withUnsafeBytes { Data($0) }

@@ -26,6 +26,7 @@ struct CaptureUpdate: @unchecked Sendable {
   var output = ""
   var sourceFormat: SourceFormat?
   var sourceDuration: CMTime?
+  var sourceFPS: Double = 0
   var mediaTime: CMTime?
   var pipelineEnabledApplied: Bool?
   var frames: UInt64 = 0
@@ -86,6 +87,8 @@ struct CaptureUpdate: @unchecked Sendable {
   var audioActivityRMS: Float = 0
   var audioBitrateKbps: Double = 0
   var audioPresent = false
+  var audioInterrupted = false
+  var audioInterruptionTime: CMTime?
   var audioPacketTime: CMTime?
   /// This capture's embedded-audio packets left out of the broadcast meters
   /// because the meter queue fell a full hand-off ring behind
@@ -165,6 +168,19 @@ final class CaptureController: @unchecked Sendable {
   /// This capture's broadcast audio meters: handed each packet on the driver
   /// thread while shown, metered on the tap's own queue.
   let audioMeterTap = AudioMeterTap()
+  private var programStreamAudioTap: ProgramStreamAudioTap?
+  private var streamPairedHost: (sequence: UInt64, time: CMTime)?
+
+  func setProgramStreamAudioTap(_ tap: ProgramStreamAudioTap?) {
+    let previous = lock.withLock { () -> ProgramStreamAudioTap? in
+      guard programStreamAudioTap !== tap else { return nil }
+      let previous = programStreamAudioTap
+      programStreamAudioTap = tap
+      streamPairedHost = nil
+      return previous
+    }
+    previous?.stop()
+  }
   private var generation: UInt64 = 0
   private var accepting = false
   private var activeFeedID: FeedID?
@@ -185,6 +201,7 @@ final class CaptureController: @unchecked Sendable {
     let packet: CaptureAudioPacket
     let source: SourceAdmissionSnapshot
     let pair: CaptureFrameInfo?
+    let resumesSegment: Bool
     let lease: MediaRetentionLedger.Lease
   }
   private enum PendingRecordingMedia {
@@ -224,6 +241,7 @@ final class CaptureController: @unchecked Sendable {
   // Under `lock`: driver-thread bookkeeping and pipeline depth.
   private var sourceDrops: UInt64 = 0
   private var sourceDuration = VideoContract.fastDuration
+  private var sourceCadence = SourceCadence()
   private var lastSourcePTS: CMTime?
   // Signal dropouts: the source reported no signal, then frames came back.
   // The last valid timestamp survives `clearSignal`, so the frames the
@@ -267,6 +285,8 @@ final class CaptureController: @unchecked Sendable {
   private var declaredSource: SourceFormat?
   private var declaredAdmission: SourceAdmissionSnapshot?
   private var declaredAudio: SourceAudioDeclaration = .unknown
+  private var audioInterrupted = false
+  private var audioSegmentPending = false
   private struct PendingAudioAdmission {
     let declaration: SourceAudioDeclaration
     let epochID: CaptureEpochID
@@ -436,6 +456,7 @@ final class CaptureController: @unchecked Sendable {
   var sourceDropsForTesting: UInt64 { lock.withLock { sourceDrops } }
   var processorBuiltForTesting: Bool { syncOnQueue { processor != nil } }
   var gpuPreparedForTesting: Bool { syncOnQueue { preparedConfiguration != nil } }
+  var cameraConnectedForTesting: Bool { syncOnQueue { cameraConnected } }
   #endif
 
   #if ULTRACAM_TEST_SUPPORT
@@ -566,11 +587,12 @@ final class CaptureController: @unchecked Sendable {
         if !self.isCurrent(token) {
           throw VideoError.message("Camera changed before its LUT finished loading.")
         }
-        try self.makeProcessor().load(lut, colorSpace: colorSpace)
+        let tagged = lut.withOutputSignal(MonitorFeedHost.declaredSignal(colorSpace.output, over: .rec709))
+        try self.makeProcessor().load(tagged, colorSpace: colorSpace)
         guard self.isCurrent(token) else {
           throw VideoError.message("Camera changed before its LUT finished loading.")
         }
-        self.lock.withLock { self.loadedLUT = lut; self.loadedLUTColorSpace = colorSpace }
+        self.lock.withLock { self.loadedLUT = tagged; self.loadedLUTColorSpace = colorSpace }
         lutLog.notice("LUT \"\(lut.cube.title, privacy: .public)\" in the pipeline of \(self.cameraLabel, privacy: .public) (controller \(UInt(bitPattern: ObjectIdentifier(self).hashValue), format: .hex, privacy: .public)); burned in: \(self.pipelineEnabled && self.configuration.applyLUT, privacy: .public)")
         DispatchQueue.main.async { completion(.success(())) }
       } catch {
@@ -696,6 +718,7 @@ final class CaptureController: @unchecked Sendable {
           guard self.generation == token else { return false }
           self.accepting = true
           self.sourceDrops = 0
+          self.sourceCadence = SourceCadence()
           self.lastSourcePTS = nil
           self.lastValidSourcePTS = nil
           self.signalLostAt = nil
@@ -709,6 +732,8 @@ final class CaptureController: @unchecked Sendable {
           self.declaredSource = nil
           self.declaredAdmission = nil
           self.declaredAudio = .unknown
+          self.audioInterrupted = false
+          self.audioSegmentPending = false
           self.declaredNativeTimecode = nil
           self.pendingAudioAdmission = nil
           self.declaredMappingRevision = nil
@@ -728,6 +753,14 @@ final class CaptureController: @unchecked Sendable {
         }
         self.noSignalSince = nil
         self.unsupportedReason = nil
+        let typedHandlers = CaptureHandlers(isRecording: { [weak self] in
+          guard let self else { return false }
+          return self.lock.withLock {
+            self.accepting && self.generation == token && self.recordingCallbacks[feedID] != nil
+          }
+        }) { [weak self] delivery in
+          self?.receiveTyped(delivery, token: token)
+        }
         // Driver events change capture-queue state (signal loss, fatal errors);
         // they are rare, so they stay on the capture queue.
         #if ULTRACAM_TEST_SUPPORT
@@ -755,9 +788,7 @@ final class CaptureController: @unchecked Sendable {
           self?.receiveMedia(stats, token: token)
         }
         if let typed = self.services.startTyped {
-          try typed(deviceID, .automatic, CaptureHandlers { [weak self] delivery in
-            self?.receiveTyped(delivery, token: token)
-          })
+          try typed(deviceID, .automatic, typedHandlers)
         } else if let automatic = self.services.startAutomatic {
           if let automaticWithSourceAudio = self.services.startAutomaticWithSourceAudio {
             try automaticWithSourceAudio(deviceID, { [weak self] image, pts, duration, valid in
@@ -804,9 +835,7 @@ final class CaptureController: @unchecked Sendable {
           }, event)
         }
         #else
-        try self.services.startTyped(deviceID, .automatic, CaptureHandlers { [weak self] delivery in
-          self?.receiveTyped(delivery, token: token)
-        })
+        try self.services.startTyped(deviceID, .automatic, typedHandlers)
         #endif
         guard self.isCurrent(token) else {
           self.stopResources(preserveRecordingCallbacks: true)
@@ -858,6 +887,7 @@ final class CaptureController: @unchecked Sendable {
             if self.signalLostAt == nil, self.lastValidSourcePTS != nil {
               self.signalLostAt = state.last
               self.signalDropouts &+= 1
+              self.sourceCadence = SourceCadence()
             }
             self.lastSourcePTS = nil
           } else {
@@ -1022,12 +1052,20 @@ final class CaptureController: @unchecked Sendable {
   /// Installs one feed's raw callback fan-out. The callback itself performs
   /// only bounded SourceRecorderCore admission and is safe to call on the
   /// native source callback thread.
+  @discardableResult
   func setRecordingCallbacks(feedID: FeedID,
-    callbacks: SourceRecordingCallbackAdapter.Callbacks?) {
-    let pending = lock.withLock { () -> (SourceAdmissionSnapshot, UInt64, UInt64)? in
+    callbacks: SourceRecordingCallbackAdapter.Callbacks?) -> Bool {
+    let result = lock.withLock { () -> (installed: Bool, pending: (SourceAdmissionSnapshot, UInt64, UInt64)?) in
+      let active = accepting && activeFeedID == feedID
+      let snapshot = active ? declaredAdmission : nil
+      if let preparedEpoch = callbacks?.preparedEpoch, !active || preparedEpoch != declaredEpoch {
+        return (false, nil)
+      }
+      if let preparedVideo = callbacks?.preparedVideoFormat, preparedVideo != snapshot?.format {
+        return (false, nil)
+      }
       recordingCallbackGeneration &+= 1
       if let callbacks {
-        let snapshot = accepting && activeFeedID == feedID ? declaredAdmission : nil
         var route = RecordingRoute(callbacks: callbacks, install: recordingCallbackGeneration,
           discovery: RecordingDiscoveryState(policy: recordingDiscoveryPolicy))
         route.sourceAdmissionAccepted = snapshot == nil || callbacks.sourceAdmission == nil
@@ -1035,15 +1073,22 @@ final class CaptureController: @unchecked Sendable {
         recordingCallbacks[feedID] = route
         // A new take places its unpaired audio from its own first pairing.
         audioPairAnchor = nil
-        if let snapshot { return (snapshot, recordingCallbackGeneration, generation) }
+        // Native takes bind on the next ordered delivery. The declaration,
+        // discovery drain and epoch cutoff then share one producer sequence.
+        if let snapshot, callbacks.finishAtSourceEpoch == nil {
+          return (true, (snapshot, recordingCallbackGeneration, generation))
+        }
       } else {
-        recordingCallbacks.removeValue(forKey: feedID)
+        if recordingCallbacks.removeValue(forKey: feedID) != nil, activeFeedID == feedID {
+          audioMeterTap.closeTakeInput()
+        }
       }
-      return nil
+      return (true, nil)
     }
-    if let pending {
+    if let pending = result.pending {
       bindRecordingAdmission(pending.0, feedID: feedID, install: pending.1, token: pending.2)
     }
+    return result.installed
   }
 
   private func bindRecordingAdmission(_ snapshot: SourceAdmissionSnapshot, feedID: FeedID,
@@ -1230,11 +1275,18 @@ final class CaptureController: @unchecked Sendable {
     lock.withLock { accepting ? declaredAdmission?.format : nil }
   }
 
-  var recordingTakeContext: RecordingTakeContext? {
+  var recordingTakeContext: RecordingTakeContext? { recordingPreparation.context }
+
+  /// Keep the encoder's video, audio, timecode and epoch preflight on one
+  /// declaration even when the device redeclares on its delivery queue.
+  var recordingPreparation: (context: RecordingTakeContext?, video: SourceFormat?, nativeTimecode: Timecode?) {
     lock.withLock {
-      guard accepting, let source = declaredAdmission, declaredAudio.isResolved else { return nil }
-      return RecordingTakeContext(sourceAdmission: source, audioDeclaration: declaredAudio,
-        mappingRevision: declaredMappingRevision, videoMapping: videoClockMapping, audioMapping: audioClockMapping)
+      guard accepting, let source = declaredAdmission else { return (nil, nil, nil) }
+      let context = declaredAudio.isResolved
+        ? RecordingTakeContext(sourceAdmission: source, audioDeclaration: declaredAudio,
+          mappingRevision: declaredMappingRevision, videoMapping: videoClockMapping, audioMapping: audioClockMapping)
+        : nil
+      return (context, source.format, declaredNativeTimecode)
     }
   }
   var latestNativeTimecode: Timecode? { lock.withLock { declaredNativeTimecode } }
@@ -1296,7 +1348,7 @@ final class CaptureController: @unchecked Sendable {
   /// already handles the dropout's gap, and this queued reset could land
   /// after frames resumed and hide the next device skip.
   private func clearSignal(resetSourceClock: Bool = true) {
-    if resetSourceClock { lock.withLock { lastSourcePTS = nil } }
+    if resetSourceClock { lock.withLock { lastSourcePTS = nil; sourceCadence = SourceCadence() } }
     detected = nil
     inputLabel = "No signal"
     outputLabel = ""
@@ -1314,6 +1366,7 @@ final class CaptureController: @unchecked Sendable {
       if let since, lastReceived != since { return }
       signalLostAt = since ?? ProcessInfo.processInfo.systemUptime
       signalDropouts &+= 1
+      sourceCadence = SourceCadence()
     }
   }
 
@@ -1436,7 +1489,8 @@ final class CaptureController: @unchecked Sendable {
       preparedConfiguration?.height != next.height || preparedConfiguration?.sourceWidth != next.sourceWidth ||
       preparedConfiguration?.sourceHeight != next.sourceHeight ||
       preparedConfiguration?.resolvedSourcePixelAspect != next.resolvedSourcePixelAspect ||
-      preparedConfiguration?.scalingMode != next.scalingMode {
+      preparedConfiguration?.scalingMode != next.scalingMode ||
+      preparedConfiguration?.allowUpscale != next.allowUpscale {
       try processor?.prepare(configuration: next, wait: wait)
       preparedConfiguration = next
     }
@@ -1444,8 +1498,11 @@ final class CaptureController: @unchecked Sendable {
 
   // MARK: - Virtual camera connection (capture-queue state, control-queue work)
 
-  private func establish(_ next: PipelineConfiguration, inputType: OSType, synchronous: Bool = false,
+  private func establish(_ configuration: PipelineConfiguration, inputType: OSType, synchronous: Bool = false,
     sourceFormat: SourceFormat? = nil) {
+    // Keep camera negotiation stable while successive frames carry variable durations.
+    var next = configuration
+    if let rate = sourceFormat?.rate, rate.isVariable { next.sourceDuration = rate.nominal }
     let prior = activeConfiguration
     let priorType = activeInputType
     // Geometry alone cannot identify a camera contract: LUT and source-profile
@@ -1470,7 +1527,6 @@ final class CaptureController: @unchecked Sendable {
       reconnectIfDue()
       return
     }
-    if prior?.duration != next.duration { frameRateGate = FrameRateGate() }
     func describe(_ value: PipelineConfiguration?, _ type: OSType?) -> String {
       guard let value else { return "none" }
       return "\(value.width)×\(value.height) \(fourCC(value.untouched ? (type ?? 0) : value.pixelFormat)) " +
@@ -1638,10 +1694,10 @@ final class CaptureController: @unchecked Sendable {
   /// The session serializes this stream. Contract state changes synchronously
   /// before the next recording callback, independently of capture queue load.
   private func receiveTyped(_ delivery: CaptureDelivery, token: UInt64) {
-    let admission = lock.withLock { () -> (accepted: Bool, newEpoch: Bool, changedTake: (FeedID, UInt64)?) in
-      guard generation == token, accepting, delivery.sequence > declaredSequence else { return (false, false, nil) }
+    let admission = lock.withLock { () -> (accepted: Bool, newEpoch: Bool) in
+      guard generation == token, accepting, delivery.sequence > declaredSequence else { return (false, false) }
       if let epoch = declaredEpoch {
-        guard epoch.sessionID == delivery.epochID.sessionID, delivery.epochID.epoch >= epoch.epoch else { return (false, false, nil) }
+        guard epoch.sessionID == delivery.epochID.sessionID, delivery.epochID.epoch >= epoch.epoch else { return (false, false) }
       }
       let newEpoch = declaredEpoch != delivery.epochID
       let declaresContract: Bool
@@ -1649,12 +1705,7 @@ final class CaptureController: @unchecked Sendable {
       case .event(.formatChanged), .event(.audioFormatChanged), .event(.discontinuity): declaresContract = true
       default: declaresContract = false
       }
-      var changedTake: (FeedID, UInt64)?
       if newEpoch && declaresContract {
-        if let feed = activeFeedID, let route = recordingCallbacks[feed], route.callbacks.takeContext != nil,
-          route.boundTakeContext != nil || route.takeContextBinding {
-          changedTake = (feed, route.install)
-        }
         // Retire old queued/GPU work on the first declaration/reset envelope,
         // before a producer can pause ahead of the remaining declarations.
         sourceEpochRevision &+= 1
@@ -1662,6 +1713,8 @@ final class CaptureController: @unchecked Sendable {
         declaredSource = nil
         declaredAdmission = nil
         declaredAudio = .unknown
+        audioInterrupted = false
+        audioSegmentPending = false
         declaredNativeTimecode = nil
         pendingAudioAdmission = nil
         declaredMappingRevision = nil
@@ -1671,22 +1724,20 @@ final class CaptureController: @unchecked Sendable {
         pairedFrame = nil
         audioPairAnchor = nil
         lastSourcePTS = nil
+        sourceCadence = SourceCadence()
       }
       declaredSequence = delivery.sequence
-      return (true, newEpoch, changedTake)
+      return (true, newEpoch && declaresContract)
     }
     guard admission.accepted else { return }
-    if admission.newEpoch { media.resetPacketBaseline() }
-    if let changed = admission.changedTake {
-      rejectRecordingMetadata(feedID: changed.0, install: changed.1, token: token,
-        message: "Recording source or audio declaration changed during the take; start a new take.")
-    }
+    if admission.newEpoch { clearLiveAudio(token: token, epoch: delivery.epochID, newEpoch: true) }
     let snapshot = lock.withLock { declaredAdmission }
     let carriesMedia: Bool
     let requiresBoundHeader: Bool
     switch delivery.payload {
     case .frame, .cpuMemory, .media, .rawAudio: carriesMedia = true; requiresBoundHeader = true
-    case .event(.audioFormatChanged), .event(.clockMappingChanged): carriesMedia = false; requiresBoundHeader = true
+    case .event(.audioFormatChanged), .event(.clockMappingChanged),
+      .event(.audioInterrupted), .event(.audioResumed): carriesMedia = false; requiresBoundHeader = true
     default: carriesMedia = false; requiresBoundHeader = false
     }
     if requiresBoundHeader {
@@ -1710,38 +1761,37 @@ final class CaptureController: @unchecked Sendable {
         return
       }
     }
-    let mappingsBecomeEffective = lock.withLock { !pendingClockMappings.isEmpty }
-    let mappingProblem = lock.withLock { () -> String? in
+    let mapping = lock.withLock { () -> (becameEffective: Bool, problem: String?) in
       let previous = declaredMappingRevision
-      let effective = Array(pendingClockMappings.values)
-      for update in effective {
+      let becameEffective = !pendingClockMappings.isEmpty
+      for update in pendingClockMappings.values {
         guard update.effectiveSequence == delivery.sequence else {
-          return "clock mapping effective sequence did not identify the next delivery"
+          return (false, "clock mapping effective sequence did not identify the next delivery")
         }
         guard update.revision == delivery.mappingRevision else {
-          return "next delivery did not carry the declared clock mapping revision"
+          return (false, "next delivery did not carry the declared clock mapping revision")
         }
       }
-      for update in effective {
+      for update in pendingClockMappings.values {
         if update.clockID == delivery.clockBindings.video { videoClockMapping = update.mapping }
         if update.clockID == delivery.clockBindings.audio { audioClockMapping = update.mapping }
-        pendingClockMappings.removeValue(forKey: update.clockID)
       }
-      if let previous, previous != delivery.mappingRevision, effective.isEmpty {
+      if becameEffective { pendingClockMappings.removeAll(keepingCapacity: true) }
+      if let previous, previous != delivery.mappingRevision, !becameEffective {
         // A session may begin with an actual revision whose mapping values are
         // unavailable. Never manufacture anchors for that declared revision.
         videoClockMapping = nil
         audioClockMapping = nil
       }
       declaredMappingRevision = delivery.mappingRevision
-      return nil
+      return (becameEffective, nil)
     }
-    if let mappingProblem {
+    if let mappingProblem = mapping.problem {
       refuseSourceContract(SourceAdmissionRefusal(stage: .capture, formatDescription: "source clock",
         reason: mappingProblem), token: token)
       return
     }
-    if carriesMedia || mappingsBecomeEffective { bindActiveRecordingTakeContext(token: token) }
+    if carriesMedia || mapping.becameEffective { bindActiveRecordingTakeContext(token: token) }
     switch delivery.payload {
     case .event(let event):
       switch event {
@@ -1768,6 +1818,7 @@ final class CaptureController: @unchecked Sendable {
             throw SourceAdmissionRefusal(stage: .capture,
               formatDescription: FormatDisplayIdentity(format).detail, reason: "contract changed without a new capture epoch")
           }
+          var cutoff: RecordingRoute?
           let route = lock.withLock { () -> (FeedID, UInt64)? in
             guard generation == token, accepting else { return nil }
             if declaredEpoch != delivery.epochID {
@@ -1784,8 +1835,15 @@ final class CaptureController: @unchecked Sendable {
             sourceDuration = format.rate.nominal
             lastSourcePTS = nil
             guard let feed = activeFeedID, let recording = recordingCallbacks[feed] else { return nil }
+            let recordingEpoch = recording.boundTakeContext?.sourceAdmission.epochID ?? recording.callbacks.preparedEpoch
+            if let recordingEpoch, recordingEpoch != snapshot.epochID {
+              cutoff = recordingCallbacks.removeValue(forKey: feed)
+              audioMeterTap.closeTakeInput()
+              return nil
+            }
             return (feed, recording.install)
           }
+          cutoff?.callbacks.finishAtSourceEpoch?()
           if case .present(let audio) = lock.withLock({ declaredAudio }) {
             do { try audioMeterTap.configure(format: audio) }
             catch { refuseSourceContract(error, token: token); return }
@@ -1884,6 +1942,21 @@ final class CaptureController: @unchecked Sendable {
             rejectRecordingMetadata(feedID: feed, install: route.install, token: token)
           }
         }
+      case .audioInterrupted, .audioResumed:
+        let interrupted: Bool
+        if case .audioInterrupted = event { interrupted = true } else { interrupted = false }
+        let accepted = lock.withLock { () -> Bool in
+          guard generation == token, accepting, declaredAdmission?.epochID == delivery.epochID,
+            case .present(let format) = declaredAudio, format.clock != .pairedWithFrames else { return false }
+          if interrupted {
+            audioInterrupted = true
+          } else {
+            audioInterrupted = false
+            audioSegmentPending = true
+          }
+          return true
+        }
+        if accepted && interrupted { clearLiveAudio(token: token, epoch: delivery.epochID) }
       case .fatal(let reason):
         failFromSource(reason, token: token)
       case .waitingForSignal, .signalLost, .unsupportedInput, .info:
@@ -1912,7 +1985,7 @@ final class CaptureController: @unchecked Sendable {
           throw SourceAdmissionRefusal(stage: .capture, formatDescription: "undeclared source",
             reason: "format declaration is required before video")
         }
-        let metadata = SourceAdmissionMetadata(pixelBuffer: buffer.value,
+        var metadata = SourceAdmissionMetadata(pixelBuffer: buffer.value,
           presentationTime: info.presentationTime, duration: info.duration,
           epochID: info.epochID, formatSignature: info.formatSignature)
         try snapshot.validate(metadata, stage: .capture)
@@ -1923,7 +1996,27 @@ final class CaptureController: @unchecked Sendable {
             reason: "frame envelope differs from the declared epoch, signature or clock bindings")
         }
         lock.withLock {
-          if info.signalValid { pairedFrame = (delivery.sequence, info); declaredNativeTimecode = info.timecode }
+          if info.signalValid {
+            pairedFrame = (delivery.sequence, info)
+            declaredNativeTimecode = info.timecode
+            let streamNeedsPair: Bool
+            if programStreamAudioTap != nil, case .present(let audio) = declaredAudio {
+              streamNeedsPair = audio.clock == .pairedWithFrames
+            } else {
+              streamNeedsPair = false
+            }
+            if programPictureWanted || streamNeedsPair {
+              // Freeze one presentation-start instant before GPU or delivery queueing.
+              // The stream picture and this frame’s embedded PCM share even the
+              // arrival-time fallback when the source has no hardware host stamp.
+              let host = (try? videoClockMapping?.hostTime(for: info.presentationTime))
+                ?? Self.presentationStartHostTime(for: buffer.value, captured: info.captureHostTime,
+                  reference: info.hostTimeReference, duration: info.duration)
+                ?? services.hostTime()
+              metadata.presentationStartHostTime = host
+              if streamNeedsPair { streamPairedHost = (delivery.sequence, host) }
+            }
+          }
         }
         receive(buffer.value, at: info.presentationTime, duration: info.duration,
           signalValid: info.signalValid, token: token, recordingFormatValid: true,
@@ -1942,48 +2035,70 @@ final class CaptureController: @unchecked Sendable {
       }
       let audio: SourceAudioFormat?
       if case .present(let format) = info.audioDeclaration { audio = format } else { audio = nil }
-      let tc = info.timecode.map {
-        String(format: "%02d:%02d:%02d%@%02d", $0.hours, $0.minutes, $0.seconds, $0.dropFrame ? ";" : ":", $0.frames)
+      // Unpaired sources report levels and counts from admitted PCM. A
+      // metadata envelope may still carry native timecode for the picture.
+      if let audio, audio.clock != .pairedWithFrames {
+        if isAccepting(token) { media.recordTimecode(info.timecode) }
+        return
       }
-      receiveMedia(CaptureMediaStats(timecode: tc, audioPacketTime: info.audioPacketTime ?? .invalid,
+      let activity = SourceAudioMeterInput.activity(peaks: info.peaks, rms: info.rms)
+      receiveMedia(CaptureMediaStats(timecode: nil, audioPacketTime: info.audioPacketTime ?? .invalid,
         audioSampleFrames: UInt64(max(0, info.sampleFrameCount)), audioChannels: audio?.channels ?? 0,
         leftPeak: info.peaks.first ?? 0, rightPeak: info.peaks.dropFirst().first ?? 0,
         leftRMS: info.rms.first ?? 0, rightRMS: info.rms.dropFirst().first ?? 0,
         audioBytes: UInt64(max(0, info.byteCount)),
         audioPresent: audio != nil && info.audioPacketTime != nil && info.sampleFrameCount > 0,
-        activityPeak: SourceAudioMeterInput.activity(peaks: info.peaks, rms: info.rms).peak,
-        activityRMS: SourceAudioMeterInput.activity(peaks: info.peaks, rms: info.rms).rms,
-        sampleRate: audio?.sampleRate), token: token)
+        activityPeak: activity.peak, activityRMS: activity.rms,
+        sampleRate: audio?.sampleRate), token: token, nativeTimecode: info.timecode)
     case .rawAudio(let packet):
-      let state = lock.withLock { () -> (Bool, CaptureFrameInfo?) in
+      let state = lock.withLock { () -> (matches: Bool, pair: CaptureFrameInfo?, tap: ProgramStreamAudioTap?,
+        pairedHost: CMTime?, audioMapping: ClockMapping?, interrupted: Bool, resumesSegment: Bool) in
         let matches = declaredEpoch == delivery.epochID && declaredSource?.signature == delivery.formatSignature &&
           declaredAudio == .present(packet.format)
         let pair = packet.pairedFrameSequence.flatMap { sequence in
           pairedFrame.flatMap { $0.sequence == sequence && $0.info.signalValid ? $0.info : nil }
         }
-        return (matches, pair)
+        let pairedHost = pair != nil && packet.pairedFrameSequence == streamPairedHost?.sequence ? streamPairedHost?.time : nil
+        let resumesSegment = matches && !audioInterrupted && audioSegmentPending
+        if resumesSegment { audioSegmentPending = false }
+        return (matches, pair, accepting && generation == token ? programStreamAudioTap : nil,
+          pairedHost, audioClockMapping, audioInterrupted, resumesSegment)
       }
-      guard state.0 else {
+      guard state.matches else {
         refuseSourceContract(SourceAdmissionRefusal(stage: .capture, formatDescription: "source audio",
           reason: "raw audio format differs from the immutable source audio contract"), token: token)
         return
       }
-      audioMeterTap.ingest(packet)
+      guard !state.interrupted else { return }
+      if packet.format.clock != .pairedWithFrames, packet.sampleFrameCount > 0 {
+        let levels = SourceAudioMeterInput.levels(packet)
+        receiveMedia(CaptureMediaStats(timecode: nil, audioPacketTime: packet.packetTime,
+          audioSampleFrames: UInt64(packet.sampleFrameCount), audioChannels: packet.format.channels,
+          leftPeak: levels.leftPeak, rightPeak: levels.rightPeak, leftRMS: levels.leftRMS, rightRMS: levels.rightRMS,
+          audioBytes: packet.planes.reduce(0) { $0 + UInt64($1.count) }, audioPresent: true,
+          activityPeak: levels.activityPeak, activityRMS: levels.activityRMS, sampleRate: packet.format.sampleRate),
+          token: token, updatesTimecode: false)
+      }
+      state.tap?.ingest(packet, epoch: delivery.epochID, pairedHostTime: state.pairedHost, audioMapping: state.audioMapping)
+      defer {
+        if isAccepting(token) { audioMeterTap.ingest(packet) }
+      }
       let pending = lock.withLock { () -> (FeedID, UInt64, SourceAdmissionSnapshot)? in
         guard let feed = activeFeedID, let route = recordingCallbacks[feed], let source = declaredAdmission else { return nil }
         return (feed, route.install, source)
       }
       if let pending {
-        if retainRecordingAudioDiscovery(packet, source: pending.2, pair: state.1,
+        if retainRecordingAudioDiscovery(packet, source: pending.2, pair: state.pair, resumesSegment: state.resumesSegment,
           feed: pending.0, install: pending.1, token: token) { return }
-        deliverRecordingAudio(packet, pair: state.1, source: pending.2, feed: pending.0, install: pending.1, token: token)
+        deliverRecordingAudio(packet, pair: state.pair, source: pending.2, feed: pending.0, install: pending.1, token: token,
+          resumesSegment: state.resumesSegment)
       }
 
     }
   }
 
   private func deliverRecordingAudio(_ packet: CaptureAudioPacket, pair: CaptureFrameInfo?, source: SourceAdmissionSnapshot?,
-    feed: FeedID, install: UInt64, token: UInt64) {
+    feed: FeedID, install: UInt64, token: UInt64, resumesSegment: Bool = false) {
     let selected = lock.withLock { () -> (RecordingRoute, RecordingTakeContext)? in
       guard generation == token, accepting, activeFeedID == feed, let route = recordingCallbacks[feed],
         route.install == install, route.sourceAdmissionAccepted, route.takeContextAccepted,
@@ -2012,7 +2127,9 @@ final class CaptureController: @unchecked Sendable {
       }
     }
     let accepted: Bool
-    if let source, let callback = route.callbacks.sourceAudioWithAdmission {
+    if resumesSegment, let source, let callback = route.callbacks.resumedSourceAudio {
+      accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, context, source)
+    } else if let source, let callback = route.callbacks.sourceAudioWithAdmission {
       // The writer owns declared layout, sample-grid conversion and exact high24
       // scaling. Packet PTS stays rational; sample rate does not imply a CMTime grid.
       accepted = callback(packet.planes, packet.sampleFrameCount, packet.format, packet.packetTime, context, source,
@@ -2044,7 +2161,7 @@ final class CaptureController: @unchecked Sendable {
   }
 
   private func retainRecordingAudioDiscovery(_ packet: CaptureAudioPacket, source: SourceAdmissionSnapshot,
-    pair: CaptureFrameInfo?, feed: FeedID, install: UInt64, token: UInt64) -> Bool {
+    pair: CaptureFrameInfo?, resumesSegment: Bool, feed: FeedID, install: UInt64, token: UInt64) -> Bool {
     let outcome = lock.withLock { () -> Int in
       guard generation == token, accepting, let route = recordingCallbacks[feed], route.install == install,
         !route.takeContextRejected else { return 1 }
@@ -2054,12 +2171,12 @@ final class CaptureController: @unchecked Sendable {
         // Paired PCM still uses its explicit frame association; its video clock
         // is checked when the queue is reconciled with the resolved contract.
         if packet.format.clock != .pairedWithFrames { return 2 }
-        return enqueueRecordingAudio(packet, source: source, pair: pair, state: state)
+        return enqueueRecordingAudio(packet, source: source, pair: pair, resumesSegment: resumesSegment, state: state)
       }
       if let original = state.pending.compactMap({ media -> PendingRecordingAudio? in
         if case .audio(let audio) = media { return audio }; return nil
       }).first, original.source.clockBindings.audio != audioClock { return 2 }
-      return enqueueRecordingAudio(packet, source: source, pair: pair, state: state)
+      return enqueueRecordingAudio(packet, source: source, pair: pair, resumesSegment: resumesSegment, state: state)
     }
     if outcome == 2 {
       rejectRecordingMetadata(feedID: feed, install: install, token: token,
@@ -2070,7 +2187,7 @@ final class CaptureController: @unchecked Sendable {
 
   /// Controller lock held; charge original PCM planes, with no conversion/copy.
   private func enqueueRecordingAudio(_ packet: CaptureAudioPacket, source: SourceAdmissionSnapshot,
-    pair: CaptureFrameInfo?, state: RecordingDiscoveryState) -> Int {
+    pair: CaptureFrameInfo?, resumesSegment: Bool, state: RecordingDiscoveryState) -> Int {
     var bytes = 0
     for plane in packet.planes {
       let sum = bytes.addingReportingOverflow(plane.count)
@@ -2080,7 +2197,7 @@ final class CaptureController: @unchecked Sendable {
     do {
       let lease = try state.budget.admit(bytes: bytes,
         duration: Double(packet.sampleFrameCount) / packet.format.sampleRate)
-      state.pending.append(.audio(PendingRecordingAudio(packet: packet, source: source, pair: pair, lease: lease)))
+      state.pending.append(.audio(PendingRecordingAudio(packet: packet, source: source, pair: pair, resumesSegment: resumesSegment, lease: lease)))
       return 1
     } catch { return 2 }
   }
@@ -2089,6 +2206,15 @@ final class CaptureController: @unchecked Sendable {
   /// cannot enter recording or be mislabeled as capacity/signal loss.
   private func refuseSourceContract(_ error: Error, token: UInt64) {
     let message = (error as? SourceAdmissionRefusal)?.description ?? "capture refused source contract: \(error)"
+    let changedTake = lock.withLock { () -> (FeedID, UInt64)? in
+      guard let feed = activeFeedID, let route = recordingCallbacks[feed],
+        let recordingEpoch = route.boundTakeContext?.sourceAdmission.epochID ?? route.callbacks.preparedEpoch,
+        recordingEpoch != declaredEpoch else { return nil }
+      return (feed, route.install)
+    }
+    if let changedTake {
+      rejectRecordingMetadata(feedID: changedTake.0, install: changedTake.1, token: token, message: message)
+    }
     failFromSource(message, token: token)
   }
 
@@ -2229,7 +2355,8 @@ final class CaptureController: @unchecked Sendable {
         #if ULTRACAM_TEST_SUPPORT
         lock.withLock { auditHooks.pendingAudioDequeued }?()
         #endif
-        deliverRecordingAudio(audio.packet, pair: audio.pair, source: audio.source, feed: feedID, install: install, token: token)
+        deliverRecordingAudio(audio.packet, pair: audio.pair, source: audio.source, feed: feedID, install: install, token: token,
+          resumesSegment: audio.resumesSegment)
       }
     }
     let exhausted = lock.withLock { () -> Bool in
@@ -2281,6 +2408,7 @@ final class CaptureController: @unchecked Sendable {
         recovered = (lost, now - lostAt)
       }
       if pts.isNumeric {
+        sourceCadence.record(pts)
         lastValidSourcePTS = pts
         if let prior = lastSourcePTS, sourceDuration.isNumeric, sourceDuration.seconds > 0 {
           let elapsed = CMTimeSubtract(pts, prior).seconds
@@ -2308,6 +2436,10 @@ final class CaptureController: @unchecked Sendable {
     // conversion or waiting. Malformed inputs stay out of the recorder while
     // its invalid-sample telemetry and processing's error reporting remain.
     if var route = admitted.0 {
+      var sourceMetadata = sourceMetadata
+      // Freeze the first available host anchor before discovery can retain the frame.
+      sourceMetadata?.presentationStartHostTime = Self.presentationStartHostTime(for: image, captured: captureHostTime,
+        reference: hostTimeReference, duration: admitted.1) ?? services.hostTime()
       var pending = false
       if signalValid, recordingFormatValid, let sourceAdmission, let sourceMetadata, let feed = admitted.3 {
         let checked = retainRecordingDiscovery(route, image: image, source: sourceAdmission,
@@ -2349,9 +2481,24 @@ final class CaptureController: @unchecked Sendable {
 
   /// Media statistics are a few counters under their own lock, recorded on
   /// the driver thread: never queued behind video, never dropped.
-  private func receiveMedia(_ stats: CaptureMediaStats, token: UInt64) {
+  private func receiveMedia(_ stats: CaptureMediaStats, token: UInt64, nativeTimecode: Timecode? = nil,
+    updatesTimecode: Bool = true) {
     guard isAccepting(token) else { return }
-    media.record(stats)
+    media.record(stats, nativeTimecode: nativeTimecode, updatesTimecode: updatesTimecode)
+  }
+
+  private func clearLiveAudio(token: UInt64, epoch: CaptureEpochID, newEpoch: Bool = false) {
+    guard isAccepting(token) else { return }
+    guard let interrupted = media.clearAudio(newEpoch: newEpoch) else { return }
+    audioMeterTap.noteInterruption()
+    queue.async {
+      guard self.lock.withLock({ self.accepting && self.generation == token && self.declaredEpoch == epoch }) else { return }
+      self.publishCurrent(token: token, audioOverride: interrupted)
+      // If delivery recovered while this queue was busy, publish the current
+      // live state after the clear even when no video frame follows it.
+      let current = self.media.snapshot()
+      if current.present { self.publishCurrent(token: token, audioOverride: current) }
+    }
   }
 
   private func receiveRawAudio(_ audio: CaptureRawAudio, token: UInt64,
@@ -2393,11 +2540,14 @@ final class CaptureController: @unchecked Sendable {
     videoRateBytes &+= UInt64(max(0, CVPixelBufferGetDataSize(input)))
     let actual = InputFormat(width: CVPixelBufferGetWidth(input), height: CVPixelBufferGetHeight(input),
       type: CVPixelBufferGetPixelFormatType(input), duration: frame.duration)
-    let metadataChanged = detected != actual
-    if detected != actual {
-      if detected?.duration != actual.duration { firstSourceTime = nil; frameRateGate = FrameRateGate() }
-      detected = actual
-      inputLabel = actual.label
+    let rate = frame.sourceAdmission?.format.rate
+    let signalFormat = InputFormat(width: actual.width, height: actual.height, type: actual.type,
+      duration: rate?.nominal ?? actual.duration)
+    let metadataChanged = detected != signalFormat
+    if metadataChanged {
+      if detected?.duration != signalFormat.duration { firstSourceTime = nil }
+      detected = signalFormat
+      inputLabel = signalFormat.label
     }
     #if ULTRACAM_TEST_SUPPORT
     if frame.sourceAdmission == nil {
@@ -2427,23 +2577,36 @@ final class CaptureController: @unchecked Sendable {
       let sink = monitorSink
       let hasPreview = previewEnabled && services.preview != nil
       let (processedHandler, programPicture) = lock.withLock { (processedFrameHandler, programPictureWanted) }
-      // Temporal selection happens before any GPU work or buffer allocation;
-      // complete bypass keeps the source duration and so every frame. The
-      // monitor shows the output's frames only, so with a lower output rate
-      // (59.94 to 29.97) the picture runs at that rate too.
-      let selected = frameRateGate.shouldDeliver(frame.pts, duration: effective.duration)
+      // Temporal selection runs before any GPU work and applies equally to
+      // pixel passthrough and processed frames. The monitor follows that cadence.
+      let selected: Bool
+      if rate?.isVariable == true {
+        if effective.reduceFrameRate {
+          selected = frameRateGate.shouldDeliver(frame.pts, duration: effective.frameRateTarget.duration)
+        } else {
+          frameRateGate.reset()
+          selected = true
+        }
+      } else {
+        selected = frameRateGate.shouldDeliver(frame.pts, duration: effective.duration)
+      }
       // No downstream demand: metadata and detection stay alive with no allocation,
       // GPU work or staged buffer nobody can consume. The monitor still gets every
       // frame (it draws the LUT itself), recording took its frame on the driver
       // thread, and the Program scheduler sees this one in order.
       guard ((cameraConnected || cameraConnecting) && cameraFramesWanted) || hasPreview || programPicture else {
         if selected {
-          offerSourceOnlyInOrder(sink, frame: frame, duration: effective.duration, token: token, untouched: effective.untouched)
+          offerSourceOnlyInOrder(sink, frame: frame, duration: effective.duration, token: token,
+            untouched: effective.untouched, burnIn: effective.applyLUT ? lock.withLock { loadedLUT } : nil)
           noteSourceOnly(effective, inputType: actual.type, pts: frame.pts, metadataChanged: metadataChanged, token: token)
         }
         return
       }
       guard selected else { return }
+      guard CVPixelBufferGetIOSurface(input) != nil else { throw LiveFrameRouteError.unshareableStorage }
+      if !effective.untouched {
+        try LUTProcessor.validateOutputGeometry(width: effective.width, height: effective.height, color: effective.outputColor)
+      }
       lastRenderAt = entryTime
       // Created on first demand; a complete bypass still uses it for the owned GPU copy.
       let processor = try makeProcessor()
@@ -2451,10 +2614,12 @@ final class CaptureController: @unchecked Sendable {
       let item = DeliveryItem(token: token, sequence: frame.sequence, source: sink == nil ? nil : input,
         pts: frame.pts, hostTime: hostTime(for: frame.pts, duration: effective.duration, image: input,
           reference: frame.hostTimeReference, sourceDuration: frame.duration, mapping: frame.videoMapping, captureHostTime: frame.captureHostTime),
+        streamHostTime: frame.sourceMetadata?.presentationStartHostTime,
         duration: effective.duration, receivedAt: frame.receivedAt, encodeStart: entryTime,
         pipelineEnabled: pipelineEnabled, applyLUT: effective.applyLUT,
         preview: previewEnabled ? services.preview : nil,
         cameraAttempt: cameraAttempt, sendsToCamera: cameraFramesWanted, monitorSink: sink, untouched: effective.untouched,
+        burnIn: effective.applyLUT ? processor.lut : nil,
         processedHandler: processedHandler, retention: frame.retention, epochRevision: frame.epochRevision,
         sourceAdmission: frame.sourceAdmission)
       let completion: LUTProcessor.Completion = { [self] completed in
@@ -2487,6 +2652,18 @@ final class CaptureController: @unchecked Sendable {
       captureCPUMS = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - cpuStart) / 1_000_000
       // The delivered frame publishes the new input metadata.
       if metadataChanged { inputMetadataChanged = true }
+    } catch let error where error is LiveFrameRouteError || error is LUTColorSpaceContractError {
+      // The source frame was already admitted and offered to the recorder.
+      // Keep its take, timing, and monitor-source delivery independent.
+      let effective = effectiveConfiguration(source: frame.sourceAdmission, duration: frame.duration)
+      offerSourceOnlyInOrder(monitorSink, frame: frame, duration: effective.duration, token: token,
+        untouched: effective.untouched, burnIn: nil)
+      let detail = error.localizedDescription
+      let changed = message != detail
+      message = detail
+      applied = nil
+      outputLabel = ""
+      publishIfDue(token: token, force: changed || metadataChanged)
     } catch VideoError.outputBackPressure {
       poolDrops &+= 1
       message = VideoError.outputBackPressure.localizedDescription
@@ -2533,14 +2710,15 @@ final class CaptureController: @unchecked Sendable {
   /// The monitor's offer and the Program scheduler's sight of a frame that skips the GPU.
   /// Ordered behind every frame already on the GPU, whose own are made when they complete.
   private func offerSourceOnlyInOrder(
-    _ sink: (any MonitorFrameSink)?, frame: CapturedFrame, duration: CMTime, token: UInt64, untouched: Bool
+    _ sink: (any MonitorFrameSink)?, frame: CapturedFrame, duration: CMTime, token: UInt64, untouched: Bool,
+    burnIn: MonitorLUT?
   ) {
     let offer: @Sendable () -> Void = { [self, deliveryQueue] in
       deliveryQueue.async {
         defer { withExtendedLifetime(frame.retention) {} }
         guard self.isAccepting(token, epochRevision: frame.epochRevision) else { return }
         sink?.offer(frame.image, pts: frame.pts, captureGeneration: token, sequence: frame.sequence,
-          untouched: untouched, sourceFormat: frame.sourceAdmission?.format)
+          untouched: untouched, sourceFormat: frame.sourceAdmission?.format, duration: duration, burnIn: burnIn)
         guard self.isAccepting(token, epochRevision: frame.epochRevision) else { return }
         self.lock.withLock { self.observedFrameHandler }?(frame.pts, duration, token)
       }
@@ -2570,7 +2748,7 @@ final class CaptureController: @unchecked Sendable {
     let outputType = CVPixelBufferGetPixelFormatType(rendered)
     if let sink = item.monitorSink, let source = item.source {
       sink.offer(source, pts: item.pts, captureGeneration: item.token, sequence: item.sequence,
-        untouched: item.untouched, sourceFormat: item.sourceAdmission?.format)
+        untouched: item.untouched, sourceFormat: item.sourceAdmission?.format, duration: item.duration, burnIn: item.burnIn)
     }
     guard isAccepting(item.token, epochRevision: item.epochRevision) else { return }
     let processingMS = (timing.completed - item.encodeStart) * 1000
@@ -2595,7 +2773,8 @@ final class CaptureController: @unchecked Sendable {
     if let handler = item.processedHandler {
       let metadata = ProcessedFrameMetadata(
         presentationTime: item.pts, duration: item.duration,
-        width: outputWidth, height: outputHeight, pixelFormat: UInt32(outputType))
+        width: outputWidth, height: outputHeight, pixelFormat: UInt32(outputType),
+        captureHostTime: item.streamHostTime ?? item.hostTime)
       handler(ProcessedFrame(payload: rendered, metadata: metadata), item.token)
     }
     let report = DeliveryReport(item: DeliveryMetadata(item), outcome: outcome,
@@ -2680,6 +2859,18 @@ final class CaptureController: @unchecked Sendable {
     publishIfDue(token: item.token, force: frames == 1 || metadataChanged)
   }
 
+  static func presentationStartHostTime(for image: CVPixelBuffer, captured: CMTime?,
+    reference: CaptureHostTimeReference, duration: CMTime) -> CMTime? {
+    let time: CMTime
+    if let captured, captured.isNumeric, captured.epoch == 0, captured >= .zero {
+      time = captured
+    } else if let seconds = (CVBufferCopyAttachment(image, DeviceAPI.captureHostTimeAttachmentKey as CFString, nil)
+      as? NSNumber)?.doubleValue, seconds.isFinite, seconds > 0 {
+      time = CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)
+    } else { return nil }
+    return reference == .presentationEnd ? CMTimeSubtract(time, duration) : time
+  }
+
   /// Maps source time onto the host clock at encode time, in commit order.
   /// A source backend attaches the frame's hardware capture time on the
   /// host clock when it has one; that anchors the mapping instead of "now".
@@ -2689,17 +2880,8 @@ final class CaptureController: @unchecked Sendable {
     // An explicit mapping is an immutable per-frame capture revision. Its
     // nonzero origins and clock rate take precedence over arrival/legacy tags.
     if let mapping { return (try? mapping.hostTime(for: sourceTime)) ?? .invalid }
-    let now: CMTime
-    if let captured = captureHostTime, captured.isNumeric, captured.epoch == 0, captured >= .zero {
-      now = reference == .presentationEnd ? CMTimeSubtract(captured, sourceDuration ?? duration) : captured
-    } else if let captured = (CVBufferCopyAttachment(image, DeviceAPI.captureHostTimeAttachmentKey as CFString, nil)
-      as? NSNumber)?.doubleValue,
-      captured.isFinite, captured > 0 {
-      let attached = CMTime(seconds: captured, preferredTimescale: 1_000_000_000)
-      now = reference == .presentationEnd ? CMTimeSubtract(attached, sourceDuration ?? duration) : attached
-    } else {
-      now = services.hostTime()
-    }
+    let now = Self.presentationStartHostTime(for: image, captured: captureHostTime,
+      reference: reference, duration: sourceDuration ?? duration) ?? services.hostTime()
     var reset = firstSourceTime == nil
     if let last = lastMappedSourceTime, CMTimeCompare(sourceTime, last) < 0 { reset = true }
     if let origin = firstSourceTime {
@@ -2760,23 +2942,28 @@ final class CaptureController: @unchecked Sendable {
     publishCurrent(token: token)
   }
 
-  private func publishCurrent(token: UInt64, stopped: Bool = false, cause: CaptureStopCause? = nil) {
+  private func publishCurrent(token: UInt64, stopped: Bool = false, cause: CaptureStopCause? = nil,
+    audioOverride: MediaState.Snapshot? = nil) {
     let gpu = processor?.inFlight
     let depth = lock.withLock {
       (sourceDrops: sourceDrops, inFlight: gpu?.count ?? 0, maxInFlight: gpu?.peak ?? 0,
         backlog: queuedFrames, maxBacklog: maxQueuedFrames,
-        signalDropouts: signalDropouts, signalLostFrames: signalLostFrames)
+        signalDropouts: signalDropouts, signalLostFrames: signalLostFrames, sourceFPS: sourceCadence.fps,
+        format: declaredAdmission?.format)
     }
     let retained = retentionBudget.snapshot
     let coreRefusals = lock.withLock { coreRejectedFrames }
     let deviceDrops = services.deviceDroppedFrames()
-    let audio = media.snapshot()
+    let audio = audioOverride ?? media.snapshot()
     let visiblePreview = previewEnabled && services.preview != nil
-    let videoLosses = depth.sourceDrops + depth.signalLostFrames + deviceDrops + coreRefusals + poolDrops + cameraDrops
+    // The device and PTS may both describe the same source loss. Keep their
+    // counts independently visible and use the larger as the source estimate.
+    let videoLosses = max(depth.sourceDrops, deviceDrops) + depth.signalLostFrames + coreRefusals + poolDrops + cameraDrops
     let update = CaptureUpdate(message: message, signal: stopped ? .waiting : currentSignal(),
       input: inputLabel, output: outputLabel,
-      sourceFormat: lock.withLock { declaredAdmission?.format },
-      sourceDuration: detected?.duration,
+      sourceFormat: depth.format,
+      sourceDuration: depth.format?.rate.nominal ?? detected?.duration,
+      sourceFPS: stopped ? 0 : depth.sourceFPS,
       mediaTime: stopped ? nil : lastDeliveredSourceTime,
       pipelineEnabledApplied: applied, frames: frames, dropped: videoLosses,
       processingMS: processingMS, previewDelivered: visiblePreview && !outputLabel.isEmpty && !stopped,
@@ -2798,6 +2985,8 @@ final class CaptureController: @unchecked Sendable {
       audioRMSLeft: stopped ? 0 : audio.rmsLeft, audioRMSRight: stopped ? 0 : audio.rmsRight,
       audioActivityPeak: stopped ? 0 : audio.activityPeak, audioActivityRMS: stopped ? 0 : audio.activityRMS,
       audioBitrateKbps: stopped ? 0 : audio.bitrateKbps, audioPresent: stopped ? false : audio.present,
+      audioInterrupted: !stopped && audio.interrupted,
+      audioInterruptionTime: stopped ? nil : audio.interruptionTime,
       audioPacketTime: stopped ? nil : audio.packetTime,
       audioMeterCoalesced: stopped ? 0 : audioMeterTap.counters.coalesced &- audioMeterCoalescedAtStart,
       videoBitrateMbps: stopped ? 0 : videoBitrateMbps,
@@ -2835,6 +3024,7 @@ private struct DeliveryItem: @unchecked Sendable {
   let source: CVPixelBuffer?
   let pts: CMTime
   let hostTime: CMTime
+  let streamHostTime: CMTime?
   let duration: CMTime
   let receivedAt: Double
   let encodeStart: Double
@@ -2846,6 +3036,7 @@ private struct DeliveryItem: @unchecked Sendable {
   let monitorSink: (any MonitorFrameSink)?
   /// Published as captured (the passthrough copy): the monitor's offer says so.
   let untouched: Bool
+  let burnIn: MonitorLUT?
   let processedHandler: ((ProcessedFrame<CVPixelBuffer>, UInt64) -> Void)?
   let retention: CaptureAdmissionBudget.Lease
   let epochRevision: UInt64
@@ -2931,7 +3122,11 @@ private final class CameraLink: @unchecked Sendable {
 /// Audio and timecode statistics, written on the driver's media callback.
 private final class MediaState: @unchecked Sendable {
   struct Snapshot {
-    var timecode: String?
+    // The capture callback stores the source value. Format it only for a
+    // consumer reading this snapshot, after releasing the writer's lock.
+    var nativeTimecode: Timecode?
+    var legacyTimecode: String?
+    var timecode: String? { nativeTimecode?.displayLabel ?? legacyTimecode }
     var channels = 0
     var sampleRate = 0
     var packets: UInt64 = 0
@@ -2945,6 +3140,8 @@ private final class MediaState: @unchecked Sendable {
     var activityPeak: Float = 0
     var activityRMS: Float = 0
     var present = false
+    var interrupted = false
+    var interruptionTime: CMTime?
     var packetTime: CMTime?
     var bitrateKbps = 0.0
   }
@@ -2966,10 +3163,6 @@ private final class MediaState: @unchecked Sendable {
     }
   }
 
-  func resetPacketBaseline() {
-    lock.withLock { state.packetTime = nil; lastSampleFrames = 0; lastPacketRate = nil }
-  }
-
   func snapshot() -> Snapshot { lock.withLock { state } }
 
   func updateRates(now: Double) {
@@ -2983,9 +3176,52 @@ private final class MediaState: @unchecked Sendable {
     }
   }
 
-  func record(_ stats: CaptureMediaStats) {
+  func recordTimecode(_ native: Timecode?) {
     lock.withLock {
-      state.timecode = stats.timecode
+      state.nativeTimecode = native
+      state.legacyTimecode = nil
+    }
+  }
+
+  func clearAudio(newEpoch: Bool) -> Snapshot? {
+    lock.withLock {
+      let hadAudio = state.present || state.interrupted || state.channels > 0
+      if newEpoch {
+        state.channels = 0
+        state.sampleRate = 0
+      }
+      state.present = false
+      state.interrupted = hadAudio || !newEpoch
+      state.interruptionTime = state.packetTime ?? state.interruptionTime
+      state.packetTime = nil
+      state.peakLeft = 0
+      state.peakRight = 0
+      state.rmsLeft = 0
+      state.rmsRight = 0
+      state.activityPeak = 0
+      state.activityRMS = 0
+      state.bitrateKbps = 0
+      rateBytes = 0
+      lastSampleFrames = 0
+      lastPacketRate = nil
+      let absence = state.interrupted ? state : nil
+      // Publish the clear once on the outgoing audio clock. Only the new
+      // epoch's timestamps should drive the switcher after that update.
+      if newEpoch { state.interruptionTime = nil }
+      return absence
+    }
+  }
+
+  func record(_ stats: CaptureMediaStats, nativeTimecode: Timecode?, updatesTimecode: Bool) {
+    lock.withLock {
+      if updatesTimecode {
+        state.nativeTimecode = nativeTimecode
+        state.legacyTimecode = stats.timecode
+      }
+      if stats.audioPresent {
+        state.interrupted = false
+        state.interruptionTime = nil
+      }
       state.channels = max(0, stats.audioChannels)
       state.packets &+= 1
       state.samples &+= stats.audioSampleFrames
@@ -3027,6 +3263,36 @@ private final class MediaState: @unchecked Sendable {
       state.packetTime = packetTime
       lastSampleFrames = stats.audioSampleFrames
     }
+  }
+}
+
+/// Source timestamps measure input cadence independently of downstream selection.
+private struct SourceCadence {
+  var fps = 0.0
+  private var first: CMTime?
+  private var last: CMTime?
+  private var intervals = 0
+
+  mutating func record(_ pts: CMTime) {
+    if let first, let last {
+      let gap = CMTimeSubtract(pts, last).seconds
+      if gap == 0 { return }
+      if gap > 0, gap < 10 {
+        self.last = pts
+        intervals += 1
+        let span = CMTimeSubtract(pts, first).seconds
+        if span >= 0.25 {
+          fps = Double(intervals) / span
+          self.first = pts
+          intervals = 0
+        }
+        return
+      }
+    }
+    first = pts
+    last = pts
+    intervals = 0
+    fps = 0
   }
 }
 
@@ -3196,6 +3462,8 @@ protocol MonitorFrameSink: AnyObject, Sendable {
   func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64, untouched: Bool)
   func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
     untouched: Bool, sourceFormat: SourceFormat?)
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
+    untouched: Bool, sourceFormat: SourceFormat?, duration: CMTime, burnIn: MonitorLUT?)
   /// The capture stopped: rejects `rejected` (and every older generation) and
   /// drops the stopped generation's state.
   func invalidate(rejectingCaptureGeneration rejected: UInt64?)
@@ -3205,6 +3473,12 @@ extension MonitorFrameSink {
   func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
     untouched: Bool, sourceFormat: SourceFormat?) {
     offer(image, pts: pts, captureGeneration: captureGeneration, sequence: sequence, untouched: untouched)
+  }
+
+  func offer(_ image: CVPixelBuffer, pts: CMTime, captureGeneration: UInt64, sequence: UInt64,
+    untouched: Bool, sourceFormat: SourceFormat?, duration: CMTime, burnIn: MonitorLUT?) {
+    offer(image, pts: pts, captureGeneration: captureGeneration, sequence: sequence,
+      untouched: untouched, sourceFormat: sourceFormat)
   }
 
   /// A frame the camera processes (or Program's, already processed).

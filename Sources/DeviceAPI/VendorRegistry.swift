@@ -30,7 +30,7 @@ struct VendorRegistrySnapshot: Sendable {
   private struct WeakObservation { weak var value: VendorRegistryObservation? }
 
   #if !ULTRACAM_REGISTRY_STANDALONE
-  nonisolated static let capture: [any CaptureSourcePlugin] = [DeckLinkCapturePlugin()]
+  nonisolated static let capture: [any CaptureSourcePlugin] = [DeckLinkCapturePlugin(), MacCameraCapturePlugin()]
   static let control: [any CameraControlPlugin] = [SonyControlPlugin()]
   static func makeLive(settingsPolicy: VendorSettingsPolicy) throws -> VendorRegistry {
     try VendorRegistry(capture: capture, control: control, settingsPolicy: settingsPolicy)

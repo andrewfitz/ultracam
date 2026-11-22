@@ -4,6 +4,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -91,6 +92,7 @@ impl LlmDecisionProvider for OllamaProvider {
 }
 
 struct Request {
+    session: Weak<()>,
     id: Uuid,
     context: DecisionContext,
 }
@@ -104,6 +106,7 @@ struct ResultMessage {
 /// requests execute on a bounded worker channel and are only eligible after
 /// the configured media delay. Late responses are discarded by the caller.
 pub struct DelayedLlmAdvisor {
+    session: Arc<()>,
     request_tx: SyncSender<Request>,
     result_rx: Receiver<ResultMessage>,
     pending: HashMap<Uuid, (MediaTime, MediaTime)>,
@@ -119,6 +122,9 @@ impl DelayedLlmAdvisor {
             .spawn(move || {
                 let mut provider = provider;
                 while let Ok(request) = request_rx.recv() {
+                    if request.session.upgrade().is_none() {
+                        continue;
+                    }
                     let id = request.id;
                     let result = provider
                         .decide(&request.context)
@@ -130,11 +136,19 @@ impl DelayedLlmAdvisor {
             })
             .expect("failed to start Ollama advisor worker");
         Self {
+            session: Arc::new(()),
             request_tx,
             result_rx,
             pending: HashMap::new(),
             completed: HashMap::new(),
         }
+    }
+
+    /// Retire queued requests and forget their IDs so in-flight replies are discarded by poll.
+    pub fn reset(&mut self) {
+        self.session = Arc::new(());
+        self.pending.clear();
+        self.completed.clear();
     }
 
     pub fn submit(
@@ -143,7 +157,9 @@ impl DelayedLlmAdvisor {
         available_at: MediaTime,
         expires_at: MediaTime,
     ) -> Option<Uuid> {
-        if !available_at.is_finite()
+        const MAX_PENDING_REQUESTS: usize = 64;
+        if self.pending.len() >= MAX_PENDING_REQUESTS
+            || !available_at.is_finite()
             || !expires_at.is_finite()
             || available_at < 0.0
             || expires_at < available_at
@@ -152,7 +168,12 @@ impl DelayedLlmAdvisor {
         }
         let id = Uuid::new_v4();
         context.request_id = id;
-        if self.request_tx.try_send(Request { id, context }).is_err() {
+        let request = Request {
+            session: Arc::downgrade(&self.session),
+            id,
+            context,
+        };
+        if self.request_tx.try_send(request).is_err() {
             return None;
         }
         self.pending.insert(id, (available_at, expires_at));

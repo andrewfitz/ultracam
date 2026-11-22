@@ -80,8 +80,8 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
         } else { self.sessionAudioDeclaration = .absent }
         self.emit(.event(.audioFormatChanged(self.sessionAudioDeclaration)))
       }
-      let media: UltracamMediaStatsHandler = { [weak self] tc, pts, frames, channels, lp, rp, lr, rr, bytes, present in
-        self?.receiveMedia(tc, pts, Int(frames), Int(channels), Double(lp), Double(rp), Double(lr), Double(rr), Int(bytes), present)
+      let media: UltracamMediaStatsHandler = { [weak self] _, pts, frames, _, lp, rp, lr, rr, bytes, present in
+        self?.receiveMedia(pts, Int(frames), Double(lp), Double(rp), Double(lr), Double(rr), Int(bytes), present)
       }
       let audio: UltracamRawAudioHandler = { [weak self] data, pts, frames, channels, bytes in
         self?.receiveAudio(data, pts, Int(frames), Int(channels), Int(bytes))
@@ -132,13 +132,15 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
   func deliverFixtureGroup(_ buffer: CVPixelBuffer, videoTime: CMTime, audioTime: CMTime, samples: Data) {
     beginGroup(); defer { endGroup() }
     receiveFrame(buffer, videoTime, VideoContract.slowDuration, true)
-    receiveMedia(nil, audioTime, 2, 2, 0, 0, 0, 0, samples.count, true)
-    receiveAudio(samples, audioTime, 2, 2, 4)
+    receiveMedia(audioTime, 2, 0, 0, 0, 0, samples.count, true)
+    // Match the ownership guarantee provided by native reportRawAudio.
+    receiveAudio(samples.withUnsafeBytes { Data($0) }, audioTime, 2, 2, 4)
   }
-  func deliverFixtureMediaWithoutAudio(_ buffer: CVPixelBuffer, at time: CMTime) {
+  func deliverFixtureMediaWithoutAudio(_ buffer: CVPixelBuffer, at time: CMTime, timecode: String? = nil) {
     beginGroup(); defer { endGroup() }
+    receiveTimecode(timecode)
     receiveFrame(buffer, time, VideoContract.slowDuration, true)
-    receiveMedia(nil, .invalid, 0, 0, 0, 0, 0, 0, 0, false)
+    receiveMedia(.invalid, 0, 0, 0, 0, 0, 0, false)
   }
   func deliverOwnedFixture(_ owner: UCDeckLinkOwnedMemoryFrame, at time: CMTime) {
     beginGroup(); defer { endGroup() }
@@ -217,10 +219,10 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
       emit(.frame(CapturedPixelBuffer(immutable: buffer), info))
     } catch { failures += 1; emit(.event(.fatal(error.localizedDescription))) }
   }
-  private func receiveMedia(_ tc: String?, _ pts: CMTime, _ frames: Int, _ channels: Int,
+  private func receiveMedia(_ pts: CMTime, _ frames: Int,
     _ lp: Double, _ rp: Double, _ lr: Double, _ rr: Double, _ bytes: Int, _ present: Bool) {
     guard accepting else { return }
-    emit(.media(CaptureMediaInfo(timecode: Self.timecode(tc), pairedFrameSequence: pairedFrame,
+    emit(.media(CaptureMediaInfo(timecode: frameTimecode, pairedFrameSequence: pairedFrame,
       audioDeclaration: sessionAudioDeclaration,
       audioPacketTime: present ? pts : nil, audioClockInstance: present ? bindings.audio : nil,
       sampleFrameCount: present ? frames : 0, byteCount: present ? bytes : 0,
@@ -292,7 +294,8 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
     guard accepting, let data else { return }
     do {
       guard channels == sessionAudioFormat.channels, bytes == 4 else { throw PluginError.unsupported("Unexpected DeckLink PCM layout") }
-      emit(.rawAudio(try CaptureAudioPacket(planes: [data], sampleFrameCount: frames, format: sessionAudioFormat,
+      // Native reportRawAudio owns an immutable NSData copy before it calls Swift.
+      emit(.rawAudio(try CaptureAudioPacket(ownedInterleavedPCM: data, sampleFrameCount: frames, format: sessionAudioFormat,
         packetTime: pts, pairedFrameSequence: pairedFrame)))
     } catch { failures += 1; emit(.event(.fatal(error.localizedDescription))) }
   }
@@ -355,9 +358,15 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
     let p = tag(kCVImageBufferColorPrimariesKey), t = tag(kCVImageBufferTransferFunctionKey), m = tag(kCVImageBufferYCbCrMatrixKey)
     let pixel = CVPixelBufferGetPixelFormatType(buffer)
     let rgb = pixel == 0x72323130 || pixel == 0x5231324c
+    let matrix: Colorimetry.Matrix
+    if rgb { matrix = .identity }
+    else if m == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String { matrix = .rec2020 }
+    else if m == kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String { matrix = .rec709 }
+    else if m == kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String { matrix = .rec601 }
+    else { matrix = .unspecified }
     return Colorimetry(primaries: p == kCVImageBufferColorPrimaries_ITU_R_2020 as String ? .rec2020 : p == kCVImageBufferColorPrimaries_ITU_R_709_2 as String ? .rec709 : .unspecified,
       transfer: t == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String ? .pq : t == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String ? .hlg : t == kCVImageBufferTransferFunction_ITU_R_709_2 as String ? .rec709 : .unspecified,
-      matrix: rgb ? .identity : m == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String ? .rec2020 : m == kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String ? .rec709 : .unspecified,
+      matrix: matrix,
       range: pixel == 0x5231324c ? .full : .video, horizontalChromaSiting: rgb ? .unspecified : .left, verticalChromaSiting: rgb ? .unspecified : .center)
   }
 }

@@ -75,12 +75,12 @@ function injectIcons() {
 
 // ---------- Synthetic pictures ----------
 
-function person(fx) {
+function person(fx, id) {
   const peak = fx.includes('peak');
   const p = `
-    <path d="M410 900 C450 700 610 655 800 655 C990 655 1150 700 1190 900 Z" fill="url(#sweater)"/>
+    <path d="M410 900 C450 700 610 655 800 655 C990 655 1150 700 1190 900 Z" fill="url(#sweater${id})"/>
     <path d="M735 560 h130 v120 c-30 25 -100 25 -130 0z" fill="#a8704f"/>
-    <ellipse cx="800" cy="420" rx="148" ry="188" fill="url(#skin)"/>
+    <ellipse cx="800" cy="420" rx="148" ry="188" fill="url(#skin${id})"/>
     <ellipse cx="652" cy="440" rx="22" ry="40" fill="#b67b5a"/>
     <ellipse cx="948" cy="440" rx="22" ry="40" fill="#b67b5a"/>
     <path d="M652 400 C640 250 720 205 805 205 C900 205 965 260 950 400 C930 330 880 300 800 300 C730 300 680 320 652 400z" fill="#2a1d16"/>
@@ -99,7 +99,7 @@ function person(fx) {
   return p + edges;
 }
 
-function room(variant) {
+function room(variant, id) {
   const book = (x, y, w, h, c) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}"/>`;
   let books = '';
   const colors = ['#7d3b33', '#36506b', '#8a7246', '#4e6046', '#5b4060', '#a0643a', '#2f4153'];
@@ -114,9 +114,9 @@ function room(variant) {
     }
   }
   return `
-    <rect width="1600" height="900" fill="url(#wall)"/>
+    <rect width="1600" height="900" fill="url(#wall${id})"/>
     <rect x="70" y="80" width="400" height="560" rx="6" fill="#c9d2d6"/>
-    <rect x="86" y="96" width="368" height="528" fill="url(#sky)"/>
+    <rect x="86" y="96" width="368" height="528" fill="url(#sky${id})"/>
     <path d="M270 96v528M86 360h368" stroke="#b8c0c4" stroke-width="12"/>
     <rect x="1180" y="120" width="350" height="580" fill="#2b221d"/>
     ${books}
@@ -124,16 +124,18 @@ function room(variant) {
     <ellipse cx="1080" cy="610" rx="70" ry="110" fill="#2e4a2c"/><ellipse cx="1040" cy="560" rx="45" ry="90" fill="#3d5f36"/>
     <rect x="1040" y="680" width="80" height="90" rx="10" fill="#6a4a36"/>
     <rect y="800" width="1600" height="100" fill="#35281f"/>
-    <rect x="0" y="0" width="1600" height="900" fill="url(#vignette)"/>
+    <rect x="0" y="0" width="1600" height="900" fill="url(#vignette${id})"/>
     ${variant === 'wide' ? '<rect x="560" y="620" width="520" height="40" rx="8" fill="#1a1512"/>' : ''}`;
 }
 
+let nextSceneID = 0;
+
 function sceneSVG(kind, tone, fx) {
-  const id = Math.random().toString(36).slice(2, 8);
-  let content = room(kind);
-  if (kind === 'wide') content += `<g transform="translate(560 250) scale(0.55)">${person(fx)}</g>`;
-  else if (kind === 'ots') content += `<g transform="translate(-150 120) scale(0.95) rotate(-4 800 500)">${person(fx)}</g>`;
-  else content += person(fx);
+  const id = `-scene-${++nextSceneID}`;
+  let content = room(kind, id);
+  if (kind === 'wide') content += `<g transform="translate(560 250) scale(0.55)">${person(fx, id)}</g>`;
+  else if (kind === 'ots') content += `<g transform="translate(-150 120) scale(0.95) rotate(-4 800 500)">${person(fx, id)}</g>`;
+  else content += person(fx, id);
   if (fx.includes('zebra')) {
     content += `<rect x="86" y="96" width="368" height="528" fill="url(#zeb${id})"/>`;
   }
@@ -154,11 +156,11 @@ function sceneSVG(kind, tone, fx) {
   const t = (c) => fcBins.map((b) => b[c]).join(' ');
   return `<svg class="scene" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
     <defs>
-      <linearGradient id="wall" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7a6553"/><stop offset="1" stop-color="#4a3b31"/></linearGradient>
-      <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f4f8fb"/><stop offset="1" stop-color="#dfe9ee"/></linearGradient>
-      <linearGradient id="sweater" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#36557a"/><stop offset="1" stop-color="#1f3149"/></linearGradient>
-      <radialGradient id="skin" cx="0.42" cy="0.4" r="0.7"><stop offset="0" stop-color="#e2a582"/><stop offset="0.7" stop-color="#c98e6c"/><stop offset="1" stop-color="#9c6347"/></radialGradient>
-      <radialGradient id="vignette" cx="0.5" cy="0.5" r="0.75"><stop offset="0.6" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></radialGradient>
+      <linearGradient id="wall${id}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7a6553"/><stop offset="1" stop-color="#4a3b31"/></linearGradient>
+      <linearGradient id="sky${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f4f8fb"/><stop offset="1" stop-color="#dfe9ee"/></linearGradient>
+      <linearGradient id="sweater${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#36557a"/><stop offset="1" stop-color="#1f3149"/></linearGradient>
+      <radialGradient id="skin${id}" cx="0.42" cy="0.4" r="0.7"><stop offset="0" stop-color="#e2a582"/><stop offset="0.7" stop-color="#c98e6c"/><stop offset="1" stop-color="#9c6347"/></radialGradient>
+      <radialGradient id="vignette${id}" cx="0.5" cy="0.5" r="0.75"><stop offset="0.6" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></radialGradient>
       <pattern id="zeb${id}" width="22" height="22" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
         <rect width="11" height="22" fill="#000" fill-opacity="0.55"/></pattern>
       <filter id="slog${id}" color-interpolation-filters="sRGB">

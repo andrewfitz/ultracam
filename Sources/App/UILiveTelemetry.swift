@@ -11,6 +11,7 @@ extension UISessionBridge {
   static func applyCapture(_ update: CaptureUpdate?, withinLossHold: Bool = false, to camera: inout UICameraSnapshot) {
     camera.timecode = update?.timecode
     camera.droppedFrames = camera.running ? update.map { Int(clamping: $0.videoDrops) } : nil
+    camera.measuredInputFPS = camera.running ? update?.sourceFPS ?? 0 : 0
     camera.signalDropouts = Int(clamping: update?.signalDropouts ?? 0)
     camera.signal = UIFormatLabels.signal(running: camera.running, deviceAvailable: camera.deviceAvailable,
       update: update, withinLossHold: withinLossHold)
@@ -43,7 +44,7 @@ extension UISessionBridge {
     rec.audio = model.takeAudioSoFar(id) ?? model.takeAudio[id]
     rec.savedDuration = rec.savedURL != nil ? stats?.elapsed : nil
     // The drive read found each folder's volume (inside its security scope); the path can't say.
-    let folder = model.recordingModel.outputFolder(for: id)?.path
+    let folder = model.recordingModel.currentOutputFolder(for: id)?.path
     let drive = folder.flatMap { path in drives.first { $0.folders.contains(path) } }
     rec.volumeID = drive?.id
     rec.secondsLeft = drive?.secondsLeft
@@ -56,17 +57,22 @@ extension UISessionBridge {
     // and the views that show the figures re-read them on a timer.
     _ = UIDriveLevels.shared.revision
     let recording = model.recordingModel
-    let folders = model.feedDescriptors.map { recording.outputFolder(for: $0.id) }
+    let folders = model.feedDescriptors.map { recording.currentOutputFolder(for: $0.id) }
     return Self.cachedDrives(for: folders, lowSeconds: interface.lowSpaceSeconds) {
       var rolling: [(URL, Double)] = []
       var assigned: [(URL, Double)] = []
       for descriptor in model.feedDescriptors {
-        guard let folder = recording.outputFolder(for: descriptor.id) else { continue }
+        guard let folder = recording.currentOutputFolder(for: descriptor.id) else { continue }
         let channels = model.cameraUpdate(descriptor.id).map { $0.audioChannels > 0 ? $0.audioChannels : 2 } ?? 2
         let estimate = displayRate(descriptor.id, audioChannels: channels)
         assigned.append((folder, estimate))
         if let state = recording.feeds.first(where: { $0.id == descriptor.id }),
           state.status == .recording || state.status == .paused {
+          if let bitrate = state.takeVideoMbps {
+            let measured = state.statistics?.videoMegabitsPerSecond ?? 0
+            rolling.append((folder, (measured > 0 ? measured : Double(bitrate)) + 0.128))
+            continue
+          }
           rolling.append((folder, UIRecordingLibrary.rollingMegabits(measuredVideo: state.statistics?.videoMegabitsPerSecond,
             estimate: estimate, audioChannels: channels)))
         }
@@ -81,6 +87,7 @@ extension UISessionBridge {
   private func displayRate(_ id: FeedID, audioChannels: Int) -> Double {
     let recording = model.recordingModel
     let state = recording.feeds.first { $0.id == id }
+    if let rate = state?.takeVideoMbps, state?.isActive == true { return Double(rate) + 0.128 }
     let source = model.cameraUpdate(id)?.sourceFormat
     let codec = (state?.isActive == true ? state?.takeCodec : nil) ?? recording.codec.resolved(for: source)
     guard let format = source else {
@@ -136,6 +143,8 @@ extension UISessionBridge {
     return camera
   }
 
+  var streamSnapshot: ProgramStreamSnapshot { bridge.model.streamSnapshot }
+
   /// The drives' free space, now (read at most every two seconds; not observable).
   func drives() -> [UIDrive] { bridge.currentDrives() }
 }
@@ -152,12 +161,12 @@ extension EnvironmentValues {
 }
 
 extension UIContext {
-  /// One leaf's snapshot. Keep the drive read even for capture-only leaves: it
-  /// also refreshes the low-space levels that wake the session's alerts.
+  /// One leaf's snapshot. Only the take's values need the drive's free space.
+  /// The status bar and the recording alert timer refresh drive levels separately.
   func liveCameraSnapshot(_ id: String, live: UILiveSource?, follows: UILiveSource.Follows) -> UICameraSnapshot? {
-    guard let live else { return snapshot(id) }
-    let drives = live.drives()
     guard let original = snapshot(id) else { return nil }
+    guard let live else { return original }
+    let drives = follows.contains(.take) ? live.drives() : []
     var camera = live.camera(original, follows: follows, drives: drives)
     if let since = camera.signalLostSince {
       camera.signalLostFor = ProcessInfo.processInfo.systemUptime - since

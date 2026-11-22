@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -16,11 +17,46 @@ final class RecordingDirectoryAccess: @unchecked Sendable {
 /// One small, fsynced journal owns an interrupted movie. A process lock keeps
 /// discovery/recovery from opening a take that another writer still owns.
 final class RecordingRecoveryJournal: @unchecked Sendable {
+  struct MovieIdentity: Codable, Equatable {
+    let bytes: UInt64
+    let fingerprint: Data
+
+    init(reading url: URL) throws {
+      let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+      guard fd >= 0 else { throw RecordingOutputError.unsafePath }
+      let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+      defer { try? handle.close() }
+      var info = stat()
+      guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size > 0 else {
+        throw RecordingOutputError.unsafePath
+      }
+      bytes = UInt64(info.st_size)
+      // The identity must survive both a rename and a removable volume remount.
+      let sampleBytes = 4096
+      let headBytes = Int(min(UInt64(sampleBytes), bytes))
+      guard let head = try handle.read(upToCount: headBytes), head.count == headBytes else {
+        throw RecordingOutputError.unsafePath
+      }
+      var hash = SHA256()
+      hash.update(data: head)
+      if bytes > UInt64(headBytes) {
+        let tailBytes = Int(min(UInt64(sampleBytes), bytes - UInt64(headBytes)))
+        try handle.seek(toOffset: bytes - UInt64(tailBytes))
+        guard let tail = try handle.read(upToCount: tailBytes), tail.count == tailBytes else {
+          throw RecordingOutputError.unsafePath
+        }
+        hash.update(data: tail)
+      }
+      fingerprint = Data(hash.finalize())
+    }
+  }
+
   struct Entry: Codable {
     var version = 1
     let temporaryName: String
     let finalName: String
     var recoveredName: String?
+    var recoveredIdentity: MovieIdentity? = nil
     var sidecarOwned: Bool? = nil
   }
   let url: URL
@@ -87,9 +123,19 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
     entry.sidecarOwned = true
     try save()
   }
-  func markRecovered(_ url: URL) throws {
-    entry.recoveredName = url.lastPathComponent
+  func preparePublication(of staging: URL, to destination: URL) throws {
+    let identity = try MovieIdentity(reading: staging)
+    entry.recoveredName = destination.lastPathComponent
+    entry.recoveredIdentity = identity
     try save()
+  }
+
+  func publishedMovie(in folder: URL) -> URL? {
+    guard let name = entry.recoveredName else { return nil }
+    let url = folder.appendingPathComponent(name)
+    guard let identity = try? MovieIdentity(reading: url),
+      entry.recoveredIdentity.map({ $0 == identity }) ?? true else { return nil }
+    return url
   }
   func remove() { try? FileManager.default.removeItem(at: url) }
   deinit { close(descriptor) }
@@ -161,9 +207,10 @@ enum RecordingRecovery {
           }
         }
         let final = folder.appendingPathComponent(journal.entry.finalName)
-        if let recovered = journal.entry.recoveredName,
-          fm.fileExists(atPath: folder.appendingPathComponent(recovered).path) { continue }
-        guard !fm.fileExists(atPath: final.path), regularNonempty(source) else { continue }
+        if journal.publishedMovie(in: folder) != nil { continue }
+        // If publication succeeded the partial was moved away. A partial
+        // beside an occupied final name still needs recovery to a new name.
+        guard regularNonempty(source) else { continue }
         result.append(InterruptedRecording(journalURL: url, temporaryURL: source, finalURL: final))
       }
     }
@@ -191,11 +238,11 @@ enum RecordingRecovery {
     guard folder.appendingPathComponent(journal.entry.temporaryName) == take.temporaryURL,
       folder.appendingPathComponent(journal.entry.finalName) == take.finalURL,
       regularNonempty(take.temporaryURL) else { throw RecordingOutputError.unsafePath }
-    if let name = journal.entry.recoveredName {
-      let recovered = folder.appendingPathComponent(name)
-      if regularNonempty(recovered) { return recovered }
-    }
-    let asset = AVURLAsset(url: take.temporaryURL, options: [AVURLAssetOverrideMIMETypeKey: "video/quicktime"])
+    if let recovered = journal.publishedMovie(in: folder) { return recovered }
+    let mp4 = take.finalURL.pathExtension.lowercased() == "mp4"
+    let mime = mp4 ? "video/mp4" : "video/quicktime"
+    let ext = mp4 ? "mp4" : "mov"
+    let asset = AVURLAsset(url: take.temporaryURL, options: [AVURLAssetOverrideMIMETypeKey: mime])
     let tracks = try await asset.loadTracks(withMediaType: .video)
     let duration = try await asset.load(.duration)
     guard !tracks.isEmpty, duration.isNumeric, duration.seconds > 0 else {
@@ -208,10 +255,10 @@ enum RecordingRecovery {
     let staging = take.temporaryURL.appendingPathExtension("export.ultracam-recovery")
     guard !fm.fileExists(atPath: staging.path) else { throw RecordingOutputError.destinationExists }
     defer { _ = unlink(staging.path) }
-    try await exporter.export(to: staging, as: .mov)
+    try await exporter.export(to: staging, as: mp4 ? .mp4 : .mov)
     // The staging name has no movie extension, so state the container type,
     // as for the source; otherwise AVFoundation cannot open the export.
-    let recoveredAsset = AVURLAsset(url: staging, options: [AVURLAssetOverrideMIMETypeKey: "video/quicktime"])
+    let recoveredAsset = AVURLAsset(url: staging, options: [AVURLAssetOverrideMIMETypeKey: mime])
     let recoveredTracks = try await recoveredAsset.loadTracks(withMediaType: .video)
     let recoveredDuration = try await recoveredAsset.load(.duration)
     guard !recoveredTracks.isEmpty, recoveredDuration.isNumeric, recoveredDuration.seconds > 0 else {
@@ -221,13 +268,16 @@ enum RecordingRecovery {
     try handle.synchronize()
     try handle.close()
     let stem = take.finalURL.deletingPathExtension().lastPathComponent + "_Recovered"
-    var destination = folder.appendingPathComponent(stem + ".mov")
+    var destination = folder.appendingPathComponent(stem + "." + ext)
     var counter = 2
     while fm.fileExists(atPath: destination.path) || fm.fileExists(atPath: RecordingTakeSidecar.url(for: destination).path)
       || fm.fileExists(atPath: RecordingTakeSidecar.url(for: destination).appendingPathExtension("journal").path) {
-      destination = folder.appendingPathComponent(stem + "_\(counter).mov")
+      destination = folder.appendingPathComponent(stem + "_\(counter).\(ext)")
       counter += 1
     }
+    // Persist the intended movie before publishing it. After an interruption,
+    // the same marker detects a completed rename or lets an unpublished take retry.
+    try journal.preparePublication(of: staging, to: destination)
     if journal.entry.sidecarOwned == true {
       try RecordingTakeSidecar.copyPairedMetadata(from: RecordingTakeSidecar.url(for: take.finalURL), toMovie: destination)
     }
@@ -238,7 +288,6 @@ enum RecordingRecovery {
       }
       throw error
     }
-    try journal.markRecovered(destination)
     return destination
   }
 }

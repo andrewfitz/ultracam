@@ -651,6 +651,8 @@ class FakeAttributes final : public IDeckLinkProfileAttributes {
   ULONG references = 1;
   int64_t persistentID = 0x1234abcd;
   HRESULT persistentIDResult = S_OK;
+  std::optional<int64_t> topology;
+  int64_t subdevice = 0;
   bool formatDetection = true, hdrMetadata = true, colorspaceMetadata = true;
   bool hdmiTimecode = true, highFrameRateTimecode = false;
   int64_t maximumHDMIAudioChannels = 8, maximumAudioChannels = 16;
@@ -673,6 +675,8 @@ class FakeAttributes final : public IDeckLinkProfileAttributes {
     if (key == BMDDeckLinkMaximumAudioChannels) { *value = maximumAudioChannels; return S_OK; }
     if (key == BMDDeckLinkAudioInputConnections) { *value = audioInputConnections; return S_OK; }
     if (key == BMDDeckLinkVideoInputConnections) { *value = videoInputConnections; return S_OK; }
+    if (key == BMDDeckLinkTopologicalID && topology) { *value = *topology; return S_OK; }
+    if (key == BMDDeckLinkSubDeviceIndex) { *value = subdevice; return S_OK; }
     if (key == BMDDeckLinkPersistentID) { *value = persistentID; return persistentIDResult; }
     if (key == BMDDeckLinkMaximumHDMIAudioChannels) { if (maximumHDMIAudioChannels <= 0) return E_INVALIDARG; *value = maximumHDMIAudioChannels; return S_OK; }
     return E_INVALIDARG;
@@ -826,6 +830,22 @@ class FakeDeckLink final : public IDeckLink {
       status.references == 1 && edid.references == 1 && notification.references == 1 && statistics.references == 1 &&
       status.detectedMode.references == 1;
   }
+};
+
+class FakeDeviceIterator final : public IDeckLinkIterator {
+ public:
+  explicit FakeDeviceIterator(std::vector<IDeckLink *> devices) : devices(std::move(devices)) {}
+  HRESULT QueryInterface(REFIID, LPVOID *out) override { *out = nullptr; return E_NOINTERFACE; }
+  ULONG AddRef() override { return ++references; }
+  ULONG Release() override { return --references; }
+  HRESULT Next(IDeckLink **out) override {
+    if (position == devices.size()) { *out = nullptr; return S_FALSE; }
+    *out = devices[position++]; (*out)->AddRef(); return S_OK;
+  }
+ private:
+  std::vector<IDeckLink *> devices;
+  size_t position = 0;
+  ULONG references = 1;
 };
 
 class FakeAPIInformation final : public IDeckLinkAPIInformation {
@@ -1150,14 +1170,14 @@ BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
     {
     DeviceRegistry registry(queue);
     registry.arrived(&a); registry.arrived(&b); registry.drain();
-    if (a.references != 3 || b.references != 3)
-      return fail(error, @"Legacy identity storage lost a COM reference while growing.");
+    if (a.references != 2 || b.references != 2)
+      return fail(error, @"Discovery must own exactly one device reference per entry.");
     NSString *aID = registry.snapshot()[0].identifier;
     NSString *bID = registry.snapshot()[1].identifier;
     registry.removed(&a); registry.drain();
     registry.arrived(&c); registry.drain();
-    if (a.references != 2 || b.references != 3 || c.references != 3)
-      return fail(error, @"Legacy identity storage lost references after removal and reallocation.");
+    if (a.references != 1 || b.references != 2 || c.references != 2)
+      return fail(error, @"Removal did not retire the legacy device reference.");
     NSArray<UltracamDevice *> *devices = registry.snapshot();
     if (devices.count != 2 || [devices[0].identifier isEqualToString:devices[1].identifier])
       return fail(error, @"Legacy hotplug reused a live device identifier.");
@@ -1166,9 +1186,11 @@ BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
     selectedC.value = registry.copyDevice(devices[1].identifier, nullptr);
     if (selectedB.value != &b || selectedC.value != &c)
       return fail(error, @"Legacy identifiers selected the wrong live COM device.");
-    if (![registry.identifierForDevice(&b) isEqualToString:bID] ||
-        ![registry.identifierForDevice(&c) isEqualToString:devices[1].identifier])
-      return fail(error, @"Legacy iterator identity disagreed with discovery.");
+    if ([devices[1].identifier isEqualToString:aID])
+      return fail(error, @"A new indistinguishable device took over a saved camera's identifier.");
+    FakeDeviceIterator ambiguous({&c, &b});
+    if (!registry.uniqueIteratorInputs(&ambiguous).empty())
+      return fail(error, @"An iterator guessed the identities of identical legacy devices.");
     auto session = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
     registry.attachSession(bID, session, session->stats);
     registry.removed(&c); registry.drain();
@@ -1177,9 +1199,33 @@ BOOL UltracamRunDiscoverySyntheticChecks(NSError **error) {
     if (!stillAccepting)
       return fail(error, @"Removing another legacy device disconnected the surviving session.");
     registry.arrived(&a); registry.drain();
-    if (![registry.snapshot()[1].identifier isEqualToString:aID])
-      return fail(error, @"Legacy rearrival changed its discovery-lifetime identity.");
+    if ([registry.snapshot()[1].identifier isEqualToString:aID])
+      return fail(error, @"Rediscovery guessed which indistinguishable physical card reconnected.");
     }
+    DeviceRegistry unique(queue);
+    unique.arrived(&a); unique.drain();
+    NSString *saved = unique.snapshot()[0].identifier;
+    unique.removed(&a); unique.drain();
+    if (a.references != 1) return fail(error, @"The removed wrapper still has an identity lease.");
+    unique.arrived(&c); unique.drain();
+    if (![unique.snapshot()[0].identifier isEqualToString:saved])
+      return fail(error, @"Unambiguous legacy reconnect through a new wrapper changed its identifier.");
+    unique.removed(&c); unique.drain();
+    FakeDeviceIterator single({&c});
+    auto only = unique.uniqueIteratorInputs(&single);
+    if (only.size() != 1 || ![only[0].identity.identifier() isEqualToString:saved])
+      return fail(error, @"Iterator identity disagreed with a single legacy discovery.");
+    only.clear();
+    a.attributes.topology = b.attributes.topology = c.attributes.topology = 0x123;
+    b.attributes.subdevice = 1;
+    FakeDeviceIterator original({&a, &b}), reordered({&b, &c});
+    auto before = unique.uniqueIteratorInputs(&original), after = unique.uniqueIteratorInputs(&reordered);
+    if (before.size() != 2 || after.size() != 2 || before[0].identity.nameOnly ||
+        [before[0].identity.key isEqualToString:before[1].identity.key] ||
+        ![before[0].identity.key isEqualToString:after[1].identity.key] ||
+        ![before[1].identity.key isEqualToString:after[0].identity.key])
+      return fail(error, @"Topology and subdevice did not survive enumeration order and new wrappers.");
+    before.clear(); after.clear();
     if (!a.balanced() || !b.balanced() || !c.balanced())
       return fail(error, @"Legacy identity teardown did not release exactly its owned COM references.");
   }

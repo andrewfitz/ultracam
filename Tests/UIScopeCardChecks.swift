@@ -100,7 +100,7 @@ import XCTest
   func testLabelsFollowTheDrawnShape() {
     var scopes = MonitorScopePreferences()
     scopes.settings = ScopeSettings(kind: .vectorscope)
-    let description = UIScopeDescription(scopes: scopes, signal: nil, stageLUT: false, isProgram: false)
+    let description = UIScopeDescription(scopes: scopes, signal: nil, stageLUT: nil, isProgram: false)
     let square = description.labels(width: 400, height: 400).filter { $0.role == .target }
     let wide = description.labels(width: 768, height: 256).filter { $0.role == .target }
     XCTAssertFalse(square.isEmpty)

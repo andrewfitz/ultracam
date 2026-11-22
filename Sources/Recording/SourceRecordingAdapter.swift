@@ -74,13 +74,19 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   @discardableResult
   func appendRawVideo(pixelBuffer: CVPixelBuffer, presentationTime: CMTime,
     duration: CMTime, signalValid: Bool = true) -> Bool {
+    appendRawVideo(pixelBuffer: pixelBuffer, presentationTime: presentationTime,
+      duration: duration, signalValid: signalValid, presentationStartHostTime: nil)
+  }
+
+  private func appendRawVideo(pixelBuffer: CVPixelBuffer, presentationTime: CMTime,
+    duration: CMTime, signalValid: Bool, presentationStartHostTime: CMTime?) -> Bool {
     guard signalValid else { return reject() }
     guard presentationTime.isValid, presentationTime.isNumeric,
       presentationTime.epoch == 0, presentationTime.value >= 0,
       duration.isValid, duration.isNumeric, duration.epoch == 0,
       duration.value > 0 else { return reject() }
     guard let sample = makeSample(pixelBuffer: pixelBuffer,
-      presentationTime: presentationTime, duration: duration) else {
+      presentationTime: presentationTime, duration: duration, presentationStartHostTime: presentationStartHostTime) else {
       return reject()
     }
     return recorder.appendVideo(sample)
@@ -184,7 +190,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
           self.clockLock.withLock { self.audioClock.noteVideo(metadata.presentationTime, duration: metadata.duration) }
         }
         return self.appendRawVideo(pixelBuffer: image, presentationTime: metadata.presentationTime,
-          duration: metadata.duration, signalValid: signalValid)
+          duration: metadata.duration, signalValid: signalValid, presentationStartHostTime: metadata.presentationStartHostTime)
       }, takeContext: { [weak self] context in
         guard let self else { return false }
         do { try self.recorder.bindTakeContext(context); return true }
@@ -203,11 +209,14 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
         self?.recorder.noteAudioBeforeFirstFrame()
       }, sourceAudioWithAdmission: { [weak self] planes, frames, format, time, context, source, pairedVideoTime in
         self?.appendSourcePCM(planes: planes, frames: frames, format: format, time: time, context: context, source: source, pairedVideoTime: pairedVideoTime) ?? false
+      }, resumedSourceAudio: { [weak self] planes, frames, format, time, context, source in
+        self?.appendSourcePCM(planes: planes, frames: frames, format: format, time: time, context: context,
+          source: source, pairedVideoTime: nil, resuming: true) ?? false
       })
   }
 
   private func appendSourcePCM(planes: [Data], frames: Int, format: SourceAudioFormat, time: CMTime,
-    context: RecordingTakeContext, source: SourceAdmissionSnapshot?, pairedVideoTime: CMTime?) -> Bool {
+    context: RecordingTakeContext, source: SourceAdmissionSnapshot?, pairedVideoTime: CMTime?, resuming: Bool = false) -> Bool {
     do {
       let sample = try makeSourceSample(planes: planes, sampleFrameCount: frames, format: format, presentationTime: time)
       if let source {
@@ -225,7 +234,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
       guard let mapping = try context.audioVideoClockMapping() else {
         throw SourceRecordingError.unsupportedSample("Recording source audio requires actual audio and video clock mappings.")
       }
-      return recorder.appendSourceAudio(sample, mapping: mapping)
+      return recorder.appendSourceAudio(sample, mapping: mapping, resuming: resuming)
     } catch { recorder.failTakeMetadata(String(describing: error)); return false }
   }
 
@@ -236,7 +245,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
       try source.validate(metadata, stage: .recordingSource)
       guard signalValid else { return reject() }
       guard let sample = makeSample(pixelBuffer: image, presentationTime: metadata.presentationTime,
-        duration: metadata.duration) else { return reject() }
+        duration: metadata.duration, presentationStartHostTime: metadata.presentationStartHostTime) else { return reject() }
       let provenance = RecordingSourceProvenance(epochID: source.epochID, formatSignature: source.formatSignature,
         videoClock: source.clockBindings.video)
       CMSetAttachment(sample, key: SourceRecordingConfiguration.sourceProvenanceAttachmentKey as CFString,
@@ -368,10 +377,14 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     var audioBeforeFirstFrame: (@Sendable () -> Void)? = nil
     /// Original ordered source identity remains distinct from the resolved take context.
     var sourceAudioWithAdmission: (@Sendable ([Data], Int, SourceAudioFormat, CMTime, RecordingTakeContext, SourceAdmissionSnapshot, CMTime?) -> Bool)? = nil
+    var resumedSourceAudio: (@Sendable ([Data], Int, SourceAudioFormat, CMTime, RecordingTakeContext, SourceAdmissionSnapshot) -> Bool)? = nil
+    var preparedEpoch: CaptureEpochID? = nil
+    var preparedVideoFormat: SourceFormat? = nil
+    var finishAtSourceEpoch: (@Sendable () -> Void)? = nil
   }
 
   private func makeSample(pixelBuffer: CVPixelBuffer, presentationTime: CMTime,
-    duration: CMTime) -> CMSampleBuffer? {
+    duration: CMTime, presentationStartHostTime: CMTime?) -> CMSampleBuffer? {
     guard let formatDescription = formatDescription(for: pixelBuffer) else { return nil }
 
     var timing = CMSampleTimingInfo(duration: duration,
@@ -381,7 +394,11 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
       allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
       formatDescription: formatDescription, sampleTiming: &timing,
       sampleBufferOut: &sample)
-    guard status == noErr else { return nil }
+    guard status == noErr, let sample else { return nil }
+    if let start = presentationStartHostTime {
+      CMSetAttachment(sample, key: SourceRecordingConfiguration.presentationStartHostTimeKey as CFString,
+        value: NSNumber(value: start.seconds), attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+    }
     return sample
   }
 

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import MonitorKit
 import XCTest
@@ -8,6 +9,7 @@ extension MonitorCoordinatorChecks {
   /// (`MonitorSurfacePresenter.failureShownFor`, as the tile shows it); after
   /// that the status is the picture's again and the failure stays counted.
   func testAudit3DiagnosticsDegradeOnlyOnARecentFailure() throws {
+    _ = try requireMonitorGPU()
     let value = MonitorCoordinator()
     value.updateTargets(feeds: [FeedDescriptor(id: FeedID(rawValue: "alpha"), name: "Wide")], programAvailable: false)
     let target = MonitorTargetID("alpha")
@@ -20,10 +22,13 @@ extension MonitorCoordinatorChecks {
       return false
     }
     value.refreshDiagnostics()
-    if case .failed = value.diagnostics(for: target).availability { throw XCTSkip("No monitor GPU") }
     XCTAssertFalse(degraded())
+    var publishedFailure = false
+    let observation = value.diagnosticsPublisher.sink { _ in publishedFailure = degraded() }
+    defer { observation.cancel() }
     presenter.recordFailure(MonitorKitError.gpu("one transient encode failure"))
     value.refreshDiagnostics()
+    XCTAssertTrue(publishedFailure, "A diagnostics observer can read the current snapshot")
     XCTAssertTrue(degraded(), "A failure just now degrades the target")
     XCTAssertNotNil(presenter.statistics.lastFailure)
     RunLoop.main.run(until: Date().addingTimeInterval(MonitorSurfacePresenter.failureShownFor + 0.15))

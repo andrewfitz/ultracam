@@ -1,56 +1,56 @@
-use crate::audio::{decode_media_audio, decode_wav, PcmCueDecoder};
+use crate::audio::{open_wav_pcm, with_media_audio, PcmCueDecoder};
 use crate::director::Director;
-use crate::model::{
-    AudioCue, OfflineAnalysis, StreamEvent, SwitcherConfig, TranscriptCue, VideoObservation,
-};
-use crate::timeline::TimelineRecorder;
+use crate::model::{OfflineAnalysis, StreamEvent, SwitcherConfig, TranscriptCue, VideoObservation};
+use crate::timeline::{event_time, TimelineRecorder};
 use anyhow::{Context, Result};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use uuid::Uuid;
 
 pub fn load_events_jsonl(path: &Path) -> Result<Vec<StreamEvent>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(line_number, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("invalid stream event on line {}", line_number + 1))
-        })
-        .collect()
+    load_jsonl(path, "stream event", |event| event)
 }
 
 pub fn load_transcript_jsonl(path: &Path) -> Result<Vec<StreamEvent>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(line_number, line)| {
-            let cue: TranscriptCue = serde_json::from_str(line)
-                .with_context(|| format!("invalid transcript on line {}", line_number + 1))?;
-            Ok(StreamEvent::Transcript { cue })
-        })
-        .collect()
+    load_jsonl(path, "transcript", |cue: TranscriptCue| {
+        StreamEvent::Transcript { cue }
+    })
 }
 
 pub fn load_video_jsonl(path: &Path) -> Result<Vec<StreamEvent>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(line_number, line)| {
-            let observation: VideoObservation = serde_json::from_str(line).with_context(|| {
-                format!("invalid video observation on line {}", line_number + 1)
+    load_jsonl(
+        path,
+        "video observation",
+        |observation: VideoObservation| StreamEvent::Video { observation },
+    )
+}
+
+fn load_jsonl<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    kind: &str,
+    wrap: impl Fn(T) -> StreamEvent,
+) -> Result<Vec<StreamEvent>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut events = Vec::new();
+    let mut line_number = 1;
+    while reader
+        .read_line(&mut line)
+        .with_context(|| format!("failed to read {} on line {line_number}", path.display()))?
+        != 0
+    {
+        if !line.trim().is_empty() {
+            let value = serde_json::from_str(&line).with_context(|| {
+                format!("invalid {kind} in {} on line {line_number}", path.display())
             })?;
-            Ok(StreamEvent::Video { observation })
-        })
-        .collect()
+            events.push(wrap(value));
+        }
+        line.clear();
+        line_number += 1;
+    }
+    Ok(events)
 }
 
 pub fn events_from_pcm(
@@ -59,17 +59,36 @@ pub fn events_from_pcm(
     chunk_ms: u32,
     threshold: f32,
 ) -> Result<Vec<StreamEvent>> {
-    let mut decoder = PcmCueDecoder::new(sample_rate, chunk_ms, threshold)?;
-    let mut events = decoder.push_pcm16le(bytes);
-    events.extend(decoder.finish());
-    let mut ordered = Vec::with_capacity(events.len() * 2);
-    for event in events {
-        let time = timeline_time(&event);
+    let decoder = PcmCueDecoder::new(sample_rate, chunk_ms, threshold)?;
+    events_from_pcm_reader(bytes, decoder)
+}
+
+fn events_from_pcm_reader(
+    mut reader: impl Read,
+    mut decoder: PcmCueDecoder,
+) -> Result<Vec<StreamEvent>> {
+    let mut ordered = Vec::new();
+    let mut push_event = |event| {
+        let time = event_time(&event);
         ordered.push(event);
         if let Some(time) = time {
             ordered.push(StreamEvent::Tick { time });
         }
+    };
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("failed to read decoded PCM"),
+        };
+        decoder
+            .push_pcm16le(&buffer[..count])
+            .into_iter()
+            .for_each(&mut push_event);
     }
+    decoder.finish().into_iter().for_each(push_event);
     Ok(ordered)
 }
 
@@ -79,88 +98,72 @@ pub fn events_from_audio_file(
     chunk_ms: u32,
     threshold: f32,
 ) -> Result<Vec<StreamEvent>> {
-    let (actual_rate, bytes) = if path
+    if path
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
     {
-        decode_wav(path)?
+        let wav = open_wav_pcm(path)?;
+        let decoder = PcmCueDecoder::new(wav.sample_rate, chunk_ms, threshold)?;
+        events_from_pcm_reader(wav, decoder)
     } else {
-        (sample_rate, decode_media_audio(path, sample_rate)?)
-    };
-    events_from_pcm(&bytes, actual_rate, chunk_ms, threshold)
+        let decoder = PcmCueDecoder::new(sample_rate, chunk_ms, threshold)?;
+        with_media_audio(path, sample_rate, |reader| {
+            events_from_pcm_reader(reader, decoder)
+        })
+    }
 }
 
 pub fn analyze_events(events: Vec<StreamEvent>, config: SwitcherConfig) -> Result<OfflineAnalysis> {
     let mut director = Director::new(config.clone()).map_err(anyhow::Error::msg)?;
     let mut timeline = TimelineRecorder::new(config, "offline", Uuid::new_v4());
+    timeline
+        .timeline
+        .metadata
+        .insert("cut_application".into(), "assumed_at_requested_time".into());
     let mut ordered = events;
-    // Missing timestamps sort last; a real timestamp of zero remains timed.
-    ordered.sort_by(|a, b| {
-        match (timeline_time(a), timeline_time(b)) {
-            (Some(a), Some(b)) => a.total_cmp(&b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-        .then_with(|| event_rank(a).cmp(&event_rank(b)))
-    });
+    // Controls stay where they arrived even when they report an application time.
+    // A reset may restart the clock for the following run.
+    for run in ordered.split_mut(|event| observation_time(event).is_none()) {
+        run.sort_by(|a, b| {
+            observation_time(a)
+                .unwrap()
+                .total_cmp(&observation_time(b).unwrap())
+                .then_with(|| event_rank(a).cmp(&event_rank(b)))
+        });
+    }
 
     let mut ordered = ordered.into_iter().peekable();
     while let Some(event) = ordered.next() {
         let explicit_tick = matches!(event, StreamEvent::Tick { .. });
-        let event_time = timeline_time(&event);
+        let time = observation_time(&event);
         let outputs = director.process_event(event.clone());
         timeline.record_event(event, outputs.clone());
-        acknowledge_offline_cuts(&mut director, &mut timeline, &outputs);
+        timeline.assume_cut_applications(&mut director, &outputs);
         // Wait for every observation at this time, including any explicit tick.
-        let next_time = ordered.peek().and_then(timeline_time);
-        if !explicit_tick && event_time != next_time {
-            if let Some(time) = event_time {
+        let next_time = ordered.peek().and_then(observation_time);
+        if !explicit_tick && time != next_time {
+            if let Some(time) = time {
                 let tick = StreamEvent::Tick { time };
                 let outputs = director.process_event(tick.clone());
                 timeline.record_event(tick, outputs.clone());
-                acknowledge_offline_cuts(&mut director, &mut timeline, &outputs);
+                timeline.assume_cut_applications(&mut director, &outputs);
             }
         }
     }
     Ok(timeline.timeline)
 }
 
-fn acknowledge_offline_cuts(
-    director: &mut Director,
-    timeline: &mut TimelineRecorder,
-    outputs: &[crate::model::SwitcherOutput],
-) {
-    for output in outputs {
-        if let crate::model::SwitcherOutput::Cut { instruction } = output {
-            let event = StreamEvent::Acknowledge {
-                decision_id: instruction.decision_id,
-                applied_at: Some(instruction.cut_time),
-            };
-            let follow_up = director.process_event(event.clone());
-            timeline.record_event(event, follow_up);
-        }
-    }
-}
-
-fn timeline_time(event: &StreamEvent) -> Option<f64> {
-    match event {
-        StreamEvent::Audio {
-            cue: AudioCue { time, .. },
-        } => Some(*time),
-        StreamEvent::Transcript {
-            cue: TranscriptCue { end, .. },
-        } => Some(*end),
-        StreamEvent::Video { observation } => Some(observation.time),
-        StreamEvent::Tick { time } => Some(*time),
-        StreamEvent::Acknowledge { applied_at, .. } => *applied_at,
-        StreamEvent::DirectorOutput | StreamEvent::Reject { .. } => None,
-        StreamEvent::ManualOverride { time, .. } => Some(*time),
-        StreamEvent::Reset { .. } => None,
-    }
-}
-
 fn event_rank(event: &StreamEvent) -> u8 {
     matches!(event, StreamEvent::Tick { .. }) as u8
+}
+
+fn observation_time(event: &StreamEvent) -> Option<f64> {
+    match event {
+        StreamEvent::Audio { .. }
+        | StreamEvent::Transcript { .. }
+        | StreamEvent::Video { .. }
+        | StreamEvent::Tick { .. } => event_time(event),
+        _ => None,
+    }
 }

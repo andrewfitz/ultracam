@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="shot" content="1500x7900">
+<title>Ultracam r6: layout without the session sidebar (revision 2)</title>
+<link rel="stylesheet" href="../r5/kit.css">
+<link rel="stylesheet" href="../r5/icons.css">
+<style>
+/* r6 additions. Layout only: every color and control comes from the r5 kit. */
+.win.r6 { grid-template-columns:minmax(0,1fr); }
+.win.r6.wi { grid-template-columns:minmax(0,1fr) 320px; }
+.win.r6 .bar { grid-column:1 / -1; grid-row:1; }
+.win.r6 .lights { background:none; border:0; padding:0 8px 0 2px; flex:none; }
+.win.r6 .main { grid-column:1; grid-row:2; }
+.win.r6 .stat { grid-column:1; grid-row:3; }
+.win.r6 .inspp { grid-column:2; grid-row:2 / 4; }
+.win.r6 .strip { margin-top:10px; }
+.win.r6 .strips .strip { margin-top:0; }
+.strip.col .name { white-space:nowrap; }
+
+/* The four-row strip: name and output controls, record, slot, meter. Every row has one height. */
+.s4 .sr.hd { height:38px; gap:8px; }
+.s4 .name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.s4 .sr.rc { height:46px; gap:10px; border-bottom:0; }
+.s4 .sr.st4 { height:28px; gap:7px; font-size:11px; color:var(--dim); white-space:nowrap; }
+.s4 .st4 b { color:var(--text); font-weight:600; }
+.s4 .st4 .tx { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.s4 .st4.warnrow { color:var(--text); font-size:12px; font-weight:600; }
+.s4 .st4.hot, .s4 .st4.hot b { color:#000; }
+.s4 .sr.rc.hot { margin:0 -14px; padding:0 14px; }
+.grp { margin-left:auto; display:flex; align-items:center; gap:6px; flex:none; }
+.gear { width:26px; height:24px; display:flex; align-items:center; justify-content:center; color:var(--dim); border-radius:7px; flex:none; }
+.xb { width:20px; height:20px; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; }
+.rec.rdy b { width:18px; height:18px; border-radius:50%; }
+.rec.off { border-color:#55555a; }
+.rec.off b { width:18px; height:18px; border-radius:50%; background:#4a4a4e; }
+.hot .rec.off { border-color:rgba(0,0,0,.5); }
+.hot .rec.off b { background:rgba(0,0,0,.45); }
+.rs { min-width:0; overflow:hidden; }
+.rs .lab { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+.pill.q { color:#d0d0d4; font-weight:500; }
+.pill .pbtn { background:rgba(255,255,255,.18); border-radius:6px; padding:1px 7px; margin:0 -4px 0 2px; color:#fff; font-weight:600; }
+.sum { display:flex; align-items:center; gap:8px; padding:0 10px; min-height:36px; border-bottom:1px solid var(--line); }
+.sum:last-child { border-bottom:0; }
+.sum .k { font-weight:600; white-space:nowrap; width:124px; flex:none; display:flex; align-items:center; gap:6px; }
+.sum .v { color:var(--dim); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
+.foot4 .btn.sm { padding:0 6px; }
+.pops { display:flex; gap:28px; align-items:flex-start; }
+.pops .pop { flex:none; }
+.pr { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:24px; }
+.tk { display:grid; grid-template-columns:1fr auto auto auto auto auto; gap:4px 12px; align-items:baseline; font-size:12px; }
+.tk .h { color:var(--dim); font-size:11px; }
+.gal { display:grid; grid-template-columns:repeat(3,400px); gap:18px 30px; }
+.gal .strip { margin:0; }
+.gal > div > .lab { margin-bottom:5px; }
+.bars1 { display:flex; flex-direction:column; gap:8px; width:1320px; }
+.bars1 .stat { border:1px solid #47474a; border-radius:9px; background:var(--bg); }
+.bars1 .lab { margin:4px 0 -3px 2px; }
+.map { width:1320px; border-collapse:collapse; font-size:12px; margin-top:6px; }
+.map td, .map th { text-align:left; vertical-align:top; padding:5px 10px 5px 0; border-bottom:1px solid #2a2a2d; }
+.map th { color:var(--dim); font-weight:600; font-size:11px; }
+.map td:first-child { width:270px; font-weight:600; }
+.map td:nth-child(2) { color:#d6d6da; }
+.map td:nth-child(3) { width:330px; }
+.new { color:var(--orange); font-weight:600; }
+.ex { color:var(--dim); }
+</style>
+</head>
+<body>
+<h1>Ultracam r6: layout without the session sidebar <span style="font-weight:400;color:var(--dim)">· revision 2</span></h1>
+<div class="sub">Layout proposal, not styling. Static mockup on the r5 kit. Frames 1 and 2 draw the state of the 2026-11-19 screenshot: Camera 1 on Program, Camera 2 with no signal and its FX3:B control link down, one interrupted take from earlier, nothing recording. Revision 2 follows an independent review: the strip keeps its name, a fixed problem slot and collapsing; the status bar keeps its one-click remedy; failure states are drawn.</div>
+
+<!-- ───────────── Frame 1 ───────────── -->
+<div class="frame"><div class="cap"><b>1 · Live view, the screenshot's state</b>No left pane. Camera 2 isn't on air, recording or in use, so its lost signal shows only on its picture and in its strip's record row: 2 places instead of 7 (3 instead of 9 with the inspector open). Nothing is amber in the status bar. The interrupted take moves to Record ⌄ (frame 9).</div>
+<div class="win r6" style="width:1320px;height:664px">
+<div class="bar"><div class="lights"><i></i><i></i><i></i></div><div class="spacer"></div>
+<div class="glass"><span class="cutg"><i class="ic sm" s="arrow.left.arrow.right"></i></span><div class="tb on"><span class="dot hollow"></span><b>1</b> Camera 1</div><div class="tb dis"><b>2</b> Camera 2</div><span class="vs"></span><div class="tb aw"><i class="ic" s="wand.and.sparkles"></i>Auto Off</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span><div class="tb dis"><i class="ic" s="pin"></i>Hold</div></div>
+<div class="spacer"></div>
+<div class="glass"><div class="tb"><i class="ic" s="record.circle"></i>Record 1 of 2</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span></div>
+<div class="glass"><span class="lay"><i class="ic" s="rectangle"></i></span><span class="lay on"><i class="ic" s="rectangle.split.2x1"></i></span><span class="lay"><i class="ic" s="sidebar.squares.trailing"></i></span><span class="lay"><i class="ic" s="square.grid.2x2"></i></span><span class="lay"><i class="ic" s="rectangle.compress.vertical"></i></span><span class="vs"></span><span class="lay"><i class="ic" s="sidebar.trailing"></i></span></div></div>
+
+<div class="main">
+<div><div class="pic sel1"><div class="ptop"><span class="numcap pic">1</span><span class="pill">Camera 1</span><span class="tally pg">PROGRAM</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="pbot"><span class="pill">2160p 59.94</span><span class="pill">ISO 1600</span><span class="pill">ƒ/5.6</span><span class="pill">1/60</span><span class="pill q"><i class="ic sm" s="battery.75percent"></i> 100</span></div></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut air"><i class="ic sm" s="tv"></i> Program</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec rdy"><b></b></span><div class="state">Ready to record</div></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>73</b> h <b>12</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i style="background:linear-gradient(90deg,var(--green) 0 34%, #333 34%)"></i><i style="background:linear-gradient(90deg,var(--green) 0 34%, #333 34%)"></i></div><div class="read"><span>1 <b>−3.4</b> &nbsp; 2 <b>−3.4</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="pic dark"><div class="ptop"><span class="numcap pic">2</span><span class="pill">Camera 2</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="hold"><i class="ic bigic o" s="video.slash"></i><div class="t">No signal</div><div class="lab">Check that the source is sending video and that its input connection is selected on the capture device.</div></div><div class="pbot"><span class="pill q"><i class="ic sm" s="wifi.slash"></i> FX3:B control not connected <span class="pbtn">Reconnect</span></span></div></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 2</span><span class="grp"><span class="cut no"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec off"><b></b></span><div class="state" style="color:var(--dim)">Waiting for a signal</div></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam B · <b>131</b> h <b>51</b> m left</span></div>
+<div class="sr meter"><i class="ic f" s="waveform"></i><div><div class="bars q"><i></i><i></i></div><div class="read"><span>No audio</span><span>OVER</span></div></div></div></div></div>
+</div>
+
+<div class="stat"><span class="inl"><i class="ic sm" s="video.badge.ellipsis"></i> <b>Program</b> Camera 1</span><span class="inl"><span class="d">Manual</span></span><span class="inl"><b>Not recording</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>73</b><i>h</i> <b>12</b><i>m</i></span> left</span><span class="inl">Audio <b>1 of 1</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+</div></div>
+
+<!-- ───────────── Frame 2 ───────────── -->
+<div class="frame"><div class="cap"><b>2 · Fixing Camera 2: the inspector, opened from the strip's gear</b>Today's six sections: the one in question open, the other five as one-line summaries. Sync cameras moves up from Effects so it stays in view. The Device picker is locked while the camera runs, as today. The strips are 470 pt wide here.</div>
+<div class="win r6 wi" style="width:1320px;height:664px">
+<div class="bar"><div class="lights"><i></i><i></i><i></i></div><div class="spacer"></div>
+<div class="glass"><span class="cutg"><i class="ic sm" s="arrow.left.arrow.right"></i></span><div class="tb on"><span class="dot hollow"></span><b>1</b> Camera 1</div><div class="tb dis"><b>2</b> Camera 2</div><span class="vs"></span><div class="tb aw"><i class="ic" s="wand.and.sparkles"></i>Auto Off</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span><div class="tb dis"><i class="ic" s="pin"></i>Hold</div></div>
+<div class="spacer"></div>
+<div class="glass"><div class="tb"><i class="ic" s="record.circle"></i>Record 1 of 2</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span></div>
+<div class="glass"><span class="lay"><i class="ic" s="rectangle"></i></span><span class="lay on"><i class="ic" s="rectangle.split.2x1"></i></span><span class="lay"><i class="ic" s="sidebar.squares.trailing"></i></span><span class="lay"><i class="ic" s="square.grid.2x2"></i></span><span class="lay"><i class="ic" s="rectangle.compress.vertical"></i></span><span class="vs"></span><span class="lay on"><i class="ic" s="sidebar.trailing"></i></span></div></div>
+
+<div class="main">
+<div><div class="pic"><div class="ptop"><span class="numcap pic">1</span><span class="pill">Camera 1</span><span class="tally pg">PROGRAM</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="pbot"><span class="pill">2160p 59.94</span><span class="pill">ISO 1600</span><span class="pill">ƒ/5.6</span><span class="pill">1/60</span><span class="pill q"><i class="ic sm" s="battery.75percent"></i> 100</span></div></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut air"><i class="ic sm" s="tv"></i> Program</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec rdy"><b></b></span><div class="state">Ready to record</div></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>73</b> h <b>12</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i style="background:linear-gradient(90deg,var(--green) 0 34%, #333 34%)"></i><i style="background:linear-gradient(90deg,var(--green) 0 34%, #333 34%)"></i></div><div class="read"><span>1 <b>−3.4</b> &nbsp; 2 <b>−3.4</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="pic dark sel1"><div class="ptop"><span class="numcap pic">2</span><span class="pill">Camera 2</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="hold"><i class="ic bigic o" s="video.slash"></i><div class="t">No signal</div><div class="lab">Check that the source is sending video and that its input connection is selected on the capture device.</div></div><div class="pbot"><span class="pill q"><i class="ic sm" s="wifi.slash"></i> FX3:B control not connected <span class="pbtn">Reconnect</span></span></div></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 2</span><span class="grp"><span class="cut no"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear" style="background:#454549;color:var(--text)"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec off"><b></b></span><div class="state" style="color:var(--dim)">Waiting for a signal</div></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam B · <b>131</b> h <b>51</b> m left</span></div>
+<div class="sr meter"><i class="ic f" s="waveform"></i><div><div class="bars q"><i></i><i></i></div><div class="read"><span>No audio</span><span>OVER</span></div></div></div></div></div>
+</div>
+
+<div class="inspp"><div class="form">
+<div class="split" style="margin:2px 2px 10px"><span class="inl" style="gap:7px"><span class="numcap">2</span><span style="font-size:15px;font-weight:700">Camera 2</span></span><span class="inl lab">Sync cameras <span class="sw mini on"></span></span></div>
+
+<div class="fh" style="margin-top:0"><i class="ic sm" s="chevron.down"></i><i class="ic sm" s="cable.connector"></i> Input <span class="end"><i class="ic sm" s="arrow.clockwise"></i></span></div>
+<div class="group">
+<div class="fr"><span>Device</span><span class="popup sm dis">UltraStudi…2G (0AB8) <i class="ic sm" s="chevron.up.chevron.down"></i></span></div>
+<div class="fr"><span>Signal</span><span class="inl val"><i class="ic sm o" s="exclamationmark.triangle.fill"></i> No signal</span></div>
+<div class="fr"><span>Dropped frames</span><span class="val">0</span></div>
+<div class="fr"><span>Timecode</span><span class="d">—</span></div>
+<div class="fr"><span>Camera log</span><span class="popup sm">S-Gamut3.Cine / S-Log3 <i class="ic sm d" s="chevron.up.chevron.down"></i></span></div>
+<div class="fr"><span>Video preview</span><span class="sw mini on"></span></div>
+</div>
+<div class="foot split"><span>Stop the camera to change its input.</span><span style="color:var(--blue)">Hardware…</span></div>
+
+<div class="group" style="margin-top:10px">
+<div class="sum"><span class="k"><i class="ic sm d" s="chevron.right"></i> Camera Control</span><span class="v">FX3:B · not connected</span></div>
+<div class="sum"><span class="k"><i class="ic sm d" s="chevron.right"></i> LUT</span><span class="v">new-fx3-5600k · On</span></div>
+<div class="sum"><span class="k"><i class="ic sm d" s="chevron.right"></i> Effects</span><span class="v">Output 1080p</span><span class="sw mini on"></span></div>
+<div class="sum"><span class="k"><i class="ic sm d" s="chevron.right"></i> Recording</span><span class="v">4TB Cam B · capture</span></div>
+<div class="sum"><span class="k"><i class="ic sm d" s="chevron.right"></i> Automation</span><span class="v">Starts with meeting apps</span></div>
+</div>
+
+<div class="split foot4" style="margin-top:12px"><span class="inl"><span class="btn sm">Restart</span><span class="btn sm">Stop</span></span><span class="inl"><span class="btn sm">Rename…</span><span class="btn sm">Remove Camera…</span></span></div>
+</div></div>
+
+<div class="stat"><span class="inl"><i class="ic sm" s="video.badge.ellipsis"></i> <b>Program</b> Camera 1</span><span class="inl"><span class="d">Manual</span></span><span class="inl"><b>Not recording</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>73</b><i>h</i> <b>12</b><i>m</i></span> left</span><span class="inl">Audio <b>1 of 1</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+</div></div>
+
+<!-- ───────────── Frame 3 ───────────── -->
+<div class="frame"><div class="cap"><b>3 · The steady state: Program in use, both cameras recording, nothing wrong</b>The strip's slot shows the one recording fact that differs per camera: its drive's time left. The status bar is today's plus the recording format.</div>
+<div class="win r6" style="width:1320px;height:664px">
+<div class="bar"><div class="lights"><i></i><i></i><i></i></div><div class="spacer"></div>
+<div class="glass"><span class="cutg"><i class="ic sm" s="arrow.left.arrow.right"></i></span><div class="tb on"><span class="dot"></span><b>1</b> Camera 1</div><div class="tb"><b>2</b> Camera 2</div><span class="vs"></span><div class="tb aw"><i class="ic" s="wand.and.sparkles"></i>Auto Off</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span><div class="tb dis"><i class="ic" s="pin"></i>Hold</div></div>
+<div class="spacer"></div>
+<div class="glass"><div class="tb"><span class="dot"></span>Stop 2 Recordings</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span></div>
+<div class="glass"><span class="lay"><i class="ic" s="rectangle"></i></span><span class="lay on"><i class="ic" s="rectangle.split.2x1"></i></span><span class="lay"><i class="ic" s="sidebar.squares.trailing"></i></span><span class="lay"><i class="ic" s="square.grid.2x2"></i></span><span class="lay"><i class="ic" s="rectangle.compress.vertical"></i></span><span class="vs"></span><span class="lay"><i class="ic" s="sidebar.trailing"></i></span></div></div>
+
+<div class="main">
+<div><div class="pic onair sel1"><div class="ptop"><span class="numcap pic">1</span><span class="pill">Camera 1</span><span class="tally air">ON AIR</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="pbot"><span class="pill">2160p 59.94</span><span class="pill">ISO 1600</span><span class="pill">ƒ/5.6</span><span class="pill">1/60</span><span class="pill q"><i class="ic sm" s="battery.75percent"></i> 100</span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC</span></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut air"><i class="ic sm" s="tv"></i> On air</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec"><b></b></span><div class="clock">12:31</div><span class="inl"><i class="ic sm g" s="checkmark.circle.fill"></i> <b style="font-size:12px;font-weight:600">0</b> <span class="lab">dropped</span></span><span class="grp"><span class="btn"><i class="ic sm" s="pause.fill"></i> Pause</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>72</b> h <b>59</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i style="background:linear-gradient(90deg,var(--green) 0 70%, #333 70%)"></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−6.4</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="pic c2"><div class="ptop"><span class="numcap pic">2</span><span class="pill">Camera 2</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="pbot"><span class="pill">2160p 59.94</span><span class="pill">ISO 800</span><span class="pill">ƒ/4</span><span class="pill">1/60</span><span class="pill q"><i class="ic sm" s="battery.75percent"></i> 64</span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC</span></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 2</span><span class="grp"><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec"><b></b></span><div class="clock">12:31</div><span class="inl"><i class="ic sm g" s="checkmark.circle.fill"></i> <b style="font-size:12px;font-weight:600">0</b> <span class="lab">dropped</span></span><span class="grp"><span class="btn"><i class="ic sm" s="pause.fill"></i> Pause</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam B · <b>131</b> h <b>38</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i style="background:linear-gradient(90deg,var(--green) 0 62%, #333 62%)"></i><i style="background:linear-gradient(90deg,var(--green) 0 60%, #333 60%)"></i></div><div class="read"><span>1 <b>−9.2</b> &nbsp; 2 <b>−9.8</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+</div>
+
+<div class="stat"><span class="inl"><i class="ic sm g" s="video.badge.checkmark"></i> <b>Program</b> Camera 1</span><span class="inl"><b>12 s</b><span class="lvl" style="margin-left:3px"><b style="width:40%"></b></span></span><span class="inl"><span class="d">Manual</span></span><span class="inl"><span class="dot"></span> REC 2 <b>12:31</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>72</b><i>h</i> <b>59</b><i>m</i></span> left</span><span class="inl">Audio <b>2 of 2</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+</div></div>
+
+<!-- ───────────── Frame 4 ───────────── -->
+<div class="frame"><div class="cap"><b>4 · The worst case: the camera on Program loses its signal while recording</b>The way out is one click on the picture, in the status bar or in the toolbar. The strip's slot turns amber in place and nothing else on the strip moves.</div>
+<div class="win r6" style="width:1320px;height:664px">
+<div class="bar"><div class="lights"><i></i><i></i><i></i></div><div class="spacer"></div>
+<div class="glass"><span class="cutg"><i class="ic sm" s="arrow.left.arrow.right"></i></span><div class="tb on"><span class="dot" style="background:var(--orange)"></span><b>1</b> Camera 1</div><div class="tb"><b>2</b> Camera 2</div><span class="vs"></span><div class="tb aw"><i class="ic" s="wand.and.sparkles"></i>Auto Off</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span><div class="tb dis"><i class="ic" s="pin"></i>Hold</div></div>
+<div class="spacer"></div>
+<div class="glass"><div class="tb"><span class="dot"></span>Stop 2 Recordings</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span></div>
+<div class="glass"><span class="lay"><i class="ic" s="rectangle"></i></span><span class="lay on"><i class="ic" s="rectangle.split.2x1"></i></span><span class="lay"><i class="ic" s="sidebar.squares.trailing"></i></span><span class="lay"><i class="ic" s="square.grid.2x2"></i></span><span class="lay"><i class="ic" s="rectangle.compress.vertical"></i></span><span class="vs"></span><span class="lay"><i class="ic" s="sidebar.trailing"></i></span></div></div>
+
+<div class="main">
+<div><div class="pic two lost sel1"><div class="ptop"><span class="numcap pic">1</span><span class="pill">Camera 1</span><span class="tally lost">NO PICTURE</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="hold"><i class="ic bigic o" s="video.slash"></i><div class="t">Signal lost <span>0:03</span></div><div class="lab">Take ends in 7 s</div><span class="cut big ph"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut to Camera 2 <span class="ks">⌃2</span></span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC</span></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut air"><i class="ic sm" s="tv"></i> Program</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec"><b></b></span><div class="clock">12:31</div><span class="inl"><i class="ic sm o" s="exclamationmark.triangle.fill"></i> Losing frames</span><span class="grp"><span class="btn"><i class="ic sm" s="pause.fill"></i> Pause</span></span></div>
+<div class="sr st4 warnrow hot"><i class="ic sm" s="exclamationmark.triangle.fill"></i><span class="tx">Check Camera 1's HDMI · Take ends in 7 s</span></div>
+<div class="sr meter"><i class="ic f" s="waveform"></i><div><div class="bars q"><i></i><i></i></div><div class="read"><span>No audio</span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="pic c2"><div class="ptop"><span class="numcap pic">2</span><span class="pill">Camera 2</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="pbot"><span class="pill">2160p 59.94</span><span class="pill">ISO 800</span><span class="pill">ƒ/4</span><span class="pill">1/60</span><span class="pill q"><i class="ic sm" s="battery.75percent"></i> 64</span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC</span></div>
+<div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 2</span><span class="grp"><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec"><b></b></span><div class="clock">12:31</div><span class="inl"><i class="ic sm g" s="checkmark.circle.fill"></i> <b style="font-size:12px;font-weight:600">0</b> <span class="lab">dropped</span></span><span class="grp"><span class="btn"><i class="ic sm" s="pause.fill"></i> Pause</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam B · <b>131</b> h <b>38</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i style="background:linear-gradient(90deg,var(--green) 0 62%, #333 62%)"></i><i style="background:linear-gradient(90deg,var(--green) 0 60%, #333 60%)"></i></div><div class="read"><span>1 <b>−9.2</b> &nbsp; 2 <b>−9.8</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+</div>
+
+<div class="stat"><span class="seg-hot"><i class="ic sm" s="exclamationmark.triangle.fill"></i> Camera 1 signal lost 0:03 <span class="btn sm">Cut to Camera 2</span></span><span class="inl"><i class="ic sm g" s="video.badge.checkmark"></i> <b>Program</b> Camera 1</span><span class="inl"><b>12 s</b><span class="lvl" style="margin-left:3px"><b style="width:40%"></b></span></span><span class="inl"><span class="d">Manual</span></span><span class="inl"><span class="dot"></span> REC 2 <b>12:31</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>72</b><i>h</i> <b>59</b><i>m</i></span> left</span><span class="inl">Audio <b>1 of 1</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+</div></div>
+
+<!-- ───────────── Frame 5 ───────────── -->
+<div class="frame"><div class="cap"><b>5 · Four Up</b>Collapsed strips are today's (name, Cut, LUT, ⋯, compact meter, record) with the gear in place of ⋯. Four Up is limited by the window's height, so losing the left pane changes little here. A collapsed strip has no slot row, so a low drive is the status bar's to report, with its remedy, as today. With four cameras the toolbar's cut buttons show numbers only, also as today.</div>
+<div class="win r6" style="width:1320px;height:786px">
+<div class="bar"><div class="lights"><i></i><i></i><i></i></div><div class="spacer"></div>
+<div class="glass"><span class="cutg"><i class="ic sm" s="arrow.left.arrow.right"></i></span><div class="tb on"><span class="dot"></span><b>1</b></div><div class="tb"><b>2</b></div><div class="tb"><b>3</b></div><div class="tb"><b>4</b></div><span class="vs"></span><div class="tb aw fill"><i class="ic" s="wand.and.sparkles"></i>Auto On</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span><div class="tb"><i class="ic" s="pin"></i>Hold</div></div>
+<div class="spacer"></div>
+<div class="glass"><div class="tb"><span class="dot"></span>Stop 4 Recordings</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span></div>
+<div class="glass"><span class="lay"><i class="ic" s="rectangle"></i></span><span class="lay"><i class="ic" s="rectangle.split.2x1"></i></span><span class="lay"><i class="ic" s="sidebar.squares.trailing"></i></span><span class="lay on"><i class="ic" s="square.grid.2x2"></i></span><span class="lay dis"><i class="ic" s="rectangle.expand.vertical"></i></span><span class="vs"></span><span class="lay"><i class="ic" s="sidebar.trailing"></i></span></div></div>
+<div class="main" style="grid-template-columns:500px 500px;justify-content:center;gap:14px 20px;padding:14px 20px">
+<div><div class="pic onair sel1"><div class="ptop"><span class="numcap pic">1</span><span class="pill">Camera 1</span><span class="tally air">ON AIR</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC 12:31</span></div><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 1</span><span style="margin-left:auto"></span><span class="cut air"><i class="ic sm" s="tv"></i> On air</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="cm"><i></i><i></i></span><span class="rec m neutral"><b></b></span></div></div></div>
+<div><div class="pic c2"><div class="ptop"><span class="numcap pic">2</span><span class="pill">Camera 2</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC 12:31</span></div><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 2</span><span style="margin-left:auto"></span><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="cm"><i></i><i></i></span><span class="rec m neutral"><b></b></span></div></div></div>
+<div><div class="pic c3"><div class="ptop"><span class="numcap pic">3</span><span class="pill">Camera 3</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC 12:31</span></div><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 3</span><span style="margin-left:auto"></span><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="cm"><i></i><i></i></span><span class="rec m neutral"><b></b></span></div></div></div>
+<div><div class="pic c4"><div class="ptop"><span class="numcap pic">4</span><span class="pill">Camera 4</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><span class="pill" style="right:12px;bottom:12px"><span class="dot"></span>REC 12:31</span></div><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 4</span><span style="margin-left:auto"></span><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="cm"><i></i><i></i></span><span class="rec m neutral"><b></b></span></div></div></div>
+</div>
+<div class="stat"><span class="seg-hot"><i class="ic sm" s="exclamationmark.triangle.fill"></i> 8TB B is low <span class="btn sm">Folder for Next Take…</span></span><span class="inl"><i class="ic sm g" s="video.badge.checkmark"></i> <b>Program</b> Camera 1</span><span class="inl"><b>8 s</b><span class="lvl" style="margin-left:3px"><b style="width:27%"></b></span></span><span class="inl"><span class="dot"></span> REC 4 <b>12:31</b> HEVC 4:2:2</span><span class="inl">8TB B <span class="uval"><b>9</b><i>m</i></span> left</span><span class="inl">Audio <b>4 of 4</b></span><span class="inl" style="margin-left:auto">CPU <b>46%</b></span><span class="inl">GPU <b>27%</b></span></div>
+</div></div>
+
+<!-- ───────────── Frame 6 ───────────── -->
+<div class="frame"><div class="cap"><b>6 · Program View</b>As today, with Program taking the left pane's width. The collapsed strips sit apart from their pictures, which is why a strip always keeps its camera's name. Cut is under each source, so these strips carry none.</div>
+<div class="win r6" style="width:1320px;height:772px">
+<div class="bar"><div class="lights"><i></i><i></i><i></i></div><div class="spacer"></div>
+<div class="glass"><span class="cutg"><i class="ic sm" s="arrow.left.arrow.right"></i></span><div class="tb on"><span class="dot"></span><b>1</b> Camera 1</div><div class="tb"><b>2</b> Camera 2</div><span class="vs"></span><div class="tb aw fill"><i class="ic" s="wand.and.sparkles"></i>Auto On</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span><div class="tb"><i class="ic" s="pin"></i>Hold</div></div>
+<div class="spacer"></div>
+<div class="glass"><div class="tb"><span class="dot"></span>Stop 2 Recordings</div><span class="chev"><i class="ic sm" s="chevron.down"></i></span></div>
+<div class="glass"><span class="lay"><i class="ic" s="rectangle"></i></span><span class="lay"><i class="ic" s="rectangle.split.2x1"></i></span><span class="lay on"><i class="ic" s="sidebar.squares.trailing"></i></span><span class="lay"><i class="ic" s="square.grid.2x2"></i></span><span class="lay dis"><i class="ic" s="rectangle.expand.vertical"></i></span><span class="vs"></span><span class="lay"><i class="ic" s="sidebar.trailing"></i></span></div></div>
+<div class="main prog"><div class="pv"><div><div class="pic onair"><div class="ptop"><span class="pill"><i class="ic sm" s="tv"></i><span class="d" style="font-weight:500">Ultracam</span> Program</span><span class="tally air">ON AIR</span></div><div class="tools"><span><i class="ic sm" s="slider.horizontal.3"></i></span></div><div class="pbot"><span class="pill">Camera 1</span><span class="pill">1080p 59.94</span></div></div></div>
+<div class="tiles"><div class="tile"><div class="pic onair sel1"><div class="ptop"><span class="numcap pic">1</span><span class="pill">Camera 1</span></div><span class="pill rp" style="right:12px;bottom:12px"><span class="dot"></span>REC 12:31</span></div><div class="slot"></div></div><div class="tile"><div class="pic c2"><div class="ptop"><span class="numcap pic">2</span><span class="pill">Camera 2</span></div><span class="pill rp" style="right:12px;bottom:12px"><span class="dot"></span>REC 12:31</span></div><div class="slot"><span class="cut wide big"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut <span class="ks">⌃2</span></span></div></div></div></div>
+<div class="strips"><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 1</span><span style="margin-left:auto"></span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="cm"><i></i><i></i></span><span class="rec m neutral"><b></b></span></div></div><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 2</span><span style="margin-left:auto"></span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="cm"><i></i><i></i></span><span class="rec m neutral"><b></b></span></div></div></div></div>
+<div class="stat"><span class="inl"><i class="ic sm g" s="video.badge.checkmark"></i> <b>Program</b> Camera 1</span><span class="inl"><b>8 s</b><span class="lvl" style="margin-left:3px"><b style="width:27%"></b></span></span><span class="inl"><span class="dot"></span> REC 2 <b>12:31</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>72</b><i>h</i> <b>59</b><i>m</i></span> left</span><span class="inl">Audio <b>2 of 2</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+</div></div>
+
+<!-- ───────────── Frame 7 ───────────── -->
+<div class="frame"><div class="cap"><b>7 · Strip states at 400 pt, the narrowest an expanded strip gets</b>Four rows at fixed heights: name with Cut, LUT, Effects and the gear, always at the same x; record, with the state's one action at its right end; the slot, which is the drive's time left until something is wrong; the meter. The standby camera with no signal is in frame 1. Last row: the collapsed strip at 340 pt, where the meter gives way first and then LUT, as today.</div>
+<div class="gal">
+
+<div><div class="lab">Ready</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec rdy"><b></b></span><div class="state">Ready to record</div></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>73</b> h <b>12</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−5.7</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">Recording, a long name</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Wide shot, stage left</span><span class="grp"><span class="cut air"><i class="ic sm" s="tv"></i> Program</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec"><b></b></span><div class="clock">1:12:31</div><span class="inl"><i class="ic sm g" s="checkmark.circle.fill"></i> <b style="font-size:12px;font-weight:600">0</b> <span class="lab">dropped</span></span><span class="grp"><span class="btn"><i class="ic sm" s="pause.fill"></i> Pause</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>71</b> h <b>59</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−5.7</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">Recording, signal lost: clock and countdown together</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut air"><i class="ic sm" s="tv"></i> Program</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec"><b></b></span><div class="clock">12:31</div><span class="inl"><i class="ic sm o" s="exclamationmark.triangle.fill"></i> Losing frames</span><span class="grp"><span class="btn"><i class="ic sm" s="pause.fill"></i> Pause</span></span></div>
+<div class="sr st4 warnrow hot"><i class="ic sm" s="exclamationmark.triangle.fill"></i><span class="tx">Check Camera 1's HDMI · Take ends in 7 s</span></div>
+<div class="sr meter"><i class="ic f" s="waveform"></i><div><div class="bars q"><i></i><i></i></div><div class="read"><span>No audio</span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">Take ended early</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc warnrow hot"><span class="rec off"><b></b></span><div class="rs"><div class="state">Take ended early</div><div class="lab">Saved 18:58</div></div><span class="grp"><span class="btn">Details</span><span class="xb">✕</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>72</b> h <b>53</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−5.7</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">Take ended, drive full</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc warnrow hot"><span class="rec off"><b></b></span><div class="rs"><div class="state">Take ended: drive full</div><div class="lab">Saved 2:05:52</div></div><span class="grp"><span class="btn">Choose Folder…</span></span></div>
+<div class="sr st4 warnrow"><i class="ic sm o" s="externaldrive.badge.exclamationmark"></i><span class="tx">4TB Cam A has no space left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−5.7</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">Saved</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec rdy"><b></b></span><div class="rs"><div class="state"><i class="ic sm g" s="checkmark.circle.fill"></i> Saved 12:31</div><div class="lab">0 dropped</div></div><span class="grp"><span class="btn"><i class="ic sm" s="folder"></i> Show in Finder</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>72</b> h <b>59</b> m left</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−5.7</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">No folder</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec off"><b></b></span><div class="state"><i class="ic sm o" s="exclamationmark.triangle.fill"></i> No folder</div><span class="grp"><span class="btn">Choose Folder…</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">No drive</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−5.7</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">Camera stopped: Start takes the record row's action place</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut no"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec off"><b></b></span><div class="state" style="color:var(--dim)">Camera stopped</div><span class="grp"><span class="btn"><i class="ic sm" s="play.fill"></i> Start</span></span></div>
+<div class="sr st4"><i class="ic sm" s="externaldrive"></i><span class="tx">4TB Cam A · <b>73</b> h <b>12</b> m left</span></div>
+<div class="sr meter"><i class="ic f" s="waveform"></i><div><div class="bars q"><i></i><i></i></div><div class="read"><span>No audio</span><span>OVER</span></div></div></div></div></div>
+
+<div><div class="lab">Meeting app stalled, while recording: the words truncate here, as today</div><div class="strip s4"><div class="sr hd"><i class="ic sm d" s="chevron.down"></i><span class="name">Camera 1</span><span class="grp"><span class="cut air"><i class="ic sm" s="tv"></i> Program</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="btn" style="padding:0 7px;gap:3px"><i class="ic sm" s="square.stack.3d.up"></i> Effects <i class="ic sm d" s="chevron.down"></i></span><span class="gear"><i class="ic" s="gearshape"></i></span></span></div>
+<div class="sr rc"><span class="rec"><b></b></span><div class="clock">12:31</div><span class="inl"><i class="ic sm g" s="checkmark.circle.fill"></i> <b style="font-size:12px;font-weight:600">0</b> <span class="lab">dropped</span></span><span class="grp"><span class="btn"><i class="ic sm" s="pause.fill"></i> Pause</span></span></div>
+<div class="sr st4 warnrow hot"><i class="ic sm" s="exclamationmark.triangle.fill"></i><span class="tx">The meeting app has stopped taking video</span><span class="btn sm" style="margin-left:auto">Restart Camera</span></div>
+<div class="sr meter"><i class="ic d" s="waveform"></i><div><div class="bars"><i></i><i></i></div><div class="read"><span>1 <b>−5.7</b> &nbsp; 2 <b>−5.7</b> <span class="unit">dBTP</span></span><span>OVER</span></div></div></div></div></div>
+
+<div style="width:340px"><div class="lab">Collapsed at 340 pt in Four Up: the meter gives way</div><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 2</span><span style="margin-left:auto"></span><span class="cut"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="lut"><i class="ic sm" s="cube.fill"></i> LUT On</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="rec m neutral"><b></b></span></div></div></div>
+
+<div style="width:340px"><div class="lab">Collapsed at 340 pt with a problem: LUT gives way too</div><div class="strip col"><div class="sr"><i class="ic sm d" s="chevron.right"></i><span class="name">Camera 2</span><span class="inl" style="font-size:12px"><i class="ic sm o" s="exclamationmark.triangle.fill"></i> Check HDMI</span><span style="margin-left:auto"></span><span class="cut no"><i class="ic sm" s="arrow.left.arrow.right"></i> Cut</span><span class="gear"><i class="ic" s="gearshape"></i></span><span class="rec m neutral"><b></b></span></div></div></div>
+
+</div></div>
+
+<!-- ───────────── Frame 8 ───────────── -->
+<div class="frame"><div class="cap"><b>8 · The status bar's problem segment keeps its remedy</b>Today's segment: the worst problem, a count of the rest and its one action. Two changes: extension setup, which only the left pane showed, joins it; the interrupted take leaves for Record ⌄.</div>
+<div class="bars1">
+<div class="lab">Nothing wrong</div>
+<div class="stat"><span class="inl"><i class="ic sm" s="video.badge.ellipsis"></i> <b>Program</b> Camera 1</span><span class="inl"><b>12 s</b><span class="lvl" style="margin-left:3px"><b style="width:40%"></b></span></span><span class="inl"><span class="d">Manual</span></span><span class="inl"><b>Not recording</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>73</b><i>h</i> <b>12</b><i>m</i></span> left</span><span class="inl">Audio <b>2 of 2</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+<div class="lab">On-air camera lost, with a second problem behind it</div>
+<div class="stat"><span class="seg-hot"><i class="ic sm" s="exclamationmark.triangle.fill"></i> Camera 1 signal lost 0:03 &nbsp;+1 <span class="btn sm">Cut to Camera 2</span></span><span class="inl"><i class="ic sm g" s="video.badge.checkmark"></i> <b>Program</b> Camera 1</span><span class="inl"><b>12 s</b><span class="lvl" style="margin-left:3px"><b style="width:40%"></b></span></span><span class="inl"><span class="d">Manual</span></span><span class="inl"><span class="dot"></span> REC 2 <b>12:31</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>72</b><i>h</i> <b>59</b><i>m</i></span> left</span><span class="inl">Audio <b>1 of 1</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+<div class="lab">Meeting app stalled on Program</div>
+<div class="stat"><span class="seg-hot"><i class="ic sm" s="exclamationmark.triangle.fill"></i> The meeting app has stopped taking video <span class="btn sm">Restart Camera</span></span><span class="inl"><i class="ic sm g" s="video.badge.checkmark"></i> <b>Program</b> Camera 1</span><span class="inl"><b>12 s</b><span class="lvl" style="margin-left:3px"><b style="width:40%"></b></span></span><span class="inl"><span class="d">Manual</span></span><span class="inl"><span class="dot"></span> REC 2 <b>12:31</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>72</b><i>h</i> <b>59</b><i>m</i></span> left</span><span class="inl">Audio <b>2 of 2</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+<div class="lab">Camera extension not installed (new here)</div>
+<div class="stat"><span class="inl" style="height:22px;padding:0 8px;border-radius:6px;background:var(--wash);border:1px solid var(--washline);color:var(--text);font-size:12px;font-weight:600;gap:5px"><i class="ic sm" s="video.badge.plus"></i> Install the Ultracam camera <span class="btn sm">Install Camera Extension…</span></span><span class="inl"><i class="ic sm" s="video.badge.ellipsis"></i> <b>Program</b> Camera 1</span><span class="inl"><span class="d">Manual</span></span><span class="inl"><b>Not recording</b> HEVC 4:2:2</span><span class="inl">4TB Cam A <span class="uval"><b>73</b><i>h</i> <b>12</b><i>m</i></span> left</span><span class="inl">Audio <b>2 of 2</b></span><span class="inl" style="margin-left:auto">CPU <b>31%</b></span><span class="inl">GPU <b>18%</b></span></div>
+</div></div>
+
+<!-- ───────────── Frame 9 ───────────── -->
+<div class="frame"><div class="cap"><b>9 · Record ⌄</b>One popover replaces the toolbar's Record menu, the status bar's Recording popover and the left pane's Recording and Takes sections. The status bar's recording segment opens it too. Left: nothing recording. Right: two takes rolling, with today's per-take table and Pause All.</div>
+<div class="pops">
+<div class="pop" style="width:380px">
+<div class="ph"><i class="ic" s="record.circle"></i><div><div class="pt">Recording</div><div class="ps">Not recording. Changes apply to the next take.</div></div></div>
+<div class="pr"><span class="inl"><span class="btn def">Record Camera 1</span><span class="btn dis">Record Camera 2</span></span></div>
+<div class="sep" style="margin:0"></div>
+<div class="pr"><span>Format</span><span class="popup sm"><i class="ic sm" s="film.stack"></i> HEVC 4:2:2 <i class="ic sm d" s="chevron.up.chevron.down"></i></span></div>
+<div class="pr"><span>Timecode</span><span class="inl"><span class="d">Mac Clock</span> <span class="btn sm">Settings…</span></span></div>
+<div class="pr"><span>Folder</span><span class="inl"><i class="ic sm d" s="folder"></i> <span class="d">capture</span> <span class="btn sm">Change…</span></span></div>
+<div class="sep" style="margin:0"></div>
+<div><div class="split"><span class="inl val"><i class="ic sm" s="externaldrive"></i> 4TB Cam A <span class="numcap">1</span></span><span class="inl"><span class="uval"><b>73</b><i>h</i> <b>12</b><i>m</i></span> <span class="unit">left</span></span></div><div class="track"><b style="width:46%"></b></div></div>
+<div><div class="split"><span class="inl val"><i class="ic sm" s="externaldrive"></i> 4TB Cam B <span class="numcap">2</span></span><span class="inl"><span class="uval"><b>131</b><i>h</i> <b>51</b><i>m</i></span> <span class="unit">left</span></span></div><div class="track"><b style="width:14%"></b></div></div>
+<div class="sep" style="margin:0"></div>
+<div class="pr"><span class="inl lab"><i class="ic sm" s="film"></i> 1 interrupted take</span><span class="inl"><span class="btn sm">Recover…</span><span class="btn sm">Show in Finder</span></span></div>
+</div>
+
+<div class="pop" style="width:440px">
+<div class="ph"><span class="dot"></span><div><div class="pt">Recording 2 cameras</div><div class="ps">HEVC 4:2:2 · camera original · Mac Clock</div></div></div>
+<div class="tk"><span class="h">Camera</span><span class="h">Clock</span><span class="h">Size</span><span class="h">Rate</span><span class="h">Drop</span><span class="h">Left</span>
+<span class="val">Camera 1</span><span class="val">12:31</span><span>5.4 GB</span><span>58 Mb/s</span><span>0</span><span>72 h 59 m</span>
+<span class="val">Camera 2</span><span class="val">12:31</span><span>5.4 GB</span><span>57 Mb/s</span><span>0</span><span>131 h 38 m</span></div>
+<div class="pr"><span class="inl"><span class="btn">Pause All</span><span class="btn">Stop All Recordings</span></span></div>
+<div class="sep" style="margin:0"></div>
+<div class="pr"><span>Format <span class="lab">next take</span></span><span class="popup sm"><i class="ic sm" s="film.stack"></i> HEVC 4:2:2 <i class="ic sm d" s="chevron.up.chevron.down"></i></span></div>
+<div class="pr"><span>Folder <span class="lab">next take</span></span><span class="inl"><i class="ic sm d" s="folder"></i> <span class="d">capture</span> <span class="btn sm">Change…</span></span></div>
+<div class="sep" style="margin:0"></div>
+<div><div class="split"><span class="inl val"><i class="ic sm" s="externaldrive"></i> 4TB Cam A <span class="numcap">1</span></span><span class="inl"><span class="uval"><b>72</b><i>h</i> <b>59</b><i>m</i></span> <span class="unit">left</span></span></div><div class="track"><b style="width:47%"></b></div></div>
+<div><div class="split"><span class="inl val"><i class="ic sm" s="externaldrive"></i> 4TB Cam B <span class="numcap">2</span></span><span class="inl"><span class="uval"><b>131</b><i>h</i> <b>38</b><i>m</i></span> <span class="unit">left</span></span></div><div class="track"><b style="width:15%"></b></div></div>
+<div class="sep" style="margin:0"></div>
+<div class="pr"><span></span><span class="btn sm">Show in Finder</span></div>
+</div>
+</div></div>
+
+<!-- ───────────── Maps ───────────── -->
+<h2>Where everything in the left pane goes</h2>
+<table class="map">
+<tr><th>Left pane today</th><th>Home in this layout</th><th>Exists today, or new work</th></tr>
+<tr><td>Attention: problems</td><td>Status bar problem segment with its action and count (frame 8); the strip's slot (frame 7)</td><td class="ex">Exists: UIStatusBar.swift:91, UICameraColumn.swift:853</td></tr>
+<tr><td>Attention: interrupted take</td><td>Record ⌄ last row; Record menu › Recover Interrupted Takes…</td><td><span class="new">New</span> row, and removed from the problem list. <span class="ex">Menu item exists: UICommands.swift:142</span></td></tr>
+<tr><td>Attention: extension to install, approve or update</td><td>Status bar problem segment, with its button (frame 8)</td><td><span class="new">New</span>: today only Attention lists these (UIProblemViews.swift:121)</td></tr>
+<tr><td>Attention: alerts prompt</td><td>Settings › Alerts</td><td class="ex">Tab exists: UISettings.swift:20. <span class="new">The first-run prompt needs a new place</span></td></tr>
+<tr><td>Cameras: the list, selecting one</td><td>Click a picture</td><td class="ex">Exists: UICameraColumn.swift:140</td></tr>
+<tr><td>Cameras: capture device, body</td><td>Inspector › Input, Camera Control</td><td class="ex">Exists: UIInspector.swift:124, :42</td></tr>
+<tr><td>Cameras: body battery and link</td><td>The picture's bottom line, beside ISO and shutter; Reconnect on it</td><td><span class="new">New</span>. <span class="ex">Reconnect also exists in the inspector: UIInspector.swift:52</span></td></tr>
+<tr><td>Cameras: Add Camera (+)</td><td>Camera menu › Add Camera; the No Cameras screen</td><td class="ex">Exists: UICommands.swift:97, UIMainWindow.swift:80</td></tr>
+<tr><td>Virtual Cameras, microphone reminder</td><td>Status bar › Virtual Cameras popover</td><td class="ex">Popover exists: UIStatusBar.swift:309. <span class="new">Open: its segment shows only with one camera or a camera's own device in use (UIPresentation.swift:1244), so no frame has it</span></td></tr>
+<tr><td>Recording: format</td><td>Set in Record ⌄ (frame 9); read beside the recording state in the status bar</td><td class="ex">Exists in the Record menu: UIToolbar.swift:421. <span class="new">As a popover, and the status bar readout: new</span></td></tr>
+<tr><td>A camera that can't use the chosen format</td><td>Its notice in the problem list and in Record ⌄</td><td class="ex">Exists: UIProblems.swift:313, UIStatusBar.swift:432</td></tr>
+<tr><td>Recording: timecode, default folder</td><td>Record ⌄ rows; Record menu › Choose Default Folder…</td><td><span class="new">New</span> rows. <span class="ex">Menu item exists: UICommands.swift:138</span></td></tr>
+<tr><td>Recording: drives</td><td>Record ⌄; each strip's slot shows its own drive's time left</td><td class="ex">Drive rows exist in the status bar's popover: UIStatusBar.swift:452. <span class="new">In the slot: new</span></td></tr>
+<tr><td>Takes: Show All</td><td>Record ⌄ › Show in Finder</td><td class="ex">Exists: UIStatusBar.swift:454, UICommands.swift:139</td></tr>
+<tr><td>Takes: last take</td><td>Removed. The strip shows Saved and its drops after a stop</td><td class="ex">Strip state exists: UICameraColumn.swift:1139</td></tr>
+<tr><td>Menu bar › Attention…</td><td>Opens the main window and the status bar's problem list</td><td><span class="new">New</span>: today it opens the left pane (UIMenuBar.swift:360)</td></tr>
+</table>
+
+<h2>What changes on the channel strip</h2>
+<table class="map">
+<tr><th>Strip today</th><th>In this layout</th><th>Exists today, or new work</th></tr>
+<tr><td>Five rows: header, record, folder or problem, output, meter</td><td>Four: name with the output controls, record, slot, meter. Fewer things, about 30 pt shorter</td><td><span class="new">New</span> arrangement. <span class="ex">Fixed row heights and the swapping slot exist: UICameraColumn.swift:853</span></td></tr>
+<tr><td>Brand marks</td><td>Removed</td><td><span class="new">New</span></td></tr>
+<tr><td>Signal badge</td><td>Format on the picture's bottom line; Inspector › Input › Signal</td><td><span class="new">On the picture: new.</span> <span class="ex">Inspector row exists: UIInspector.swift:140</span></td></tr>
+<tr><td>Badge menu: capture device, output format, body output timing, Camera Control…</td><td>Inspector: Input › Hardware…, Effects summary, Camera Control</td><td class="ex">Camera Control and output format exist: UIInspector.swift:54, :264. <span class="new">Always-on Hardware link and output timing in the inspector: new</span></td></tr>
+<tr><td>Start, Retry (header)</td><td>The record row's action place (frame 7); the picture; the toolbar</td><td class="ex">Exist: Retry on the picture, Start on it over a collapsed strip (UICameraColumn.swift:209, :215); Start in the toolbar (UIToolbar.swift:82). <span class="new">On the record row: new</span></td></tr>
+<tr><td>Folder row: path, format chip</td><td>Path in Inspector › Recording; format in Record ⌄</td><td class="ex">Exists: UIInspector.swift:380</td></tr>
+<tr><td>Output row: virtual camera glyph, output format</td><td>Inspector › Effects</td><td class="ex">Exists: UIInspector.swift:264</td></tr>
+<tr><td>"Camera original, no LUT or effects"</td><td>The record button's help; Inspector › Recording</td><td class="ex">Exists: UICameraColumn.swift:1029, UIInspector.swift:393</td></tr>
+<tr><td>Record row actions: Pause, Show in Finder, Choose Folder…, Details, ×</td><td>Unchanged</td><td class="ex">Exists: UICameraColumn.swift:1129</td></tr>
+<tr><td>⋯ › Show Inspector</td><td>The gear</td><td><span class="new">New</span></td></tr>
+<tr><td>⋯ › Cut, Record, Pause, Dismiss Ended Take</td><td>Their buttons on the strip</td><td class="ex">Exist</td></tr>
+<tr><td>⋯ › Copy Monitor Settings To</td><td>The picture's right-click menu</td><td class="ex">Exists: UICameraColumn.swift:516</td></tr>
+<tr><td>⋯ › Camera Control…, Rename…, Remove Camera…</td><td>Inspector; Camera menu</td><td class="ex">Exist: UIInspector.swift:54, :74, :78; UICommands.swift:74, :102</td></tr>
+<tr><td>⋯ › Diagnostics…</td><td>Window menu; Details buttons</td><td class="ex">Exists: UICommands.swift:264</td></tr>
+<tr><td>⋯ › Stop Camera, Start Camera</td><td>Camera menu; the inspector's foot</td><td class="ex">Menu exists: UICommands.swift:61. <span class="new">Inspector buttons: new</span></td></tr>
+<tr><td>⋯ › Restart Camera</td><td>The stalled-output remedy; the inspector's foot; Camera menu</td><td class="ex">Remedy exists: UIProblems.swift:226. <span class="new">Inspector button and menu item: new</span></td></tr>
+<tr><td>Collapsed strip, Collapse All</td><td>Unchanged, with the gear for ⋯</td><td class="ex">Exists: UICameraColumn.swift:1326</td></tr>
+<tr><td>Meter and its menu</td><td>Unchanged</td><td class="ex">Exists</td></tr>
+</table>
+
+<h2>Everything else</h2>
+<table class="map">
+<tr><th>Part</th><th>In this layout</th><th>Exists today, or new work</th></tr>
+<tr><td>Status bar</td><td>Every segment stays, with frame 8's two changes and the format beside the recording state. The recording segment opens Record ⌄ (frame 9). The Program popover is unchanged</td><td class="ex">Exists: UIStatusBar.swift:8, :328</td></tr>
+<tr><td>Toolbar</td><td>Loses the sidebar button. Record ⌄ opens a popover instead of a menu (frame 9)</td><td class="ex">Exists. <span class="new">Popover: new</span></td></tr>
+<tr><td>Inspector</td><td>Sections open as one-line summaries with one expanded (frame 2). Sync cameras moves from Effects to the header. Restart and Stop join Rename… and Remove Camera… at the foot</td><td><span class="new">New</span>. <span class="ex">Sections and Sync cameras exist: UIInspector.swift:35, :209</span></td></tr>
+<tr><td>One camera</td><td>Not drawn. The toolbar already drops cuts, Auto and the layout picker; the strip is the same</td><td class="ex">Exists: UIToolbar.swift:13, :43</td></tr>
+<tr><td>Clean View</td><td>Not drawn. It hides the picture's overlays, so the format, battery and link line go with them. The strip keeps the name; state stays in the strip and status bar</td><td class="ex">Exists</td></tr>
+<tr><td>Menu bar panel, Settings, monitor tools</td><td>Not touched, apart from the menu bar's Attention… row above</td><td class="ex">Exist</td></tr>
+</table>
+</body>
+</html>

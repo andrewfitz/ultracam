@@ -31,6 +31,7 @@ struct CameraDemandChange: Equatable, Sendable {
   let route: CameraDemandRoute
   let requested: Bool?
   let error: String?
+  var clientApps: Set<String>? = nil
 }
 
 // Registers notifications only; it never starts a stream, allocates images,
@@ -52,12 +53,15 @@ final class CameraDemandMonitor {
   }
 
   private struct State: Equatable {
+    let route: CameraDemandRoute
     let requested: Bool?
+    let clientApps: Set<String>?
     let error: String?
   }
 
   private var topology: Listener?
   private var demand: [String: Listener] = [:]
+  private var appListeners: [String: Listener] = [:]
   private var routesByID: [String: CameraDemandRoute] = [:]
   private var states: [String: State] = [:]
   private var enabled = false
@@ -76,6 +80,7 @@ final class CameraDemandMonitor {
     for route in routes where next[route.id] == nil { next[route.id] = route }
     let removed = Set(routesByID.keys).subtracting(next.keys)
     for id in removed {
+      appListeners[id] = nil
       demand[id] = nil
       states[id] = nil
     }
@@ -106,6 +111,7 @@ final class CameraDemandMonitor {
       // A failed registration can be retried after a mode or device change.
       enabled = false
       remove(&demand)
+      remove(&appListeners)
       remove(&topology)
       emitError(error.localizedDescription, for: routes)
     }
@@ -114,6 +120,7 @@ final class CameraDemandMonitor {
   func stop() {
     enabled = false
     remove(&demand)
+    remove(&appListeners)
     remove(&topology)
     states.removeAll(keepingCapacity: true)
   }
@@ -132,13 +139,18 @@ final class CameraDemandMonitor {
     guard enabled else { return }
     do {
       let devices = try ids(CMIOObjectID(kCMIOObjectSystemObject), kCMIOHardwarePropertyDevices)
-      for route in routes { discover(route, devices: devices) }
+      var devicesByUID: [String: UInt32] = [:]
+      for device in devices {
+        guard let uid = try? string(device, kCMIODevicePropertyDeviceUID), devicesByUID[uid] == nil else { continue }
+        devicesByUID[uid] = device
+      }
+      for route in routes { discover(route, device: devicesByUID[route.deviceUID]) }
     } catch { emitError(error.localizedDescription, for: routes) }
   }
 
-  private func discover(_ route: CameraDemandRoute, devices: [UInt32]) {
+  private func discover(_ route: CameraDemandRoute, device: UInt32?) {
     do {
-      guard let device = devices.first(where: { (try? string($0, kCMIODevicePropertyDeviceUID)) == route.deviceUID }) else {
+      guard let device else {
         throw VideoError.message("Install and enable the \(route.displayName) virtual camera to start cameras with meeting apps.")
       }
       let streams = try ids(device, kCMIODevicePropertyStreams).map { ($0, try string($0, kCMIOObjectPropertyName)) }
@@ -157,8 +169,18 @@ final class CameraDemandMonitor {
           self?.readDemand(routeID: route.id)
         }
       }
+      if appListeners[route.id]?.object != source {
+        appListeners[route.id] = nil
+        var property = address(Int(VideoContract.clientAppsSelector))
+        if CMIOObjectHasProperty(source, &property) {
+          appListeners[route.id] = try? listen(source, Int(VideoContract.clientAppsSelector)) { [weak self] in
+            self?.readDemand(routeID: route.id)
+          }
+        }
+      }
       readDemand(routeID: route.id)
     } catch {
+      appListeners[route.id] = nil
       demand[route.id] = nil
       emitError(error.localizedDescription, for: route)
     }
@@ -179,7 +201,11 @@ final class CameraDemandMonitor {
     do {
       let value = try string(source, Int(VideoContract.demandSelector))
       guard value == "0" || value == "1" else { throw VideoError.message("Invalid virtual camera activity state.") }
-      emit(CameraDemandChange(route: route, requested: value == "1", error: nil))
+      var apps: Set<String>?
+      if appListeners[routeID] != nil, let json = try? string(source, Int(VideoContract.clientAppsSelector)) {
+        apps = try? JSONDecoder().decode(Set<String>.self, from: Data(json.utf8))
+      }
+      emit(CameraDemandChange(route: route, requested: value == "1", error: nil, clientApps: apps))
     } catch { emitError(error.localizedDescription, for: route) }
   }
 
@@ -192,7 +218,7 @@ final class CameraDemandMonitor {
   }
 
   private func emit(_ change: CameraDemandChange) {
-    let next = State(requested: change.requested, error: change.error)
+    let next = State(route: change.route, requested: change.requested, clientApps: change.clientApps, error: change.error)
     guard states[change.route.id] != next else { return }
     states[change.route.id] = next
     onRouteChange?(change)

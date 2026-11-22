@@ -46,45 +46,45 @@ struct SourceScalePlan: Hashable, Codable, Sendable {
   let offsetX: Double
   let offsetY: Double
   init(source: SourceSize, destinationWidth: Int, destinationHeight: Int,
-       policy: SourceScalingPolicy = .fit) throws {
+       policy: SourceScalingPolicy = .fit, allowUpscale: Bool = false) throws {
     guard destinationWidth > 0, destinationHeight > 0 else { throw SourceFormatError.invalid("Invalid destination size") }
     self.source = source; self.destinationWidth = destinationWidth; self.destinationHeight = destinationHeight; self.policy = policy
     let sw = Double(source.width) * Double(source.pixelAspect.numerator) / Double(source.pixelAspect.denominator)
     let sh = Double(source.height)
     let sx = Double(destinationWidth) / sw
     let sy = Double(destinationHeight) / sh
-    let scale = policy == .fit ? min(sx, sy) : max(sx, sy)
+    let scale = policy == .fit ? min(sx, sy, allowUpscale ? .infinity : 1) : max(sx, sy)
     scaledWidth = sw * scale; scaledHeight = sh * scale
     offsetX = (Double(destinationWidth) - scaledWidth) / 2
     offsetY = (Double(destinationHeight) - scaledHeight) / 2
   }
 }
 
-enum SourceAdmissionError: Error, Equatable, Sendable { case unsupportedSize(String), upscaleRequired(String), invalidAspect }
+enum SourceAdmissionError: Error, Equatable, Sendable { case unsupportedSize(String), invalidAspect }
 struct SourceSizeProjection: Sendable {
   let source: SourceSize
   let displayAspect: Rational
   let destination: (width: Int, height: Int)?
+  let fit: SourceScalePlan?
 }
 
 struct SourceSizeAdmission: Sendable {
   static func snapshot(_ format: SourceFormat, destination: (width: Int, height: Int)? = nil,
                         allowUpscale: Bool = false) throws -> SourceSizeProjection {
-    let size = try validate(format, destination: destination, allowUpscale: allowUpscale)
-    return SourceSizeProjection(source: size, displayAspect: size.displayAspect, destination: destination)
+    let size = try SourceSize(format)
+    guard size.pixelAspect.denominator > 0 else { throw SourceAdmissionError.invalidAspect }
+    let fit = try destination.map { canvas in
+      guard canvas.width > 0, canvas.height > 0 else {
+        throw SourceAdmissionError.unsupportedSize("Destination must be positive")
+      }
+      return try SourceScalePlan(source: size, destinationWidth: canvas.width,
+        destinationHeight: canvas.height, allowUpscale: allowUpscale)
+    }
+    return SourceSizeProjection(source: size, displayAspect: size.displayAspect, destination: destination, fit: fit)
   }
 
   static func validate(_ format: SourceFormat, destination: (width: Int, height: Int)? = nil,
                        allowUpscale: Bool = false) throws -> SourceSize {
-    let size = try SourceSize(format)
-    guard size.pixelAspect.denominator > 0 else { throw SourceAdmissionError.invalidAspect }
-    if let destination {
-      guard destination.width > 0, destination.height > 0 else { throw SourceAdmissionError.unsupportedSize("Destination must be positive") }
-      let sw = Double(size.width) * Double(size.pixelAspect.numerator) / Double(size.pixelAspect.denominator)
-      if !allowUpscale && (Double(destination.width) > sw || Double(destination.height) > Double(size.height)) {
-        throw SourceAdmissionError.upscaleRequired("Source is smaller than destination")
-      }
-    }
-    return size
+    try snapshot(format, destination: destination, allowUpscale: allowUpscale).source
   }
 }

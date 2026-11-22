@@ -101,6 +101,7 @@ enum UISymbol {
   static let information = "info.circle"
   static let retry = "arrow.clockwise"
   static let audio = "waveform"
+  static let stream = "antenna.radiowaves.left.and.right"
   static let microphoneReminder = "mic.slash"
   static let diagnostics = "stethoscope"
   static let settings = "gearshape"

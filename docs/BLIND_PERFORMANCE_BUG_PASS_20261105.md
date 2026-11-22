@@ -21,6 +21,6 @@ Validation completed in this pass:
 - MonitorKit package built successfully from a clean external scratch path.
 - Swift frontend parsing, vendor-boundary checks, CPU-pixel checks, and `git diff --check` passed.
 - The native CMSampleBuffer association retention probe passed through copy/release behavior.
-- The previous full integration proof remains valid: 1,610 app tests passed; the latest affected-source proof added 125 passing tests. Existing package/UI failures remain baseline-reproduced and were not hidden or threshold-adjusted.
+- Historical validation from the earlier performance pass recorded 1,610 passing app tests and a later 125-test affected-source run. Those results apply to their recorded snapshots, not subsequent changes. Existing package/UI failures were reproduced on that baseline; thresholds were not adjusted.
 
 No speculative catalog cache or SDK changes were made. The working tree remains uncommitted so the full diff can be reviewed together with the existing feature work.

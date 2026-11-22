@@ -29,7 +29,8 @@ struct ProgramScalingPlan: Equatable, Sendable {
 enum ProgramScalingPolicy {
   /// Produces geometry without floating point, making boundary behavior deterministic.
   static func plan(sourceWidth: Int, sourceHeight: Int, targetWidth: Int, targetHeight: Int,
-                   mode: ProgramScalingMode = .fit, pixelAspect: Rational = .one) throws -> ProgramScalingPlan {
+                   mode: ProgramScalingMode = .fit, pixelAspect: Rational = .one,
+                   allowUpscale: Bool = false) throws -> ProgramScalingPlan {
     guard sourceWidth > 0, sourceHeight > 0, targetWidth > 0, targetHeight > 0 else {
       throw ProgramScalingError.invalidDimensions
     }
@@ -45,7 +46,11 @@ enum ProgramScalingPolicy {
     let limitWidth: Bool = mode == .fit ? sourceIsWider : !sourceIsWider
     let scaledWidth: Int64
     let scaledHeight: Int64
-    if limitWidth {
+    if mode == .fit && !allowUpscale && tw > sw / pixelAspect.denominator && th > sourceHeight {
+      // At 1× the picture has its native display dimensions on a square-pixel canvas.
+      scaledWidth = sw / pixelAspect.denominator
+      scaledHeight = Int64(sourceHeight)
+    } else if limitWidth {
       scaledWidth = tw
       scaledHeight = try scaledProduct(sh, tw, sw, roundingUp: mode == .crop)
     } else {

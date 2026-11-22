@@ -178,7 +178,7 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
       let frame = try host.frame(delivery, in: context, core: core)
       drawn = frame
       try pass.encode(
-        frame: frame, feed: host.feed(engine: core.engine), state: state, target: target, into: context.submission)
+        frame: frame, feed: host.feed(engine: core.engine, for: delivery), state: state, target: target, into: context.submission)
     }
     XCTAssertTrue(completion.wait(), "The monitor submission failed")
     return try XCTUnwrap(drawn)
@@ -343,6 +343,49 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     let completion = Completion()
     try core.submit(completion: completion) { _ in }
     XCTAssertTrue(completion.wait())
+  }
+
+  @MainActor func testScopeLossClearsTraceAndReadoutUntilNewMeasurement() throws {
+    let (gpu, core) = try gpuCore()
+    let (host, slot) = host("scope-loss", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("scope-loss"), host: host, gpu: gpu)
+    host.setConsumers([slot, presenter])
+    let layer = CAMetalLayer()
+    layer.device = core.device
+    layer.pixelFormat = .bgra8Unorm
+    layer.drawableSize = CGSize(width: 128, height: 64)
+    gpu.attachDrawables(layer.residencySet)
+    defer { gpu.detachDrawables(layer.residencySet) }
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    var settings = MonitorScopePreferences()
+    settings.enabled = true
+    let image = try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8)
+    offer(host, image, sequence: 1)
+    let first = try XCTUnwrap(slot.latest)
+    loop.holdScopeForTesting(first, layer: layer, settings: settings)
+    loop.drawScope(drawable: try XCTUnwrap(layer.nextDrawable()), at: 1)
+    let deadline = Date().addingTimeInterval(5)
+    while presenter.scopeStatisticsReader == nil && Date() < deadline {
+      RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+    }
+    let oldReader = try XCTUnwrap(presenter.scopeStatisticsReader)
+    XCTAssertNotNil(oldReader.statistics)
+    presenter.setClean(false)
+    XCTAssertNotNil(presenter.shownSignal)
+    loop.holdScopeForTesting(first, layer: layer, settings: settings)
+    presenter.setUnavailable("Camera stopped")
+    XCTAssertNil(presenter.scopeStatisticsReader, "The detached window covers its trace when no reader is available")
+    XCTAssertNil(presenter.statistics.lastScope)
+    XCTAssertEqual(presenter.scopeTiming, "No scope signal")
+    XCTAssertNil(presenter.shownSignal)
+    XCTAssertEqual(presenter.scopeInterpretation, MonitorSurfacePresenter.describe(nil as SignalDescription?))
+    let submitted = core.statistics.submissions
+    loop.drawScope(drawable: try XCTUnwrap(layer.nextDrawable()), at: 2)
+    XCTAssertEqual(core.statistics.submissions, submitted, "The queued scope is discarded before encoding")
+    offer(host, image, sequence: 2)
+    presenter.publishScopeStatisticsReader(oldReader, epoch: 0)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    XCTAssertNil(presenter.scopeStatisticsReader, "Late feedback cannot uncover a lost signal's trace")
   }
 
   @MainActor func testSuccessfulPictureFeedbackRecordsTimingWithoutRenderThreadWork() throws {
@@ -543,6 +586,35 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     }
   }
 
+  @MainActor func testHDROutputLayerAndScopeUseBurnInDeclaration() throws {
+    let (gpu, core) = try gpuCore()
+    let host = MonitorFeedHost(target: "hdr-burn-in", gpu: gpu)
+    let presenter = MonitorSurfacePresenter(target: MonitorTargetID("hdr-burn-in"), host: host, gpu: gpu)
+    host.setConsumers([presenter])
+    let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
+    let cube = try CubeLUT(text: "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n")
+    let image = try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8)
+    var prefs = MonitorFeedPreferences()
+    prefs.setPictureStage(.output)
+    prefs.scopes.settings.stage = .output
+    presenter.setPreferences(prefs)
+    for (index, id) in ["rec2020-pq-video", "rec2020-hlg-video"].enumerated() {
+      let colour = try SourceColorSpaceCatalog.color(id)
+      let lut = try LUTProcessor.makeLUT(cube, device: core.device, outputColorimetry: colour)
+      host.offer(image, pts: .zero, captureGeneration: 1, sequence: UInt64(index), untouched: false,
+        sourceFormat: nil, duration: CMTime(value: 1, timescale: 30), burnIn: lut)
+      let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
+      let feed = loop.drawingFeed(for: work, core: core)
+      _ = loop.applyColor(signal: .rec709, state: work.state, feed: feed)
+      XCTAssertEqual(loop.appliedColor.pixelFormat, .rgba16Float)
+      let measured = UIScopeDescription(scopes: prefs.scopes, signal: .rec709,
+        stageLUT: presenter.scopeLUTSignal(prefs), isProgram: false)
+      XCTAssertEqual(measured.hdrTransfer, index == 0 ? .pq : .hlg)
+      XCTAssertEqual(measured.context.matrix, .bt2020)
+      XCTAssertEqual(measured.context.range, .legal)
+    }
+  }
+
   @MainActor func testFrozenScopeDescriptionKeepsItsCopiedLUT() throws {
     let (gpu, core) = try gpuCore()
     let mailbox = MonitorFeedbackMailbox()
@@ -555,16 +627,21 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     preferences.scopes.settings.stage = .output
     presenter.setPreferences(preferences)
     host.setConsumers([presenter])
-    offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 1)
+    let signal = SignalDescription(range: .legal, matrix: .bt2020, encoding: .display(.pq), primaries: .rec2020)
+    let pq = try XCTUnwrap(host.burnInLUT).withOutputSignal(signal)
+    let image = try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8)
+    host.offer(image, pts: .zero, captureGeneration: 1, sequence: 1, untouched: false, sourceFormat: nil,
+      duration: CMTime(value: 1, timescale: 30), burnIn: pq)
+    host.burnInLUT = nil
     presenter.toggleFreeze()
     try mailbox.take(MonitorSurfaceRenderLoop.freezeKind)(false)
     try monitorOnRender(gpu) {}
-    host.burnInLUT = nil
-    XCTAssertTrue(presenter.scopeMeasuresLUT(preferences),
+    presenter.setUnavailable("Camera stopped")
+    XCTAssertEqual(presenter.scopeLUTSignal(preferences), signal,
       "The frozen scope still measures the copied feed's LUT after the live LUT is removed")
     presenter.toggleFreeze()
     offer(host, try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8), sequence: 2)
-    XCTAssertFalse(presenter.scopeMeasuresLUT(preferences), "New live pictures use the live feed's LUT state")
+    XCTAssertNil(presenter.scopeLUTSignal(preferences), "New live pictures use the live feed's LUT state")
   }
 
   @MainActor func testFrozenOwnerPlanesBecomeResidentOnReplacementCore() throws {
@@ -654,15 +731,14 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
 
   /// The kept MonitorCoordinatorChecks allocation case, against the feed host: the
   /// primaries, transfer and matrix tags, the clean aperture and the pixel aspect are
-  /// read, and a steady stream of tagged frames allocates nothing on the delivery thread.
-  func testSteadyOffersReadColorimetryAndGeometryWithoutAllocating() throws {
+  /// read per frame. Core Video can allocate to return a dictionary attachment.
+  func testSteadyOffersAllocateOnlyForCoreVideoGeometryAttachments() throws {
     let image = try buffer(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, width: 64, height: 36)
     CVBufferSetAttachment(image, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
     CVBufferSetAttachment(
       image, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG, .shouldPropagate)
     CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
-    // Core Video rebuilds dictionary attachments on every read (they live on the
-    // IOSurface), so the host must not read them per frame.
+    // The same pooled surface can carry different dictionary attachments on every offer.
     CVBufferSetAttachment(
       image, kCVImageBufferCleanApertureKey,
       [
@@ -695,7 +771,54 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     }
     XCTAssertEqual(slot.latest?.stamp.sequence, sequence)
     XCTAssertEqual(slot.accepted, 220)
-    XCTAssertEqual(allocations, 0, "Steady-state offers allocate on the delivery thread")
+    let geometryAllocations = countingAllocations {
+      for _ in 0..<200 { _ = MonitorFrame.geometry(of: image) }
+    }
+    XCTAssertEqual(allocations, geometryAllocations, "Offers should allocate only what Core Video needs to read frame geometry")
+    CVBufferRemoveAttachment(image, kCVImageBufferCleanApertureKey)
+    CVBufferRemoveAttachment(image, kCVImageBufferPixelAspectRatioKey)
+    next()
+    XCTAssertEqual(countingAllocations { for _ in 0..<200 { next() } }, 0)
+  }
+
+  func testPooledFrameGeometryFollowsChangedAndRemovedAperture() throws {
+    let image = try buffer(kCVPixelFormatType_32BGRA, width: 64, height: 36)
+    let (host, slot) = host("aperture")
+    func setAperture(width: Int, height: Int) {
+      CVBufferSetAttachment(image, kCVImageBufferCleanApertureKey,
+        [kCVImageBufferCleanApertureWidthKey: width, kCVImageBufferCleanApertureHeightKey: height,
+         kCVImageBufferCleanApertureHorizontalOffsetKey: 0, kCVImageBufferCleanApertureVerticalOffsetKey: 0]
+          as CFDictionary, .shouldPropagate)
+    }
+    setAperture(width: 60, height: 32)
+    offer(host, image, sequence: 1)
+    let first = try XCTUnwrap(slot.latest)
+    setAperture(width: 48, height: 24)
+    offer(host, image, sequence: 2)
+    let second = try XCTUnwrap(slot.latest)
+    XCTAssertEqual(first.geometry.cleanAperture, MonitorRect(x: 2, y: 2, width: 60, height: 32))
+    XCTAssertEqual(second.geometry.cleanAperture, MonitorRect(x: 8, y: 6, width: 48, height: 24))
+    XCTAssertGreaterThan(second.stamp.revision, first.stamp.revision)
+    CVBufferRemoveAttachment(image, kCVImageBufferCleanApertureKey)
+    offer(host, image, sequence: 3)
+    XCTAssertNil(try XCTUnwrap(slot.latest).geometry.cleanAperture)
+  }
+
+  func testStaleDeadlineUsesTheDeliveredAndDeclaredIntervals() throws {
+    let image = try buffer(kCVPixelFormatType_32BGRA, width: 16, height: 8)
+    let (host, slot) = host("clock")
+    let second = CMTime(value: 1, timescale: 1)
+    let fast = CMTime(value: 1, timescale: 60)
+    for (index, rate) in [FrameRate.constant(second), .variable(nominal: fast, shortest: fast, longest: second),
+      .constant(fast)].enumerated() {
+      let format = try SourceFormat(width: 16, height: 8, pixel: .bgra8, colour: .rec709Video, rate: rate)
+      host.offer(image, pts: .zero, captureGeneration: 1, sequence: UInt64(index), untouched: true,
+        sourceFormat: format, duration: index == 0 ? second : fast, burnIn: nil)
+      let stamp = try XCTUnwrap(slot.latest).stamp
+      let deadline: Double = index == 2 ? 0.25 : 3
+      XCTAssertFalse(stamp.isStale(at: stamp.hostTime + deadline))
+      XCTAssertTrue(stamp.isStale(at: stamp.hostTime + deadline + 0.001))
+    }
   }
 
   /// Must-check (a): an HLG or PQ buffer tagged with BT.709 primaries keeps them.
@@ -916,6 +1039,9 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     // must not replace the slot or inflate accepted-frame diagnostics.
     offer(host, image, generation: 2, sequence: 1)
     XCTAssertEqual(slot.accepted, 2, "Duplicate source sequence is ignored")
+    host.setSignalDeclaration(MonitorSignalDeclaration(range: .full))
+    offer(host, image, generation: 2, sequence: 1)
+    XCTAssertEqual(slot.accepted, 2, "Revising the signal does not make an old delivery new")
     offer(host, image, generation: 1, sequence: 99)
     XCTAssertEqual(slot.accepted, 2, "A late older capture generation cannot roll back a running host")
     XCTAssertEqual(slot.latest?.stamp, second)
@@ -996,12 +1122,20 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     var lines = ["LUT_3D_SIZE 2"]
     for b in 0..<2 { for g in 0..<2 { for r in 0..<2 { lines.append("\(1 - r) \(1 - g) \(1 - b)") } } }
     let invert = try LUTProcessor.makeLUT(try CubeLUT(text: lines.joined(separator: "\n")), device: core.device)
-    host.burnInLUT = invert
-    offer(host, try greyV210(), sequence: 1)
+    let input = try greyV210()
+    let processor = try LUTProcessor(device: core.device)
+    try processor.load(invert)
+    let burned = try processor.process(input, configuration: PipelineConfiguration(
+      applyLUT: true, downscale: false, convertTo420: false))
+    host.offer(input, pts: .zero, captureGeneration: 1, sequence: 1, untouched: false,
+      sourceFormat: nil, duration: CMTime(value: 1, timescale: 30), burnIn: processor.lut)
     let delivery = try XCTUnwrap(slot.latest)
     let pass = core.engine.makePass()
     let target = try target(core, width: 48, height: 16)
-    XCTAssertTrue(host.feed(engine: core.engine).burnInLUT === invert)
+    host.burnInLUT = nil
+    offer(host, try greyV210(), sequence: 2)
+    XCTAssertNil(try XCTUnwrap(slot.latest).burnIn)
+    XCTAssertTrue(host.feed(engine: core.engine, for: delivery).burnInLUT === invert)
     XCTAssertNil(host.lutMismatch)
     for (stage, expected) in [(SignalStage.source, 130.4), (.output, 124.6), (.monitor, 124.6)] {
       var state = MonitorState()
@@ -1011,7 +1145,14 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
         XCTAssertEqual(Double(value), expected, accuracy: 3, "\(stage)")
       }
     }
-    host.burnInLUT = nil
+    let monitored = pixel(target, x: 24, y: 8)
+    offer(host, burned, sequence: 3)
+    var native = MonitorState()
+    native.pictureStage = .source
+    _ = try draw(try XCTUnwrap(slot.latest), host: host, core: core, pass: pass, state: native, into: target)
+    for (camera, monitor) in zip(pixel(target, x: 24, y: 8), monitored) {
+      XCTAssertEqual(Double(camera), Double(monitor), accuracy: 1, "Camera burn-in and held monitor delivery")
+    }
     XCTAssertNil(host.feed(engine: core.engine).burnInLUT)
   }
 

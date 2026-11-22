@@ -295,17 +295,17 @@ struct UIFalseColorLegendGrid: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
-      Text(legend.headline).font(.caption.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+      Text(legend.headline).font(.uiMeta.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
       if let reason = unavailableText {
         Label(reason, systemImage: UISymbol.warning)
-          .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+          .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       } else {
         ForEach(Array(legend.captions.enumerated()), id: \.offset) { _, line in
-          Text(line).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+          Text(line).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         swatches
         ForEach(Array(legend.footnotes.enumerated()), id: \.offset) { _, line in
-          Text(line).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+          Text(line).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
       }
     }
@@ -347,7 +347,7 @@ struct UIFalseColorLegendGrid: View {
         }
       }
     }
-    .font(.caption)
+    .font(.uiMeta)
     .fixedSize()
     .padding(.vertical, 2)
   }

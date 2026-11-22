@@ -65,10 +65,8 @@ public final class NoCopyIngestLease: @unchecked Sendable {
   public let roundedBaseAddress: UInt
   public let roundedLength: Int
   public let pixelOffset: Int
-  private let frameRelease: () -> Void
-  private let onGPUResourcesReleased: () -> Void
   private let lock = NSLock()
-  private var completed = false
+  private var callbacks: (frameRelease: () -> Void, onGPUResourcesReleased: () -> Void)?
   private var submitted = false
 
   public init(pointer: UnsafeRawPointer, length: Int,
@@ -104,8 +102,7 @@ public final class NoCopyIngestLease: @unchecked Sendable {
     self.allocation = allocation
     self.byteOffset = Int(start - allocation.baseAddress)
     self.byteLength = length
-    self.frameRelease = frameRelease
-    self.onGPUResourcesReleased = onGPUResourcesReleased
+    self.callbacks = (frameRelease, onGPUResourcesReleased)
   }
 
   /// Hands this lease to an asynchronous GPU submission. The submitter must
@@ -113,7 +110,7 @@ public final class NoCopyIngestLease: @unchecked Sendable {
   /// wrapper is retired. Only the first submission is accepted.
   public func submitGPU(_ submit: (@escaping () -> Void) -> Void) {
     lock.lock()
-    let alreadyCompleted = completed || submitted
+    let alreadyCompleted = callbacks == nil || submitted
     if !alreadyCompleted { submitted = true }
     lock.unlock()
     guard !alreadyCompleted else { return }
@@ -121,9 +118,13 @@ public final class NoCopyIngestLease: @unchecked Sendable {
   }
 
   public func completeGPU() {
-    lock.lock(); guard !completed else { lock.unlock(); return }; completed = true; lock.unlock()
-    onGPUResourcesReleased()
-    frameRelease()
+    let completedCallbacks = lock.withLock {
+      let pending = callbacks
+      callbacks = nil
+      return pending
+    }
+    completedCallbacks?.onGPUResourcesReleased()
+    completedCallbacks?.frameRelease()
     // Allocation lifetime belongs to its shared owner, not one frame.
     // Other in-flight frames may reference the same SDK allocation.
   }

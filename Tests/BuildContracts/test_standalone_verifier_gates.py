@@ -13,7 +13,7 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "ultracam"
-        for folder in ('scripts', 'Sources/App', 'Tools/UIVerify', 'Tools/auto-switcher/src',
+        for folder in ('scripts', 'Sources/App', 'Tools/UIVerify', 'Apps/AutoSwitcher/src',
                        '../MonitorKit/Sources', 'Vendors', 'Config/Assets.xcassets', 'bin'):
             (self.root / folder).mkdir(parents=True)
         for name in ('ui-verify.sh', 'monitor-app-integration.sh', 'monitor-feed-host-checks.sh', 'check-gpu-proof-skips.py'):
@@ -24,17 +24,19 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.write('scripts/vendor-build.sh', 'vendor_configure() { :; }; vendor_compile_native() { :; }; vendor_bridge=/dev/null')
         self.write('Sources/App/Fixture.swift', '// fixture')
         self.write('../MonitorKit/Package.swift', '// fixture')
-        self.write('Tools/auto-switcher/src/lib.rs', '// fixture')
-        self.write('Tools/auto-switcher/Cargo.toml', '# fixture')
-        self.write('Tools/auto-switcher/Cargo.lock', '# fixture')
+        self.write('Apps/AutoSwitcher/src/lib.rs', '// fixture')
+        self.write('Apps/AutoSwitcher/Cargo.toml', '# fixture')
+        self.write('Apps/AutoSwitcher/Cargo.lock', '# fixture')
         self.write('bin/rustup', '#!/bin/bash\nexit 0\n', True)
         self.write('bin/xcode-select', '#!/bin/bash\necho /fake\n', True)
         executable = """#!/bin/bash\necho executed >> "$RUN_RECEIPT"\nprintf '%s\\n' "$FAKE_TEST_OUTPUT"\n"""
         self.write('bin/xcrun', '#!/usr/bin/env python3\nimport pathlib, sys\nout = pathlib.Path(sys.argv[sys.argv.index("-o") + 1])\nout.write_text(' + repr(executable) + ')\nout.chmod(0o755)\n', True)
         self.env = dict(os.environ, PATH=str(self.root / 'bin') + ':' + os.environ['PATH'],
                         RUN_RECEIPT=str(self.root / 'receipt'), FAKE_TEST_OUTPUT='PASS', FORCE='0',
-                        UI_PERF_ONLY='0', UI_PERF_CAMERAS='2,4', UI_PERF_METERS='live,fixed',
+                        UI_MAC_CAMERA_ONLY='0', UI_PERF_ONLY='0', UI_PERF_CAMERAS='2,4', UI_PERF_METERS='live,fixed',
+                        UI_PERF_IDLE='4', UI_PERF_PROFILE_INSPECTOR='0', RENDER_INSPECTOR='0',
                         ULTRACAM_REQUIRE_GPU_PROOFS='0')
+        self.env.pop('UI_VERIFY_TIMING', None)
 
     def write(self, name, text, executable=False):
         path = self.root / name
@@ -77,12 +79,23 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.assertEqual(self.count(), 1)
         for name in ('src/lib.rs', 'Cargo.toml', 'Cargo.lock', 'build.rs', '.cargo/config.toml'):
             with self.subTest(name=name):
-                path = self.root / 'Tools/auto-switcher' / name
+                path = self.root / 'Apps/AutoSwitcher' / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('changed')
                 before = self.count()
                 self.passes()
                 self.assertEqual(self.count(), before + 1)
+
+    def test_diagnostic_requests_do_not_reuse_or_replace_default_result(self):
+        self.passes()
+        proof = self.root / 'work/agent-work/build/ultracam/ui-verify/last-pass'
+        original_proof = proof.read_text()
+        self.passes(RENDER_INSPECTOR='1')
+        self.passes(UI_VERIFY_TIMING='')
+        self.passes(UI_MAC_CAMERA_ONLY='1')
+        self.passes()
+        self.assertEqual(self.count(), 4)
+        self.assertEqual(proof.read_text(), original_proof)
 
     def test_standalone_skip_policy(self):
         for script in ('monitor-app-integration.sh', 'monitor-feed-host-checks.sh'):

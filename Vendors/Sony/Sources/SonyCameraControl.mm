@@ -488,6 +488,26 @@ public:
     { std::lock_guard<std::mutex> lock(mutex); error = e; condition.notify_all(); }
     event(@"error", sonyError("operation", e));
   }
+  // A notification may describe another property. Only a read of the requested
+  // value confirms a write, including a final read if firmware sends no event.
+  NSString *confirmWrite(uint64_t seen, std::chrono::steady_clock::time_point deadline,
+                         BOOL (^readConfirmed)(NSString **)) {
+    std::unique_lock<std::mutex> lock(mutex);
+    while (true) {
+      condition.wait_until(lock, deadline, [&] { return revision != seen || disconnected || error; });
+      if (disconnected) return @"The camera disconnected before confirming this setting.";
+      if (error) return sonyError("set setting", error);
+      seen = revision;
+      const bool finalRead = std::chrono::steady_clock::now() >= deadline;
+      lock.unlock();
+      NSString *readError = nil;
+      const BOOL confirmed = readConfirmed(&readError);
+      lock.lock();
+      if (disconnected || error) continue;
+      if (readError || confirmed) return readError;
+      if (finalRead) return @"The camera has not confirmed this value. Refresh to check it; its current mode or control priority may prevent the change.";
+    }
+  }
   void changed() {
     auto keepAlive = weak_from_this().lock();
     { std::lock_guard<std::mutex> lock(mutex); ++revision; condition.notify_all(); }
@@ -734,6 +754,13 @@ static SonyRuntime &sonyRuntime() {
     break;
   }
   if (properties) ReleaseDeviceProperties(session.handle, properties);
+  {
+    std::lock_guard<std::mutex> lock(session.callback->mutex);
+    if (session.callback->disconnected) {
+      *error = @"The Sony camera is disconnected.";
+      return nil;
+    }
+  }
   return fields;
 }
 - (NSDictionary *)prepareCandidateAddress:(NSString *)address macAddress:(NSString *)macAddress
@@ -952,15 +979,25 @@ static SonyRuntime &sonyRuntime() {
     const auto *field = sonyField(code);
     if (found == self->_sony->sessions.end() || !field || !field->editable) { [self reply:reply object:nil error:@"This camera setting is unavailable."]; return; }
     auto &session = found->second;
+    uint64_t revision;
+    {
+      std::lock_guard<std::mutex> lock(session.callback->mutex);
+      if (!session.handle || session.callback->disconnected) {
+        [self reply:reply object:nil error:@"The Sony camera is disconnected."];
+        return;
+      }
+      revision = session.callback->revision;
+      session.callback->error = 0;
+    }
     CrDeviceProperty *properties = nullptr; CrInt32 count = 0;
     CrInt32u requestedCode = code;
+    bool allowed = false, alreadyCurrent = false;
     auto error = GetSelectDeviceProperties(session.handle, 1, &requestedCode, &properties, &count);
-    bool allowed = false; uint64_t revision;
-    { std::lock_guard<std::mutex> lock(session.callback->mutex); revision = session.callback->revision; session.callback->error = 0; }
     if (!error && properties) for (CrInt32 i = 0; i < count; ++i) {
       auto &p = properties[i]; if (p.GetCode() != code || !p.IsSetEnableCurrentValue()) continue;
       for (auto choice : sonyChoices(p)) if (choice == value) allowed = true;
-      if (allowed) {
+      alreadyCurrent = p.IsGetEnableCurrentValue() && sonySignExtended(p.GetValueType(), p.GetCurrentValue()) == value;
+      if (allowed && !alreadyCurrent) {
         CrDeviceProperty request; request.SetCode(code); request.SetValueType(p.GetValueType()); request.SetCurrentValue(value);
         error = SetDeviceProperty(session.handle, &request);
       }
@@ -968,25 +1005,18 @@ static SonyRuntime &sonyRuntime() {
     }
     if (properties) ReleaseDeviceProperties(session.handle, properties);
     if (error || !allowed) { [self reply:reply object:nil error:error ? sonyError("set setting", error) : @"The camera no longer allows this value. Refresh its settings; check exposure mode and control priority."]; return; }
-    // SetDeviceProperty only queues a command. Wait for notification, then read
-    // the actual camera value; never display a requested value as confirmed.
-    uint32_t callbackError = 0;
-    bool callbackDisconnected = false;
-    {
-      std::unique_lock<std::mutex> lock(session.callback->mutex);
-      session.callback->condition.wait_for(lock, std::chrono::seconds(3), [&] { return session.callback->revision != revision || session.callback->error || session.callback->disconnected; });
-      callbackError = session.callback->error;
-      callbackDisconnected = session.callback->disconnected;
-    }
-    if (callbackDisconnected || callbackError) {
-      [self reply:reply object:nil error:callbackDisconnected ?
-        @"The camera disconnected before confirming this setting." : sonyError("set setting", callbackError)];
-      return;
-    }
-    NSString *readError = nil; NSArray *snapshot = [self propertiesFor:session error:&readError];
-    BOOL confirmed = NO;
-    for (NSDictionary *p in snapshot) if ([p[@"code"] unsignedIntValue] == code && [p[@"value"] unsignedLongLongValue] == value) confirmed = YES;
-    [self reply:reply object:snapshot error:readError ?: (confirmed ? nil : @"The camera has not confirmed this value. Refresh to check it; its current mode or control priority may prevent the change.")];
+    SonySession *current = &session;
+    __block NSArray *snapshot = nil;
+    // An already-current value has no SDK write notification to wait for.
+    const auto deadline = std::chrono::steady_clock::now() + (alreadyCurrent ? std::chrono::seconds(0) : std::chrono::seconds(3));
+    NSString *confirmationError = session.callback->confirmWrite(revision,
+      deadline, ^BOOL(NSString **readError) {
+        snapshot = [self propertiesFor:*current error:readError];
+        for (NSDictionary *p in snapshot)
+          if ([p[@"code"] unsignedIntValue] == code && [p[@"value"] unsignedLongLongValue] == value) return YES;
+        return NO;
+      });
+    [self reply:reply object:snapshot error:confirmationError];
 #else
     [self reply:reply object:nil error:@"Sony SDK is unavailable in this build."];
 #endif

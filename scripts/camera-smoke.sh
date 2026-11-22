@@ -28,7 +28,7 @@ source "$task_root/scripts/monitor-kit-package.sh"
 monitor_kit_package_build >> "$compile_log" 2>&1 || { cat "$compile_log"; exit 1; }
 # PipelineConfiguration's production settings declarations depend on the recording
 # model. Use the same complete app source set as the standalone UI verifier.
-rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
+rust_manifest="$task_root/Apps/AutoSwitcher/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"

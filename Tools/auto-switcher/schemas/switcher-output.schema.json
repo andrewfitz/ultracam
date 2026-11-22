@@ -6,10 +6,11 @@
   "required": ["type"],
   "properties": {
     "type": { "enum": ["cut", "status", "llmAdvisory", "decisionExpired", "error"] },
-    "instruction": { "type": "object" },
+    "instruction": { "$ref": "#/$defs/instruction" },
     "time": { "type": "number" },
     "state": { "type": "string" },
     "current_camera_id": { "type": "string" },
+    "shot_age": { "type": "number" },
     "hard_deadline": { "type": "number" },
     "pending_decision_id": { "type": ["string", "null"], "format": "uuid" },
     "request_id": { "type": "string", "format": "uuid" },
@@ -22,5 +23,27 @@
     "error": { "type": ["string", "null"] },
     "message": { "type": "string" }
   },
-  "additionalProperties": true
+  "allOf": [
+    { "if": { "properties": { "type": { "const": "cut" } } }, "then": { "required": ["instruction"] } },
+    { "if": { "properties": { "type": { "const": "status" } } }, "then": { "required": ["time", "state", "current_camera_id", "shot_age", "hard_deadline"] } },
+    { "if": { "properties": { "type": { "const": "llmAdvisory" } } }, "then": { "required": ["request_id", "available_at", "confidence", "reason", "hold"] } },
+    { "if": { "properties": { "type": { "const": "decisionExpired" } } }, "then": { "required": ["decision_id"] } },
+    { "if": { "properties": { "type": { "const": "error" } } }, "then": { "required": ["message"] } }
+  ],
+  "$defs": {
+    "instruction": {
+      "type": "object",
+      "required": ["decision_id", "session_generation", "target_camera_id", "cut_time", "expires_at", "confidence", "reason", "forced"],
+      "properties": {
+        "decision_id": { "type": "string", "format": "uuid" },
+        "session_generation": { "type": "integer", "minimum": 1 },
+        "target_camera_id": { "type": "string", "minLength": 1 },
+        "cut_time": { "type": "number", "minimum": 0 },
+        "expires_at": { "type": "number", "minimum": 0 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "reason": { "enum": ["emphasisBoundary", "emphasisResolved", "audioDegradedFallback", "cameraHealthFallback", "forcedMaximumShotDuration"] },
+        "forced": { "type": "boolean" }
+      }
+    }
+  }
 }

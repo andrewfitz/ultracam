@@ -17,7 +17,7 @@ monitor_kit_package_build > "$test_root/package-build.log" 2>&1 || {
   cat "$test_root/package-build.log"
   exit 1
 }
-rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
+rust_manifest="$task_root/Apps/AutoSwitcher/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"
@@ -33,7 +33,8 @@ while IFS= read -r source_file; do
 done < <(rg --files "$task_root/Sources/App" -g '*.swift' | sort)
 frameworks="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/Frameworks"
 libraries="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib"
-xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D ULTRACAM_TEST_SUPPORT \
+xcrun swiftc -O -whole-module-optimization -num-threads 4 \
+  -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D ULTRACAM_TEST_SUPPORT \
   -target arm64-apple-macos26.0 \
   -module-cache-path "$test_root/modules" "${monitor_kit_link_args[@]}" \
   ${vendor_swift_native_args[@]+"${vendor_swift_native_args[@]}"} \

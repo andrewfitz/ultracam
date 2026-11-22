@@ -27,9 +27,9 @@ enum UIChannelsShown: Int, CaseIterable, Identifiable, Sendable {
     return min(wanted, available)
   }
 
-  /// "Showing 2 of 8" for a running camera, "Stopped" for one that isn't.
-  static func status(shown: Int, of available: Int?) -> String {
-    guard let available, available > 0 else { return "Stopped" }
+  /// "Showing 2 of 8" for a running camera, "No embedded audio" when it carries none, "Stopped" otherwise.
+  static func status(shown: Int, of available: Int?, running: Bool = false, source: CaptureAudioKind = .embedded) -> String {
+    guard let available, available > 0 else { return running ? source.missingLabel : "Stopped" }
     return "Showing \(shown) of \(available)"
   }
 }
@@ -89,7 +89,8 @@ struct UISettingsAudioPane: View {
         UINumberCapsule(number: number)
         Text(descriptor.name)
       }
-      Text(UIChannelsShown.status(shown: shown, of: available))
+      let audio = model.captureVendor(for: descriptor.selectedDevice)?.captureAudio ?? .embedded
+      Text(UIChannelsShown.status(shown: shown, of: available, running: model.isCameraRunning(id), source: audio))
     }
   }
 }

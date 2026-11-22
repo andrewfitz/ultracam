@@ -39,6 +39,9 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
   var captureServices: (FeedID) -> CaptureServices
   var devices: () throws -> [InputDevice]
   var driverWarning: () -> String?
+  var captureVendorWarning: (String) -> String? = { _ in nil }
+  var captureAuthorization: (_ pluginID: String, _ deviceID: String?) -> CaptureAuthorizationStatus = { _, _ in .authorized }
+  var authorizeCapture: (_ pluginID: String, _ deviceID: String?) async throws -> Void = { _, _ in }
   var observeDevices: (@escaping @MainActor @Sendable ([InputDevice]) -> Void) -> Any?
   /// Calls the handler whenever CMIO's device list changes (the camera extension starting,
   /// its cameras appearing). Holds the observation until the returned value is released.
@@ -107,11 +110,22 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
       },
       driverWarning: {
         let warning = registry.snapshot.capture.compactMap { vendor -> String? in
-          if let error = vendor.error { return "\(vendor.descriptor.localizedDisplayName()): \(error.localizedDescription)" }
-          guard !vendor.status.installed || !vendor.status.supported else { return nil }
-          return "\(vendor.descriptor.localizedDisplayName()): \(vendor.status.reason ?? "Driver unavailable")"
+          guard let warning = warning(for: vendor) else { return nil }
+          return "\(vendor.descriptor.localizedDisplayName()): \(warning)"
         }.joined(separator: "\n")
         return warning.isEmpty ? nil : warning
+      },
+      captureVendorWarning: { id in
+        registry.snapshot.capture.first { $0.descriptor.id == id }.flatMap(warning(for:))
+      },
+      captureAuthorization: { id, deviceID in
+        registry.readyCapturePlugins.first { $0.descriptor.id == id }?.authorizationStatus(deviceID: deviceID) ?? .authorized
+      },
+      authorizeCapture: { id, deviceID in
+        guard let plugin = registry.readyCapturePlugins.first(where: { $0.descriptor.id == id }) else {
+          throw PluginError.unavailable("Unknown capture plugin: \(id)")
+        }
+        try await plugin.authorizeCapture(deviceID: deviceID)
       },
       observeDevices: { handler in
         registry.observe { snapshot in
@@ -130,6 +144,12 @@ extension VirtualCameraRegistryPublisher: AppVirtualCameraRegistryPublishing {}
       refreshIdleStatus: { registry.readyCapturePlugins.forEach { $0.refreshIdleStatus() } },
       controlViewFactories: { registry.controlViewFactories },
       setCompatibilityPolicy: { compatibility.update($0) })
+  }
+
+  private static func warning(for vendor: CaptureVendorSnapshot) -> String? {
+    if let error = vendor.error { return error.localizedDescription }
+    guard !vendor.status.installed || !vendor.status.supported else { return nil }
+    return vendor.status.reason ?? "Driver unavailable"
   }
 
   /// No devices; starting a camera fails with an error and nothing is sent.

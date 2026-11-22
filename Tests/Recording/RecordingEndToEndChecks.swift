@@ -1007,6 +1007,73 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertEqual(try videoFrameCount(url, frameDuration: duration), Double(telemetry.encodedVideo), accuracy: 0.5)
   }
 
+  func testAutomaticMP4EncodesHEVCAndAACAndHonorsBitrate() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let frames = try (0..<12).map { try v210Frame(width: 640, height: 360, seed: UInt32($0 + 1)) }
+    var sizes: [Int] = []
+    XCTAssertEqual(AppRecordingProfile().bitrate, 10_000_000)
+    for mbps in [2, AppRecordingProfile().videoMbps] {
+      let url = root.appendingPathComponent("take-\(mbps).mp4")
+      let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("cam"), outputURL: url,
+        width: 640, height: 360, videoProfile: .matrix(.hevcMain10), fileType: .mp4, targetVideoBitrate: mbps * 1_000_000,
+        render420: try NativeRecordingSessionDriver.make420Renderer(codec: .hevcMain10, width: 640, height: 360),
+        queueCapacity: 120, frameRate: .fps2997, timecodePolicy: .wallClock)
+      let recorder = try SourceRecorderCore(configuration: config)
+      try recorder.start()
+      for frame in 0..<90 {
+        let pts = CMTimeMultiply(VideoContract.slowDuration, multiplier: Int32(frame))
+        XCTAssertTrue(recorder.appendVideo(try VideoContract.sample(frames[frame < 30 ? 0 : frame % frames.count], at: pts, duration: VideoContract.slowDuration)))
+        XCTAssertTrue(recorder.appendAudio(try audioSample(at: CMTime(value: Int64(frame * 1600), timescale: 48_000), frameCount: 1600)))
+        Thread.sleep(forTimeInterval: 0.008)
+      }
+      try recorder.stop()
+      let data = try Data(contentsOf: url)
+      XCTAssertEqual(String(decoding: data[4..<8], as: UTF8.self), "ftyp")
+      XCTAssertNotEqual(String(decoding: data[8..<12], as: UTF8.self), "qt  ")
+      XCTAssertGreaterThan(try trackDuration(url, .video), 2.9)
+      XCTAssertGreaterThan(try trackDuration(url, .audio), 2.9)
+      let done = DispatchSemaphore(value: 0)
+      Task {
+        defer { done.signal() }
+        do {
+          let asset = AVURLAsset(url: url)
+          for (media, subtype) in [(AVMediaType.video, kCMVideoCodecType_HEVC), (.audio, kAudioFormatMPEG4AAC)] {
+            let tracks = try await asset.loadTracks(withMediaType: media)
+            let track = try XCTUnwrap(tracks.first)
+            let formats = try await track.load(.formatDescriptions)
+            let format = try XCTUnwrap(formats.first)
+            XCTAssertEqual(CMFormatDescriptionGetMediaSubType(format), subtype)
+            if media == .video {
+              let atoms = CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Data]
+              let hvcc = try XCTUnwrap(atoms?["hvcC"])
+              XCTAssertGreaterThan(hvcc.count, 17)
+              if hvcc.count > 17 {
+                XCTAssertEqual(hvcc[16] & 3, 1, "HEVC chromaFormat must be 4:2:0")
+                XCTAssertEqual(hvcc[17] & 7, 2, "Preserve the 10-bit camera source")
+              }
+              let reader = try AVAssetReader(asset: asset)
+              let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+              reader.add(output)
+              XCTAssertTrue(reader.startReading())
+              var bytes = [0, 0]
+              while let packet = output.copyNextSampleBuffer() {
+                let time = CMSampleBufferGetPresentationTimeStamp(packet)
+                guard time.isNumeric, time.seconds >= 0, time.seconds < 2 else { continue }
+                bytes[Int(time.seconds)] += CMSampleBufferGetTotalSampleSize(packet)
+              }
+              XCTAssertEqual(reader.status, .completed)
+              XCTAssertGreaterThan(bytes[1], bytes[0], "The moving scene should use more bits than the still scene")
+            }
+          }
+        } catch { XCTFail("Could not read MP4 tracks: \(error)") }
+      }
+      XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+      sizes.append(data.count)
+    }
+    XCTAssertGreaterThan(sizes[1], sizes[0] * 2, "Both takes encode the same moving images at different target bitrates")
+  }
+
   private func trackDuration(_ url: URL, _ type: AVMediaType) throws -> Double {
     let asset = AVURLAsset(url: url)
     let done = DispatchSemaphore(value: 0)

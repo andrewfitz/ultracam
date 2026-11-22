@@ -17,10 +17,9 @@ struct RecordingOutputContract: Codable {
   let codec: UInt32
   let outputColour: Colorimetry
 
-  /// `burnedInColour`: a take with its camera LUT burned in is encoded in the
-  /// LUT's output colour (`RecordingLUTBurnIn.outputColour`), not the source's.
+  /// A GPU-rendered take carries the colour of its output surface.
   init(sourceFormat: SourceFormat, outputRate: FrameRate? = nil, encoderInputPixelFormat: UInt32, codec: UInt32,
-    burnedInColour: Colorimetry? = nil) {
+    renderedColour: Colorimetry? = nil) {
     width = sourceFormat.width; height = sourceFormat.height
     pixelAspect = sourceFormat.pixelAspect; scan = sourceFormat.scan
     rate = outputRate ?? sourceFormat.rate; clock = sourceFormat.clock
@@ -30,8 +29,8 @@ struct RecordingOutputContract: Codable {
     let video = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
       kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
       kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange].contains(encoderInputPixelFormat)
-    if let burnedInColour {
-      outputColour = burnedInColour
+    if let renderedColour {
+      outputColour = renderedColour
       return
     }
     outputColour = Colorimetry(primaries: source.primaries, transfer: source.transfer,

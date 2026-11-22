@@ -166,7 +166,7 @@ import XCTest
     XCTAssertEqual(UIFormat.duration(1320), "22 min")
   }
 
-  // MARK: Left pane
+  // MARK: Session lists
 
   func testVirtualCamerasPutProgramFirstAndSayInUseOnlyWhenTrue() {
     var state = session([camera(1), camera(2, inUse: true)])
@@ -184,21 +184,66 @@ import XCTest
     XCTAssertEqual(UIPresentationBuilder.folderAction(state), "Folder for Next Take…")
   }
 
-  func testExtensionRowsAreSetupNotProblems() {
+  func testExtensionRowsAreSetupNotProblems() throws {
     var state = session([camera(1)])
     state.install = UIInstallState(canRequestChanges: true, pending: false, status: "", unavailableReason: nil, installed: false)
     let presentation = UIPresentationBuilder.session(state)
     XCTAssertEqual(presentation.setupRows.first?.action?.title, "Install Camera Extension…")
     XCTAssertEqual(presentation.setupRows.first?.symbol, UISymbol.installExtension)
-    XCTAssertFalse(presentation.statusSegments.contains { $0.kind == .warning }, "Nothing is wrong yet")
+    XCTAssertTrue(presentation.problems.isEmpty, "Nothing is wrong yet")
+    // With no left pane, the status bar leads with the setup row and its one action.
+    let segment = try XCTUnwrap(presentation.statusSegments.first)
+    XCTAssertEqual(segment.kind, .warning)
+    XCTAssertEqual(segment.level, .notice)
+    XCTAssertEqual(segment.action?.action, .installCameraExtension)
+    XCTAssertFalse(segment.pieces.contains(.warningGlyph), "A setup row has no warning triangle")
   }
 
-  func testInterruptedTakesAreOneAttentionRow() {
+  func testSetupRowsFollowProblemsInTheStatusBar() throws {
+    var state = session([camera(1)])
+    state.install = UIInstallState(canRequestChanges: true, pending: false, status: "", unavailableReason: nil, installed: false)
+    state.defaultFolderPath = nil
+    state.cameras[0].recording.folderPath = nil
+    let presentation = UIPresentationBuilder.session(state)
+    XCTAssertEqual(presentation.problems.map(\.id), ["folder.none"])
+    let segment = try XCTUnwrap(presentation.statusSegments.first)
+    XCTAssertTrue(segment.text.hasPrefix("No recording folder"), segment.text)
+    XCTAssertTrue(segment.text.hasSuffix("+1"), "The setup row is counted behind the problem")
+    XCTAssertTrue(segment.pieces.contains(.warningGlyph))
+  }
+
+  func testAlertsOfferIsASetupRowOnlyBeforeASession() {
+    var state = session([camera(1)])
+    state.offerAlerts = true
+    var presentation = UIPresentationBuilder.session(state)
+    XCTAssertEqual(presentation.setupRows.map(\.id), ["alerts.offer"])
+    XCTAssertEqual(presentation.setupRows.first?.action?.action, .turnOnAlerts)
+    XCTAssertEqual(presentation.setupRows.first?.dismiss?.action, .dismissAlertsPrompt)
+    XCTAssertTrue(presentation.problems.isEmpty)
+    state.cameras[0].running = true
+    state.cameras[0].recording.status = .recording
+    presentation = UIPresentationBuilder.session(state)
+    XCTAssertTrue(presentation.setupRows.isEmpty, "Never while a take is rolling")
+  }
+
+  func testInterruptedTakesStayOutOfTheProblemList() {
     var state = session([camera(1)])
     state.interruptedTakes = [UIInterruptedTake(id: "a", title: "a.mov"), UIInterruptedTake(id: "b", title: "b.mov")]
-    let row = UIPresentationBuilder.problems(state).first { $0.id == "takes.interrupted" }
-    XCTAssertEqual(row?.title, "2 interrupted takes")
-    XCTAssertEqual(row?.action?.action, .showInterruptedTakes)
+    let presentation = UIPresentationBuilder.session(state)
+    // History, not a fault: Recording's popover and the Record menu offer the recovery.
+    XCTAssertFalse(presentation.problems.contains { $0.id == "takes.interrupted" })
+    XCTAssertFalse(presentation.statusSegments.contains { $0.kind == .warning })
+    XCTAssertEqual(presentation.menuBarIcon, UIPresentationBuilder.session(session([camera(1)])).menuBarIcon)
+  }
+
+  func testRecordingSegmentCarriesTheFormatAtFullWidthOnly() throws {
+    let presentation = UIPresentationBuilder.session(session([camera(1)], codec: .hevcMain10_422))
+    let segment = try XCTUnwrap(presentation.statusSegments.first { $0.kind == .recording })
+    let title = RecordingCodec.hevcMain10_422.title
+    XCTAssertTrue(segment.pieces.contains(.dim(title)), "\(segment.pieces)")
+    XCTAssertFalse(segment.compactPieces.contains(.dim(title)))
+    XCTAssertFalse(segment.essentialPieces.contains(.dim(title)))
+    XCTAssertFalse(segment.text.contains(title), "Help and VoiceOver keep the summary as it was")
   }
 
   // MARK: Confirmations
@@ -235,9 +280,11 @@ import XCTest
 
   func testSyncConfirmationNamesTheSourceCamera() {
     let presentation = UIPresentationBuilder.session(session([camera(1), camera(2)]))
-    XCTAssertEqual(UIAction.setSyncCameras(true).confirmationTitle(in: presentation), "Sync cameras from Camera 1?")
-    XCTAssertTrue(UIAction.setSyncCameras(true).needsConfirmation(in: presentation)?.hasPrefix("Camera 2 takes Camera 1's effects") == true)
-    XCTAssertNil(UIAction.setSyncCameras(false).needsConfirmation(in: presentation), "Turning it off rewrites nothing")
+    let enable = UIAction.setSyncCameras(true, sourceID: "camera-2")
+    XCTAssertEqual(enable.confirmationTitle(in: presentation), "Sync Cameras from Camera 2?")
+    XCTAssertTrue(enable.needsConfirmation(in: presentation)?.hasPrefix("Camera 1 takes Camera 2's effects") == true)
+    XCTAssertNil(UIAction.setSyncCameras(false, sourceID: "camera-2").needsConfirmation(in: presentation),
+      "Turning it off rewrites nothing")
   }
 
   // MARK: Background shortcuts
@@ -288,17 +335,64 @@ import XCTest
       target: nil, previewItem: nil)
     let titles = items.map(\.title)
     XCTAssertFalse(titles.contains("Processing"))
-    XCTAssertFalse(titles.contains("Cut to Camera 1"), "The camera on Program gets no Cut row")
+    let onAir = items.first { $0.title == "Cut to Camera 1" }
+    XCTAssertEqual(onAir?.isEnabled, false)
+    XCTAssertEqual(onAir?.state, .on)
     XCTAssertTrue(titles.contains("Cut to Camera 2"))
     XCTAssertTrue(titles.contains("Hold Current Shot"))
     XCTAssertTrue(titles.contains("Pause All"))
-    let stop = items.firstIndex { $0.title == "Stop All Cameras" }
+    let stop = items.firstIndex { $0.title == "Stop All Capture" }
     XCTAssertEqual(stop.map { items[$0 - 1].isSeparatorItem }, true, "A separator keeps a slip off a camera row off Stop")
     let rows = items.filter { !$0.isSeparatorItem }
-    XCTAssertLessThanOrEqual(rows.count, 14, titles.joined(separator: " | "))
+    XCTAssertLessThanOrEqual(rows.count, 16, titles.joined(separator: " | "))
     for name in ["Camera 1", "Camera 2"] {
       XCTAssertTrue(items.first { $0.title == name }?.submenu?.items.contains { $0.title == "LUT" } == true)
     }
+  }
+
+  @MainActor func testMenuRefreshKeepsRowsInPlaceAsCamerasAndProblemsChange() throws {
+    var state = session([camera(1), camera(2)])
+    state.cameras[0].automaticStart = true
+    state.cameras[0].running = false
+    state.cameras[1].running = false
+    func items() -> [NSMenuItem] {
+      UIMenuBarController.buildItems(presentation: UIPresentationBuilder.session(state), session: state,
+        target: nil, previewItem: nil, includesPreviewCommand: true)
+    }
+    let existing = items()
+    let attention = try XCTUnwrap(existing.first { $0.title == "Attention…" })
+    let preview = try XCTUnwrap(existing.first { $0.title == "Show Live Preview" })
+    let firstCut = try XCTUnwrap(existing.first { $0.title == "Cut to Camera 1" })
+    let secondCut = try XCTUnwrap(existing.first { $0.title == "Cut to Camera 2" })
+    let pause = try XCTUnwrap(existing.first { $0.title == "Pause All" })
+    XCTAssertFalse(attention.isEnabled)
+    XCTAssertTrue(preview.isEnabled)
+    XCTAssertFalse(pause.isEnabled)
+
+    state.cameras[0].running = true
+    state.cameras[1].running = true
+    state.cameras[1].recording.status = .recording
+    state.cameras[1].signal = .noSignal
+    state.onAirID = "camera-2"
+    state.programInUse = true
+    state.interruptedTakes = [UIInterruptedTake(id: "interrupted", title: "Interrupted take")]
+    XCTAssertTrue(UIMenuBarController.refresh(existing, with: items()))
+    XCTAssertTrue(attention.isEnabled)
+    // The lost signal on air. The interrupted take isn't a problem, so it isn't counted.
+    XCTAssertEqual(attention.badge?.stringValue, "1")
+    XCTAssertEqual(UIMenuBarController.commands(for: attention), [.action(.showProblems), .action(.openMainWindow)])
+    XCTAssertFalse(preview.isEnabled)
+    XCTAssertTrue(firstCut.isEnabled)
+    XCTAssertEqual(firstCut.state, .off)
+    XCTAssertFalse(secondCut.isEnabled)
+    XCTAssertEqual(secondCut.state, .on)
+    XCTAssertTrue(pause.isEnabled)
+
+    state.cameras[1].signal = .live(format: "2160p 59.94")
+    state.interruptedTakes.removeAll()
+    XCTAssertTrue(UIMenuBarController.refresh(existing, with: items()))
+    XCTAssertFalse(attention.isEnabled)
+    XCTAssertNil(attention.badge)
   }
 
   @MainActor func testMenuRefreshReplacesUnnamedSymbolsAndTheirTint() throws {

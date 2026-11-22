@@ -12,7 +12,7 @@ import time
 
 # Keep imports from creating cache files beside the project scripts.
 sys.dont_write_bytecode = True
-from validate_bundle import binary_uuids, validate
+from validate_bundle import RELOAD_HELPER, binary_uuids, validate
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_GROUP = "group.org.ultracam.local"
@@ -147,6 +147,11 @@ def sign_and_validate(destination):
             info["CMIOExtension"]["CMIOExtensionMachServiceName"] = LOCAL_GROUP + ".camera"
         write_plist(info_path, info)
     sign_staged_libraries(destination)
+    reload_helper = destination / RELOAD_HELPER
+    subprocess.run([
+        "/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none",
+        "--options", "runtime", str(reload_helper),
+    ], check=True)
     # Generate outside the repo; both signatures must contain the exact same
     # app group, and the extension's Mach service must start with that group.
     with tempfile.TemporaryDirectory(prefix="ultracam-sign-", dir=os.environ.get("TMPDIR")) as work:
@@ -165,7 +170,7 @@ def sign_and_validate(destination):
                 "/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none",
                 "--options", "runtime", "--entitlements", str(entitlements_path), str(bundle),
             ], check=True)
-    for bundle in (extension, destination):
+    for bundle in (reload_helper, extension, destination):
         subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(bundle)], check=True)
     validate(destination)
 

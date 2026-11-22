@@ -31,8 +31,8 @@ fixture+='''enum ARRIFalseColorProfile: String {
 enum UIFalseColorChoices {
 '''
 fixture+=ui[ui.index('  static let profiles:'):ui.index('  /// The modes, in menu order.')]+ '}\n'
-bridge_line=next(line for line in (root/'Sources/App/UILiveRoot.swift').read_text().splitlines() if 'inputs: model.devices.map' in line)
-bridge_expression=bridge_line[bridge_line.index('model.devices.map'):].rstrip().removesuffix(',')
+bridge=(root/'Sources/App/UILiveRoot.swift').read_text()
+bridge_expression=declaration(bridge,'model.devices.map')
 fixture+='''struct UIInput {let id:String;let name:String;let vendor:String?;let shareable:Bool;let supportedModes:String}
 struct FeedDescriptor { var id:Int;var enabled=false;var selectedDevice="";var automaticFeed=false }
 enum VendorRegistry {static func pluginID(for id:String) throws ->String {"fixture"}}

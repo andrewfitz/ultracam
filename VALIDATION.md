@@ -1,5 +1,68 @@
 # Validation
 
+## Program streaming
+
+The stream checks run on Apple silicon with synthetic camera pictures and embedded PCM. Build the app first, then supply the products directory from the signed Release build, including its ProgramAV1 and RTMP dependencies. Both receiver checks use FFmpeg and ffprobe on the local machine.
+
+```sh
+bash scripts/test-program-cadence-cpu.sh
+bash scripts/program-stream-smoke.sh "$stream_products"
+bash scripts/program-stream-app-smoke.sh "$stream_products" 24 all
+```
+
+The transport check decodes pictures and stereo sound, compares flash/tone timestamps and exercises rejection, congestion and recovery. Its optional trusted-TLS scenario takes a test certificate chain, matching key and a hostname resolving to loopback. The app check drives automatic cuts, opens and closes virtual-camera demand, records local ISO takes and compares receiver output before and after a disconnect. The `all` argument exercises the default H.264 profile, 4K60 HEVC and 720p29.97 software AV1. Both tools print the location of their recordings and JSON measurements.
+
+### Streaming audit and performance checks
+
+The audit exercised cancellation during TLS and RTMP handshakes, retries, audio after a stalled publisher, hardware encoder backpressure, native menu operation and source lifetime across cuts. Performance checks used an Apple M4 Max and the same input for each comparison.
+
+| Operation | Before | After | Measurement |
+| --- | ---: | ---: | --- |
+| 16-channel interleaved Int32 input to selected stereo PCM | 30.60 µs | 4.61 µs | Median thread CPU per 480-frame packet with simulated clock drift |
+| 16-channel planar Float32 input to selected stereo PCM | 31.02 µs | 4.83 µs | Same packet size at 48,000.5 Hz |
+| DeckLink 16-channel PCM handoff | 3.54 µs | 1.65 µs | Median callback cost across three runs |
+| Native timecode telemetry | 2.09 µs | 0.18 µs | Amortized callback cost at 60 callbacks and 4 display reads per second |
+| GPU conversion of 4K full-range NV12 to video range | 2.66 ms | 1.36 ms | Median wall time over 120 warm frames |
+
+The selected stereo PCM matched the original full-channel conversion sample for sample across 24 encoding, layout and rate combinations. The DeckLink handoff retained an immutable copy past the SDK callback and eliminated a second copy of 3.07 MB/s per 16-channel input. The GPU conversion now preserves alternating chroma rows through the range conversion. These timings measure individual operations. End-to-end receiver throughput also depends on the encoder, picture content and host load.
+
+An independent receiver verified the common audio/video clock by deliberately dropping the first six video frames on three connections. Each time the first video timestamp followed AAC by the expected 200 ms, and all 16 flash-to-tone offsets stayed within 44 ms. Cancelling an incomplete TLS or RTMP handshake released its socket in under 5 ms in the direct publisher test. The trusted RTMPS audio-continuity fixture recovered all 335 markers during repeated deliberate video gaps.
+
+Twelve six-second trusted RTMPS captures alternated the previous and audited builds on the same M4 Max. The one-minute system load ranged from 85 to 101 on 16 logical CPUs. Each cell shows the range of the two independent receiver measurements.
+
+| Codec and UHD60 fixture | Previous build | Audited build |
+| --- | ---: | ---: |
+| Hardware H.264, moving bars | 58.18–58.72 fps | 54.57–59.45 fps |
+| Hardware HEVC, moving bars | 60.00–60.01 fps | 60.00 fps |
+| Software AV1, high detail | 19.49–19.77 fps | 9.57–17.49 fps |
+
+The audited HEVC runs lost zero frames. One audited AV1 run missed a flash by 126 ms, and both AV1 runs were slower than the previous build. Publisher drops dominated while CPU availability varied. The linked libaom archive was identical, and these measurements do not isolate a cause for the difference. Software AV1 at UHD60 remains below real time on this host.
+
+### Selectable stream formats
+
+Short mixed-input app runs on Apple M4 Max exercised source cuts, one deliberate reconnect, simultaneous 4K ISO recording and one fixed stereo pair. An independent receiver decoded each connection.
+
+| Stream setting | Received fps before reconnect | Received fps after reconnect |
+| --- | ---: | ---: |
+| Hardware H.264, 1080p30 | 30.002 | 30.001 |
+| Hardware HEVC, UHD60 | 59.456 | 59.935 |
+| Software AV1, 720p29.97 | 29.881 | 29.971 |
+
+The UHD receiver decoded 55 successive alternating pictures at 16–17 ms intervals. The three runs had no unplanned reconnects, and all 35 A/V offsets fell between −6 and +42 ms. The hardware HEVC receiver also decoded 10-bit PQ and 4:2:2 10-bit HLG over trusted loopback RTMPS. A separate high-detail UHD60 software AV1 test delivered 5.85–31.29 fps as host load varied. In final hardware H.264 UHD60 tests over trusted RTMPS, moving bars delivered 55.89 fps and high-detail video delivered 56.26 fps at a 50 Mbps target. Both had 17 ms median frame intervals, 21 dropped pictures and −26 ms A/V offsets on the shared host. These figures come from synthetic sources and local receivers.
+
+The short regression runs passed 83 focused app checks, 31 routing and cadence checks, and 144 native UI checks. Package tests covered software AV1 decoding and explicit destination codec refusal. Saved profiles from the original release retained their destination and format.
+
+### Original 1080p30 release
+
+On the Apple M4 Max test host, the short mixed-format app check measured 30.002 and 30.001 fps on its two receiver connections. Switching between 4K29.97 and 1080p59.94 preserved channels 3–4 of the fixed input in all 63 voiced blocks. Eleven decoded flash/tone offsets ranged from +9 to +34 ms. The forced reconnect interrupted the receiver for 1.20 seconds. In a separate six-minute run on the same code, the first 11 seconds averaged 29.178 fps, below the 29.7 fps minimum. The next 350 seconds averaged 29.920 fps with zero unplanned disconnects. All eleven offsets were within +12 to +41 ms.
+
+All 12 receiver scenarios passed, including trusted-loopback RTMPS, certificate rejection, Video Only and reconnect. The receiver decoded limited-range Rec.709 H.264 and stereo 48 kHz AAC. Forty flash/tone measurements ranged from +40 to +44 ms. The audio-continuity fixture decoded 337 consecutive audio markers through 18 deliberate video omissions. All 29 cadence tests passed, including a regression test for early and late timer callbacks.
+
+The two-hour run used the build preceding the final audio-continuity and timer corrections. The receiver averaged 29.272 fps before the forced reconnect and 28.978 fps over the following 7,190.766 seconds, below the 29.7 fps minimum. The largest interframe gap was 1.7 seconds. There were zero unplanned reconnects, zero additional ISO drops and no net RSS growth from warmup to stop. The 24 measured flash/tone offsets ranged from +7 to +42 ms. Host load was high during the run, but the measurements cannot isolate its contribution. The final sources have short and six-minute receiver coverage. Sustained 30 fps under this workload is still unverified.
+
+The full app suite ran 1,757 tests with zero failures or skips. The Rust suite passed 39 tests and Python passed 187 contracts. MonitorKit reported 1,136 cases with zero failures and 12 skips. Interleaved benchmark output split a MonitorKit success marker, so its wrapper reported a failure. Checking the same log with the marker on a separate line confirmed coverage of every expected bundle and case.
+
+
 ## Capture discovery and Source overlay corrections — October 20, 2026
 
 Signed host **14** is installed in `/Applications/Ultracam.app`; extension **4**

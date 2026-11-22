@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CoreVideo
 import Observation
 import os
@@ -71,10 +72,10 @@ final class AppModel {
     RecordingCompatibilityPolicy(allowCPUConversion: allowCPUConversion)
   }
   var devices: [InputDevice] = [] { didSet { expireResolvedStartRefusals() } }
-  /// Set when Desktop Video is missing or older than 16.0, whose drivers
-  /// reject the SDK 16 interfaces and would otherwise list no inputs.
+  /// Aggregate capture driver warnings for the Hardware overview.
   var driverWarning: String?
   @ObservationIgnored private var deviceListObserver: Any?
+  @ObservationIgnored private var appActivationObservation: AnyCancellable?
   @ObservationIgnored private var virtualCameraObserver: Any?
   var feedDescriptors: [FeedDescriptor] { feedCoordinator.descriptors }
   /// What Ultracam · Program sends. One value for Program, kept on every camera because
@@ -143,6 +144,7 @@ final class AppModel {
     get { feedCoordinator.switcher.naturalTalkingHead.anchorFeedID }
     set {
       var settings = feedCoordinator.switcher
+      guard newValue == nil || newValue != settings.naturalTalkingHead.emphasisFeedID else { return }
       settings.naturalTalkingHead.anchorFeedID = newValue
       updateSwitcher(settings)
     }
@@ -152,6 +154,7 @@ final class AppModel {
     get { feedCoordinator.switcher.naturalTalkingHead.emphasisFeedID }
     set {
       var settings = feedCoordinator.switcher
+      guard newValue == nil || newValue != settings.naturalTalkingHead.anchorFeedID else { return }
       settings.naturalTalkingHead.emphasisFeedID = newValue
       updateSwitcher(settings)
     }
@@ -165,9 +168,11 @@ final class AppModel {
 
   /// Nothing runs, stops, records or loads anywhere: settings can be wiped.
   var canResetSettings: Bool {
-    FeedLifecycleDemandPolicy.canResetSettings(loading: !lutLoadingFeeds.isEmpty || recordingModel.recoveringID != nil,
-      sourceActive: feedDescriptors.contains { cameraActive($0.id) },
-      recordingActive: recordingModel.feeds.contains { $0.isActive })
+    !terminating && !settingsResetPending && !streamSnapshot.active &&
+      FeedLifecycleDemandPolicy.canResetSettings(
+        loading: !lutLoadingFeeds.isEmpty || recordingModel.recoveringID != nil,
+        sourceActive: feedDescriptors.contains { cameraActive($0.id) },
+        recordingActive: recordingModel.feeds.contains { $0.isActive })
   }
 
   var canAddCamera: Bool {
@@ -190,12 +195,14 @@ final class AppModel {
   var syncCameras: Bool { feedCoordinator.syncCameras }
   private var synchronizingCameras = false
 
-  func setSyncCameras(_ enabled: Bool) {
+  func setSyncCameras(_ enabled: Bool, sourceID: FeedID) {
     guard enabled != syncCameras else { return }
+    let source = descriptor(for: sourceID)
+    guard !enabled || source?.enabled == true else { return }
     feedCoordinator.syncCameras = enabled
-    if enabled {
-      synchronizeProcessing(from: feedCoordinator.selectedDescriptor)
-      synchronizeMonitoring(from: MonitorTargetID(selectedFeedID.rawValue), preferences: feedCoordinator.selectedDescriptor.monitor)
+    if enabled, let source {
+      synchronizeProcessing(from: source)
+      synchronizeMonitoring(from: MonitorTargetID(source.id.rawValue), preferences: source.monitor)
     }
     saveSettings()
   }
@@ -219,6 +226,7 @@ final class AppModel {
         $0.colorTarget = source.colorTarget
         $0.frameRateTarget = source.frameRateTarget
         $0.scalingMode = source.scalingMode
+        $0.allowUpscale = source.allowUpscale
         $0.pipelineEnabled = source.pipelineEnabled
         $0.setSourceProfile(source.sourceProfileID)
         $0.lutInputSpaceID = source.lutInputSpaceID
@@ -288,9 +296,38 @@ final class AppModel {
   let monitorCoordinator: MonitorCoordinator
   private var monitorDemand: Set<MonitorTargetID> = []
   private var feedPolicies: [FeedID: AutomaticFeedPolicy] = [:]
+  private struct PendingCaptureStart {
+    let generation: UUID
+    let deviceID: String
+    var automatic: Bool
+    let task: Task<Void, Never>
+  }
+  private var pendingCaptureStarts: [FeedID: PendingCaptureStart] = [:]
+  private var authorizationInProgress: Set<String> = []
+  private var captureStatusRevision = 0
   /// Who is really using each route, this moment: tally and problems read this. Work reads
   /// `routeHeld`, which outlasts a client by `LiveWatchLimits.clientRelease`.
   private var routeDemand: [String: Bool] = [:]
+  @ObservationIgnored private var routeClientApps: [String: Set<String>] = [:]
+  var recordingProfiles: [String: AppRecordingProfile] {
+    didSet {
+      guard recordingProfiles != oldValue else { return }
+      settingsStore.recordingProfiles = recordingProfiles
+      if recordingProfiles.compactMapValues(\.folderBookmark) != oldValue.compactMapValues(\.folderBookmark) {
+        reconcileAutomaticFeed()
+      }
+    }
+  }
+  var recordingApps: [String: String] {
+    didSet {
+      guard recordingApps != oldValue else { return }
+      settingsStore.recordingApps = recordingApps
+      for (route, requested) in routeDemand {
+        updateRecordingDemand(route, requested: unknownRoutes.contains(route) ? nil : requested)
+      }
+      reconcileAutomaticFeed()
+    }
+  }
   /// Routes whose client left, and when that takes effect (`systemUptime`).
   @ObservationIgnored private var routeReleaseAt: [String: TimeInterval] = [:]
   /// What each running camera's controller was last told about its sink.
@@ -299,6 +336,8 @@ final class AppModel {
   private var unknownRoutes: Set<String> = []
   /// The demand monitor's error for a virtual camera route, by route ID.
   private var routeErrors: [String: String] = [:]
+  @ObservationIgnored private var appDemand: [String: [String: CameraAppRecordingDemand]] = [:]
+  @ObservationIgnored private var recordingAttempted: [FeedID: Set<String>] = [:]
   private var demandStartedFeeds: Set<FeedID> = []
   private var manuallyStoppedFeeds: Set<FeedID> = []
   /// Each camera's virtual-camera route ID. It depends only on the feed ID, and
@@ -377,18 +416,63 @@ final class AppModel {
   private(set) var cameraStateRevision = 0
   /// Set by `resetAllSettings()`; no further saves happen before the app quits.
   private(set) var settingsResetPending = false
+  private(set) var terminating = false
+  private let streamSession: ProgramStreamSession
+  // The whole window observes state changes. Only an open status popover or Diagnostics
+  // needs the live bitrate, level and counters, which those views sample on their timers.
+  private var streamDisplayState = ProgramStreamSnapshot()
+  var streamSnapshot: ProgramStreamSnapshot {
+    _ = streamDisplayState
+    return streamSession.snapshot
+  }
+  @ObservationIgnored private var streamResourceGeneration: UInt64 = 0
+  private(set) var streamConfiguration = ProgramStreamConfiguration()
+  var streamVideoDrops: UInt64 { streamResourcesActive ? feedCoordinator.programStreamVideoDrops : stoppedStreamVideoDrops }
+  var streamAudioDrops: UInt64 { streamResourcesActive ? streamAudioTap?.statistics.dropped ?? 0 : stoppedStreamAudioDrops }
+  private(set) var streamConversionIssue: String?
+  @ObservationIgnored private var stoppedStreamVideoDrops: UInt64 = 0
+  @ObservationIgnored private var stoppedStreamAudioDrops: UInt64 = 0
+  @ObservationIgnored private var streamResourcesActive = false
+  @ObservationIgnored private var streamAudioController: CaptureController?
+  @ObservationIgnored private var streamAudioTap: ProgramStreamAudioTap?
+  @ObservationIgnored private var streamVideoStart: Task<Void, Never>?
   let recordingModel: RecordingModel
   private let feedCoordinator: FeedCoordinator
   private let settingsStore: AppSettingsStore
   let vendorSettings: VendorSettingsStore
   let cameraControls: CameraControlStore
-  /// Nicknames, last known names and cached device status (Settings › Hardware, the left pane).
+  /// Nicknames, last known names and cached device status (Settings › Hardware, the inspector).
   let hardwareInventory: HardwareInventory
   var controlViewFactories: [String: ControlViewFactory] { hardware.controlViewFactories() }
   /// A listed capture device as its plugin describes it; nil once unlisted.
   func captureDevice(_ deviceID: String) -> CaptureDeviceInfo? { hardware.captureDevice(deviceID) }
   /// Each capture vendor's driver, by vendor ID.
-  var captureDrivers: [String: DriverStatus] { hardware.captureDrivers() }
+  var captureDrivers: [String: DriverStatus] {
+    _ = captureStatusRevision
+    return hardware.captureDrivers()
+  }
+  func captureAuthorizationStatus(pluginID: String) -> CaptureAuthorizationStatus {
+    _ = captureStatusRevision
+    return hardware.captureAuthorization(pluginID, nil)
+  }
+  func isRequestingCaptureAccess(pluginID: String) -> Bool { authorizationInProgress.contains(pluginID) }
+  func requestCaptureAccess(pluginID: String) {
+    guard !terminating, !settingsResetPending, captureAuthorizationStatus(pluginID: pluginID) == .requestable,
+      authorizationInProgress.insert(pluginID).inserted else { return }
+    let problemKey = "capture-authorization.\(pluginID)"
+    clearProblem(problemKey)
+    Task { [weak self, hardware] in
+      do { try await hardware.authorizeCapture(pluginID, nil) }
+      catch {
+        if let self, !self.terminating, !self.settingsResetPending,
+          self.captureAuthorizationStatus(pluginID: pluginID) == .requestable {
+          self.reportProblem(error.localizedDescription, key: problemKey)
+        }
+      }
+      self?.authorizationInProgress.remove(pluginID)
+      self?.refresh()
+    }
+  }
   func captureVendor(for deviceID: String) -> VendorDescriptor? { hardware.captureDescriptor(deviceID) }
   /// Capture vendors in registry order; Settings › Hardware groups devices by them.
   var captureVendors: [VendorDescriptor] { hardware.captureVendors() }
@@ -404,6 +488,7 @@ final class AppModel {
   private var lutLoadingFeeds: Set<FeedID> = [] { didSet { expireResolvedStartRefusals() } }
   private let demandMonitor = CameraDemandMonitor()
   private var persistedSnapshot = AppSettingsSnapshot()
+  private var nextDirectorAttempt: TimeInterval = 0
   private var autoSwitcherBridge: AutoSwitcherBridge?
   /// The cameras the running director cuts between, fixed when it was built.
   private var directorCameras: (anchor: FeedID, emphasis: FeedID)?
@@ -443,11 +528,12 @@ final class AppModel {
        registryStore: VirtualCameraRegistryStore? = nil,
        registryPublisher: (any AppVirtualCameraRegistryPublishing)? = nil,
        recordingFolderStore: RecordingFolderStore? = nil, installer: ExtensionInstaller? = nil,
-       hardware: AppHardware = .live) {
+       recordingDriver: RecordingSessionDriver? = nil, streamSession: ProgramStreamSession? = nil, hardware: AppHardware = .live) {
     self.hardware = hardware
     self.installer = installer ?? ExtensionInstaller()
     let store = settingsStore ?? AppSettingsStore()
     self.settingsStore = store
+    self.streamSession = streamSession ?? ProgramStreamSession(defaults: store.preferenceDefaults)
     self.vendorSettings = VendorSettingsStore(plugins: Dictionary(uniqueKeysWithValues: hardware.settingsPlugins().map { ($0.descriptor.id, $0) }),
       persistence: VendorSettingsPreferences(defaults: store.preferenceDefaults))
     self.cameraControls = CameraControlStore(plugins: Dictionary(uniqueKeysWithValues: hardware.controlPlugins().map { ($0.descriptor.id, $0) }),
@@ -455,6 +541,8 @@ final class AppModel {
     self.hardwareInventory = HardwareInventory(defaults: store.preferenceDefaults, hardware: hardware)
     lastInputNames = hardwareInventory.lastKnownNames
     self.registryPublisher = registryPublisher ?? VirtualCameraRegistryPublisher()
+    recordingProfiles = store.recordingProfiles
+    recordingApps = store.recordingApps
     hideFromDock = store.hideFromDock
     self.virtualCameraRegistryStore = registryStore ?? VirtualCameraRegistryStore()
     let snapshot = store.loadSnapshot()
@@ -470,10 +558,13 @@ final class AppModel {
     if let programBridge = hardware.programBridge { coordinator.makeProgramBridge = programBridge }
     recordingModel = RecordingModel(
       feeds: feedCoordinator.descriptors.map { RecordingFeedDescriptor(id: $0.id, name: $0.name, recordingConstantFrameRate: $0.recordingConstantFrameRate) },
-      driver: NativeRecordingSessionDriver(captureForFeed: { id in coordinator.capture(for: id) },
+      driver: recordingDriver ?? NativeRecordingSessionDriver(captureForFeed: { id in coordinator.capture(for: id) },
         rawAudioCallbackAvailable: true),
       folderStore: recordingFolderStore ?? RecordingFolderStore())
     self.lutLoader = lutLoader
+    streamConfiguration = self.streamSession.configuration
+    streamDisplayState = self.streamSession.snapshot
+    self.streamSession.onChange = { [weak self] in self?.streamChanged() }
     allowCPUConversion = store.allowCPUConversion
     recordingModel.codec = store.recordingCodec
     recordingModel.timecodeMode = store.recordingTimecodeMode
@@ -517,7 +608,7 @@ final class AppModel {
       self.saveSettings()
     }
     monitorCoordinator.onResetSettings = { [weak self] target in
-      self?.replaceMonitorPreferences(of: target) { $0.resetTools() } ?? false
+      self?.replaceMonitorPreferences(of: target, resetSource: true) { $0.resetTools() } ?? false
     }
     monitorCoordinator.onCopySettings = { [weak self] source, destination in
       guard let self, let tools = self.monitorPreferences(of: source) else { return false }
@@ -547,6 +638,12 @@ final class AppModel {
     monitorCoordinator.updateTargets(feeds: feedCoordinator.descriptors, programAvailable: programAvailable)
     recordingModel.onOutputFolderChanged = { [weak self] folder in
       self?.autoSwitcherTimeline?.setOutputFolder(folder)
+    }
+    recordingModel.onRecordingFolderChanged = { [weak self] in self?.reconcileAutomaticFeed() }
+    recordingModel.onManualStop = { [weak self] id in
+      guard let self else { return }
+      let held = self.heldRecordingApps(for: id, at: ProcessInfo.processInfo.systemUptime)
+      self.recordingAttempted[id, default: []].formUnion(held)
     }
     recordingModel.onRecordingStarted = { [weak self] feedID, url in
       guard let self else { return }
@@ -608,6 +705,14 @@ final class AppModel {
       // the shot start on the decision's own cut time.
       self.autoSwitcherBridge?.acknowledge(decisionID: decisionID, appliedAt: nil)
     }
+    if let publisher = self.registryPublisher as? VirtualCameraRegistryPublisher {
+      publisher.onSynchronizationResult = { [weak self] result in
+        switch result {
+        case .success: self?.clearProblem("registry-sync")
+        case .failure(let error): self?.reportRegistryError(error, key: "registry-sync")
+        }
+      }
+    }
     launching = false
     // Program color is one setting, kept on every camera, and older builds could save it apart:
     // what Program declared would change with the camera on air. The first camera's wins.
@@ -620,7 +725,9 @@ final class AppModel {
       persistedSnapshot = feedCoordinator.snapshot
       store.saveSnapshot(persistedSnapshot)
     }
-    publishVirtualCameraRegistry(snapshot, reason: "launch")
+    if let registry = validatedRegistry(for: snapshot.feeds) {
+      publishVirtualCameraRegistry(registry, reason: "launch")
+    }
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
     // Every camera is wired the same way, and every saved LUT is restored
     // into its own camera's pipeline.
@@ -632,7 +739,13 @@ final class AppModel {
     // Hot-plug: arrivals and removals update the list without a manual refresh.
     deviceListObserver = hardware.observeDevices { [weak self] list in
       self?.driverWarning = hardware.driverWarning()
+      self?.captureStatusRevision &+= 1
       self?.applyDevices(list, fromDiscovery: true)
+    }
+    if !hardware.captureVendors().isEmpty {
+      appActivationObservation = NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).sink { [weak self] _ in
+        Task { @MainActor in self?.refresh() }
+      }
     }
     // The camera extension can start after a camera does (installed, approved or updated while
     // the app runs): when its cameras appear, every running camera whose virtual camera isn't
@@ -646,12 +759,30 @@ final class AppModel {
       self?.reconcileProgramTransportDemand()
     }
     demandMonitor.onRouteChange = { [weak self] change in
-      self?.routeDemandChanged(change.route.id, requested: change.requested, error: change.error)
+      self?.routeDemandChanged(change.route.id, requested: change.requested, error: change.error, clientApps: change.clientApps)
     }
     if wantsDemandMonitor { demandMonitor.start() }
   }
 
-  private func routeDemandChanged(_ route: String, requested: Bool?, error: String?) {
+  private func updateRecordingDemand(_ route: String, requested: Bool?) {
+    let clients = routeClientApps[route]
+    let now = ProcessInfo.processInfo.systemUptime
+    var states = appDemand[route] ?? [:]
+    for id in recordingApps.keys {
+      let matching = clients.map { clients in
+        clients.contains(id) || (id == "us.zoom.xos" && !clients.isDisjoint(with: Self.zoomCameraHelpers))
+      }
+      let active = requested == true ? matching : requested
+      states[id, default: CameraAppRecordingDemand()].update(active, now: now)
+    }
+    appDemand[route] = states.filter { recordingApps[$0.key] != nil }
+  }
+
+  // Zoom Workplace ships these camera/meeting helpers under their own signing IDs.
+  // Match them exactly if macOS exposes only the helper's signing ID.
+  private static let zoomCameraHelpers: Set<String> = ["us.zoom.ZoomMeeting", "us.zoom.CptHost", "us.zoom.caphost", "us.zoom.ZoomHybridConf"]
+
+  private func routeDemandChanged(_ route: String, requested: Bool?, error: String?, clientApps: Set<String>? = nil) {
     // Every client edge, with its time in the log: whether apps open streams just to
     // probe a camera, and how often, can be read from these.
     if (routeDemand[route] == true) != (requested == true) || (requested == nil) != unknownRoutes.contains(route) {
@@ -663,6 +794,8 @@ final class AppModel {
     } else if routeDemand[route] == true {
       routeReleaseAt[route] = ProcessInfo.processInfo.systemUptime + LiveWatchLimits.clientRelease
     }
+    routeClientApps[route] = clientApps
+    updateRecordingDemand(route, requested: requested)
     routeDemand[route] = requested == true
     if requested == nil { unknownRoutes.insert(route) } else { unknownRoutes.remove(route) }
     routeErrors[route] = error
@@ -678,6 +811,7 @@ final class AppModel {
   }
 
   func refresh() {
+    guard !terminating, !settingsResetPending else { return }
     do {
       applyDevices(try hardware.devices(), fromDiscovery: false)
     } catch {
@@ -685,6 +819,7 @@ final class AppModel {
       reportProblem(error.localizedDescription, key: "inputs")
     }
     driverWarning = hardware.driverWarning()
+    captureStatusRevision &+= 1
   }
 
   private func applyDevices(_ next: [InputDevice], fromDiscovery: Bool) {
@@ -707,15 +842,18 @@ final class AppModel {
       guard let free = devices.first(where: { inputHolder($0.id, excluding: descriptor.id) == nil }) else { break }
       updateCamera(descriptor.id) { $0.selectedDevice = free.id }
     }
-    if feedDescriptors.contains(where: \.automaticFeed) {
-      if wantsDemandMonitor { demandMonitor.refresh() }
-      reconcileAutomaticFeed()
-    }
+    if wantsDemandMonitor { demandMonitor.refresh() }
+    reconcileAutomaticFeed()
   }
 
   /// Running, or its controller still owns the device while a stop drains.
   private func cameraActive(_ id: FeedID) -> Bool {
     feedCoordinator.isFeedRunning(id) || feedCoordinator.capturePool.existingController(for: id)?.hasActiveFeed == true
+  }
+
+  func canChangeCameraInput(_ id: FeedID) -> Bool {
+    _ = cameraStateRevision
+    return descriptor(for: id) != nil && !cameraActive(id)
   }
 
   // MARK: - LUTs (one path for every camera)
@@ -900,7 +1038,10 @@ final class AppModel {
     guard canAddCamera else { return nil }
     let source = feedCoordinator.selectedDescriptor
     let programColor = programColorSpaceID
-    let id = feedCoordinator.add(name: name)
+    let added = feedCoordinator.newFeed(name: name)
+    guard validatedRegistry(for: feedDescriptors + [added]) != nil else { return nil }
+    feedCoordinator.update(added)
+    let id = added.id
     wireCamera(id)
     // Program color is one setting: a new camera sends what the others do.
     if let added = descriptor(for: id), added.programColorSpaceID != programColor {
@@ -965,10 +1106,17 @@ final class AppModel {
   func removeFeed(_ id: FeedID) -> Bool {
     guard canRemoveCamera(id) else { return false }
     guard feedCoordinator.remove(id) else { return false }
+    if streamSnapshot.active, streamSnapshot.audioFeedID == id.rawValue {
+      streamAudioController?.setProgramStreamAudioTap(nil)
+      streamAudioController = nil
+    }
     // The selection moves off a removed camera, and Program off it if it was on air, with
     // no cut and so no event: the window hears of it here.
     switchingRevision &+= 1
     let route = feedRouteID(id)
+    recordingAttempted[id] = nil
+    routeClientApps[route] = nil
+    appDemand[route] = nil
     routeDemand[route] = nil
     routeReleaseAt[route] = nil
     unknownRoutes.remove(route)
@@ -980,6 +1128,7 @@ final class AppModel {
     cameraLUTs[id] = nil
     cameraUpdates[id] = nil
     feedPolicies[id] = nil
+    cancelPendingCaptureStart(id)
     sinkDemand[id] = nil
     stalledCameras.remove(id)
     signalHealth.remove(id)
@@ -992,8 +1141,8 @@ final class AppModel {
     detectedSourceDurations[id] = nil
     lastSourceDurations[id] = nil
     appliedPipelines[id] = nil
-    monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(id.rawValue), nil)
     syncRecordingFeeds()
+    telemetry.remove(id)
     saveSettings(reason: "camera removed")
     // It may have been the director's anchor or emphasis, or Program's selection. Down to one
     // camera, Program's demand went with it (`saveSettings`): cameras stop rendering for it,
@@ -1011,6 +1160,7 @@ final class AppModel {
     guard !trimmed.isEmpty else { return false }
     var updated = existing
     updated.name = trimmed
+    guard validatedRegistry(for: feedDescriptors.map { $0.id == id ? updated : $0 }) != nil else { return false }
     feedCoordinator.update(updated)
     syncRecordingFeeds()
     saveSettings()
@@ -1027,7 +1177,7 @@ final class AppModel {
     if autoSwitcherBridge != nil { stopAutoSwitcher() }
     feedCoordinator.setSwitcher(settings)
     saveSettings()
-    reconcileAutoSwitcher()
+    reconcileAutomaticFeed()
   }
   @discardableResult
   func requestProgramCut(to feedID: FeedID) -> ProgramCutRequestResult<FeedID> {
@@ -1128,24 +1278,27 @@ final class AppModel {
       $0.enabled && !$0.selectedDevice.isEmpty && feedCoordinator.isFeedRunning($0.id)
     }
     let enabledIDs = Set(feeds.map(\.id))
-    let anchor = settings.anchorFeedID.flatMap { enabledIDs.contains($0) ? $0 : nil }
-      ?? feeds.first?.id
-    let emphasis = settings.emphasisFeedID.flatMap { enabledIDs.contains($0) ? $0 : nil }
-      ?? feeds.first(where: { $0.id != anchor })?.id
-    guard let anchor, let emphasis, anchor != emphasis else {
-      stopAutoSwitcher()
-      return
-    }
-    // A running director keeps its two cameras, and its clock moves from one to the other.
-    // With neither left it hears nothing, so it starts over on two that run.
+    // A running director keeps its two cameras while either still runs.
+    // Only a new director needs two running sources to start.
     if let directorCameras, autoSwitcherBridge != nil {
       if enabledIDs.contains(directorCameras.anchor) || enabledIDs.contains(directorCameras.emphasis) { return }
       stopAutoSwitcher()
     }
-    guard let bridge = AutoSwitcherBridge(settings: settings, anchor: anchor, emphasis: emphasis) else {
-      reportProblem("Natural Talking Head could not start its Rust director.", key: "director")
+    let explicitAnchor = settings.anchorFeedID.flatMap { enabledIDs.contains($0) ? $0 : nil }
+    let explicitEmphasis = settings.emphasisFeedID.flatMap { enabledIDs.contains($0) ? $0 : nil }
+    let anchor = explicitAnchor ?? feeds.first(where: { $0.id != explicitEmphasis })?.id
+    let emphasis = explicitEmphasis ?? feeds.first(where: { $0.id != anchor })?.id
+    guard let anchor, let emphasis, anchor != emphasis else {
+      stopAutoSwitcher()
       return
     }
+    guard ProcessInfo.processInfo.systemUptime >= nextDirectorAttempt else { return }
+    guard let bridge = AutoSwitcherBridge(settings: settings, anchor: anchor, emphasis: emphasis, availableRoutes: feeds.map(\.id)) else {
+      nextDirectorAttempt = ProcessInfo.processInfo.systemUptime + 3
+      reportProblem("Auto Switcher could not connect to its director.", key: "director")
+      return
+    }
+    nextDirectorAttempt = 0
     autoSwitcherTimeline = AutoSwitcherTimelineRecorder(settings: settings, anchor: anchor,
       emphasis: emphasis, outputFolder: recordingModel.outputFolder)
     guard let timeline = autoSwitcherTimeline else { return }
@@ -1178,7 +1331,7 @@ final class AppModel {
     }
     bridge.onInstruction = { [weak self, weak bridge] instruction in
       Task { @MainActor [weak self] in
-        guard let self, self.autoSwitcherBridge === bridge else { return }
+        guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
         self.autoSwitcherTimeline?.recordInstruction(instruction,
           from: self.switcherSelectedFeedID)
         // `cutTime` is on the director's audio clock, not on the target
@@ -1196,13 +1349,13 @@ final class AppModel {
           // acknowledge. The director hears it as it hears an operator's selection, or it
           // would go on asking for the camera Program already shows.
           self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
-          bridge?.reject(decisionID: instruction.decisionID)
-          bridge?.manualOverride(cameraID: instruction.targetCameraID, at: self.directorClock())
+          bridge.reject(decisionID: instruction.decisionID)
+          bridge.manualOverride(cameraID: instruction.targetCameraID, at: self.directorClock())
           self.persistProgramSelection()
           self.reconcileProgramTransportDemand()
         case .ignoredSameSource, .rejectedMissingSource:
           self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
-          bridge?.reject(decisionID: instruction.decisionID)
+          bridge.reject(decisionID: instruction.decisionID)
         }
       }
     }
@@ -1210,6 +1363,10 @@ final class AppModel {
       Task { @MainActor [weak self] in
         guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
         self.autoSwitcherTimeline?.recordError(message)
+        if bridge.connectionLost {
+          self.nextDirectorAttempt = ProcessInfo.processInfo.systemUptime + 3
+          self.stopAutoSwitcher()
+        }
         self.reportProblem("Auto director: \(message)", key: "director")
       }
     }
@@ -1268,7 +1425,9 @@ final class AppModel {
   }
 
   private func feedAutoSwitcherAudio(_ update: CaptureUpdate) {
-    guard let time = update.mediaTime ?? update.audioPacketTime else { return }
+    guard let time = update.mediaTime ?? update.audioPacketTime ?? update.audioInterruptionTime else { return }
+    if autoSwitcherBridge == nil && directorWanted && nextDirectorAttempt > 0
+      && ProcessInfo.processInfo.systemUptime >= nextDirectorAttempt { reconcileAutoSwitcher() }
     if autoSwitcherBridge == nil {
       if directorWanted { _ = feedCoordinator.evaluateSwitcher(at: time) }
       else { feedCoordinator.expirePendingCut() }
@@ -1281,6 +1440,9 @@ final class AppModel {
         rms: update.audioActivityRMS,
         peak: update.audioActivityPeak,
         present: true)
+    } else if update.audioInterrupted {
+      autoSwitcherBridge?.ingestAudio(time: update.audioInterruptionTime.map { CMTimeMaximum(time, $0) } ?? time,
+        rms: 0, peak: 0, present: false)
     } else {
       autoSwitcherTimeline?.recordTick(time: time)
       autoSwitcherBridge?.tick(time: time)
@@ -1308,10 +1470,12 @@ final class AppModel {
 
   private func saveSettings(reason: String) {
     guard !launching, !settingsResetPending else { return }
-    persistedSnapshot = feedCoordinator.snapshot
+    let next = feedCoordinator.snapshot
+    guard let registry = validatedRegistry(for: next.feeds) else { return }
+    persistedSnapshot = next
     settingsStore.saveSnapshot(persistedSnapshot)
     demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
-    publishVirtualCameraRegistry(persistedSnapshot, reason: reason)
+    publishVirtualCameraRegistry(registry, reason: reason)
     let available = programAvailable
     // A monitor that lost Program takes frames again from a new generation, and a Program
     // camera published again has had nothing written to it.
@@ -1323,6 +1487,8 @@ final class AppModel {
     // forgotten here. Any client left keeps the device, on standby black, until it goes.
     if !available {
       let route = VirtualCameraDescriptor.program().id
+      routeClientApps[route] = nil
+      appDemand[route] = nil
       routeDemand[route] = nil
       routeReleaseAt[route] = nil
       unknownRoutes.remove(route)
@@ -1340,13 +1506,15 @@ final class AppModel {
   /// Changes a target's whole monitor preferences (reset, copy) and saves them;
   /// false for an unknown target.
   private func replaceMonitorPreferences(
-    of target: MonitorTargetID, _ change: (inout MonitorFeedPreferences) -> Void
+    of target: MonitorTargetID, resetSource: Bool = false, _ change: (inout MonitorFeedPreferences) -> Void
   ) -> Bool {
     if target.rawValue == "program" {
       change(&feedCoordinator.programMonitor)
     } else if var descriptor = feedDescriptors.first(where: { $0.id.rawValue == target.rawValue }) {
       change(&descriptor.monitor)
+      if resetSource { descriptor.setSourceProfile("unspecified") }
       feedCoordinator.update(descriptor)
+      if resetSource { applyPipeline(descriptor.id) }
       synchronizeMonitoring(from: target, preferences: descriptor.monitor)
     } else {
       return false
@@ -1361,22 +1529,35 @@ final class AppModel {
     })
   }
 
+  private func validatedRegistry(for feeds: [FeedDescriptor]) -> VirtualCameraRegistrySnapshot? {
+    let candidate = VirtualCameraRegistrySnapshot.forFeeds(feeds, previous: virtualCameraRegistryStore.load(),
+      appGroupIdentifier: virtualCameraRegistryStore.groupIdentifier)
+    do {
+      _ = try VirtualCameraRegistryWire.encodedData(candidate)
+      guard candidate.generation < UInt64.max else { throw VirtualCameraRegistryError.invalidGeneration }
+      return candidate
+    } catch {
+      reportRegistryError(error, key: "registry")
+      return nil
+    }
+  }
+
+  private func reportRegistryError(_ error: Error, key: String) {
+    registryLog.error("Registry publish failed: \(error.localizedDescription, privacy: .public)")
+    reportProblem("Virtual cameras could not be updated: \(error.localizedDescription)", key: key)
+  }
+
   /// Publishes the complete feed topology in one transaction. The camera
   /// extension receives it through CMIO and retains existing devices until
   /// their clients release them during reconciliation.
-  private func publishVirtualCameraRegistry(_ snapshot: AppSettingsSnapshot, reason: String) {
-    let previous = virtualCameraRegistryStore.load()
-    let candidate = VirtualCameraRegistrySnapshot.forFeeds(snapshot.feeds, previous: previous)
+  private func publishVirtualCameraRegistry(_ candidate: VirtualCameraRegistrySnapshot, reason: String) {
     do {
-      try candidate.validateDeviceCount()
       try virtualCameraRegistryStore.save(candidate)
-      if candidate != previous {
-        registryLog.notice("Registry publish: generation \(candidate.generation, privacy: .public), \(candidate.devices.filter(\.enabled).count, privacy: .public) devices, reason: \(reason, privacy: .public)")
-      }
+      registryLog.notice("Registry publish: generation \(candidate.generation, privacy: .public), \(candidate.devices.filter(\.enabled).count, privacy: .public) devices, reason: \(reason, privacy: .public)")
       registryPublisher.publish(candidate)
+      clearProblem("registry")
     } catch {
-      registryLog.error("Registry publish failed: \(error.localizedDescription, privacy: .public)")
-      reportProblem("Virtual cameras could not be updated: \(error.localizedDescription)", key: "registry")
+      reportRegistryError(error, key: "registry")
     }
   }
 
@@ -1431,11 +1612,6 @@ final class AppModel {
   private func wireCamera(_ feedID: FeedID) {
     let controller = feedCoordinator.capture(for: feedID)
     controller.setMonitorSink(monitorCoordinator.captureSink(for: MonitorTargetID(feedID.rawValue)))
-    // The Output (LUT) picture and Output-stage tools show the very MonitorLUT
-    // this camera burns in (nil while Apply LUT is off), read at each encode.
-    monitorCoordinator.setBurnInLUTSource(for: MonitorTargetID(feedID.rawValue)) { [weak controller] in
-      controller?.burnInLUT
-    }
     // Frames go from the capture delivery thread straight into the Program
     // route (and from there to the Program camera); none pass through here.
     feedCoordinator.installProgramFrameDelivery(feedID: feedID)
@@ -1448,6 +1624,7 @@ final class AppModel {
   /// work drains, so updates for a removed camera are ignored.
   private func cameraDidUpdate(_ feedID: FeedID, _ update: CaptureUpdate) {
     guard descriptor(for: feedID) != nil else { return }
+    let sourceChanged = _cameraUpdates[feedID]?.sourceFormat != update.sourceFormat
     if let previous = _cameraUpdates[feedID], CaptureUpdateState(previous) == CaptureUpdateState(update) {
       // Only telemetry changed: stored without telling the observers of `cameraUpdates`.
       _cameraUpdates[feedID] = update
@@ -1494,12 +1671,14 @@ final class AppModel {
       !feedCoordinator.isFeedRunning(onAir) {
       moveProgramToProducingCamera(.notReady)
     }
+    var durationChanged = false
     if let duration = update.sourceDuration, duration.isNumeric, duration.epoch == 0, duration.value > 0,
       detectedSourceDurations[feedID] != duration {
       lastSourceDurations[feedID] = duration
       detectedSourceDurations[feedID] = duration
-      reconcileProgramTransportDemand()
+      durationChanged = true
     }
+    if sourceChanged || durationChanged { reconcileProgramTransportDemand() }
     if feedID == directorClockFeedID {
       if autoSwitcherBridge != nil, directorClockOwner != feedID { rebaseDirectorClock(on: feedID, update) }
       feedAutoSwitcherAudio(update)
@@ -1563,6 +1742,89 @@ final class AppModel {
     updateLiveWatch()
   }
 
+  func isCaptureAuthorizationPending(_ id: FeedID) -> Bool { pendingCaptureStarts[id] != nil }
+
+  private func cancelPendingCaptureStart(_ id: FeedID) {
+    pendingCaptureStarts.removeValue(forKey: id)?.task.cancel()
+  }
+
+  private func cancelPendingCaptureStarts() {
+    pendingCaptureStarts.values.forEach { $0.task.cancel() }
+    pendingCaptureStarts.removeAll()
+  }
+
+  private func captureAuthorization(for deviceID: String) -> CaptureAuthorizationStatus {
+    _ = captureStatusRevision
+    guard let pluginID = try? VendorRegistry.pluginID(for: deviceID) else { return .authorized }
+    return hardware.captureAuthorization(pluginID, deviceID)
+  }
+
+  private func requestCaptureStart(_ id: FeedID, deviceID: String, automatic: Bool) {
+    switch captureAuthorization(for: deviceID) {
+    case .authorized:
+      guard canStart(id) else {
+        if !automatic { noteStartAttempt(id, started: false) }
+        return
+      }
+      startAuthorizedCapture(id, automatic: automatic)
+    case .unavailable:
+      if !automatic { noteStartAttempt(id, started: false) }
+    case .requestable:
+      guard let pluginID = try? VendorRegistry.pluginID(for: deviceID) else { return }
+      forgetStartRefusal(id)
+      let generation = UUID()
+      let task = Task { [weak self, hardware] in
+        guard self?.pendingCaptureStarts[id]?.generation == generation else { return }
+        let failure: String?
+        do {
+          try await hardware.authorizeCapture(pluginID, deviceID)
+          failure = nil
+        } catch {
+          failure = error.localizedDescription
+        }
+        self?.finishCaptureAuthorization(id, generation: generation, failure: failure)
+      }
+      pendingCaptureStarts[id] = PendingCaptureStart(generation: generation, deviceID: deviceID,
+        automatic: automatic, task: task)
+    }
+  }
+
+  private func finishCaptureAuthorization(_ id: FeedID, generation: UUID, failure: String?) {
+    // Authorization may reveal previously hidden devices. Reconcile demand
+    // while this generation is still pending, then consume only that request.
+    refresh()
+    guard let request = pendingCaptureStarts[id], request.generation == generation else { return }
+    pendingCaptureStarts[id] = nil
+    guard !terminating, !settingsResetPending, let descriptor = descriptor(for: id), descriptor.enabled,
+      descriptor.selectedDevice == request.deviceID, !manuallyStoppedFeeds.contains(id),
+      !request.automatic || feedPolicies[id]?.captureRequested == true else { return }
+    if let failure {
+      if !request.automatic { noteStartAttempt(id, started: false) }
+      if inputUnavailableReason(request.deviceID, for: id) == nil {
+        reportProblem(failure, key: "capture-authorization.\(id.rawValue)")
+      }
+      return
+    }
+    guard canStart(id), captureAuthorization(for: request.deviceID) == .authorized else {
+      if !request.automatic { noteStartAttempt(id, started: false) }
+      return
+    }
+    startAuthorizedCapture(id, automatic: request.automatic)
+    reconcileAutomaticFeed()
+  }
+
+  private func startAuthorizedCapture(_ id: FeedID, automatic: Bool) {
+    noteStartAttempt(id, started: true)
+    clearProblem("capture-authorization.\(id.rawValue)")
+    if automatic {
+      demandStartedFeeds.insert(id)
+    } else {
+      // A camera the user started is theirs: demand never stops it.
+      demandStartedFeeds.remove(id)
+    }
+    launchCapture(id)
+  }
+
   /// Ends one camera's capture, its virtual camera output and its recording.
   private func endCapture(_ id: FeedID, message: String) {
     recordingModel.stop(feedID: id)
@@ -1601,12 +1863,30 @@ final class AppModel {
       devices.contains { $0.id == descriptor.selectedDevice } && inputInUse(by: id) == nil
   }
 
+  func canRequestCaptureStart(_ id: FeedID) -> Bool {
+    guard let descriptor = descriptor(for: id), descriptor.enabled, !descriptor.selectedDevice.isEmpty,
+      !feedCoordinator.isFeedRunning(id), !isCaptureAuthorizationPending(id) else { return false }
+    let deviceID = descriptor.selectedDevice
+    return captureAuthorization(for: deviceID) == .requestable
+      ? !lutLoadingFeeds.contains(id) && inputInUse(by: id) == nil
+      : canStart(id)
+  }
+
   /// What the interface calls an input: its label while listed (`UIInputLabels`),
   /// its last name seen and ID digits while unplugged, nil for none.
   func inputLabel(_ device: String) -> String? {
     guard !device.isEmpty else { return nil }
-    if let nickname = hardwareInventory.nickname(for: device) { return nickname }
-    return devices.label(for: device) ?? UIInputLabels.missingLabel(id: device, lastName: lastInputNames[device])
+    let listed = devices.map { (id: $0.id, name: hardwareInventory.nickname(for: $0.id) ?? $0.name) }
+    if let input = listed.first(where: { $0.id == device }) {
+      return UIInputLabels.label(id: device, name: input.name, among: listed)
+    }
+
+    let assigned = Set(feedDescriptors.map(\.selectedDevice)).subtracting(listed.map(\.id))
+    let missing = assigned.filter { !$0.isEmpty }.map { id in
+      (id: id, name: hardwareInventory.nickname(for: id) ?? lastInputNames[id] ?? "Input device")
+    }
+    let nickname = hardwareInventory.nickname(for: device)
+    return UIInputLabels.missingLabel(id: device, lastName: nickname ?? lastInputNames[device], among: listed + missing)
   }
 
   /// Only an explicit plugin declaration permits multiple camera owners.
@@ -1658,10 +1938,20 @@ final class AppModel {
   /// Why camera `id` on input `device` can't start, nil while that input is listed and free.
   /// With no input listed there is no available device to choose.
   private func inputUnavailableReason(_ device: String, for id: FeedID) -> String? {
-    if device.isEmpty && !devices.isEmpty { return driverWarning ?? "Choose an input for this camera." }
-    if !devices.contains(where: { $0.id == device }) { return driverWarning ?? "Connect an input device." }
+    if case .unavailable(let error) = captureAuthorization(for: device) { return error.localizedDescription }
+    if device.isEmpty { return devices.isEmpty ? "Connect an input device." : "Choose an input for this camera." }
+    if !devices.contains(where: { $0.id == device }) {
+      return captureDriverWarning(deviceID: device) ?? "Connect an input device."
+    }
     if let holder = inputInUse(by: id) { return "\(holder.name) is using this input. Choose another input." }
     return nil
+  }
+
+  func captureDriverWarning(deviceID: String) -> String? {
+    _ = captureStatusRevision
+    if case .unavailable(let error) = captureAuthorization(for: deviceID) { return error.localizedDescription }
+    guard let pluginID = try? VendorRegistry.pluginID(for: deviceID) else { return nil }
+    return hardware.captureVendorWarning(pluginID)
   }
 
   /// Removes one failed source from Program eligibility without ending the
@@ -1687,6 +1977,7 @@ final class AppModel {
         ? "Camera in use. Hide preview without interrupting camera output."
         : "Preview is live. Hide it to stop capture until a camera app needs it."
     }
+    if isCaptureAuthorizationPending(id) { return "Waiting for capture access…" }
     if manuallyStoppedFeeds.contains(id) { return "Camera stopped. It stays off until you start it." }
     if let error = routeErrors[feedRouteID(id)] { return error }
     if feedPolicies[id]?.captureRequested != true {
@@ -1715,12 +2006,11 @@ final class AppModel {
     reconcileAutomaticFeed()
   }
 
-  /// Program has a client, or its monitor is showing: someone wants its pixels. Cuts land
-  /// without this; it decides what renders, starts automatic cameras and runs the director.
-  /// With one camera there is no Program to want.
+  /// Network publishing, monitoring and the virtual camera share source and director demand.
+  /// A live network session keeps its pixels when removing a camera unpublishes the CMIO device.
   private var programPicture: Bool {
-    programAvailable &&
-      (routeHeld(VirtualCameraDescriptor.program().id) || monitorDemand.contains(MonitorTargetID("program")))
+    streamResourcesActive || (programAvailable &&
+      (routeHeld(VirtualCameraDescriptor.program().id) || monitorDemand.contains(MonitorTargetID("program"))))
   }
 
   private var takeActive: Bool { recordingModel.feeds.contains { $0.status == .recording || $0.status == .paused } }
@@ -1736,40 +2026,60 @@ final class AppModel {
   /// Program's picture, automatic switching during a take, a recording, or a visible
   /// preview. The same rules for every camera.
   private func reconcileAutomaticFeed() {
-    guard !launching else { return }
+    guard !launching, !terminating, !settingsResetPending else { return }
+    let now = ProcessInfo.processInfo.systemUptime
     let programRequested = programPicture
+    let programRoute = VirtualCameraDescriptor.program().id
+    let programDemandIsCurrent = streamResourcesActive || (programAvailable &&
+      (routeDemand[programRoute] == true || monitorDemand.contains(MonitorTargetID("program"))))
+    let streamAudioFeedID = streamResourcesActive ? streamSession.snapshot.audioFeedID : nil
     let autoTake = feedCoordinator.switcher.automatic && feedCoordinator.switcher.strategy != .manual && takeActive
     for descriptor in feedDescriptors where descriptor.enabled {
       let id = descriptor.id
-      if !FeedLifecycleDemandPolicy.retainsAutomaticOwnership(automaticEnabled: descriptor.automaticFeed,
-        wasAutomaticallyStarted: demandStartedFeeds.contains(id)) {
-        demandStartedFeeds.remove(id)
+      let isRunning = feedCoordinator.isFeedRunning(id)
+      let wantsBackup = descriptor.recordWithCameraApps && heldRecordingApps(for: id, at: now, allowRelease: isRunning).contains {
+        recordingModel.outputFolder(for: id) != nil || recordingProfiles[$0]?.folderBookmark != nil
       }
       let recording = recordingModel.feeds.contains {
         $0.id == id && ($0.status == .recording || $0.status == .paused)
       }
       var policy = feedPolicies[id] ?? AutomaticFeedPolicy()
-      let camera = routeHeld(feedRouteID(id))
-      policy.demand(camera || programRequested || autoTake || recording)
-      policy.previewDemand(descriptor.previewEnabled && monitorDemand.contains(MonitorTargetID(id.rawValue)))
-      let isRunning = feedCoordinator.isFeedRunning(id)
+      // The client-release grace period keeps a live session open. A cold
+      // start still needs a client or another current reason to open capture.
+      let camera = isRunning ? routeHeld(feedRouteID(id)) : routeDemand[feedRouteID(id)] == true
+      let program = isRunning ? programRequested : programDemandIsCurrent
+      let streamAudio = streamAudioFeedID == id.rawValue
+      // Keep ownership through disarming, until the automatic take finishes.
+      let backupOnly = !descriptor.automaticFeed && (descriptor.recordWithCameraApps || demandStartedFeeds.contains(id))
+      policy.updateDemand(
+        requested: (!backupOnly && (camera || program || autoTake)) || wantsBackup || recording || streamAudio,
+        previewRequested: !backupOnly && descriptor.previewEnabled && monitorDemand.contains(MonitorTargetID(id.rawValue)))
+      let automaticEnabled = descriptor.automaticFeed || wantsBackup
+      if pendingCaptureStarts[id]?.automatic == true, !policy.captureRequested || !automaticEnabled {
+        cancelPendingCaptureStart(id)
+      }
+      let authorization = captureAuthorization(for: descriptor.selectedDevice)
+      let deviceAvailable: Bool
+      switch authorization {
+      case .authorized: deviceAvailable = devices.contains { $0.id == descriptor.selectedDevice }
+      case .requestable: deviceAvailable = true
+      case .unavailable: deviceAvailable = false
+      }
       // A camera waits for its own LUT, so its first frame is graded.
-      let ready = FeedLifecycleDemandPolicy.canStartSource(automaticEnabled: descriptor.automaticFeed,
+      let ready = FeedLifecycleDemandPolicy.canStartSource(automaticEnabled: automaticEnabled && pendingCaptureStarts[id] == nil,
         manuallyStopped: manuallyStoppedFeeds.contains(id),
-        deviceAvailable: devices.contains { $0.id == descriptor.selectedDevice } && inputInUse(by: id) == nil,
+        deviceAvailable: deviceAvailable && inputInUse(by: id) == nil,
         loading: lutLoadingFeeds.contains(id))
       let action = policy.action(ready: ready, running: isRunning)
       feedPolicies[id] = policy
-      let why = [camera ? "camera app" : nil, recording ? "recording" : nil,
-        programRequested ? "Program" : nil, autoTake ? "automatic switching" : nil,
-        policy.previewRequested ? "preview" : nil].compactMap { $0 }.joined(separator: ", ")
       reconcileSink(id)
       switch action {
       case .start:
+        let why = [camera ? "camera app" : nil, recording ? "recording" : nil,
+          program ? "Program" : nil, autoTake ? "automatic switching" : nil,
+          policy.previewRequested ? "preview" : nil].compactMap { $0 }.joined(separator: ", ")
         captureLog.notice("Start \(id.rawValue, privacy: .public): automatic (\(why.isEmpty ? "demand" : why, privacy: .public))")
-        demandStartedFeeds.insert(id)
-        refusedStarts.remove(id)
-        launchCapture(id)
+        requestCaptureStart(id, deviceID: descriptor.selectedDevice, automatic: true)
       case .stop:
         guard demandStartedFeeds.contains(id), !recording else { continue }
         captureLog.notice("Stop \(id.rawValue, privacy: .public): automatic (no camera app, preview or recording needs it)")
@@ -1806,6 +2116,143 @@ final class AppModel {
     }
   }
 
+  func saveProgramStream(_ configuration: ProgramStreamConfiguration, key: String) throws {
+    guard !terminating, !settingsResetPending else {
+      throw ProgramStreamSettingsError(message: "Ultracam is quitting.")
+    }
+    try streamSession.save(configuration, key: key)
+  }
+
+  func isCaptureManuallyStopped(_ id: FeedID) -> Bool { manuallyStoppedFeeds.contains(id) }
+
+  func programStreamCaptureInputAvailable(_ id: FeedID, deviceAvailable: Bool) -> Bool {
+    guard deviceAvailable, inputInUse(by: id) == nil, let camera = descriptor(for: id) else { return false }
+    if case .unavailable = captureAuthorization(for: camera.selectedDevice) { return false }
+    return true
+  }
+
+  func programStreamCaptureEligible(_ camera: FeedDescriptor, deviceAvailable: Bool) -> Bool {
+    isCameraRunning(camera.id) || FeedLifecycleDemandPolicy.canStartSource(automaticEnabled: camera.automaticFeed,
+      manuallyStopped: isCaptureManuallyStopped(camera.id),
+      deviceAvailable: programStreamCaptureInputAvailable(camera.id, deviceAvailable: deviceAvailable), loading: false)
+  }
+
+  func startProgramStream() {
+    guard !terminating, !settingsResetPending, !streamSnapshot.active else { return }
+    stoppedStreamVideoDrops = 0
+    stoppedStreamAudioDrops = 0
+    streamConversionIssue = nil
+    guard programAvailable else {
+      streamSession.fail("Enable two cameras to start a Program stream.")
+      return
+    }
+    let enabled = feedDescriptors.filter(\.enabled)
+    func permissionFailure(_ camera: FeedDescriptor) -> String? {
+      guard !isCameraRunning(camera.id), case .unavailable(let error) = captureAuthorization(for: camera.selectedDevice)
+      else { return nil }
+      return error.localizedDescription
+    }
+    func canSupply(_ camera: FeedDescriptor) -> Bool {
+      programStreamCaptureEligible(camera, deviceAvailable: devices.contains { $0.id == camera.selectedDevice })
+    }
+    guard enabled.contains(where: canSupply) else {
+      let permissionIssue = enabled.filter(\.automaticFeed).compactMap(permissionFailure).first
+      streamSession.fail(permissionIssue ?? "Start capture on a Program camera, then retry the stream.")
+      return
+    }
+    do {
+      try streamSession.start { configuration in
+        guard let selected = configuration.audioFeedID else { return }
+        let source = enabled.first { $0.id.rawValue == selected }
+        if let source, canSupply(source) { return }
+        throw ProgramStreamSettingsError(message: source.flatMap(permissionFailure) ??
+          "Start capture on the selected stream audio camera or choose another audio feed in Streaming settings.")
+      }
+    } catch {
+      streamSession.fail(error.localizedDescription, needsSetup: true)
+      return
+    }
+    streamResourcesActive = true
+    streamResourceGeneration &+= 1
+    let generation = streamResourceGeneration
+    let session = streamSession.snapshot
+    if let audioSource = session.audioFeedID {
+      let controller = feedCoordinator.capture(for: FeedID(rawValue: audioSource))
+      let tap = ProgramStreamAudioTap(pairIndex: session.firstChannel / 2,
+        deliver: streamSession.makeAudioHandler())
+      streamAudioController = controller
+      streamAudioTap = tap
+      controller.setProgramStreamAudioTap(tap)
+    }
+    let requestedFormat = session.format
+    let send = streamSession.makeVideoHandler()
+    streamVideoStart = Task { [weak self] in
+      guard let self, !Task.isCancelled else { return }
+      do {
+        var selected = requestedFormat
+        // A cold auto-start has no source dimensions until the camera declares them.
+        // Session preflight owns the timeout and cancels this task when stopped.
+        while selected.size == .source {
+          try Task.checkCancellation()
+          if let id = self.feedCoordinator.programOutput.selectedFeedID, self.isCameraRunning(id),
+             let update = self.liveCameraUpdate(id), update.signal == .live, update.sourceFormat != nil {
+            let picture = self.programContract(for: self.descriptor(for: id))
+            selected.size = try PublishedSourceSizeSelection.nearest(width: picture.width, height: picture.height)
+            self.streamSession.resolveSourceSize(selected.size)
+          } else {
+            try await Task.sleep(for: .milliseconds(25))
+          }
+        }
+        let contract = ProgramOutputFormat(width: selected.size.width, height: selected.size.height,
+          pixelFormat: selected.codec.pixelFormat, duration: selected.rate.duration,
+          scalingMode: selected.scalingMode, allowUpscale: selected.allowUpscale,
+          colour: try SourceColorSpaceCatalog.color(selected.colorSpaceID))
+        try await self.feedCoordinator.startProgramStreamVideo(contract: contract, onError: { [weak self] message in
+          Task { @MainActor in
+            guard let self, self.streamResourcesActive, self.streamResourceGeneration == generation else { return }
+            self.streamConversionIssue = message
+          }
+        }, send: send)
+      } catch {
+        guard !Task.isCancelled, self.streamResourcesActive, self.streamResourceGeneration == generation else { return }
+        self.streamSession.fail("Program stream video could not start. " + error.localizedDescription)
+      }
+    }
+    reconcileAutomaticFeed()
+  }
+
+  func stopProgramStream() {
+    streamSession.stop()
+  }
+
+  var streamNeedsShutdown: Bool { streamSession.needsShutdown }
+
+  func finishProgramStreamShutdown() async {
+    await streamSession.shutdown()
+  }
+
+  private func streamChanged() {
+    if streamConfiguration != streamSession.configuration { streamConfiguration = streamSession.configuration }
+    var state = streamSession.snapshot
+    state.bitrate = 0
+    state.audioPeak = 0
+    state.lastVideoSentAt = nil
+    state.audioGaps = 0
+    state.droppedVideo = 0
+    if streamDisplayState != state { streamDisplayState = state }
+    guard !state.active, streamResourcesActive else { return }
+    stoppedStreamVideoDrops = streamVideoDrops
+    stoppedStreamAudioDrops = streamAudioDrops
+    streamResourcesActive = false
+    streamVideoStart?.cancel()
+    streamVideoStart = nil
+    feedCoordinator.stopProgramStreamVideo()
+    streamAudioController?.setProgramStreamAudioTap(nil)
+    streamAudioController = nil
+    streamAudioTap = nil
+    reconcileAutomaticFeed()
+  }
+
   /// Program transport follows its camera clients and the actual on-air source.
   private func reconcileProgramTransportDemand() {
     let producerID = feedCoordinator.programOutput.selectedFeedID
@@ -1814,6 +2261,7 @@ final class AppModel {
       cameraRequested: routeHeld(VirtualCameraDescriptor.program().id),
       anyCameraRunning: feedDescriptors.contains { $0.enabled && feedCoordinator.isFeedRunning($0.id) })
     let contract = programContract(for: producer)
+    let passthroughFormat = contract.sourcePixelFormat ?? contract.pixelFormat
     // After any connect or close below: the bridge's control queue runs them in order, and
     // it writes the closed camera only once its session has closed.
     defer {
@@ -1821,7 +2269,7 @@ final class AppModel {
         contract != programPreNegotiated {
         programPreNegotiated = contract
         feedCoordinator.requestProgramOutputPreNegotiation(configuration: contract,
-          passthroughFormat: kCVPixelFormatType_422YpCbCr10)
+          passthroughFormat: passthroughFormat)
       }
     }
     // One contract per client session: the format of the camera on air when
@@ -1851,7 +2299,7 @@ final class AppModel {
     let requestID = programTransportRequestID
     // CMIO discovery can take seconds: connect on the bridge's control queue.
     feedCoordinator.requestProgramOutputDemand(required, configuration: contract,
-      passthroughFormat: kCVPixelFormatType_422YpCbCr10, renegotiate: renegotiate) { [weak self] error in
+      passthroughFormat: passthroughFormat, renegotiate: renegotiate) { [weak self] error in
       guard let self, requestID == self.programTransportRequestID else { return }
       guard let error else {
         self.clearProblem("program-connect")
@@ -1874,7 +2322,8 @@ final class AppModel {
         pipelineEnabled: true, detectedSourceDuration: nil)
     }
     var contract = FeedLifecycleDemandPolicy.programContract(configuration: effectiveConfiguration(for: descriptor.id),
-      pipelineEnabled: descriptor.pipelineEnabled, detectedSourceDuration: detectedSourceDurations[descriptor.id])
+      pipelineEnabled: descriptor.pipelineEnabled, detectedSourceDuration: detectedSourceDurations[descriptor.id],
+      source: cameraUpdate(descriptor.id)?.sourceFormat)
     contract.applyLUT = false
     return contract
   }
@@ -1894,6 +2343,7 @@ final class AppModel {
   /// The interface offers Retry (one attempt per camera session, no background loop).
   /// A camera the user stopped hasn't failed; it stays off until Start.
   func automaticStartFailed(_ id: FeedID) -> Bool {
+    guard !isCaptureAuthorizationPending(id) else { return false }
     if startRefusal(id) != nil { return true }
     guard let descriptor = descriptor(for: id), descriptor.automaticFeed, !feedCoordinator.isFeedRunning(id),
       !manuallyStoppedFeeds.contains(id) else { return false }
@@ -2054,9 +2504,14 @@ final class AppModel {
   }
 
   func liveWatchTick(now: TimeInterval) {
+    reconcileCameraAppRecordings(now: now)
     signalHealth.tick(now: now).forEach(signalChanged)
+    var appReleased = false
+    for (route, clients) in appDemand {
+      for id in clients.keys where appDemand[route]?[id]?.expireRelease(at: now) == true { appReleased = true }
+    }
     let released = routeReleaseAt.filter { now >= $0.value }.keys
-    if !released.isEmpty {
+    if appReleased || !released.isEmpty {
       released.forEach { routeReleaseAt[$0] = nil }
       reconcileAutomaticFeed()
     }
@@ -2085,6 +2540,45 @@ final class AppModel {
     if !wantsLiveWatch {
       liveWatchTimer?.invalidate()
       liveWatchTimer = nil
+    }
+  }
+
+  private func heldRecordingApps(for id: FeedID, at now: TimeInterval, allowRelease: Bool = true) -> Set<String> {
+    let program = programAvailable ? appDemand[VirtualCameraDescriptor.program().id] ?? [:] : [:]
+    let camera = appDemand[feedRouteID(id)] ?? [:]
+    let needed: (CameraAppRecordingDemand?) -> Bool = { demand in
+      allowRelease ? demand?.keepsSession(at: now) == true : demand?.hasActiveClient == true
+    }
+    return Set(recordingApps.keys.filter { needed(camera[$0]) || needed(program[$0]) })
+  }
+
+  private func reconcileCameraAppRecordings(now: TimeInterval) {
+    guard !terminating, !settingsResetPending else { return }
+    let program = programAvailable ? appDemand[VirtualCameraDescriptor.program().id] ?? [:] : [:]
+    for descriptor in feedDescriptors {
+      let id = descriptor.id
+      guard let take = recordingModel.feeds.first(where: { $0.id == id }) else { continue }
+      let camera = appDemand[feedRouteID(id)] ?? [:]
+      let held = descriptor.enabled && descriptor.recordWithCameraApps ? heldRecordingApps(for: id, at: now) : []
+      var attempted = recordingAttempted[id, default: []].intersection(held)
+      if take.status == .recording || take.status == .paused {
+        if let owner = take.triggerAppID {
+          if !held.contains(owner) { recordingModel.stop(feedID: id, automatic: true) }
+        } else {
+          attempted.formUnion(held)
+        }
+      }
+      recordingAttempted[id] = attempted.isEmpty ? nil : attempted
+      guard take.status == .idle, !held.isEmpty, feedCoordinator.isFeedRunning(id), cameraUpdates[id]?.signal == .live else { continue }
+      // A direct camera client has priority over Program when both qualify at once.
+      let eligible = held.subtracting(attempted).sorted().filter {
+        recordingProfiles[$0]?.folderBookmark != nil || recordingModel.outputFolder(for: id) != nil
+      }
+      guard let app = eligible.first(where: { camera[$0]?.shouldStart(at: now) == true })
+        ?? eligible.first(where: { program[$0]?.shouldStart(at: now) == true }), let name = recordingApps[app] else { continue }
+      recordingAttempted[id, default: []].insert(app)
+      recordingModel.record(feedID: id, appTake: AppRecordingTake(appID: app, appName: name,
+        profile: recordingProfiles[app] ?? AppRecordingProfile()))
     }
   }
 
@@ -2139,21 +2633,22 @@ final class AppModel {
 
   /// Starts one camera, whichever is selected. It then stays up until Stop.
   func startCamera(_ id: FeedID) {
-    guard let descriptor = descriptor(for: id), descriptor.enabled else { return }
+    guard !terminating, !settingsResetPending, let descriptor = descriptor(for: id), descriptor.enabled else { return }
     if let error = descriptor.processingDeclarationError { reportProblem(error, key: "declaration.\(id.rawValue)"); return }
     clearProblem("declaration.\(id.rawValue)")
     manuallyStoppedFeeds.remove(id)
     guard !feedCoordinator.isFeedRunning(id) else { return }
-    guard canStart(id) else {
+    if pendingCaptureStarts[id]?.deviceID == descriptor.selectedDevice {
+      pendingCaptureStarts[id]?.automatic = false
+      return
+    }
+    guard canRequestCaptureStart(id) else {
       captureLog.notice("Start \(id.rawValue, privacy: .public): user, refused")
       noteStartAttempt(id, started: false)
       return
     }
     captureLog.notice("Start \(id.rawValue, privacy: .public): user")
-    noteStartAttempt(id, started: true)
-    // A camera the user started is theirs: demand never stops it.
-    demandStartedFeeds.remove(id)
-    launchCapture(id)
+    requestCaptureStart(id, deviceID: descriptor.selectedDevice, automatic: false)
     reconcileAutomaticFeed()
   }
 
@@ -2162,6 +2657,7 @@ final class AppModel {
   func stopCamera(_ id: FeedID) {
     guard descriptor(for: id) != nil else { return }
     manuallyStoppedFeeds.insert(id)
+    cancelPendingCaptureStart(id)
     refusedStarts.remove(id)
     demandStartedFeeds.remove(id)
     // Stop means now: a client that just left holds nothing up.
@@ -2183,7 +2679,10 @@ final class AppModel {
   }
 
   func stopAllCameras() {
-    for descriptor in feedDescriptors where feedCoordinator.isFeedRunning(descriptor.id) {
+    // A continuing stream would otherwise start a missing camera when it next appears.
+    let streaming = streamSnapshot.active
+    for descriptor in feedDescriptors where (streaming && descriptor.enabled) ||
+      feedCoordinator.isFeedRunning(descriptor.id) || isCaptureAuthorizationPending(descriptor.id) {
       stopCamera(descriptor.id)
     }
   }
@@ -2191,9 +2690,35 @@ final class AppModel {
   /// Edits one camera's saved settings and applies them to its pipeline. The
   /// one path for every camera's edits; the selection plays no part.
   func updateCamera(_ id: FeedID, shareProcessing: Bool = true, _ mutate: (inout FeedDescriptor) -> Void) {
+    updateCamera(id, shareProcessing: shareProcessing, finishInputChange: true, mutate)
+  }
+
+  /// Moves an exclusive input between cameras. Defer demand reconciliation until both
+  /// assignments are in place so automatic capture can't lock the destination in between.
+  func assignExclusiveInput(_ device: String, to destination: FeedID?) {
+    let holders = feedDescriptors.filter { $0.selectedDevice == device }
+    guard !device.isEmpty, !inputShareable(device), !holders.contains(where: { $0.id == destination }),
+      !holders.isEmpty || destination != nil,
+      holders.allSatisfy({ canChangeCameraInput($0.id) }),
+      destination.map(canChangeCameraInput) ?? true else { return }
+    for holder in holders {
+      updateCamera(holder.id, shareProcessing: false, finishInputChange: false) { $0.selectedDevice = "" }
+    }
+    if let destination {
+      updateCamera(destination, shareProcessing: false, finishInputChange: false) { $0.selectedDevice = device }
+    }
+    saveSettings(reason: "capture input reassigned")
+    reconcileAutomaticFeed()
+  }
+
+  private func updateCamera(_ id: FeedID, shareProcessing: Bool, finishInputChange: Bool,
+    _ mutate: (inout FeedDescriptor) -> Void) {
     guard var descriptor = descriptor(for: id) else { return }
     let before = descriptor
     mutate(&descriptor)
+    if descriptor.name != before.name || descriptor.enabled != before.enabled {
+      guard validatedRegistry(for: feedDescriptors.map { $0.id == id ? descriptor : $0 }) != nil else { return }
+    }
     // One input serves one camera: an input another camera has is refused, and a
     // running camera keeps its input. None is remembered so discovery leaves it.
     if descriptor.selectedDevice != before.selectedDevice {
@@ -2204,9 +2729,19 @@ final class AppModel {
         if descriptor.selectedDevice.isEmpty { inputsClearedByChoice.insert(id) } else { inputsClearedByChoice.remove(id) }
         // Another camera on this input: its signal calibration doesn't apply.
         descriptor.monitor.forgetCameraCalibration()
+        descriptor.setSourceProfile("unspecified")
       }
     }
     guard descriptor != before else { return }
+    let inputChanged = descriptor.selectedDevice != before.selectedDevice
+    if inputChanged || !descriptor.enabled {
+      cancelPendingCaptureStart(id)
+      clearProblem("capture-authorization.\(id.rawValue)")
+    }
+    if inputChanged {
+      feedPolicies[id]?.retry()
+      forgetStartRefusal(id)
+    }
     if descriptor.applyLUT != before.applyLUT {
       lutLog.notice("Apply LUT \(descriptor.applyLUT ? "on" : "off", privacy: .public): \(id.rawValue, privacy: .public), running: \(self.isCameraRunning(id), privacy: .public), saved LUT: \(descriptor.lutBookmark != nil, privacy: .public)")
     }
@@ -2216,9 +2751,10 @@ final class AppModel {
       monitorCoordinator.adopt(descriptor.monitor, for: MonitorTargetID(id.rawValue))
     }
     if descriptor.recordingConstantFrameRate != before.recordingConstantFrameRate { syncRecordingFeeds() }
-    if shareProcessing && descriptor.processingChoicesDiffer(from: before) { synchronizeProcessing(from: descriptor) }
-    saveSettings(reason: "camera settings changed")
-    if descriptor.selectedDevice != before.selectedDevice { forgetStartRefusal(id) }
+    if shareProcessing && descriptor.selectedDevice == before.selectedDevice && descriptor.processingChoicesDiffer(from: before) {
+      synchronizeProcessing(from: descriptor)
+    }
+    if finishInputChange { saveSettings(reason: "camera settings changed") }
     if descriptor.previewEnabled != before.previewEnabled {
       monitorCoordinator.setPreviewEnabled(descriptor.previewEnabled, for: MonitorTargetID(id.rawValue))
     }
@@ -2242,9 +2778,12 @@ final class AppModel {
     }
     applyPipeline(id)
     if descriptor.automaticFeed != before.automaticFeed {
-      if !descriptor.automaticFeed { demandStartedFeeds.remove(id) }
+      if !FeedLifecycleDemandPolicy.retainsAutomaticOwnership(
+        automaticEnabled: descriptor.automaticFeed || descriptor.recordWithCameraApps,
+        wasAutomaticallyStarted: demandStartedFeeds.contains(id)) { demandStartedFeeds.remove(id) }
       installAutomaticFeedMonitor()
-    } else if descriptor.previewEnabled != before.previewEnabled {
+    } else if (finishInputChange && descriptor.selectedDevice != before.selectedDevice) || descriptor.previewEnabled != before.previewEnabled
+      || descriptor.recordWithCameraApps != before.recordWithCameraApps {
       reconcileAutomaticFeed()
     }
   }
@@ -2254,13 +2793,25 @@ final class AppModel {
   @discardableResult
   func resetAllSettings() -> Bool {
     guard canResetSettings else { return false }
+    do {
+      try streamSession.resetConfiguration()
+    } catch {
+      reportProblem("Could not clear the saved stream destination: " + error.localizedDescription, key: "stream-reset")
+      return false
+    }
     settingsResetPending = true
+    cancelPendingCaptureStarts()
     cameraControls.reset()
     vendorSettings.reset()
     hardwareInventory.reset()
     lastInputNames = [:]
     settingsStore.resetAll()
     return true
+  }
+
+  func beginTermination() {
+    terminating = true
+    cancelPendingCaptureStarts()
   }
 
   /// Every strategy control comes through here: Manual turns automatic off, so
@@ -2290,11 +2841,11 @@ final class AppModel {
   func isSignalUnhealthy(_ id: FeedID) -> Bool { signalHealth.isUnhealthy(id) }
   var demandMonitorIsRunning: Bool { demandMonitor.isRunning }
   /// What the demand monitor reports, without CMIO. Nil is an unreadable route.
-  func setCameraDemandForTesting(_ id: FeedID, requested: Bool?) {
-    routeDemandChanged(feedRouteID(id), requested: requested, error: requested == nil ? "unreadable" : nil)
+  func setCameraDemandForTesting(_ id: FeedID, requested: Bool?, apps: Set<String>? = nil) {
+    routeDemandChanged(feedRouteID(id), requested: requested, error: requested == nil ? "unreadable" : nil, clientApps: apps)
   }
-  func setProgramDemandForTesting(requested: Bool?) {
-    routeDemandChanged(VirtualCameraDescriptor.program().id, requested: requested, error: requested == nil ? "unreadable" : nil)
+  func setProgramDemandForTesting(requested: Bool?, apps: Set<String>? = nil) {
+    routeDemandChanged(VirtualCameraDescriptor.program().id, requested: requested, error: requested == nil ? "unreadable" : nil, clientApps: apps)
   }
   func deliverCaptureUpdateForTesting(_ id: FeedID, _ update: CaptureUpdate) { cameraDidUpdate(id, update) }
   /// What the running director sends, without the audio it decides on.

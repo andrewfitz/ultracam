@@ -53,8 +53,7 @@ import SystemExtensions
     let strip = HostedView(UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 230), dark: false)
     let more = Menus.items(in: strip.host, containing: "Show Inspector").map(\.title)
     strip.close()
-    verifier.check("monitor LUT: the strip ⋯ menu no longer has it", !more.isEmpty && !more.contains("Monitor LUT")
-      && !more.contains("Load LUT…") && more.contains("Restart Camera"), more.joined(separator: ", "), viewDependent: true)
+    verifier.check("monitor LUT: the strip has no menu that offers it", more.isEmpty, more.joined(separator: ", "), viewDependent: true)
     func item(_ title: String, in list: [NSMenuItem]) -> NSMenuItem? { list.first { $0.title == title } }
     let titles = empty.lut.map(\.title).joined(separator: ", ")
     verifier.check("monitor LUT: offers Load Monitor LUT… without a file",

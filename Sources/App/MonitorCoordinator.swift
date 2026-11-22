@@ -46,8 +46,6 @@ import MonitorKit
   /// app's pipeline warm start (`MonitorGPUContext.appPipelineCacheDirectory`).
   nonisolated static let sharedGPU = MonitorGPUContext(
     pipelineCacheDirectory: MonitorGPUContext.appPipelineCacheDirectory)
-  /// Where each camera's burn-in LUT is read (its capture controller).
-  private var burnInSources: [MonitorTargetID: @Sendable () -> MonitorLUT?] = [:]
   private var diagnosticsTimer: Timer?
   private var hosts: [MonitorTargetID: MonitorFeedHost] = [:]
   private struct Surface {
@@ -124,8 +122,8 @@ import MonitorKit
     }
     guard next != diagnosticSnapshots else { return }
     if next.mapValues(\.monitorLUT) != diagnosticSnapshots.mapValues(\.monitorLUT) { objectWillChange.send() }
-    diagnosticsPublisher.send()
     diagnosticSnapshots = next
+    diagnosticsPublisher.send()
   }
 
   func diagnostics(for target: MonitorTargetID) -> MonitorDiagnostics {
@@ -153,17 +151,17 @@ import MonitorKit
   }
 
   /// What the target's scope measures: the signal of a picture of it on screen
-  /// with both its readings (nil before a frame), and whether a LUT is on the
-  /// scope's stage (`MonitorSurfacePresenter.scopeMeasuresLUT`). The signal is
+  /// with both its readings (nil before a frame), and the output signal of a LUT on the
+  /// scope's stage (`MonitorSurfacePresenter.scopeLUTSignal`). The signal is
   /// not resolved to a stage here: the scope's description picks its own stage's
   /// reading (`SignalDescription.signal(for:)`, as `ScopeAccumulator` does) from
   /// the stage the settings form shows, which reaches this coordinator a change
   /// later, and a resolved Output reading cannot be read back as the Source's.
-  func scopeMeasurement(for target: MonitorTargetID) -> (signal: SignalDescription?, stageLUT: Bool) {
+  func scopeMeasurement(for target: MonitorTargetID) -> (signal: SignalDescription?, stageLUT: SignalDescription?) {
     let presenter = surfaces.values.first { $0.target == target && $0.presenter.shownSignal != nil }?.presenter
       ?? surfaces.values.first { $0.target == target }?.presenter
-    guard let presenter else { return (nil, false) }
-    return (presenter.shownSignal, presenter.scopeMeasuresLUT(preferences(for: target)))
+    guard let presenter else { return (nil, nil) }
+    return (presenter.shownSignal, presenter.scopeLUTSignal(preferences(for: target)))
   }
 
   /// A target's tools, signal declaration and scopes.
@@ -278,7 +276,7 @@ import MonitorKit
 
   /// Lets go of a camera that is no longer listed: its host stops taking frames
   /// and drops its LUTs and render state (the feed, its focus mask, their GPU
-  /// residency), and its tools, burn-in source and assignment are forgotten (the
+  /// residency), and its tools and assignment are forgotten (the
   /// owner keeps the saved ones). Surfaces still bound to it say so.
   private func release(_ target: MonitorTargetID) {
     if let host = hosts.removeValue(forKey: target) {
@@ -290,14 +288,10 @@ import MonitorKit
       host.releaseRenderState()
     }
     preferences[target] = nil
-    if burnInSources.removeValue(forKey: target) != nil {
-      lutLog.notice("Monitor burn-in LUT source cleared: \(target.rawValue, privacy: .public) (camera removed)")
-    }
     assignedDevices[target] = nil
     previewEnabled[target] = nil
     diagnosticSnapshots[target] = nil
     for surface in surfaces.values where surface.target == target {
-      surface.presenter.setBurnInLUTSource(nil)
       surface.presenter.setUnavailable("Missing camera")
     }
   }
@@ -329,29 +323,11 @@ import MonitorKit
     setPreferences(value, for: target)
   }
 
-  /// Where `target`'s burn-in LUT is read: the camera's capture controller
-  /// (`CaptureController.burnInLUT`), so the Output (LUT) picture shows the very
-  /// `MonitorLUT` the camera burns in. Surfaces read it at each encode, so a LUT
-  /// load or Apply LUT change shows on the next picture. Nil for Program.
-  func setBurnInLUTSource(for target: MonitorTargetID, _ source: (@Sendable () -> MonitorLUT?)?) {
-    let wasSet = burnInSources[target] != nil
-    burnInSources[target] = target.isProgram ? nil : source
-    let isSet = burnInSources[target] != nil
-    if wasSet != isSet || isSet {
-      lutLog.notice("Monitor burn-in LUT source \(isSet ? (wasSet ? "replaced" : "set") : "cleared", privacy: .public): \(target.rawValue, privacy: .public), \(self.surfaces.values.filter { $0.target == target }.count, privacy: .public) surfaces")
-    }
-    for surface in surfaces.values where surface.target == target {
-      surface.presenter.setBurnInLUTSource(burnInSources[target])
-    }
-    hosts[target]?.burnInLUT = burnInSources[target]?()
-  }
-
   func surface(id: UUID, target: MonitorTargetID) -> MonitorSurfacePresenter {
     if let existing = surfaces[id], existing.target == target { return existing.presenter }
     let previousTarget = surfaces[id]?.target
     let presenter = MonitorSurfacePresenter(target: target, host: captureSink(for: target), gpu: gpu)
     presenter.setPreferences(preferences(for: target))
-    presenter.setBurnInLUTSource(burnInSources[target])
     surfaces[id] = Surface(target: target, presenter: presenter)
     if let previousTarget { refreshHost(previousTarget) }
     presenter.onVisibilityChange = { [weak self] presented, drawable in

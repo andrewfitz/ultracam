@@ -15,6 +15,37 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 import validate_bundle as validator
 
 class VendorBundleTests(unittest.TestCase):
+    def reload_helper(self):
+        helper = self.app / validator.RELOAD_HELPER
+        self.plist(helper / 'Contents/Info.plist', {
+            'CFBundleExecutable': 'ReloadExecutable',
+            'CFBundleIdentifier': 'org.ultracam.app.camera-reload',
+            'CFBundlePackageType': 'APPL',
+            'LSUIElement': True,
+        })
+        executable = self.binary(helper / 'Contents/MacOS/ReloadExecutable')
+        executable.chmod(0o755)
+        return executable
+
+    def test_reload_helper_must_exist_with_an_executable(self):
+        with self.assertRaisesRegex(ValueError, 'Missing camera reload helper'):
+            validator.reload_helper_executable(self.app)
+        executable = self.reload_helper()
+        self.assertEqual(validator.reload_helper_executable(self.app), executable.resolve())
+        executable.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, 'invalid camera reload helper executable'):
+            validator.reload_helper_executable(self.app)
+
+    def test_reload_helper_resolves_dependencies_in_its_own_bundle(self):
+        executable = self.reload_helper()
+        library = self.binary(executable.parent.parent / 'Frameworks/libReload.dylib')
+        self.meta[executable]['dependencies'] = ['@rpath/libReload.dylib']
+        self.meta[executable]['rpaths'] = ['@executable_path/../Frameworks']
+        self.validate(reload_executable=validator.reload_helper_executable(self.app))
+        library.unlink()
+        with self.assertRaisesRegex(ValueError, 'Unresolved non-system dependency'):
+            self.validate(reload_executable=validator.reload_helper_executable(self.app))
+
     def test_rpath_first_existing_external_match_is_rejected(self):
         self.meta[self.host]['rpaths'] = [str(self.root / 'SDK'), '@executable_path/../Frameworks']
         with self.assertRaisesRegex(ValueError, 'dependency'):
@@ -71,10 +102,14 @@ class VendorBundleTests(unittest.TestCase):
         self.validate()
 
     def test_top_level_signed_extension_requires_extracted_entitlements(self):
+        self.reload_helper()
         host_entitlements = {'com.apple.security.files.user-selected.read-write': True,
                              'com.apple.security.cs.disable-library-validation': True,
                              'com.apple.security.app-sandbox': True,
                              'com.apple.developer.system-extension.install': True,
+                             'com.apple.security.network.client': True,
+                             'com.apple.application-identifier': 'TEST.org.ultracam.app',
+                             'keychain-access-groups': ['TEST.org.ultracam.app'],
                              'com.apple.security.application-groups': ['group.org.ultracam.shared']}
         camera_entitlements = {'com.apple.security.app-sandbox': True, 'com.apple.security.application-groups': ['group.org.ultracam.shared']}
         for bundle, name, identifier, kind in [(self.app, 'Ultracam', 'org.ultracam.app', 'APPL'),
@@ -89,6 +124,11 @@ class VendorBundleTests(unittest.TestCase):
             for shader in shaders:
                 path = self.app / 'Contents/Resources' / name / 'Shaders' / shader
                 path.parent.mkdir(parents=True, exist_ok=True); path.write_text('// fixture')
+        notice_source = self.root / validator.STREAM_LICENSES
+        notice_source.parent.mkdir(exist_ok=True)
+        notice_source.write_text('Pinned streaming notices')
+        notice = self.app / 'Contents/Resources' / notice_source.name
+        shutil.copyfile(notice_source, notice)
         for extraction_status in (0, 1):
             def extraction(args, **kwargs):
                 if Path(args[-1]) == self.app:
@@ -107,6 +147,9 @@ class VendorBundleTests(unittest.TestCase):
                 'com.apple.security.cs.disable-library-validation': True,
                 'com.apple.security.app-sandbox': True,
                 'com.apple.developer.system-extension.install': True,
+                'com.apple.security.network.client': True,
+                'com.apple.application-identifier': 'TEST.org.ultracam.app',
+                'keychain-access-groups': ['TEST.org.ultracam.app'],
                 'com.apple.security.application-groups': ['group.org.ultracam.shared']}
         camera = {'com.apple.security.app-sandbox': True,
                   'com.apple.security.application-groups': ['group.org.ultracam.shared']}
@@ -118,6 +161,9 @@ class VendorBundleTests(unittest.TestCase):
             for values, key, replacement in [(host, 'com.apple.security.application-groups', []),
                     (host, 'com.apple.security.application-groups', ['group.other']),
                     (host, 'com.apple.developer.system-extension.install', False),
+                    (host, 'com.apple.security.network.client', False),
+                    (host, 'com.apple.application-identifier', 'TEST.other.app'),
+                    (host, 'keychain-access-groups', ['group.other', host['com.apple.application-identifier']]),
                     (host, 'com.apple.security.app-sandbox', False),
                     (camera, 'com.apple.security.app-sandbox', False),
                     (camera, 'com.apple.security.application-groups', ['group.other'])]:
@@ -125,6 +171,14 @@ class VendorBundleTests(unittest.TestCase):
                 with self.subTest(key=key, replacement=replacement), self.assertRaises(ValueError):
                     validator.validate(self.app, root=self.root, signed=True)
                 values[key] = original
+            notice = self.app / 'Contents/Resources' / validator.STREAM_LICENSES.name
+            notice.write_text('Outdated streaming notices')
+            with self.assertRaisesRegex(ValueError, 'Program streaming licenses'):
+                validator.validate(self.app, root=self.root, signed=True)
+            notice.unlink()
+            with self.assertRaisesRegex(ValueError, 'Program streaming licenses'):
+                validator.validate(self.app, root=self.root, signed=True)
+            shutil.copyfile(self.root / validator.STREAM_LICENSES, notice)
             for bundle in (self.app, self.extension):
                 info = plistlib.loads((bundle / 'Contents/Info.plist').read_bytes())
                 info['UltracamLocalDevelopmentBuild'] = True
@@ -317,6 +371,20 @@ class VendorBundleTests(unittest.TestCase):
         self.binary(self.app / 'Contents/Frameworks/libSystemHelper.dylib', install='@rpath/libSystemHelper.dylib')
         self.validate()
 
+    def test_sdkless_camera_requires_boolean_continuity_opt_in_in_host_bundle(self):
+        key = 'NSCameraUseContinuityCameraDeviceType'
+        self.manifests.append({'id': 'maccamera', 'capabilities': {'entitlements': [], 'infoPlist': [key]}})
+        self.inventory['maccamera'] = {'available': False}
+        info_path = self.app / 'Contents/Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        for opt_in in ({}, {key: False}, {key: 'true'}, {key: 1}):
+            with self.subTest(opt_in=opt_in):
+                self.plist(info_path, {**info, **opt_in})
+                with self.assertRaisesRegex(ValueError, key):
+                    self.validate()
+        self.plist(info_path, {**info, key: True})
+        self.validate()
+
     def test_official_evidence_binds_sdk_inventory_notices_and_artifact(self):
         for name in ['LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md']:
             notice = self.app / 'Contents/Resources' / name
@@ -366,6 +434,9 @@ class VendorBundleTests(unittest.TestCase):
         import vendors
         manifests, inventory = vendors.read_inventory(ROOT, sdk_present='sony')
         settings = vendors.build_settings(manifests, inventory)
+        info = plistlib.loads((ROOT / 'Config/App-Info.plist').read_bytes())
+        info['CFBundleExecutable'] = self.host.name
+        self.plist(self.app / 'Contents/Info.plist', info)
         shutil.rmtree(self.app / 'Contents/Frameworks')
         for item in settings['embedLibraries']:
             destination = self.app / 'Contents/Frameworks' / item['subfolder'] / Path(item['path']).name

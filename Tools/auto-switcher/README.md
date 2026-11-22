@@ -31,7 +31,8 @@ The JSONL protocol accepts `StreamEvent` objects on stdin and emits
 `SwitcherOutput` objects on stdout. It also writes a complete replay timeline
 to a UTC-datetime filename such as `auto-switcher-session-20261015-190102-123.json`
 by default; use `--output` to choose the path. Existing explicit output files
-are never overwritten.
+are never overwritten. Use `--output -` to stream instructions without
+collecting a replay timeline.
 
 ```sh
 rustup run stable cargo run -- realtime --input-format jsonl
@@ -53,6 +54,11 @@ cat microphone.pcm | rustup run stable cargo run -- realtime \
 ```
 
 The PCM adapter emits normalized energy, speech start/stop, and pause cues.
+Raw PCM carries no host control events. In this mode the CLI assumes each
+emitted cut takes effect at its requested media time and records a matching
+`acknowledge` event. Timeline metadata marks these simulated applications with
+`cut_application` set to `assumed_at_requested_time`. Use realtime JSONL for
+confirmed frame-boundary acknowledgements from a host.
 Transcript or higher-quality prosody adapters can send additional JSONL events
 on the event protocol.
 
@@ -65,6 +71,14 @@ rustup run stable cargo run -- offline \
   --events session.jsonl --output analysis.json
 ```
 
+Offline analysis sorts observations and ticks between consecutive controls.
+Controls retain their arrival position even when they carry application
+timestamps. Each reset starts a new segment whose media clock can begin at
+zero. Offline analysis assumes cuts take effect at the requested time and
+records the corresponding acknowledgements.
+As observations arrive in realtime, camera health follows the newest timestamp
+for each camera within its session generation.
+
 Analyze a mono 16-bit PCM WAV or a media file with an audio stream:
 
 ```sh
@@ -73,8 +87,9 @@ rustup run stable cargo run -- offline --audio interview.mov \
   --transcript transcript.jsonl --video-cues video-observations.jsonl
 ```
 
-Non-WAV media uses the installed `ffmpeg` command to decode mono PCM. Video
-observations can be supplied as JSONL `video` events or with `--video-cues`.
+Non-WAV media uses the installed `ffmpeg` command to decode mono PCM. Offline
+analysis reads decoded samples in chunks and keeps the cue events for the
+replay timeline. Video observations can be supplied as JSONL `video` events or with `--video-cues`.
 Full vision extraction is deliberately an adapter boundary rather than a
 dependency of this crate.
 
@@ -98,6 +113,8 @@ rustup run stable cargo run -- realtime --ollama \
   --llm-delay-seconds 15
 ```
 
+A session reset or backward clock discontinuity clears advisory context and
+discards outstanding replies from the previous session.
 Responses are emitted as `llmAdvisory` records. They are advisory only; the
 heuristic director remains authoritative until a later integration adds an
 explicit policy for accepting an LLM proposal. This prevents a slow or
@@ -107,7 +124,9 @@ The request/response boundary is represented by `DecisionContext`,
 `LlmProposal`, and `DelayedLlmAdvisor`. A future vision model can add video
 features to the same context without changing the realtime director API.
 
-The protocol schemas are in `schemas/` and can be printed with:
+The Draft 2020-12 protocol schemas are in `schemas/`. Register the schemas
+by their `$id` values when validating documents that reference other schemas.
+Print the full set with:
 
 ```sh
 rustup run stable cargo run -- schema all

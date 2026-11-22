@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "maccamera",
+  "kinds": ["capture"],
+  "frameworks": ["AudioToolbox", "AVFoundation", "CoreMedia", "CoreVideo", "Foundation", "IOKit"],
+  "sources": [
+    { "path": "Sources/MacCameraAudio.swift", "membership": ["app", "test"] },
+    { "path": "Sources/MacCameraCapturePlugin.swift", "membership": ["app", "test"] },
+    { "path": "Sources/MacCameraModes.swift", "membership": ["app", "test"] },
+    { "path": "Sources/MacCameraSession.swift", "membership": ["app", "test"] },
+    { "path": "Tests/MacCameraAudioChecks.swift", "membership": ["test"] },
+    { "path": "Tests/MacCameraReusableConformanceChecks.swift", "membership": ["test"] },
+    { "path": "Tests/MacCameraVideoChecks.swift", "membership": ["test"] }
+  ],
+  "resources": [
+    { "path": "Resources/en.lproj/MacCamera.strings", "membership": ["app"] }
+  ],
+  "capabilities": {
+    "entitlements": [
+      "com.apple.security.device.camera",
+      "com.apple.security.device.audio-input"
+    ],
+    "infoPlist": [
+      "NSCameraUsageDescription",
+      "NSMicrophoneUsageDescription",
+      "NSCameraUseContinuityCameraDeviceType"
+    ]
+  }
+}

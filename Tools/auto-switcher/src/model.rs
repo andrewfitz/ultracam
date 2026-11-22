@@ -102,6 +102,39 @@ pub enum StreamEvent {
     },
 }
 
+impl StreamEvent {
+    // serde_json emits non-finite floats as null. Reject evidence that would
+    // turn into a different or unreadable cue when saved to the replay ledger.
+    pub fn has_valid_cue_values(&self) -> bool {
+        match self {
+            Self::Audio { cue } => {
+                cue.time.is_finite()
+                    && cue.time >= 0.0
+                    && cue.duration.is_finite()
+                    && cue.duration >= 0.0
+                    && cue.pause_duration.is_finite()
+                    && cue.speech_energy.is_finite()
+                    && cue.emphasis.is_finite()
+                    && cue.laughter.is_finite()
+            }
+            Self::Transcript { cue } => {
+                cue.start.is_finite()
+                    && cue.start >= 0.0
+                    && cue.end.is_finite()
+                    && cue.end >= cue.start
+                    && cue.confidence.is_finite()
+            }
+            Self::Video { observation } => {
+                observation.time.is_finite()
+                    && observation.time >= 0.0
+                    && observation.motion.is_finite()
+                    && observation.scene_change.is_finite()
+            }
+            _ => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SwitcherConfig {
     pub anchor_camera_id: String,

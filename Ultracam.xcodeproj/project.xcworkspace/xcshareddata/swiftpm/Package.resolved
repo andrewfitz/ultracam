@@ -1,0 +1,24 @@
+{
+  "originHash" : "c9e834e8a584e583e7f6144e8942f2412f57e629b30181d4cc19bb771d9a7ca8",
+  "pins" : [
+    {
+      "identity" : "libaom-xcframework",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/HaishinKit/libaom-xcframework.git",
+      "state" : {
+        "revision" : "2646d382326772cd9e1ffb11c7bc7fb079395bf0",
+        "version" : "3.15.3"
+      }
+    },
+    {
+      "identity" : "logboard",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/shogo4405/Logboard.git",
+      "state" : {
+        "revision" : "8f41c63afb903040b77049ee2efa8c257b8c0d50",
+        "version" : "2.6.0"
+      }
+    }
+  ],
+  "version" : 3
+}

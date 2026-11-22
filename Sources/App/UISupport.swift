@@ -1,6 +1,5 @@
 import AppKit
 import AVFoundation
-import CoreMediaIO
 import MonitorKitCore
 import Observation
 import os
@@ -81,107 +80,173 @@ enum UIRecordingLibrary {
   /// Each folder's and mount point's last resolved volume.
   private static let resolvedVolumes = Mutex<[String: (id: String, name: String)]>([:])
 
-  /// One entry per destination volume. Time left divides free space by the combined
-  /// rate of the takes recording to that volume, or with none, of every camera assigned
-  /// to it, since Record All fills it that fast. Rates are `displayMegabits` figures.
-  @MainActor private static var takeCache: (key: [String], date: Date, takes: [UITake])?
-
-  /// `recentTakes(in:)` cached for a few seconds; folder scans are not free.
-  @MainActor static func cachedRecentTakes(in folders: [URL]) -> [UITake] {
-    let key = folders.map(\.path)
-    if let cache = takeCache, cache.key == key, Date().timeIntervalSince(cache.date) < 3 { return cache.takes }
-    let takes = recentTakes(in: folders)
-    takeCache = (key, Date(), takes)
-    return takes
-  }
-
+  /// One entry per destination volume. Time left uses the combined rate of takes on the volume.
   static func drives(for folders: [URL?], recordingRates: [(URL, Double)], assignedRates: [(URL, Double)] = [],
     fallbackMegabits: Double = displayMegabits(codec: .proRes42210Bit)) -> [UIDrive] {
     // Each folder's volume, read once inside its security scope: the folders come from
     // security-scoped bookmarks, and a sandboxed read of a volume needs the grant held.
-    var volumes: [String: (id: String, name: String)] = [:]
-    for case let folder? in folders where volumes[folder.path] == nil {
-      let accessed = folder.startAccessingSecurityScopedResource()
-      volumes[folder.path] = volume(for: folder)
-      if accessed { folder.stopAccessingSecurityScopedResource() }
-    }
-    func volumeID(_ url: URL) -> String? { volumes[url.path]?.id }
-    var seen: [String: UIDrive] = [:]
+    var volumeIDs: [String: String] = [:]
+    var groups: [String: (name: String, folders: [URL])] = [:]
     var order: [String] = []
-    for case let folder? in folders {
-      guard let volume = volumes[folder.path] else { continue }
-      let (id, name) = (volume.id, volume.name)
-      guard seen[id] == nil else {
-        if seen[id]?.folders.contains(folder.path) == false { seen[id]?.folders.append(folder.path) }
-        continue
-      }
-      // Its capacity, too, needs the grant held, or it fails and the drive reads as empty.
+    for case let folder? in folders where volumeIDs[folder.path] == nil {
       let accessed = folder.startAccessingSecurityScopedResource()
-      defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
-      var reported: Int64?
-      var values: URLResourceValues?
-      do {
-        reported = try VolumeFreeSpace.bytes(at: folder)
-        values = try folder.resourceValues(forKeys: [.volumeTotalCapacityKey])
-      } catch {
-        // Either read failing leaves the drive unknown, not full.
-        reported = nil
-        values = nil
-        Self.logUnreadable(name, error)
-      }
-      let available = reported ?? 0
-      // An unreadable free figure leaves the size unknown too, so the drive isn't shown as full.
-      let total = reported == nil ? 0 : Int64(values?.volumeTotalCapacity ?? 0)
-      func sum(_ rates: [(URL, Double)]) -> Double { rates.filter { volumeID($0.0) == id }.map(\.1).reduce(0, +) }
-      let rate = sum(recordingRates)
-      let assigned = sum(assignedRates)
-      let megabits = rate > 0 ? rate : assigned > 0 ? assigned : fallbackMegabits
-      let seconds = available > 0 ? Double(available) * 8 / (megabits * 1_000_000) : nil
-      seen[id] = UIDrive(name: name, availableBytes: available, totalBytes: total, secondsLeft: seconds, volumeID: id,
-        folders: [folder.path])
-      order.append(id)
+      let (id, name) = volume(for: folder)
+      if accessed { folder.stopAccessingSecurityScopedResource() }
+      volumeIDs[folder.path] = id
+      if groups[id] == nil { order.append(id) }
+      groups[id, default: (name, [])].folders.append(folder)
     }
-    return order.compactMap { seen[$0] }
+    func sums(_ rates: [(URL, Double)]) -> [String: Double] {
+      var totals: [String: Double] = [:]
+      for (url, rate) in rates {
+        if let id = volumeIDs[url.path] { totals[id, default: 0] += rate }
+      }
+      return totals
+    }
+    let rolling = sums(recordingRates)
+    let assigned = sums(assignedRates)
+    return order.compactMap { id in
+      guard let group = groups[id] else { return nil }
+      var drive = UIDrive(name: group.name, availableBytes: 0, totalBytes: 0, secondsLeft: nil, volumeID: id,
+        folders: group.folders.map(\.path))
+      let rate = rolling[id] ?? 0
+      let estimate = assigned[id] ?? 0
+      let megabits = rate > 0 ? rate : estimate > 0 ? estimate : fallbackMegabits
+      var capacityError: Error?
+      for folder in group.folders {
+        do {
+          guard let (available, total) = try capacity(at: folder) else { continue }
+          drive.availableBytes = available
+          drive.totalBytes = total
+          drive.secondsLeft = available > 0 && megabits > 0 ? Double(available) * 8 / (megabits * 1_000_000) : nil
+          return drive
+        } catch {
+          if capacityError == nil { capacityError = error }
+        }
+      }
+      if let capacityError { logUnreadable(id: id, name: drive.name, capacityError) }
+      return drive
+    }
+  }
+
+  private static func capacity(at folder: URL) throws -> (Int64, Int64)? {
+    // Capacity reads also need the bookmarked grant.
+    let accessed = folder.startAccessingSecurityScopedResource()
+    defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
+    guard let available = try VolumeFreeSpace.bytes(at: folder) else { return nil }
+    let values = try folder.resourceValues(forKeys: [.volumeTotalCapacityKey])
+    return (available, Int64(values.volumeTotalCapacity ?? 0))
   }
 
   private static let driveLog = Logger(subsystem: "org.ultracam.app", category: "recording")
-  nonisolated(unsafe) private static var unreadableLogged = Set<String>()
+  private static let unreadableLogged = Mutex<Set<String>>([])
 
   /// Once per volume per run: why its free space couldn't be read.
-  private static func logUnreadable(_ name: String, _ error: Error) {
-    guard unreadableLogged.insert(name).inserted else { return }
+  private static func logUnreadable(id: String, name: String, _ error: Error) {
+    guard unreadableLogged.withLock({ $0.insert(id).inserted }) else { return }
     driveLog.error("Free space of \(name, privacy: .public) unreadable: \(error.localizedDescription, privacy: .public)")
   }
 
-  /// Finished movies in the recording folders (and one level of camera
-  /// subfolders), newest first. Hidden partial files are skipped.
-  static func recentTakes(in folders: [URL], limit: Int = 5) -> [UITake] {
-    var takes: [UITake] = []
-    var visited = Set<String>()
+  struct RecentMovie: Sendable {
+    var take: UITake
+    let scope: URL
+    var checkedAt: Date?
+  }
+
+  /// Enumerate under the bookmarked grants on a worker. Only the newest movies
+  /// go on to have their movie headers and sidecars read.
+  static func newestMovies(in folders: [URL], limit: Int = 5) -> [RecentMovie] {
+    guard limit > 0 else { return [] }
     let manager = FileManager.default
-    for folder in folders where visited.insert(folder.path).inserted {
+    let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey]
+    var newest: [RecentMovie] = []
+    var visited = Set<URL>()
+    func entries(_ folder: URL) -> [URL] {
+      (try? manager.contentsOfDirectory(at: folder, includingPropertiesForKeys: Array(keys),
+        options: [.skipsHiddenFiles])) ?? []
+    }
+    func consider(_ url: URL, scope: URL) {
+      guard ["mov", "mp4"].contains(url.pathExtension.lowercased()),
+        !newest.contains(where: { $0.take.url == url.standardizedFileURL }),
+        let values = try? url.resourceValues(forKeys: keys), values.isDirectory != true else { return }
+      let date = values.contentModificationDate ?? .distantPast
+      let take = UITake(url: url.standardizedFileURL, name: url.lastPathComponent, date: date)
+      let position = newest.firstIndex {
+        date > $0.take.date || (date == $0.take.date && take.url.path < $0.take.url.path)
+      } ?? newest.count
+      guard position < limit else { return }
+      newest.insert(RecentMovie(take: take, scope: scope), at: position)
+      if newest.count > limit { newest.removeLast() }
+    }
+    for folder in folders where visited.insert(folder.standardizedFileURL).inserted {
       let accessed = folder.startAccessingSecurityScopedResource()
       defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
-      var candidates: [URL] = []
-      let entries = (try? manager.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
-        options: [.skipsHiddenFiles])) ?? []
-      for entry in entries {
+      for entry in entries(folder) {
         if (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-          candidates += (try? manager.contentsOfDirectory(at: entry, includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles])) ?? []
+          for movie in entries(entry) { consider(movie, scope: folder) }
         } else {
-          candidates.append(entry)
+          consider(entry, scope: folder)
         }
       }
-      for url in candidates where url.pathExtension.lowercased() == "mov" {
-        let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-        takes.append(UITake(url: url, name: url.lastPathComponent, date: date, duration: UITakeDurations.duration(for: url, scope: folder)))
-      }
     }
-    return takes.sorted { $0.date > $1.date }.prefix(limit).map { take in
-      var take = take
-      take.lostFrames = UITakeDurations.lostFrames(for: take.url)
-      return take
+    return newest
+  }
+}
+
+/// One scan and at most one movie metadata read at a time, across window and menu requests.
+@MainActor @Observable final class RecentTakeCache {
+  typealias ReadDetails = @Sendable (URL, URL) async -> (duration: TimeInterval?, lostFrames: UInt64?)
+  private let readDetails: ReadDetails
+  @ObservationIgnored private var requested: [URL] = []
+  @ObservationIgnored private var refreshing = false
+  @ObservationIgnored private var finishedAt = Date.distantPast
+  private var shownFolders: [URL] = []
+  private var movies: [UIRecordingLibrary.RecentMovie] = []
+
+  init(readDetails: @escaping ReadDetails = { await UITakeDurations.read($0, scope: $1) }) {
+    self.readDetails = readDetails
+  }
+
+  func takes(in folders: [URL]) -> [UITake] {
+    requested = folders
+    if !refreshing && (shownFolders != folders || Date().timeIntervalSince(finishedAt) >= 3) {
+      refreshing = true
+      Task { await refresh() }
+    }
+    return shownFolders == folders ? movies.map(\.take) : []
+  }
+
+  private func refresh() async {
+    defer { refreshing = false }
+    while true {
+      let folders = requested
+      var newest = await Task.detached(priority: .utility) {
+        UIRecordingLibrary.newestMovies(in: folders)
+      }.value
+      guard folders == requested else { continue }
+      for index in newest.indices {
+        if let cached = movies.first(where: {
+          $0.take.url == newest[index].take.url && $0.take.date == newest[index].take.date
+        }) {
+          newest[index].take = cached.take
+          newest[index].checkedAt = cached.checkedAt
+        }
+      }
+      shownFolders = folders
+      movies = newest
+      for (index, movie) in newest.enumerated() {
+        // An unfinished movie may not have a readable header yet.
+        if movie.take.duration != nil || movie.checkedAt.map({ Date().timeIntervalSince($0) < 30 }) == true { continue }
+        let readDetails = self.readDetails
+        let details = await Task.detached(priority: .utility) {
+          await readDetails(movie.take.url, movie.scope)
+        }.value
+        guard folders == requested else { break }
+        movies[index].take.duration = details.duration
+        movies[index].take.lostFrames = details.lostFrames
+        movies[index].checkedAt = Date()
+      }
+      if folders == requested { finishedAt = Date(); return }
     }
   }
 }
@@ -317,87 +382,13 @@ enum UIPanels {
   }
 }
 
-/// Detects whether the Ultracam camera extension is installed and active by
-/// looking for one of its devices in Core Media I/O. Cached briefly so the
-/// interface can ask on every refresh.
-@MainActor
-enum UIExtensionDetector {
-  private static var cached: (date: Date, installed: Bool)?
-
-  static func isInstalled() -> Bool {
-    if let cached, Date().timeIntervalSince(cached.date) < 5 { return cached.installed }
-    let installed = scan()
-    cached = (Date(), installed)
-    return installed
-  }
-
-  private static func address(_ selector: Int) -> CMIOObjectPropertyAddress {
-    CMIOObjectPropertyAddress(mSelector: UInt32(selector), mScope: UInt32(kCMIOObjectPropertyScopeGlobal),
-      mElement: UInt32(kCMIOObjectPropertyElementMain))
-  }
-
-  private static func scan() -> Bool {
-    var property = address(kCMIOHardwarePropertyDevices)
-    var size: UInt32 = 0
-    guard CMIOObjectGetPropertyDataSize(CMIOObjectID(kCMIOObjectSystemObject), &property, 0, nil, &size) == noErr,
-      size % 4 == 0, size <= 64 * 1024 else { return false }
-    var devices = [CMIOObjectID](repeating: 0, count: Int(size) / 4)
-    guard !devices.isEmpty, devices.withUnsafeMutableBytes({
-      CMIOObjectGetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &property, 0, nil, size, &size, $0.baseAddress!)
-    }) == noErr else { return false }
-    return devices.contains { device in
-      var nameProperty = address(kCMIOObjectPropertyName)
-      var value: Unmanaged<CFString>?
-      var valueSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-      guard CMIOObjectGetPropertyData(device, &nameProperty, 0, nil, valueSize, &valueSize, &value) == noErr else { return false }
-      let name = value?.takeRetainedValue() as String? ?? ""
-      return name.hasPrefix(VideoContract.cameraName)
-    }
-  }
-}
-
-/// Durations of finished takes, read from the movie files in the background and
-/// cached. The first lookup returns nil; the next refresh shows the duration.
-/// A movie that can't be read yet (a take still recording has no movie
-/// header) is tried again at most every 30 s, not on every refresh.
 enum UITakeDurations {
-  private static let lock = NSLock()
-  nonisolated(unsafe) private static var known: [URL: TimeInterval] = [:]
-  nonisolated(unsafe) private static var loading: Set<URL> = []
-  nonisolated(unsafe) private static var failedAt: [URL: TimeInterval] = [:]
-  nonisolated(unsafe) private static var lost: [URL: UInt64] = [:]
-  static let retryInterval: TimeInterval = 30
-
-  static func duration(for url: URL, scope: URL? = nil) -> TimeInterval? {
-    lock.lock()
-    if let value = known[url] { lock.unlock(); return value }
-    if let failed = failedAt[url], ProcessInfo.processInfo.systemUptime - failed < retryInterval { lock.unlock(); return nil }
-    let start = loading.insert(url).inserted
-    lock.unlock()
-    if start {
-      Task.detached(priority: .utility) {
-        // Keep the bookmarked parent grant for the entire asynchronous movie/sidecar read.
-        let accessed = scope?.startAccessingSecurityScopedResource() ?? false
-        defer { if accessed { scope?.stopAccessingSecurityScopedResource() } }
-        let seconds = try? await AVURLAsset(url: url).load(.duration).seconds
-        let frames = lostFrames(sidecarOf: url)
-        lock.withLock {
-          if let seconds, seconds.isFinite, seconds > 0 {
-            known[url] = seconds
-            lost[url] = frames
-            failedAt[url] = nil
-          } else {
-            failedAt[url] = ProcessInfo.processInfo.systemUptime
-          }
-          loading.remove(url)
-        }
-      }
-    }
-    return nil
+  static func read(_ url: URL, scope: URL) async -> (duration: TimeInterval?, lostFrames: UInt64?) {
+    let accessed = scope.startAccessingSecurityScopedResource()
+    defer { if accessed { scope.stopAccessingSecurityScopedResource() } }
+    let seconds = try? await AVURLAsset(url: url).load(.duration).seconds
+    return (seconds.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }, lostFrames(sidecarOf: url))
   }
-
-  /// A take's lost frames, read with its duration. Nil for a take without the count.
-  static func lostFrames(for url: URL) -> UInt64? { lock.withLock { lost[url] } }
 
   /// Device skips are already inside `sourceVideoLost`. Older sidecars have no count, and
   /// a movie with no sidecar has nothing to say: both show nothing.

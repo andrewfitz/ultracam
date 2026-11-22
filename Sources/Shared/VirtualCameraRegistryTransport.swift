@@ -11,15 +11,19 @@ enum VirtualCameraRegistryWire {
   static let maximumDevices = 32
 
   static func encode(_ snapshot: VirtualCameraRegistrySnapshot) throws -> String {
+    String(decoding: try encodedData(snapshot), as: UTF8.self)
+  }
+
+  static func encodedData(_ snapshot: VirtualCameraRegistrySnapshot) throws -> Data {
     try snapshot.validate()
     guard snapshot.devices.count <= maximumDevices else {
       throw VideoError.message("A virtual-camera registry supports at most 32 devices.")
     }
     let data = try JSONEncoder().encode(snapshot)
-    guard data.count <= maximumBytes, let text = String(data: data, encoding: .utf8) else {
+    guard data.count <= maximumBytes else {
       throw VideoError.message("Virtual-camera registry is too large.")
     }
-    return text
+    return data
   }
 
   static func decode(_ text: String) throws -> VirtualCameraRegistrySnapshot {
@@ -183,13 +187,14 @@ final class VirtualCameraRegistryPublisher {
   private var desired: VirtualCameraRegistrySnapshot?
   private var listener: Listener?
   private let queue = DispatchQueue(label: "org.ultracam.registry-publication", qos: .utility)
-  private let apply: @Sendable (VirtualCameraRegistrySnapshot) -> Void
+  var onSynchronizationResult: ((Result<Void, Error>) -> Void)?
+  private let apply: @Sendable (VirtualCameraRegistrySnapshot) throws -> Void
   private var synchronizing = false
   private var synchronizationRequested = false
 
   init(observeTopology: Bool = true,
-    apply: @escaping @Sendable (VirtualCameraRegistrySnapshot) -> Void = {
-      _ = try? VirtualCameraRegistryTransport.synchronize($0, onlyIfCurrent: true)
+    apply: @escaping @Sendable (VirtualCameraRegistrySnapshot) throws -> Void = {
+      _ = try VirtualCameraRegistryTransport.synchronize($0, onlyIfCurrent: true)
     }) {
     self.apply = apply
     guard observeTopology else { return }
@@ -223,11 +228,11 @@ final class VirtualCameraRegistryPublisher {
     queue.async { [weak self] in
       // CMIO discovery and the read/write/acknowledgement handshake can block
       // for seconds. Keep them off the main actor, including topology retries.
-      // Absence before installation is expected; capture surfaces its own error.
-      apply(desired)
+      let result = Result { try apply(desired) }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         self.synchronizing = false
+        if self.desired == desired { self.onSynchronizationResult?(result) }
         // Read the latest intent here rather than queueing every publication:
         // intermediate snapshots must never replay after a newer request.
         self.startSynchronizationIfNeeded()

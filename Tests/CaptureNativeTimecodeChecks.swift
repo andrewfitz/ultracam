@@ -54,20 +54,27 @@ import XCTest
     XCTAssertEqual(CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
       [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &image), kCVReturnSuccess)
     let buffer = try XCTUnwrap(image)
-    let metadata = SourceAdmissionMetadata(pixelBuffer: buffer, presentationTime: .zero,
+    var metadata = SourceAdmissionMetadata(pixelBuffer: buffer, presentationTime: .zero,
       duration: VideoContract.fastDuration, epochID: epoch, formatSignature: format.signature)
+    metadata.presentationStartHostTime = CMTime(value: 99, timescale: 10)
+    CVBufferSetAttachment(buffer, DeviceAPI.captureHostTimeAttachmentKey as CFString, NSNumber(value: 10), .shouldPropagate)
     let label = try Timecode(hours: 1, minutes: 2, seconds: 3, frames: 4, dropFrame: false)
     XCTAssertTrue(adapter.appendNativeVideo(buffer, metadata: metadata, source: snapshot, signalValid: true, timecode: label))
     try adapter.stop()
     XCTAssertEqual(writer.nativeLabels.first?.label, "01:02:03:04")
     XCTAssertEqual(writer.nativeLabels.first?.epoch, 2)
+    XCTAssertEqual(try XCTUnwrap(writer.anchor).timeIntervalSince1970, 999.9, accuracy: 0.000001)
   }
 }
 private final class SampleTimecodeWriter: SourceRecordingWriter {
+  var anchor: Date?
   var nativeLabels: [TimecodeMetadata] = []
   var rawLabels: [Timecode] = []
   func start() throws {}
   func appendVideo(_ sample: CMSampleBuffer) throws {
+    if let image = CMSampleBufferGetImageBuffer(sample) {
+      anchor = AVAssetSourceRecordingWriter.captureDate(of: image, sample: sample, now: Date(timeIntervalSince1970: 1000), hostNow: 10)
+    }
     if let data = CMGetAttachment(sample, key: SourceRecordingConfiguration.sourceTimecodeAttachmentKey as CFString,
       attachmentModeOut: nil) as? Data { rawLabels.append(try JSONDecoder().decode(Timecode.self, from: data)) }
     if let data = CMGetAttachment(sample, key: SourceRecordingConfiguration.nativeTimecodeAttachmentKey as CFString,

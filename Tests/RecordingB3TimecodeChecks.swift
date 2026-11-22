@@ -139,6 +139,73 @@ import XCTest
     if audioPTS.count > 1 { XCTAssertEqual(audioPTS[1].seconds, duration.seconds, accuracy: 1.0 / 48000) }
   }
 
+  func testMicrophoneGapPreservesVideoTimelineAndReturningSamplesInMOV() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("microphone-gap-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let duration = CMTime(value: 1, timescale: 30)
+    let source = try SourceAdmissionSnapshot(
+      format: SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(duration)),
+      epochID: .init(sessionID: UUID(), epoch: 0), clockBindings: .init(video: .init(), audio: .init()), stage: .recordingSource)
+    let mic = try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .float32,
+      interleaved: true, layout: .init(), clock: .deviceClock)
+    let clock = try ClockMapping(sourceAnchor: .zero, hostAnchor: .zero, rate: .one)
+    let mapping = try AudioVideoClockMapping(audio: clock, video: clock)
+    let framesPerPacket = 1470
+
+    func record(_ name: String, gap: Bool, returnMic: Bool = true) throws -> URL {
+      let movie = folder.appendingPathComponent(name).appendingPathExtension("mov")
+      let config = try SourceRecordingConfiguration(feedID: .init("mic-gap"), outputURL: movie,
+        width: 1920, height: 1080, videoCodec: kCMVideoCodecType_AppleProRes422HQ,
+        sourceFrameRate: .constant(duration), sourceAdmission: source)
+      let writer = try AVAssetSourceRecordingWriter(configuration: config)
+      try writer.start()
+      try writer.bindTakeContext(.init(sourceAdmission: source, audioDeclaration: .present(mic),
+        mappingRevision: 1, videoMapping: clock, audioMapping: clock))
+      for frame in 0..<8 {
+        let time = CMTime(value: Int64(frame), timescale: 30)
+        try writer.appendVideo(sample(pts: time, duration: duration))
+        if gap && (1..<5).contains(frame) { continue }
+        if !returnMic && frame > 0 { continue }
+        let values = [Float](repeating: frame < 5 ? 0.5 : -0.5, count: framesPerPacket)
+        let packet = try makeSourceSample(planes: [values.withUnsafeBytes { Data($0) }],
+          sampleFrameCount: framesPerPacket, format: mic, presentationTime: time)
+        if gap && frame == 5 { try writer.appendResumedSourceAudio(packet, mapping: mapping) }
+        else { try writer.appendSourceAudio(packet, mapping: mapping) }
+      }
+      try writer.finish()
+      return movie
+    }
+
+    let uninterrupted = try record("control", gap: false)
+    let interrupted = try record("returned", gap: true)
+    let missingAtStop = try record("stopped-without-mic", gap: true, returnMic: false)
+    let expectedVideo = try readMovieSamples(uninterrupted, type: .video).map(CMSampleBufferGetPresentationTimeStamp)
+    XCTAssertEqual(expectedVideo.count, 8)
+    for movie in [interrupted, missingAtStop] {
+      let timestamps = try readMovieSamples(movie, type: .video).map(CMSampleBufferGetPresentationTimeStamp)
+      XCTAssertEqual(timestamps, expectedVideo)
+    }
+    let audio = try readMovieSamples(interrupted, type: .audio)
+    var values = [Float]()
+    for sample in audio {
+      let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+      let size = CMBlockBufferGetDataLength(block)
+      var data = Data(count: size)
+      XCTAssertEqual(data.withUnsafeMutableBytes {
+        CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress!)
+      }, noErr)
+      values += data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+    XCTAssertEqual(values.count, 8 * framesPerPacket)
+    guard values.count >= 8 * framesPerPacket else { return }
+    XCTAssertEqual(values[0], 0.5)
+    XCTAssertEqual(values[2 * framesPerPacket], 0)
+    XCTAssertEqual(values[5 * framesPerPacket - 1], 0)
+    XCTAssertEqual(values[5 * framesPerPacket], -0.5)
+    XCTAssertEqual(values.last, -0.5)
+  }
+
   func testCoreRefusesOneAudioPacketBeyondDurationBudgetBeforeRetention() throws {
     let format = try SourceAudioFormat(sampleRate: 48000, channels: 1, sample: .int16, interleaved: true, layout: .init(), clock: .pairedWithFrames)
     let config = try SourceRecordingConfiguration(feedID: .init("audio-retention"), outputURL: URL(fileURLWithPath: "/tmp/unused-retention.mov"), width: 1920, height: 1080)

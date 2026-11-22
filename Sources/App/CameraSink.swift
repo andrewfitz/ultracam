@@ -347,16 +347,32 @@ final class CameraSink {
   deinit { disconnect() }
 
   func connect(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat? = nil) throws {
-    try Self.validateCameraSource(sourceFormat)
-    sourcePauseAllowanceSeconds = configuration.sourcePauseAllowanceSeconds
-    let pixelFormat = route.feedID == nil ? ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat).pixelFormat : (configuration.untouched ? passthroughFormat : configuration.pixelFormat)
-    cameraOutputLog.notice("""
-      Camera connect: \(self.route.feedID ?? "Program", privacy: .public) → \(self.route.deviceUID, privacy: .public), \
-      \(configuration.width, privacy: .public)×\(configuration.height, privacy: .public) \
-      \(fourCC(pixelFormat), privacy: .public), frame \(configuration.duration.value, privacy: .public)/\
-      \(configuration.duration.timescale, privacy: .public) s
-      """)
-    do { try connectOnce(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat) } catch {
+    try connect(try outputContract(configuration: configuration, passthroughFormat: passthroughFormat,
+      sourceFormat: sourceFormat), untouched: configuration.untouched && route.feedID != nil,
+      sourcePauseAllowanceSeconds: configuration.sourcePauseAllowanceSeconds)
+  }
+
+  func connect(program: ProgramOutputFormat, sourcePauseAllowanceSeconds: Double?) throws {
+    try connect(try outputContract(program: program), untouched: false,
+      sourcePauseAllowanceSeconds: sourcePauseAllowanceSeconds)
+  }
+
+  private func connect(_ request: @autoclosure () throws -> DerivedOutputContract, untouched: Bool,
+    sourcePauseAllowanceSeconds: Double?) throws {
+    do {
+      let requested = try request()
+      let size = CMVideoFormatDescriptionGetDimensions(requested.format)
+      let pixelFormat = CMFormatDescriptionGetMediaSubType(requested.format)
+      let duration = requested.duration
+      cameraOutputLog.notice("""
+        Camera connect: \(self.route.feedID ?? "Program", privacy: .public) → \(self.route.deviceUID, privacy: .public), \
+        \(size.width, privacy: .public)×\(size.height, privacy: .public) \
+        \(fourCC(pixelFormat), privacy: .public), frame \(duration.value, privacy: .public)/\
+        \(duration.timescale, privacy: .public) s
+        """)
+      try connectOnce(requested, untouched: untouched)
+      self.sourcePauseAllowanceSeconds = sourcePauseAllowanceSeconds
+    } catch {
       cameraOutputLog.error("""
         Camera connect failed: \(self.route.feedID ?? "Program", privacy: .public) → \(self.route.deviceUID, privacy: .public): \
         \(error.localizedDescription, privacy: .public)
@@ -375,6 +391,7 @@ final class CameraSink {
     let physical = sourceFormat?.colour ?? Colorimetry(
       primaries: .rec709, transfer: .rec709, matrix: .rec709,
       range: .video, horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
+    if configuration.untouched { return physical }
     let interpreted = physical.overridingRGBEncoding(with: configuration.sourceColorimetryOverride)
     let encoded: Colorimetry
     if configuration.applyLUT {
@@ -388,18 +405,20 @@ final class CameraSink {
     } else {
       encoded = interpreted
     }
-    if configuration.untouched { return encoded }
     // The feed GPU encoder performs native video-range YUV encoding with
     // centered chroma, independently of the interpreted source's storage.
-    return Colorimetry(primaries: encoded.primaries, transfer: encoded.transfer,
-      matrix: encoded.matrix == .identity ? .rec709 : encoded.matrix, range: .video,
-      horizontalChromaSiting: .center, verticalChromaSiting: .center)
+    return encoded.centeredVideoOutput
   }
 
   static func requestedFormat(configuration: PipelineConfiguration, passthroughFormat: OSType,
                               sourceFormat: SourceFormat?) throws -> CMVideoFormatDescription {
     try validateCameraSource(sourceFormat)
     let pixel = configuration.untouched ? passthroughFormat : configuration.pixelFormat
+    if configuration.untouched,
+       !VideoContract.tenBit422.contains(pixel),
+       !ColorTarget.allCases.contains(where: { $0.pixelFormat == pixel }) {
+      throw VideoError.message("Virtual camera output cannot publish native \(fourCC(pixel)). Enable Effects and choose a supported Color format.")
+    }
     // A declaration-free caller selects the fixed Rec709 compatibility
     // configuration. Frame admission still requires matching explicit tags.
     let legacy = try VideoContract.formatDescription(width: configuration.width, height: configuration.height, pixelFormat: pixel)
@@ -424,6 +443,7 @@ final class CameraSink {
     let matrix: CFString
     switch colour.matrix {
     case .rec709: matrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+    case .rec601: matrix = kCVImageBufferYCbCrMatrix_ITU_R_601_4
     case .rec2020: matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
     default: throw VideoError.message("The virtual camera does not support this source colour matrix.")
     }
@@ -434,6 +454,11 @@ final class CameraSink {
     // processor's advertised native output FourCC range.
     if configuration.untouched, sourceFormat != nil {
       tags[kCMFormatDescriptionExtension_FullRangeVideo as String] = colour.range == .full
+    }
+    if !configuration.downscale, let aspect = sourceFormat?.pixelAspect, aspect != .one {
+      tags[kCMFormatDescriptionExtension_PixelAspectRatio as String] = [
+        kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing as String: NSNumber(value: aspect.numerator),
+        kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing as String: NSNumber(value: aspect.denominator)]
     }
     if !configuration.untouched {
       tags[kCMFormatDescriptionExtension_ChromaLocationTopField as String] = kCVImageBufferChromaLocation_Center
@@ -452,7 +477,7 @@ final class CameraSink {
     return result
   }
 
-  private func connectOnce(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat?) throws {
+  private func connectOnce(_ requested: DerivedOutputContract, untouched: Bool) throws {
     disconnect()
     if let desired = registrySnapshot() {
       try VirtualCameraRegistryTransport.synchronize(desired)
@@ -467,9 +492,8 @@ final class CameraSink {
     for id in try discoverDevices() {
       guard (try? string(id, selector: kCMIODevicePropertyDeviceUID)) == route.deviceUID else { continue }
       let streams = try ids(id, selector: kCMIODevicePropertyStreams)
-      let format = try outputFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+      let format = requested.format
       let paired = try pairedStreams(streams)
-      let requested = DerivedOutputContract(format: format, duration: configuration.duration)
       // Claim native identity before setters or CopyBufferQueue: an old retry
       // must not stop this connection or share its still-live native queue.
       let stopDevice = id, stopStream = paired.sink
@@ -479,7 +503,14 @@ final class CameraSink {
       var armed = false
       defer { if !armed { CameraStreamStopRecovery.shared.cancelUnstarted(recoveryToken) } }
       for stream in [paired.sink, paired.source] {
-        guard requested.matchingPublishedIndex(in: try publishedFormats(stream)) != nil else {
+        let installed = try publishedFormats(stream)
+        guard requested.matchingPublishedIndex(in: installed) != nil else {
+          if untouched {
+            if installed.contains(where: { DerivedOutputContract.matchesLayout(format, $0) }) {
+              throw VideoError.message("The installed virtual camera cannot publish this native colour or pixel aspect. For a colour mismatch, use a LUT with a supported output colour space. For a pixel-aspect mismatch, enable Output size.")
+            }
+            throw VideoError.message("The installed virtual camera cannot publish this native size and pixel layout. Enable Effects and choose a supported Output size or Color format.")
+          }
           throw VideoError.message("The installed virtual camera does not publish this output size, pixel layout and complete colour contract. Update the camera extension or choose an installed output format.")
         }
       }
@@ -490,9 +521,9 @@ final class CameraSink {
       let controlled = controlledByAnotherProcess(id)
       var firstSampleDecides = false
       for stream in [paired.sink, paired.source] {
-        let outcome = try Self.negotiateInstalledContract(format: format, duration: configuration.duration,
+        let outcome = try Self.negotiateInstalledContract(format: format, duration: requested.duration,
           controlled: { self.controlledByAnotherProcess(id) },
-          set: { try writeContract(stream, format: format, duration: configuration.duration) },
+          set: { try writeContract(stream, format: format, duration: requested.duration) },
           read: { try self.installedActiveContract(stream) })
         if outcome == .firstSampleDecides { firstSampleDecides = true }
       }
@@ -504,7 +535,7 @@ final class CameraSink {
       stopRecoveryToken = recoveryToken
       armed = true
       negotiatedFormat = format
-      negotiatedDuration = configuration.duration
+      negotiatedDuration = requested.duration
       deviceID = id
       streamID = paired.sink
       do { try check(CMIODeviceStartStream(id, paired.sink), "Start virtual camera input") }
@@ -513,7 +544,7 @@ final class CameraSink {
       cameraOutputLog.notice("""
         Camera connected: \(self.route.feedID ?? "Program", privacy: .public), negotiated \(size.width, privacy: .public)×\
         \(size.height, privacy: .public) \(fourCC(CMFormatDescriptionGetMediaSubType(format)), privacy: .public), \
-        frame \(configuration.duration.value, privacy: .public)/\(configuration.duration.timescale, privacy: .public) s, \
+        frame \(requested.duration.value, privacy: .public)/\(requested.duration.timescale, privacy: .public) s, \
         queue capacity \(self.queue.map { CMSimpleQueueGetCapacity($0.queue) } ?? 0, privacy: .public)\
         \(firstSampleDecides ? ", the first frame renegotiates under the camera app holding device control"
           : controlled ? ", format left to the camera app holding device control" : "", privacy: .public)
@@ -528,7 +559,16 @@ final class CameraSink {
   /// write per contract change, nothing per frame. Waits for nothing: a device that isn't
   /// published yet, or one a client already holds, is left to the connect.
   func preNegotiate(configuration: PipelineConfiguration, passthroughFormat: OSType, sourceFormat: SourceFormat?) throws {
-    try Self.validateCameraSource(sourceFormat)
+    try preNegotiate(try outputContract(configuration: configuration, passthroughFormat: passthroughFormat,
+      sourceFormat: sourceFormat))
+  }
+
+  func preNegotiate(program: ProgramOutputFormat) throws {
+    try preNegotiate(try outputContract(program: program))
+  }
+
+  private func preNegotiate(_ requested: DerivedOutputContract) throws {
+    guard FrameRateTarget.allCases.contains(where: { DerivedOutputContract.sameDuration($0.duration, requested.duration) }) else { return }
     var address = CMIOObjectPropertyAddress(
       mSelector: UInt32(kCMIOHardwarePropertyAllowScreenCaptureDevices),
       mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
@@ -538,25 +578,29 @@ final class CameraSink {
     let devices = try ids(CMIOObjectID(kCMIOObjectSystemObject), selector: kCMIOHardwarePropertyDevices)
     guard let id = devices.first(where: { (try? string($0, selector: kCMIODevicePropertyDeviceUID)) == route.deviceUID }),
       !controlledByAnotherProcess(id) else { return }
-    let format = try outputFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+    let format = requested.format
     let paired = try pairedStreams(try ids(id, selector: kCMIODevicePropertyStreams))
-    let requested = DerivedOutputContract(format: format, duration: configuration.duration)
     let streams = [paired.sink, paired.source]
     for stream in streams {
       guard requested.matchingPublishedIndex(in: try publishedFormats(stream)) != nil else { return }
     }
     for stream in streams {
-      try writeContract(stream, format: format, duration: configuration.duration)
+      try writeContract(stream, format: format, duration: requested.duration)
     }
     cameraOutputLog.notice("Camera format prepared: \(self.route.feedID ?? "Program", privacy: .public), \(fourCC(CMFormatDescriptionGetMediaSubType(format)), privacy: .public)")
   }
 
-  private func outputFormat(configuration: PipelineConfiguration, passthroughFormat: OSType,
-    sourceFormat: SourceFormat?) throws -> CMVideoFormatDescription {
+  func outputContract(configuration: PipelineConfiguration, passthroughFormat: OSType,
+    sourceFormat: SourceFormat?) throws -> DerivedOutputContract {
     if route.feedID == nil {
-      return try ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat).formatDescription()
+      return try outputContract(program: ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat))
     }
-    return try Self.requestedFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+    let format = try Self.requestedFormat(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: sourceFormat)
+    return DerivedOutputContract(format: format, duration: configuration.duration)
+  }
+
+  func outputContract(program: ProgramOutputFormat) throws -> DerivedOutputContract {
+    DerivedOutputContract(format: try program.formatDescription(), duration: program.duration)
   }
 
   /// The UID selects the feed. Match the published names, then the source/input
@@ -689,6 +733,9 @@ final class CameraSink {
   static func negotiateInstalledContract(format: CMVideoFormatDescription, duration: CMTime,
     controlled: () -> Bool, set: () throws -> Void,
     read: () throws -> (CMVideoFormatDescription, Double)) throws -> InstalledContract {
+    guard FrameRateTarget.allCases.contains(where: { DerivedOutputContract.sameDuration($0.duration, duration) }) else {
+      throw VideoError.message("The installed virtual camera does not publish this output cadence.")
+    }
     var busy = controlled()
     if !busy {
       do { try set() }
@@ -696,10 +743,6 @@ final class CameraSink {
         guard controlled() else { throw error }
         busy = true
       }
-    }
-    guard duration.isNumeric, duration.epoch == 0, duration.value > 0, duration.timescale > 0,
-      FrameRateTarget.allCases.contains(where: { DerivedOutputContract.sameDuration($0.duration, duration) }) else {
-      throw VideoError.message("The installed virtual camera does not publish this output cadence.")
     }
     let (activeFormat, activeRate) = try read()
     if activeRate.isFinite, activeRate > 0, activeRate == Double(duration.timescale) / Double(duration.value),

@@ -1,5 +1,7 @@
 use crate::model::{AudioCue, StreamEvent};
 use anyhow::{bail, Context, Result};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Take};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -23,7 +25,11 @@ impl PcmCueDecoder {
         {
             bail!("sample rate, chunk duration, and threshold must be valid");
         }
-        let chunk_frames = ((sample_rate as u64 * chunk_ms as u64) / 1_000).max(1) as usize;
+        let chunk_frames =
+            usize::try_from(((u64::from(sample_rate) * u64::from(chunk_ms)) / 1_000).max(1))
+                .ok()
+                .filter(|frames| *frames <= usize::MAX / 2)
+                .context("PCM chunk size exceeds platform limits")?;
         Ok(Self {
             sample_rate,
             chunk_frames,
@@ -37,40 +43,30 @@ impl PcmCueDecoder {
     }
 
     pub fn push_pcm16le(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
-        self.pending_bytes.extend_from_slice(bytes);
-        let available_frames = self.pending_bytes.len() / 2;
-        let complete_frames = available_frames / self.chunk_frames * self.chunk_frames;
-        let complete_bytes = complete_frames * 2;
-        let raw: Vec<u8> = self.pending_bytes.drain(..complete_bytes).collect();
-        let (chunks, _) = raw.as_chunks::<2>();
-        let samples: Vec<i16> = chunks
-            .iter()
-            .map(|chunk| i16::from_le_bytes(*chunk))
-            .collect();
-        let chunk_frames = self.chunk_frames;
-        let mut events = Vec::new();
-        for chunk in samples.chunks(chunk_frames) {
-            if chunk.len() == chunk_frames {
-                events.push(self.make_cue(chunk));
-            }
+        let mut pending = std::mem::take(&mut self.pending_bytes);
+        pending.extend_from_slice(bytes);
+        let chunk_bytes = self.chunk_frames * 2;
+        let complete_bytes = pending.len() / chunk_bytes * chunk_bytes;
+        let mut events = Vec::with_capacity(complete_bytes / chunk_bytes);
+        for chunk in pending[..complete_bytes].chunks_exact(chunk_bytes) {
+            events.push(self.make_cue(chunk));
         }
+        pending.copy_within(complete_bytes.., 0);
+        pending.truncate(pending.len() - complete_bytes);
+        self.pending_bytes = pending;
         events
     }
 
     pub fn finish(&mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-        let complete_bytes = self.pending_bytes.len() / 2 * 2;
+        let mut pending = std::mem::take(&mut self.pending_bytes);
+        let complete_bytes = pending.len() / 2 * 2;
         if complete_bytes > 0 {
-            let raw: Vec<u8> = self.pending_bytes.drain(..complete_bytes).collect();
-            let (chunks, _) = raw.as_chunks::<2>();
-            let samples: Vec<i16> = chunks
-                .iter()
-                .map(|chunk| i16::from_le_bytes(*chunk))
-                .collect();
-            if !samples.is_empty() {
-                events.push(self.make_cue(&samples));
-            }
+            events.push(self.make_cue(&pending[..complete_bytes]));
         }
+        // Discard any odd trailing byte after emitting complete samples.
+        pending.clear();
+        self.pending_bytes = pending;
         if self.speaking {
             self.speaking = false;
             let id = self.next_id;
@@ -89,18 +85,15 @@ impl PcmCueDecoder {
                     session_generation: 0,
                 },
             });
-        } else {
-            // An odd trailing byte is malformed PCM and is intentionally
-            // discarded after any complete final sample has been emitted.
         }
-        self.pending_bytes.clear();
         events
     }
 
-    fn make_cue(&mut self, samples: &[i16]) -> StreamEvent {
+    fn make_cue(&mut self, bytes: &[u8]) -> StreamEvent {
+        let (samples, _) = bytes.as_chunks::<2>();
         let energy = (samples
             .iter()
-            .map(|sample| (*sample as f32 / i16::MAX as f32).powi(2))
+            .map(|sample| (i16::from_le_bytes(*sample) as f32 / i16::MAX as f32).powi(2))
             .sum::<f32>()
             / samples.len() as f32)
             .sqrt()
@@ -141,65 +134,158 @@ impl PcmCueDecoder {
     }
 }
 
-pub fn decode_wav(path: &Path) -> Result<(u32, Vec<u8>)> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read WAV {}", path.display()))?;
-    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+pub(crate) struct WavPcm {
+    pcm: Take<File>,
+    pub sample_rate: u32,
+}
+
+impl Read for WavPcm {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.pcm.read(buffer)?;
+        if count == 0 && !buffer.is_empty() && self.pcm.limit() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated WAV data",
+            ));
+        }
+        Ok(count)
+    }
+}
+
+pub(crate) fn open_wav_pcm(path: &Path) -> Result<WavPcm> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open WAV {}", path.display()))?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0; 12];
+    file.read_exact(&mut header)
+        .context("truncated WAV header")?;
+    if &header[..4] != b"RIFF" || &header[8..] != b"WAVE" {
         bail!("{} is not a RIFF/WAVE file", path.display());
     }
-    let mut cursor = 12usize;
-    let mut sample_rate = None;
-    let mut channels = None;
-    let mut bits_per_sample = None;
+    let end = 8 + u64::from(u32::from_le_bytes(header[4..8].try_into()?));
+    if end < 12 || end > file_len {
+        bail!("truncated WAV container");
+    }
+
+    let mut cursor = 12;
+    let mut format = None;
     let mut data = None;
-    while cursor + 8 <= bytes.len() {
-        let id = &bytes[cursor..cursor + 4];
-        let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into()?) as usize;
-        cursor += 8;
-        if cursor + size > bytes.len() {
+    while cursor < end {
+        let mut chunk_header = [0; 8];
+        if end - cursor < chunk_header.len() as u64 {
+            bail!("truncated WAV chunk header");
+        }
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut chunk_header)
+            .context("truncated WAV chunk header")?;
+        let id = &chunk_header[..4];
+        let size = u64::from(u32::from_le_bytes(chunk_header[4..].try_into()?));
+        let offset = cursor + chunk_header.len() as u64;
+        cursor = offset + size + (size % 2);
+        if cursor > end {
             bail!("truncated WAV chunk");
         }
         match id {
             b"fmt " if size >= 16 => {
-                let format = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into()?);
-                if format != 1 {
+                let mut pcm_format = [0; 16];
+                file.read_exact(&mut pcm_format)
+                    .context("truncated WAV format")?;
+                if u16::from_le_bytes(pcm_format[..2].try_into()?) != 1 {
                     bail!("only PCM WAV input is supported");
                 }
-                channels = Some(u16::from_le_bytes(
-                    bytes[cursor + 2..cursor + 4].try_into()?,
-                ));
-                sample_rate = Some(u32::from_le_bytes(
-                    bytes[cursor + 4..cursor + 8].try_into()?,
-                ));
-                bits_per_sample = Some(u16::from_le_bytes(
-                    bytes[cursor + 14..cursor + 16].try_into()?,
-                ));
+                let channels = u16::from_le_bytes(pcm_format[2..4].try_into()?);
+                let sample_rate = u32::from_le_bytes(pcm_format[4..8].try_into()?);
+                let bits_per_sample = u16::from_le_bytes(pcm_format[14..16].try_into()?);
+                format = Some((channels, sample_rate, bits_per_sample));
             }
-            b"data" => data = Some(bytes[cursor..cursor + size].to_vec()),
+            b"data" => data = Some((offset, size)),
             _ => {}
         }
-        cursor += size + (size % 2);
     }
-    let rate = sample_rate.context("WAV fmt chunk missing")?;
-    if channels != Some(1) || bits_per_sample != Some(16) {
+
+    let (channels, sample_rate, bits_per_sample) = format.context("WAV fmt chunk missing")?;
+    if channels != 1 || bits_per_sample != 16 {
         bail!("WAV input must be mono 16-bit PCM");
     }
-    Ok((rate, data.context("WAV data chunk missing")?))
+    if sample_rate == 0 {
+        bail!("WAV sample rate must be positive");
+    }
+    let (offset, size) = data.context("WAV data chunk missing")?;
+    if size % 2 != 0 {
+        bail!("truncated 16-bit sample in WAV data");
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    Ok(WavPcm {
+        pcm: file.take(size),
+        sample_rate,
+    })
 }
 
-pub fn decode_media_audio(path: &Path, sample_rate: u32) -> Result<Vec<u8>> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
+pub fn decode_wav(path: &Path) -> Result<(u32, Vec<u8>)> {
+    let mut wav = open_wav_pcm(path)?;
+    let mut bytes = Vec::new();
+    wav.read_to_end(&mut bytes)?;
+    Ok((wav.sample_rate, bytes))
+}
+
+pub(crate) fn with_media_audio<T>(
+    path: &Path,
+    sample_rate: u32,
+    consume: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<T> {
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-nostdin", "-i"])
         .arg(path)
         .args(["-f", "s16le", "-ac", "1", "-ar"])
         .arg(sample_rate.to_string())
-        .args(["pipe:1"])
+        .arg("pipe:1")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .with_context(|| "failed to start ffmpeg; install ffmpeg or use a WAV file")?;
-    if !output.status.success() {
-        bail!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr));
+        .spawn()
+        .context("failed to start ffmpeg; install ffmpeg or use a WAV file")?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let diagnostics = std::thread::Builder::new()
+        .name("auto-switcher-ffmpeg-stderr".into())
+        .spawn(move || -> io::Result<Vec<u8>> {
+            // Drain stderr concurrently even after reaching the diagnostic limit.
+            let mut message = Vec::new();
+            stderr.by_ref().take(16 * 1024).read_to_end(&mut message)?;
+            io::copy(&mut stderr, &mut io::sink())?;
+            Ok(message)
+        });
+    let diagnostics = match diagnostics {
+        Ok(thread) => thread,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("failed to start ffmpeg diagnostic reader");
+        }
+    };
+    let result = consume(&mut stdout);
+    drop(stdout);
+    if result.is_err() {
+        let _ = child.kill();
     }
-    Ok(output.stdout)
+    let status = child.wait();
+    let stderr = diagnostics.join();
+    let value = result?;
+    let status = status.context("failed to wait for ffmpeg")?;
+    let stderr = stderr
+        .map_err(|_| anyhow::anyhow!("ffmpeg diagnostic reader panicked"))?
+        .context("failed to read ffmpeg diagnostics")?;
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr);
+        bail!("ffmpeg failed ({status}): {}", message.trim_end());
+    }
+    Ok(value)
+}
+
+pub fn decode_media_audio(path: &Path, sample_rate: u32) -> Result<Vec<u8>> {
+    with_media_audio(path, sample_rate, |reader| {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
 }

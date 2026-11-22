@@ -12,7 +12,7 @@ Three layers check the new interface:
 
 The script compiles every app source except `UltracamApp.swift` with the release build's strict settings, plus `Tools/UIVerify/*.swift`, and runs the result.
 
-1. **Renders.** Each screen is drawn in an offscreen window, in light and dark: the main window for every `UIFixtures` session at 1320×860 and 980×680, every layout, all strips collapsed, the camera column, every strip state (expanded and collapsed), sidebar, inspector, status bar, Program View, each Settings pane and Diagnostics (with a real `AppModel`), and the main window driven by the real model. Each PNG must not be blank. For main windows, the content area must draw too, not just the window chrome.
+1. **Renders.** Each screen is drawn in an offscreen window, in light and dark: the main window for every `UIFixtures` session at 1320×860 and 980×680, every layout, all strips collapsed, the camera column, every strip state (expanded and collapsed), inspector, status bar and its popovers, Program View, each Settings pane and Diagnostics (with a real `AppModel`), and the main window driven by the real model. Each PNG must not be blank. For main windows, the content area must draw too, not just the window chrome.
 2. **Accessibility.** The tool walks the SwiftUI accessibility tree. Enhanced user interface mode is turned on at startup, because SwiftUI builds the tree only for an assistive client; no permission is needed. It checks key labels, and that no app names appear.
 3. **Interactions.** Controls are pressed through accessibility, and the `UIAction` that each one sends is recorded:
    - a picture press selects and never cuts (D1)
@@ -34,7 +34,8 @@ The script compiles every app source except `UltracamApp.swift` with the release
 
 ## Output and options
 
-Artifacts go to `/Volumes/8TB/cinesomatic-director-work/agent-work/build/ultracam/ui-verify/<run>/` (with a `latest` link):
+Artifacts go to `agent-work/build/ultracam/ui-verify/<run>/` under `ULTRACAM_WORK_ROOT`, which defaults to `.build` in the checkout. A `latest` link points to the last run.
+
 - `png/`
 - `ui-verify.log`
 - `accessibility-program-meeting.tsv`
@@ -42,14 +43,18 @@ Artifacts go to `/Volumes/8TB/cinesomatic-director-work/agent-work/build/ultraca
 
 `STRICT=0` reports view-dependent failures as pending instead of failing.
 
+`UI_PERF_ONLY=1` runs only the live performance checks. The default cases cover two and four cameras with both live and fixed meters. `UI_PERF_CAMERAS` and `UI_PERF_METERS` select cases for a focused run. `UI_PERF_IDLE` sets the idle interval in seconds and `UI_PERF_PROFILE_INSPECTOR` adds inspector toggles before the measured interactions.
+
+`UI_MAC_CAMERA_ONLY=1` runs the scripted Mac Camera and DeckLink scenario. It checks the Hardware permission action and mixed inventory, the inspector's input and Hardware link, per-device settings, the live effects route and the finalized source take. The fixture sends frames to an in-process sink. Screenshots and the fixture take are saved in the run directory.
+
 ## Known limits
 
 - **Inspector:** `.inspector` inside a bare `NSHostingView` throws during AppKit layout, so the whole-window inspector render runs in the app self-test. `RENDER_INSPECTOR=1` attempts it here anyway.
-- **Vibrancy:** offscreen capture draws vibrant sidebar materials as a flat color.
+- **Vibrancy:** offscreen capture draws vibrant materials (the inspector, bars) as a flat color.
 
 ## Speed
 
-- `scripts/ui-verify.sh` skips the run when nothing it compiles has changed since its last passing run (a hash of the inputs is kept next to `latest`). `FORCE=1` reruns.
+- `scripts/ui-verify.sh` reuses a passing run for unchanged inputs and default coverage. It reports the passing artifact directory even after an intervening focused or failed run. `FORCE=1` reruns.
 - Views settle until layout stops changing, in 16 ms slices; the old fixed waits are only the upper limit.
 - A strict timer ends each slice on time (a process started from a background shell or agent gets coalesced timers, which stretched 16 ms to ~130 ms), and a closed window drops its content so it stops updating.
 - The verifier is compiled unoptimized, and the MonitorKit package build is cached across runs.

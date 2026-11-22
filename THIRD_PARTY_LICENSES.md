@@ -18,6 +18,18 @@ and [NOTICE](https://github.com/andrewfitz/MonitorKit/blob/main/NOTICE). Its not
 
 Retain both files. The root NOTICE reproduces this attribution.
 
+## Program streaming
+
+The app links its Enhanced RTMP adaptation of HaishinKit 2.3.1, Logboard 2.6.0, and
+the static libaom 3.15.3 AV1 encoder. The application’s Resources directory includes
+the copyright notices, libaom contributor list, and Alliance for Open Media patent license.
+[Program streaming license texts](ThirdParty/ProgramStreaming-Licenses.txt)
+
+The [Xcode package lock](Ultracam.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved)
+pins Logboard and the libaom wrapper to exact revisions. The libaom wrapper verifies the
+downloaded XCFramework against SHA-256
+`a6dd4f65cb772770f2dcded2d72076c84dd7e5220dbb4b0b6813454e0f77e7a7`.
+
 ## Blackmagic DeckLink SDK 16.0 interfaces
 
 The committed `Vendors/Blackmagic/SDK/include/` contains interface headers and
@@ -101,7 +113,7 @@ successful signing or a successful build does not satisfy this gate.
 
 ## Rust auto-switcher
 
-`Tools/auto-switcher/` is an Ultracam component licensed under the root
+`Apps/AutoSwitcher/` is a standalone application licensed under the root
 [Apache-2.0 license](LICENSE). Its `Cargo.toml` declares `Apache-2.0`, consistent
 with vendor-plan decision 4. Its third-party dependencies retain their own
 license terms below.
@@ -272,3 +284,5 @@ are not substitutes for those texts. `Cargo.lock` changes require a new audit.
 | zmij | 1.0.23 | MIT |
 
 Snapshot: 2026-10-27. Cargo.lock SHA-256: `b049458ada44f0489288fe4fd679b01fd288e652f88e94804315a877bed76ffd`.
+
+Auto Switcher bundles the YuNet 2023mar face detector under its [MIT license](Apps/AutoSwitcher/models/LICENSE-YuNet).

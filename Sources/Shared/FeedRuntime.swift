@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import Observation
 
 /// The lifecycle owned by one configured feed. Capture and camera transport
 /// are deliberately outside this contract for now; they advance this state
@@ -55,7 +56,7 @@ final class FeedSession: Identifiable {
 /// capture owners. Persisted ordering remains the source of truth for the
 /// collection; sessions and controllers are created only for descriptors that
 /// are accessed. Each controller owns an independent capture session.
-@MainActor
+@MainActor @Observable
 final class FeedCoordinator {
   private(set) var descriptors: [FeedDescriptor]
   private(set) var selectedFeedID: FeedID
@@ -74,6 +75,15 @@ final class FeedCoordinator {
   private var sessions: [FeedID: FeedSession] = [:]
   let capturePool: FeedCapturePool
   let programOutput: ProgramOutputRoute
+  private struct StreamVideoResources: Sendable {
+    let normalizer: ProgramNormalizer
+    let black: GPUStandbyImage
+  }
+  private var streamVideoPreparation: Task<StreamVideoResources, Error>?
+  private var streamPreparationContract: ProgramOutputFormat?
+  private var streamPreparationID: UInt64 = 0
+  private var streamVideo: ProgramStreamVideo?
+  private var streamVideoGeneration: UInt64 = 0
   private var programBridge: ProgramOutputBridge?
   private let programNormalizer = ProgramNormalizerLoader()
   /// Harnesses replace this: the production bridge opens the Mac's real Program camera.
@@ -163,6 +173,70 @@ final class FeedCoordinator {
   func isFeedRunning(_ id: FeedID) -> Bool {
     sessions[id]?.isRunning == true
   }
+
+  /// Stream preparation builds Metal pipelines on a background thread. Stop or a new start
+  /// fences completion from an old request, including a still-pending GPU black fill.
+  func startProgramStreamVideo(contract: ProgramOutputFormat, onError: @escaping @Sendable (String) -> Void = { _ in },
+                               send: @escaping ProgramStreamVideo.Send) async throws {
+    detachProgramStreamVideo()
+    let generation = streamVideoGeneration
+    if streamVideoPreparation == nil || streamPreparationContract != contract {
+      let retired = streamVideoPreparation
+      retired?.cancel()
+      streamPreparationContract = contract
+      streamPreparationID &+= 1
+      streamVideoPreparation = Task.detached(priority: .userInitiated) {
+        // At most one warm-up performs Metal work, even when repeated starts
+        // supersede work that is already compiling or on the GPU.
+        if let retired { _ = await retired.result }
+        try Task.checkCancellation()
+        let normalizer = try ProgramNormalizer()
+        try Task.checkCancellation()
+        let producer = try GPUStandbyProducer()
+        try Task.checkCancellation()
+        let format = try contract.formatDescription()
+        let black: GPUStandbyImage = try await withCheckedThrowingContinuation { continuation in
+          do { try producer.makeBlack(format: format) { continuation.resume(with: $0) } }
+          catch { continuation.resume(throwing: error) }
+        }
+        try Task.checkCancellation()
+        return StreamVideoResources(normalizer: normalizer, black: black)
+      }
+    }
+    // Requests for the same contract can share a warm-up. Only the newest may publish.
+    let preparationID = streamPreparationID
+    defer {
+      if preparationID == streamPreparationID,
+        generation == streamVideoGeneration || streamPreparationContract == nil {
+        streamVideoPreparation = nil
+        streamPreparationContract = nil
+      }
+    }
+    guard let preparation = streamVideoPreparation else { throw CancellationError() }
+    let resources = try await preparation.value
+    guard generation == streamVideoGeneration, !Task.isCancelled else { throw CancellationError() }
+    let prepared = ProgramStreamVideo(contract: contract, normalizer: resources.normalizer, black: resources.black.pixelBuffer,
+      send: send, report: onError)
+    streamVideo = prepared
+    programOutput.setStreamSink(prepared)
+    prepared.start()
+  }
+
+  func stopProgramStreamVideo() {
+    streamVideoPreparation?.cancel()
+    streamPreparationContract = nil
+    detachProgramStreamVideo()
+  }
+
+  private func detachProgramStreamVideo() {
+    streamVideoGeneration &+= 1
+    guard let streamVideo else { return }
+    programOutput.setStreamSink(nil)
+    streamVideo.stop()
+    self.streamVideo = nil
+  }
+
+  var programStreamVideoDrops: UInt64 { streamVideo?.droppedFrames ?? 0 }
 
   /// Installs the single consumer for the Program CMIO stream. The route is
   /// persistent across demand transitions so queued leases can be drained and
@@ -300,7 +374,7 @@ final class FeedCoordinator {
         capturePool.stop(descriptor.id)
       }
       programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
-        publishVirtualCameraRegistry()
+      publishVirtualCameraRegistry()
       return
     }
     descriptors[index] = descriptor
@@ -319,15 +393,17 @@ final class FeedCoordinator {
     publishVirtualCameraRegistry()
   }
 
-  @discardableResult
-  func add(name: String? = nil) -> FeedID {
+  func newFeed(name: String?) -> FeedDescriptor {
     var id = FeedID(uuid: UUID())
     while descriptors.contains(where: { $0.id == id }) { id = FeedID(uuid: UUID()) }
-    let descriptor = FeedDescriptor(id: id, name: name ?? "Camera \(descriptors.count + 1)")
-    descriptors.append(descriptor)
-    programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
-    publishVirtualCameraRegistry()
-    return id
+    return FeedDescriptor(id: id, name: name ?? "Camera \(descriptors.count + 1)")
+  }
+
+  @discardableResult
+  func add(name: String? = nil) -> FeedID {
+    let descriptor = newFeed(name: name)
+    update(descriptor)
+    return descriptor.id
   }
 
   /// Removes an idle feed. A running feed remains configured until its owner

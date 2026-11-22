@@ -1,5 +1,7 @@
 # App conformance review: real app vs round-4 design
 
+> Note (2026-11-19): the r6 layout ([mockup](mockups/r6/layout.html)) supersedes the rows below about the left pane and the strip's structure. The session sidebar and its Attention section are gone (rows 1, 2, 58, 59, 66): the status bar's problem list carries problems and extension setup, and Recording's popover (the arrow beside Record) carries format, folder, drives and interrupted takes. The strip has four rows and a gear in place of the ⋯ menu (rows 22, 24, 25, 26). This review is otherwise left as written.
+
 **Reviewed (read-only):**
 - **Design:** `docs/mockups/r4/*`, `SELF_CHECK.md`, `docs/mockups/r3/audit/REPORT.md` (D1–D8) and `docs/IMPLEMENTATION_MAP.md`.
 - **Code:** `Sources/App/UI*.swift` and `UltracamApp.swift`, the per-camera API in `AppModel.swift`, and `RecordingModel.swift`.

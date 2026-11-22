@@ -77,9 +77,13 @@ import SwiftUI
           let mono = try SourceAudioFormat(sampleRate: 44_100, channels: 1, sample: .float32,
             interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
           try tap.configure(format: mono)
-          hosted.settle(0.3)
-          let replacement = Accessibility.nodes(in: hosted.host).first { $0.label == "Camera 1 audio" }
-          let replacementHelp = replacement.flatMap { $0.object.value(forKey: "accessibilityHelp") as? String } ?? ""
+          let deadline = ProcessInfo.processInfo.systemUptime + 1
+          var replacementHelp = ""
+          repeat {
+            MainLoop.run(seconds: 0.025)
+            let replacement = Accessibility.nodes(in: hosted.host).first { $0.label == "Camera 1 audio" }
+            replacementHelp = replacement.flatMap { $0.object.value(forKey: "accessibilityHelp") as? String } ?? ""
+          } while !replacementHelp.hasPrefix("Camera 1: channel 1 max ") && ProcessInfo.processInfo.systemUptime < deadline
           verifier.check("live meter: an open strip follows a new declaration without reattaching",
             tap.viewerCount == 2 && replacementHelp.hasPrefix("Camera 1: channel 1 max ") && !replacementHelp.contains("right"),
             "\(tap.viewerCount) viewers, \(replacementHelp)", viewDependent: true)

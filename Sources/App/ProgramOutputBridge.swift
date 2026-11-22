@@ -50,7 +50,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
     var mainThreadSends: UInt64 = 0
   }
 
-  typealias Connect = (PipelineConfiguration, OSType) throws -> Void
+  typealias Connect = (ProgramOutputFormat, Double?) throws -> Void
   typealias Disconnect = () -> Void
   typealias Send = (CMSampleBuffer) throws -> Bool
 
@@ -90,8 +90,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
   private var link = Link.disconnected
   private var fullSince: TimeInterval?
   private var demand = false
-  private var configuration: PipelineConfiguration?
-  private var passthroughFormat: OSType?
+  private var negotiatedFormat: ProgramOutputFormat?
+  private var sourcePauseAllowanceSeconds: Double?
   private var deliveredOnConnection: UInt64 = 0
   /// When the connect now pending its first frame began. Under `lock`.
   private var connectStarted: TimeInterval?
@@ -105,12 +105,12 @@ final class ProgramOutputBridge: @unchecked Sendable {
   /// The production bridge uses the dedicated Program CMIO destination.
   convenience init(route: FrameRoute<CVPixelBuffer>, queueLabel: String = "org.ultracam.program-output-bridge", paced: Bool = false) {
     let sink = CameraSink(route: CameraSinkRoute(descriptor: .program()))
-    self.init(route: route, connect: { configuration, passthroughFormat in
-      try sink.connect(configuration: configuration, passthroughFormat: passthroughFormat)
+    self.init(route: route, connect: { format, sourcePauseAllowanceSeconds in
+      try sink.connect(program: format, sourcePauseAllowanceSeconds: sourcePauseAllowanceSeconds)
     }, disconnect: { sink.disconnect() }, send: { sample in
       try sink.send(sample)
-    }, preNegotiate: { configuration, passthroughFormat in
-      try sink.preNegotiate(configuration: configuration, passthroughFormat: passthroughFormat, sourceFormat: nil)
+    }, preNegotiate: { format, _ in
+      try sink.preNegotiate(program: format)
     }, queueLabel: queueLabel, paced: paced)
   }
 
@@ -168,10 +168,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
 
   /// The format the Program camera negotiated, or nil while not connected.
   var contract: ProgramOutputFormat? {
-    locked {
-      guard link == .connected, let configuration, let passthroughFormat else { return nil }
-      return ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat)
-    }
+    locked { link == .connected ? negotiatedFormat : nil }
   }
 
   /// When true, a frame that doesn't match the negotiated contract is counted
@@ -221,7 +218,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
   func requestPreNegotiation(configuration: PipelineConfiguration, passthroughFormat: OSType) {
     controlQueue.async { [self] in
       guard let preNegotiateSink, locked({ link == .disconnected && !demand }) else { return }
-      do { try preNegotiateSink(Self.transport(configuration), passthroughFormat) }
+      let format = ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat)
+      do { try preNegotiateSink(format, configuration.sourcePauseAllowanceSeconds) }
       catch { cameraOutputLog.notice("Camera format not prepared: Program: \(error.localizedDescription, privacy: .public)") }
     }
   }
@@ -278,10 +276,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
     let next = ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat)
     let keep = locked { () -> Bool in
       demand = true
-      guard link == .connected, let current = self.configuration, let pass = self.passthroughFormat else {
-        return false
-      }
-      if ProgramOutputFormat(configuration: current, passthroughFormat: pass) == next { return true }
+      guard link == .connected else { return false }
+      if negotiatedFormat == next { return true }
       // One fixed contract per client session. Before the first frame the
       // contract may still settle (e.g. input cadence detected after
       // connect); after it, cuts and settings changes are converted on the
@@ -293,20 +289,11 @@ final class ProgramOutputBridge: @unchecked Sendable {
       return false
     }
     if keep { schedulePump(); return }
-    try connect(configuration: configuration, passthroughFormat: passthroughFormat)
-  }
-
-  /// CameraSink also serves feed routes, where rate controls may only reduce
-  /// source cadence. Program owns a CFR clock and may repeat up to its explicitly
-  /// selected rate, so it negotiates that output cadence.
-  private static func transport(_ configuration: PipelineConfiguration) -> PipelineConfiguration {
-    var result = configuration
-    if configuration.reduceFrameRate { result.sourceDuration = configuration.frameRateTarget.duration }
-    return result
+    try connect(next, sourcePauseAllowanceSeconds: configuration.sourcePauseAllowanceSeconds)
   }
 
   /// Connects (or reconnects) the sink. Control queue only.
-  private func connect(configuration: PipelineConfiguration, passthroughFormat: OSType) throws {
+  private func connect(_ format: ProgramOutputFormat, sourcePauseAllowanceSeconds: Double?) throws {
     let wasLinked = locked { () -> Bool in
       let linked = link == .connected || link == .failed
       link = .connecting
@@ -320,7 +307,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
       locked { contractHandler }?(nil)
     }
     do {
-      try connectSink(Self.transport(configuration), passthroughFormat)
+      try connectSink(format, sourcePauseAllowanceSeconds)
     } catch {
       locked {
         link = .disconnected
@@ -331,13 +318,13 @@ final class ProgramOutputBridge: @unchecked Sendable {
     }
     let handler = locked { () -> (@Sendable (ProgramOutputFormat?) -> Void)? in
       link = .connected
-      self.configuration = configuration
-      self.passthroughFormat = passthroughFormat
+      negotiatedFormat = format
+      self.sourcePauseAllowanceSeconds = sourcePauseAllowanceSeconds
       deliveredOnConnection = 0
       self.connection &+= 1
       return contractHandler
     }
-    handler?(ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat))
+    handler?(format)
     schedulePump()
   }
 
@@ -353,8 +340,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
     let handler = locked { () -> (@Sendable (ProgramOutputFormat?) -> Void)? in
       link = .disconnected
       fullSince = nil
-      configuration = nil
-      passthroughFormat = nil
+      negotiatedFormat = nil
+      sourcePauseAllowanceSeconds = nil
       return contractHandler
     }
     handler?(nil)
@@ -371,22 +358,22 @@ final class ProgramOutputBridge: @unchecked Sendable {
     }
     guard schedule else { return }
     controlQueue.asyncAfter(deadline: .now() + delay) { [self] in
-      let target = locked { () -> (PipelineConfiguration, OSType)? in
+      let target = locked { () -> (ProgramOutputFormat, Double?)? in
         reconnectScheduled = false
-        guard demand, link == .failed, let configuration, let passthroughFormat else { return nil }
-        return (configuration, passthroughFormat)
+        guard demand, link == .failed, let negotiatedFormat else { return nil }
+        return (negotiatedFormat, sourcePauseAllowanceSeconds)
       }
-      guard let (configuration, passthroughFormat) = target else { return }
+      guard let (format, pauseAllowance) = target else { return }
       locked { statistics.reconnects &+= 1 }
       do {
-        try connect(configuration: configuration, passthroughFormat: passthroughFormat)
+        try connect(format, sourcePauseAllowanceSeconds: pauseAllowance)
       } catch {
         // `connect` cleared demand on failure; restore it and keep trying.
         locked {
           demand = true
           link = .failed
-          self.configuration = configuration
-          self.passthroughFormat = passthroughFormat
+          negotiatedFormat = format
+          sourcePauseAllowanceSeconds = pauseAllowance
         }
         scheduleReconnect(after: 1)
       }
@@ -408,9 +395,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
       defer { lease.release() }
       let (connected, expected, connection) = locked { () -> (Bool, ProgramOutputFormat?, UInt64) in
         guard link == .connected, demand else { return (false, nil, self.connection) }
-        guard enforcesContract, let configuration, let passthroughFormat else { return (true, nil, self.connection) }
-        return (true, ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat),
-          self.connection)
+        return (true, enforcesContract ? negotiatedFormat : nil, self.connection)
       }
       guard connected else {
         locked { statistics.withoutSink &+= 1 }
@@ -526,7 +511,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
   /// clocks skip source images; slower clocks repeat the last image. Neither
   /// correction changes negotiated sample durations or host-grid spacing.
   private func pumpPacedOnSendQueue() {
-    let state = locked { (link == .connected && demand, connection, enforcesContract ? contractWithoutLock() : nil) }
+    let state = locked { (link == .connected && demand, connection, enforcesContract ? negotiatedFormat : nil) }
     guard state.0, !route.isCancelled else { clearPacing(); drainRoute(); return }
     let generation = route.generation
     if pacedRouteGeneration != generation {
@@ -610,6 +595,11 @@ final class ProgramOutputBridge: @unchecked Sendable {
       pacedRemaining = max(0, pacedRemaining - missed)
       time = CMTimeAdd(time, CMTimeMultiplyByFloat64(duration, multiplier: Double(missed)))
       locked { statistics.clockSkipped &+= UInt64(missed); statistics.pacingDiscontinuities &+= 1 }
+      if CMTimeCompare(time, now) > 0 {
+        pacedNextTime = time
+        wakePacer(at: time)
+        return
+      }
     }
     if pacedRemaining == 0 { locked { statistics.clockRepeated &+= 1 } }
     else { pacedRemaining -= 1 }
@@ -634,12 +624,6 @@ final class ProgramOutputBridge: @unchecked Sendable {
     }
     pacedNextTime = CMTimeAdd(time, duration)
     wakePacer(at: pacedNextTime!)
-  }
-
-  /// Called only with the state lock held.
-  private func contractWithoutLock() -> ProgramOutputFormat? {
-    guard let configuration, let passthroughFormat else { return nil }
-    return ProgramOutputFormat(configuration: configuration, passthroughFormat: passthroughFormat)
   }
 
 }
@@ -726,6 +710,8 @@ final class ProgramMonitorTap: @unchecked Sendable {
     let generation = self.generation
     let sequence = self.sequence
     lock.unlock()
-    sink.offer(frame.payload, pts: sourcePTS, captureGeneration: generation, sequence: sequence)
+    let span = CMTimeMultiply(frame.metadata.duration, multiplier: Int32(clamping: frame.metadata.repeatCount))
+    sink.offer(frame.payload, pts: sourcePTS, captureGeneration: generation, sequence: sequence,
+      untouched: false, sourceFormat: nil, duration: span, burnIn: nil)
   }
 }

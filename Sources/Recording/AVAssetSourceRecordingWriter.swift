@@ -115,11 +115,15 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   private var timebaseOrigin: CMTime?
   private var mappedPCMBridge: ClockMappedPCMBridge?
   private var mappedPCMResumePending = false
+  private var markMappedAudioSegmentStart = false
+  private static let resumedPCMKey = "org.ultracam.recording.resumedPCM"
+  private var writtenAudioEnd: CMTime? // writerQueue only
   private var mappedAudioFrames: UInt64 = 0
   private var mappedAudioDiscontinuities: UInt64 = 0
   private var heldMappedAudio: [CMSampleBuffer] = []
+  private var submittedVideo = false
   private var firstSourceVideoPTS: CMTime?
-  private var sourceNativeTrackExpected: Bool?
+  private var timecodeTrackPlan: TimecodeTrackPlan? // Frozen by the first raw or compressed frame, under timelineLock.
   private var nativeTimecodeMetadata: TimecodeMetadata?
   private var nativeTimecodeOrigin: CMTime?
   private var submittedNativeTimecodes: [Rational: Data] = [:]
@@ -161,6 +165,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     case passThrough
     /// GPU repack into the encoder's own x422 pool.
     case gpu(RecordingPixelConverter, CVPixelBufferPool)
+    case gpu420(SourceRecordingConfiguration.Render420, CVPixelBufferPool,
+      rawUYVA: (converter: Packed422RecordingConverter, pool: CVPixelBufferPool)?)
     case gpuRGB(RecordingRGBPixelConverter, CVPixelBufferPool, RGBFormat)
     case gpuPlanar(PlanarRecordingConverter, CVPixelBufferPool)
     case gpuPacked422(Packed422RecordingConverter, CVPixelBufferPool)
@@ -383,14 +389,49 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       qos: .userInitiated)
   }
 
-  /// Returns the generated track description for modes that do not depend on
-  /// an embedded source timecode. Source mode remains absent until the capture
-  /// boundary supplies a source timecode value.
+  /// One decision for the first submitted frame, shared by the label journal and the movie writer.
+  private enum TimecodeTrackPlan {
+    case absent, generated, native(TimecodeMetadata)
+
+    static func select(_ configuration: SourceRecordingConfiguration, variable: Bool,
+      firstNative: TimecodeMetadata?) -> Self {
+      guard configuration.fileType != .mp4 else { return .absent }
+      if configuration.timecodePolicy == .source {
+        guard !variable, let firstNative else { return .absent }
+        return .native(firstNative)
+      }
+      return variable && !configuration.recordingConstantFrameRate ? .absent : .generated
+    }
+
+    var carriesNativeLabels: Bool {
+      if case .native = self { return true }
+      return false
+    }
+
+    func makeTrack(configuration: SourceRecordingConfiguration, rate: RecordingFrameRate) throws -> QuickTimeTimecodeTrack? {
+      switch self {
+      case .absent: return nil
+      case .native(let value): return try QuickTimeTimecodeTrack(frameRate: value.frameRate, dropFrame: value.dropFrame)
+      case .generated: return try QuickTimeTimecodeTrack(frameRate: rate, dropFrame: configuration.timecodeDropFrame)
+      }
+    }
+  }
+
+  private func resolveTimecodeTrack(variable: Bool, firstNative: TimecodeMetadata?) -> TimecodeTrackPlan {
+    timelineLock.withLock {
+      if let timecodeTrackPlan { return timecodeTrackPlan }
+      let plan = TimecodeTrackPlan.select(configuration, variable: variable, firstNative: firstNative)
+      timecodeTrackPlan = plan
+      return plan
+    }
+  }
+
   static func makeTimecodeTrack(for configuration: SourceRecordingConfiguration,
     frameRate: RecordingFrameRate? = nil) throws -> QuickTimeTimecodeTrack? {
-    guard configuration.timecodePolicy != .source || configuration.nativeTimecodeMetadata != nil else { return nil }
-    return try QuickTimeTimecodeTrack(frameRate: frameRate ?? configuration.frameRate,
-      dropFrame: configuration.timecodeDropFrame)
+    let variable = (configuration.sourceFrameRate ?? configuration.sourceAdmission?.format.rate ??
+      configuration.expectedSourceFormat?.rate)?.isVariable == true
+    return try TimecodeTrackPlan.select(configuration, variable: variable, firstNative: configuration.nativeTimecodeMetadata)
+      .makeTrack(configuration: configuration, rate: frameRate ?? configuration.frameRate)
   }
 
   /// Wall-clock recordings that ask for computer-clock alignment take the
@@ -408,11 +449,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
 
   /// The wall-clock moment a frame was captured: its host capture time
   /// attachment mapped onto the computer clock, or `now` without one.
-  static func captureDate(of image: CVBuffer, now: Date = Date(),
+  static func captureDate(of image: CVBuffer, sample: CMSampleBuffer? = nil, now: Date = Date(),
     hostNow: Double = CMClockGetTime(CMClockGetHostTimeClock()).seconds) -> Date {
-    guard let captured = (CVBufferCopyAttachment(image,
-      SourceRecordingConfiguration.captureHostTimeAttachmentKey as CFString, nil) as? NSNumber)?.doubleValue,
-      captured.isFinite, captured > 0, hostNow.isFinite else { return now }
+    let start = sample.flatMap { CMGetAttachment($0, key: SourceRecordingConfiguration.presentationStartHostTimeKey as CFString,
+      attachmentModeOut: nil) as? NSNumber }
+    guard let captured = (start ?? (CVBufferCopyAttachment(image,
+      SourceRecordingConfiguration.captureHostTimeAttachmentKey as CFString, nil) as? NSNumber))?.doubleValue,
+      captured.isFinite, captured >= 0, (start != nil || captured > 0), hostNow.isFinite else { return now }
     // A capture time from the future or from long ago is not this frame's.
     let age = hostNow - captured
     guard age >= 0, age < 10 else { return now }
@@ -542,14 +585,17 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       let source = context.sourceAdmission
       let output = RecordingOutputContract(sourceFormat: source.format, outputRate: configuration.recordingConstantFrameRate && source.format.rate.isVariable ? .constant((Self.matchingFrameRate(source.format.rate.nominal) ?? configuration.frameRate).frameDuration) : source.format.rate,
         encoderInputPixelFormat: configuration.videoProfile.encoderPixelFormat, codec: configuration.videoCodec,
-        burnedInColour: configuration.lutBurnIn?.outputColour)
+        renderedColour: renderedColour(for: source.format))
       var metadata = RecordingTakeSidecar.Metadata(sourceSignature: source.formatSignature, outputSignature: output.signature)
       metadata.epoch = source.epochID; metadata.clockBindings = source.clockBindings
       metadata.audioDeclaration = context.audioDeclaration; metadata.policy = configuration.compatibilityPolicy
       if case .present(let audio) = context.audioDeclaration {
         let outputRate = try recordingPCMOutputSampleRate(for: audio)
         metadata.audioOutputSampleRate = outputRate
-        if Self.usesLegacyPairedPCM(audio) {
+        if configuration.fileType == .mp4 {
+          metadata.audioOutputSampleRate = 48_000
+          metadata.conversionNotes.append("Embedded audio is encoded as AAC at 48 kHz with up to two channels.")
+        } else if Self.usesLegacyPairedPCM(audio) {
           metadata.conversionNotes.append("Paired signed Int32 PCM is stored as its exact high 24 bits.")
         }
         if outputRate != audio.sampleRate {
@@ -575,7 +621,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       metadata.sourceFormat = source.format
       metadata.keyframeIntervalDuration = configuration.keyframeDuration(for: Self.matchingFrameRate(source.format.rate.nominal) ?? configuration.frameRate)
       if [PixelFormatID.uyva, PixelFormatID.pa16].contains(source.format.pixel) {
-        metadata.conversionNotes.append("The selected 4:2:2 recording profile omits the source alpha plane.")
+        metadata.conversionNotes.append("The selected recording profile omits the source alpha plane.")
       }
       if source.format.pixel == .r210, source.format.colour.range == .video,
         configuration.videoProfile.encoderPixelFormat == kCVPixelFormatType_64RGBALE {
@@ -634,6 +680,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
           snapshot.format.pixel.rawValue == configuration.sourcePixelFormat else {
           throw SourceRecordingError.unsupportedSample("Recording source declaration differs from configured dimensions or pixel format.")
         }
+        try SourceRecordingConfiguration.validate420Render(format: snapshot.format, encoderPixel: configuration.videoProfile.encoderPixelFormat,
+          render420: configuration.render420, burnIn: configuration.lutBurnIn)
         boundSourceAdmission = snapshot
       }
     } catch {
@@ -767,7 +815,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
           }
         }
       }
-      let captured = Self.captureDate(of: imageBuffer)
+      let captured = Self.captureDate(of: imageBuffer, sample: sample)
       telemetryLock.withLock { firstFrameDate = captured }
     }
     var pauseBoundaryError: Double?
@@ -820,7 +868,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       let base = sourceTimecodeBase ?? Self.timecodeBase(declaredRate?.nominal ?? duration)
       sourceTimecodeBase = base
       let broke = sourceTimecodeRun.breaks(raw, base: base, pts: pts, duration: duration)
-      let runs = declaredRate?.isVariable == true || Self.matchingFrameRate(duration) == nil
+      let runs = sourceTimecodeRunOpen || declaredRate?.isVariable == true ||
+        CMGetAttachment(sample, key: SourceRecordingConfiguration.nativeTimecodeAttachmentKey as CFString, attachmentModeOut: nil) == nil
       if fieldMarkChanged || runs && broke {
         journal(.init(kind: "nativeTimecode", detail: "Original source timecode, counted at \(base) frames a second",
           originalValue: pts.value, originalTimescale: pts.timescale, nativeSourceTimecode: raw,
@@ -847,8 +896,8 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       nativeValue = native
       nativeData = try JSONEncoder().encode(native)
     } else { nativeValue = nil; nativeData = nil }
-    if sourceNativeTrackExpected == nil { sourceNativeTrackExpected = configuration.timecodePolicy == .source && nativeData != nil && declaredRate?.isVariable != true }
-    if let value = nativeValue, declaredRate?.isVariable == true || sourceNativeTrackExpected == false {
+    let plan = resolveTimecodeTrack(variable: declaredRate?.isVariable == true, firstNative: nativeValue)
+    if let value = nativeValue, !plan.carriesNativeLabels {
       // Only the labels the run can't predict, and the next record's time gives
       // its length. One line per frame filled the journal, and failed the take,
       // after 19 minutes. A variable-rate run breaks wherever a frame's duration
@@ -883,7 +932,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     } else {
       timelineLock.withLock { selectedTrackTimescale = normalizedTiming?.presentationTime.timescale }
       try submitVideo(session: session, image: encoderImage, pts: outputPTS,
-        duration: normalizedTiming?.duration ?? duration, nativeTimecode: nativeData)
+        duration: normalizedTiming?.duration ?? duration, nativeTimecode: plan.carriesNativeLabels ? nativeData : nil)
     }
     if case let .systemCompatibility(reason) = route {
       noteSystemCompatibility(reason)
@@ -922,6 +971,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       telemetryLock.withLock { frameStarts.removeNewest(key); submittedNativeTimecodes.removeValue(forKey: key) }
       throw SourceRecordingError.writerFailure("VideoToolbox encode failed (OSStatus \(status)).")
     }
+    submittedVideo = true
   }
 
   /// The session for the next frame, creating it (outside the lock) if
@@ -1007,6 +1057,17 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         telemetryLock.withLock {
           telemetryValue.gpuConvertedFrames &+= 1
           telemetryValue.gpuConversionMS = (ProcessInfo.processInfo.systemUptime - start) * 1000
+        }
+        return (destination, .gpu)
+      } catch { return try recoverConversionFailure(source, error: error) }
+    case let .gpu420(render, pool, _):
+      do {
+        let destination = try makeEncoderBuffer(from: pool)
+        let ms = try render(source, recordingSourceFormat?.colour, destination)
+        applyEncoderColour(to: destination)
+        telemetryLock.withLock {
+          telemetryValue.gpuConvertedFrames &+= 1
+          telemetryValue.gpuConversionMS = telemetryValue.gpuConversionMS.map { $0 * 0.9 + ms * 0.1 } ?? ms
         }
         return (destination, .gpu)
       } catch { return try recoverConversionFailure(source, error: error) }
@@ -1111,18 +1172,35 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       throw RecordingLUTBurnInError.unsupported("this camera’s NDI picture with alpha (UYVA) reaches the recorder in a form the LUT pass can’t read.")
     }
     let input = try encoderLock.withLock { try ensureCanAppend(); return encoderInput }
-    guard case let .gpuPacked422(converter, pool) = input else {
-      throw SourceRecordingError.unsupportedSample("Raw UYVA requires its proven GPU recording route.")
+    let converter: Packed422RecordingConverter
+    let pool: CVPixelBufferPool
+    let render420: SourceRecordingConfiguration.Render420?
+    let intermediatePool: CVPixelBufferPool?
+    switch input {
+    case let .gpuPacked422(packed, encoderPool):
+      (converter, pool, render420, intermediatePool) = (packed, encoderPool, nil, nil)
+    case let .gpu420(render, encoderPool, packed?):
+      (converter, pool, render420, intermediatePool) = (packed.converter, encoderPool, render, packed.pool)
+    default:
+      throw SourceRecordingError.unsupportedSample("Raw UYVA requires its GPU recording route.")
     }
     let output: CVPixelBuffer
     do {
+      let start = ProcessInfo.processInfo.systemUptime
       let destination = try makeEncoderBuffer(from: pool)
-      output = try waitForPackedConversion { completion in
+      let packedDestination = try intermediatePool.map { try makeEncoderBuffer(from: $0) } ?? destination
+      let unpacked = try waitForPackedConversion { completion in
         try converter.convertUYVA(source, owner: owner, width: width, height: height, rowBytes: rowBytes,
-          alphaRowBytes: alphaRowBytes, output: destination, completion: completion)
+          alphaRowBytes: alphaRowBytes, output: packedDestination, completion: completion)
       }
+      if let render420 { _ = try render420(unpacked, recordingSourceFormat?.colour, destination) }
+      output = destination
       applyEncoderColour(to: output)
-      telemetryLock.withLock { telemetryValue.gpuConvertedFrames &+= 1 }
+      let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
+      telemetryLock.withLock {
+        telemetryValue.gpuConvertedFrames &+= 1
+        telemetryValue.gpuConversionMS = telemetryValue.gpuConversionMS.map { $0 * 0.9 + ms * 0.1 } ?? ms
+      }
     } catch {
       // Raw UYVA has no VideoToolbox buffer representation to hand over. A
       // failed GPU frame is counted; the following frame can still record.
@@ -1174,13 +1252,27 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
 
   /// The colour the encoded frames are in: the source's, or with a burned-in
   /// LUT the LUT's output (the sidecar's `outputContract` says the same).
+  private func renderedColour(for source: SourceFormat) -> Colorimetry? {
+    if let burnIn = configuration.lutBurnIn { return burnIn.outputColour }
+    guard configuration.render420 != nil,
+      source.pixel.rawValue != configuration.videoProfile.encoderPixelFormat || source.colour.range == .full else { return nil }
+    return source.colour.centeredVideoOutput
+  }
+
   private func encoderOutputColour(_ source: SourceFormat) -> Colorimetry {
     RecordingOutputContract(sourceFormat: source, encoderInputPixelFormat: configuration.videoProfile.encoderPixelFormat,
-      codec: configuration.videoCodec, burnedInColour: configuration.lutBurnIn?.outputColour).outputColour
+      codec: configuration.videoCodec, renderedColour: renderedColour(for: source)).outputColour
   }
 
   private func configureEncoderColour(_ session: VTCompressionSession) throws {
     guard let source = recordingSourceFormat else { return }
+    if configuration.videoCodec == kCMVideoCodecType_HEVC {
+      let aspect = [kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing: NSNumber(value: source.pixelAspect.numerator),
+        kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing: NSNumber(value: source.pixelAspect.denominator)] as CFDictionary
+      guard VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PixelAspectRatio, value: aspect) == noErr else {
+        throw SourceRecordingError.writerFailure("VideoToolbox rejected the declared recording pixel aspect ratio.")
+      }
+    }
     let colour = encoderOutputColour(source)
     let (primaries, transfer, matrix) = Self.encoderColourValues(colour)
     for (key, value) in [(kVTCompressionPropertyKey_ColorPrimaries, primaries),
@@ -1461,6 +1553,18 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
           "VideoToolbox rejected profile \(profileLevel) for \(configuration.videoProfile.displayName).")
       }
     }
+    if let bitrate = configuration.targetVideoBitrate {
+      // The long-term average: the encoder still spends more on a moving scene than a still
+      // one. Never kVTCompressionPropertyKey_VariableBitRate (macOS 26): with it the hardware
+      // HEVC encoder accepts every frame and then never returns from CompleteFrames, so the
+      // take can't end, and ending that process takes the Mac down with it (a kernel panic in
+      // the video encoder's driver, seen three times on macOS 27.0.1 on an M4 Max).
+      let status = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
+      guard status == noErr else {
+        VTCompressionSessionInvalidate(session)
+        throw SourceRecordingError.writerFailure("The HEVC encoder rejected the requested bitrate (OSStatus \(status)).")
+      }
+    }
     do { try configureEncoderColour(session) }
     catch { VTCompressionSessionInvalidate(session); throw error }
     let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(session)
@@ -1494,6 +1598,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     switch input {
     case .passThrough: inputDescription = "v210 (native)"
     case .gpu: inputDescription = "x422 (GPU repack from v210)"
+    case .gpu420: inputDescription = "\(Self.fourCC(configuration.videoProfile.encoderPixelFormat)) (GPU conversion to 4:2:0)"
     case .gpuRGB: inputDescription = "l64r (GPU repack from original RGB)"
     case .gpuPlanar: inputDescription = "Native planar input (GPU range/depth repack)"
     case .gpuPacked422: inputDescription = "x422 (GPU repack from packed 8-bit 4:2:2)"
@@ -1526,6 +1631,26 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     let attributes = CVPixelBufferPoolGetPixelBufferAttributes(pool) as? [String: Any]
     if sourceFormat == nativeFormat, !needsRangeConversion, Self.formats(in: attributes) == [nativeFormat],
       attributes?[kCVPixelBufferIOSurfacePropertiesKey as String] != nil { return .passThrough }
+    if let render = configuration.render420 {
+      guard Self.formats(in: attributes) == [nativeFormat],
+        attributes?[kCVPixelBufferIOSurfacePropertiesKey as String] != nil else {
+        throw SourceRecordingError.unsupportedSample("The HEVC encoder has no matching 4:2:0 conversion target.")
+      }
+      guard sourceFormat == PixelFormatID.uyva.rawValue else { return .gpu420(render, pool, rawUYVA: nil) }
+      let intermediateAttributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: Packed422RecordingConverter.outputPixelFormat,
+        kCVPixelBufferWidthKey as String: configuration.width,
+        kCVPixelBufferHeightKey as String: configuration.height,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        kCVPixelBufferMetalCompatibilityKey as String: true,
+      ]
+      var intermediate: CVPixelBufferPool?
+      let status = CVPixelBufferPoolCreate(nil, nil, intermediateAttributes as CFDictionary, &intermediate)
+      guard status == kCVReturnSuccess, let intermediate else {
+        throw SourceRecordingError.writerFailure("Could not create a raw UYVA recording conversion pool (CVReturn \(status)).")
+      }
+      return .gpu420(render, pool, rawUYVA: (try Packed422RecordingConverter(), intermediate))
+    }
     if nativeFormat == Packed422RecordingConverter.outputPixelFormat,
       [kCVPixelFormatType_422YpCbCr8, kCVPixelFormatType_422YpCbCr8_yuvs, PixelFormatID.uyva.rawValue].contains(sourceFormat) {
       guard recordingSourceFormat?.colour.range != .full else {
@@ -1673,11 +1798,19 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
   }
 
   func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws {
+    try appendSourceAudio(sample, mapping: mapping, restartingSegment: false)
+  }
+
+  func appendResumedSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws {
+    try appendSourceAudio(sample, mapping: mapping, restartingSegment: true)
+  }
+
+  private func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping, restartingSegment: Bool) throws {
     guard let context = takeContext, case .present(let format) = context.audioDeclaration,
       format.clock != .pairedWithFrames else {
       throw SourceRecordingError.unsupportedSample("Source PCM requires a declared independently clocked audio route.")
     }
-    try appendConvertedSourceAudio(sample, transform: .mapped(mapping))
+    try appendConvertedSourceAudio(sample, transform: .mapped(mapping), restartingSegment: restartingSegment)
   }
 
   private static func usesLegacyPairedPCM(_ format: SourceAudioFormat) -> Bool {
@@ -1739,7 +1872,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     }
   }
 
-  private func appendConvertedSourceAudio(_ sample: CMSampleBuffer, transform: PCMClockTransform) throws {
+  private func appendConvertedSourceAudio(_ sample: CMSampleBuffer, transform: PCMClockTransform, restartingSegment: Bool = false) throws {
     try encoderLock.withLock { try ensureCanAppend(); sourceMediaAdmitted = true }
     guard let context = takeContext, case .present(let format) = context.audioDeclaration else {
       throw SourceRecordingError.unsupportedSample("Source PCM requires an actual resolved audio declaration.")
@@ -1747,11 +1880,17 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     try validateSourceAudioProvenance(sample, context: context, paired: format.clock == .pairedWithFrames)
     if mappedPCMBridge == nil { mappedPCMBridge = try ClockMappedPCMBridge(format: format, outputSampleRate: try recordingPCMOutputSampleRate(for: format)) }
     do {
-      if mappedPCMResumePending {
-        try mappedPCMBridge!.resume(audioTime: CMSampleBufferGetPresentationTimeStamp(sample), mapping: transform)
+      let audioTime = CMSampleBufferGetPresentationTimeStamp(sample)
+      if restartingSegment {
+        try mappedPCMBridge!.restartSegment(audioTime: audioTime, mapping: transform)
+        mappedPCMResumePending = false
+        markMappedAudioSegmentStart = true
+      } else if mappedPCMResumePending {
+        try mappedPCMBridge!.resume(audioTime: audioTime, mapping: transform)
         mappedPCMResumePending = false
       }
       if let converted = try mappedPCMBridge!.convert(sample, mapping: transform) {
+        markAudioSegmentStart(converted)
         if firstSourceVideoPTS == nil {
           try validateHeldAudio(converted, held: heldMappedAudio)
           heldMappedAudio.append(converted)
@@ -1772,6 +1911,13 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         discardQueued: false, countEncoderError: false)
       throw error
     }
+  }
+
+  private func markAudioSegmentStart(_ sample: CMSampleBuffer) {
+    guard markMappedAudioSegmentStart else { return }
+    CMSetAttachment(sample, key: Self.resumedPCMKey as CFString, value: kCFBooleanTrue,
+      attachmentMode: kCMAttachmentMode_ShouldPropagate)
+    markMappedAudioSegmentStart = false
   }
 
   private func validateHeldAudio(_ candidate: CMSampleBuffer, held: [CMSampleBuffer]) throws {
@@ -2169,17 +2315,23 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
           }
         }
         if let audioInput, sessionStarted {
-          // Popping also claims the PTS, so `appendAudio` rejects a packet
-          // older than one already on its way into the file.
-          while inputReady(audioInput), let next = fifoLock.withLock({ () -> (CMSampleBuffer, Bool)? in
-            guard let sample = pendingAudio.first else { return nil }
-            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-            pendingAudio.removeFirst()
-            bufferedBytes -= CMSampleBufferGetTotalSampleSize(sample)
-            let late = lastWrittenAudioPTS.map { CMTimeCompare(pts, $0) < 0 } ?? false
-            if !late { lastWrittenAudioPTS = pts }
-            return (sample, late)
-          }) {
+          while inputReady(audioInput), let first = fifoLock.withLock({ pendingAudio.first }) {
+            if try writeMicrophoneGap(before: first, input: audioInput) {
+              // Write one bounded chunk per pump iteration so video can advance.
+              progressed = true
+              break
+            }
+            // Popping also claims the PTS, so appendAudio rejects a packet
+            // older than one already on its way into the file.
+            guard let next = fifoLock.withLock({ () -> (CMSampleBuffer, Bool)? in
+              guard let sample = pendingAudio.first, sample === first else { return nil }
+              let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+              pendingAudio.removeFirst()
+              bufferedBytes -= CMSampleBufferGetTotalSampleSize(sample)
+              let late = lastWrittenAudioPTS.map { CMTimeCompare(pts, $0) < 0 } ?? false
+              if !late { lastWrittenAudioPTS = pts }
+              return (sample, late)
+            }) else { continue }
             if next.1 {
               telemetryLock.withLock {
                 telemetryValue.droppedAudio &+= 1
@@ -2189,6 +2341,7 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
               guard appendSample(next.0, audioInput) else {
                 throw Self.writerError(writer, fallback: "Pending audio sample append failed.")
               }
+              writtenAudioEnd = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(next.0), CMSampleBufferGetDuration(next.0))
             }
             writtenItems &+= 1
             progressed = true
@@ -2206,6 +2359,26 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
         return waiting ? .blocked : .idle
       }
     }
+  }
+
+  /// MOV packs successive PCM buffers together. Insert silence on the audio
+  /// writer queue at its own pace to retain the source gap on the movie grid.
+  private func writeMicrophoneGap(before sample: CMSampleBuffer, input: AVAssetWriterInput) throws -> Bool {
+    guard CMGetAttachment(sample, key: Self.resumedPCMKey as CFString, attachmentModeOut: nil) != nil,
+      let end = writtenAudioEnd,
+      let description = CMSampleBufferGetFormatDescription(sample),
+      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee else { return false }
+    let rate = Int32(asbd.mSampleRate)
+    let time = CMSampleBufferGetPresentationTimeStamp(sample)
+    let gap = CMTimeConvertScale(CMTimeSubtract(time, end), timescale: rate, method: .roundHalfAwayFromZero)
+    guard gap.isNumeric, gap.value > 0 else { return false }
+    let silence = try Self.silence(like: sample, frames: Int(min(gap.value, Int64(max(1, rate / 10)))), at: end)
+    guard appendSample(silence, input) else {
+      throw Self.writerError(writer, fallback: "Microphone gap silence append failed.")
+    }
+    writtenAudioEnd = CMTimeAdd(end, CMSampleBufferGetDuration(silence))
+    writtenItems &+= 1
+    return true
   }
 
   private func ensureSession(at time: CMTime) throws {
@@ -2243,7 +2416,15 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     // the packed 24-bit CMSampleBuffers produced from source PCM.
     let audio: AVAssetWriterInput?
     if let context = takeContext, case .absent = context.audioDeclaration { audio = nil }
-    else if let context = takeContext, case .present(let format) = context.audioDeclaration, !Self.usesLegacyPairedPCM(format) {
+    else if configuration.fileType == .mp4 {
+      let channels: Int
+      if let context = takeContext, case .present(let format) = context.audioDeclaration {
+        channels = min(2, format.channels)
+      } else { channels = 2 }
+      let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000,
+        AVNumberOfChannelsKey: channels, AVEncoderBitRateKey: channels * 64_000]
+      audio = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+    } else if let context = takeContext, case .present(let format) = context.audioDeclaration, !Self.usesLegacyPairedPCM(format) {
       let outputFormat = try SourceAudioFormat(sampleRate: format.sampleRate, channels: format.channels,
         sample: .float32, interleaved: true, layout: format.layout, clock: .pairedWithFrames)
       audio = AVAssetWriterInput(mediaType: .audio,
@@ -2261,14 +2442,11 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     let selectedTrackScale = timelineLock.withLock { selectedTrackTimescale } ?? rate.frameDuration.timescale
     video.mediaTimeScale = selectedTrackScale
     writer.movieTimeScale = selectedTrackScale
-    let attachedNative = try Self.nativeTimecode(from: sample)
-    nativeTimecodeMetadata = attachedNative ?? configuration.nativeTimecodeMetadata
-    let isVariable = (configuration.sourceFrameRate ?? recordingSourceFormat?.rate)?.isVariable == true
-    let generatedTimecodeTrack: QuickTimeTimecodeTrack?
-    if isVariable && (!configuration.recordingConstantFrameRate || configuration.timecodePolicy == .source) { generatedTimecodeTrack = nil }
-    else if configuration.timecodePolicy == .source, let native = attachedNative ?? configuration.nativeTimecodeMetadata {
-      generatedTimecodeTrack = try QuickTimeTimecodeTrack(frameRate: native.frameRate, dropFrame: native.dropFrame)
-    } else { generatedTimecodeTrack = try Self.makeTimecodeTrack(for: configuration, frameRate: rate) }
+    let variable = (configuration.sourceFrameRate ?? recordingSourceFormat?.rate)?.isVariable == true
+    let firstNative = try Self.nativeTimecode(from: sample) ?? configuration.nativeTimecodeMetadata
+    let plan = resolveTimecodeTrack(variable: variable, firstNative: firstNative)
+    if case .native(let value) = plan { nativeTimecodeMetadata = value }
+    let generatedTimecodeTrack = try plan.makeTrack(configuration: configuration, rate: rate)
     let timecode = generatedTimecodeTrack?.makeInput()
     video.setValue(NSNumber(value: configuration.realTimeEncoding), forKey: "expectsMediaDataInRealTime")
     audio?.setValue(NSNumber(value: configuration.realTimeEncoding), forKey: "expectsMediaDataInRealTime")
@@ -2373,7 +2551,10 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
     do {
       if firstSourceVideoPTS == nil { heldMappedAudio.removeAll() }
       do {
-        if let final = try mappedPCMBridge?.finish() { try appendMappedAudio(final) }
+        if let final = try mappedPCMBridge?.finish() {
+          markAudioSegmentStart(final)
+          try appendMappedAudio(final)
+        }
       } catch {
         mappedAudioDiscontinuities &+= 1
         telemetryLock.withLock { telemetryValue.audioClockDiscontinuities = mappedAudioDiscontinuities }
@@ -2443,6 +2624,9 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       if status != noErr {
         rememberFinalizationFailure(SourceRecordingError.writerFailure("VideoToolbox flush failed (OSStatus \(status))."))
       }
+    }
+    if !submittedVideo, telemetryLock.withLock({ telemetryValue.droppedGPUFrames > 0 }) {
+      rememberFinalizationFailure(SourceRecordingError.writerFailure("Recording produced no video after GPU frame conversion failed."))
     }
     let closing = writerQueue.sync { () -> Result<AVAssetWriter?, SourceRecordingError> in
       let stalled = drainForFinish()

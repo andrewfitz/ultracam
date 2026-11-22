@@ -14,6 +14,7 @@ struct CaptureLegacyCallbacks: @unchecked Sendable {
   var event: ((String) -> Void)?
   #endif
   var typed: ((CaptureDelivery) -> Void)?
+  var isRecording: @Sendable () -> Bool = { false }
 }
 
 final class CaptureServicesBridge: @unchecked Sendable {
@@ -62,13 +63,10 @@ final class CaptureServicesBridge: @unchecked Sendable {
           case .cpuMemory:
             callbacks.event?("Capture error: CPU-memory frames require ordered GPU ingest")
           case .media(let info):
+            guard let media = callbacks.media else { return }
             let format: SourceAudioFormat?
             if case .present(let value) = info.audioDeclaration { format = value } else { format = nil }
-            let tc = info.timecode.map {
-              String(format: "%02d:%02d:%02d%@%02d", $0.hours, $0.minutes, $0.seconds,
-                $0.dropFrame ? ";" : ":", $0.frames)
-            }
-            callbacks.media?(CaptureMediaStats(timecode: tc,
+            media(CaptureMediaStats(timecode: info.timecode?.displayLabel,
               audioPacketTime: info.audioPacketTime ?? .invalid,
               audioSampleFrames: UInt64(max(0, info.sampleFrameCount)), audioChannels: format?.channels ?? 0,
               leftPeak: info.peaks.first ?? 0, rightPeak: info.peaks.dropFirst().first ?? 0,
@@ -152,7 +150,7 @@ final class CaptureServicesBridge: @unchecked Sendable {
           }
         })
         state.withLock { orderedIngest = stage }
-        try next.start(deviceID: deviceID, timing: timing, handlers: CaptureHandlers { delivery in
+        try next.start(deviceID: deviceID, timing: timing, handlers: CaptureHandlers(isRecording: callbacks.isRecording) { delivery in
           guard self.state.withLock({ self.ingestGeneration == generation && !self.ingestTerminated }) else { return }
           if case .cpuMemory(_, let info) = delivery.payload {
             do { try info.validate() }
@@ -260,6 +258,8 @@ final class CaptureServicesBridge: @unchecked Sendable {
   static func message(_ event: CaptureEvent) -> String? {
     switch event {
     case .formatChanged, .audioFormatChanged, .clockMappingChanged: nil
+    case .audioInterrupted(let reason): "Microphone unavailable: \(reason)"
+    case .audioResumed: "Microphone resumed"
     case .discontinuity: "Source clock restarted"
     case .waitingForSignal: "Waiting for signal…"
     case .signalLost(let reason): "No video signal: \(reason)"
@@ -316,12 +316,12 @@ extension CaptureServices {
     }
     #else
     var services = CaptureServices(startTyped: { id, timing, handlers in
-      try bridge.start(deviceID: id, timing: timing, callbacks: CaptureLegacyCallbacks(typed: handlers.deliver))
+      try bridge.start(deviceID: id, timing: timing, callbacks: CaptureLegacyCallbacks(typed: handlers.deliver, isRecording: handlers.isRecording))
     }, stop: { bridge.stop() }, connect: { try sink.connect(configuration: $0, passthroughFormat: $1) },
       disconnect: { sink.disconnect() }, send: { try sink.send($0) })
     #endif
     services.startTyped = { id, timing, handlers in
-      try bridge.start(deviceID: id, timing: timing, callbacks: CaptureLegacyCallbacks(typed: handlers.deliver))
+      try bridge.start(deviceID: id, timing: timing, callbacks: CaptureLegacyCallbacks(typed: handlers.deliver, isRecording: handlers.isRecording))
     }
     services.connectWithSource = { configuration, type, source in
       try sink.connect(configuration: configuration, passthroughFormat: type, sourceFormat: source)

@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import VideoToolbox
 import XCTest
 
 @MainActor @objcMembers final class RecordingModelChecks: XCTestCase {
@@ -210,6 +211,7 @@ import XCTest
       func resumeRecording(feedID: FeedID) throws {}
       func stopRecording(feedID: FeedID) throws {}
       func recordingOutputURL(feedID: FeedID) -> URL? { url }
+      func finishedOutputURL(feedID: FeedID) -> URL? { url }
     }
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("take-grants-\(UUID().uuidString)")
     let original = root.appendingPathComponent("A")
@@ -710,12 +712,16 @@ import XCTest
 
   /// Starts one native take whose writer refuses a frame, and waits for the take
   /// to close by itself: no Stop is pressed.
-  private func runFailingTake(root: URL, framesBeforeFailure: Int, media: Data) throws -> RecordingModel {
+  private func runFailingTake(root: URL, framesBeforeFailure: Int, media: Data,
+    occupiedDestination: Data? = nil) throws -> RecordingModel {
     let capture = CaptureController(services: CaptureServices(
       start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
     var recorder: SourceRecorderCore?
     let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, recorderFactory: { configuration in
       try media.write(to: configuration.outputURL)
+      if let occupiedDestination {
+        try occupiedDestination.write(to: XCTUnwrap(configuration.sidecarMovieURL))
+      }
       let core = try SourceRecorderCore(configuration: configuration,
         writerFactory: { FailingAfterFirstFrameWriter(framesBeforeFailure: framesBeforeFailure) })
       recorder = core
@@ -768,6 +774,20 @@ import XCTest
     XCTAssertTrue(model.feeds[0].error?.contains("Metadata refused the frame") == true, model.feeds[0].error ?? "no error")
     let take = try XCTUnwrap(RecordingRecovery.scan(root: root).first, "Its error record isn't deleted")
     XCTAssertEqual(try Data(contentsOf: take.temporaryURL), media)
+  }
+
+  func testOccupiedFinalMovieIsNotReportedAsSavedAndPartialRemainsDiscoverable() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ultracam-occupied-movie-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let partial = Data([10, 20, 30])
+    let foreignMovie = Data([40, 50, 60])
+    let model = try runFailingTake(root: root, framesBeforeFailure: 1, media: partial,
+      occupiedDestination: foreignMovie)
+    XCTAssertNil(model.feeds[0].savedURL)
+    XCTAssertEqual(model.feeds[0].error, RecordingOutputError.destinationExists.localizedDescription)
+    let take = try XCTUnwrap(RecordingRecovery.scan(root: root).first)
+    XCTAssertEqual(try Data(contentsOf: take.temporaryURL), partial)
+    XCTAssertEqual(try Data(contentsOf: take.finalURL), foreignMovie)
   }
 
   func testFolderRequirementIsReportedPerFeed() {
@@ -897,6 +917,165 @@ import XCTest
     // The two takes start on workers, in either order.
     XCTAssertEqual(Set(idsLock.withLock { sourceIDs }), [FeedID.primary.rawValue, second.rawValue])
     model.stopAll()
+  }
+
+  func testSourceEpochChangeDuringEncoderPreparationRejectsStaleStartAndAllowsRetry() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("epoch-start-race-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let feed = first
+    let duration = CMTime(value: 1, timescale: 30)
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(duration))
+    let source = FakeCaptureSession(format: format)
+    let capture = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in source }))
+    capture.setCameraOutputEnabled(false)
+    let ready = expectation(description: "Capture source declared")
+    let initial = expectation(description: "Initial take context committed")
+    let changed = expectation(description: "New take context committed")
+    capture.onUpdate = {
+      if $0.message.hasPrefix("Waiting") { ready.fulfill() }
+      if $0.message == "initial epoch committed" { initial.fulfill() }
+      if $0.message == "new epoch committed" { changed.fulfill() }
+    }
+    capture.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(),
+      pipelineEnabled: false, previewEnabled: false)
+    defer { capture.onUpdate = nil; capture.stop() }
+    await fulfillment(of: [ready], timeout: 5)
+    XCTAssertTrue(source.submit(.event(.info("initial epoch committed"))))
+    await fulfillment(of: [initial], timeout: 5)
+    let oldEpoch = try XCTUnwrap(capture.recordingTakeContext).sourceAdmission.epochID
+
+    let preparing = expectation(description: "Old encoder preparation blocked")
+    let release = DispatchSemaphore(value: 0)
+    defer { release.signal() }
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, rawAudioCallbackAvailable: true,
+      recorderFactory: { config in
+        if config.sourceAdmission?.epochID == oldEpoch {
+          preparing.fulfill()
+          guard release.wait(timeout: .now() + 8) == .success else { throw TestError.failed }
+        }
+        return try SourceRecorderCore(configuration: config, writerFactory: { Writer() })
+      })
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: feed, name: "Epoch start test")], driver: driver)
+    model.outputFolder = directory
+    model.record(feedID: feed)
+    await fulfillment(of: [preparing], timeout: 5)
+    XCTAssertTrue(source.submit(.event(.discontinuity)))
+    XCTAssertTrue(source.submit(.event(.info("new epoch committed"))))
+    await fulfillment(of: [changed], timeout: 5)
+    XCTAssertNotEqual(capture.recordingTakeContext?.sourceAdmission.epochID, oldEpoch)
+    release.signal()
+
+    XCTAssertTrue(waitForStarts(model))
+    XCTAssertEqual(model.feeds.first?.status, .idle)
+    XCTAssertEqual(model.feeds.first?.error, RecordingUIError.sourceChangedDuringPreparation.localizedDescription)
+    XCTAssertNil(model.feeds.first?.savedURL)
+    XCTAssertNil(driver.recordingOutputURL(feedID: feed))
+    XCTAssertNil(capture.recordingDiscoverySnapshotForTesting(feedID: feed))
+
+    model.record(feedID: feed)
+    XCTAssertTrue(waitForStarts(model))
+    XCTAssertEqual(model.feeds.first?.status, .recording)
+    XCTAssertNil(model.feeds.first?.error)
+    XCTAssertNotNil(capture.recordingDiscoverySnapshotForTesting(feedID: feed))
+    let finished = expectation(description: "Replacement take stopped")
+    model.onRecordingFinished = { _, _ in finished.fulfill() }
+    model.stop(feedID: feed)
+    await fulfillment(of: [finished], timeout: 5)
+  }
+
+  func testSourceEpochFinalizesTheOldMovieWhilePreviewAdvances() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("epoch-cutoff-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let feed = first
+    let duration = CMTime(value: 1, timescale: 30)
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(duration))
+    let source = FakeCaptureSession(format: format)
+    let previewed = expectation(description: "Preview delivered a new-epoch frame")
+    let newTime = CMTime(value: 15, timescale: 30)
+    var services = CaptureServices.registryBridge(feedID: feed, makeSession: { _ in source })
+    services.preview = { @Sendable sample in
+      if CMSampleBufferGetPresentationTimeStamp(sample) == newTime { previewed.fulfill() }
+    }
+    let capture = CaptureController(services: services)
+    capture.setCameraOutputEnabled(false)
+    let ready = expectation(description: "Capture source declared")
+    capture.onUpdate = { if $0.message == "Source format declared" { ready.fulfill() } }
+    capture.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(), pipelineEnabled: false)
+    defer { capture.stop() }
+    await fulfillment(of: [ready], timeout: 5)
+    capture.onUpdate = nil
+
+    let encoding = expectation(description: "First admitted frame reached the encoder")
+    let flushing = expectation(description: "Old take finalization entered")
+    let releaseEncoding = DispatchSemaphore(value: 0)
+    let releaseFinalizing = DispatchSemaphore(value: 0)
+    defer { releaseEncoding.signal(); releaseFinalizing.signal() }
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, rawAudioCallbackAvailable: true,
+      recorderFactory: { config in
+        try SourceRecorderCore(configuration: config, writerFactory: {
+          try AVAssetSourceRecordingWriter(configuration: config, encodeFrame: { session, image, pts, duration in
+            if pts == .zero {
+              encoding.fulfill()
+              _ = releaseEncoding.wait(timeout: .now() + 8)
+            }
+            return VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts,
+              duration: duration, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
+          }, completeFrames: { session in
+            flushing.fulfill()
+            _ = releaseFinalizing.wait(timeout: .now() + 8)
+            return VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+          })
+        })
+      })
+    let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: feed, name: "Epoch test")], driver: driver)
+    model.outputFolder = directory
+    let finished = expectation(description: "Old movie published exactly once")
+    model.onRecordingFinished = { _, _ in finished.fulfill() }
+    model.record(feedID: feed)
+    XCTAssertTrue(waitForStarts(model))
+    guard model.feeds.first?.status == .recording else { return }
+
+    var image: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_422YpCbCr10,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &image), kCVReturnSuccess)
+    let pixels = CapturedPixelBuffer(immutable: try XCTUnwrap(image))
+    func emit(_ time: CMTime) {
+      let context = source.context
+      XCTAssertTrue(source.submit(.frame(pixels, CaptureFrameInfo(epochID: context.epochID,
+        formatSignature: context.formatSignature, presentationTime: time, duration: duration,
+        signalValid: true, timecode: nil))))
+    }
+    emit(.zero)
+    await fulfillment(of: [encoding], timeout: 5)
+    for index in 1..<3 { emit(CMTime(value: Int64(index), timescale: 30)) }
+    XCTAssertTrue(source.submit(.event(.discontinuity)))
+    emit(newTime)
+
+    await fulfillment(of: [previewed], timeout: 5)
+    XCTAssertEqual(model.feeds.first?.status, .finishing)
+    releaseEncoding.signal()
+    await fulfillment(of: [flushing], timeout: 5)
+    XCTAssertEqual(model.feeds.first?.status, .finishing)
+    releaseFinalizing.signal()
+    await fulfillment(of: [finished], timeout: 8)
+    XCTAssertNil(model.feeds.first?.error)
+    XCTAssertEqual(model.feeds.first?.status, .idle)
+    let saved = try XCTUnwrap(model.feeds.first?.savedURL)
+    XCTAssertEqual(saved, driver.finishedOutputURL(feedID: feed))
+    let timestamps = try await Task.detached {
+      let movie = AVURLAsset(url: saved)
+      let track = try await movie.loadTracks(withMediaType: .video).first
+      let reader = try AVAssetReader(asset: movie)
+      let output = AVAssetReaderTrackOutput(track: try XCTUnwrap(track), outputSettings: nil)
+      reader.add(output)
+      guard reader.startReading() else { throw try XCTUnwrap(reader.error) }
+      var times = [Double]()
+      while let sample = output.copyNextSampleBuffer() {
+        if CMSampleBufferGetNumSamples(sample) > 0 { times.append(CMSampleBufferGetPresentationTimeStamp(sample).seconds) }
+      }
+      return times
+    }.value
+    XCTAssertEqual(timestamps.sorted(), (0..<3).map { Double($0) / 30 })
   }
 
   func testSlowNativeFinalizationKeepsUIResponsiveAndQuitWaitsForCompletion() throws {
@@ -1066,7 +1245,10 @@ import XCTest
     let capture = CaptureController(services: CaptureServices(
       start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
     let writer = SlowStartingWriter()
-    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in capture }, rawAudioCallbackAvailable: true,
+    let replacement = CaptureController(services: CaptureServices(
+      start: { _, _, _, _ in }, stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true }))
+    var currentCapture = capture
+    let driver = NativeRecordingSessionDriver(captureForFeed: { _ in currentCapture }, rawAudioCallbackAvailable: true,
       recorderFactory: { configuration in
         try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
       })
@@ -1090,12 +1272,15 @@ import XCTest
     XCTAssertEqual(model.feeds[0].status, .recording)
     XCTAssertNotEqual(model.feeds[0].displayStatus, "Starting…")
     XCTAssertNotNil(driver.recordingOutputURL(feedID: first))
+    XCTAssertNotNil(capture.recordingDiscoverySnapshotForTesting(feedID: first))
+    currentCapture = replacement
     var stopped = false
     model.stopAll { stopped = true }
     let deadline = Date(timeIntervalSinceNow: 3)
     while !stopped && Date() < deadline { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01)) }
     XCTAssertTrue(stopped)
     XCTAssertEqual(model.feeds[0].status, .idle)
+    XCTAssertNil(capture.recordingDiscoverySnapshotForTesting(feedID: first), "Stop detaches the controller that started the take")
 
     // Stop while the take is still starting: it finishes once the take exists.
     let second = SlowStartingWriter()

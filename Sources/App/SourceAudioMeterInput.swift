@@ -2,8 +2,7 @@ import Foundation
 import AudioToolbox
 import MonitorKitAudio
 
-/// PCM interpretation shared by metering and source-level analysis. Work is
-/// performed away from the source delivery callback. Int24 is right justified
+/// PCM interpretation shared by metering and source-level analysis. Int24 is right justified
 /// and sign extended in its 32-bit container, as in the source contract.
 enum SourceAudioMeterInput {
   static func interleavedSamples(_ packet: CaptureAudioPacket) -> [Float] {
@@ -15,30 +14,69 @@ enum SourceAudioMeterInput {
         for frame in 0..<packet.sampleFrameCount {
           let index = format.interleaved ? frame * format.channels + channel : frame
           let offset = index * format.sample.bytesPerSample
-          let value: Float
-          switch format.sample {
-          case .int16:
-            value = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self))) / 32_768
-          case .int24in32:
-            value = Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 8_388_608
-          case .int32:
-            value = Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 2_147_483_648
-          case .float32:
-            value = Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
-          }
-          result[frame * format.channels + channel] = value.isFinite ? value : 0
+          result[frame * format.channels + channel] = sample(raw, offset: offset, type: format.sample)
         }
       }
     }
     return result
   }
 
+  /// Lightweight packet statistics for status and switching, independent of
+  /// the bounded broadcast meter. Long packets are sampled at even intervals.
+  static func levels(_ packet: CaptureAudioPacket) -> (leftPeak: Double, rightPeak: Double,
+    leftRMS: Double, rightRMS: Double, activityPeak: Float, activityRMS: Float) {
+    let format = packet.format
+    let frames = packet.sampleFrameCount
+    guard frames > 0 else { return (0, 0, 0, 0, 0, 0) }
+    let step = (frames - 1) / 2048 + 1
+    let measuredFrames = (frames - 1) / step + 1
+    let frameStride = format.interleaved ? format.channels : 1
+    let bytesPerSample = format.sample.bytesPerSample
+    var levels: (Double, Double, Double, Double, Float, Float) = (0, 0, 0, 0, 0, 0)
+    for channel in 0..<min(format.channels, audioMeterMaximumChannelCount) {
+      let plane = packet.planes[format.interleaved ? 0 : channel]
+      let first = format.interleaved ? channel : 0
+      let measured = plane.withUnsafeBytes { raw -> (peak: Double, rms: Double) in
+        var peak = 0.0
+        var squares = 0.0
+        for frame in stride(from: 0, to: frames, by: step) {
+          let amplitude = min(1, abs(Double(sample(raw, offset: (frame * frameStride + first) * bytesPerSample,
+            type: format.sample))))
+          peak = max(peak, amplitude)
+          squares += amplitude * amplitude
+        }
+        return (peak, sqrt(squares / Double(measuredFrames)))
+      }
+      if channel == 0 { levels.0 = measured.peak; levels.2 = measured.rms }
+      if channel == 1 { levels.1 = measured.peak; levels.3 = measured.rms }
+      levels.4 = max(levels.4, Float(measured.peak))
+      levels.5 = max(levels.5, Float(measured.rms))
+    }
+    return levels
+  }
+
+  private static func sample(_ raw: UnsafeRawBufferPointer, offset: Int, type: AudioSampleType) -> Float {
+    switch type {
+    case .int16:
+      return Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self))) / 32_768
+    case .int24in32:
+      return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 8_388_608
+    case .int32:
+      return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 2_147_483_648
+    case .float32:
+      let value = Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+      return value.isFinite ? value : 0
+    }
+  }
+
   /// Auto switching follows the strongest channel so speech outside the first
   /// stereo pair remains audible to its activity detector.
   static func activity(peaks: [Double], rms: [Double]) -> (peak: Float, rms: Float) {
-    let peak = peaks.filter { $0.isFinite }.max() ?? 0
-    let level = rms.filter { $0.isFinite }.max() ?? 0
-    return (Float(max(0, peak)), Float(max(0, level)))
+    var peak = 0.0
+    var level = 0.0
+    for value in peaks where value.isFinite { peak = max(peak, value) }
+    for value in rms where value.isFinite { level = max(level, value) }
+    return (Float(peak), Float(level))
   }
 }
 

@@ -8,6 +8,10 @@ enum OutputFormatCatalog {
   static let published = ExtensionFormatCatalog.published
 
   static func descriptions() throws -> [CMVideoFormatDescription] {
+    try cachedDescriptions.get()
+  }
+
+  private static let cachedDescriptions = Result<[CMVideoFormatDescription], Error> {
     try published.map { entry in
       let original = try VideoContract.formatDescription(width: entry.width, height: entry.height,
         pixelFormat: entry.pixel.rawValue)

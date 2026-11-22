@@ -50,9 +50,21 @@ import XCTest
 
   func testActualWriterEncodesRawUYVAAndRetainsSourceDescription() throws {
     let folder = try temporaryFolder(); defer { try? FileManager.default.removeItem(at: folder) }
+    try checkRawUYVA(folder: folder, automatic: false)
+    try checkRawUYVA(folder: folder, automatic: true)
+  }
+
+  private func checkRawUYVA(folder: URL, automatic: Bool) throws {
     let declaration = try source(pixel: .uyva)
-    let movie = folder.appendingPathComponent("uyva.mov")
-    let writer = try AVAssetSourceRecordingWriter(configuration: configuration(source: declaration, movie: movie))
+    let movie = folder.appendingPathComponent(automatic ? "uyva.mp4" : "uyva.mov")
+    let config: SourceRecordingConfiguration
+    if automatic {
+      config = try SourceRecordingConfiguration(feedID: .init("camera"), outputURL: movie, width: 320, height: 64,
+        videoProfile: .matrix(.hevcMain), fileType: .mp4, targetVideoBitrate: AppRecordingProfile().bitrate,
+        render420: NativeRecordingSessionDriver.make420Renderer(codec: .hevcMain, width: 320, height: 64),
+        sourceAdmission: declaration, sidecarMovieURL: movie)
+    } else { config = try configuration(source: declaration, movie: movie) }
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
     try writer.start()
     try writer.bindTakeContext(.init(sourceAdmission: declaration, audioDeclaration: .absent))
     let rowBytes = 320 * 2 + 32, alphaRowBytes = 320 + 16
@@ -71,6 +83,10 @@ import XCTest
     XCTAssertEqual(writer.telemetry.systemCompatibilityFrames, 0)
     let metadata = try RecordingTakeSidecar.readSnapshot(for: movie)
     XCTAssertEqual(metadata.metadata.sourceFormat?.pixel, .uyva)
+    if automatic {
+      XCTAssertEqual(metadata.metadata.outputContract?.encoderInputPixelFormat, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+      XCTAssertEqual(metadata.metadata.outputContract?.outputColour.horizontalChromaSiting, .center)
+    }
     XCTAssertEqual(metadata.metadata.outputContract?.outputColour.range, .video)
     XCTAssertTrue(metadata.metadata.conversionNotes.contains { $0.contains("alpha") })
     XCTAssertTrue(FileManager.default.fileExists(atPath: movie.path))

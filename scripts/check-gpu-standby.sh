@@ -17,7 +17,7 @@ export MACOSX_DEPLOYMENT_TARGET=26.0
 xcrun swiftc -O -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
   -target arm64-apple-macos26.0 -module-cache-path "$build/modules" \
   "$task_root/Sources/Shared/GPUStandbyProducer.swift" \
-  "$task_root/Sources/Shared/VideoContract.swift" \
+  "$task_root/Sources/Shared/VideoContract.swift" "$task_root/Sources/Shared/VideoOutputOptions.swift" \
   "$task_root/Sources/Shared/VideoBufferLayout.swift" \
   "$task_root/Sources/Shared/SourceFormat.swift" \
   "$task_root/Sources/Shared/ExtensionFormatCatalog.swift" \

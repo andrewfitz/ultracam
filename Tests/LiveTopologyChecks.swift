@@ -99,6 +99,26 @@ import XCTest
     XCTAssertFalse(model.canRemoveCamera(rolling), "The last camera stays")
   }
 
+  func testOversizedMultibyteRenameAndAddLeaveBothStoresAndSelectionIntact() throws {
+    let model = try appModel()
+    defer { fixture.stop() }
+    let settings = AppSettingsStore(defaults: defaults)
+    let registry = VirtualCameraRegistryStore(defaults: defaults)
+    let first = model.feedDescriptors[0].id, second = model.feedDescriptors[1].id
+    let longName = String(repeating: "📷", count: 9_000)
+    XCTAssertTrue(model.renameFeed(first, name: longName))
+    let saved = settings.loadSnapshot(), published = registry.load()
+    XCTAssertFalse(model.renameFeed(second, name: longName))
+    XCTAssertNil(model.addFeed(name: longName))
+    XCTAssertEqual(model.feedDescriptors, saved.feeds)
+    XCTAssertEqual(model.selectedFeedID, saved.selectedFeedID)
+    XCTAssertEqual(settings.loadSnapshot(), saved)
+    XCTAssertEqual(registry.load(), published)
+    XCTAssertTrue(model.appProblems.contains { $0.id == "registry" && $0.text.contains("too large") })
+    XCTAssertTrue(model.renameFeed(second, name: "Tight"))
+    XCTAssertFalse(model.appProblems.contains { $0.id == "registry" })
+  }
+
   func testThirtySecondCameraIsRefused() throws {
     let model = try appModel()
     defer { fixture.stop() }

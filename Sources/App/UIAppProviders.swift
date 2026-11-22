@@ -28,6 +28,7 @@ import SwiftUI
   /// Pictures held by Freeze: they look live at rest, so the picture says so.
   private(set) var frozen: Set<String> = []
   func set(_ isClean: Bool, for targetID: String) {
+    guard isClean != clean.contains(targetID) else { return }
     if isClean { clean.insert(targetID) } else { clean.remove(targetID) }
   }
   func setFrozen(_ isFrozen: Bool, for targetID: String) {
@@ -49,7 +50,7 @@ import SwiftUI
   func monitorLUTState(for cameraID: String) -> MonitorFeedHost.MonitorLUTState {
     model.monitorCoordinator.monitorLUTState(for: MonitorTargetID(cameraID))
   }
-  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: Bool) {
+  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: SignalDescription?) {
     model.monitorCoordinator.scopeMeasurement(for: MonitorTargetID(cameraID))
   }
 }
@@ -112,7 +113,7 @@ private struct UIAppSurfacePicture: View {
         // MonitorKit draws the scope and its graticule at the card's size; the labels are SwiftUI.
         GeometryReader { geometry in
           UIScopeCard(description: UIScopeDescription(scopes: displayed.scopes, signal: presenter.shownSignal,
-            stageLUT: presenter.scopeMeasuresLUT(displayed), isProgram: isProgram),
+            stageLUT: presenter.scopeLUTSignal(displayed), isProgram: isProgram),
             size: geometry.size,
             onPopOut: { openWindow(id: UIScopeWindow.id, value: target.rawValue) },
             onHide: {

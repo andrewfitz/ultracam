@@ -172,7 +172,29 @@ int main() {
     callback.OnPropertyChanged();
     callback.OnPropertyChanged();
     assert(events == beforeGeneric + 1 && callback.revision == revisionBeforeGeneric + 2 && callback.dirty);
+    // Battery telemetry arrives before the write notification. A stale first
+    // read must keep waiting even when the next notification races the read.
+    SonyCallback *pending = &callback;
+    uint64_t seen = callback.revision;
+    uint32_t battery = CrDeviceProperty_BatteryRemain;
+    callback.OnPropertyChangedCodes(1, &battery);
+    __block int reads = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    assert(!callback.confirmWrite(seen, deadline, ^BOOL(NSString **) {
+      if (++reads == 1) {
+        uint32_t isoCode = CrDeviceProperty_IsoSensitivity;
+        pending->OnPropertyChangedCodes(1, &isoCode);
+        return NO;
+      }
+      return YES;
+    }));
+    assert(reads == 2);
+    assert(callback.confirmWrite(callback.revision, std::chrono::steady_clock::now(),
+      ^BOOL(NSString **) { ++reads; return NO; }));
+    assert(reads == 3);
     callback.OnError(0x1234);
+    assert(callback.confirmWrite(callback.revision, deadline, ^BOOL(NSString **) { ++reads; return YES; }));
+    assert(reads == 3);
     assert(callback.error == 0x1234);
     callback.OnDisconnected(0x5678);
     assert(callback.disconnected && !callback.connected && callback.error == 0x5678);

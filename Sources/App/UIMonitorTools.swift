@@ -249,7 +249,7 @@ private struct UIMonitorToolSplitButton: View {
       Button(action: openSettings) {
         Image(systemName: UISymbol.menuIndicator)
           .font(.caption.weight(.bold)).imageScale(.small)
-          .frame(width: 16, height: 24)
+          .frame(width: 20, height: 24)
           .foregroundStyle(.white.opacity(0.75))
           .contentShape(Rectangle())
       }

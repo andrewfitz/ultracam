@@ -34,7 +34,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     var owned: MonitorFrame?
     var feed: MonitorFeed?
     /// The owned feed's LUTs, read on the render thread when its copy is adopted.
-    var lutPresence: (burnIn: Bool, monitor: Bool)? = nil
+    var luts: (burnIn: MonitorLUT?, monitor: MonitorLUT?)? = nil
     let stamp: MonitorFeedHost.Stamp
     /// Both readings (`Delivery.signal`), which the owned copy carries too.
     let signal: SignalDescription
@@ -46,7 +46,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   private var takenVersion: UInt64 = 0
   private var stateVersion: UInt64 = 1
   private var lastAcceptedStamp: MonitorFeedHost.Stamp?
-  private var unavailableReason = "No Signal"
+  private var unavailableReason = "No signal"
   /// Set by setUnavailable until the next accepted frame.
   private var signalLost = false
   /// Set while the surface is reported not drawable (hidden, occluded, minimized):
@@ -67,8 +67,9 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   private var clean = false
   private var magnification = Magnification()
   private var encodeState = MonitorFeedPreferences().surfaceState(isProgram: false)
-  /// Where the target's burn-in LUT is read at each encode (nil: the host's as set).
-  private var burnInSource: (@Sendable () -> MonitorLUT?)?
+  /// Separates scope work and readbacks across signal loss, even if the next frame
+  /// arrives before the render thread observes the empty slot.
+  private var scopeEpoch: UInt64 = 0
   private var rendererStatus: [String] = []
   private var pictureStatus = MonitorStatus()
   private var counters = MonitorSurfaceStatistics()
@@ -83,7 +84,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   private var lastStatusUpdate = 0.0
 
   /// Published only when it changes: the picture views observe this presenter.
-  @MainActor @Published private(set) var status = "No Signal"
+  @MainActor @Published private(set) var status = "No signal"
   /// The picture's timing ("Picture PTS … · 0.0 s old"), which changes with every refresh
   /// (2 Hz): published by `readout`, which only the monitor windows' text observes, so the
   /// main window's pictures aren't re-evaluated twice a second each.
@@ -109,6 +110,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   /// The statistics (clip readout) of this surface's scope accumulator, readable
   /// from any thread; nil until its first scope.
   @MainActor @Published private(set) var scopeStatisticsReader: ScopeStatisticsReader?
+  @MainActor private var readerEpoch: UInt64 = 0
   @MainActor var onVisibilityChange: ((Bool, Bool) -> Void)?
   @MainActor private weak var visibilityView: MonitorVisibilityNSView?
   @MainActor private var visibility = (presented: false, drawable: false)
@@ -138,6 +140,10 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   var currentStamp: MonitorFeedHost.Stamp? {
     lock.withLock { frozen?.stamp ?? latest?.stamp ?? lingering?.stamp }
   }
+
+  #if ULTRACAM_TEST_SUPPORT
+  var latestBurnInLUT: MonitorLUT? { lock.withLock { latest?.burnIn } }
+  #endif
 
   /// True while the surface keeps a capture buffer: a live frame waiting to be
   /// drawn, or a hold not yet copied on the GPU.
@@ -184,7 +190,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let now = ProcessInfo.processInfo.systemUptime
     return lock.withLock {
       guard !hidden, !clean, !signalLost, !pendingFreeze, frozen == nil,
-        let live = latest, now - live.stamp.hostTime <= 0.25 else { return nil }
+        let live = latest, !live.stamp.isStale(at: now) else { return nil }
       return (live.geometry, encodeState)
     }
   }
@@ -211,7 +217,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     released = latest
     latestVersion &+= 1
     counters.acceptedFrames += 1
-    unavailableReason = "No Signal"
+    unavailableReason = "No signal"
     signalLost = false
     resuming = false
     // A live frame ends any lingering hold.
@@ -262,6 +268,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let preferences: MonitorFeedPreferences
     let latestVersion: UInt64
     let stateVersion: UInt64
+    var scopeEpoch: UInt64 = 0
     var frozenToken: UInt64? {
       switch content {
       case .frozenLive(_, let token), .frozenOwned(_, _, let token): token
@@ -295,11 +302,11 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
         }
         return RenderWork(
           content: content, stamp: held.stamp, state: frozenState(held), preferences: held.preferences,
-          latestVersion: latestVersion, stateVersion: stateVersion)
+          latestVersion: latestVersion, stateVersion: stateVersion, scopeEpoch: scopeEpoch)
       }
       return RenderWork(
         content: latest.map { .live($0) } ?? .none, stamp: latest?.stamp, state: encodeState,
-        preferences: preferences, latestVersion: latestVersion, stateVersion: stateVersion)
+        preferences: preferences, latestVersion: latestVersion, stateVersion: stateVersion, scopeEpoch: scopeEpoch)
     }
   }
 
@@ -349,8 +356,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       return
     }
     let feed = core.engine.makeFeed()
-    refreshBurnInLUT()
-    let live = host.feed(engine: core.engine)
+    let live = host.feed(engine: core.engine, for: source)
     feed.burnInLUT = live.burnInLUT
     feed.monitorLUT = live.monitorLUT
     let owned: MonitorFrame
@@ -399,7 +405,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       value.live = nil
       value.owned = frame
       value.feed = feed
-      value.lutPresence = (feed.burnInLUT != nil, feed.monitorLUT != nil)
+      value.luts = (feed.burnInLUT, feed.monitorLUT)
       if isFrozen { frozen = value } else { lingering = value }
       stateVersion &+= 1
       return true
@@ -417,17 +423,6 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   }
 
   var currentScopeLayer: CAMetalLayer? { lock.withLock { scopeLayer } }
-
-  /// Render thread, before an encode: hands the camera's current burn-in LUT to
-  /// the host, whose feed applies it when it changed (an identity check otherwise).
-  func refreshBurnInLUT() {
-    guard let source = lock.withLock({ burnInSource }) else { return }
-    host.burnInLUT = source()
-  }
-
-  func setBurnInLUTSource(_ source: (@Sendable () -> MonitorLUT?)?) {
-    lock.withLock { burnInSource = source }
-  }
 
   func recordPresented(_ stamp: MonitorFeedHost.Stamp?) {
     lock.withLock {
@@ -453,28 +448,51 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     }
   }
 
-  /// Render thread: a new scope accumulator was made; its statistics reader is
-  /// published on the main thread.
-  func publishScopeStatisticsReader(_ reader: ScopeStatisticsReader) {
+  /// Only a completed measurement from the current signal can uncover the trace.
+  func publishScopeStatisticsReader(_ reader: ScopeStatisticsReader, epoch: UInt64) {
     DispatchQueue.main.async { [weak self] in
       MainActor.assumeIsolated {
-        guard let self, self.scopeStatisticsReader !== reader else { return }
+        guard let self, self.scopeStatisticsReader !== reader,
+          self.lock.withLock({ self.scopeEpoch == epoch && (!self.signalLost || self.frozen != nil) })
+        else { return }
+        self.readerEpoch = epoch
         self.scopeStatisticsReader = reader
       }
     }
   }
 
-  /// Whether a scope of `preferences` measures a LUT's output (then Rec.709):
-  /// `MonitorState.pictureHasLUT`'s rule for the scope's stage, with the LUTs
-  /// the host has now (the burn-in LUT on Output and Monitor, the monitor LUT
-  /// on Monitor while it is shown).
-  func scopeMeasuresLUT(_ preferences: MonitorFeedPreferences) -> Bool {
-    var state = preferences.state
-    state.pictureStage = preferences.scopes.settings.stage
-    let heldLUTs = lock.withLock { (frozen ?? (latest == nil ? lingering : nil))?.lutPresence }
-    return state.pictureHasLUT(
-      burnInLUT: heldLUTs?.burnIn ?? (host.burnInLUT != nil),
-      monitorLUT: heldLUTs?.monitor ?? (host.monitorLUT != nil))
+  /// The final LUT on this stage supplies the encoding of the measured values.
+  func stageLUTSignal(_ stage: SignalStage, monitorEnabled: Bool) -> SignalDescription? {
+    guard stage != .source else { return nil }
+    let (held, live) = lock.withLock {
+      (frozen ?? (latest == nil ? lingering : nil), latest)
+    }
+    return stageLUTSignal(stage, monitorEnabled: monitorEnabled, held: held, live: live)
+  }
+
+  private func stageLUTSignal(
+    _ stage: SignalStage, monitorEnabled: Bool, held: Frozen?, live: MonitorFeedHost.Delivery?
+  ) -> SignalDescription? {
+    guard stage != .source else { return nil }
+    let delivery = held == nil ? live : held?.live
+    let burn = held?.luts == nil ? delivery?.burnIn : held?.luts?.burnIn
+    let lut: MonitorLUT?
+    if stage == .monitor && monitorEnabled {
+      let monitor = held?.luts == nil ? host.monitorLUT : held?.luts?.monitor
+      lut = monitor ?? burn
+    } else {
+      lut = burn
+    }
+    guard let lut else { return nil }
+    if let declared = lut.declaredOutputSignal { return declared }
+    var legacy = lut.outputSignal
+    let signal = held?.signal ?? delivery?.signal
+    legacy.range = signal?.signal(for: stage).range ?? .legal
+    return legacy
+  }
+
+  func scopeLUTSignal(_ preferences: MonitorFeedPreferences) -> SignalDescription? {
+    stageLUTSignal(preferences.scopes.settings.stage, monitorEnabled: preferences.state.monitorLUT)
   }
 
   /// A scope display link callback (render thread).
@@ -482,11 +500,16 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     lock.withLock { counters.scopeRefreshes &+= 1 }
   }
 
-  func recordScope(_ stamp: MonitorFeedHost.Stamp) {
+  func recordScope(_ stamp: MonitorFeedHost.Stamp, epoch: UInt64) {
     lock.withLock {
+      guard scopeEpoch == epoch else { return }
       counters.scopeUpdates += 1
       counters.lastScope = stamp
     }
+  }
+
+  func canMeasureScope(epoch: UInt64) -> Bool {
+    lock.withLock { scopeEpoch == epoch }
   }
 
   func recordScopeSkip(busy: Bool) {
@@ -633,6 +656,10 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       latest = nil
       latestVersion &+= 1
       unavailableReason = reason
+      if !signalLost && frozen == nil {
+        scopeEpoch &+= 1
+        counters.lastScope = nil
+      }
       signalLost = true
       resuming = false
       pendingFreeze = false
@@ -708,6 +735,10 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       guard let held = frozen else { return nil }
       stateVersion &+= 1
       frozen = nil
+      if signalLost {
+        scopeEpoch &+= 1
+        counters.lastScope = nil
+      }
       // A hidden surface never keeps an uncopied capture frame.
       if latest == nil && !signalLost && !(hidden && held.owned == nil) {
         // Keep drawing the hold until live frames resume.
@@ -852,6 +883,8 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let frozenValue = frozen
     let held = latest == nil ? lingering : nil
     let pending = pendingFreeze
+    let lost = signalLost
+    let measurementEpoch = scopeEpoch
     let unavailable = resuming ? "Resuming" : unavailableReason
     let statuses = rendererStatus
     let drawnStatus = pictureStatus
@@ -883,6 +916,18 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     // A picture kept live for its popped-out scope still publishes what that scope reads.
     let occluded = !frozenNow && visibilityReported && !visibility.drawable
       && !(visibility.presented && scopeAlone)
+    if readerEpoch != measurementEpoch {
+      readerEpoch = measurementEpoch
+      if scopeStatisticsReader != nil { scopeStatisticsReader = nil }
+    }
+    if lost && shown == nil && live == nil {
+      if shownSignal != nil { shownSignal = nil }
+      if shownLayout != nil { shownLayout = nil }
+      let unavailableInterpretation = Self.describe(nil as SignalDescription?)
+      if pictureInterpretation != unavailableInterpretation { pictureInterpretation = unavailableInterpretation }
+      if scopeInterpretation != unavailableInterpretation { scopeInterpretation = unavailableInterpretation }
+      readout.setScopeTiming("No scope signal")
+    }
     if pending {
       setStatus("Waiting to freeze next picture")
       readout.setDetail(status)
@@ -915,24 +960,28 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     if shownLayout != layout { shownLayout = layout }
     /// How a pass on `stage` reads the frame (a declared range is the Source's alone).
     func reading(_ stage: SignalStage) -> SignalDescription? { signal?.signal(for: stage) }
-    let interpretation = Self.describe(
-      signal.flatMap { reading(MonitorFeedHost.pictureReading(shown?.state ?? state, signal: $0)) })
+    let shownState = shown?.state ?? state
+    let interpretation = Self.describe(signal.flatMap {
+      let stage = MonitorFeedHost.pictureReading(shownState, signal: $0)
+      return stageLUTSignal(stage, monitorEnabled: shownState.monitorLUT, held: shown, live: live) ?? reading(stage)
+    })
     if pictureInterpretation != interpretation { pictureInterpretation = interpretation }
     // Scopes measure the stage their settings name; with no LUT on it that is the signal itself.
-    let scopeSignal = scopeMeasuresLUT(shownTools) ? nil : reading(shownTools.scopes.settings.stage)
-    let scopeText = scopeSignal.map { Self.describe($0) } ?? "Rec.709 (after the LUT)"
+    let scopeStage = shownTools.scopes.settings.stage
+    let scopeText = Self.describe(
+      stageLUTSignal(scopeStage, monitorEnabled: shownTools.state.monitorLUT, held: shown, live: live) ?? reading(scopeStage))
     if scopeInterpretation != scopeText { scopeInterpretation = scopeText }
     if let geometry {
       let aspect = geometry.displayAspectRatio(for: shown?.state ?? state)
       if aspect.isFinite, aspect > 0, abs(aspect - pictureAspectRatio) > 0.0001 { pictureAspectRatio = aspect }
     }
     let age = max(0, now - stamp.hostTime)
-    setStatus(frozenNow ? "Frozen" : age > 0.25 ? "Stale" : "Live")
+    setStatus(frozenNow ? "Frozen" : stamp.isStale(at: now) ? "Stale" : "Live")
     var text = "Picture PTS \(String(format: "%.3f", stamp.sourcePTS)) · \(String(format: "%.1f", age)) s old"
     if shownTools.scopesShown, let lastScope {
       let scopeAge = max(0, now - lastScope.hostTime)
       let scopeState =
-        frozenNow ? "Frozen" : scopeAge > 0.25 ? "Stale" : "Live"
+        frozenNow ? "Frozen" : lastScope.isStale(at: now) ? "Stale" : "Live"
       readout.setScopeTiming(
         "\(scopeState) · Scope PTS \(String(format: "%.3f", lastScope.sourcePTS)) · \(String(format: "%.1f", scopeAge)) s old")
       text += " · Scope PTS \(String(format: "%.3f", lastScope.sourcePTS))"
@@ -1354,6 +1403,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   private var pass: MonitorPass?
   private var clearPass: MTL4RenderPassDescriptor?
   private var accumulator: ScopeAccumulator?
+  private var accumulatorEpoch: UInt64?
+  private weak var reportedReader: ScopeStatisticsReader?
   private var scopeRenderer: ScopeRenderer?
   /// The layer's colour and what it was chosen for.
   private(set) var appliedColor = MonitorSurfaceRenderLoop.initialColor
@@ -1521,7 +1572,6 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       presenter.recordFailure(error)
       return
     }
-    presenter.refreshBurnInLUT()
     // What the picture shows, and with which feed (its LUTs and focus mask).
     let feed = drawingFeed(for: work, core: core)
     if let signal = work.signal, applyColor(signal: signal, state: work.state, feed: feed) {
@@ -1572,7 +1622,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     guard let scopeSource, let stamp = work.stamp, Self.wantsScopes(work), let scopeLinkLayer else { return }
     let key = ScopeKey(
       stamp: stamp, frozenToken: work.frozenToken, layer: ObjectIdentifier(scopeLinkLayer),
-      scopes: work.preferences.scopes, monitorLUT: work.state.monitorLUT, size: scopeLinkLayer.drawableSize)
+      scopes: work.preferences.scopes, monitorLUT: work.state.monitorLUT, size: scopeLinkLayer.drawableSize, epoch: work.scopeEpoch)
     guard key != scopedKey else { return }
     // Keep the newest picture while waiting for the saved scope-rate ceiling.
     if scopePending == nil {
@@ -1602,7 +1652,6 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     case .live(let delivery), .frozenLive(let delivery, _): source = .live(delivery)
     case .frozenOwned(let owned, let owner, _): source = .frozen(owned, owner)
     }
-    presenter.refreshBurnInLUT()
     queueScope(source, for: work, at: now)
   }
 
@@ -1639,9 +1688,13 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
 
   /// The feed `work` is drawn with: a hold's own, else the host's (made on first use).
   func drawingFeed(for work: MonitorSurfacePresenter.RenderWork, core: MonitorGPUContext.Core) -> MonitorFeed {
-    if case .frozenOwned(_, let owner, _) = work.content { return freezeFeed(owner: owner, core: core) }
-    recoveredFreezeFeed = nil
-    return host.feed(engine: core.engine)
+    switch work.content {
+    case .frozenOwned(_, let owner, _): return freezeFeed(owner: owner, core: core)
+    case .live(let delivery), .frozenLive(let delivery, _):
+      recoveredFreezeFeed = nil
+      return host.feed(engine: core.engine, for: delivery)
+    case .none: return host.feed(engine: core.engine)
+    }
   }
 
   /// Rebuild feed-local GPU state on the replacement queue; old and new cores
@@ -1727,13 +1780,14 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   /// whether the pixel format changed. Render thread (tests call it directly).
   @discardableResult
   func applyColor(signal: SignalDescription, state: MonitorState, feed: MonitorFeed) -> Bool {
+    let lut = feed.pictureLUT(for: state)
     let key = ColorKey(
-      signal: signal, transform: state.displayTransform.mode,
-      monitorStageHasLUT: feed.monitorStageHasLUT(for: state))
+      signal: lut?.displayOutputSignal ?? signal, transform: state.displayTransform.mode,
+      monitorStageHasLUT: lut != nil && lut?.displayOutputSignal == nil)
     guard key != colorKey else { return false }
     colorKey = key
     let color = MonitorOutputColor.signalNative.layer(
-      for: signal, displayTransform: key.transform, monitorStageHasLUT: key.monitorStageHasLUT)
+      for: key.signal, displayTransform: key.transform, monitorStageHasLUT: key.monitorStageHasLUT)
     guard color != appliedColor else { return false }
     let formatChanged = color.pixelFormat != appliedColor.pixelFormat
     appliedColor = color
@@ -1761,6 +1815,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let monitorLUT: Bool
     /// The scope drawables' size: a resize draws the scope again, frozen or not.
     var size: CGSize = .zero
+    var epoch: UInt64 = 0
   }
 
   private static func wantsScopes(_ work: MonitorSurfacePresenter.RenderWork) -> Bool {
@@ -1810,7 +1865,9 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     presenter?.recordScopeRefresh()
     guard let pending = scopePending, let presenter else { return }
     let key = pending.key
-    guard key.scopes.enabled, let scopeLinkLayer, key.layer == ObjectIdentifier(scopeLinkLayer) else {
+    guard key.scopes.enabled, presenter.canMeasureScope(epoch: key.epoch),
+      let scopeLinkLayer, key.layer == ObjectIdentifier(scopeLinkLayer)
+    else {
       scopePending = nil
       return
     }
@@ -1848,13 +1905,14 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       presenter.recordFailure(error)
       return
     }
+    let reader: ScopeStatisticsReader
     do {
       let frame: MonitorFrame
       let feed: MonitorFeed
       switch pending.source {
       case .live(let delivery):
         frame = try host.frame(delivery, in: context, core: core)
-        feed = host.feed(engine: core.engine)
+        feed = host.feed(engine: core.engine, for: delivery)
       case .frozen(let held, let owner):
         // The accumulator reads its own stage's reading (`SignalDescription.signal(for:)`).
         frame = held
@@ -1866,20 +1924,22 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       // Bins at the drawable's pixels, so the scope is accurate at whatever size it is shown.
       let settings = key.scopes.settings.atNativeResolution(
         viewportWidth: drawable.texture.width, viewportHeight: drawable.texture.height)
-      let (accumulator, renderer) = try scopeObjects(core, settings: settings)
+      let (accumulator, renderer) = try scopeObjects(core, settings: settings, epoch: key.epoch)
+      reader = accumulator.statisticsReader
       try accumulator.accumulate(frame, feed: feed, monitorLUTEnabled: key.monitorLUT, into: context.submission)
       try renderer.render(accumulator, target: drawable.texture, clear: true, into: context.submission)
       #if ULTRACAM_TEST_SUPPORT
       try scopeEncodedForTesting?()
       #endif
     } catch {
+      if accumulator?.engine === core.scopeEngine { scopeRenderer?.invalidateGPUResults() }
       core.abandon(context, drawable: drawable)
       presenter.cancelScope()
       presenter.recordFailure(error)
       return
     }
     scopeSubmission &+= 1
-    let completion = submissionCompletion(core: core, kind: Self.scopeKind, serial: scopeSubmission)
+    let completion = submissionCompletion(core: core, kind: Self.scopeKind, serial: scopeSubmission, reader: reader, epoch: key.epoch)
     core.commit(context, drawable: drawable, completion: completion, kind: Self.scopeKind)
     lastScope = pending
     // Failed setup/encoding must leave the held frame eligible on the next
@@ -1887,15 +1947,15 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     scopePending = nil
     scopedKey = key
     scopeCadence.didRefresh(at: now)
-    presenter.recordScope(key.stamp)
+    presenter.recordScope(key.stamp, epoch: key.epoch)
   }
 
   /// The surface's scope accumulator and renderer, made on first use; a settings
   /// change only updates the accumulator's settings.
-  private func scopeObjects(_ core: MonitorGPUContext.Core, settings: ScopeSettings) throws
+  private func scopeObjects(_ core: MonitorGPUContext.Core, settings: ScopeSettings, epoch: UInt64) throws
     -> (ScopeAccumulator, ScopeRenderer)
   {
-    if let accumulator, let scopeRenderer, accumulator.engine === core.scopeEngine {
+    if let accumulator, let scopeRenderer, accumulatorEpoch == epoch, accumulator.engine === core.scopeEngine {
       if accumulator.settings != settings { accumulator.settings = settings }
       return (accumulator, scopeRenderer)
     }
@@ -1903,13 +1963,14 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let renderer = core.scopeEngine.makeRenderer()
     accumulator = made
     scopeRenderer = renderer
-    presenter?.publishScopeStatisticsReader(made.statisticsReader)
+    accumulatorEpoch = epoch
     return (made, renderer)
   }
 
   /// A failed obsolete submission may count a failure, but cannot invalidate a
   /// replacement core or consume the newer picture/scope's retry bookkeeping.
-  private func submissionCompletion(core: MonitorGPUContext.Core, kind: Int, serial: UInt64) -> MonitorGPUCompletion {
+  private func submissionCompletion(core: MonitorGPUContext.Core, kind: Int, serial: UInt64,
+    reader: ScopeStatisticsReader? = nil, epoch: UInt64 = 0) -> MonitorGPUCompletion {
     MonitorGPUTransaction { [weak self, weak presenter = self.presenter, gpu = self.gpu, core] failed, milliseconds in
       guard let self else {
         // The view went away with this work on the GPU. The presenter outlives it (hide and
@@ -1927,11 +1988,18 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       }
       self.gpu.renderThread.perform { [self, core] in
         if failed {
+          if kind == Self.scopeKind, self.accumulator?.engine === core.scopeEngine {
+            self.scopeRenderer?.invalidateGPUResults()
+          }
           self.gpu.invalidate(ifCurrent: core)
           if (kind == Self.pictureKind && serial == self.pictureSubmission) ||
              (kind == Self.scopeKind && serial == self.scopeSubmission) {
             self.recoverFailedSubmission()
           }
+        }
+        if !failed, let reader, self.accumulator?.statisticsReader === reader, self.reportedReader !== reader {
+          self.reportedReader = reader
+          self.presenter?.publishScopeStatisticsReader(reader, epoch: epoch)
         }
         if !failed, kind == Self.scopeKind, serial == self.scopeSubmission { self.lastScope = nil }
         self.presenter?.recordGPU(kind: kind, milliseconds: milliseconds, failed: failed)
@@ -1991,7 +2059,20 @@ struct MonitorNativePicture: NSViewRepresentable {
   }
 }
 
-struct MonitorNativeScope: NSViewRepresentable {
+struct MonitorNativeScope: View {
+  @ObservedObject var presenter: MonitorSurfacePresenter
+
+  var body: some View {
+    MonitorScopeLayerView(presenter: presenter)
+      .overlay {
+        if presenter.scopeStatisticsReader == nil {
+          Color.black.overlay { Text("No scope signal").font(.caption).foregroundStyle(.secondary) }
+        }
+      }
+  }
+}
+
+private struct MonitorScopeLayerView: NSViewRepresentable {
   let presenter: MonitorSurfacePresenter
   func makeNSView(context: Context) -> NSView { presenter.makeScopeView() }
   func updateNSView(_ nsView: NSView, context: Context) {}

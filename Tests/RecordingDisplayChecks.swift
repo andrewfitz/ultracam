@@ -66,6 +66,24 @@ import XCTest
     XCTAssertEqual(drive.id, drive.volumeID, "Known by its volume, not its name")
   }
 
+  func testUnavailableFirstFolderDoesNotHideCapacityOfSharedVolume() throws {
+    let manager = FileManager.default
+    let base = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let first = base.appendingPathComponent("Removed")
+    let second = base.appendingPathComponent("Available")
+    for folder in [first, second] { try manager.createDirectory(at: folder, withIntermediateDirectories: true) }
+    defer { try? manager.removeItem(at: base) }
+    let volumeID = UIRecordingLibrary.volume(for: first).id
+    try manager.removeItem(at: first)
+    let removed = URL(fileURLWithPath: first.path, isDirectory: true)
+    let drives = UIRecordingLibrary.drives(for: [removed, second], recordingRates: [], assignedRates: [(second, 60)])
+    XCTAssertEqual(drives.map(\.id), [volumeID])
+    let drive = try XCTUnwrap(drives.first)
+    XCTAssertEqual(drive.folders, [removed.path, second.path])
+    XCTAssertGreaterThan(drive.totalBytes, 0)
+    XCTAssertGreaterThan(drive.availableBytes, 0)
+  }
+
   /// Folders on external drives that can't be read (unmounted, no grant) are each their own
   /// drive, by mount point and name, not one "Volumes".
   func testUnreadableExternalFoldersStayOnTheirOwnDrives() {
@@ -200,6 +218,52 @@ import XCTest
     noted.recording.note = "The input was missing 60 frames in 5 gaps during this take."
     XCTAssertEqual(presented(noted).recordDetail, "60 frames lost in 5 gaps", "Said once, plainly")
     XCTAssertNil(presented(noted).recordingNote, "The writer's sentence is for Diagnostics")
+  }
+
+  @MainActor func testArchiveSelectsFiveNewestAcrossScopes() async throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let nested = folder.appendingPathComponent("Camera")
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    for index in 0..<150 {
+      let url = (index.isMultiple(of: 2) ? nested : folder).appendingPathComponent("\(index).mov")
+      try Data().write(to: url)
+      try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(index))],
+        ofItemAtPath: url.path)
+    }
+    actor Reads {
+      var names: [String] = []
+      var active = 0
+      var maximum = 0
+      func read(_ url: URL) async {
+        names.append(url.lastPathComponent)
+        active += 1
+        maximum = max(active, maximum)
+        await Task.yield()
+        active -= 1
+      }
+    }
+    let reads = Reads()
+    let cache = RecentTakeCache { url, _ in
+      dispatchPrecondition(condition: .notOnQueue(.main))
+      await reads.read(url)
+      return (duration: 10, lostFrames: 2)
+    }
+    let scopes = [folder, nested]
+    XCTAssertTrue(cache.takes(in: scopes).isEmpty)
+    let deadline = Date().addingTimeInterval(5)
+    var takes: [UITake] = []
+    repeat {
+      try await Task.sleep(for: .milliseconds(5))
+      takes = cache.takes(in: scopes)
+    } while takes.filter({ $0.duration == 10 }).count < 5 && Date() < deadline
+    let expected = (145...149).reversed().map { "\($0).mov" }
+    let names = await reads.names
+    let maximum = await reads.maximum
+    XCTAssertEqual(takes.map(\.name), expected)
+    XCTAssertEqual(takes.map(\.lostFrames), Array(repeating: 2, count: 5))
+    XCTAssertEqual(names, expected)
+    XCTAssertEqual(maximum, 1)
   }
 
   func testTakesListReadsSidecarCountsAndOlderTakesShowNothing() throws {

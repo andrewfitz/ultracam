@@ -16,13 +16,14 @@ import CoreVideo
   let duration: CMTime
   private let claims = CaptureDeviceClaims()
 
-  init(duration: CMTime = VideoContract.fastDuration, deviceIDs: [String] = ["fake:fixture"]) throws {
+  init(duration: CMTime = VideoContract.fastDuration, deviceIDs: [String] = ["fake:fixture"], audioChannels: Int = 2,
+       width: Int = 3840, height: Int = 2160) throws {
     guard duration == VideoContract.fastDuration || duration == VideoContract.slowDuration else {
       throw PluginError.unsupported("Synthetic fixture supports Part A rates only")
     }
     self.duration = duration
-    format = try SourceFormat(width: 3840, height: 2160, pixel: .v210, rate: .constant(duration))
-    audio = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: .int32,
+    format = try SourceFormat(width: width, height: height, pixel: .v210, rate: .constant(duration))
+    audio = try SourceAudioFormat(sampleRate: 48000, channels: audioChannels, sample: .int32,
       interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
     plugin = FakeCapturePlugin(format: format, audio: .present(audio), deviceIDs: deviceIDs)
     registry = try VendorRegistry(capture: [plugin])
@@ -52,10 +53,10 @@ import CoreVideo
 
   /// Explicit test-only CPU pattern generation. The production app excludes
   /// this entire file. The returned v210 IOSurface is published immutably.
-  func makePattern() throws -> CVPixelBuffer {
+  func makePattern(lumaCode: UInt32? = nil, width: Int = 3840, height: Int = 2160) throws -> CVPixelBuffer {
     var made: CVPixelBuffer?
     let attributes: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
-    guard CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
+    guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_422YpCbCr10,
       attributes as CFDictionary, &made) == kCVReturnSuccess, let image = made else {
       throw PluginError.failed("Synthetic IOSurface allocation failed")
     }
@@ -63,10 +64,10 @@ import CoreVideo
     defer { CVPixelBufferUnlockBaseAddress(image, []) }
     guard let base = CVPixelBufferGetBaseAddress(image) else { throw PluginError.failed("Synthetic pixels unavailable") }
     let stride = CVPixelBufferGetBytesPerRow(image)
-    for y in 0..<2160 {
+    for y in 0..<height {
       let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
       for group in 0..<(stride / 16) {
-        let luma = UInt32(64 + min(group, 639) * 876 / 639)
+        let luma = lumaCode ?? UInt32(64 + min(group, 639) * 876 / 639)
         row[group * 4] = 512 | (luma << 10) | (512 << 20)
         row[group * 4 + 1] = luma | (512 << 10) | (luma << 20)
         row[group * 4 + 2] = 512 | (luma << 10) | (512 << 20)
@@ -80,31 +81,55 @@ import CoreVideo
   }
   /// Each active session receives frame → media → PCM in one admitted group.
   /// Return count is admitted sessions, so stopped sessions never mask progress.
-  @discardableResult func emit(_ image: CVPixelBuffer, index: Int32) throws -> Int {
+  @discardableResult func emit(_ image: CVPixelBuffer, index: Int32, forDevice device: String? = nil,
+                                firstChannelLevel: Int8 = 32, toneHz: Double? = nil, firstPairToneHz: Double? = nil,
+                                captureEndHostTime: CMTime? = nil, sourceFormat: SourceFormat? = nil) throws -> Int {
     guard index >= 0 else { throw PluginError.unsupported("Synthetic frame index must be nonnegative") }
+    let duration = sourceFormat?.rate.nominal ?? self.duration
     let pts = CMTimeMultiply(duration, multiplier: index)
     let nominal: Int32 = duration == VideoContract.fastDuration ? 60 : 30
     let seconds = Int(index / nominal)
     let timecode = try Timecode(hours: (1 + seconds / 3600) % 24, minutes: (seconds / 60) % 60,
       seconds: seconds % 60, frames: Int(index % nominal), dropFrame: false)
     return try plugin.sessions.reduce(0) { count, session in
+      if let device, session.deviceID != device { return count }
+      if let sourceFormat, session.context.formatSignature != sourceFormat.signature {
+        guard session.submit(.event(.formatChanged(sourceFormat))) else { return count }
+      }
       let context = session.context
       let frameSequence = context.nextSequence
       let info = CaptureFrameInfo(epochID: context.epochID, formatSignature: context.formatSignature,
-        presentationTime: pts, duration: duration, signalValid: true, timecode: timecode)
+        presentationTime: pts, duration: duration, signalValid: true, timecode: timecode,
+        hostTimeReference: captureEndHostTime == nil ? .presentationStart : .presentationEnd,
+        captureHostTime: captureEndHostTime)
       let startSample = Int64(index) * duration.value * 48000 / Int64(duration.timescale)
       let endSample = (Int64(index) + 1) * duration.value * 48000 / Int64(duration.timescale)
       let sampleCount = Int(endSample - startSample)
-      // Signed little-endian constant-amplitude stereo: the declared peaks
-      // and RMS below exactly describe these owned PCM samples.
-      var pcm = Data(capacity: sampleCount * 8)
-      for _ in 0..<sampleCount { pcm.append(contentsOf: [0, 0, 0, 32, 0, 0, 0, 16]) }
+      // Signed stereo PCM, optionally modulated for receiver-side tone identification.
+      let channels = audio.channels
+      var pcm = Data(count: sampleCount * channels * MemoryLayout<Int32>.size)
+      var peaks = Array(repeating: 0.0, count: channels)
+      var squares = peaks
+      pcm.withUnsafeMutableBytes { bytes in
+        let samples = bytes.bindMemory(to: Int32.self)
+        for i in 0..<sampleCount {
+          let phase = 2 * .pi * Double(startSample + Int64(i)) / 48_000
+          for c in 0..<channels {
+            let hz = c < 2 ? firstPairToneHz ?? toneHz : toneHz
+            let gain = hz.map { sin(phase * $0) } ?? 1
+            let value = (c.isMultiple(of: 2) ? Double(firstChannelLevel) / 128 : 0.125) * gain
+            samples[i * channels + c] = Int32(clamping: Int64(value * 2_147_483_648))
+            peaks[c] = max(peaks[c], abs(value))
+            squares[c] += value * value
+          }
+        }
+      }
       let audioTime = CMTime(value: startSample, timescale: 48000)
       let packet = try CaptureAudioPacket(planes: [pcm], sampleFrameCount: sampleCount, format: audio,
         packetTime: audioTime, pairedFrameSequence: frameSequence)
       let media = CaptureMediaInfo(timecode: timecode, pairedFrameSequence: frameSequence,
         audioDeclaration: .present(audio), audioPacketTime: audioTime, audioClockInstance: nil,
-        sampleFrameCount: sampleCount, byteCount: pcm.count, peaks: [0.25, 0.125], rms: [0.25, 0.125])
+        sampleFrameCount: sampleCount, byteCount: pcm.count, peaks: peaks, rms: squares.map { sqrt($0 / Double(sampleCount)) })
       return count + (session.submitGroup([.frame(CapturedPixelBuffer(immutable: image), info), .media(media), .rawAudio(packet)]) ? 1 : 0)
     }
   }

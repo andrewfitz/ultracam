@@ -10,11 +10,12 @@ import Security
 import MonitorKit
 import MonitorKitScopes
 
-func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+func require(_ condition: @autoclosure () -> Bool, _ message: @autoclosure () -> String) throws {
   if !condition() {
-    fputs("CMIO_SMOKE assertion: \(message)\n", stderr)
+    let detail = message()
+    fputs("CMIO_SMOKE assertion: \(detail)\n", stderr)
     fflush(stderr)
-    throw VideoError.message(message)
+    throw VideoError.message(detail)
   }
 }
 
@@ -134,17 +135,25 @@ final class SourceArrivals: @unchecked Sendable {
     let key = UInt(bitPattern: token), deadline = Date(timeIntervalSinceNow: 0.1)
     condition.lock(); defer { condition.unlock() }
     func matchingIndex() -> Int? {
-      entries.indices.filter { entries[$0]?.token == key }.min {
-        entries[$0]!.ordinal < entries[$1]!.ordinal
+      var match: Int?
+      var earliest = UInt64.max
+      for index in entries.indices {
+        guard let entry = entries[index], entry.token == key, match == nil || entry.ordinal < earliest else { continue }
+        match = index
+        earliest = entry.ordinal
       }
+      return match
     }
-    while matchingIndex() == nil && !closed && failure == nil {
+    var index = matchingIndex()
+    while index == nil && !closed && failure == nil {
       // Native insertion can win the notification race. Keep exactly this one
       // dequeued/retained sample while bounded-waiting for its callback record.
-      if !condition.wait(until: deadline) { break }
+      let signalled = condition.wait(until: deadline)
+      index = matchingIndex()
+      if !signalled { break }
     }
     if let failure { throw VideoError.message(failure) }
-    guard let index = matchingIndex(), let entry = entries[index] else {
+    guard let index, let entry = entries[index] else {
       throw VideoError.message("Receiver notification deadline: token=\(key) pending=\(pending) closed=\(closed).")
     }
     entries[index] = nil
@@ -630,6 +639,12 @@ final class ControlledCameraProducer: @unchecked Sendable {
   func snapshot() -> (times: [Double], cpu: [Double], error: String?, active: Bool, setup: kern_return_t, restore: kern_return_t, postReadback: kern_return_t, postActive: Bool) {
     lock.withLock { (emissions, cpuMS, error, active, setup, restore, postReadback, postActive) }
   }
+  func progress() -> (count: Int, error: String?) {
+    lock.withLock { (emissions.count, error) }
+  }
+  func emission(at index: Int) -> (time: Double?, count: Int, last: Double?) {
+    lock.withLock { (index < emissions.count ? emissions[index] : nil, emissions.count, emissions.last) }
+  }
   func cancel() { lock.withLock { cancelled = true } }
   func start() {
     let producer = Thread { [self] in
@@ -743,19 +758,20 @@ func controlledComparison(sink: CameraSink, source: SourceQueue, factory: VideoS
   var previous: CMTime?
   var latenciesMS: [Double] = [], inspectionDelaysMS: [Double] = []
   while received < count && now() < deadline {
-    let state = producer.snapshot()
+    let state = producer.progress()
     if let error = state.error { throw VideoError.message(error) }
-    while monitorOffered < state.times.count {
-      monitor?.offer(samples[monitorOffered], sequence: UInt64(monitorOffered + 1),
-        sourceHostTime: state.times[monitorOffered])
-      monitorOffered += 1
+    if let monitor {
+      while monitorOffered < state.count, let time = producer.emission(at: monitorOffered).time {
+        monitor.offer(samples[monitorOffered], sequence: UInt64(monitorOffered + 1), sourceHostTime: time)
+        monitorOffered += 1
+      }
     }
     while let delivery = try source.nextArrival() {
       let sample = delivery.sample, arrival = delivery.hostTime
       let inspectionStart = now()
       let marker = try inspect(sample, duration: duration, mode: mode)
       let time = CMSampleBufferGetPresentationTimeStamp(sample)
-      let sent = producer.snapshot().times
+      let sent = producer.emission(at: received)
       let expected = CMTimeAdd(epoch, CMTimeMultiply(duration, multiplier: Int32(received)))
       let context = "marker=\(marker) index=\(received) sentCount=\(sent.count) actualPTS=\(time.value)/\(time.timescale) expectedPTS=\(expected.value)/\(expected.timescale) epochPTS=\(epoch.value)/\(epoch.timescale) arrivalHost=\(arrival) lastEnqueueHost=\(sent.last ?? -1)"
       try require(time.isNumeric && time.epoch == 0, "Controlled receiver invalid timestamp: \(context)")
@@ -767,12 +783,14 @@ func controlledComparison(sink: CameraSink, source: SourceQueue, factory: VideoS
         if marker == 63 { excludedWarm += 1 } else { excludedStandby += 1 }
         continue
       }
-      try require(received < sent.count, "Controlled consumer received an unsent/duplicate frame: \(context)")
+      guard let sentTime = sent.time else {
+        throw VideoError.message("Controlled consumer received an unsent/duplicate frame: \(context)")
+      }
       try require(marker == UInt16(64 + received % fixtureCount), "Controlled synthetic marker order mismatch: \(context)")
       try require(time == expected, "Controlled receiver changed exact original PTS or frame order: \(context)")
       if let previous { try require(CMTimeSubtract(time, previous) == duration, "Controlled receiver rational cadence changed.") }
       previous = time
-      latenciesMS.append((arrival - sent[received]) * 1000)
+      latenciesMS.append((arrival - sentTime) * 1000)
       inspectionDelaysMS.append((inspectionStart - arrival) * 1000)
       received += 1
     }
@@ -781,15 +799,17 @@ func controlledComparison(sink: CameraSink, source: SourceQueue, factory: VideoS
   try require(received == count, "Controlled receiver deadline expired after \(received)/\(count) frames.")
   // Main-thread monitor submission can lag the last receive slightly; it stays
   // outside the source thread and is always after successful original enqueue.
-  let finalTimes = producer.snapshot().times
-  while monitorOffered < finalTimes.count {
-    monitor?.offer(samples[monitorOffered], sequence: UInt64(monitorOffered + 1),
-      sourceHostTime: finalTimes[monitorOffered]); monitorOffered += 1
-  }
   try require(producer.finished.wait(timeout: .now() + 1) == .success, "Controlled source teardown deadline.")
   joined = true
   let state = producer.snapshot()
   if let error = state.error { throw VideoError.message(error) }
+  if let monitor {
+    while monitorOffered < state.times.count {
+      monitor.offer(samples[monitorOffered], sequence: UInt64(monitorOffered + 1),
+        sourceHostTime: state.times[monitorOffered])
+      monitorOffered += 1
+    }
+  }
   try require(state.setup == KERN_SUCCESS && state.active && state.postReadback == KERN_SUCCESS && state.postActive && state.restore == KERN_SUCCESS,
     "Controlled source policy pre/post readback and restore must all succeed.")
   try require(state.times.count == count && state.cpu.count == count && (state.cpu.max() ?? .infinity) <= 0.5,
@@ -953,7 +973,7 @@ func runCase(fast: Bool, pool: CVPixelBufferPool, mode: SyntheticMode,
   var sent = 0
   var retries = 0
   var previous: CMTime?
-  var origins: [Double] = [], emittedAt: [Double] = [], latenciesMS: [Double] = []
+  var origins: [Double] = [], latenciesMS: [Double] = []
   func consume() throws {
     while let sample = source.next() {
       let arrival = now()
@@ -983,7 +1003,6 @@ func runCase(fast: Bool, pool: CVPixelBufferPool, mode: SyntheticMode,
       try require(now() < sendDeadline, "Producer queue remained full for 250 milliseconds.")
       pollPause()
     }
-    emittedAt.append(now()) // actual successful CMIO enqueue, after source CPU work
     sent += 1
     monitor?.offer(sample, sequence: UInt64(index + 1))
     try consume()

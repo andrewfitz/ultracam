@@ -42,6 +42,7 @@ final class UIMenuCommandBox: NSObject {
   private let menu = NSMenu()
   private var previewHost: NSHostingView<AnyView>?
   private var previewItem: NSMenuItem?
+  private var includesPreviewCommand = false
   private var showLivePreview = false
   private var previewWidth = UIMenuPreviewContent.minimumWidth
   private var menuOpen = false
@@ -161,6 +162,7 @@ final class UIMenuCommandBox: NSObject {
   // MARK: Menu lifecycle
 
   func menuNeedsUpdate(_ menu: NSMenu) {
+    guard !menuOpen else { return }
     rebuild()
   }
 
@@ -192,6 +194,7 @@ final class UIMenuCommandBox: NSObject {
     let bridge = bridge()
     let session = bridge.snapshot()
     let presentation = UIPresentationBuilder.session(session)
+    includesPreviewCommand = Self.waitingForPreview(presentation, session: session)
     let host = NSHostingView(rootView: card(width: UIMenuPreviewContent.minimumWidth))
     host.frame.size = host.fittingSize
     let item = NSMenuItem()
@@ -199,7 +202,7 @@ final class UIMenuCommandBox: NSObject {
     previewHost = host
     previewItem = item
     let items = Self.buildItems(presentation: presentation, session: session, target: self, previewItem: item,
-      showLivePreview: showLivePreview)
+      includesPreviewCommand: includesPreviewCommand, showLivePreview: showLivePreview)
     menu.removeAllItems()
     for item in items { menu.addItem(item) }
     // The menu is as wide as its widest row. Lay the card out again at that width, so the
@@ -211,13 +214,13 @@ final class UIMenuCommandBox: NSObject {
     }
   }
 
-  /// Brings the open menu's rows up to date: in place when only their state changed, so the
-  /// menu neither jumps nor closes a submenu; rebuilt when rows came or went.
+  /// Session changes update the rows in place. A change to the configured cameras or
+  /// Program availability can still change the menu's structure.
   private func refreshOpenMenu() {
     guard menuOpen, let previewItem else { return }
     let session = bridge().snapshot()
     let fresh = Self.buildItems(presentation: UIPresentationBuilder.session(session), session: session, target: self,
-      previewItem: previewItem, showLivePreview: showLivePreview)
+      previewItem: previewItem, includesPreviewCommand: includesPreviewCommand, showLivePreview: showLivePreview)
     guard !Self.refresh(menu.items, with: fresh) else { return }
     menu.removeAllItems()
     for item in fresh { menu.addItem(item) }
@@ -276,9 +279,10 @@ final class UIMenuCommandBox: NSObject {
     for command in Self.commands(for: sender) {
       switch command {
       case .showLivePreview:
+        // Choosing a row closes the menu (and menuDidClose has already reset the preview),
+        // so open it again with the card live.
         showLivePreview = true
-        // Reopen the card as live on the next update; the menu stays as it is.
-        previewHost?.rootView = card(width: previewWidth)
+        DispatchQueue.main.async { [weak self] in self?.statusItem.button?.performClick(nil) }
       case .action(let action):
         run(action)
       }
@@ -342,40 +346,35 @@ final class UIMenuCommandBox: NSObject {
     return image
   }()
 
-  /// The session with the window hidden: fourteen rows or fewer when healthy, problem rows
-  /// not counted. No row depends on the window's selection.
+  private static func waitingForPreview(_ presentation: UISessionPresentation, session: UISessionSnapshot) -> Bool {
+    !presentation.camerasRunning && session.cameras.contains(where: \.automaticStart)
+  }
+
+  /// No row depends on the window's selection.
   static func buildItems(presentation: UISessionPresentation, session: UISessionSnapshot,
-    target: AnyObject?, previewItem: NSMenuItem?, showLivePreview: Bool = false) -> [NSMenuItem] {
+    target: AnyObject?, previewItem: NSMenuItem?, includesPreviewCommand: Bool? = nil,
+    showLivePreview: Bool = false) -> [NSMenuItem] {
     var items: [NSMenuItem] = []
     if let previewItem { items.append(previewItem) }
-    let waiting = !presentation.camerasRunning && session.cameras.contains(where: \.automaticStart)
-
-    // Problems first, each one row that does its one action. A row can't take a fill, so
-    // damage to what's on air or rolling is a solid amber image and a semibold title.
-    for problem in presentation.problems {
-      // Cuts only ever come from a "Cut to …" row (D1), and those are just below.
-      var offered = problem.action
-      if case .cut? = offered?.action { offered = UIProblemAction(title: "Details", action: .openDiagnostics) }
-      let damage = problem.level == .damage
-      let item = row(problem.title, offered.map { action($0.action) } ?? [], enabled: offered != nil,
-        symbol: UISymbol.warning, tint: .systemOrange, subtitle: problem.detail, badge: offered?.title, target: target)
-      if damage {
-        item.image = damageImage
-        item.attributedTitle = NSAttributedString(string: problem.title,
-          attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)])
-      }
-      items.append(item)
+    let waiting = waitingForPreview(presentation, session: session)
+    let problems = presentation.problems
+    // Opens the main window with the status bar's problem list showing.
+    let attention = row("Attention…", [.action(.showProblems), .action(.openMainWindow)],
+      enabled: !problems.isEmpty, symbol: UISymbol.warning, tint: problems.isEmpty ? nil : .systemOrange,
+      badge: problems.isEmpty ? nil : "\(problems.count)", target: target)
+    if problems.contains(where: { $0.level == .damage }) { attention.image = damageImage }
+    items.append(attention)
+    if includesPreviewCommand ?? waiting {
+      items.append(row("Show Live Preview", [.showLivePreview], enabled: waiting && !showLivePreview,
+        symbol: UISymbol.showPreview, target: target))
     }
-    if waiting && !showLivePreview {
-      items.append(row("Show Live Preview", [.showLivePreview], symbol: UISymbol.showPreview, target: target))
-    }
-    if items.last !== previewItem || previewItem != nil { items.append(.separator()) }
+    items.append(.separator())
 
-    // Switching. The camera on Program gets no Cut row: there's nothing to cut to.
+    // A cut updates the checkmark and availability, keeping each camera in its own row.
     if presentation.programAvailable {
-      for button in presentation.cutButtons where !button.onAir {
+      for button in presentation.cutButtons {
         items.append(row("Cut to \(button.name)", action(.cut(cameraID: button.id)), key: button.number <= 4 ? "\(button.number)" : "",
-          modifiers: .control, enabled: button.enabled, symbol: UISymbol.cut,
+          modifiers: .control, checked: button.onAir, enabled: button.enabled && !button.onAir, symbol: UISymbol.cut,
           badge: button.pending ? UITally.next.label : nil, target: target))
       }
       let auto = row("Automatic Switching", action(.setAutoSwitching(!presentation.autoSwitching)), key: "a",
@@ -389,6 +388,14 @@ final class UIMenuCommandBox: NSObject {
       items.append(.separator())
     }
 
+    if presentation.programAvailable || session.stream.active || session.stream.phase == .failed {
+      let command = session.streamCommand
+      items.append(row(command.title, action(command.action), enabled: session.streamCommandEnabled,
+        symbol: UISymbol.stream,
+        badge: session.stream.active || session.stream.phase == .failed ? session.stream.phase.streamTitle : nil, target: target))
+      items.append(.separator())
+    }
+
     // Recording, per camera, then the session's.
     for camera in presentation.cameras {
       let taking = camera.recordButtonActive || camera.pauseTitle == "Resume"
@@ -397,11 +404,9 @@ final class UIMenuCommandBox: NSObject {
         enabled: camera.recordButtonEnabled, symbol: taking ? UISymbol.stop : UISymbol.record,
         badge: taking ? elapsed : nil, target: target))
     }
-    if presentation.canPauseAll {
-      let resume = presentation.pauseAllTitle == "Resume All"
-      items.append(row(presentation.pauseAllTitle, action(resume ? .resumeAll : .pauseAll), key: "p", modifiers: [.command, .option],
-        symbol: resume ? UISymbol.start : UISymbol.paused, target: target))
-    }
+    let resume = presentation.pauseAllTitle == "Resume All"
+    items.append(row(presentation.pauseAllTitle, action(resume ? .resumeAll : .pauseAll), key: "p", modifiers: [.command, .option],
+      enabled: presentation.canPauseAll, symbol: resume ? UISymbol.start : UISymbol.paused, target: target))
     let format = NSMenu(title: "Format")
     format.autoenablesItems = false
     format.addItem(NSMenuItem.sectionHeader(title: "Applies to the next take"))
@@ -413,7 +418,7 @@ final class UIMenuCommandBox: NSObject {
     formatItem.submenu = format
     items.append(formatItem)
     // All drives share one row: the one that runs out first, a full one before any. With no
-    // estimate yet it says the free space, as the sidebar does. It shows the recordings in Finder.
+    // estimate yet it says the free space, as Record's popover does. It shows the recordings in Finder.
     let worst = UIPresentationBuilder.worstDrive(session.drives)
     let low = worst.map { UIPresentationBuilder.isLow($0) || UIPresentationBuilder.isFull($0) } ?? false
     let unestimated = worst == nil
@@ -441,7 +446,7 @@ final class UIMenuCommandBox: NSObject {
     // A separator above it, so a slip off a camera row can't land on it. It keeps its prompt.
     items.append(.separator())
     items.append(row(presentation.camerasControlTitle,
-      action(presentation.camerasRunning ? .stopAllCameras : .startAllCameras), key: "\r", modifiers: .command,
+      action(presentation.cameras.contains(where: \.canStop) ? .stopAllCameras : .startAllCameras), key: "\r", modifiers: .command,
       enabled: presentation.canStartAny,
       symbol: presentation.camerasRunning ? UISymbol.stop : UISymbol.start, target: target))
 
@@ -466,17 +471,16 @@ final class UIMenuCommandBox: NSObject {
     default: if camera.tileState == .live && status.isEmpty { status.append("Live") }
     }
     let item = NSMenuItem(title: camera.name, action: nil, keyEquivalent: "")
-    item.subtitle = status.prefix(2).joined(separator: "  ")
+    item.subtitle = status.prefix(2).joined(separator: " · ")
     item.image = image(camera.tally.isRed ? UISymbol.cameraOnAir : UISymbol.camera, tint: camera.state == .warning ? .systemOrange : nil)
     let submenu = NSMenu(title: camera.name)
     submenu.autoenablesItems = false
     let taking = camera.recordButtonActive || camera.pauseTitle == "Resume"
     submenu.addItem(row(taking ? "Stop Recording" : "Record", action(.toggleRecording(cameraID: camera.id)),
       enabled: camera.recordButtonEnabled, symbol: taking ? UISymbol.stop : UISymbol.record, target: target))
-    if let pause = camera.pauseTitle {
-      submenu.addItem(row(pause == "Pause" ? "Pause Recording" : "Resume Recording",
-        action(.pauseOrResume(cameraID: camera.id)), symbol: pause == "Pause" ? UISymbol.paused : UISymbol.start, target: target))
-    }
+    let resume = camera.pauseTitle == "Resume"
+    submenu.addItem(row(resume ? "Resume Recording" : "Pause Recording", action(.pauseOrResume(cameraID: camera.id)),
+      enabled: camera.pauseTitle != nil, symbol: resume ? UISymbol.start : UISymbol.paused, target: target))
     // Always there with two cameras (checked while on Program), so an automatic cut changes
     // the row's state, not the submenu's rows, and the open menu updates in place.
     if presentation.programAvailable {
@@ -491,7 +495,7 @@ final class UIMenuCommandBox: NSObject {
     let effects = NSMenu(title: "Effects")
     effects.autoenablesItems = false
     for chip in camera.chips.dropFirst() {
-      effects.addItem(row("\(chip.id + 1)  \(UIPresentationBuilder.effectLongTitles[chip.id])",
+      effects.addItem(row(UIPresentationBuilder.effectLongTitles[chip.id].capitalized,
         action(.setEffect(cameraID: camera.id, index: chip.id, !chip.isOn)), checked: chip.isOn,
         enabled: chip.enabled && camera.processing, badge: chip.title, target: target))
     }
@@ -609,9 +613,10 @@ struct UIMenuPreviewContent: View {
       .overlay {
         VStack(spacing: 6) {
           Image(systemName: waiting ? UISymbol.waitingCamera : UISymbol.camera).font(.system(size: 26, weight: .light))
-          Text(waiting ? "Waiting to start" : presentation.cameras.count == 1 ? "Camera stopped" : "Cameras stopped")
+          Text(waiting ? "Waiting to start" : "Capture stopped")
             .font(.callout.weight(.semibold))
-          Text(waiting ? "Starts when a meeting app opens Ultracam." : "Start the camera to see its picture.")
+          Text(waiting ? "Starts when a meeting app opens Ultracam."
+            : presentation.canStartAny ? "Start Capture to receive video." : "Connect an input or choose one in the inspector.")
             .font(.caption).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center)
         }
         .foregroundStyle(.white)
@@ -642,6 +647,7 @@ struct UIMenuPreviewContent: View {
   private func cameraPicture(_ camera: UICameraPresentation) -> some View {
     UIColumnPictureLayout { pictures.picture(cameraID: camera.id, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 10))
+      .overlay { previewStatus(camera) }
       .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(camera.tally.ringColor ?? .clear, lineWidth: 3))
       .overlay(alignment: .topLeading) { Text("Ultracam · \(camera.name)").font(.uiCompactOverlay).uiPictureOverlay().padding(7) }
       .overlay(alignment: .topTrailing) { UITallyBadge(tally: camera.tally).padding(7) }
@@ -662,11 +668,23 @@ struct UIMenuPreviewContent: View {
   private func miniPicture(_ camera: UICameraPresentation) -> some View {
     UIColumnPictureLayout { pictures.picture(cameraID: camera.id, compact: true) }
       .clipShape(RoundedRectangle(cornerRadius: 8))
+      .overlay { previewStatus(camera) }
       .overlay(alignment: .topLeading) { Text(camera.name).font(.uiCompactOverlay).uiPictureOverlay().padding(5) }
       .overlay(alignment: .bottomTrailing) {
         recPill(for: session.cameras.filter { $0.id == camera.id && ($0.recording.status == .recording || $0.recording.status == .paused) })
           .padding(5)
       }
+  }
+
+  @ViewBuilder private func previewStatus(_ camera: UICameraPresentation) -> some View {
+    switch camera.tileState {
+    case .stopped, .noSignal, .signalLost:
+      Text(camera.statusBadge)
+        .font(.uiMeta)
+        .foregroundStyle(camera.statusTone == .warning ? Color.orange : Color.white.opacity(0.7))
+    default:
+      EmptyView()
+    }
   }
 
   /// Program thumbnails show tally only; cutting happens from the menu rows.

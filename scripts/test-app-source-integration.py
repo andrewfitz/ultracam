@@ -19,6 +19,7 @@ struct FeedDescriptor {
  var id:Int; var enabled=true; var selectedDevice="device"
  var applyLUT=false;var lutBookmark:String?;var downscale=false;var convertTo420=false;var reduceFrameRate=false
  var resizeTarget="source";var colorTarget="source";var frameRateTarget="source";var scalingMode="fit"
+ var allowUpscale = false
  var pipelineEnabled=true;var gamut="source";var previewEnabled=true
  var sourceProfileID="source";var lutInputSpaceID="input";var lutOutputSpaceID="output";var programColorSpaceID="rec709"
  mutating func setSourceProfile(_ id:String) { sourceProfileID=id }
@@ -26,13 +27,14 @@ struct FeedDescriptor {
 }
 struct CaptureUpdate {
  var mediaTime:Int?; var audioPacketTime:Int?;var audioPresent:Bool
- var audioActivityRMS:Float;var audioActivityPeak:Float
+ var audioActivityRMS:Float;var audioActivityPeak:Float;var audioInterrupted=false;var audioInterruptionTime:Int?
  var audioRMSLeft=0.0;var audioRMSRight=0.0;var audioPeakLeft=0.0;var audioPeakRight=0.0
 }
+func CMTimeMaximum(_ lhs:Int,_ rhs:Int)->Int {max(lhs,rhs)}
 final class IntegrationCoordinator {func evaluateSwitcher(at:Int)->Bool {true};func expirePendingCut() {}}
 final class DirectorSpy {
- var rms:Float?;var peak:Float?;var audioTime:Int?;var tickTime:Int?
- func ingestAudio(time:Int,rms:Float,peak:Float,present:Bool) { self.rms=rms;self.peak=peak;audioTime=time }
+ var rms:Float?;var peak:Float?;var audioTime:Int?;var tickTime:Int?;var present:Bool?
+ func ingestAudio(time:Int,rms:Float,peak:Float,present:Bool) { self.rms=rms;self.peak=peak;audioTime=time;self.present=present }
  func tick(time:Int) {tickTime=time}
 }
 final class TimelineSpy {var tickTime:Int?;func recordTick(time:Int) {tickTime=time}}
@@ -40,6 +42,7 @@ final class IntegrationFixture {
  let feedCoordinator=IntegrationCoordinator()
  let directorWanted=true
  var autoSwitcherBridge:DirectorSpy?=DirectorSpy();var autoSwitcherTimeline:TimelineSpy?=TimelineSpy()
+ var nextDirectorAttempt: TimeInterval = 0
  var syncCameras=true;var synchronizingCameras=false;var lutLoadingFeeds:Set<Int>=[];var cameraLUTs:[Int:String]=[:]
  var feedDescriptors=[FeedDescriptor(id:1),FeedDescriptor(id:2,selectedDevice:"second-device"),FeedDescriptor(id:3,enabled:false)]
  func cancelLUTLoad(_ id:Int) {}
@@ -47,6 +50,10 @@ final class IntegrationFixture {
  func descriptor(for id:Int)->FeedDescriptor? {feedDescriptors.first {$0.id==id}}
  func applyPipeline(_ id:Int) {}
  func restoreLUT(_ id:Int) {}
+ func reconcileAutoSwitcher() {
+   nextDirectorAttempt = 0
+   autoSwitcherBridge = DirectorSpy()
+ }
  func feedAudio(_ update:CaptureUpdate) {feedAutoSwitcherAudio(update)}
  func sync(_ source:FeedDescriptor) {synchronizeProcessing(from:source)}
 '''
@@ -55,7 +62,7 @@ fixture += (root / 'Tests/BoundaryContracts/AppSourceIntegrationChecks.swift').r
 fixture += '''
 let suite=XCTestSuite(forTestCaseClass:AppSourceIntegrationChecks.self)
 suite.run()
-guard let run=suite.testRun,run.executionCount==3 else {exit(2)}
+guard let run=suite.testRun,run.executionCount==5 else {exit(2)}
 exit(run.hasSucceeded ? 0:1)
 '''
 developer = Path(subprocess.check_output(['xcode-select', '-p'], text=True).strip())

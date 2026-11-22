@@ -103,7 +103,7 @@ struct UIScopeClipReadoutView: View {
       Text(text.low)
       Text(text.luma)
     }
-    .font(.system(.caption2, design: .monospaced))
+    .font(.system(.subheadline, design: .monospaced))
     .monospacedDigit()
     .lineLimit(1)
     .minimumScaleFactor(0.8)
@@ -133,9 +133,9 @@ struct UIScopePanel<Scope: View>: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 3) {
       HStack {
-        Text(description.title).font(.caption)
+        Text(description.title).font(.uiMeta)
         Spacer()
-        Button(expanded ? "Dock" : "Expand") { expanded.toggle() }.font(.caption)
+        Button(expanded ? "Dock" : "Expand") { expanded.toggle() }.font(.uiMeta)
           .help(expanded ? "Make the scope smaller" : "Make the scope larger")
       }
       UIScopeImage(description: description, scope: scope)
@@ -149,15 +149,15 @@ struct UIScopePanel<Scope: View>: View {
       if statistics != nil || heldReadout != nil {
         UIScopeClipReadoutView(reader: statistics, settings: description.settings, isLive: isLive, held: heldReadout)
       }
-      if !timing.isEmpty { Text(timing).font(.caption2).foregroundStyle(.secondary) }
-      if !interpretation.isEmpty { Text(interpretation).font(.caption2).foregroundStyle(.secondary) }
-      Text(description.caption).font(.caption2).foregroundStyle(.secondary)
+      if !timing.isEmpty { Text(timing).font(.uiMeta).foregroundStyle(.secondary) }
+      if !interpretation.isEmpty { Text(interpretation).font(.uiMeta).foregroundStyle(.secondary) }
+      Text(description.caption).font(.uiMeta).foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
       // The note suggests scales the settings may not offer yet (UIScopeSettingsView.offersEveryScope).
       if let note = description.scaleNote,
         UIScopeSettingsView.offersEveryScope || description.settings.display.waveformScale != .percent
       {
-        Text(note).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        Text(note).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
     }
   }

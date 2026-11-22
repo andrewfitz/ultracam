@@ -1,4 +1,6 @@
 import Foundation
+import Observation
+import Synchronization
 import SystemExtensions
 import XCTest
 
@@ -362,5 +364,57 @@ import XCTest
     replies[0]([record("8")])
     callbacks()
     XCTAssertEqual(installer.system?.enabledVersion, "9")
+  }
+  func testPublishedIdentityUsesRegistryUIDAndIgnoresDisplayName() {
+    XCTAssertTrue(VirtualCameraDescriptor.isDeviceUID(VideoContract.deviceUID))
+    XCTAssertTrue(VirtualCameraDescriptor.isDeviceUID(VirtualCameraDescriptor.program().deviceUID))
+    let feed = VirtualCameraDescriptor.feed(feedID: "Étalon 4", displayName: "Studio")
+    XCTAssertTrue(VirtualCameraDescriptor.isDeviceUID(feed.deviceUID))
+    XCTAssertFalse(VirtualCameraDescriptor.isDeviceUID("Ultracam · Program"))
+    XCTAssertFalse(VirtualCameraDescriptor.isDeviceUID(VideoContract.deviceUID + ".666565643aff"))
+    XCTAssertFalse(VirtualCameraDescriptor.isDeviceUID(VideoContract.deviceUID + ".666565643a"))
+    XCTAssertFalse(VirtualCameraDescriptor.isDeviceUID(VideoContract.deviceUID + ".666565643a64656661756c74"))
+  }
+
+  func testReadersShareWorkerAndOnlyChangedAnswersNotify() async {
+    let scans = Mutex(0)
+    let gate = DispatchSemaphore(value: 0)
+    let discovery = ExtensionDeviceDiscovery {
+      dispatchPrecondition(condition: .notOnQueue(.main))
+      let call = scans.withLock { count in count += 1; return count }
+      if call == 1 { return gate.wait(timeout: .now() + 2) == .success }
+      if call == 2 { return true }
+      if call == 3 { return nil }
+      return false
+    }
+    let changes = Mutex(0)
+    func track() {
+      withObservationTracking {
+        _ = discovery.published
+      } onChange: {
+        changes.withLock { $0 += 1 }
+      }
+    }
+    track()
+    XCTAssertFalse(discovery.published)
+    discovery.refresh()
+    XCTAssertFalse(discovery.published)
+    gate.signal()
+    let initial = await discovery.checkPublication()
+    XCTAssertTrue(initial)
+    XCTAssertEqual(scans.withLock { $0 }, 1)
+    XCTAssertEqual(changes.withLock { $0 }, 1)
+    track()
+    let unchanged = await discovery.checkPublication()
+    XCTAssertTrue(unchanged)
+    XCTAssertEqual(changes.withLock { $0 }, 1)
+    let failed = await discovery.checkPublication()
+    XCTAssertFalse(failed)
+    XCTAssertTrue(discovery.published)
+    XCTAssertEqual(changes.withLock { $0 }, 1)
+    let removed = await discovery.checkPublication()
+    XCTAssertFalse(removed)
+    XCTAssertFalse(discovery.published)
+    XCTAssertEqual(changes.withLock { $0 }, 2)
   }
 }

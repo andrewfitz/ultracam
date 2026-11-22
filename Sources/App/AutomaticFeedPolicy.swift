@@ -33,13 +33,27 @@ enum FeedLifecycleDemandPolicy {
   }
 
   static func programContract(configuration: PipelineConfiguration, pipelineEnabled: Bool,
-                              detectedSourceDuration: CMTime?) -> PipelineConfiguration {
+                              detectedSourceDuration: CMTime?, source: SourceFormat? = nil) -> PipelineConfiguration {
     var result = configuration
     if !pipelineEnabled {
       result.applyLUT = false
       result.downscale = false
       result.convertTo420 = false
       result.reduceFrameRate = false
+    }
+    if let source {
+      result.sourceWidth = source.width
+      result.sourceHeight = source.height
+      result.sourcePixelAspect = source.pixelAspect
+      result.sourcePixelFormat = source.pixel.rawValue
+      result.sourceDuration = source.rate.nominal
+      // Program's camera has a finite catalog. Its canvas is independent of
+      // the native feed, which may still serve preview and source recording.
+      if !result.downscale && (source.pixelAspect != .one ||
+        !PublishedSourceSizeSelection.targets.contains(where: { $0.width == source.width && $0.height == source.height })) {
+        result.downscale = true
+        result.resizeTarget = .source
+      }
     }
     if let duration = detectedSourceDuration,
        duration.isNumeric, duration.epoch == 0, CMTimeCompare(duration, .zero) > 0 {
@@ -82,14 +96,17 @@ struct AutomaticFeedPolicy {
   private var attempted = false
 
   mutating func demand(_ requested: Bool) {
-    let wasRequested = captureRequested
-    self.requested = requested
-    if wasRequested != captureRequested { attempted = false }
+    updateDemand(requested: requested, previewRequested: previewRequested)
   }
 
   mutating func previewDemand(_ requested: Bool) {
+    updateDemand(requested: self.requested, previewRequested: requested)
+  }
+
+  mutating func updateDemand(requested: Bool, previewRequested: Bool) {
     let wasRequested = captureRequested
-    previewRequested = requested
+    self.requested = requested
+    self.previewRequested = previewRequested
     if wasRequested != captureRequested { attempted = false }
   }
 
@@ -100,5 +117,43 @@ struct AutomaticFeedPolicy {
     guard ready, !running, !attempted else { return nil }
     attempted = true
     return .start
+  }
+}
+
+/// CMIO can briefly lose a route during rediscovery. Unknown use breaks the
+/// start debounce, but cannot establish that an existing recording should end.
+struct CameraAppRecordingDemand {
+  static let startDelay: TimeInterval = 2
+  private var activeSince: TimeInterval?
+  private var lastConfirmedActive = false
+  private var releaseAt: TimeInterval?
+  var hasActiveClient: Bool { activeSince != nil }
+
+  mutating func update(_ requested: Bool?, now: TimeInterval) {
+    if requested == true {
+      activeSince = activeSince ?? now
+      lastConfirmedActive = true
+      releaseAt = nil
+    } else {
+      activeSince = nil
+      if requested == false, lastConfirmedActive {
+        lastConfirmedActive = false
+        releaseAt = now + LiveWatchLimits.clientRelease
+      }
+    }
+  }
+
+  func shouldStart(at now: TimeInterval) -> Bool {
+    activeSince.map { now - $0 >= Self.startDelay } ?? false
+  }
+
+  mutating func expireRelease(at now: TimeInterval) -> Bool {
+    guard let releaseAt, now >= releaseAt else { return false }
+    self.releaseAt = nil
+    return true
+  }
+
+  func keepsSession(at now: TimeInterval) -> Bool {
+    lastConfirmedActive || releaseAt.map { now < $0 } == true
   }
 }

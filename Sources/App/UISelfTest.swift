@@ -62,7 +62,7 @@ import AppKit
     }
     try? timeline.joined(separator: "\n").write(to: output.appendingPathComponent("live-timeline.txt"), atomically: true, encoding: .utf8)
     let started = bridge.snapshot().cameras.first { $0.id == camera.id }
-    record("live: Start Camera starts capture", started?.running == true, "")
+    record("live: Start Capture starts capture", started?.running == true, "")
     let tile = started.map { UIPresentationBuilder.tileState(for: $0) }
     record("live: the picture shows a real state", tile != nil && tile != .stopped,
       "signal \(String(describing: started?.signal)), tile \(String(describing: tile))")
@@ -78,7 +78,7 @@ import AppKit
     bridge.send(.stopCamera(cameraID: camera.id))
     await wait(2)
     let stopped = bridge.snapshot().cameras.first { $0.id == camera.id }
-    record("live: Stop Camera stops capture", stopped?.running == false, "")
+    record("live: Stop Capture stops capture", stopped?.running == false, "")
   }
 
   private static func wait(_ seconds: Double) async {
@@ -92,7 +92,7 @@ import AppKit
     openWindows()
     await wait(1.5)
     checkStatusItem()
-    // The inspector opens in the real scene window (an offscreen NSHostingView can't host it).
+    // The inspector opens in the real scene window, beside the pictures.
     interface.inspectorOpen = true
     await wait(1)
     record("main window survives opening the inspector", appWindows().contains { identifier(of: $0).hasPrefix("main") })
@@ -105,7 +105,7 @@ import AppKit
     try? mainLabels.joined(separator: "\n").write(to: output.appendingPathComponent("accessibility-main.txt"), atomically: true, encoding: .utf8)
     record("inspector shows the selected camera's settings", mainLabels.contains("Refresh capture devices"),
       "\(mainLabels.count) labels")
-    for label in ["Effects", "Start Camera"] {
+    for label in ["Effects", "Start Capture", "Hide Preview"] {
       record("main window exposes \"\(label)\"", mainLabels.contains { $0.contains(label) }, "")
     }
     await renderWindows()
@@ -157,7 +157,7 @@ import AppKit
   }
 
   static let requiredMenus = ["Camera", "Record", "Program", "View", "Window"]
-  static let requiredShortcuts = ["⌘↩", "⇧⌘B", "⇧⌘P", "⌘R", "⌥⌘R", "⌃1", "⌃⌥A", "⌥⌘1", "⌃⌘S", "⌥⌘S", "⌥⌘K", "⌥⌘I",
+  static let requiredShortcuts = ["⌘↩", "⇧⌘B", "⇧⌘P", "⌘R", "⌥⌘R", "⌃1", "⌃⌥A", "⌥⌘1", "⌥⌘S", "⌥⌘K", "⌥⌘I",
     "⌘0", "⌃⌥F", "⌃⌥C"]
 
   private static func checkMenus() {

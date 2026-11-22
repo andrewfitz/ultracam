@@ -120,10 +120,12 @@ struct RGBSource {
   float3 pixel(uint x, uint y, constant Parameters &p) const {
     uint kind = uint(p.chroma.w);
     if (kind == 4) {
-      uint bit = x * 36, first = bit / 8, shift = bit % 8;
-      ulong word = 0;
-      for (uint i = 0; i < 5; ++i) word |= ulong(pixels.read(uint2(first + i, y)).r) << (i * 8);
-      word >>= shift;
+      // Each RGBA16Uint texel holds 64 consecutive source bits.
+      uint bit = x * 36, first = bit / 64, shift = bit % 64;
+      ulong word = as_type<ulong>(ushort4(pixels.read(uint2(first, y)))) >> shift;
+      if (shift > 64 - 36) {
+        word |= as_type<ulong>(ushort4(pixels.read(uint2(first + 1, y)))) << (64 - shift);
+      }
       return (float3(float(word & 4095), float((word >> 12) & 4095), float((word >> 24) & 4095)) - p.decodeRange.x) / p.decodeRange.y;
     }
     uint4 b = pixels.read(uint2(x,y));

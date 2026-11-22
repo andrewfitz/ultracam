@@ -1,101 +1,30 @@
 import SwiftUI
 
-/// The camera's signal badge: its state, and a menu naming both links (capture device and
-/// camera body) with the body's output properties. Dropped frames are a stat in the inspector,
-/// not a warning beside the format.
-struct UIFeedSettingsMenu: View {
-    let camera: UICameraPresentation
-    let snapshot: UICameraSnapshot?
-    let controlStore: CameraControlStore?
-    var viewFactories: [String: ControlViewFactory] = [:]
-    /// Settings › Hardware, at a device's or body's row.
-    var openHardware: (String?) -> Void = { _ in }
-    @State private var showingSettings = false
-    private var state: CameraControlFeedState? {
-        guard let controlStore, controlStore.assignment(for: camera.id) != nil else { return nil }
-        return controlStore.state(for: camera.id)
-    }
-    private var live: Bool { camera.statusTone == .positive }
+/// The paired body's output timing (what it sends over HDMI), as rows of the inspector's
+/// Camera Control section. They were the signal badge's menu on the strip; the badge is gone,
+/// the signal's format is on the picture, and what is set once is in the inspector.
+struct UICameraOutputTimingRows: View {
+    let cameraID: String
+    let store: CameraControlStore
+
     var body: some View {
-        Menu {
-            Button { openHardware(snapshot?.inputID) } label: {
-                Label(camera.inputName, systemImage: UISymbol.input)
-            }
-            .badge(snapshot?.inputConnector.map { Text($0) })
-            if let format = snapshot?.outputFormat {
-                Label("Ultracam · \(camera.name)", systemImage: UISymbol.virtualCamera(inUse: camera.outputInUse)).badge(Text(format))
-            }
-            Divider()
-            if let controlStore, let state, let assignment = controlStore.assignment(for: camera.id) {
-                Label(assignment.camera.name, systemImage: UISymbol.cameraBody)
-                    .badge(Text(state.connected ? "Connected" : "Disconnected"))
-                if state.connected {
-                    ForEach(state.properties.filter { $0.role == .outputTiming }) { property in
-                        if property.writable, !property.options.isEmpty {
-                            Picker(property.localizedLabel(), selection: Binding(get: { property.value }, set: { value in
-                                Task { await controlStore.set(property, value: value, feedID: camera.id) }
-                            })) {
-                                if !property.options.contains(where: { $0.value == property.value }) {
-                                    Text(UIControlPresentation.value(property)).tag(property.value)
-                                }
-                                ForEach(property.options) { Text($0.localizedLabel()).tag($0.value) }
-                            }.disabled(state.busy)
-                        } else {
-                            Text(property.localizedLabel()).badge(Text(UIControlPresentation.value(property)))
+        let state = store.state(for: cameraID)
+        if store.assignment(for: cameraID) != nil, state.connected {
+            ForEach(state.properties.filter { $0.role == .outputTiming }) { property in
+                if property.writable, !property.options.isEmpty {
+                    Picker(property.localizedLabel(), selection: Binding(get: { property.value }, set: { value in
+                        Task { await store.set(property, value: value, feedID: cameraID) }
+                    })) {
+                        if !property.options.contains(where: { $0.value == property.value }) {
+                            Text(UIControlPresentation.value(property)).tag(property.value)
                         }
+                        ForEach(property.options) { Text($0.localizedLabel()).tag($0.value) }
                     }
-                }
-                Divider()
-            } else {
-                Label("Output timing is controlled by the source", systemImage: UISymbol.information)
-            }
-            if let controlStore, controlStore.available {
-                if controlStore.assignment(for: camera.id) != nil {
-                    Button("Camera Control…", systemImage: UISymbol.cameraControl) { showingSettings = true }
+                    .disabled(state.busy)
                 } else {
-                    Button("Assign Camera Body…", systemImage: UISymbol.cameraBody) { openHardware(nil) }
+                    LabeledContent(property.localizedLabel()) { Text(UIControlPresentation.value(property)) }
                 }
-            }
-        } label: {
-            HStack(spacing: 4) {
-                if live {
-                    UIStateGlyph(state: .healthy, size: 6)
-                } else if camera.statusTone == .warning {
-                    UIStateGlyph(state: .warning)
-                } else {
-                    UIStateGlyph(state: .inactive, size: 6)
-                }
-                Text(camera.statusBadge)
-                Image(systemName: UISymbol.menuIndicator).font(.caption2.weight(.bold))
-            }
-            .font(.uiBadge).lineLimit(1).padding(.horizontal, 6).frame(height: 18)
-            .foregroundStyle(camera.statusTone == .neutral ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-            .background(.fill.tertiary, in: Capsule()).contentShape(Capsule())
-        }
-        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-        .help(help)
-        .accessibilityLabel("\(camera.name) signal, \(camera.statusBadge)")
-        .sheet(isPresented: $showingSettings) {
-            if let controlStore {
-                UICameraControlSettings(feedID: camera.id, name: camera.name, store: controlStore, viewFactories: viewFactories,
-                    openHardware: { openHardware(nil) })
             }
         }
-    }
-
-    private var help: String { live ? "Signal arriving from \(camera.inputName)" : camera.statusBadge }
-}
-
-struct UIFeedBrandMark: View {
-    let descriptor: VendorDescriptor
-    var body: some View {
-        Group {
-            switch UIControlPresentation.badge(descriptor, assetAvailable: { NSImage(named: NSImage.Name($0)) != nil }) {
-            case .asset(let name):
-                Image(name).resizable().renderingMode(.template).scaledToFit().frame(width: 18, height: 18)
-            case .text(let text):
-                Text(text).font(.uiBadge).lineLimit(1)
-            }
-        }.foregroundStyle(.secondary).accessibilityLabel(descriptor.localizedDisplayName())
     }
 }

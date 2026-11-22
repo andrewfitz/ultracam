@@ -70,7 +70,7 @@ func reconstruct(_ feeds:[FeedDescriptor]) {let snapshot=(feeds:feeds,unused:0)
 INITIALIZATION
 }
 func cameraActive(_ id:Int)->Bool {false};func inputHolder(_ device:String,excluding:Int)->Int? {nil}
-func updateCamera(_ id:Int,shareProcessing:Bool = true,_ mutate:(inout FeedDescriptor)->Void) {var descriptor=feedCoordinator.saved;let before=descriptor;mutate(&descriptor); SELECTION;feedCoordinator.update(descriptor);if shareProcessing && before.sourceProfileID != descriptor.sourceProfileID {peerSource=descriptor.sourceProfileID}}
+func updateCamera(_ id:Int,shareProcessing:Bool = true,_ mutate:(inout FeedDescriptor)->Void) {var descriptor=feedCoordinator.saved;let before=descriptor;mutate(&descriptor);if descriptor.selectedDevice != before.selectedDevice { SELECTION };feedCoordinator.update(descriptor);if shareProcessing && before.sourceProfileID != descriptor.sourceProfileID {peerSource=descriptor.sourceProfileID}}
 func edit(_ configuration:Preferences) {let target=(rawValue: "1", unused:0)
 CALLBACK
 }

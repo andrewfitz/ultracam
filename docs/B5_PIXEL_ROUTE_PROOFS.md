@@ -13,7 +13,7 @@ float texture. Primitive raw-buffer tests do not prove an app consumer route.
 | Formats | Stage | Test evidence | Storage / qualification |
 |---|---|---|---|
 | 2vuy, yuvs, 420v, 420f, BGRA, r210, R12L | extension feed output | `SourceFormatRouteChecks.testEveryNewSourceReachesAnExactPublishedProcessedCameraFormat` | Actual typed nonlinear LUT GPU processing, 14 submissions (seven sources × 720/1080), expected grey code 71, `CameraSink.requestedFormat` matches exact published catalog; no physical external client claim |
-| r210, R12L and registered raw formats | monitor | `Packages/MonitorKit/Tests/MonitorKitTests/RawCVFrameDecoderTests.swift:testRegisteredCaptureCVEnvelopesReachMonitorOutputOnMetal4` | Actual CV envelopes mapped and rendered through MonitorPass; all six newly registered raw cases pass |
+| r210, R12L and registered raw formats | monitor | `../MonitorKit/Tests/MonitorKitTests/RawCVFrameDecoderTests.swift:testRegisteredCaptureCVEnvelopesReachMonitorOutputOnMetal4` | Actual CV envelopes mapped and rendered through MonitorPass; all six newly registered raw cases pass |
 | 2vuy, yuvs | input | `Packed422GPUChecks` | Raw-buffer Metal 4 decoder, both byte orders; not a full capture route |
 | 2vuy, yuvs | LUT | `Packed422LUTChecks.testBothPackedOrdersRunProductionFullAndResizeKernels` | Native CV, full and resize, NV12 and 422 output |
 | 2vuy, yuvs | Program | `ProgramScalingGPUChecks.testPackedSourcesExecuteThroughProgramOutput` | Native CV 128×64, actual Program GPU pixels |
@@ -45,7 +45,7 @@ float texture. Primitive raw-buffer tests do not prove an app consumer route.
 | I420, PA16 | input | `NDIPlanarGPUChecks.testI420SeparateChromaPlanesAndPA16NativePrecisionIgnoreAlpha` | Standalone Metal 4 decoder; separate I420 chroma planes and PA16 alpha present but ignored in v1 processing |
 | I420, PA16, P216, UYVA | ingest storage | `CPUMemoryGPUIngestChecks.testNDIPlanarStorageAndAlphaArePreservedOnGPU` | Actual plane storage preserved through GPU ingest, including alpha; does not prove LUT/Program/recording |
 | UYVA | input | `Packed422GPUChecks` | Standalone decoder, UYVY plus alpha planes |
-| 2vuy, yuvs, 420v, 420f, BGRA | monitor | `Packages/MonitorKit/Tests/MonitorKitTests/RawFrameDecoderTests.swift:testExistingCVFormatsMapIntoMonitorTexturesAndDecodeOnGPU` | Native CV texture mapping and GPU decode: uyvy8/yuyv8/nv12 legal/full/bgra8 full; other range/storage variants unqualified |
+| 2vuy, yuvs, 420v, 420f, BGRA | monitor | `../MonitorKit/Tests/MonitorKitTests/RawFrameDecoderTests.swift:testExistingCVFormatsMapIntoMonitorTexturesAndDecodeOnGPU` | Native CV texture mapping and GPU decode: uyvy8/yuyv8/nv12 legal/full/bgra8 full; other range/storage variants unqualified |
 
 UYVA, P216, I420 and PA16 now have all consumer route proofs and actual-writer
 qualification; `captureQualified` is true. RGBA retains missing consumer routes

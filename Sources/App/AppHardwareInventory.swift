@@ -36,7 +36,10 @@ import Observation
     refresh = hardware.refreshIdleStatus
     nicknames = defaults.dictionary(forKey: Self.nicknamesKey) as? [String: String] ?? [:]
     lastKnownNames = defaults.dictionary(forKey: Self.lastKnownNamesKey) as? [String: String] ?? [:]
-    observation = hardware.observeDeviceStatus { [weak self] id, status in self?.statuses[id] = status }
+    observation = hardware.observeDeviceStatus { [weak self] id, status in
+      guard let self, self.statuses[id] != status else { return }
+      self.statuses[id] = status
+    }
   }
 
   /// The cached status, from the observer or, before its first delivery, the plugin's cache.
@@ -77,8 +80,8 @@ import Observation
     polling = true
     pollTask = Task { @MainActor [weak self, interval] in
       while !Task.isCancelled {
-        guard let self, self.polling else { return }
-        self.refresh()
+        guard self?.polling == true else { return }
+        self?.refresh()
         do { try await Task.sleep(for: interval) } catch { return }
       }
     }

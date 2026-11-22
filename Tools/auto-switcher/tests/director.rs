@@ -579,67 +579,84 @@ fn recorder_drops_pending_cuts_when_director_resets_or_expires_them() {
     }
 }
 
+fn health(camera_id: &str, time: f64, healthy: bool, session_generation: u64) -> StreamEvent {
+    StreamEvent::Video {
+        observation: auto_switcher::VideoObservation {
+            camera_id: camera_id.into(),
+            time,
+            healthy,
+            motion: 0.0,
+            scene_change: 0.0,
+            session_generation,
+        },
+    }
+}
+
 #[test]
-fn offline_sorts_untimed_events_after_timed_events_and_preserves_time_zero() {
-    let unknown_decision = Uuid::new_v4();
-    let untimed = vec![
-        StreamEvent::Reset {
-            generation: Some(7),
-        },
-        StreamEvent::Acknowledge {
-            decision_id: unknown_decision,
-            applied_at: None,
-        },
-        StreamEvent::Reject {
-            decision_id: unknown_decision,
-        },
-        StreamEvent::Reset { generation: None },
+fn camera_health_uses_each_cameras_latest_observation_within_the_generation() {
+    let mut director = Director::new(SwitcherConfig::default()).unwrap();
+    director.process_event(health("B", 4.0, false, 1));
+    director.process_event(health("B", 3.0, true, 1));
+    director.process_event(health("A", 5.0, false, 1));
+    assert!(director.tick(5.0).is_none());
+    // B's recovery can arrive behind A's clock.
+    director.process_event(health("B", 4.5, true, 1));
+    assert_eq!(director.tick(5.0).unwrap().target_camera_id, "B");
+
+    assert!(director.tick(0.0).is_none());
+    director.process_event(health("B", 0.0, false, 2));
+    assert!(director.tick(0.0).is_none());
+    director.process_event(health("B", 0.1, true, 2));
+    assert_eq!(director.tick(0.1).unwrap().target_camera_id, "B");
+
+    director.reset(Some(3));
+    director.process_event(health("A", 0.0, false, 3));
+    director.process_event(health("B", 5.0, false, 2));
+    assert_eq!(director.tick(0.0).unwrap().target_camera_id, "B");
+}
+
+#[test]
+fn offline_sorts_observations_without_reordering_controls() {
+    let id = Uuid::new_v4();
+    let controls = [
+        StreamEvent::Acknowledge { decision_id: id, applied_at: None },
+        StreamEvent::Acknowledge { decision_id: id, applied_at: Some(11.0) },
+        StreamEvent::Reject { decision_id: id },
+        StreamEvent::DirectorOutput,
     ];
-    let mut events = untimed.clone();
-    events.extend([
-        StreamEvent::Tick { time: 1.0 },
-        StreamEvent::ManualOverride {
-            camera_id: "B".into(),
-            time: 0.0,
-        },
-    ]);
+    let mut events = vec![StreamEvent::Tick { time: 7.0 }];
+    // A control must retain its position even within a single generation.
+    for control in &controls {
+        events.push(control.clone());
+        events.push(StreamEvent::Tick { time: 7.0 });
+    }
+    for generation in [2, 3] {
+        events.extend([
+            StreamEvent::Reset { generation: Some(generation) },
+            StreamEvent::Tick { time: 1.0 },
+            StreamEvent::Tick { time: 0.0 },
+            health("A", 0.0, false, generation),
+        ]);
+    }
     let timeline =
         auto_switcher::offline::analyze_events(events, SwitcherConfig::default()).unwrap();
-    let first = &timeline.events[0];
-    assert!(matches!(
-        first.event,
-        StreamEvent::ManualOverride { time: 0.0, .. }
-    ));
-    assert_eq!(first.media_time, Some(0.0));
-    assert_eq!(first.media_time_ticks, Some(0));
-    assert_eq!(timeline.cuts.len(), 1);
-    assert_eq!(timeline.cuts[0].session_generation, 1);
-    assert_eq!(timeline.cuts[0].applied_source_time, Some(0.0));
-    assert_eq!(timeline.cuts[0].applied_program_time_ticks, Some(0));
-    assert_eq!(timeline.cuts[0].status, "applied");
-    let first_untimed = timeline
-        .events
-        .iter()
-        .position(|event| event.media_time.is_none())
-        .unwrap();
-    assert!(timeline.events[..first_untimed]
-        .iter()
-        .all(|event| event.media_time.is_some()));
-    assert_eq!(
-        timeline.events[first_untimed..]
-            .iter()
-            .map(|event| event.event.clone())
-            .collect::<Vec<_>>(),
-        untimed,
-        "untimed events retain their input order"
-    );
-    assert!(timeline.events[first_untimed..]
-        .iter()
-        .all(|event| event.media_time_ticks.is_none()));
-    assert_eq!(
-        timeline.config.session_generation, 1,
-        "the replay configuration must remain the initial generation"
-    );
+    for (index, control) in controls.iter().enumerate() {
+        let entry = &timeline.events[2 * index + 1];
+        assert_eq!(&entry.event, control);
+        assert_eq!(
+            entry.media_time_ticks,
+            if index == 1 { Some(11 * 240_000) } else { None }
+        );
+        assert_eq!(timeline.events[2 * index + 2].media_time, Some(7.0));
+    }
+    assert_eq!(timeline.config.session_generation, 1);
+    assert_eq!(timeline.cuts.len(), 2);
+    for (cut, generation) in timeline.cuts.iter().zip([2, 3]) {
+        assert_eq!(cut.session_generation, generation);
+        assert_eq!(cut.target_camera_id, "B");
+        assert_eq!(cut.status, "applied");
+        assert_eq!(cut.applied_program_time_ticks, Some(0));
+    }
 }
 
 #[test]

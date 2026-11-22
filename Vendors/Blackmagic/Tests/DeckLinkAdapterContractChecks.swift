@@ -264,6 +264,19 @@ import CoreVideo
     XCTAssertEqual(declaration.signature, frame.formatSignature)
     XCTAssertEqual(info.hostTimeReference, .presentationEnd)
   }
+  func testAdapterPreservesRec601Matrix() throws {
+    let recorder = AdapterDeliveryRecorder(), session = DeckLinkCaptureSession()
+    session.startFixture(handlers: CaptureHandlers(deliver: { recorder.append($0) }))
+    defer { session.stop() }
+    let buffer = try fixtureBuffer()
+    CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, .shouldPropagate)
+    session.deliverFixtureFrame(buffer, at: .zero)
+    let format = try XCTUnwrap(recorder.values.compactMap { delivery -> SourceFormat? in
+      if case .event(.formatChanged(let format)) = delivery.payload { return format }
+      return nil
+    }.first)
+    XCTAssertEqual(format.colour.matrix, .rec601)
+  }
   func testUnchangedFramesReuseDeclarationAndStillReadChangedPhysicalMetadata() throws {
     let recorder = AdapterDeliveryRecorder(), session = DeckLinkCaptureSession()
     session.startFixture(handlers: CaptureHandlers(deliver: { recorder.append($0) }))
@@ -404,11 +417,18 @@ import CoreVideo
     let session = DeckLinkCaptureSession()
     session.startFixture(handlers: CaptureHandlers(deliver: { recorder.append($0) }))
     defer { session.stop() }
-    session.deliverFixtureFrame(try fixtureBuffer(), at: .zero, timecode: "01:02:03;04")
+    let buffer = try fixtureBuffer()
+    session.deliverFixtureMediaWithoutAudio(buffer, at: .zero, timecode: "01:02:03;04")
+    session.deliverFixtureMediaWithoutAudio(buffer, at: VideoContract.slowDuration)
     let frames = recorder.values.compactMap { value -> CaptureFrameInfo? in
       if case .frame(_, let info) = value.payload { return info }; return nil
     }
-    XCTAssertEqual(frames.first?.timecode, try Timecode(hours: 1, minutes: 2, seconds: 3, frames: 4, dropFrame: true))
+    let media = recorder.values.compactMap { value -> CaptureMediaInfo? in
+      if case .media(let info) = value.payload { return info }; return nil
+    }
+    let expected = try Timecode(hours: 1, minutes: 2, seconds: 3, frames: 4, dropFrame: true)
+    XCTAssertEqual(frames.map(\.timecode), [expected, nil])
+    XCTAssertEqual(media.map(\.timecode), [expected, nil])
   }
   private func fixtureBuffer() throws -> CVPixelBuffer {
     var value: CVPixelBuffer?

@@ -1,4 +1,5 @@
 #if ULTRACAM_TEST_SUPPORT
+import AppKit
 import CoreMedia
 import Foundation
 import Observation
@@ -15,7 +16,8 @@ import XCTest
   private var publisher: DemandRegistryPublisher!
   private var defaults: UserDefaults!
 
-  private func prepare(cameras: Int = 2) throws {
+  private func prepare(cameras: Int = 2, recordingDriver: RecordingSessionDriver? = nil,
+                       authorization: TestCaptureAuthorization? = nil) throws {
     let devices = (1...cameras).map { "fake:\($0)" }
     let fixture = try AppHardwareSyntheticFixture(deviceIDs: devices)
     self.fixture = fixture
@@ -30,11 +32,22 @@ import XCTest
       queryProperties: { $0([]) }))
     self.defaults = defaults
     publisher = DemandRegistryPublisher()
+    var hardware = fixture.hardware
+    if let authorization {
+      let listedDevices = hardware.devices
+      hardware.devices = {
+        authorization.refreshCount += 1
+        return authorization.status == .authorized ? try listedDevices() : []
+      }
+      hardware.observeDevices = { _ in nil }
+      hardware.captureAuthorization = { _, _ in authorization.status }
+      hardware.authorizeCapture = { _, deviceID in try await authorization.request(deviceID: deviceID) }
+    }
     model = AppModel(settingsStore: AppSettingsStore(defaults: defaults),
       registryStore: VirtualCameraRegistryStore(defaults: defaults),
       registryPublisher: publisher,
       recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer,
-      hardware: fixture.hardware)
+      recordingDriver: recordingDriver, hardware: hardware)
     model.refresh()
     while model.feedDescriptors.count < cameras { _ = model.addFeed() }
     ids = model.feedDescriptors.map(\.id)
@@ -89,6 +102,189 @@ import XCTest
     model.startCamera(ids[0])
     XCTAssertTrue(model.isCameraRunning(ids[0]))
     XCTAssertFalse(model.isCameraRunning(ids[1]), "Start All covers that habit")
+  }
+
+  func testColdManualStartOpensHiddenInputOnceAfterGrant() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    XCTAssertTrue(model.devices.isEmpty)
+    XCTAssertTrue(model.canRequestCaptureStart(id))
+    model.startCamera(id)
+    model.startCamera(id)
+    spin("Authorization was requested") { authorization.requests.count == 1 }
+    XCTAssertEqual(authorization.requests, ["fake:1"])
+    XCTAssertFalse(model.isCameraRunning(id))
+    authorization.grant()
+    spin("Capture opens after grant") { model.isCameraRunning(id) }
+    XCTAssertFalse(model.isCaptureAuthorizationPending(id))
+    XCTAssertFalse(model.isCameraRunning(ids[1]))
+  }
+
+  func testStopAllDiscardsPendingManualCapture() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    model.startCamera(ids[0])
+    spin("Authorization was requested") { authorization.requests.count == 1 }
+    model.stopAllCameras()
+    let refresh = authorization.refreshCount
+    authorization.grant()
+    spin("Grant refreshed inventory") { authorization.refreshCount > refresh }
+    XCTAssertFalse(model.isCameraRunning(ids[0]))
+  }
+
+  func testAnOldPermissionCompletionCannotConsumeANewerStart() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    model.startCamera(id)
+    spin("First authorization was requested") { authorization.requests.count == 1 }
+    model.stopCamera(id)
+    model.startCamera(id)
+    spin("Second authorization was requested") { authorization.requests.count == 2 }
+    let refresh = authorization.refreshCount
+    authorization.grant()
+    spin("Old grant refreshed inventory") { authorization.refreshCount > refresh }
+    XCTAssertTrue(model.isCaptureAuthorizationPending(id))
+    XCTAssertFalse(model.isCameraRunning(id))
+    authorization.grant()
+    spin("Only the current request opens capture") { model.isCameraRunning(id) }
+  }
+
+  func testReassigningPendingCaptureDiscardsTheGrant() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    model.startCamera(id)
+    spin("Authorization was requested") { authorization.requests.count == 1 }
+    model.updateCamera(id, shareProcessing: false) { $0.selectedDevice = "" }
+    let refresh = authorization.refreshCount
+    authorization.grant()
+    spin("Grant refreshed inventory") { authorization.refreshCount > refresh }
+    XCTAssertEqual(model.descriptor(for: id)?.selectedDevice, "")
+    XCTAssertFalse(model.isCameraRunning(id))
+  }
+
+  func testReassigningAutomaticCaptureStartsOnlyTheNewInputUnderHeldDemand() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    model.updateCamera(id, shareProcessing: false) { $0.automaticFeed = true }
+    model.setCameraDemandForTesting(id, requested: true)
+    spin("The first input requested authorization") { authorization.requests.count == 1 }
+    model.assignExclusiveInput("fake:2", to: id)
+    spin("The reassigned input requested authorization") { authorization.requests.count == 2 }
+    XCTAssertEqual(authorization.requests, ["fake:1", "fake:2"])
+    let refresh = authorization.refreshCount
+    authorization.grant()
+    spin("The old request refreshed inventory") { authorization.refreshCount > refresh }
+    XCTAssertTrue(model.isCaptureAuthorizationPending(id))
+    XCTAssertFalse(model.isCameraRunning(id))
+    XCTAssertTrue(fixture.plugin.sessions.isEmpty)
+    authorization.grant()
+    spin("Capture opened only the reassigned input") { fixture.plugin.sessions.first?.deviceID == "fake:2" }
+    XCTAssertEqual(fixture.plugin.sessions.map(\.deviceID), ["fake:2"])
+    XCTAssertFalse(model.isCaptureAuthorizationPending(id))
+  }
+
+  func testAutomaticPendingCaptureEndsAsSoonAsClientLeaves() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    model.updateCamera(id, shareProcessing: false) { $0.automaticFeed = true }
+    model.setCameraDemandForTesting(id, requested: true)
+    spin("Authorization was requested") { authorization.requests.count == 1 }
+    model.setCameraDemandForTesting(id, requested: false)
+    XCTAssertFalse(model.isCaptureAuthorizationPending(id))
+    let refresh = authorization.refreshCount
+    authorization.grant()
+    spin("Grant refreshed inventory") { authorization.refreshCount > refresh }
+    XCTAssertFalse(model.isCameraRunning(id))
+  }
+
+  func testColdAutomaticCaptureStartsOnGrantAndReleasesAfterTheClientLeaves() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    model.updateCamera(id, shareProcessing: false) { $0.automaticFeed = true }
+    model.setCameraDemandForTesting(id, requested: true)
+    spin("Authorization was requested") { authorization.requests.count == 1 }
+    authorization.grant()
+    spin("Current automatic demand started capture") { model.isCameraRunning(id) }
+    model.setCameraDemandForTesting(id, requested: false)
+    XCTAssertTrue(model.isCameraRunning(id))
+    model.liveWatchTick(now: ProcessInfo.processInfo.systemUptime + LiveWatchLimits.clientRelease + 1)
+    XCTAssertFalse(model.isCameraRunning(id))
+  }
+
+  func testAutomaticPermissionDenialStaysLatchedThroughStatusRefresh() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    model.updateCamera(id, shareProcessing: false) { $0.automaticFeed = true }
+    model.setCameraDemandForTesting(id, requested: true)
+    spin("Authorization was requested") { authorization.requests.count == 1 }
+    authorization.deny()
+    spin("Denied authorization was consumed") { !model.isCaptureAuthorizationPending(id) }
+    XCTAssertEqual(model.automaticStatus(id), "Allow Camera in Privacy & Security.")
+    authorization.status = .authorized
+    NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+    spin("Activation refreshed previously hidden inventory") { !model.devices.isEmpty }
+    XCTAssertFalse(model.isCameraRunning(id))
+    model.retryAutomaticFeed(feedID: id)
+    XCTAssertTrue(model.isCameraRunning(id))
+  }
+
+  func testExistingPermissionDenialDoesNotConsumeTheFirstAutomaticAttempt() throws {
+    let authorization = TestCaptureAuthorization()
+    authorization.status = .unavailable(.unavailable("Allow Camera in Privacy & Security."))
+    try prepare(authorization: authorization)
+    defer { finish() }
+    let id = ids[0]
+    model.updateCamera(id, shareProcessing: false) { $0.automaticFeed = true }
+    model.setCameraDemandForTesting(id, requested: true)
+    XCTAssertEqual(model.automaticStatus(id), "Allow Camera in Privacy & Security.")
+    XCTAssertFalse(model.isCaptureAuthorizationPending(id))
+    authorization.status = .authorized
+    NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+    spin("Activation started capture under current demand") { model.isCameraRunning(id) }
+    XCTAssertTrue(authorization.requests.isEmpty)
+  }
+
+  func testHardwareCanUnlockDiscoveryBeforeAnyFeedStarts() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    XCTAssertTrue(model.devices.isEmpty)
+    XCTAssertEqual(model.captureAuthorizationStatus(pluginID: "fake"), .requestable)
+    model.requestCaptureAccess(pluginID: "fake")
+    model.requestCaptureAccess(pluginID: "fake")
+    spin("Hardware requested capture access") { authorization.requests.count == 1 }
+    XCTAssertNil(authorization.requests.first ?? nil)
+    authorization.grant()
+    spin("Grant refreshed previously hidden inventory") { !model.devices.isEmpty }
+    XCTAssertFalse(model.isRequestingCaptureAccess(pluginID: "fake"))
+    XCTAssertFalse(ids.contains(where: model.isCameraRunning))
+  }
+
+  func testHardwarePermissionDenialStaysInDriverStatus() throws {
+    let authorization = TestCaptureAuthorization()
+    try prepare(authorization: authorization)
+    defer { finish() }
+    model.requestCaptureAccess(pluginID: "fake")
+    spin("Hardware requested capture access") { authorization.requests.count == 1 }
+    authorization.deny()
+    spin("Hardware refreshed permission status") { !model.isRequestingCaptureAccess(pluginID: "fake") }
+    XCTAssertEqual(model.captureAuthorizationStatus(pluginID: "fake"), authorization.status)
+    XCTAssertFalse(model.appProblems.contains { $0.id == "capture-authorization.fake" })
   }
 
   func testAProgramClientStartsAutomaticCamerasAndTheHoldReleasesThem() throws {
@@ -378,6 +574,21 @@ import XCTest
     model.naturalTalkingHeadEnabled = on
   }
 
+  func testRunningDirectorKeepsSurvivingCameraWhenAnchorStops() throws {
+    try prepare()
+    defer { finish() }
+    natural(true)
+    model.startAllCameras()
+    model.setProgramDemandForTesting(requested: true)
+    XCTAssertTrue(model.directorRunningForTesting)
+    XCTAssertEqual(model.directorClockFeedIDForTesting, ids[0])
+    model.stopCamera(ids[0])
+    XCTAssertTrue(model.directorRunningForTesting)
+    XCTAssertEqual(model.directorClockFeedIDForTesting, ids[1])
+    model.stopCamera(ids[1])
+    XCTAssertFalse(model.directorRunningForTesting)
+  }
+
   /// R7: strategy, two running, and something for its cuts to reach.
   func testDirectorRunsForAPictureOrATakeNotForNobody() throws {
     try prepare()
@@ -431,6 +642,293 @@ import XCTest
     XCTAssertNotNil(model.programIssue, "A camera that stopped under its cut still says so")
   }
 
+  private func prepareRecordingFolder() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+    model.recordingModel.outputFolder = folder
+  }
+
+  func testBackupDemandSurvivesLateDiscoveryAndInspectorSelection() throws {
+    let driver = DemandRecordingDriver()
+    try prepare(recordingDriver: driver)
+    defer { finish() }
+    try prepareRecordingFolder()
+    let first = ids[0], second = ids[1]
+    model.updateCamera(second) { $0.selectedDevice = "" }
+    fixture.disconnect()
+    spin("The assigned input disconnected") { model.devices.isEmpty }
+    for camera in ids {
+      model.updateCamera(camera) { $0.recordWithCameraApps = true }
+      model.setCameraDemandForTesting(camera, requested: true, apps: ["us.zoom.xos"])
+      XCTAssertFalse(model.isCameraRunning(camera))
+    }
+    fixture.connect()
+    spin("The returning input starts its camera") { model.isCameraRunning(first) }
+    XCTAssertFalse(model.isCameraRunning(second))
+    model.updateCamera(second) { $0.selectedDevice = "fake:2" }
+    XCTAssertTrue(model.isCameraRunning(second))
+    for camera in ids {
+      var update = CaptureUpdate(message: "")
+      update.signal = .live
+      model.deliverCaptureUpdateForTesting(camera, update)
+    }
+    model.liveWatchTick(now: ProcessInfo.processInfo.systemUptime + CameraAppRecordingDemand.startDelay + 1)
+    XCTAssertEqual(Set(driver.started), Set(ids))
+    XCTAssertTrue(model.recordingModel.feeds.allSatisfy { $0.status == .recording && $0.triggerAppID == "us.zoom.xos" })
+    for camera in ids { model.recordingModel.stop(feedID: camera) }
+  }
+
+  func testAutoDuringManualTakeStartsAndReleasesOtherCamera() throws {
+    try prepare(recordingDriver: DemandRecordingDriver())
+    defer { finish() }
+    try prepareRecordingFolder()
+    let first = ids[0], second = ids[1]
+    model.updateCamera(second) { $0.previewEnabled = false; $0.automaticFeed = true }
+    model.startCamera(first)
+    model.recordingModel.record(feedID: first)
+    XCTAssertEqual(model.recordingModel.feeds.first { $0.id == first }?.status, .recording)
+    var switcher = model.switcherSettings
+    switcher.strategy = .fixedInterval
+    XCTAssertFalse(model.isCameraRunning(second))
+    switcher.automatic = true
+    model.updateSwitcher(switcher)
+    XCTAssertTrue(model.isCameraRunning(second))
+    switcher.automatic = false
+    model.updateSwitcher(switcher)
+    XCTAssertFalse(model.isCameraRunning(second))
+    XCTAssertTrue(model.isCameraRunning(first))
+    model.recordingModel.stop(feedID: first)
+  }
+
+  func testExplicitEmphasisReservesFirstLiveCamera() throws {
+    try prepare()
+    defer { finish() }
+    model.naturalEmphasisFeedID = ids[0]
+    model.naturalAnchorFeedID = ids[0]
+    XCTAssertNil(model.naturalAnchorFeedID)
+    natural(true)
+    model.startAllCameras()
+    model.setProgramDemandForTesting(requested: true)
+    XCTAssertTrue(model.directorRunningForTesting)
+    XCTAssertEqual(model.directorClockFeedIDForTesting, ids[1])
+  }
+
+  func testInputChangeAndMonitorResetClearBothSourceDeclarations() throws {
+    try prepare()
+    defer { finish() }
+    let id = ids[0], peer = ids[1]
+    let target = MonitorTargetID(id.rawValue)
+    let store = AppSettingsStore(defaults: defaults)
+    model.setSyncCameras(true, sourceID: id)
+    model.updateCamera(peer, shareProcessing: false) { $0.setSourceProfile("rec709-video") }
+    for profile in ["sony-slog3-sgamut3cine", "rec2020-hlg-video"] {
+      for reset in [false, true] {
+        model.updateCamera(id, shareProcessing: false) { $0.setSourceProfile(profile) }
+        XCTAssertEqual(store.loadSnapshot().feeds.first { $0.id == id }?.sourceProfileID, profile)
+        if reset { model.monitorCoordinator.resetSettings(for: target) }
+        else { model.updateCamera(id) { $0.selectedDevice = $0.selectedDevice == "fake:1" ? "fake:2" : "fake:1" } }
+        for item in [model.descriptor(for: id), store.loadSnapshot().feeds.first { $0.id == id }] {
+          let descriptor = try XCTUnwrap(item)
+          XCTAssertEqual(descriptor.sourceProfileID, "unspecified")
+          XCTAssertNil(descriptor.monitor.signal.logProfileID)
+          XCTAssertNil(descriptor.monitor.signal.sourceProfileID)
+          XCTAssertEqual(descriptor.monitor, model.monitorCoordinator.preferences(for: target))
+        }
+        XCTAssertEqual(model.descriptor(for: peer)?.sourceProfileID, "rec709-video")
+      }
+    }
+  }
+
+  func testConfirmedSyncUsesTheCameraThatOpenedThePrompt() throws {
+    try prepare()
+    defer { finish() }
+    let source = ids[0], peer = ids[1]
+    model.updateCamera(source, shareProcessing: false) { $0.previewEnabled = false }
+    model.updateCamera(peer, shareProcessing: false) { $0.previewEnabled = true }
+    let bridge = UISessionBridge(model: model, interface: UIInterfaceState(defaults: defaults))
+    XCTAssertTrue(model.selectFeed(source))
+    let action = UIAction.setSyncCameras(true, sourceID: source.rawValue)
+    XCTAssertTrue(model.selectFeed(peer))
+    bridge.send(action, confirmed: true)
+    XCTAssertTrue(model.syncCameras)
+    XCTAssertEqual(model.selectedFeedID, peer)
+    XCTAssertEqual(model.descriptor(for: peer)?.previewEnabled, false)
+  }
+
+  func testRecordingBindingObservesRepeatedTriggerEdits() throws {
+    try prepare(cameras: 1)
+    defer { finish() }
+    let pane = UISettingsRecordingPane(model: model, interface: UIInterfaceState(defaults: defaults))
+    let binding = pane.recordWithCameraApps(for: ids[0])
+    for enabled in [true, false] {
+      let fired = Mutex(false)
+      withObservationTracking { _ = binding.wrappedValue } onChange: { fired.withLock { $0 = true } }
+      binding.wrappedValue = enabled
+      XCTAssertTrue(fired.withLock { $0 })
+      XCTAssertEqual(binding.wrappedValue, enabled)
+    }
+  }
+
+  func testSharedHardwareMenuChangesOnlyChosenCamera() throws {
+    try prepare(cameras: 3)
+    defer { finish() }
+    let pane = UISettingsHardwarePane(model: model, interface: UIInterfaceState(defaults: defaults))
+    let device = "fake:1"
+    XCTAssertTrue(model.inputShareable(device))
+    let bindings = ids.map { pane.membership(of: $0, in: device) }
+    bindings[1].wrappedValue = true
+    bindings[2].wrappedValue = true
+    XCTAssertEqual(bindings.map(\.wrappedValue), [true, true, true])
+    bindings[1].wrappedValue = false
+    XCTAssertEqual(bindings.map(\.wrappedValue), [true, false, true])
+    model.updateCamera(ids[1]) { $0.selectedDevice = "fake:2" }
+    bindings[1].wrappedValue = false
+    XCTAssertEqual(model.descriptor(for: ids[1])?.selectedDevice, "fake:2")
+  }
+
+  func testExclusiveHardwareTransferChecksDestinationBeforeReleasingOwner() throws {
+    try prepare()
+    defer { finish() }
+    let source = ids[0], destination = ids[1]
+    let device = "fake:offline"
+    model.updateCamera(source) { $0.selectedDevice = device }
+    model.startCamera(destination)
+    XCTAssertFalse(model.canChangeCameraInput(destination))
+    model.assignExclusiveInput(device, to: destination)
+    XCTAssertEqual(model.descriptor(for: source)?.selectedDevice, device)
+    XCTAssertEqual(model.descriptor(for: destination)?.selectedDevice, "fake:2")
+
+    model.stopCamera(destination)
+    spin("Capture no longer owns the input") { model.canChangeCameraInput(destination) }
+    model.assignExclusiveInput(device, to: destination)
+    XCTAssertEqual(model.descriptor(for: source)?.selectedDevice, "")
+    XCTAssertEqual(model.descriptor(for: destination)?.selectedDevice, device)
+    let saved = AppSettingsStore(defaults: defaults).loadSnapshot().feeds
+    XCTAssertEqual(saved.first { $0.id == source }?.selectedDevice, "")
+    XCTAssertEqual(saved.first { $0.id == destination }?.selectedDevice, device)
+  }
+
+  func testSelectedAppRecordsCameraAndProgramWithoutOwningManualTakes() throws {
+    try prepare()
+    defer { finish() }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+    let recording = model.recordingModel
+    recording.outputFolder = folder
+    let first = ids[0], second = ids[1]
+    func state(_ id: FeedID) -> RecordingFeedState { recording.feeds.first { $0.id == id }! }
+    for id in ids { model.updateCamera(id) { $0.recordWithCameraApps = true } }
+    let store = AppSettingsStore(defaults: defaults)
+    XCTAssertTrue(store.loadSnapshot().feeds.allSatisfy(\.recordWithCameraApps))
+    XCTAssertEqual(model.recordingApps, ["us.zoom.xos": "Zoom"])
+    model.setCameraDemandForTesting(first, requested: true, apps: ["com.example.viewer"])
+    XCTAssertFalse(model.isCameraRunning(first))
+    model.setCameraDemandForTesting(first, requested: true, apps: ["us.zoom.ZoomMeeting"])
+    XCTAssertTrue(model.isCameraRunning(first))
+    XCTAssertFalse(model.isCameraRunning(second))
+    try emitUntil("Camera has a source") { model.cameraUpdate(first)?.signal == .live }
+    func tick(_ offset: TimeInterval) {
+      model.liveWatchTick(now: ProcessInfo.processInfo.systemUptime + offset)
+    }
+    tick(CameraAppRecordingDemand.startDelay + 0.1)
+    try emitUntil("Zoom's helper starts an automatic take") { state(first).status == .recording && !state(first).isStarting }
+    XCTAssertTrue(state(first).startedByCameraApp)
+    XCTAssertEqual(state(first).takeVideoMbps, 10)
+    XCTAssertTrue([RecordingCodec.hevcMain, .hevcMain10].contains(state(first).takeCodec ?? .hevcMain10_422))
+    model.setCameraDemandForTesting(first, requested: true, apps: ["com.example.viewer"])
+    tick(1)
+    XCTAssertEqual(state(first).status, .recording)
+    tick(LiveWatchLimits.clientRelease + 1)
+    try emitUntil("The unselected viewer cannot keep the take alive") { state(first).status == .idle }
+    let zoomMovie = try XCTUnwrap(state(first).savedURL)
+    XCTAssertEqual(zoomMovie.pathExtension, "mp4")
+    XCTAssertEqual(zoomMovie.deletingLastPathComponent().lastPathComponent, "Zoom")
+    XCTAssertTrue(zoomMovie.lastPathComponent.contains("Ultracam ("))
+    model.recordingApps = ["com.example.viewer": "Viewer"]
+    XCTAssertEqual(store.recordingApps, model.recordingApps)
+    model.setProgramDemandForTesting(requested: true, apps: ["com.example.viewer"])
+    try emitUntil("Both camera inputs are live for Program") { ids.allSatisfy { model.cameraUpdate($0)?.signal == .live } }
+    recording.record(feedID: second)
+    tick(CameraAppRecordingDemand.startDelay + 0.1)
+    try emitUntil("Program rolls the armed sources") {
+      ids.allSatisfy { state($0).status == .recording && !state($0).isStarting }
+    }
+    XCTAssertFalse(state(second).startedByCameraApp)
+    model.recordingApps["com.example.other"] = "Other"
+    model.setCameraDemandForTesting(first, requested: true, apps: ["com.example.other"])
+    tick(CameraAppRecordingDemand.startDelay + 0.1)
+    XCTAssertEqual(state(first).triggerAppID, "com.example.viewer")
+    recording.stop(feedID: first)
+    try emitUntil("Manual Stop closes the automatic take") { state(first).status == .idle }
+    tick(10)
+    XCTAssertEqual(state(first).status, .idle, "A manual stop lasts through the session")
+    model.setProgramDemandForTesting(requested: false, apps: [])
+    model.setCameraDemandForTesting(first, requested: false, apps: [])
+    tick(LiveWatchLimits.clientRelease + 1)
+    XCTAssertEqual(state(second).status, .recording)
+    recording.stop(feedID: second)
+    try emitUntil("Manual take closes") { state(second).status == .idle }
+  }
+
+  func testPerAppFolderWithoutManualFolderAndEmailFreeNaming() throws {
+    try prepare(cameras: 1)
+    defer { finish() }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    var profile = AppRecordingProfile()
+    try profile.chooseFolder(folder)
+    let time = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-11-06T15:05:24Z"))
+    let take = AppRecordingTake(appID: "us.zoom.xos", appName: "Zoom", profile: profile, started: time)
+    let title = ZoomSessionTitle.topic(in: [("Zoom Meeting – Dharun Mohan (dharun@example.test)", true)])
+    XCTAssertEqual(take.filename(camera: "Camera A", session: title, timeZone: TimeZone(secondsFromGMT: 0)!),
+      "2026-11-06 15.05.24 Dharun Mohan - Ultracam (Camera A)")
+    XCTAssertNil(ZoomSessionTitle.topic(in: [("Zoom Workplace", false), ("Zoom Meeting", true)]))
+    XCTAssertEqual(take.filename(camera: "Camera A", session: "<dharun@example.test>", timeZone: TimeZone(secondsFromGMT: 0)!),
+      "2026-11-06 15.05.24 Zoom Meeting - Ultracam (Camera A)")
+    profile.videoMbps = 4
+    profile.pattern = "{app} {camera} - synced"
+    model.recordingProfiles["us.zoom.xos"] = profile
+    let id = ids[0]
+    let recording = model.recordingModel
+    XCTAssertNil(recording.outputFolder(for: id))
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).recordingProfiles["us.zoom.xos"]?.videoMbps, 4)
+    model.updateCamera(id) { $0.recordWithCameraApps = true }
+    model.setCameraDemandForTesting(id, requested: true, apps: ["us.zoom.xos"])
+    XCTAssertTrue(model.isCameraRunning(id))
+    try emitUntil("Camera ready") { model.cameraUpdate(id)?.signal == .live }
+    model.liveWatchTick(now: ProcessInfo.processInfo.systemUptime + 3)
+    try emitUntil("Automatic take gets frames") { recording.feeds[0].isActive && !recording.feeds[0].isStarting }
+    let pattern = try fixture.makePattern()
+    for _ in 0..<8 {
+      try fixture.emit(pattern, index: index)
+      index += 1
+      settle()
+    }
+    recording.stop(feedID: id)
+    try emitUntil("Movie closed") { recording.feeds[0].status == .idle }
+    let movie = try XCTUnwrap(recording.feeds[0].savedURL)
+    XCTAssertEqual(movie.deletingLastPathComponent().resolvingSymlinksInPath().path, folder.resolvingSymlinksInPath().path)
+    XCTAssertEqual(movie.lastPathComponent, "Zoom Camera 1 - synced.mp4")
+  }
+
+  func testCameraRecordingDemandRequiresContinuousIdentifiedUse() {
+    var demand = CameraAppRecordingDemand()
+    demand.update(true, now: 1)
+    demand.update(false, now: 1.5)
+    XCTAssertFalse(demand.shouldStart(at: 4))
+    demand.update(true, now: 4)
+    XCTAssertFalse(demand.shouldStart(at: 5))
+    XCTAssertTrue(demand.shouldStart(at: 6))
+    demand.update(nil, now: 7)
+    XCTAssertFalse(demand.shouldStart(at: 20))
+    XCTAssertTrue(demand.keepsSession(at: 20))
+    demand.update(false, now: 21)
+    XCTAssertFalse(demand.keepsSession(at: 26))
+  }
+
   func testATakeStartsTheDirectorAndBindsToItsTimeline() throws {
     try prepare()
     defer { finish() }
@@ -448,6 +946,40 @@ import XCTest
     try emitUntil("The take closes") { model.recordingModel.feeds.first { $0.id == ids[0] }?.status == .idle }
     XCTAssertFalse(model.directorRunningForTesting)
   }
+}
+
+/// Records trigger requests without opening a writer.
+@MainActor private final class TestCaptureAuthorization {
+  var status = CaptureAuthorizationStatus.requestable
+  var refreshCount = 0
+  private(set) var requests: [String?] = []
+  private var continuations: [CheckedContinuation<Void, Error>] = []
+
+  func request(deviceID: String?) async throws {
+    requests.append(deviceID)
+    try await withCheckedThrowingContinuation { continuations.append($0) }
+  }
+
+  func grant() {
+    guard !continuations.isEmpty else { XCTFail("No pending authorization request"); return }
+    status = .authorized
+    continuations.removeFirst().resume()
+  }
+
+  func deny() {
+    guard !continuations.isEmpty else { XCTFail("No pending authorization request"); return }
+    let error = PluginError.unavailable("Allow Camera in Privacy & Security.")
+    status = .unavailable(error)
+    continuations.removeFirst().resume(throwing: error)
+  }
+}
+
+private final class DemandRecordingDriver: RecordingSessionDriver {
+  var started: [FeedID] = []
+  func startRecording(feedID: FeedID, configuration: RecordingConfiguration) throws { started.append(feedID) }
+  func pauseRecording(feedID: FeedID) throws {}
+  func resumeRecording(feedID: FeedID) throws {}
+  func stopRecording(feedID: FeedID) throws {}
 }
 
 @MainActor private final class DemandRegistryPublisher: AppVirtualCameraRegistryPublishing {

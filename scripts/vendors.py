@@ -222,8 +222,9 @@ def resolve_sdk_inventory(manifests, requested, checkout_root):
             for path, expected in sdk['fileSHA256'].items():
                 actual = hashlib.sha256((root / path).read_bytes()).hexdigest()
                 _check(actual == expected, f'{identity} SDK checksum mismatch: {path}; verify/install declared SDK {sdk["version"]}')
+        reason = 'uses system frameworks' if sdk is None else 'disabled by explicit SDK inventory'
         result[identity] = dict(available=enabled, version=sdk['version'] if enabled else None,
-                                reason=None if enabled else 'disabled by explicit SDK inventory')
+                                reason=None if enabled else reason)
     return result
 
 def input_digest(manifests, sdk_inventory):
@@ -291,7 +292,7 @@ def render_bridge(manifests):
         for path in manifest['publicHeaders']:
             relative = os.path.relpath(path, str(BRIDGE.parent))
             lines.append(f'#import "{relative}"')
-    lines += ['#include "../../Tools/auto-switcher/include/auto_switcher.h"', '#endif', '']
+    lines += ['#include "../../Apps/AutoSwitcher/include/auto_switcher.h"', '#endif', '']
     return '\n'.join(lines)
 
 def generate_bridge(root=ROOT, manifests=None, destination=None):
@@ -303,6 +304,12 @@ def generate_bridge(root=ROOT, manifests=None, destination=None):
     if not destination.exists() or destination.read_text() != text:
         destination.write_text(text)
 
+def valid_info_capability(info, key):
+    if key == 'NSCameraUseContinuityCameraDeviceType':
+        return info.get(key) is True
+    return bool(info.get(key))
+
+
 def check_capabilities(root, manifests, inventory):
     import plistlib
     root = Path(root)
@@ -311,11 +318,12 @@ def check_capabilities(root, manifests, inventory):
     with (root / 'Config/App-Info.plist').open('rb') as stream:
         info = plistlib.load(stream)
     for manifest in manifests:
-        if not inventory[manifest['id']]['available']:
+        if manifest.get('sdk') and not inventory[manifest['id']]['available']:
             continue
-        for field, actual in (('entitlements', entitlements), ('infoPlist', info)):
-            for key in manifest['capabilities'][field]:
-                _check(key in actual, f'{manifest["id"]} requires {field} key {key}')
+        for key in manifest['capabilities']['entitlements']:
+            _check(bool(entitlements.get(key)), f'{manifest["id"]} requires entitlements key {key}')
+        for key in manifest['capabilities']['infoPlist']:
+            _check(valid_info_capability(info, key), f'{manifest["id"]} requires infoPlist key {key}')
 
 def query_values(args, manifests, inventory):
     selected = [m for m in manifests if not args.vendor or m['id'] == args.vendor]
@@ -350,8 +358,9 @@ def query_values(args, manifests, inventory):
         _check(len(selected) == 1, 'bridge-header requires one vendor')
         return [absolute(root, path) for path in selected[0]['publicHeaders']]
     if kind == 'sdk-root':
-        _check(len(selected) == 1 and 'sdk' in selected[0], 'SDK root requires one SDK vendor')
-        return [absolute(root, selected[0]['sdk']['root'])]
+        _check(len(selected) == 1, 'SDK root requires one vendor')
+        sdk = selected[0].get('sdk')
+        return [absolute(root, sdk['root'])] if sdk else []
     if kind == 'python-test':
         _check(group is not None and 'python' in group, 'group is not a Python test')
         return [absolute(root, group['python'])]
@@ -371,6 +380,7 @@ def main():
     parser.add_argument('--kind')
     parser.add_argument('--null', action='store_true')
     parser.add_argument('--expected-digest')
+    parser.add_argument('--bridge', type=Path, help='Check a private generated bridging header')
     args = parser.parse_args()
     try:
         forced_sdk, disabled_sdk = args.sdk_present, None
@@ -397,7 +407,8 @@ def main():
             print(digest)
         elif args.command == 'check-generated':
             _check(args.expected_digest == digest, 'generated Xcode inputs are stale; run python3 scripts/generate_project.py with your explicit SDK inventory')
-            _check((args.root / BRIDGE).is_file() and (args.root / BRIDGE).read_text() == render_bridge(manifests), 'generated bridge is stale; run python3 scripts/generate_project.py')
+            bridge = args.bridge or args.root / BRIDGE
+            _check(bridge.is_file() and bridge.read_text() == render_bridge(manifests), 'generated bridge is stale; run python3 scripts/generate_project.py')
             check_capabilities(args.root, manifests, inventory)
         elif args.command == 'run-tests':
             import subprocess, sys

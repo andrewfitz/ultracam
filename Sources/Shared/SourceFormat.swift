@@ -99,6 +99,15 @@ struct Colorimetry: Hashable, Codable, Sendable {
   let range: Range
   let horizontalChromaSiting: ChromaSiting
   let verticalChromaSiting: ChromaSiting
+  var supportsLUTVideoOutput: Bool {
+    range == .video && [.rec709, .rec2020, .rec601].contains(matrix) &&
+      primaries != .unspecified && transfer != .unspecified
+  }
+  /// Colour written by the GPU when it averages chroma into video-range YCbCr.
+  var centeredVideoOutput: Self {
+    Self(primaries: primaries, transfer: transfer, matrix: matrix == .identity ? .rec709 : matrix,
+      range: .video, horizontalChromaSiting: .center, verticalChromaSiting: .center)
+  }
   static let rec709Video = Self(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
 }
 struct PixelFormatID: RawRepresentable, Hashable, Codable, Sendable {
@@ -170,7 +179,7 @@ enum PixelFormatTable {
     partial(.bgra8, bits: 8, packed: true, range: .full, kernel: "decodeRGB", routes: ["input", "lut", "program", "recording", "monitor", "extension"], captureQualified: true, planes: rgb32),
     partial(.rgba8, bits: 8, packed: true, range: .full, kernel: "decodeRGB", routes: ["input"], planes: rgb32),
     partial(.r210, bits: 10, packed: true, kernel: "decodeRGB", routes: ["input", "lut", "program", "recording", "monitor", "extension"], captureQualified: true, order: .bigEndian, planes: rgb32),
-    partial(.r12L, bits: 12, packed: true, range: .full, kernel: "decodeRGB", routes: ["input", "lut", "program", "recording", "monitor", "extension"], captureQualified: true, planes: [Plane(metalFormat: "r8Uint", pixelsPerGroup: 2, bytesPerGroup: 9, horizontalSubsampling: 1, verticalSubsampling: 1, packedBitsPerPixel: 36)]),
+    partial(.r12L, bits: 12, packed: true, range: .full, kernel: "decodeRGB", routes: ["input", "lut", "program", "recording", "monitor", "extension"], captureQualified: true, planes: [Plane(metalFormat: "rgba16Uint", pixelsPerGroup: 2, bytesPerGroup: 9, horizontalSubsampling: 1, verticalSubsampling: 1, packedBitsPerPixel: 36)]),
     partial(.uyva, bits: 8, packed: false, kernel: "decodePacked422", routes: ["input", "lut", "program", "recording", "monitor", "extension"], captureQualified: true, planes: [Plane(metalFormat: "rgba8Uint", pixelsPerGroup: 2, bytesPerGroup: 4, horizontalSubsampling: 1, verticalSubsampling: 1), Plane(metalFormat: "r8Unorm", pixelsPerGroup: 1, bytesPerGroup: 1, horizontalSubsampling: 1, verticalSubsampling: 1)]),
     partial(.p216, bits: 16, packed: false, alignment: 2, kernel: "decodePlanar", routes: ["input", "lut", "program", "recording", "monitor", "extension"], captureQualified: true, planes: planar(2, vertical: 1)),
     partial(.i420, bits: 8, packed: false, kernel: "decodeNDIPlanar", routes: ["input", "lut", "program", "recording", "monitor", "extension"], captureQualified: true, planes: [Plane(metalFormat: "r8Unorm", pixelsPerGroup: 1, bytesPerGroup: 1, horizontalSubsampling: 1, verticalSubsampling: 1), Plane(metalFormat: "r8Unorm", pixelsPerGroup: 1, bytesPerGroup: 1, horizontalSubsampling: 2, verticalSubsampling: 2), Plane(metalFormat: "r8Unorm", pixelsPerGroup: 1, bytesPerGroup: 1, horizontalSubsampling: 2, verticalSubsampling: 2)]),
@@ -248,6 +257,9 @@ struct Timecode: Hashable, Codable, Sendable {
   let hours: Int, minutes: Int, seconds: Int, frames: Int
   let dropFrame: Bool
   let fieldMark: Bool?
+  var displayLabel: String {
+    String(format: "%02d:%02d:%02d%@%02d", hours, minutes, seconds, dropFrame ? ";" : ":", frames)
+  }
   func validate(rate: FrameRate) throws {
     try rate.validate()
     let fps = 1 / CMTimeGetSeconds(rate.nominal)

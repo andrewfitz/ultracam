@@ -90,6 +90,46 @@ import XCTest
     XCTAssertFalse(waiting.cameras[0].stopNeedsConfirmation, "Nothing is reaching anyone")
   }
 
+  func testStreamTallyFollowsPublisherAcrossCutAndBlackVideo() {
+    var session = program([camera(1), camera(2)], client: false)
+    session.stream.phase = .streaming
+    session.stream.pictureFresh = true
+    session.stream.pictureFeedID = "camera-1"
+    session.onAirID = "camera-2"
+    let between = UIPresentationBuilder.session(session)
+    XCTAssertEqual(between.programTally, .onAir)
+    XCTAssertEqual(between.cameras[0].tally, .onAir)
+    XCTAssertEqual(between.cameras[1].tally, .program)
+    XCTAssertEqual(between.cutButtons[1].tally, .program)
+    XCTAssertTrue(between.statusSegments.first { $0.kind == .program }?.text.contains("Camera 1 on air") == true)
+
+    session.programInUse = true
+    XCTAssertEqual(tally(session, 0), .onAir)
+    XCTAssertEqual(tally(session, 1), .onAir, "Each output may be delivering a different picture during a cut")
+
+    session.stream.pictureFresh = false
+    session.stream.pictureFeedID = nil
+    XCTAssertEqual(tally(session, 0), .none)
+    XCTAssertEqual(UIPresentationBuilder.programTally(session), .onAir, "Black on the network cannot override live virtual-camera delivery")
+    session.programInUse = false
+    XCTAssertEqual(UIPresentationBuilder.programTally(session), .noPicture)
+  }
+
+  func testStreamStopWarningsCoverPictureAndFixedOffAirAudio() {
+    var session = program([camera(1), camera(2)], client: false)
+    session.stream.phase = .reconnecting
+    session.stream.audioFeedID = "camera-2"
+    let presentation = UIPresentationBuilder.session(session)
+    XCTAssertEqual(UIAction.stopCamera(cameraID: "camera-1").needsConfirmation(in: presentation),
+      "Stopping this camera removes its picture from the Program stream.")
+    XCTAssertEqual(UIAction.stopCamera(cameraID: "camera-2").needsConfirmation(in: presentation),
+      "Stopping this camera silences the stream audio.")
+    XCTAssertEqual(UIAction.stopAllCameras.needsConfirmation(in: presentation),
+      "A connected Program stream continues with black video and silent audio.")
+    XCTAssertEqual(UIAction.endingMessage(in: presentation), "Quitting ends the Program stream.")
+    XCTAssertTrue(UIAction.removeCamera(cameraID: "camera-2").needsConfirmation(in: presentation)?.contains("stream’s audio source") == true)
+  }
+
   func testUnknownClientIsNeitherInUseNorNotInUse() {
     var unknown = camera(1, sink: true)
     unknown.clientUnknown = true
@@ -140,7 +180,7 @@ import XCTest
     XCTAssertEqual(dot(program([camera(1, signal: .noSignal), camera(2)])), .orange, "A meeting waiting on a picture")
     XCTAssertNil(dot(program([camera(1), camera(2)]), 1))
     XCTAssertEqual(dot(program([camera(1), camera(2)], pending: "camera-2"), 1), .green)
-    XCTAssertEqual(UIToolbarCutGroup.programWords(UIPresentationBuilder.session(program([camera(1), camera(2)], client: false))
+    XCTAssertEqual(UIProgramSwitchBar.programWords(UIPresentationBuilder.session(program([camera(1), camera(2)], client: false))
       .cutButtons[0]), "on Program")
   }
 

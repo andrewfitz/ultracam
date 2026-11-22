@@ -4,14 +4,20 @@ import CoreMedia
 /// it never needs invented host anchors. Independent clocks require mappings.
 enum PCMClockTransform {
   case mapped(AudioVideoClockMapping)
+  case host(ClockMapping)
   case paired(audioAnchor: CMTime, videoAnchor: CMTime)
 
   var audioToVideoRate: Double {
-    switch self { case .mapped(let mapping): return mapping.audioToVideoRate; case .paired: return 1 }
+    switch self {
+    case .mapped(let mapping): return mapping.audioToVideoRate
+    case .host(let mapping): return Double(mapping.rate.numerator) / Double(mapping.rate.denominator)
+    case .paired: return 1
+    }
   }
   func videoTime(forAudioTime time: CMTime) throws -> CMTime {
     switch self {
     case .mapped(let mapping): return try mapping.videoTime(forAudioTime: time)
+    case .host(let mapping): return try mapping.hostTime(for: time)
     case .paired(let audio, let video):
       guard time.isNumeric, audio.isNumeric, video.isNumeric, time.epoch == audio.epoch else {
         throw ClockMappedPCMError.invalidPacket

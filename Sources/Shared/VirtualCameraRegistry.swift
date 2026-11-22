@@ -48,12 +48,39 @@ struct VirtualCameraDescriptor: Codable, Equatable, Sendable, Identifiable {
     "org.ultracam.virtual-camera.\(kind.rawValue).\(encodedIdentity(for: kind, feedID: feedID))"
   }
 
+  private static let deviceUIDPrefix = "org.ultracam.camera.device"
+
   static func deviceUID(for kind: VirtualCameraDeviceKind, feedID: String? = nil) -> String {
     // Keep the migrated single-feed route discoverable by legacy CMIO clients.
     if kind == .feed && normalizedFeedID(feedID) == "default" {
-      return "org.ultracam.camera.device"
+      return deviceUIDPrefix
     }
-    return "org.ultracam.camera.device.\(encodedIdentity(for: kind, feedID: feedID))"
+    return "\(deviceUIDPrefix).\(encodedIdentity(for: kind, feedID: feedID))"
+  }
+
+  /// Matches published legacy, Program, and per-feed UIDs independently of the device name.
+  static func isDeviceUID(_ uid: String) -> Bool {
+    if uid == deviceUIDPrefix || uid == deviceUID(for: .program) { return true }
+    // CMIO UIDs encode the UTF-8 bytes of "feed:<id>" as lowercase hex.
+    let feedPrefix = deviceUID(for: .feed, feedID: "")
+    guard uid.hasPrefix(feedPrefix) else { return false }
+    let digits = Array(uid.dropFirst(feedPrefix.count).utf8)
+    guard !digits.isEmpty, digits.count.isMultiple(of: 2) else { return false }
+    var bytes: [UInt8] = []
+    for index in stride(from: 0, to: digits.count, by: 2) {
+      guard let high = hexDigit(digits[index]), let low = hexDigit(digits[index + 1]) else { return false }
+      bytes.append(high * 16 + low)
+    }
+    guard let feedID = String(bytes: bytes, encoding: .utf8) else { return false }
+    return uid == deviceUID(for: .feed, feedID: feedID)
+  }
+
+  private static func hexDigit(_ byte: UInt8) -> UInt8? {
+    switch byte {
+    case 48...57: return byte - 48
+    case 97...102: return byte - 87
+    default: return nil
+    }
   }
 
   static func sourceStreamID(for kind: VirtualCameraDeviceKind, feedID: String? = nil) -> String {
@@ -291,7 +318,7 @@ final class VirtualCameraRegistryStore {
   /// copied to backup before replacement, so a torn write can roll back.
   func save(_ snapshot: VirtualCameraRegistrySnapshot) throws {
     guard let defaults else { throw VirtualCameraRegistryError.unavailableContainer }
-    try snapshot.validate()
+    let encoded = try VirtualCameraRegistryWire.encodedData(snapshot)
     guard snapshot.generation < UInt64.max else {
       throw VirtualCameraRegistryError.invalidGeneration
     }
@@ -327,7 +354,6 @@ final class VirtualCameraRegistryStore {
     } else {
       defaults.removeObject(forKey: Self.backupKey)
     }
-    let encoded = try JSONEncoder().encode(snapshot)
     defaults.set(encoded, forKey: Self.key)
     guard decode(data: defaults.data(forKey: Self.key)) == snapshot else {
       if let previousSnapshot,
@@ -343,11 +369,11 @@ final class VirtualCameraRegistryStore {
   private func decode(data: Data?) -> VirtualCameraRegistrySnapshot? {
     // Persistence is a publication boundary too. A reserved generation must
     // not outrank a valid backup and poison every subsequent save.
-    guard let data,
+    guard let data, data.count <= VirtualCameraRegistryWire.maximumBytes,
       let snapshot = try? JSONDecoder().decode(VirtualCameraRegistrySnapshot.self, from: data),
       snapshot.generation > 0, snapshot.generation < UInt64.max,
       snapshot.appGroupIdentifier == appGroupIdentifier,
-      (try? snapshot.validate()) != nil else { return nil }
+      (try? VirtualCameraRegistryWire.encodedData(snapshot)) != nil else { return nil }
     return snapshot
   }
 }

@@ -19,6 +19,7 @@ struct SourceAdmissionMetadata: Sendable {
   var dataSize: Int
   var presentationTime: CMTime
   var duration: CMTime
+  var presentationStartHostTime: CMTime? = nil
   var epochID: CaptureEpochID
   var formatSignature: String
   var planes: [VideoBufferLayout.Plane] = []

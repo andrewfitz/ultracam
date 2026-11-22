@@ -179,6 +179,9 @@ struct SourceRecordingConfiguration {
   let height: Int
   let videoCodec: CMVideoCodecType
   let videoProfile: SourceRecordingVideoProfile
+  typealias Render420 = @Sendable (CVPixelBuffer, Colorimetry?, CVPixelBuffer) throws -> Double
+  let render420: Render420?
+  let targetVideoBitrate: Int?
   let fileType: AVFileType
   /// Video frames that may wait for the encoder stage. Each one holds a
   /// source capture buffer of about 22 MB at 2160p v210 that the driver
@@ -228,7 +231,23 @@ struct SourceRecordingConfiguration {
   static let sourceProvenanceAttachmentKey = "UltracamRecordingSourceProvenance"
   static let sourceTimecodeAttachmentKey = "UltracamSourceTimecode"
   static let nativeTimecodeAttachmentKey = "UltracamNativeTimecodeMetadata"
+  /// Normalized presentation start on a recorder-owned sample (seconds on the host clock).
+  static let presentationStartHostTimeKey = "UltracamPresentationStartHostTime"
   static let captureHostTimeAttachmentKey = "UltracamCaptureHostTime"
+
+  /// The automatic renderer preserves the source's encoding unless a LUT supplies its own.
+  static func validate420Render(format: SourceFormat, encoderPixel: OSType,
+    render420: Render420?, burnIn: (any RecordingLUTBurnIn)?) throws {
+    guard render420 != nil || burnIn != nil,
+      [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange].contains(encoderPixel),
+      burnIn != nil || format.pixel.rawValue != encoderPixel || format.colour.range == .full else { return }
+    guard format.width.isMultiple(of: 2), format.height.isMultiple(of: 2) else {
+      throw SourceRecordingError.invalidConfiguration("Recording conversion to 4:2:0 requires even source dimensions.")
+    }
+    guard (burnIn?.outputColour ?? format.colour.centeredVideoOutput).supportsLUTVideoOutput else {
+      throw SourceRecordingError.invalidConfiguration("Recording conversion to 4:2:0 requires supported output primaries, transfer function and matrix.")
+    }
+  }
 
   /// Why `burnIn` can't burn this take in on the GPU, or nil. ProRes 4444 takes
   /// RGB the LUT pass doesn't write; raw NDI UYVA reaches the recorder as a GPU
@@ -261,6 +280,7 @@ struct SourceRecordingConfiguration {
   /// The most this take is expected to write per second before it has
   /// measured its own rate (see `SourceRecordingVideoProfile.nominalBytesPerPixel`).
   var nominalBytesPerSecond: Double {
+    if let targetVideoBitrate { return Double(targetVideoBitrate + 128_000) / 8 }
     let duration = sourceFrameRate?.nominal ?? frameRate.frameDuration
     let codec: RecordingSizeEstimator.Codec?
     switch videoProfile {
@@ -288,7 +308,7 @@ struct SourceRecordingConfiguration {
   init(feedID: SourceRecordingFeedID, outputURL: URL, width: Int, height: Int,
     videoCodec: CMVideoCodecType = kCMVideoCodecType_HEVC,
     videoProfile: SourceRecordingVideoProfile? = nil,
-    fileType: AVFileType = .mov, queueCapacity: Int = 12,
+    fileType: AVFileType = .mov, targetVideoBitrate: Int? = nil, render420: Render420? = nil, queueCapacity: Int = 12,
     audioQueueCapacity: Int = SourceRecordingConfiguration.defaultAudioMetadataSlots,
     maximumBufferedWriterBytes: Int = AVAssetSourceRecordingWriter.defaultMaximumBufferedBytes,
     spaceCheckInterval: TimeInterval = 1,
@@ -310,6 +330,13 @@ struct SourceRecordingConfiguration {
     guard !feedID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       throw SourceRecordingError.invalidConfiguration("A feed ID is required.")
     }
+    if let targetVideoBitrate {
+      guard (1_000_000...50_000_000).contains(targetVideoBitrate), videoCodec == kCMVideoCodecType_HEVC else {
+        throw SourceRecordingError.invalidConfiguration("Choose a supported HEVC bitrate between 1 and 50 Mbps.")
+      }
+    }
+    self.targetVideoBitrate = targetVideoBitrate
+    self.render420 = render420
     guard width > 0, height > 0 else {
       throw SourceRecordingError.invalidConfiguration("Video dimensions must be positive.")
     }
@@ -352,7 +379,13 @@ struct SourceRecordingConfiguration {
         (selectedProfile.recordingMatrixProfile != nil || format.pixel.rawValue == selectedProfile.sourcePixelFormat) else {
         throw SourceRecordingError.invalidConfiguration("Recording source declaration differs from configured dimensions or pixel format.")
       }
-      if let matrixProfile = selectedProfile.recordingMatrixProfile {
+      try Self.validate420Render(format: format, encoderPixel: selectedProfile.encoderPixelFormat,
+        render420: render420, burnIn: lutBurnIn)
+      let matrixProfile = selectedProfile.recordingMatrixProfile
+      let renders420 = fileType == .mp4 && (matrixProfile == .hevcMain || matrixProfile == .hevcMain10)
+        && PixelFormatTable.entry(for: format.pixel)?.gpuRoutes.contains("recording") == true
+        && (render420 != nil || lutBurnIn != nil)
+      if let matrixProfile, !renders420 {
         do {
           try RecordingProfileMatrix.validate(matrixProfile, source: format)
         } catch {
@@ -580,6 +613,7 @@ protocol SourceRecordingWriter: AnyObject {
   func appendVideo(_ sample: CMSampleBuffer) throws
   func appendAudio(_ sample: CMSampleBuffer) throws
   func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws
+  func appendResumedSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws
   func appendPairedSourceAudio(_ sample: CMSampleBuffer, videoTime: CMTime) throws
   /// Called on the recorder queue after every sample admitted before a pause
   /// and before any sample admitted after the matching resume.
@@ -593,6 +627,9 @@ extension SourceRecordingWriter {
   func resumeAfterPause() {}
   func bindSourceAdmission(_ snapshot: SourceAdmissionSnapshot) throws {}
   func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws { try appendAudio(sample) }
+  func appendResumedSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws {
+    try appendSourceAudio(sample, mapping: mapping)
+  }
   func appendPairedSourceAudio(_ sample: CMSampleBuffer, videoTime: CMTime) throws { try appendAudio(sample) }
   func bindTakeContext(_ context: RecordingTakeContext) throws {}
   func noteClockMapping(_ event: RecordingClockMappingEvent) throws {}
@@ -921,8 +958,8 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   @discardableResult
-  func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) -> Bool {
-    enqueue(sample, kind: .audio, audioMapping: mapping)
+  func appendSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping, resuming: Bool = false) -> Bool {
+    enqueue(sample, kind: .audio, audioMapping: mapping, resumingAudio: resuming)
   }
 
   @discardableResult
@@ -1036,7 +1073,9 @@ final class SourceRecorderCore: @unchecked Sendable {
 
   /// Runs on the capture (driver) thread. Metadata checks, one short lock and
   /// an async submit: it never waits on the encoder, the GPU or the disk.
-  private func enqueue(_ sample: CMSampleBuffer, kind: SampleKind, audioMapping: AudioVideoClockMapping? = nil, pairedVideoTime: CMTime? = nil) -> Bool {
+  private var pendingAudioSegmentRestart = false // under stateLock
+
+  private func enqueue(_ sample: CMSampleBuffer, kind: SampleKind, audioMapping: AudioVideoClockMapping? = nil, pairedVideoTime: CMTime? = nil, resumingAudio: Bool = false) -> Bool {
     guard Self.isReady(sample, kind: kind) else {
       recordDrop(.invalidSample, video: kind == .video)
       return false
@@ -1045,9 +1084,11 @@ final class SourceRecorderCore: @unchecked Sendable {
     if writer.hasFailed { observeWriterFailure() }
     var retained: MediaRetentionLedger.Lease?
     var intentionallyPaused = false
+    var restartAudioSegment = false
     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
     let duration = CMSampleBufferGetDuration(sample)
     let admitted = stateLock.withLock { () -> Bool in
+      if resumingAudio { pendingAudioSegmentRestart = true }
       guard telemetryValue.state == .recording else {
         switch telemetryValue.state {
         case .paused:
@@ -1121,6 +1162,10 @@ final class SourceRecorderCore: @unchecked Sendable {
         pendingVideo += 1
         telemetryValue.enqueuedVideo &+= 1
       case .audio:
+        if audioMapping != nil {
+          restartAudioSegment = pendingAudioSegmentRestart
+          pendingAudioSegmentRestart = false
+        }
         pendingAudio += 1
         telemetryValue.enqueuedAudio &+= 1
       }
@@ -1128,6 +1173,7 @@ final class SourceRecorderCore: @unchecked Sendable {
       return true
     }
     guard admitted, let retained else { return intentionallyPaused }
+    let resumesAudioSegment = restartAudioSegment
     let queuedSample = QueuedSample(value: sample, retention: retained)
     defer { admission.leave() }
     queue.async { [weak self] in
@@ -1167,7 +1213,10 @@ final class SourceRecorderCore: @unchecked Sendable {
           }
         case .audio:
           if let pairedVideoTime { try self.writer.appendPairedSourceAudio(queuedSample.value, videoTime: pairedVideoTime) }
-          else if let audioMapping { try self.writer.appendSourceAudio(queuedSample.value, mapping: audioMapping) }
+          else if let audioMapping {
+            if resumesAudioSegment { try self.writer.appendResumedSourceAudio(queuedSample.value, mapping: audioMapping) }
+            else { try self.writer.appendSourceAudio(queuedSample.value, mapping: audioMapping) }
+          }
           else { try self.writer.appendAudio(queuedSample.value) }
           self.stateLock.withLock { self.telemetryValue.appendedAudio &+= 1 }
         }

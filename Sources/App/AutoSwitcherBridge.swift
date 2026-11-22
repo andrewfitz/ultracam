@@ -1,3 +1,4 @@
+import Darwin
 import CoreMedia
 import Foundation
 
@@ -39,7 +40,7 @@ enum AutoSwitcherControlEvent: Equatable, Sendable {
   case reset
 }
 
-/// Serializes the Rust director behind a small C ABI. The bridge owns no
+/// Serializes events to the standalone Rust director. The bridge owns no
 /// frames and never applies a cut itself; the host acknowledges a cut after
 /// ProgramOutputRoute applies the target frame.
 final class AutoSwitcherBridge: @unchecked Sendable {
@@ -54,11 +55,9 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     qos: .userInteractive)
   private let stateLock = NSLock()
   private let queueKey = DispatchSpecificKey<UInt8>()
-  private var handle: OpaquePointer?
-  private var nextAudioID: UInt64 = 1
-  private var silenceStartedAt: CMTime?
-  private var speaking = false
-  private var lastCueSeconds: Double?
+  private var handle: SwitcherProcess?
+  private var _connectionLost = false
+  var connectionLost: Bool { stateLock.withLock { _connectionLost } }
   private var _lastError: String?
   private var _onInstruction: InstructionHandler?
   private var _onError: ErrorHandler?
@@ -96,9 +95,10 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     set { stateLock.withLock { _onTranscriptCue = newValue } }
   }
 
-  init?(settings: NaturalTalkingHeadSettings, anchor: FeedID, emphasis: FeedID) {
+  init?(settings: NaturalTalkingHeadSettings, anchor: FeedID, emphasis: FeedID, availableRoutes: [FeedID] = []) {
     queue.setSpecific(key: queueKey, value: 1)
     let config: [String: Any] = [
+      "available_routes": availableRoutes.map(\.rawValue),
       "anchor_camera_id": anchor.rawValue,
       "emphasis_camera_id": emphasis.rawValue,
       "minimum_shot_duration": max(10, settings.minimumShotDuration),
@@ -121,7 +121,7 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: config),
       let json = String(data: data, encoding: .utf8) else { return nil }
-    handle = json.withCString { auto_switcher_create($0) }
+    handle = try? SwitcherProcess(configuration: json)
     guard handle != nil else { return nil }
   }
 
@@ -129,11 +129,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
 
   func stop() {
     let release = {
-      if let handle = self.handle { auto_switcher_destroy(handle) }
+      self.handle?.close()
       self.handle = nil
-      self.silenceStartedAt = nil
-      self.speaking = false
-      self.lastCueSeconds = nil
     }
     // deinit can run on this queue when the last release happens inside a
     // queued callback. queue.sync from that queue deadlocks.
@@ -161,9 +158,6 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     guard let seconds = seconds(time) else { return }
     queue.async { [weak self] in
       guard let self, self.handle != nil else { return }
-      self.speaking = false
-      self.silenceStartedAt = nil
-      self.lastCueSeconds = nil
       self.send(["type": "reset"])
       for (cameraID, healthy) in health { self.sendHealth(cameraID: cameraID, healthy: healthy, seconds: seconds) }
       if let onAir { self.send(["type": "manualOverride", "camera_id": onAir.rawValue, "time": seconds]) }
@@ -186,51 +180,10 @@ final class AutoSwitcherBridge: @unchecked Sendable {
 
   func ingestAudio(time: CMTime, rms: Float, peak: Float, present: Bool) {
     guard let seconds = seconds(time), seconds >= 0 else { return }
-    let energy = max(0, min(1, rms))
-    let emphasis = max(0, min(1, peak))
+    guard rms.isFinite, peak.isFinite else { return }
     queue.async { [weak self] in
       guard let self, self.handle != nil else { return }
-      let threshold: Float = 0.035
-      let isSpeech = present && energy >= threshold
-      let wasSpeaking = self.speaking
-      let speechStart = isSpeech && !wasSpeaking
-      let speechStop = !isSpeech && wasSpeaking
-      if isSpeech { self.silenceStartedAt = nil }
-      else if self.silenceStartedAt == nil { self.silenceStartedAt = time }
-      let pause = self.silenceStartedAt.map { max(0, seconds - (secondsValue($0) ?? seconds)) } ?? 0
-      self.speaking = isSpeech
-      // Status updates arrive in bursts, not once per audio sample. A
-      // 1/sampleRate duration records a 20 µs cue for a packet that actually
-      // covers the gap since the previous update.
-      let duration = self.cueDuration(endingAt: seconds)
-      self.lastCueSeconds = seconds
-      let event: [String: Any] = [
-        "type": "audio",
-        "cue": [
-          "id": self.nextAudioID,
-          "time": seconds,
-          "duration": duration,
-          "speech_energy": energy,
-          "pause_duration": pause,
-          "emphasis": emphasis,
-          "laughter": 0.0,
-          "speech_start": speechStart,
-          "speech_stop": speechStop,
-          // Zero asks the Rust director to bind the cue to its current
-          // session. The director can advance generations after a clock
-          // discontinuity, so hard-coding 1 would permanently reject all
-          // subsequent cues.
-          "session_generation": 0,
-        ],
-      ]
-      let audioCueHandler = self.onAudioCue
-      audioCueHandler?(AutoSwitcherAudioCue(id: self.nextAudioID, time: seconds,
-        duration: duration,
-        speechEnergy: energy, pauseDuration: pause, emphasis: emphasis, laughter: 0,
-        speechStart: speechStart, speechStop: speechStop,
-        sessionGeneration: 0))
-      self.nextAudioID &+= 1
-      self.send(event)
+      self.send(["type": "levels", "time": seconds, "rms": rms, "peak": peak, "present": present])
       self.send(["type": "tick", "time": seconds])
     }
   }
@@ -280,9 +233,6 @@ final class AutoSwitcherBridge: @unchecked Sendable {
   func reset() {
     queue.async { [weak self] in
       guard let self else { return }
-      self.speaking = false
-      self.silenceStartedAt = nil
-      self.lastCueSeconds = nil
       self.send(["type": "reset"])
     }
   }
@@ -310,15 +260,17 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     guard let handle,
       let data = try? JSONSerialization.data(withJSONObject: event),
       let json = String(data: data, encoding: .utf8) else { return }
-    let outputPointer: UnsafeMutablePointer<CChar>? = json.withCString {
-      auto_switcher_process_json(handle, $0)
+    let output: String?
+    do {
+      let response = try handle.exchange(json)
+      output = response == "[]" ? nil : response
+    } catch {
+      stateLock.withLock { _connectionLost = true }
+      report("Auto Switcher connection closed: \(error.localizedDescription)")
+      handle.close()
+      self.handle = nil
+      return
     }
-    guard let outputPointer else { return }
-    // Most events produce the canonical empty array. Avoid constructing a
-    // String, Data and JSON decoder for that response on every audio/tick.
-    let isEmpty = outputPointer[0] == 91 && outputPointer[1] == 93 && outputPointer[2] == 0
-    let output = isEmpty ? nil : String(cString: outputPointer)
-    auto_switcher_free_string(outputPointer)
     // Capture control inputs on the same serialized path as audio. In
     // particular, a clock rebase is reset + health + manual override.
     switch event["type"] as? String {
@@ -339,6 +291,8 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     }
     for value in values {
       switch value.type {
+      case "audioCue":
+        if let cue = value.cue { onAudioCue?(cue) }
       case "cut":
         guard let instruction = value.instruction,
           let target = instruction.targetCameraID,
@@ -378,15 +332,12 @@ final class AutoSwitcherBridge: @unchecked Sendable {
 
   private func seconds(_ time: CMTime) -> Double? { secondsValue(time) }
 
-  private func cueDuration(endingAt seconds: Double) -> Double {
-    guard let previous = lastCueSeconds, seconds >= previous else { return 0.02 }
-    let delta = seconds - previous
-    return delta > 0 && delta <= 1 ? delta : 0.02
-  }
+
 }
 
 private struct RustOutput: Decodable {
   let type: String
+  let cue: AutoSwitcherAudioCue?
   let instruction: RustInstruction?
   let decisionID: String?
   let message: String?
@@ -395,7 +346,7 @@ private struct RustOutput: Decodable {
   let pendingDecisionID: UUID?
 
   enum CodingKeys: String, CodingKey {
-    case type, instruction, message
+    case type, instruction, message, cue
     case decisionID = "decision_id"
     case time
     case currentCameraID = "current_camera_id"
@@ -434,5 +385,54 @@ private extension CMTime {
     guard isValid, isNumeric, epoch == 0, timescale > 0,
       CMTimeGetSeconds(self).isFinite, CMTimeGetSeconds(self) >= 0 else { return nil }
     return self
+  }
+}
+
+/// One private request at a time on the bridge queue. The helper exits on EOF.
+/// A stalled or failed peer ends the session before another cut can be sent.
+private final class SwitcherProcess {
+  private let child = Process()
+  private let input = Pipe()
+  private let output = Pipe()
+
+  init(configuration: String) throws {
+    let env = ProcessInfo.processInfo.environment
+    let binary = Bundle.main.url(forAuxiliaryExecutable: "auto-switcher")
+      ?? env["CARGO_TARGET_DIR"].map { URL(fileURLWithPath: $0).appendingPathComponent("release/auto-switcher") }
+    guard let binary else { throw CocoaError(.fileNoSuchFile) }
+    child.executableURL = binary
+    let port = UserDefaults.standard.integer(forKey: "AutoSwitcherServerPort")
+    child.arguments = port > 0 ? ["attach", "--port", String(port)] : ["worker"]
+    child.standardInput = input
+    child.standardOutput = output
+    _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+    try child.run()
+    do {
+      guard try exchange(configuration) == "[]" else { throw CocoaError(.fileReadCorruptFile) }
+    } catch {
+      close()
+      throw error
+    }
+  }
+
+  func exchange(_ json: String) throws -> String {
+    try input.fileHandleForWriting.write(contentsOf: Data((json + "\n").utf8))
+    let handle = output.fileHandleForReading
+    var bytes = Data()
+    while bytes.count < 262144 {
+      var descriptor = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+      guard poll(&descriptor, 1, 2500) > 0 else { throw CocoaError(.fileReadUnknown) }
+      let chunk = handle.availableData
+      guard !chunk.isEmpty else { throw CocoaError(.fileReadUnknown) }
+      bytes.append(chunk)
+      if bytes.last == 10 { return String(decoding: bytes.dropLast(), as: UTF8.self) }
+    }
+    throw CocoaError(.fileReadCorruptFile)
+  }
+
+  func close() {
+    try? input.fileHandleForWriting.close()
+    if child.isRunning { child.terminate() }
+    try? output.fileHandleForReading.close()
   }
 }

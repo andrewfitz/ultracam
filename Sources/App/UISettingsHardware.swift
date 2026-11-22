@@ -40,7 +40,7 @@ struct UISettingsHardwarePane: View {
       ForEach(groups.bodies, id: \.vendor.id) { group in bodySection(group, groups: groups) }
       if model.cameraControls.available { refreshSection }
       ForEach([model.vendorSettings.persistenceMessage, model.cameraControls.discoveryMessages["persistence"]].compactMap { $0 }, id: \.self) { message in
-        Section { Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange) }
+        Section { Label { Text(message) } icon: { Image(systemName: UISymbol.warning).foregroundStyle(.orange) } }
       }
     }
     .uiWatchesHardware(model.hardwareInventory)
@@ -80,13 +80,20 @@ struct UISettingsHardwarePane: View {
   // MARK: Capture devices
 
   private func captureSection(_ group: UISettingsHardwareGroups.Capture) -> some View {
-    Section {
+    let access = model.captureAuthorizationStatus(pluginID: group.vendor.id)
+    return Section {
       if let problem = Self.driverProblem(group.driver) {
         Label { Text(problem).fixedSize(horizontal: false, vertical: true) } icon: {
           Image(systemName: UISymbol.warning).foregroundStyle(.orange)
         }
       }
-      if group.devices.isEmpty {
+      if access == .requestable {
+        Button("Enable Camera Access") {
+          UISessionBridge(model: model, interface: interface).send(.requestCaptureAccess(pluginID: group.vendor.id))
+        }
+        .disabled(model.isRequestingCaptureAccess(pluginID: group.vendor.id))
+      }
+      if group.devices.isEmpty, access == .authorized {
         Text("No devices connected").foregroundStyle(.secondary)
       }
       ForEach(group.devices) { device in
@@ -134,28 +141,44 @@ struct UISettingsHardwarePane: View {
   }
 
   /// The camera that uses the device. A running camera can't change its input.
-  private func devicePicker(_ device: UIHardwareDevice) -> some View {
-    let running = Set(model.feedDescriptors.filter { model.isCameraRunning($0.id) }.map(\.id.rawValue))
-    return Picker("Camera", selection: Binding(get: { device.cameras.first?.id ?? "" }, set: { assign(device, to: $0) })) {
+  @ViewBuilder private func devicePicker(_ device: UIHardwareDevice) -> some View {
+    if model.inputShareable(device.id) || (!device.present && device.cameras.count > 1) {
+      Menu(device.cameras.isEmpty ? "None" : UISettingsDeviceSettings.names(device.cameras)) {
+        ForEach(model.feedDescriptors) { camera in
+          Toggle(camera.name, isOn: membership(of: camera.id, in: device.id))
+          .disabled(!model.canChangeCameraInput(camera.id) || (!device.present && camera.selectedDevice != device.id))
+        }
+      }
+      .help("Choose the cameras that capture from \(device.name)")
+      .accessibilityLabel("Cameras for \(device.name)")
+    } else {
+      exclusiveDevicePicker(device)
+    }
+  }
+
+  func membership(of camera: FeedID, in device: String) -> Binding<Bool> {
+    Binding(get: { model.descriptor(for: camera)?.selectedDevice == device }, set: { selected in
+      guard selected || model.descriptor(for: camera)?.selectedDevice == device else { return }
+      model.updateCamera(camera) { $0.selectedDevice = selected ? device : "" }
+    })
+  }
+
+  private func exclusiveDevicePicker(_ device: UIHardwareDevice) -> some View {
+    let locked = device.cameras.filter { !model.canChangeCameraInput(FeedID(rawValue: $0.id)) }
+    return Picker("Camera", selection: Binding(get: { device.cameras.first?.id ?? "" }, set: {
+      model.assignExclusiveInput(device.id, to: $0.isEmpty ? nil : FeedID(rawValue: $0))
+    })) {
       Text("None").tag("")
       Divider()
       ForEach(model.feedDescriptors) { descriptor in
-        Text(descriptor.name).tag(descriptor.id.rawValue).selectionDisabled(running.contains(descriptor.id.rawValue))
+        Text(descriptor.name).tag(descriptor.id.rawValue).selectionDisabled(!model.canChangeCameraInput(descriptor.id))
       }
     }
     .labelsHidden().fixedSize()
-    .disabled(!device.runningCameras.isEmpty)
-    .help(device.runningCameras.isEmpty ? "The camera that captures from \(device.name)"
-      : "Stop \(UISettingsDeviceSettings.names(device.runningCameras)) to change its input.")
+    .disabled(!locked.isEmpty)
+    .help(locked.isEmpty ? "The camera that captures from \(device.name)"
+      : "Stop \(UISettingsDeviceSettings.names(locked)) to change its input.")
     .accessibilityLabel("Camera for \(device.name)")
-  }
-
-  private func assign(_ device: UIHardwareDevice, to cameraID: String) {
-    guard device.cameras.first?.id != cameraID else { return }
-    let bridge = UISessionBridge.live(model: model, interface: interface)
-    // One camera per exclusive device: the previous camera lets go first.
-    for camera in device.cameras { bridge.perform(.setInput(cameraID: camera.id, deviceID: "")) }
-    if !cameraID.isEmpty { bridge.perform(.setInput(cameraID: cameraID, deviceID: device.id)) }
   }
 
   @ViewBuilder private func deviceDetails(_ device: UIHardwareDevice) -> some View {
@@ -168,6 +191,9 @@ struct UISettingsHardwarePane: View {
     ForEach(facts.filter { $0.group <= .connection }) { fact in factRow(fact) }
     if device.present { UISettingsDeviceSettings(model: model, device: device) { confirmation = $0 } }
     ForEach(facts.filter { $0.group > .connection }) { fact in factRow(fact) }
+    if let detail = device.status?.signalDetail {
+      LabeledContent("Input signal") { Text(detail).fixedSize(horizontal: false, vertical: true) }
+    }
     let formats = UIHardwareText.formatGroups(device.modes)
     if !formats.isEmpty {
       LabeledContent("Supported formats") {
@@ -216,7 +242,7 @@ struct UISettingsHardwarePane: View {
         Text(scanning ? "Looking on this Mac’s network…" : "No camera bodies yet.").foregroundStyle(.secondary)
       }
       if group.available, let message = store.discoveryMessages[group.vendor.id] {
-        Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+        Label { Text(message) } icon: { Image(systemName: UISymbol.warning).foregroundStyle(.orange) }.fixedSize(horizontal: false, vertical: true)
       }
       ForEach(group.bodies) { body in
         if group.available {
@@ -409,7 +435,7 @@ struct UISettingsHardwarePane: View {
         }
         if let overheating = body.overheating {
           LabeledContent("Temperature") {
-            Label(UIControlPresentation.value(overheating), systemImage: UISymbol.warning).foregroundStyle(.orange)
+            Label { Text(UIControlPresentation.value(overheating)) } icon: { Image(systemName: UISymbol.warning).foregroundStyle(.orange) }
           }
         }
         if let setup = setup(for: body, groups: groups), !setup.rows.isEmpty {
@@ -425,7 +451,7 @@ struct UISettingsHardwarePane: View {
         if state.retrying {
           UICameraControlReconnectStatus(state: state)
         } else if let message = state.message {
-          Label(message, systemImage: UISymbol.warning).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+          Label { Text(message) } icon: { Image(systemName: UISymbol.warning).foregroundStyle(.orange) }.fixedSize(horizontal: false, vertical: true)
         }
         DisclosureGroup("Add camera by address") {
           UICameraBodyAddByAddress(pluginID: vendor.id, store: store, cameras: feeds,
@@ -489,7 +515,7 @@ struct UIHardwareDisclosure<Label: View, Content: View>: View {
         Image(systemName: UISymbol.expandStrip)
           .font(.uiBadge)
           .rotationEffect(.degrees(isExpanded ? 90 : 0))
-          .frame(width: 16, height: 22).contentShape(Rectangle())
+          .frame(width: 24, height: 24).contentShape(Rectangle())
       }
       .buttonStyle(.plain).foregroundStyle(.secondary)
       .help(isExpanded ? "Hide details" : "Show details")

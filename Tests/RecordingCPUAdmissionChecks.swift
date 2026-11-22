@@ -29,6 +29,18 @@ import XCTest
     XCTAssertEqual(allowed.telemetry.systemCompatibilityFrames, 1)
     try allowed.finish()
   }
+  func testStoppingTakeWhoseEveryConversionFailedReportsFailure() throws {
+    let configuration = try config()
+    let writer = try makeWriter(operations: .init(convert: { _, _, _ in throw Injected.gpu }))
+    let core = try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
+    try core.start()
+    XCTAssertTrue(core.appendVideo(try sample()))
+    XCTAssertTrue(core.appendVideo(try sample(index: 1)))
+    XCTAssertThrowsError(try core.stop()) { XCTAssertTrue($0.localizedDescription.contains("no video")) }
+    XCTAssertEqual(core.state, .failed)
+    XCTAssertEqual(core.telemetry.droppedGPUFrames, 2)
+  }
+
   func testGPUCommandFailureDropsOnlyOneFrameAndNextFrameWorks() throws { try checkRecoverableFailure(pool: false) }
   func testPoolAllocationFailureDropsOnlyOneFrameAndNextFrameWorks() throws { try checkRecoverableFailure(pool: true) }
   private func checkRecoverableFailure(pool: Bool) throws {

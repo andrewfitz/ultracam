@@ -1,279 +1,16 @@
 import AppKit
 import SwiftUI
 
-/// The session board: what is connected, what's going out, where it's saving and what's wrong,
-/// in signal order. Attention pins above the list. Nothing about switching lives here:
-/// Auto, Strategy, Anchor, Emphasis and Hold are in the toolbar, shot time in the status bar.
-/// Rebuilds the context inside its own body so this column refreshes with the models.
-struct UISessionSidebarView: View {
-  let context: UIContext
-  var body: some View {
-    let _ = UIRenderProbe.count("UISessionSidebarView")
-    UISessionSidebarViewContent(context: context.current)
-  }
-}
-
-struct UISessionSidebarViewContent: View {
-  let context: UIContext
-
-  private var session: UISessionSnapshot { context.session }
-  private var presentation: UISessionPresentation { context.presentation }
-
-  var body: some View {
-    let _ = UIRenderProbe.count("UISessionSidebarViewContent")
-    List(selection: selection) {
-      camerasSection
-      virtualCamerasSection
-      recordingSection
-      if let take = session.recentTakes.first { takesSection(take) }
-    }
-    .listStyle(.sidebar)
-    .accessibilityLabel("Session")
-    // An inset, not a stack: the list scrolls under it and the column keeps its own sizing.
-    .safeAreaInset(edge: .top, spacing: 0) {
-      VStack(spacing: 0) {
-        UIAttentionSection(context: context)
-        if presentation.offersAlerts {
-          UIAlertsPrompt(context: context).padding(.horizontal, 10).padding(.bottom, 8)
-        }
-      }
-    }
-  }
-
-  private var selection: Binding<String?> {
-    Binding(
-      // The context is already the refreshed one (UISessionSidebarView builds it).
-      get: { context.presentation.selected?.id },
-      set: { if let id = $0 { inspect(id) } })
-  }
-
-  /// A click on a row that names a camera selects it and shows it in the inspector.
-  /// (The bridge ignores selecting the camera that's already selected.) Under 1100 pt the
-  /// inspector opening beside this column would squeeze the pictures, and making room for them
-  /// would close this column, the one just clicked: there the click only selects.
-  private func inspect(_ cameraID: String) {
-    context.send(.select(cameraID: cameraID))
-    if session.inspectorOpen || !session.narrowWindow {
-      context.send(.showInspector(cameraID: cameraID))
-    }
-  }
-
-  // MARK: Cameras
-
-  /// Only what the strip doesn't show: capture device and camera body. The tally is the
-  /// picture's and the status bar's, and the signal badge owns format and dropouts.
-  private var camerasSection: some View {
-    Section {
-      ForEach(presentation.cameras) { camera in
-        UISidebarCameraRow(camera: camera, snapshot: context.snapshot(camera.id), context: context)
-          .tag(camera.id)
-          .accessibilityHint("Shows \(camera.name) in the inspector")
-      }
-    } header: {
-      HStack {
-        Text("Cameras")
-        Spacer()
-        Button { context.send(.addCamera) } label: {
-          Image(systemName: UISymbol.add).frame(minWidth: 24, minHeight: 24).contentShape(Rectangle())
-        }
-        .buttonStyle(.borderless)
-        .disabled(!session.canAddCamera)
-        .help(UIPresentationBuilder.addCameraHelp(session))
-        .accessibilityLabel("Add Camera")
-      }
-    }
-  }
-
-  // MARK: Virtual Cameras
-
-  /// The one section that collapses, by hand only. Closed, its header keeps the count, so
-  /// collapsing hides no state.
-  private var virtualCamerasSection: some View {
-    Section {
-      if !session.virtualCamerasCollapsed {
-        ForEach(presentation.virtualCameras) { row in
-          if let cameraID = row.cameraID {
-            UIVirtualCameraRow(row: row)
-              .uiSidebarInspectButton(cameraName: row.name) { inspect(cameraID) }
-              .selectionDisabled()
-          } else {
-            UIVirtualCameraRow(row: row)
-              .help("One switched camera for meeting apps. Cut with the toolbar or ⌃1–⌃\(min(4, max(1, presentation.cameras.count))).")
-              .selectionDisabled()
-          }
-        }
-        if presentation.virtualCamerasInUse == 0 {
-          Label { Text(Self.microphoneReminder).lineLimit(3) } icon: { Image(systemName: UISymbol.microphoneReminder) }
-            .font(.uiMeta).foregroundStyle(.secondary)
-            .selectionDisabled()
-        }
-      }
-    } header: {
-      Button { context.send(.setVirtualCamerasCollapsed(!session.virtualCamerasCollapsed)) } label: {
-        HStack(spacing: 6) {
-          Text("Virtual Cameras")
-          Spacer(minLength: 4)
-          if session.virtualCamerasCollapsed {
-            Text("\(presentation.virtualCamerasInUse) of \(presentation.virtualCameras.count) in use").font(.uiMeta)
-          }
-          Image(systemName: session.virtualCamerasCollapsed ? UISymbol.expandStrip : UISymbol.collapseStrip).imageScale(.small)
-        }
-        .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .help(session.virtualCamerasCollapsed ? "Show the virtual cameras" : "Hide the virtual cameras")
-      .accessibilityLabel(session.virtualCamerasCollapsed ? "Show Virtual Cameras" : "Hide Virtual Cameras")
-      .accessibilityValue("\(presentation.virtualCamerasInUse) of \(presentation.virtualCameras.count) in use")
-    }
-  }
-
-  static let microphoneReminder = "Video only — select your microphone in your meeting app."
-
-  // MARK: Recording
-
-  private var recordingSection: some View {
-    Section("Recording") {
-      UIFormatMenu(context: context)
-        .selectionDisabled()
-      HStack(spacing: 8) {
-        Text(UIPresentationBuilder.recordingLook(session))
-        // Timecode is set once per rig: the caption opens Settings › Recording.
-        Button { context.send(.openSettingsTab(.recording)) } label: {
-          Label { Text(session.timecodeTitle) } icon: { Image(systemName: UISymbol.timecode) }
-            .labelStyle(.titleAndIcon)
-        }
-        .buttonStyle(.plain)
-        .help("Timecode is set in Settings › Recording. Click to open it.")
-        .accessibilityLabel("Timecode \(session.timecodeTitle)")
-        .accessibilityHint("Opens Settings › Recording")
-      }
-      .font(.uiMeta).foregroundStyle(.secondary)
-      .help((UIPresentationBuilder.recordingLook(session) == "Camera original"
-        ? "Records the camera original, without LUT or effects."
-        : "Records the camera original; a camera's LUT is burned in where Burn LUT into recordings applies.")
-        + " Timecode is set in Settings › Recording.")
-      .selectionDisabled()
-      ForEach(session.drives) { drive in
-        UILiveDriveRow(drive: drive, cameras: UIPresentationBuilder.cameras(on: drive, in: session), context: context)
-          .selectionDisabled()
-      }
-      if session.drives.isEmpty {
-        Text("No drive").font(.uiMeta).foregroundStyle(.secondary)
-          .accessibilityLabel("No recording drive")
-          .selectionDisabled()
-      }
-      destinationRow.selectionDisabled()
-    }
-  }
-
-  /// A change applies to the next take, so during one the button says so.
-  private var destinationRow: some View {
-    HStack(spacing: 6) {
-      Image(systemName: UISymbol.folder).foregroundStyle(.secondary).imageScale(.small)
-        .accessibilityHidden(true)
-      Text(session.defaultFolderPath.map(UIFormat.folderName) ?? "No folder")
-        .font(.uiMeta).foregroundStyle(.secondary)
-        .lineLimit(1).truncationMode(.middle)
-        .help(session.defaultFolderPath ?? "Choose where takes are saved.")
-      Spacer(minLength: 4)
-      Button(UIPresentationBuilder.folderAction(session)) { context.send(.chooseRecordingFolder(cameraID: nil)) }
-        .controlSize(.small)
-        .fixedSize()
-        .help("Choose the default recording folder. Changes apply to the next take.")
-    }
-  }
-
-  // MARK: Takes
-
-  /// The latest only, so Recording stays above the fold. Show All reveals the rest in Finder.
-  private func takesSection(_ take: UITake) -> some View {
-    Section("Takes") {
-      VStack(alignment: .leading, spacing: 2) {
-        HStack(spacing: 6) {
-          Image(systemName: UISymbol.take).foregroundStyle(.secondary).imageScale(.small).accessibilityHidden(true)
-          Text("Last take").font(.uiMeta).foregroundStyle(.secondary)
-          if let duration = take.duration { UIValue(parts: [UIValuePart(number: UIFormat.shortElapsed(duration))]) }
-          Spacer(minLength: 4)
-          Button("Show All") { context.send(.revealRecordings) }
-            .controlSize(.small)
-            .fixedSize()
-            .disabled(!presentation.canRevealRecordings)
-            .help("Show the takes in Finder")
-        }
-        HStack(spacing: 6) {
-          Text(take.date, format: .dateTime.hour().minute())
-          if let lost = take.lostFrames {
-            Image(systemName: lost > 0 ? UISymbol.warning : UISymbol.saved)
-              .imageScale(.small).foregroundStyle(lost > 0 ? Color.orange : .green)
-              .accessibilityHidden(true)
-            Text("\(lost) lost").foregroundStyle(lost > 0 ? .primary : .secondary)
-          }
-        }
-        .font(.uiMeta).foregroundStyle(.secondary)
-      }
-      .help(take.url.path)
-      .accessibilityElement(children: .combine)
-      .selectionDisabled()
-    }
-  }
-}
-
-// MARK: - Pieces
-
-extension View {
-  /// Makes a whole sidebar row (its empty space too) one button that shows a camera in the inspector.
-  func uiSidebarInspectButton(cameraName: String, action: @escaping () -> Void) -> some View {
-    Button(action: action) {
-      frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-    }
-    .buttonStyle(.plain)
-    .help("Show \(cameraName) in the inspector")
-    .accessibilityHint("Shows \(cameraName) in the inspector")
-  }
-}
-
-/// A camera's state, name and hardware: the capture device's nickname, then the camera body
-/// when one is paired. A camera with no body draws one line, not an empty one.
-struct UISidebarCameraRow: View {
-  let camera: UICameraPresentation
-  let snapshot: UICameraSnapshot?
-  let context: UIContext
-
-  var body: some View {
-    HStack(alignment: .firstTextBaseline, spacing: 8) {
-      UIStateGlyph(state: camera.state).frame(width: 12)
-      VStack(alignment: .leading, spacing: 1) {
-        Text(camera.name).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
-        HStack(spacing: 6) {
-          Text(camera.inputName).lineLimit(1).truncationMode(.middle).help(camera.inputName)
-          // The connector only when it isn't HDMI (ruling 23).
-          if let connector = snapshot?.inputConnector { Text(connector).fixedSize() }
-        }
-        .font(.uiMeta).foregroundStyle(.secondary)
-        if let body = snapshot?.body {
-          HStack(spacing: 6) {
-            Label { Text(body.name).lineLimit(1) } icon: { Image(systemName: UISymbol.cameraBody).imageScale(.small) }
-            if !body.connected {
-              // Wi-Fi only when degraded: a healthy link draws nothing.
-              Image(systemName: UISymbol.wifi(connected: false)).imageScale(.small).foregroundStyle(.orange)
-              Text("Disconnected").foregroundStyle(.primary).fixedSize()
-            } else if let battery = body.battery {
-              UIBatteryGlyph(battery: battery)
-            }
-          }
-          .font(.uiMeta).foregroundStyle(.secondary)
-        }
-      }
-    }
-    .accessibilityElement(children: .combine)
-    // It names the take's clock, which ticks without the row: brought up to date in the modifier.
-    .modifier(UILiveCameraAccessibilityLabel(camera: camera, context: context))
-  }
-}
+// The session's shared rows. The left pane that used to draw them is gone: the pictures are
+// the camera list, the status bar reports the session, and Record's popover sets up
+// recording. What remains here is what those surfaces share: a virtual camera's row, the
+// format menu, a drive's row, the Interrupted Takes sheet and the extension's setup state.
 
 /// One line: its state glyph, its name, and "In use" only when true.
 struct UIVirtualCameraRow: View {
   let row: UIVirtualCamera
+
+  static let microphoneReminder = "Video only — select your microphone in your meeting app."
 
   var body: some View {
     HStack(spacing: 6) {
@@ -289,9 +26,9 @@ struct UIVirtualCameraRow: View {
   }
 }
 
-/// The session's one format: the same menu in the left pane, the Record toolbar menu, the
-/// Record app menu and the menu bar. Each row shows its rate and time left for the current
-/// sources. It applies to the next take; each strip shows its own, read-only.
+/// The session's one format: the same menu in Record's popover, the Record app menu and the
+/// menu bar. Each row shows its rate and time left for the current sources. It applies to
+/// the next take.
 struct UIFormatMenu: View {
   let context: UIContext
 
@@ -331,7 +68,7 @@ struct UIFormatChoices: View {
   }
 }
 
-/// Every interrupted take, one Recover each. Attention's row opens it.
+/// Every interrupted take, one Recover each. Record's popover and the Record menu open it.
 struct UIInterruptedTakesSheet: View {
   let context: UIContext
 
@@ -415,15 +152,14 @@ struct UIDriveRow: View {
   }
 }
 
-// MARK: - Camera extension banner
+// MARK: - Camera extension setup
 
 enum UIExtensionBanner: Equatable {
   case unavailable(String)
   case pending(String)
   case needsApproval(String)
   case notInstalled
-  /// macOS has the extension enabled but hasn't started it, so it has no cameras yet
-  /// (after an update, until the Mac restarts). Installing again wouldn't help.
+  /// macOS has enabled the extension but hasn't started its cameras yet.
   case needsRestart
   /// The enabled extension is older than the one in this app.
   case outdated(installed: String, bundled: String)

@@ -113,28 +113,26 @@ import XCTest
     }
   }
 
-  /// The burn-in LUT reaches the camera's feed host through the real AppModel
-  /// wiring (`installCaptureUpdateHandler` hands the controller's `burnInLUT`
-  /// to the coordinator): the very `MonitorLUT` the controller burns in while
-  /// Apply LUT is on, nil while it is off, and nil at once when the feed is
-  /// removed. The controller is started with `.offline` services, whose start
-  /// fails before any device or camera is touched; the burn-in decision is
-  /// made before that.
-  func testBurnInLUTReachesTheFeedHostThroughAppModel() throws {
+  func testBurnInConfigurationReachesOnlyFramesThatUseIt() throws {
     let suiteName = "org.ultracam.monitor-app-integration.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let settings = AppSettingsStore(defaults: defaults)
     let feeds = [
-      FeedDescriptor(id: alpha, name: "Integration Wide", selectedDevice: "integration-device-a",
+      FeedDescriptor(id: alpha, name: "Integration Wide", selectedDevice: "fake:integration-device-a",
         applyLUT: false, automaticFeed: false),
-      FeedDescriptor(id: beta, name: "Integration Tight", selectedDevice: "integration-device-b",
+      FeedDescriptor(id: beta, name: "Integration Tight", selectedDevice: "fake:integration-device-b",
         applyLUT: false, automaticFeed: false),
     ]
     settings.saveSnapshot(AppSettingsSnapshot(feeds: feeds, selectedFeedID: alpha, outputMode: .separateCameras))
+    let fixture = try AppHardwareSyntheticFixture(duration: VideoContract.slowDuration,
+      deviceIDs: ["fake:integration-device-a", "fake:integration-device-b"])
+    fixture.connect()
+    defer { fixture.stop() }
+    let pattern = try fixture.makePattern()
     let model = AppModel(settingsStore: settings, registryStore: VirtualCameraRegistryStore(defaults: defaults),
       registryPublisher: CapturingRegistryPublisher(), recordingFolderStore: RecordingFolderStore(defaults: defaults),
-      hardware: .offline)
+      hardware: fixture.hardware)
     let controller = try controller(model, alpha)
     defer { controller.stop() }
     let coordinator = model.monitorCoordinator
@@ -143,14 +141,18 @@ import XCTest
     let surfaceID = UUID()
     let presenter = coordinator.surface(id: surfaceID, target: target)
     defer { coordinator.unregisterSurface(id: surfaceID) }
-    /// What the feed host shows after an encode reads the camera's LUT. A test
-    /// probe: `refreshBurnInLUT` runs on the render thread in the app, but only
-    /// reads the source and sets the host's LUT under their locks.
-    func shown() -> MonitorLUT? {
-      presenter.refreshBurnInLUT()
-      return host.burnInLUT
+    coordinator.registerSurface(id: surfaceID, target: target, isVisible: true, scopeVisible: false)
+    XCTAssertNil(presenter.latestBurnInLUT)
+    var index: Int32 = 0
+    func deliver(_ expected: MonitorLUT?) -> Bool {
+      let previous = presenter.currentStamp
+      return spinUntil {
+        do { _ = try fixture.emit(pattern, index: index) } catch { XCTFail(error.localizedDescription) }
+        index += 1
+        RunLoop.main.run(until: Date().addingTimeInterval(1 / 30))
+        return presenter.currentStamp != previous && presenter.latestBurnInLUT === expected
+      }
     }
-    XCTAssertNil(shown(), "Nothing loaded: no burn-in LUT")
 
     let lut = try LUTProcessor.makeLUT(CubeLUT(text: MonitorCoordinatorChecks.identityCube))
     let loaded = expectation(description: "LUT loaded")
@@ -163,23 +165,22 @@ import XCTest
     var on = off
     on.applyLUT = true
 
-    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "monitor-integration-offline", configuration: on)
-    XCTAssertTrue(spinUntil { controller.burnInLUT === lut }, "Apply LUT on burns the loaded LUT in")
-    let withLUT = shown()
-    XCTAssertNotNil(withLUT, "Apply LUT on: the feed host has the burn-in LUT")
-    XCTAssertTrue(withLUT === controller.burnInLUT, "The feed host shows the very LUT the camera burns in")
-
-    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "monitor-integration-offline", configuration: off)
-    XCTAssertTrue(spinUntil { controller.burnInLUT == nil }, "Apply LUT off burns nothing in")
-    XCTAssertNil(shown(), "Apply LUT off: the feed host has no burn-in LUT")
-
-    controller.start(feedID: FeedID(rawValue: "test"), deviceID: "monitor-integration-offline", configuration: on)
+    controller.start(feedID: alpha, deviceID: "fake:integration-device-a", configuration: on)
     XCTAssertTrue(spinUntil { controller.burnInLUT === lut })
-    XCTAssertTrue(shown() === lut)
+    XCTAssertTrue(deliver(lut))
+    controller.reconfigure(configuration: off, pipelineEnabled: true)
+    XCTAssertTrue(spinUntil { controller.burnInLUT == nil })
+    XCTAssertTrue(presenter.latestBurnInLUT === lut, "Changing Apply LUT cannot recolour the last frame")
+    XCTAssertTrue(deliver(nil))
+    controller.reconfigure(configuration: on, pipelineEnabled: true)
+    XCTAssertTrue(spinUntil { controller.burnInLUT === lut })
+    XCTAssertTrue(deliver(lut))
+    controller.stop()
+    XCTAssertTrue(spinUntil { !model.running })
     XCTAssertFalse(model.running)
     XCTAssertTrue(model.removeFeed(alpha))
-    XCTAssertNil(host.burnInLUT, "Removing the feed clears its burn-in LUT at once")
-    XCTAssertNil(shown(), "A removed feed's surfaces no longer read the old controller")
+    XCTAssertFalse(host.hasConsumers, "Removing the feed stops its old host from accepting frames")
+    XCTAssertNil(presenter.latestBurnInLUT, "A removed feed has no live frame")
   }
 
   /// Every camera on automatic start, at launch, whichever is selected: its saved

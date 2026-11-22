@@ -1,4 +1,5 @@
 import CoreMedia
+import CoreVideo
 import XCTest
 
 @objcMembers final class AutomaticFeedChecks: XCTestCase {
@@ -32,6 +33,30 @@ import XCTest
       XCTAssertEqual(result.sourceDuration, duration)
       XCTAssertEqual(result.duration, duration)
     }
+  }
+
+  func testProgramUsesDeclaredPixelFormatAndChoosesItsOwnCanvasForSmallSource() throws {
+    let duration = CMTime(value: 1, timescale: 30)
+    let native = try SourceFormat(width: 1280, height: 720, pixel: .video420, rate: .constant(duration))
+    let compatible = FeedLifecycleDemandPolicy.programContract(configuration: .init(), pipelineEnabled: false,
+      detectedSourceDuration: nil, source: native)
+    XCTAssertFalse(compatible.downscale)
+    XCTAssertEqual(compatible.width, 1280)
+    XCTAssertEqual(compatible.height, 720)
+    XCTAssertEqual(compatible.duration, duration)
+    let declaredPixel = try XCTUnwrap(compatible.sourcePixelFormat)
+    XCTAssertEqual(ProgramOutputFormat(configuration: compatible, passthroughFormat: declaredPixel).pixelFormat,
+      kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+
+    let small = try SourceFormat(width: 640, height: 480, pixel: .video420, rate: .constant(duration))
+    let program = FeedLifecycleDemandPolicy.programContract(configuration: .init(), pipelineEnabled: false,
+      detectedSourceDuration: nil, source: small)
+    XCTAssertTrue(program.downscale)
+    XCTAssertEqual(program.resolvedResizeTarget, .hd720)
+    XCTAssertEqual(program.resolvedSourceWidth, 640)
+    XCTAssertEqual(program.resolvedSourceHeight, 480)
+    XCTAssertEqual(program.scalingMode, .fit)
+    XCTAssertFalse(program.allowUpscale)
   }
 
   func testProgramContractRejectsInvalidDetectedCadenceAndRetainsDeclaredDuration() {
@@ -95,6 +120,14 @@ import XCTest
     policy.previewDemand(false)
     policy.previewDemand(true)
     XCTAssertEqual(policy.action(ready: true, running: false), .start)
+  }
+
+  func testACameraClientCanHandOffToPreviewWithoutRearmingAnAttempt() {
+    var policy = AutomaticFeedPolicy()
+    policy.updateDemand(requested: true, previewRequested: false)
+    XCTAssertEqual(policy.action(ready: true, running: false), .start)
+    policy.updateDemand(requested: false, previewRequested: true)
+    XCTAssertNil(policy.action(ready: true, running: false))
   }
 
   func testWaitsForLUTAndStartsOncePerSession() {

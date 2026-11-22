@@ -23,6 +23,7 @@ struct ClockMappedPCMConverter {
   let maximumSlewPPM: Double
   let maximumAVErrorSeconds: Double
   let maximumWorkspaceBytes: Int
+  private let selectedChannels: Range<Int>
   private var pending: [Float] = []
   private var phase = 0.0
   private var outputOrigin: CMTime?
@@ -57,6 +58,26 @@ struct ClockMappedPCMConverter {
     expectedVideoTime = videoTime
   }
 
+  /// A microphone gap leaves video and the movie origin intact. Reanchor
+  /// the audio grid at the returning packet without mixing two segments.
+  mutating func restartSegment(audioTime: CMTime, mapping: PCMClockTransform) throws {
+    guard !finished else { throw ClockMappedPCMError.invalidPacket }
+    let videoTime = try mapping.videoTime(forAudioTime: audioTime)
+    if let expectedAudioTime, CMTimeSubtract(expectedAudioTime, audioTime).seconds > 1 / format.sampleRate {
+      throw ClockMappedPCMError.discontinuity
+    }
+    if let origin = outputOrigin,
+      videoTime < CMTimeAdd(origin, CMTime(value: emitted, timescale: Int32(outputSampleRate))) {
+      throw ClockMappedPCMError.discontinuity
+    }
+    pending.removeAll(keepingCapacity: true)
+    phase = 0
+    outputOrigin = videoTime
+    emitted = 0
+    expectedAudioTime = audioTime
+    expectedVideoTime = videoTime
+  }
+
   /// Drains the final interpolation interval by extending the last sample.
   /// Repeated drains return nil; a drained stream cannot accept more packets.
   mutating func finish() -> ClockMappedPCMChunk? {
@@ -64,30 +85,36 @@ struct ClockMappedPCMConverter {
     finished = true
     guard let origin = outputOrigin, let ratio = previousRatio, !pending.isEmpty else { return nil }
     let step = format.sampleRate / (outputSampleRate * ratio)
+    let channels = selectedChannels.count
+    let frameCount = pending.count / channels
     var output = [Float]()
-    while phase < Double(pending.count / format.channels) {
-      let index = min(Int(phase), pending.count / format.channels - 1)
-      let next = min(index + 1, pending.count / format.channels - 1)
+    while phase < Double(frameCount) {
+      let index = min(Int(phase), frameCount - 1)
+      let next = min(index + 1, frameCount - 1)
       let fraction = Float(phase - Double(index))
-      for channel in 0..<format.channels {
-        let first = Double(pending[index * format.channels + channel])
-        let second = Double(pending[next * format.channels + channel])
+      for channel in 0..<channels {
+        let first = Double(pending[index * channels + channel])
+        let second = Double(pending[next * channels + channel])
         output.append(Float(first + (second - first) * Double(fraction)))
       }
       phase += step
     }
     let start = CMTimeAdd(origin, CMTime(value: emitted, timescale: Int32(outputSampleRate)))
-    let count = output.count / format.channels
+    let count = output.count / channels
     pending.removeAll(); emitted += Int64(count)
     guard count > 0 else { return nil }
     return ClockMappedPCMChunk(samples: output.withUnsafeBytes { Data($0) }, presentationTime: start,
-      sampleFrameCount: count, channels: format.channels, correctionRatio: ratio)
+      sampleFrameCount: count, channels: channels, correctionRatio: ratio)
   }
 
-  init(format: SourceAudioFormat, outputSampleRate: Double,
+  /// An explicit selection limits sample decoding and output to consecutive
+  /// source channels. Packet layout and byte sizes still describe the source.
+  init(format: SourceAudioFormat, outputSampleRate: Double, selectedChannels: Range<Int>? = nil,
     maximumDriftPPM: Double = 2_000, maximumSlewPPM: Double = 100,
     maximumAVErrorSeconds: Double = 0.02, maximumWorkspaceBytes: Int = 64 * 1024 * 1024) throws {
-    guard outputSampleRate.isFinite, outputSampleRate > 0, outputSampleRate <= Double(Int32.max),
+    let selection = selectedChannels ?? 0..<format.channels
+    guard selection.lowerBound >= 0, selection.upperBound <= format.channels, !selection.isEmpty,
+      outputSampleRate.isFinite, outputSampleRate > 0, outputSampleRate <= Double(Int32.max),
       outputSampleRate.rounded() == outputSampleRate,
       maximumDriftPPM.isFinite, maximumDriftPPM >= 0,
       maximumSlewPPM.isFinite, maximumSlewPPM >= 0,
@@ -98,6 +125,7 @@ struct ClockMappedPCMConverter {
     self.maximumDriftPPM = maximumDriftPPM; self.maximumSlewPPM = maximumSlewPPM
     self.maximumAVErrorSeconds = maximumAVErrorSeconds
     self.maximumWorkspaceBytes = maximumWorkspaceBytes
+    self.selectedChannels = selection
   }
 
   mutating func convert(planes: [Data], sampleFrameCount: Int,
@@ -124,34 +152,35 @@ struct ClockMappedPCMConverter {
       preferredTimescale: 1_000_000_000))
     let nextVideoTime = try mapping.videoTime(forAudioTime: nextAudioTime)
     let frames = try decode(planes, frames: sampleFrameCount)
+    let channels = selectedChannels.count
+    let frameCount = frames.count / channels
     var cursor = phase
     let step = format.sampleRate / (outputSampleRate * ratio)
     var output = [Float]()
-    output.reserveCapacity(outputCapacity * format.channels)
-    while cursor + 1 < Double(frames.count / format.channels) {
+    output.reserveCapacity(outputCapacity * channels)
+    while cursor + 1 < Double(frameCount) {
       let index = Int(cursor), fraction = Float(cursor - Double(index))
-      for channel in 0..<format.channels {
-        let first = Double(frames[index * format.channels + channel])
-        let second = Double(frames[(index + 1) * format.channels + channel])
+      for channel in 0..<channels {
+        let first = Double(frames[index * channels + channel])
+        let second = Double(frames[(index + 1) * channels + channel])
         output.append(Float(first + (second - first) * Double(fraction)))
       }
       cursor += step
     }
-    let frameCount = frames.count / format.channels
     let consumed = cursor >= Double(frameCount) ? frameCount : Int(cursor)
     let start = CMTimeAdd(outputOrigin ?? videoTime,
       CMTime(value: emitted, timescale: Int32(outputSampleRate)))
     // Copy only the remaining interpolation frame; retaining the combined
     // array capacity would keep an entire large packet alive between calls.
-    pending = Array(frames[(consumed * format.channels)...]); phase = cursor - Double(consumed)
+    pending = Array(frames[(consumed * channels)...]); phase = cursor - Double(consumed)
     outputOrigin = outputOrigin ?? videoTime
     previousRatio = ratio
-    let count = output.count / format.channels
+    let count = output.count / channels
     emitted += Int64(count)
     expectedAudioTime = nextAudioTime
     expectedVideoTime = nextVideoTime
     return ClockMappedPCMChunk(samples: output.withUnsafeBytes { Data($0) }, presentationTime: start,
-      sampleFrameCount: count, channels: format.channels, correctionRatio: ratio)
+      sampleFrameCount: count, channels: channels, correctionRatio: ratio)
   }
 
   /// Checked before PCM decoding or bridge copies. Conservatively includes
@@ -170,55 +199,79 @@ struct ClockMappedPCMConverter {
       guard !overflow else { throw ClockMappedPCMError.workspaceLimit }
       return value
     }
-    let samples = try multiply(sampleFrameCount, format.channels)
-    let inputBytes = try multiply(samples, format.sample.bytesPerSample)
+    let inputSamples = try multiply(sampleFrameCount, format.channels)
+    let inputBytes = try multiply(inputSamples, format.sample.bytesPerSample)
+    let channels = selectedChannels.count
+    let samples = try multiply(sampleFrameCount, channels)
     let allSamples = try add(samples, pending.count)
     let floatBytes = try multiply(allSamples, MemoryLayout<Float>.stride)
     let step = format.sampleRate / (outputSampleRate * mapping.audioToVideoRate)
-    let bound = ceil(Double(allSamples / format.channels) / step) + 1
+    let bound = ceil(Double(allSamples / channels) / step) + 1
     guard step.isFinite, step > 0, bound.isFinite, bound > 0, bound < Double(Int.max) else {
       throw ClockMappedPCMError.workspaceLimit
     }
     let outputFrames = Int(bound)
-    let outputBytes = try multiply(try multiply(outputFrames, format.channels), MemoryLayout<Float>.stride)
+    let outputBytes = try multiply(try multiply(outputFrames, channels), MemoryLayout<Float>.stride)
     let workspace = try add(inputBytes, try add(try multiply(floatBytes, 3), try multiply(outputBytes, 3)))
     guard workspace <= maximumWorkspaceBytes else { throw ClockMappedPCMError.workspaceLimit }
     return outputFrames
   }
 
   private func decode(_ planes: [Data], frames: Int) throws -> [Float] {
-    let (samples, overflow) = frames.multipliedReportingOverflow(by: format.interleaved ? format.channels : 1)
-    let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: format.sample.bytesPerSample)
+    let sourceChannels = format.channels
+    let sampleType = format.sample
+    let bytesPerSample = sampleType.bytesPerSample
+    let (samples, overflow) = frames.multipliedReportingOverflow(by: format.interleaved ? sourceChannels : 1)
+    let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: bytesPerSample)
     guard !overflow, !byteOverflow, planes.count == (format.interleaved ? 1 : format.channels),
       planes.allSatisfy({ $0.count == bytes }) else { throw ClockMappedPCMError.invalidPacket }
-    // Decode directly after the retained interpolation frame. Borrow each
-    // plane once, rather than once per sample, and avoid a second full-packet
-    // Float array when joining the decoded samples to that retained frame.
+    // Decode directly after the retained interpolation frame and borrow each
+    // used plane once.
     let prefix = pending.count
-    var output = [Float](repeating: 0, count: prefix + frames * format.channels)
+    let channels = selectedChannels.count
+    var output = [Float](repeating: 0, count: prefix + frames * channels)
     output.replaceSubrange(0..<prefix, with: pending)
-    for (plane, data) in planes.enumerated() {
-      try data.withUnsafeBytes { raw in
-        for sample in 0..<samples {
-          let index = sample * format.sample.bytesPerSample
-          let value: Float
-          if format.sample == .int16 {
-            value = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: index, as: Int16.self))) / 32768
-          } else {
-            let bits = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: index, as: UInt32.self))
-            switch format.sample {
-            case .float32: value = Float(bitPattern: bits)
-            case .int24in32: value = Float(Int32(bitPattern: bits)) / 8_388_608
-            case .int32: value = Float(Int32(bitPattern: bits)) / 2_147_483_648
-            case .int16: value = 0
+    if format.interleaved {
+      try planes[0].withUnsafeBytes { raw in
+        if channels == sourceChannels {
+          for sample in 0..<samples {
+            output[prefix + sample] = try Self.decodeSample(raw, at: sample * bytesPerSample, as: sampleType)
+          }
+        } else {
+          for frame in 0..<frames {
+            let source = frame * sourceChannels + selectedChannels.lowerBound
+            let destination = prefix + frame * channels
+            for channel in 0..<channels {
+              output[destination + channel] = try Self.decodeSample(raw, at: (source + channel) * bytesPerSample, as: sampleType)
             }
           }
-          guard value.isFinite else { throw ClockMappedPCMError.nonFiniteSample }
-          let destination = format.interleaved ? sample : sample * format.channels + plane
-          output[prefix + destination] = value
+        }
+      }
+    } else {
+      for (channel, plane) in selectedChannels.enumerated() {
+        try planes[plane].withUnsafeBytes { raw in
+          for frame in 0..<frames {
+            output[prefix + frame * channels + channel] = try Self.decodeSample(raw, at: frame * bytesPerSample, as: sampleType)
+          }
         }
       }
     }
     return output
+  }
+
+  private static func decodeSample(_ raw: UnsafeRawBufferPointer, at offset: Int, as sampleType: AudioSampleType) throws -> Float {
+    switch sampleType {
+    case .int16:
+      return Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self))) / 32_768
+    case .int24in32:
+      return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 8_388_608
+    case .int32:
+      return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 2_147_483_648
+    case .float32:
+      let bits = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+      let value = Float(bitPattern: bits)
+      guard value.isFinite else { throw ClockMappedPCMError.nonFiniteSample }
+      return value
+    }
   }
 }

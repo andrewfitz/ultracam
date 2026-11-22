@@ -277,6 +277,7 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   /// Stable source-profile identity; display strings remain a UI concern.
   var sourceProfileID: String = "unspecified"
   var scalingMode: ProgramScalingMode = .fit
+  var allowUpscale = false
   var lutInputSpaceID = "rec709-video"
   var lutOutputSpaceID = "rec709-video"
   var programColorSpaceID = "rec709-video"
@@ -286,6 +287,7 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   var previewEnabled = true
   var lutBookmark: Data?
   var automaticFeed = false
+  var recordWithCameraApps = false
   var enabled = true
   /// Monitor tools for this feed's surfaces (key `monitor`). Settings saved
   /// by the MonitorTools builds (key `monitorConfiguration`) are migrated into
@@ -311,12 +313,13 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     automaticFeed: Bool = false, enabled: Bool = true,
     monitor: MonitorFeedPreferences = MonitorFeedPreferences(),
     resizeTarget: ResizeTarget? = .hd1080, colorTarget: ColorTarget? = .yuv4208,
-    frameRateTarget: FrameRateTarget? = .fps2997, scalingMode: ProgramScalingMode = .fit,
+    frameRateTarget: FrameRateTarget? = .fps2997, scalingMode: ProgramScalingMode = .fit, allowUpscale: Bool = false,
     lutInputSpaceID: String = "rec709-video", lutOutputSpaceID: String = "rec709-video", programColorSpaceID: String = "rec709-video", recordingConstantFrameRate: Bool = false) {
     self.recordingConstantFrameRate = recordingConstantFrameRate
     self.programColorSpaceID = programColorSpaceID
     self.lutInputSpaceID = lutInputSpaceID; self.lutOutputSpaceID = lutOutputSpaceID
     self.scalingMode = scalingMode
+    self.allowUpscale = allowUpscale
     self.resizeTarget = resizeTarget
     self.colorTarget = colorTarget
     self.frameRateTarget = frameRateTarget
@@ -358,7 +361,7 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     PipelineConfiguration(applyLUT: applyLUT, downscale: downscale,
       convertTo420: convertTo420, reduceFrameRate: reduceFrameRate,
       resizeTarget: resizeTarget ?? .hd1080, colorTarget: colorTarget ?? .yuv4208,
-      frameRateTarget: frameRateTarget ?? .fps2997, scalingMode: scalingMode,
+      frameRateTarget: frameRateTarget ?? .fps2997, scalingMode: scalingMode, allowUpscale: allowUpscale,
       sourceColorimetryOverride: try? SourceColorSpaceCatalog.sourceRGBOverride(sourceProfileID),
       lutOutputColorimetry: applyLUT && lutBookmark != nil ? (try? SourceColorSpaceCatalog.color(lutOutputSpaceID)) : nil,
       programColorimetry: (try? SourceColorSpaceCatalog.color(programColorSpaceID)) ?? .rec709Video)
@@ -367,14 +370,14 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
   private enum CodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, inputClearedByChoice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, sourceProfileID, scalingMode, lutInputSpaceID, lutOutputSpaceID, programColorSpaceID, recordingConstantFrameRate, pipelineEnabled, previewEnabled, lutBookmark,
-      automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
+      automaticFeed, recordWithCameraApps, enabled, monitor, resizeTarget, colorTarget, frameRateTarget, allowUpscale
   }
 
   /// `CodingKeys` and the MonitorTools key, read only to migrate.
   private enum DecodingKeys: String, CodingKey {
     case version, id, name, selectedDevice, inputClearedByChoice, applyLUT, downscale, convertTo420,
       reduceFrameRate, gamut, sourceProfileID, scalingMode, lutInputSpaceID, lutOutputSpaceID, programColorSpaceID, recordingConstantFrameRate, pipelineEnabled, previewEnabled, lutBookmark,
-      automaticFeed, enabled, monitor, resizeTarget, colorTarget, frameRateTarget
+      automaticFeed, recordWithCameraApps, enabled, monitor, resizeTarget, colorTarget, frameRateTarget, allowUpscale
     case legacyMonitorConfiguration = "monitorConfiguration"
   }
 
@@ -403,12 +406,14 @@ struct FeedDescriptor: Codable, Equatable, Sendable, Identifiable {
     lutInputSpaceID = try values.decodeIfPresent(String.self, forKey: .lutInputSpaceID) ?? "rec709-video"
     lutOutputSpaceID = try values.decodeIfPresent(String.self, forKey: .lutOutputSpaceID) ?? "rec709-video"
     scalingMode = (try? values.decodeIfPresent(ProgramScalingMode.self, forKey: .scalingMode)) ?? .fit
+    allowUpscale = (try? values.decodeIfPresent(Bool.self, forKey: .allowUpscale)) ?? false
     sourceProfileID = try values.decodeIfPresent(String.self, forKey: .sourceProfileID)
       ?? Self.profileID(forLegacyGamut: gamut)
     pipelineEnabled = try values.decodeIfPresent(Bool.self, forKey: .pipelineEnabled) ?? true
     previewEnabled = try values.decodeIfPresent(Bool.self, forKey: .previewEnabled) ?? true
     lutBookmark = try values.decodeIfPresent(Data.self, forKey: .lutBookmark)
     automaticFeed = try values.decodeIfPresent(Bool.self, forKey: .automaticFeed) ?? false
+    recordWithCameraApps = try values.decodeIfPresent(Bool.self, forKey: .recordWithCameraApps) ?? false
     enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     // New keys only: `version` stays 1, since `validated()` rejects any other
     // and a rejected snapshot loses every feed.
@@ -521,7 +526,8 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
     if let anchor = switcher.naturalTalkingHead.anchorFeedID, !seen.contains(anchor) {
       repaired.switcher.naturalTalkingHead.anchorFeedID = nil
     }
-    if let emphasis = switcher.naturalTalkingHead.emphasisFeedID, !seen.contains(emphasis) {
+    if let emphasis = switcher.naturalTalkingHead.emphasisFeedID,
+      !seen.contains(emphasis) || emphasis == repaired.switcher.naturalTalkingHead.anchorFeedID {
       repaired.switcher.naturalTalkingHead.emphasisFeedID = nil
     }
     // Persistence preserves a valid descriptor ID even when that feed is
@@ -577,6 +583,8 @@ final class AppSettingsStore {
   static let recordingCodecKey = "ultracam.recordingCodec"
   static let recordingTimecodeModeKey = "ultracam.recordingTimecodeMode"
   static let recordingNamingKey = "ultracam.recordingNaming"
+  static let recordingProfilesKey = "ultracam.recordingAppProfiles"
+  static let recordingAppsKey = "ultracam.recordingApps"
   static let recordingBurnInLUTKey = "ultracam.recordingBurnInLUT"
   static let advertiseHDRKey = "ultracam.advertiseHDRToCameras"
   static let key = "ultracam.settings.v1"
@@ -595,7 +603,7 @@ final class AppSettingsStore {
   func resetAll() {
     let names = defaults.dictionaryRepresentation().keys.filter {
       $0 == Self.hideFromDockKey || $0 == Self.allowCPUConversionKey || $0 == Self.recordingCodecKey || $0 == Self.recordingTimecodeModeKey || $0 == Self.recordingNamingKey ||
-        $0 == Self.recordingBurnInLUTKey ||
+        $0 == Self.recordingProfilesKey || $0 == Self.recordingAppsKey || $0 == Self.recordingBurnInLUTKey ||
         $0 == Self.advertiseHDRKey || $0 == Self.key || $0 == Self.snapshotKey ||
         $0 == VendorSettingsKeys.preferences || $0 == "ultracam.settings.pre-b1d.backup" || $0 == Self.lutInputRepairedKey ||
         $0.hasPrefix("ui.") || $0.hasPrefix("recordingFolderBookmark")
@@ -628,6 +636,20 @@ final class AppSettingsStore {
         .flatMap { try? JSONDecoder().decode(RecordingFileNaming.self, from: $0) } ?? .standard
     }
     set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Self.recordingNamingKey) }
+  }
+
+  /// The app picker remembers bundle identity across renames and app updates.
+  var recordingApps: [String: String] {
+    get { defaults.dictionary(forKey: Self.recordingAppsKey) as? [String: String] ?? ["us.zoom.xos": "Zoom"] }
+    set { defaults.set(newValue, forKey: Self.recordingAppsKey) }
+  }
+
+  var recordingProfiles: [String: AppRecordingProfile] {
+    get {
+      guard let data = defaults.data(forKey: Self.recordingProfilesKey) else { return [:] }
+      return (try? JSONDecoder().decode([String: AppRecordingProfile].self, from: data)) ?? [:]
+    }
+    set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Self.recordingProfilesKey) }
   }
 
   /// Burn LUT into recordings. Off when never saved.

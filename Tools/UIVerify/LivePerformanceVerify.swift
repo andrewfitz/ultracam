@@ -13,44 +13,91 @@ import Synchronization
 // The window is on the main screen but invisible (`orderInvisiblyForTesting`), so the
 // display link, meters and Metal surfaces tick. It reports body evaluations per second
 // per view, main-thread busy time, run loop hitches and display ticks, idle and while
-// the sidebar and inspector are toggled, and checks them against budgets.
+// the inspector is toggled, and checks them against budgets.
 // UI_PERF_ONLY=1 runs only this check; UI_PERF_CAMERAS=2,4 picks the camera counts.
 
-/// Scripted UltraStudios: each started device gets a thread that delivers frames,
-/// timecode and embedded audio at 59.94 Hz until it is stopped.
+/// Scripted UltraStudios deliver frames, timecode and audio at 59.94 Hz.
 final class ScriptedLiveCapture: @unchecked Sendable {
-  /// Legacy CaptureServices callbacks are designed for capture-thread delivery.
-  /// This fixture supplies CaptureController's synchronized entry points, never
-  /// UI closures. Each run retains its callbacks unchanged and serializes calls;
-  /// the controller owns cancellation/lifetime checks. The legacy function types
-  /// cannot express that contract, so only this boundary needs a manual audit.
-  private final class DeliveryCallbacks: @unchecked Sendable {
-    private let lock = NSLock()
+  /// The serial timer queue owns all callbacks and cadence state. The lifecycle
+  /// methods only activate or cancel the timer and publish its atomic counters.
+  private final class Run: @unchecked Sendable {
+    private static let period: UInt64 = 16_683_333
+    private let timer: DispatchSourceTimer
+    private let buffers: [CapturedPixelBuffer]
     private let frames: (CVPixelBuffer, CMTime, Bool) -> Void
     private let media: (CaptureMediaStats) -> Void
     private let audio: (CaptureRawAudio) -> Void
+    private let cancelled = Atomic(false)
+    private let offered = Atomic(0)
+    private var sequence: Int64 = 0
+    private var lastOffer: UInt64?
 
-    init(frames: @escaping (CVPixelBuffer, CMTime, Bool) -> Void,
+    init(device: String, buffers: [CapturedPixelBuffer], frames: @escaping (CVPixelBuffer, CMTime, Bool) -> Void,
       media: @escaping (CaptureMediaStats) -> Void, audio: @escaping (CaptureRawAudio) -> Void) {
+      let queue = DispatchQueue(label: "ui-verify.capture.\(device)", qos: .userInteractive)
+      timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+      self.buffers = buffers
       self.frames = frames
       self.media = media
       self.audio = audio
     }
 
-    func frame(_ image: CVPixelBuffer, _ pts: CMTime) {
-      lock.withLock { frames(image, pts, true) }
+    func start() {
+      timer.setEventHandler { [weak self] in self?.emit() }
+      timer.schedule(deadline: .now(), repeating: .nanoseconds(Int(Self.period)), leeway: .nanoseconds(0))
+      timer.activate()
     }
-    func packet(_ value: CaptureRawAudio) { lock.withLock { audio(value) } }
-    func statistics(_ value: CaptureMediaStats) { lock.withLock { media(value) } }
+
+    func cancel() {
+      cancelled.store(true, ordering: .releasing)
+      timer.cancel()
+    }
+
+    var offeredFrames: Int { offered.load(ordering: .relaxed) }
+
+    private func emit() {
+      guard !cancelled.load(ordering: .acquiring) else { return }
+      // Dispatch merges missed timer fires. Preserve their gap in source time
+      // while delivering at most the newest frame. Drop a compressed next wake.
+      sequence += Int64(max(1, timer.data))
+      let index = sequence - 1
+      let now = DispatchTime.now().uptimeNanoseconds
+      if let lastOffer, now - lastOffer < Self.period / 2 { return }
+      lastOffer = now
+      let pts = CMTime(value: index * 1001, timescale: 60_000)
+      offered.add(1, ordering: .relaxed)
+      frames(buffers[Int(index) % buffers.count].value, pts, true)
+      // A 1 kHz tone whose level drifts so meter and timecode changes are visible.
+      let audioStart = index * 1001 * 48_000 / 60_000
+      let audioEnd = sequence * 1001 * 48_000 / 60_000
+      let sampleFrames = Int(audioEnd - audioStart)
+      let level = 0.25 + 0.2 * sin(Double(index) / 40)
+      let phaseStep = 2 * Double.pi / 48
+      var phase = Double(audioStart % 48) * phaseStep
+      var pcm = [Int32](repeating: 0, count: sampleFrames * 2)
+      for frame in 0..<sampleFrames {
+        let value = Int32(level * sin(phase) * Double(Int32.max))
+        pcm[frame * 2] = value
+        pcm[frame * 2 + 1] = value / 2
+        phase += phaseStep
+      }
+      let packetTime = CMTime(value: audioStart, timescale: 48_000)
+      audio(CaptureRawAudio(samples: pcm.withUnsafeBytes { Data($0) }, packetTime: packetTime,
+        sampleFrames: UInt64(sampleFrames), channels: 2, bytesPerSample: 4))
+      let seconds = index * 1001 / 60_000
+      let timecode = String(format: "14:%02d:%02d:%02d", Int32(seconds / 60 % 60), Int32(seconds % 60), Int32(index % 60))
+      media(CaptureMediaStats(timecode: timecode, audioPacketTime: packetTime, audioSampleFrames: UInt64(sampleFrames),
+        audioChannels: 2, leftPeak: level, rightPeak: level / 2, leftRMS: level * 0.7, rightRMS: level * 0.35,
+        audioBytes: UInt64(pcm.count * 4), audioPresent: true))
+    }
   }
 
   private let lock = NSLock()
-  private var running: Set<String> = []
-  private var generation: [String: Int] = [:]
+  private var runs: [String: Run] = [:]
   // Attachments are initialized once; producers and consumers only read these images.
   private let buffers: [CapturedPixelBuffer]
 
-  init() {
+  init() throws {
     buffers = (0..<6).compactMap { _ in
       var made: CVPixelBuffer?
       CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
@@ -60,66 +107,39 @@ final class ScriptedLiveCapture: @unchecked Sendable {
       }
       return made.map { CapturedPixelBuffer(immutable: $0) }
     }
+    guard buffers.count == 6 else { throw CocoaError(.fileReadUnknown) }
   }
 
-  func services() -> CaptureServices {
+  func services(deviceID: String?) -> CaptureServices {
     var services = CaptureServices(
       start: { _, _, _, _ in throw CocoaError(.featureUnsupported) },
       startWithSourceAudio: { [self] device, _, frames, media, audio, _ in
-        start(device, frames: frames, media: media, audio: audio)
+        guard device == deviceID else { throw CocoaError(.featureUnsupported) }
+        let run = Run(device: device, buffers: buffers, frames: frames, media: media, audio: audio)
+        lock.withLock {
+          runs.updateValue(run, forKey: device)?.cancel()
+          run.start()
+        }
       },
-      stop: {}, connect: { _, _ in }, disconnect: {}, send: { _ in true })
+      stop: { [self] in
+        guard let deviceID else { return }
+        lock.withLock {
+          if let run = runs.removeValue(forKey: deviceID) { run.cancel() }
+        }
+      }, connect: { _, _ in }, disconnect: {}, send: { _ in true })
     services.capturePixelFormat = kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
     return services
   }
 
-  func stopAll() { lock.withLock { running.removeAll() } }
+  func offeredFrames(for deviceIDs: [String]) -> [Int] {
+    lock.withLock { deviceIDs.map { runs[$0]?.offeredFrames ?? 0 } }
+  }
 
-  private func start(_ device: String, frames: @escaping (CVPixelBuffer, CMTime, Bool) -> Void,
-    media: @escaping (CaptureMediaStats) -> Void, audio: @escaping (CaptureRawAudio) -> Void) {
-    let token = lock.withLock { () -> Int in
-      running.insert(device)
-      generation[device, default: 0] += 1
-      return generation[device]!
+  func stopAll() {
+    lock.withLock {
+      for run in runs.values { run.cancel() }
+      runs.removeAll()
     }
-    let buffers = buffers
-    let callbacks = DeliveryCallbacks(frames: frames, media: media, audio: audio)
-    let thread = Thread { [self] in
-      var timebase = mach_timebase_info_data_t()
-      mach_timebase_info(&timebase)
-      let ticksPerSecond = 1e9 * Double(timebase.denom) / Double(timebase.numer)
-      let start = mach_absolute_time()
-      let hz = 60_000.0 / 1001
-      let samplesPerFrame = 801
-      var sequence: Int64 = 0
-      var phase = 0.0
-      while lock.withLock({ running.contains(device) && generation[device] == token }) {
-        let pts = CMTimeMultiply(VideoContract.fastDuration, multiplier: Int32(truncatingIfNeeded: sequence))
-        callbacks.frame(buffers[Int(sequence) % buffers.count].value, pts)
-        // A 1 kHz tone whose level drifts, so the peaks and timecode change with every update.
-        let level = 0.25 + 0.2 * sin(Double(sequence) / 40)
-        var pcm = [Int32](repeating: 0, count: samplesPerFrame * 2)
-        for frame in 0..<samplesPerFrame {
-          let value = Int32(level * sin(phase) * Double(Int32.max))
-          pcm[frame * 2] = value
-          pcm[frame * 2 + 1] = value / 2
-          phase += 2 * .pi * 1000 / 48_000
-        }
-        let packetTime = CMTime(value: sequence * Int64(samplesPerFrame), timescale: 48_000)
-        callbacks.packet(CaptureRawAudio(samples: pcm.withUnsafeBytes { Data($0) }, packetTime: packetTime,
-          sampleFrames: UInt64(samplesPerFrame), channels: 2, bytesPerSample: 4))
-        let seconds = Int(Double(sequence) / hz)
-        let timecode = String(format: "14:%02d:%02d:%02d", (seconds / 60) % 60, seconds % 60, Int(sequence) % 60)
-        callbacks.statistics(CaptureMediaStats(timecode: timecode, audioPacketTime: packetTime, audioSampleFrames: UInt64(samplesPerFrame),
-          audioChannels: 2, leftPeak: level, rightPeak: level / 2, leftRMS: level * 0.7, rightRMS: level * 0.35,
-          audioBytes: UInt64(pcm.count * 4), audioPresent: true))
-        sequence += 1
-        // Each frame at its own time, never a burst to catch up.
-        mach_wait_until(start + UInt64(Double(sequence) / hz * ticksPerSecond))
-      }
-    }
-    thread.qualityOfService = .userInteractive
-    thread.start()
   }
 }
 
@@ -135,12 +155,14 @@ final class ScriptedLiveCapture: @unchecked Sendable {
     super.init()
     link = view.displayLink(target: self, selector: #selector(tick))
     link?.add(to: .main, forMode: .common)
-    let observer = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.afterWaiting.rawValue | CFRunLoopActivity.beforeWaiting.rawValue,
-      true, 0) { [weak self] _, activity in
+    let activities: CFRunLoopActivity = [.entry, .afterWaiting, .beforeWaiting, .exit]
+    let observer = CFRunLoopObserverCreateWithHandler(nil, activities.rawValue, true, 0) { [weak self] _, activity in
       MainActor.assumeIsolated {
         guard let self else { return }
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        if activity == .afterWaiting { self.wokeAt = now } else if self.wokeAt != 0 {
+        if activity == .afterWaiting || activity == .entry {
+          if self.wokeAt == 0 { self.wokeAt = now }
+        } else if self.wokeAt != 0 {
           self.stretches.append(Double(now - self.wokeAt) / 1e6)
           self.wokeAt = 0
         }
@@ -159,6 +181,7 @@ final class ScriptedLiveCapture: @unchecked Sendable {
 
   func reset() {
     displayTicks = 0
+    wokeAt = 0
     stretches = []
   }
 
@@ -180,16 +203,17 @@ struct LivePerformanceSample {
   var seconds: Double
   var busy: Double
   var process: Double
-  var bodies: [String: Double]
+  var bodies: [String: Int]
   var displayHz: Double
   var hitches8: Int
   var hitches16: Int
   var longest: Double
 
-  func rate(_ name: String) -> Double { bodies[name] ?? 0 }
+  func count(_ name: String) -> Int { bodies[name] ?? 0 }
+  func rate(_ name: String) -> Double { Double(count(name)) / seconds }
 
   var summary: String {
-    let views = bodies.sorted { $0.key < $1.key }.map { "\($0.key)=\(String(format: "%.1f", $0.value))" }.joined(separator: " ")
+    let views = bodies.keys.sorted().map { "\($0)=\(String(format: "%.1f", rate($0)))" }.joined(separator: " ")
     return String(format: "main %.1f%% process %.0f%% display %.0f Hz hitches>8ms %d >16ms %d longest %.1f ms | bodies/s ", busy * 100, process * 100,
       displayHz, hitches8, hitches16, longest) + views
   }
@@ -197,7 +221,7 @@ struct LivePerformanceSample {
 
 @MainActor enum LivePerformanceVerify {
   /// Views that must not re-evaluate while nothing but telemetry changes.
-  static let structural = ["UILiveRoot", "UIMainWindowView", "UISessionSidebarView", "UISessionSidebarViewContent",
+  static let structural = ["UILiveRoot", "UIMainWindowView",
     "UIInspectorView", "UIInspectorViewContent", "UIToolbarContent", "UICameraColumnView", "UICameraPictureView",
     "UIChannelStripView", "UIStatusBarView", "UIAppSurfacePicture"]
 
@@ -232,29 +256,41 @@ struct LivePerformanceSample {
     guard !meters.isEmpty, meters.allSatisfy({ $0 == "live" || $0 == "fixed" }) else {
       return verifier.check("perf: UI_PERF_METERS contains live or fixed", false)
     }
+    let environment = ProcessInfo.processInfo.environment
+    let idleSeconds = Double(environment["UI_PERF_IDLE"] ?? "4")
+    guard let idleSeconds, idleSeconds.isFinite, idleSeconds > 0 else {
+      return verifier.check("perf: UI_PERF_IDLE is a finite positive duration", false)
+    }
+    let profileToggles = Int(environment["UI_PERF_PROFILE_INSPECTOR"] ?? "0")
+    guard let profileToggles, profileToggles >= 0 else {
+      return verifier.check("perf: UI_PERF_PROFILE_INSPECTOR is a nonnegative integer", false)
+    }
     for cameras in counts {
       // With live meters (as in the app), then with the meters showing fixed readings, which never
       // tick: the difference is what the meters' display-rate drawing costs the window.
-      if meters.contains("live") { measure(cameras: cameras, liveMeters: true, verifier: verifier) }
-      if meters.contains("fixed") { measure(cameras: cameras, liveMeters: false, verifier: verifier) }
+      if meters.contains("live") { measure(cameras: cameras, liveMeters: true, idleSeconds: idleSeconds, profileToggles: profileToggles, verifier: verifier) }
+      if meters.contains("fixed") { measure(cameras: cameras, liveMeters: false, idleSeconds: idleSeconds, profileToggles: profileToggles, verifier: verifier) }
     }
   }
 
-  static func measure(cameras: Int, liveMeters: Bool, verifier: Verifier) {
+  static func measure(cameras: Int, liveMeters: Bool, idleSeconds: Double, profileToggles: Int, verifier: Verifier) {
     let name = "perf \(cameras) cameras\(liveMeters ? "" : ", fixed meters")"
     let suiteName = "org.ultracam.ui-verify-perf.\(UUID().uuidString)"
     guard let defaults = UserDefaults(suiteName: suiteName) else { return verifier.check("perf: defaults suite", false) }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let ids = (1...cameras).map { FeedID(rawValue: "ui-verify-perf-\($0)") }
+    let deviceIDs = (1...cameras).map { "perf-dev-\($0)" }
     let settings = AppSettingsStore(defaults: defaults)
     settings.saveSnapshot(AppSettingsSnapshot(feeds: ids.enumerated().map { index, id in
-      FeedDescriptor(id: id, name: "Camera \(index + 1)", selectedDevice: "perf-dev-\(index + 1)", applyLUT: false,
-        automaticFeed: false)
+      FeedDescriptor(id: id, name: "Camera \(index + 1)", selectedDevice: deviceIDs[index], applyLUT: false,
+        automaticFeed: false, frameRateTarget: .fps5994)
     }, selectedFeedID: ids[0], outputMode: .separateCameras))
-    let capture = ScriptedLiveCapture()
+    let capture: ScriptedLiveCapture
+    do { capture = try ScriptedLiveCapture() }
+    catch { return verifier.check("\(name): allocate scripted capture buffers", false, "\(error)") }
     var hardware = AppHardware.offline
-    hardware.devices = { (1...cameras).map { InputDevice(id: "perf-dev-\($0)", name: "UltraStudio \($0)") } }
-    hardware.captureServices = { _ in capture.services() }
+    hardware.devices = { deviceIDs.enumerated().map { InputDevice(id: $0.element, name: "UltraStudio \($0.offset + 1)") } }
+    hardware.captureServices = { id in capture.services(deviceID: ids.firstIndex(of: id).map { deviceIDs[$0] }) }
     let model = AppModel(settingsStore: settings, lutLoader: LUTFileLoader(scopedBookmarks: false),
       registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: PerfRegistryPublisher(),
       recordingFolderStore: RecordingFolderStore(defaults: defaults),
@@ -264,8 +300,11 @@ struct LivePerformanceSample {
         submit: { _ in })),
       hardware: hardware)
     let interface = UIInterfaceState(defaults: defaults)
-    interface.layout = cameras > 2 ? .fourUp : .sideBySide
-    interface.sidebarVisible = true
+    switch cameras {
+    case 1: interface.layout = .single
+    case 2: interface.layout = .sideBySide
+    default: interface.layout = .fourUp
+    }
     for id in ids { model.startCamera(id) }
     defer {
       for id in ids { model.stopCamera(id) }
@@ -293,14 +332,18 @@ struct LivePerformanceSample {
       meter.reset()
       let cpu = MainThreadMeter.mainThreadCPU()
       let processCPU = MainThreadMeter.processCPU()
-      let start = Date()
+      let start = ProcessInfo.processInfo.systemUptime
       action()
-      let end = start.addingTimeInterval(seconds)
-      while Date() < end { MainLoop.run(seconds: min(0.05, max(0.001, end.timeIntervalSinceNow))) }
-      let elapsed = Date().timeIntervalSince(start)
+      let end = start + seconds
+      var remaining = end - ProcessInfo.processInfo.systemUptime
+      while remaining > 0 {
+        MainLoop.run(seconds: min(0.05, remaining))
+        remaining = end - ProcessInfo.processInfo.systemUptime
+      }
+      let elapsed = ProcessInfo.processInfo.systemUptime - start
       let busy = (MainThreadMeter.mainThreadCPU() - cpu) / elapsed
       return LivePerformanceSample(seconds: elapsed, busy: busy, process: (MainThreadMeter.processCPU() - processCPU) / elapsed,
-        bodies: UIRenderProbe.counts.mapValues { Double($0) / elapsed }, displayHz: Double(meter.displayTicks) / elapsed,
+        bodies: UIRenderProbe.counts, displayHz: Double(meter.displayTicks) / elapsed,
         hitches8: meter.stretches.filter { $0 > 1000.0 / 120 }.count, hitches16: meter.stretches.filter { $0 > 1000.0 / 60 }.count,
         longest: meter.stretches.max() ?? 0)
     }
@@ -317,6 +360,7 @@ struct LivePerformanceSample {
     /// Selecting another camera and cutting to one: the click's own main-thread time, then the
     /// longest stall while the window catches up. Both are the wait before the click shows.
     func react(_ where: String) {
+      guard ids.count > 1 else { return }
       let other = ids[1]
       let back = ids[0]
       for (step, action) in [("select another camera", UIAction.select(cameraID: other.rawValue)),
@@ -339,12 +383,16 @@ struct LivePerformanceSample {
     }
 
     let before = ids.map { model.cameraUpdate($0)?.frames ?? 0 }
+    let offeredBefore = capture.offeredFrames(for: deviceIDs)
     // UI_PERF_IDLE stretches the idle interval, e.g. to attach Instruments to this process.
     let meterTicks = MeterDiagnostics.displayTicks
-    let idle = sample(Double(ProcessInfo.processInfo.environment["UI_PERF_IDLE"] ?? "") ?? 4)
+    let idle = sample(idleSeconds)
     let after = ids.map { model.cameraUpdate($0)?.frames ?? 0 }
+    let offered = zip(capture.offeredFrames(for: deviceIDs), offeredBefore).map { $0 - $1 }
+    let accepted = zip(after, before).map { $0 - $1 }
+    let rates = offered.map { String(format: "%.1f", Double($0) / idle.seconds) }
     let meterHz = Double(MeterDiagnostics.displayTicks - meterTicks) / idle.seconds
-    print("PERF \(name) idle: \(idle.summary) | meter frames/s \(Int(meterHz))")
+    print("PERF \(name) idle: \(idle.summary) | meter frames/s \(Int(meterHz)) | offered frames \(offered) (\(rates.joined(separator: ", ")) Hz), accepted frames \(accepted)")
     // Each camera's strip meter draws on every display frame, without SwiftUI.
     if liveMeters {
       verifier.check("\(name): the live meters draw at the display rate",
@@ -354,46 +402,20 @@ struct LivePerformanceSample {
     }
     verifier.check("\(name): the window is on a display and ticks", idle.displayHz > 50, "\(idle.displayHz) Hz")
     verifier.check("\(name): every camera delivers frames while measured",
-      zip(before, after).allSatisfy { Double($1) > Double($0) + idle.seconds * 40 }, "\(before) -> \(after)")
+      accepted.allSatisfy { Double($0) > idle.seconds * 40 }, "offered \(offered), accepted \(accepted)")
     verifier.check("\(name): the session snapshot and context follow no capture update", !rebuilt.withLock { $0 })
     check(idle, "idle", name: name, verifier: verifier, liveMeters: liveMeters)
 
-    // The split view's own sidebar animation, as the toolbar's sidebar button runs it.
-    if let split = window.splitViewController {
-      // UI_PERF_PROFILE_SIDEBAR=n toggles the sidebar n times first, to profile its animation,
-      // and reports the main thread's CPU time per toggle (steadier than stalls on a busy machine).
-      let profileToggles = Int(ProcessInfo.processInfo.environment["UI_PERF_PROFILE_SIDEBAR"] ?? "") ?? 0
-      let profileCPU = MainThreadMeter.mainThreadCPU()
-      for _ in 0..<profileToggles { _ = sample(0.6) { split.toggleSidebar(nil) } }
-      if profileToggles > 0 {
-        print(String(format: "PERF \(name) sidebar toggle: main CPU %.1f ms per toggle",
-          (MainThreadMeter.mainThreadCPU() - profileCPU) * 1000 / Double(profileToggles)))
-      }
-      let hide = sample(1.2) { split.toggleSidebar(nil) }
-      let grew = UIRenderProbe.samples.withLock { $0["cells scale"] ?? [] }
-      let show = sample(1.2) { split.toggleSidebar(nil) }
-      let shrank = UIRenderProbe.samples.withLock { $0["cells scale"] ?? [] }
-      print("PERF \(name) sidebar hide: \(hide.summary)")
-      print("PERF \(name) sidebar show: \(show.summary)")
-      for (step, value) in [("sidebar hide", hide), ("sidebar show", show)] {
-        checkToggle(value, step, name: name, verifier: verifier, liveMeters: liveMeters)
-      }
-      // The pictures follow the detail through the animation, scaled, rather than standing still
-      // until it ends: on macOS 26 the sidebar floats over the detail and animates its safe area.
-      // At least two sizes in between (a loaded machine draws few frames), then laid out at 1.
-      verifier.check("\(name): the pictures grow with the detail as the sidebar hides",
-        Set(grew.filter { $0 > 1.01 }).count >= 2 && grew.last == 1, grew.map { String(format: "%.2f", $0) }.joined(separator: " "))
-      verifier.check("\(name): the pictures shrink with the detail as the sidebar shows",
-        Set(shrank.filter { $0 < 0.99 }).count >= 2 && shrank.last == 1, shrank.map { String(format: "%.2f", $0) }.joined(separator: " "))
-    } else {
-      verifier.check("\(name): the main window has a split view controller with a sidebar", false)
-    }
     // UI_PERF_PROFILE_INSPECTOR=n toggles the inspector n times first, to profile its animation.
-    for _ in 0..<(Int(ProcessInfo.processInfo.environment["UI_PERF_PROFILE_INSPECTOR"] ?? "") ?? 0) {
+    for _ in 0..<profileToggles {
+      _ = sample(0.8) { bridge.send(.toggleInspector) }
+    }
+    if profileToggles % 2 != 0 {
       _ = sample(0.8) { bridge.send(.toggleInspector) }
     }
     // The inspector, as the toolbar's Inspector button opens and closes it; and live with it open.
     let open = sample(1.2) { bridge.send(.toggleInspector) }
+    let shrank = UIRenderProbe.samples.withLock { $0["cells scale"] ?? [] }
     print("PERF \(name) inspector open: \(open.summary)")
     checkToggle(open, "inspector open", name: name, verifier: verifier, liveMeters: liveMeters)
     let inspecting = sample(3)
@@ -404,8 +426,16 @@ struct LivePerformanceSample {
       inspecting.rate("UILiveCamera(capture)") >= 3, inspecting.summary)
     react("with the inspector open")
     let close = sample(1.2) { bridge.send(.toggleInspector) }
+    let grew = UIRenderProbe.samples.withLock { $0["cells scale"] ?? [] }
     print("PERF \(name) inspector close: \(close.summary)")
     checkToggle(close, "inspector close", name: name, verifier: verifier, liveMeters: liveMeters)
+    // The inspector is a panel of the content and opens at once. The pictures follow the
+    // detail's new size scaled, in the render pass, until that size settles, and are then laid
+    // out at 1: never a frame at the old size beside the panel.
+    verifier.check("\(name): the pictures shrink with the detail as the inspector opens",
+      shrank.contains { $0 < 0.99 } && shrank.last == 1, shrank.map { String(format: "%.2f", $0) }.joined(separator: " "))
+    verifier.check("\(name): the pictures grow with the detail as the inspector closes",
+      grew.contains { $0 > 1.01 } && grew.last == 1, grew.map { String(format: "%.2f", $0) }.joined(separator: " "))
     let afterToggles = sample(3)
     print("PERF \(name) idle after toggles: \(afterToggles.summary)")
     check(afterToggles, "idle after toggles", name: name, verifier: verifier, liveMeters: liveMeters)
@@ -418,7 +448,7 @@ struct LivePerformanceSample {
   /// meters or not (an unoptimized build).
   static func check(_ value: LivePerformanceSample, _ step: String, name: String, verifier: Verifier, liveMeters: Bool) {
     for view in structural {
-      verifier.check("\(name), \(step): \(view) is not re-evaluated", value.rate(view) * value.seconds < 1,
+      verifier.check("\(name), \(step): \(view) is not re-evaluated", value.count(view) == 0,
         String(format: "%.1f per second", value.rate(view)))
     }
     // The rebuilds on every capture update stalled it 40–100 ms several times a second. Shorter
@@ -432,10 +462,10 @@ struct LivePerformanceSample {
   /// change (the column's state, the strips' measured heights), never once per frame of the
   /// animation, and no frame stalls as the 50 ms rebuilds on every capture update did.
   static func checkToggle(_ value: LivePerformanceSample, _ step: String, name: String, verifier: Verifier, liveMeters: Bool) {
-    for view in ["UILiveRoot", "UIMainWindowView", "UISessionSidebarViewContent", "UIInspectorViewContent", "UIChannelStripView"] {
-      let total = value.rate(view) * value.seconds
+    for view in ["UILiveRoot", "UIMainWindowView", "UIInspectorViewContent", "UIChannelStripView"] {
+      let total = value.count(view)
       verifier.check("\(name), \(step): \(view) evaluated a few times, not per frame", total <= 10,
-        String(format: "%.0f times", total))
+        "\(total) times")
     }
     // Opening the inspector builds its form, once: the longest pass, 50–120 ms unoptimized.
     verifier.check("\(name), \(step): no run loop stall past 250 ms", value.longest < 250, value.summary)
@@ -446,10 +476,10 @@ struct LivePerformanceSample {
   /// refresh), not once per density it measures: each hidden copy wrapped its segments in its own
   /// live session, so a statistics tick built the presentation (problems and all) 12 times.
   static func statusBarBuildsOneLiveSession(_ value: LivePerformanceSample, _ step: String, name: String, verifier: Verifier) {
-    let bar = value.rate("UIStatusBarView") * value.seconds
-    let live = value.rate("UILiveSession(status)") * value.seconds
+    let bar = value.count("UIStatusBarView")
+    let live = value.count("UILiveSession(status)")
     verifier.check("\(name), \(step): the status bar builds one live session, not one per measured copy",
-      live <= bar + 2, String(format: "%.0f live sessions for %.0f bars", live, bar))
+      live <= bar + 2, "\(live) live sessions for \(bar) bars")
   }
 }
 
@@ -474,19 +504,6 @@ struct LivePerformanceSample {
     window.setContentSize(size)
     if let screen = NSScreen.main { window.setFrameOrigin(screen.visibleFrame.origin) }
     window.orderInvisiblyForTesting()
-  }
-
-  /// The NavigationSplitView's controller (the split view's delegate).
-  /// The split view controller with the sidebar: the NavigationSplitView's. The window's
-  /// outermost split is the inspector's (the content and the inspector), which has none.
-  var splitViewController: NSSplitViewController? {
-    func find(_ view: NSView) -> NSSplitViewController? {
-      if let split = view as? NSSplitView, let controller = split.delegate as? NSSplitViewController,
-        controller.splitViewItems.contains(where: { $0.behavior == .sidebar }) { return controller }
-      for child in view.subviews { if let found = find(child) { return found } }
-      return nil
-    }
-    return window.contentView.flatMap(find)
   }
 
   func close() {

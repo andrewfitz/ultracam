@@ -99,11 +99,11 @@ extension AudioMeterTap {
 
   /// A running take: its own meter, and the overs its own watch counted.
   struct TakeState {
-    let meter: AudioMeter
+    var meter: AudioMeter
     let number: UInt64
     /// The first packet (ring position) the take meters.
     let startPacket: Int
-    var paused = false
+    var inputClosed = false
     var overs = 0
   }
 

@@ -1,4 +1,5 @@
 import CoreMedia
+import CoreVideo
 import Foundation
 
 /// The immutable description that travels with a processed image.
@@ -14,9 +15,11 @@ public struct ProcessedFrameMetadata: @unchecked Sendable, Equatable {
   public let maximumRepeatDuration: Double
   public let repeatCount: Int
   public let processingRevision: UInt64
+  /// Presentation start on the host clock, captured before GPU processing.
+  public let captureHostTime: CMTime?
 
   public init(presentationTime: CMTime, duration: CMTime, width: Int, height: Int,
-              pixelFormat: UInt32, processingRevision: UInt64 = 0, repeatCount: Int = 1, maximumRepeatDuration: Double = 2) {
+              pixelFormat: UInt32, processingRevision: UInt64 = 0, repeatCount: Int = 1, maximumRepeatDuration: Double = 2, captureHostTime: CMTime? = nil) {
     self.presentationTime = presentationTime
     self.duration = duration
     self.width = width
@@ -24,6 +27,7 @@ public struct ProcessedFrameMetadata: @unchecked Sendable, Equatable {
     self.pixelFormat = pixelFormat
     self.maximumRepeatDuration = maximumRepeatDuration.isFinite ? max(0, maximumRepeatDuration) : 0
     self.repeatCount = max(1, repeatCount)
+    self.captureHostTime = captureHostTime
     self.processingRevision = processingRevision
   }
 }
@@ -49,6 +53,12 @@ public final class ProcessedFrame<Payload>: @unchecked Sendable {
   /// released by the consumer; deinitialization is an idempotent safety net.
   public func retainLease() -> FrameLease<Payload> {
     return FrameLease(storage: storage)
+  }
+
+  /// A consumer that uses the payload directly only needs a separate lease
+  /// when the producer's release action owns resources outside the payload.
+  func retainProducerLease() -> FrameLease<Payload>? {
+    storage.hasReleaseAction ? retainLease() : nil
   }
 }
 
@@ -258,21 +268,29 @@ public final class FrameFanOut<Payload>: @unchecked Sendable {
     sync {
       var summary = FrameFanOutSummary()
       guard !closed else { summary.routerClosed = true; return summary }
+      guard count > 0 else { return summary }
       let metadata = frame.metadata
       for id in orderedRouteIDs {
         guard let route = routes[id] else { continue }
-        let sends = route.compactRepeats ? 1 : count
-        var acceptedSamples = 0
-        for index in 0..<sends {
+        let available = route.capacity - route.pending.count
+        let accepts = min(available, route.compactRepeats ? 1 : count)
+        let repeatCount = route.compactRepeats ? count : 1
+        for index in 0..<accepts {
+          if index == 0, metadata.repeatCount == repeatCount {
+            _ = enqueueLocked(frame, on: route)
+            continue
+          }
           let timed = ProcessedFrame(payload: frame.payload, metadata: ProcessedFrameMetadata(
             presentationTime: CMTimeAdd(metadata.presentationTime, CMTimeMultiply(metadata.duration, multiplier: Int32(index))),
             duration: metadata.duration, width: metadata.width, height: metadata.height,
             pixelFormat: metadata.pixelFormat, processingRevision: metadata.processingRevision,
-            repeatCount: route.compactRepeats ? count : 1, maximumRepeatDuration: metadata.maximumRepeatDuration), onReleased: { withExtendedLifetime(frame) {} })
-          let logicalCount = route.compactRepeats ? count : 1
-          if enqueueLocked(timed, on: route) == .enqueued { summary.enqueued += logicalCount; acceptedSamples += logicalCount }
-          else { summary.rejected += logicalCount }
+            repeatCount: repeatCount, maximumRepeatDuration: metadata.maximumRepeatDuration,
+            captureHostTime: metadata.captureHostTime), onReleased: { withExtendedLifetime(frame) {} })
+          _ = enqueueLocked(timed, on: route)
         }
+        let acceptedSamples = accepts * repeatCount
+        summary.enqueued += acceptedSamples
+        summary.rejected += count - acceptedSamples
         summary.publishedSamples = max(summary.publishedSamples, acceptedSamples)
       }
       return summary
@@ -365,6 +383,7 @@ private final class FrameStorage<Payload>: @unchecked Sendable {
   let payload: Payload
   let metadata: ProcessedFrameMetadata
   private let onReleased: (() -> Void)?
+  var hasReleaseAction: Bool { onReleased != nil }
 
   init(payload: Payload, metadata: ProcessedFrameMetadata, onReleased: (() -> Void)?) {
     self.payload = payload
@@ -375,4 +394,16 @@ private final class FrameStorage<Payload>: @unchecked Sendable {
   // ARC tracks the producer and each unreleased lease directly. A second
   // reference counter would duplicate that ownership with a lock per access.
   deinit { onReleased?() }
+}
+
+extension CMSampleBuffer {
+  private static var imageFrameLeaseKey: CFString { "org.ultracam.image-frame-lease" as CFString }
+
+  var retainedImageFrame: FrameLease<CVPixelBuffer>? {
+    CMGetAttachment(self, key: Self.imageFrameLeaseKey, attachmentModeOut: nil) as? FrameLease<CVPixelBuffer>
+  }
+
+  func retainImageFrame(_ lease: FrameLease<CVPixelBuffer>) {
+    CMSetAttachment(self, key: Self.imageFrameLeaseKey, value: lease, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+  }
 }

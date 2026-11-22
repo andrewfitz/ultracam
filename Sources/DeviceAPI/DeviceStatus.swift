@@ -56,6 +56,7 @@ struct CaptureDeviceStatus: Equatable, Sendable {
   var detected: SourceFormat? = nil
   var facts: [DeviceFact] = []
   var problems: [DeviceProblem] = []
+  var signalDetail: String? = nil
 }
 
 /// Main-actor delivery and cancellation share this token, as `DeviceObservation` does for

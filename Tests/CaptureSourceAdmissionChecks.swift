@@ -1,10 +1,225 @@
 #if ULTRACAM_TEST_SUPPORT
+import AVFAudio
 import CoreMedia
 import CoreVideo
 import Foundation
 import XCTest
 
 @objcMembers final class CaptureSourceAdmissionChecks: XCTestCase {
+  func testNativeMediaTimecodeLabelIsPublishedAndClearedWithoutAudio() throws {
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(VideoContract.fastDuration))
+    let source = FakeCaptureSession(format: format, audio: .absent)
+    let feed = FeedID(rawValue: "native-media-timecode")
+    let controller = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in source }))
+    controller.setCameraOutputEnabled(false)
+    let ready = expectation(description: "Capture ready")
+    let shown = expectation(description: "Native timecode displayed")
+    let cleared = expectation(description: "Missing native timecode clears display")
+    controller.onUpdate = { update in
+      switch update.message {
+      case let message where message.hasPrefix("Waiting"): ready.fulfill()
+      case "Timecode detected":
+        XCTAssertEqual(update.timecode, "01:02:03;04")
+        shown.fulfill()
+      case "Timecode absent":
+        XCTAssertNil(update.timecode)
+        cleared.fulfill()
+      default: break
+      }
+    }
+    defer { controller.onUpdate = nil; controller.stop() }
+    controller.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(),
+      pipelineEnabled: false, previewEnabled: false)
+    wait(for: [ready], timeout: 1)
+    func report(_ timecode: Timecode?, message: String) {
+      let media = CaptureMediaInfo(timecode: timecode, pairedFrameSequence: nil, audioDeclaration: .absent,
+        audioPacketTime: nil, audioClockInstance: nil, sampleFrameCount: 0, byteCount: 0, peaks: [], rms: [])
+      XCTAssertTrue(source.submitGroup([.media(media), .event(.info(message))]))
+    }
+    report(try Timecode(hours: 1, minutes: 2, seconds: 3, frames: 4, dropFrame: true), message: "Timecode detected")
+    wait(for: [shown], timeout: 1)
+    XCTAssertEqual(controller.latestSourceTimecode, "01:02:03;04")
+    report(nil, message: "Timecode absent")
+    wait(for: [cleared], timeout: 1)
+    XCTAssertNil(controller.latestSourceTimecode)
+  }
+
+  func testProgramStreamFixedAudioUsesPairedFrameAndIndependentClockWithoutRecording() throws {
+    for clock: AudioClockDomain in [.pairedWithFrames, .deviceClock] {
+      let fixture = try SourceRouteFixture(pixel: .video420)
+      let paired = clock == .pairedWithFrames
+      let format = try SourceAudioFormat(sampleRate: 48_000, channels: paired ? 4 : 1,
+        sample: .int16, interleaved: true, layout: AudioChannelMap(), clock: clock)
+      let source = FakeCaptureSession(format: fixture.format, audio: .present(format))
+      let feed = FeedID(rawValue: "program-stream-audio")
+      let controller = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in source }))
+      controller.setCameraOutputEnabled(false)
+      let host = CMTime(value: 120, timescale: 1)
+      let pts = CMTime(value: 55, timescale: 1)
+      let delivered = expectation(description: "Selected audio pair on the common host timeline")
+      let tap = ProgramStreamAudioTap(pairIndex: paired ? 1 : 0) { pcm, time in
+        XCTAssertEqual(time, host)
+        XCTAssertEqual(pcm.format.channelCount, 2)
+        XCTAssertEqual(pcm.format.sampleRate, 48_000)
+        XCTAssertEqual(pcm.frameLength, 7)
+        XCTAssertEqual(pcm.floatChannelData?[0][0], 0.25)
+        XCTAssertEqual(pcm.floatChannelData?[1][0], paired ? -0.5 : 0.25)
+        delivered.fulfill()
+      }
+      let picture = paired ? expectation(description: "Program picture and PCM share capture timestamp") : nil
+      if let picture {
+        controller.setProgramPictureWanted(true)
+        controller.onProcessedFrame = { frame, _ in
+          XCTAssertEqual(frame.metadata.captureHostTime, host)
+          picture.fulfill()
+        }
+      }
+      let ready = expectation(description: "Capture ready")
+      controller.onUpdate = { if $0.message.hasPrefix("Waiting") { ready.fulfill() } }
+      controller.setProgramStreamAudioTap(tap)
+      defer { tap.stop(); controller.setProgramStreamAudioTap(nil); controller.onUpdate = nil; controller.stop() }
+      controller.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(),
+        pipelineEnabled: false, previewEnabled: false)
+      wait(for: [ready], timeout: 3)
+      let ctx = source.context
+      var payloads: [CaptureDelivery.Payload] = []
+      if paired {
+        let duration = fixture.format.rate.nominal
+        let info = CaptureFrameInfo(epochID: ctx.epochID, formatSignature: ctx.formatSignature,
+          presentationTime: .zero, duration: duration, signalValid: true, timecode: nil,
+          hostTimeReference: .presentationEnd, captureHostTime: CMTimeAdd(host, duration))
+        payloads.append(.frame(CapturedPixelBuffer(immutable: fixture.image), info))
+      } else {
+        let mapping = try ClockMapping(sourceAnchor: pts, hostAnchor: host, rate: .one)
+        let clockID = try XCTUnwrap(ctx.clockBindings.audio)
+        payloads.append(.event(.clockMappingChanged(CaptureClockMappingUpdate(epochID: ctx.epochID,
+          clockID: clockID, revision: 1, effectiveSequence: ctx.nextSequence + 1, mapping: mapping))))
+      }
+      let values: [Int16] = paired ? [1024, 2048, 8192, -16384] : [8192]
+      let data = Array(repeating: values, count: 8).flatMap { $0 }.withUnsafeBytes { Data($0) }
+      let packet = try CaptureAudioPacket(planes: [data], sampleFrameCount: 8, format: format,
+        packetTime: pts, pairedFrameSequence: paired ? ctx.nextSequence : nil)
+      payloads.append(.rawAudio(packet))
+      XCTAssertTrue(source.submitGroup(payloads))
+      wait(for: [delivered] + [picture].compactMap { $0 }, timeout: 5)
+      tap.drainForTesting()
+      XCTAssertEqual(tap.statistics.dropped, 0)
+      XCTAssertEqual(tap.statistics.packets, 1)
+      XCTAssertFalse(controller.audioMeterTap.isMetering)
+    }
+  }
+
+  func testProgramStreamAudioPreservesShortPacketLossAndForgetsPreviousEpochPair() throws {
+    let tap = ProgramStreamAudioTap(pairIndex: 0) { _, _ in }
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .int16,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    let epoch = CaptureEpochID(sessionID: UUID(), epoch: 1)
+    let anchor = CMTime(value: 120, timescale: 1)
+    func packet(_ start: Int64) throws -> CaptureAudioPacket {
+      try CaptureAudioPacket(planes: [Data(count: 960)], sampleFrameCount: 480, format: format,
+        packetTime: CMTime(value: start, timescale: 48_000))
+    }
+    tap.ingest(try packet(0), epoch: epoch, pairedHostTime: anchor, audioMapping: nil)
+    tap.drainForTesting()
+    // Miss ten milliseconds, less than the converter's host-jitter tolerance.
+    tap.ingest(try packet(960), epoch: epoch, pairedHostTime: nil, audioMapping: nil)
+    tap.drainForTesting()
+    XCTAssertEqual(tap.statistics.lastHostTime, CMTimeAdd(anchor, CMTime(value: 960, timescale: 48_000)))
+    let newEpoch = CaptureEpochID(sessionID: epoch.sessionID, epoch: epoch.epoch + 1)
+    tap.ingest(try packet(0), epoch: newEpoch, pairedHostTime: nil, audioMapping: nil)
+    tap.drainForTesting()
+    XCTAssertEqual(tap.statistics.packets, 2)
+    XCTAssertEqual(tap.statistics.dropped, 1)
+    tap.stop()
+  }
+
+  func testProgramStreamAudioTracksEmbeddedClockDriftWithoutBreakingSampleGrid() throws {
+    final class Timing: @unchecked Sendable {
+      var end: CMTime?
+      var largestOffset = 0.0
+      var observations = 0
+    }
+    let result = Timing()
+    let tap = ProgramStreamAudioTap(pairIndex: 0) { buffer, time in
+      if let end = result.end { XCTAssertEqual(time.seconds, end.seconds, accuracy: 1.0 / 48_000) }
+      let expected = 100.0 + Double(result.observations) * 0.1001
+      result.largestOffset = max(result.largestOffset, abs(time.seconds - expected))
+      result.end = CMTimeAdd(time, CMTime(value: Int64(buffer.frameLength), timescale: 48_000))
+      result.observations += 1
+    }
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    let data = Data(count: 4800 * 4)
+    let epoch = CaptureEpochID(sessionID: UUID(), epoch: 1)
+    for i in 0..<200 {
+      let packet = try CaptureAudioPacket(planes: [data], sampleFrameCount: 4800,
+        format: format, packetTime: CMTime(value: Int64(i), timescale: 10))
+      tap.ingest(packet, epoch: epoch,
+        pairedHostTime: CMTime(value: 1_000_000 + Int64(i) * 1001, timescale: 10_000), audioMapping: nil)
+      tap.drainForTesting()
+    }
+    XCTAssertEqual(result.observations, 200)
+    XCTAssertLessThan(result.largestOffset, 0.006)
+    XCTAssertEqual(tap.statistics.dropped, 0)
+    tap.stop()
+  }
+
+  func testAudioOnlyCallbacksKeepTheLastPictureAnchorAndDiscardDuplicatePCM() throws {
+    final class Times: @unchecked Sendable { var values: [CMTime] = [] }
+    let times = Times()
+    let tap = ProgramStreamAudioTap(pairIndex: 0) { _, time in times.values.append(time) }
+    defer { tap.stop() }
+    let epoch = CaptureEpochID(sessionID: UUID(), epoch: 0)
+    let host = CMTime(value: 120, timescale: 1)
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .int16,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    func ingest(at frame: Int64) throws {
+      let packet = try CaptureAudioPacket(planes: [Data(count: 960)], sampleFrameCount: 480,
+        format: format, packetTime: CMTime(value: frame, timescale: 48_000), pairedFrameSequence: 10)
+      tap.ingest(packet, epoch: epoch, pairedHostTime: host, audioMapping: nil)
+      tap.drainForTesting()
+    }
+    for frame in stride(from: Int64(0), to: 480 * 8, by: 480) { try ingest(at: frame) }
+    try ingest(at: 480 * 4)
+    // A one-sample gap starts the next packet at its actual host time.
+    try ingest(at: 480 * 8 + 1)
+    XCTAssertEqual(tap.statistics.packets, 9)
+    XCTAssertEqual(tap.statistics.dropped, 1)
+    XCTAssertEqual(times.values, [host] + (1..<8).map { slot in
+      CMTimeAdd(host, CMTime(value: Int64(slot * 480 - 1), timescale: 48_000))
+    } + [CMTimeAdd(host, CMTime(value: 480 * 8 + 1, timescale: 48_000))])
+  }
+
+  func testProgramStreamAudioRefusesMissingClocksAndDropsBoundedBacklog() throws {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let tap = ProgramStreamAudioTap(pairIndex: 0) { _, _ in
+      entered.signal()
+      _ = release.wait(timeout: .now() + 3)
+    }
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .float32,
+      interleaved: false, layout: AudioChannelMap(), clock: .deviceClock)
+    let epoch = CaptureEpochID(sessionID: UUID(), epoch: 0)
+    let pcm = Data(count: 4800 * 4)
+    let packet = try CaptureAudioPacket(planes: [pcm], sampleFrameCount: 4800, format: format, packetTime: .zero)
+    tap.ingest(packet, epoch: epoch, pairedHostTime: nil, audioMapping: nil)
+    tap.drainForTesting()
+    XCTAssertEqual(tap.statistics.dropped, 1)
+    let mapping = try ClockMapping(sourceAnchor: .zero, hostAnchor: CMTime(value: 21, timescale: 1), rate: .one)
+    tap.ingest(packet, epoch: epoch, pairedHostTime: nil, audioMapping: mapping)
+    XCTAssertEqual(entered.wait(timeout: .now() + 3), .success)
+    for i in 1...9 {
+      let p = try CaptureAudioPacket(planes: [pcm], sampleFrameCount: 4800, format: format,
+        packetTime: CMTime(value: Int64(i), timescale: 10))
+      tap.ingest(p, epoch: epoch, pairedHostTime: nil, audioMapping: mapping)
+    }
+    XCTAssertEqual(tap.statistics.dropped, 9)
+    tap.stop()
+    release.signal()
+    tap.drainForTesting()
+    XCTAssertEqual(tap.statistics.packets, 1)
+  }
+
   func testProvenSourceFormatsReachRecordingThroughTypedController() throws {
     for pixel in [PixelFormatID.twoVuy, .yuvs, .video420, .full420, .bgra8, .r210, .r12L, .uyva, .p216, .i420, .pa16] {
       let fixture = try SourceRouteFixture(pixel: pixel)

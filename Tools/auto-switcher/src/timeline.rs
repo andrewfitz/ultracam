@@ -1,9 +1,10 @@
+use crate::director::Director;
 use crate::model::{
     CutInstruction, CutRecord, MediaTime, RecordingArtifact, SessionSource, SessionTimebase,
     SessionTimeline, StreamEvent, SwitcherConfig, SwitcherOutput, TimelineEvent,
     SESSION_TIMELINE_SCHEMA_VERSION,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// Builds the durable replay ledger used by both realtime and offline modes.
@@ -17,6 +18,7 @@ pub struct TimelineRecorder {
     session_generation: u64,
     last_media_time: Option<MediaTime>,
     pending: HashMap<Uuid, usize>,
+    instruction_ids: HashSet<Uuid>,
 }
 
 impl TimelineRecorder {
@@ -69,6 +71,7 @@ impl TimelineRecorder {
             session_generation,
             last_media_time: None,
             pending: HashMap::new(),
+            instruction_ids: HashSet::new(),
         }
     }
 
@@ -121,16 +124,15 @@ impl TimelineRecorder {
     }
 
     pub fn record_event(&mut self, event: StreamEvent, outputs: Vec<SwitcherOutput>) {
-        if serde_json::to_value(&event).is_err()
-            || serde_json::to_value(&outputs).is_err()
-            || event_time(&event).is_some_and(|time| !time.is_finite() || time < 0.0)
+        let media_time = event_time(&event);
+        if media_time.is_some_and(|time| !time.is_finite() || time < 0.0)
+            || !event.has_valid_cue_values()
         {
             self.timeline.statuses.push(SwitcherOutput::Error {
                 message: "invalid event omitted from timeline".to_string(),
             });
             return;
         }
-        let media_time = event_time(&event).filter(|time| time.is_finite() && *time >= 0.0);
         let event_end = match &event {
             StreamEvent::Audio { cue } => Some(cue.time + cue.duration),
             _ => media_time,
@@ -156,6 +158,24 @@ impl TimelineRecorder {
         });
         self.timeline.events_processed = self.timeline.events.len();
         self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    /// Advance the simulated Program and record the matching replay input.
+    pub fn assume_cut_applications(&mut self, director: &mut Director, outputs: &[SwitcherOutput]) {
+        for output in outputs {
+            if let SwitcherOutput::Cut { instruction } = output {
+                let ack = Self::assumed_acknowledgement(instruction);
+                let follow_up = director.process_event(ack.clone());
+                self.record_event(ack, follow_up);
+            }
+        }
+    }
+
+    pub fn assumed_acknowledgement(instruction: &CutInstruction) -> StreamEvent {
+        StreamEvent::Acknowledge {
+            decision_id: instruction.decision_id,
+            applied_at: Some(instruction.cut_time),
+        }
     }
 
     pub fn record_output(&mut self, output: SwitcherOutput) {
@@ -190,12 +210,7 @@ impl TimelineRecorder {
     }
 
     fn record_instruction(&mut self, instruction: CutInstruction) {
-        if self
-            .timeline
-            .instructions
-            .iter()
-            .any(|existing| existing.decision_id == instruction.decision_id)
-        {
+        if !self.instruction_ids.insert(instruction.decision_id) {
             return;
         }
         let from_camera_id = Some(self.current_camera_id.clone());
@@ -255,7 +270,9 @@ impl TimelineRecorder {
                             cut.applied_program_time_ticks = applied
                                 .map(|time| to_ticks(time, self.timeline.timebase.timescale));
                             self.current_camera_id = cut.target_camera_id.clone();
-                            if self.last_media_time.is_none() { self.last_media_time = applied; }
+                            if self.last_media_time.is_none() {
+                                self.last_media_time = applied;
+                            }
                         }
                     }
                 }
@@ -318,9 +335,12 @@ impl TimelineRecorder {
                 self.last_media_time = Some(*time);
             }
             StreamEvent::Video { observation } => {
-                if (observation.session_generation == 0 || observation.session_generation == self.session_generation)
+                if (observation.session_generation == 0
+                    || observation.session_generation == self.session_generation)
                     && !observation.camera_id.is_empty()
-                    && self.last_media_time.is_none_or(|last| observation.time >= last)
+                    && self
+                        .last_media_time
+                        .is_none_or(|last| observation.time >= last)
                 {
                     self.last_media_time = Some(observation.time);
                 }
@@ -348,7 +368,7 @@ pub fn to_ticks(time: MediaTime, timescale: i32) -> i64 {
     (time * f64::from(timescale)).round() as i64
 }
 
-fn event_time(event: &StreamEvent) -> Option<MediaTime> {
+pub(crate) fn event_time(event: &StreamEvent) -> Option<MediaTime> {
     match event {
         StreamEvent::Audio { cue } => Some(cue.time),
         StreamEvent::Transcript { cue } => Some(cue.end),

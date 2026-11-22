@@ -9,12 +9,11 @@ import Metal
 /// processing settings never renegotiates the Program virtual camera.
 ///
 /// Zero CPU pixel copies: source and destination are IOSurfaces wrapped as
-/// Metal textures; one compute pass reads the source planes (4:2:0 8-bit,
-/// 4:2:2 10-bit bi-planar, or packed v210) and writes the contract's planes
-/// into an IOSurface pool owned here. Y'CbCr stays Y'CbCr (every format in the
-/// pipeline is BT.709 video range), so the pass only rescales, resamples chroma
-/// and requantizes. Integer ratios (1:1, 2:1, 4:1) use an exact box filter,
-/// so identity planes are bit-exact; other ratios are bilinear.
+/// Metal textures. Native Y'CbCr paths rescale, resample chroma and convert
+/// code range or bit depth directly. A separate GPU prepass handles packed
+/// layouts without native sampling and changes to primaries, transfer or
+/// matrix. Small integer downscale ratios use exact box filtering; other
+/// ratios use bilinear sampling.
 ///
 /// Metal 4: one `MTL4CommandQueue`, a ring of `MTL4CommandAllocator` +
 /// reusable `MTL4CommandBuffer` slots, `MTL4ArgumentTable` bindings, a
@@ -75,6 +74,13 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     let surface: IOSurfaceID
     let plane: Int
     let format: UInt
+    let width: Int
+    let height: Int
+  }
+
+  private struct TextureChange {
+    let key: TextureKey
+    let previousUse: (sequence: UInt64, time: TimeInterval)?
   }
 
   private final class CachedTexture {
@@ -225,7 +231,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   }
 
   static func supportsSource(_ format: OSType) -> Bool {
-    sourceCode(format) != nil || [OSType(0x32767579), OSType(0x79757673), OSType(0x34323066),
+    sourceCode(format) != nil || [OSType(0x32767579), OSType(0x79757673),
       OSType(0x50323136), OSType(0x55595641), OSType(0x49343230), OSType(0x50413136), kCVPixelFormatType_32BGRA, OSType(0x72323130), OSType(0x5231324c)].contains(format)
   }
 
@@ -245,6 +251,12 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     let sourceColour = try LUTProcessor.sourceColorimetry(source)
     guard sourceColour.range == .video || sourceColour.range == .full else {
       throw VideoError.message("Program requires a declared source code range.")
+    }
+    if let sourceCode = Self.sourceCode(sourceFormat) {
+      guard [.left, .center].contains(sourceColour.horizontalChromaSiting),
+        !sourceCode.is420 || [.top, .center, .bottom].contains(sourceColour.verticalChromaSiting) else {
+        throw VideoError.message("Program requires declared source chroma siting before resampling this YUV input.")
+      }
     }
     let conversionNeeded = sourceColour.primaries != contract.colour.primaries ||
       sourceColour.transfer != contract.colour.transfer || sourceColour.matrix != contract.colour.matrix
@@ -271,7 +283,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
           configuration.colorTarget = .yuv42210
           let conversion: LUTColorSpaceConversion = .sourceToLUTInput(from: sourceColour, to: contract.colour)
           try processor.submit(retainedSource.image, configuration: configuration, colorConversion: conversion,
-            destinationColorimetry: contract.colour) { [self] result in
+            destinationColorimetry: contract.colour, declaredSourceColorimetry: sourceColour) { [self] result in
             switch result.result {
             case .failure(let error): completion(.failure(error))
             case .success(let output):
@@ -295,23 +307,24 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     // Committed to `self.sequence` only once the work is on the GPU, so a
     // failed encode never leaves the shared event waiting for a value.
     let sequence = self.sequence &+ 1
-    // A refused encode never reaches the shared event. Restore prior cache use
-    // so a byte-pressure failure cannot pin an uncommitted sequence forever.
-    let previousUses = textures.mapValues { ($0.lastUsed, $0.lastUsedTime) }
+    // Roll back only the plane views touched while preparing this frame.
+    // Restoring a prior use keeps its in-flight residency protected.
+    var textureChanges: [TextureChange] = []
+    var residencyChanged = false
     defer {
       if self.sequence != sequence {
-        var removed = false
-        for (key, entry) in textures where entry.lastUsed == sequence {
-          if let previous = previousUses[key] {
-            entry.lastUsed = previous.0
-            entry.lastUsedTime = previous.1
+        for change in textureChanges.reversed() {
+          guard let entry = textures[change.key] else { continue }
+          if let previous = change.previousUse {
+            entry.lastUsed = previous.sequence
+            entry.lastUsedTime = previous.time
           } else {
             residency.removeAllocation(entry.texture)
-            textures.removeValue(forKey: key)
-            removed = true
+            textures.removeValue(forKey: change.key)
+            residencyChanged = true
           }
         }
-        if removed { residency.commit() }
+        if residencyChanged { residency.commit() }
       }
     }
     let slot = slots[Int(sequence % UInt64(slots.count))]
@@ -333,31 +346,30 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     let resized = width != contract.width || height != contract.height || pixelAspect != .one
     Self.stampAttachments(output, from: source, resized: resized,
       chromaResampled: resized || sourceCode.is420 != destinationCode.is420)
-    try contract.stampColour(on: output)
+    LUTProcessor.stampDeclaredColorimetry(contract.colour, on: output)
     let fullRange: UInt32 = (sourceColour.range == .full ? 1 : 0)
       | (sourceColour.horizontalChromaSiting == .left ? 2 : 0)
       | (sourceColour.verticalChromaSiting == .top ? 4 : 0)
       | (sourceColour.verticalChromaSiting == .bottom ? 8 : 0)
-    var residencyChanged = false
     let sourcePlanes: [MTLTexture]
     switch sourceCode {
     case .yuv420, .yuv42010:
       sourcePlanes = [
         try texture(sourceSurface, plane: 0, format: sourceCode.eight ? .r8Uint : .r16Uint, width: width, height: height,
-          sequence: sequence, changed: &residencyChanged),
+          sequence: sequence, changes: &textureChanges, changed: &residencyChanged),
         try texture(sourceSurface, plane: 1, format: sourceCode.eight ? .rg8Uint : .rg16Uint, width: (width + 1) / 2,
-          height: (height + 1) / 2, sequence: sequence, changed: &residencyChanged),
+          height: (height + 1) / 2, sequence: sequence, changes: &textureChanges, changed: &residencyChanged),
       ]
     case .yuv422, .yuv4228:
       sourcePlanes = [
         try texture(sourceSurface, plane: 0, format: sourceCode.eight ? .r8Uint : .r16Uint, width: width, height: height,
-          sequence: sequence, changed: &residencyChanged),
+          sequence: sequence, changes: &textureChanges, changed: &residencyChanged),
         try texture(sourceSurface, plane: 1, format: sourceCode.eight ? .rg8Uint : .rg16Uint, width: (width + 1) / 2,
-          height: height, sequence: sequence, changed: &residencyChanged),
+          height: height, sequence: sequence, changes: &textureChanges, changed: &residencyChanged),
       ]
     case .v210:
       let packed = try texture(sourceSurface, plane: -1, format: .rgba32Uint,
-        width: (width + 5) / 6, height: height, sequence: sequence, changed: &residencyChanged)
+        width: (width + 5) / 6, height: height, sequence: sequence, changes: &textureChanges, changed: &residencyChanged)
       sourcePlanes = [packed, packed]
     }
     guard let outputSurface = CVPixelBufferGetIOSurface(output)?.takeUnretainedValue() else {
@@ -370,21 +382,22 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
       let eight = destinationCode.eight
       let chromaHeight = destinationCode.is420 ? (dh + 1) / 2 : dh
       let y = try texture(outputSurface, plane: 0, format: eight ? .r8Uint : .r16Uint,
-        width: dw, height: dh, sequence: sequence, changed: &residencyChanged)
+        width: dw, height: dh, sequence: sequence, changes: &textureChanges, changed: &residencyChanged)
       let c = try texture(outputSurface, plane: 1, format: eight ? .rg8Uint : .rg16Uint,
-        width: (dw + 1) / 2, height: chromaHeight, sequence: sequence, changed: &residencyChanged)
+        width: (dw + 1) / 2, height: chromaHeight, sequence: sequence, changes: &textureChanges, changed: &residencyChanged)
       passes = [(lumaState, y, MTLSize(width: dw, height: dh, depth: 1)),
                 (chromaState, c, MTLSize(width: (dw + 1) / 2, height: chromaHeight, depth: 1))]
     case .v210:
       let packed = try texture(outputSurface, plane: -1, format: .rgba32Uint,
-        width: (dw + 5) / 6, height: dh, sequence: sequence, changed: &residencyChanged)
+        width: (dw + 5) / 6, height: dh, sequence: sequence, changes: &textureChanges, changed: &residencyChanged)
       passes = [(v210State, packed, MTLSize(width: (dw + 5) / 6, height: dh, depth: 1))]
     }
     residencyChanged = evictIdleTextures(sequence: sequence) || residencyChanged
     if residencyChanged { residency.commit() }
 
     let geometry = try ProgramScalingPolicy.plan(sourceWidth: width, sourceHeight: height,
-      targetWidth: dw, targetHeight: dh, mode: scalingMode ?? contract.scalingMode, pixelAspect: pixelAspect)
+      targetWidth: dw, targetHeight: dh, mode: scalingMode ?? contract.scalingMode, pixelAspect: pixelAspect,
+      allowUpscale: contract.allowUpscale)
     guard geometry.scaledWidth <= Int(Int32.max), geometry.scaledHeight <= Int(Int32.max) else {
       throw VideoError.message("Program scaling geometry is too large.")
     }
@@ -437,6 +450,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
         recordFrame(milliseconds: milliseconds)
         completion(.success(retained.output))
       }
+      withExtendedLifetime(retained.source) {}
       // After `completion`, which takes the route lock: the route calls
       // `normalize` under its lock, so this lock is never held across it.
       scheduleIdleSweep()
@@ -453,7 +467,6 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   func releaseIdleResources() {
     conversionQueue.async { [weak self] in
       self?.conversionProcessor?.releaseIdleResources()
-      self?.conversionProcessor = nil
     }
     lock.lock()
     defer { lock.unlock() }
@@ -473,6 +486,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     CVBufferRemoveAttachment(output, kCVImageBufferPixelAspectRatioKey)
     if resized {
       CVBufferRemoveAttachment(output, kCVImageBufferCleanApertureKey)
+      CVBufferRemoveAttachment(output, kCVImageBufferPreferredCleanApertureKey)
       CVBufferRemoveAttachment(output, kCVImageBufferDisplayDimensionsKey)
     }
     if chromaResampled {
@@ -486,6 +500,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   private func makeOutput(_ contract: ProgramOutputFormat) throws -> CVPixelBuffer {
     if poolFormat != contract || pool == nil {
+      _ = try contract.formatDescription()
       var created: CVPixelBufferPool?
       let attributes: [CFString: Any] = [
         kCVPixelBufferPixelFormatTypeKey: contract.pixelFormat,
@@ -526,17 +541,17 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
   /// `plane` -1 wraps a non-planar surface (v210).
   private func texture(_ surface: IOSurfaceRef, plane: Int, format: MTLPixelFormat,
                        width: Int, height: Int, sequence: UInt64,
-                       changed: inout Bool) throws -> MTLTexture {
-    let key = TextureKey(surface: IOSurfaceGetID(surface), plane: plane, format: format.rawValue)
-    if let cached = textures[key], cached.surface === surface,
-      cached.texture.width == width, cached.texture.height == height {
+                       changes: inout [TextureChange], changed: inout Bool) throws -> MTLTexture {
+    guard (1...16384).contains(width), (1...16384).contains(height) else {
+      throw VideoError.message("Program frame plane exceeds the supported Metal texture dimensions.")
+    }
+    let key = TextureKey(surface: IOSurfaceGetID(surface), plane: plane, format: format.rawValue,
+      width: width, height: height)
+    if let cached = textures[key] {
+      changes.append(TextureChange(key: key, previousUse: (cached.lastUsed, cached.lastUsedTime)))
       cached.lastUsed = sequence
       cached.lastUsedTime = monotonicNow()
       return cached.texture
-    }
-    if let stale = textures.removeValue(forKey: key) {
-      residency.removeAllocation(stale.texture)
-      changed = true
     }
     let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width,
       height: height, mipmapped: false)
@@ -557,6 +572,7 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     }
     textures[key] = CachedTexture(surface: surface, texture: texture, lastUsed: sequence,
       time: monotonicNow(), lease: lease)
+    changes.append(TextureChange(key: key, previousUse: nil))
     residency.addAllocation(texture)
     changed = true
     return texture
@@ -615,8 +631,9 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     if idle {
       releaseCompletedLocked()
       conversionQueue.async { [weak self] in
+        // Keep the compiled pipelines for the next source cut. The processor
+        // releases its staging textures and output pools independently.
         self?.conversionProcessor?.releaseIdleResources()
-        self?.conversionProcessor = nil
       }
     }
     if !idle || !textures.isEmpty { scheduleIdleSweepLocked() }
@@ -648,7 +665,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
     switch format {
     case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return .yuv42010
     case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange: return .yuv4228
-    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return .yuv420
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return .yuv420
     case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
          kCVPixelFormatType_422YpCbCr10BiPlanarFullRange: return .yuv422
     case kCVPixelFormatType_422YpCbCr10: return .v210

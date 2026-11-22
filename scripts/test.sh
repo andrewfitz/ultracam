@@ -43,7 +43,7 @@ monitor_kit_test_log="$logs_root/monitor-kit-package-tests-$run_id.log"
 if [[ "$compile_only" == false ]]; then
   monitor_kit_package_test "$monitor_kit_test_log" || { monitor_kit_test_report "$monitor_kit_test_log"; exit 1; }
 fi
-rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
+rust_manifest="$task_root/Apps/AutoSwitcher/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"
@@ -60,7 +60,6 @@ libraries="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib"
 compile_log="$logs_root/test-compile-$run_id.log"
 test_log="$logs_root/tests-$run_id.log"
 ln -sfn "logs/$(basename "$compile_log")" "$artifact_root/test-compile.log"
-ln -sfn "logs/$(basename "$test_log")" "$artifact_root/tests.log"
 source "$task_root/scripts/vendor-build.sh"
 vendor_configure test
 vendor_compile_native "$compile_log"
@@ -72,7 +71,9 @@ shared_sources=()
 for source_file in "$task_root"/Sources/Shared/*.swift; do
   if [[ "$source_file" != */ExtensionFormatCatalog.swift ]]; then shared_sources+=("$source_file"); fi
 done
-xcrun swiftc -O -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D ULTRACAM_TEST_SUPPORT -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
+# Match the release compilation mode and bound code generation concurrency.
+xcrun swiftc -O -whole-module-optimization -num-threads 4 \
+  -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D ULTRACAM_TEST_SUPPORT -target arm64-apple-macos26.0 -module-cache-path "$test_root/modules" \
   "${monitor_kit_link_args[@]}" \
   -D CAPTURE_LIFECYCLE_TESTS ${vendor_swift_native_args[@]+"${vendor_swift_native_args[@]}"} \
   -import-objc-header "$vendor_bridge" \
@@ -97,6 +98,8 @@ if [[ "$compile_only" == true ]]; then
   echo "App compile passed: $test_root/lut-tests (compile log: $compile_log)"
   exit 0
 fi
+: > "$test_log"
+ln -sfn "logs/$(basename "$test_log")" "$artifact_root/tests.log"
 "$test_root/lut-tests" > "$test_log" 2>&1 || {
   cat "$test_log"
   exit 1

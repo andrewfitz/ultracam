@@ -44,6 +44,7 @@ struct UICameraControlSettings: View {
     var openHardware: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var confirmForget = false
+    @State private var confirmUnassign = false
     private var state: CameraControlFeedState { store.state(for: feedID) }
     private var assignment: CameraControlAssignment? { store.assignment(for: feedID) }
     private var pluginID: String { assignment?.camera.pluginID ?? "" }
@@ -65,6 +66,8 @@ struct UICameraControlSettings: View {
                 }
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                    // Esc closes the sheet too.
+                    .background(Button("Close") { dismiss() }.keyboardShortcut(.cancelAction).opacity(0).accessibilityHidden(true))
             }
             Divider()
             ScrollView {
@@ -76,7 +79,7 @@ struct UICameraControlSettings: View {
                         if state.retrying {
                             UICameraControlReconnectStatus(state: state)
                         } else if let message = state.message {
-                            Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+                            Label { Text(message) } icon: { Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange) }.textSelection(.enabled)
                         }
                         if let factory = viewFactories[pluginID] { factory(vendorContext) }
                         else { properties }
@@ -91,7 +94,7 @@ struct UICameraControlSettings: View {
             }
             if state.busy {
                 HStack { ProgressView().controlSize(.small); Text("Contacting camera…") }
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.subheadline).foregroundStyle(.secondary)
             }
         }
         .padding(24).frame(width: 640, height: 690)
@@ -112,7 +115,7 @@ struct UICameraControlSettings: View {
             Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh(feedID) } }.disabled(!state.connected || state.busy)
         }
         Label(state.cacheStatus, systemImage: state.connected ? "wifi" : "wifi.slash")
-            .font(.caption).foregroundStyle(.secondary)
+            .font(.subheadline).foregroundStyle(.secondary)
         if state.properties.isEmpty {
             Text("Connect and read settings to see the values available in the camera’s current mode.").foregroundStyle(.secondary)
         } else {
@@ -125,7 +128,7 @@ struct UICameraControlSettings: View {
             }
         }
         Text(Self.refreshNote(store.refreshInterval) + " Unavailable settings are read-only; camera mode or physical control priority may prevent editing.")
-            .font(.caption).foregroundStyle(.secondary)
+            .font(.subheadline).foregroundStyle(.secondary)
     }
     /// How the shown values keep up with the body, in words.
     static func refreshNote(_ interval: CameraControlRefreshInterval) -> String {
@@ -138,7 +141,7 @@ struct UICameraControlSettings: View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
                 Label(assignment.camera.name, systemImage: state.connected ? "wifi" : "wifi.slash").font(.headline)
-                Text("Assigned to \(name)").font(.caption).foregroundStyle(.secondary)
+                Text("Assigned to \(name)").font(.subheadline).foregroundStyle(.secondary)
             }.help(Self.bodyHelp(assignment.camera))
             Spacer()
             if state.connected {
@@ -147,13 +150,21 @@ struct UICameraControlSettings: View {
                 // Reconnect uses the saved sign-in: a body dropping mid-show never sends anyone to Settings.
                 Button("Reconnect") { Task { await store.reconnect(feedID) } }.disabled(state.busy)
             }
-            Button("Unassign") { Task { await store.disconnect(feedID, forget: true) } }.disabled(state.busy)
+            // Asks first, as Settings › Hardware does: this unpairs the body from the camera.
+            Button("Unassign…") { confirmUnassign = true }.disabled(state.busy)
+                .confirmationDialog("Unpair \(assignment.camera.name) from \(name)?", isPresented: $confirmUnassign, titleVisibility: .visible) {
+                    Button("Unassign") { Task { await store.disconnect(feedID, forget: true) } }
+                    Button("Cancel", role: .cancel) {}
+                        .keyboardShortcut(.defaultAction)
+                } message: {
+                    Text("Camera control disconnects. Capture and recording are not affected.")
+                }
         }
         if state.hasSavedCredentials {
             HStack {
-                Label("Camera sign-in saved in macOS Keychain", systemImage: "key.fill").font(.caption).foregroundStyle(.secondary)
+                Label("Camera sign-in saved in macOS Keychain", systemImage: "key.fill").font(.subheadline).foregroundStyle(.secondary)
                 Spacer()
-                Button("Forget Saved Sign-In…", role: .destructive) { confirmForget = true }.disabled(state.busy)
+                Button("Forget Saved Sign-In…") { confirmForget = true }.disabled(state.busy)
             }
             .confirmationDialog("Forget the saved sign-in for \(assignment.camera.name)?", isPresented: $confirmForget) {
                 Button("Forget Saved Sign-In", role: .destructive) { Task { await store.forgetCredentials(feedID) } }
@@ -187,7 +198,7 @@ struct UICameraBodySignIn: View {
                 DisclosureGroup("Change camera sign-in") { fields }
             } else { fields }
             if let message = state.message {
-                Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+                Label { Text(message) } icon: { Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange) }.textSelection(.enabled)
             }
         }
         // The Keychain only; the body is contacted when Connect is pressed.
@@ -199,14 +210,14 @@ struct UICameraBodySignIn: View {
             TextField("Camera user name", text: $user).textContentType(.username)
             SecureField("Camera password", text: $password).textContentType(.password)
             if let fingerprint = camera.fingerprint {
-                LabeledContent("Camera fingerprint") { Text(fingerprint).font(.caption.monospaced()).textSelection(.enabled) }
+                LabeledContent("Camera fingerprint") { Text(fingerprint).font(.subheadline.monospaced()).textSelection(.enabled) }
             }
         }
         Text(["\(captureName.map { "Check that this body’s HDMI goes to \($0)." } ?? "")",
               camera.authenticationMode == .usernamePassword
                 ? "A successful sign-in is saved in macOS Keychain. Unassigning keeps it; Forget Saved Sign-In removes it." : ""]
             .filter { !$0.isEmpty }.joined(separator: " "))
-            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         Button("Connect and Assign to \(cameraName)") {
             let credential: ControlCredentials? = camera.authenticationMode == .usernamePassword ? .usernamePassword(username: user, password: password) : nil
             password = ""
@@ -244,7 +255,7 @@ struct UICameraBodyAddByAddress: View {
                 .accessibilityLabel("Camera stable identity")
             Toggle("Camera access authentication is enabled", isOn: $authentication)
             Text("Check Camera resolves its identity before connecting. Sign-in is sent when you press Connect.")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.subheadline).foregroundStyle(.secondary)
             Button("Check Camera") {
                 // Keep the result attached to the camera chosen when the check began.
                 // The picker can change while preparation awaits the network.
@@ -258,7 +269,7 @@ struct UICameraBodyAddByAddress: View {
             }
             .disabled(feedID.isEmpty || store.state(for: feedID).busy || address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if let message = store.state(for: feedID).message, !feedID.isEmpty {
-                Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+                Label { Text(message) } icon: { Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange) }.textSelection(.enabled)
             }
         }
         .onAppear {
@@ -302,7 +313,7 @@ struct UICameraSettingsOverlay: View {
             ViewThatFits(in: .horizontal) {
                 pieces(UIControlPresentation.overlayPieces(state.properties))
                 pieces(UIControlPresentation.overlayPieces(state.properties, compact: true))
-            }.font(.caption.monospacedDigit()).foregroundStyle(.white).padding(6)
+            }.font(.subheadline.weight(.semibold).monospacedDigit()).foregroundStyle(.white).padding(6)
                 .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 6))
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(UIControlPresentation.overlay(state.properties))

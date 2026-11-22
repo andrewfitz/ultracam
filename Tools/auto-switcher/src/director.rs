@@ -66,6 +66,16 @@ impl DirectorState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CameraHealth {
+    healthy: bool,
+    observed_at: MediaTime,
+}
+
+impl CameraHealth {
+    const INITIAL: Self = Self { healthy: true, observed_at: 0.0 };
+}
+
 pub struct Director {
     pub config: SwitcherConfig,
     current_camera_id: String,
@@ -78,7 +88,7 @@ pub struct Director {
     candidate: Option<Candidate>,
     audio: VecDeque<AudioCue>,
     transcripts: HashMap<String, TranscriptCue>,
-    health: HashMap<String, bool>,
+    health: HashMap<String, CameraHealth>,
 }
 
 impl Director {
@@ -86,8 +96,8 @@ impl Director {
         config.session_generation = config.session_generation.max(1);
         config.validate()?;
         let mut health = HashMap::new();
-        health.insert(config.anchor_camera_id.clone(), true);
-        health.insert(config.emphasis_camera_id.clone(), true);
+        health.insert(config.anchor_camera_id.clone(), CameraHealth::INITIAL);
+        health.insert(config.emphasis_camera_id.clone(), CameraHealth::INITIAL);
         Ok(Self {
             session_generation: config.session_generation.max(1),
             current_camera_id: config.anchor_camera_id.clone(),
@@ -259,7 +269,11 @@ impl Director {
         {
             return;
         }
-        if !observation.time.is_finite() || observation.time < 0.0 {
+        if !observation.time.is_finite()
+            || observation.time < 0.0
+            || !observation.motion.is_finite()
+            || !observation.scene_change.is_finite()
+        {
             return;
         }
         if observation.camera_id.is_empty() {
@@ -268,8 +282,15 @@ impl Director {
         if observation.camera_id == self.config.anchor_camera_id
             || observation.camera_id == self.config.emphasis_camera_id
         {
-            self.health
-                .insert(observation.camera_id, observation.healthy);
+            if self.health.get(&observation.camera_id)
+                .is_some_and(|health| observation.time < health.observed_at)
+            {
+                return;
+            }
+            self.health.insert(observation.camera_id, CameraHealth {
+                healthy: observation.healthy,
+                observed_at: observation.time,
+            });
         }
         if self
             .last_media_time
@@ -517,9 +538,9 @@ impl Director {
         self.transcripts.clear();
         self.state = DirectorState::HoldAnchor;
         self.health
-            .insert(self.config.anchor_camera_id.clone(), true);
+            .insert(self.config.anchor_camera_id.clone(), CameraHealth::INITIAL);
         self.health
-            .insert(self.config.emphasis_camera_id.clone(), true);
+            .insert(self.config.emphasis_camera_id.clone(), CameraHealth::INITIAL);
     }
 
     fn rebase_after_clock_discontinuity(&mut self, now: MediaTime) {
@@ -528,6 +549,10 @@ impl Director {
         self.reset(None);
         self.current_camera_id = current;
         self.health = health;
+        // Retain the last known health, but accept the new clock's first observation.
+        for camera in self.health.values_mut() {
+            camera.observed_at = 0.0;
+        }
         self.shot_started_at = now;
         self.last_media_time = Some(now);
         self.state = self.state_for_current();
@@ -742,7 +767,7 @@ impl Director {
     }
 
     fn is_healthy(&self, camera_id: &str) -> bool {
-        self.health.get(camera_id).copied().unwrap_or(false)
+        self.health.get(camera_id).is_some_and(|health| health.healthy)
     }
 
     fn state_for_current(&self) -> DirectorState {

@@ -3,7 +3,7 @@ import Foundation
 import MonitorKitAudio
 import XCTest
 
-/// Phase 4 of the UI plan: the Settings window's eight tabs and what they save. The tab comes
+/// Phase 4 of the UI plan: the Settings window's tabs and what they save. The tab comes
 /// back, links open their tab, Channels Shown counts and measures as section 7 says, the
 /// background shortcuts follow their one switch, and alerts, low space, the true-peak warning,
 /// file naming and B14 persist and take effect.
@@ -16,11 +16,11 @@ import XCTest
 
   // MARK: Tabs
 
-  func testTabsAreEightInOrderAndSettingsReopensOnTheLastOne() {
+  func testTabsAreInOrderAndSettingsReopensOnTheLastOne() {
     let (defaults, done) = suite("tab")
     defer { done() }
     XCTAssertEqual(UISettingsTab.allCases.map(\.title),
-      ["General", "Hardware", "Virtual Cameras", "Recording", "Audio", "Switching", "Alerts", "Advanced"])
+      ["General", "Hardware", "Virtual Cameras", "Recording", "Streaming", "Audio", "Switching", "Alerts", "Advanced"])
     XCTAssertEqual(UIInterfaceState(defaults: defaults).settingsTab, .general, "A first run opens on General")
     UIInterfaceState(defaults: defaults).settingsTab = .alerts
     XCTAssertEqual(UIInterfaceState(defaults: defaults).settingsTab, .alerts)

@@ -1,0 +1,29 @@
+{
+  "strategy": "rules",
+  "anchor_camera_id": "Presenter",
+  "emphasis_camera_id": "Desk",
+  "rules": [
+    {
+      "target": "Desk",
+      "all": [
+        {
+          "signal": "motion",
+          "minimum": 0.12
+        },
+        {
+          "signal": "energy",
+          "minimum": 0.03
+        }
+      ]
+    },
+    {
+      "target": "Presenter",
+      "all": [
+        {
+          "signal": "questionConfidence",
+          "minimum": 0.7
+        }
+      ]
+    }
+  ]
+}

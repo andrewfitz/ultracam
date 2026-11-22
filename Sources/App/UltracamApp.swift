@@ -7,7 +7,6 @@ import SwiftUI
   private var menuBar: UIMenuBarController?
   private var alerts: UIAlertCoordinator?
   private var cameraControlRetries: CameraControlRetryTriggers?
-  private var terminationPending = false
   /// A Quit the operator has confirmed, so the second pass through here doesn't ask again.
   private var quitConfirmed = false
 
@@ -15,6 +14,7 @@ import SwiftUI
     let model = UIAppEnvironment.model
     self.model = model
     let interface = UIAppEnvironment.interface
+    interface.pruneLayoutPreferences(for: Set(model.feedDescriptors.map(\.id.rawValue)))
     model.stripOrder = { ids in
       interface.ordered(ids.map(\.rawValue), id: { $0 }).map { FeedID(rawValue: $0) }
     }
@@ -70,13 +70,13 @@ import SwiftUI
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    if terminationPending { return .terminateLater }
     guard let model else { return .terminateNow }
+    if model.terminating { return .terminateLater }
     // Ending takes or on-air video asks first, behind Settings › General's switch. Cancel is
     // the default, so Return never ends a take.
     let bridge = UISessionBridge.live(model: model, interface: UIAppEnvironment.interface)
     let presentation = bridge.presentation()
-    if !quitConfirmed, presentation.askBeforeEnding, let message = UIAction.endingMessage(in: presentation) {
+    if !quitConfirmed, !model.settingsResetPending, presentation.askBeforeEnding, let message = UIAction.endingMessage(in: presentation) {
       let alert = UISessionBridge.confirmationAlert(for: .quit, message: message, in: presentation)
       NSApplication.shared.activate(ignoringOtherApps: true)
       let escape = UISessionBridge.cancelOnEscape(alert)
@@ -85,23 +85,25 @@ import SwiftUI
       guard response == .alertSecondButtonReturn else { return .terminateCancel }
       quitConfirmed = true
     }
+    let streaming = model.streamNeedsShutdown
     let recording = model.recordingModel.hasActiveRecordings
-    guard recording || model.cameraControls.needsShutdown else { return .terminateNow }
-    terminationPending = true
+    guard streaming || recording || model.cameraControls.needsShutdown else { return .terminateNow }
+    model.beginTermination()
+    if model.streamSnapshot.active { model.stopProgramStream() }
     // Finishing a take can take a while; without this the app would look hung.
     let progress = recording ? UIQuitProgressPanel.show() : nil
-    if recording {
-      model.saveSettings()
-      model.stopAllCameras()
-    }
+    if recording { model.saveSettings() }
+    if streaming || recording { model.stopAllCameras() }
     Task { @MainActor in
       async let controlCleanup = model.cameraControls.shutdown()
+      async let streamCleanup: Void = model.finishProgramStreamShutdown()
       if recording {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
           model.recordingModel.stopAll { continuation.resume() }
         }
       }
       if let message = await controlCleanup { NSLog("Camera control cleanup on quit: %@", message) }
+      await streamCleanup
       progress?.close()
       sender.reply(toApplicationShouldTerminate: true)
     }
@@ -169,7 +171,7 @@ struct UltracamApp: App {
     .commands { UICommands(model: model, interface: interface) }
 
     Window("Diagnostics", id: "diagnostics") {
-      UIDiagnosticsView(model: model)
+      UIDiagnosticsView(model: model, interface: interface)
     }
     .commandsRemoved()
     .defaultSize(width: 1100, height: 760)

@@ -70,16 +70,16 @@ private struct MonitorBoundTile: View {
     ) {
       if !previewEnabled {
         Rectangle().fill(.black).aspectRatio(16.0 / 9, contentMode: .fit)
-          .overlay { Text("Preview hidden").foregroundStyle(.secondary) }
+          .overlay { Text("Preview hidden").foregroundStyle(.white.opacity(0.6)) }
           .overlay { MonitorSurfaceVisibility(presenter: presenter).allowsHitTesting(false) }
       } else {
         Rectangle().fill(.black).aspectRatio(16.0 / 9, contentMode: .fit)
           .overlay {
             MonitorNativePicture(presenter: presenter)
-            if presenter.status == "No Signal" || presenter.status == "Camera stopped"
+            if presenter.status == "No signal" || presenter.status == "Camera stopped"
               || presenter.status == "Missing camera" || presenter.status == "Stale"
             {
-              Text(presenter.status).foregroundStyle(.secondary)
+              Text(presenter.status).foregroundStyle(.white.opacity(0.6))
             }
           }.clipped()
       }
@@ -134,7 +134,7 @@ private struct MonitorBoundTile: View {
           }.menuStyle(.borderlessButton).fixedSize()
           Spacer(minLength: 0)
         }
-      }.font(.caption).controlSize(.mini)
+      }.font(.uiMeta).controlSize(.small)
         .background {
           // ⌃⌥F and ⌃⌥C for this window while it is key, whichever row fits, and taken even
           // with the preview hidden, so they never reach the main window's selected camera.
@@ -188,7 +188,7 @@ private struct MonitorBoundTile: View {
   /// What the shown scope measures: the frozen settings while frozen.
   private var scopeDescription: UIScopeDescription {
     UIScopeDescription(
-      scopes: displayed.scopes, signal: presenter.shownSignal, stageLUT: presenter.scopeMeasuresLUT(displayed),
+      scopes: displayed.scopes, signal: presenter.shownSignal, stageLUT: presenter.scopeLUTSignal(displayed),
       isProgram: target.isProgram)
   }
   @ViewBuilder private var surfaceViewActions: some View {
@@ -296,7 +296,7 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
           }
           ForEach(choices) { Text($0.title).tag(Optional($0.id)) }
         }.labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
-        Text(status).font(.caption).foregroundStyle(.secondary)
+        Text(status).font(.uiMeta).foregroundStyle(.secondary)
       }
       picture()
       HStack {
@@ -304,12 +304,12 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
           Text("Source").tag(SignalStage.source).disabled(isProgram)
           Text("Output (LUT)").tag(SignalStage.output)
           Text("Monitor").tag(SignalStage.monitor)
-        }.controlSize(.mini)
+        }.controlSize(.small)
       }
       if frozenPreferences != nil {
-        Text("Frozen · " + pictureCaption).font(.caption)
+        Text("Frozen · " + pictureCaption).font(.uiMeta)
       } else {
-        Text(pictureCaption).font(.caption2)
+        Text(pictureCaption).font(.uiMeta)
       }
       MonitorTileToolbar(
         state: toolState, name: target.flatMap { id in choices.first { $0.id == id }?.title } ?? "Monitor",
@@ -327,16 +327,16 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
       ) {
         UIScopeSettingsView(
           scopes: $preferences.scopes, isProgram: isProgram, signal: presenter?.shownSignal,
-          stageLUT: presenter?.scopeMeasuresLUT(preferences) == true)
+          stageLUT: presenter?.scopeLUTSignal(preferences))
       }
       .disabled(target == nil)
       if !detail.isEmpty {
-        Text(detail).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        Text(detail).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
       if displayed.toolsEnabled && displayed.state.falseColor.mode != .off {
         if isProgram && displayed.state.falseColor.mode.needsLogSource {
           Text("Program is not a camera signal, so log false color is off. Six band and custom bands work on Program.")
-            .font(.caption2)
+            .font(.uiMeta)
         } else if let legend = FalseColorLegend(settings: displayed.state.falseColor, signal: presenter?.shownSignal,
           layout: presenter?.shownLayout) {
           FalseColorLegendView(
@@ -344,7 +344,7 @@ private struct MonitorDetachedChrome<Picture: View, Scopes: View>: View {
         }
       }
       if displayed.toolsEnabled && displayed.state.focus.enabled {
-        Text(isProgram ? "Focus unavailable for Program" : "Focus: Source").font(.caption2)
+        Text(isProgram ? "Focus unavailable for Program" : "Focus: Source").font(.uiMeta)
       }
       if showsScopes && displayed.scopesShown {
         scopes()
@@ -375,7 +375,7 @@ private struct MonitorDiagnosticsDisclosure: View {
         Text("This surface: \(surfaceScopeTiming)")
         if let lut = MonitorFeedHost.describe(snapshot.monitorLUT) { Text(lut) }
       }.frame(maxWidth: .infinity, alignment: .leading).padding(.top, 3)
-    }.font(.caption2).foregroundStyle(.secondary)
+    }.font(.uiMeta).foregroundStyle(.secondary)
   }
   private func rate(_ value: Double) -> String { String(format: "%.1f", value) }
   private func milliseconds(_ value: Double?) -> String { value.map { String(format: "%.2f ms", $0) } ?? "—" }
@@ -466,10 +466,10 @@ private struct DetachedMonitorContent: View {
     } else {
       MonitorDetachedChrome(
         target: $owner.target, preferences: .constant(MonitorFeedPreferences()),
-        choices: coordinator.targets, status: "No Signal", compact: false
+        choices: coordinator.targets, status: "No signal", compact: false
       ) {
         Rectangle().fill(.black).aspectRatio(16.0 / 9, contentMode: .fit)
-          .overlay { Text("Choose a camera or Program").foregroundStyle(.secondary) }
+          .overlay { Text("Choose a camera or Program").foregroundStyle(.white.opacity(0.6)) }
       } scopes: {
         EmptyView()
       }

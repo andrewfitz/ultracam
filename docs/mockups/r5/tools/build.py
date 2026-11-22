@@ -11,11 +11,18 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 cache = '/tmp/ultracam-symbols/icons'
 chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 pages = sorted(glob.glob(f'{root}/*.html'))
+targets = [os.path.join(root, os.path.basename(a)) for a in sys.argv[1:]] or pages
+for page in targets:
+    if page not in pages:
+        sys.exit(f'Unknown mockup page: {os.path.basename(page)}')
+
 os.makedirs(cache, exist_ok=True)
 os.makedirs(f'{root}/png', exist_ok=True)
 
@@ -36,15 +43,23 @@ for name in sorted(names):
     rules.append(f'.ic[s="{name}"]{{-webkit-mask-image:url(data:image/png;base64,{data});}}')
 open(f'{root}/icons.css', 'w').write('\n'.join(rules) + '\n')
 
-targets = [os.path.join(root, os.path.basename(a)) for a in sys.argv[1:]] or pages
 for page in targets:
     base = os.path.splitext(os.path.basename(page))[0]
     if base == 'index':
         continue
     shot = re.search(r'name="shot" content="(\d+)x(\d+)"', open(page).read())
     width, height = shot.groups() if shot else ('1500', '2000')
-    subprocess.run([chrome, '--headless=new', '--disable-gpu', '--hide-scrollbars',
-        f'--user-data-dir=/tmp/ultracam-mock-chrome-{base}', '--force-device-scale-factor=1.5',
-        f'--window-size={width},{height}', f'--screenshot={root}/png/{base}.png', f'file://{page}'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    output = Path(root) / 'png' / f'{base}.png'
+    with tempfile.TemporaryDirectory(prefix='.capture-', dir=output.parent) as temp_dir:
+        screenshot = Path(temp_dir) / output.name
+        result = subprocess.run([chrome, '--headless=new', '--disable-gpu', '--hide-scrollbars',
+            f'--user-data-dir={temp_dir}/profile', '--force-device-scale-factor=1.5',
+            f'--window-size={width},{height}', f'--screenshot={screenshot}', Path(page).as_uri()],
+            capture_output=True, text=True)
+        # Chrome can complete the PNG and then fail during headless shutdown.
+        # A fresh capture must still have both the PNG signature and its IEND chunk.
+        png = screenshot.read_bytes() if screenshot.is_file() else b''
+        if not (png.startswith(b'\x89PNG\r\n\x1a\n') and png.endswith(b'\x00\x00\x00\x00IEND\xaeB\x60\x82')):
+            sys.exit(f'Chrome could not capture {base}.html (exit {result.returncode}):\n{result.stderr.strip()}')
+        screenshot.replace(output)
     print(f'png/{base}.png  {width}x{height}')

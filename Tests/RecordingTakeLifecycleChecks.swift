@@ -127,16 +127,24 @@ import XCTest
     XCTAssertTrue(FileManager.default.fileExists(atPath: output.temporaryURL.path))
   }
   func testRealMovieWithoutCameraSubfoldersRecoversFromTheRoot() throws {
+    try checkRootRecovery(fileType: .mov, ext: "mov", codec: kCMVideoCodecType_AppleProRes422HQ)
+  }
+
+  func testAutomaticMP4RecoversFromCustomAppFolder() throws {
+    try checkRootRecovery(fileType: .mp4, ext: "mp4", codec: kCMVideoCodecType_HEVC)
+  }
+
+  private func checkRootRecovery(fileType: AVFileType, ext: String, codec: CMVideoCodecType) throws {
     let folder = try temporaryFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
     let naming = RecordingFileNaming(tokens: [.camera, .take], cameraSubfolders: false)
-    let manager = try RecordingOutputManager(rootDirectory: folder, minimumFreeBytes: 0, naming: naming)
+    let manager = try RecordingOutputManager(rootDirectory: folder, fileExtension: ext, minimumFreeBytes: 0, naming: naming)
     let output = try manager.beginExternalWriterSession(feedID: "camera")
     XCTAssertEqual(output.temporaryURL.deletingLastPathComponent().resolvingSymlinksInPath().path,
       folder.resolvingSymlinksInPath().path)
     let source = try snapshot()
     let config = try SourceRecordingConfiguration(feedID: .init("root-take"), outputURL: output.temporaryURL,
-      width: 3840, height: 2160, videoCodec: kCMVideoCodecType_AppleProRes422HQ,
+      width: 3840, height: 2160, videoCodec: codec, fileType: fileType,
       sourceAdmission: source, sidecarMovieURL: output.finalURL, sidecarCreated: { try output.claimSidecar() })
     let writer = try AVAssetSourceRecordingWriter(configuration: config)
     try writer.start()
@@ -156,6 +164,7 @@ import XCTest
     XCTAssertEqual(done.wait(timeout: .now() + 15), .success)
     let recovered = try XCTUnwrap(result.withLock { $0 }).get()
     XCTAssertTrue(FileManager.default.fileExists(atPath: recovered.path))
+    XCTAssertEqual(recovered.pathExtension, ext)
     XCTAssertEqual(recovered.deletingLastPathComponent().resolvingSymlinksInPath().path, folder.resolvingSymlinksInPath().path)
   }
   func testOwnedCancellationDeletesPairAndPreservesUnrelatedOccupiedMetadata() throws {

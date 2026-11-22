@@ -1,5 +1,8 @@
 # Ultracam
 
+The standalone [Auto Switcher application and Rust server](Apps/AutoSwitcher/README.md) live in the sibling checkout at `../auto-switcher`. Keep it beside UltraCam, like MonitorKit, when building from source. UltraCam can use a private worker or join a shared session.
+
+
 Ultracam uses fresh app and camera identities: `org.ultracam.app`,
 `org.ultracam.app.camera` and the shared app group `group.org.ultracam.shared`.
 Settings start fresh. Blackmagic UltraStudio refers to the input hardware.
@@ -7,9 +10,16 @@ The Xcode project is `Ultracam.xcodeproj`, with the `Ultracam` scheme.
 The custom macOS icon and its reproducible asset catalog are documented in
 [docs/ICON.md](docs/ICON.md).
 
-A standalone native macOS app and Core Media I/O camera extension for a 4K
-HDMI camera feed through a supported Blackmagic capture device. Select **Ultracam**
-as the camera in Zoom or another macOS camera application.
+A standalone native macOS app and Core Media I/O camera extension. Capture
+4K HDMI through a supported Blackmagic device, or choose a camera macOS
+exposes through AVFoundation under **Mac Camera**. Select **Ultracam** as
+the camera in Zoom or another macOS camera application.
+
+For Mac Camera, select a device in **Inspector → Input**, then open its settings
+under **Settings → Hardware** to choose a capture mode and optional microphone.
+Availability depends on macOS camera and microphone permissions. See the
+[Mac Camera qualification report](docs/MAC_CAMERA_VALIDATION.md) for the tested
+devices and modes, consumer coverage and audio sync procedure.
 
 ## Processing
 
@@ -22,8 +32,8 @@ Each camera has four independent effects, applied in order:
    floating-point precision until output quantization. Disable Resize to retain
    source dimensions.
 3. **Color format:** select **4:2:0 8-bit**, **4:2:0 10-bit**, **4:2:2 8-bit** or
-   **4:2:2 10-bit**, all video range. Disable this effect to retain the native
-   10-bit 4:2:2 output path.
+   **4:2:2 10-bit**, all video range. Disable this effect to retain the source
+   pixel format.
 4. **Frame-rate cap:** **60, 59.94, 50, 30, 29.97, 25, 24 or 23.976 fps**.
    Caps select source frames without interpolation or duplication and never
    exceed the detected input rate. Disable the cap to follow the source.
@@ -86,13 +96,11 @@ session, with an explicit Retry action rather than a background retry loop.
 Turn automatic mode off to regain manual Start/Stop controls; an already live
 feed continues under manual control.
 
-The metadata panel also reports the detected RP188 video timecode when the HDMI
-source carries one. It shows two embedded-audio meters from the UltraStudio's
-48 kHz, 32-bit stereo input, with peak and RMS values for left and right. The
-diagnostics disclosure includes audio channels, sample rate, packet/sample/byte
-counts, estimated audio bitrate and audio gaps, plus video bitrate and separate
-video drop counters. If the source carries no audio or timecode, the UI says so
-instead of fabricating values.
+The metadata panel reports RP188 video timecode when the DeckLink HDMI source
+carries one. Audio meters show peak and RMS values for available source channels,
+from DeckLink embedded audio or the microphone selected for a Mac Camera device.
+Diagnostics include channel count, sample rate, packet/sample/byte counts,
+estimated audio bitrate and audio gaps, plus video bitrate and drop counters.
 
 A missing or invalid saved LUT leaves capture usable and keeps
 the saved choice for recovery.
@@ -120,21 +128,28 @@ the movie recording and S&Q frame-rate settings.
 
 The main window is a native macOS window in light or dark appearance:
 
-- **Sidebar:** the session panel. It shows the published output, the Program
-  summary and shot timer, recording drives with time left, recent takes,
-  interrupted takes (Recover) and automation.
+- **No left pane:** the pictures are the camera list. The status bar reports the
+  session (the worst problem with its one action, Program and its shot timer,
+  recording, audio), and the arrow beside Record opens Recording's popover: the
+  takes, the next take's format, timecode, folder and drives, and interrupted
+  takes (Recover).
 - **Camera columns:** each camera has its picture, then its channel strip.
-  - The strip holds that camera's own recording (record, pause, folder, time left)
-    and output (cut, effects, Processing, audio).
+  - The picture's bottom line says what's coming in: the signal's format, the
+    body's exposure and battery, and its control link when that is down.
+  - The strip holds what changes during a show: the name with Cut, LUT, Effects and
+    the gear that opens the inspector; record and pause; the drive's time left
+    (or the camera's problem with its remedy); audio.
   - Each strip collapses to one line; collapse all with ⌥⌘S.
+- **Inspector:** everything set once per camera. Each section closes to a
+  one-line summary.
 - **Selection:** clicking a picture selects that camera (blue ring); it never cuts.
 - **Tally:** with two or more cameras, the camera on Program shows a red ON AIR
-  ring once a meeting app is receiving "Ultracam · Program" (PROGRAM before that), and
+  ring once its picture reaches the Program virtual camera or stream (PROGRAM before that), and
   NEXT while a cut is pending. A camera seen only through its own virtual camera
   shows a red ISO ring. Red means frames are arriving, not just that a client exists.
 - **Inspector (⌥⌘I):** deeper per-camera settings, opened on demand.
 - **Status bar:** output, Program, recording, audio and resources.
-- **Settings (⌘,):** General, Recording, Camera, Switcher, Monitor and Advanced.
+- **Settings (⌘,):** General, Hardware, Virtual Cameras, Recording, Streaming, Audio, Switching, Alerts and Advanced.
 - **Diagnostics:** engineering detail lives in its own window.
 
 The menu bar item is a native menu. Its live preview row shows what is
@@ -154,7 +169,6 @@ Shortcuts:
 | ⌃⌥A | Automatic switching |
 | ⌘1–⌘4 | Select a camera |
 | ⌥⌘1–⌥⌘4 | Layout |
-| ⌃⌘S | Sidebar |
 | ⌥⌘S | Collapse all strips |
 | ⌥⌘K | Scopes |
 | ⌥⌘I | Inspector |
@@ -172,11 +186,23 @@ real model. `bash scripts/app-self-test.sh` runs checks inside the real app;
 `LIVE=1` also starts and stops the selected camera on the real input. See
 [Tools/UIVerify/README.md](Tools/UIVerify/README.md).
 
+### Stream Program
+
+With two cameras enabled, open the **Program** status-bar popover and choose **Set Up Stream…**. In **Settings → Streaming**, enter the destination’s RTMPS server and stream key. Choose the camera and embedded channel pair carrying the show audio, or select **Video Only**. The selected audio stays with the stream across manual and automatic cuts. Ultracam stores the destination credentials in the app’s private macOS Keychain.
+
+Choose Source size, 720p, 1080p, 4K UHD or 4K DCI, then choose Fit or Crop, a frame rate and a target bitrate (1–50 Mbps). Source size resolves when streaming starts and stays fixed across cuts. H.264 and HEVC use the Mac’s hardware encoder. HEVC also offers 10-bit 4:2:0 and 4:2:2 profiles with Rec.709, PQ or HLG. AV1 uses the bundled software encoder in 8-bit Rec.709. Its delivered frame rate depends on CPU capacity, especially at 4K. HEVC and AV1 require a destination that accepts that codec over Enhanced RTMP. Existing setups open at their original 1080p30 H.264 settings.
+
+Start capture for manually operated inputs, then choose **Start Stream** in Program. Automatic inputs start on demand. The stream delivers the processed Program picture and, when enabled, stereo AAC audio. The Program popover shows stream health and lets you stop publishing. You can close the main window during a stream and use the menu bar item to stop it.
+
 ## Monitor tools
 
 The main window offers **Single**, **Side by Side**, **Four Up** and, in Program
-mode, **Program View** layouts. Expand a picture from its context menu, swap the
-first two, or detach a camera into its own window. Tools are off by default, and
+mode, **Program View** layouts. In Single view, click the camera name or number
+to choose the picture. Use the **Program** bar under the pictures to cut to a
+camera or configure automatic switching. **Start Capture** starts receiving an
+input, **Hide Preview** controls its picture in the app, and **Record** saves a
+take. Expand a picture from its context menu, swap the first two, or detach a
+camera into its own window. Tools are off by default, and
 each camera retains its own settings. Each tool is a split button on the picture:
 click it to toggle the tool, or use its chevron for settings.
 
@@ -232,6 +258,33 @@ with a one-second initial fragment and ten-second subsequent fragment intervals.
 Normal Stop drains the encoder and finalizes the whole take on a worker, while
 **Finishing…** keeps duplicate recording actions disabled. Quitting waits for
 active recordings to finish.
+
+In **Settings → Recording**, Zoom is preselected under **Recording triggers**.
+Use **Add App…** to select other apps, then enable each camera you want under
+**Record with camera apps**. After two seconds of continuous use, a selected
+app starts a local camera take. Using Program starts takes for all enabled
+cameras with a live input and a recording folder. Camera setup previews also
+count as use. For a web meeting, select the browser. If several apps use a
+camera, the first qualifying app owns the take. Five seconds after that app
+releases the feed, Ultracam closes the take. Another selected app still using
+the camera can then start its own take. Manual Stop holds until the apps
+currently using that camera release it. Camera triggers require extension build 14 or later.
+
+Expand an app under **Recording triggers** to set its video quality, target
+bitrate, folder and filename pattern. Automatic takes default to HEVC 4:2:0 MP4 with an average bitrate
+target of 10 Mbps. At that rate, stereo AAC and video use about 4.56 GB per hour
+per camera. File size varies with the picture. Presets also offer 5 or 20 Mbps, and the bitrate control accepts 1–50 Mbps. The default
+destination is an app-named subfolder inside the camera’s recording folder.
+Choosing a folder for an app sends its recordings directly there, including
+when no camera folder is set. Changes apply to the next take.
+
+The default Zoom filename follows the local start time, meeting title and
+camera name, for example `2026-11-06 15.05.24 Dharun Mohan - Ultracam (Camera A).mp4`.
+Choose **Allow meeting window titles…** to grant the macOS Screen Recording
+permission used to read Zoom’s window title. If Zoom exposes no identifiable
+title or permission is unavailable, the session field reads **Zoom Meeting**.
+For other apps, it uses the app name. Email addresses are removed from
+filenames, and duplicate names receive a numeric suffix.
 
 **Settings → Advanced → Video compatibility** offers **Allow CPU conversion
 (compatibility)**, off by default. Recording samples this policy at take start;
@@ -295,6 +348,22 @@ The deployment target is macOS 26; there is no Metal 3 fallback. Capturing throu
 the bundled DeckLink plugin also requires Blackmagic Desktop Video with its
 camera extension enabled.
 
+Xcode and the command-line tools use the sibling checkout at `../MonitorKit`.
+This revision requires the MonitorKit LUT output-signal and scope GPU recovery
+changes. The upstream default branch currently points to `5bf8dfe`, which predates
+the APIs Ultracam uses.
+
+- `MonitorLUT.withOutputSignal(_:)`, `declaredOutputSignal`, `outputSignal` and
+  `displayOutputSignal`, with the matching picture and scope shader changes for
+  declared LUT output colorimetry.
+- `MonitorFeed.pictureLUT(for:)` for choosing the LUT that supplies the picture's
+  final signal.
+- `ScopeRenderer.invalidateGPUResults()` for retrying a scope after a failed
+  encode or GPU submission.
+
+Use a sibling checkout containing those changes to build and run synthetic checks.
+The commands below assume that revision is available in the MonitorKit checkout.
+
 ```sh
 git clone https://github.com/andrewfitz/MonitorKit.git
 git clone https://github.com/andrewfitz/ultracam.git
@@ -303,9 +372,7 @@ bash scripts/build.sh
 bash scripts/test.sh
 ```
 
-Xcode and the command-line tools use the sibling checkout at `../MonitorKit`.
-If you already have MonitorKit, clone Ultracam beside it and reuse that checkout.
-Its development log is [docs/monitorkit/PROGRESS.md](docs/monitorkit/PROGRESS.md).
+See the [MonitorKit development log](docs/monitorkit/PROGRESS.md).
 
 The production camera extension generates standby black images through Metal 4,
 with no CPU or legacy Metal fallback. The focused GPU proof passed all 18
@@ -391,6 +458,12 @@ After signing, place the app in `/Applications`, launch it and click **Install
 camera**. Approve the camera extension in System Settings when macOS asks.
 **Remove camera** requests deactivation of this app's extension.
 
+If macOS enables the extension but the cameras don't appear after an update,
+use **Settings → Virtual Cameras → Force Update Without Restart** in a signed
+build. macOS requests administrator approval before reloading the camera
+service. Virtual camera feeds may briefly disconnect. The same control is
+called **Reload Camera Service** when the cameras are already available.
+
 For local testing on a Mac already configured to permit unsigned system
 extensions (including SIP disabled), build an explicitly marked development
 package without an Apple Developer identity:
@@ -436,13 +509,13 @@ and frame rate from its own supported features, settings, and meeting conditions
 ## Natural talking-head auto-switcher
 
 Program includes a **Natural talking head** strategy. When enabled, the
-app feeds live audio cues to the Rust director in `Tools/auto-switcher`, queues
+app feeds live audio cues to the Rust director in `Apps/AutoSwitcher`, queues
 decisions at Program frame boundaries, and acknowledges them only after the
 target frame is applied. The hard shot maximum forces a bounded cut, preferring
 the nearest speech gap and using the configured grace period only when no safe
 gap arrives. The standalone package also accepts realtime JSONL or PCM16LE and
 can analyze complete audio/video files offline; see
-[Tools/auto-switcher/README.md](Tools/auto-switcher/README.md).
+[Apps/AutoSwitcher/README.md](Apps/AutoSwitcher/README.md).
 Recorded source movies use the readable feed name and a local datetime in
 their filenames. Each switcher session writes a datetime JSON sidecar in the
 recording folder.
@@ -450,14 +523,14 @@ recording folder.
 ## Qualification status and boundaries
 
 See [VALIDATION.md](VALIDATION.md) for executed checks and outstanding live tests.
-Capture uses the native DeckLink SDK directly and validates every received frame
+DeckLink capture uses the native SDK directly and validates every received frame
 as 3840 × 2160 10-bit 4:2:2. It detects 29.97/59.94 input automatically and reports
 the actual captured dimensions, format and rate. Unsupported HDMI modes are
 reported while the detector waits for a supported signal. The build
 fetches checksum-pinned, permissively licensed Blackmagic headers and dispatch
 source from official OBS upstream; Blackmagic Desktop Video supplies the runtime.
 
-The established physical-input qualification baseline is 3840 × 2160, 10-bit
+The established DeckLink qualification baseline is 3840 × 2160, 10-bit
 4:2:2 at 29.97/59.94 fps. Shared format contracts, synthetic checks and a plugin’s
 reported mode list do not by themselves qualify additional physical modes.
 Confirm the actual detected source format in Capture diagnostics and consult

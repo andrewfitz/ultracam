@@ -30,12 +30,18 @@ import XCTest
     XCTAssertEqual(snapshot.displayAspect, snapshot.source.displayAspect)
     XCTAssertEqual(snapshot.destination?.width, 1920)
   }
-  func testAdmissionRejectsUpscaleByDefaultAndAllowsExplicitCompatibility() throws {
-    let format = try SourceFormat(width: 1280, height: 720, pixel: .v210, rate: .constant(CMTime(value: 1, timescale: 30)))
-    XCTAssertThrowsError(try SourceSizeAdmission.validate(format, destination: (3840, 2160))) { error in
-      XCTAssertEqual(error as? SourceAdmissionError, .upscaleRequired("Source is smaller than destination"))
-    }
-    XCTAssertNoThrow(try SourceSizeAdmission.validate(format, destination: (3840, 2160), allowUpscale: true))
+  func testAdmissionAllowsLargerCanvasWithNativeOrMagnifiedPicture() throws {
+    let format = try SourceFormat(width: 640, height: 480, pixel: .v210, rate: .constant(CMTime(value: 1, timescale: 30)))
+    let native = try XCTUnwrap(SourceSizeAdmission.snapshot(format, destination: (1280, 720)).fit)
+    XCTAssertEqual(native.scaledWidth, 640)
+    XCTAssertEqual(native.scaledHeight, 480)
+    XCTAssertEqual(native.offsetX, 320)
+    XCTAssertEqual(native.offsetY, 120)
+    let enlarged = try XCTUnwrap(SourceSizeAdmission.snapshot(format, destination: (1280, 720), allowUpscale: true).fit)
+    XCTAssertEqual(enlarged.scaledWidth, 960)
+    XCTAssertEqual(enlarged.scaledHeight, 720)
+    XCTAssertEqual(enlarged.offsetX, 160)
+    XCTAssertEqual(enlarged.offsetY, 0)
   }
 }
 #endif

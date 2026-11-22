@@ -4,6 +4,9 @@ import CoreVideo
 import XCTest
 
 @objcMembers final class CameraContractChecks: XCTestCase {
+  // CMIO initializes its notification queues with a process-wide provider.
+  // Filtered runners and this suite must reference the same instance.
+  @nonobjc static let nativeProvider = CameraProvider(automaticTimers: false)
   /// The extension's bootstrap device, which a provider without a registry publishes.
   static let bootstrapRoute = CameraSinkRoute(descriptor: .feed(feedID: "default", displayName: VideoContract.cameraName))
 
@@ -58,6 +61,32 @@ import XCTest
     }
   }
 
+  func testClientIdentityIncludesEnclosingAppAndRejectsUnknownClients() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let app = root.appendingPathComponent("Meeting.app")
+    let helper = app.appendingPathComponent("Contents/Frameworks/Video.app")
+    for (bundle, id) in [(app, "example.meeting"), (helper, "example.video")] {
+      let contents = bundle.appendingPathComponent("Contents")
+      try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+      let plist = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": id,
+        "CFBundlePackageType": "APPL"], format: .xml, options: 0)
+      try plist.write(to: contents.appendingPathComponent("Info.plist"))
+    }
+    XCTAssertEqual(CameraStream.appIdentifiers(signingID: "example.helper",
+      executablePath: helper.appendingPathComponent("Contents/MacOS/video").path),
+      ["example.meeting", "example.video", "example.helper"])
+    XCTAssertEqual(CameraStream.appIdentifiers(signingID: "us.zoom.xos", executablePath: nil), ["us.zoom.xos"])
+    XCTAssertTrue(CameraStream.appIdentifiers(signingID: "unknown", executablePath: nil).isEmpty)
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false)
+    let property = CMIOExtensionProperty(rawValue: VideoContract.clientAppsProperty)
+    XCTAssertTrue(camera.source.availableProperties.contains(property))
+    XCTAssertFalse(camera.sink.availableProperties.contains(property))
+    let state = try camera.source.streamProperties(forProperties: [property]).propertiesDictionary[property]
+    XCTAssertEqual(state?.value as? String, "[]")
+    XCTAssertEqual(state?.attributes?.isReadOnly, true)
+  }
+
   private func sample(width: Int = 1920, height: Int = 1080,
     pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
     time: CMTime = CMTime(value: 60_000, timescale: 60_000),
@@ -78,8 +107,7 @@ import XCTest
   }
 
   func testAllAdvertisedFormatsAndAtomicNegotiation() throws {
-    // Construct the real process singleton once without calling startService.
-    let camera = CameraProvider(automaticTimers: false)
+    let camera = Self.nativeProvider
     try camera.queue.sync {
       XCTAssertEqual(camera.provider.devices.count, 1)
       XCTAssertEqual(camera.device.streams.count, 2)

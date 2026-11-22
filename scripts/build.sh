@@ -70,15 +70,17 @@ mkdir -p "$TMPDIR" "$artifact_root" "$logs_root"
 python3 "$task_root/scripts/vendor-sdk.py" status
 python3 "$task_root/scripts/vendors.py" status
 bash "$task_root/scripts/fetch-decklink-sdk.sh"
-rust_manifest="$task_root/Tools/auto-switcher/Cargo.toml"
+rust_manifest="$task_root/Apps/AutoSwitcher/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"
 RUSTC="$rustc_path" RUSTDOC="$rustdoc_path" rustup run stable cargo build \
   --manifest-path "$rust_manifest" --release --locked
 export AUTO_SWITCHER_LIB_DIR="$CARGO_TARGET_DIR/release"
-python3 "$task_root/scripts/generate_project.py"
-args=(-project "$task_root/Ultracam.xcodeproj" -scheme 'Ultracam' -configuration "$configuration" -derivedDataPath "$build_root" -jobs 4 ARCHS=arm64)
+project="$build_root/Generated/$run_id/Ultracam.xcodeproj"
+python3 "$task_root/scripts/generate_project.py" --build-project "$project"
+args=(-project "$project" -scheme 'Ultracam' -configuration "$configuration" -derivedDataPath "$build_root"
+  -onlyUsePackageVersionsFromResolvedFile -jobs 4 ARCHS=arm64)
 if [[ "$signed" == true ]]; then
   args+=("DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
   if [[ "$provisioning_updates" == true ]]; then

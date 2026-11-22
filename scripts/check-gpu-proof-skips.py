@@ -29,7 +29,8 @@ OPTIONAL_PACKAGE_CASES = {
 
 def skipped_cases(text):
     result = set()
-    for identity in re.findall(r"^Test Case '([^']+)' skipped[^\n]*", text, re.MULTILINE):
+    # XCTest may flush a marker directly after buffered benchmark output.
+    for identity in re.findall(r"Test Case '([^'\n]+)' skipped \(", text):
         objc = re.fullmatch(r'-\[([^ ]+) ([^]]+)\]', identity)
         result.add(f'{objc[1]}/{objc[2]}' if objc else identity)
     return sorted(result)

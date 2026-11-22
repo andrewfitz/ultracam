@@ -105,6 +105,22 @@ import XCTest
     XCTAssertEqual(store.load(), first, "Rollback repairs the primary slot")
   }
 
+  func testStoreRejectsOversizedDataAndRecoversOldOversizedPrimaryFromBackup() throws {
+    let suite = "org.ultracam.tests.registry-size.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = VirtualCameraRegistryStore(defaults: defaults)
+    let first = VirtualCameraRegistrySnapshot(generation: 1, devices: [.feed(feedID: "wide")])
+    let second = first.advancing(to: [.feed(feedID: "tight")])
+    try store.save(first)
+    try store.save(second)
+    let oversized = second.advancing(to: [.feed(feedID: "tight", displayName: String(repeating: "📷", count: 16_384))])
+    XCTAssertThrowsError(try store.save(oversized))
+    XCTAssertEqual(store.load(), second)
+    defaults.set(try JSONEncoder().encode(oversized), forKey: VirtualCameraRegistryStore.key)
+    XCTAssertEqual(store.load(), first)
+  }
+
   func testStoreRejectsStaleOrWrongGroupWritesWithoutChangingCurrent() throws {
     let suiteName = "org.ultracam.tests.registry.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

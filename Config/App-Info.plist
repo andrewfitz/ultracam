@@ -13,7 +13,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>52</string>
+	<string>59</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSBonjourServices</key>
@@ -22,12 +22,16 @@
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Capture video from your selected input to apply a LUT and publish a processed camera.</string>
+	<key>NSCameraUseContinuityCameraDeviceType</key>
+	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Discover and connect to cameras and video devices on your local network.</string>
+	<string>Discover cameras and video devices, and stream Program to the destination you choose on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Capture audio from your selected input for recording and camera switching.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Read the Zoom meeting window title to name automatic recordings.</string>
 	<key>NSSystemExtensionUsageDescription</key>
 	<string>Publish Ultracam as a camera for Zoom and other video applications.</string>
 </dict>

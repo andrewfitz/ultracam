@@ -286,10 +286,21 @@ import XCTest
     let pcm = [Float](repeating: 0.5, count: 8).withUnsafeBytes { Data($0) }
     XCTAssertTrue(source.submit(.rawAudio(try CaptureAudioPacket(planes: [pcm], sampleFrameCount: 8,
       format: audio, packetTime: CMTime(value: 50, timescale: 1)))))
-    emit(source, image: try image(), time: CMTime(value: 20, timescale: 1))
+    let buffer = try image()
+    emit(source, image: buffer, time: CMTime(value: 20, timescale: 1))
+    XCTAssertTrue(source.submit(.event(.audioInterrupted(reason: "Fixture microphone disconnected"))))
+    XCTAssertTrue(source.submit(.rawAudio(try CaptureAudioPacket(planes: [pcm], sampleFrameCount: 8,
+      format: audio, packetTime: CMTime(value: 51, timescale: 1)))))
+    emit(source, image: buffer, time: CMTime(value: 21, timescale: 1))
+    XCTAssertTrue(source.submit(.event(.audioResumed)))
+    XCTAssertTrue(source.submit(.rawAudio(try CaptureAudioPacket(planes: [pcm], sampleFrameCount: 8,
+      format: audio, packetTime: CMTime(value: 52, timescale: 1)))))
+    emit(source, image: buffer, time: CMTime(value: 22, timescale: 1))
     source.stop()
     try? adapter.stop()
-    XCTAssertEqual(writer.sourceAudioCount, 1)
+    XCTAssertEqual(writer.sourceAudioCount, 1, "PCM during the interruption must never reach the writer")
+    XCTAssertEqual(writer.order.filter { ["sourceAudio", "video", "resumedAudio"].contains($0) },
+      ["sourceAudio", "video", "video", "resumedAudio", "video"])
     XCTAssertEqual(writer.order.first, "context")
     if let audioIndex = writer.order.firstIndex(of: "sourceAudio"), let videoIndex = writer.order.firstIndex(of: "video") {
       XCTAssertLessThan(audioIndex, videoIndex, "Independent audio must reach the bounded writer hold before the first video")
@@ -450,7 +461,7 @@ import XCTest
     XCTAssertEqual(writer.contextContracts.count, 1)
   }
 
-  func testLateUnknownAudioEndsBoundTakeBeforeAudioFirstVideoRedeclaration() throws {
+  func testEpochCutoffWaitsForValidatedVideoDeclarationAndKeepsBoundTake() throws {
     let source = TakeContextFixtureSession(format: try format(), audio: .absent, lateUnknownFirst: true)
     let feed = FeedID(rawValue: "late-unknown-audio")
     let writer = TakeContextWriter()
@@ -461,7 +472,10 @@ import XCTest
     try adapter.start()
     let controller = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in source }))
     controller.setCameraOutputEnabled(false)
-    controller.setRecordingCallbacks(feedID: feed, callbacks: adapter.callbacks)
+    var callbacks = adapter.callbacks
+    let cutoffs = TakeContextObservation()
+    callbacks.finishAtSourceEpoch = { cutoffs.video() }
+    controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks)
     let ready = expectation(description: "Bound take source ready")
     let barrier = expectation(description: "Initial take media admitted")
     controller.onUpdate = { update in
@@ -476,16 +490,20 @@ import XCTest
     wait(for: [barrier], timeout: 1)
     XCTAssertTrue(source.source.submit(.event(.audioFormatChanged(.unknown))))
     XCTAssertEqual(source.unknownDelivered.wait(timeout: .now() + 1), .success)
-    XCTAssertEqual(core.state, .failed, "A bound take must fail on the first new-epoch audio declaration, even while video redeclaration is paused")
-    XCTAssertTrue(core.telemetry.lastError?.contains("audio") == true)
+    XCTAssertEqual(core.state, .recording)
+    XCTAssertEqual(cutoffs.videoCalls, 0, "The provisional audio envelope arrives before the validated video declaration")
     source.releaseUnknown.signal()
+    emit(source.source, image: try image(), time: VideoContract.fastDuration)
     source.stop()
-    try? adapter.stop()
+    try adapter.stop()
+    XCTAssertEqual(core.state, .finished)
+    XCTAssertEqual(cutoffs.videoCalls, 1)
+    XCTAssertEqual(core.telemetry.appendedVideo, 1)
     XCTAssertEqual(writer.initialContext?.audioDeclaration, .absent)
     XCTAssertEqual(writer.contextContracts.count, 1)
   }
 
-  func testLateAudioChangeFailsTakeWithoutReplacingItsInitialContext() throws {
+  func testLateAudioChangeCutsOffTakeWithoutReplacingItsInitialContext() throws {
     let source = FakeCaptureSession(format: try format(), audio: .absent)
     let feed = FeedID(rawValue: "changed-audio-take-context")
     let writer = TakeContextWriter()
@@ -496,7 +514,10 @@ import XCTest
     try adapter.start()
     let controller = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in source }))
     controller.setCameraOutputEnabled(false)
-    controller.setRecordingCallbacks(feedID: feed, callbacks: adapter.callbacks)
+    var callbacks = adapter.callbacks
+    let cutoffs = TakeContextObservation()
+    callbacks.finishAtSourceEpoch = { cutoffs.video() }
+    controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks)
     let ready = expectation(description: "Take source ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { ready.fulfill() } }
     defer { controller.onUpdate = nil; controller.stop(); try? adapter.stop() }
@@ -506,12 +527,49 @@ import XCTest
     let audio = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: .int32,
       interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
     XCTAssertTrue(source.submit(.event(.audioFormatChanged(.present(audio)))))
+    emit(source, image: try image(), time: VideoContract.fastDuration)
     source.stop()
-    try? adapter.stop()
-    XCTAssertEqual(core.state, .failed)
+    try adapter.stop()
+    XCTAssertEqual(core.state, .finished)
+    XCTAssertEqual(cutoffs.videoCalls, 1)
+    XCTAssertEqual(core.telemetry.appendedVideo, 1)
     XCTAssertEqual(writer.initialContext?.audioDeclaration, .absent)
     XCTAssertEqual(writer.contextContracts.count, 1)
   }
+
+  func testMalformedEpochDeclarationFailsBoundTakeInsteadOfFinishingIt() throws {
+    let fixture = TakeContextFixtureSession(format: try format(), audio: .absent, malformedEpochFormat: true)
+    let feed = FeedID(rawValue: "malformed-epoch-take")
+    let writer = TakeContextWriter()
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID(feed.rawValue),
+      outputURL: URL(fileURLWithPath: "/tmp/unused-malformed-epoch.mov"), width: 3840, height: 2160)
+    let core = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    let adapter = SourceRecordingCallbackAdapter(feedID: config.feedID, recorder: core)
+    try adapter.start()
+    let controller = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in fixture }))
+    controller.setCameraOutputEnabled(false)
+    var callbacks = adapter.callbacks
+    let cutoffs = TakeContextObservation()
+    callbacks.finishAtSourceEpoch = { cutoffs.video() }
+    controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks)
+    let ready = expectation(description: "Capture ready")
+    let failure = expectation(description: "Malformed source declaration failed capture")
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if update.stopped && update.message.contains("signature") { failure.fulfill() }
+    }
+    defer { controller.onUpdate = nil; controller.stop(); try? adapter.stop() }
+    controller.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(),
+      pipelineEnabled: false, previewEnabled: false)
+    wait(for: [ready], timeout: 1)
+    emit(fixture.source, image: try image())
+    XCTAssertTrue(fixture.source.submit(.event(.discontinuity)))
+    wait(for: [failure], timeout: 2)
+    XCTAssertEqual(core.state, .failed)
+    XCTAssertEqual(cutoffs.videoCalls, 0)
+    XCTAssertTrue(core.telemetry.lastError?.contains("signature") == true)
+  }
+
 }
 
 private final class TakeContextObservation: @unchecked Sendable {
@@ -559,6 +617,9 @@ private final class TakeContextWriter: SourceRecordingWriter, @unchecked Sendabl
     let description = CMSampleBufferGetFormatDescription(sample).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
     lock.withLock { sourceAudio += 1; sourceFormat = description; sourceMapping = mapping; ordering.append("sourceAudio") }
   }
+  func appendResumedSourceAudio(_ sample: CMSampleBuffer, mapping: AudioVideoClockMapping) throws {
+    lock.withLock { ordering.append("resumedAudio") }
+  }
   func finish() throws {}
 }
 
@@ -569,21 +630,28 @@ private final class TakeContextFixtureSession: CaptureSession, @unchecked Sendab
   private let mappingDelay: UInt64
   private let maximumEventSequence: Bool
   private let lateUnknownFirst: Bool
+  private let malformedEpochFormat: Bool
   let unknownDelivered = DispatchSemaphore(value: 0)
   let releaseUnknown = DispatchSemaphore(value: 0)
   private var heldLateFormat: CaptureDelivery?
   private var held: CaptureDelivery?
   private var reordered = false
   init(format: SourceFormat, audio: SourceAudioDeclaration, audioFirst: Bool = false, revisionOverride: UInt64? = nil,
-    mappingDelay: UInt64 = 0, maximumEventSequence: Bool = false, lateUnknownFirst: Bool = false) {
+    mappingDelay: UInt64 = 0, maximumEventSequence: Bool = false, lateUnknownFirst: Bool = false, malformedEpochFormat: Bool = false) {
     source = FakeCaptureSession(format: format, audio: audio)
     self.audioFirst = audioFirst; self.revisionOverride = revisionOverride
     self.mappingDelay = mappingDelay; self.maximumEventSequence = maximumEventSequence
     self.lateUnknownFirst = lateUnknownFirst
+    self.malformedEpochFormat = malformedEpochFormat
   }
   var counters: CaptureCounters { source.counters }
   func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws {
     try source.start(deviceID: deviceID, timing: timing, handlers: CaptureHandlers { [self] value in
+      if malformedEpochFormat, value.epochID.epoch > 0, case .event(.formatChanged) = value.payload {
+        handlers.deliver(CaptureDelivery(sequence: value.sequence, epochID: value.epochID, formatSignature: "invalid",
+          clockBindings: value.clockBindings, mappingRevision: value.mappingRevision, payload: value.payload))
+        return
+      }
       let delivery = CaptureDelivery(sequence: value.sequence, epochID: value.epochID, formatSignature: value.formatSignature,
         clockBindings: value.clockBindings, mappingRevision: revisionOverride ?? value.mappingRevision, payload: value.payload)
       if lateUnknownFirst, delivery.epochID.epoch > 0 {

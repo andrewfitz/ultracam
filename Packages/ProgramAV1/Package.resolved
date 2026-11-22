@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "libaom-xcframework",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/HaishinKit/libaom-xcframework.git",
+      "state" : {
+        "revision" : "2646d382326772cd9e1ffb11c7bc7fb079395bf0",
+        "version" : "3.15.3"
+      }
+    }
+  ],
+  "version" : 2
+}

@@ -2,32 +2,40 @@ import AppKit
 import MonitorKitAudio
 import SwiftUI
 
+enum UIDiagnosticsSection: Hashable, Sendable {
+  case camera(String)
+  case program
+  case app
+}
+
 /// Diagnostics window: per-camera capture, drops, audio, encoder and
 /// monitoring details, Program state, and app resource use. Engineering
 /// detail lives here so the everyday window stays calm.
 struct UIDiagnosticsView: View {
   let model: AppModel
-  @State private var tab = ""
+  let interface: UIInterfaceState
   @State private var copied = false
 
-  private var tabs: [(id: String, title: String)] {
-    model.feedDescriptors.map { ($0.id.rawValue, $0.name) }
-      + (model.programAvailable ? [("program", "Program")] : []) + [("app", "App")]
+  private var tabs: [(id: UIDiagnosticsSection, title: String)] {
+    model.feedDescriptors.map { (.camera($0.id.rawValue), $0.name) }
+      + (model.programAvailable || model.streamSnapshot.active || model.streamSnapshot.phase == .failed ? [(.program, "Program")] : []) + [(.app, "App")]
   }
 
   /// Until a section is chosen, a camera that stopped or ended a take early: a problem's Details
   /// opens this window, and the reason is on that camera's tab.
-  private var incidentTab: String? {
-    model.feedDescriptors.first { model.unexpectedStops[$0.id] != nil }?.id.rawValue
+  private var incidentTab: UIDiagnosticsSection? {
+    model.feedDescriptors.first { model.unexpectedStops[$0.id] != nil }.map { .camera($0.id.rawValue) }
   }
 
   var body: some View {
-    let selected = tabs.contains { $0.id == tab } ? tab : (incidentTab ?? tabs.first?.id ?? "app")
+    let chosen = interface.diagnosticsSection
+    let selected = tabs.first { $0.id == chosen }?.id ?? incidentTab ?? tabs.first?.id ?? .app
     Group {
       switch selected {
-      case "app": UIDiagnosticsAppTab()
-      case "program": UIDiagnosticsProgramTab(model: model)
-      default: UIDiagnosticsCameraTab(model: model, cameraID: FeedID(rawValue: selected))
+      case .app: UIDiagnosticsAppTab()
+      case .program: UIDiagnosticsProgramTab(model: model)
+      case .camera(let id):
+        UIDiagnosticsCameraTab(model: model, cameraID: FeedID(rawValue: id)).id(id)
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -60,8 +68,8 @@ struct UIDiagnosticsView: View {
     }
   }
 
-  private func sectionPicker(_ selected: String) -> some View {
-    Picker("Section", selection: Binding(get: { selected }, set: { tab = $0 })) {
+  private func sectionPicker(_ selected: UIDiagnosticsSection) -> some View {
+    Picker("Section", selection: Binding(get: { selected }, set: { interface.diagnosticsSection = $0 })) {
       ForEach(tabs, id: \.id) { Text($0.title).tag($0.id) }
     }
     .labelsHidden()
@@ -118,12 +126,13 @@ private struct UIDiagnosticsCameraTab: View {
     let _ = model.recordingModel.liveStatistics(cameraID)
     let state = model.recordingModel.feeds.first { $0.id == cameraID }
     let target = MonitorTargetID(cameraID.rawValue)
+    let audio = model.descriptor(for: cameraID).flatMap { model.captureVendor(for: $0.selectedDevice)?.captureAudio } ?? .embedded
     Form {
       if !running {
         // Values from a stopped camera would be stale, so only the last take's encoder details stay,
         // with why it stopped and its last messages, said as the last known.
         Section {
-          ContentUnavailableView("Camera Stopped", systemImage: "video.slash",
+          ContentUnavailableView("Capture Stopped", systemImage: "video.slash",
             description: Text("Live capture, drops, audio and monitoring details appear while this camera runs."))
             .frame(maxWidth: .infinity)
         }
@@ -142,6 +151,7 @@ private struct UIDiagnosticsCameraTab: View {
       if running, let update {
         Section("Capture") {
           UIDiagnosticsRow("Input", update.sourceFormat.map { FormatDisplayIdentity($0).detail } ?? update.input)
+          UIDiagnosticsRow("Measured input rate", update.sourceFPS > 0 ? String(format: "%.2f fps", update.sourceFPS) : "—")
           UIDiagnosticsRow("Output", update.output.isEmpty ? "—" : update.output)
           UIDiagnosticsRow("Delivered", String(format: "%.2f fps", update.outputFPS))
           UIDiagnosticsRow("Processing", String(format: "%.2f ms", update.processingMS))
@@ -157,8 +167,8 @@ private struct UIDiagnosticsCameraTab: View {
         Section {
           UIDiagnosticsRow("Signal dropouts · frames lost", "\(UIDiagnosticsFormat.count(update.signalDropouts)) · \(UIDiagnosticsFormat.count(update.signalLostFrames))",
             warning: update.signalDropouts > 0)
-          UIDiagnosticsRow("Source gaps", UIDiagnosticsFormat.count(update.sourceDrops), warning: update.sourceDrops > 0)
-          UIDiagnosticsRow("Device", UIDiagnosticsFormat.count(update.deviceDrops), warning: update.deviceDrops > 0)
+          UIDiagnosticsRow("Inferred timestamp gaps", UIDiagnosticsFormat.count(update.sourceDrops), warning: update.sourceDrops > 0)
+          UIDiagnosticsRow("Confirmed device drops", UIDiagnosticsFormat.count(update.deviceDrops), warning: update.deviceDrops > 0)
           UIDiagnosticsRow("Ingest · CPU copied frames", UIDiagnosticsFormat.count(update.ingestCPUCopyFrames), warning: update.ingestCPUCopyFrames > 0)
           UIDiagnosticsRow("Late processing", UIDiagnosticsFormat.count(update.lateFrames), warning: update.lateFrames > 0)
           UIDiagnosticsRow("Output stalls", UIDiagnosticsFormat.count(update.poolDrops), warning: update.poolDrops > 0)
@@ -167,11 +177,11 @@ private struct UIDiagnosticsCameraTab: View {
           UIDiagnosticsRow("Connect to first frame", update.cameraFirstFrameSeconds.map { String(format: "%.2f s", $0) } ?? "—")
         } header: { Text("Drops by Stage") } footer: {
           Text("Capture keeps every frame; a stage that can't keep up is counted as a stall. Late processing counts frames started over two frame intervals after capture. Monitor pictures report their own counts below. Intentional frame-rate reduction is excluded.")
-            .font(.caption).foregroundStyle(.secondary)
+            .font(.uiMeta).foregroundStyle(.secondary)
         }
-        Section("Embedded Audio") {
+        Section(audio.title) {
           UIDiagnosticsRow("Format", update.audioPresent
-            ? "\(update.audioChannels) ch · \(String(format: "%.1f kHz", Double(update.audioSampleRate) / 1000))" : "No embedded audio")
+            ? "\(update.audioChannels) ch · \(String(format: "%.1f kHz", Double(update.audioSampleRate) / 1000))" : audio.missingLabel)
           UIDiagnosticsRow("Audio bitrate", UIDiagnosticsFormat.kilobits(update.audioBitrateKbps))
           UIDiagnosticsRow("Packets · samples", "\(UIDiagnosticsFormat.count(update.audioPackets)) · \(UIDiagnosticsFormat.count(update.audioSamples))")
           UIDiagnosticsRow("Audio drops · gaps", UIDiagnosticsFormat.count(update.audioDrops), warning: update.audioDrops > 0)
@@ -185,7 +195,9 @@ private struct UIDiagnosticsCameraTab: View {
             tap: model.audioMeterTap(for: cameraID))
         }
       }
-      UIDiagnosticsDeviceSection(device: model.deviceDiagnostics(cameraID), driverWarning: model.driverWarning)
+      UIDiagnosticsDeviceSection(device: model.deviceDiagnostics(cameraID),
+        driverWarning: model.descriptor(for: cameraID).flatMap { model.captureDriverWarning(deviceID: $0.selectedDevice) },
+        running: running)
       Section("Recording · Encoder") {
         // Why the last take ended early, until it's dismissed: also once the camera runs again.
         if let stop = model.unexpectedStops[cameraID], stop.take != nil || !stop.cameraStopped,
@@ -223,7 +235,9 @@ private struct UIDiagnosticsCameraTab: View {
         }
       }
       if running {
-        UIDiagnosticsMonitorSection(snapshot: model.monitorCoordinator.diagnostics(for: target))
+        MonitorLiveDiagnostics(coordinator: model.monitorCoordinator, target: target) { snapshot in
+          UIDiagnosticsMonitorSection(snapshot: snapshot)
+        }
       }
       if running, let update {
         Section("Messages") {
@@ -273,16 +287,17 @@ private struct UIDiagnosticsLoudness: View {
         "Phase " + MeterText.correlation(s.map { Double($0.correlation) } ?? .nan),
         "Overs \(tap.overCount)",
       ].joined(separator: " · "))
-      .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+      .font(.uiMeta.monospacedDigit()).foregroundStyle(.secondary)
     }
   }
 }
 
-/// The capture device and driver: cached SDK attributes plus the last
-/// session's device-side counters. Reading never calls into the driver.
+/// The capture device and driver: cached SDK attributes and, while capture runs,
+/// device-side counters. Reading never calls into the driver.
 private struct UIDiagnosticsDeviceSection: View {
   let device: DeviceDiagnostics?
   let driverWarning: String?
+  let running: Bool
 
   var body: some View {
     Section("Device") {
@@ -291,15 +306,17 @@ private struct UIDiagnosticsDeviceSection: View {
         ForEach(Array(device.vendorFields.enumerated()), id: \.offset) { _, field in
           UIDiagnosticsRow(field.label, field.value)
         }
-        if let signal = device.signalPresent {
-          UIDiagnosticsRow("Signal", signal ? "Present" : "Absent", warning: !signal)
+        if running {
+          if let signal = device.signalPresent {
+            UIDiagnosticsRow("Signal", signal ? "Present" : "Absent", warning: !signal)
+          }
+          UIDiagnosticsRow("Confirmed device drops", UIDiagnosticsFormat.count(device.counters.deviceDroppedFrames),
+            warning: device.counters.deviceDroppedFrames > 0)
+          UIDiagnosticsRow("Driver backlog · peak", "\(device.counters.currentBacklog) · \(device.counters.maximumBacklog) frames",
+            warning: device.counters.maximumBacklog > 2)
+          UIDiagnosticsRow("Host capture clock", device.hostTimeMapped ? "Mapped" : "Unavailable", warning: !device.hostTimeMapped)
+          UIDiagnosticsRow("Temperature", device.temperatureCelsius.map { "\($0) °C" } ?? "—")
         }
-        UIDiagnosticsRow("Device drops", UIDiagnosticsFormat.count(device.counters.deviceDroppedFrames),
-          warning: device.counters.deviceDroppedFrames > 0)
-        UIDiagnosticsRow("Driver backlog · peak", "\(device.counters.currentBacklog) · \(device.counters.maximumBacklog) frames",
-          warning: device.counters.maximumBacklog > 2)
-        UIDiagnosticsRow("Host capture clock", device.hostTimeMapped ? "Mapped" : "Unavailable", warning: !device.hostTimeMapped)
-        UIDiagnosticsRow("Temperature", device.temperatureCelsius.map { "\($0) °C" } ?? "—")
       } else if driverWarning == nil {
         Text("No capture device is connected.").foregroundStyle(.secondary)
       }
@@ -353,7 +370,7 @@ private struct UIDiagnosticsProgramTab: View {
 
   private func name(_ id: FeedID?) -> String {
     guard let id else { return "—" }
-    return model.feedDescriptors.first { $0.id == id }?.name ?? id.rawValue
+    return model.feedDescriptors.first { $0.id == id }?.name ?? "Removed camera"
   }
 
   var body: some View {
@@ -393,6 +410,10 @@ private struct UIDiagnosticsProgramTab: View {
           UIDiagnosticsRow("Conversion or send errors", UIDiagnosticsFormat.count(failures), warning: failures > 0)
         }
       }
+      let stream = model.streamSnapshot
+      if stream.active {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in streaming(model.streamSnapshot) }
+      } else { streaming(stream) }
       Section("Switching") {
         UIDiagnosticsRow("On air", name(model.switcherSelectedFeedID))
         UIDiagnosticsRow("Pending cut", name(model.switcherPendingFeedID))
@@ -412,10 +433,33 @@ private struct UIDiagnosticsProgramTab: View {
         }
       } header: { Text("Recent Cuts") } footer: {
         Text("Transcript cues need an external transcript source; the director otherwise listens to one audio stream from the selected camera.")
-          .font(.caption).foregroundStyle(.secondary)
+          .font(.uiMeta).foregroundStyle(.secondary)
       }
     }
     .formStyle(.grouped)
+  }
+
+  private func streaming(_ stream: ProgramStreamSnapshot) -> some View {
+    Section("Streaming") {
+      UIDiagnosticsRow("State", stream.phase.streamTitle)
+      if stream.active || stream.phase == .failed {
+        let videoDrops = model.streamVideoDrops
+        let audioDrops = model.streamAudioDrops
+        UIDiagnosticsRow("Video", stream.format.pictureDescription)
+        UIDiagnosticsRow("Encoder target", stream.format.encoderDescription)
+        UIDiagnosticsRow("Sent bitrate", UIFormat.bitrate(stream.bitrate / 1_000_000))
+        UIDiagnosticsRow("Last video submitted", stream.lastVideoSentAt?.formatted(date: .omitted, time: .standard) ?? "—")
+        UIDiagnosticsRow("Video conversion drops", UIDiagnosticsFormat.count(videoDrops), warning: videoDrops > 0)
+        UIDiagnosticsRow("Audio input drops", UIDiagnosticsFormat.count(audioDrops), warning: audioDrops > 0)
+        if let issue = model.streamConversionIssue { UIDiagnosticsRow("Video conversion", issue, warning: true) }
+        UIDiagnosticsRow("Publisher video drops", UIDiagnosticsFormat.count(stream.droppedVideo), warning: stream.droppedVideo > 0)
+        UIDiagnosticsRow("Stream audio gaps", UIDiagnosticsFormat.count(stream.audioGaps), warning: stream.audioGaps > 0)
+        if let interruption = stream.lastInterruption {
+          UIDiagnosticsRow("Last interruption", interruption.rawValue, warning: true)
+        }
+        if let error = stream.lastError { UIDiagnosticsRow("Last error", error, warning: true) }
+      }
+    }
   }
 }
 
@@ -431,7 +475,7 @@ private struct UIDiagnosticsAppTab: View {
         UIDiagnosticsMetric(title: "CPU", value: latest?.cpuPercent.map { String(format: "%.1f%%", $0) } ?? "—",
           samples: history.map { $0.cpuPercent ?? 0 },
           help: "Total Ultracam process CPU across all threads. 100% is one CPU core; this can exceed 100%. System encoder services run outside this process.")
-        UIDiagnosticsMetric(title: "GPU (video)", value: String(format: "%.1f%%", latest?.gpuPercent ?? 0),
+        UIDiagnosticsMetric(title: "GPU (video)", value: latest.map { String(format: "%.1f%%", $0.gpuPercent) } ?? "—",
           samples: history.map(\.gpuPercent), upperBound: 100,
           help: "Combined busy time of Ultracam's Metal video processing and copy queues over the last second. Overlapping work counts once. Excludes the hardware media encoder and system display compositor.")
         UIDiagnosticsMetric(title: "Memory", value: latest?.memoryBytes.map {
@@ -439,7 +483,7 @@ private struct UIDiagnosticsAppTab: View {
           samples: history.map { Double($0.memoryBytes ?? 0) },
           help: "Process memory footprint, including bounded frame pools and the shared monitor budget.")
       } header: { Text("Ultracam Total · Last 60 s") } footer: {
-        Text("Sampled once per second only while this tab is visible.").font(.caption).foregroundStyle(.secondary)
+        Text("Sampled once per second only while this tab is visible.").font(.uiMeta).foregroundStyle(.secondary)
       }
     }
     .formStyle(.grouped)
@@ -470,7 +514,7 @@ private struct UIDiagnosticsMetric: View {
       }
       UIDiagnosticsSparkline(samples: samples, upperBound: upperBound)
         .frame(height: 44)
-      Text(help).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      Text(help).font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
     .padding(.vertical, 4)
     .accessibilityElement(children: .combine)
@@ -507,19 +551,44 @@ enum UIDiagnosticsText {
   static func summary(model: AppModel) -> String {
     var lines = ["Ultracam diagnostics"]
     if model.programAvailable {
-      lines.append("Program: \(model.programInUse ? "in use" : "not in use")")
+      let clients = model.programInUse ? "in use" : model.programClientUnknown ? "use unknown" : "not in use"
+      lines.append("Program: \(clients)")
+    }
+    let stream = model.streamSnapshot
+    if stream.active || stream.phase == .failed {
+      lines.append("Program stream: \(stream.phase.streamTitle)")
+      lines.append("Video: \(stream.format.pictureDescription) · \(stream.format.encoderDescription)")
+      lines.append("Sent bitrate: \(UIFormat.bitrate(stream.bitrate / 1_000_000))")
+      if let time = stream.lastVideoSentAt { lines.append("Last video submitted: \(time.formatted(date: .omitted, time: .standard))") }
+      lines.append("Stream drops: video conversion \(model.streamVideoDrops), publisher video \(stream.droppedVideo), audio input \(model.streamAudioDrops), audio gaps \(stream.audioGaps)")
+      if let issue = model.streamConversionIssue { lines.append("Video conversion: \(issue)") }
+      if let interruption = stream.lastInterruption { lines.append("Last stream interruption: \(interruption.rawValue)") }
+      if let error = stream.lastError {
+        let destinationRefusal = "\(stream.name) does not accept "
+        let detail = error.hasPrefix(destinationRefusal) ? "The destination" + error.dropFirst(stream.name.count) : error
+        lines.append("Last stream error: \(detail)")
+      }
     }
     for descriptor in model.feedDescriptors {
       lines.append("")
-      lines.append("[\(descriptor.name)] \(model.isCameraRunning(descriptor.id) ? "running" : "stopped")")
-      if let update = model.cameraUpdate(descriptor.id) {
-        lines.append("Input: \(update.input)")
+      let running = model.isCameraRunning(descriptor.id)
+      lines.append("[\(descriptor.name)] \(running ? "running" : "stopped")")
+      if let update = model.cameraUpdate(descriptor.id), running {
+        lines.append("Input: \(update.sourceFormat.map { FormatDisplayIdentity($0).detail } ?? update.input)")
         lines.append("Output: \(update.output.isEmpty ? "—" : update.output)")
         lines.append(String(format: "Delivered: %.2f fps · processing %.2f ms · video %.2f Mb/s", update.outputFPS, update.processingMS, update.videoBitrateMbps))
-        lines.append("Drops: source \(update.sourceDrops), device \(update.deviceDrops), signal dropouts \(update.signalDropouts) (\(update.signalLostFrames) frames), buffers \(update.poolDrops), camera \(update.cameraDrops)")
+        lines.append("Drops: source \(update.sourceDrops), device \(update.deviceDrops), signal dropouts \(update.signalDropouts) (\(update.signalLostFrames) frames), output stalls \(update.poolDrops), camera stalls \(update.cameraDrops)")
         lines.append("Audio: \(update.audioPresent ? "\(update.audioChannels) ch \(update.audioSampleRate) Hz" : "none") · drops \(update.audioDrops)")
         lines.append("Message: \(update.message)")
         lines.append("Camera: \(update.cameraMessage)")
+      } else if !running {
+        if let stop = model.unexpectedStops[descriptor.id], stop.cameraStopped {
+          lines.append("Stopped because: \(stop.reason)")
+        }
+        if let update = model.cameraUpdate(descriptor.id) {
+          if !update.message.isEmpty { lines.append("Last capture message: \(update.message)") }
+          if !update.cameraMessage.isEmpty { lines.append("Last camera message: \(update.cameraMessage)") }
+        }
       }
       if let state = model.recordingModel.feeds.first(where: { $0.id == descriptor.id }) {
         lines.append("Recording: \(state.displayStatus)")

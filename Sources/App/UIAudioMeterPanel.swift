@@ -68,7 +68,7 @@ private struct UIAudioMeterTapView: View {
         } else { Color.clear }
       }
       Text("Click OVER to reset the peaks; right-click to reset loudness. Loudness is measured while shown or recording, and starts over with each take.")
-        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
     .onAppear {
       if attachment == nil { attachment = AudioMeterTap.Attachment(tap: tap) }

@@ -1,5 +1,8 @@
 """All compilers consume DeviceAPI; standalone vendor groups use live core APIs."""
 import importlib.util
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -41,6 +44,34 @@ class SourceMembershipTests(unittest.TestCase):
                 if name != 'credentials':
                     self.assertIn('Sources/App/CameraControlStore.swift', sources)
                     self.assertIn('Sources/App/UIControlPresentation.swift', sources)
+
+    def test_mac_camera_uses_the_same_sources_in_the_app_and_test_compilers(self):
+        spec = importlib.util.spec_from_file_location('vendors', ROOT / 'scripts/vendors.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        manifests, inventory = module.read_inventory(ROOT)
+        manifest = next(m for m in manifests if m['id'] == 'maccamera')
+        self.assertNotIn('sdk', manifest)
+        self.assertFalse(inventory['maccamera']['available'])
+        self.assertEqual(manifest['kinds'], ['capture'])
+        self.assertIn('AVFoundation', module.build_settings(manifests, inventory, vendor='maccamera')['frameworks'])
+        self.assertCountEqual(manifest['capabilities']['entitlements'],
+                              ['com.apple.security.device.camera', 'com.apple.security.device.audio-input'])
+        self.assertCountEqual(manifest['capabilities']['infoPlist'],
+                              ['NSCameraUsageDescription', 'NSMicrophoneUsageDescription',
+                               'NSCameraUseContinuityCameraDeviceType'])
+        app = set(module.source_paths(manifests, membership='app', vendor='maccamera'))
+        test = set(module.source_paths(manifests, membership='test', vendor='maccamera'))
+        self.assertIn('Vendors/MacCamera/Sources/MacCameraCapturePlugin.swift', app)
+        self.assertLess(app, test)
+        self.assertIn('Vendors/MacCamera/Tests/MacCameraReusableConformanceChecks.swift', test - app)
+        with tempfile.TemporaryDirectory() as work:
+            subprocess.run(
+                ['bash', '-eu', '-c', 'source scripts/vendor-build.sh\n'
+                 'vendor_configure app maccamera\n'
+                 '[[ -z "$vendor_sdk_root" && -z "$vendor_bridge" ]]'],
+                cwd=ROOT, env=dict(os.environ, task_root=str(ROOT), check_root=work, test_root=''),
+                check=True, capture_output=True)
 
     def test_generator_isolates_fakes_and_shares_format_with_extension(self):
         source = (ROOT / 'scripts/generate_project.py').read_text()

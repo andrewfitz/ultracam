@@ -278,23 +278,38 @@ struct HDMILease {
   }
 };
 
-static NSString *deviceIdentifier(IDeckLink *device, NSUInteger index) {
+struct DeviceIdentity {
+  NSString *key;
+  bool nameOnly;
+  NSString *identifier() const { return nameOnly ? [key stringByAppendingString:@":0"] : key; }
+};
+static DeviceIdentity readDeviceIdentity(IDeckLink *device) {
   ComRef<IDeckLinkProfileAttributes> attributes;
-  int64_t persistentID = 0;
   if (device->QueryInterface(IID_IDeckLinkProfileAttributes,
-      reinterpret_cast<void **>(attributes.out())) == S_OK &&
-      attributes->GetInt(BMDDeckLinkPersistentID, &persistentID) == S_OK) {
-    return [NSString stringWithFormat:@"decklink:%016llx", (unsigned long long)persistentID];
+      reinterpret_cast<void **>(attributes.out())) == S_OK && attributes) {
+    int64_t id = 0;
+    if (attributes->GetInt(BMDDeckLinkPersistentID, &id) == S_OK)
+      return {[NSString stringWithFormat:@"decklink:%016llx", (unsigned long long)id], false};
+    if (attributes->GetInt(BMDDeckLinkTopologicalID, &id) == S_OK) {
+      int64_t subdevice = 0;
+      attributes->GetInt(BMDDeckLinkSubDeviceIndex, &subdevice);
+      return {[NSString stringWithFormat:@"decklink:location:%016llx:%lld",
+        (unsigned long long)id, (long long)subdevice], false};
+    }
   }
-  // The registry supplies an ordinal stable for its discovery lifetime.
   CFStringRef name = nullptr;
   device->GetDisplayName(&name);
-  NSString *result = [NSString stringWithFormat:@"decklink:%@:%lu",
-    name ? (__bridge NSString *)name : @"Unknown", (unsigned long)index];
-  if (name) CFRelease(name);
-  return result;
+  return {[NSString stringWithFormat:@"decklink:%@", CFBridgingRelease(name) ?: @"Unknown"], true};
 }
 
+// Some legacy cards expose only a name. Discovery can distinguish simultaneous
+// arrivals by their live references. An iterator returning fresh wrappers cannot
+// prove which of two identical cards is which. Never open one by iterator order.
+struct EnumeratedInput {
+  ComRef<IDeckLink> device;
+  ComRef<IDeckLinkInput> input;
+  DeviceIdentity identity;
+};
 // Native wire validation precedes the Swift route/table admission. This is the
 // current two-mode SDK contract, not another extensible pixel-format table.
 struct NativeFrameContract {
@@ -1005,13 +1020,22 @@ class CaptureCallback final : public IDeckLinkInputCallback {
       const auto active = std::atomic_load(&activeContract);
       const bool timeValid = timeStatus == S_OK && timestamp >= 0 && duration > 0 && active &&
         CMTimeCompare(CMTimeMake(duration, timeScale), active->duration) == 0;
+      bool signalValid = false, signalChanged = false;
+      if (frame) {
+        signalValid = !(frame->GetFlags() & bmdFrameHasNoInputSource);
+        stats->signalPresent = signalValid ? 1 : 0;
+        const int prior = signalState.exchange(signalValid ? 1 : 0);
+        signalChanged = prior != (signalValid ? 1 : 0);
+        if (signalValid) trackStreamTime(timeValid, timestamp, duration, prior == 0);
+        else if (signalChanged) timecodes.reset();
+      }
       // Above 30 fps: 1001/60000 stream durations, or the opened mode before time is valid.
       const bool highFrameRate = timeValid ? duration * 30 < timeScale :
         requestedMode.load() == bmdMode4K2160p5994;
       if (resetTimecodeCadence.load(std::memory_order_relaxed) && resetTimecodeCadence.exchange(false)) timecodes.reset();
-      // Read before the frame is delivered: a signal loss there starts the cadence over.
+      // Apply the clock boundary before this frame can influence cadence.
       const unsigned nominalFPS = active ? unsigned(std::ceil(1.0 / CMTimeGetSeconds(active->duration))) : 0;
-      NSString *timecode = (mediaHandler || timecodeHandler) ? timecodes.read(frame, highFrameRate, nominalFPS) : nil;
+      NSString *timecode = signalValid && (mediaHandler || timecodeHandler) ? timecodes.read(frame, highFrameRate, nominalFPS) : nil;
       if (timecodeHandler) timecodeHandler(timecode);
       // The callback's video frame is wrapped and handed off first, so the
       // frame consumers (recording admission, the capture queue) never wait
@@ -1020,7 +1044,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
       // audio packet while the video input is absent (for example during a
       // source reconnect), and the media path owns its own clock, so it never
       // acquires an artificial audio hole for want of a video object.
-      if (frame) deliverVideo(frame, timeValid, timestamp, duration);
+      if (frame) deliverVideo(frame, active.get(), timeValid, timestamp, duration, signalValid, signalChanged);
       if (mediaHandler) reportMedia(timecode, audioPacket, mediaHandler, audioChannels);
       reportRawAudio(audioPacket, rawAudioHandler, audioChannels);
     }
@@ -1031,22 +1055,18 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   // frame, wraps its native buffer and hands it to the frame handler (or
   // counts it as gated). Input faults are reported here; the caller reports
   // the callback's audio afterwards on every path.
-  void deliverVideo(IDeckLinkVideoInputFrame *frame, bool timeValid, BMDTimeValue timestamp, BMDTimeValue duration) {
-    bool valid = !(frame->GetFlags() & bmdFrameHasNoInputSource);
-    stats->signalPresent = valid ? 1 : 0;
-    int prior = signalState.exchange(valid ? 1 : 0);
-    trackStreamTime(timeValid, timestamp, duration, valid && prior == 0);
+  void deliverVideo(IDeckLinkVideoInputFrame *frame, const NativeFrameContract *contract,
+                    bool timeValid, BMDTimeValue timestamp, BMDTimeValue duration,
+                    bool signalValid, bool signalChanged) {
     // Embedded audio has its own packet clock: the caller reports this
     // callback's audio whatever happens to the frame here, so signal loss and
     // format reconfiguration never put an artificial hole in a recording.
-    if (!valid) {
-      if (prior != 0) timecodes.reset();
-      if (prior != 0) eventHandler(modeHandler ? @"No HDMI video signal — waiting for the camera to reconnect." :
+    if (!signalValid) {
+      if (signalChanged) eventHandler(modeHandler ? @"No HDMI video signal — waiting for the camera to reconnect." :
         @"No video signal. Check the FX3 HDMI output and selected frame rate.");
       return;
     }
     if (!framesEnabled) { noteGatedFrame(); return; }
-    const auto contract = std::atomic_load(&activeContract);
     if (!contract || frame->GetWidth() != contract->width || frame->GetHeight() != contract->height || frame->GetPixelFormat() != contract->pixel) {
       reportFatal([NSString stringWithFormat:@"Unsupported capture frame: %ld × %ld, pixel format 0x%08x. Requires dimensions and cadence matching the active HDMI mode in 10-bit YUV 4:2:2.",
         frame->GetWidth(), frame->GetHeight(), (unsigned)frame->GetPixelFormat()]); return;
@@ -1150,7 +1170,9 @@ class CaptureCallback final : public IDeckLinkInputCallback {
     if (signalReturned || (resetStreamClock.load(std::memory_order_relaxed) && resetStreamClock.exchange(false)))
       lastStreamTime = -1;
     if (!valid || timestamp < 0 || duration <= 0 || timeScale <= 0) return;
-    if (lastStreamTime >= 0 && timestamp >= lastStreamTime) {
+    if (lastStreamTime >= 0 && timestamp < lastStreamTime) {
+      timecodes.reset();
+    } else if (lastStreamTime >= 0) {
       // Both timestamps are nonnegative, so subtraction cannot overflow.
       // Divide before comparing; adding 2*duration to last time can overflow.
       const BMDTimeValue gap = timestamp - lastStreamTime;
@@ -1491,6 +1513,7 @@ class DeviceRegistry {
     observerBlocks = [NSMutableDictionary dictionary];
     statusObserverBlocks = [NSMutableDictionary dictionary];
     statuses = [NSMutableDictionary dictionary];
+    ambiguousNames = [NSMutableSet set];
   }
   ~DeviceRegistry() {
     if (discovery) discovery->UninstallDeviceNotifications();
@@ -1545,21 +1568,47 @@ class DeviceRegistry {
   }
   void drain() { dispatch_sync(queue, ^{}); }
 
-  NSString *identifierForDevice(IDeckLink *device) {
-    ComRef<IDeckLinkProfileAttributes> attributes;
-    int64_t persistentID = 0;
-    if (device->QueryInterface(IID_IDeckLinkProfileAttributes,
-        reinterpret_cast<void **>(attributes.out())) == S_OK &&
-        attributes->GetInt(BMDDeckLinkPersistentID, &persistentID) == S_OK)
-      return [NSString stringWithFormat:@"decklink:%016llx", (unsigned long long)persistentID];
+  // An unambiguous name keeps the legacy :0 ID across replacement wrappers.
+  // Once two indistinguishable inputs have appeared, keep existing leases and
+  // give each subsequent arrival a connection-scoped ID. Reusing a vacant
+  // slot could silently assign the other camera to a saved feed.
+  NSString *arrivalIdentifier(const DeviceIdentity &identity) {
+    if (!identity.nameOnly) return identity.key;
     std::lock_guard<std::mutex> guard(mutex);
-    for (auto &identity : identities)
-      if (identity.first.value == device) return identity.second;
-    NSString *identifier = deviceIdentifier(device, identities.size());
-    ComRef<IDeckLink> retained;
-    device->AddRef(); retained.value = device;
-    identities.emplace_back(std::move(retained), identifier);
-    return identifier;
+    for (const auto &entry : entries) if ([entry.legacyName isEqualToString:identity.key]) {
+      [ambiguousNames addObject:identity.key];
+      break;
+    }
+    return [ambiguousNames containsObject:identity.key]
+      ? [identity.key stringByAppendingFormat:@":connection:%@", NSUUID.UUID.UUIDString]
+      : identity.identifier();
+  }
+
+  std::vector<EnumeratedInput> uniqueIteratorInputs(IDeckLinkIterator *iterator, bool *ambiguous = nullptr) {
+    std::vector<EnumeratedInput> devices;
+    NSCountedSet *keys = [NSCountedSet set];
+    IDeckLink *raw = nullptr;
+    while (iterator->Next(&raw) == S_OK) {
+      EnumeratedInput item;
+      item.device.value = raw;
+      if (raw->QueryInterface(IID_IDeckLinkInput, reinterpret_cast<void **>(item.input.out())) != S_OK || !item.input) continue;
+      item.identity = readDeviceIdentity(raw);
+      if (item.identity.nameOnly) [keys addObject:item.identity.key];
+      devices.push_back(std::move(item));
+    }
+    NSMutableSet<NSString *> *excluded = [NSMutableSet set];
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      for (NSString *key in keys) {
+        if ([keys countForObject:key] > 1) [ambiguousNames addObject:key];
+        if ([ambiguousNames containsObject:key]) [excluded addObject:key];
+      }
+    }
+    if (ambiguous) *ambiguous = excluded.count > 0;
+    devices.erase(std::remove_if(devices.begin(), devices.end(), [&](const EnumeratedInput &item) {
+      return item.identity.nameOnly && [excluded containsObject:item.identity.key];
+    }), devices.end());
+    return devices;
   }
 
   // Returns an owned reference, or null when discovery has not seen the device.
@@ -1613,7 +1662,7 @@ class DeviceRegistry {
       for (auto &entry : entries) if ([entry.description.identifier isEqualToString:identifier]) {
         if (available) *available = true;
         *enabled = effectiveAdvertisement(identifier);
-        result = *enabled && !entry.edid ? entry.advertisementResult : S_OK;
+        result = *enabled != (entry.edid != nullptr) ? entry.advertisementResult : S_OK;
         break;
       }
     });
@@ -1852,6 +1901,7 @@ class DeviceRegistry {
     IDeckLink *device = nullptr;  // One owned reference.
     UltracamDevice *description = nil;
     uint32_t interface = 0;
+    NSString *legacyName = nil;
     DeviceCapabilities capabilities;
     // The HDR advertisement (see setAdvertiseHDR); one owned reference or null.
     IDeckLinkHDMIInputEDID *edid = nullptr;
@@ -1936,7 +1986,9 @@ class DeviceRegistry {
     DeviceEntry entry;
     entry.capabilities = readCapabilities(device);
     UltracamDevice *description = [UltracamDevice new];
-    description.identifier = identifierForDevice(device);
+    const auto identity = readDeviceIdentity(device);
+    entry.legacyName = identity.nameOnly ? identity.key : nil;
+    description.identifier = arrivalIdentifier(identity);
     CFStringRef name = nullptr; device->GetDisplayName(&name);
     description.name = name ? (__bridge NSString *)name : @"Blackmagic capture device";
     if (name) CFRelease(name);
@@ -1998,7 +2050,6 @@ class DeviceRegistry {
   }
   HRESULT updateAdvertisement(IDeckLink *device, NSString *identifier, NSString *name) {
     bool held = false, capturing = false;
-    IDeckLinkHDMIInputEDID *released = nullptr;
     bool enabled = effectiveAdvertisement(identifier);
     {
       std::lock_guard<std::mutex> guard(mutex);
@@ -2007,19 +2058,10 @@ class DeviceRegistry {
       for (auto &entry : entries) {
         if (entry.device != device) continue;
         held = entry.edid != nullptr;
-        if (!enabled) { released = entry.edid; entry.edid = nullptr; entry.advertisementResult = S_OK; }
-        else if (held) entry.advertisementResult = S_OK;
+        if (held == enabled) { entry.advertisementResult = S_OK; return S_OK; }
       }
       for (auto &session : sessions) if ([session.identifier isEqualToString:identifier]) capturing = true;
     }
-    if (!enabled) {
-      if (!released) return S_OK;
-      released->Release();
-      os_log(backendLog(), "HDR advertisement turned off: released the HDMI EDID of %{public}@ (%{public}@); the driver default returns",
-        name, identifier);
-      return S_OK;
-    }
-    if (held) return S_OK;
     // Another app capturing: rewriting the EDID would renegotiate HDMI under it.
     // Ultracam's own capture is renegotiated: the user changed the setting.
     ComRef<IDeckLinkStatus> status;
@@ -2033,6 +2075,15 @@ class DeviceRegistry {
       return E_ACCESSDENIED;
     }
     ComRef<IDeckLinkHDMIInputEDID> edid;
+    if (!enabled) {
+      // The last release restores the default EDID and renegotiates the input.
+      std::lock_guard<std::mutex> guard(mutex);
+      for (auto &entry : entries) if (entry.device == device) {
+        edid.value = std::exchange(entry.edid, nullptr);
+        entry.advertisementResult = S_OK;
+      }
+      return S_OK;
+    }
     HRESULT result = advertiseHDR(device, edid);
     if (result == S_OK)
       os_log(backendLog(), "HDMI EDID of %{public}@ (%{public}@) now advertises SDR, PQ and HLG; held while the device is listed",
@@ -2098,6 +2149,7 @@ class DeviceRegistry {
   dispatch_queue_t observerQueue;
   std::mutex mutex;
   std::vector<DeviceEntry> entries;
+  NSMutableSet<NSString *> *ambiguousNames; // mutex; contains no device references
   std::vector<Session> sessions;
   std::map<std::string, std::shared_ptr<SessionStats>> statsByDevice;
   std::map<std::string, int> starting; // mutex; see beginStart
@@ -2110,9 +2162,6 @@ class DeviceRegistry {
   std::atomic<bool> advertisingHDR{false};
   std::map<std::string, bool> hdrPolicies; // discovery queue only
   std::map<std::string, BMDVideoConnection> connectorPolicies; // mutex
-  // Retain identity objects until discovery ends, preventing pointer reuse and
-  // preserving legacy IDs across unplug/replug and iterator order changes.
-  std::vector<std::pair<ComRef<IDeckLink>, NSString *>> identities; // mutex
   std::map<std::string, HRESULT> connectorErrors; // mutex
   IDeckLinkDiscovery *discovery = nullptr;
   DiscoveryCallback *callback = nullptr;
@@ -2369,15 +2418,19 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   // A pre-16 driver enumerates devices but rejects SDK 16 interface IDs, which
   // would otherwise look like an empty device list.
   if (driver.installed && !driver.supported) { fail(error, driver.message); return nil; }
+  DeviceRegistry &registry = DeviceRegistry::shared();
+  if (registry.isDiscovering()) {
+    registry.drain();
+    NSArray *listed = registry.snapshot();
+    if (listed.count) return listed;
+  }
   ComRef<IDeckLinkIterator> iterator; iterator.value = CreateDeckLinkIteratorInstance();
   if (!iterator) { fail(error, @"Blackmagic Desktop Video is not available. Install Desktop Video 16 or later."); return nil; }
   NSMutableArray<UltracamDevice *> *result = [NSMutableArray array];
-  IDeckLink *raw = nullptr;
-  while (iterator->Next(&raw) == S_OK) {
-    ComRef<IDeckLink> device; device.value = raw;
-    NSString *identifier = DeviceRegistry::shared().identifierForDevice(device.value);
-    ComRef<IDeckLinkInput> input;
-    if (device->QueryInterface(IID_IDeckLinkInput, reinterpret_cast<void **>(input.out())) != S_OK) continue;
+  bool ambiguous = false;
+  for (auto &item : registry.uniqueIteratorInputs(iterator.value, &ambiguous)) {
+    auto &device = item.device;
+    NSString *identifier = item.identity.identifier();
     UltracamDevice *description = [UltracamDevice new]; description.identifier = identifier;
     CFStringRef name = nullptr; device->GetDisplayName(&name);
     description.name = name ? (__bridge NSString *)name : @"Blackmagic capture device";
@@ -2387,8 +2440,12 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
     description.videoInputConnections = capabilities.connections;
     BMDVideoConnection selectedConnection = DeviceRegistry::defaultConnector(capabilities.connections);
     DeviceRegistry::shared().deviceConnector(identifier, &selectedConnection);
-    description.modes = supportedModes(input.value, selectedConnection);
+    description.modes = supportedModes(item.input.value, selectedConnection);
     [result addObject:description];
+  }
+  if (!result.count && ambiguous) {
+    fail(error, @"Legacy capture devices share the same name and report no hardware location. Device discovery must identify the connected inputs.");
+    return nil;
   }
   return result;
 }
@@ -2506,10 +2563,9 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (!device) {
     ComRef<IDeckLinkIterator> iterator; iterator.value = CreateDeckLinkIteratorInstance();
     if (!iterator) return fail(error, @"Blackmagic Desktop Video is not available.");
-    IDeckLink *raw = nullptr;
-    while (iterator->Next(&raw) == S_OK) {
-      ComRef<IDeckLink> candidate; candidate.value = raw;
-      if ([_registry->identifierForDevice(candidate.value) isEqualToString:deviceID]) { device.value = candidate.take(); break; }
+    for (auto &item : _registry->uniqueIteratorInputs(iterator.value)) {
+      NSString *identifier = item.identity.identifier();
+      if ([identifier isEqualToString:deviceID]) { device.value = item.device.take(); break; }
     }
   }
   if (!device) return fail(error, @"UltraStudio is disconnected. Refresh the input list.");
@@ -3754,6 +3810,7 @@ BOOL UltracamRunCallbackGroupSyntheticChecks(NSError **error) {
   callback->VideoInputFrameArrived(nullptr, nullptr);
   frame->noSignal = true;
   callback->VideoInputFrameArrived(frame, nullptr);
+  if (preframeTimecode) valid = false;
   frame->timecode = nullptr; timecode->Release(); frame->Release();
   callback->Release();
   NSArray *expected = @[@"begin", @"frame", @"media", @"audio", @"end",
@@ -3800,6 +3857,12 @@ BOOL UltracamRunPerDeviceHDRSyntheticChecks(NSError **error) {
     registry.setAdvertiseHDR(true); registry.drain();
     if (second.edid.writes != 0 || inherited.edid.writes != 1 || first.edid.writes != 1)
       return fail(error, @"Legacy HDR fallback overwrote a per-device policy or stopped applying to unmigrated devices.");
+    first.status.busy = bmdDeviceCaptureBusy;
+    if (registry.setDeviceAdvertiseHDR(@"decklink:00000000000000a1", false) != E_ACCESSDENIED ||
+        first.edid.references != 2 || first.edid.value != kAdvertisedDynamicRange ||
+        registry.deviceAdvertiseHDR(@"decklink:00000000000000a1", &requested) != S_OK || !requested)
+      return fail(error, @"Disabling HDR under an external capture released the EDID or changed its policy.");
+    first.status.busy = 0;
     if (registry.setDeviceAdvertiseHDR(@"decklink:00000000000000a1", false) != S_OK || first.edid.references != 1 || inherited.edid.references != 2)
       return fail(error, @"Turning one device off changed another device's held EDID.");
     if (registry.setDeviceAdvertiseHDR(@"decklink:missing", true) != E_INVALIDARG ||
@@ -3859,14 +3922,21 @@ BOOL UltracamRunFrameContractSyntheticChecks(NSError **error) {
   return YES;
 }
 BOOL UltracamRunExpandedModeSyntheticChecks(NSError **error) {
-  __block NSUInteger reportedChannels = 0, reportedBytes = 0;
+  __block NSUInteger reportedChannels = 0;
+  __block NSData *ownedPCM = nil;
   auto packet = new FakeRawAudioPacket({1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16});
   packet->channelCount = 8;
-  reportRawAudio(packet, ^(NSData *data, CMTime, NSUInteger, NSUInteger channels, NSUInteger) {
-    reportedChannels = channels; reportedBytes = data.length;
-  }, 8);
+  @autoreleasepool {
+    reportRawAudio(packet, ^(NSData *data, CMTime, NSUInteger, NSUInteger channels, NSUInteger) {
+      reportedChannels = channels; ownedPCM = data;
+    }, 8);
+  }
+  std::fill(packet->samples.begin(), packet->samples.end(), -1);
   packet->Release();
-  if (reportedChannels != 8 || reportedBytes != 64) return fail(error, @"Embedded multichannel PCM was truncated to stereo.");
+  if (reportedChannels != 8 || ownedPCM.length != 64) return fail(error, @"Embedded multichannel PCM was truncated to stereo.");
+  const auto *retainedSamples = static_cast<const int32_t *>(ownedPCM.bytes);
+  if (retainedSamples[0] != 1 || retainedSamples[15] != 16)
+    return fail(error, @"Retained embedded PCM still aliases the SDK packet.");
   FakeMode mode; mode.width = 1280; mode.height = 720; mode.mode = bmdModeHD720p5994;
   auto flags = bmdDetectedVideoInputYCbCr422 | bmdDetectedVideoInput10BitDepth;
   auto detection = describeInput(&mode, flags);
@@ -4015,6 +4085,30 @@ BOOL UltracamRunElapsedGapSyntheticChecks(NSError **error) {
   if (skips(1001, 599 * 1001) != 598) return fail(error, @"59.94 fps behavior changed inside the ten-second gap bound.");
   if (skips(1001, 601 * 1001) != 0) return fail(error, @"59.94 fps gap beyond ten seconds was counted as device drops.");
   if (skips(1001, INT64_MAX) != 0) return fail(error, @"Timestamp gap arithmetic overflowed at Int64 maximum.");
+  // A raw label that happens to continue the old sequence must not be the
+  // final piece of cadence evidence when the stream clock was reset.
+  for (BMDTimeValue boundary : {BMDTimeValue(0), BMDTimeValue(605 * 1001)}) {
+    auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+    __block NSString *label = nil;
+    callback->timecodeHandler = ^(NSString *value) { label = value; };
+    callback->timecodes.highFrameRateSupported = false;
+    bool destroyed = false;
+    auto frame = new FakeFrame(&destroyed);
+    auto timecode = new FakeTimecode();
+    frame->timecode = timecode;
+    for (int index = 0; index < TimecodeReader::kEvidenceSteps; ++index) {
+      timecode->frames = index;
+      frame->streamTime = (index + 1) * 1001;
+      callback->VideoInputFrameArrived(frame, nullptr);
+    }
+    timecode->frames = TimecodeReader::kEvidenceSteps;
+    frame->streamTime = boundary;
+    callback->VideoInputFrameArrived(frame, nullptr);
+    frame->timecode = nullptr;
+    timecode->Release(); frame->Release(); callback->Release();
+    if (![label isEqualToString:@"01:02:03;08"])
+      return fail(error, @"Timecode cadence crossed a stream clock discontinuity.");
+  }
   return YES;
 }
 NSUInteger UltracamNativeObserverCount(void) { return DeviceRegistry::shared().observerCount(); }

@@ -97,6 +97,24 @@ private final class WeakFrameLease {
     rejectFanOut.close()
   }
 
+  func testRepeatsCountLogicalSamplesAcrossCompactAndOrdinaryRoutes() throws {
+    let fanOut = FrameFanOut<Int>()
+    let compact = try fanOut.addRoute(id: "compact", capacity: 1, policy: .reject, compactRepeats: true)
+    let ordinary = try fanOut.addRoute(id: "ordinary", capacity: 2, policy: .reject)
+    let source = frame(20)
+    XCTAssertEqual(fanOut.publishRepeatedSummary(source, count: 4),
+      FrameFanOutSummary(enqueued: 6, publishedSamples: 4, rejected: 2))
+    XCTAssertEqual(fanOut.publishRepeatedSummary(source, count: 4),
+      FrameFanOutSummary(enqueued: 0, publishedSamples: 0, rejected: 8))
+    XCTAssertEqual(compact.dequeue()?.metadata?.repeatCount, 4)
+    XCTAssertEqual(ordinary.dequeue()?.metadata, source.metadata)
+    let second = try XCTUnwrap(ordinary.dequeue()?.metadata)
+    XCTAssertEqual(second.repeatCount, 1)
+    XCTAssertEqual(CMTimeCompare(second.presentationTime,
+      CMTimeAdd(source.metadata.presentationTime, source.metadata.duration)), 0)
+    XCTAssertNil(ordinary.dequeue())
+  }
+
   func testCancellationOnlyDrainsItsRoute() throws {
     let counter = FrameReleaseCounter()
     let fanOut = FrameFanOut<Int>(label: "processed-frame-test-cancel")

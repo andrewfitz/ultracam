@@ -6,8 +6,9 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   let format: SourceFormat
   let audio: SourceAudioDeclaration
   private let pluginLock = NSLock()
-  private var connected = false
+  private var connectedDevices = Set<String>()
   private let deviceIDs: [String]
+  private let shareable: Bool
   private var createdSessions: [FakeCaptureSession] = []
   @MainActor private var observers: [WeakObservation] = []
   @MainActor private struct WeakObservation { weak var value: DeviceObservation? }
@@ -20,9 +21,11 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   private var scriptedSettings: [String: [VendorSetting]] = [:]
   private var idleRefreshCount = 0
   init(format: SourceFormat, audio: SourceAudioDeclaration, deviceIDs: [String] = ["fake:fixture"],
-       descriptor: VendorDescriptor = VendorDescriptor(id: "fake", displayName: "Fake capture", badgeText: "FAKE", signalHint: nil, sdkVersion: nil, sdkPresent: true)) {
-    precondition(!deviceIDs.isEmpty && Set(deviceIDs).count == deviceIDs.count && deviceIDs.allSatisfy { $0.hasPrefix("fake:") })
+       descriptor: VendorDescriptor = VendorDescriptor(id: "fake", displayName: "Fake capture", badgeText: "FAKE", signalHint: nil, sdkVersion: nil, sdkPresent: true),
+       shareable: Bool = true) {
+    precondition(!deviceIDs.isEmpty && Set(deviceIDs).count == deviceIDs.count && deviceIDs.allSatisfy { $0.hasPrefix(descriptor.id + ":") })
     self.format = format; self.audio = audio; self.deviceIDs = deviceIDs; self.descriptor = descriptor
+    self.shareable = shareable
   }
   /// Names, models and modes for the listed devices.
   func setDetails(_ value: Details, for deviceID: String) { pluginLock.withLock { details[deviceID] = value } }
@@ -44,8 +47,15 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   func refreshIdleStatus() { pluginLock.withLock { idleRefreshCount += 1 } }
   var sessions: [FakeCaptureSession] { pluginLock.withLock { createdSessions } }
   @MainActor func setConnected(_ connected: Bool) {
+    setConnectedDevices(connected ? Set(deviceIDs) : [])
+  }
+  @MainActor func setConnectedDevices(_ connectedIDs: Set<String>) {
+    precondition(connectedIDs.isSubset(of: deviceIDs))
     // A real plugin's cache forgets a device that leaves.
-    pluginLock.withLock { self.connected = connected; if !connected { statuses = [:] } }
+    pluginLock.withLock {
+      connectedDevices = connectedIDs
+      statuses = statuses.filter { connectedIDs.contains($0.key) }
+    }
     let snapshot = CaptureDeviceSnapshot(status: driverStatus(), devices: (try? devices()) ?? [], error: nil)
     observers = observers.filter { $0.value != nil }
     observers.compactMap(\.value).forEach { $0.deliver(snapshot) }
@@ -53,12 +63,12 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   let descriptor: VendorDescriptor
   func driverStatus() -> DriverStatus { DriverStatus(installed: true, supported: true, version: nil, reason: nil) }
   func devices() throws -> [CaptureDeviceInfo] {
-    guard pluginLock.withLock({ connected }) else { return [] }
-    let details = pluginLock.withLock { self.details }
-    return deviceIDs.enumerated().map { index, id in
+    let (connected, details) = pluginLock.withLock { (connectedDevices, self.details) }
+    return deviceIDs.enumerated().compactMap { index, id in
+      guard connected.contains(id) else { return nil }
       let detail = details[id]
       return CaptureDeviceInfo(id: id, name: detail?.name ?? "Fixture source \(index + 1)", connectors: detail?.connectors ?? [],
-        shareable: true, mayPause: nil, supportedModes: "Scripted fixture", model: detail?.model, modes: detail?.modes ?? [])
+        shareable: shareable, mayPause: nil, supportedModes: "Scripted fixture", model: detail?.model, modes: detail?.modes ?? [])
     }
   }
   @MainActor func observeDevices(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) -> DeviceObservation {
@@ -81,7 +91,8 @@ final class FakeCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
         let old = scriptedSettings[deviceID]?[index] else { throw PluginError.unsupported("Fixture has no settings") }
       scriptedSettings[deviceID]?[index] = VendorSetting(id: old.id, labelKey: old.labelKey, value: value, allowedValues: old.allowedValues,
         mutable: old.mutable, availabilityReason: old.availabilityReason, interruptsCapture: old.interruptsCapture,
-        labelFallback: old.labelFallback)
+        labelFallback: old.labelFallback, localizationTable: old.localizationTable,
+        availabilityReasonKey: old.availabilityReasonKey, captureFormats: old.captureFormats, interruption: old.interruption)
     }
   }
 }
@@ -118,6 +129,7 @@ final class FakeCaptureSession: CaptureSession, @unchecked Sendable {
     queue.setSpecific(key: queueKey, value: true)
   }
   var counters: CaptureCounters { lock.withLock { stats } }
+  var deviceID: String? { control.withLock { startedDeviceID } }
   func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws {
     guard DispatchQueue.getSpecific(key: queueKey) == nil else { throw PluginError.invalidState("Start from delivery callback") }
     try control.withLock {

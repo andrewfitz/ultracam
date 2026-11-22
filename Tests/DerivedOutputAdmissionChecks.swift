@@ -192,6 +192,39 @@ import XCTest
     XCTAssertThrowsError(try CameraSink.validateCameraSource(source)) { error in
       XCTAssertTrue(error.localizedDescription.contains("Preview and recording remain available"))
     }
+    let program = CameraSink(route: CameraSinkRoute(descriptor: .program()))
+    var fixedOutput = PipelineConfiguration()
+    fixedOutput.sourceDuration = source.rate.nominal
+    let contract = try program.outputContract(configuration: fixedOutput,
+      passthroughFormat: source.pixel.rawValue, sourceFormat: source)
+    XCTAssertEqual(contract.duration, FrameRateTarget.fps30.duration,
+      "Program fixes cadence at the output boundary independently of source timing")
+  }
+
+  func testNativeCameraMismatchIsLocalAndNamesTheResolvingEffect() throws {
+    let source = try SourceFormat(width: 1920, height: 1080, pixel: .full420,
+      colour: Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .full,
+        horizontalChromaSiting: .center, verticalChromaSiting: .center),
+      rate: .constant(FrameRateTarget.fps30.duration))
+    var configuration = PipelineConfiguration(applyLUT: false, downscale: false,
+      convertTo420: false, reduceFrameRate: false)
+    configuration.sourceWidth = source.width
+    configuration.sourceHeight = source.height
+    configuration.sourceDuration = source.rate.nominal
+    XCTAssertThrowsError(try CameraSink.requestedFormat(configuration: configuration,
+      passthroughFormat: source.pixel.rawValue, sourceFormat: source)) { error in
+      XCTAssertTrue(error.localizedDescription.contains("420f"))
+      XCTAssertTrue(error.localizedDescription.contains("Effects"))
+      XCTAssertTrue(error.localizedDescription.contains("Color format"))
+    }
+    configuration.convertTo420 = true
+    let processed = try CameraSink.requestedFormat(configuration: configuration,
+      passthroughFormat: source.pixel.rawValue, sourceFormat: source)
+    XCTAssertEqual(CMFormatDescriptionGetMediaSubType(processed), PixelFormatID.video420.rawValue)
+    XCTAssertEqual(CMFormatDescriptionGetExtension(processed,
+      extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool, false)
+    XCTAssertNotNil(DerivedOutputContract(format: processed, duration: source.rate.nominal)
+      .matchingPublishedIndex(in: try OutputFormatCatalog.descriptions()))
   }
 
   func testSinkBuildsDeclaredHDRAndRetainsExplicitLegacy709Compatibility() throws {
@@ -382,5 +415,71 @@ import XCTest
       "A transport bridge must neither convert nor mutate refused HDR pixels")
     CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
     bridge.disconnect()
+  }
+
+  func testProgramBridgeUsesOnePublishedContractForPreflightConnectAndSend() throws {
+    let sink = CameraSink(route: CameraSinkRoute(descriptor: .program()))
+    let installed = OutputFormatCatalog.published.map { $0.formatDescription }
+    let normalizer = try ProgramNormalizer()
+    for pixel in [PixelFormatID.video420, .full420, .twoVuy, .bgra8] {
+      let native420 = pixel == .video420
+      let input = try SourceRouteFixture(pixel: pixel,
+        width: native420 ? 1280 : 640, height: native420 ? 720 : 480)
+      LUTProcessor.stampDeclaredColorimetry(input.format.colour, on: input.image)
+      var configuration = PipelineConfiguration(downscale: false, convertTo420: false,
+        reduceFrameRate: !native420, frameRateTarget: .fps30, sourcePauseAllowanceSeconds: 0.5)
+      let source = try SourceFormat(width: input.format.width, height: input.format.height,
+        pixel: pixel, colour: input.format.colour,
+        rate: .constant(native420 ? FrameRateTarget.fps30.duration : FrameRateTarget.fps24.duration))
+      configuration = FeedLifecycleDemandPolicy.programContract(configuration: configuration, pipelineEnabled: true,
+        detectedSourceDuration: nil, source: source)
+
+      let fanout = FrameFanOut<CVPixelBuffer>()
+      let consumer = try fanout.addRoute(id: "camera", capacity: 4, policy: .reject)
+      var preflight: DerivedOutputContract?
+      var connected: DerivedOutputContract?
+      var sent = 0
+      let bridge = ProgramOutputBridge(route: consumer, connect: { format, pauseAllowance in
+        XCTAssertEqual(pauseAllowance, 0.5)
+        connected = try sink.outputContract(program: format)
+      }, disconnect: {}, send: { sample in
+        let contract = try XCTUnwrap(connected)
+        XCTAssertNil(CameraSink.mismatch(sample, format: contract.format, duration: contract.duration))
+        sent += 1
+        return true
+      }, preNegotiate: { format, _ in
+        preflight = try sink.outputContract(program: format)
+      })
+      defer { bridge.disconnect() }
+      bridge.enforceContract = true
+      bridge.requestPreNegotiation(configuration: configuration, passthroughFormat: pixel.rawValue)
+      try bridge.setDemand(true, configuration: configuration, passthroughFormat: pixel.rawValue)
+      let prepared = try XCTUnwrap(preflight)
+      let negotiated = try XCTUnwrap(connected)
+      let target = try XCTUnwrap(bridge.contract)
+      XCTAssertEqual(prepared.matchingPublishedIndex(in: installed), try XCTUnwrap(negotiated.matchingPublishedIndex(in: installed)))
+      XCTAssertEqual(prepared.duration, FrameRateTarget.fps30.duration)
+      XCTAssertEqual(negotiated.duration, FrameRateTarget.fps30.duration)
+      XCTAssertEqual(target.width, 1280)
+      XCTAssertEqual(target.height, 720)
+      XCTAssertEqual(target.pixelFormat, native420 ? pixel.rawValue : kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+      XCTAssertEqual(target.colour.horizontalChromaSiting, .center)
+
+      let output = Mutex<Result<CVPixelBuffer, Error>?>(nil)
+      let completed = DispatchSemaphore(value: 0)
+      try normalizer.normalize(input.image, to: target) { result in
+        output.withLock { $0 = result }
+        completed.signal()
+      }
+      XCTAssertEqual(completed.wait(timeout: .now() + 5), .success)
+      let buffer = try XCTUnwrap(output.withLock { $0 }).get()
+      _ = fanout.publish(ProcessedFrame(payload: buffer, metadata: ProcessedFrameMetadata(
+        presentationTime: CMTime(value: 1, timescale: 1), duration: target.duration,
+        width: target.width, height: target.height, pixelFormat: target.pixelFormat)))
+      bridge.pump()
+      bridge.waitUntilIdle()
+      XCTAssertEqual(sent, 1, VideoContract.fourCC(pixel.rawValue))
+      XCTAssertEqual(bridge.currentStatistics.invalid, 0)
+    }
   }
 }

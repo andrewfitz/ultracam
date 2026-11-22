@@ -130,7 +130,7 @@ func syntheticRamp() throws -> CVPixelBuffer {
     let processor = try LUTProcessor()
     try processor.load(CubeLUT(text: cubeText()))
     let source = try syntheticRamp()
-    for bits in 0..<8 {
+    for bits in 0..<16 {
       let config = PipelineConfiguration(applyLUT: bits & 1 != 0, downscale: bits & 2 != 0,
         convertTo420: bits & 4 != 0, reduceFrameRate: bits & 8 != 0, sourceDuration: VideoContract.fastDuration)
       XCTAssertEqual(config.width, bits & 2 != 0 ? 1920 : 3840)
@@ -263,6 +263,8 @@ suite.addTest(XCTestSuite(forTestCaseClass: SignalHealthChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: ProgramFailoverChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: LiveTopologyChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: ProgramDemandChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ProgramStreamSessionChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: ProgramStreamDemandChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: DirectorReviewFixChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: UnexpectedStopChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: HardwareAwarenessChecks.self))
@@ -393,6 +395,9 @@ suite.addTest(XCTestSuite(forTestCaseClass: GPUAllocationBudgetChecks.self))
 #if CAPTURE_LIFECYCLE_TESTS
 suite.addTest(XCTestSuite(forTestCaseClass: CaptureLifecycleChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: CaptureRecordingIsolationChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: MacCameraAudioChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: MacCameraReusableConformanceChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: MacCameraVideoChecks.self))
 #endif
 var selectedSuite = suite
 var filteredCameraBootstrap: CameraProvider?
@@ -407,7 +412,7 @@ if let selection = ProcessInfo.processInfo.environment["ULTRACAM_TEST_SUITES"] {
   // CMIO requires one native provider to initialize its notification queues,
   // even when the selected tests use only isolated non-native providers.
   if requested.contains(where: { $0.contains("Camera") || $0.contains("Program") || $0.contains("DerivedOutput") }) {
-    filteredCameraBootstrap = CameraProvider(automaticTimers: false)
+    filteredCameraBootstrap = CameraContractChecks.nativeProvider
   }
   chosen.forEach { selectedSuite.addTest($0) }
   print("Filtered runtime suites: " + requested.sorted().joined(separator: ","))

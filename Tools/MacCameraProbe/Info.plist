@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>org.ultracam.mac-camera-probe</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Inspect an explicitly selected camera for Ultracam qualification.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Inspect sample timing and format from an explicitly selected microphone for Ultracam qualification.</string>
+  <key>NSCameraUseContinuityCameraDeviceType</key>
+  <true/>
+</dict>
+</plist>

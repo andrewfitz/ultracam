@@ -1,4 +1,5 @@
 #if ULTRACAM_TEST_SUPPORT
+import CoreMedia
 import Foundation
 import XCTest
 
@@ -41,6 +42,35 @@ private actor SettingsFake: VendorSettingsProviding {
     func ignore(_ enabled: Bool) { ignoreWrites = enabled }
     func count() -> Int { writes }
 
+}
+
+private actor CaptureSettingsFake: VendorSettingsProviding {
+    nonisolated let descriptor = VendorDescriptor(id: "capture", displayName: "Capture", badgeText: "CAPTURE",
+      signalHint: nil, sdkVersion: nil, sdkPresent: true)
+
+    private var mode = VendorCaptureMode.automatic
+    private var control = VendorSettingValue.choice("auto")
+    private var writes: [String] = []
+    static let format = VendorCaptureFormat(id: "medium", label: "720p",
+      rates: [.init(duration: CMTime(value: 1, timescale: 30), label: "30 fps")],
+      ranges: [.init(shortest: CMTime(value: 1, timescale: 60), longest: CMTime(value: 1, timescale: 24))])
+
+    func settings(deviceID: String) -> [VendorSetting] {
+        let choices: [VendorSetting.Choice] = mode == VendorCaptureMode.automatic
+            ? [.init(id: "auto", label: "Auto")] : [.init(id: "locked", label: "Locked")]
+        return [
+            .init(id: "mode", labelKey: "Capture Format", value: mode, allowedValues: .unrestricted,
+              mutable: true, availabilityReason: nil, interruptsCapture: true, captureFormats: [Self.format]),
+            .init(id: "focus", labelKey: "Focus", value: control, allowedValues: .choices(choices),
+              mutable: true, availabilityReason: nil, interruptsCapture: false)
+        ]
+    }
+    func apply(_ value: VendorSettingValue, to setting: String, deviceID: String) {
+        writes.append(setting)
+        if setting == "mode" { mode = value }
+        if setting == "focus" { control = value }
+    }
+    func appliedIDs() -> [String] { writes }
 }
 
 @MainActor @objcMembers final class VendorSettingsStoreChecks: XCTestCase {
@@ -163,6 +193,52 @@ private actor SettingsFake: VendorSettingsProviding {
         await store.apply(.boolean(true), to: setting, deviceID: "decklink:failure", pluginID: "decklink")
         XCTAssertEqual(persistence.snapshot.desiredByDevice["decklink:failure"]?[setting], .boolean(true))
         XCTAssertNil(store.state(for: "decklink:failure").message)
+    }
+
+    func testRestoreValidatesDependentControlsAgainstRefreshedModeCapabilities() async throws {
+        let fake = CaptureSettingsFake(), persistence = MemoryVendorSettings()
+        let device = "capture:test"
+        let duration = try XCTUnwrap(VendorCaptureMode.customDuration("30000/1001"))
+        let mode = VendorCaptureMode.value(formatID: "medium", duration: duration)
+        persistence.snapshot.desiredByDevice[device] = ["mode": mode, "focus": .choice("locked")]
+        let store = VendorSettingsStore(plugins: ["capture": fake], persistence: persistence)
+        await store.restore(deviceID: device, pluginID: "capture")
+        let applied = await fake.appliedIDs()
+        XCTAssertEqual(applied, ["mode", "focus"])
+        XCTAssertNil(store.state(for: device).message)
+        XCTAssertEqual(store.state(for: device).settings.last?.value, .choice("locked"))
+    }
+
+    func testMissingSavedModeAndInvalidRatePreserveSavedPair() async throws {
+        let fake = CaptureSettingsFake(), persistence = MemoryVendorSettings()
+        let device = "capture:test"
+        let missing = VendorCaptureMode.value(formatID: "discontinued", duration: CMTime(value: 1, timescale: 30))
+        persistence.snapshot.desiredByDevice[device] = ["mode": missing]
+        let store = VendorSettingsStore(plugins: ["capture": fake], persistence: persistence)
+        await store.restore(deviceID: device, pluginID: "capture")
+        XCTAssertEqual(store.state(for: device).message, "The requested capture format is unavailable")
+        XCTAssertEqual(persistence.snapshot.desiredByDevice[device]?["mode"], missing)
+        let outOfRange = VendorCaptureMode.value(formatID: "medium", duration: CMTime(value: 1, timescale: 90))
+        await store.apply(outOfRange, to: "mode", deviceID: device, pluginID: "capture")
+        XCTAssertEqual(store.state(for: device).message, "The requested frame rate is outside this format’s supported ranges")
+        XCTAssertEqual(persistence.snapshot.desiredByDevice[device]?["mode"], missing)
+        let applied = await fake.appliedIDs()
+        XCTAssertTrue(applied.isEmpty)
+    }
+
+    func testCustomFrameRateRetainsExactRational() throws {
+        let fractional = try XCTUnwrap(VendorCaptureMode.customDuration(" 30000/1001 "))
+        let decimal = try XCTUnwrap(VendorCaptureMode.customDuration("29.97"))
+        XCTAssertEqual(fractional.value, 1001)
+        XCTAssertEqual(fractional.timescale, 30000)
+        XCTAssertEqual(decimal.value, 100)
+        XCTAssertEqual(decimal.timescale, 2997)
+        XCTAssertNotEqual(CMTimeCompare(fractional, decimal), 0)
+        XCTAssertEqual(VendorCaptureMode.customDuration("30000 / 1001"), fractional)
+        XCTAssertEqual(VendorCaptureMode.customDuration("29,97"), decimal)
+        for invalid in ["", "0", "0/1", "30/0", "30/1/2", "30.fps", "NaN", "-29.97", "99999999999999999999"] {
+            XCTAssertNil(VendorCaptureMode.customDuration(invalid), invalid)
+        }
     }
 
 }

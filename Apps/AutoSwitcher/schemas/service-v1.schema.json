@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ultracam-auto-switcher/service-v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "op": {
+          "const": "state"
+        }
+      },
+      "required": [
+        "v",
+        "op"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "op": {
+          "const": "watch"
+        }
+      },
+      "required": [
+        "v",
+        "op"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "op": {
+          "const": "event"
+        },
+        "event": {
+          "$ref": "../ultracam-auto-switcher/stream-event"
+        }
+      },
+      "required": [
+        "v",
+        "op",
+        "event"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "op": {
+          "const": "take"
+        },
+        "route": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "v",
+        "op",
+        "route"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "type": {
+          "const": "state"
+        },
+        "session": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "clock": {
+          "enum": [
+            "server",
+            "host"
+          ]
+        },
+        "hotkeys": {
+          "type": "boolean"
+        },
+        "config": {
+          "$ref": "../ultracam-auto-switcher/profile-v1"
+        },
+        "status": {
+          "$ref": "../ultracam-auto-switcher/switcher-output"
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "session",
+        "seq",
+        "clock",
+        "hotkeys",
+        "config",
+        "status"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "type": {
+          "const": "update"
+        },
+        "session": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "event": {
+          "$ref": "../ultracam-auto-switcher/stream-event"
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "../ultracam-auto-switcher/switcher-output"
+          }
+        },
+        "status": {
+          "$ref": "../ultracam-auto-switcher/switcher-output"
+        },
+        "application": {
+          "enum": [
+            "host",
+            "keyDispatched",
+            "keyFailed"
+          ]
+        },
+        "pending": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "../ultracam-auto-switcher/switcher-output#/$defs/instruction"
+            }
+          ]
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "session",
+        "seq",
+        "event",
+        "outputs",
+        "status",
+        "application",
+        "pending"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "type": {
+          "const": "error"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "message"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "type": {
+          "const": "listening"
+        },
+        "session": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1
+        },
+        "journal": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "session",
+        "address",
+        "journal"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "op": {
+          "const": "claim"
+        },
+        "hold": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "v",
+        "op",
+        "hold"
+      ]
+    }
+  ]
+}

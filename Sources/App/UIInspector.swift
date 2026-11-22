@@ -1,12 +1,12 @@
 import SwiftUI
 
 /// On-demand inspector for the selected camera's deeper settings (D5).
-/// Rebuilds the context inside its own body so this column refreshes with the models.
+/// Uses the main window's current snapshot. Running telemetry updates its own rows.
 struct UIInspectorView: View {
   let context: UIContext
   var body: some View {
     let _ = UIRenderProbe.count("UIInspectorView")
-    UIInspectorViewContent(context: context.current)
+    UIInspectorViewContent(context: context)
   }
 }
 
@@ -15,6 +15,15 @@ struct UIInspectorViewContent: View {
   /// The camera whose live LUT is waiting on the Remove LUT confirmation. By ID, so a
   /// selection change while it's up can't move the removal to another camera.
   @State private var confirmingLUTRemoval: String?
+  /// Which sections are open. Closed, a section is its header and one summary beside it, so
+  /// the inspector reads as a line per section. Input starts open: it says what arrives, and
+  /// it's where a camera gets fixed. Kept across launches.
+  @AppStorage("ui.inspector.open.input") private var inputOpen = true
+  @AppStorage("ui.inspector.open.control") private var controlOpen = false
+  @AppStorage("ui.inspector.open.lut") private var lutOpen = false
+  @AppStorage("ui.inspector.open.effects") private var effectsOpen = false
+  @AppStorage("ui.inspector.open.recording") private var recordingOpen = false
+  @AppStorage("ui.inspector.open.automation") private var automationOpen = false
 
   var body: some View {
     let _ = UIRenderProbe.count("UIInspectorViewContent")
@@ -30,60 +39,66 @@ struct UIInspectorViewContent: View {
     Form {
       Section {
         header(camera: camera, snapshot: snapshot)
+        // What this pane edits: this camera, or with Sync on, every camera. It asks first.
+        Toggle(isOn: Binding(get: { context.session.syncCameras },
+          set: { context.send(.setSyncCameras($0, sourceID: camera.id)) })) {
+          Text("Sync cameras")
+          if context.session.syncCameras { Text("Editing all cameras") }
+        }
+        .help("Copies this camera's effects, LUT, monitor tools, source declarations and preview setting to every camera, then keeps edits in sync. Input devices and recording folders stay separate.")
       }
-      // Signal order: what comes in, what controls it, what's done to it, what's kept.
-      inputSection(camera: camera, snapshot: snapshot)
-      // A build without any camera-control SDK has no section: it reads as a normal build.
-      if let store = context.cameraControls, store.available {
-        Section {
-          if let assignment = store.assignment(for: camera.id) {
-            let state = store.state(for: camera.id)
-            HStack(spacing: 6) {
-              Label(assignment.camera.name, systemImage: UISymbol.cameraBody)
-              Spacer(minLength: 4)
-              Label(state.connected ? "Connected" : state.retrying ? "Reconnecting…" : "Disconnected", systemImage: UISymbol.wifi(connected: state.connected))
-                .font(.uiMeta).foregroundStyle(state.connected ? .secondary : .primary)
-                .symbolRenderingMode(.palette).tint(state.connected ? .secondary : .orange)
-            }
-            LabeledContent(state.cacheStatus) {
-              HStack(spacing: 6) {
-                // Reconnect stays near the camera; it uses the saved sign-in.
-                if !state.connected {
-                  Button("Reconnect") { context.send(.reconnectCameraBody(cameraID: camera.id)) }.disabled(state.busy)
-                }
-                UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories,
-                  openHardware: { context.send(.openHardware(itemID: assignment.camera.id)) })
-              }
-            }
-          } else {
-            LabeledContent("Pairing is in Settings") {
-              Button("Open Hardware…") { context.send(.openHardware(itemID: nil)) }
-            }
+      // Signal order: what comes in, what controls it, what's done to it, what's kept. A build
+      // without any camera-control SDK has no Camera Control: it reads as a normal build.
+      let controls = context.cameraControls.flatMap { $0.available ? $0 : nil }
+      let sections: [InspectorSection] = [.input] + (controls == nil ? [] : [.control]) + [.lut, .effects, .recording, .automation]
+      ForEach(groups(sections), id: \.first) { group in
+        if let only = group.first, group.count == 1, isOpen(only) {
+          openSection(only, camera: camera, snapshot: snapshot, controls: controls)
+        } else {
+          Section {
+            ForEach(group) { summaryRow($0, camera: camera, snapshot: snapshot, controls: controls) }
           }
-        } header: {
-          UIInspectorHeader(title: "Camera Control", symbol: UISymbol.cameraControl)
         }
       }
-      lutSection(camera: camera, snapshot: snapshot)
-      effectsSection(camera: camera, snapshot: snapshot)
-      recordingSection(camera: camera, snapshot: snapshot)
-      automationSection(camera: camera, snapshot: snapshot)
       Section {
+        // The camera itself. A strip has no menu for these: they aren't for the middle of a show.
+        HStack {
+          if camera.canStop {
+            if snapshot.running {
+              Button("Restart Camera") { context.send(.restartCamera(cameraID: camera.id)) }
+                .help("Reopen \(camera.name)'s output. Capture and the take keep running.")
+                .accessibilityLabel("Restart \(camera.name)")
+            }
+            // The bridge asks first while it's recording or on air.
+            Button("Stop Capture") { context.send(.stopCamera(cameraID: camera.id)) }
+              .help("Stop \(camera.name).")
+              .accessibilityLabel("Stop \(camera.name)")
+          } else {
+            Button("Start Capture") { context.send(.startCamera(cameraID: camera.id)) }
+              .disabled(!camera.canStart)
+              .help(camera.canStart ? "Start capture from \(camera.inputName)."
+                : snapshot.inputName == nil ? "Choose an input device first." : "Connect the camera's input first.")
+              .accessibilityLabel("Start \(camera.name)")
+          }
+          Spacer()
+        }
         HStack {
           // The shared rename alert (uiRenameAlert) asks for the name.
           Button("Rename…") { context.send(.beginRename(cameraID: camera.id)) }
             .help("Rename this camera.")
           Spacer()
           // The bridge asks for confirmation before removing.
-          Button("Remove Camera…", role: .destructive) { context.send(.removeCamera(cameraID: camera.id)) }
+          Button("Remove Camera…") { context.send(.removeCamera(cameraID: camera.id)) }
             .disabled(!camera.canRemove)
             .help(camera.removeHelp)
         }
       }
     }
     .formStyle(.grouped)
-    // Even margins wide enough for the scroller, so it runs beside the sections and never over their controls.
-    .contentMargins(.horizontal, 16, for: .scrollContent)
+    // Even margins wide enough for the scroller, so it runs beside the sections and never over
+    // their controls. A grouped form outside the system's inspector column insets its sections
+    // 20 pt on its own; with this they sit 26 pt in, as they did in that column.
+    .contentMargins(.horizontal, 6, for: .scrollContent)
     // Like the app's other scroll views: no rubber band when everything fits.
     .scrollBounceBehavior(.basedOnSize)
   }
@@ -104,6 +119,196 @@ struct UIInspectorViewContent: View {
 
   // MARK: Sections
 
+  /// The inspector's sections, in signal order: what comes in, what controls it, what's done
+  /// to it, what's kept.
+  private enum InspectorSection: String, Identifiable {
+    case input, control, lut, effects, recording, automation
+    var id: String { rawValue }
+
+    var title: String {
+      switch self {
+      case .input: return "Input"
+      case .control: return "Camera Control"
+      case .lut: return "LUT"
+      case .effects: return "Effects"
+      case .recording: return "Recording"
+      case .automation: return "Automation"
+      }
+    }
+
+    var symbol: String {
+      switch self {
+      case .input: return UISymbol.input
+      case .control: return UISymbol.cameraControl
+      case .lut: return UISymbol.lut(on: true)
+      case .effects: return UISymbol.effects
+      case .recording: return UISymbol.record
+      case .automation: return UISymbol.startWithApps
+      }
+    }
+  }
+
+  private func isOpen(_ section: InspectorSection) -> Bool {
+    switch section {
+    case .input: return inputOpen
+    case .control: return controlOpen
+    case .lut: return lutOpen
+    case .effects: return effectsOpen
+    case .recording: return recordingOpen
+    case .automation: return automationOpen
+    }
+  }
+
+  private func toggle(_ section: InspectorSection) {
+    switch section {
+    case .input: inputOpen.toggle()
+    case .control: controlOpen.toggle()
+    case .lut: lutOpen.toggle()
+    case .effects: effectsOpen.toggle()
+    case .recording: recordingOpen.toggle()
+    case .automation: automationOpen.toggle()
+    }
+  }
+
+  /// An open section is a box of its own; a run of closed ones shares a box, a line each.
+  private func groups(_ sections: [InspectorSection]) -> [[InspectorSection]] {
+    var groups: [[InspectorSection]] = []
+    for section in sections {
+      if !isOpen(section), let previous = groups.last?.last, !isOpen(previous) {
+        groups[groups.count - 1].append(section)
+      } else {
+        groups.append([section])
+      }
+    }
+    return groups
+  }
+
+  @ViewBuilder private func openSection(_ section: InspectorSection, camera: UICameraPresentation, snapshot: UICameraSnapshot,
+    controls: CameraControlStore?) -> some View {
+    switch section {
+    case .input: inputSection(camera: camera, snapshot: snapshot)
+    case .control: if let controls { controlSection(camera: camera, store: controls) }
+    case .lut: lutSection(camera: camera, snapshot: snapshot)
+    case .effects: effectsSection(camera: camera, snapshot: snapshot)
+    case .recording: recordingSection(camera: camera, snapshot: snapshot)
+    case .automation: automationSection(camera: camera, snapshot: snapshot)
+    }
+  }
+
+  /// An open section's header: the chevron and title close it; then the control it carries.
+  private func sectionHeader<Accessory: View>(_ section: InspectorSection, symbol: String? = nil,
+    @ViewBuilder accessory: () -> Accessory = { EmptyView() }) -> some View {
+    HStack(spacing: 8) {
+      Button { toggle(section) } label: {
+        HStack(spacing: 6) {
+          Image(systemName: UISymbol.collapseStrip).imageScale(.small).frame(width: 12).accessibilityHidden(true)
+          UIInspectorHeader(title: section.title, symbol: symbol ?? section.symbol)
+        }
+        .frame(minHeight: 24)
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help("Hide \(section.title)")
+      .accessibilityLabel(section.title)
+      .accessibilityValue("Expanded")
+      Spacer(minLength: 4)
+      accessory()
+    }
+  }
+
+  /// A closed section: its title, and what it holds in a line (typed pieces set apart by
+  /// spacing, the last one primary). The whole row opens it.
+  private func summaryRow(_ section: InspectorSection, camera: UICameraPresentation, snapshot: UICameraSnapshot,
+    controls: CameraControlStore?) -> some View {
+    let summary = summary(section, camera: camera, snapshot: snapshot, controls: controls)
+    return Button { toggle(section) } label: {
+      HStack(spacing: 8) {
+        Image(systemName: UISymbol.expandStrip).imageScale(.small).foregroundStyle(.secondary)
+          .frame(width: 12).accessibilityHidden(true)
+        UIInspectorHeader(title: section.title, symbol: section == .lut ? UISymbol.lut(on: camera.lutIsOn)
+          : section == .effects && !snapshot.processing ? UISymbol.effectsOff : section.symbol)
+          .fixedSize()
+        Spacer(minLength: 8)
+        if summary.warns { UIStateGlyph(state: .warning) }
+        ForEach(Array(summary.pieces.enumerated()), id: \.offset) { index, piece in
+          Text(piece).font(.uiMeta).foregroundStyle(index == summary.pieces.count - 1 ? .primary : .secondary)
+            .lineLimit(1).truncationMode(.middle)
+            .layoutPriority(index == summary.pieces.count - 1 ? 1 : 0)
+        }
+      }
+      .frame(minHeight: 24)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help("Show \(section.title)")
+    .accessibilityLabel(section.title)
+    .accessibilityValue((["Collapsed"] + summary.pieces).joined(separator: ", "))
+  }
+
+  /// What a closed section says in its line.
+  private func summary(_ section: InspectorSection, camera: UICameraPresentation, snapshot: UICameraSnapshot,
+    controls: CameraControlStore?) -> (pieces: [String], warns: Bool) {
+    switch section {
+    // One short piece where the title is long: at 280 pt a second piece only truncates both.
+    case .input:
+      if case .live(let format) = snapshot.signal, snapshot.running { return ([format], false) }
+      return ([Self.signalText(snapshot)], camera.statusTone == .warning)
+    case .control:
+      guard let controls, controls.assignment(for: camera.id) != nil else { return (["Not paired"], false) }
+      let state = controls.state(for: camera.id)
+      return ([state.connected ? "Connected" : state.retrying ? "Reconnecting…" : "Disconnected"],
+        !state.connected && !state.retrying)
+    case .lut:
+      if snapshot.lutLoading { return (["Loading…"], false) }
+      guard let name = snapshot.lutName else { return (["None"], snapshot.lutError != nil) }
+      return ([(name as NSString).deletingPathExtension, camera.lutIsOn ? "On" : "Off"], snapshot.lutError != nil)
+    case .effects:
+      return (snapshot.processing ? [snapshot.outputFormat.map { "Output \($0)" } ?? "On"] : ["Off"], false)
+    case .recording:
+      guard let path = snapshot.recording.folderPath else { return (["No folder chosen"], true) }
+      return ([UIFormat.folderName(path)], false)
+    case .automation:
+      return ([snapshot.automaticStartFailed ? "Couldn't start" : snapshot.automaticStart ? "With meeting apps" : "Manual start"],
+        snapshot.automaticStartFailed)
+    }
+  }
+
+  /// The paired body: its link, the cached values' age, Reconnect and the Camera Control
+  /// sheet, then what it sends over HDMI (the strip's signal badge used to list these).
+  private func controlSection(camera: UICameraPresentation, store: CameraControlStore) -> some View {
+    let assignment = store.assignment(for: camera.id)
+    let state = store.state(for: camera.id)
+    let link = state.connected ? "Connected" : state.retrying ? "Reconnecting…" : "Disconnected"
+    return Section {
+      if let assignment {
+        HStack(spacing: 6) {
+          Label(assignment.camera.name, systemImage: UISymbol.cameraBody)
+          Spacer(minLength: 4)
+          Label(link, systemImage: UISymbol.wifi(connected: state.connected))
+            .font(.uiMeta).foregroundStyle(state.connected ? .secondary : .primary)
+            .symbolRenderingMode(.palette).tint(state.connected ? .secondary : .orange)
+        }
+        LabeledContent(state.cacheStatus) {
+          HStack(spacing: 6) {
+            // Reconnect stays near the camera; it uses the saved sign-in.
+            if !state.connected {
+              Button("Reconnect") { context.send(.reconnectCameraBody(cameraID: camera.id)) }.disabled(state.busy)
+            }
+            UICameraControlButton(feedID: camera.id, name: camera.name, store: store, viewFactories: context.controlViewFactories,
+              openHardware: { context.send(.openHardware(itemID: assignment.camera.id)) })
+          }
+        }
+        UICameraOutputTimingRows(cameraID: camera.id, store: store)
+      } else {
+        LabeledContent("Pairing is in Settings") {
+          Button("Open Hardware…") { context.send(.openHardware(itemID: nil)) }
+        }
+      }
+    } header: {
+      sectionHeader(.control)
+    }
+  }
+
   @ViewBuilder private func inputOptions(_ inputs: [UIInput], options: [UIInputOption], selectedID: String?) -> some View {
     ForEach(inputs) { input in
       if let option = options.first(where: { $0.id == input.id }) {
@@ -121,6 +326,9 @@ struct UIInspectorViewContent: View {
       let options = UIInputLabels.options(context.inputs.map { ($0.id, $0.name) }, cameras: context.session.cameras,
         for: camera.id)
       let missingID = snapshot.inputID.flatMap { id in options.contains { $0.id == id } ? nil : id }
+      // The label above its menu: at the inspector's width a device name beside its label truncates.
+      VStack(alignment: .leading, spacing: 4) {
+      Text("Device")
       Picker("Device", selection: Binding(
         get: { snapshot.inputID ?? "" },
         set: { context.send(.setInput(cameraID: camera.id, deviceID: $0)) })) {
@@ -134,9 +342,12 @@ struct UIInspectorViewContent: View {
         if let missingID { Text("\(snapshot.inputName ?? missingID) (disconnected)").tag(missingID) }
       }
       // One row: a long device name truncates instead of widening the inspector. Help names it in full.
+      .labelsHidden()
       .lineLimit(1)
+      .frame(maxWidth: .infinity, alignment: .leading)
       .disabled(snapshot.running)
       .help(Self.deviceHelp(snapshot))
+      }
       LabeledContent("Signal") {
         // The tone goes on the symbol; small orange text is hard to read in light mode.
         HStack(spacing: 4) {
@@ -148,10 +359,16 @@ struct UIInspectorViewContent: View {
       .accessibilityLabel("Signal")
       .accessibilityValue(Self.signalText(snapshot))
       .help(Self.signalDetail(snapshot) ?? "")
-      // Why a format is unsupported, in the backend's words, wrapped on its own line.
+      // Explain input negotiation or refusal separately from the delivered format.
       if let detail = Self.signalDetail(snapshot) {
         Text(detail).font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+      }
+      LabeledContent("Measured input rate") {
+        UILiveCamera(snapshotFor: camera, context: context, follows: .capture) { snapshot in
+          let fps = snapshot?.measuredInputFPS ?? 0
+          Text(fps > 0 ? String(format: "%.2f fps", fps) : "—").monospacedDigit()
+        }
       }
       // A plain stat like Timecode: always present, "—" while stopped, never a warning.
       LabeledContent("Dropped frames") {
@@ -168,9 +385,14 @@ struct UIInspectorViewContent: View {
           Text(snapshot.map { $0.timecode ?? "—" } ?? camera.timecode).monospacedDigit().textSelection(.enabled)
         }
       }
-      Picker("Camera log", selection: Binding(get: { snapshot.sourceProfileID }, set: { context.send(.setSourceProfile(cameraID: camera.id, $0)) })) {
-        Text("Not declared").tag("unspecified")
-        colorSpaceOptions(selected: snapshot.sourceProfileID)
+      VStack(alignment: .leading, spacing: 4) {
+        Text("Camera log")
+        Picker("Camera log", selection: Binding(get: { snapshot.sourceProfileID }, set: { context.send(.setSourceProfile(cameraID: camera.id, $0)) })) {
+          Text("Not declared").tag("unspecified")
+          colorSpaceOptions(selected: snapshot.sourceProfileID)
+        }
+        .labelsHidden()
+        .frame(maxWidth: .infinity, alignment: .leading)
       }
       .help("Declares the captured signal for monitoring and capture. This does not declare either LUT edge.")
       if snapshot.sourceProfileID != "unspecified", !SourceColorSpaceCatalog.entries.contains(where: { $0.id == snapshot.sourceProfileID }) {
@@ -181,9 +403,7 @@ struct UIInspectorViewContent: View {
         set: { context.send(.setPreviewEnabled(cameraID: camera.id, $0)) }))
         .help("Hidden previews do no rendering work. Camera output continues.")
     } header: {
-      HStack {
-        UIInspectorHeader(title: "Input", symbol: UISymbol.input)
-        Spacer()
+      sectionHeader(.input) {
         Button { context.send(.refreshInputs) } label: {
           Image(systemName: UISymbol.retry).frame(minWidth: 24, minHeight: 24).contentShape(Rectangle())
         }
@@ -192,43 +412,50 @@ struct UIInspectorViewContent: View {
         .accessibilityLabel("Refresh capture devices")
       }
     } footer: {
-      if snapshot.running {
-        Text("Stop the camera to change its input.").font(.uiMeta).foregroundStyle(.secondary)
-      } else if let inputID = snapshot.inputID {
+      HStack {
+        if snapshot.running { Text("Stop the camera to change its input.") }
+        Spacer(minLength: 4)
         // Supported formats, connector and the device's name live on its Hardware row.
-        Button("Supported formats and settings…") { context.send(.openHardware(itemID: inputID)) }
-          .buttonStyle(.link).font(.uiMeta)
+        if let inputID = snapshot.inputID {
+          Button(snapshot.running ? "Hardware…" : "Supported formats and settings…") { context.send(.openHardware(itemID: inputID)) }
+            .buttonStyle(.link)
+            .help("Supported formats, the connector and this device's name, in Settings › Hardware.")
+        }
       }
+      .font(.uiMeta).foregroundStyle(.secondary)
     }
   }
 
   /// One row per effect, its checkbox and value merged, in pipeline order. The master
-  /// switch heads the section. Sync cameras lives only here, and asks first.
+  /// switch heads the section, open or closed.
   private func effectsSection(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> some View {
     Section {
-      Toggle(isOn: Binding(get: { context.session.syncCameras }, set: { context.send(.setSyncCameras($0)) })) {
-        Text("Sync cameras")
-        if context.session.syncCameras { Text("Editing all cameras") }
-      }
-      .help("Copies this camera's effects, LUT, monitor tools, source declarations and preview setting to every camera, then keeps edits in sync. Input devices and recording folders stay separate.")
       // The file is named in the LUT section above, in full; here only whether there is one.
       effectRow(camera, index: 0, title: "LUT", enabled: snapshot.lutName != nil) {
         if snapshot.lutName == nil { Text("None").foregroundStyle(.secondary) }
       }
       effectRow(camera, index: 1, title: "Output size") {
-        HStack(spacing: 4) {
-          Picker("Output size", selection: Binding(get: { snapshot.resizeTarget },
-            set: { context.send(.setResizeTarget(cameraID: camera.id, $0)) })) {
-            ForEach(ResizeTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+        VStack(alignment: .trailing, spacing: 4) {
+          HStack(spacing: 4) {
+            Picker("Output size", selection: Binding(get: { snapshot.resizeTarget },
+              set: { context.send(.setResizeTarget(cameraID: camera.id, $0)) })) {
+              ForEach(ResizeTarget.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .labelsHidden().fixedSize()
+            Picker("Aspect", selection: Binding(get: { snapshot.scalingMode },
+              set: { context.send(.setScalingMode(cameraID: camera.id, $0)) })) {
+              Text("Fit").tag(ProgramScalingMode.fit)
+              Text("Crop").tag(ProgramScalingMode.crop)
+            }
+            .labelsHidden().fixedSize()
+            .help("Fit or Crop keeps the source's aspect ratio.")
           }
-          .labelsHidden().fixedSize()
-          Picker("Aspect", selection: Binding(get: { snapshot.scalingMode },
-            set: { context.send(.setScalingMode(cameraID: camera.id, $0)) })) {
-            Text("Fit").tag(ProgramScalingMode.fit)
-            Text("Crop").tag(ProgramScalingMode.crop)
+          if snapshot.showsAllowUpscale {
+            Toggle("Allow upscaling", isOn: Binding(get: { snapshot.allowUpscale },
+              set: { context.send(.setAllowUpscale(cameraID: camera.id, $0)) }))
+              .toggleStyle(.checkbox)
+              .help("Enlarge smaller pictures to fit the canvas. Otherwise, Fit pads them at native size.")
           }
-          .labelsHidden().fixedSize()
-          .help("Fit or Crop keeps the source's aspect ratio.")
         }
       }
       effectRow(camera, index: 2, title: "Color format") {
@@ -239,17 +466,14 @@ struct UIInspectorViewContent: View {
         .labelsHidden().fixedSize()
       }
       effectRow(camera, index: 3, title: "Frame-rate cap") {
-        Picker("Frame-rate cap", selection: Binding(get: { snapshot.frameRateTarget },
-          set: { context.send(.setFrameRateTarget(cameraID: camera.id, $0)) })) {
+        Picker("Frame-rate cap", selection: frameRateSelection(cameraID: camera.id, current: snapshot.frameRateTarget)) {
           ForEach(FrameRateTarget.allCases, id: \.self) { Text($0.title + " fps").tag($0) }
         }
         .labelsHidden().fixedSize()
         .help("Never exceeds the detected source rate. Turn the cap off to keep source timing.")
       }
     } header: {
-      HStack {
-        UIInspectorHeader(title: "Effects", symbol: snapshot.processing ? UISymbol.effects : UISymbol.effectsOff)
-        Spacer()
+      sectionHeader(.effects, symbol: snapshot.processing ? UISymbol.effects : UISymbol.effectsOff) {
         Toggle("Effects", isOn: Binding(get: { snapshot.processing }, set: { context.send(.setProcessing(cameraID: camera.id, $0)) }))
           .toggleStyle(.switch).labelsHidden().controlSize(.small)
           .help("Effects Off sends the camera original unchanged. Your effect choices stay saved. ⇧⌘B")
@@ -268,6 +492,10 @@ struct UIInspectorViewContent: View {
       .font(.uiMeta).foregroundStyle(.secondary)
       .fixedSize(horizontal: false, vertical: true)
     }
+  }
+
+  func frameRateSelection(cameraID: String, current: FrameRateTarget) -> Binding<FrameRateTarget> {
+    Binding(get: { current }, set: { context.send(.setFrameRateTarget(cameraID: cameraID, $0)) })
   }
 
   /// An effect's checkbox and its value on one row; the value is off while its checkbox is.
@@ -309,17 +537,27 @@ struct UIInspectorViewContent: View {
           .font(.uiMeta)
           .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
       }
-      Picker("Input space", selection: Binding(get: { snapshot.lutInputSpaceID }, set: { context.send(.setLUTInputSpace(cameraID: camera.id, $0)) })) {
-        colorSpaceOptions(selected: snapshot.lutInputSpaceID)
+      VStack(alignment: .leading, spacing: 4) {
+        Text("Input space")
+        Picker("Input space", selection: Binding(get: { snapshot.lutInputSpaceID }, set: { context.send(.setLUTInputSpace(cameraID: camera.id, $0)) })) {
+          colorSpaceOptions(selected: snapshot.lutInputSpaceID)
+        }
+        .labelsHidden()
+        .frame(maxWidth: .infinity, alignment: .leading)
       }
-      Picker("Output space", selection: Binding(get: { snapshot.lutOutputSpaceID }, set: { context.send(.setLUTOutputSpace(cameraID: camera.id, $0)) })) {
-        colorSpaceOptions(selected: snapshot.lutOutputSpaceID)
+      VStack(alignment: .leading, spacing: 4) {
+        Text("Output space")
+        Picker("Output space", selection: Binding(get: { snapshot.lutOutputSpaceID }, set: { context.send(.setLUTOutputSpace(cameraID: camera.id, $0)) })) {
+          colorSpaceOptions(selected: snapshot.lutOutputSpaceID)
+        }
+        .labelsHidden()
+        .frame(maxWidth: .infinity, alignment: .leading)
       }
       if snapshot.lutName != nil || snapshot.lutError != nil {
         HStack {
           Spacer()
           // Asks first only while the LUT is in live use: on air, or burned into a take.
-          Button("Remove LUT") {
+          Button(liveLUTCameras(camera, snapshot: snapshot).isEmpty ? "Remove LUT" : "Remove LUT…") {
             if !liveLUTCameras(camera, snapshot: snapshot).isEmpty {
               confirmingLUTRemoval = camera.id
             } else {
@@ -334,14 +572,14 @@ struct UIInspectorViewContent: View {
               confirmingLUTRemoval = nil
               context.send(.forgetLUT(cameraID: camera.id))
             }
-            Button("Cancel", role: .cancel) { confirmingLUTRemoval = nil }
+            Button("Cancel", role: .cancel) { confirmingLUTRemoval = nil }.keyboardShortcut(.defaultAction)
           } message: {
             Text(lutRemovalMessage(camera: camera, snapshot: snapshot))
           }
         }
       }
     } header: {
-      UIInspectorHeader(title: "LUT", symbol: UISymbol.lut(on: camera.lutIsOn))
+      sectionHeader(.lut, symbol: UISymbol.lut(on: camera.lutIsOn))
     } footer: {
       Text("Choose the spaces specified by the LUT author. LUT spaces are never inferred from its file name; legacy LUTs keep Rec.709 input and output.")
         .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -388,11 +626,12 @@ struct UIInspectorViewContent: View {
         }
       }
     } header: {
-      UIInspectorHeader(title: "Recording", symbol: UISymbol.record)
+      sectionHeader(.recording)
     } footer: {
+      let audio = snapshot.captureAudio == .microphone ? " with the selected microphone when available" : " with embedded audio"
       Text(UIPresentationBuilder.recordsLUT(snapshot, in: context.session)
-        ? "Records the camera original with embedded audio and its LUT burned in."
-        : "Records the camera original with embedded audio: no LUT or effects.")
+        ? "Records the camera original with its LUT burned in" + audio + "."
+        : "Records the camera original" + audio + ". The take uses the original picture without live effects.")
         .font(.uiMeta).foregroundStyle(.secondary)
     }
   }
@@ -411,7 +650,7 @@ struct UIInspectorViewContent: View {
         }
       }
     } header: {
-      UIInspectorHeader(title: "Automation", symbol: UISymbol.startWithApps)
+      sectionHeader(.automation)
     } footer: {
       if let status = snapshot.automaticStatus, !status.isEmpty {
         Text(status).font(.uiMeta).foregroundStyle(.secondary)
@@ -434,7 +673,7 @@ struct UIInspectorViewContent: View {
 
   nonisolated static func signalText(_ snapshot: UICameraSnapshot) -> String {
     switch snapshot.signal {
-    case .none: return snapshot.deviceAvailable ? "Camera stopped" : "Input disconnected"
+    case .none: return snapshot.deviceAvailable ? "Capture stopped" : snapshot.inputName == nil ? "No input" : "Input disconnected"
     case .connecting: return "Starting…"
     case .live(let format): return [format, snapshot.sourcePixel].compactMap { $0 }.joined(separator: "  ")
     case .noSignal: return "No signal"
@@ -454,8 +693,8 @@ struct UIInspectorViewContent: View {
 
   /// The backend's reason a format is unsupported, for the line under the Signal row.
   nonisolated static func signalDetail(_ snapshot: UICameraSnapshot) -> String? {
-    guard case .unsupported(let reason) = snapshot.signal, !reason.isEmpty else { return nil }
-    return reason
+    if case .unsupported(let reason) = snapshot.signal, !reason.isEmpty { return reason }
+    return snapshot.inputDriverWarning ?? snapshot.inputSignalDetail
   }
 
   /// A signal is arriving, so the Signal row already names its format.

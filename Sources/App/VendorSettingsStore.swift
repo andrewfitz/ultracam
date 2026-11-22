@@ -62,6 +62,22 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
         if let state = states[deviceID] { return state }
         let state = VendorSettingsDeviceState(); states[deviceID] = state; return state
     }
+    /// Refresh capabilities as the editor opens or capture releases the device.
+    func refresh(deviceID: String, pluginID: String) async {
+        let state = state(for: deviceID)
+        guard !closed, !state.busy, let plugin = plugins[pluginID] else { return }
+        let generation = self.generation
+        state.busy = true
+        defer { if valid(generation) { state.busy = false } }
+        do {
+            let settings = try await plugin.settings(deviceID: deviceID)
+            guard valid(generation), !Task.isCancelled else { return }
+            state.settings = settings
+        } catch {
+            if valid(generation), !Task.isCancelled { state.message = error.localizedDescription }
+        }
+    }
+
     func restore(deviceID: String, pluginID: String) async {
         let state = state(for: deviceID)
         guard !closed, !state.busy, let plugin = plugins[pluginID] else { return }
@@ -75,24 +91,31 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
             let inherited = policy.inheritedByPlugin[pluginID] ?? [:]
             let desired = policy.desiredByDevice[deviceID] ?? [:]
             var verified: [String: VendorSettingValue] = [:]
-            for setting in settings {
+            var visited: Set<String> = []
+            var errors: [String] = []
+            while let setting = state.settings.first(where: {
+                !visited.contains($0.id) && (desired[$0.id] != nil || inherited[$0.id] != nil)
+            }) {
+                visited.insert(setting.id)
                 guard let value = desired[setting.id] ?? inherited[setting.id] else { continue }
-                try value.validate()
-                if value != setting.value || setting.applicationError != nil {
-                    try validate(value, setting: setting)
-                    try await plugin.apply(value, to: setting.id, deviceID: deviceID)
+                do {
+                    try value.validate()
+                    if value != setting.value || setting.applicationError != nil {
+                        try validate(value, setting: setting)
+                        try await plugin.apply(value, to: setting.id, deviceID: deviceID)
+                        guard valid(generation), !Task.isCancelled else { return }
+                        let fresh = try await plugin.settings(deviceID: deviceID)
+                        guard valid(generation), !Task.isCancelled else { return }
+                        state.settings = fresh
+                    }
+                    try verify(value, settingID: setting.id, settings: state.settings)
+                    verified[setting.id] = value
+                } catch {
                     guard valid(generation), !Task.isCancelled else { return }
+                    errors.append(error.localizedDescription)
                 }
-                guard valid(generation), !Task.isCancelled else { return }
-                let fresh = try await plugin.settings(deviceID: deviceID)
-                guard valid(generation), !Task.isCancelled else { return }
-                state.settings = fresh
-                if let error = fresh.first(where: { $0.id == setting.id })?.applicationError { throw error }
-                guard fresh.first(where: { $0.id == setting.id })?.value == value else {
-                    throw PluginError.failed("The device did not confirm the requested setting")
-                }
-                verified[setting.id] = value
             }
+            if !errors.isEmpty { state.message = errors.joined(separator: "\n") }
             if !verified.isEmpty {
                 var next = policy
                 for (id, value) in verified { next.desiredByDevice[deviceID, default: [:]][id] = value }
@@ -119,10 +142,7 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
             let fresh = try await plugin.settings(deviceID: deviceID)
             guard valid(generation), !Task.isCancelled else { return }
             state.settings = fresh
-            if let error = fresh.first(where: { $0.id == settingID })?.applicationError { throw error }
-            guard fresh.first(where: { $0.id == settingID })?.value == value else {
-                throw PluginError.failed("The device did not confirm the requested setting")
-            }
+            try verify(value, settingID: settingID, settings: fresh)
             var next = policy
             next.desiredByDevice[deviceID, default: [:]][settingID] = value
             try persist(next)
@@ -140,9 +160,26 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
         try persistence.save(next)
         policy = next; persistenceMessage = nil
     }
+    private func verify(_ value: VendorSettingValue, settingID: String, settings: [VendorSetting]) throws {
+        let setting = settings.first { $0.id == settingID }
+        if let error = setting?.applicationError { throw error }
+        guard setting?.value == value else {
+            throw PluginError.failed("The device did not confirm the requested setting")
+        }
+    }
     private func validate(_ value: VendorSettingValue, setting: VendorSetting) throws {
         try value.validate()
         guard setting.mutable else { throw PluginError.unsupported(setting.availabilityReason ?? "Setting is read-only") }
+        if let formats = setting.captureFormats {
+            if value == VendorCaptureMode.automatic { return }
+            guard let mode = VendorCaptureMode(selection: value), let format = formats.first(where: { $0.id == mode.formatID }) else {
+                throw PluginError.unsupported("The requested capture format is unavailable")
+            }
+            guard format.supports(mode.duration) else {
+                throw PluginError.unsupported("The requested frame rate is outside this format’s supported ranges")
+            }
+            return
+        }
         let allowed: Bool
         switch (setting.allowedValues, value) {
         case (.unrestricted, _):

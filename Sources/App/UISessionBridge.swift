@@ -1,47 +1,37 @@
 import AppKit
 import SwiftUI
 
-enum UISideColumn: Sendable { case sidebar, inspector }
-
 /// Interface-only preferences that are not part of the capture settings.
 @MainActor @Observable
 final class UIInterfaceState {
   private let defaults: UserDefaults
   var layout: UILayout { didSet { defaults.set(layout.rawValue, forKey: "ui.layout") } }
   var collapsed: Set<String> { didSet { defaults.set(Array(collapsed), forKey: "ui.collapsed") } }
-  var sidebarVisible: Bool {
-    didSet {
-      defaults.set(sidebarVisible, forKey: "ui.sidebar")
-      if sidebarVisible { lastOpenedColumn = .sidebar }
-    }
-  }
   /// Display order of the pictures (camera IDs); cameras not listed follow in their saved order.
   var order: [String] { didSet { defaults.set(order, forKey: "ui.order") } }
   /// Set while a picture is expanded from a grid layout.
   var expandedFrom: UILayout?
-  var inspectorOpen = false { didSet { if inspectorOpen { lastOpenedColumn = .inspector } } }
-  /// Which side column the user opened most recently; it stays when space runs out.
-  var lastOpenedColumn: UISideColumn = .sidebar
+  var inspectorOpen = false
+  /// The menu bar's Attention row asked for the status bar's problem list; the bar clears it.
+  var problemsRequested = false
   /// Tests set this so confirmations are recorded instead of shown as alerts.
   var alertsDisabled = false
   /// A pending confirmation: the message and the action to run when confirmed.
   var confirmation: (message: String, action: UIAction)?
   /// The camera whose rename prompt is open (`uiRenameAlert`), if any.
   var renamingCameraID: String?
-  /// The left pane's Virtual Cameras section is closed. Only the operator closes it.
-  var virtualCamerasCollapsed: Bool {
-    didSet { defaults.set(virtualCamerasCollapsed, forKey: "ui.virtualCamerasCollapsed") }
-  }
   /// The window is under 1100 pt wide.
   var narrowWindow = false
   /// The Interrupted Takes sheet is open.
   var interruptedTakesOpen = false
-  /// Notification permission is undecided, so Attention may offer it. Set by `UIAlertCoordinator`.
+  /// Notification permission is undecided, so the problem list may offer it. Set by `UIAlertCoordinator`.
   var offerAlerts = false
   @ObservationIgnored var turnOnAlerts: (@MainActor () -> Void)?
   @ObservationIgnored var dismissAlertsPrompt: (@MainActor () -> Void)?
   /// The row Settings › Hardware expands when it next appears (`openHardware`); it clears it.
   var hardwareFocus: String?
+  /// A section selected in Diagnostics or requested by a Details button.
+  var diagnosticsSection: UIDiagnosticsSection?
   /// Settings' tab. Settings reopens on it, and a "Settings › Audio" link sets it before opening.
   var settingsTab: UISettingsTab { didSet { defaults.set(settingsTab.rawValue, forKey: Self.settingsTabKey) } }
   /// Settings › Audio: how many channels each camera's strip meters show, by camera ID.
@@ -61,9 +51,7 @@ final class UIInterfaceState {
     self.defaults = defaults
     layout = UILayout(rawValue: defaults.string(forKey: "ui.layout") ?? "") ?? .sideBySide
     collapsed = Set(defaults.stringArray(forKey: "ui.collapsed") ?? [])
-    sidebarVisible = defaults.object(forKey: "ui.sidebar") as? Bool ?? true
     order = defaults.stringArray(forKey: "ui.order") ?? []
-    virtualCamerasCollapsed = defaults.bool(forKey: "ui.virtualCamerasCollapsed")
     settingsTab = defaults.string(forKey: Self.settingsTabKey).flatMap(UISettingsTab.init(rawValue:)) ?? .general
     channelsShown = (defaults.dictionary(forKey: Self.channelsShownKey) as? [String: Int] ?? [:])
       .compactMapValues(UIChannelsShown.init(rawValue:))
@@ -89,6 +77,14 @@ final class UIInterfaceState {
 
   func setChannelsShown(_ value: UIChannelsShown, for cameraID: String) {
     if value == .asDetected { channelsShown[cameraID] = nil } else { channelsShown[cameraID] = value }
+  }
+
+  /// Older builds could leave the layout preferences of removed cameras behind.
+  func pruneLayoutPreferences(for liveIDs: Set<String>) {
+    let validCollapsed = collapsed.intersection(liveIDs)
+    if validCollapsed != collapsed { collapsed = validCollapsed }
+    let validOrder = order.filter { liveIDs.contains($0) }
+    if validOrder != order { order = validOrder }
   }
 
   /// Sorts cameras into the display order.
@@ -145,13 +141,6 @@ struct UISessionBridge {
   var openSettings: () -> Void = {}
 
   func snapshot() -> UISessionSnapshot {
-    // Drop preferences for cameras that no longer exist. Older builds could
-    // leave these IDs behind after a camera was removed.
-    let liveIDs = Set(model.feedDescriptors.map { $0.id.rawValue })
-    let validCollapsed = interface.collapsed.intersection(liveIDs)
-    if validCollapsed != interface.collapsed { interface.collapsed = validCollapsed }
-    let validOrder = interface.order.filter { liveIDs.contains($0) }
-    if validOrder != interface.order { interface.order = validOrder }
     // Register the observable camera state up front. Whether a camera runs is read
     // from the capture coordinator, which SwiftUI can't observe on its own.
     _ = model.cameraStateRevision
@@ -159,6 +148,7 @@ struct UISessionBridge {
     _ = model.cameraLUTs
     let recording = model.recordingModel
     let drives = currentDrives()
+    let stream = model.streamSnapshot
     var cameras: [UICameraSnapshot] = []
     for descriptor in model.feedDescriptors {
       let id = descriptor.id
@@ -168,11 +158,13 @@ struct UISessionBridge {
       let lut = model.lutState(id)
       let state = recording.feeds.first { $0.id == id }
       let stats = state?.statistics
-      let folder = recording.outputFolder(for: id)
+      let folder = recording.currentOutputFolder(for: id)
       var camera = UICameraSnapshot(id: id.rawValue, name: descriptor.name)
+      camera.enabled = descriptor.enabled
       camera.inputID = descriptor.selectedDevice.isEmpty ? nil : descriptor.selectedDevice
       camera.inputName = model.inputLabel(descriptor.selectedDevice)
       camera.deviceAvailable = deviceAvailable
+      camera.inputDriverWarning = model.captureDriverWarning(deviceID: descriptor.selectedDevice)
       camera.running = running
       camera.outputFormat = update.flatMap { UIFormatLabels.shortFormat($0.output) }
       camera.applying = running && update != nil && update?.pipelineEnabledApplied == nil &&
@@ -183,7 +175,10 @@ struct UISessionBridge {
       camera.sinkConnected = update?.cameraOutputActive == true
       camera.clientWaiting = model.waitingClients.contains(id)
       camera.queueStalled = model.stalledCameras.contains(id)
-      if let connector = model.hardwareInventory.status(for: descriptor.selectedDevice)?.connector, connector != .hdmi {
+      let deviceStatus = model.hardwareInventory.status(for: descriptor.selectedDevice)
+      camera.inputSignalDetail = deviceStatus?.signalDetail
+      camera.captureAudio = model.captureVendor(for: descriptor.selectedDevice)?.captureAudio ?? .embedded
+      if let connector = deviceStatus?.connector, connector != .hdmi {
         camera.inputConnector = UIHardwareText.connector(connector)
       }
       camera.body = Self.body(model: model, cameraID: id.rawValue)
@@ -193,6 +188,7 @@ struct UISessionBridge {
       camera.processing = descriptor.pipelineEnabled
       camera.resizeTarget = descriptor.configuration.resizeTarget
       camera.scalingMode = descriptor.scalingMode
+      camera.allowUpscale = descriptor.allowUpscale
       camera.colorTarget = descriptor.configuration.colorTarget
       camera.frameRateTarget = descriptor.configuration.frameRateTarget
       camera.effects = [descriptor.applyLUT, descriptor.downscale, descriptor.convertTo420, descriptor.reduceFrameRate]
@@ -212,8 +208,15 @@ struct UISessionBridge {
       camera.sourcePixel = update?.sourceFormat.map { FormatDisplayIdentity($0).sampling }
       camera.previewEnabled = descriptor.previewEnabled
       camera.automaticStart = descriptor.automaticFeed
+      camera.captureManuallyStopped = model.isCaptureManuallyStopped(id)
+      if stream.configured && !stream.active && !running {
+        camera.streamCaptureInputAvailable = model.programStreamCaptureInputAvailable(id, deviceAvailable: deviceAvailable)
+      }
+      camera.captureAuthorizationPending = model.isCaptureAuthorizationPending(id)
+      camera.captureAuthorizationRequestable = !camera.deviceAvailable && model.canRequestCaptureStart(id)
       // A refused Start says why; otherwise an automatic camera's status.
-      camera.automaticStatus = model.startRefusal(id) ?? (descriptor.automaticFeed ? model.automaticStatus(id) : nil)
+      camera.automaticStatus = model.startRefusal(id) ??
+        ((descriptor.automaticFeed || camera.captureAuthorizationPending) ? model.automaticStatus(id) : nil)
       camera.automaticStartFailed = model.automaticStartFailed(id)
       Self.applyCapture(update, withinLossHold: model.signalWithinLossHold(id), to: &camera)
       camera.cutBlockedFor = model.cutBlockedFor(id)
@@ -248,10 +251,11 @@ struct UISessionBridge {
     session.syncCameras = model.syncCameras
     session.cameras = interface.ordered(cameras, id: \.id)
     session.selectedID = model.selectedFeedID.rawValue
+    session.stream = stream
     session.programInUse = model.programInUse
     session.programClientUnknown = model.programAvailable && model.programClientUnknown
     session.programSinkConnected = model.programSinkConnected
-    session.onAirID = model.programAvailable ? model.switcherSelectedFeedID?.rawValue : nil
+    session.onAirID = model.programAvailable || session.stream.active ? model.switcherSelectedFeedID?.rawValue : nil
     session.pendingCutID = model.switcherPendingFeedID?.rawValue
     let switcher = model.switcherSettings
     session.autoSwitching = switcher.automatic
@@ -259,7 +263,7 @@ struct UISessionBridge {
     session.strategy = switcher.strategy
     session.anchorID = switcher.naturalTalkingHead.anchorFeedID?.rawValue
     session.emphasisID = switcher.naturalTalkingHead.emphasisFeedID?.rawValue
-    session.expandedFrom = interface.expandedFrom
+    session.expandedFrom = model.feedDescriptors.count > 1 ? interface.expandedFrom : nil
     session.strategyTitle = UIStrategy.title(switcher.strategy)
     // Fixed Interval cuts on its interval alone; the director's shot limits don't apply to it.
     let fixedInterval = switcher.strategy == .fixedInterval
@@ -282,29 +286,28 @@ struct UISessionBridge {
     session.timecodeTitle = UITimecode.title(recording.timecodeMode)
     session.defaultFolderPath = recording.outputFolder?.path
     session.drives = drives
-    session.recentTakes = UIRecordingLibrary.cachedRecentTakes(in: model.feedDescriptors.compactMap { recording.outputFolder(for: $0.id) })
     session.interruptedTakes = recording.interruptedRecordings.map { UIInterruptedTake(id: $0.id.path, title: $0.title) }
     session.recoveringID = recording.recoveringID?.path
     session.recoveryMessage = recording.recoveryMessage
     session.recoveredURL = recording.recoveredURL
     session.interruptedTakesOpen = interface.interruptedTakesOpen
-    session.install = UIInstallState(canRequestChanges: model.installer.canRequestChanges, pending: model.installer.pending,
+    session.install = UIInstallState(canRequestChanges: model.installer.canRequestChanges, canReloadCamera: model.installer.canReloadCamera,
+      pending: model.installer.pending,
       status: model.installer.status, unavailableReason: model.installer.unavailableReason,
-      installed: UIExtensionDetector.isInstalled(), system: model.installer.system,
+      installed: model.installer.devicesPublished, system: model.installer.system,
       needsApproval: model.installer.needsApproval)
     session.canAddCamera = model.canAddCamera
     session.layout = model.programAvailable || interface.layout != .programView ? interface.layout : .sideBySide
     session.collapsed = interface.collapsed
-    session.sidebarVisible = interface.sidebarVisible
     session.inspectorOpen = interface.inspectorOpen
+    session.problemsRequested = interface.problemsRequested
     session.renamingCameraID = interface.renamingCameraID
-    session.virtualCamerasCollapsed = interface.virtualCamerasCollapsed
     session.narrowWindow = interface.narrowWindow
     session.askBeforeEnding = interface.askBeforeEnding
     return session
   }
 
-  /// The camera's paired body, as the left pane and the problem list read it. A build without
+  /// The camera's paired body, as the picture, the inspector and the problem list read it. A build without
   /// its vendor's SDK shows none: a saved pairing there is kept, never a problem.
   static func body(model: AppModel, cameraID: String) -> UICameraBody? {
     let controls = model.cameraControls
@@ -314,7 +317,7 @@ struct UISessionBridge {
     let properties = state.connected ? state.properties : []
     var body = UICameraBody(name: assignment.camera.name, connected: state.connected,
       battery: UIHardwareText.battery(properties), id: assignment.camera.id, lost: !state.connected && state.lostAt != nil,
-      retrying: !state.connected && state.retrying, notice: state.notice)
+      retrying: !state.connected && state.retrying)
     let worst = properties.filter { [.thermal, .power, .media].contains($0.role) && ($0.severity ?? .info) >= .warning }
       .max { ($0.severity ?? .info) < ($1.severity ?? .info) }
     if let worst {
@@ -345,23 +348,23 @@ struct UISessionBridge {
   func presentation() -> UISessionPresentation { UIPresentationBuilder.session(snapshot()) }
 
   /// Free space takes about 10 ms per volume to read, and every view that rebuilds the
-  /// context (window, sidebar, inspector, their bindings) read it on each capture update,
+  /// context (window, inspector, their bindings) read it on each capture update,
   /// 4 Hz per running camera: main-thread time taken from scrolling. The figures are
   /// reused for two seconds.
   /// Each drive carries `lowSeconds` (Settings › Alerts, Low Space), so every surface and the
   /// drive levels that wake the alerts judge "low" the same way.
-  private static var driveCache: (folders: [String?], lowSeconds: TimeInterval, date: Date, drives: [UIDrive])?
+  private static var driveCache: (folders: [String?], lowSeconds: TimeInterval, uptime: TimeInterval, drives: [UIDrive])?
 
   static func cachedDrives(for folders: [URL?], lowSeconds: TimeInterval, read: () -> [UIDrive]) -> [UIDrive] {
     let key = folders.map { $0?.path }
     if let cache = driveCache, cache.folders == key, cache.lowSeconds == lowSeconds,
-      Date().timeIntervalSince(cache.date) < 2 { return cache.drives }
+      ProcessInfo.processInfo.systemUptime - cache.uptime < 2 { return cache.drives }
     let drives = read().map { drive in
       var drive = drive
       drive.lowSeconds = lowSeconds
       return drive
     }
-    driveCache = (key, lowSeconds, Date(), drives)
+    driveCache = (key, lowSeconds, ProcessInfo.processInfo.systemUptime, drives)
     UIDriveLevels.shared.update(drives)
     return drives
   }
@@ -382,8 +385,15 @@ struct UISessionBridge {
 
   /// Runs an action, asking for confirmation first when it would end a recording or on-air output.
   func send(_ action: UIAction, confirmed: Bool = false) {
-    let presentation = presentation()
-    guard !confirmed, let message = action.needsConfirmation(in: presentation) else {
+    guard !model.terminating else { return }
+    var cached: UISessionPresentation?
+    func currentPresentation() -> UISessionPresentation {
+      if let cached { return cached }
+      let value = presentation()
+      cached = value
+      return value
+    }
+    guard !confirmed, let message = action.needsConfirmation(in: currentPresentation()) else {
       perform(action)
       return
     }
@@ -393,7 +403,7 @@ struct UISessionBridge {
     }
     // Ask in the window in front as a sheet; without a key window (menus while the app is
     // in the background, the menu bar item) as a standard alert.
-    let alert = Self.confirmationAlert(for: action, message: message, in: presentation)
+    let alert = Self.confirmationAlert(for: action, message: message, in: currentPresentation())
     let escape = Self.cancelOnEscape(alert)
     if let key = NSApplication.shared.keyWindow, key.isVisible, key.attachedSheet == nil {
       let bridge = self
@@ -441,6 +451,7 @@ struct UISessionBridge {
   }
 
   func perform(_ action: UIAction) {
+    guard !model.terminating else { return }
     let recording = model.recordingModel
     switch action {
     case .select(let id): select(feedID(id))
@@ -450,14 +461,11 @@ struct UISessionBridge {
       if interface.collapsed.contains(id) { interface.collapsed.remove(id) } else { interface.collapsed.insert(id) }
     case .setAllCollapsed(let collapsed):
       interface.collapsed = collapsed ? Set(model.feedDescriptors.map(\.id.rawValue)) : []
-    case .toggleSidebar: interface.sidebarVisible.toggle()
     case .toggleInspector: interface.inspectorOpen.toggle()
     case .setInspectorOpen(let open): if interface.inspectorOpen != open { interface.inspectorOpen = open }
-    case .setSidebarVisible(let visible): if interface.sidebarVisible != visible { interface.sidebarVisible = visible }
     case .showInspector(let id): select(feedID(id)); interface.inspectorOpen = true
-    case .makeRoomForPictures:
-      guard interface.sidebarVisible && interface.inspectorOpen else { break }
-      if interface.lastOpenedColumn == .sidebar { interface.inspectorOpen = false } else { interface.sidebarVisible = false }
+    case .showProblems: interface.problemsRequested = true
+    case .problemsShown: if interface.problemsRequested { interface.problemsRequested = false }
     case .expandPicture(let id):
       select(feedID(id))
       if interface.layout != .single { interface.expandedFrom = interface.layout }
@@ -484,9 +492,10 @@ struct UISessionBridge {
         default: break
         }
       }
-    case .setSyncCameras(let enabled): model.setSyncCameras(enabled)
+    case .setSyncCameras(let enabled, let id): model.setSyncCameras(enabled, sourceID: feedID(id))
     case .setCodec(let codec): recording.codec = codec
     case .setScalingMode(let id, let mode): model.updateCamera(feedID(id)) { $0.scalingMode = mode }
+    case .setAllowUpscale(let id, let enabled): model.updateCamera(feedID(id)) { $0.allowUpscale = enabled }
     case .setResizeTarget(let id, let target): model.updateCamera(feedID(id)) { $0.resizeTarget = target; $0.downscale = true }
     case .setColorTarget(let id, let target): model.updateCamera(feedID(id)) { $0.colorTarget = target; $0.convertTo420 = true }
     case .setFrameRateTarget(let id, let target): model.updateCamera(feedID(id)) { $0.frameRateTarget = target; $0.reduceFrameRate = true }
@@ -500,6 +509,7 @@ struct UISessionBridge {
     case .setGamut(let id, let gamut): model.updateCamera(feedID(id)) { $0.setGamut(gamut) }
     case .setInput(let id, let device): model.updateCamera(feedID(id)) { $0.selectedDevice = device }
     case .refreshInputs: model.refresh()
+    case .requestCaptureAccess(let id): model.requestCaptureAccess(pluginID: id)
     case .setPreviewEnabled(let id, let on): model.updateCamera(feedID(id)) { $0.previewEnabled = on }
     case .setAutomaticStart(let id, let on): model.updateCamera(feedID(id)) { $0.automaticFeed = on }
     case .retryAutomaticStart(let id):
@@ -516,11 +526,16 @@ struct UISessionBridge {
       guard model.removeFeed(feedID(id)) else { return }
       interface.collapsed.remove(id)
       interface.order.removeAll { $0 == id }
+      // One camera has only the single layout: nothing is left to restore.
+      if model.feedDescriptors.count < 2 { interface.expandedFrom = nil }
+      if interface.renamingCameraID == id { interface.renamingCameraID = nil }
     case .renameCamera(let id, let name):
       _ = model.renameFeed(feedID(id), name: name)
       interface.renamingCameraID = nil
     case .beginRename(let id): interface.renamingCameraID = id
     case .endRename: interface.renamingCameraID = nil
+    case .startProgramStream: model.startProgramStream()
+    case .stopProgramStream: model.stopProgramStream()
     case .cut(let id): _ = model.requestProgramCut(to: feedID(id))
     case .cutNumber(let number): if let id = cameraID(number: number) { _ = model.requestProgramCut(to: id) }
     case .setAutoSwitching(let on):
@@ -606,11 +621,13 @@ struct UISessionBridge {
     case .reconnectCameraBody(let id):
       Task { await model.cameraControls.reconnect(id) }
     case .openDiagnostics: openWindow("diagnostics")
+    case .openDiagnosticsSection(let section):
+      interface.diagnosticsSection = section
+      openWindow("diagnostics")
     case .openExtensionApproval:
       if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
         NSWorkspace.shared.open(url)
       }
-    case .setVirtualCamerasCollapsed(let collapsed): interface.virtualCamerasCollapsed = collapsed
     case .setNarrowWindow(let narrow): if interface.narrowWindow != narrow { interface.narrowWindow = narrow }
     case .turnOnAlerts: interface.turnOnAlerts?()
     case .dismissAlertsPrompt: interface.dismissAlertsPrompt?()
@@ -631,9 +648,9 @@ enum UIStrategy {
   static func title(_ strategy: SwitcherStrategy) -> String {
     switch strategy {
     case .manual: return "Manual"
-    case .fixedInterval: return "Fixed interval"
-    case .naturalTalkingHead: return "Natural talking head"
-    case .dynamicAnalysis: return "Dynamic analysis (later)"
+    case .fixedInterval: return "Fixed Interval"
+    case .naturalTalkingHead: return "Natural Talking Head"
+    case .dynamicAnalysis: return "Dynamic Analysis (Later)"
     }
   }
 }
@@ -641,7 +658,7 @@ enum UIStrategy {
 enum UITimecode {
   static func title(_ mode: RecordingTimecodeMode) -> String {
     switch mode {
-    case .source: return "Source timecode"
+    case .source: return "Source Timecode"
     case .recordStart: return "Record Start"
     case .wallClock: return "Mac Clock"
     }

@@ -1,3 +1,5 @@
+import AppKit
+import CoreMediaIO
 import Foundation
 import Observation
 import Security
@@ -175,6 +177,88 @@ private struct ExtensionRequestReference: @unchecked Sendable {
   let request: OSSystemExtensionRequest
 }
 
+/// Published devices are a separate signal from System Extensions' installed-version records.
+@MainActor @Observable final class ExtensionDeviceDiscovery {
+  private static let queue = DispatchQueue(label: "org.ultracam.camera-discovery", qos: .utility)
+  private let scan: @Sendable () -> Bool?
+  private var lastPublished = false
+  @ObservationIgnored private var completedAt: TimeInterval?
+  @ObservationIgnored private var pending: Task<Bool?, Never>?
+
+  init(scan: @escaping @Sendable () -> Bool? = { ExtensionDeviceDiscovery.scanDevices() }) {
+    self.scan = scan
+  }
+
+  /// Returns the last answer immediately. Readers share one in-flight scan.
+  var published: Bool {
+    if completedAt.map({ ProcessInfo.processInfo.systemUptime - $0 >= 5 }) ?? true {
+      beginScan()
+    }
+    return lastPublished
+  }
+
+  /// Install and remove requests can change publication before the normal cache expires.
+  func refresh() { beginScan() }
+
+  /// The reload helper waits for each new enumeration; a failed read is not proof of publication.
+  func checkPublication(afterPendingScan: Bool = false) async -> Bool {
+    if afterPendingScan { _ = await pending?.value }
+    beginScan()
+    return await pending?.value == true
+  }
+
+  private func beginScan() {
+    guard pending == nil else { return }
+    let scan = scan
+    pending = Task { [weak self] in
+      let result = await withCheckedContinuation { continuation in
+        Self.queue.async { continuation.resume(returning: scan()) }
+      }
+      if let self {
+        self.pending = nil
+        self.completedAt = ProcessInfo.processInfo.systemUptime
+        if let result, self.lastPublished != result { self.lastPublished = result }
+      }
+      return result
+    }
+  }
+
+  private nonisolated static func address(_ selector: Int) -> CMIOObjectPropertyAddress {
+    CMIOObjectPropertyAddress(mSelector: UInt32(selector), mScope: UInt32(kCMIOObjectPropertyScopeGlobal),
+      mElement: UInt32(kCMIOObjectPropertyElementMain))
+  }
+
+  private nonisolated static func scanDevices() -> Bool? {
+    let system = CMIOObjectID(kCMIOObjectSystemObject)
+    var property = address(kCMIOHardwarePropertyDevices)
+    var size: UInt32 = 0
+    let stride = UInt32(MemoryLayout<CMIOObjectID>.stride)
+    guard CMIOObjectGetPropertyDataSize(system, &property, 0, nil, &size) == noErr,
+      size.isMultiple(of: stride), size <= 64 * 1024 else { return nil }
+    guard size > 0 else { return false }
+    var devices = [CMIOObjectID](repeating: 0, count: Int(size / stride))
+    var used: UInt32 = 0
+    let status = devices.withUnsafeMutableBufferPointer {
+      CMIOObjectGetPropertyData(system, &property, 0, nil, size, &used, $0.baseAddress!)
+    }
+    guard status == noErr, used <= size, used.isMultiple(of: stride) else { return nil }
+    var readFailed = false
+    for device in devices.prefix(Int(used / stride)) {
+      var uidProperty = address(kCMIODevicePropertyDeviceUID)
+      var value: Unmanaged<CFString>?
+      let expectedSize = UInt32(MemoryLayout.size(ofValue: value))
+      var uidSize: UInt32 = 0
+      guard CMIOObjectGetPropertyData(device, &uidProperty, 0, nil, expectedSize, &uidSize, &value) == noErr,
+        uidSize == expectedSize, let uid = value?.takeRetainedValue() as String? else {
+        readFailed = true
+        continue
+      }
+      if VirtualCameraDescriptor.isDeviceUID(uid) { return true }
+    }
+    return readFailed ? nil : false
+  }
+}
+
 @MainActor @Observable
 final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   enum Change { case install, remove }
@@ -186,9 +270,12 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     /// Asks macOS which versions of the extension it knows (nil when it couldn't say).
     var queryProperties: (@escaping @Sendable ([ExtensionSystemRecord]?) -> Void) -> Void = { _ in }
     var bundledVersion: () -> String? = { nil }
+    var reloadCamera: (() async throws -> Bool)? = nil
+    var deviceDiscovery: ExtensionDeviceDiscovery? = nil
 
-    static func live() -> Self {
-      Self(preflight: { ExtensionInstallPreflight.current() }, makeRequest: { change in
+    @MainActor static func live() -> Self {
+      let discovery = ExtensionDeviceDiscovery()
+      return Self(preflight: { ExtensionInstallPreflight.current() }, makeRequest: { change in
         switch change {
         case .install:
           return .activationRequest(forExtensionWithIdentifier: VideoContract.extensionID, queue: .main)
@@ -197,7 +284,44 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
         }
       }, submit: { OSSystemExtensionManager.shared.submitRequest($0) },
       queryProperties: { ExtensionPropertiesQuery.run(completion: $0) },
-      bundledVersion: { ExtensionSystemState.bundledVersion() })
+      bundledVersion: { ExtensionSystemState.bundledVersion() }, reloadCamera: cameraReloader(discovery: discovery),
+      deviceDiscovery: discovery)
+    }
+
+    private static func cameraReloader(discovery: ExtensionDeviceDiscovery) -> (() async throws -> Bool)? {
+      let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/Ultracam Camera Reload.app")
+      var runningCode: SecCode?
+      var hostSignature: SecStaticCode?
+      var information: CFDictionary?
+      var requirement: SecRequirement?
+      guard Bundle(url: helper)?.bundleIdentifier == "org.ultracam.app.camera-reload",
+        SecCodeCopySelf([], &runningCode) == errSecSuccess, let runningCode,
+        SecCodeCopyStaticCode(runningCode, [], &hostSignature) == errSecSuccess, let hostSignature,
+        SecCodeCopySigningInformation(hostSignature, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+        let details = information as? [String: Any], let team = details[kSecCodeInfoTeamIdentifier as String] as? String,
+        team.utf8.count == 10, team.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) }),
+        SecRequirementCreateWithString(("identifier \"org.ultracam.app.camera-reload\" and anchor apple generic "
+          + "and certificate leaf[subject.OU] = \"\(team)\"") as CFString, [], &requirement) == errSecSuccess,
+        let requirement else { return nil }
+      return { @MainActor in
+        var signature: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(helper as CFURL, [], &signature) == errSecSuccess,
+          let signature, SecStaticCodeCheckValidity(signature, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess else {
+          throw CocoaError(.fileReadCorruptFile)
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.allowsRunningApplicationSubstitution = false
+        let app = try await NSWorkspace.shared.openApplication(at: helper, configuration: configuration)
+        while !app.isTerminated {
+          try await Task.sleep(for: .milliseconds(250))
+        }
+        // Re-enumerating wakes Core Media I/O's registration service on demand.
+        for attempt in 0..<20 {
+          if await discovery.checkPublication(afterPendingScan: attempt == 0) { return true }
+          try await Task.sleep(for: .milliseconds(500))
+        }
+        return await discovery.checkPublication()
+      }
     }
   }
 
@@ -209,8 +333,13 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   private(set) var installCompleted = false
   private(set) var unavailableReason: String?
   var canRequestChanges: Bool { unavailableReason == nil }
+  var canReloadCamera: Bool {
+    canRequestChanges && !needsApproval && system?.enabled == true && system?.outdated == false
+      && system?.awaitingApproval == false && services.reloadCamera != nil
+  }
   /// What macOS last said about the extension; nil until it answers (or when it can't be asked).
   private(set) var system: ExtensionSystemState?
+  var devicesPublished: Bool { services.deviceDiscovery?.published ?? false }
 
   @ObservationIgnored private let services: Services
   @ObservationIgnored private var activeRequest: OSSystemExtensionRequest?
@@ -232,6 +361,7 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
   /// Asks macOS about the extension again: at launch and after each install or removal.
   /// Its cameras alone can't tell "not installed" from "enabled, not started yet".
   func refreshSystemState() {
+    services.deviceDiscovery?.refresh()
     guard canRequestChanges else { return }
     let queryID = UUID()
     systemQueryID = queryID
@@ -247,6 +377,23 @@ final class ExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
 
   func install() { requestChange(.install) }
   func uninstall() { requestChange(.remove) }
+
+  func reloadCamera() async {
+    guard !pending, canReloadCamera, let reload = services.reloadCamera else { return }
+    pending = true
+    installCompleted = false
+    status = "Reloading the camera service…"
+    defer {
+      pending = false
+      refreshSystemState()
+    }
+    do {
+      status = try await reload() ? "The Ultracam cameras are available."
+        : "The Ultracam cameras are still unavailable. Try reloading again or restart your Mac."
+    } catch {
+      status = "Camera service reload failed: \(error.localizedDescription)"
+    }
+  }
 
   private func requestChange(_ change: Change) {
     guard !pending else { return }

@@ -1,23 +1,23 @@
 # Vendor plugins
 
 Ultracam compiles vendor integrations into its host app from `Vendors/<Vendor>/`.
-There are no dynamically discovered plugin bundles. The current integrations
-are Blackmagic DeckLink capture (`decklink`) and Sony camera control (`sony`).
-A camera-control connection is assigned to a feed independently of its capture
-device; connecting to an FX3 does not identify its HDMI cable or supply video.
+The capture plugins are Blackmagic DeckLink (`decklink`) and Mac Camera
+(`maccamera`). Sony camera control (`sony`) is assigned independently of a
+feed's capture device.
 
-The current production capture path still requires 3840 × 2160 HDMI, 10-bit
-4:2:2, at 29.97 or 59.94 fps, with 48 kHz signed 32-bit embedded audio. The
-shared types can describe more formats, but that does not make the app support
-them. [Part B](SOURCE_FORMAT_PLAN.md) tracks wider input formats, clocks,
-colourimetry and pipeline support. Output resize/colour/rate controls do not
-change this input restriction. UVC, AJA and other vendor integrations are not
-implemented.
+The established DeckLink baseline is 3840 × 2160 HDMI, 10-bit 4:2:2, at 29.97
+or 59.94 fps, with 48 kHz signed 32-bit embedded audio. Mac Camera uses the
+system AVFoundation frameworks to discover cameras such as built-in cameras,
+USB webcams, Continuity Camera and compatible virtual cameras. It uses the
+first usable samples macOS delivers. Camera firmware and drivers can process
+the image before delivery.
 
-B1c's bounded retention work and B1d's settings migration remain preparatory;
-their scratch reviews are not production acceptance gates. B2's size/aspect
-catalog expansion, including 1080p and 720p input, is not active. Do not infer
-new capture modes from shared value types or focused helper tests.
+Mac Camera declares its delivered input format and timing for each capture
+epoch. A consumer may impose narrower input requirements than capture itself.
+Qualification applies to the device, macOS version, mode and consumer tested.
+Microphone sync qualification also depends on the particular camera and
+microphone pair. See the [qualification report](MAC_CAMERA_VALIDATION.md) for
+the evidence and [Part B](SOURCE_FORMAT_PLAN.md) for the shared format contracts.
 
 ## Boundaries and registry
 
@@ -182,9 +182,10 @@ not Codable; only the Keychain owner may encode them.
 
 ## Manifests and generated inputs
 
-Each vendor owns `vendor.json`, sources, tests, optional resources, SDK files and
-a README. Start from [Blackmagic](../Vendors/Blackmagic/vendor.json) or
-[Sony](../Vendors/Sony/vendor.json), not a second handwritten build source list.
+Each vendor owns `vendor.json`, sources, tests and any resources or SDK files.
+The [Mac Camera](../Vendors/MacCamera/vendor.json) manifest uses system frameworks.
+[Blackmagic](../Vendors/Blackmagic/vendor.json) and
+[Sony](../Vendors/Sony/vendor.json) show how to declare external SDK inputs.
 Schema version 1 describes:
 
 | Field | Purpose |
@@ -218,6 +219,16 @@ explicit inventory JSON file containing `{"sony": true}` via
 `ULTRACAM_SDK_INVENTORY`). Do not commit a locally enabled generated project as
 the canonical SDK-absent project. Generated inputs include the native bridge;
 Xcode prebuild checks reject stale generated inputs.
+
+Capability checks also apply to integrations that use system frameworks.
+Mac Camera requires the host's camera and microphone entitlements and usage
+descriptions. The Continuity Camera opt-in must be a Boolean true in the host
+template and the built app.
+
+`bash scripts/mac-camera-probe.sh` inventories the camera modes, transport and
+authorization state macOS reports on the test machine. Use the probe's explicit
+`--capture` option to inspect delivery for a particular device and mode.
+Synthetic adapter tests run through `bash scripts/test.sh`.
 
 Adding a vendor also requires explicit registry wiring, typed adapter behavior,
 SDK provenance/terms, capability declarations and conformance tests. A manifest

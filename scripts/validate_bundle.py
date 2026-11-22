@@ -10,6 +10,28 @@ import json
 import ctypes
 
 ROOT = Path(__file__).resolve().parents[1]
+RELOAD_HELPER = Path("Contents/Helpers/Ultracam Camera Reload.app")
+STREAM_LICENSES = Path("ThirdParty/ProgramStreaming-Licenses.txt")
+
+
+def reload_helper_executable(app):
+    app = app.resolve()
+    helper = app / RELOAD_HELPER
+    info_path = helper / "Contents/Info.plist"
+    if not info_path.is_file():
+        raise ValueError(f"Missing camera reload helper: {helper}")
+    info = plistlib.loads(info_path.read_bytes())
+    if (info.get("CFBundleIdentifier") != "org.ultracam.app.camera-reload"
+            or info.get("CFBundlePackageType") != "APPL" or info.get("LSUIElement") is not True):
+        raise ValueError(f"Incorrect camera reload helper metadata: {helper}")
+    name = info.get("CFBundleExecutable")
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise ValueError(f"Invalid camera reload helper executable name: {helper}")
+    executable = helper / "Contents/MacOS" / name
+    if (not executable.is_file() or executable.resolve() != executable
+            or not (executable.stat().st_mode & 0o111) or not _macho(executable)):
+        raise ValueError(f"Missing or invalid camera reload helper executable: {executable}")
+    return executable
 
 
 def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_release=False,
@@ -55,6 +77,14 @@ def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_rele
                 raise ValueError("Read-only selected-file access prevents recording output.")
             if app_entitlements.get("com.apple.security.cs.disable-library-validation") is not True:
                 raise ValueError("The host must allow Blackmagic's separately signed DeckLink framework.")
+            if app_entitlements.get("com.apple.security.network.client") is not True:
+                raise ValueError("Program streaming requires outbound network access in the host.")
+            if signed:
+                app_identifier = app_entitlements.get("com.apple.application-identifier")
+                keychain_groups = app_entitlements.get("keychain-access-groups", [])
+                if (not isinstance(app_identifier, str) or not app_identifier.endswith("." + identifier)
+                        or not isinstance(keychain_groups, list) or keychain_groups[:1] != [app_identifier]):
+                    raise ValueError("Program streaming requires the host's private Keychain group.")
         if bundle == extension:
             service = info.get("CMIOExtension", {}).get("CMIOExtensionMachServiceName", "")
             if not service or "$(" in service:
@@ -102,10 +132,17 @@ def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_rele
     # Static linking leaves no file behind, so also check the extension's code for MonitorKit symbols.
     if any(b"MonitorKit" in path.read_bytes() for path in (extension / "Contents/MacOS").iterdir() if path.is_file()):
         raise ValueError("MonitorKit must not be linked into the camera extension.")
+    stream_licenses = app / "Contents/Resources" / STREAM_LICENSES.name
+    if (not stream_licenses.is_file() or stream_licenses.is_symlink()
+            or stream_licenses.read_bytes() != (Path(root) / STREAM_LICENSES).read_bytes()):
+        raise ValueError(f"Missing or incorrect Program streaming licenses: {stream_licenses}")
+    reload_executable = reload_helper_executable(app)
     validate_symbols(app)
     validate_vendors(app, root=root, inventory_path=inventory_path, signed=signed,
-                     official_release=official_release, architectures=architectures, release_evidence=release_evidence)
+                     official_release=official_release, architectures=architectures, release_evidence=release_evidence,
+                     reload_executable=reload_executable)
     print("Camera metadata and host-only MonitorKit resources validated; no MonitorTools shipped.")
+    print("Program streaming licenses and host entitlements validated.")
 
 
 def binary_uuids(path):
@@ -242,13 +279,16 @@ def system_library_available(path):
 
 
 def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, official_release=False,
-                     architectures=None, release_evidence=None, manifests=None, inventory=None, runner=subprocess.run):
+                     architectures=None, release_evidence=None, manifests=None, inventory=None, runner=subprocess.run,
+                     reload_executable=None):
     """Inspect shipped code even for unsigned builds. Runner injection models
     tool output in tests; production always uses the platform Mach-O tools.
     """
-    from vendors import read_inventory, build_settings
+    from vendors import read_inventory, build_settings, valid_info_capability
     root = Path(root)
     app = Path(app).resolve()
+    if reload_executable is not None:
+        reload_executable = reload_executable.resolve()
     if manifests is None or inventory is None:
         manifests, inventory = read_inventory(root, inventory_path)
     if official_release:
@@ -284,7 +324,7 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
             if not entitlements.get(key):
                 raise ValueError(f"Missing vendor entitlement {key} ({manifest['id']}).")
         for key in manifest.get("capabilities", {}).get("infoPlist", []) if enabled else []:
-            if not info.get(key):
+            if not valid_info_capability(info, key):
                 raise ValueError(f"Missing vendor Info.plist capability {key} ({manifest['id']}).")
         if enabled:
             external_drivers.extend((manifest.get("sdk") or {}).get("externalDrivers", []))
@@ -294,12 +334,13 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
                 raise ValueError(f"Missing enabled vendor runtime: {destination}")
             if not destination.resolve().is_relative_to(app):
                 raise ValueError(f"Vendor runtime escapes app: {destination}")
+            expected_embeds[destination] = {}
             for architecture in required_architectures:
                 expected = _install_names(root / item["path"], runner, [architecture])
                 actual = _install_names(destination, runner, [architecture])
                 if not expected or expected != actual:
                     raise ValueError(f"Unexpected vendor install name ({architecture}): {destination}")
-            expected_embeds[destination] = _install_names(destination, runner, required_architectures)
+                expected_embeds[destination][architecture] = actual
     binaries = [p for p in app.rglob("*") if p.is_file() and _macho(p)]
     metadata = {}
     for binary in binaries:
@@ -316,7 +357,9 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
             dependencies = {line.strip().split(" (compatibility version", 1)[0] for line in load.splitlines()
                             if line[:1].isspace() and " (compatibility version" in line}
             # LC_ID_DYLIB belongs to this slice, just like LC_LOAD_DYLIB and LC_RPATH.
-            if binary.suffix == ".dylib" or binary in expected_embeds:
+            if binary in expected_embeds:
+                dependencies -= expected_embeds[binary][arch]
+            elif binary.suffix == ".dylib":
                 dependencies -= _install_names(binary, runner, [arch])
             commands = _tool(runner, ["/usr/bin/otool", "-arch", arch, "-l", str(binary)]).splitlines()
             rpaths = []
@@ -379,17 +422,29 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
             if binary.is_relative_to(extension) and not target.is_relative_to(extension):
                 raise ValueError(f"Camera extension dependency escapes its bundle: {dependency}")
             inspect_dependencies(target, architecture, search_paths, executable)
-    roots = [host] + [p for p in extension.glob("Contents/MacOS/*") if p in metadata] + list(expected_embeds) + list(metadata)
+    extension_executables = [p for p in extension.glob("Contents/MacOS/*") if p in metadata]
+    roots = [host] + extension_executables
+    if reload_executable is not None:
+        roots.append(reload_executable)
+    roots.extend(expected_embeds)
+    roots.extend(metadata)
     for architecture in required_architectures:
         for binary in roots:
             if (binary, architecture) in reached:
                 continue
-            executable = next((p for p in extension.glob("Contents/MacOS/*") if p in metadata), host) if binary.is_relative_to(extension) else host
+            executable = (extension_executables or [host])[0] if binary.is_relative_to(extension) else host
+            # A helper app under Contents/Helpers runs as its own process: its
+            # @executable_path is its own MacOS folder, not the host's.
+            if reload_executable is not None and binary.is_relative_to(app / RELOAD_HELPER):
+                executable = reload_executable
             inherited = [value.replace("@loader_path", str(executable.parent)).replace("@executable_path", str(executable.parent))
                          for value in metadata.get(executable, {}).get(architecture, ([], []))[1]]
             inspect_dependencies(binary, architecture, inherited, executable)
     if signed:
-        for code in list(metadata) + [extension, app]:
+        bundles = [extension, app]
+        if reload_executable is not None:
+            bundles.insert(0, app / RELOAD_HELPER)
+        for code in list(metadata) + bundles:
             result = runner(["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(code)], capture_output=True, text=True)
             if result.returncode:
                 raise ValueError(f"Invalid code signature: {code}: {result.stderr.strip()}")

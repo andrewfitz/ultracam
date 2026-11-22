@@ -10,10 +10,15 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 
 class GPUProofSkipChecks(unittest.TestCase):
-    def run_gate(self, identity, strict=True, package=False, extra_env=None):
+    def run_gate(self, identity, strict=True, package=False, extra_env=None, prefix=''):
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / 'tests.log'
-            log.write_text("Test Suite 'All tests' started.\n" + f"Test Case '-[{identity}]' skipped (0.001 seconds).\n" + "Test Suite 'All tests' passed.\nExecuted 1 test, with 1 test skipped and 0 failures in 0.001 seconds\n")
+            log.write_text(
+                "Test Suite 'All tests' started.\n"
+                f"{prefix}Test Case '-[{identity}]' skipped (0.001 seconds).\n"
+                "Test Suite 'All tests' passed.\n"
+                "Executed 1 test, with 1 test skipped and 0 failures in 0.001 seconds\n"
+            )
             return subprocess.run([sys.executable, str(ROOT / 'scripts/check-gpu-proof-skips.py'),
                                    '--package' if package else '--app', str(log)],
                                   env=dict(os.environ, ULTRACAM_REQUIRE_GPU_PROOFS='1' if strict else '0', **(extra_env or {})),
@@ -22,6 +27,12 @@ class GPUProofSkipChecks(unittest.TestCase):
     def test_required_app_and_package_skip_fail_strict_lane(self):
         self.assertEqual(self.run_gate('CPUMemoryGPUIngestChecks testGPUOwnership').returncode, 1)
         self.assertEqual(self.run_gate('MonitorKitTests.Metal4Tests testGPUOutput', package=True).returncode, 1)
+
+    def test_interleaved_benchmark_output_does_not_hide_a_required_skip(self):
+        result = self.run_gate('MonitorKitTests.Metal4Tests testGPUOutput',
+                               package=True, prefix='benchmark sample 0.061')
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('MonitorKitTests.Metal4Tests/testGPUOutput', result.stdout)
 
     def test_ordinary_run_reports_incomplete_coverage_but_is_permissive(self):
         result = self.run_gate('CPUMemoryGPUIngestChecks testGPUOwnership', strict=False)

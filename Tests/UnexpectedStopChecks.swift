@@ -67,6 +67,41 @@ import XCTest
       UISessionBridge.unexpectedStop(first).incident)
   }
 
+  func testDiagnosticDetailsRetargetAnOpenWindow() throws {
+    let model = appModel()
+    let original = model.selectedFeedID
+    let other = try XCTUnwrap(model.addFeed())
+    let interface = UIInterfaceState()
+    var selections: [UIDiagnosticsSection?] = []
+    let bridge = UISessionBridge(model: model, interface: interface, openWindow: { window in
+      XCTAssertEqual(window, "diagnostics")
+      selections.append(interface.diagnosticsSection)
+    })
+
+    bridge.send(.openDiagnosticsSection(.camera(original.rawValue)))
+    bridge.send(.openDiagnosticsSection(.camera(other.rawValue)))
+    bridge.send(.openDiagnosticsSection(.program))
+    bridge.send(.openDiagnostics)
+
+    XCTAssertEqual(selections, [.camera(original.rawValue), .camera(other.rawValue), .program, .program])
+  }
+
+  func testStoppedCameraDiagnosticsUseLastKnownMessages() {
+    let model = appModel()
+    let id = model.selectedFeedID
+    var update = stopped(.failed("input disconnected"))
+    update.outputFPS = 59.94
+    update.audioPresent = true
+    model.deliverCaptureUpdateForTesting(id, update)
+
+    let summary = UIDiagnosticsText.summary(model: model)
+    XCTAssertTrue(summary.contains("] stopped"))
+    XCTAssertTrue(summary.contains("Stopped because: input disconnected"))
+    XCTAssertTrue(summary.contains("Last capture message: Stopped"))
+    XCTAssertFalse(summary.contains("Delivered:"))
+    XCTAssertFalse(summary.contains("Audio:"))
+  }
+
   func testAStoppedCameraWithNoTakeHasNoTakeResult() {
     let model = appModel()
     let id = model.selectedFeedID
@@ -125,7 +160,7 @@ import XCTest
     let problem = try XCTUnwrap(UIPresentationBuilder.problems(session(snapshot)).first)
     XCTAssertEqual(problem.title, "Camera 1 stopped: input disconnected")
     XCTAssertEqual(problem.detail, "Take ended early, 12:31 saved")
-    XCTAssertEqual(problem.action, UIProblemAction(title: "Start", action: .startCamera(cameraID: "camera-1")))
+    XCTAssertEqual(problem.action, UIProblemAction(title: "Start Capture", action: .startCamera(cameraID: "camera-1")))
     XCTAssertEqual(problem.level, .damage)
     XCTAssertEqual(UIPresentationBuilder.stripState(for: snapshot), .failed)
   }
@@ -137,7 +172,7 @@ import XCTest
     let problem = try XCTUnwrap(UIPresentationBuilder.problems(session(snapshot)).first)
     XCTAssertEqual(problem.title, "Take ended early")
     XCTAssertEqual(problem.detail, "Camera 1, 12:31 saved")
-    XCTAssertEqual(problem.action, UIProblemAction(title: "Details", action: .openDiagnostics))
+    XCTAssertEqual(problem.action, UIProblemAction(title: "Details", action: .openDiagnosticsSection(.camera(snapshot.id))))
     XCTAssertEqual(problem.dismiss, UIProblemAction(title: "Dismiss", action: .acknowledgeStop(cameraID: "camera-1")))
     let shown = UIPresentationBuilder.camera(snapshot, index: 0, in: session(snapshot))
     XCTAssertEqual(shown.recordTitle, "Take ended early")

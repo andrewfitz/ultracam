@@ -50,9 +50,9 @@ import XCTest
     let full = VirtualCameraRegistrySnapshot.devices(for: feeds(32))
     XCTAssertEqual(full.count, 32)
     XCTAssertFalse(full.contains { $0.kind == .program })
-    XCTAssertNoThrow(try VirtualCameraRegistrySnapshot(generation: 1, devices: full).validateDeviceCount())
-    XCTAssertThrowsError(try VirtualCameraRegistrySnapshot(generation: 1,
-      devices: VirtualCameraRegistrySnapshot.devices(for: feeds(33))).validateDeviceCount())
+    XCTAssertNoThrow(try VirtualCameraRegistryWire.encode(VirtualCameraRegistrySnapshot(generation: 1, devices: full)))
+    XCTAssertThrowsError(try VirtualCameraRegistryWire.encode(VirtualCameraRegistrySnapshot(generation: 1,
+      devices: VirtualCameraRegistrySnapshot.devices(for: feeds(33)))))
   }
 
   func testForeignGroupDoesNotSupplyGeneration() {

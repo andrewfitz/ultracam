@@ -77,6 +77,16 @@ struct UIProgramPictureView: View {
       .aspectRatio(16 / 9, contentMode: .fit)
       .clipShape(RoundedRectangle(cornerRadius: 14))
       .overlay {
+        // Nothing is capturing: say so, as each source's picture does, instead of plain black.
+        if !session.cameras.contains(where: \.running) {
+          let black = session.stream.phase == .streaming && !session.stream.pictureFresh
+          UIPicturePlaceholder(symbol: UISymbol.program, title: black ? "No Program picture" : "Program idle",
+            detail: black ? "The stream is sending black. Start Capture to restore video."
+              : "Start Capture to send \(onAir?.name ?? "a camera") to Program.")
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+        }
+      }
+      .overlay {
         // What the meeting has: a picture gone, on air. The way out is here too.
         if tally == .noPicture, let camera = context.presentation.cameras.first(where: { $0.id == session.onAirID }),
           camera.tileState == .signalLost {
@@ -222,8 +232,10 @@ struct UIProgramRowLayout: Layout {
   func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
     let split = widths(bounds.width, height: proposal.height)
     guard subviews.count == 2 else { return }
-    subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: split.program, height: split.program * 9 / 16))
-    subviews[1].place(at: CGPoint(x: bounds.maxX - split.sources, y: bounds.minY),
+    // A wide, short window limits Program by height: keep the pair together, centered.
+    let x0 = bounds.minX + max(0, (bounds.width - split.program - gutter - split.sources) / 2)
+    subviews[0].place(at: CGPoint(x: x0, y: bounds.minY), proposal: ProposedViewSize(width: split.program, height: split.program * 9 / 16))
+    subviews[1].place(at: CGPoint(x: x0 + split.program + gutter, y: bounds.minY),
       proposal: ProposedViewSize(width: split.sources, height: proposal.height == nil ? nil : bounds.height))
   }
 

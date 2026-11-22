@@ -3,5 +3,5 @@
   "$id": "ultracam-auto-switcher/offline-analysis",
   "title": "Auto switcher offline analysis",
   "description": "Offline analysis uses the same complete replay timeline as realtime sessions.",
-  "$ref": "session-timeline.schema.json"
+  "$ref": "session-timeline"
 }

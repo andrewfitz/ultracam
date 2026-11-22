@@ -8,14 +8,14 @@ struct SourceRouteFixture {
   let image: CVPixelBuffer
   let format: SourceFormat
 
-  init(pixel: PixelFormatID) throws {
+  init(pixel: PixelFormatID, width: Int = 128, height: Int = 72, shareable: Bool = true) throws {
     let rgb = [PixelFormatID.bgra8, .r210, .r12L].contains(pixel)
     let colour = Colorimetry(primaries: .rec709, transfer: .rec709,
       matrix: rgb ? .identity : .rec709,
       range: [.full420, .bgra8, .r12L].contains(pixel) ? .full : .video,
       horizontalChromaSiting: rgb ? .unspecified : .center,
       verticalChromaSiting: rgb ? .unspecified : .center)
-    format = try SourceFormat(width: 128, height: 72, pixel: pixel, colour: colour,
+    format = try SourceFormat(width: width, height: height, pixel: pixel, colour: colour,
       rate: .constant(VideoContract.fastDuration))
     if pixel == .r210 || pixel == .r12L {
       let base = try XCTUnwrap(CVPixelFormatDescriptionCreateWithPixelFormatType(nil, kCVPixelFormatType_32BGRA))
@@ -28,10 +28,14 @@ struct SourceRouteFixture {
       try CPUMemoryPixelFormatRegistration.ensure(pixel.rawValue)
     }
     var made: CVPixelBuffer?
-    XCTAssertEqual(CVPixelBufferCreate(nil, 128, 72, pixel.rawValue,
-      [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true, kCVPixelBufferBytesPerRowAlignmentKey: 256] as CFDictionary, &made), kCVReturnSuccess)
+    var attributes: [CFString: Any] = [kCVPixelBufferBytesPerRowAlignmentKey: 256]
+    if shareable {
+      attributes[kCVPixelBufferIOSurfacePropertiesKey] = [:] as [String: Any]
+      attributes[kCVPixelBufferMetalCompatibilityKey] = true
+    }
+    XCTAssertEqual(CVPixelBufferCreate(nil, width, height, pixel.rawValue, attributes as CFDictionary, &made), kCVReturnSuccess)
     image = try XCTUnwrap(made)
-    XCTAssertNotNil(CVPixelBufferGetIOSurface(image))
+    XCTAssertEqual(CVPixelBufferGetIOSurface(image) != nil, shareable)
     CVPixelBufferLockBaseAddress(image, [])
     defer { CVPixelBufferUnlockBaseAddress(image, []) }
     if CVPixelBufferIsPlanar(image) {
@@ -52,8 +56,8 @@ struct SourceRouteFixture {
     } else {
       let p = try XCTUnwrap(CVPixelBufferGetBaseAddress(image)).assumingMemoryBound(to: UInt8.self)
       let stride = CVPixelBufferGetBytesPerRow(image)
-      p.initialize(repeating: 0, count: stride * 72)
-      for row in 0..<72 { for x in 0..<128 {
+      p.initialize(repeating: 0, count: stride * height)
+      for row in 0..<height { for x in 0..<width {
         let offset = row * stride
         if pixel == .r12L {
           for c in 0..<3 { for bit in 0..<12 {

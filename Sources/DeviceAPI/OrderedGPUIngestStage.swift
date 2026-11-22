@@ -73,14 +73,16 @@ final class OrderedGPUIngestStage<Input: Sendable, Output: Sendable>: @unchecked
 
   private func startNext() {
     guard !closed, active == nil, !pending.isEmpty else { return }
-    let next = pending.removeFirst()
+    let (input, weight) = pending.removeFirst()
     let token = UUID(); active = token
-    transform(next.input) { [self] result in
+    transform(input) { [self] result in
       queue.async { [self] in
         guard !closed, active == token else { return }
         active = nil
-        retainedBytes -= next.weight.bytes
-        retainedDuration = max(0, retainedDuration - next.weight.duration)
+        retainedBytes -= weight.bytes
+        // Empty queues have no retained duration. Reset explicitly so a
+        // rounding residue cannot reject a later frame at the exact limit.
+        retainedDuration = pending.isEmpty ? 0 : max(0, retainedDuration - weight.duration)
         emit(result)
         startNext()
       }

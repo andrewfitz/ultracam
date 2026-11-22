@@ -115,6 +115,26 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try Data(contentsOf: child), Data([42]))
   }
 
+  func testFailedSidecarCancellationReleasesVolumeClaims() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let volumes = RecordingVolumeSpaceRegistry()
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0,
+      diskSpace: FixedRecordingOutputDiskSpace(bytes: 1_000), volumes: volumes)
+    let session = try manager.beginExternalWriterSession(feedID: "Wide", expectedBytes: 100)
+    let sidecar = RecordingTakeSidecar.url(for: session.finalURL)
+    try Data([1]).write(to: sidecar)
+    try session.claimSidecar()
+    try session.checkExternalWriterCapacity(headroom: 200)
+    try FileManager.default.removeItem(at: sidecar)
+    try FileManager.default.createDirectory(at: sidecar, withIntermediateDirectories: false)
+    XCTAssertThrowsError(try session.cancel())
+    XCTAssertEqual(session.state, .failed)
+    XCTAssertEqual(volumes.usage(for: root).reserved, 0)
+    XCTAssertEqual(volumes.usage(for: root).headroom, 0)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: sidecar.path))
+  }
+
   func testCancellationPreservesSymlinkAndItsTarget() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -482,6 +502,71 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertFalse(FileManager.default.fileExists(atPath: take.finalURL.path))
   }
 
+  func testRecoveryPublicationMarkerSurvivesInterruptionOnEitherSideOfRename() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let session = try manager.beginExternalWriterSession(feedID: "Wide")
+    let original = Data("interrupted source".utf8)
+    let export = Data([1, 2, 3, 4])
+    try original.write(to: session.temporaryURL)
+    session.preserveForRecovery()
+    let take = try XCTUnwrap(RecordingRecovery.scan(root: root).first)
+    let folder = take.journalURL.deletingLastPathComponent()
+    let staging = take.temporaryURL.appendingPathExtension("export.ultracam-recovery")
+    let destination = folder.appendingPathComponent("published.mov")
+    try export.write(to: staging)
+    do {
+      let journal = try RecordingRecoveryJournal(opening: take.journalURL)
+      try journal.preparePublication(of: staging, to: destination)
+    }
+    XCTAssertEqual(try RecordingRecovery.scan(root: root), [take])
+    XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path))
+    // A foreign file claiming the intended name before the interrupted rename
+    // cannot be mistaken for the export, even when its size is identical.
+    try Data([4, 3, 2, 1]).write(to: destination)
+    XCTAssertEqual(try RecordingRecovery.scan(root: root), [take])
+    try FileManager.default.removeItem(at: destination)
+    try export.write(to: staging)
+    do {
+      let journal = try RecordingRecoveryJournal(opening: take.journalURL)
+      try journal.preparePublication(of: staging, to: destination)
+      try FileManager.default.moveItem(at: staging, to: destination)
+    }
+    XCTAssertTrue(try RecordingRecovery.scan(root: root).isEmpty)
+    let done = expectation(description: "A retry returns the published movie")
+    Task {
+      defer { done.fulfill() }
+      do {
+        let recovered = try await RecordingRecovery.recover(take, root: root)
+        XCTAssertEqual(recovered, destination)
+      } catch { XCTFail("Retry failed: \(error)") }
+    }
+    wait(for: [done], timeout: 5)
+    XCTAssertEqual(try Data(contentsOf: take.temporaryURL), original)
+  }
+
+  func testLegacyRecoveryMarkerRequiresANonemptyRegularMovie() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let session = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1]).write(to: session.temporaryURL)
+    session.preserveForRecovery()
+    let take = try XCTUnwrap(RecordingRecovery.scan(root: root).first)
+    let destination = take.journalURL.deletingLastPathComponent().appendingPathComponent("legacy.mov")
+    let entry = RecordingRecoveryJournal.Entry(temporaryName: take.temporaryURL.lastPathComponent,
+      finalName: take.finalURL.lastPathComponent, recoveredName: destination.lastPathComponent)
+    try JSONEncoder().encode(entry).write(to: take.journalURL)
+    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+    XCTAssertEqual(try RecordingRecovery.scan(root: root), [take])
+    try FileManager.default.removeItem(at: destination)
+    try Data().write(to: destination)
+    XCTAssertEqual(try RecordingRecovery.scan(root: root), [take])
+    try Data([2]).write(to: destination)
+    XCTAssertTrue(try RecordingRecovery.scan(root: root).isEmpty)
+  }
+
   func testRecordingFolderBookmarkSurvivesStoreRecreationAndClears() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -632,9 +717,12 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertNoThrow(try wide.checkExternalWriterCapacity(headroom: 100))
     XCTAssertEqual(volumes.usage(for: root).headroom, 100)
     XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 600))
+    XCTAssertThrowsError(try wide.resume())
+    XCTAssertEqual(wide.state, .paused)
+    XCTAssertEqual(volumes.usage(for: root).headroom, 700, "A rejected resume preserves the paused claim")
+    try tight.checkExternalWriterCapacity(headroom: 300)
     try wide.resume()
-    XCTAssertEqual(volumes.usage(for: root).headroom, 1_200, "Resume restores the last full headroom")
-    XCTAssertThrowsError(try tight.checkExternalWriterCapacity(headroom: 600))
+    XCTAssertEqual(volumes.usage(for: root).headroom, 900, "Resume restores the last admitted full headroom")
     // A failed recorder reports only what it still owes; here, nothing.
     try wide.checkExternalWriterCapacity(headroom: 0)
     XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 800))

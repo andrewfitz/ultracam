@@ -1,8 +1,6 @@
 import SwiftUI
 
-/// Main window toolbar, on three pieces of glass: switching (cuts, Auto, Hold), then Start
-/// when a camera is stopped and the record control, then layout and the inspector. Stop
-/// Cameras isn't here while they run: it's ⌘↩, in the Camera menu and in the menu bar.
+/// Camera capture, recording and window controls. Program switching lives below the pictures.
 struct UIToolbarContent: ToolbarContent {
   let context: UIContext
 
@@ -10,16 +8,14 @@ struct UIToolbarContent: ToolbarContent {
 
   var body: some ToolbarContent {
     let _ = UIRenderProbe.count("UIToolbarContent")
-    if !presentation.cutButtons.isEmpty {
-      ToolbarItem(placement: .principal) {
-        UIToolbarCutGroup(context: context)
-      }
+    if !presentation.cameras.isEmpty {
+      ToolbarItem(placement: .primaryAction) { captureControl }
+      ToolbarSpacer(.fixed, placement: .primaryAction)
     }
 
     // Order matters: when the window narrows, macOS moves the trailing items into the
     // overflow menu first, so the record control stays visible; layout, collapse and the
-    // inspector are also in View. From macOS 26.1 the record control also has the highest
-    // priority, so it's the last thing to overflow whatever the cut pills take.
+    // inspector are also in View. From macOS 26.1 the record control has the highest priority.
     if #available(macOS 26.1, *) {
       recordGroup.visibilityPriority(.high)
     } else {
@@ -60,7 +56,9 @@ struct UIToolbarContent: ToolbarContent {
         Label(allCollapsed ? "Expand All Strips" : "Collapse All Strips",
           systemImage: allCollapsed ? UISymbol.expandAll : UISymbol.collapseAll)
       }
-      .help(allCollapsed ? "Expand All Strips (⌥⌘S)" : "Collapse All Strips (⌥⌘S)")
+      .help(presentation.layout == .fourUp || presentation.layout == .programView
+        ? "Strips are always collapsed in Four Up and Program View."
+        : allCollapsed ? "Expand All Strips (⌥⌘S)" : "Collapse All Strips (⌥⌘S)")
       .disabled(presentation.layout == .fourUp || presentation.layout == .programView)
     }
 
@@ -76,17 +74,25 @@ struct UIToolbarContent: ToolbarContent {
     }
   }
 
-  /// Start, when a camera is stopped, and the record control.
   @ToolbarContentBuilder private var recordGroup: some ToolbarContent {
-    ToolbarItemGroup(placement: .primaryAction) {
-      if let start = presentation.startControl {
-        Button { context.send(start.action) } label: {
-          Label(start.title, systemImage: UISymbol.start).labelStyle(.titleAndIcon)
-        }
-        .disabled(!start.enabled)
-        .help(start.help)
+    ToolbarItem(placement: .primaryAction) { UIToolbarRecordControl(context: context) }
+    ToolbarItem(placement: .primaryAction) { UIToolbarRecordingOptions(context: context) }
+  }
+
+  @ViewBuilder private var captureControl: some View {
+    if let start = presentation.startControl, start.enabled || !presentation.camerasRunning {
+      let title = start.action == .startAllCameras ? "Start Capture" : start.title
+      Button { context.send(start.action) } label: {
+        Label(title, systemImage: UISymbol.camera).labelStyle(.titleAndIcon)
       }
-      UIToolbarRecordControl(context: context)
+      .disabled(!start.enabled)
+      .help(start.enabled ? "Start receiving video from the configured inputs\(start.action == .startAllCameras ? " (⌘↩)" : ""). Use Record to save a take." : start.help)
+    } else {
+      Button { context.send(.stopAllCameras) } label: {
+        Label(presentation.cameras.count > 1 ? "Stop All Capture" : "Stop Capture", systemImage: UISymbol.noSignal)
+          .labelStyle(.titleAndIcon)
+      }
+      .help("Stop capture and video output for running cameras (⌘↩). This ends any active recordings.")
     }
   }
 
@@ -97,6 +103,23 @@ struct UIToolbarContent: ToolbarContent {
 
   private var layoutBinding: Binding<UILayout> {
     Binding(get: { presentation.layout }, set: { context.send(.setLayout($0)) })
+  }
+}
+
+private struct UIToolbarRecordingOptions: View {
+  let context: UIContext
+  @State private var presented = false
+
+  var body: some View {
+    Button { presented.toggle() } label: {
+      Label("Recording Options", systemImage: UISymbol.menuIndicator).labelStyle(.titleAndIcon)
+    }
+    .help("Format, folder, drives, Record a camera, Pause All")
+    .popover(isPresented: $presented, arrowEdge: .bottom) {
+      UIStatusPopover(kind: .recording,
+        segment: context.presentation.statusSegments.first { $0.kind == .recording }
+          ?? UIStatusSegment(kind: .recording, text: "", tone: .neutral), context: context)
+    }
   }
 }
 
@@ -133,9 +156,8 @@ struct UIToolbarPillStyle: ButtonStyle {
   }
 }
 
-/// One ⇆ glyph so the group reads as Cut and not as tabs, the cut buttons, then Auto with its
-/// options and Hold in a fixed slot, so nothing moves under the pointer.
-struct UIToolbarCutGroup: View {
+/// Program cuts and automatic switching, directly below the pictures.
+struct UIProgramSwitchBar: View {
   let context: UIContext
 
   private var presentation: UISessionPresentation { context.presentation }
@@ -146,21 +168,31 @@ struct UIToolbarCutGroup: View {
     let cuts = UIPresentationBuilder.toolbarCuts(presentation.cutButtons)
     let numberOnly = UIPresentationBuilder.toolbarCutsNumberOnly(cuts.shown, hasMore: !cuts.more.isEmpty,
       narrowWindow: session.narrowWindow)
-    HStack(spacing: 4) {
-      Image(systemName: UISymbol.cut).foregroundStyle(.secondary).padding(.horizontal, 4)
-        .help("Cut: each button puts its camera on Program")
-        .accessibilityHidden(true)
-      ForEach(cuts.shown) { button in
-        cutButton(button, numberOnly: numberOnly)
+    HStack(spacing: 12) {
+      HStack(spacing: 4) {
+        Label("Program", systemImage: UISymbol.program)
+          .font(.uiRowEmphasis).padding(.trailing, 8)
+          .help("Choose the camera sent to the Program output.")
+        ForEach(cuts.shown) { button in
+          cutButton(button, numberOnly: numberOnly)
+        }
+        if !cuts.more.isEmpty { moreCuts(cuts.more) }
       }
-      if !cuts.more.isEmpty { moreCuts(cuts.more) }
-      Divider().frame(height: 18).padding(.horizontal, 2)
-      auto
-      autoOptions
-      hold
+      Spacer(minLength: 4)
+      Divider().frame(height: 18)
+      HStack(spacing: 4) {
+        auto
+        autoOptions
+        hold
+      }
     }
-    // A toolbar draws labels icon-only; these keep their words, which carry the state.
+    .padding(.horizontal, 12)
+    .padding(.vertical, 6)
+    .background(.bar)
+    .overlay(alignment: .top) { Divider() }
     .labelStyle(.titleAndIcon)
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("Program switching")
   }
 
   @ViewBuilder private func cutButton(_ button: UICutButton, numberOnly: Bool) -> some View {
@@ -222,15 +254,13 @@ struct UIToolbarCutGroup: View {
     }
   }
 
-  /// "Auto On" or "Auto Off" at one width. With Manual chosen, Auto asks how to switch first.
+  /// With Manual selected, turning on Auto first asks which strategy to use.
   @ViewBuilder private var auto: some View {
     let on = presentation.autoSwitching
-    let label = Label {
-      ZStack(alignment: .leading) {
-        Text("Auto Off").hidden()
-        Text(on ? "Auto On" : "Auto Off")
-      }
-    } icon: { Image(systemName: UISymbol.auto) }
+    let label = ZStack(alignment: .leading) {
+      Text("Auto Switch Off").hidden()
+      Text(on ? "Auto Switch On" : "Auto Switch Off")
+    }
     if presentation.canAutoSwitch {
       Button { context.send(.setAutoSwitching(!on)) } label: { label }
         .buttonStyle(UIToolbarPillStyle(on: on))
@@ -268,28 +298,31 @@ struct UIToolbarCutGroup: View {
       .pickerStyle(.inline)
       if session.strategy == .naturalTalkingHead {
         Divider()
-        UICameraPickerMenu(title: "Anchor", selection: session.anchorID, cameras: presentation.cameras) {
+        UICameraPickerMenu(title: "Anchor", selection: session.anchorID, otherRole: session.emphasisID, cameras: presentation.cameras) {
           context.send(.setAnchor(cameraID: $0))
         }
-        UICameraPickerMenu(title: "Emphasis", selection: session.emphasisID, cameras: presentation.cameras) {
+        UICameraPickerMenu(title: "Emphasis", selection: session.emphasisID, otherRole: session.anchorID, cameras: presentation.cameras) {
           context.send(.setEmphasis(cameraID: $0))
         }
       }
     } label: {
-      Image(systemName: UISymbol.menuIndicator).font(.caption.weight(.bold)).frame(width: 16, height: 26).contentShape(Rectangle())
+      HStack(spacing: 4) {
+        Text("Strategy")
+        Image(systemName: UISymbol.menuIndicator).font(.caption2.weight(.bold))
+      }
     }
     .menuStyle(.button)
-    .buttonStyle(.plain)
+    .buttonStyle(UIToolbarPillStyle())
     .menuIndicator(.hidden)
     .fixedSize()
     .help("Strategy, Anchor and Emphasis")
-    .accessibilityLabel("Auto options")
+    .accessibilityLabel("Switching strategy")
   }
 
   private var hold: some View {
     let on = presentation.canHoldShot && session.autoHold
     return Button { context.send(.setAutoHold(!session.autoHold)) } label: {
-      Label("Hold", systemImage: UISymbol.hold(on: on))
+      Label(on ? "Release Hold" : "Hold Shot", systemImage: UISymbol.hold(on: on))
     }
     .buttonStyle(UIToolbarPillStyle(on: on))
     .disabled(!presentation.canHoldShot)
@@ -304,13 +337,16 @@ struct UIToolbarCutGroup: View {
 struct UICameraPickerMenu: View {
   let title: String
   let selection: String?
+  let otherRole: String?
   let cameras: [UICameraPresentation]
   let choose: (String?) -> Void
 
   var body: some View {
     Picker(title, selection: Binding(get: { selection }, set: { choose($0) })) {
       Text("Automatic").tag(String?.none)
-      ForEach(cameras) { Text($0.name).tag(String?.some($0.id)) }
+      ForEach(cameras) { camera in
+        Text(camera.name).tag(String?.some(camera.id)).selectionDisabled(camera.id == otherRole)
+      }
     }
     .pickerStyle(.menu)
   }
@@ -391,55 +427,27 @@ private struct UIMaxWidthLayout: Layout {
   }
 }
 
-/// "Record All", "Record 1 of 2", "Stop Recording" or "Stop 2 Recordings", at one width
-/// whatever the clock does, plus its menu: Format, Record Camera 2, Pause All. A red dot, not
-/// a red fill, while rolling. The words stay: this ends something.
+/// The primary recording action shows its scope and changes to Stop while a take is active.
 struct UIToolbarRecordControl: View {
   let context: UIContext
 
   var body: some View {
     let _ = UIRenderProbe.count("UIToolbarRecordControl")
-    let presentation = context.presentation
-    let control = presentation.recordControl
-    HStack(spacing: 0) {
-      Button { context.send(action(control)) } label: {
-        HStack(spacing: 6) {
-          if case .record = control {
-            Image(systemName: UISymbol.record)
-          } else {
-            UIStateGlyph(state: .recording)
-          }
-          Text(control.title)
+    let control = context.presentation.recordControl
+    Button { context.send(action(control)) } label: {
+      HStack(spacing: 6) {
+        if case .record = control {
+          Image(systemName: UISymbol.record).foregroundStyle(enabled(control) ? Color.red : Color.secondary)
+        } else {
+          Image(systemName: UISymbol.stop).foregroundStyle(.red)
         }
+        Text(control.title)
       }
-      .buttonStyle(UIToolbarPillStyle())
-      .disabled(!enabled(control))
-      .help(help(control))
-      .accessibilityLabel(control.title)
-      Menu {
-        Menu {
-          UIFormatChoices(session: context.session, send: context.send)
-        } label: {
-          Label("Format", systemImage: UISymbol.format)
-        }
-        .badge(Text(context.session.codec.title))
-        if presentation.cameras.count > 1 {
-          ForEach(presentation.cameras.filter { $0.recordButtonEnabled && !$0.recordButtonActive && $0.pauseTitle == nil }) { camera in
-            Button("Record \(camera.name)") { context.send(.toggleRecording(cameraID: camera.id)) }
-          }
-        }
-        Button(presentation.pauseAllTitle) { context.send(presentation.pauseAllTitle == "Resume All" ? .resumeAll : .pauseAll) }
-          .disabled(!presentation.canPauseAll)
-      } label: {
-        Image(systemName: UISymbol.menuIndicator).font(.caption.weight(.bold)).frame(width: 18, height: 26).contentShape(Rectangle())
-      }
-      .menuStyle(.button)
-      .buttonStyle(.plain)
-      .menuIndicator(.hidden)
-      .fixedSize()
-      .help("Format, Record a camera, Pause All")
-      .accessibilityLabel("Record options")
     }
+    .buttonStyle(UIToolbarPillStyle())
+    .disabled(!enabled(control))
+    .help(help(control))
+    .accessibilityLabel(control.title)
   }
 
   private func action(_ control: UIRecordControl) -> UIAction {

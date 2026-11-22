@@ -36,6 +36,7 @@ import Observation
 
   func captureChanged(_ id: FeedID) { camera(id).capture &+= 1 }
   func statisticsChanged(_ id: FeedID) { camera(id).statistics &+= 1 }
+  func remove(_ id: FeedID) { cameras[id] = nil }
 }
 
 /// What of a capture update the interface shows as state, rather than as a running value.
@@ -46,6 +47,7 @@ struct CaptureUpdateState: Equatable {
   var signal: CaptureSignal
   var input: String
   var output: String
+  var sourceFormat: SourceFormat?
   var sourceDuration: CMTime?
   var pipelineEnabledApplied: Bool?
   var hasFrames: Bool
@@ -63,6 +65,7 @@ struct CaptureUpdateState: Equatable {
     signal = update.signal
     input = update.input
     output = update.output
+    sourceFormat = update.sourceFormat
     sourceDuration = update.sourceDuration
     pipelineEnabledApplied = update.pipelineEnabledApplied
     hasFrames = update.frames > 0

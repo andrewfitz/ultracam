@@ -12,8 +12,10 @@ use auto_switcher::offline::{
 use auto_switcher::timeline::TimelineRecorder;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::VecDeque;
-use std::io::{self, BufRead, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -106,7 +108,7 @@ enum SchemaName {
 struct LlmRuntime {
     advisor: DelayedLlmAdvisor,
     delay: f64,
-    last_submit: f64,
+    last_submit_attempt: f64,
     audio: VecDeque<AudioCue>,
     transcript: VecDeque<TranscriptCue>,
     video: VecDeque<VideoObservation>,
@@ -122,29 +124,35 @@ impl LlmRuntime {
         Self {
             advisor: DelayedLlmAdvisor::new(Box::new(provider)),
             delay: delay.max(0.0),
-            last_submit: -f64::INFINITY,
+            last_submit_attempt: -f64::INFINITY,
             audio: VecDeque::new(),
             transcript: VecDeque::new(),
             video: VecDeque::new(),
         }
     }
 
-    fn observe(&mut self, event: &StreamEvent) {
+    fn reset(&mut self) {
+        self.advisor.reset();
+        self.audio.clear();
+        self.transcript.clear();
+        self.video.clear();
+        self.last_submit_attempt = -f64::INFINITY;
+    }
+
+    fn observe(&mut self, event: &StreamEvent, generation: u64) {
+        if !event.has_valid_cue_values() {
+            return;
+        }
+        let current = |tag: u64| tag == 0 || tag == generation;
         match event {
-            StreamEvent::Audio { cue } => {
+            StreamEvent::Audio { cue } if current(cue.session_generation) => {
                 self.audio.push_back(cue.clone());
             }
-            StreamEvent::Transcript { cue } => {
+            StreamEvent::Transcript { cue } if current(cue.session_generation) => {
                 self.transcript.push_back(cue.clone());
             }
-            StreamEvent::Video { observation } => {
+            StreamEvent::Video { observation } if current(observation.session_generation) => {
                 self.video.push_back(observation.clone());
-            }
-            StreamEvent::Reset { .. } => {
-                self.audio.clear();
-                self.transcript.clear();
-                self.video.clear();
-                self.last_submit = -f64::INFINITY;
             }
             _ => {}
         }
@@ -165,6 +173,9 @@ impl LlmRuntime {
         config: &SwitcherConfig,
         current_camera_id: &str,
     ) -> Vec<SwitcherOutput> {
+        if !now.is_finite() || now < 0.0 {
+            return Vec::new();
+        }
         let mut output = Vec::new();
         for (request_id, result) in self.advisor.poll(now) {
             match result {
@@ -206,7 +217,7 @@ impl LlmRuntime {
                 }),
             }
         }
-        if now - self.last_submit >= 1.0 && now.is_finite() {
+        if now - self.last_submit_attempt >= 1.0 {
             let context = DecisionContext {
                 request_id: Uuid::nil(),
                 media_time: now,
@@ -217,13 +228,9 @@ impl LlmRuntime {
                 transcript: self.transcript.iter().cloned().collect(),
                 video: self.video.iter().cloned().collect(),
             };
-            if self
-                .advisor
-                .submit(context, now + self.delay, now + self.delay + 10.0)
-                .is_some()
-            {
-                self.last_submit = now;
-            }
+            self.last_submit_attempt = now;
+            self.advisor
+                .submit(context, now + self.delay, now + self.delay + 10.0);
         }
         output
     }
@@ -249,7 +256,7 @@ fn main() -> Result<()> {
             speech_threshold,
             load_config(config)?,
             ollama.then(|| LlmRuntime::new(ollama_url, ollama_model, llm_delay_seconds)),
-            output.unwrap_or_else(|| default_output_path("auto-switcher-session")),
+            output,
         )?,
         Command::Offline {
             events,
@@ -302,36 +309,52 @@ fn realtime(
     threshold: f32,
     config: SwitcherConfig,
     mut llm: Option<LlmRuntime>,
-    output_path: PathBuf,
+    output_path: Option<PathBuf>,
 ) -> Result<()> {
     let mut director = Director::new(config.clone()).map_err(anyhow::Error::msg)?;
-    let mut timeline = TimelineRecorder::new(config.clone(), "realtime", Uuid::new_v4());
+    let mut timeline = if output_path.as_deref() == Some(Path::new("-")) {
+        None
+    } else {
+        let mut timeline = TimelineRecorder::new(config, "realtime", Uuid::new_v4());
+        timeline.timeline.started_at_unix_ms = Some(unix_ms());
+        if matches!(input_format, InputFormat::Pcm16le) {
+            timeline
+                .timeline
+                .metadata
+                .insert("cut_application".into(), "assumed_at_requested_time".into());
+        }
+        Some(timeline)
+    };
     let stdout = io::stdout();
     let mut output = stdout.lock();
+    let mut process = |event| {
+        process_realtime_event(
+            &mut output,
+            &mut director,
+            &mut llm,
+            timeline.as_mut(),
+            input_format,
+            event,
+        )
+    };
     match input_format {
         InputFormat::Jsonl => {
-            for line in io::stdin().lock().lines() {
-                let line = line.context("failed to read realtime input")?;
-                if line.trim().is_empty() {
-                    continue;
+            let mut input = io::stdin().lock();
+            let mut line = String::new();
+            let mut line_number = 1;
+            while input
+                .read_line(&mut line)
+                .context("failed to read realtime input")?
+                != 0
+            {
+                if !line.trim().is_empty() {
+                    let event = serde_json::from_str(&line).with_context(|| {
+                        format!("invalid realtime JSONL event on line {line_number}")
+                    })?;
+                    process(event)?;
                 }
-                let event: StreamEvent =
-                    serde_json::from_str(&line).context("invalid realtime JSONL event")?;
-                if let Some(runtime) = llm.as_mut() {
-                    runtime.observe(&event);
-                }
-                let outputs = director.process_event(event.clone());
-                timeline.record_event(event.clone(), outputs.clone());
-                emit_events(&mut output, outputs)?;
-                if let StreamEvent::Tick { time } = event {
-                    if let Some(runtime) = llm.as_mut() {
-                        let advisory = runtime.tick(time, &config, director.current_camera_id());
-                        for item in advisory.iter().cloned() {
-                            timeline.record_output(item);
-                        }
-                        emit_events(&mut output, advisory)?;
-                    }
-                }
+                line.clear();
+                line_number += 1;
             }
         }
         InputFormat::Pcm16le => {
@@ -342,70 +365,89 @@ fn realtime(
             let mut bytes = [0_u8; 16 * 1024];
             loop {
                 let count = input.read(&mut bytes).context("failed to read PCM input")?;
+                let events = if count == 0 {
+                    decoder.finish()
+                } else {
+                    decoder.push_pcm16le(&bytes[..count])
+                };
+                for event in events {
+                    let tick = match &event {
+                        StreamEvent::Audio { cue } => Some(StreamEvent::Tick { time: cue.time }),
+                        _ => None,
+                    };
+                    process(event)?;
+                    if let Some(tick) = tick {
+                        process(tick)?;
+                    }
+                }
                 if count == 0 {
                     break;
                 }
-                for event in decoder.push_pcm16le(&bytes[..count]) {
-                    process_realtime_event(
-                        &mut output,
-                        &mut director,
-                        &config,
-                        &mut llm,
-                        &mut timeline,
-                        event,
-                    )?;
-                }
-            }
-            for event in decoder.finish() {
-                process_realtime_event(
-                    &mut output,
-                    &mut director,
-                    &config,
-                    &mut llm,
-                    &mut timeline,
-                    event,
-                )?;
             }
         }
     }
-    timeline.finish(Some(unix_ms()));
-    write_json(&output_path, &timeline.timeline)?;
+    if let Some(mut timeline) = timeline {
+        timeline.finish(Some(unix_ms()));
+        write_json(
+            output_path.as_deref(),
+            "auto-switcher-session",
+            &timeline.timeline,
+        )?;
+    }
     Ok(())
 }
 
 fn process_realtime_event(
     output: &mut impl Write,
     director: &mut Director,
-    config: &SwitcherConfig,
     llm: &mut Option<LlmRuntime>,
-    timeline: &mut TimelineRecorder,
+    mut timeline: Option<&mut TimelineRecorder>,
+    input_format: InputFormat,
     event: StreamEvent,
 ) -> Result<()> {
-    if let Some(runtime) = llm.as_mut() {
-        runtime.observe(&event);
-    }
+    let generation = director.session_generation();
     let outputs = director.process_event(event.clone());
-    timeline.record_event(event.clone(), outputs.clone());
-    emit_events(output, outputs)?;
-    if let StreamEvent::Audio { cue } = event {
-        let tick = StreamEvent::Tick { time: cue.time };
-        let outputs = director.process_event(tick.clone());
-        timeline.record_event(tick, outputs.clone());
-        emit_events(output, outputs)?;
-        if let Some(runtime) = llm.as_mut() {
-            let advisory = runtime.tick(cue.time, config, director.current_camera_id());
-            for item in advisory.iter().cloned() {
-                timeline.record_output(item);
+    if let Some(runtime) = llm.as_mut() {
+        if matches!(event, StreamEvent::Reset { .. }) || generation != director.session_generation()
+        {
+            runtime.reset();
+        }
+        runtime.observe(&event, director.session_generation());
+    }
+    let tick_time = match &event {
+        StreamEvent::Tick { time } => Some(*time),
+        _ => None,
+    };
+    emit_events(output, &outputs)?;
+    if let Some(timeline) = timeline.as_deref_mut() {
+        timeline.record_event(event, outputs.clone());
+    }
+    if matches!(input_format, InputFormat::Pcm16le) {
+        for item in &outputs {
+            if let SwitcherOutput::Cut { instruction } = item {
+                let ack = TimelineRecorder::assumed_acknowledgement(instruction);
+                let follow_up = director.process_event(ack.clone());
+                if let Some(timeline) = timeline.as_deref_mut() {
+                    timeline.record_event(ack, follow_up);
+                }
             }
-            emit_events(output, advisory)?;
+        }
+    }
+    if let (Some(time), Some(runtime)) = (tick_time, llm.as_mut()) {
+        let advisory = runtime.tick(time, &director.config, director.current_camera_id());
+        emit_events(output, &advisory)?;
+        if let Some(timeline) = timeline {
+            if !advisory.is_empty() {
+                timeline.record_event(StreamEvent::DirectorOutput, advisory);
+            }
         }
     }
     Ok(())
 }
 
-fn emit_events(writer: &mut impl Write, outputs: Vec<SwitcherOutput>) -> Result<()> {
+fn emit_events(writer: &mut impl Write, outputs: &[SwitcherOutput]) -> Result<()> {
     for output in outputs {
-        serde_json::to_writer(&mut *writer, &output)?;
+        serde_json::to_writer(&mut *writer, output)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
     }
@@ -445,56 +487,66 @@ fn offline(options: OfflineOptions, config: SwitcherConfig) -> Result<()> {
     analysis
         .metadata
         .insert("source_mode".to_string(), "offline".to_string());
-    let json = serde_json::to_string_pretty(&analysis)?;
-    let output = options
-        .output
-        .unwrap_or_else(|| default_output_path("auto-switcher-analysis"));
-    write_json(&output, &analysis)?;
-    if output.as_os_str() == "-" {
-        println!("{json}");
+    if options.output.as_deref() == Some(Path::new("-")) {
+        let mut stdout = BufWriter::new(io::stdout().lock());
+        serde_json::to_writer_pretty(&mut stdout, &analysis)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    } else {
+        write_json(
+            options.output.as_deref(),
+            "auto-switcher-analysis",
+            &analysis,
+        )?;
     }
     Ok(())
 }
 
-fn write_json<T: serde::Serialize>(path: &PathBuf, value: &T) -> Result<()> {
-    if path.as_os_str() == "-" {
+fn write_json<T: serde::Serialize>(path: Option<&Path>, prefix: &str, value: &T) -> Result<()> {
+    let parent = path
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    builder.permissions(std::fs::Permissions::from_mode(0o666));
+    let mut file = builder
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create a temporary file in {}", parent.display()))?;
+    {
+        let mut writer = BufWriter::new(file.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, value)?;
+        writer.flush()?;
+    }
+    if let Some(path) = path {
+        file.persist_noclobber(path)
+            .with_context(|| format!("failed to save output {}", path.display()))?;
         return Ok(());
     }
-    let json = serde_json::to_vec_pretty(value)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("refusing to overwrite existing output {}", path.display()))?;
-    file.write_all(&json)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
 
-fn default_output_path(prefix: &str) -> PathBuf {
     let stem = format!("{prefix}-{}", utc_datetime_stem());
-    let base = PathBuf::from(format!("{stem}.json"));
-    if !base.exists() {
-        return base;
-    }
-    for suffix in 2..10_000 {
-        let candidate = PathBuf::from(format!("{stem}-{suffix}.json"));
-        if !candidate.exists() {
-            return candidate;
+    for suffix in 1..10_000 {
+        let filename = if suffix == 1 {
+            format!("{stem}.json")
+        } else {
+            format!("{stem}-{suffix}.json")
+        };
+        match file.persist_noclobber(&filename) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => file = error.file,
+            Err(error) => return Err(error).with_context(|| format!("failed to save {filename}")),
         }
     }
-    PathBuf::from(format!("{stem}-{}.json", Uuid::new_v4()))
+    let filename = format!("{stem}-{}.json", Uuid::new_v4());
+    file.persist_noclobber(&filename)
+        .with_context(|| format!("failed to save {filename}"))?;
+    Ok(())
 }
 
 fn utc_datetime_stem() -> String {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0);
+    let millis = unix_ms();
     let total_seconds = millis.div_euclid(1_000);
     let milliseconds = millis.rem_euclid(1_000);
     let days = total_seconds.div_euclid(86_400);
@@ -558,4 +610,115 @@ fn print_schema(name: SchemaName) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use auto_switcher::llm::{LlmDecisionProvider, LlmProposal};
+    use std::sync::mpsc::{channel, Receiver, Sender};
+
+    struct ControlledAdvisor {
+        requests: Sender<DecisionContext>,
+        release: Receiver<()>,
+    }
+
+    impl LlmDecisionProvider for ControlledAdvisor {
+        fn decide(&mut self, context: &DecisionContext) -> Result<LlmProposal> {
+            self.requests.send(context.clone())?;
+            self.release.recv()?;
+            Ok(LlmProposal {
+                target_camera_id: None,
+                confidence: 1.0,
+                reason: "hold".into(),
+                hold: true,
+            })
+        }
+    }
+
+    #[test]
+    fn reset_discards_completed_inflight_and_queued_advice() {
+        let (requests, received) = channel();
+        let (release, gate) = channel();
+        let mut runtime = Some(LlmRuntime {
+            advisor: DelayedLlmAdvisor::new(Box::new(ControlledAdvisor {
+                requests,
+                release: gate,
+            })),
+            delay: 10.0,
+            last_submit_attempt: -f64::INFINITY,
+            audio: VecDeque::new(),
+            transcript: VecDeque::new(),
+            video: VecDeque::new(),
+        });
+        let config = SwitcherConfig::default();
+        let mut director = Director::new(config.clone()).unwrap();
+        let mut timeline = TimelineRecorder::new(config, "realtime", Uuid::new_v4());
+        let mut output = Vec::new();
+        let mut send = |event| {
+            process_realtime_event(
+                &mut output,
+                &mut director,
+                &mut runtime,
+                Some(&mut timeline),
+                InputFormat::Jsonl,
+                event,
+            )
+            .unwrap();
+        };
+        let next_request = || received.recv_timeout(Duration::from_secs(5)).unwrap();
+        send(StreamEvent::Tick { time: -1.0 });
+        send(StreamEvent::Tick { time: 0.0 });
+        assert_eq!(next_request().media_time, 0.0);
+        release.send(()).unwrap();
+        send(StreamEvent::Tick { time: 1.0 });
+        next_request(); // The worker finished the first request and is blocked on the second.
+        send(StreamEvent::Tick { time: 2.0 }); // Buffer the first reply and queue a third request.
+        send(StreamEvent::Reset {
+            generation: Some(2),
+        });
+        let observation = VideoObservation {
+            camera_id: "A".into(),
+            time: 2.0,
+            healthy: true,
+            motion: 0.0,
+            scene_change: 0.0,
+            session_generation: 1,
+        };
+        send(StreamEvent::Video {
+            observation: observation.clone(),
+        });
+        send(StreamEvent::Video {
+            observation: VideoObservation {
+                session_generation: 2,
+                ..observation
+            },
+        });
+        send(StreamEvent::Tick { time: 3.0 });
+        release.send(()).unwrap();
+        let fresh = next_request();
+        assert_eq!(fresh.media_time, 3.0);
+        assert_eq!(fresh.video.len(), 1);
+        assert_eq!(fresh.video[0].session_generation, 2);
+        release.send(()).unwrap();
+        send(StreamEvent::Tick { time: 4.0 });
+        next_request(); // The fresh reply is now available for the next poll.
+        send(StreamEvent::Tick { time: 13.0 });
+        let ids: Vec<_> = timeline
+            .timeline
+            .statuses
+            .iter()
+            .filter_map(|item| match item {
+                SwitcherOutput::LlmAdvisory { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, [fresh.request_id]);
+        let advisory_record = timeline.timeline.events.last().unwrap();
+        assert_eq!(advisory_record.event, StreamEvent::DirectorOutput);
+        assert!(matches!(
+            advisory_record.outputs.as_slice(),
+            [SwitcherOutput::LlmAdvisory { request_id, .. }] if *request_id == fresh.request_id
+        ));
+    }
 }

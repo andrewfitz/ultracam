@@ -16,7 +16,10 @@ private let monitorMallocLogger: MonitorMallocLogger = { type, _, _, _, _, _ in
   monitorCountedAllocations += 1
 }
 func monitorCountingAllocations(_ body: () -> Void) -> Int? {
-  guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "malloc_logger") else { return nil }
+  guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "malloc_logger") else {
+    body()
+    return nil
+  }
   let slot = symbol.assumingMemoryBound(to: MonitorMallocLogger?.self)
   let previous = slot.pointee
   monitorCountedAllocations = 0
@@ -53,11 +56,26 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   var completed: Int { lock.withLock { times.count + failures } }
   var failed: Int { lock.withLock { failures } }
   var milliseconds: [Double] { lock.withLock { times } }
+
+  func waitForCompletion(_ count: Int, timeout: TimeInterval) throws {
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    while completed < count, ProcessInfo.processInfo.systemUptime < deadline { usleep(200) }
+    guard completed == count, failed == 0 else {
+      throw VideoError.message("Expected \(count) successful GPU completions, got \(completed) with \(failed) failures")
+    }
+  }
 }
 
 @MainActor @objcMembers final class MonitorCoordinatorChecks: XCTestCase {
   private let alpha = MonitorTargetID("alpha")
   private let beta = MonitorTargetID("beta")
+  @nonobjc func requireMonitorGPU() throws -> MonitorGPUContext.Core {
+    guard MTLCreateSystemDefaultDevice()?.supportsFamily(.metal4) == true else {
+      throw XCTSkip("No Metal 4 device")
+    }
+    return try MonitorCoordinator.sharedGPU.core()
+  }
+
   private func coordinator() -> MonitorCoordinator {
     let value = MonitorCoordinator()
     value.updateTargets(
@@ -425,10 +443,9 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     let program = value.captureSink(for: .program)
     let lut = try LUTProcessor.makeLUT(CubeLUT(text: Self.identityCube))
     program.burnInLUT = lut
-    value.setBurnInLUTSource(for: .program) { lut }
     XCTAssertNil(program.burnInLUT, "Program's frames are processed: no burn-in LUT")
     let camera = value.captureSink(for: alpha)
-    value.setBurnInLUTSource(for: alpha) { lut }
+    camera.burnInLUT = lut
     XCTAssertTrue(camera.burnInLUT === lut, "A camera's Output picture uses the LUT it burns in")
   }
 
@@ -445,17 +462,15 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     """
 
   /// The feed host reads primaries, transfer and matrix tags, and a steady stream
-  /// of tagged frames reads them (and the clean aperture and pixel aspect) without
-  /// allocating on the capture thread, up to the surface's latest-frame slot.
-  func testSteadyOffersReadColorimetryWithoutAllocating() throws {
+  /// of tagged frames adds no allocations beyond Core Video's geometry attachment reads.
+  func testSteadyOffersAllocateOnlyForCoreVideoGeometryAttachments() throws {
     let buffer = try monitorPixelBuffer(width: 64, height: 36, format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
     CVBufferSetAttachment(
       buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
     CVBufferSetAttachment(
       buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG, .shouldPropagate)
     CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
-    // Core Video rebuilds dictionary attachments on every read (they live on the
-    // IOSurface), so the host must not read them per frame.
+    // The same pooled surface can carry different dictionary attachments on every offer.
     CVBufferSetAttachment(
       buffer, kCVImageBufferCleanApertureKey,
       [
@@ -494,7 +509,14 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
       throw XCTSkip("malloc_logger unavailable")
     }
     XCTAssertEqual(presenter.currentStamp?.sequence, sequence)
-    XCTAssertEqual(allocations, 0, "Steady-state offers allocate on the capture thread")
+    let geometryAllocations = monitorCountingAllocations {
+      for _ in 0..<200 { _ = MonitorFrame.geometry(of: buffer) }
+    }
+    XCTAssertEqual(allocations, geometryAllocations, "Offers should allocate only what Core Video needs to read frame geometry")
+    CVBufferRemoveAttachment(buffer, kCVImageBufferCleanApertureKey)
+    CVBufferRemoveAttachment(buffer, kCVImageBufferPixelAspectRatioKey)
+    offer()
+    XCTAssertEqual(monitorCountingAllocations { for _ in 0..<200 { offer() } }, 0)
   }
 
   // MARK: - Surfaces
@@ -645,7 +667,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   /// The Freeze copy is MonitorKit's (one compute copy, into planes the hold
   /// owns); once it is adopted the hold keeps no capture buffer.
   func testFreezeCopiesOnTheGPUAndReleasesTheCaptureBuffer() throws {
-    guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     let value = coordinator()
     let (presenter, host) = liveSurface(value)
     host.offer(try monitorPixelBuffer(width: 64, height: 36), pts: .zero, captureGeneration: 1, sequence: 1)
@@ -668,7 +690,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   /// encoding (EDR for HLG and PQ, with their metadata), primaries from the
   /// primaries tag alone (HLG or PQ on BT.709 keeps BT.709), Rec.709 SDR after a LUT.
   func testLayerColorFollowsTheSignalAndKeepsBT709Primaries() throws {
-    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let core = try requireMonitorGPU()
     let value = coordinator()
     let (presenter, _) = liveSurface(value)
     let layer = CAMetalLayer()
@@ -713,7 +735,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   /// per frame, no allocation beyond the Metal encoder calls themselves, and the
   /// picture pass within its GPU budget.
   func testSteadyPictureEncodeCopiesNothingAndStaysInBudget() throws {
-    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let core = try requireMonitorGPU()
     let value = coordinator()
     let (presenter, host) = liveSurface(value)
     let buffer = try monitorPixelBuffer(width: 3840, height: 2160, format: kCVPixelFormatType_422YpCbCr10)
@@ -730,6 +752,9 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     control.colorAttachments[0]!.loadAction = .load
     control.colorAttachments[0]!.storeAction = .store
     var sequence: UInt64 = 0
+    let validating = ["MTL_DEBUG_LAYER", "MTL_SHADER_VALIDATION"].contains {
+      ProcessInfo.processInfo.environment[$0].map { $0 != "0" } ?? false
+    }
 
     struct Counts {
       var slot: [Int] = [], wrap: [Int] = [], encode: [Int] = [], inline: [Int] = [], begin: [Int] = []
@@ -748,9 +773,11 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
         var failure: Error?
         let begin = monitorCountingAllocations { context = try? core.begin() }
         let made = try XCTUnwrap(context)
+        var committed = false
+        defer { if !committed { core.abandon(made) } }
         let slot = monitorCountingAllocations { work = presenter.renderWork(after: (.max, .max), force: false) }
         let drawn = try XCTUnwrap(work)
-        guard case .live(let delivery) = drawn.content else { throw XCTSkip("Expected a live frame") }
+        guard case .live(let delivery) = drawn.content else { throw VideoError.message("Expected a live frame") }
         let wrap = monitorCountingAllocations {
           do { _ = try host.frame(delivery, in: made, core: core) } catch { failure = error }
         }
@@ -769,8 +796,8 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
           made.commandBuffer.makeRenderCommandEncoder(descriptor: control)?.endEncoding()
         }
         let commit = monitorCountingAllocations { core.commit(made, completion: probe, kind: 1) }
-        let deadline = Date().addingTimeInterval(2)
-        while probe.completed == before && Date() < deadline { usleep(200) }
+        committed = true
+        try probe.waitForCompletion(before + 1, timeout: 2)
         guard index >= warmUp, let begin, let slot, let wrap, let encode, let inline, let commit else { continue }
         counts.begin.append(begin)
         counts.slot.append(slot)
@@ -779,8 +806,13 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
         counts.inline.append(inline)
         counts.commit.append(commit)
       }
-      XCTAssertEqual(probe.failed, 0)
-      return (counts, Array(probe.milliseconds.suffix(frames)).sorted())
+      let times = Array(probe.milliseconds.suffix(frames)).sorted()
+      XCTAssertEqual(times.count, frames)
+      if !validating {
+        XCTAssertEqual(counts.slot.count, frames, "Allocation logging must cover every measured frame")
+        XCTAssertTrue(times.allSatisfy { $0.isFinite && $0 > 0 }, "GPU completion must report valid timing")
+      }
+      return (counts, times)
     }
     func middle(_ values: [Int]) -> Int { values.isEmpty ? -1 : values.sorted()[values.count / 2] }
     func report(_ name: String, _ counts: Counts, _ times: [Double]) {
@@ -800,7 +832,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     report("picture", plain, plainTimes)
     XCTAssertEqual(core.statistics.texturesMade, texturesMade, "Every frame's planes come from the resident cache")
     XCTAssertEqual(core.engine.resourcesCreated, resources, "Nothing is made per frame: no copy, no scratch")
-    if !["MTL_DEBUG_LAYER", "MTL_SHADER_VALIDATION"].contains(where: { ProcessInfo.processInfo.environment[$0].map { $0 != "0" } ?? false }) {
+    if !validating {
       XCTAssertLessThanOrEqual(plainTimes.first ?? .infinity, 0.5, "GPU time per 4K-to-1080p picture over the 0.5 ms budget")
     }
     // Every tool a camera tile shows: focus analysis, zebra and guides.
@@ -815,9 +847,6 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     report("focus+zebra+guides", full, fullTimes)
     // Metal's debug layer allocates inside every call it wraps: counts and times
     // mean nothing there (the run checks for validation messages instead).
-    let validating = ["MTL_DEBUG_LAYER", "MTL_SHADER_VALIDATION"].contains {
-      ProcessInfo.processInfo.environment[$0].map { $0 != "0" } ?? false
-    }
     for counts in [plain, full] where !validating {
       XCTAssertEqual(middle(counts.slot), 0, "Taking the frame from the slot allocates")
       XCTAssertEqual(middle(counts.wrap), 0, "Wrapping the frame allocates")
@@ -825,6 +854,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     }
     // The frame's texture is the capture IOSurface itself: no pixel copy.
     let context = try core.begin()
+    defer { core.abandon(context) }
     sequence += 1
     host.offer(buffer, pts: CMTime(value: CMTimeValue(sequence), timescale: 30), captureGeneration: 1, sequence: sequence)
     let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
@@ -834,7 +864,6 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     } else {
       XCTFail("A live frame")
     }
-    core.abandon(context)
   }
 
   /// A v210 frame of one colour: Y, Cb, Cr codes in every pixel, BT.709 tagged.
@@ -875,7 +904,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   /// decode, which is what LUTProcessor publishes, within a code, live and frozen;
   /// its Source picture reads the declared range.
   func testDeclaredRangeIsTheSourceStagesAndOutputPictureIsTheBurnIn() throws {
-    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let core = try requireMonitorGPU()
     let value = coordinator()
     var tools = value.preferences(for: alpha)
     tools.signal.range = .full
@@ -894,7 +923,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     let cube = try CubeLUT(text: lines.joined(separator: "\n"))
     let lut = try LUTProcessor.makeLUT(cube, device: core.device)
     let (presenter, host) = liveSurface(value)
-    value.setBurnInLUTSource(for: alpha) { lut }
+    host.burnInLUT = lut
     let codes: (y: UInt32, cb: UInt32, cr: UInt32) = (600, 420, 640)
     let buffer = try flatV210(y: codes.y, cb: codes.cb, cr: codes.cr)
     var sequence: UInt64 = 0
@@ -913,15 +942,12 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     defer { core.engine.residency.retire(target, resident: target) }
     func draw() throws -> SIMD3<Float> {
       let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
-      presenter.refreshBurnInLUT()
       let probe = MonitorCompletionProbe()
-      let context = try core.begin()
-      _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
-        context: context)
-      core.commit(context, completion: probe, kind: 1)
-      let deadline = Date().addingTimeInterval(5)
-      while probe.completed == 0 && Date() < deadline { usleep(200) }
-      XCTAssertEqual(probe.failed, 0)
+      try core.submit(completion: probe, kind: 1) { context in
+        _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
+          context: context)
+      }
+      try probe.waitForCompletion(1, timeout: 5)
       var pixel = SIMD4<Float>(repeating: 0)
       target.getBytes(&pixel, bytesPerRow: 48 * 16, from: MTLRegionMake2D(24, 8, 1, 1), mipmapLevel: 0)
       return SIMD3(pixel.x, pixel.y, pixel.z)
@@ -965,7 +991,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   /// SMPTE 240M camera, the tag for one published untouched). Clip indicators at a
   /// threshold between the two readings tell them apart.
   func testEveryToolReadsItsOwnStagesReadingOnOnePicture() throws {
-    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let core = try requireMonitorGPU()
     let value = coordinator()
     let (presenter, host) = liveSurface(value)
     let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
@@ -987,13 +1013,11 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
         sequence: sequence, untouched: untouched)
       let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
       let probe = MonitorCompletionProbe()
-      let context = try core.begin()
-      _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
-        context: context)
-      core.commit(context, completion: probe, kind: 1)
-      let deadline = Date().addingTimeInterval(5)
-      while probe.completed == 0 && Date() < deadline { usleep(200) }
-      XCTAssertEqual(probe.failed, 0)
+      try core.submit(completion: probe, kind: 1) { context in
+        _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
+          context: context)
+      }
+      try probe.waitForCompletion(1, timeout: 5)
       var pixels = [SIMD4<Float>](repeating: SIMD4(repeating: 0), count: 48 * 16)
       target.getBytes(&pixels, bytesPerRow: 48 * 16, from: MTLRegionMake2D(0, 0, 48, 16), mipmapLevel: 0)
       return pixels
@@ -1064,7 +1088,7 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
   /// the hold still reads the capture buffer and once its GPU copy is drawn (the
   /// copy carries both readings, as the live frame does).
   func testAHeldPictureReadsEveryStageAsTheLiveOneDoes() throws {
-    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let core = try requireMonitorGPU()
     let value = coordinator()
     let (presenter, host) = liveSurface(value)
     let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
@@ -1080,13 +1104,11 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     func draw() throws -> [SIMD4<Float>] {
       let work = try XCTUnwrap(presenter.renderWork(after: (.max, .max), force: true))
       let probe = MonitorCompletionProbe()
-      let context = try core.begin()
-      _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
-        context: context)
-      core.commit(context, completion: probe, kind: 1)
-      let deadline = Date().addingTimeInterval(5)
-      while probe.completed == 0 && Date() < deadline { usleep(200) }
-      XCTAssertEqual(probe.failed, 0)
+      try core.submit(completion: probe, kind: 1) { context in
+        _ = try loop.encode(work, feed: loop.drawingFeed(for: work, core: core), target: target, core: core,
+          context: context)
+      }
+      try probe.waitForCompletion(1, timeout: 5)
       var pixels = [SIMD4<Float>](repeating: SIMD4(repeating: 0), count: 48 * 16)
       target.getBytes(&pixels, bytesPerRow: 48 * 16, from: MTLRegionMake2D(0, 0, 48, 16), mipmapLevel: 0)
       return pixels

@@ -12,14 +12,18 @@ import XCTest
     let observation = DiscoveryObservation()
     var callbacks = fixture.callbacks(failure: { XCTFail($0) })
     callbacks.videoWithAdmission = { _, metadata, source, _ in
+      let expectedHostStart = metadata.presentationTime == .zero ? CMTimeSubtract(CMTime(value: 10, timescale: 1), VideoContract.fastDuration)
+        : CMTime(value: 20, timescale: 1)
+      XCTAssertEqual(metadata.presentationStartHostTime, expectedHostStart)
       observation.note(metadata.presentationTime, epoch: source.epochID)
       received.fulfill(); return true
     }
     fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: callbacks)
     try fixture.start(self)
     let original = fixture.source.context.epochID
-    try fixture.frame(.zero)
+    try fixture.frame(.zero, captured: CMTime(value: 10, timescale: 1), reference: .presentationEnd)
     XCTAssertTrue(fixture.source.submit(.event(.audioFormatChanged(.absent))))
+    CVBufferSetAttachment(fixture.image, DeviceAPI.captureHostTimeAttachmentKey as CFString, NSNumber(value: 20), .shouldPropagate)
     try fixture.frame(VideoContract.fastDuration)
     wait(for: [received], timeout: 1)
     XCTAssertEqual(observation.times, [.zero, VideoContract.fastDuration])
@@ -249,10 +253,10 @@ private final class DiscoveryFixture {
     controller.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(), pipelineEnabled: false, previewEnabled: false)
     test.wait(for: [ready], timeout: 1)
   }
-  func frame(_ time: CMTime) throws {
+  func frame(_ time: CMTime, captured: CMTime? = nil, reference: CaptureHostTimeReference = .presentationStart) throws {
     let context = source.context
     XCTAssertTrue(source.submit(.frame(CapturedPixelBuffer(immutable: image), CaptureFrameInfo(epochID: context.epochID,
-      formatSignature: context.formatSignature, presentationTime: time, duration: VideoContract.fastDuration, signalValid: true, timecode: nil))))
+      formatSignature: context.formatSignature, presentationTime: time, duration: VideoContract.fastDuration, signalValid: true, timecode: nil, hostTimeReference: reference, captureHostTime: captured))))
   }
   func resolveMappings() throws {
     let video = source.context

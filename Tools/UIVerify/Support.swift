@@ -152,10 +152,11 @@ struct AXNode {
   static func nodes(in root: NSObject, limit: Int = 6000) -> [AXNode] {
     var result: [AXNode] = []
     var queue: [(NSObject, Int)] = [(root, 0)]
-    var seen = Set<ObjectIdentifier>()
-    while !queue.isEmpty && result.count < limit {
-      let (object, depth) = queue.removeFirst()
-      guard seen.insert(ObjectIdentifier(object)).inserted else { continue }
+    var seen: Set<ObjectIdentifier> = [ObjectIdentifier(root)]
+    var next = 0
+    while next < queue.count && result.count < limit {
+      let (object, depth) = queue[next]
+      next += 1
       let value = read(object, "accessibilityValue")
       result.append(AXNode(label: read(object, "accessibilityLabel") as? String ?? "",
         title: read(object, "accessibilityTitle") as? String ?? "",
@@ -167,7 +168,10 @@ struct AXNode {
       // Outlines and tables (the sidebar List) expose their content as rows, not children.
       for key in ["accessibilityChildren", "accessibilityRows", "accessibilityChildrenInNavigationOrder"] {
         for child in read(object, key) as? [Any] ?? [] {
-          if let child = child as? NSObject { queue.append((child, depth + 1)) }
+          if queue.count == limit { break }
+          if let child = child as? NSObject, seen.insert(ObjectIdentifier(child)).inserted {
+            queue.append((child, depth + 1))
+          }
         }
       }
     }
@@ -194,10 +198,14 @@ struct AXNode {
   private static let writes = DispatchGroup()
   // One encoder thread: it overlaps rendering without competing with it for every core.
   private static let encoder = DispatchQueue(label: "ui-verify.png", qos: .utility)
+  private static let availableSlots = DispatchSemaphore(value: 3)
   nonisolated private static let writeFailures = Mutex<[String]>([])
   static func write(_ rep: NSBitmapImageRep, to url: URL) {
     nonisolated(unsafe) let image = rep
+    let slots = availableSlots
+    slots.wait()
     encoder.async(group: writes) {
+      defer { slots.signal() }
       do {
         guard let data = image.representation(using: .png, properties: [:]) else {
           throw CocoaError(.fileWriteUnknown)

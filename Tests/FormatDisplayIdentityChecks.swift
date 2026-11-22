@@ -67,7 +67,7 @@ import XCTest
 @MainActor
 @objcMembers final class StructuredFormatUILabelTests: XCTestCase {
   func testSourceTimecodeTitleDescribesNativePreservation() {
-    XCTAssertEqual(UITimecode.title(.source), "Source timecode")
+    XCTAssertEqual(UITimecode.title(.source), "Source Timecode")
     XCTAssertFalse(RecordingTimecodeMode.source.help.lowercased().contains("no timecode track"))
   }
 

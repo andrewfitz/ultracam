@@ -57,7 +57,7 @@ import XCTest
   func testTwoLevels() {
     let rolling = problems(separate([camera(1, signal: .noSignal, recording: .recording)]))
     XCTAssertEqual(rolling.map(\.level), [.damage], "Rolling damage")
-    XCTAssertEqual(problems(separate([camera(1, signal: .noSignal)])).map(\.level), [.notice], "Nothing on air or rolling")
+    XCTAssertTrue(problems(separate([camera(1, signal: .noSignal)])).isEmpty)
     XCTAssertEqual(problems(program([camera(1, signal: .noSignal), camera(2)])).map(\.level), [.damage], "On-air damage")
     var drive = separate([camera(1, recording: .recording)])
     drive.drives = [UIDrive(name: "8TB", availableBytes: 100, totalBytes: 1000, secondsLeft: 600)]
@@ -79,21 +79,47 @@ import XCTest
   }
 
   func testStatusBarLeadsWithTheWorstProblemAndItsAction() {
-    var session = separate([camera(1, signal: .noSignal), camera(2, signal: .unsupported("x"))])
+    var session = separate([camera(1, signal: .unsupported("x")), camera(2, signal: .unsupported("x"))])
     let bar = UIPresentationBuilder.session(session)
     XCTAssertEqual(bar.statusSegments.first?.kind, .warning)
-    XCTAssertEqual(bar.statusSegments.first?.text, "Camera 1: no signal  +1")
+    XCTAssertEqual(bar.statusSegments.first?.text, "Camera 1: unsupported format  +1")
     XCTAssertEqual(bar.statusSegments.first?.action?.title, "Details")
     XCTAssertEqual(bar.statusSegments.first?.level, .notice)
-    XCTAssertEqual(bar.problems.count, 2, "The bar, Attention and the menu bar render one list")
-    session.cameras = [camera(1)]
+    XCTAssertEqual(bar.problems.count, 2)
+    session.cameras = [camera(1, signal: .noSignal)]
     XCTAssertFalse(UIPresentationBuilder.session(session).statusSegments.contains { $0.kind == .warning })
   }
 
   func testOneCameraProblemStillReachesTheBar() {
-    let bar = UIPresentationBuilder.session(separate([camera(1, signal: .noSignal)]))
+    var used = camera(1, signal: .noSignal)
+    used.inUse = true
+    let bar = UIPresentationBuilder.session(separate([used]))
     XCTAssertEqual(bar.statusSegments.first?.text, "Camera 1: no signal", "One list everywhere, one camera or several")
     XCTAssertEqual(bar.menuBarIcon, .attention)
+    XCTAssertEqual(bar.problems.first?.level, .damage)
+  }
+
+  func testPoweringOffAnUnusedCameraKeepsItsSignalStatusLocal() {
+    var offline = camera(2, signal: .noSignal)
+    offline.signalLostFor = 20
+    offline.body = UICameraBody(name: "Body B", connected: false, lost: true, retrying: true)
+    var session = program([camera(1), offline])
+    XCTAssertTrue(problems(session).isEmpty)
+    XCTAssertEqual(UIPresentationBuilder.session(session).cameras[1].tileState, .signalLost)
+    XCTAssertEqual(UIPresentationBuilder.session(session).cameras[1].statusTone, .neutral)
+    XCTAssertEqual(UIPresentationBuilder.session(session).cameras[1].state, .inactive)
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(separate([offline])), .noSignal)
+
+    session.cameras[1].body?.retrying = false
+    XCTAssertTrue(problems(session).isEmpty, "A powered-off body stays quiet after retries finish")
+    session.cameras[1].signal = .live(format: "2160p 59.94")
+    XCTAssertEqual(problems(session).map(\.id), ["body.camera-2"], "Manual recovery is available when only control dropped")
+    session.cameras[1].body?.retrying = true
+    XCTAssertTrue(problems(session).isEmpty, "Hardware shows reconnect progress")
+
+    session.cameras[1].signal = .noSignal
+    session.cameras[1].recording.status = .paused
+    XCTAssertEqual(problems(session).map(\.id), ["signal.camera-2"])
   }
 
   func testStripRowShowsWhatToDoAndCountsWhenThereIsMore() throws {
@@ -125,7 +151,7 @@ import XCTest
     XCTAssertEqual(problem?.action, UIProblemAction(title: "Restart Camera", action: .restartCamera(cameraID: "camera-1")))
     var stopped = camera(1, running: false)
     stopped.clientWaiting = true
-    XCTAssertEqual(problems(separate([stopped])).first?.action, UIProblemAction(title: "Start", action: .startCamera(cameraID: "camera-1")))
+    XCTAssertEqual(problems(separate([stopped])).first?.action, UIProblemAction(title: "Start Capture", action: .startCamera(cameraID: "camera-1")))
   }
 
   func testConnectFailureOnlyWithAClientOrUnknown() {
@@ -181,18 +207,19 @@ import XCTest
   }
 
   /// Text that can land on a shared display: camera names and state, nothing else.
-  func testAlertTextIsMeetingSafe() {
+  func testAlertTextIsMeetingSafe() throws {
     var failed = camera(1)
     failed.recording.failed = true
     failed.recording.savedDuration = 1138
     failed.recording.folderPath = "/Volumes/Secret Client/Takes"
     var session = separate([failed])
     session.drives = [UIDrive(name: "Secret Client", availableBytes: 100, totalBytes: 1000, secondsLeft: 600)]
-    for problem in problems(session) {
-      let alert = problem.alert
-      XCTAssertNotNil(alert)
-      XCTAssertFalse((alert?.title ?? "").contains("Secret"), "\(problem.id)")
-      XCTAssertFalse((alert?.body ?? "").contains("Secret"), "\(problem.id)")
+    let list = problems(session)
+    for id in ["take.camera-1", "drive.Secret Client"] {
+      let problem = try XCTUnwrap(list.first { $0.id == id }, "Expected the \(id) problem")
+      let alert = try XCTUnwrap(problem.alert)
+      XCTAssertFalse(alert.title.contains("Secret"), id)
+      XCTAssertFalse(alert.body.contains("Secret"), id)
     }
   }
 }

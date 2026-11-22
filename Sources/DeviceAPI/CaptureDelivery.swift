@@ -62,6 +62,10 @@ struct CaptureFrameInfo: Sendable {
 }
 enum CaptureEvent: Sendable {
   case formatChanged(SourceFormat), audioFormatChanged(SourceAudioDeclaration)
+  /// A declared, independently clocked microphone may become temporarily
+  /// unavailable without changing the epoch. Resume immediately before the
+  /// first packet whose format and clock continuity have been verified.
+  case audioInterrupted(reason: String), audioResumed
   case clockMappingChanged(CaptureClockMappingUpdate)
   case discontinuity, waitingForSignal, signalLost(reason: String), unsupportedInput(String), fatal(String), info(String)
 }

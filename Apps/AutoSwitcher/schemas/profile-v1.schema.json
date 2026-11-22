@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ultracam-auto-switcher/profile-v1",
+  "type": "object",
+  "required": [
+    "anchor_camera_id",
+    "emphasis_camera_id"
+  ],
+  "properties": {
+    "anchor_camera_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "emphasis_camera_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "strategy": {
+      "enum": [
+        "talkingHead",
+        "timer",
+        "motion",
+        "eyeContact",
+        "provider",
+        "rules"
+      ]
+    },
+    "additional_targets": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "mode": {
+      "enum": [
+        "lowLatency",
+        "transcriptAssisted"
+      ]
+    },
+    "manual_hold": {
+      "type": "boolean"
+    },
+    "session_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "minimum_shot_duration": {
+      "type": "number",
+      "minimum": 0
+    },
+    "cooldown": {
+      "type": "number",
+      "minimum": 0
+    },
+    "emphasis_hold": {
+      "type": "number",
+      "minimum": 0
+    },
+    "soft_maximum_shot_duration": {
+      "type": "number",
+      "minimum": 0
+    },
+    "maximum_shot_duration": {
+      "type": "number",
+      "minimum": 0
+    },
+    "forced_cut_grace_period": {
+      "type": "number",
+      "minimum": 0
+    },
+    "forced_boundary_lookback": {
+      "type": "number",
+      "minimum": 0
+    },
+    "boundary_window": {
+      "type": "number",
+      "minimum": 0
+    },
+    "candidate_dwell": {
+      "type": "number",
+      "minimum": 0
+    },
+    "pause_boundary_duration": {
+      "type": "number",
+      "minimum": 0
+    },
+    "transcript_output_delay": {
+      "type": "number",
+      "minimum": 0
+    },
+    "transcript_confidence_threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "cut_threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "hysteresis_margin": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "target",
+          "all"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string"
+          },
+          "all": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "signal",
+                "minimum"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "signal": {
+                  "enum": [
+                    "motion",
+                    "eyeContact",
+                    "providerScore",
+                    "energy",
+                    "emphasis",
+                    "laughter",
+                    "pauseSeconds",
+                    "questionConfidence",
+                    "audioFeature"
+                  ]
+                },
+                "minimum": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

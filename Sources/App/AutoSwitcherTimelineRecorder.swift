@@ -24,7 +24,7 @@ struct AutoSwitcherAudioCue: Codable, Sendable {
   }
 }
 
-private struct AutoSwitcherTimelineTimebase: Codable {
+private struct AutoSwitcherTimelineTimebase: Codable, Sendable {
   var kind = "media"
   var units = "seconds"
   let timescale: Int32
@@ -32,7 +32,7 @@ private struct AutoSwitcherTimelineTimebase: Codable {
   var origin = "source_pts"
 }
 
-private struct AutoSwitcherTimelineConfig: Codable {
+private struct AutoSwitcherTimelineConfig: Codable, Sendable {
   let anchorCameraID: String
   let emphasisCameraID: String
   let minimumShotDuration: Double
@@ -76,7 +76,7 @@ private struct AutoSwitcherTimelineConfig: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineSource: Codable {
+private struct AutoSwitcherTimelineSource: Codable, Sendable {
   let cameraID: String
   let role: String
   var label: String?
@@ -95,7 +95,7 @@ private struct AutoSwitcherTimelineSource: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineRecording: Codable {
+private struct AutoSwitcherTimelineRecording: Codable, Sendable {
   let recordingID: UUID
   let cameraID: String
   let path: String
@@ -113,7 +113,7 @@ private struct AutoSwitcherTimelineRecording: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineInstruction: Codable {
+private struct AutoSwitcherTimelineInstruction: Codable, Sendable {
   let decisionID: UUID
   let sessionGeneration: UInt64
   let targetCameraID: String
@@ -137,7 +137,7 @@ private struct AutoSwitcherTimelineInstruction: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineOutput: Codable {
+private struct AutoSwitcherTimelineOutput: Codable, Sendable {
   let type: String
   let instruction: AutoSwitcherTimelineInstruction?
   let decisionID: UUID?
@@ -149,7 +149,7 @@ private struct AutoSwitcherTimelineOutput: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineObservation: Codable {
+private struct AutoSwitcherTimelineObservation: Codable, Sendable {
   let time: Double
   let camera_id: String
   let healthy: Bool
@@ -158,7 +158,7 @@ private struct AutoSwitcherTimelineObservation: Codable {
   var session_generation: UInt64 = 0
 }
 
-private struct AutoSwitcherTimelineEvent: Codable {
+private struct AutoSwitcherTimelineEvent: Codable, Sendable {
   let type: String
   let cue: AutoSwitcherAudioCue?
   let transcript: AutoSwitcherTranscriptCue?
@@ -224,7 +224,7 @@ private struct AutoSwitcherTimelineEvent: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineEventRecord: Codable {
+private struct AutoSwitcherTimelineEventRecord: Codable, Sendable {
   let sequence: UInt64
   let mediaTime: Double?
   let mediaTimeTicks: Int64?
@@ -239,7 +239,7 @@ private struct AutoSwitcherTimelineEventRecord: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineCut: Codable {
+private struct AutoSwitcherTimelineCut: Codable, Sendable {
   let decisionID: UUID?
   let sessionGeneration: UInt64
   let fromCameraID: String?
@@ -274,7 +274,7 @@ private struct AutoSwitcherTimelineCut: Codable {
   }
 }
 
-private struct AutoSwitcherTimelineDocument: Codable {
+private struct AutoSwitcherTimelineDocument: Codable, Sendable {
   let schemaVersion = 3
   let sessionID: UUID
   let mode: String
@@ -285,7 +285,6 @@ private struct AutoSwitcherTimelineDocument: Codable {
   let config: AutoSwitcherTimelineConfig
   var sources: [AutoSwitcherTimelineSource]
   var recordings: [AutoSwitcherTimelineRecording]
-  var events: [AutoSwitcherTimelineEventRecord]
   var eventsProcessed: Int
   var cuts: [AutoSwitcherTimelineCut]
   var instructions: [AutoSwitcherTimelineInstruction]
@@ -298,9 +297,68 @@ private struct AutoSwitcherTimelineDocument: Codable {
     case mode, timebase
     case startedAtUnixMS = "started_at_unix_ms"
     case endedAtUnixMS = "ended_at_unix_ms"
-    case duration, config, sources, recordings, events
+    case duration, config, sources, recordings
     case eventsProcessed = "events_processed"
     case cuts, instructions, statuses, metadata
+  }
+}
+
+// All mutable state is confined to queue, including writes for the old folder during a move.
+private final class AutoSwitcherTimelineWriter: @unchecked Sendable {
+  enum Result: Sendable {
+    case written
+    case failed(String, retryAt: DispatchTime)
+  }
+
+  let queue = DispatchQueue(label: "Ultracam.AutoSwitcherTimeline", qos: .utility)
+  private let encoder = JSONEncoder()
+  private var encodedEvents = Data()
+  private var eventEncodingError: (any Error)?
+  private var failure: (message: String, retryAt: DispatchTime)?
+  private var writtenRevision: UInt64?
+
+  init() {
+    encoder.outputFormatting = [.sortedKeys]
+  }
+
+  func write(_ document: AutoSwitcherTimelineDocument, events: [AutoSwitcherTimelineEventRecord],
+             to url: URL, folder: URL?, revision: UInt64, urgent: Bool) -> Result {
+    dispatchPrecondition(condition: .onQueue(queue))
+    // Transfer each batch once, even while the destination is unavailable.
+    if eventEncodingError == nil, !events.isEmpty {
+      do {
+        let batch = try encoder.encode(events)
+        if !encodedEvents.isEmpty { encodedEvents.append(0x2C) }
+        encodedEvents.append(contentsOf: batch.dropFirst().dropLast()) // strip array brackets
+      } catch {
+        eventEncodingError = error
+      }
+    }
+    if writtenRevision == revision { return .written }
+    if !urgent, let failure, DispatchTime.now() < failure.retryAt {
+      return .failed(failure.message, retryAt: failure.retryAt)
+    }
+    do {
+      if let eventEncodingError { throw eventEncodingError }
+      var data = try encoder.encode(document)
+      data.removeLast() // closing object brace
+      data.append(contentsOf: Data(",\"events\":[".utf8))
+      data.append(encodedEvents)
+      data.append(contentsOf: Data("]}\n".utf8))
+      let accessed = folder?.startAccessingSecurityScopedResource() ?? false
+      defer { if accessed { folder?.stopAccessingSecurityScopedResource() } }
+      try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+        withIntermediateDirectories: true)
+      try data.write(to: url, options: .atomic)
+      writtenRevision = revision
+      failure = nil
+      return .written
+    } catch {
+      let message = error.localizedDescription
+      let retryAt = DispatchTime.now() + .seconds(1)
+      failure = (message, retryAt)
+      return .failed(message, retryAt: retryAt)
+    }
   }
 }
 
@@ -321,7 +379,13 @@ final class AutoSwitcherTimelineRecorder {
   private var pending: [UUID: Int] = [:]
   private var recordingIDs: [FeedID: UUID] = [:]
   private var currentCameraID: FeedID
-  private var lastPersistedEventCount = 0
+  private let writer = AutoSwitcherTimelineWriter()
+  private var unsubmittedEvents: [AutoSwitcherTimelineEventRecord] = []
+  private var revision: UInt64 = 0
+  private var persistedRevision: UInt64?
+  private var inFlightRevision: UInt64?
+  private var retryAt: DispatchTime?
+  private var announcedError: String?
 
   init(settings: NaturalTalkingHeadSettings, anchor: FeedID, emphasis: FeedID,
        outputFolder: URL?) {
@@ -351,11 +415,11 @@ final class AutoSwitcherTimelineRecorder {
           mediaFile: nil, mediaStart: nil, mediaEnd: nil, timebase: timebase),
         AutoSwitcherTimelineSource(cameraID: emphasis.rawValue, role: "emphasis", label: nil,
           mediaFile: nil, mediaStart: nil, mediaEnd: nil, timebase: timebase),
-      ], recordings: [], events: [], eventsProcessed: 0, cuts: [], instructions: [],
+      ], recordings: [], eventsProcessed: 0, cuts: [], instructions: [],
       statuses: [], metadata: ["clock": "source_pts"])
     folder = outputFolder
     outputURL = Self.scoped(outputFolder) { Self.makeOutputURL(folder: outputFolder) }
-    persist(force: true)
+    persistImmediately(urgent: true)
   }
 
   func setOutputFolder(_ folder: URL?) {
@@ -364,10 +428,11 @@ final class AutoSwitcherTimelineRecorder {
       return
     }
     let nextURL = Self.scoped(folder) { Self.makeOutputURL(folder: folder) }
-    persist(force: true)
+    if persistedRevision != revision { persistImmediately(urgent: true) }
     self.folder = folder
     outputURL = nextURL
-    persist(force: true)
+    revision &+= 1
+    persistImmediately(urgent: true)
   }
 
   /// A recording folder restored from its bookmark grants nothing until access starts.
@@ -392,7 +457,7 @@ final class AutoSwitcherTimelineRecorder {
       event = AutoSwitcherTimelineEvent(type: "reset")
       time = nil
     case let .manualOverride(cameraID, seconds):
-      guard let timestamp = Self.timestamp(CMTime(seconds: seconds, preferredTimescale: 240_000)) else { return }
+      guard let timestamp = Self.timestamp(seconds: seconds) else { return }
       for index in pending.values where document.cuts.indices.contains(index) {
         document.cuts[index].status = "cancelled"
       }
@@ -414,13 +479,12 @@ final class AutoSwitcherTimelineRecorder {
         AutoSwitcherTimelineObservation(time: seconds, camera_id: cameraID, healthy: healthy))
       time = seconds
     }
-    let timestamp = time.flatMap { Self.timestamp(CMTime(seconds: $0, preferredTimescale: 240_000)) }
+    let timestamp = time.flatMap(Self.timestamp(seconds:))
     append(event: event, mediaTime: timestamp, outputs: [])
   }
 
   func recordAudioCue(_ cue: AutoSwitcherAudioCue) {
-    let timestamp = Self.timestamp(CMTime(seconds: cue.time, preferredTimescale: document.timebase.timescale))
-    guard let timestamp else { return }
+    guard let timestamp = Self.timestamp(seconds: cue.time) else { return }
     append(event: AutoSwitcherTimelineEvent(type: "audio", cue: cue,
       time: timestamp.seconds, timeTicks: timestamp.ticks, decisionID: nil,
       appliedAt: nil, appliedAtTicks: nil, cameraID: nil), mediaTime: timestamp,
@@ -436,9 +500,7 @@ final class AutoSwitcherTimelineRecorder {
   func recordTranscript(_ cue: AutoSwitcherTranscriptCue) {
     guard cue.end >= cue.start,
       cue.start.isFinite, cue.end.isFinite, cue.start >= 0 else { return }
-    let timestamp = Self.timestamp(CMTime(seconds: cue.end,
-      preferredTimescale: document.timebase.timescale))
-    guard let timestamp else { return }
+    guard let timestamp = Self.timestamp(seconds: cue.end) else { return }
     append(event: AutoSwitcherTimelineEvent(type: "transcript", transcript: cue,
       time: timestamp.seconds, timeTicks: timestamp.ticks, decisionID: nil,
       appliedAt: nil, appliedAtTicks: nil, cameraID: nil), mediaTime: timestamp,
@@ -487,8 +549,7 @@ final class AutoSwitcherTimelineRecorder {
     let event = AutoSwitcherTimelineEvent(type: "acknowledge", cue: nil,
       time: directorTime?.seconds, timeTicks: directorTime?.ticks, decisionID: decisionID,
       appliedAt: directorTime?.seconds, appliedAtTicks: directorTime?.ticks, cameraID: target.rawValue)
-    append(event: event, mediaTime: directorTime, outputs: [])
-    persist(force: true)
+    append(event: event, mediaTime: directorTime, outputs: [], checkpoint: true)
   }
 
   func recordExpired(decisionID: UUID) {
@@ -499,8 +560,7 @@ final class AutoSwitcherTimelineRecorder {
       decisionID: decisionID, message: nil)
     append(event: AutoSwitcherTimelineEvent(type: "directorOutput", cue: nil,
       time: nil, timeTicks: nil, decisionID: decisionID, appliedAt: nil,
-      appliedAtTicks: nil, cameraID: nil), mediaTime: nil, outputs: [output])
-    persist(force: true)
+      appliedAtTicks: nil, cameraID: nil), mediaTime: nil, outputs: [output], checkpoint: true)
   }
 
   func recordRejected(decisionID: UUID) {
@@ -508,8 +568,7 @@ final class AutoSwitcherTimelineRecorder {
       document.cuts[index].status = "rejected"
     }
     append(event: AutoSwitcherTimelineEvent(type: "reject", decisionID: decisionID),
-      mediaTime: nil, outputs: [])
-    persist(force: true)
+      mediaTime: nil, outputs: [], checkpoint: true)
   }
 
   func recordError(_ message: String) {
@@ -517,8 +576,7 @@ final class AutoSwitcherTimelineRecorder {
       decisionID: nil, message: message)
     append(event: AutoSwitcherTimelineEvent(type: "directorOutput", cue: nil,
       time: nil, timeTicks: nil, decisionID: nil, appliedAt: nil,
-      appliedAtTicks: nil, cameraID: nil), mediaTime: nil, outputs: [output])
-    persist(force: true)
+      appliedAtTicks: nil, cameraID: nil), mediaTime: nil, outputs: [output], checkpoint: true)
   }
 
   func recordingStarted(feedID: FeedID, url: URL, mediaStart: CMTime?) {
@@ -532,7 +590,8 @@ final class AutoSwitcherTimelineRecorder {
     document.sources[index].mediaFile = url.path
     document.sources[index].mediaStart = start?.seconds
     document.sources[index].mediaEnd = nil
-    persist(force: true)
+    revision &+= 1
+    persistImmediately(urgent: true)
   }
 
   func recordingFinished(feedID: FeedID, url: URL?, mediaEnd: CMTime?) {
@@ -543,16 +602,20 @@ final class AutoSwitcherTimelineRecorder {
     if let url { document.sources[source].mediaFile = url.path }
     document.sources[source].mediaEnd = document.recordings[index].mediaEnd
     recordingIDs.removeValue(forKey: feedID)
-    persist(force: true)
+    revision &+= 1
+    persistImmediately(urgent: true)
   }
 
   func finish() {
-    for index in pending.values where document.cuts.indices.contains(index) {
-      document.cuts[index].status = "cancelled"
+    if document.endedAtUnixMS == nil || !pending.isEmpty {
+      for index in pending.values where document.cuts.indices.contains(index) {
+        document.cuts[index].status = "cancelled"
+      }
+      pending.removeAll()
+      document.endedAtUnixMS = document.endedAtUnixMS ?? Self.unixMS()
+      revision &+= 1
     }
-    pending.removeAll()
-    document.endedAtUnixMS = Self.unixMS()
-    persist(force: true)
+    persistImmediately(urgent: true)
   }
 
   private func sourceIndex(for feedID: FeedID) -> Int {
@@ -563,7 +626,8 @@ final class AutoSwitcherTimelineRecorder {
     return document.sources.count - 1
   }
 
-  private func append(event: AutoSwitcherTimelineEvent, mediaTime: (seconds: Double, ticks: Int64)?, outputs: [AutoSwitcherTimelineOutput]) {
+  private func append(event: AutoSwitcherTimelineEvent, mediaTime: (seconds: Double, ticks: Int64)?,
+                      outputs: [AutoSwitcherTimelineOutput], checkpoint: Bool = false) {
     if event.type == "tick", let time = mediaTime?.seconds {
       if let last = lastDirectorMediaTime, time + 1e-6 < last {
         sessionGeneration = sessionGeneration == .max ? .max : sessionGeneration + 1
@@ -573,34 +637,73 @@ final class AutoSwitcherTimelineRecorder {
       lastDirectorMediaTime = max(lastDirectorMediaTime ?? time, time)
     }
     document.duration = max(document.duration, mediaTime?.seconds ?? 0)
-    document.events.append(AutoSwitcherTimelineEventRecord(sequence: nextSequence,
+    unsubmittedEvents.append(AutoSwitcherTimelineEventRecord(sequence: nextSequence,
       mediaTime: mediaTime?.seconds, mediaTimeTicks: mediaTime?.ticks, event: event, outputs: outputs))
     nextSequence &+= 1
-    document.eventsProcessed = document.events.count
-    maybePersist()
+    document.eventsProcessed += 1
+    revision &+= 1
+    if checkpoint { persistImmediately() }
+    else { maybePersist() }
+  }
+
+  private func takeEvents() -> [AutoSwitcherTimelineEventRecord] {
+    let events = unsubmittedEvents
+    unsubmittedEvents = []
+    return events
   }
 
   private func maybePersist() {
-    guard document.events.count - lastPersistedEventCount >= 30 else { return }
-    persist(force: false)
+    guard inFlightRevision == nil, !unsubmittedEvents.isEmpty else { return }
+    if let retryAt {
+      guard DispatchTime.now() >= retryAt else { return }
+    } else {
+      guard unsubmittedEvents.count >= 30 else { return }
+    }
+    let document = self.document
+    let events = takeEvents()
+    let url = outputURL
+    let folder = self.folder
+    let revision = self.revision
+    inFlightRevision = revision
+    writer.queue.async { [writer, weak self] in
+      let result = writer.write(document, events: events, to: url, folder: folder, revision: revision, urgent: false)
+      Task { @MainActor [weak self] in
+        guard let self, self.inFlightRevision == revision else { return }
+        self.inFlightRevision = nil
+        self.didPersist(result, revision: revision)
+        self.maybePersist()
+      }
+    }
   }
 
-  private func persist(force: Bool) {
-    guard force || document.events.count != lastPersistedEventCount else { return }
-    do {
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-      let data = try encoder.encode(document)
-      try Self.scoped(folder) {
-        try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(),
-          withIntermediateDirectories: true)
-        try data.write(to: outputURL, options: .atomic)
-      }
-      lastPersistedEventCount = document.events.count
-    } catch {
+  private func persistImmediately(urgent: Bool = false) {
+    if !urgent, let retryAt, DispatchTime.now() < retryAt { return }
+    // Drain any older checkpoint before publishing the newer snapshot.
+    let document = self.document
+    let events = takeEvents()
+    let url = outputURL
+    let folder = self.folder
+    inFlightRevision = nil
+    let result = writer.queue.sync {
+      writer.write(document, events: events, to: url, folder: folder, revision: revision, urgent: urgent)
+    }
+    didPersist(result, revision: revision)
+  }
+
+  private func didPersist(_ result: AutoSwitcherTimelineWriter.Result, revision: UInt64) {
+    switch result {
+    case .written:
+      persistedRevision = revision
+      retryAt = nil
+      announcedError = nil
+    case .failed(let message, let retryAt):
       // Recording remains usable if the optional sidecar cannot be written.
-      lastError = error.localizedDescription
-      onError?(lastError ?? "unknown timeline write error")
+      self.retryAt = retryAt
+      lastError = message
+      if announcedError != message, let onError {
+        announcedError = message
+        onError(message)
+      }
     }
   }
 
@@ -635,6 +738,11 @@ final class AutoSwitcherTimelineRecorder {
     guard seconds.isFinite, seconds >= 0 else { return nil }
     let projected = CMTimeConvertScale(time, timescale: 240_000, method: .roundHalfAwayFromZero)
     guard projected.isValid, projected.isNumeric, projected.value >= 0 else { return nil }
+    return (seconds, projected.value)
+  }
+
+  private static func timestamp(seconds: Double) -> (seconds: Double, ticks: Int64)? {
+    guard let projected = AutoSwitcherBridge.instructionTime(seconds: seconds) else { return nil }
     return (seconds, projected.value)
   }
 

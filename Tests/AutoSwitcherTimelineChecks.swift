@@ -3,6 +3,71 @@ import Foundation
 import XCTest
 
 @MainActor @objcMembers final class AutoSwitcherTimelineChecks: XCTestCase {
+  func testPeriodicCheckpointAndFolderMovePreserveOrderedEvents() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B"), outputFolder: root)
+    let oldURL = recorder.outputFileURL
+    func snapshot(at url: URL) throws -> (count: Int, sequence: [Int], ended: Bool) {
+      let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+      let events = try XCTUnwrap(object["events"] as? [[String: Any]])
+      return (try XCTUnwrap(object["events_processed"] as? Int),
+        events.compactMap { $0["sequence"] as? Int }, object["ended_at_unix_ms"] != nil)
+    }
+
+    for frame in 1...29 { recorder.recordTick(time: CMTime(value: Int64(frame), timescale: 30)) }
+    XCTAssertEqual(try snapshot(at: oldURL).count, 0)
+    recorder.recordTick(time: CMTime(value: 30, timescale: 30))
+    let deadline = ContinuousClock.now + .seconds(5)
+    while try snapshot(at: oldURL).count == 0, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    XCTAssertEqual(try snapshot(at: oldURL).sequence, Array(1...30))
+
+    for frame in 31...63 { recorder.recordTick(time: CMTime(value: Int64(frame), timescale: 30)) }
+    recorder.setOutputFolder(root.appendingPathComponent("moved"))
+    recorder.recordTick(time: CMTime(value: 64, timescale: 30))
+    recorder.finish()
+    XCTAssertEqual(try snapshot(at: oldURL).sequence, Array(1...63))
+    XCTAssertFalse(try snapshot(at: oldURL).ended)
+    let final = try snapshot(at: recorder.outputFileURL)
+    XCTAssertEqual(final.count, 64)
+    XCTAssertEqual(final.sequence, Array(1...64))
+    XCTAssertTrue(final.ended)
+    let attributes = try FileManager.default.attributesOfItem(atPath: recorder.outputFileURL.path)
+    recorder.finish()
+    let afterRepeatFinish = try FileManager.default.attributesOfItem(atPath: recorder.outputFileURL.path)
+    XCTAssertEqual(attributes[.systemFileNumber] as? NSNumber,
+      afterRepeatFinish[.systemFileNumber] as? NSNumber)
+  }
+
+  func testWriteFailureBacksOffAndFinishRecoversBufferedEvents() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B"), outputFolder: root)
+    let url = recorder.outputFileURL
+    try FileManager.default.removeItem(at: root)
+    try Data().write(to: root)
+    var errors: [String] = []
+    recorder.onError = { errors.append($0) }
+    recorder.recordError("starts a checkpoint")
+    XCTAssertEqual(errors.count, 1)
+
+    try FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    for frame in 1...60 { recorder.recordTick(time: CMTime(value: Int64(frame), timescale: 30)) }
+    recorder.recordError("checkpoint during backoff")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    recorder.finish()
+    XCTAssertEqual(errors.count, 1)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+    let events = try XCTUnwrap(object["events"] as? [[String: Any]])
+    XCTAssertEqual(events.compactMap { $0["sequence"] as? Int }, Array(1...62))
+    XCTAssertNotNil(object["ended_at_unix_ms"])
+  }
+
   func testTimelinePersistsExactTicksAndAppliedProgramCut() throws {
     var settings = NaturalTalkingHeadSettings()
     settings.maximumShotDuration = 30
@@ -113,6 +178,27 @@ import XCTest
     let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
     let events = try XCTUnwrap(object["events"] as? [[String: Any]])
     XCTAssertEqual(events.compactMap { $0["media_time_ticks"] as? Int64 }, [10_010, 20_020, 10_010_000_000])
+  }
+
+  func testTimelineRoundsDirectorSecondsToNearestTick() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B"), outputFolder: folder)
+    let seconds = 59.0 / 240_000
+    recorder.recordControlEvent(.manualOverride(cameraID: "B", time: seconds))
+    recorder.recordAudioCue(AutoSwitcherAudioCue(id: 1, time: seconds,
+      duration: 0.02, speechEnergy: 0, pauseDuration: 0, emphasis: 0, laughter: 0,
+      speechStart: false, speechStop: false, sessionGeneration: 1))
+    recorder.recordTranscript(AutoSwitcherTranscriptCue(segmentID: "s", revision: 0,
+      start: 0, end: seconds, kind: "sentenceEnd", confidence: 1, isFinal: true, sessionGeneration: 1))
+    recorder.finish()
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
+    let events = try XCTUnwrap(object["events"] as? [[String: Any]])
+    XCTAssertEqual(events.compactMap { $0["media_time_ticks"] as? Int }, [59, 59, 59, 59])
+    for event in events {
+      XCTAssertEqual(try XCTUnwrap(event["media_time"] as? Double), seconds, accuracy: 1e-18)
+    }
   }
 
   func testClockRebaseControlInputsArePersistedInOrder() throws {

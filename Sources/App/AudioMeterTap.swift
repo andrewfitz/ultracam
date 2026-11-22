@@ -255,8 +255,15 @@ final class AudioMeterTap: @unchecked Sendable {
   /// the capture control queue, never the driver thread.
   func configure(format: SourceAudioFormat) throws {
     let candidate = try AudioMeter(configuration: Self.configuration(for: format, take: false))
-    let changed = sessions.withLock { state -> Bool in
+    let changed = try sessions.withLock { state -> Bool in
       guard state.format != format else { return false }
+      try take.withLock { take in
+        guard let current = take, !current.inputClosed,
+          head.load(ordering: .acquiring) == current.startPacket else { return }
+        // A cold take can begin before the first PCM declaration. Install the
+        // declared layout before the first packet, preserving the take identity.
+        take?.meter = try AudioMeter(configuration: Self.configuration(for: format, take: true))
+      }
       state.format = format
       if viewers.load(ordering: .relaxed) > 0 { requestSession(candidate, state: &state) }
       return true
@@ -744,6 +751,15 @@ final class AudioMeterTap: @unchecked Sendable {
     }
   }
 
+  /// Retire the live display so it clears even if no more packets arrive.
+  /// The take metering session keeps its totals and primes at the returning PCM.
+  func noteInterruption() {
+    noteGap()
+    sessions.withLock { sessions in
+      if viewers.load(ordering: .relaxed) > 0 { startSession(&sessions) }
+    }
+  }
+
   // MARK: Channels shown
 
   /// The channels the highest pair that has carried signal covers since the capture started,
@@ -787,21 +803,23 @@ final class AudioMeterTap: @unchecked Sendable {
   /// show from here is the take. Main thread. A second call during a take
   /// starts it over.
   func beginTake() {
-    let meter: AudioMeter
-    do {
-      let format = sessions.withLock { $0.format }
-      meter = try AudioMeter(configuration: format.map { try Self.configuration(for: $0, take: true) } ?? Self.takeConfiguration)
-    } catch {
-      preconditionFailure("The take meter configuration is invalid: \(error)")
+    let restarted = sessions.withLock { sessions in
+      let meter: AudioMeter
+      do {
+        let configuration = try sessions.format.map { try Self.configuration(for: $0, take: true) } ?? Self.takeConfiguration
+        meter = try AudioMeter(configuration: configuration)
+      } catch {
+        preconditionFailure("The take meter configuration is invalid: \(error)")
+      }
+      let start = head.load(ordering: .acquiring)
+      let number = takeNumbers.add(1, ordering: .relaxed).newValue
+      return take.withLock { state in
+        let running = state != nil
+        state = TakeState(meter: meter, number: number, startPacket: start)
+        measuringTake.store(number, ordering: .releasing)
+        return running
+      }
     }
-    let start = head.load(ordering: .acquiring)
-    let number = takeNumbers.add(1, ordering: .relaxed).newValue
-    let restarted = take.withLock { state -> Bool in
-      let running = state != nil
-      state = TakeState(meter: meter, number: number, startPacket: start)
-      return running
-    }
-    measuringTake.store(number, ordering: .releasing)
     // The take keeps the stream metered; a restart already holds its viewer.
     let live = restarted ? self.meter : attach()
     live?.resetPeaks()
@@ -814,8 +832,17 @@ final class AudioMeterTap: @unchecked Sendable {
   /// in again on resume. Main thread; a no-op without a take.
   func pauseTake(_ paused: Bool) {
     take.withLock { state in
-      state?.paused = paused
-      measuringTake.store(paused ? 0 : (state?.number ?? 0), ordering: .releasing)
+      guard let current = state, !current.inputClosed else { return }
+      measuringTake.store(paused ? 0 : current.number, ordering: .releasing)
+    }
+  }
+
+  /// Close take input at the recording boundary. Packets already tagged for
+  /// this take still drain into it while the writer finalizes.
+  func closeTakeInput() {
+    take.withLock { state in
+      state?.inputClosed = true
+      measuringTake.store(0, ordering: .releasing)
     }
   }
 

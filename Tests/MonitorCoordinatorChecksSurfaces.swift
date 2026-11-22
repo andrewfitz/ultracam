@@ -83,8 +83,6 @@ extension MonitorCoordinatorChecks {
       sequence: sequence)
   }
 
-  private var portedHasGPU: Bool { (try? MonitorCoordinator.sharedGPU.core()) != nil }
-
   /// Runs the main run loop until `condition` holds or `seconds` pass.
   @discardableResult
   private func portedWait(_ seconds: Double = 3, until condition: () -> Bool) -> Bool {
@@ -156,7 +154,7 @@ extension MonitorCoordinatorChecks {
   /// tools and signal; another surface of the same feed takes the new frame, tools
   /// and signal. After unfreezing, the hold stays until the next live frame.
   func testFreezeAndCleanKeepTheHeldToolsAndLeaveTheOtherSurfaceLive() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     let value = portedCoordinator()
     var tools = value.preferences(for: portedAlpha)
     tools.toolsEnabled = true
@@ -269,7 +267,7 @@ extension MonitorCoordinatorChecks {
   /// buffer. A surface that stops being drawable drops its waiting frame, and frames
   /// replaced while hidden are not counted as superseded.
   func testFreezeAndHiddenSurfacesHoldNoCaptureBuffer() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     let gpu = MonitorCoordinator.sharedGPU
     let host = MonitorFeedHost(target: portedAlpha.rawValue, gpu: gpu)
     let presenter = MonitorSurfacePresenter(target: portedAlpha, host: host, gpu: gpu)
@@ -311,7 +309,7 @@ extension MonitorCoordinatorChecks {
   /// satisfied but the interface has not shown yet; another surface is untouched,
   /// and cancelling never ends a freeze that is already shown.
   func testCancelWinsOverAnAdmittedButUnpublishedPendingFreeze() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     let value = portedCoordinator()
     let (presenter, host, _) = portedSurface(value, portedAlpha)
     let (other, otherHost, _) = portedSurface(value, portedBeta)
@@ -516,7 +514,7 @@ extension MonitorCoordinatorChecks {
   /// MonitorToolsUITests:750. A picture whose window cannot be seen starts with its
   /// display link paused, and draws once the view becomes drawable.
   func testDisplayLinkStartsPausedWhileTheWindowCannotBeSeen() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     let gpu = MonitorCoordinator.sharedGPU
     let host = MonitorFeedHost(target: portedAlpha.rawValue, gpu: gpu)
     let presenter = MonitorSurfacePresenter(target: portedAlpha, host: host, gpu: gpu)
@@ -551,7 +549,7 @@ extension MonitorCoordinatorChecks {
   /// loop: Rec.709 SDR to start, EDR for HLG, back to SDR with the EDR metadata
   /// cleared, and declared log or untagged pictures stay Rec.709 code values.
   func testPictureLayerPresentationFollowsSignalColorimetry() throws {
-    guard let core = try? MonitorCoordinator.sharedGPU.core() else { throw XCTSkip("No Metal 4 device") }
+    let core = try requireMonitorGPU()
     let value = portedCoordinator()
     let (presenter, _, _) = portedSurface(value, portedAlpha)
     let picture = try XCTUnwrap(presenter.makeView() as? MonitorPictureNSView)
@@ -592,7 +590,7 @@ extension MonitorCoordinatorChecks {
   /// the picture layer to half-float EDR in the HLG colour space, and a Rec.709
   /// frame switches it back.
   func testDrawnHLGFrameSwitchesThePictureLayerToEDR() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
     defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
     let value = portedCoordinator()
@@ -643,7 +641,7 @@ extension MonitorCoordinatorChecks {
   /// scope while the other keeps updating; after unfreezing it holds until the
   /// next live frame.
   func testNativeFrozenCleanScopePairStaysFixedWhileOtherWindowContinues() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
     defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
     let value = portedCoordinator()
@@ -733,7 +731,7 @@ extension MonitorCoordinatorChecks {
   /// drawables, and a drawn scope reports its GPU interval to the context's timing
   /// hook and to the surface statistics.
   func testScopePresentationReportsItsGPUInterval() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
     defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
     let timing = PortedGPUTimingProbe()
@@ -931,7 +929,7 @@ extension MonitorCoordinatorChecks {
   /// frames independently: each shows its own feed's newest frame, live, with the
   /// feed's tools.
   func testFourUpNativeHostingShowsEverySurface() throws {
-    guard portedHasGPU else { throw XCTSkip("No Metal 4 device") }
+    _ = try requireMonitorGPU()
     MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = true
     defer { MonitorVisibilityNSView.treatsPresentedViewsAsDrawable = false }
     let names = ["tile-0", "tile-1", "tile-2", "tile-3"]

@@ -13,7 +13,7 @@ smoke_root="$external_root/agent-work/build/ultracam/recording-recovery/$run_id"
 mkdir -p "$TMPDIR" "$smoke_root/modules"
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos26.0 \
   -module-cache-path "$smoke_root/modules" \
-  "$task_root/Sources/Shared/SourceFormat.swift" "$task_root/Sources/Shared/SourceSize.swift" "$task_root/Sources/Shared/SourceAdmission.swift" "$task_root/Sources/Shared/VideoContract.swift" \
+  "$task_root/Sources/Shared/SourceFormat.swift" "$task_root/Sources/Shared/SourceSize.swift" "$task_root/Sources/Shared/SourceAdmission.swift" "$task_root/Sources/Shared/VideoContract.swift" "$task_root/Sources/Shared/VideoOutputOptions.swift" \
   "$task_root/Sources/Shared/VideoBufferLayout.swift" \
   "$task_root/Sources/Shared/RecordingTimebase.swift" "$task_root/Sources/Shared/VariableFrameTimeline.swift" \
   "$task_root/Sources/Shared/AudioVideoClockMapping.swift" "$task_root/Sources/Shared/MediaRetention.swift" \

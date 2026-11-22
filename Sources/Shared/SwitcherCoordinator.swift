@@ -115,7 +115,7 @@ struct SwitcherCoordinator {
   private(set) var selectedFeedID: FeedID?
   private(set) var programOutput: ProgramOutput<FeedID>
 
-  private var fixedIntervalOrigin: TimeInterval?
+  private var fixedIntervalOrigin = Double.nan
   private var automaticRequestPending = false
   /// The most recent cut dropped without landing, kept until the route
   /// reports it. The scheduler reports each one once.
@@ -240,7 +240,7 @@ struct SwitcherCoordinator {
     if changed {
       cancelPendingCut()
     }
-    fixedIntervalOrigin = nil
+    fixedIntervalOrigin = .nan
     automaticRequestPending = false
     reconcilePendingState()
   }
@@ -285,30 +285,15 @@ struct SwitcherCoordinator {
     programOutput.expirePendingCutIfNeeded()
     reconcilePendingState()
     guard settings.automatic, settings.strategy == .fixedInterval else { return .idle }
-    // Hold: Auto stays on and makes no cuts, whatever the strategy. The interval starts
-    // again from release, so the held shot gets a full one after it.
-    guard !settings.naturalTalkingHead.manualHold else {
-      fixedIntervalOrigin = now
-      return .idle
-    }
-    guard !automaticRequestPending, !programOutput.hasPendingCut else { return .idle }
-
-    // The media clock starts over when its camera's stream restarts or the clock moves to
-    // another camera. An origin ahead of now would hold every cut until the new clock caught up.
-    if let origin = fixedIntervalOrigin, now < origin { fixedIntervalOrigin = nil }
-    if fixedIntervalOrigin == nil {
-      fixedIntervalOrigin = now
-      return .idle
-    }
-    let interval = max(settings.intervalSeconds.isFinite ? settings.intervalSeconds : 0, 0.001)
-    guard now - (fixedIntervalOrigin ?? now) >= interval else { return .idle }
-
-    guard let target = nextHealthyFeed(after: selectedFeedID) else {
-      fixedIntervalOrigin = now
-      return .noHealthyFeed
-    }
+    let health: [UInt8] = feedIDs.map { isFeedHealthy($0) ? 1 : 0 }
+    let current = selectedFeedID.flatMap { feedIDs.firstIndex(of: $0) } ?? -1
+    let index = auto_switcher_interval(&fixedIntervalOrigin, now, settings.intervalSeconds,
+      settings.naturalTalkingHead.manualHold, automaticRequestPending || programOutput.hasPendingCut,
+      health, health.count, current)
+    if index == -2 { return .noHealthyFeed }
+    guard feedIDs.indices.contains(index) else { return .idle }
+    let target = feedIDs[index]
     let result = programOutput.requestCut(to: target)
-    fixedIntervalOrigin = now
     guard case .queued = result else { return .idle }
     automaticRequestPending = true
     return .cutQueued(target)
@@ -378,7 +363,7 @@ struct SwitcherCoordinator {
     }
     abandonedCut = nil
     _ = programOutput.takeAbandonedCut()
-    fixedIntervalOrigin = nil
+    fixedIntervalOrigin = .nan
     automaticRequestPending = false
   }
 
@@ -399,16 +384,6 @@ struct SwitcherCoordinator {
   mutating func expirePendingCutIfNeeded() {
     programOutput.expirePendingCutIfNeeded()
     reconcilePendingState()
-  }
-
-  private func nextHealthyFeed(after feedID: FeedID?) -> FeedID? {
-    guard !feedIDs.isEmpty else { return nil }
-    let start = feedID.flatMap { feedIDs.firstIndex(of: $0) } ?? -1
-    for offset in 1...feedIDs.count {
-      let candidate = feedIDs[(start + offset) % feedIDs.count]
-      if candidate != feedID, isFeedHealthy(candidate) { return candidate }
-    }
-    return nil
   }
 
   private static func unique(_ ids: [FeedID]) -> [FeedID] {

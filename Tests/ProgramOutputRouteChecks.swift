@@ -1126,8 +1126,8 @@ import XCTest
     route.setOutput(contract: nil, active: false)
     let events = EventLog()
     route.onEvent = { events.append($0) }
-    var monitored = 0
-    route.onMonitorFrame = { _, _, _, _, _ in monitored += 1 }
+    var monitorCuts: [Bool] = []
+    route.onMonitorFrame = { _, _, _, _, cut in monitorCuts.append(cut) }
     route.setSourceHealth(a, healthy: true)
     route.setSourceHealth(b, healthy: true)
     let time = { (index: Int64) in CMTime(value: index, timescale: 30) }
@@ -1146,13 +1146,18 @@ import XCTest
     let deadline = Date().addingTimeInterval(1)
     while events.applied.isEmpty, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
     XCTAssertEqual(events.applied, [b], "Logged and timed like any cut")
-    XCTAssertEqual(monitored, 0, "No frame to show")
+    XCTAssertTrue(monitorCuts.isEmpty, "No frame to show")
     XCTAssertEqual(route.statistics.published, 0)
     XCTAssertEqual(route.statistics.accepted, 3)
     XCTAssertEqual(route.statistics.withoutConsumer, 3)
     route.setSourceLive(b, live: false)
     route.observe(fromCapture: a, presentationTime: time(2), duration: duration)
     XCTAssertEqual(route.statistics.accepted, 3, "A stopped source takes no new frames")
+    route.setSourceLive(b, live: true)
+    let image = try frame(b, at: 0).payload
+    route.ingest(fromCapture: b, frame: processed(image, at: 5))
+    route.ingest(fromCapture: b, frame: processed(image, at: 6))
+    XCTAssertEqual(monitorCuts, [true, false], "The first visible frame carries the cut")
   }
 
   /// An add invalidates nothing, so nothing on its way to a client goes, and neither does

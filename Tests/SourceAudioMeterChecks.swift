@@ -85,6 +85,49 @@ import XCTest
     XCTAssertEqual(tap.viewerCount, 0)
   }
 
+  func testInterruptionClearsLiveMeterAndPreservesTakeMeter() throws {
+    let tap = AudioMeterTap()
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    try tap.configure(format: format)
+    let attachment = AudioMeterTap.Attachment(tap: tap)
+    tap.beginTake()
+    let bytes = [Float](repeating: 0.4, count: 24_000).withUnsafeBytes { Data($0) }
+    let before = try CaptureAudioPacket(planes: [bytes], sampleFrameCount: 24_000, format: format, packetTime: .zero)
+    tap.ingest(before)
+    tap.waitUntilMetered()
+    let priorMeter = try XCTUnwrap(attachment.meter)
+    priorMeter.flush()
+    XCTAssertEqual(priorMeter.snapshot().frameCount, 24_000)
+    let beforeGap = tap.takeSummarySoFar()
+    tap.noteInterruption()
+    XCTAssertFalse(priorMeter === attachment.meter)
+    XCTAssertEqual(attachment.meter?.snapshot().frameCount, 0)
+    XCTAssertEqual(tap.takeSummarySoFar()?.duration, beforeGap?.duration)
+    let resumed = try CaptureAudioPacket(planes: [bytes], sampleFrameCount: 24_000,
+      format: format, packetTime: CMTime(value: 4, timescale: 1))
+    tap.ingest(resumed)
+    tap.waitUntilMetered()
+    XCTAssertTrue(try XCTUnwrap(tap.endTake()).duration >= 1)
+  }
+
+  func testColdTakeAdoptsFirstPCMDeclarationBeforeMetering() throws {
+    let tap = AudioMeterTap()
+    tap.beginTake()
+    let format = try SourceAudioFormat(sampleRate: 44_100, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    try tap.configure(format: format)
+    let bytes = [Float](repeating: 0.4, count: 4_410).withUnsafeBytes { Data($0) }
+    let packet = try CaptureAudioPacket(planes: [bytes], sampleFrameCount: 4_410, format: format, packetTime: .zero)
+    tap.ingest(packet)
+    tap.waitUntilMetered()
+    let changed = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    try tap.configure(format: changed)
+    XCTAssertEqual(try XCTUnwrap(tap.endTake()).duration, 0.1, accuracy: 0.000001,
+      "A late first declaration configures the take and a later change preserves its existing measurements")
+  }
+
   func testStableAttachmentFollowsDeclarationWithoutAddingViewers() throws {
     let tap = AudioMeterTap()
     let attachment = AudioMeterTap.Attachment(tap: tap)
@@ -387,6 +430,25 @@ import XCTest
     }
   }
 
+  func testPCMPacketOwnsBytesFromEveryPlane() throws {
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .int16,
+      interleaved: false, layout: AudioChannelMap(), clock: .hostTime)
+    let frames = 64
+    let left = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
+    let right = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
+    defer { left.deallocate(); right.deallocate() }
+    left.initialize(repeating: 16_384, count: frames)
+    right.initialize(repeating: -16_384, count: frames)
+    let planes = [left, right].map {
+      Data(bytesNoCopy: $0, count: frames * MemoryLayout<Int16>.size, deallocator: .none)
+    }
+    let packet = try CaptureAudioPacket(planes: planes, sampleFrameCount: frames,
+      format: format, packetTime: .zero)
+    left[0] = 0
+    right[0] = 0
+    XCTAssertEqual(Array(SourceAudioMeterInput.interleavedSamples(packet).prefix(2)), [0.5, -0.5])
+  }
+
   func testNativeIntegerPacketsMatchConvertedMetersDisplaysAndTakes() throws {
     let frames = 19_200
     for sample in [AudioSampleType.int16, .int32] {
@@ -482,7 +544,7 @@ import XCTest
   }
 
   func testAutoSwitchActivityIncludesChannelsBeyondStereo() {
-    let result = SourceAudioMeterInput.activity(peaks: [0, 0, 0.8], rms: [0, 0, 0.4])
+    let result = SourceAudioMeterInput.activity(peaks: [.nan, -.infinity, 0.8], rms: [-1, .infinity, 0.4])
     XCTAssertEqual(result.peak, 0.8, accuracy: 0.0001)
     XCTAssertEqual(result.rms, 0.4, accuracy: 0.0001)
   }

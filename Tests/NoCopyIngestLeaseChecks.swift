@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 @objcMembers final class NoCopyIngestLeaseChecks: XCTestCase {
@@ -31,6 +32,23 @@ import XCTest
     XCTAssertFalse(released)
     completion?()
     XCTAssertTrue(released)
+  }
+
+  func testCompletionReleasesCapturedFrameOwnerWhileLeaseRemainsAlive() throws {
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: 4096, alignment: 4096)
+    defer { raw.deallocate() }
+    let allocation = NoCopyIngestAllocation(baseAddress: raw, length: 4096, generation: 1)
+    var owner: NSObject? = NSObject()
+    weak let retainedOwner = owner
+    let lease = try NoCopyIngestLease(pointer: raw, length: 32, allocation: allocation,
+      inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) },
+      frameRelease: { [owner] in withExtendedLifetime(owner) {} },
+      onGPUResourcesReleased: { XCTAssertNotNil(retainedOwner) })
+    owner = nil
+    XCTAssertNotNil(retainedOwner)
+    lease.completeGPU()
+    XCTAssertNil(retainedOwner)
+    XCTAssertEqual(lease.byteLength, 32)
   }
 
   func testPointerOnlyInputIsRejected() {

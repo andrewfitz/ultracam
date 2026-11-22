@@ -146,7 +146,7 @@ struct UIBatteryGlyph: View {
 /// A camera's number: the same digit the toolbar's cut button and ⌃n use.
 struct UINumberCapsule: View {
   let number: Int
-  /// On a picture: the 24 pt dark capsule. Otherwise the small chip of sidebar rows.
+  /// On a picture: the 24 pt dark capsule. Otherwise the small chip of list rows.
   var onPicture = false
 
   var body: some View {

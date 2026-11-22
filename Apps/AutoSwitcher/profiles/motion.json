@@ -1,0 +1,7 @@
+{
+  "anchor_camera_id": "A",
+  "emphasis_camera_id": "B",
+  "strategy": "motion",
+  "cut_threshold": 0.12,
+  "hysteresis_margin": 0.06
+}

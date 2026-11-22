@@ -56,6 +56,32 @@ import XCTest
       read: { (format, 59.94) }), "With nobody else holding the device, what was set has to stick")
   }
 
+  func testUnsupportedCadenceLeavesInstalledContractUntouched() throws {
+    let format = try format()
+    XCTAssertThrowsError(try CameraSink.negotiateInstalledContract(format: format,
+      duration: CMTime(value: 1, timescale: 90), controlled: { false },
+      set: { XCTFail("Unsupported cadence must be rejected before writing format or rate") },
+      read: {
+        XCTFail("Unsupported cadence needs no readback")
+        return (format, 60_000.0 / 1001)
+      }))
+  }
+
+  func testProgramSinkNegotiatesTheCadenceTheBridgeSends() throws {
+    var configuration = PipelineConfiguration()
+    configuration.sourceDuration = FrameRateTarget.fps23976.duration
+    configuration.frameRateTarget = .fps2997
+    configuration.reduceFrameRate = true
+    let pixels = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    let program = CameraSink(route: CameraSinkRoute(descriptor: .program()))
+    let feed = CameraSink(feedID: .primary)
+    let programContract = try program.outputContract(configuration: configuration, passthroughFormat: pixels, sourceFormat: nil)
+    let feedContract = try feed.outputContract(configuration: configuration, passthroughFormat: pixels, sourceFormat: nil)
+
+    XCTAssertEqual(programContract.duration, FrameRateTarget.fps2997.duration)
+    XCTAssertEqual(feedContract.duration, FrameRateTarget.fps23976.duration)
+  }
+
   func testControlAcquiredDuringSetterRequiresReadback() throws {
     let format = try format()
     var busy = false

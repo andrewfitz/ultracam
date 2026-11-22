@@ -66,7 +66,7 @@ import XCTest
     XCTAssertEqual(configuration.width, 1440)
     XCTAssertEqual(configuration.height, 1080)
     XCTAssertEqual(configuration.duration, CMTime(value: 1, timescale: 25))
-    XCTAssertFalse(configuration.untouched, "Non-square pixels need aspect conversion")
+    XCTAssertTrue(configuration.untouched, "Native output preserves non-square pixel aspect")
   }
 
   func testSourceTargetMapsPortraitToPublishedCanvas() {
@@ -94,14 +94,15 @@ import XCTest
     XCTAssertEqual(output.width, 1280); XCTAssertEqual(output.height, 720)
   }
 
-  func testUntouchedComparesActualSizeAndCadence() {
+  func testUntouchedComparesPixelEffectsIndependentlyOfCadence() {
     var configuration = PipelineConfiguration(convertTo420: false, resizeTarget: .uhd4K,
       sourceWidth: 1920, sourceHeight: 1080)
     XCTAssertFalse(configuration.untouched)
     configuration.resizeTarget = .hd1080
     XCTAssertTrue(configuration.untouched)
     configuration.reduceFrameRate = true
-    XCTAssertFalse(configuration.untouched)
+    XCTAssertTrue(configuration.untouched)
+    XCTAssertEqual(configuration.duration, VideoContract.slowDuration)
     configuration.sourceDuration = VideoContract.slowDuration
     XCTAssertTrue(configuration.untouched)
   }

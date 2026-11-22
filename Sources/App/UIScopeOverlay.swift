@@ -214,18 +214,18 @@ struct UIScopeCard<Scope: View>: View {
 
   private var header: some View {
     HStack(spacing: 6) {
-      Text(description.title).font(.caption).foregroundStyle(.white.opacity(0.85)).lineLimit(1)
+      Text(description.title).font(.uiOverlay).foregroundStyle(.white.opacity(0.85)).lineLimit(1)
       Spacer(minLength: 4)
-      Button(action: onPopOut) { Image(systemName: UISymbol.scopePopOut) }
+      Button(action: onPopOut) { Image(systemName: UISymbol.scopePopOut).frame(width: 24, height: 24).contentShape(Rectangle()) }
         .help("Open this scope in its own window")
         .accessibilityLabel("Pop Out")
-      Button(action: onHide) { Image(systemName: UISymbol.close) }
+      Button(action: onHide) { Image(systemName: UISymbol.close).frame(width: 24, height: 24).contentShape(Rectangle()) }
         .help("Hide the scope")
         .accessibilityLabel("Hide Scope")
     }
     .buttonStyle(.borderless)
     .foregroundStyle(.white.opacity(0.85))
-    .padding(.horizontal, 8).padding(.vertical, 4)
+    .padding(.leading, 8).padding(.trailing, 2)
     .background(.black.opacity(0.55))
     .clipShape(UnevenRoundedRectangle(topLeadingRadius: 8, topTrailingRadius: 8))
   }
@@ -234,7 +234,7 @@ struct UIScopeCard<Scope: View>: View {
     Image(systemName: UISymbol.resizeGrip)
       .font(.system(size: 9, weight: .semibold))
       .foregroundStyle(.white.opacity(0.7))
-      .frame(width: 18, height: 18)
+      .frame(width: 24, height: 24)
       .contentShape(Rectangle())
       .gesture(resize(rect))
       .accessibilityHidden(true)
@@ -291,6 +291,8 @@ struct UIScopeWindowView: View {
     content
       .frame(minWidth: 240, minHeight: 160)
       .background(Color.black)
+      // Always on black: the placeholders and their button read as on the picture.
+      .environment(\.colorScheme, .dark)
       .navigationTitle("\(name) Scope")
       .toolbar {
         ToolbarItem(placement: .primaryAction) {
@@ -307,7 +309,7 @@ struct UIScopeWindowView: View {
                     coordinator.setPreferences(next, for: targetID)
                   }),
                   isProgram: isProgram, signal: presenter?.shownSignal,
-                  stageLUT: presenter?.scopeMeasuresLUT(preferences) == true)
+                  stageLUT: presenter?.scopeLUTSignal(preferences))
               }
               .padding(16)
               .frame(width: 320, alignment: .topLeading)
@@ -353,16 +355,16 @@ private struct UIScopeWindowScope: View {
   var body: some View {
     let displayed = presenter.isFrozen ? presenter.shownPreferences : preferences
     let description = UIScopeDescription(scopes: displayed.scopes, signal: presenter.shownSignal,
-      stageLUT: presenter.scopeMeasuresLUT(displayed), isProgram: isProgram)
+      stageLUT: presenter.scopeLUTSignal(displayed), isProgram: isProgram)
     VStack(alignment: .leading, spacing: 6) {
       UIScopeImage(description: description) { MonitorNativeScope(presenter: presenter) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityLabel(description.title)
+        .accessibilityLabel(presenter.scopeStatisticsReader == nil ? "No scope signal" : description.title)
       HStack(alignment: .bottom) {
         UIScopeClipReadoutView(reader: presenter.scopeStatisticsReader, settings: description.settings,
           isLive: !presenter.isFrozen)
         Spacer(minLength: 8)
-        Text(description.caption).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+        Text(description.caption).font(.uiMeta).foregroundStyle(.secondary).lineLimit(2)
           .multilineTextAlignment(.trailing)
       }
     }

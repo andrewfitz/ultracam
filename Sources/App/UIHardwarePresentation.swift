@@ -1,6 +1,6 @@
 import Foundation
 
-// What Ultracam knows about its hardware, as Settings › Hardware, the left pane, the problem
+// What Ultracam knows about its hardware, as Settings › Hardware, the inspector, the problem
 // list and Copy Diagnostics show it. Built from plugin facts only: every word about a vendor's
 // hardware comes from its plugin, so nothing here names one.
 
@@ -249,7 +249,7 @@ enum UIHardwareText {
       let info = model.captureDevice(device.id)
       let label = model.devices.label(for: device.id) ?? device.name
       let nickname = inventory.nickname(for: device.id)
-      byVendor[vendor.id, default: []].append(UIHardwareDevice(id: device.id, name: nickname ?? label,
+      byVendor[vendor.id, default: []].append(UIHardwareDevice(id: device.id, name: model.inputLabel(device.id) ?? label,
         driverName: nickname == nil ? nil : label, present: true, model: info?.model,
         cameras: cameras.filter { $0.descriptor.selectedDevice == device.id }.map(\.camera),
         status: inventory.status(for: device.id), modes: info?.modes ?? []))
@@ -265,7 +265,7 @@ enum UIHardwareText {
       let nickname = inventory.nickname(for: id)
       let lastName = inventory.lastKnownNames[id]
       byVendor[vendor.id, default: []].append(UIHardwareDevice(id: id,
-        name: nickname ?? lastName.map { UIInputLabels.missingLabel(id: id, lastName: $0) } ?? UIInputLabels.missingLabel(id: id, lastName: nil),
+        name: model.inputLabel(id) ?? UIInputLabels.missingLabel(id: id, lastName: lastName),
         driverName: nickname == nil ? nil : lastName, present: false,
         cameras: cameras.filter { $0.descriptor.selectedDevice == id }.map(\.camera),
         hint: vendor.localizedMissingDeviceHint()))

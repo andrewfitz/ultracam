@@ -22,7 +22,7 @@ import SwiftUI
   var notificationsEnabled: Bool { didSet { defaults.set(notificationsEnabled, forKey: "ui.alerts.notifications") } }
   var panelEnabled: Bool { didSet { defaults.set(panelEnabled, forKey: "ui.alerts.panel") } }
   var soundEnabled: Bool { didSet { defaults.set(soundEnabled, forKey: "ui.alerts.sound") } }
-  /// "Not Now" on the Attention prompt: don't ask again from there.
+  /// "Not Now" on the problem list's offer: don't ask again from there.
   var promptDismissed: Bool { didSet { defaults.set(promptDismissed, forKey: "ui.alerts.promptDismissed") } }
   /// Events that notify. All five by default; the panel follows its own switch.
   var events: Set<UIAlertEvent> {
@@ -270,7 +270,7 @@ extension UIAlertDelivering {
     delivery.readPermission { [weak self] permission in
       guard let self else { return }
       if self.preferences.permission != permission { self.preferences.permission = permission }
-      // Decided elsewhere (System Settings): Attention stops offering it.
+      // Decided elsewhere (System Settings): the problem list stops offering it.
       if permission.status != .notDetermined && permission.status != .unknown { self.interface.offerAlerts = false }
     }
   }
@@ -349,7 +349,7 @@ extension UIAlertDelivering {
     URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(Bundle.main.bundleIdentifier ?? "org.ultracam.app")")
   }
 
-  /// Attention already shows it when the main window is key.
+  /// The status bar already shows it when the main window is key.
   static func presentation(mainWindowKey: Bool, sound: Bool = false) -> UNNotificationPresentationOptions {
     var options: UNNotificationPresentationOptions = mainWindowKey ? [.list] : [.banner, .list]
     if sound { options.insert(.sound) }
@@ -441,26 +441,5 @@ struct UIAlertPanelView: View {
     .frame(width: UIAlertPanelController.size.width, height: UIAlertPanelController.size.height)
     .accessibilityElement(children: .contain)
     .accessibilityLabel(alert.title)
-  }
-}
-
-/// Before a session, while nothing's on air or rolling: the one place Ultracam asks.
-struct UIAlertsPrompt: View {
-  let context: UIContext
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Text("Turn on alerts").font(.uiRowEmphasis)
-      Text("See a lost camera or an early take while another app is in front.")
-        .font(.uiMeta).foregroundStyle(.secondary).lineLimit(3)
-      HStack {
-        Spacer(minLength: 0)
-        Button("Not Now") { context.send(.dismissAlertsPrompt) }.controlSize(.small)
-        Button("Turn On Alerts") { context.send(.turnOnAlerts) }.controlSize(.small)
-      }
-    }
-    .padding(8)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.fill.quaternary, in: RoundedRectangle(cornerRadius: 8))
   }
 }

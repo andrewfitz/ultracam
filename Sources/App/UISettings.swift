@@ -5,7 +5,7 @@ import SwiftUI
 /// Settings' sections, one native toolbar tab each, in this order. The raw value is saved
 /// (`UIInterfaceState.settingsTab`), so Settings reopens where it was left.
 enum UISettingsTab: String, CaseIterable, Identifiable, Sendable {
-  case general, hardware, virtualCameras, recording, audio, switching, alerts, advanced
+  case general, hardware, virtualCameras, recording, streaming, audio, switching, alerts, advanced
 
   var id: String { rawValue }
 
@@ -15,6 +15,7 @@ enum UISettingsTab: String, CaseIterable, Identifiable, Sendable {
     case .hardware: return "Hardware"
     case .virtualCameras: return "Virtual Cameras"
     case .recording: return "Recording"
+    case .streaming: return "Streaming"
     case .audio: return "Audio"
     case .switching: return "Switching"
     case .alerts: return "Alerts"
@@ -36,6 +37,7 @@ enum UISettingsTab: String, CaseIterable, Identifiable, Sendable {
     case .hardware: return UISymbol.input
     case .virtualCameras: return UISymbol.virtualCamera(inUse: true)
     case .recording: return UISymbol.record
+    case .streaming: return UISymbol.stream
     case .audio: return UISymbol.audio
     case .switching: return UISymbol.cut
     case .alerts: return UISymbol.alerts
@@ -72,6 +74,7 @@ struct UISettingsView: View {
     case .hardware: UISettingsHardwarePane(model: model, interface: interface)
     case .virtualCameras: UISettingsVirtualCamerasPane(model: model)
     case .recording: UISettingsRecordingPane(model: model)
+    case .streaming: UISettingsStreamingPane(model: model)
     case .audio: UISettingsAudioPane(model: model, interface: interface)
     case .switching: UISettingsSwitchingPane(model: model)
     case .alerts: UISettingsAlertsPane(model: model, interface: interface, preferences: alerts)
@@ -81,11 +84,11 @@ struct UISettingsView: View {
 }
 
 enum UISettingsLayout {
-  /// Wide enough for the eight tabs.
-  static let minimumWidth: CGFloat = 820
+  /// Wide enough for the Settings toolbar.
+  static let minimumWidth: CGFloat = 880
   static let minimumHeight: CGFloat = 320
   /// The window's size the first time it opens; after that it keeps the user's.
-  static let defaultSize = CGSize(width: 820, height: 600)
+  static let defaultSize = CGSize(width: minimumWidth, height: 600)
 }
 
 /// One tab: a grouped form filling the window, scrolling when it is longer. A pane may end
@@ -139,9 +142,10 @@ struct UISettingsInfoButton: View {
   @State private var shown = false
 
   var body: some View {
-    Button { shown.toggle() } label: { Image(systemName: UISymbol.information) }
+    Button { shown.toggle() } label: {
+      Image(systemName: UISymbol.information).frame(width: 24, height: 24).contentShape(Rectangle())
+    }
       .buttonStyle(.borderless)
-      .frame(width: 24, height: 24)
       .help(title)
       .accessibilityLabel("About \(title)")
       .popover(isPresented: $shown, arrowEdge: .trailing) {
@@ -234,11 +238,11 @@ struct UISettingsGeneralPane: View {
           Text("They work while another app is in front. No Accessibility permission needed.")
         }
         if shortcuts.enabled {
-          shortcutRow("Cut to Camera 1 to 7", key: "⌃⌥⌘1 to ⌃⌥⌘7",
+          shortcutRow("Cut Program to Camera 1 to 7", key: "⌃⌥⌘1 to ⌃⌥⌘7",
             unavailable: shortcuts.unavailable.contains { if case .cut = $0 { return true }; return false })
-          shortcutRow("Auto", key: UIBackgroundShortcut.auto.title, unavailable: shortcuts.unavailable.contains(.auto))
-          shortcutRow("Hold", key: UIBackgroundShortcut.hold.title, unavailable: shortcuts.unavailable.contains(.hold))
-          shortcutRow("Record", detail: "Starts a recording. Never stops one, so a stray chord can’t end a take.",
+          shortcutRow("Automatic Switching", key: UIBackgroundShortcut.auto.title, unavailable: shortcuts.unavailable.contains(.auto))
+          shortcutRow("Hold Current Shot", key: UIBackgroundShortcut.hold.title, unavailable: shortcuts.unavailable.contains(.hold))
+          shortcutRow("Record All Cameras", detail: "Starts a recording. Never stops one, so a stray chord can’t end a take.",
             key: UIBackgroundShortcut.record.title, unavailable: shortcuts.unavailable.contains(.record))
         }
       } header: { Text("Background Shortcuts") }
@@ -299,7 +303,8 @@ struct UISettingsVirtualCamerasPane: View {
 
   var body: some View {
     let installer = model.installer
-    let state = UISettingsExtensionState(installer: installer, published: UIExtensionDetector.isInstalled())
+    let published = installer.devicesPublished
+    let state = UISettingsExtensionState(installer: installer, published: published)
     let locked = !installer.canRequestChanges || installer.pending || model.running
     UISettingsPane {
       Section {
@@ -331,6 +336,22 @@ struct UISettingsVirtualCamerasPane: View {
             }
           } label: {
             Text("System Settings › General › Login Items & Extensions › Camera Extensions")
+          }
+        }
+        if installer.canReloadCamera {
+          LabeledContent {
+            Button(published ? "Reload Camera Service…" : "Force Update Without Restart…") {
+              Task { @MainActor in
+                guard !model.recordingModel.hasActiveRecordings else { return }
+                await installer.reloadCamera()
+              }
+            }
+            .disabled(installer.pending || model.recordingModel.hasActiveRecordings)
+            .help(model.recordingModel.hasActiveRecordings ? "Stop recording before reloading the camera service."
+              : "macOS asks for administrator approval. Meeting apps may briefly lose the camera.")
+          } label: {
+            Text("Reload the camera service")
+            Text("Requires an administrator. Meeting apps may briefly lose the camera.")
           }
         }
         if state.removable {
@@ -418,8 +439,8 @@ struct UISettingsExtensionState: Equatable {
       } else if published {
         (title, symbol, color, action, removable) = ("Installed", UISymbol.saved, .green, .none, true)
       } else {
-        // Enabled but not started until a restart: installing again wouldn't help.
-        (title, symbol, color, action, removable) = ("Restart your Mac to finish installing", UISymbol.restartNeeded, .orange, .none, true)
+        let title = installer.canReloadCamera ? "Camera service needs to start" : "Restart your Mac to finish installing"
+        (self.title, symbol, color, action, removable) = (title, UISymbol.restartNeeded, .orange, .none, true)
         version = nil
       }
     } else if published {
@@ -435,6 +456,7 @@ struct UISettingsExtensionState: Equatable {
 
 struct UISettingsSwitchingPane: View {
   let model: AppModel
+  @AppStorage("AutoSwitcherServerPort") private var switcherPort = 0
   @State private var draft = NaturalTalkingHeadSettings()
   @State private var interval = UISettingsSwitchingPane.defaultInterval
   @State private var loaded = false
@@ -445,6 +467,13 @@ struct UISettingsSwitchingPane: View {
 
   var body: some View {
     UISettingsPane {
+      Section("Auto Switcher") {
+        Picker("Director connection", selection: $switcherPort) {
+          Text("Private worker").tag(0)
+          Text("Local server · 48765").tag(48765)
+        }
+        UISettingsFootnote("Takes effect when the director next starts. Select Host clock in Auto Switcher. The first two profile routes map to Anchor and Emphasis.")
+      }
       Section("Fixed Interval") {
         UISettingsNumberRow(title: "Interval", value: $interval, range: 1...30, step: 0.5, unit: "s") { commitInterval() }
       }
@@ -460,7 +489,7 @@ struct UISettingsSwitchingPane: View {
         UISettingsNumberRow(title: "Emphasis hold", value: $draft.emphasisHold, range: 0...30, step: 0.5, unit: "s") { commitDirector() }
         UISettingsNumberRow(title: "Forced-cut grace", value: $draft.forcedCutGracePeriod, range: 0...10, step: 0.5, unit: "s") { commitDirector() }
       } header: {
-        UISettingsHeader("Natural Talking Head", info: "Before the minimum shot nothing cuts. Cuts are allowed after it, encouraged after the soft maximum, and forced within the grace after the maximum. Strategy, Anchor, Emphasis and Hold are in the toolbar's Auto menu.")
+        UISettingsHeader("Natural Talking Head", info: "Before the minimum shot nothing cuts. Cuts are allowed after it, encouraged after the soft maximum, and forced within the grace after the maximum. Strategy, Anchor and Emphasis are in the Strategy menu in the Program bar and the Program menu. Hold Shot is the button beside it.")
       }
 
       Section {
@@ -673,7 +702,7 @@ struct UISettingsShotTimeline: View {
         Text("soft max \(Int(softMaximum)) s")
         Text("max \(Int(maximum)) s")
       }
-      .font(.caption2)
+      .font(.uiMeta)
       .foregroundStyle(.secondary)
     }
     .opacity(isEnabled ? 1 : 0.5)
@@ -733,6 +762,8 @@ struct UISettingsAdvancedPane: View {
   @State private var confirmForgetLUTs = false
 
   var body: some View {
+    let resetUnavailable = model.streamSnapshot.active ? "Stop the Program stream and all cameras, then let recordings finish."
+      : "Stop all cameras and let recordings finish before resetting."
     UISettingsPane {
       Section {
         Toggle("Allow CPU conversion (compatibility)", isOn: $model.allowCPUConversion)
@@ -755,17 +786,15 @@ struct UISettingsAdvancedPane: View {
 
       Section {
         LabeledContent {
-          Button("Reset…", role: .destructive) {
+          Button("Reset…") {
             // The bridge asks for confirmation (in the main window, or as an alert), then resets and quits.
             UISessionBridge.live(model: model, interface: UIAppEnvironment.interface).send(.resetAllSettings)
           }
           .disabled(!model.canResetSettings)
-          .help(model.canResetSettings ? "Reset every saved preference and quit."
-            : "Stop all cameras and let recordings finish before resetting.")
+          .help(model.canResetSettings ? "Reset every saved preference and quit." : resetUnavailable)
         } label: {
           Text("Reset all settings")
-          Text(model.canResetSettings ? "Cameras, effects, folders, monitor tools and layout"
-            : "Stop all cameras and let recordings finish first")
+          Text(model.canResetSettings ? "Cameras, effects, folders, monitor tools, layout and streaming" : resetUnavailable)
         }
       } header: { Text("Reset") } footer: {
         UISettingsFootnote("Recordings are never touched. Reset asks first, then Ultracam quits so it starts fresh.")

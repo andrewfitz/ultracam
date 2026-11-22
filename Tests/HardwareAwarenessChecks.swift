@@ -29,13 +29,15 @@ import XCTest
     return UserDefaults(suiteName: suite)!
   }
 
-  private func rig(defaults: UserDefaults? = nil, controlPresent: Bool = true, properties: [ControlProperty] = []) throws -> Rig {
+  private func rig(defaults: UserDefaults? = nil, controlPresent: Bool = true, properties: [ControlProperty] = [],
+    deviceIDs: [String] = ["fake:left", "fake:right"]) throws -> Rig {
     let defaults = defaults ?? self.defaults()
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210, rate: .constant(VideoContract.slowDuration))
-    let capture = FakeCapturePlugin(format: format, audio: .absent, deviceIDs: ["fake:left", "fake:right"],
-      descriptor: Self.captureDescriptor)
-    capture.setDetails(.init(name: "Recorder", model: "Recorder 12G", modes: [format], connectors: [.hdmi]), for: "fake:left")
-    capture.setDetails(.init(name: "Recorder", model: "Recorder 12G"), for: "fake:right")
+    let capture = FakeCapturePlugin(format: format, audio: .absent, deviceIDs: deviceIDs, descriptor: Self.captureDescriptor)
+    for (index, id) in deviceIDs.enumerated() {
+      capture.setDetails(.init(name: "Recorder", model: "Recorder 12G", modes: index == 0 ? [format] : [],
+        connectors: index == 0 ? [.hdmi] : []), for: id)
+    }
     capture.setConnected(true)
     var descriptor = Self.controlDescriptor
     if !controlPresent {
@@ -132,6 +134,25 @@ import XCTest
     XCTAssertNil(relaunched.model.hardwareInventory.nickname(for: "fake:left"), "An empty name brings the driver's back")
   }
 
+  func testSameEndingDeviceIDsStayDistinctInTheInspectorAndHardware() throws {
+    let ids = ["fake:usb-left-ABCD", "fake:usb-right-ABCD", "fake:usb.RIGHT.abcd"]
+    let rig = try rig(deviceIDs: ids)
+    let picked = rig.model.selectedFeedID
+    rig.model.updateCamera(picked) { $0.selectedDevice = ids[1] }
+    let bridge = UISessionBridge.live(model: rig.model, interface: UIInterfaceState(defaults: rig.defaults))
+    let context = bridge.context()
+    let inputs = context.inputs.map { (id: $0.id, name: $0.name) }
+    let picker = UIInputLabels.options(inputs, cameras: context.session.cameras, for: picked.rawValue)
+    let labels = Dictionary(uniqueKeysWithValues: picker.map { ($0.id, $0.label) })
+    XCTAssertEqual(Set(labels.values).count, ids.count)
+    XCTAssertEqual(labels[ids[0]], "Recorder (FTABCD)")
+    XCTAssertEqual(context.snapshot(picked.rawValue)?.inputName, labels[ids[1]])
+    let hardware = UISettingsHardwareGroups(model: rig.model).capture.flatMap(\.devices)
+    XCTAssertEqual(Dictionary(uniqueKeysWithValues: hardware.map { ($0.id, $0.name) }), labels)
+    let reversed = UIInputLabels.options(Array(inputs.reversed()), cameras: [], for: picked.rawValue)
+    XCTAssertEqual(Dictionary(uniqueKeysWithValues: reversed.map { ($0.id, $0.label) }), labels)
+  }
+
   // MARK: Bodies
 
   /// The name field keeps a name typed when its row collapses, and shows a name changed
@@ -172,15 +193,20 @@ import XCTest
     XCTAssertEqual(state.notice, "The body's card is full")
     rig.control.postNotice("Recovered", severity: .info, feedID: feed)
     XCTAssertNil(state.notice, "A recovery clears the notice")
-    // The body drops on its own: a notice with Reconnect, never damage, since HDMI carries the picture.
+    // Hardware shows the retry. Attention offers Reconnect once a live camera needs manual help.
     rig.control.replaceCameras([])
     XCTAssertNotNil(state.lostAt)
     let snapshot = try XCTUnwrap(UISessionBridge.body(model: rig.model, cameraID: feed))
     XCTAssertTrue(snapshot.lost)
     var camera = UICameraSnapshot(id: feed, name: "Camera 1")
+    camera.running = true
+    camera.signal = .live(format: "2160p 59.94")
     camera.body = snapshot
     var session = UISessionSnapshot()
     session.cameras = [camera]
+    XCTAssertTrue(snapshot.retrying)
+    XCTAssertFalse(UIPresentationBuilder.problems(session).contains { $0.id == "body.\(feed)" })
+    session.cameras[0].body?.retrying = false
     let problem = try XCTUnwrap(UIPresentationBuilder.problems(session).first { $0.id == "body.\(feed)" })
     XCTAssertEqual(problem.level, .notice)
     XCTAssertEqual(problem.action?.action, .reconnectCameraBody(cameraID: feed))
@@ -275,6 +301,17 @@ import XCTest
     XCTAssertEqual(asked.count, 1, "No Retry, no write")
   }
 
+  func testMicrophoneChangesUseAudioSpecificStopReason() {
+    let microphone = VendorSetting(id: "fake:mic", labelKey: "Microphone", value: .choice("off"),
+      allowedValues: .choices([.init(id: "off", label: "Off")]), mutable: true,
+      availabilityReason: nil, interruptsCapture: true, interruption: .audio)
+    let cameras = [UIHardwareDevice.Camera(id: "camera", name: "Camera 1", running: true)]
+    XCTAssertEqual(UISettingsDeviceSettings.stopReason(microphone, running: cameras),
+      "Stop Camera 1 to change the audio input")
+    XCTAssertNil(UISettingsDeviceSettings.stopReason(microphone, running: []))
+    XCTAssertFalse(UISettingsDeviceSettings.offersRetry(microphone, running: cameras))
+  }
+
   // MARK: Idle reader and diagnostics
 
   func testIdleStatusIsReadOnlyWhileSomeoneIsLooking() async throws {
@@ -306,6 +343,21 @@ import XCTest
     await settle { rig.capture.idleRefreshes > 0 }
     XCTAssertGreaterThan(rig.capture.idleRefreshes, 0)
     rig.model.hardwareInventory.endWatching()
+  }
+
+  func testIdleStatusReaderDoesNotRetainInventoryBetweenPolls() async throws {
+    let rig = try rig()
+    var hardware = AppHardware.offline
+    let counter = PollCounter()
+    hardware.refreshIdleStatus = { counter.count += 1 }
+    var inventory: HardwareInventory? = HardwareInventory(defaults: rig.defaults,
+      hardware: hardware, interval: .seconds(2))
+    weak let releasedInventory = inventory
+    inventory?.beginWatching()
+    await settle { counter.count == 1 }
+    XCTAssertEqual(counter.count, 1)
+    inventory = nil
+    XCTAssertNil(releasedInventory)
   }
 
   /// An unplugged input takes its status with it: no old connector chip, and plugged back

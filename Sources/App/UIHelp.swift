@@ -6,18 +6,18 @@ struct UIHelpView: View {
   @Environment(\.openSettings) private var openSettings
 
   private let steps = [
-    "Install the Ultracam camera from the sidebar or [Settings › Virtual Cameras](ultracam-settings:virtualCameras), and approve it in System Settings.",
-    "Choose each camera's input device in its inspector (⌥⌘I), then Start Camera.",
+    "Install the Ultracam camera from the status bar or [Settings › Virtual Cameras](ultracam-settings:virtualCameras), and approve it in System Settings.",
+    "Choose each camera’s input device in its inspector (⌥⌘I), then click Start Capture.",
     "In your meeting app, choose “Ultracam · Camera 1” (or “Ultracam · Program” with two or more cameras).",
-    "To back up the meeting, choose a recording folder and a format in the sidebar's Recording section, then press Record. Recordings are the camera original, without the LUT or effects.",
+    "To back up the meeting, choose a recording folder and a format in Recording Options in the toolbar, then press Record. Recordings are the camera original, without effects; a LUT is burned in only when Burn LUT into recordings is on in Settings › Recording.",
   ]
 
   private let shortcuts: [(String, String)] = [
-    ("⌘↩", "Start or stop the cameras"),
+    ("⌘↩", "Start or stop capture"),
     ("⇧⌘B", "Effects for the selected camera (Effects Off sends the camera original)"),
     ("⇧⌘P", "Video preview"),
     ("⌘R", "Record or stop the selected camera"),
-    ("⇧⌘R", "Pause or resume the selected camera's recording"),
+    ("⇧⌘R", "Pause or resume the selected camera’s recording"),
     ("⌥⌘R", "Record all or stop all recordings"),
     ("⌥⌘P", "Pause All, or Resume All when every take is paused"),
     ("⌃1–⌃4", "Cut Program to camera 1 to 4"),
@@ -25,7 +25,6 @@ struct UIHelpView: View {
     ("⌃⌥H", "Hold the current shot: Auto stays on and makes no cuts"),
     ("⌘1–⌘4", "Select camera 1 to 4"),
     ("⌥⌘1–⌥⌘4", "Layout: Single, Side by Side, Program View, Four Up"),
-    ("⌃⌘S", "Show or hide the sidebar"),
     ("⌥⌘S", "Collapse or expand all strips"),
     ("⌥⌘G", "Guides for the selected camera"),
     ("⌥⌘Z", "Zebra for the selected camera"),
@@ -62,21 +61,25 @@ struct UIHelpView: View {
         }
       }
       Section("Good to Know") {
-        Text("Clicking a picture selects that camera; it never cuts. Cut with the toolbar, a strip's Cut button or ⌃1–⌃4.")
+        Text("Clicking a picture selects that camera; it never cuts. Cut with the toolbar, a strip’s Cut button or ⌃1–⌃4.")
         Text("Stopping a camera that is recording or on air asks first, and so do stopping several takes and quitting. Cancel is the default, so Return never ends a take.")
         Text("Record › Pause All pauses every take. When every take is paused, it becomes Resume All.")
-        Text("LUT On and LUT Off change the picture only, so meeting apps keep their format. Everything in a strip's Effects menu changes the format they receive, so the meeting's video updates briefly.")
-        Text("Every camera records one format, chosen in the sidebar or Record › Format. A camera whose source can't use it records the nearest format, and its strip says so in orange.")
+        Text("LUT On and LUT Off change the picture only, so meeting apps keep their format. Everything in a strip’s Effects menu changes the format they receive, so the meeting’s video updates briefly.")
+        Text("Every camera records one format, chosen in the toolbar’s Recording Options or Record › Format. A camera whose source can’t use it records the nearest format, and its strip says so in orange.")
         Text("Timecode and folders are in [Settings › Recording](ultracam-settings:recording). Capture devices, their names and connectors, and camera body pairing are in [Settings › Hardware](ultracam-settings:hardware). Channels Shown is in [Settings › Audio](ultracam-settings:audio).")
       }
+      Section("Streaming") {
+        Text("With two cameras enabled, set a destination and audio input in [Settings › Streaming](ultracam-settings:streaming). Choose Start Stream in Program to go live. The audio stays on the same input when you cut.")
+        Text("Open Program in the status bar for the destination, audio level and Stop Stream. Closing the window keeps the stream running. You can also stop it from the menu bar item.")
+      }
       Section("Recording") {
-        Text("Program is not recorded. A session leaves each camera's original and a list of the cuts.")
-        Text("Takes are always written as fragmented QuickTime movies. The first fragment is written after 1 s, then every 10 s. Hidden .partial files and journals sit beside each take until it finishes.")
-        Text("An interrupted take appears in Attention. Recovery copies complete fragments into a separate _Recovered.mov without re-encoding and keeps the original.")
+        Text("Program is not recorded. A session leaves each camera’s original and a list of the cuts.")
+        Text("Takes you start with Record are written as fragmented QuickTime movies; recordings a meeting app triggers (Settings › Recording) are HEVC MP4. The first fragment is written after 1 s, then every 10 s. Hidden .partial files and journals sit beside each take until it finishes.")
+        Text("An interrupted take is listed in the toolbar’s Recording Options and in Record › Recover Interrupted Takes. Recovery copies complete fragments into a separate _Recovered.mov without re-encoding and keeps the original.")
       }
       Section("Monitor Tools") {
         Text("Each camera has its own guides, zebra, false color, focus peaking and scopes. Hover a picture for the full tool bar, or use View › Monitor Tools. Scopes' refresh is set per camera in its Scopes popover.")
-        Text("New cameras start with monitor tools off. Zebra starts at 95 IRE, and the picture shows the camera's output with its LUT. Right-click a picture to copy its tools to another camera.")
+        Text("New cameras start with monitor tools off. Zebra starts at 95 IRE, and the picture shows the camera’s output with its LUT. Right-click a picture to copy its tools to another camera.")
         Text("Monitor tools never change camera output or recordings. Six-band false color works with any source; S-Log3 and LogC modes need the matching source declaration.")
       }
       Section {
@@ -84,7 +87,7 @@ struct UIHelpView: View {
       } header: {
         Text("Keyboard Shortcuts")
       } footer: {
-        Text("The keys and the Camera and Program menus cover cameras 1 to 4. Cut a higher-numbered camera with the toolbar or its strip's Cut button, and click its picture or its sidebar row to select it. ⌃1–⌃4 are also Mission Control's Switch to Desktop shortcuts, and macOS takes them first while those are on. If a cut does nothing, turn them off in System Settings › Keyboard › Keyboard Shortcuts › Mission Control, or cut with the toolbar.")
+        Text("The keys cover cameras 1 to 4. Cut or select a higher-numbered camera from the Program and Camera menus, the Program bar or its strip’s Cut button. ⌃1–⌃4 are also Mission Control’s Switch to Desktop shortcuts, and macOS takes them first while those are on. If a cut does nothing, turn them off in System Settings › Keyboard › Keyboard Shortcuts › Mission Control, or cut with the toolbar.")
           .font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -93,7 +96,7 @@ struct UIHelpView: View {
       } header: {
         Text("Background Shortcuts")
       } footer: {
-        Text("Off until you turn them on in [Settings › General](ultracam-settings:general). They reach Ultracam while a meeting app is in front, and the meeting app doesn't get the key. Cuts cover cameras 1 to 7, numbered as in the toolbar.")
+        Text("Off until you turn them on in [Settings › General](ultracam-settings:general). They reach Ultracam while a meeting app is in front, and the meeting app doesn’t get the key. Cuts cover cameras 1 to 7, numbered as in the toolbar.")
           .font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }

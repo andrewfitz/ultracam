@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import CoreVideo
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -9,6 +10,33 @@ import Foundation
 func require(_ condition: Bool, _ message: String) throws {
   if !condition { throw RecordingOutputError.ioFailure(message) }
 }
+func waitForReady(_ handle: FileHandle) throws {
+  let deadline = ProcessInfo.processInfo.systemUptime + 10
+  var input = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+  for expected in "READY\n".utf8 {
+    while true {
+      let remaining = deadline - ProcessInfo.processInfo.systemUptime
+      try require(remaining > 0, "Timed out waiting for the child writer.")
+      let result = poll(&input, 1, Int32((remaining * 1_000).rounded(.up)))
+      if result < 0 && errno == EINTR { continue }
+      try require(result > 0, "Child writer readiness poll failed or timed out.")
+      let byte = try handle.read(upToCount: 1)?.first
+      try require(byte == expected, "Child writer exited or sent an invalid readiness signal.")
+      break
+    }
+  }
+}
+
+func fingerprint(_ url: URL) throws -> SHA256Digest {
+  let input = try FileHandle(forReadingFrom: url)
+  defer { try? input.close() }
+  var hash = SHA256()
+  while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
+    hash.update(data: chunk)
+  }
+  return hash.finalize()
+}
+
 func child(root: URL, codecName: String, timecode: Bool) throws {
   let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
   let output = try manager.beginExternalWriterSession(feedID: "Synthetic \(codecName)")
@@ -21,22 +49,28 @@ func child(root: URL, codecName: String, timecode: Bool) throws {
   var buffer: CVPixelBuffer?
   let status = CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
     [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
-  try require(status == kCVReturnSuccess && buffer != nil, "Cannot allocate v210.")
-  let image = buffer!
-  CVPixelBufferLockBaseAddress(image, [])
-  memset(CVPixelBufferGetBaseAddress(image)!, 0, CVPixelBufferGetDataSize(image))
+  guard status == kCVReturnSuccess, let image = buffer else {
+    throw RecordingOutputError.ioFailure("Cannot allocate v210.")
+  }
+  try require(CVPixelBufferLockBaseAddress(image, []) == kCVReturnSuccess, "Cannot lock v210.")
+  if let base = CVPixelBufferGetBaseAddress(image) {
+    memset(base, 0, CVPixelBufferGetDataSize(image))
+  }
   CVPixelBufferUnlockBaseAddress(image, [])
   let duration = CMTime(value: 1001, timescale: 60000)
   let start = ProcessInfo.processInfo.systemUptime
   print("READY"); fflush(stdout)
   for frame in 0..<1800 {
     let target = start + Double(frame) * duration.seconds
-    while ProcessInfo.processInfo.systemUptime < target { Thread.sleep(forTimeInterval: 0.001) }
+    let delay = target - ProcessInfo.processInfo.systemUptime
+    if delay > 0 { Thread.sleep(forTimeInterval: delay) }
     try require(recorder.appendVideo(try VideoContract.sample(image,
       at: CMTimeMultiply(duration, multiplier: Int32(frame)), duration: duration)), "Video admission failed.")
-    let packet = try EmbeddedAudioPacket(sourcePCM32: Data(repeating: 0, count: 800 * 2 * 4),
-      sampleFrameCount: 800, presentationTime: CMTime(value: Int64(frame) * 800, timescale: 48000))
-    try require(recorder.appendAudio(EmbeddedAudioRecording.makeSampleBuffer(for: packet)), "Audio admission failed.")
+    let audioStart = Int64(frame) * 1001 * 48_000 / 60_000
+    let audioEnd = Int64(frame + 1) * 1001 * 48_000 / 60_000
+    let audio = try EmbeddedAudioRecording.makeSilenceSampleBuffer(sampleFrameCount: Int(audioEnd - audioStart),
+      presentationTime: CMTime(value: audioStart, timescale: 48_000))
+    try require(recorder.appendAudio(audio), "Audio admission failed.")
   }
   // A normal exit here is a test failure: the parent must interrupt us.
   withExtendedLifetime(output) {}
@@ -60,8 +94,8 @@ func parent(root: URL) async throws {
           process.waitUntilExit()
         }
       }
-      let ready = pipe.fileHandleForReading.availableData
-      try require(String(data: ready, encoding: .utf8)?.contains("READY") == true, "Child did not start.")
+      try pipe.fileHandleForWriting.close()
+      try waitForReady(pipe.fileHandleForReading)
       let live = try RecordingRecovery.scan(root: takeRoot)
       try require(live.isEmpty, "Recovery offered an active recording.")
       try await Task.sleep(for: .seconds(seconds))
@@ -69,11 +103,19 @@ func parent(root: URL) async throws {
       process.waitUntilExit()
       try require(process.terminationReason == .uncaughtSignal && process.terminationStatus == SIGKILL,
         "Child was not abruptly interrupted.")
+      let initial = try RecordingRecovery.scan(root: takeRoot)
+      try require(initial.count == 1, "Interrupted take was not discovered.")
+      let occupied = Data("unrelated movie".utf8)
+      if !timecode { try occupied.write(to: initial[0].finalURL, options: .withoutOverwriting) }
       let takes = try RecordingRecovery.scan(root: takeRoot)
       try require(takes.count == 1, "Interrupted take was not discovered.")
-      let original = try Data(contentsOf: takes[0].temporaryURL)
+      let original = try fingerprint(takes[0].temporaryURL)
       let recovered = try await RecordingRecovery.recover(takes[0], root: takeRoot)
-      try require(try Data(contentsOf: takes[0].temporaryURL) == original, "Recovery modified the original.")
+      try require(try fingerprint(takes[0].temporaryURL) == original, "Recovery modified the original.")
+      if !timecode {
+        try require(recovered != takes[0].finalURL, "Recovery reused the occupied destination.")
+        try require(try Data(contentsOf: takes[0].finalURL) == occupied, "Recovery modified the occupied destination.")
+      }
       let asset = AVURLAsset(url: recovered)
       let video = try await asset.loadTracks(withMediaType: .video)
       let audio = try await asset.loadTracks(withMediaType: .audio)

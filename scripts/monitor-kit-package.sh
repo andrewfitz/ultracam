@@ -97,11 +97,13 @@ monitor_kit_package_build() {
 # that never finished. Prints nothing for a complete log. $2 overrides the bundle list.
 monitor_kit_log_problems() {
   LC_ALL=C awk -v bundles="${2:-$monitor_kit_test_bundles}" '
-    /^Test Case .-\[[^ ]+ [^]]+\]. started/ { started++ }
-    /^Test Case .-\[[^ ]+ [^]]+\]. (passed|failed|skipped)/ { ended++ }
-    /^Test Suite .[^ ]+\.xctest. started/ { suites++ }
-    /^Test Suite .[^ ]+\.xctest. (passed|failed)/ {
-      name = $3; gsub(/\047|\.xctest/, "", name); finished[name] = 1; done++
+    # Buffered benchmark output can share a line with an XCTest marker.
+    /Test Case \047-\[[^ ]+ [^]]+\]\047 started\./ { started++ }
+    /Test Case \047-\[[^ ]+ [^]]+\]\047 (passed|failed|skipped) \(/ { ended++ }
+    /Test Suite \047[^ ]+\.xctest\047 started at / { suites++ }
+    match($0, /Test Suite \047[^ ]+\.xctest\047 (passed|failed) at /) {
+      split(substr($0, RSTART, RLENGTH), marker, " ")
+      name = marker[3]; gsub(/\047|\.xctest/, "", name); finished[name] = 1; done++
     }
     /^error: |Exited with|unexpected signal|Fatal error|fatal error:|Restarting after unexpected exit|^\342\234\230 / {
       if (errors++ < 3) print "error line: " substr($0, 1, 300)
@@ -113,17 +115,22 @@ monitor_kit_log_problems() {
       for (i = 1; i <= n; i++) if (!(expected[i] in finished)) print "test bundle " expected[i] " never finished"
     }' "$1"
 }
+# Prints cases with the given result as Module.Class/test. Use the marker itself
+# as the starting point, since test output can be flushed before it on the same line.
+monitor_kit_cases_with_result() {
+  local marker="Test Case '-\[([^ ]+) ([^]]+)\]' $2 \("
+  { LC_ALL=C grep -aE "$marker" "$1" || true; } \
+    | LC_ALL=C sed -nE "s/.*$marker.*/\1\/\2/p"
+}
 # Prints the failed cases of a log as Module.Class/test, sorted.
 monitor_kit_failed_cases() {
-  { LC_ALL=C grep -aE "^Test Case '-\[[^ ]+ [^]]+\]' failed" "$1" || true; } \
-    | sed -E "s/^Test Case '-\[([^ ]+) ([^]]+)\]'.*/\1\/\2/" | sort -u
+  monitor_kit_cases_with_result "$1" failed | sort -u
 }
 # Prints the skipped cases of a log, sorted. Skips are expected on hosts without
 # optional platform capabilities (for example Metal), but remain part of the
 # run accounting so a passing run cannot imply that every case executed.
 monitor_kit_skipped_cases() {
-  { LC_ALL=C grep -aE "^Test Case '-\[[^ ]+ [^]]+\]' skipped" "$1" || true; } \
-    | sed -E "s/^Test Case '-\[([^ ]+) ([^]]+)\]'.*/\1\/\2/" | sort -u
+  monitor_kit_cases_with_result "$1" skipped | sort -u
 }
 # Prints the failure messages the case $2 (Module.Class/test) logged in $1, one per line,
 # each cut short: a pixel array's message can be hundreds of megabytes.
@@ -173,7 +180,7 @@ monitor_kit_package_test() {
     rc=0
     "${monitor_kit_env[@]}" xcrun swift test "${test_args[@]}" --skip-build --filter "$filter" > "$retry_log" 2>&1 || rc=$?
     problems="$(monitor_kit_log_problems "$retry_log")"
-    passed="$({ LC_ALL=C grep -acE "^Test Case '-\[[^ ]+ [^]]+\]' passed" "$retry_log" || true; })"
+    passed="$(monitor_kit_cases_with_result "$retry_log" passed | awk 'END { print NR }')"
     if [[ $rc -ne 0 || -n "$problems" || -n "$(monitor_kit_failed_cases "$retry_log")" || "$passed" -ne "$(printf '%s\n' "$plan" | wc -l)" ]]; then
       printf 'MonitorKit retry failed (exit %s, %s of the retried cases passed): %s\n' "$rc" "$passed" "$retry_log" >> "$log"
       [[ -z "$problems" ]] || printf '%s\n' "$problems" >> "$log"
@@ -192,7 +199,7 @@ monitor_kit_test_report() {
   local log="$1"
   echo "MonitorKit package tests failed. Log: $log"
   [[ ! -f "$log.retry" ]] || echo "Retry log: $log.retry"
-  { LC_ALL=C grep -aE "^Test Case '.*' failed|: error: |^error: |Exited with|unexpected signal|Fatal error|^not retried|^FLAKY|^MonitorKit |^error line: |never finished" "$log" || true; } \
+  { LC_ALL=C grep -aE "Test Case '.*' failed|: error: |^error: |Exited with|unexpected signal|Fatal error|^not retried|^FLAKY|^MonitorKit |^error line: |never finished" "$log" || true; } \
     | cut -c1-400 | head -80
   echo '--- last lines ---'
   tail -20 "$log" | cut -c1-400
@@ -277,13 +284,19 @@ STUB
     expect "$got" "$4" "$name: result"
     expect "$(wc -l < "$dir/calls" | tr -d ' ')" "$5" "$name: swift test runs"
   }
-  local bench=Benchmarks/testPicturePassGPUTime
+  local bench=Benchmarks/testPicturePassGPUTime fixture
   # Clean run.
   { bundle MonitorKitTests passed "$bench/passed" ContractTests/testA/passed
     bundle MonitorKitAudioTests passed RealtimeTests/testX/skipped; } > "$dir/first.log"
   expect "$(monitor_kit_log_problems "$dir/first.log")" "" "complete log has no problems"
   expect "$(monitor_kit_skipped_cases "$dir/first.log")" "MonitorKitAudioTests.RealtimeTests/testX" "skipped cases are accounted for"
   scenario 'clean run' 0 0 0 1
+  # A benchmark can flush part of a line before a suite or case marker.
+  sed -E "/^Test( Suite| Case)/s/^/v210 general source: separate 1.068, fused group 0.61/" \
+    "$dir/first.log" > "$dir/interleaved.log"
+  mv "$dir/interleaved.log" "$dir/first.log"
+  expect "$(monitor_kit_skipped_cases "$dir/first.log")" "MonitorKitAudioTests.RealtimeTests/testX" "interleaved skips are accounted for"
+  scenario 'interleaved benchmark output' 0 0 0 1
   # A timing budget failed; the retry passes.
   { bundle MonitorKitTests failed "$bench/failed" ContractTests/testA/passed
     bundle MonitorKitAudioTests passed RealtimeTests/testX/passed; } > "$dir/first.log"
@@ -292,6 +305,11 @@ STUB
   expect "$rc:$plan" "0:MonitorKitTests.Benchmarks/testPicturePassGPUTime" 'allowlisted timing failure is retried'
   scenario 'timing flake passes on retry' 1 0 0 2
   expect "$(grep -c '^FLAKY (passed on retry): MonitorKitTests.Benchmarks/testPicturePassGPUTime$' "$dir/run.log")" 1 'flake is logged'
+  for fixture in "$dir/first.log" "$dir/retry.log"; do
+    sed -E "/^Test Case/s/^/benchmark output/" "$fixture" > "$dir/interleaved.log"
+    mv "$dir/interleaved.log" "$fixture"
+  done
+  scenario 'timing flake with interleaved benchmark output' 1 0 0 2
   # The same, but the retry fails again.
   { bundle MonitorKitTests failed "$bench/failed"; bundle MonitorKitAudioTests passed; } > "$dir/retry.log"
   scenario 'timing failure that repeats' 1 1 1 2

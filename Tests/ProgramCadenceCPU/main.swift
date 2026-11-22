@@ -12,4 +12,5 @@ if ProcessInfo.processInfo.environment["ULTRACAM_CADENCE_LOW_RATE_ONLY"] == "1" 
   suite.addTest(XCTestSuite(forTestCaseClass: ProgramStageRetentionChecks.self))
 }
 suite.run()
-exit(suite.testRun!.hasSucceeded ? 0 : 1)
+guard let run = suite.testRun, run.executionCount > 0 else { exit(2) }
+exit(run.hasSucceeded ? 0 : 1)

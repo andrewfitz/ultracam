@@ -15,6 +15,8 @@ struct VendorDescriptor: Equatable, Sendable, Identifiable {
   /// vendor's failures (a unit on the wrong port, a body not on the network); the host shows it.
   var missingDeviceHint: String? = nil
   var missingDeviceHintKey: String? = nil
+  var captureAudio: CaptureAudioKind = .embedded
+
   func localizedDisplayName(in bundle: Bundle = .main) -> String {
     VendorDisplayLocalization.resolve(key: displayNameKey, fallback: displayName, table: localizationTable, in: bundle)
   }
@@ -40,4 +42,9 @@ enum VendorDisplayLocalization {
     guard let key, !key.isEmpty else { return fallback }
     return bundle.localizedString(forKey: key, value: fallback, table: table)
   }
+}
+
+
+enum CaptureAudioKind: Sendable, Hashable {
+  case embedded, microphone
 }

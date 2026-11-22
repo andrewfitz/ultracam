@@ -35,12 +35,12 @@ struct ProofFailure: Error, CustomStringConvertible {
 func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
   guard condition() else { throw ProofFailure(message) }
 }
-func prove(_ contract: ExtensionFormatContract, index: Int, producer: GPUStandbyProducer) -> SlotEvidence {
+func prove(_ contract: ExtensionFormatContract, format: CMFormatDescription, index: Int,
+  producer: GPUStandbyProducer) -> SlotEvidence {
   var evidence = SlotEvidence(index: index, contractID: contract.id, width: contract.width,
     height: contract.height, fourCC: VideoContract.fourCC(contract.pixel.rawValue))
   do {
     let type = contract.pixel.rawValue
-    let format = try OutputFormatCatalog.descriptions()[index]
     let done = DispatchSemaphore(value: 0)
     let result = Mutex<Result<GPUStandbyImage, Error>?>(nil)
     try producer.makeBlack(format: format) { value in result.withLock { $0 = value }; done.signal() }
@@ -122,8 +122,11 @@ if let device = MTLCreateSystemDefaultDevice() {
   if device.supportsFamily(.metal4) {
     do {
       let producer = try GPUStandbyProducer(device: device)
-      for (index, contract) in ExtensionFormatCatalog.published.enumerated() {
-        evidence.slots.append(autoreleasepool { prove(contract, index: index, producer: producer) })
+      let formats = try OutputFormatCatalog.descriptions()
+      let contracts = ExtensionFormatCatalog.published
+      try require(formats.count == contracts.count, "Published formats and standby contracts differ in count")
+      for (index, (contract, format)) in zip(contracts, formats).enumerated() {
+        evidence.slots.append(autoreleasepool { prove(contract, format: format, index: index, producer: producer) })
       }
       evidence.status = evidence.slots.count == OutputFormatCatalog.published.count && evidence.slots.allSatisfy { $0.status == "passed" } ? "passed" : "failed"
     } catch { evidence.error = String(describing: error) }

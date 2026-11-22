@@ -10,8 +10,8 @@
     "current_camera_id": { "type": "string" },
     "anchor_camera_id": { "type": "string" },
     "emphasis_camera_id": { "type": "string" },
-    "audio": { "type": "array" },
-    "transcript": { "type": "array" },
-    "video": { "type": "array" }
+    "audio": { "type": "array", "items": { "$ref": "stream-event#/$defs/audio" } },
+    "transcript": { "type": "array", "items": { "$ref": "stream-event#/$defs/transcript" } },
+    "video": { "type": "array", "items": { "$ref": "stream-event#/$defs/video" } }
   }
 }

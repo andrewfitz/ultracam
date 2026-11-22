@@ -330,9 +330,9 @@ public final class RecordingOutputManager: @unchecked Sendable {
   /// Creates an idle session after performing disk-space admission. Call
   /// `start()` (or use `beginSession`) before appending bytes.
   public func makeSession(feedID: String, sessionID: UUID = UUID(),
-                          expectedBytes: UInt64 = 0) throws -> RecordingOutputSession {
+                          expectedBytes: UInt64 = 0, filenameStem: String? = nil) throws -> RecordingOutputSession {
     let safeFeedID = try Self.validateFeedID(feedID)
-    let paths = try makePaths(feedID: safeFeedID)
+    let paths = try makePaths(feedID: safeFeedID, filenameStem: filenameStem)
     try reserve(expectedBytes: expectedBytes)
     return RecordingOutputSession(manager: self, paths: paths, expectedBytes: expectedBytes)
   }
@@ -355,9 +355,9 @@ public final class RecordingOutputManager: @unchecked Sendable {
   /// temporary URL, while this boundary retains disk admission and performs
   /// the final same-volume rename after the writer closes it.
   public func beginExternalWriterSession(feedID: String, sessionID: UUID = UUID(),
-                                         expectedBytes: UInt64 = 0) throws -> RecordingOutputSession {
+                                         expectedBytes: UInt64 = 0, filenameStem: String? = nil) throws -> RecordingOutputSession {
     let session = try makeSession(feedID: feedID, sessionID: sessionID,
-      expectedBytes: expectedBytes)
+      expectedBytes: expectedBytes, filenameStem: filenameStem)
     do {
       try session.startExternalWriter()
       return session
@@ -454,7 +454,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
     volume.reservedBytes = Self.saturatingAdd(volume.reservedBytes, additional)
   }
 
-  private func makePaths(feedID: String) throws -> RecordingOutputPaths {
+  private func makePaths(feedID: String, filenameStem: String?) throws -> RecordingOutputPaths {
     // Path allocation is performed under the same lock as reservations. This
     // manager is used by multiple feed starts, and an external AVAssetWriter
     // does not create its temporary file until after this method returns.
@@ -476,7 +476,12 @@ public final class RecordingOutputManager: @unchecked Sendable {
     }
     let nonce = pathNonce
     pathNonce &+= 1
-    let stemBase = configuration.naming.stem(camera: feedID, date: Date(), take: nonce + 1)
+    if let filenameStem {
+      guard !filenameStem.isEmpty, !filenameStem.hasPrefix("."), filenameStem.utf8.count <= 195,
+        filenameStem.rangeOfCharacter(from: .controlCharacters.union(CharacterSet(charactersIn: "/\\"))) == nil
+      else { throw RecordingOutputError.unsafePath }
+    }
+    let stemBase = filenameStem ?? configuration.naming.stem(camera: feedID, date: Date(), take: nonce + 1)
     var stem = stemBase
     var suffix = 2
     Self.issuedLock.lock()
@@ -675,11 +680,12 @@ public final class RecordingOutputSession: @unchecked Sendable {
       releaseReservationLocked()
       throw RecordingOutputError.ioFailure("Temporary output file is closed.")
     }
-    stateValue = .recording
-    // Counted again at once, not only from the next check a second later.
+    // Other feeds can claim the space released while paused. Re-admit this
+    // take before it can accept new samples again.
     if externalWriterOwnsFile, let lastHeadroom {
-      manager.setHeadroom(lastHeadroom, for: ObjectIdentifier(self))
+      try manager.checkHeadroom(lastHeadroom, for: ObjectIdentifier(self))
     }
+    stateValue = .recording
   }
 
   /// Appends bytes to the current temporary output. Pausing preserves the file
@@ -751,8 +757,8 @@ public final class RecordingOutputSession: @unchecked Sendable {
       reservedBytes -= consumed
       bytesWrittenValue = written
     }
-    lastHeadroom = headroom
     try manager.checkHeadroom(headroom, for: ObjectIdentifier(self))
+    lastHeadroom = headroom
   }
 
   /// Called only after exclusive metadata creation succeeded. Persisting this
@@ -866,7 +872,15 @@ public final class RecordingOutputSession: @unchecked Sendable {
         throw RecordingOutputError.ioFailure(error.localizedDescription)
       }
     }
-    if recoveryJournal?.entry.sidecarOwned == true { try RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
+    do {
+      if recoveryJournal?.entry.sidecarOwned == true {
+        try RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile)
+      }
+    } catch {
+      stateValue = .failed
+      releaseReservationLocked()
+      throw error
+    }
     recoveryJournal?.remove()
     recoveryJournal = nil
     stateValue = .cancelled

@@ -129,13 +129,20 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var ingestCPUCopyActive = false
   var id: String
   var name: String
+  var enabled = true
   /// The assigned input's ID, listed or not; nil when the camera has none (None).
   var inputID: String?
   /// The assigned input's label (`UIInputLabels.label`), also while it's unplugged; nil with none.
   var inputName: String?
   /// The input's connector when it isn't HDMI, the usual one (ruling 23): "SDI".
   var inputConnector: String?
+  var captureAudio: CaptureAudioKind = .embedded
+  var inputSignalDetail: String?
+  var measuredInputFPS: Double = 0
   var deviceAvailable = true
+  var captureAuthorizationPending = false
+  var captureAuthorizationRequestable = false
+  var inputDriverWarning: String?
   var running = false
   var signal: UISignal = .none
   var outputFormat: String?
@@ -160,7 +167,7 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var signalLostFor: TimeInterval?
   /// `systemUptime` of the same, so a view can tick it while no updates arrive.
   var signalLostSince: TimeInterval?
-  /// Its paired camera body. Nil means none, so the left pane draws one line less.
+  /// Its paired camera body. Nil means none.
   var body: UICameraBody?
   /// Seconds of steady signal still needed before Program may cut here again.
   var cutBlockedFor: TimeInterval?
@@ -172,6 +179,17 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var effects: [Bool] = [false, true, true, false]
   var resizeTarget: ResizeTarget = .hd1080
   var scalingMode: ProgramScalingMode = .fit
+  var allowUpscale = false
+  var showsAllowUpscale: Bool {
+    guard scalingMode == .fit else { return false }
+    guard let sourceFormat else { return true }
+    let target = resizeTarget == .source
+      ? (try? PublishedSourceSizeSelection.nearest(width: sourceFormat.width, height: sourceFormat.height)) ?? .hd720
+      : resizeTarget
+    let displayWidth = Double(sourceFormat.width) * Double(sourceFormat.pixelAspect.numerator)
+      / Double(sourceFormat.pixelAspect.denominator)
+    return Double(target.width) > displayWidth && target.height > sourceFormat.height
+  }
   var colorTarget: ColorTarget = .yuv4208
   var frameRateTarget: FrameRateTarget = .fps2997
   var lutName: String?
@@ -198,6 +216,8 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var showsRecordingConstantFrameRateCompatibility: Bool { sourceFrameRate?.isVariable == true }
   var previewEnabled = true
   var automaticStart = false
+  var captureManuallyStopped = false
+  var streamCaptureInputAvailable: Bool?
   var automaticStatus: String?
   /// Automatic mode tried to start this camera and failed; Retry is available.
   var automaticStartFailed = false
@@ -215,7 +235,7 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var message = ""
 }
 
-/// The camera body behind a capture device, as the left pane shows it.
+/// The camera body behind a capture device.
 struct UICameraBody: Sendable, Equatable {
   /// What the body reports about itself that can end the picture.
   struct Warning: Sendable, Equatable { var text: String; var short: String }
@@ -231,8 +251,6 @@ struct UICameraBody: Sendable, Equatable {
   var retrying = false
   /// Overheating, a low battery in a known unit, a card error: the worst one.
   var warning: Warning? = nil
-  /// The body's latest notice that still matters (reconnecting, card full).
-  var notice: String? = nil
 }
 
 struct UIUnexpectedStop: Sendable, Equatable {
@@ -325,6 +343,7 @@ struct UIInterruptedTake: Sendable, Equatable, Identifiable {
 
 struct UIInstallState: Sendable, Equatable {
   var canRequestChanges = true
+  var canReloadCamera = false
   var pending = false
   var status = ""
   var unavailableReason: String?
@@ -340,8 +359,10 @@ struct UISessionSnapshot: Sendable, Equatable {
   var syncCameras = false
   var cameras: [UICameraSnapshot] = []
   /// Switching exists with two cameras: Program is published and cuts are offered.
-  var programAvailable: Bool { FeedLifecycleDemandPolicy.programPublished(enabledCameras: cameras.count) }
+  var programAvailable: Bool { FeedLifecycleDemandPolicy.programPublished(enabledCameras: cameras.filter(\.enabled).count) }
   var selectedID: String = ""
+  var stream = ProgramStreamSnapshot()
+  var streamOnAirID: String? { stream.phase == .streaming && stream.pictureFresh ? stream.pictureFeedID : nil }
   var programInUse = false
   /// Program's route can't be read: its clients are unknown, not none.
   var programClientUnknown = false
@@ -372,7 +393,7 @@ struct UISessionSnapshot: Sendable, Equatable {
   /// A take has outlived the last client seen during it.
   var unusedTake = false
   var appProblems: [UIAppProblem] = []
-  /// Notifications have never been asked for, so Attention may offer them.
+  /// Notifications have never been asked for, so the problem list may offer them.
   var offerAlerts = false
   var recentCuts: [UICutRecord] = []
   /// The format chosen for every camera, applied to the next take.
@@ -382,7 +403,6 @@ struct UISessionSnapshot: Sendable, Equatable {
   var timecodeTitle = "Mac Clock"
   var defaultFolderPath: String?
   var drives: [UIDrive] = []
-  var recentTakes: [UITake] = []
   var interruptedTakes: [UIInterruptedTake] = []
   var recoveringID: String?
   var recoveryMessage: String?
@@ -393,14 +413,13 @@ struct UISessionSnapshot: Sendable, Equatable {
   var canAddCamera = true
   var layout: UILayout = .sideBySide
   var collapsed: Set<String> = []
-  var sidebarVisible = true
   var inspectorOpen = false
+  /// The menu bar's Attention row asked for the status bar's problem list.
+  var problemsRequested = false
   /// The camera whose rename prompt is open, if any.
   var renamingCameraID: String?
   /// Under 1100 pt the toolbar's cut buttons keep their digits only, with names in help.
   var narrowWindow = false
-  /// The left pane's one collapsible section. Nothing collapses by itself.
-  var virtualCamerasCollapsed = false
   /// Settings › General: stopping several takes and quitting ask first. On by default.
   var askBeforeEnding = true
 }
@@ -430,7 +449,7 @@ enum UITally: Sendable, Equatable {
     case .next: return "NEXT"
     }
   }
-  /// Sentence case for text outside the picture (strip, sidebar, menus, status).
+  /// Sentence case for text outside the picture (strip, menus, status).
   var label: String? {
     switch self {
     case .none: return nil
@@ -535,7 +554,7 @@ struct UICameraPresentation: Sendable, Equatable, Identifiable {
   var collapsedWord: String? = nil
   /// That word is a problem: a triangle, and words in primary.
   var collapsedWarns = false
-  /// The sidebar's glyph for this camera.
+  /// The state glyph for this camera, where a list names it.
   var state: UIState = .inactive
   /// "Signal lost 0:06", from a camera that had a picture.
   var lostTitle: String? = nil
@@ -564,21 +583,49 @@ struct UIInputOption: Sendable, Equatable, Identifiable {
 /// Device labels that stay apart when two units share a model name. The driver's own
 /// "(1)"/"(2)" follow enumeration order, so they can name a different unit next launch.
 enum UIInputLabels {
-  /// The last four hex digits of the persistent ID: "0AB8" for input:00000000a1850ab8.
-  static func suffix(_ id: String) -> String {
-    let digits = id.split(separator: ":").last.map(String.init) ?? id
-    return String(digits.filter { $0.isLetter || $0.isNumber }.suffix(4)).uppercased()
+  /// Preserve the familiar four-character label unless a longer suffix is needed.
+  static func suffix(_ id: String) -> String { suffix(id, among: []) }
+
+  private static func suffix(_ id: String, among otherIDs: [String]) -> String {
+    let normalized = readableID(id)
+    let peers = otherIDs.map(readableID)
+    if !normalized.isEmpty, let suffix = uniqueSuffix(normalized, among: peers) { return suffix }
+
+    // Case and punctuation can be part of an opaque ID. Encode the original bytes
+    // when the display normalization erased the distinction.
+    let encoded = hexadecimalID(id)
+    let suffix = uniqueSuffix(encoded, among: otherIDs.map(hexadecimalID)) ?? encoded
+    return "ID \(suffix)"
   }
 
-  /// The name, with the ID's last four digits when another input in `inputs` has the same name.
-  /// "Recorder (0AB8)": a plain string, so no " · " join (J 22).
+  private static func readableID(_ id: String) -> String {
+    let tail = id.split(separator: ":").last.map(String.init) ?? id
+    return String(tail.filter { $0.isLetter || $0.isNumber }).uppercased()
+  }
+
+  private static func hexadecimalID(_ id: String) -> String {
+    id.utf8.map { String(format: "%02X", Int($0)) }.joined()
+  }
+
+  private static func uniqueSuffix(_ id: String, among peers: [String]) -> String? {
+    for width in min(4, id.count)...id.count {
+      let candidate = id.suffix(width)
+      if !peers.contains(where: { $0.suffix(width) == candidate }) { return String(candidate) }
+    }
+    return nil
+  }
+
+  /// Pair a shared display name with the shortest useful suffix of its persistent ID.
   static func label(id: String, name: String, among inputs: [(id: String, name: String)]) -> String {
-    inputs.contains { $0.id != id && $0.name == name } ? "\(name) (\(suffix(id)))" : name
+    let others = inputs.filter { $0.id != id && $0.name == name }.map(\.id)
+    return others.isEmpty ? name : "\(name) (\(suffix(id, among: others)))"
   }
 
-  /// An assigned input that isn't listed. The last name seen this session when there is one.
-  static func missingLabel(id: String, lastName: String?) -> String {
-    "\(lastName ?? "Input device") (\(suffix(id)))"
+  /// An assigned input that isn't listed. Keep its last name and show its identity.
+  static func missingLabel(id: String, lastName: String?, among inputs: [(id: String, name: String)] = []) -> String {
+    let name = lastName ?? "Input device"
+    let others = inputs.filter { $0.id != id && $0.name == name }.map(\.id)
+    return "\(name) (\(suffix(id, among: others)))"
   }
 
   /// The picker rows for one camera: every listed input, labelled, with the camera that holds it.
@@ -715,10 +762,13 @@ struct UISessionPresentation: Sendable, Equatable {
   var problems: [UIProblem]
   /// The Program picture's own tally (`UIPresentationBuilder.programTally`).
   var programTally: UITally = .none
-  /// Attention offers to turn alerts on: before a session, never while live.
+  var streamActive = false
+  var streamAudioFeedID: String?
+  /// The problem list offers to turn alerts on: before a session, never while live.
   var offersAlerts = false
-  /// Attention's rows after the problems, where nothing is wrong yet: an extension to install
-  /// or update. They keep their noun as their symbol, and stay out of the status bar.
+  /// The rows after the problems in the status bar's list, where nothing is wrong yet: an
+  /// extension to install or update, and the alerts offer. They keep their noun as their
+  /// symbol, and stay out of `problems`.
   var setupRows: [UIProblem] = []
   /// Every published camera, Program first.
   var virtualCameras: [UIVirtualCamera] = []
@@ -736,7 +786,7 @@ struct UISessionPresentation: Sendable, Equatable {
 
 extension UISessionPresentation {
   /// A camera is on air or rolling: no time to ask anyone anything.
-  var isLive: Bool { cameras.contains { $0.tally.isRed || $0.pauseTitle != nil } }
+  var isLive: Bool { streamActive || cameras.contains { $0.tally.isRed || $0.pauseTitle != nil } }
   /// The camera the menu bar preview shows: the one a meeting sees, then one a meeting has open,
   /// then the first running. Never the window's selection (D7): the menu has none.
   var previewCamera: UICameraPresentation? {
@@ -746,11 +796,11 @@ extension UISessionPresentation {
 }
 
 enum UIMenuBarIcon: String, Sendable, Equatable {
-  case stopped, waiting, live, bypass, recording, attention
-  /// The camera: outlined while stopped or waiting, filled while it sends pictures.
+  case stopped, waiting, noSignal, live, bypass, recording, attention
+  /// The camera is outlined while idle and filled while it sends pictures.
   var symbol: String {
     switch self {
-    case .stopped: return "video"
+    case .stopped, .noSignal: return "video"
     case .waiting: return UISymbol.waitingCamera
     case .live, .bypass, .recording, .attention: return "video.fill"
     }
@@ -760,7 +810,7 @@ enum UIMenuBarIcon: String, Sendable, Equatable {
     switch self {
     // Effects off has no badge: at real size it blurred into the two that matter, and the
     // panel says it.
-    case .stopped, .waiting, .live, .bypass: return nil
+    case .stopped, .waiting, .noSignal, .live, .bypass: return nil
     case .recording: return "circle.fill"
     case .attention: return UISymbol.warning
     }
@@ -769,6 +819,7 @@ enum UIMenuBarIcon: String, Sendable, Equatable {
     switch self {
     case .stopped: return "Ultracam, cameras stopped"
     case .waiting: return "Ultracam, waiting for a meeting app"
+    case .noSignal: return "Ultracam, no camera signal"
     case .live: return "Ultracam, live with effects"
     case .bypass: return "Ultracam, live with effects off"
     case .recording: return "Ultracam, recording"
@@ -804,6 +855,8 @@ enum UIFormat {
       return [UIValuePart(number: "\(minutes / 60)", unit: "h"),
         UIValuePart(number: String(format: "%02d", minutes % 60), unit: "m")]
     }
+    // The last minute never reads "0 min left".
+    if minutes == 0 && seconds > 0 { return [UIValuePart(number: "<1", unit: "min")] }
     return [UIValuePart(number: "\(minutes)", unit: "min")]
   }
 
@@ -871,6 +924,9 @@ enum UIPresentationBuilder {
 
   static func tally(for camera: UICameraSnapshot, in session: UISessionSnapshot) -> UITally {
     let onAir = session.onAirID == camera.id
+    // A committed cut can precede delivery at ingest. Keep the red ring on the source
+    // carried by the latest fresh stream sample until the new picture reaches the publisher.
+    if session.streamOnAirID == camera.id { return .onAir }
     let program = onAir ? programTally(camera, in: session) : .none
     if program == .onAir { return .onAir }
     // A client of the camera's own device: red, as frames reach it.
@@ -880,18 +936,24 @@ enum UIPresentationBuilder {
     return program
   }
 
-  /// Program's own tally: the Program picture's, and the cut button's of the camera on it.
+  /// Program's own tally, using delivery from either output.
   /// `.onAir`, `.noPicture` or `.program`, never `.iso`: a client of the on-air camera's own
   /// device isn't watching Program.
   static func programTally(_ session: UISessionSnapshot) -> UITally {
-    session.cameras.first { $0.id == session.onAirID }.map { programTally($0, in: session) } ?? .none
+    if session.streamOnAirID != nil { return .onAir }
+    if let selected = session.cameras.first(where: { $0.id == session.onAirID }) {
+      return programTally(selected, in: session)
+    }
+    return session.stream.phase == .streaming && !session.stream.pictureFresh ? .noPicture : .none
   }
 
   private static func programTally(_ camera: UICameraSnapshot, in session: UISessionSnapshot) -> UITally {
     // Red needs frames arriving, not just a client.
     if session.programInUse, session.programSinkConnected, sendsFrames(camera) { return .onAir }
+    if session.streamOnAirID == camera.id { return .onAir }
+    if session.stream.phase == .streaming, !session.stream.pictureFresh { return .noPicture }
     if session.programInUse, hasNoPicture(camera) { return .noPicture }
-    return session.cameras.count > 1 ? .program : .none
+    return session.programAvailable || session.stream.active ? .program : .none
   }
 
   /// Running with a picture: frames leave it.
@@ -956,7 +1018,7 @@ enum UIPresentationBuilder {
       switch camera.signal {
       case .live(let format): return (format, .positive)
       case .connecting, .none: return ("Starting…", .neutral)
-      case .noSignal: return ("No signal", .warning)
+      case .noSignal: return ("No signal", pictureNeeded(camera, in: session) ? .warning : .neutral)
       case .unsupported: return ("Unsupported format", .warning)
       case .deviceMissing: return ("Input disconnected", .warning)
       }
@@ -990,7 +1052,11 @@ enum UIPresentationBuilder {
         recordTitle = "Take ended early"
         recordDetail = takeSavedLine(camera) ?? rec.error ?? "The take ended with an error."
       }
-    case .stopped: recordTitle = "Not recording"; recordDetail = "Start the camera to record"
+    case .stopped:
+      recordTitle = "Not recording"
+      // A camera that can't start is told what it needs, as its problem row says.
+      recordDetail = camera.deviceAvailable ? "Start capture to record"
+        : camera.inputName == nil ? "Choose an input to record" : "Reconnect the input to record"
     case .waiting:
       // Name what is actually missing; the badge and picture already say which signal problem it is.
       recordTitle = "Can't record yet"
@@ -1003,13 +1069,18 @@ enum UIPresentationBuilder {
     let canRecordNow = camera.running && liveFormat != nil && rec.folderPath != nil && rec.status == .idle
     let recordButtonActive = rec.status == .recording || rec.status == .paused
     let recordButtonEnabled = rec.status == .recording || rec.status == .paused || canRecordNow
+    let recordKey = camera.id == session.selectedID ? " (⌘R)" : ""
     let recordHelp: String = {
-      if rec.status == .recording || rec.status == .paused { return "Stop Recording (⌘R)" }
-      if !camera.running { return "Start this camera before recording it." }
+      // ⌘R acts on the selected camera only, so only its button advertises the key.
+      if rec.status == .recording || rec.status == .paused { return "Stop Recording" + recordKey }
+      if !camera.running {
+        return camera.deviceAvailable ? "Start capture on this camera before recording it."
+          : camera.inputName == nil ? "Choose this camera's input before recording it." : "Reconnect this camera's input before recording it."
+      }
       if liveFormat == nil { return "Recording becomes available when a supported signal arrives." }
       if rec.folderPath == nil { return "Choose a recording folder first." }
       if rec.status == .finishing { return "Saving the previous take." }
-      return "Record (⌘R)"
+      return "Record" + recordKey
     }()
 
     let titles = ["LUT", camera.resizeTarget.title, camera.colorTarget.title, camera.frameRateTarget.title]
@@ -1021,11 +1092,22 @@ enum UIPresentationBuilder {
           : "\(effectLongTitles[index]). Changes the camera output format; the video updates briefly.")
     }
 
+    let carriesStreamAudio = session.stream.active && session.stream.audioFeedID == camera.id
+    let carriesStreamVideo = session.stream.active && (session.onAirID == camera.id || session.streamOnAirID == camera.id)
+    let virtualOutputLive = sendsFrames(camera) && ((camera.inUse && camera.sinkConnected) ||
+      (session.onAirID == camera.id && session.programInUse && session.programSinkConnected))
+    var stopConsequences: [String] = []
+    if isRecording || virtualOutputLive {
+      stopConsequences.append(stopMessage(camera: camera, recording: isRecording, onAir: virtualOutputLive))
+    }
+    if carriesStreamVideo { stopConsequences.append("Stopping this camera removes its picture from the Program stream.") }
+    if carriesStreamAudio { stopConsequences.append("Stopping this camera silences the stream audio.") }
     let outputLine: String
     if tally == .onAir {
       outputLine = "On air"
     } else if session.onAirID == camera.id, tally != .iso {
       outputLine = tally == .noPicture ? "In Program, no picture"
+        : session.stream.active ? "In Program, " + session.stream.phase.streamTitle.lowercased()
         : session.programInUse ? "In Program, viewer waiting" : "In Program, no viewer yet"
     } else if session.pendingCutID == camera.id {
       outputLine = "Next"
@@ -1074,10 +1156,11 @@ enum UIPresentationBuilder {
       cutEnabled: session.programAvailable && canTakeCut(camera) && session.onAirID != camera.id,
       cutHelp: cutHelp(camera, in: session),
       chips: chips, processing: camera.processing, applying: camera.applying,
-      canStart: !camera.running && camera.deviceAvailable,
-      canStop: camera.running,
-      stopNeedsConfirmation: camera.running && (isRecording || tally.isRed),
-      stopConfirmationMessage: stopMessage(camera: camera, recording: isRecording, onAir: tally.isRed),
+      canStart: !camera.running && !camera.captureAuthorizationPending &&
+        (camera.deviceAvailable || camera.captureAuthorizationRequestable),
+      canStop: camera.running || camera.captureAuthorizationPending,
+      stopNeedsConfirmation: camera.running && !stopConsequences.isEmpty,
+      stopConfirmationMessage: stopConsequences.isEmpty ? "Stop \(camera.name)?" : stopConsequences.joined(separator: " "),
       timecode: camera.timecode ?? "—", audio: camera.audio,
       activeTools: UIMonitorTool.allCases.filter { camera.activeTools.contains($0) },
       accessibilityLabel: labelParts.joined(separator: ", "),
@@ -1147,11 +1230,12 @@ enum UIPresentationBuilder {
     return session.codec
   }
 
-  /// The glyph beside a camera's name in the left pane.
+  /// The glyph beside a camera's name in a list.
   static func state(_ camera: UICameraSnapshot, strip: UIStripState, tone: UITone) -> UIState {
     if tone == .warning || strip == .failed { return .warning }
     guard camera.running else { return .inactive }
     if case .live = camera.signal { return .healthy }
+    if camera.signal == .noSignal { return .inactive }
     return .starting
   }
 
@@ -1213,7 +1297,7 @@ enum UIPresentationBuilder {
       outputSummary = unknown ? "Ultracam cameras: use unknown" : "Ultracam cameras not in use"
     }
 
-    // The worst drive here, every drive in the sidebar.
+    // The worst drive here, every drive in Record's popover.
     let worstDrive = worstDrive(session.drives)
     let drivesLine = session.drives.compactMap { drive in
       isFull(drive) ? "\(drive.name) full" : drive.secondsLeft.map { "\(drive.name) \(UIFormat.duration($0)) left" }
@@ -1224,19 +1308,28 @@ enum UIPresentationBuilder {
     let recordingSummary: String
     if recording.isEmpty { recordingSummary = drivesLine.isEmpty ? "Not recording" : "Not recording, \(drivesLine)" }
     else {
-      let count = recording.count > 1 ? (paused > 0 ? "\(rollingCount), \(paused) paused " : "\(recording.count) ") : (paused > 0 ? "paused " : "")
+      let count = recording.count > 1 ? (paused == recording.count ? "\(paused) paused " : paused > 0 ? "\(rollingCount), \(paused) paused " : "\(recording.count) ") : (paused > 0 ? "paused " : "")
       recordingSummary = "REC \(count)\(elapsed)" + (drivesLine.isEmpty ? "" : ", \(drivesLine)")
     }
 
-    // The worst problem comes first in the bar, with its action, so it's one click with the sidebar closed.
+    // The worst problem comes first in the bar, with its action, so it's one click.
     let problems = problems(session)
+    // What isn't wrong yet but needs a click (an extension to install, the alerts offer)
+    // follows the problems in the bar's list. It stays out of `problems`: the menu bar's
+    // count, its icon and the alerts are for problems alone.
+    let offersAlerts = session.offerAlerts && !session.stream.active && !cameras.contains { $0.tally.isRed || $0.pauseTitle != nil }
+    let setup = setupRows(session) + (offersAlerts ? [alertsOffer] : [])
+    let listed = problems + setup
     var segments: [UIStatusSegment] = []
-    if let worst = problems.first {
-      let text = worst.title + (problems.count > 1 ? "  +\(problems.count - 1)" : "")
-      let pieces: [UIStatusPiece] = [.warningGlyph, .strong(text)]
-      let compact: [UIStatusPiece] = problems.count > 1 ? [.warningGlyph, .strong("\(problems.count) problems")] : pieces
-      segments.append(UIStatusSegment(kind: .warning, text: text, tone: .warning, level: worst.level, action: worst.action,
-        pieces: pieces, compactPieces: compact, essentialPieces: compact))
+    if let first = listed.first {
+      let text = first.title + (listed.count > 1 ? "  +\(listed.count - 1)" : "")
+      // A setup row keeps its words alone: no warning triangle while nothing is wrong.
+      let glyph: [UIStatusPiece] = problems.isEmpty ? [] : [.warningGlyph]
+      let pieces = glyph + [.strong(text)]
+      let compact: [UIStatusPiece] = problems.count > 1 ? glyph + [.strong("\(problems.count) problems")]
+        : listed.count > 1 ? glyph + [.strong(first.title)] : pieces
+      segments.append(UIStatusSegment(kind: .warning, text: text, tone: problems.isEmpty ? .neutral : .warning,
+        level: first.level, action: first.action, pieces: pieces, compactPieces: compact, essentialPieces: compact))
     }
     let virtualCameras = virtualCameras(session)
     // With Program, its segment leads with the virtual camera glyph; this one only says what
@@ -1244,13 +1337,16 @@ enum UIPresentationBuilder {
     if !session.programAvailable || session.cameras.contains(where: \.inUse) {
       segments.append(outputSegment(session, cameras: virtualCameras, summary: outputSummary, inUse: outputInUse))
     }
-    let onAirName = session.cameras.first { $0.id == session.onAirID }?.name
-    if session.programAvailable {
-      segments.append(programSegment(session, onAirName: onAirName, autoSwitching: autoSwitching, holding: canHoldShot && session.autoHold,
-        onAirWord: cameras.contains { $0.tally == .onAir } ? "on air" : "in Program"))
+    let selectedProgram = session.cameras.first { $0.id == session.onAirID }
+    let selectedProgramTally = selectedProgram.map { programTally($0, in: session) } ?? .none
+    let programSource = selectedProgramTally == .onAir ? selectedProgram
+      : session.cameras.first { $0.id == session.streamOnAirID } ?? selectedProgram
+    if session.programAvailable || session.stream.active || session.stream.phase == .failed {
+      segments.append(programSegment(session, onAirName: programSource?.name, autoSwitching: autoSwitching, holding: canHoldShot && session.autoHold,
+        onAirWord: programSource.map { tally(for: $0, in: session) == .onAir } == true ? "on air" : "in Program"))
     }
     segments.append(recordingSegment(worstDrive: worstDrive, recording: recording.count, paused: paused, elapsed: elapsed,
-      summary: recordingSummary))
+      codec: session.codec.title, summary: recordingSummary))
     // Audio can only be judged from a picture with a signal; a running camera without HDMI has none.
     let live = session.cameras.filter(isLive)
     // No segment at all until a camera is live.
@@ -1258,23 +1354,25 @@ enum UIPresentationBuilder {
     if !live.isEmpty {
       let healthy = withAudio.count == live.count
       let count = "\(withAudio.count) of \(live.count)"
-      let text = healthy ? "Audio \(count)" : live.count == 1 ? "No embedded audio" : "Audio: \(count)"
+      let text = healthy ? "Audio \(count)" : live.count == 1 ? live[0].captureAudio.missingLabel : "Audio: \(count)"
       let pieces: [UIStatusPiece] = healthy ? [.dim("Audio"), .strong(count)] : [.warningGlyph, .strong(text)]
       segments.append(UIStatusSegment(kind: .audio, text: text, tone: healthy ? .neutral : .warning,
         pieces: pieces, compactPieces: pieces, essentialPieces: pieces))
     }
 
     let programTally = programTally(session)
-    let cutButtons = session.programAvailable ? cameras.map {
-      UICutButton(id: $0.id, number: $0.number, name: $0.name, onAir: session.onAirID == $0.id,
-        pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || session.onAirID == $0.id, help: $0.cutHelp,
-        tally: session.onAirID == $0.id ? programTally : .none)
+    let cutButtons: [UICutButton] = session.programAvailable ? cameras.map {
+      let selected = selectedProgram?.id == $0.id
+      return UICutButton(id: $0.id, number: $0.number, name: $0.name, onAir: selected,
+        pending: session.pendingCutID == $0.id, enabled: $0.cutEnabled || selected, help: $0.cutHelp,
+        tally: selected ? selectedProgramTally : .none)
     } : []
 
     // One camera has one picture: every grid layout is the single layout.
     let available = UILayout.allCases.filter { session.programAvailable || $0 != .programView }
     let layouts = cameras.count > 1 ? available : available.filter { $0 == .single }
     let layout = layouts.contains(session.layout) ? session.layout : .single
+    let canStopCapture = cameras.contains(where: \.canStop)
 
     var presentation = UISessionPresentation(
       title: "Ultracam",
@@ -1282,18 +1380,20 @@ enum UIPresentationBuilder {
       programAvailable: session.programAvailable,
       layouts: layouts, layout: layout, recordControl: recordControl,
       camerasRunning: running,
-      camerasControlTitle: camerasControlTitle(session, running: running),
+      camerasControlTitle: camerasControlTitle(session, running: canStopCapture),
       startControl: startControl(cameras),
       cutButtons: cutButtons, autoSwitching: autoSwitching,
       canAutoSwitch: canAutoSwitch, canHoldShot: canHoldShot,
-      canStartAny: running || cameras.contains(where: \.canStart),
+      canStartAny: canStopCapture || cameras.contains(where: \.canStart),
       canRevealRecordings: session.defaultFolderPath != nil || session.cameras.contains { $0.recording.folderPath != nil },
       statusSegments: segments, problems: problems, outputSummary: outputSummary, outputInUse: outputInUse,
       recordingSummary: recordingSummary, menuBarIcon: menuBarIcon(session, problems: problems))
-    presentation.offersAlerts = session.offerAlerts && !presentation.isLive
+    presentation.offersAlerts = offersAlerts
+    presentation.streamActive = session.stream.active
+    presentation.streamAudioFeedID = session.stream.active ? session.stream.audioFeedID : nil
     presentation.programTally = programTally
     presentation.autoHoldOn = canHoldShot && session.autoHold
-    presentation.setupRows = setupRows(session)
+    presentation.setupRows = setup
     presentation.virtualCameras = virtualCameras
     presentation.askBeforeEnding = session.askBeforeEnding
     presentation.canPauseAll = !recording.isEmpty
@@ -1301,10 +1401,10 @@ enum UIPresentationBuilder {
     return presentation
   }
 
-  /// The menus' Start or Stop row. One camera says which; several say "All" when it stops them.
+  /// The menus' Start or Stop row, worded as the toolbar's: several cameras say "All" when it stops them.
   static func camerasControlTitle(_ session: UISessionSnapshot, running: Bool) -> String {
-    if session.cameras.count == 1 { return (running ? "Stop " : "Start ") + session.cameras[0].name }
-    return running ? "Stop All Cameras" : "Start Cameras"
+    if !running { return "Start Capture" }
+    return session.cameras.count == 1 ? "Stop Capture" : "Stop All Capture"
   }
 
   /// The toolbar's cut pills: every camera up to six, else the first five and a More menu
@@ -1322,25 +1422,27 @@ enum UIPresentationBuilder {
     narrowWindow || hasMore || shown.count > 3 || shown.reduce(0) { $0 + min($1.name.count, 18) } > 40
   }
 
-  /// A drive's free space as the sidebar words it when there's no time to estimate.
+  /// A drive's free space in words, when there's no time to estimate.
   static func freeSpaceText(_ drive: UIDrive) -> String {
     drive.totalBytes == 0 && drive.availableBytes == 0 ? "Free space unknown" : "\(UIFormat.bytes(drive.availableBytes)) free"
   }
 
-  /// "Start Cameras" with every camera stopped, "Start Camera 2" with one of several.
+  /// "Start Capture" with every camera stopped, "Start Camera 2" with one of several.
   static func startControl(_ cameras: [UICameraPresentation]) -> UIStartControl? {
     let stopped = cameras.filter { !$0.canStop }
     guard !stopped.isEmpty else { return nil }
     let startable = stopped.filter(\.canStart)
     let help = startable.isEmpty ? "No camera can start: connect its input device or choose another input in the inspector." : nil
     if cameras.count == 1 {
-      return UIStartControl(title: "Start Camera", enabled: !startable.isEmpty, action: .startAllCameras, help: help ?? "Start the camera (⌘↩).")
+      return UIStartControl(title: "Start Capture", enabled: !startable.isEmpty, action: .startAllCameras, help: help ?? "Start capture (⌘↩).")
     }
     if stopped.count == 1, let only = stopped.first {
       return UIStartControl(title: "Start \(only.name)", enabled: only.canStart, action: .startCamera(cameraID: only.id),
         help: help ?? "Start \(only.name).")
     }
-    return UIStartControl(title: "Start Cameras", enabled: !startable.isEmpty, action: .startAllCameras, help: help ?? "Start every stopped camera (⌘↩).")
+    let shortcut = cameras.contains(where: \.canStop) ? "" : " (⌘↩)"
+    return UIStartControl(title: "Start Capture", enabled: !startable.isEmpty, action: .startAllCameras,
+      help: help ?? "Start capture on every stopped camera\(shortcut).")
   }
 
   /// Every published camera, Program first once there are two.
@@ -1380,13 +1482,19 @@ enum UIPresentationBuilder {
     let counts = autoSwitching && !holding && session.recentCuts.first?.automatic == false
     let word: [UIStatusPiece] = autoSwitching ? (holding ? [.strong("Hold")] : []) : [.dim("Manual")]
     let lead: [UIStatusPiece] = [.virtualCamera(inUse: session.programInUse), .strong("Program"), .dim(onAir)]
-    return UIStatusSegment(kind: .program, text: "\(onAir) \(onAirWord), \(mode)", tone: .neutral,
-      pieces: lead + [.shot(bar: true, countsAuto: counts)] + word,
-      compactPieces: lead + [.shot(bar: false, countsAuto: counts)] + word,
-      essentialPieces: lead)
+    let showsStream = session.stream.active || session.stream.phase == .failed
+    let stream: [UIStatusPiece] = showsStream ? [.strong(session.stream.phase.streamTitle)] : []
+    let summary = "\(onAir) \(onAirWord), \(mode)" + (showsStream ? ", " + session.stream.phase.streamTitle : "")
+    return UIStatusSegment(kind: .program, text: summary, tone: .neutral,
+      pieces: lead + stream + [.shot(bar: true, countsAuto: counts)] + word,
+      compactPieces: lead + stream + [.shot(bar: false, countsAuto: counts)] + word,
+      essentialPieces: stream.isEmpty ? lead : [.strong("Program")] + stream)
   }
 
-  private static func recordingSegment(worstDrive: UIDrive?, recording: Int, paused: Int, elapsed: String, summary: String) -> UIStatusSegment {
+  /// The session's format rides along at full width only, read-only: it's set in the
+  /// popover this segment opens, and no strip repeats it.
+  private static func recordingSegment(worstDrive: UIDrive?, recording: Int, paused: Int, elapsed: String, codec: String,
+    summary: String) -> UIStatusSegment {
     var state: [UIStatusPiece]
     let rolling = recording - paused
     if recording == 0 {
@@ -1396,16 +1504,17 @@ enum UIPresentationBuilder {
       state = rolling > 0 ? [.recordingDot, .dim(rolling > 1 ? "REC \(rolling)" : "REC"), clock] : [clock]
       if paused > 0 { state += [.pausedGlyph, .strong("\(paused)")] }
     }
+    let format: [UIStatusPiece] = [.dim(codec)]
     // A full drive says so: it has no time to show.
     if let full = worstDrive, isFull(full) {
       let driveName: [UIStatusPiece] = [.dim(full.name), .strong("full")]
       return UIStatusSegment(kind: .recording, text: summary, tone: recording == 0 ? .neutral : .critical,
-        pieces: state + driveName, compactPieces: state + driveName, essentialPieces: state)
+        pieces: state + format + driveName, compactPieces: state + driveName, essentialPieces: state)
     }
     let drive = worstDrive.flatMap { drive in drive.secondsLeft.map { (drive.name, UIFormat.durationParts($0)) } }
     let driveName: [UIStatusPiece] = drive.map { [.dim($0.0), .value($0.1)] } ?? []
     return UIStatusSegment(kind: .recording, text: summary, tone: recording == 0 ? .neutral : .critical,
-      pieces: state + driveName + (drive == nil ? [] : [.dim("left")]), compactPieces: state + driveName, essentialPieces: state)
+      pieces: state + format + driveName + (drive == nil ? [] : [.dim("left")]), compactPieces: state + driveName, essentialPieces: state)
   }
 
   /// The drive that runs out first: a full one before any, then the least time left. A drive
@@ -1472,9 +1581,68 @@ enum UIPresentationBuilder {
     guard !running.isEmpty else {
       return session.cameras.contains(where: \.automaticStart) ? .waiting : .stopped
     }
+    if running.allSatisfy({ $0.signal == .noSignal }) { return .noSignal }
     // The camera a meeting sees, not the window's selection (D7): Program's, then one in use.
     let shown = running.first { $0.id == session.onAirID && session.programInUse } ?? running.first(where: \.inUse)
       ?? running.first { $0.id == session.onAirID } ?? running[0]
     return shown.processing ? .live : .bypass
   }
+}
+
+extension ProgramStreamPhase {
+  var streamTitle: String {
+    switch self {
+    case .idle: return "Idle"
+    case .connecting: return "Connecting"
+    case .streaming: return "Streaming"
+    case .reconnecting: return "Reconnecting"
+    case .failed: return "Stream Failed"
+    }
+  }
+}
+
+extension UISessionSnapshot {
+  var streamCommand: UIProblemAction {
+    if stream.active { return UIProblemAction(title: "Stop Stream", action: .stopProgramStream) }
+    if !stream.configured || stream.needsSetup {
+      return UIProblemAction(title: "Set Up Stream…", action: .openSettingsTab(.streaming))
+    }
+    if programAvailable {
+      let enabled = cameras.filter(\.enabled)
+      func hasAvailableInput(_ camera: UICameraSnapshot) -> Bool { camera.streamCaptureInputAvailable ?? camera.deviceAvailable }
+      func canSupply(_ camera: UICameraSnapshot) -> Bool {
+        camera.running || FeedLifecycleDemandPolicy.canStartSource(automaticEnabled: camera.automaticStart,
+          manuallyStopped: camera.captureManuallyStopped, deviceAvailable: hasAvailableInput(camera), loading: false)
+      }
+      if let id = stream.audioFeedID {
+        guard let audio = enabled.first(where: { $0.id == id }), audio.running || hasAvailableInput(audio) else {
+          return UIProblemAction(title: "Choose Audio Input…", action: .openSettingsTab(.streaming))
+        }
+        if !canSupply(audio) {
+          return UIProblemAction(title: "Start Capture on " + audio.name, action: .startCamera(cameraID: id))
+        }
+      }
+      if !enabled.contains(where: canSupply) {
+        guard let first = enabled.first(where: hasAvailableInput) else {
+          return UIProblemAction(title: "Choose a Program Input…", action: .openSettingsTab(.hardware))
+        }
+        return UIProblemAction(title: "Start Capture on " + first.name, action: .startCamera(cameraID: first.id))
+      }
+    }
+    return UIProblemAction(title: stream.phase == .failed ? "Retry Stream" : "Start Stream", action: .startProgramStream)
+  }
+
+  var streamCommandEnabled: Bool { streamCommand.action != .startProgramStream || programAvailable }
+
+  var streamAudioName: String {
+    guard let id = stream.audioFeedID else { return "Video only" }
+    return cameras.first { $0.id == id }?.name ?? "Unavailable camera"
+  }
+}
+
+
+extension CaptureAudioKind {
+  var title: String { self == .embedded ? "Embedded Audio" : "Microphone Audio" }
+  var label: String { self == .embedded ? "embedded audio" : "microphone audio" }
+  var missingLabel: String { self == .embedded ? "No embedded audio" : "No microphone audio" }
 }

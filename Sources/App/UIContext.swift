@@ -62,15 +62,15 @@ extension UIPictureProviding {
   /// Where the camera's monitor-only LUT file stands (loading, shown, failed).
   func monitorLUTState(for cameraID: String) -> MonitorFeedHost.MonitorLUTState
   /// What the camera's scope measures: the shown picture's signal (nil before a
-  /// frame) and whether a LUT is on the scope's stage.
-  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: Bool)
+  /// frame) and the output signal of a LUT on the scope's stage.
+  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: SignalDescription?)
 }
 
 extension UIMonitorSettingsProviding {
   /// Fixtures have no feed host: no monitor LUT is loading or loaded.
   func monitorLUTState(for cameraID: String) -> MonitorFeedHost.MonitorLUTState { .none }
   /// Fixtures have no picture: no signal yet and no LUT.
-  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: Bool) { (nil, false) }
+  func scopeMeasurement(for cameraID: String) -> (signal: SignalDescription?, stageLUT: SignalDescription?) { (nil, nil) }
 }
 
 /// Everything a view in the new interface needs: the derived presentation,
@@ -84,7 +84,7 @@ struct UIContext {
   var pictures: any UIPictureProviding
   var monitor: any UIMonitorSettingsProviding
   /// Rebuilds the context from the live models. Views hosted in their own column
-  /// (inspector, sidebar) call this inside `body` so Observation tracks the models
+  /// (the inspector) call this inside `body` so Observation tracks the models
   /// there too. Fixtures leave it nil.
   var refreshed: (@MainActor () -> UIContext)? = nil
   var cameraControls: CameraControlStore? = nil
@@ -209,8 +209,6 @@ enum UIFixtures {
     session.codec = .hevcMain10_422
     session.drives = [UIDrive(name: "8TB", availableBytes: 595_000_000_000, totalBytes: 8_000_000_000_000, secondsLeft: 6720),
       UIDrive(name: "Archive", availableBytes: 3_000_000_000_000, totalBytes: 4_000_000_000_000, secondsLeft: 20400)]
-    session.recentTakes = [UITake(url: URL(fileURLWithPath: "/Volumes/8TB/Takes/Camera 1/Camera 1_2026-10-21_08-02-11_001.mov"),
-      name: "Camera 1_2026-10-21_08-02-11_001.mov", date: Date(timeIntervalSince1970: 1_792_400_000), duration: 2292)]
     session.interruptedTakes = [UIInterruptedTake(id: "/Volumes/8TB/Takes/.journal", title: "Camera 1_2026-10-19_11-15-02_001.mov")]
     session.defaultFolderPath = "/Volumes/8TB/Takes"
     return session
@@ -227,7 +225,7 @@ enum UIFixtures {
     session.autoSwitching = true
     // Auto only shows as on with a strategy that switches on its own.
     session.strategy = .naturalTalkingHead
-    session.strategyTitle = "Natural talking head"
+    session.strategyTitle = "Natural Talking Head"
     session.shot = UIShotTiming(currentShot: 8.2)
     session.recentCuts = [UICutRecord(at: Date(timeIntervalSince1970: 1_792_405_343), cameraID: "camera-1", cameraName: "Camera 1", automatic: true),
       UICutRecord(at: Date(timeIntervalSince1970: 1_792_405_318), cameraID: "camera-2", cameraName: "Camera 2", automatic: false)]
@@ -262,7 +260,6 @@ enum UIFixtures {
     session.onAirID = "camera-1"
     session.selectedID = "camera-2"
     session.layout = .fourUp
-    session.sidebarVisible = false
     return session
   }
 

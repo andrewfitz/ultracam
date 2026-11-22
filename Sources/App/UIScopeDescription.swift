@@ -98,7 +98,7 @@ enum UIScopeLook: String, CaseIterable, Identifiable, Sendable {
 
 /// What one target's scope measures and how it is labelled: the scope's
 /// settings, the stage signal it measures (the source where no LUT touches the
-/// stage, Rec.709 after the burn-in LUT) and the graticule labels, computed from
+/// stage, the LUT's declared output signal after burn-in) and the graticule labels, computed from
 /// the same inputs MonitorKit draws the graticule lines from. Built only when the
 /// settings or the shown signal change, never per frame.
 struct UIScopeDescription: Equatable, Sendable {
@@ -111,31 +111,23 @@ struct UIScopeDescription: Equatable, Sendable {
   let isProgram: Bool
   /// The signal of the measured stage; nil before a frame arrives.
   let signal: SignalDescription?
-  /// A LUT changes the measured stage (it is then Rec.709).
+  /// Whether the selected stage carries LUT output.
   let lutApplied: Bool
   let context: ScopeContext
 
-  /// `signal` is the shown frame's, with both readings (`shownSignal`,
-  /// `MonitorCoordinator.scopeMeasurement`): the description takes its own stage's
-  /// (`SignalDescription.signal(for:)`), as `ScopeAccumulator` does, so an Output
-  /// or Monitor scope of a camera declared Full is labelled with the legal range
-  /// the scope measures. `stageLUT`: whether a LUT is on the path to the scope's
-  /// stage, by `MonitorState.pictureHasLUT`'s rule for that stage (the burn-in LUT
-  /// on Output and Monitor, a shown monitor LUT on Monitor);
-  /// `MonitorSurfacePresenter.scopeMeasuresLUT` decides it for a surface.
-  init(scopes: MonitorScopePreferences, signal: SignalDescription?, stageLUT: Bool, isProgram: Bool) {
+  /// A source frame carries both code readings. When a LUT ran on the selected
+  /// stage, its output signal supplies the measured transfer, range and matrix.
+  init(scopes: MonitorScopePreferences, signal: SignalDescription?, stageLUT: SignalDescription?, isProgram: Bool) {
     let s = scopes.settings.normalized()
     settings = s
     self.isProgram = isProgram
-    let lut = s.stage != .source && stageLUT
-    lutApplied = lut
-    let staged = signal?.signal(for: s.stage)
-    self.signal = lut ? nil : staged
-    // As `ScopeAccumulator` measures it: the stage's range, the matrix the
-    // colorimetry picks for the stage's reading.
+    let lut = s.stage == .source ? nil : stageLUT
+    lutApplied = lut != nil
+    let measured = lut ?? signal?.signal(for: s.stage)
+    self.signal = measured
     context = ScopeContext(
-      range: staged?.range ?? .legal,
-      matrix: s.colorimetry.matrix(source: staged?.matrix ?? .bt709, lutApplied: lut))
+      range: measured?.range ?? .legal,
+      matrix: s.colorimetry.matrix(source: measured?.matrix ?? .bt709, lutApplied: false))
   }
 
   var choice: UIScopeChoice { UIScopeChoice(settings) }

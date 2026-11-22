@@ -30,6 +30,22 @@ import XCTest
     withExtendedLifetime(publisher) {}
   }
 
+  @MainActor
+  func testRegistryPublisherReportsSynchronizationFailure() {
+    let reported = expectation(description: "Publication error on the main actor")
+    let publisher = VirtualCameraRegistryPublisher(observeTopology: false) { _ in
+      throw VideoError.message("Injected failure")
+    }
+    publisher.onSynchronizationResult = { result in
+      guard case .failure(let error) = result else { return XCTFail("Expected a failure") }
+      XCTAssertEqual(error.localizedDescription, "Injected failure")
+      reported.fulfill()
+    }
+    publisher.publish(VirtualCameraRegistrySnapshot(generation: 1))
+    wait(for: [reported], timeout: 2)
+    withExtendedLifetime(publisher) {}
+  }
+
   func testQueuedPublicationCannotRebaseIntentSupersededByCapture() throws {
     let old = VirtualCameraRegistrySnapshot(generation: 1, devices: [
       .feed(feedID: FeedID.primary.rawValue, displayName: "Old")])
@@ -667,6 +683,96 @@ import XCTest
       runtime.source.streamingSourceClientIDsForTesting = []
       try runtime.source.stopStream()
       XCTAssertEqual(runtime.consumers, 0)
+    }
+  }
+
+  func testTrailingStopWhileStreamingListIsEmptyKeepsRemainingStartedViewer() throws {
+    let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let departed = UUID(), remaining = UUID()
+    try runtime.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.streamingSourceClientIDsForTesting = [departed, remaining]
+      for id in [departed, remaining] {
+        runtime.source.authorizeSourceForTesting(clientID: id)
+        try runtime.source.startStream()
+      }
+      runtime.source.streamingSourceClientIDsForTesting = []
+      runtime.source.disconnectSourceForTesting(clientID: departed)
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 1)
+      runtime.source.observeStreamingClientsForTesting([remaining])
+      XCTAssertEqual(runtime.consumers, 1)
+      runtime.source.streamingSourceClientIDsForTesting = []
+      try runtime.source.stopStream()
+      XCTAssertFalse(runtime.inUse)
+    }
+  }
+
+  func testRealFinalStopWithNoTrailingDisconnectCallbackSettlesFromMembership() throws {
+    for stopFirst in [false, true] {
+      let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+      let departed = UUID(), remaining = UUID()
+      try runtime.queue.sync {
+        runtime.enableGPUStandbyForTesting { _, _ in }
+        runtime.source.streamingSourceClientIDsForTesting = [departed, remaining]
+        for id in [departed, remaining] {
+          runtime.source.authorizeSourceForTesting(clientID: id)
+          try runtime.source.startStream()
+        }
+        runtime.source.streamingSourceClientIDsForTesting = [remaining]
+        runtime.source.disconnectSourceForTesting(clientID: departed)
+        if stopFirst { try runtime.source.stopStream() }
+        runtime.source.observeStreamingClientsForTesting([])
+        if !stopFirst {
+          XCTAssertEqual(runtime.consumers, 1, "A list change alone cannot release a completed start")
+          try runtime.source.stopStream()
+        }
+        XCTAssertFalse(runtime.inUse)
+      }
+    }
+  }
+
+  func testDelayedListRestoresAStartedViewerAfterAMisattributedStop() throws {
+    let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let remaining = UUID(), leaving = UUID()
+    try runtime.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.streamingSourceClientIDsForTesting = [remaining, leaving]
+      for id in [remaining, leaving] {
+        runtime.source.authorizeSourceForTesting(clientID: id)
+        try runtime.source.startStream()
+      }
+      try runtime.source.stopStream()
+      runtime.source.streamingSourceClientIDsForTesting = []
+      runtime.source.disconnectSourceForTesting(clientID: leaving)
+      runtime.source.observeStreamingClientsForTesting([remaining])
+      XCTAssertEqual(runtime.consumers, 1)
+      runtime.source.streamingSourceClientIDsForTesting = []
+      try runtime.source.stopStream()
+      XCTAssertFalse(runtime.inUse)
+    }
+  }
+
+  func testLateMembershipRestoresAuthorizedViewerWithoutAnotherStart() throws {
+    let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let departed = UUID(), remaining = UUID()
+    try runtime.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.authorizeSourceForTesting(clientID: departed)
+      try runtime.source.startStream()
+      runtime.source.authorizeSourceForTesting(clientID: remaining)
+      runtime.source.streamingSourceClientIDsForTesting = []
+      runtime.source.disconnectSourceForTesting(clientID: departed)
+      try runtime.source.stopStream()
+      XCTAssertTrue(runtime.source.hasPendingStart)
+      runtime.source.observeStreamingClientsForTesting([departed, remaining])
+      XCTAssertEqual(runtime.consumers, 1)
+      XCTAssertFalse(runtime.source.hasPendingStart)
+      runtime.source.observeStreamingClientsForTesting([remaining])
+      XCTAssertEqual(runtime.consumers, 1)
+      runtime.source.streamingSourceClientIDsForTesting = []
+      try runtime.source.stopStream()
+      XCTAssertFalse(runtime.inUse)
     }
   }
 
