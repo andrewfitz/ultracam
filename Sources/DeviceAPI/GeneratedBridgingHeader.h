@@ -4,5 +4,5 @@
 #import "DeviceAPI.h"
 #import "../../Vendors/Blackmagic/Sources/DeckLinkBackend.h"
 #import "../../Vendors/Sony/Sources/SonyCameraControl.h"
-#include "../../Apps/AutoSwitcher/include/auto_switcher.h"
+#include <auto_switcher.h>
 #endif

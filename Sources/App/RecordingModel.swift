@@ -311,12 +311,13 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
   // different folders on one drive are all counted against its free space.
   private let sessionLock = NSLock()
   private var sessions: [FeedID: Session] = [:]
-  @MainActor var onSourceEpochCutoff: ((FeedID, UUID) -> Void)?
+  @MainActor var onSourceEpochCutoff: ((FeedID, UUID, CMTime?) -> Void)?
   private var stoppingFeeds = Set<FeedID>()
   /// Feeds whose take is being prepared on a worker, and stops that arrived
   /// meanwhile (run by that worker once the take exists).
   private var startingFeeds = Set<FeedID>()
   private var stopsAfterStart: [FeedID: [StopCompletion]] = [:]
+  private var completedTakeIDs: [FeedID: UUID] = [:]
   private var completedStatistics: [FeedID: RecordingStatistics] = [:]
   private var finishedOutputs: [FeedID: URL] = [:]
   /// Feeds whose last started take burns the camera's LUT in.
@@ -411,6 +412,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
       guard sessions[feedID] == nil, startingFeeds.insert(feedID).inserted else {
         throw SourceRecordingError.invalidState(.recording, operation: "start recording")
       }
+      completedTakeIDs.removeValue(forKey: feedID)
       completedStatistics.removeValue(forKey: feedID)
       finishedOutputs.removeValue(forKey: feedID)
     }
@@ -444,10 +446,11 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
         let feedID = request.feedID
         callbacks.preparedEpoch = request.takeContext?.sourceAdmission.epochID
         callbacks.preparedVideoFormat = request.videoFormat
-        callbacks.finishAtSourceEpoch = { [weak self] in
+        callbacks.takeOutputURL = session.output.finalURL
+        callbacks.finishAtSourceEpoch = { [weak self] mediaEnd in
           DispatchQueue.main.async { [weak self] in
-            guard let self, self.hasCurrentTake(feedID: feedID, takeID: takeID) else { return }
-            if let handle = self.onSourceEpochCutoff { handle(feedID, takeID) }
+            guard let self, self.matchesTake(feedID: feedID, takeID: takeID) else { return }
+            if let handle = self.onSourceEpochCutoff { handle(feedID, takeID, mediaEnd) }
             else { self.stopAtSourceEpoch(feedID: feedID, takeID: takeID) { _ in } }
           }
         }
@@ -612,8 +615,8 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     }
   }
 
-  private func hasCurrentTake(feedID: FeedID, takeID: UUID) -> Bool {
-    sessionLock.withLock { sessions[feedID]?.id == takeID && !stoppingFeeds.contains(feedID) }
+  private func matchesTake(feedID: FeedID, takeID: UUID) -> Bool {
+    sessionLock.withLock { (sessions[feedID]?.id ?? completedTakeIDs[feedID]) == takeID }
   }
 
   @MainActor func stopAtSourceEpoch(feedID: FeedID, takeID: UUID, completion: @escaping StopCompletion) {
@@ -670,6 +673,7 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
     defer {
       let final = snapshot(session, stopped: true)
       sessionLock.withLock {
+        completedTakeIDs[feedID] = session.id
         completedStatistics[feedID] = final
         finishedOutputs[feedID] = session.output.state == .finished ? session.output.finalURL : nil
         sessions.removeValue(forKey: feedID)
@@ -828,6 +832,7 @@ final class RecordingModel {
   var onManualStop: ((FeedID) -> Void)?
   var onRecordingStarted: ((FeedID, URL) -> Void)?
   var onRecordingFinished: ((FeedID, URL?) -> Void)?
+  var onRecordingSourceEpochCutoff: ((FeedID, CMTime?) -> Void)?
   /// A take paused (`true`) or resumed (`false`).
   var onRecordingPaused: ((FeedID, Bool) -> Void)?
   /// What a camera is sending now: `record(feedID:)` resolves the take's format from it. Nil
@@ -848,8 +853,10 @@ final class RecordingModel {
     self.resolveFinishedFile = resolveFinishedFile
     self.driver = driver
     self.folderStore = folderStore
-    (driver as? NativeRecordingSessionDriver)?.onSourceEpochCutoff = { [weak self] feedID, takeID in
-      self?.stop(feedID: feedID, automatic: true, expectedTakeID: takeID)
+    (driver as? NativeRecordingSessionDriver)?.onSourceEpochCutoff = { [weak self] feedID, takeID, mediaEnd in
+      guard let self, let index = self.index(of: feedID), self.feeds[index].status != .idle else { return }
+      self.onRecordingSourceEpochCutoff?(feedID, mediaEnd)
+      self.stop(feedID: feedID, automatic: true, expectedTakeID: takeID)
     }
     updateFeeds(feeds)
     do {

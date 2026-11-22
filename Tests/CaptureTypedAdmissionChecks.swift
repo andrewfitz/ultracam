@@ -18,9 +18,9 @@ import XCTest
     controller.setCameraOutputEnabled(false)
     controller.setMonitorSink(sink)
     defer { sink.release.signal(); controller.onUpdate = nil; controller.stop() }
-    let recording = TypedRecordingAdmission()
+    let firstTake = TypedRecordingAdmission()
     controller.setRecordingCallbacks(feedID: feed, callbacks: SourceRecordingCallbackAdapter.Callbacks(
-      video: { _, _, _, admitted in recording.note(admitted); return admitted }, audio: { _ in false },
+      video: { _, _, _, admitted in firstTake.note(admitted); return admitted }, audio: { _ in false },
       rawAudio: { _, _, _, _, _ in false }))
     let started = expectation(description: "Epoch source ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { started.fulfill() } }
@@ -42,15 +42,27 @@ import XCTest
       if index == 0 { XCTAssertEqual(sink.entered.wait(timeout: .now() + 2), .success) }
     }
     controller.setCameraOutputEnabled(false)
-    XCTAssertTrue(source.source.submitGroup([.event(.discontinuity), .event(.info("stale declaration"))]))
+    XCTAssertTrue(source.source.submit(.event(.discontinuity)))
     let context = source.source.context
+    let declarationDeadline = Date().addingTimeInterval(2)
+    while source.counters.currentBacklog > 0, Date() < declarationDeadline {
+      Thread.sleep(forTimeInterval: 0.001)
+    }
+    XCTAssertEqual(controller.recordingTakeContext?.sourceAdmission.epochID, context.epochID)
+    XCTAssertNil(controller.recordingDiscoverySnapshotForTesting(feedID: feed), "The old take ends on the new declaration")
+    let nextTake = TypedRecordingAdmission()
+    controller.setRecordingCallbacks(feedID: feed, callbacks: SourceRecordingCallbackAdapter.Callbacks(
+      video: { _, _, _, admitted in nextTake.note(admitted); return admitted }, audio: { _ in false },
+      rawAudio: { _, _, _, _, _ in false }, preparedEpoch: context.epochID))
+    XCTAssertTrue(source.source.submit(.event(.info("stale declaration"))))
     let newTime = CMTime(value: 1, timescale: 1)
     XCTAssertTrue(source.source.submit(.frame(CapturedPixelBuffer(immutable: image),
       CaptureFrameInfo(epochID: context.epochID, formatSignature: context.formatSignature,
         presentationTime: newTime, duration: VideoContract.fastDuration, signalValid: true, timecode: nil))))
     source.stop()
     controller.setCameraOutputEnabled(false)
-    XCTAssertEqual(recording.accepted, 3, "A stale declaration cannot roll the current contract backwards")
+    XCTAssertEqual(firstTake.accepted, 2)
+    XCTAssertEqual(nextTake.accepted, 1, "A stale declaration cannot roll the current contract backwards")
     sink.release.signal()
     let deadline = Date().addingTimeInterval(2)
     while budget.snapshot.currentSlots > 0, Date() < deadline { Thread.sleep(forTimeInterval: 0.001) }

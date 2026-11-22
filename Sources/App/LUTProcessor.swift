@@ -11,6 +11,7 @@ enum LiveFrameRouteError: LocalizedError {
   case unsupportedChromaSiting
   case unmappablePlane(Int, CVReturn)
   case odd420Output
+  case unsupportedColourConversion(String)
 
   var errorDescription: String? {
     switch self {
@@ -19,6 +20,7 @@ enum LiveFrameRouteError: LocalizedError {
     case .unsupportedChromaSiting: return "Live pixel processing requires supported chroma siting. Choose a capture mode that provides it."
     case .unmappablePlane(let plane, let status): return "Live video cannot map capture plane \(plane) for the GPU (\(status)). Choose a capture mode that supplies GPU-compatible buffers."
     case .odd420Output: return "4:2:0 live output requires even width and height. Enable Output size or choose a 4:2:2 Color format."
+    case .unsupportedColourConversion(let detail): return detail
     }
   }
 }
@@ -780,7 +782,7 @@ final class LUTProcessor: @unchecked Sendable {
         .validate(source: sourceColour, destination: destination, conversion: colorConversion)
     }
     guard destination.supportsLUTVideoOutput else {
-      throw VideoError.message("Unsupported LUT output range, matrix, primaries or transfer function.")
+      throw LiveFrameRouteError.unsupportedColourConversion("Unsupported LUT output range, matrix, primaries or transfer function.")
     }
     let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
     let type = CVPixelBufferGetPixelFormatType(input)
@@ -1024,10 +1026,10 @@ final class LUTProcessor: @unchecked Sendable {
     if from.primaries == to.primaries && from.transfer == to.transfer { return .zero }
     func transferID(_ t: Colorimetry.Transfer) throws -> UInt32 {
       switch t { case .linear: return 1; case .rec709: return 2; case .sRGB: return 3; case .pq: return 4; case .hlg: return 5
-      default: throw VideoError.message("Unsupported colour conversion transfer function.") }
+      default: throw LiveFrameRouteError.unsupportedColourConversion("Unsupported colour conversion transfer function.") }
     }
     guard [.rec709, .rec2020].contains(from.primaries), [.rec709, .rec2020].contains(to.primaries) else {
-      throw VideoError.message("Unsupported colour conversion primaries.")
+      throw LiveFrameRouteError.unsupportedColourConversion("Unsupported colour conversion primaries.")
     }
     return try SIMD4(transferID(from.transfer), transferID(to.transfer),
       from.primaries == to.primaries ? 0 : (from.primaries == .rec709 ? 1 : 2), 0)

@@ -1,4 +1,5 @@
 #if ULTRACAM_TEST_SUPPORT
+import CoreMedia
 import Foundation
 import XCTest
 
@@ -67,6 +68,13 @@ import XCTest
     spin("The first try fails and says so") { model.appProblems.contains { $0.id == "program-connect" } }
     let start = now + 1000
     let first = fixture.programSink.connectAttempts
+    let onAir = try XCTUnwrap(model.switcherSelectedFeedID)
+    let changedCadence = CMTime(value: 1, timescale: 25)
+    model.deliverCaptureUpdateForTesting(onAir, CaptureUpdate(message: "Detected cadence", sourceDuration: changedCadence))
+    model.setProgramDemandForTesting(requested: true)
+    _ = model.requestProgramCut(to: onAir)
+    settle()
+    XCTAssertEqual(fixture.programSink.connectAttempts, first, "Demand, cut and source changes respect a failed connection's backoff")
     model.liveWatchTick(now: start)
     spin("It tries again") { fixture.programSink.connectAttempts == first + 1 }
     spin("Which fails too") { model.appProblems.contains { $0.id == "program-connect" } }
@@ -77,6 +85,27 @@ import XCTest
     model.liveWatchTick(now: start + LiveWatchLimits.connectRetry)
     spin("Then connects") { fixture.programSink.openConnections == 1 }
     spin("And clears the problem") { !model.appProblems.contains { $0.id == "program-connect" } }
+  }
+
+  func testChangingTheProgramContractCanRetryBeforeBackoffEnds() throws {
+    try prepare()
+    defer { finish() }
+    fixture.programSink.failNextConnects(1000)
+    model.setProgramDemandForTesting(requested: true)
+    spin("The requested connection fails") { model.appProblems.contains { $0.id == "program-connect" } }
+    let first = fixture.programSink.connectAttempts
+    let onAir = try XCTUnwrap(model.switcherSelectedFeedID)
+    model.updateCamera(onAir, shareProcessing: false) { $0.name = "Renamed source" }
+    settle()
+    XCTAssertEqual(fixture.programSink.connectAttempts, first, "A rename leaves the negotiated contract alone")
+
+    fixture.programSink.failNextConnects(0)
+    model.updateCamera(onAir, shareProcessing: false) {
+      $0.downscale = true
+      $0.resizeTarget = $0.resizeTarget == .hd720 ? .hd1080 : .hd720
+    }
+    spin("A change to the requested resolution retries the connection") { fixture.programSink.openConnections == 1 }
+    XCTAssertEqual(fixture.programSink.connectAttempts, first + 1)
   }
 
   private func spin(_ what: String, _ done: () -> Bool) {

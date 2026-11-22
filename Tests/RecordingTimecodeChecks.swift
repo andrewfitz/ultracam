@@ -144,6 +144,32 @@ import XCTest
     }
   }
 
+  /// A take started before its camera declared a format is configured at the
+  /// 59.94 fallback, so drop-frame is chosen by convention; a camera can also
+  /// flag drop-frame at a rate that has none. When the frames turn out to be
+  /// 25p, the movie's timecode track is non-drop instead of failing the take
+  /// at its first frame.
+  func testDropFrameChoiceNeverFailsATakeAtANonDropRate() throws {
+    let undeclared = try SourceRecordingConfiguration(
+      feedID: SourceRecordingFeedID("tc-undeclared"),
+      outputURL: URL(fileURLWithPath: "/tmp/tc-undeclared.mov"),
+      width: 3_840, height: 2_160, timecodePolicy: .wallClock)
+    XCTAssertTrue(undeclared.timecodeDropFrame)
+    let adopted = try XCTUnwrap(AVAssetSourceRecordingWriter.makeTimecodeTrack(for: undeclared, frameRate: .fps25))
+    XCTAssertEqual(adopted.frameRate, .fps25)
+    XCTAssertFalse(adopted.dropFrame)
+    let session = RecordingTimecodeSession(frameRate: .fps25, dropFrame: undeclared.timecodeDropFrame, policy: .recordStart)
+    XCTAssertNoThrow(try adopted.sample(for: XCTUnwrap(session.timecode(for: .zero))))
+
+    let flagged = try SourceRecordingConfiguration(
+      feedID: SourceRecordingFeedID("tc-flagged"),
+      outputURL: URL(fileURLWithPath: "/tmp/tc-flagged.mov"),
+      width: 1_920, height: 1_080, frameRate: .fps25,
+      timecodePolicy: .recordStart, sourceTimecode: "10:00:00;00")
+    let track = try XCTUnwrap(AVAssetSourceRecordingWriter.makeTimecodeTrack(for: flagged))
+    XCTAssertFalse(track.dropFrame)
+  }
+
   func testPCTimeAnchorSamplesTheComputerClockAndKeepsExplicitDates() throws {
     let explicit = utc(12, 34, 56, 500_000_000)
     let now = utc(8, 15, 30, 250_000_000)

@@ -380,7 +380,10 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     var resumedSourceAudio: (@Sendable ([Data], Int, SourceAudioFormat, CMTime, RecordingTakeContext, SourceAdmissionSnapshot) -> Bool)? = nil
     var preparedEpoch: CaptureEpochID? = nil
     var preparedVideoFormat: SourceFormat? = nil
-    var finishAtSourceEpoch: (@Sendable () -> Void)? = nil
+    var takeOutputURL: URL? = nil
+    /// Called with capture admission locked. Queue the handoff without
+    /// waiting or querying capture or recording session state.
+    var finishAtSourceEpoch: (@Sendable (CMTime?) -> Void)? = nil
   }
 
   private func makeSample(pixelBuffer: CVPixelBuffer, presentationTime: CMTime,

@@ -700,7 +700,7 @@ impl Director {
         self.health = health;
         // Retain the last known health, but accept the new clock's first observation.
         for camera in self.health.values_mut() {
-            camera.observed_at = 0.0;
+            *camera = CameraHealth { healthy: camera.healthy, ..CameraHealth::INITIAL };
         }
         self.shot_started_at = now;
         self.last_media_time = Some(now);

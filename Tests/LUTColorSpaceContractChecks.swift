@@ -1,5 +1,6 @@
 import XCTest
 import CoreVideo
+import CoreGraphics
 import IOSurface
 
 @objcMembers final class LUTColorSpaceContractChecks: XCTestCase {
@@ -85,6 +86,25 @@ import IOSurface
 }
 
 extension LUTDynamicSizeChecks {
+  func testOddRGBRejectsNative420AndCanRenderToEvenCanvas() throws {
+    let fixture = try SourceRouteFixture(pixel: .bgra8, width: 129)
+    let processor = try LUTProcessor()
+    var configuration = PipelineConfiguration(downscale: false)
+    XCTAssertThrowsError(try processor.process(fixture.image, configuration: configuration,
+      declaredSourceColorimetry: fixture.format.colour)) { error in
+      guard case .odd420Output = error as? LiveFrameRouteError else {
+        return XCTFail("Expected an odd output geometry refusal, received \(error)")
+      }
+    }
+    configuration.downscale = true
+    configuration.resizeTarget = .hd720
+    let output = try processor.process(fixture.image, configuration: configuration,
+      declaredSourceColorimetry: fixture.format.colour)
+    XCTAssertEqual(CVPixelBufferGetWidth(output), 1280)
+    XCTAssertEqual(CVPixelBufferGetHeight(output), 720)
+    XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), PixelFormatID.video420.rawValue)
+  }
+
   private func graySource(transfer: CFString = kCVImageBufferTransferFunction_ITU_R_709_2,
     pixelFormat: OSType = kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, lumaCode: UInt16 = 502) throws -> CVPixelBuffer {
     var image: CVPixelBuffer?
@@ -375,6 +395,10 @@ extension LUTDynamicSizeChecks {
   func testPhysicalPixelAspectFitRemovesNativePixelAspectMetadata() throws {
     guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
     let source = try graySource()
+    let aperture = [kCVImageBufferCleanApertureWidthKey: CVPixelBufferGetWidth(source) - 2,
+      kCVImageBufferCleanApertureHeightKey: CVPixelBufferGetHeight(source) - 2,
+      kCVImageBufferCleanApertureHorizontalOffsetKey: 0, kCVImageBufferCleanApertureVerticalOffsetKey: 0] as CFDictionary
+    CVBufferSetAttachment(source, kCVImageBufferPreferredCleanApertureKey, aperture, .shouldPropagate)
     var configuration = PipelineConfiguration(downscale: false)
     configuration.sourcePixelAspect = try Rational(2, 1)
     let processor = try LUTProcessor()
@@ -392,6 +416,7 @@ extension LUTDynamicSizeChecks {
     let output = try processor.process(source, configuration: configuration)
     XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferPixelAspectRatioKey, nil),
       "Physical fitting produces square output pixels; native PAR would apply the correction twice")
+    XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferPreferredCleanApertureKey, nil))
     XCTAssertNotNil(CVBufferCopyAttachment(source, kCVImageBufferPixelAspectRatioKey, nil))
     CVPixelBufferLockBaseAddress(output, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
@@ -399,5 +424,61 @@ extension LUTDynamicSizeChecks {
     let stride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
     XCTAssertEqual(Int(y[5 * stride + 640]), 16, accuracy: 1)
     XCTAssertEqual(Int(y[360 * stride + 640]), 126, accuracy: 1)
+  }
+}
+
+extension LUTDynamicSizeChecks {
+  func testUnsupportedLiveColourTransformHasRouteRefusalType() throws {
+    let p3 = Colorimetry(primaries: .p3D65, transfer: .sRGB, matrix: .identity, range: .full,
+      horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
+    XCTAssertThrowsError(try LUTProcessor.conversionParameters(from: p3, to: .rec709Video)) { error in
+      guard case .unsupportedColourConversion = error as? LiveFrameRouteError else {
+        return XCTFail("Expected a route refusal, received \(error)")
+      }
+    }
+  }
+
+  func testTypedBypassPreservesProducerImageInterpretationAttachments() throws {
+    let fixture = try SourceRouteFixture(pixel: .video420)
+    let input = fixture.image
+    let colour = fixture.format.colour
+    let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.itur_709))
+    let aperture = [kCVImageBufferCleanApertureWidthKey: 126, kCVImageBufferCleanApertureHeightKey: 70,
+      kCVImageBufferCleanApertureHorizontalOffsetKey: 0, kCVImageBufferCleanApertureVerticalOffsetKey: 0] as CFDictionary
+    let tags: [(CFString, CFTypeRef)] = [
+      (kCVImageBufferCGColorSpaceKey, space),
+      (kCVImageBufferICCProfileKey, try XCTUnwrap(space.copyICCData())),
+      (kCVImageBufferGammaLevelKey, NSNumber(value: 2.2)),
+      (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2),
+      (kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2),
+      (kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Center),
+      (kCVImageBufferChromaLocationBottomFieldKey, kCVImageBufferChromaLocation_Bottom),
+      (kCVImageBufferPreferredCleanApertureKey, aperture),
+    ]
+    for (key, value) in tags { CVBufferSetAttachment(input, key, value, .shouldNotPropagate) }
+    let original = CapturedPixelBuffer(immutable: input)
+    let source = try SourceAdmissionSnapshot(format: fixture.format, epochID: CaptureEpochID(sessionID: UUID(), epoch: 0),
+      clockBindings: CaptureClockBindings(video: ClockInstanceID()), stage: .capture)
+    let metadata = SourceAdmissionMetadata(pixelBuffer: input, presentationTime: .zero,
+      duration: fixture.format.rate.nominal, epochID: source.epochID, formatSignature: source.formatSignature)
+    let processor = try LUTProcessor()
+    let done = expectation(description: "Typed bypass completes")
+    try processor.submitPassthrough(input, source: source, metadata: metadata) { completed in
+      defer { done.fulfill() }
+      do {
+        let output = try completed.result.get()
+        XCTAssertEqual(try LUTProcessor.sourceColorimetry(output), colour)
+        for key in [kCVImageBufferCGColorSpaceKey, kCVImageBufferICCProfileKey, kCVImageBufferGammaLevelKey,
+          kCVImageBufferTransferFunctionKey, kCVImageBufferColorPrimariesKey, kCVImageBufferChromaLocationTopFieldKey,
+          kCVImageBufferChromaLocationBottomFieldKey, kCVImageBufferPreferredCleanApertureKey] {
+          var mode = CVAttachmentMode.shouldPropagate
+          let expected = try XCTUnwrap(CVBufferCopyAttachment(original.value, key, nil), key as String)
+          let copied = try XCTUnwrap(CVBufferCopyAttachment(output, key, &mode), key as String)
+          XCTAssertTrue(CFEqual(copied, expected), key as String)
+          XCTAssertEqual(mode, .shouldNotPropagate, key as String)
+        }
+      } catch { XCTFail(error.localizedDescription) }
+    }
+    wait(for: [done], timeout: 5)
   }
 }

@@ -17,7 +17,8 @@ monitor_kit_package_build > "$test_root/package-build.log" 2>&1 || {
   cat "$test_root/package-build.log"
   exit 1
 }
-rust_manifest="$task_root/Apps/AutoSwitcher/Cargo.toml"
+auto_switcher_source="$(python3 "$task_root/scripts/auto_switcher_source.py")"
+rust_manifest="$auto_switcher_source/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"

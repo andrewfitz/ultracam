@@ -19,6 +19,8 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   private let queueKey = DispatchSpecificKey<UInt8>()
   private var discovery: AVCaptureDevice.DiscoverySession?
   private var discoveryObservation: NSKeyValueObservation?
+  private let identityDefaults: UserDefaults
+  private var ambiguousUIDs: Set<String>
   private var deviceObservers: [UUID: WeakDeviceObserver] = [:]
   private var statusObservers: [UUID: WeakStatusObserver] = [:]
   private var statuses: [String: CaptureDeviceStatus] = [:]
@@ -32,10 +34,17 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   static let modeKey = "captureMode"
   static let fallbackKey = "captureFallback"
   private static let prefix = "maccamera:"
+  private static let ambiguousUIDsKey = "ultracam.macCamera.ambiguousDeviceUIDs.v1"
+  private static let ambiguousDevice = PluginError.unavailable(
+    "Multiple connected cameras reported the same device ID. Ultracam cannot safely identify the assigned camera. Select a device with a unique ID.")
   private static let cameraAccessError = PluginError.unavailable(
     "Mac Camera access is disabled. Enable Ultracam in System Settings › Privacy & Security › Camera.")
 
-  init() { queue.setSpecific(key: queueKey, value: 1) }
+  init(identityDefaults: UserDefaults = .standard) {
+    self.identityDefaults = identityDefaults
+    ambiguousUIDs = Set(identityDefaults.stringArray(forKey: Self.ambiguousUIDsKey) ?? [])
+    queue.setSpecific(key: queueKey, value: 1)
+  }
 
   func withQueue<T>(_ action: () throws -> T) rethrows -> T {
     if DispatchQueue.getSpecific(key: queueKey) != nil { return try action() }
@@ -101,14 +110,61 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
         .builtInWideAngleCamera, .external, .continuityCamera, .deskViewCamera
       ], mediaType: .video, position: .unspecified)
       discovery = session
-      discoveryObservation = session.observe(\.devices) { [weak self] _, _ in
-        self?.queue.async { [weak self] in self?.publishDevices() }
+      discoveryObservation = session.observe(\.devices, options: [.new]) { [weak self] _, change in
+        // Preserve the observed collision even if another discovery update
+        // removes one of the devices before the inventory queue runs.
+        let identities = change.newValue.map(Self.discoveryIdentities) ?? []
+        self?.queue.async { [weak self] in
+          self?.quarantineDuplicateUIDs(identities)
+          self?.publishDevices()
+        }
       }
     }
     let devices = discovery?.devices.filter { Self.includes(uid: $0.uniqueID) && $0.isConnected } ?? []
-    let counts = Dictionary(grouping: devices, by: \.uniqueID)
-    return devices.filter { counts[$0.uniqueID]?.count == 1 }
+    quarantineDuplicateUIDs(Self.discoveryIdentities(devices))
+    var seen = Set<String>()
+    return devices.filter { !ambiguousUIDs.contains($0.uniqueID) && seen.insert($0.uniqueID).inserted }
   }
+
+  private struct DiscoveryIdentity: Sendable {
+    let uid: String
+    let object: ObjectIdentifier
+  }
+
+  private static func discoveryIdentities(_ devices: [AVCaptureDevice]) -> [DiscoveryIdentity] {
+    devices.compactMap {
+      guard includes(uid: $0.uniqueID), $0.isConnected else { return nil }
+      return DiscoveryIdentity(uid: $0.uniqueID, object: ObjectIdentifier($0))
+    }
+  }
+
+  private func quarantineDuplicateUIDs(_ identities: [DiscoveryIdentity]) {
+    var objects: [String: ObjectIdentifier] = [:]
+    var changed = false
+    for identity in identities {
+      if let prior = objects.updateValue(identity.object, forKey: identity.uid), prior != identity.object {
+        if ambiguousUIDs.insert(identity.uid).inserted { changed = true }
+      }
+    }
+    if changed { identityDefaults.set(ambiguousUIDs.sorted(), forKey: Self.ambiguousUIDsKey) }
+  }
+
+  func unavailableDeviceError(_ id: String) -> PluginError {
+    withQueue {
+      if id.hasPrefix(Self.prefix), ambiguousUIDs.contains(String(id.dropFirst(Self.prefix.count))) {
+        return Self.ambiguousDevice
+      }
+      return .unavailable("The assigned Mac Camera is disconnected.")
+    }
+  }
+
+  #if CAPTURE_LIFECYCLE_TESTS
+  func observeFixtureIdentities(_ identities: [(String, ObjectIdentifier)]) {
+    withQueue {
+      quarantineDuplicateUIDs(identities.map { DiscoveryIdentity(uid: $0.0, object: $0.1) })
+    }
+  }
+  #endif
 
   static func includes(uid: String) -> Bool { !uid.isEmpty && !VirtualCameraDescriptor.isDeviceUID(uid) }
   static func id(for uid: String) -> String { prefix + uid }
@@ -140,8 +196,11 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
 
   private func snapshot() -> CaptureDeviceSnapshot {
     let status = driverStatus()
-    let error = status.reason.map { PluginError.unavailable($0) }
-    return CaptureDeviceSnapshot(status: status, devices: error == nil ? allDevices().map(deviceInfo) : [], error: error)
+    if let reason = status.reason {
+      return CaptureDeviceSnapshot(status: status, devices: [], error: .unavailable(reason))
+    }
+    let devices = allDevices().map(deviceInfo)
+    return CaptureDeviceSnapshot(status: status, devices: devices, error: nil)
   }
 
   @MainActor func observeDevices(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) -> DeviceObservation {
@@ -180,8 +239,15 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
 
   private func refreshIdleStatuses() {
     let devices = allDevices()
-    let activeIDs = Set(devices.map { Self.id(for: $0.uniqueID) }).union(sessions.keys)
+    let quarantined = ambiguousUIDs.map(Self.id)
+    let activeIDs = Set(devices.map { Self.id(for: $0.uniqueID) }).union(sessions.keys).union(quarantined)
     statuses = statuses.filter { activeIDs.contains($0.key) }
+    for id in quarantined where sessions[id] == nil {
+      var status = CaptureDeviceStatus()
+      status.problems = [DeviceProblem(id: "ambiguous-camera-id", severity: .warning,
+        title: "Duplicate camera device ID", detail: Self.ambiguousDevice.localizedDescription)]
+      publish(status, id: id)
+    }
     for device in devices {
       let id = Self.id(for: device.uniqueID)
       if sessions[id] == nil { publish(Self.baseStatus(device, running: false), id: id) }
@@ -238,7 +304,7 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
       return try session.withDevice(work)
     }
     return try withQueue {
-      guard let device = device(id) else { throw PluginError.unavailable("The assigned Mac Camera is disconnected.") }
+      guard let device = device(id) else { throw unavailableDeviceError(id) }
       guard sessions[id] == nil else { throw PluginError.busy("The Mac Camera is starting capture. Try again shortly.") }
       return try work(device, false)
     }

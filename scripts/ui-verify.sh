@@ -15,6 +15,7 @@ source "$task_root/scripts/monitor-kit-package.sh"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 build_root="$external_root/agent-work/build/ultracam/ui-verify"
 # Sampling and diagnostic overrides must run instead of reusing the default result.
+auto_switcher_source="$(python3 "$task_root/scripts/auto_switcher_source.py")"
 full_proof=true
 if [[ "${UI_MAC_CAMERA_ONLY:-0}" == 1 || "${UI_PERF_ONLY:-0}" == 1 || "${UI_PERF_CAMERAS-2,4}" != 2,4 || "${UI_PERF_METERS-live,fixed}" != live,fixed ||
       "${UI_PERF_IDLE-4}" != 4 || "${UI_PERF_PROFILE_INSPECTOR-0}" != 0 ||
@@ -27,11 +28,11 @@ fi
 # Hash every Rust package input (including extensionless/config/build inputs),
 # excluding generated build output and repository metadata.
 if [[ "$full_proof" == true ]]; then
-  rust_inputs_hash="$(cd "$task_root" && find -H Apps/AutoSwitcher \
+  rust_inputs_hash="$(cd "$auto_switcher_source" && find . \
     -type d \( -name target -o -name build -o -name __pycache__ -o -name .git \) -prune -o -type f -print0 | \
     sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
   inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify ../MonitorKit/Sources ../MonitorKit/Package.swift \
-    Vendors Config/Assets.xcassets scripts/ui-verify.sh scripts/monitor-kit-package.sh scripts/vendor-build.sh scripts/vendors.py \
+    Vendors Config/Assets.xcassets scripts/ui-verify.sh scripts/monitor-kit-package.sh scripts/vendor-build.sh scripts/vendors.py scripts/auto_switcher_source.py \
     -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.msl' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' -o -name '*.py' -o -name '*.json' -o -name '*.svg' -o -name '*.png' \) \
     -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-rust${rust_inputs_hash}-strict${STRICT:-1}-vendors$(python3 "$task_root/scripts/vendors.py" digest)"
   if [[ "${FORCE:-0}" != 1 && -f "$build_root/last-pass" ]]; then
@@ -52,7 +53,7 @@ monitor_kit_package_build > "$test_root/package-build.log" 2>&1 || {
   cat "$test_root/package-build.log"
   exit 1
 }
-rust_manifest="$task_root/Apps/AutoSwitcher/Cargo.toml"
+rust_manifest="$auto_switcher_source/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"

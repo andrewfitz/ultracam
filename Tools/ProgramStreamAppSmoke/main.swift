@@ -52,9 +52,10 @@ private final class MediaCounter: @unchecked Sendable {
       throw SmokeError("Expected a loopback endpoint, output folder, run duration and optional profile.")
     }
     let profile = args.count == 5 ? args[4] : "legacy"
+    let macCamera = profile == "maccamera-1080"
     let streamFormat: ProgramStreamFormat
     switch profile {
-    case "legacy": streamFormat = .init()
+    case "legacy", "maccamera-1080": streamFormat = .init()
     case "uhd60-hevc": streamFormat = .init(size: .uhd4K, rate: .fps60, codec: .hevc, videoMbps: 25)
     case "720p2997-av1": streamFormat = .init(size: .hd720, rate: .fps2997, codec: .av1, videoMbps: 4)
     default: throw SmokeError("Unknown stream profile \(profile)")
@@ -65,7 +66,8 @@ private final class MediaCounter: @unchecked Sendable {
     defer { defaults.removePersistentDomain(forName: suite) }
     let credentials = FixtureKeychain()
     let devices = ["fake:audio", "fake:cutaway"]
-    let fixture = try AppHardwareSyntheticFixture(duration: VideoContract.slowDuration, deviceIDs: devices, audioChannels: 4)
+    let fixture = try AppHardwareSyntheticFixture(duration: VideoContract.slowDuration, deviceIDs: devices, audioChannels: 4,
+      width: macCamera ? 1920 : 3840, height: macCamera ? 1080 : 2160, pixel: macCamera ? .video420 : .v210)
     fixture.connect()
     let counts = MediaCounter(frameDuration: streamFormat.rate.duration.seconds)
     let publisher: @Sendable () -> any ProgramStreamPublishing = {
@@ -114,7 +116,7 @@ private final class MediaCounter: @unchecked Sendable {
     model.recordingModel.codec = .proRes42210Bit
     let testMotion = profile == "uhd60-hevc"
     let fast = try SourceFormat(width: testMotion ? 3840 : 1920, height: testMotion ? 2160 : 1080,
-      pixel: .v210, rate: .constant(VideoContract.fastDuration))
+      pixel: fixture.format.pixel, rate: .constant(VideoContract.fastDuration))
     let cameraA = try fixture.makePattern(lumaCode: 256)
     let cameraB = try fixture.makePattern(lumaCode: testMotion ? 624 : 720, width: fast.width, height: fast.height)
     let cameraBOdd = testMotion ? try fixture.makePattern(lumaCode: 752, width: fast.width, height: fast.height) : cameraB

@@ -25,6 +25,18 @@ final class MacCameraAudio {
   deinit { if let claimedUID { Self.claims.release(claimedUID) } }
 
   var isEnabled: Bool { selection != Self.off }
+  func isCurrentDisconnect(_ notifiedDevice: ObjectIdentifier) -> Bool {
+    guard let device = (connection?.inputPorts.first?.input as? AVCaptureDeviceInput)?.device else { return false }
+    return Self.isCurrentDisconnect(notifiedDevice, attached: ObjectIdentifier(device), stillConnected: device.isConnected)
+  }
+
+  static func isCurrentDisconnect(_ notifiedDevice: ObjectIdentifier, attached: ObjectIdentifier,
+    stillConnected: Bool) -> Bool {
+    // AVFoundation may vend a different wrapper for a disconnected device.
+    // A replacement that is still connected must never inherit that event.
+    notifiedDevice == attached || !stillConnected
+  }
+
   var deviceUID: String? {
     guard isEnabled else { return nil }
     for prefix in [Self.linkedPrefix, Self.inputPrefix] where selection.hasPrefix(prefix) {

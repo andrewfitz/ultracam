@@ -739,7 +739,7 @@ import XCTest
         let done = DispatchSemaphore(value: 0)
         let box = EventLog()
         let format = ProgramOutputFormat(width: 1920, height: 1080, pixelFormat: destination.pixelFormat,
-          duration: FrameRateTarget.fps24.duration)
+          duration: FrameRateTarget.fps24.duration, allowUpscale: true)
         try normalizer.normalize(source, to: format) { result in
           if case let .success(output) = result { box.setBuffer(output) }
           done.signal()
@@ -802,7 +802,8 @@ import XCTest
       for index in 0..<(CVPixelBufferGetBytesPerRowOfPlane(image, 1) * 540) { c[index] = index % 2 == 0 ? 100 : 160 }
     }
     let up = try convert(flat, ProgramOutputFormat(width: 3840, height: 2160,
-      pixelFormat: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, duration: VideoContract.fastDuration))
+      pixelFormat: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, duration: VideoContract.fastDuration,
+      allowUpscale: true))
     CVPixelBufferLockBaseAddress(up, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(up, .readOnly) }
     let y = CVPixelBufferGetBaseAddressOfPlane(up, 0)!.assumingMemoryBound(to: UInt16.self)

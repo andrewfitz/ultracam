@@ -382,6 +382,7 @@ final class AppModel {
   /// When a failed sink connect may next try again, while its client waits.
   @ObservationIgnored private var connectRetryAt: [FeedID: TimeInterval] = [:]
   @ObservationIgnored private var programConnectRetryAt: TimeInterval = 0
+  @ObservationIgnored private var programTransportConnecting = false
   private var programTransportRequired = false
   /// `programPicture` as of the last reconcile: its rise moves Program off an empty camera.
   @ObservationIgnored private var programPictureWanted = false
@@ -496,6 +497,7 @@ final class AppModel {
   @ObservationIgnored private var directorClockOwner: FeedID?
   private var autoSwitcherTimeline: AutoSwitcherTimelineRecorder?
   private var recordingTimelines: [FeedID: AutoSwitcherTimelineRecorder] = [:]
+  @ObservationIgnored private var recordingEpochEnds: [FeedID: CMTime] = [:]
   /// Each rolling take's file and start, for the timeline of a director recreated under it.
   @ObservationIgnored private var rollingTakes: [FeedID: (url: URL, mediaStart: CMTime?)] = [:]
   /// The tap each running take measures its audio on: the one it started on,
@@ -649,7 +651,7 @@ final class AppModel {
       guard let self else { return }
       self.acknowledgedTakes.remove(feedID)
       if self.unexpectedStops[feedID]?.cameraStopped == false { self.unexpectedStops[feedID] = nil }
-      self.beginTakeAudio(feedID)
+      self.beginTakeAudio(feedID, outputURL: url)
       // A take can be what starts the director, and it binds to that director's timeline.
       self.reconcileAutomaticFeed()
       // Noted after the director this take may have started: that one binds just below.
@@ -659,14 +661,22 @@ final class AppModel {
       self.recordingTimelines[feedID] = timeline
       timeline.recordingStarted(feedID: feedID, url: url, mediaStart: mediaStart)
     }
+    recordingModel.onRecordingSourceEpochCutoff = { [weak self] feedID, sourceTime in
+      guard let self else { return }
+      // The switcher timeline uses its clock camera's source PTS. For a
+      // different recording camera, sample that clock at the cutoff callback.
+      self.recordingEpochEnds[feedID] = self.directorClockFeedID == feedID
+        ? sourceTime ?? .invalid : self.directorUpdate?.mediaTime ?? .invalid
+    }
     recordingModel.onRecordingFinished = { [weak self] feedID, url in
       guard let self else { return }
+      let epochEnd = self.recordingEpochEnds.removeValue(forKey: feedID)
       self.noteTakeFinished(feedID, saved: url)
       self.endTakeAudio(feedID)
       self.rollingTakes[feedID] = nil
       self.reconcileAutomaticFeed()
       guard let timeline = self.recordingTimelines.removeValue(forKey: feedID) else { return }
-      timeline.recordingFinished(feedID: feedID, url: url, mediaEnd: self.directorUpdate?.mediaTime)
+      timeline.recordingFinished(feedID: feedID, url: url, mediaEnd: epochEnd ?? self.directorUpdate?.mediaTime)
     }
     recordingModel.onRecordingPaused = { [weak self] feedID, paused in
       self?.takeTaps[feedID]?.pauseTake(paused)
@@ -1062,13 +1072,12 @@ final class AppModel {
 
   /// A take started recording: its audio is measured on the camera's tap
   /// from here, on a meter of its own (see `AudioMeterTap.beginTake`).
-  private func beginTakeAudio(_ id: FeedID) {
+  private func beginTakeAudio(_ id: FeedID, outputURL: URL) {
+    guard let controller = feedCoordinator.capturePool.existingController(for: id),
+      let tap = audioMeterTap(for: id), controller.beginTakeAudio(feedID: id, outputURL: outputURL) else { return }
     takeAudio[id] = nil
-    // A take never ended (no finish callback) must not keep a viewer.
-    _ = takeTaps.removeValue(forKey: id)?.endTake()
-    guard let tap = audioMeterTap(for: id) else { return }
+    if let previous = takeTaps[id], previous !== tap { _ = previous.endTake() }
     takeTaps[id] = tap
-    tap.beginTake()
   }
 
   /// A take that ended by itself stays on the list until someone has seen it, as does one
@@ -2254,7 +2263,7 @@ final class AppModel {
   }
 
   /// Program transport follows its camera clients and the actual on-air source.
-  private func reconcileProgramTransportDemand() {
+  private func reconcileProgramTransportDemand(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
     let producerID = feedCoordinator.programOutput.selectedFeedID
     let producer = feedDescriptors.first { $0.id == producerID && $0.enabled }
     let required = FeedLifecycleDemandPolicy.programTransportRequired(
@@ -2272,6 +2281,8 @@ final class AppModel {
           passthroughFormat: passthroughFormat)
       }
     }
+    if !required { programConnectRetryAt = 0 }
+    guard !required || programTransportRequired || now >= programConnectRetryAt else { return }
     // One contract per client session: the format of the camera on air when
     // the client connected (its "owner"). Cuts never renegotiate; frames from
     // cameras with other settings are converted on the GPU. Only the owner's
@@ -2288,12 +2299,14 @@ final class AppModel {
       programContractOwner = required ? producerID : nil
       // A session leaves the camera on its own contract: write the closed one afresh.
       programPreNegotiated = nil
-    } else if required, producerID == programContractOwner, contract != programTransportConfiguration {
+    } else if required, !programTransportConnecting,
+      producerID == programContractOwner, contract != programTransportConfiguration {
       renegotiate = true
     } else {
       return
     }
     programTransportRequired = required
+    programTransportConnecting = required
     programTransportConfiguration = required ? contract : nil
     programTransportRequestID &+= 1
     let requestID = programTransportRequestID
@@ -2301,14 +2314,19 @@ final class AppModel {
     feedCoordinator.requestProgramOutputDemand(required, configuration: contract,
       passthroughFormat: passthroughFormat, renegotiate: renegotiate) { [weak self] error in
       guard let self, requestID == self.programTransportRequestID else { return }
+      self.programTransportConnecting = false
       guard let error else {
+        self.programConnectRetryAt = 0
         self.clearProblem("program-connect")
+        // A declaration may have arrived while CMIO was still opening.
+        if required { self.reconcileProgramTransportDemand() }
         return
       }
       // The live watch tries again in a second while the client waits.
       self.programTransportRequired = false
       self.programTransportConfiguration = nil
       self.programContractOwner = nil
+      self.programConnectRetryAt = max(now, ProcessInfo.processInfo.systemUptime) + LiveWatchLimits.connectRetry
       // Only demand connects Program, so a client is waiting on this.
       self.reportProblem("Program camera unavailable: \(error.localizedDescription)", key: "program-connect")
     }
@@ -2326,6 +2344,11 @@ final class AppModel {
       source: cameraUpdate(descriptor.id)?.sourceFormat)
     contract.applyLUT = false
     return contract
+  }
+
+  private func programCameraFormat(for descriptor: FeedDescriptor) -> ProgramOutputFormat {
+    let contract = programContract(for: descriptor)
+    return ProgramOutputFormat(configuration: contract, passthroughFormat: contract.sourcePixelFormat ?? contract.pixelFormat)
   }
 
   /// Program output counters for diagnostics: route, GPU conversion, camera.
@@ -2519,8 +2542,7 @@ final class AppModel {
       programSinkConnected = feedCoordinator.programOutputConnected
     }
     if programInUse, !programTransportRequired, now >= programConnectRetryAt {
-      programConnectRetryAt = now + LiveWatchLimits.connectRetry
-      reconcileProgramTransportDemand()
+      reconcileProgramTransportDemand(now: now)
     }
     for descriptor in feedDescriptors {
       let id = descriptor.id
@@ -2733,6 +2755,8 @@ final class AppModel {
       }
     }
     guard descriptor != before else { return }
+    let previousProgramFormat = programConnectRetryAt > 0 && feedCoordinator.programOutput.selectedFeedID == id
+      ? programCameraFormat(for: before) : nil
     let inputChanged = descriptor.selectedDevice != before.selectedDevice
     if inputChanged || !descriptor.enabled {
       cancelPendingCaptureStart(id)
@@ -2775,6 +2799,11 @@ final class AppModel {
       // Turned on with its saved LUT not in memory (it could not be read at
       // launch): read it again. It is applied when it loads.
       restoreLUT(id)
+    }
+    // An operator's change to the active Program contract can correct the refusal.
+    // Ordinary discovery, cadence updates and cut callbacks still honor backoff.
+    if let previousProgramFormat, previousProgramFormat != programCameraFormat(for: descriptor) {
+      programConnectRetryAt = 0
     }
     applyPipeline(id)
     if descriptor.automaticFeed != before.automaticFeed {

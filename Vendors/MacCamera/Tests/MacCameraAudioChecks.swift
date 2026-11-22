@@ -104,4 +104,14 @@ import XCTest
     XCTAssertEqual(MacCameraAudio(selection: "linked:USB:1").deviceUID, "USB:1")
     XCTAssertEqual(MacCameraAudio(selection: "input:USB:2").deviceUID, "USB:2")
   }
+
+  func testMacCameraMicrophoneRejectsStaleDisconnectFromPriorDeviceWithSameUID() {
+    let previousDevice = NSObject()
+    let replacementDevice = NSObject()
+    let stale = ObjectIdentifier(previousDevice)
+    let current = ObjectIdentifier(replacementDevice)
+    XCTAssertFalse(MacCameraAudio.isCurrentDisconnect(stale, attached: current, stillConnected: true))
+    XCTAssertTrue(MacCameraAudio.isCurrentDisconnect(current, attached: current, stillConnected: false))
+    XCTAssertTrue(MacCameraAudio.isCurrentDisconnect(stale, attached: current, stillConnected: false))
+  }
 }

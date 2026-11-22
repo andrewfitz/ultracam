@@ -17,12 +17,12 @@ import CoreVideo
   private let claims = CaptureDeviceClaims()
 
   init(duration: CMTime = VideoContract.fastDuration, deviceIDs: [String] = ["fake:fixture"], audioChannels: Int = 2,
-       width: Int = 3840, height: Int = 2160) throws {
+       width: Int = 3840, height: Int = 2160, pixel: PixelFormatID = .v210) throws {
     guard duration == VideoContract.fastDuration || duration == VideoContract.slowDuration else {
       throw PluginError.unsupported("Synthetic fixture supports Part A rates only")
     }
     self.duration = duration
-    format = try SourceFormat(width: width, height: height, pixel: .v210, rate: .constant(duration))
+    format = try SourceFormat(width: width, height: height, pixel: pixel, rate: .constant(duration))
     audio = try SourceAudioFormat(sampleRate: 48000, channels: audioChannels, sample: .int32,
       interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
     plugin = FakeCapturePlugin(format: format, audio: .present(audio), deviceIDs: deviceIDs)
@@ -52,26 +52,39 @@ import CoreVideo
   func stop() { plugin.sessions.forEach { $0.stop() } }
 
   /// Explicit test-only CPU pattern generation. The production app excludes
-  /// this entire file. The returned v210 IOSurface is published immutably.
-  func makePattern(lumaCode: UInt32? = nil, width: Int = 3840, height: Int = 2160) throws -> CVPixelBuffer {
+  /// this entire file. The returned IOSurface is published immutably.
+  func makePattern(lumaCode: UInt32? = nil, width: Int? = nil, height: Int? = nil) throws -> CVPixelBuffer {
+    let width = width ?? format.width
+    let height = height ?? format.height
     var made: CVPixelBuffer?
     let attributes: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
-    guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_422YpCbCr10,
+    guard CVPixelBufferCreate(nil, width, height, format.pixel.rawValue,
       attributes as CFDictionary, &made) == kCVReturnSuccess, let image = made else {
       throw PluginError.failed("Synthetic IOSurface allocation failed")
     }
     guard CVPixelBufferLockBaseAddress(image, []) == kCVReturnSuccess else { throw PluginError.failed("Synthetic pixel lock failed") }
     defer { CVPixelBufferUnlockBaseAddress(image, []) }
-    guard let base = CVPixelBufferGetBaseAddress(image) else { throw PluginError.failed("Synthetic pixels unavailable") }
-    let stride = CVPixelBufferGetBytesPerRow(image)
-    for y in 0..<height {
-      let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
-      for group in 0..<(stride / 16) {
-        let luma = lumaCode ?? UInt32(64 + min(group, 639) * 876 / 639)
-        row[group * 4] = 512 | (luma << 10) | (512 << 20)
-        row[group * 4 + 1] = luma | (512 << 10) | (luma << 20)
-        row[group * 4 + 2] = 512 | (luma << 10) | (512 << 20)
-        row[group * 4 + 3] = luma | (512 << 10) | (luma << 20)
+    if format.pixel == .video420 {
+      guard let luma = CVPixelBufferGetBaseAddressOfPlane(image, 0),
+        let chroma = CVPixelBufferGetBaseAddressOfPlane(image, 1) else {
+        throw PluginError.failed("Synthetic planar pixels unavailable")
+      }
+      memset(luma, Int32((lumaCode ?? 512) / 4), CVPixelBufferGetBytesPerRowOfPlane(image, 0) * height)
+      memset(chroma, 128, CVPixelBufferGetBytesPerRowOfPlane(image, 1) * CVPixelBufferGetHeightOfPlane(image, 1))
+    } else {
+      guard format.pixel == .v210, let base = CVPixelBufferGetBaseAddress(image) else {
+        throw PluginError.failed("Synthetic packed pixels unavailable")
+      }
+      let stride = CVPixelBufferGetBytesPerRow(image)
+      for y in 0..<height {
+        let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
+        for group in 0..<(stride / 16) {
+          let luma = lumaCode ?? UInt32(64 + min(group, 639) * 876 / 639)
+          row[group * 4] = 512 | (luma << 10) | (512 << 20)
+          row[group * 4 + 1] = luma | (512 << 10) | (luma << 20)
+          row[group * 4 + 2] = 512 | (luma << 10) | (512 << 20)
+          row[group * 4 + 3] = luma | (512 << 10) | (luma << 20)
+        }
       }
     }
     CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)

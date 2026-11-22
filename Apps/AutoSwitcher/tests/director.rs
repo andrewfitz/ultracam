@@ -858,3 +858,34 @@ fn silent_pcm_timeline_includes_final_partial_audio_chunk() {
     let timeline = auto_switcher::offline::analyze_events(events, config()).unwrap();
     assert!((timeline.duration - 0.025).abs() < 1e-9);
 }
+
+#[test]
+fn workbench_rules_require_both_fresh_audio_and_desk_motion() {
+    let profile = serde_json::from_str(include_str!("../profiles/workbench.json")).unwrap();
+    let mut d = Director::new(profile).unwrap();
+    let video = |time| serde_json::from_value(serde_json::json!({
+        "type":"video","observation":{"time":time,"camera_id":"Desk","motion":0.9}
+    })).unwrap();
+    d.process_event(video(11.0));
+    assert!(d.tick(11.0).is_none());
+    d.process_event(audio(13.0, 0.9, 0.0));
+    assert!(d.tick(13.0).is_none(), "outdated motion must expire");
+    d.process_event(video(13.1));
+    assert_eq!(d.tick(13.1).unwrap().target_camera_id, "Desk");
+}
+
+#[test]
+fn timer_rotates_multiple_routes_and_waits_for_application() {
+    let profile = serde_json::from_value(serde_json::json!({
+        "anchor_camera_id":"wide","emphasis_camera_id":"close","additional_targets":["desk"],
+        "strategy":"timer","minimum_shot_duration":60.0
+    })).unwrap();
+    let mut d = Director::new(profile).unwrap();
+    assert!(d.tick(59.0).is_none());
+    let first = d.tick(60.0).unwrap();
+    assert_eq!(first.target_camera_id,"close");
+    assert!(d.tick(60.2).is_none());
+    assert!(d.acknowledge(first.decision_id,Some(60.25)));
+    assert!(d.tick(120.0).is_none());
+    assert_eq!(d.tick(120.25).unwrap().target_camera_id,"desk");
+}

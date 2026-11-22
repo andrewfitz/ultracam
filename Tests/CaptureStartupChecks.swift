@@ -27,6 +27,52 @@ import XCTest
     XCTAssertNil(stopped.message, "Audio while the input locks must not stop capture")
     XCTAssertTrue(controller.isAccepting(feedID: feed), "The first declared frame runs as normal")
   }
+
+  /// The LUT belongs to the camera's controller across stops and starts. A stop
+  /// that lands while the LUT's queued load waits behind a busy capture queue
+  /// must not refuse the LUT ("Camera changed before its LUT finished loading").
+  func testLUTLoadSurvivesAStopWhileTheCaptureQueueIsBusy() throws {
+    let session = GatedStartSession()
+    let feed = FeedID(rawValue: "lut-across-stop")
+    let controller = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in session }))
+    controller.setCameraOutputEnabled(false)
+    defer { controller.onUpdate = nil; controller.stop() }
+    var configuration = PipelineConfiguration()
+    configuration.applyLUT = true
+    controller.start(feedID: feed, deviceID: "gated:fixture", configuration: configuration,
+      pipelineEnabled: true, previewEnabled: false)
+    XCTAssertEqual(session.entered.wait(timeout: .now() + 5), .success, "The capture queue is inside start")
+    let loaded = expectation(description: "LUT load finished")
+    let outcome = LoadOutcome()
+    controller.load(try CubeLUT(text: cubeText(size: 2))) { result in
+      if case .failure(let error) = result { outcome.note(error.localizedDescription) }
+      loaded.fulfill()
+    }
+    controller.stop()
+    session.gate.signal()
+    wait(for: [loaded], timeout: 5)
+    XCTAssertNil(outcome.message, "A stop must not refuse the camera's LUT")
+    XCTAssertNotNil(controller.burnInLUT, "The LUT stays in the camera's pipeline for its next start")
+  }
+}
+
+private final class LoadOutcome: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: String?
+  func note(_ message: String) { lock.withLock { value = message } }
+  var message: String? { lock.withLock { value } }
+}
+
+/// Holds the capture queue inside `start` until the test opens the gate.
+private final class GatedStartSession: CaptureSession, @unchecked Sendable {
+  let entered = DispatchSemaphore(value: 0)
+  let gate = DispatchSemaphore(value: 0)
+  var counters: CaptureCounters { CaptureCounters() }
+  func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws {
+    entered.signal()
+    gate.wait()
+  }
+  func stop() {}
 }
 
 private final class Stopped: @unchecked Sendable {

@@ -362,6 +362,28 @@ import XCTest
     }
   }
 
+  func testProgramResamplingRequiresDeclaredChromaSitingAndClearsPreferredAperture() throws {
+    let unknownSiting = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709,
+      range: .video, horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
+    let source = try chromaFixture(width: 32, height: 16, colour: unknownSiting, cb: { _, _ in 128 })
+    let normalizer = try ProgramNormalizer()
+    let target = ProgramOutputFormat(width: 16, height: 16,
+      pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, duration: FrameRateTarget.fps30.duration)
+    XCTAssertThrowsError(try normalizer.normalize(source, to: target) { _ in
+      XCTFail("Refused pixels must never reach GPU completion.")
+    }) { error in
+      XCTAssertTrue(error.localizedDescription.contains("declared source chroma siting"))
+    }
+    LUTProcessor.stampDeclaredColorimetry(.rec709Video, on: source)
+    CVBufferSetAttachment(source, kCVImageBufferPreferredCleanApertureKey,
+      [kCVImageBufferCleanApertureWidthKey: 30, kCVImageBufferCleanApertureHeightKey: 16,
+       kCVImageBufferCleanApertureHorizontalOffsetKey: 0, kCVImageBufferCleanApertureVerticalOffsetKey: 0]
+        as CFDictionary, .shouldPropagate)
+    let output = try converted(source, width: 16, height: 16)
+    XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferPreferredCleanApertureKey, nil))
+    XCTAssertNotNil(CVBufferCopyAttachment(source, kCVImageBufferPreferredCleanApertureKey, nil))
+  }
+
   private func chroma(_ image: CVPixelBuffer, x: Int, y: Int) -> UInt8 {
     CVPixelBufferLockBaseAddress(image, .readOnly); defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
     return CVPixelBufferGetBaseAddressOfPlane(image, 1)!.assumingMemoryBound(to: UInt8.self)[y * CVPixelBufferGetBytesPerRowOfPlane(image, 1) + x * 2]

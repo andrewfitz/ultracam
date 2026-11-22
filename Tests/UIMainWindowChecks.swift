@@ -340,11 +340,12 @@ import XCTest
     XCTAssertEqual(onAir?.state, .on)
     XCTAssertTrue(titles.contains("Cut to Camera 2"))
     XCTAssertTrue(titles.contains("Hold Current Shot"))
+    XCTAssertTrue(titles.contains("Set Up Stream…"))
     XCTAssertTrue(titles.contains("Pause All"))
     let stop = items.firstIndex { $0.title == "Stop All Capture" }
     XCTAssertEqual(stop.map { items[$0 - 1].isSeparatorItem }, true, "A separator keeps a slip off a camera row off Stop")
     let rows = items.filter { !$0.isSeparatorItem }
-    XCTAssertLessThanOrEqual(rows.count, 16, titles.joined(separator: " | "))
+    XCTAssertLessThanOrEqual(rows.count, 17, titles.joined(separator: " | "))
     for name in ["Camera 1", "Camera 2"] {
       XCTAssertTrue(items.first { $0.title == name }?.submenu?.items.contains { $0.title == "LUT" } == true)
     }

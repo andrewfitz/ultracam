@@ -474,7 +474,7 @@ import XCTest
     controller.setCameraOutputEnabled(false)
     var callbacks = adapter.callbacks
     let cutoffs = TakeContextObservation()
-    callbacks.finishAtSourceEpoch = { cutoffs.video() }
+    callbacks.finishAtSourceEpoch = { _ in cutoffs.video() }
     controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks)
     let ready = expectation(description: "Bound take source ready")
     let barrier = expectation(description: "Initial take media admitted")
@@ -516,7 +516,7 @@ import XCTest
     controller.setCameraOutputEnabled(false)
     var callbacks = adapter.callbacks
     let cutoffs = TakeContextObservation()
-    callbacks.finishAtSourceEpoch = { cutoffs.video() }
+    callbacks.finishAtSourceEpoch = { _ in cutoffs.video() }
     controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks)
     let ready = expectation(description: "Take source ready")
     controller.onUpdate = { if $0.message.hasPrefix("Waiting") { ready.fulfill() } }
@@ -550,7 +550,7 @@ import XCTest
     controller.setCameraOutputEnabled(false)
     var callbacks = adapter.callbacks
     let cutoffs = TakeContextObservation()
-    callbacks.finishAtSourceEpoch = { cutoffs.video() }
+    callbacks.finishAtSourceEpoch = { _ in cutoffs.video() }
     controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks)
     let ready = expectation(description: "Capture ready")
     let failure = expectation(description: "Malformed source declaration failed capture")

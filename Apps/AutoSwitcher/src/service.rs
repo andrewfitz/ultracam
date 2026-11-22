@@ -298,6 +298,71 @@ pub fn serve(
     bail!("listener stopped")
 }
 
+#[derive(Default)]
+struct LevelAdapter {
+    last: Option<f64>,
+    silence_start: Option<f64>,
+    speaking: bool,
+    id: u64,
+}
+
+impl LevelAdapter {
+    /// Convert capture meter readings into the same replayable cues used by PCM.
+    fn input(&mut self, line: &str) -> Result<(Value, Option<Value>)> {
+        let event: Value = serde_json::from_str(line)?;
+        if event["type"] == "reset" {
+            self.last = None;
+            self.silence_start = None;
+            self.speaking = false;
+        }
+        if event["type"] != "levels" {
+            return Ok((event, None));
+        }
+        #[derive(Deserialize)]
+        struct Levels {
+            time: f64,
+            rms: f32,
+            peak: f32,
+            present: bool,
+        }
+        let levels: Levels = serde_json::from_value(event)?;
+        ensure!(
+            levels.time >= 0.0 && levels.rms.is_finite() && levels.peak.is_finite(),
+            "invalid meter reading"
+        );
+        let energy = levels.rms.clamp(0.0, 1.0);
+        let speaking = levels.present && energy >= 0.035;
+        if speaking {
+            self.silence_start = None;
+        } else {
+            self.silence_start.get_or_insert(levels.time);
+        }
+        self.id += 1;
+        let gap = self.last.map(|previous| levels.time - previous);
+        let cue = auto_switcher::AudioCue {
+            features: Default::default(),
+            id: self.id,
+            time: levels.time,
+            duration: gap.filter(|d| *d > 0.0 && *d <= 1.0).unwrap_or(0.02),
+            speech_energy: energy,
+            emphasis: levels.peak.clamp(0.0, 1.0),
+            laughter: 0.0,
+            pause_duration: self
+                .silence_start
+                .map_or(0.0, |start| (levels.time - start).max(0.0)),
+            speech_start: speaking && !self.speaking,
+            speech_stop: !speaking && self.speaking,
+            session_generation: 0,
+        };
+        self.speaking = speaking;
+        self.last = Some(levels.time);
+        Ok((
+            json!({"type":"audio","cue":cue}),
+            Some(json!({"type":"audioCue","cue":cue})),
+        ))
+    }
+}
+
 /// Private host-owned session. Each input has exactly one array response,
 /// including inputs that produce no instruction.
 pub fn worker() -> Result<()> {
@@ -308,9 +373,16 @@ pub fn worker() -> Result<()> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "[]")?;
     out.flush()?;
+    let mut levels = LevelAdapter::default();
     for input in lines {
-        let event = serde_json::from_str(&input?)?;
-        serde_json::to_writer(&mut out, &director.process_event(event))?;
+        let (event, cue) = levels.input(&input?)?;
+        let outputs = director.process_event(serde_json::from_value(event)?);
+        if let Some(cue) = cue {
+            // Audio observations are retained until a tick. They produce no immediate cut.
+            serde_json::to_writer(&mut out, &[cue])?;
+        } else {
+            serde_json::to_writer(&mut out, &outputs)?;
+        }
         writeln!(out)?;
         out.flush()?;
     }
@@ -363,8 +435,9 @@ pub fn attach(port: u16) -> Result<()> {
     );
     let mut delivered = Value::Null;
     println!("[]");
+    let mut levels = LevelAdapter::default();
     for input in input {
-        let mut event: Value = serde_json::from_str(&input?)?;
+        let (mut event, cue) = levels.input(&input?)?;
         let field = if event["type"] == "video" {
             "/observation/camera_id"
         } else {
@@ -383,6 +456,7 @@ pub fn attach(port: u16) -> Result<()> {
         let update = request(json!({"v":1,"op":"event","event":event}))?;
         ensure!(update["outputs"].is_array(), "server rejected event");
         let mut outputs = update["outputs"].as_array().unwrap().clone();
+        outputs.extend(cue);
         let pending = &update["pending"];
         if !pending.is_null() && pending["decision_id"] != delivered {
             delivered = pending["decision_id"].clone();

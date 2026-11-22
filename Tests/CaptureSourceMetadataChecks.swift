@@ -3,9 +3,87 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import Synchronization
 import XCTest
 
 @objcMembers final class CaptureSourceMetadataChecks: XCTestCase {
+  func testOddRGBOutputRefusalKeepsTakeAndRecoversAfterEffectsChange() throws {
+    try checkLivePixelSelection(oddRGB: true)
+  }
+
+  func testCapOnlyPreservesUntagged420vAndRecordsAllSourceFrames() throws {
+    try checkLivePixelSelection(oddRGB: false)
+  }
+
+  private func checkLivePixelSelection(oddRGB: Bool) throws {
+    guard MTLCreateSystemDefaultDevice()?.supportsFamily(.metal4) == true else { throw XCTSkip("Metal 4 required") }
+    let fixture = try SourceRouteFixture(pixel: oddRGB ? .bgra8 : .video420, width: oddRGB ? 129 : 128)
+    let duration = FrameRateTarget.fps60.duration
+    let colour = oddRGB ? fixture.format.colour : Colorimetry(primaries: .unspecified, transfer: .unspecified,
+      matrix: .unspecified, range: .video, horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
+    let format = try SourceFormat(width: fixture.format.width, height: fixture.format.height,
+      pixel: fixture.format.pixel, colour: colour, rate: .constant(duration))
+    let fake = FakeCaptureSession(format: format, audio: .absent)
+    let feed = FeedID(rawValue: "live-pixel-selection")
+    var services = CaptureServices.registryBridge(feedID: feed, makeSession: { _ in fake })
+    let recorded = expectation(description: "Source take receives every input frame")
+    recorded.expectedFulfillmentCount = oddRGB ? 2 : 4
+    let picture = expectation(description: "Native picture delivered")
+    picture.expectedFulfillmentCount = oddRGB ? 1 : 2
+    let original = CapturedPixelBuffer(immutable: fixture.image)
+    services.preview = { sample in
+      let image = CMSampleBufferGetImageBuffer(sample)
+      XCTAssertFalse(image === original.value)
+      XCTAssertEqual(image.map(CVPixelBufferGetPixelFormatType), format.pixel.rawValue)
+      XCTAssertEqual(image.map(CVPixelBufferGetWidth), format.width)
+      if let image {
+        XCTAssertEqual(try? LUTProcessor.sourceColorimetry(image), colour)
+        if !oddRGB {
+          XCTAssertNil(CVBufferCopyAttachment(image, kCVImageBufferColorPrimariesKey, nil))
+          XCTAssertNil(CVBufferCopyAttachment(image, kCVImageBufferTransferFunctionKey, nil))
+          XCTAssertNil(CVBufferCopyAttachment(image, kCVImageBufferYCbCrMatrixKey, nil))
+        }
+      }
+      XCTAssertEqual(CMSampleBufferGetDuration(sample), oddRGB ? duration : FrameRateTarget.fps30.duration)
+      picture.fulfill()
+    }
+    let controller = CaptureController(services: services)
+    controller.setCameraOutputEnabled(false)
+    controller.setRecordingCallbacks(feedID: feed, callbacks: .init(video: { image, _, sourceDuration, valid in
+      XCTAssertTrue(image === original.value)
+      XCTAssertTrue(valid)
+      XCTAssertEqual(sourceDuration, duration)
+      recorded.fulfill()
+      return valid
+    }, audio: { _ in false }, rawAudio: { _, _, _, _, _ in false }))
+    let ready = expectation(description: "Source ready")
+    let refused = oddRGB ? expectation(description: "Only the live 4:2:0 output refuses odd width") : nil
+    let seenBarriers = Mutex(Set<String>())
+    controller.onUpdate = { update in
+      XCTAssertFalse(update.stopped)
+      guard seenBarriers.withLock({ $0.insert(update.message).inserted }) else { return }
+      if update.message == "Waiting for signal…" { ready.fulfill() }
+      if update.message == LiveFrameRouteError.odd420Output.localizedDescription { refused?.fulfill() }
+    }
+    defer { controller.onUpdate = nil; controller.stop() }
+    var config = PipelineConfiguration(downscale: false, convertTo420: oddRGB, reduceFrameRate: !oddRGB)
+    config.frameRateTarget = .fps30
+    controller.start(feedID: feed, deviceID: "fake:fixture", configuration: config, previewEnabled: true)
+    wait(for: [ready], timeout: 3)
+    let context = fake.context
+    for index in 0..<(oddRGB ? 2 : 4) {
+      let frame = CaptureFrameInfo(epochID: context.epochID, formatSignature: context.formatSignature,
+        presentationTime: CMTime(value: Int64(index), timescale: 60), duration: duration,
+        signalValid: true, timecode: nil)
+      XCTAssertTrue(fake.submit(.frame(original, frame)))
+      if index == 0, let refused {
+        wait(for: [refused], timeout: 3)
+        controller.reconfigure(configuration: config, pipelineEnabled: false)
+      }
+    }
+    wait(for: [recorded, picture], timeout: 5)
+  }
+
   func testLiveStorageRefusalLeavesSourceRecordingAndCaptureRunning() throws {
     guard MTLCreateSystemDefaultDevice()?.supportsFamily(.metal4) == true else { throw XCTSkip("Metal 4 required") }
     let ordinary = try SourceRouteFixture(pixel: .video420, shareable: false)
@@ -144,9 +222,13 @@ import XCTest
       let first = expectation(description: "First PCM packet published")
       let lost = paired ? nil : expectation(description: "Audio interruption published")
       let resumed = paired ? nil : expectation(description: "Returning PCM packet published")
+      let seenBarriers = Mutex(Set<String>())
       controller.onUpdate = { update in
+        // Capture updates keep the last status message when audio state changes.
+        // A later snapshot can carry the same barrier with different audio data.
+        guard seenBarriers.withLock({ $0.insert(update.message).inserted }) else { return }
         switch update.message {
-        case let message where message.hasPrefix("Waiting"): ready.fulfill()
+        case "Waiting for signal…": ready.fulfill()
         case "first PCM barrier":
           XCTAssertTrue(update.audioPresent)
           XCTAssertEqual(update.audioActivityRMS, paired ? 0.125 : 0.5)
@@ -192,6 +274,7 @@ import XCTest
       }
       XCTAssertTrue(source.submit(.event(.info("first PCM barrier"))))
       wait(for: [first], timeout: 1)
+      XCTAssertEqual(controller.audioMeterTap.counters.metered, 0)
       guard let lost, let resumed else { continue }
       XCTAssertTrue(source.submit(.event(.audioInterrupted(reason: "Fixture mic lost"))))
       XCTAssertTrue(source.submit(.event(.info("interruption barrier"))))
@@ -244,16 +327,13 @@ import XCTest
     let absent = expectation(description: "Audio absence published with no further media")
     let continuing = expectation(description: "Video continued through audio epoch")
     let returned = expectation(description: "New epoch PCM appears in the live meter")
-    var awaitingAbsence = false
+    let awaitingAbsence = Mutex(false)
+    let seenBarriers = Mutex(Set<String>())
     controller.onUpdate = { update in
-      if update.message.hasPrefix("Waiting") { ready.fulfill() }
-      if update.message == "PCM barrier" && !awaitingAbsence {
-        XCTAssertTrue(update.audioPresent)
-        XCTAssertEqual(update.audioActivityRMS, 0.5)
-        firstPCM.fulfill()
-      }
-      if awaitingAbsence, update.audioInterrupted {
-        awaitingAbsence = false
+      if update.audioInterrupted, awaitingAbsence.withLock({ waiting in
+        defer { waiting = false }
+        return waiting
+      }) {
         XCTAssertFalse(update.audioPresent)
         XCTAssertNil(update.audioPacketTime)
         XCTAssertEqual(update.audioActivityRMS, 0)
@@ -263,19 +343,26 @@ import XCTest
         XCTAssertEqual(update.audioPackets, 1)
         absent.fulfill()
       }
-      if update.message == "ongoing video barrier" {
+      guard seenBarriers.withLock({ $0.insert(update.message).inserted }) else { return }
+      switch update.message {
+      case "Waiting for signal…": ready.fulfill()
+      case "PCM barrier":
+        XCTAssertTrue(update.audioPresent)
+        XCTAssertEqual(update.audioActivityRMS, 0.5)
+        firstPCM.fulfill()
+      case "ongoing video barrier":
         XCTAssertEqual(update.frames, 1)
         XCTAssertFalse(update.audioPresent)
         XCTAssertEqual(update.audioPackets, 1)
         XCTAssertEqual(update.audioSamples, 4_800)
         XCTAssertEqual(update.audioBytes, 19_200)
         continuing.fulfill()
-      }
-      if update.message == "new PCM barrier" {
+      case "new PCM barrier":
         XCTAssertTrue(update.audioPresent)
         XCTAssertEqual(update.audioActivityPeak, 1)
         XCTAssertEqual(update.audioPackets, 2)
         returned.fulfill()
+      default: break
       }
     }
     defer { controller.onUpdate = nil; controller.stop() }
@@ -286,8 +373,11 @@ import XCTest
     var callbacks = SourceRecordingCallbackAdapter.Callbacks(video: { _, _, _, _ in true },
       audio: { _ in false }, rawAudio: { _, _, _, _, _ in false })
     callbacks.preparedEpoch = source.context.epochID
+    let takeURL = URL(fileURLWithPath: "/tmp/absent-audio-epoch-take.mov")
+    callbacks.takeOutputURL = takeURL
     XCTAssertTrue(controller.setRecordingCallbacks(feedID: feed, callbacks: callbacks))
-    controller.audioMeterTap.beginTake()
+    XCTAssertFalse(controller.beginTakeAudio(feedID: feed, outputURL: takeURL.appendingPathExtension("other")))
+    XCTAssertTrue(controller.beginTakeAudio(feedID: feed, outputURL: takeURL))
     let bytes = [Float](repeating: 0.5, count: 4_800).withUnsafeBytes { Data($0) }
     let packet = try CaptureAudioPacket(planes: [bytes], sampleFrameCount: 4_800, format: audio, packetTime: .zero)
     XCTAssertTrue(source.submitGroup([.rawAudio(packet), .event(.info("PCM barrier"))]))
@@ -296,7 +386,7 @@ import XCTest
     let priorMeter = try XCTUnwrap(attachment.meter)
     priorMeter.flush()
     XCTAssertEqual(priorMeter.snapshot().frameCount, 4_800)
-    awaitingAbsence = true
+    awaitingAbsence.withLock { $0 = true }
     XCTAssertTrue(source.submit(.event(.audioFormatChanged(.absent))))
     wait(for: [absent], timeout: 1)
     XCTAssertFalse(priorMeter === attachment.meter)
@@ -312,6 +402,8 @@ import XCTest
       .event(.info("ongoing video barrier")),
     ]))
     wait(for: [continuing], timeout: 1)
+    XCTAssertFalse(controller.beginTakeAudio(feedID: feed, outputURL: takeURL),
+      "A queued recording-start callback cannot reopen the detached take")
     // The detached take's writer can finish later. New source PCM must feed
     // the live meter immediately without reaching that take's summary.
     controller.audioMeterTap.pauseTake(false)
@@ -324,6 +416,8 @@ import XCTest
     let summary = try XCTUnwrap(controller.audioMeterTap.endTake())
     XCTAssertEqual(summary.duration, 0.1, accuracy: 0.000001)
     XCTAssertLessThan(summary.maximumTruePeak, -2)
+    XCTAssertFalse(controller.beginTakeAudio(feedID: feed, outputURL: takeURL))
+    XCTAssertNil(controller.audioMeterTap.takeSummarySoFar())
   }
 
   func testVariableCadenceFrameRateCapKeepsItsPhaseAcrossDurationChanges() throws {
@@ -347,8 +441,13 @@ import XCTest
       var config = PipelineConfiguration(downscale: false, convertTo420: false, reduceFrameRate: cap)
       config.frameRateTarget = .fps30
       let ready = expectation(description: "Variable-cadence source ready")
+      let waiting = Mutex(true)
       controller.onUpdate = { update in
-        if update.message.hasPrefix("Waiting") { ready.fulfill() }
+        guard update.message == "Waiting for signal…", waiting.withLock({ value in
+          defer { value = false }
+          return value
+        }) else { return }
+        ready.fulfill()
       }
       defer { controller.onUpdate = nil; controller.stop() }
       controller.start(feedID: feed, deviceID: "fake:fixture", configuration: config, pipelineEnabled: true, previewEnabled: false)
@@ -363,8 +462,12 @@ import XCTest
       for batch in 0..<6 {
         let barrier = "variable cadence batch \(batch)"
         let measured = expectation(description: barrier)
+        let pending = Mutex(true)
         controller.onUpdate = { update in
-          guard update.message == barrier else { return }
+          guard update.message == barrier, pending.withLock({ value in
+            defer { value = false }
+            return value
+          }) else { return }
           if batch == 5 {
             if cap {
               XCTAssertTrue((7..<12).contains(update.frames), "A 30 fps cap must survive changing source durations")

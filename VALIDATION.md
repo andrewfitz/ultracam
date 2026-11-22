@@ -38,6 +38,12 @@ Twelve six-second trusted RTMPS captures alternated the previous and audited bui
 
 The audited HEVC runs lost zero frames. One audited AV1 run missed a flash by 126 ms, and both AV1 runs were slower than the previous build. Publisher drops dominated while CPU availability varied. The linked libaom archive was identical, and these measurements do not isolate a cause for the difference. Software AV1 at UHD60 remains below real time on this host.
 
+In short app-level runs with synthetic mixed inputs, H.264 at 1080p30 delivered 30.002 and 30.000 fps on either side of a forced reconnect. HEVC UHD60 delivered 60.002 and 59.946 fps on repeat. Its first run measured 59.364 and 59.150 fps, below the 59.4 threshold. Software AV1 at 720p29.97 delivered 29.972 and 29.970 fps on repeat after the initial fixture timed out waiting for the cameras, before encoding started. The successful runs kept the selected stereo pair through cuts, had no unplanned reconnects and recorded their concurrent 4K ISOs without drops. All 333 focused native UI checks passed.
+
+The full app audit also found a Program virtual-camera retry bug. A camera metadata update or a cut could bypass the one-second reconnect delay and issue duplicate requests. All reconciliation paths now share the same deadline. A genuine output-format edit can start a new negotiation. All 13 failover checks passed.
+
+Every one of the 1,836 registered app tests across 177 suites has a passing result. This total combines the original optimized run, its continuation, isolated reruns, and a 226-test unoptimized run after the retry fix and fixture corrections. The initial optimized invocation stopped on a double fulfillment in a capture metadata test. No case was skipped in the combined results.
+
 ### Selectable stream formats
 
 Short mixed-input app runs on Apple M4 Max exercised source cuts, one deliberate reconnect, simultaneous 4K ISO recording and one fixed stereo pair. An independent receiver decoded each connection.

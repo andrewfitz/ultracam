@@ -38,7 +38,10 @@ struct FeedDescriptor { var id:Int;var enabled=false;var selectedDevice="";var a
 enum VendorRegistry {static func pluginID(for id:String) throws ->String {"fixture"}}
 @MainActor final class VendorSettingsFixture {func restore(deviceID:String,pluginID:String) async {}}
 final class DemandFixture {func refresh() {}}
-@MainActor final class InventoryFixture {func devicesListed(_ ids:[String]) {}}
+@MainActor final class InventoryFixture {
+ func devicesListed(_ ids:[String]) {}
+ func nickname(for deviceID:String)->String? { nil }
+}
 @MainActor final class DiscoveryFixture {
  var devices:[InputDevice]=[];var lastInputNames:[String:String]=[:];let hardwareInventory=InventoryFixture()
  var feedDescriptors:[FeedDescriptor]=[];var inputsClearedByChoice:Set<Int>=[]

@@ -965,7 +965,8 @@ import XCTest
     XCTAssertNotEqual(capture.recordingTakeContext?.sourceAdmission.epochID, oldEpoch)
     release.signal()
 
-    XCTAssertTrue(waitForStarts(model))
+    let completedOldStart = try await waitForAsyncStarts(model)
+    XCTAssertTrue(completedOldStart, "The rejected start must complete on the main queue")
     XCTAssertEqual(model.feeds.first?.status, .idle)
     XCTAssertEqual(model.feeds.first?.error, RecordingUIError.sourceChangedDuringPreparation.localizedDescription)
     XCTAssertNil(model.feeds.first?.savedURL)
@@ -973,7 +974,8 @@ import XCTest
     XCTAssertNil(capture.recordingDiscoverySnapshotForTesting(feedID: feed))
 
     model.record(feedID: feed)
-    XCTAssertTrue(waitForStarts(model))
+    let completedNewStart = try await waitForAsyncStarts(model)
+    XCTAssertTrue(completedNewStart, "The replacement start must complete on the main queue")
     XCTAssertEqual(model.feeds.first?.status, .recording)
     XCTAssertNil(model.feeds.first?.error)
     XCTAssertNotNil(capture.recordingDiscoverySnapshotForTesting(feedID: feed))
@@ -984,6 +986,14 @@ import XCTest
   }
 
   func testSourceEpochFinalizesTheOldMovieWhilePreviewAdvances() async throws {
+    try await verifyEpochFinalization(manuallyStopAfterCutoff: false)
+  }
+
+  func testManualStopRacingSourceEpochPreservesCutoffTimeAndFinishesOnce() async throws {
+    try await verifyEpochFinalization(manuallyStopAfterCutoff: true)
+  }
+
+  private func verifyEpochFinalization(manuallyStopAfterCutoff: Bool) async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("epoch-cutoff-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
     let feed = first
@@ -993,9 +1003,7 @@ import XCTest
     let previewed = expectation(description: "Preview delivered a new-epoch frame")
     let newTime = CMTime(value: 15, timescale: 30)
     var services = CaptureServices.registryBridge(feedID: feed, makeSession: { _ in source })
-    services.preview = { @Sendable sample in
-      if CMSampleBufferGetPresentationTimeStamp(sample) == newTime { previewed.fulfill() }
-    }
+    services.preview = { _ in }
     let capture = CaptureController(services: services)
     capture.setCameraOutputEnabled(false)
     let ready = expectation(description: "Capture source declared")
@@ -1003,7 +1011,9 @@ import XCTest
     capture.start(feedID: feed, deviceID: "fake:fixture", configuration: PipelineConfiguration(), pipelineEnabled: false)
     defer { capture.stop() }
     await fulfillment(of: [ready], timeout: 5)
-    capture.onUpdate = nil
+    capture.onUpdate = { update in
+      if update.previewDelivered && update.mediaTime == newTime { previewed.fulfill() }
+    }
 
     let encoding = expectation(description: "First admitted frame reached the encoder")
     let flushing = expectation(description: "Old take finalization entered")
@@ -1030,10 +1040,14 @@ import XCTest
     let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: feed, name: "Epoch test")], driver: driver)
     model.outputFolder = directory
     let finished = expectation(description: "Old movie published exactly once")
+    var cutoffTimes = [CMTime?]()
+    model.onRecordingSourceEpochCutoff = { _, end in cutoffTimes.append(end) }
     model.onRecordingFinished = { _, _ in finished.fulfill() }
     model.record(feedID: feed)
-    XCTAssertTrue(waitForStarts(model))
-    guard model.feeds.first?.status == .recording else { return }
+    let completedStart = try await waitForAsyncStarts(model)
+    XCTAssertTrue(completedStart, "The take start must complete on the main queue")
+    XCTAssertEqual(model.feeds.first?.status, .recording, model.feeds.first?.error ?? "")
+    guard completedStart, model.feeds.first?.status == .recording else { return }
 
     var image: CVPixelBuffer?
     XCTAssertEqual(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_422YpCbCr10,
@@ -1051,8 +1065,16 @@ import XCTest
     XCTAssertTrue(source.submit(.event(.discontinuity)))
     emit(newTime)
 
+    if manuallyStopAfterCutoff {
+      // Drain typed declarations on their delivery queue while the main actor
+      // is still here. Manual Stop wins the main-actor turn against cutoff.
+      source.stop()
+      XCTAssertNil(capture.recordingDiscoverySnapshotForTesting(feedID: feed))
+      model.stop(feedID: feed)
+    }
     await fulfillment(of: [previewed], timeout: 5)
     XCTAssertEqual(model.feeds.first?.status, .finishing)
+    XCTAssertEqual(cutoffTimes, [CMTime(value: 2, timescale: 30)])
     releaseEncoding.signal()
     await fulfillment(of: [flushing], timeout: 5)
     XCTAssertEqual(model.feeds.first?.status, .finishing)
@@ -1219,6 +1241,14 @@ import XCTest
     let deadline = Date(timeIntervalSinceNow: timeout)
     while model.feeds.contains(where: \.isStarting) && Date() < deadline {
       RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    return !model.feeds.contains(where: \.isStarting)
+  }
+
+  private func waitForAsyncStarts(_ model: RecordingModel) async throws -> Bool {
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.feeds.contains(where: \.isStarting) && ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(10))
     }
     return !model.feeds.contains(where: \.isStarting)
   }

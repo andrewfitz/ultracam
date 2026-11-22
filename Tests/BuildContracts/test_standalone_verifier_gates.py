@@ -13,10 +13,11 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "ultracam"
-        for folder in ('scripts', 'Sources/App', 'Tools/UIVerify', 'Apps/AutoSwitcher/src',
+        for folder in ('scripts', 'Sources/App', 'Tools/UIVerify', 'Apps/AutoSwitcher/src', 'Apps/AutoSwitcher/include',
                        '../MonitorKit/Sources', 'Vendors', 'Config/Assets.xcassets', 'bin'):
             (self.root / folder).mkdir(parents=True)
-        for name in ('ui-verify.sh', 'monitor-app-integration.sh', 'monitor-feed-host-checks.sh', 'check-gpu-proof-skips.py'):
+        for name in ('ui-verify.sh', 'monitor-app-integration.sh', 'monitor-feed-host-checks.sh',
+                     'check-gpu-proof-skips.py', 'auto_switcher_source.py'):
             shutil.copyfile(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         self.write('scripts/work_paths.py', 'print(' + repr(str(self.root / 'work')) + ')')
         self.write('scripts/vendors.py', 'print("fixture")')
@@ -27,6 +28,7 @@ class StandaloneVerifierGates(unittest.TestCase):
         self.write('Apps/AutoSwitcher/src/lib.rs', '// fixture')
         self.write('Apps/AutoSwitcher/Cargo.toml', '# fixture')
         self.write('Apps/AutoSwitcher/Cargo.lock', '# fixture')
+        self.write('Apps/AutoSwitcher/include/auto_switcher.h', '// fixture')
         self.write('bin/rustup', '#!/bin/bash\nexit 0\n', True)
         self.write('bin/xcode-select', '#!/bin/bash\necho /fake\n', True)
         executable = """#!/bin/bash\necho executed >> "$RUN_RECEIPT"\nprintf '%s\\n' "$FAKE_TEST_OUTPUT"\n"""

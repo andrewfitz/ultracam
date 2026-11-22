@@ -1,16 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 if [[ $# -lt 1 || $# -gt 3 ]]; then
-  echo 'Usage: program-stream-app-smoke.sh PRODUCT_DIRECTORY [DURATION_SECONDS] [legacy|uhd60-hevc|720p2997-av1|all]' >&2
+  echo 'Usage: program-stream-app-smoke.sh PRODUCT_DIRECTORY [DURATION_SECONDS] [legacy|maccamera-1080|uhd60-hevc|720p2997-av1|all]' >&2
   exit 2
 fi
 profile="${3:-legacy}"
 case "$profile" in
-  legacy|uhd60-hevc|720p2997-av1|all) ;;
+  legacy|maccamera-1080|uhd60-hevc|720p2997-av1|all) ;;
   *) echo "Unknown stream profile: $profile" >&2; exit 2 ;;
 esac
 pkg="$1"
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
+auto_switcher_source="$(python3 "$task_root/scripts/auto_switcher_source.py")"
 source "$task_root/scripts/program-stream-link.sh"
 program_stream_link_args "$pkg"
 build_root="$(python3 "$task_root/scripts/work_paths.py" --path build_root)"
@@ -27,7 +28,7 @@ vendor_configure test "" "" app
 vendor_compile_native "$test_root/native.log"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$build_root/auto-switcher-target}"
 rustc_path="$(rustup which --toolchain stable rustc)"
-RUSTC="$rustc_path" rustup run stable cargo build --release --locked --manifest-path "$task_root/Apps/AutoSwitcher/Cargo.toml"
+RUSTC="$rustc_path" rustup run stable cargo build --release --locked --manifest-path "$auto_switcher_source/Cargo.toml"
 # Compile and verify against the same fixture sources throughout the matrix.
 cp -R "$task_root/Sources" "$test_root/Sources"
 mkdir -p "$test_root/Tools/ProgramStreamSmoke" "$test_root/Tools/ProgramStreamAppSmoke"

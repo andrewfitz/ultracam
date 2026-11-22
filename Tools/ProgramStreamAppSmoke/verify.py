@@ -15,6 +15,7 @@ from run_receiver import free_port, receive, stop_process
 
 PROFILES = {
     "legacy": ("h264", 1920, 1080, 30),
+    "maccamera-1080": ("h264", 1920, 1080, 30),
     "uhd60-hevc": ("hevc", 3840, 2160, 60),
     "720p2997-av1": ("av1", 1280, 720, 30000 / 1001),
 }
@@ -165,9 +166,13 @@ def run(executable, folder, seconds, profile="legacy"):
         streams = {s["codec_type"]: s for s in probe(original, "-show_streams")["streams"]}
         require({"video", "audio"} <= streams.keys(), f"ISO tracks missing in {original}")
         video, audio = streams["video"], streams["audio"]
-        require((video["codec_name"], video["width"], video["height"]) == ("prores", 3840, 2160),
+        # The codec resolver selects HEVC Main for the native 8-bit 420v input.
+        iso_format = ("hevc", 1920, 1080) if profile == "maccamera-1080" else ("prores", 3840, 2160)
+        require((video["codec_name"], video["width"], video["height"]) == iso_format,
                 f"ISO capture format changed in {original}")
-        require((audio["sample_rate"], audio["channels"]) == ("48000", 4), f"ISO embedded audio changed in {original}")
+        if profile == "maccamera-1080":
+            require(video["r_frame_rate"] == "30000/1001", f"ISO capture cadence changed in {original}")
+        require((audio["sample_rate"], audio["channels"]) == ("48000", 4), f"ISO source audio changed in {original}")
     if seconds >= 1800 and len(rss) >= 900:
         early = statistics.median(rss[300:600])
         late = statistics.median(rss[-300:])

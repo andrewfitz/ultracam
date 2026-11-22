@@ -15,6 +15,27 @@ import XCTest
     XCTAssertEqual(MacCameraCapturePlugin.id(for: uid), "maccamera:USB:1234")
   }
 
+  func testDuplicateDeviceIdentityRemainsQuarantinedAfterRemovalAndRelaunch() throws {
+    let suite = "ultracam.macCamera.identity-test.\(UUID())"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let first = NSObject()
+    let second = NSObject()
+    let uid = "fixture-camera"
+    let id = MacCameraCapturePlugin.id(for: uid)
+    let plugin = MacCameraCapturePlugin(identityDefaults: defaults)
+    let sameObject = ObjectIdentifier(first)
+    plugin.observeFixtureIdentities([(uid, sameObject), (uid, sameObject)])
+    XCTAssertEqual(plugin.unavailableDeviceError(id), .unavailable("The assigned Mac Camera is disconnected."))
+    plugin.observeFixtureIdentities([(uid, sameObject), (uid, ObjectIdentifier(second))])
+    plugin.observeFixtureIdentities([(uid, ObjectIdentifier(second))])
+    let quarantined = plugin.unavailableDeviceError(id)
+    XCTAssertTrue(quarantined.localizedDescription.contains("same device ID"))
+    let restarted = MacCameraCapturePlugin(identityDefaults: defaults)
+    restarted.observeFixtureIdentities([(uid, ObjectIdentifier(second))])
+    XCTAssertEqual(restarted.unavailableDeviceError(id), quarantined)
+  }
+
   func testSerializedStopBarrier() throws {
     let session = MacCameraCaptureSession(plugin: MacCameraCapturePlugin())
     try PluginConformanceHarness.serializedStopBarrier(session: session,
@@ -36,7 +57,7 @@ import XCTest
       entered.signal()
       _ = finish.wait(timeout: .now() + 3)
     }
-    weak var retired = first
+    weak let retired = first
     let storage = SessionReleaseBox(first)
     first = nil
     DispatchQueue.global().async {

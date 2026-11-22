@@ -285,12 +285,12 @@ impl SwitcherConfig {
                 return Err(format!("{name} must be finite and non-negative"));
             }
         }
-        if self.maximum_shot_duration <= self.minimum_shot_duration
-            || self.maximum_shot_duration <= self.cooldown
+        if self.strategy == Strategy::TalkingHead && (self.maximum_shot_duration <= self.minimum_shot_duration
+            || self.maximum_shot_duration <= self.cooldown)
         {
             return Err("maximum_shot_duration must exceed minimum shot and cooldown".to_string());
         }
-        if self.soft_maximum_shot_duration > self.maximum_shot_duration {
+        if self.strategy == Strategy::TalkingHead && self.soft_maximum_shot_duration > self.maximum_shot_duration {
             return Err(
                 "soft_maximum_shot_duration must not exceed maximum_shot_duration".to_string(),
             );

@@ -56,21 +56,49 @@ The capability probe opens the explicitly selected non-Ultracam device. Use its 
 
 The hardware smoke compiles the shipping Mac Camera vendor sources and exercises two capture/stop cycles using an explicit device UID and a saved format/rate pair. Its format list uses the plugin's deduplicated catalog, with stable format IDs, exact FPS intervals and presets. Use an ID from that list and an FPS such as 60/1 or 30000/1001 within an advertised interval. The smoke checks declarations, frame delivery, settings readback and callback quiescence after stop. The microphone defaults to Off. Use --audio-inputs to list available microphone UIDs, then pass the chosen UID after the FPS to verify independent PCM format, timing and sample counts. First-sample host-clock checks catch large timebase errors. Set ULTRACAM_MAC_CAMERA_SMOKE_SECONDS to sample each cycle for longer and observe periodic clock mapping updates.
 
+On OBS Virtual Camera the plugin listed a single 1920×1080 BGRA mode with exact FPS interval 60/1 through 60/1. It rejected 30000/1001 before starting capture. Selecting the listed format ID at 60/1 with Universal Audio Thunderbolt passed both starts with one epoch each, 12 and 9 native video frames, and 22 and 9 independent eight-channel Float32 PCM packets at 48 kHz.
+
 For synchronized recording, record a visible and audible cue at the start and approximately ten minutes into a fixed-rate take. Measure the video and audio cue timestamps at both points and evaluate them with [mac-camera-sync-check.py](../scripts/mac-camera-sync-check.py). Report initial offset and accumulated drift in milliseconds. Keep these measurements with the camera and microphone identities, selected and delivered formats, mode and consumer results.
+
+When macOS exposes two distinct capture devices with the same UID, Ultracam remembers that UID as ambiguous across relaunches and excludes it from automatic assignment. Select a camera with a unique ID to recover. If a driver reuses the exact same UID for a replacement and the two devices are never visible together, AVFoundation alone may offer no evidence to distinguish them.
 
 ## Synthetic route coverage
 
 The typed host fixture in SourceFormatRouteChecks submits 1280×720 and 1920×1080 at exactly 30 fps with 420v, 420f and 2vuy, crossed with Float32 mono PCM at 44.1 and 48 kHz. It checks source identity and timing at recording admission, independent PCM admission, the monitor source handoff, the owned live bypass preview and the local extension catalog decision. At these sizes and centered Rec.709, 420v has a published native contract. 420f and 2vuy require an Effects output color format for this route.
 
+The matrix passed in the integrated app test executable. All 56 tests in CaptureSourceMetadataChecks and RecordingModelChecks passed together after the audit fixes. They include keeping video running after audio loss, excluding resumed audio from the previous take’s loudness summary, refusing a stale recorder start and finishing the old movie once when manual Stop races a source format change.
+
 The focused Metal checks verified pixel-exact, independently owned bypass copies for all six size and FourCC combinations. They also verified the live GPU refusal for ordinary buffers without IOSurface backing. The Fit checks verified a centered 640×480 picture on a 1280×720 canvas in both feed and Program output, expanding to 960×720 with upscaling enabled.
 
-The offscreen Mac Camera GUI fixture passed 37 checks. It verified the Hardware access and navigation controls, saved per-device modes and microphones after relaunch, and Sync isolation. It verified a saved 1080p60 source take while live Effects delivered 720p30 4:2:2, then verified pixel and color fidelity after restoring 420v bypass.
+The offscreen Mac Camera GUI fixture passed 42 checks. It verified the Hardware access and navigation controls, saved per-device modes and microphones after relaunch, and Sync isolation. It verified a saved 1080p60 source take while live Effects delivered 720p30 4:2:2, then verified pixel and color fidelity after restoring 420v bypass. Independent ffprobe inspection of the resulting MOV found a 1920×1080 HEVC video track at 60/1, with 50 frames.
 
 The host matrix ends at the typed monitor handoff, recording admission callbacks and local extension catalog. Dedicated MonitorKit scopes tests cover scope rendering, and focused Program tests cover normalization and Fit. The GUI fixture verifies a source movie at 1080p60. Full matrix evidence through scopes, Program, a network stream, and a finalized recording for every input combination remains open.
 
+The app integration tools have dedicated 1080p 420v runs. The monitor tool drives the typed capture controller and waits for real Metal picture and scope updates. The Program profile drives the AppModel's Program route, publishes to an isolated loopback receiver, and inspects source MOV files. It uses the existing deterministic four-channel fixture audio to check downstream audio selection. The typed host tests separately cover independent Float32 packets.
+
+The focused app monitor run passed without skips. It drove the typed 1920×1080 420v fixture through CaptureController and MonitorKit and presented two picture frames and two scope updates with no surface failures.
+
+The optimized AppModel Program run cut between two typed 420v sources, reconnected after the loopback receiver closed, and completed with zero video-route, PCM-route and transport drops. The corrected media verifier passed on the captured files. It measured 30.002 and 30.001 fps with 1 ms p95 timestamp-grid error, found both pictures and the selected audio, and verified the two native source MOVs. The baseline MOV contained 116 frames and the simultaneous MOV contained 120 frames, both HEVC at 1920×1080 and 30000/1001 with four-channel 48 kHz PCM. A second run under heavy host load missed 487 synthetic input slots and failed the receiver's continuity check with a 799 ms post-reconnect gap.
+
+The final AppModel loopback repeat passed end to end at 30.002 and 30.001 fps. The receiver measured 1 ms p95 timestamp-grid error on both connections and no unplanned interruptions. The source MOV recorded during streaming contained 120 frames with zero recording drops.
+
+The standalone Program encoder and receiver reconnect check passed with a 1920×1080 420v fixture. The independent receiver decoded 120, 120 and 751 H.264 Main frames at approximately 30 fps across three connections. All 16 fixture flashes matched their audio cues. This check starts at the Program encoder input.
+
+```sh
+ULTRACAM_MONITOR_MAC_CAMERA_ONLY=1 scripts/monitor-app-integration.sh
+scripts/program-stream-app-smoke.sh "$xcode_release_products" 26 maccamera-1080
+scripts/program-stream-smoke.sh "$xcode_release_products" --only reconnect
+```
+
 ## Callback performance baseline
 
+The full optimized app rerun passed all 1,864 tests in 177 suites, with zero skips. The suite discovery check verified the expected count for each suite. Under concurrent host load the 4K 59.94 fps regression dropped four frames in an earlier run. Its isolated rerun delivered all 180 frames at source cadence and all 90 selected frames with the output cap enabled. The 1,136 MonitorKit package cases completed with zero failures and 12 skips. The 197 Python contract checks and 42 Rust tests passed.
+
 The initial optimized synthetic callback fixture on an M4 Max measured median process CPU costs of 20.6 µs for steady 1080p30 video, 67.0 µs when alternating 1080p and 720p formats, and 26.6–27.7 µs for 10 ms Float32 PCM packets. The retention fixture verified a six-buffer maximum, recovery after draining and no delivery after stop. Concurrent builds made wall-clock timings unsuitable for setting latency budgets. The fixture covers software callbacks. Record live hardware and end-to-end latency separately.
+
+A paired synthetic benchmark measured the warmed PCM parser before and after caching the native format description. Across 44.1 kHz mono and 48 kHz stereo interleaved and planar packets, median process CPU time fell from 30.699–32.714 µs to 0.270–0.448 µs per packet. The harness reused the same packet description and measured parser validation and storage copy. Five dedicated PCM tests passed, including changed layouts, rates and clocks.
+
+After the optimization, the production adapter passed two more live OBS and Universal Audio start/stop cycles. It delivered 8 and 13 native 1080p BGRA frames and 18 eight-channel Float32 packets at 48 kHz in each cycle. Both streams shared a verified clock mapping, and the driver reported zero drops.
 
 ## Remaining hardware checks
 

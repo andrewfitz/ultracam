@@ -36,6 +36,11 @@ vendor_configure() {
   vendor_embed_json="${vendor_values[0]}"
   vendor_native_args=()
   vendor_swift_native_args=()
+  if [[ -z "$vendor_id" ]]; then
+    local switcher_source
+    switcher_source="$(python3 "$task_root/scripts/auto_switcher_source.py")" || return $?
+    vendor_swift_native_args+=(-Xcc "-I$switcher_source/include")
+  fi
   for value in ${vendor_header_dirs[@]+"${vendor_header_dirs[@]}"}; do
     vendor_native_args+=(-I "$value")
     vendor_swift_native_args+=(-Xcc "-I$value")

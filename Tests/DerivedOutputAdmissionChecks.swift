@@ -418,8 +418,11 @@ import XCTest
   }
 
   func testProgramBridgeUsesOnePublishedContractForPreflightConnectAndSend() throws {
+    struct Output: @unchecked Sendable {
+      let result: Result<CVPixelBuffer, Error>
+    }
     let sink = CameraSink(route: CameraSinkRoute(descriptor: .program()))
-    let installed = OutputFormatCatalog.published.map { $0.formatDescription }
+    let installed = try OutputFormatCatalog.descriptions()
     let normalizer = try ProgramNormalizer()
     for pixel in [PixelFormatID.video420, .full420, .twoVuy, .bgra8] {
       let native420 = pixel == .video420
@@ -465,14 +468,14 @@ import XCTest
       XCTAssertEqual(target.pixelFormat, native420 ? pixel.rawValue : kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
       XCTAssertEqual(target.colour.horizontalChromaSiting, .center)
 
-      let output = Mutex<Result<CVPixelBuffer, Error>?>(nil)
+      let output = Mutex<Output?>(nil)
       let completed = DispatchSemaphore(value: 0)
       try normalizer.normalize(input.image, to: target) { result in
-        output.withLock { $0 = result }
+        output.withLock { $0 = Output(result: result) }
         completed.signal()
       }
       XCTAssertEqual(completed.wait(timeout: .now() + 5), .success)
-      let buffer = try XCTUnwrap(output.withLock { $0 }).get()
+      let buffer = try XCTUnwrap(output.withLock { $0 }).result.get()
       _ = fanout.publish(ProcessedFrame(payload: buffer, metadata: ProcessedFrameMetadata(
         presentationTime: CMTime(value: 1, timescale: 1), duration: target.duration,
         width: target.width, height: target.height, pixelFormat: target.pixelFormat)))

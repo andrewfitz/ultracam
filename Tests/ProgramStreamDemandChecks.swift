@@ -113,8 +113,9 @@ private final class ProgramStreamTestCredentials: ProgramStreamCredentialStoring
       }
     }
     sourceFormats = [fixture.format, try SourceFormat(width: 3840, height: 2160, pixel: .v210, rate: .constant(fixture.duration))]
-    pictures = try [fixture.makePattern(lumaCode: 256, width: firstSize.width, height: firstSize.height),
-      fixture.makePattern(lumaCode: 848)]
+    pictures = try zip(sourceFormats, [UInt32(256), 848]).map { format, luma in
+      try fixture.makePattern(lumaCode: luma, width: format.width, height: format.height)
+    }
   }
 
   private func finish() {
@@ -263,7 +264,10 @@ private final class ProgramStreamTestCredentials: ProgramStreamCredentialStoring
     XCTAssertEqual(probe.formats.map(\.size), [.hd720])
     XCTAssertEqual(probe.lastSize, CGSize(width: 1280, height: 720))
     XCTAssertEqual(model.streamConfiguration.format.size, .source)
-    _ = model.requestProgramCut(to: ids[1])
+    switch model.requestProgramCut(to: ids[1]) {
+    case .queued, .coalesced, .selectedImmediately: break
+    case let result: return XCTFail("The UHD cutaway request was rejected: \(result)")
+    }
     try emit(until: { probe.pictures.last.map { $0 >= 170 } == true }, message: "The UHD cutaway is visible")
     XCTAssertEqual(probe.lastSize, CGSize(width: 1280, height: 720))
     XCTAssertEqual(probe.formats.count, 1)

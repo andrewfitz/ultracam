@@ -9,7 +9,8 @@ import XCTest
     let processor = try LUTProcessor()
     try processor.load(CubeLUT(text: cubeText(size: 17, transform: { $0 * $0 })))
     for resize in [false, true] {
-      let output = try processor.process(input, configuration: PipelineConfiguration(applyLUT: true, downscale: resize))
+      let output = try processor.process(input, configuration: PipelineConfiguration(
+        applyLUT: true, downscale: resize, allowUpscale: true))
       CVPixelBufferLockBaseAddress(output, .readOnly)
       let p = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 0)).assumingMemoryBound(to: UInt8.self)
       let stride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)

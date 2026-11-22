@@ -2,6 +2,7 @@ import CoreMedia
 import CoreVideo
 import Darwin
 import Foundation
+import Synchronization
 import XCTest
 
 // Exercise the real pixel processor, rational cadence selector, and sample
@@ -421,6 +422,23 @@ private final class PacedDriverMetrics: @unchecked Sendable {
   var times: [Double] { lock.withLock { emittedTimes } }
 }
 
+private final class CaptureStartExpectation: Sendable {
+  private let pending = Mutex(true)
+  private let expectation: XCTestExpectation
+
+  init(_ expectation: XCTestExpectation) {
+    self.expectation = expectation
+  }
+
+  func observe(_ update: CaptureUpdate) {
+    guard update.message.hasPrefix("Waiting"), pending.withLock({ waiting in
+      defer { waiting = false }
+      return waiting
+    }) else { return }
+    expectation.fulfill()
+  }
+}
+
 @objcMembers final class CaptureLifecycleChecks: XCTestCase {
   private let config = PipelineConfiguration(applyLUT: false, downscale: true,
     convertTo420: true, reduceFrameRate: false, sourceDuration: VideoContract.fastDuration)
@@ -467,9 +485,8 @@ private final class PacedDriverMetrics: @unchecked Sendable {
   private func ready(_ controller: CaptureController, harness: CaptureHarness,
     configuration: PipelineConfiguration, pipelineEnabled: Bool = true, previewEnabled: Bool = true) {
     let started = expectation(description: "Capture start completed")
-    controller.onUpdate = { update in
-      if update.message.hasPrefix("Waiting") { started.fulfill() }
-    }
+    let start = CaptureStartExpectation(started)
+    controller.onUpdate = { start.observe($0) }
     controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: configuration,
       pipelineEnabled: pipelineEnabled, previewEnabled: previewEnabled)
     wait(for: [started], timeout: 5)
@@ -1124,9 +1141,8 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let controller = CaptureController(services: harness.services())
     defer { controller.onUpdate = nil; controller.stop() }
     let firstStart = expectation(description: "First start ready")
-    controller.onUpdate = { update in
-      if update.message.hasPrefix("Waiting") { firstStart.fulfill() }
-    }
+    let first = CaptureStartExpectation(firstStart)
+    controller.onUpdate = { first.observe($0) }
     controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [firstStart], timeout: 3)
     let stopped = expectation(description: "First stop completed")
@@ -1134,9 +1150,8 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     controller.stop()
     wait(for: [stopped], timeout: 3)
     let secondStart = expectation(description: "Second start ready")
-    controller.onUpdate = { update in
-      if update.message.hasPrefix("Waiting") { secondStart.fulfill() }
-    }
+    let second = CaptureStartExpectation(secondStart)
+    controller.onUpdate = { second.observe($0) }
     controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [secondStart], timeout: 3)
     let delivered = expectation(description: "New generation frame processed")
@@ -1228,8 +1243,9 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let controller = CaptureController(services: harness.services())
     defer { controller.onUpdate = nil; controller.stop(); harness.releaseOutputs() }
     let ready = expectation(description: "Start ready")
+    let start = CaptureStartExpectation(ready)
     controller.onUpdate = { update in
-      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      start.observe(update)
       XCTAssertFalse(update.stopped, "Backpressure must not be a fatal capture error")
     }
     controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
@@ -1277,7 +1293,8 @@ private final class PacedDriverMetrics: @unchecked Sendable {
     let controller = CaptureController(services: harness.services())
     defer { controller.onUpdate = nil; controller.stop() }
     let ready = expectation(description: "Start ready")
-    controller.onUpdate = { if $0.message.hasPrefix("Waiting") { ready.fulfill() } }
+    let start = CaptureStartExpectation(ready)
+    controller.onUpdate = { start.observe($0) }
     controller.start(feedID: FeedID(rawValue: "test"), deviceID: "synthetic", configuration: config)
     wait(for: [ready], timeout: 3)
     let firstPreview = expectation(description: "Preview survives consumer disconnect")
@@ -1675,9 +1692,10 @@ private final class PacedDriverMetrics: @unchecked Sendable {
       }
       wait(for: [loaded], timeout: 5)
       let ready = expectation(description: "Prewarmed native processing ready")
+      let start = CaptureStartExpectation(ready)
       controller.onUpdate = { update in
         statuses.record(update)
-        if update.message.hasPrefix("Waiting") { ready.fulfill() }
+        start.observe(update)
       }
       let config = PipelineConfiguration(applyLUT: true, downscale: true,
         convertTo420: true, reduceFrameRate: reduce, sourceDuration: VideoContract.fastDuration)

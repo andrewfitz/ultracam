@@ -10,6 +10,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from work_paths import work_paths
 from vendors import read_inventory, build_settings, source_paths, generate_bridge, input_digest, check_capabilities
+from auto_switcher_source import auto_switcher_source
 
 ROOT = Path(__file__).resolve().parents[1]
 if not (ROOT.parent / "MonitorKit" / "Package.swift").is_file():
@@ -32,6 +33,10 @@ vendor_digest = input_digest(manifests, sdk_inventory)
 directory = (args.build_project or args.output_dir or ROOT / "Ultracam.xcodeproj").resolve()
 private_bridge = directory / "GeneratedBridgingHeader.h" if args.build_project else None
 check_capabilities(ROOT, manifests, sdk_inventory)
+try:
+    switcher_include = "$(SRCROOT)/" + (auto_switcher_source(ROOT) / "include").relative_to(ROOT).as_posix()
+except ValueError as error:
+    parser.exit(1, f'{error}\n')
 if args.output_dir is None or args.bridge_output is not None:
     generate_bridge(ROOT, manifests, private_bridge or args.bridge_output)
 
@@ -197,7 +202,8 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
                        DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")
         settings.update(ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon",
                         SWIFT_OBJC_BRIDGING_HEADER=str(private_bridge) if private_bridge else "Sources/DeviceAPI/GeneratedBridgingHeader.h",
-                        HEADER_SEARCH_PATHS=["$(inherited)"] + [project_path(path) for path in vendor_settings['headerSearchPaths']],
+                        HEADER_SEARCH_PATHS=["$(inherited)", switcher_include]
+                        + [project_path(path) for path in vendor_settings['headerSearchPaths']],
                         LIBRARY_SEARCH_PATHS=["$(inherited)", auto_switcher_lib_dir] + [project_path(path) for path in vendor_settings['librarySearchPaths']],
                         OTHER_LDFLAGS=["$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv",
                                        "-framework", "Security", "-framework", "CoreFoundation",

@@ -41,7 +41,7 @@ import XCTest
     for type: OSType in [kCVPixelFormatType_32BGRA,0x72323130,0x5231324c] {
       for full in [false,true] { for resize in [false,true] { for lut in [false,true] {
         let (source,levels) = try rgb(type,full:full)
-        var config = PipelineConfiguration(applyLUT:lut,downscale:resize)
+        var config = PipelineConfiguration(applyLUT:lut,downscale:resize,allowUpscale:true)
         config.resizeTarget = .hd720
         let declaration = Colorimetry(primaries:.rec709,transfer:.rec709,matrix:.identity,
           range:full ? .full : .video,horizontalChromaSiting:.unspecified,verticalChromaSiting:.unspecified)

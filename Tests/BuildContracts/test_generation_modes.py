@@ -23,11 +23,13 @@ class GenerationModeTests(unittest.TestCase):
                           'Sources/App', 'Sources/Shared', 'Sources/Recording',
                           'Sources/DeviceAPI', 'Sources/CameraExtension'):
             (self.root / directory).mkdir(parents=True)
-        for name in ('vendors.py', 'generate_project.py', 'work_paths.py'):
+        for name in ('vendors.py', 'generate_project.py', 'work_paths.py', 'auto_switcher_source.py'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         for name in ('App.entitlements', 'App-Info.plist'):
             shutil.copy2(ROOT / 'Config' / name, self.root / 'Config' / name)
         self.write('../MonitorKit/Package.swift')
+        for path in ('Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'include/auto_switcher.h'):
+            self.write('../auto-switcher/' + path)
         self.write('Sources/App/App.swift')
         self.write('Sources/DeviceAPI/DeviceAPI.h')
         self.write('Sources/DeviceAPI/Neutral.swift')
@@ -83,6 +85,14 @@ class GenerationModeTests(unittest.TestCase):
                        env=self.environment, check=True, capture_output=True)
         self.assertTrue((comparison / 'project.pbxproj').is_file())
         self.assertEqual((self.root / bridge).read_text(), 'existing bridge')
+
+    def test_incomplete_switcher_uses_sibling_for_both_cargo_and_bridge(self):
+        self.write('Apps/AutoSwitcher/Cargo.toml')
+        self.write('Apps/AutoSwitcher/include/auto_switcher.h')
+        self.assertIn('$(SRCROOT)/../auto-switcher/include', self.run_generator())
+        self.write('Apps/AutoSwitcher/Cargo.lock')
+        self.write('Apps/AutoSwitcher/src/lib.rs')
+        self.assertIn('$(SRCROOT)/Apps/AutoSwitcher/include', self.run_generator())
 
     def test_asset_catalogs_share_one_resources_phase(self):
         self.run_generator()

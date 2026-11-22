@@ -224,6 +224,7 @@ final class CaptureController: @unchecked Sendable {
     let install: UInt64
     let discovery: RecordingDiscoveryState
     var videoStarted = false
+    var lastAdmittedVideoPTS: CMTime?
     var sourceAdmissionAccepted = true
     var takeContextAccepted = true
     var takeContextBinding = false
@@ -1293,6 +1294,16 @@ final class CaptureController: @unchecked Sendable {
 
   var latestSourceTimecode: String? { media.snapshot().timecode }
 
+  /// Finish-start can run after the driver has detached this take on an epoch
+  /// change. The route check and meter start share the detach lock.
+  func beginTakeAudio(feedID: FeedID, outputURL: URL) -> Bool {
+    lock.withLock {
+      guard recordingCallbacks[feedID]?.callbacks.takeOutputURL == outputURL else { return false }
+      audioMeterTap.beginTake()
+      return true
+    }
+  }
+
   private func stopResources(preserveRecordingCallbacks: Bool = false,
     callbackGeneration: UInt64? = nil) {
     watchdog?.cancel()
@@ -1818,7 +1829,6 @@ final class CaptureController: @unchecked Sendable {
             throw SourceAdmissionRefusal(stage: .capture,
               formatDescription: FormatDisplayIdentity(format).detail, reason: "contract changed without a new capture epoch")
           }
-          var cutoff: RecordingRoute?
           let route = lock.withLock { () -> (FeedID, UInt64)? in
             guard generation == token, accepting else { return nil }
             if declaredEpoch != delivery.epochID {
@@ -1837,13 +1847,15 @@ final class CaptureController: @unchecked Sendable {
             guard let feed = activeFeedID, let recording = recordingCallbacks[feed] else { return nil }
             let recordingEpoch = recording.boundTakeContext?.sourceAdmission.epochID ?? recording.callbacks.preparedEpoch
             if let recordingEpoch, recordingEpoch != snapshot.epochID {
-              cutoff = recordingCallbacks.removeValue(forKey: feed)
+              recordingCallbacks.removeValue(forKey: feed)
               audioMeterTap.closeTakeInput()
+              // Queue the timeline notification before a racing manual stop
+              // can detach and queue its completion.
+              recording.callbacks.finishAtSourceEpoch?(recording.lastAdmittedVideoPTS)
               return nil
             }
             return (feed, recording.install)
           }
-          cutoff?.callbacks.finishAtSourceEpoch?()
           if case .present(let audio) = lock.withLock({ declaredAudio }) {
             do { try audioMeterTap.configure(format: audio) }
             catch { refuseSourceContract(error, token: token); return }
@@ -2274,10 +2286,11 @@ final class CaptureController: @unchecked Sendable {
       }
       // The take's first admitted frame opens it to audio, on this thread
       // before this callback's audio arrives; a newer install starts over.
-      if appended, !route.videoStarted,
-        let feed = feed {
+      if appended, let feed {
         lock.withLock {
-          if recordingCallbacks[feed]?.install == route.install { recordingCallbacks[feed]?.videoStarted = true }
+          guard recordingCallbacks[feed]?.install == route.install else { return }
+          recordingCallbacks[feed]?.videoStarted = true
+          recordingCallbacks[feed]?.lastAdmittedVideoPTS = pts
         }
       }
     }

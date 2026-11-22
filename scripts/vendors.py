@@ -292,7 +292,7 @@ def render_bridge(manifests):
         for path in manifest['publicHeaders']:
             relative = os.path.relpath(path, str(BRIDGE.parent))
             lines.append(f'#import "{relative}"')
-    lines += ['#include "../../Apps/AutoSwitcher/include/auto_switcher.h"', '#endif', '']
+    lines += ['#include <auto_switcher.h>', '#endif', '']
     return '\n'.join(lines)
 
 def generate_bridge(root=ROOT, manifests=None, destination=None):

@@ -487,12 +487,22 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
       let image = try v210Frame(width: 1_920, height: 1_080)
       let frames = 30
       for frame in 0..<frames {
+        // Feed the timestamp fixture at the writer's pace with at most two
+        // frames outstanding. The sample timing still models the broadcast rate.
+        let written = UInt64(max(0, frame - 1))
+        guard waitUntil(5, { adapter.telemetry.encodedVideo >= written }) else {
+          XCTFail("Writer stalled before frame \(frame): \(adapter.telemetry)")
+          return
+        }
         let pts = CMTime(value: Int64(frame) * duration.value, timescale: duration.timescale)
-        XCTAssertTrue(adapter.callbacks.video(image, pts, duration, true))
-        Thread.sleep(forTimeInterval: duration.seconds)
+        guard adapter.callbacks.video(image, pts, duration, true) else {
+          XCTFail("Frame \(frame) was rejected: \(adapter.telemetry)")
+          return
+        }
       }
       try adapter.stop()
       XCTAssertEqual(adapter.state, .finished, adapter.telemetry.lastError ?? "")
+      XCTAssertEqual(adapter.telemetry.encodedVideo, UInt64(frames))
 
       final class Track: @unchecked Sendable {
         var timescale: CMTimeScale = 0, minFrame: CMTime = .invalid, rate: Float = 0

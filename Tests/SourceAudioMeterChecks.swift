@@ -128,6 +128,24 @@ import XCTest
       "A late first declaration configures the take and a later change preserves its existing measurements")
   }
 
+  func testTakeCutoffDrainsOldPacketsAndRejectsNewPacketsAfterResume() throws {
+    let tap = AudioMeterTap()
+    tap.beginTake()
+    tap.meterQueue.suspend()
+    let quiet = [Int32](repeating: 268_435_456, count: 9_600).withUnsafeBytes { Data($0) }
+    let loud = [Int32](repeating: Int32.max, count: 9_600).withUnsafeBytes { Data($0) }
+    tap.ingest(samples: quiet, sampleFrames: 4_800, channels: 2, bytesPerSample: 4)
+    tap.closeTakeInput()
+    tap.pauseTake(false)
+    tap.ingest(samples: loud, sampleFrames: 4_800, channels: 2, bytesPerSample: 4)
+    tap.meterQueue.resume()
+    tap.waitUntilMetered()
+    XCTAssertEqual(tap.counters.metered, 2)
+    let summary = try XCTUnwrap(tap.endTake())
+    XCTAssertEqual(summary.duration, 0.1, accuracy: 0.000001)
+    XCTAssertLessThan(summary.maximumTruePeak, -12)
+  }
+
   func testStableAttachmentFollowsDeclarationWithoutAddingViewers() throws {
     let tap = AudioMeterTap()
     let attachment = AudioMeterTap.Attachment(tap: tap)

@@ -1,6 +1,6 @@
 # Mac Camera capture source
 
-Proposed implementation. Add **Mac Camera** under `Vendors/MacCamera/` alongside Blackmagic, with plugin ID `maccamera`. One AVFoundation capture plugin serves the built-in FaceTime camera, USB webcams such as Logitech, iPhones using Continuity Camera, and third-party cameras published to macOS. A feed selects a specific device. The goal is the earliest usable video sample macOS exposes, at the selected capture mode, before Ultracam applies any effects. A camera or its driver may already have decoded, cropped, tone-mapped or otherwise processed that image.
+**Mac Camera** is the AVFoundation capture plugin in `Vendors/MacCamera/` alongside Blackmagic. Its plugin ID is `maccamera`. Each feed selects a specific device exposed by macOS, including built-in, USB, Continuity and third-party virtual cameras. The plugin requests the earliest usable sample at the selected capture mode, before Ultracam applies effects. The camera or driver may already have decoded, cropped or tone-mapped the image. The qualification report lists the devices and routes exercised and the hardware checks still open. [Mac Camera qualification](MAC_CAMERA_VALIDATION.md)
 
 Out of scope: screen capture, muxed (DV / iOS-screen) devices, following `systemPreferredCamera`, and vendor USB control requests.
 

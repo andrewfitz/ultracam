@@ -22,6 +22,53 @@ import XCTest
     return try XCTUnwrap(coordinator.capturePool.existingController(for: id))
   }
 
+  func testMacCameraTypedSourceDrawsPictureAndScope() throws {
+    guard (try? MonitorCoordinator.sharedGPU.core()) != nil else { throw XCTSkip("No Metal 4 device") }
+    let suite = "org.ultracam.monitor-integration.maccamera.\(UUID())"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let device = "fake:monitor-420v"
+    let fixture = try AppHardwareSyntheticFixture(duration: VideoContract.slowDuration,
+      deviceIDs: [device], width: 1920, height: 1080, pixel: .video420)
+    fixture.connect()
+    defer { fixture.stop() }
+    let settings = AppSettingsStore(defaults: defaults)
+    settings.saveSnapshot(AppSettingsSnapshot(
+      feeds: [FeedDescriptor(id: alpha, name: "Mac Camera fixture", selectedDevice: device, automaticFeed: false)],
+      selectedFeedID: alpha, outputMode: .separateCameras))
+    let model = AppModel(settingsStore: settings, registryStore: VirtualCameraRegistryStore(defaults: defaults),
+      registryPublisher: fixture.publisher, recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      hardware: fixture.hardware)
+    let controller = try controller(model, alpha)
+    defer { controller.stop() }
+    controller.setCameraOutputEnabled(false)
+    let coordinator = model.monitorCoordinator
+    let target = MonitorTargetID(alpha.rawValue)
+    var tools = coordinator.preferences(for: target)
+    tools.toolsEnabled = true
+    tools.scopes.enabled = true
+    coordinator.setPreferences(tools, for: target)
+    let (window, presenter, id) = pictureWindow(
+      coordinator, target: target, points: CGSize(width: 640, height: 360), scope: true)
+    defer { coordinator.unregisterSurface(id: id); window.close() }
+    controller.start(feedID: alpha, deviceID: device, configuration: PipelineConfiguration(),
+      pipelineEnabled: false, previewEnabled: false)
+    XCTAssertTrue(spinUntil(seconds: 3) { !fixture.plugin.sessions.isEmpty })
+    let image = try fixture.makePattern(lumaCode: 576)
+    var index: Int32 = 0
+    XCTAssertTrue(spinUntil(seconds: 6) {
+      do { _ = try fixture.emit(image, index: index) }
+      catch { XCTFail(error.localizedDescription); return true }
+      index += 1
+      RunLoop.main.run(until: Date().addingTimeInterval(1 / 30))
+      let statistics = presenter.statistics
+      return statistics.presentedFrames > 1 && statistics.scopeUpdates > 1
+    })
+    let statistics = presenter.statistics
+    XCTAssertEqual(statistics.failures, 0)
+    print("Mac Camera 420v: \(statistics.presentedFrames) pictures and \(statistics.scopeUpdates) scopes presented")
+  }
+
   func testRemovingIdleFeedRefreshesMonitorAndRegistryProjections() throws {
     for removeSelected in [false, true] {
       let suiteName = "org.ultracam.monitor-app-integration.\(UUID().uuidString)"
@@ -731,8 +778,14 @@ NSApplication.shared.setActivationPolicy(.accessory)
 NSApplication.shared.finishLaunching()
 
 let suite = XCTestSuite(name: "Ultracam App monitor integration")
-suite.addTest(XCTestSuite(forTestCaseClass: MonitorAppIntegrationChecks.self))
-suite.addTest(XCTestSuite(forTestCaseClass: MonitorCoordinatorChecks.self))
+let integration = XCTestSuite(forTestCaseClass: MonitorAppIntegrationChecks.self)
+if ProcessInfo.processInfo.environment["ULTRACAM_MONITOR_MAC_CAMERA_ONLY"] == "1" {
+  guard let selected = integration.tests.first(where: { $0.name.contains("testMacCameraTypedSourceDrawsPictureAndScope") }) else { exit(2) }
+  suite.addTest(selected)
+} else {
+  suite.addTest(integration)
+  suite.addTest(XCTestSuite(forTestCaseClass: MonitorCoordinatorChecks.self))
+}
 suite.run()
 guard let run = suite.testRun, run.executionCount > 0 else { exit(2) }
 ProcessInfo.processInfo.endActivity(activity)

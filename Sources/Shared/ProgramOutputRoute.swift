@@ -43,8 +43,8 @@ struct ProgramOutputFormat: Equatable, Sendable, CustomStringConvertible {
       range: colour.range, horizontalChromaSiting: .center, verticalChromaSiting: .center)
   }
 
-  /// Mirrors `CameraSink.connect`: an untouched configuration negotiates the
-  /// passthrough format, otherwise the processed format.
+  /// Reuse the source's layout when it is compatible with Program's published
+  /// contract. Program still owns the output colour and cadence.
   init(configuration: PipelineConfiguration, passthroughFormat: OSType) {
     width = configuration.width
     height = configuration.height

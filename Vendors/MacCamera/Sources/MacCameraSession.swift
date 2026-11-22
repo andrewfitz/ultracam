@@ -166,7 +166,7 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
 
   private func open(deviceID: String, timing: CaptureTiming, allowAudio: Bool = true) throws {
     guard let device = plugin.device(deviceID), device.isConnected else {
-      throw PluginError.unavailable("The assigned Mac Camera is disconnected.")
+      throw plugin.unavailableDeviceError(deviceID)
     }
     guard !device.isSuspended else { throw PluginError.unavailable("macOS paused the assigned camera.") }
     let requested = try plugin.resolveMode(for: device, id: deviceID, timing: timing)
@@ -459,6 +459,7 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
         reattachMicrophone()
       }
       else {
+        guard audio?.isCurrentDisconnect(identity) == true else { return }
         microphoneReconnectPending = false
         let reason = "The selected microphone disconnected."
         interruptAudio(reason)
@@ -813,6 +814,9 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
   }
 
   private func validateVideoDelivery(_ image: CVPixelBuffer) throws {
+    // A queued device observation can follow the first affected sample.
+    // Recheck the consented hardware mode before admitting converted video.
+    if negotiatedFallback != nil { refreshMode() }
     let pixel = CVPixelBufferGetPixelFormatType(image)
     let width = CVPixelBufferGetWidth(image)
     let height = CVPixelBufferGetHeight(image)

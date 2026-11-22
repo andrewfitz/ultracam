@@ -19,6 +19,7 @@ import XCTest
     private(set) var accepted = 0
     private(set) var forwarded = 0
     private var stager = CameraFrameStager()
+    let sendFinished = DispatchSemaphore(value: 0)
     let runtime: CameraDeviceRuntime
 
     init() {
@@ -59,6 +60,7 @@ import XCTest
         },
         disconnect: {},
         send: { sample in
+          defer { self.sendFinished.signal() }
           let (format, duration) = self.lock.withLock { (self.format, self.duration) }
           guard let format, let duration else { throw VideoError.message("Not connected") }
           if let mismatch = CameraSink.mismatch(sample, format: format, duration: duration) {
@@ -91,7 +93,8 @@ import XCTest
     return image
   }
 
-  private func run(_ configuration: PipelineConfiguration, frames: Int, expected: Int, label: String) throws {
+  private func run(_ configuration: PipelineConfiguration, frames: Int, expected: Int,
+    inputFramesPerOutput: Int, label: String) throws {
     let path = Path()
     let controller = CaptureController(services: path.services())
     defer { controller.stop() }
@@ -112,17 +115,27 @@ import XCTest
     XCTAssertNotNil(controller.burnInLUT, "\(label): the LUT is burned in")
     XCTAssertTrue(path.driverStarted, "\(label): the driver starts")
     let source = try v210Source()
+    let period = VideoContract.fastDuration.seconds
     for index in 0..<frames {
+      let emittedAt = ProcessInfo.processInfo.systemUptime
       XCTAssertTrue(path.emit(source, at: CMTimeMultiply(VideoContract.fastDuration, multiplier: Int32(index + 1)),
         duration: VideoContract.fastDuration), "\(label): frame \(index) delivered by the driver")
-      // The driver's cadence, compressed: the pipeline never sees a burst.
-      Thread.sleep(forTimeInterval: 0.004)
+      // A route compatibility check, independent of sustained throughput.
+      // Keep at most one group contributing to an expected output in flight.
+      if index % inputFramesPerOutput == 0,
+        path.sendFinished.wait(timeout: .now() + 10) == .timedOut {
+        XCTFail("\(label): frame \(index) did not complete the camera send")
+        break
+      }
+      let remaining = period - (ProcessInfo.processInfo.systemUptime - emittedAt)
+      if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
     }
     let settle = Date().addingTimeInterval(10)
     while path.counts.accepted < expected && path.counts.refusals.isEmpty && Date() < settle {
       RunLoop.current.run(until: Date().addingTimeInterval(0.01))
     }
     let counts = path.counts
+    XCTAssertEqual(controller.retentionSnapshotForTesting.rejected, 0, "\(label): the fixture stays within capture capacity")
     XCTAssertEqual(counts.refusals, [], "\(label): nothing refused on the way to the camera")
     XCTAssertEqual(counts.accepted, expected, "\(label): every output frame reaches the camera queue")
     XCTAssertEqual(counts.forwarded, expected, "\(label): the extension forwards every frame")
@@ -135,7 +148,7 @@ import XCTest
       reduceFrameRate: false)
     configuration.sourceDuration = VideoContract.fastDuration
     configuration.lutOutputColorimetry = .rec709Video
-    try run(configuration, frames: 24, expected: 24, label: "2160p59.94 4:2:2 LUT")
+    try run(configuration, frames: 24, expected: 24, inputFramesPerOutput: 1, label: "2160p59.94 4:2:2 LUT")
   }
 
   /// 1080p 4:2:0 at 29.97 from 59.94, LUT and processing on.
@@ -144,7 +157,7 @@ import XCTest
       reduceFrameRate: true)
     configuration.sourceDuration = VideoContract.fastDuration
     configuration.lutOutputColorimetry = .rec709Video
-    try run(configuration, frames: 24, expected: 12, label: "1080p29.97 4:2:0 LUT")
+    try run(configuration, frames: 24, expected: 12, inputFramesPerOutput: 2, label: "1080p29.97 4:2:0 LUT")
   }
 
 }

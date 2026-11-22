@@ -173,6 +173,7 @@ import SwiftUI
     func savedSettings() -> [String: [String: VendorSettingValue]] {
       (try? VendorSettingsPreferences(defaults: defaults).load().desiredByDevice) ?? [:]
     }
+    try stagedMode(verifier, model: model, deviceID: spareID, settingID: modeID, saved: savedSettings)
     settle("mode and microphone save under the selected device") {
       savedSettings()[webID]?[modeID] == mode && savedSettings()[webID]?[micID] == microphone
     }
@@ -305,6 +306,74 @@ import SwiftUI
       let values = Dictionary(uniqueKeysWithValues: relaunched.vendorSettings.state(for: webID).settings.map { ($0.id, $0.value) })
       return values[modeID] == mode && values[micID] == microphone && !relaunched.vendorSettings.state(for: webID).busy
     }
+  }
+
+  private static func stagedMode(_ verifier: Verifier, model: AppModel, deviceID: String, settingID: String,
+    saved: () -> [String: [String: VendorSettingValue]]) throws {
+    let store = model.vendorSettings
+    let state = store.state(for: deviceID)
+    guard let setting = state.settings.first(where: { $0.id == settingID }),
+      let formats = setting.captureFormats, let format = formats.first else {
+      throw PluginError.failed("Missing staged capture editor fixture")
+    }
+    let original = setting.value
+    let originalPreference = saved()[deviceID]?[settingID]
+    let duration = CMTime(value: 1001, timescale: 60_000)
+    let expected = VendorCaptureMode.value(formatID: format.id, duration: duration)
+    let size = CGSize(width: 620, height: 260)
+    var writes: [VendorSettingValue] = []
+
+    func draft(fps: String) -> UICaptureModeDraft {
+      var value = UICaptureModeDraft()
+      value.selectFormat(format.id, formats: formats, committed: original)
+      value.selectCustomRate(fps)
+      return value
+    }
+    func editor(_ draft: UICaptureModeDraft = .init()) -> HostedView {
+      HostedView(Form {
+        UICaptureModeSettings(setting: setting, formats: formats, busy: false, stopReason: nil, draft: draft) { value in
+          writes.append(value)
+          Task { await store.apply(value, to: settingID, deviceID: deviceID, pluginID: "maccamera") }
+        }
+      }, size: size, dark: false)
+    }
+    func button(_ label: String, in host: HostedView) -> AXNode? {
+      Accessibility.nodes(in: host.host).first { $0.role == "AXButton" && $0.text.contains(label) }
+    }
+    func untouched() -> Bool {
+      writes.isEmpty && state.settings.first(where: { $0.id == settingID })?.value == original &&
+        saved()[deviceID]?[settingID] == originalPreference
+    }
+
+    let invalid = editor(draft(fps: "15"))
+    verifier.check("Mac Camera: custom FPS outside the selected format range disables Apply",
+      button("Apply Capture Mode", in: invalid)?.enabled == false, viewDependent: true)
+    invalid.close()
+
+    let valid = draft(fps: "60000/1001")
+    verifier.check("Mac Camera: the draft resolves the new format with the exact custom rate",
+      valid.pendingValue(formats: formats, committed: original) == expected && untouched())
+    let cancelled = editor(valid)
+    let didCancel = button("Cancel", in: cancelled).map(Accessibility.press) ?? false
+    cancelled.settle()
+    verifier.check("Mac Camera: Cancel clears the staged editor without applying settings",
+      didCancel && button("Apply Capture Mode", in: cancelled) == nil && untouched(), viewDependent: true)
+    cancelled.close()
+
+    editor(valid).close()
+    let reopened = editor()
+    verifier.check("Mac Camera: closing without Apply reopens at the committed selection",
+      button("Apply Capture Mode", in: reopened) == nil && untouched(), viewDependent: true)
+    reopened.close()
+
+    let applying = editor(valid)
+    let didApply = button("Apply Capture Mode", in: applying).map(Accessibility.press) ?? false
+    let deadline = Date().addingTimeInterval(4)
+    while saved()[deviceID]?[settingID] != expected && Date() < deadline { MainLoop.run(seconds: 0.012) }
+    verifier.check("Mac Camera: Apply saves the exact format and FPS in one setting write",
+      didApply && writes == [expected] && saved()[deviceID]?[settingID] == expected &&
+        state.settings.first(where: { $0.id == settingID })?.value == expected, viewDependent: true)
+    applying.close()
   }
 
   private static func makePattern(_ format: SourceFormat) throws -> CVPixelBuffer {
