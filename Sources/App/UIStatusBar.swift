@@ -489,7 +489,8 @@ struct UIStatusPopover: View {
         + presentation.cameras.compactMap { camera in
           session.cameras.first { $0.id == camera.id }?.recording.compatibilityNote.map { "\(camera.name): \($0)" }
         }
-      ForEach(notes, id: \.self) { note in
+      // Two cameras can say the same thing; identical text must not collide as an identity.
+      ForEach(Array(notes.enumerated()), id: \.offset) { _, note in
         Label { Text(note) } icon: { UIStateGlyph(state: .warning) }
           .font(.uiMeta).fixedSize(horizontal: false, vertical: true)
       }

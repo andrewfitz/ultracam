@@ -247,3 +247,17 @@ public struct AudioCodecSettings: Codable, Sendable {
         return channelMap.map { NSNumber(value: $0) }
     }
 }
+
+extension AudioCodecSettings {
+    /// The priming interval the configured encoder emits ahead of the first input sample
+    /// (2112 frames for AAC-LC). FLV has no edit list, so receivers present it.
+    package var encoderDelay: TimeInterval {
+        let rate = format.makeSampleRate(48_000, output: sampleRate)
+        guard format != .pcm, let input = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2),
+              let output = format.makeOutputAudioFormat(input, sampleRate: sampleRate, channelMap: channelMap),
+              output.sampleRate > 0, let converter = AVAudioConverter(from: input, to: output) else {
+            return 0
+        }
+        return TimeInterval(converter.primeInfo.leadingFrames) / output.sampleRate
+    }
+}

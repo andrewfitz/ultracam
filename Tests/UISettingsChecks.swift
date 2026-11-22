@@ -28,6 +28,14 @@ import XCTest
     XCTAssertEqual(UIInterfaceState(defaults: defaults).settingsTab, .general, "A tab that's gone opens General")
   }
 
+  /// Out-of-range text resolves to the nearest bound on the step grid; when that is the value
+  /// already saved, the row redraws instead of leaving the typed text showing.
+  func testNumberRowClampsTypedValuesToItsRangeAndStep() {
+    XCTAssertEqual(UISettingsNumberRow.stepped(999, range: 1...60, step: 1), 60)
+    XCTAssertEqual(UISettingsNumberRow.stepped(-5, range: 1...60, step: 1), 1)
+    XCTAssertEqual(UISettingsNumberRow.stepped(2.26, range: 0...10, step: 0.5), 2.5)
+  }
+
   func testSettingsLinksNameTheirTab() throws {
     XCTAssertEqual(UISettingsTab.linked(try XCTUnwrap(URL(string: "ultracam-settings:recording"))), .recording)
     XCTAssertEqual(UISettingsTab.linked(try XCTUnwrap(URL(string: "ultracam-settings:virtualCameras"))), .virtualCameras)

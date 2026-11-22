@@ -27,4 +27,17 @@ import XCTest
     update.frames = 101
     XCTAssertEqual(firstFrame, CaptureUpdateState(update))
   }
+  /// The CPU copy count is a total since Start. A window opened (or reopened) long after a
+  /// camera stopped copying reads that total first: no "CPU copy" pill for it; only growth
+  /// after that first reading lights it, for a second.
+  func testCPUCopyPillNeedsGrowthAfterTheFirstReading() {
+    let first = UILiveSource.ingestActivity(previous: nil, count: 500, now: 100)
+    XCTAssertFalse(100 - first.lastChange < 1, "The first reading of an old total is not copying now")
+    let same = UILiveSource.ingestActivity(previous: first, count: 500, now: 100.25)
+    XCTAssertFalse(100.25 - same.lastChange < 1)
+    let grew = UILiveSource.ingestActivity(previous: same, count: 503, now: 100.5)
+    XCTAssertTrue(100.5 - grew.lastChange < 1, "Copying now lights the pill")
+    let quiet = UILiveSource.ingestActivity(previous: grew, count: 503, now: 101.75)
+    XCTAssertFalse(101.75 - quiet.lastChange < 1, "A second without growth turns it off")
+  }
 }

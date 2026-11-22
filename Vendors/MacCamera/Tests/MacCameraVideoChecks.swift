@@ -344,6 +344,17 @@ import XCTest
     XCTAssertEqual(session.counters.deviceDroppedFrames, 0)
   }
 
+  // Automatic capture consents to a conversion for "format@automatic": the
+  // hardware cadence may drift (auto frame rate, low light) without leaving
+  // that scope. Dropping the conversion on a rate-only change refused every
+  // later frame. A real AVCaptureDevice is needed to drive refreshMode itself.
+  func testAutomaticRateDriftKeepsConsentedInputConversion() {
+    XCTAssertTrue(MacCameraCaptureSession.keepsInputConversion(formatChanged: false, requestedDuration: nil))
+    XCTAssertFalse(MacCameraCaptureSession.keepsInputConversion(formatChanged: true, requestedDuration: nil))
+    XCTAssertFalse(MacCameraCaptureSession.keepsInputConversion(formatChanged: false, requestedDuration: Self.duration30))
+    XCTAssertFalse(MacCameraCaptureSession.keepsInputConversion(formatChanged: true, requestedDuration: Self.duration30))
+  }
+
   func testModeCapabilitiesKeepExactRatesAndRejectDisjointGaps() throws {
     let exact = CMTime(value: 1001, timescale: 30_000)
     let fast = VendorCaptureRateRange(shortest: CMTime(value: 1, timescale: 60),

@@ -412,7 +412,12 @@ final class AVAssetSourceRecordingWriter: SourceRecordingWriter, @unchecked Send
       switch self {
       case .absent: return nil
       case .native(let value): return try QuickTimeTimecodeTrack(frameRate: value.frameRate, dropFrame: value.dropFrame)
-      case .generated: return try QuickTimeTimecodeTrack(frameRate: rate, dropFrame: configuration.timecodeDropFrame)
+      // The drop-frame choice was made for the configured rate (or flagged by the
+      // camera); frames that arrive at a rate without drop-frame get non-drop
+      // labels, as `RecordingTimecodeSession` counts them, never a failed take.
+      case .generated:
+        return try QuickTimeTimecodeTrack(frameRate: rate,
+          dropFrame: configuration.timecodeDropFrame && rate.supportsDropFrame)
       }
     }
   }

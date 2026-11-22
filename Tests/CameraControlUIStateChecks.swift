@@ -39,6 +39,16 @@ import XCTest
         XCTAssertEqual(UICameraControlSettings.refreshNote(.never),
             "Settings are read on connecting, right after you change one here, and when you press Refresh. Change how often in Settings › Hardware.")
     }
+    /// A value the camera reports while a number is being typed (auto ISO moving, a refresh)
+    /// must not replace the typing; untouched or unfocused fields follow the camera.
+    func testScalarEditorKeepsTypingWhenTheCameraReportsANewValue() {
+        XCTAssertEqual(UIControlScalarEditor.resynced(draft: "1600", old: .integer(800), new: .integer(1000), editing: true), "1600",
+            "Typed over while the camera's value moved")
+        XCTAssertEqual(UIControlScalarEditor.resynced(draft: "800", old: .integer(800), new: .integer(1000), editing: true), "1000",
+            "Focused but untouched follows the camera")
+        XCTAssertEqual(UIControlScalarEditor.resynced(draft: "1600", old: .integer(800), new: .integer(1000), editing: false), "1000",
+            "Not editing follows the camera")
+    }
 }
 private enum UIControlFailure: Error { case identityWasNotPinned }
 @MainActor private final class UIControlPersistence: CameraControlAssignmentPersisting {

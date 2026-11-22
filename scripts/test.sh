@@ -43,9 +43,23 @@ monitor_kit_test_log="$logs_root/monitor-kit-package-tests-$run_id.log"
 if [[ "$compile_only" == false ]]; then
   monitor_kit_package_test "$monitor_kit_test_log" || { monitor_kit_test_report "$monitor_kit_test_log"; exit 1; }
 fi
+# In-repo Swift packages with their own tests (MonitorKit runs above).
+package_test() {
+  local log="$logs_root/package-$1-tests-$run_id.log"
+  xcrun swift test --package-path "$task_root/Packages/$1" --scratch-path "$test_root/package-$1" > "$log" 2>&1 || {
+    cat "$log"; echo "$1 package tests failed ($log)" >&2; exit 1;
+  }
+  echo "$1 package tests passed ($log)"
+}
+if [[ "$compile_only" == false ]]; then
+  package_test HaishinKitRTMP
+  package_test ProgramAV1
+fi
 auto_switcher_source="$(python3 "$task_root/scripts/auto_switcher_source.py")"
 rust_manifest="$auto_switcher_source/Cargo.toml"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(python3 "$task_root/scripts/work_paths.py" --path build_root)/auto-switcher-target}"
+# rustup installs to ~/.cargo/bin, which non-login shells may not have on PATH.
+command -v rustup >/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"
 RUSTC="$rustc_path" RUSTDOC="$rustdoc_path" rustup run stable cargo build \

@@ -27,6 +27,8 @@ source "$task_root/scripts/vendor-build.sh"
 vendor_configure test "" "" app
 vendor_compile_native "$test_root/native.log"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$build_root/auto-switcher-target}"
+# rustup installs to ~/.cargo/bin, which non-login shells may not have on PATH.
+command -v rustup >/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
 rustc_path="$(rustup which --toolchain stable rustc)"
 RUSTC="$rustc_path" rustup run stable cargo build --release --locked --manifest-path "$auto_switcher_source/Cargo.toml"
 # Compile and verify against the same fixture sources throughout the matrix.

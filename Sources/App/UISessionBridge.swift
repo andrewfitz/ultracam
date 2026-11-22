@@ -140,6 +140,14 @@ struct UISessionBridge {
   var openWindow: (String) -> Void = { _ in }
   var openSettings: () -> Void = {}
 
+  /// What Show Recordings in Finder opens: the default folder, else the first camera's folder,
+  /// the one its rolling take writes to included (a meeting app's own folder, or the default
+  /// folder cleared mid-take), as `canRevealRecordings` counts them.
+  var recordingsFolder: URL? {
+    let recording = model.recordingModel
+    return recording.outputFolder ?? model.feedDescriptors.compactMap { recording.currentOutputFolder(for: $0.id) }.first
+  }
+
   func snapshot() -> UISessionSnapshot {
     // Register the observable camera state up front. Whether a camera runs is read
     // from the capture coordinator, which SwiftUI can't observe on its own.
@@ -582,9 +590,7 @@ struct UISessionBridge {
     case .clearDefaultFolder: recording.outputFolder = nil
     case .revealInFinder(let url): NSWorkspace.shared.activateFileViewerSelecting([url])
     case .revealRecordings:
-      if let folder = recording.outputFolder ?? model.feedDescriptors.compactMap({ recording.outputFolder(for: $0.id) }).first {
-        NSWorkspace.shared.open(folder)
-      }
+      if let folder = recordingsFolder { NSWorkspace.shared.open(folder) }
     case .recover(let id): if let take = recording.interruptedRecordings.first(where: { $0.id.path == id }) { recording.recover(take) }
     case .showInterruptedTakes: interface.interruptedTakesOpen = true
     case .hideInterruptedTakes: interface.interruptedTakesOpen = false

@@ -223,6 +223,31 @@ fn connection(mut stream: TcpStream, state: Arc<Mutex<Session>>, clock: bool) ->
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum AcceptErrorAction {
+    /// The failure belongs to one connection; keep serving.
+    Skip,
+    /// The process or system is out of descriptors; pause, then keep serving.
+    Backoff,
+    /// The listener itself is unusable.
+    Fatal,
+}
+
+fn accept_error_action(error: &std::io::Error) -> AcceptErrorAction {
+    use std::io::ErrorKind;
+    // ENFILE and EMFILE have these values on both macOS and Linux.
+    const ENFILE: i32 = 23;
+    const EMFILE: i32 = 24;
+    match error.kind() {
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::Interrupted
+        | ErrorKind::WouldBlock => AcceptErrorAction::Skip,
+        _ if matches!(error.raw_os_error(), Some(EMFILE | ENFILE)) => AcceptErrorAction::Backoff,
+        _ => AcceptErrorAction::Fatal,
+    }
+}
+
 pub fn serve(
     config: SwitcherConfig,
     port: u16,
@@ -282,7 +307,18 @@ pub fn serve(
     }
     let slots = Arc::new(());
     for stream in listener.incoming() {
-        let stream = stream?;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => match accept_error_action(&error) {
+                AcceptErrorAction::Skip => continue,
+                AcceptErrorAction::Backoff => {
+                    eprintln!("accept failed, retrying: {error}");
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                AcceptErrorAction::Fatal => return Err(error.into()),
+            },
+        };
         if Arc::strong_count(&slots) > 32 {
             continue;
         }
@@ -307,13 +343,18 @@ struct LevelAdapter {
 }
 
 impl LevelAdapter {
+    /// Forget timing state so the next reading starts on the current clock.
+    fn reset(&mut self) {
+        self.last = None;
+        self.silence_start = None;
+        self.speaking = false;
+    }
+
     /// Convert capture meter readings into the same replayable cues used by PCM.
     fn input(&mut self, line: &str) -> Result<(Value, Option<Value>)> {
         let event: Value = serde_json::from_str(line)?;
         if event["type"] == "reset" {
-            self.last = None;
-            self.silence_start = None;
-            self.speaking = false;
+            self.reset();
         }
         if event["type"] != "levels" {
             return Ok((event, None));
@@ -376,7 +417,13 @@ pub fn worker() -> Result<()> {
     let mut levels = LevelAdapter::default();
     for input in lines {
         let (event, cue) = levels.input(&input?)?;
+        let generation = director.session_generation();
         let outputs = director.process_event(serde_json::from_value(event)?);
+        if director.session_generation() != generation {
+            // The director rebased (e.g. the clock jumped backward); readings
+            // from the old timeline must not shape the next pause.
+            levels.reset();
+        }
         if let Some(cue) = cue {
             // Audio observations are retained until a tick. They produce no immediate cut.
             serde_json::to_writer(&mut out, &[cue])?;
@@ -553,5 +600,39 @@ pub fn feed_pcm(port: u16, rate: u32, origin: f64, tick: bool) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn accept_errors_for_one_connection_do_not_stop_the_server() {
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind)),
+                AcceptErrorAction::Skip,
+                "{kind:?}"
+            );
+        }
+        // EMFILE and ENFILE.
+        for code in [24, 23] {
+            assert_eq!(
+                accept_error_action(&Error::from_raw_os_error(code)),
+                AcceptErrorAction::Backoff,
+                "errno {code}"
+            );
+        }
+        assert_eq!(
+            accept_error_action(&Error::from(ErrorKind::InvalidInput)),
+            AcceptErrorAction::Fatal
+        );
     }
 }

@@ -134,4 +134,53 @@ import XCTest
     XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferContentLightLevelInfoKey, nil))
     XCTAssertEqual(try LUTProcessor.sourceColorimetry(output).transfer, .rec709)
   }
+
+  /// Capture start warms the pipeline (`prepare`) before any source declaration
+  /// exists, with an untagged frame. An HLG camera with a Rec.2020/HLG → Rec.709
+  /// LUT (no manual source profile) must start: its live frames declare HLG and
+  /// pass the contract, so the warm frames must not refuse as "Rec.709".
+  func testWarmUpAcceptsALUTWhoseInputIsNotRec709() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal") }
+    let hlg = try SourceColorSpaceCatalog.color("rec2020-hlg-video")
+    let contract = LUTColorSpaceContract(input: hlg, output: .rec709Video)
+    var config = PipelineConfiguration(applyLUT: true, downscale: true)
+    config.resizeTarget = .hd720
+    let processor = try LUTProcessor()
+    try processor.load(CubeLUT(text: cubeText()), colorSpace: contract)
+    XCTAssertNoThrow(try processor.prepare(configuration: config), "Capture start (wait: true) must not fail")
+    XCTAssertTrue(processor.workingResourceDiagnostics.outputPoolActive)
+    let live = try LUTProcessor()
+    try live.load(CubeLUT(text: cubeText()), colorSpace: contract)
+    try live.prepare(configuration: config, wait: false)
+    XCTAssertTrue(live.waitUntilIdle(timeout: 5))
+    XCTAssertTrue(live.workingResourceDiagnostics.outputPoolActive, "Live-path warm frames must reach the GPU")
+    // The contract itself is unchanged: an HLG frame runs, an untagged one refuses.
+    let source = try packed(kCVPixelFormatType_422YpCbCr10, width: 128)
+    XCTAssertNoThrow(try processor.process(source, configuration: config, declaredSourceColorimetry: hlg))
+    XCTAssertThrowsError(try processor.process(source, configuration: config))
+  }
+
+  /// The live path re-warms after a configuration change with the admitted
+  /// source's size in the configuration. Warm frames of another size (always
+  /// 3840 × 2160) left the first live frame to reallocate the working texture,
+  /// waiting on the capture thread for the warm frames still on the GPU.
+  func testLiveWarmUpAllocatesForTheConfiguredSourceSize() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal") }
+    var config = PipelineConfiguration(downscale: true)
+    config.resizeTarget = .hd720
+    config.sourceWidth = 1920
+    config.sourceHeight = 1080
+    let processor = try LUTProcessor()
+    try processor.prepare(configuration: config, wait: false)
+    XCTAssertTrue(processor.waitUntilIdle(timeout: 5))
+    let warmed = processor.workingResourceDiagnostics.floatTextureBytes
+    XCTAssertGreaterThan(warmed, 0)
+    var made: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_422YpCbCr10,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &made),
+      kCVReturnSuccess)
+    _ = try processor.process(try XCTUnwrap(made), configuration: config)
+    XCTAssertEqual(processor.workingResourceDiagnostics.floatTextureBytes, warmed,
+      "The first live frame must find the working texture the warm-up made")
+  }
 }

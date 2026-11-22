@@ -34,6 +34,29 @@ import XCTest
       CMTime(value: 1, timescale: 24))
   }
 
+  /// One app's recording profile missing a field (saved before it existed) or
+  /// unreadable must not silently drop every app's profile, which the next
+  /// profile edit would then write back as the whole set.
+  func testRecordingProfilesSurviveAPartialOrUnreadableEntry() throws {
+    let suiteName = "org.ultracam.tests.profiles.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let json = """
+      {"us.zoom.xos": {"videoMbps": 4, "pattern": "{date} Zoom", "folderPath": "/Volumes/Takes"},
+       "com.microsoft.teams2": {"folderPath": "/Volumes/Teams"},
+       "com.example.broken": 7}
+      """
+    defaults.set(Data(json.utf8), forKey: AppSettingsStore.recordingProfilesKey)
+    let profiles = AppSettingsStore(defaults: defaults).recordingProfiles
+    XCTAssertEqual(profiles["us.zoom.xos"]?.videoMbps, 4)
+    XCTAssertEqual(profiles["us.zoom.xos"]?.pattern, "{date} Zoom")
+    XCTAssertEqual(profiles["us.zoom.xos"]?.folderPath, "/Volumes/Takes")
+    XCTAssertEqual(profiles["com.microsoft.teams2"]?.folderPath, "/Volumes/Teams")
+    XCTAssertEqual(profiles["com.microsoft.teams2"]?.videoMbps, AppRecordingProfile.defaultVideoMbps)
+    XCTAssertEqual(profiles["com.microsoft.teams2"]?.pattern, AppRecordingProfile.defaultPattern)
+    XCTAssertNil(profiles["com.example.broken"])
+  }
+
   func testDockVisibilityPreferencePersistsIndependentlyOfFeedSettings() throws {
     let suiteName = "org.ultracam.tests.dock.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -219,7 +242,7 @@ import XCTest
   }
 
   func testBookmarkRestoreAndMissingFileRecovery() throws {
-    let directory = URL(fileURLWithPath: "/Volumes/8TB/cinesomatic-director-work/tmp")
+    let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("settings-check-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -263,7 +286,7 @@ import XCTest
   }
 
   func testInvalidSelectionDoesNotReplaceSavedBookmark() throws {
-    let directory = URL(fileURLWithPath: "/Volumes/8TB/cinesomatic-director-work/tmp")
+    let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("settings-check-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -291,7 +314,7 @@ import XCTest
   }
 
   func testLUTReadRejectsOversizedNonTextAndNonFileInputs() throws {
-    let directory = URL(fileURLWithPath: "/Volumes/8TB/cinesomatic-director-work/tmp")
+    let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("settings-check-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }

@@ -276,6 +276,30 @@ import XCTest
     XCTAssertEqual(try store.loadRecoveryRoots().count, 1)
   }
 
+  /// A retained root whose drive went away (or whose folder was removed) can't
+  /// be bookmarked again. Saving must still persist the take folder just
+  /// chosen, and keep the stored grant for the missing root, instead of
+  /// failing the whole save while that root stays offline.
+  func testOfflineRecoveryRootDoesNotBlockSavingNewRoots() throws {
+    let suite = "offline-root-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    defer { try? FileManager.default.removeItem(at: base) }
+    let offline = base.appendingPathComponent("ejected")
+    let next = base.appendingPathComponent("next")
+    try FileManager.default.createDirectory(at: offline, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+    let store = RecordingFolderStore(defaults: defaults)
+    try store.saveRecoveryRoots([offline])
+    let stored = try XCTUnwrap(defaults.dictionary(forKey: "recordingRecoveryRootBookmarks")?[offline.standardizedFileURL.path] as? Data)
+    try FileManager.default.removeItem(at: offline)
+    XCTAssertNoThrow(try store.saveRecoveryRoots([offline, next]))
+    let saved = defaults.dictionary(forKey: "recordingRecoveryRootBookmarks") ?? [:]
+    XCTAssertEqual(saved[offline.standardizedFileURL.path] as? Data, stored)
+    XCTAssertNotNil(saved[next.standardizedFileURL.path] as? Data)
+  }
+
   func testRecoveryRootBookmarksRoundTripAndDeduplicate() throws {
     let suite = "recovery-roots-\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

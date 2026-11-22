@@ -408,55 +408,66 @@ fn realtime(
             event,
         )
     };
-    match input_format {
-        InputFormat::Jsonl => {
-            let mut input = io::stdin().lock();
-            let mut line = String::new();
-            let mut line_number = 1;
-            while input
-                .read_line(&mut line)
-                .context("failed to read realtime input")?
-                != 0
-            {
-                if !line.trim().is_empty() {
-                    let event = serde_json::from_str(&line).with_context(|| {
-                        format!("invalid realtime JSONL event on line {line_number}")
-                    })?;
-                    process(event)?;
-                }
-                line.clear();
-                line_number += 1;
-            }
-        }
+    let mut decoder = match input_format {
+        InputFormat::Jsonl => None,
         InputFormat::Pcm16le => {
-            let mut decoder =
-                PcmCueDecoder::new(sample_rate, chunk_ms, threshold).map_err(anyhow::Error::msg)?;
-            let stdin = io::stdin();
-            let mut input = stdin.lock();
-            let mut bytes = [0_u8; 16 * 1024];
-            loop {
-                let count = input.read(&mut bytes).context("failed to read PCM input")?;
-                let events = if count == 0 {
-                    decoder.finish()
-                } else {
-                    decoder.push_pcm16le(&bytes[..count])
-                };
-                for event in events {
-                    let tick = match &event {
-                        StreamEvent::Audio { cue } => Some(StreamEvent::Tick { time: cue.time }),
-                        _ => None,
+            Some(PcmCueDecoder::new(sample_rate, chunk_ms, threshold).map_err(anyhow::Error::msg)?)
+        }
+    };
+    // An input or output failure ends the session, but the ledger already
+    // collected is still saved before the error is reported.
+    let session = (|| -> Result<()> {
+        match decoder.as_mut() {
+            None => {
+                let mut input = io::stdin().lock();
+                let mut line = String::new();
+                let mut line_number = 1;
+                while input
+                    .read_line(&mut line)
+                    .context("failed to read realtime input")?
+                    != 0
+                {
+                    if !line.trim().is_empty() {
+                        let event = serde_json::from_str(&line).with_context(|| {
+                            format!("invalid realtime JSONL event on line {line_number}")
+                        })?;
+                        process(event)?;
+                    }
+                    line.clear();
+                    line_number += 1;
+                }
+            }
+            Some(decoder) => {
+                let stdin = io::stdin();
+                let mut input = stdin.lock();
+                let mut bytes = [0_u8; 16 * 1024];
+                loop {
+                    let count = input.read(&mut bytes).context("failed to read PCM input")?;
+                    let events = if count == 0 {
+                        decoder.finish()
+                    } else {
+                        decoder.push_pcm16le(&bytes[..count])
                     };
-                    process(event)?;
-                    if let Some(tick) = tick {
-                        process(tick)?;
+                    for event in events {
+                        let tick = match &event {
+                            StreamEvent::Audio { cue } => {
+                                Some(StreamEvent::Tick { time: cue.time })
+                            }
+                            _ => None,
+                        };
+                        process(event)?;
+                        if let Some(tick) = tick {
+                            process(tick)?;
+                        }
+                    }
+                    if count == 0 {
+                        break;
                     }
                 }
-                if count == 0 {
-                    break;
-                }
             }
         }
-    }
+        Ok(())
+    })();
     if let Some(mut timeline) = timeline {
         timeline.finish(Some(unix_ms()));
         write_json(
@@ -465,7 +476,7 @@ fn realtime(
             &timeline.timeline,
         )?;
     }
-    Ok(())
+    session
 }
 
 fn process_realtime_event(

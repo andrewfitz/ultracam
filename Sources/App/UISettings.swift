@@ -595,13 +595,23 @@ struct UISettingsNumberRow: View {
   let unit: String
   let onCommit: () -> Void
   @FocusState private var focused: Bool
+  /// Bumped when typed text resolves to the value already saved, so the field redraws the
+  /// saved number instead of keeping text such as an out-of-range entry.
+  @State private var revision = 0
 
   private var digits: Int { step < 0.1 ? 2 : step < 1 ? 1 : 0 }
 
+  static func stepped(_ newValue: Double, range: ClosedRange<Double>, step: Double) -> Double {
+    (min(max(newValue, range.lowerBound), range.upperBound) / step).rounded() * step
+  }
+
   private var committed: Binding<Double> {
     Binding(get: { value }, set: { newValue in
-      let stepped = (min(max(newValue, range.lowerBound), range.upperBound) / step).rounded() * step
-      guard stepped != value else { return }
+      let stepped = Self.stepped(newValue, range: range, step: step)
+      guard stepped != value else {
+        if newValue != value { revision &+= 1 }
+        return
+      }
       value = stepped
       onCommit()
     })
@@ -616,6 +626,7 @@ struct UISettingsNumberRow: View {
           .monospacedDigit()
           .frame(width: 56)
           .focused($focused)
+          .id(revision)
         Text(unit).foregroundStyle(.secondary)
         Stepper(title, value: committed, in: range, step: step).labelsHidden()
       }

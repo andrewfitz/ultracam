@@ -481,24 +481,45 @@ final class LUTProcessor: @unchecked Sendable {
       if wait { releaseIdleResources() }
       return
     }
-    let source = try warmInput()
+    // Warm at the size the live source will arrive at, so its first frame
+    // reuses the working texture and output pool instead of waiting on the
+    // capture thread for the warm frames to retire and reallocating them.
+    let width = configuration.resolvedSourceWidth, height = configuration.resolvedSourceHeight
+    let source: CVPixelBuffer
+    if wait {
+      source = try warmInput(width: width, height: height)
+    } else {
+      guard let made = try? warmInput(width: width, height: height) else { return }
+      source = made
+    }
+    // The warm frame carries no colour tags and no source has declared one yet
+    // (capture start). Declare the encoding the loaded LUT expects, so a LUT
+    // whose input is HLG, PQ or a log space is not refused as untagged Rec.709.
+    // Live frames are still validated against the contract with their own
+    // declaration; a manual source profile still overrides this one.
+    let colour = configuration.applyLUT ? Colorimetry.rec709Video.overridingRGBEncoding(with: lutColorSpace.input) : nil
     guard wait else {
       // Best effort: a warm frame that can't get a buffer or slot is not an
       // error of its own; the live frame that follows reports any stall.
       for _ in 0..<VideoContract.warmBufferCount {
-        do { try submit(source, configuration: configuration) { _ in } } catch { break }
+        do { try submit(source, configuration: configuration, declaredSourceColorimetry: colour) { _ in } } catch { break }
       }
       return
     }
     var warm = [CVPixelBuffer]()
-    for _ in 0..<VideoContract.warmBufferCount { warm.append(try process(source, configuration: configuration)) }
+    for _ in 0..<VideoContract.warmBufferCount {
+      warm.append(try process(source, configuration: configuration, declaredSourceColorimetry: colour))
+    }
     withExtendedLifetime(warm) {}
   }
 
-  private func warmInput() throws -> CVPixelBuffer {
-    if let warmSource { return warmSource }
+  private func warmInput(width: Int, height: Int) throws -> CVPixelBuffer {
+    if let warmSource, CVPixelBufferGetWidth(warmSource) == width, CVPixelBufferGetHeight(warmSource) == height {
+      return warmSource
+    }
+    warmSource = nil
     var source: CVPixelBuffer?
-    let status = CVPixelBufferCreate(nil, 3840, 2160, kCVPixelFormatType_422YpCbCr10,
+    let status = CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_422YpCbCr10,
       [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &source)
     guard status == kCVReturnSuccess, let source else {
       throw VideoError.message("Cannot prepare capture processing buffers (\(status)).")

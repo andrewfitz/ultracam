@@ -322,10 +322,11 @@ struct UICameraSettingsOverlay: View {
     }
 }
 
-private struct UIControlScalarEditor: View {
+struct UIControlScalarEditor: View {
     let property: ControlProperty
     let apply: @MainActor @Sendable (ControlValue) -> Void
     @State private var draft = ""
+    @FocusState private var editing: Bool
     private var parsed: ControlValue? {
         switch property.value {
         case .integer: return Int64(draft).map(ControlValue.integer)
@@ -341,9 +342,23 @@ private struct UIControlScalarEditor: View {
     var body: some View {
         HStack {
             TextField(property.localizedLabel(), text: $draft).textFieldStyle(.roundedBorder).onSubmit(commit)
+                .focused($editing)
             Button("Apply", action: commit).disabled(parsed == nil || parsed == property.value)
         }.onAppear { draft = UIControlPresentation.value(property.value) }
-            .onChange(of: property.value) { _, value in draft = UIControlPresentation.value(value) }
+            .onChange(of: property.value) { old, value in
+                draft = Self.resynced(draft: draft, old: old, new: value, editing: editing)
+            }
     }
-    private func commit() { if let value = parsed { apply(value) } }
+    /// Applying ends the edit, so the value the camera then reports (perhaps clamped) shows.
+    private func commit() {
+        guard let value = parsed else { return }
+        editing = false
+        apply(value)
+    }
+
+    /// The field's text after the camera reports a new value: that value, unless the field is
+    /// being typed over (a moving auto value or a refresh would replace the typing).
+    static func resynced(draft: String, old: ControlValue, new: ControlValue, editing: Bool) -> String {
+        editing && draft != UIControlPresentation.value(old) ? draft : UIControlPresentation.value(new)
+    }
 }

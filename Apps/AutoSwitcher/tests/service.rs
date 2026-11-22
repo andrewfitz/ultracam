@@ -72,3 +72,36 @@ fn service_orders_observations_and_exports_only_applied_cuts() {
     assert_eq!(records.len(), 4);
     assert_eq!(records[3], applied);
 }
+
+#[test]
+fn worker_level_pause_restarts_after_backward_clock_jump() {
+    let mut worker = Server(
+        Command::new(env!("CARGO_BIN_EXE_auto-switcher"))
+            .arg("worker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = worker.0.stdin.take().unwrap();
+    let mut stdout = BufReader::new(worker.0.stdout.take().unwrap());
+    let mut send = |value: Value| {
+        writeln!(stdin, "{value}").unwrap();
+        stdin.flush().unwrap();
+        read(&mut stdout)
+    };
+    assert_eq!(
+        send(json!({"strategy":"eyeContact","anchor_camera_id":"wide","emphasis_camera_id":"left"})),
+        json!([])
+    );
+    let levels = |time: f64, rms: f64| json!({"type":"levels","time":time,"rms":rms,"peak":rms,"present":true});
+    send(levels(10.0, 0.5));
+    send(levels(10.5, 0.0));
+    send(json!({"type":"tick","time":11.0}));
+    // The host clock restarts; the director rebases its session.
+    send(json!({"type":"tick","time":2.0}));
+    send(levels(2.0, 0.0));
+    let pause = send(levels(2.5, 0.0));
+    let pause = pause[0]["cue"]["pause_duration"].as_f64().unwrap();
+    assert!((pause - 0.5).abs() < 1e-9, "pause after clock jump was {pause}");
+}

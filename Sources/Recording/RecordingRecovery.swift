@@ -304,17 +304,26 @@ final class RecordingFolderStore {
   }
   func saveRecoveryRoots(_ urls: [URL]) throws {
     var bookmarks = unresolvedRecoveryBookmarks
+    // A retained root that is offline now keeps the bookmark it was saved with,
+    // so one unplugged drive never stops newer take folders from being saved.
+    let stored = defaults.dictionary(forKey: "recordingRecoveryRootBookmarks") ?? [:]
+    var firstError: Error?
     var seen = Set<String>()
     for url in urls {
       let path = url.standardizedFileURL.path
       guard seen.insert(path).inserted else { continue }
       let access = RecordingDirectoryAccess(url)
       defer { withExtendedLifetime(access) {} }
-      bookmarks[path] = try url.bookmarkData(options: .withSecurityScope,
-        includingResourceValuesForKeys: nil, relativeTo: nil)
+      do {
+        bookmarks[path] = try url.bookmarkData(options: .withSecurityScope,
+          includingResourceValuesForKeys: nil, relativeTo: nil)
+      } catch {
+        if let previous = stored[path] { bookmarks[path] = previous } else if firstError == nil { firstError = error }
+      }
       unresolvedRecoveryBookmarks.removeValue(forKey: path)
     }
     defaults.set(bookmarks, forKey: "recordingRecoveryRootBookmarks")
+    if let firstError { throw firstError }
   }
   func loadRecoveryRoots() throws -> [URL] {
     let bookmarks = defaults.dictionary(forKey: "recordingRecoveryRootBookmarks") ?? [:]

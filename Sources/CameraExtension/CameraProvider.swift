@@ -1052,9 +1052,13 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
     // lack it because CMIO sent no start callback for it, or because an
     // earlier unqualified stop released its lease in place of this client's.
     // The departed client is excluded here in case the list still names it.
+    // Both cases need this client to have held a lease. The provider fans
+    // every client's disconnect out to every runtime, and the list can still
+    // name a viewer whose own stop just released its lease; an unrelated
+    // departure must not hand that stopped viewer a new lease.
     owner.consumers -= removed
     let streaming = streamingSourceClientIDs
-    adoptStreamingClients(streaming.filter { authorizedSourceClientIDs.contains($0) })
+    if removed > 0 { adoptStreamingClients(streaming.filter { authorizedSourceClientIDs.contains($0) }) }
     guard owner.consumers != previous || removed > 0 || hadPendingLease else { return }
     if owner.consumers < previous {
       disconnectedSourceStopCredits += 1

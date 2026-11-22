@@ -776,6 +776,30 @@ import XCTest
     }
   }
 
+  // CameraProvider fans every client's disconnect out to every runtime. A
+  // process that never used this camera can leave while streamingClients
+  // still names a viewer whose stop has already released its lease; that
+  // disconnect must not hand the stopped viewer a new lease.
+  func testUnrelatedClientDisconnectDoesNotRegrantAStoppedViewerLease() throws {
+    let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let viewer = UUID(), unrelated = UUID()
+    try runtime.queue.sync {
+      runtime.enableGPUStandbyForTesting { _, _ in }
+      runtime.source.streamingSourceClientIDsForTesting = [viewer]
+      runtime.source.authorizeSourceForTesting(clientID: viewer)
+      try runtime.source.startStream()
+      XCTAssertEqual(runtime.consumers, 1)
+      // The list has not caught up with the viewer's stop.
+      try runtime.source.stopStream()
+      XCTAssertEqual(runtime.consumers, 0)
+      runtime.source.disconnectSourceForTesting(clientID: unrelated)
+      XCTAssertEqual(runtime.consumers, 0, "An unrelated disconnect must not restart demand for a stopped viewer")
+      runtime.source.observeStreamingClientsForTesting([])
+      XCTAssertEqual(runtime.consumers, 0)
+      XCTAssertFalse(runtime.inUse)
+    }
+  }
+
   func testFailedPreparationReleasesPendingLeaseWithoutAdmittingDemand() throws {
     let feed = VirtualCameraDescriptor.feed(feedID: "pending-failed-start")
     let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,

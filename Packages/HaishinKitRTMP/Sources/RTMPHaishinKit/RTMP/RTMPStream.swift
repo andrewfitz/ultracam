@@ -229,6 +229,7 @@ public actor RTMPStream {
     private var audioTimestamp: RTMPTimestamp<AVAudioTime> = .init()
     private var videoTimestamp: RTMPTimestamp<CMTime> = .init()
     private var publishEpochSeconds: TimeInterval?
+    private var videoEpochDelay: TimeInterval = 0
     private var firstPCMOffset: TimeInterval?
     private var requestTimeout = RTMPConnection.defaultRequestTimeout
     private var requestTimer: Task<Void, Never>?
@@ -360,6 +361,7 @@ public actor RTMPStream {
             audioTimestamp.clear()
             videoTimestamp.clear()
             publishEpochSeconds = nil
+            videoEpochDelay = 0
             firstPCMOffset = nil
             let response = try await withCheckedThrowingContinuation { continuation in
                 readyState = .publish
@@ -767,6 +769,9 @@ extension RTMPStream: _Stream {
             return
         }
         publishEpochSeconds = epoch.seconds
+        // Receivers present the audio encoder's priming before the first PCM sample.
+        // Delay pictures by the same interval so they decode with their PCM.
+        videoEpochDelay = outgoing.audioSettings.encoderDelay
     }
 
     private func sendCompressedVideo(_ sampleBuffer: CMSampleBuffer, usesLegacyCompositionOffset: Bool) {
@@ -776,7 +781,7 @@ extension RTMPStream: _Stream {
         var timestamp = videoTimestamp
         let decodeTimeStamp = sampleBuffer.decodeTimeStamp.isValid ? sampleBuffer.decodeTimeStamp : sampleBuffer.presentationTimeStamp
         do {
-            let firstOffset = publishEpochSeconds.map { decodeTimeStamp.seconds - $0 } ?? 0
+            let firstOffset = publishEpochSeconds.map { decodeTimeStamp.seconds - $0 + videoEpochDelay } ?? 0
             let delta = try timestamp.update(decodeTimeStamp, firstOffset: firstOffset)
             guard let message = RTMPVideoMessage(streamId: id, timestamp: delta, sampleBuffer: sampleBuffer,
                                                  usesLegacyCompositionOffset: usesLegacyCompositionOffset) else {

@@ -99,6 +99,30 @@ import XCTest
     XCTAssertFalse(model.canRemoveCamera(rolling), "The last camera stays")
   }
 
+  /// Show Recordings in Finder stays enabled while a take rolls in a folder that is no longer
+  /// any camera's choice (the default folder cleared mid-take): it opens that take's folder.
+  func testShowRecordingsOpensARollingTakesFolderAfterTheDefaultIsCleared() throws {
+    let model = try appModel()
+    defer { fixture.stop() }
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("reveal-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+    model.recordingModel.outputFolder = folder
+    let rolling = model.feedDescriptors[0].id
+    model.startCamera(rolling)
+    defer { model.stopCamera(rolling) }
+    // The take's folder is fixed when Record is pressed; no picture is needed for that.
+    model.recordingModel.record(feedID: rolling)
+    try emitUntil("Rolling") { status(model, rolling) == .recording }
+    model.recordingModel.outputFolder = nil
+    let bridge = UISessionBridge(model: model, interface: UIInterfaceState(defaults: defaults))
+    XCTAssertTrue(UIPresentationBuilder.session(bridge.snapshot()).canRevealRecordings, "The take's folder is shown")
+    XCTAssertEqual(bridge.recordingsFolder?.standardizedFileURL.path, folder.standardizedFileURL.path,
+      "The menu item opens what it offers")
+    model.recordingModel.stop(feedID: rolling)
+    try emitUntil("The take closes") { status(model, rolling) == .idle }
+  }
+
   func testOversizedMultibyteRenameAndAddLeaveBothStoresAndSelectionIntact() throws {
     let model = try appModel()
     defer { fixture.stop() }

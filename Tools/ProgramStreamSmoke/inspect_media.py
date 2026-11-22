@@ -150,10 +150,12 @@ def verify_recording(path, *, with_audio, require_black=True, check_tone_channel
     if startup_epoch:
         # The fixture withholds the first six video frames on every connection while
         # audio advances against the common epoch. Independent track zeroes erase this gap.
+        # Pictures also follow by the AAC encoder's 2112-sample (44 ms) priming, which FLV
+        # receivers present before the first PCM sample.
         require(len(composition_offsets) == len(frames) and max(map(abs, composition_offsets)) <= .001,
                 f"The low-latency fixture has a video composition offset in {path}")
         startup_delay = float(frames[0]["dts_time"]) - float(packets[0]["dts_time"])
-        require(.17 <= startup_delay <= .235, f"Expected an audio lead of 200 ms, got {startup_delay:.3f}s in {path}")
+        require(.214 <= startup_delay <= .279, f"Expected an audio lead of 244 ms, got {startup_delay:.3f}s in {path}")
         metrics["first_audio_lead_ms"] = round(startup_delay * 1000, 1)
     # Preserve transport gaps as silence and measure the resulting waveform in 5 ms bins.
     samples = array("f")

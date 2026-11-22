@@ -574,6 +574,27 @@ struct AppSettingsSnapshot: Codable, Equatable, Sendable {
   }
 }
 
+/// One saved app recording profile, read leniently: a field saved before it
+/// existed (or unreadable) keeps its default; an entry that isn't a profile is nil.
+private struct StoredRecordingProfile: Decodable {
+  let profile: AppRecordingProfile?
+
+  private enum Keys: String, CodingKey { case videoMbps, pattern, folderBookmark, folderPath }
+
+  init(from decoder: Decoder) throws {
+    guard let values = try? decoder.container(keyedBy: Keys.self) else {
+      profile = nil
+      return
+    }
+    var profile = AppRecordingProfile()
+    if let value = (try? values.decodeIfPresent(Int.self, forKey: .videoMbps)) ?? nil { profile.videoMbps = value }
+    if let value = (try? values.decodeIfPresent(String.self, forKey: .pattern)) ?? nil { profile.pattern = value }
+    profile.folderBookmark = (try? values.decodeIfPresent(Data.self, forKey: .folderBookmark)) ?? nil
+    profile.folderPath = (try? values.decodeIfPresent(String.self, forKey: .folderPath)) ?? nil
+    self.profile = profile
+  }
+}
+
 // Small preferences stay on the main actor. Video state, frame buffers and LUT
 // contents are never serialized into defaults.
 @MainActor
@@ -646,8 +667,11 @@ final class AppSettingsStore {
 
   var recordingProfiles: [String: AppRecordingProfile] {
     get {
-      guard let data = defaults.data(forKey: Self.recordingProfilesKey) else { return [:] }
-      return (try? JSONDecoder().decode([String: AppRecordingProfile].self, from: data)) ?? [:]
+      guard let data = defaults.data(forKey: Self.recordingProfilesKey),
+        let stored = try? JSONDecoder().decode([String: StoredRecordingProfile].self, from: data) else { return [:] }
+      // Entry by entry: one unreadable app's profile must not drop the others,
+      // which the next edit would then save as the whole set.
+      return stored.compactMapValues(\.profile)
     }
     set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Self.recordingProfilesKey) }
   }

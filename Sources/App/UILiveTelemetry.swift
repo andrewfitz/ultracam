@@ -129,18 +129,24 @@ extension UISessionBridge {
       UISessionBridge.applyCapture(update, withinLossHold: model.signalWithinLossHold(id), to: &camera)
       let count = update?.ingestCPUCopyFrames ?? 0
       let now = ProcessInfo.processInfo.systemUptime
-      let previous = ingestActivity[camera.id]
-      let changed = count > 0 && (previous == nil || previous!.count != count)
-      let lastChange = changed ? now : (previous?.lastChange ?? -.infinity)
-      ingestActivity[camera.id] = (count, lastChange)
+      let activity = Self.ingestActivity(previous: ingestActivity[camera.id], count: count, now: now)
+      ingestActivity[camera.id] = activity
       camera.ingestCPUCopyFrames = count
-      camera.ingestCPUCopyActive = camera.running && count > 0 && now - lastChange < 1
-
+      camera.ingestCPUCopyActive = camera.running && count > 0 && now - activity.lastChange < 1
     }
     if follows.contains(.take) {
       bridge.applyTake(id, statistics: model.recordingModel.liveStatistics(id), drives: drives, to: &camera.recording)
     }
     return camera
+  }
+
+  /// A camera's CPU copy count and when it last grew. The count is a running total since Start,
+  /// so the first reading (a window opened, or reopened, after copying stopped) is a baseline:
+  /// only growth after it means copying is happening now.
+  nonisolated static func ingestActivity(previous: (count: UInt64, lastChange: TimeInterval)?, count: UInt64,
+    now: TimeInterval) -> (count: UInt64, lastChange: TimeInterval) {
+    guard let previous else { return (count, -.infinity) }
+    return (count, count > 0 && previous.count != count ? now : previous.lastChange)
   }
 
   var streamSnapshot: ProgramStreamSnapshot { bridge.model.streamSnapshot }

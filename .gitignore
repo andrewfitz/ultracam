@@ -9,3 +9,4 @@ Config/Signing.xcconfig
 Vendors/Sony/SDK/include/
 Vendors/Sony/SDK/lib/
 Vendors/*/SDK/.ultracam-sdk.json
+/Apps/AutoSwitcher/target/debug

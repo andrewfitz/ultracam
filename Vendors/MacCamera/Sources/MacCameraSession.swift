@@ -429,7 +429,8 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
     if changedFormat { activeMode = MacCameraMode(device.activeFormat) }
     let currentRate = effectiveRate(for: device)
     guard changedFormat || currentRate != hardwareRate else { return }
-    if let output = videoOutput, negotiatedFallback != nil {
+    if let output = videoOutput, negotiatedFallback != nil,
+       !Self.keepsInputConversion(formatChanged: changedFormat, requestedDuration: requested?.duration) {
       output.videoSettings = [:]
       negotiatedFallback = nil
       modeNote = "The saved Input Delivery conversion applies to the previously selected capture mode."
@@ -441,6 +442,13 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
     discardPendingDuration()
     forceEpoch = declaration != nil
     report()
+  }
+
+  /// Input Delivery consent is scoped to a capture format and its requested
+  /// cadence ("@automatic" when no rate was fixed). A hardware change outside
+  /// that scope ends the conversion.
+  static func keepsInputConversion(formatChanged: Bool, requestedDuration: CMTime?) -> Bool {
+    !formatChanged && requestedDuration == nil
   }
 
   private func deviceConnectionChanged(_ uid: String, identity: ObjectIdentifier, connected: Bool) {

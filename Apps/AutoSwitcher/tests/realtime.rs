@@ -146,3 +146,23 @@ fn jsonl_cue_that_overflows_float_does_not_corrupt_the_ledger() {
         [SwitcherOutput::Error { .. }]
     ));
 }
+
+#[test]
+fn invalid_jsonl_line_still_saves_the_ledger_received_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_auto-switcher"))
+        .args(["realtime", "--input-format", "jsonl", "--output"])
+        .arg(&path)
+        .stdin(pcm_input(b"{\"type\":\"tick\",\"time\":75}\n{\"type\":\"unknown\"}\n"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "the invalid line is still reported");
+    let timeline: SessionTimeline =
+        serde_json::from_reader(std::fs::File::open(&path).expect("ledger saved")).unwrap();
+    assert_eq!(timeline.events.len(), 1);
+    assert_eq!(timeline.events[0].event, StreamEvent::Tick { time: 75.0 });
+    assert_eq!(timeline.cuts.len(), 1);
+    assert_eq!(timeline.cuts[0].status, "cancelled");
+    assert!(timeline.ended_at_unix_ms.is_some());
+}

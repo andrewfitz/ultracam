@@ -396,7 +396,11 @@ final class FeedCoordinator {
   func newFeed(name: String?) -> FeedDescriptor {
     var id = FeedID(uuid: UUID())
     while descriptors.contains(where: { $0.id == id }) { id = FeedID(uuid: UUID()) }
-    return FeedDescriptor(id: id, name: name ?? "Camera \(descriptors.count + 1)")
+    // Number from the first unused default name so a removal followed by an add
+    // cannot publish two cameras with the same name.
+    let used = Set(descriptors.map(\.name))
+    let number = (1...).first { !used.contains("Camera \($0)") }!
+    return FeedDescriptor(id: id, name: name ?? "Camera \(number)")
   }
 
   @discardableResult

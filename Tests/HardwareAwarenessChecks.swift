@@ -167,6 +167,16 @@ import XCTest
     XCTAssertEqual(UIHardwareNicknameField.resynced(draft: "Typing", saved: "New", editing: true), "Typing")
   }
 
+  /// Return shows the name as saved: trimmed and cut to 64 characters.
+  func testNicknameFieldShowsTheSavedNameAfterCommit() throws {
+    let rig = try rig()
+    let inventory = HardwareInventory(defaults: rig.defaults, hardware: .offline)
+    XCTAssertEqual(UIHardwareNicknameField.save("  Left Recorder  ", to: inventory, deviceID: "a"), "Left Recorder")
+    let long = String(repeating: "x", count: 80)
+    XCTAssertEqual(UIHardwareNicknameField.save(long, to: inventory, deviceID: "a"), String(repeating: "x", count: 64))
+    XCTAssertEqual(UIHardwareNicknameField.save("   ", to: inventory, deviceID: "a"), "", "A blank name brings the driver's back")
+  }
+
   func testBatteryUnitDecidesTheGlyphAndOnlyAKnownUnitWarns() {
     func power(_ value: UInt64, _ unit: ControlValueUnit?, _ severity: DeviceSeverity? = nil) -> [ControlProperty] {
       [ControlProperty(id: "battery", label: "Battery", writable: false, value: .unsignedInteger(value), role: .power,

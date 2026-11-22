@@ -316,6 +316,46 @@ import XCTest
     }
   }
 
+  /// Record pressed before the camera declared its format: the take is set up
+  /// at the 59.94 fallback, which picks drop-frame PC-time timecode. The
+  /// camera then declares UHD 25p. The movie must still be written, with a
+  /// non-drop 25 fps timecode track, instead of failing at its first frame.
+  func testTakeConfiguredBeforeItsFormatRecords25pWithNonDropTimecode() throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("late-25p.mov")
+    let config = try SourceRecordingConfiguration(feedID: .init("late-25p"), outputURL: movie,
+      width: 3840, height: 2160, videoCodec: kCMVideoCodecType_AppleProRes422HQ, timecodePolicy: .wallClock,
+      timecodeSamplesComputerClockAtFirstFrame: true)
+    XCTAssertEqual(config.frameRate, .fps5994)
+    XCTAssertTrue(config.timecodeDropFrame)
+    let frame = CMTime(value: 1, timescale: 25)
+    let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210, rate: .constant(frame))
+    let source = try SourceAdmissionSnapshot(format: format, epochID: .init(sessionID: UUID(), epoch: 0),
+      clockBindings: .init(video: .init(), audio: nil), stage: .recordingSource)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    try writer.start()
+    try writer.bindSourceAdmission(source)
+    try writer.appendVideo(sample(duration: frame))
+    XCTAssertNoThrow(try writer.finish())
+    let result = Mutex<Result<UInt32, Error>?>(nil)
+    let done = DispatchSemaphore(value: 0)
+    Task.detached {
+      let flags: Result<UInt32, Error>
+      do {
+        let tracks = try await AVURLAsset(url: movie).loadTracks(withMediaType: .timecode)
+        guard let track = tracks.first, let description = try await track.load(.formatDescriptions).first else {
+          throw NSError(domain: "MissingTimecode", code: 1)
+        }
+        flags = .success(CMTimeCodeFormatDescriptionGetTimeCodeFlags(description))
+      } catch { flags = .failure(error) }
+      result.withLock { $0 = flags }; done.signal()
+    }
+    XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+    let flags = try XCTUnwrap(result.withLock { $0 }).get()
+    XCTAssertEqual(flags & UInt32(kCMTimeCodeFlag_DropFrame), 0)
+  }
+
   private func temporaryFolder() throws -> URL {
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

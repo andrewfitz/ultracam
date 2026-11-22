@@ -582,15 +582,19 @@ final class CaptureController: @unchecked Sendable {
   func load(_ lut: MonitorLUT, colorSpace: LUTColorSpaceContract = .rec709Video,
     expectedGeneration: UInt64? = nil,
     completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
-    let token = expectedGeneration ?? generationToken
+    // The LUT belongs to this camera's controller across stops and starts, so
+    // a capture generation change (a stop while this load waits behind a busy
+    // capture queue) must not refuse it. Only a caller that names the
+    // generation it loads for is held to it.
+    let token = expectedGeneration
     queue.async {
       do {
-        if !self.isCurrent(token) {
+        if let token, !self.isCurrent(token) {
           throw VideoError.message("Camera changed before its LUT finished loading.")
         }
         let tagged = lut.withOutputSignal(MonitorFeedHost.declaredSignal(colorSpace.output, over: .rec709))
         try self.makeProcessor().load(tagged, colorSpace: colorSpace)
-        guard self.isCurrent(token) else {
+        if let token, !self.isCurrent(token) {
           throw VideoError.message("Camera changed before its LUT finished loading.")
         }
         self.lock.withLock { self.loadedLUT = tagged; self.loadedLUTColorSpace = colorSpace }

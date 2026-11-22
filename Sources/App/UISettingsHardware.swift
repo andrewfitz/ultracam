@@ -590,8 +590,8 @@ struct UIHardwareNicknameField: View {
         TextField("Name", text: $draft, prompt: Text(placeholder)).labelsHidden()
           .textFieldStyle(.roundedBorder).multilineTextAlignment(.leading).frame(maxWidth: 220)
           .focused($focused)
-          .onSubmit { inventory.setNickname(draft, for: deviceID) }
-          .onChange(of: focused) { _, now in if !now { inventory.setNickname(draft, for: deviceID) } }
+          .onSubmit { draft = Self.save(draft, to: inventory, deviceID: deviceID) }
+          .onChange(of: focused) { _, now in if !now { draft = Self.save(draft, to: inventory, deviceID: deviceID) } }
         Text("Stays on this Mac").font(.uiMeta).foregroundStyle(.secondary)
       }
     }
@@ -606,6 +606,12 @@ struct UIHardwareNicknameField: View {
   /// write a name back after Reset.
   static func commits(draft: String, saved: String?) -> Bool {
     draft.trimmingCharacters(in: .whitespacesAndNewlines) != (saved ?? "")
+  }
+  /// Saves the draft and returns what was stored, trimmed and cut to length, so the field
+  /// never shows a name that wasn't saved.
+  @MainActor static func save(_ draft: String, to inventory: HardwareInventory, deviceID: String) -> String {
+    inventory.setNickname(draft, for: deviceID)
+    return inventory.nickname(for: deviceID) ?? ""
   }
   /// The draft after the saved name changed: the new name, unless the person is typing.
   static func resynced(draft: String, saved: String?, editing: Bool) -> String { editing ? draft : saved ?? "" }

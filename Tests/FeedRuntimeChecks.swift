@@ -62,6 +62,16 @@ import XCTest
       "Starting an unknown ID must not create a ghost descriptor")
   }
 
+  func testNewFeedNameSkipsNamesStillInUseAfterARemoval() {
+    let feeds = (1...3).map { FeedDescriptor(id: FeedID(rawValue: "feed-\($0)"), name: "Camera \($0)") }
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: feeds))
+    XCTAssertTrue(coordinator.remove(feeds[0].id))
+    XCTAssertEqual(coordinator.newFeed(name: nil).name, "Camera 1")
+    coordinator.add()
+    XCTAssertEqual(coordinator.newFeed(name: nil).name, "Camera 4")
+    XCTAssertEqual(Set(coordinator.descriptors.map(\.name)).count, coordinator.descriptors.count)
+  }
+
   func testRemovingSelectedFeedSelectsAnotherEnabledFeed() {
     let disabled = FeedDescriptor(id: FeedID(rawValue: "disabled"), name: "Disabled", enabled: false)
     let first = FeedDescriptor(id: FeedID(rawValue: "first"), name: "First")
